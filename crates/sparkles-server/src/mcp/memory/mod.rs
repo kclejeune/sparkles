@@ -58,21 +58,152 @@ pub(crate) const DEFAULT_GRAPH: &str = "urn:x-arq:DefaultGraph";
 /// The reciprocal rank fusion constant (Cormack et al.), as `spk:hybridSearch` uses.
 pub(crate) const RRF_K: f64 = sparkles::rank::RRF_K;
 
-/// One snapshot read as the caller: the call's query options (the caller's view, its
-/// budgets and deadline) and whether the materialized inferences take part.
+/// Physical backing of a [`Reader`]: either an ordinary snapshot or a bound evidence view.
+pub(crate) enum ReaderSource {
+    Snapshot(Arc<Snapshot>),
+    Evidence {
+        view: sparkles::store::BoundEvidenceView,
+        ds: Arc<Dataset>,
+    },
+}
+
+/// One snapshot or bound evidence view read as the caller: the call's query options
+/// (the caller's view, its budgets and deadline) and whether materialized inferences
+/// take part.
 pub(crate) struct Reader {
-    pub snap: Arc<Snapshot>,
+    source: ReaderSource,
     pub opts: QueryOptions,
     pub deadline: Instant,
     pub reasoning: bool,
 }
 
 impl Reader {
+    pub(crate) fn from_snapshot(
+        snap: Arc<Snapshot>,
+        opts: QueryOptions,
+        deadline: Instant,
+        reasoning: bool,
+    ) -> Self {
+        Self {
+            source: ReaderSource::Snapshot(snap),
+            opts,
+            deadline,
+            reasoning,
+        }
+    }
+
+    pub(crate) fn from_evidence(
+        view: sparkles::store::BoundEvidenceView,
+        ds: Arc<Dataset>,
+        opts: QueryOptions,
+        deadline: Instant,
+        reasoning: bool,
+    ) -> Self {
+        Self {
+            source: ReaderSource::Evidence { view, ds },
+            opts,
+            deadline,
+            reasoning,
+        }
+    }
+
+    /// The underlying snapshot for tools that opened an ordinary snapshot reader.
+    pub(crate) fn snap(&self) -> &Arc<Snapshot> {
+        match &self.source {
+            ReaderSource::Snapshot(snap) => snap,
+            ReaderSource::Evidence { .. } => {
+                panic!("evidence-backed reader does not expose a raw Snapshot")
+            }
+        }
+    }
+
+    /// Commit sequence reflected by this reader.
+    pub(crate) fn commit(&self) -> u64 {
+        match &self.source {
+            ReaderSource::Snapshot(snap) => snap.commit,
+            ReaderSource::Evidence { view, .. } => view.commit().seq,
+        }
+    }
+
     /// The query options with the remaining time as their timeout.
     pub fn timed(&self) -> Result<QueryOptions, Error> {
         let mut opts = self.opts.clone();
         opts.timeout = Some(remaining(self.deadline)?);
         Ok(opts)
+    }
+
+    fn execute(&self, q: &str, mut opts: QueryOptions) -> Result<sparql::QueryResult, Error> {
+        match &self.source {
+            ReaderSource::Snapshot(snap) => sparql::query(snap.clone(), q, &opts),
+            ReaderSource::Evidence { view, ds } => {
+                if opts.graphs.is_none() {
+                    opts.graphs = Some(Arc::new(sparkles::access::GraphAccess::all()));
+                }
+                sparql::query_source(view.read_source(), ds.dataset.store(), q, &opts)
+            }
+        }
+    }
+
+    /// Whether `graph` is readable under `opts` at this reader's state.
+    pub(crate) fn readable_graph(&self, opts: &QueryOptions, graph: &str) -> Result<bool, Error> {
+        match &self.source {
+            ReaderSource::Snapshot(snap) => Ok(crate::graphrag::read::readable(snap, opts, graph)),
+            ReaderSource::Evidence { view, .. } => match &opts.graphs {
+                None => Ok(true),
+                Some(access) => {
+                    let graph_only = Arc::new(sparkles::access::GraphAccess::graphs(
+                        access.read.clone(),
+                        sparkles::access::Graphs::none(),
+                    ));
+                    let prep = sparkles::access::Preparation::for_request(opts)?;
+                    Ok(view.prepare_view(graph_only, &prep)?.allows_read_iri(graph))
+                }
+            },
+        }
+    }
+
+    /// Read the SHACL constraints layer at this reader's snapshot or evidence view
+    /// without opening live `HEAD`.
+    pub(crate) fn constraints(
+        &self,
+        ds: &Dataset,
+        view: Option<&sparkles::access::GraphAccess>,
+    ) -> Result<Option<sparkles::schema::ConstraintsLayer>, Error> {
+        let shapes = sparkles::handles::ShapesRequest::default();
+        match &self.source {
+            ReaderSource::Snapshot(snap) => ds.dataset.schema().constraints_at(snap, &shapes, view),
+            ReaderSource::Evidence { view: ev, .. } => ds
+                .dataset
+                .schema()
+                .constraints_for_evidence(ev, &shapes, view),
+        }
+    }
+
+    /// Read community reports for `members` at this reader's state.
+    pub(crate) fn reports_of_members(
+        &self,
+        opts: &QueryOptions,
+        graph: &str,
+        members: &[String],
+        level: Option<u32>,
+        filter: crate::graphrag::read::Filter,
+    ) -> Result<Vec<(String, crate::graphrag::read::ReportRef)>, Error> {
+        match &self.source {
+            ReaderSource::Snapshot(snap) => {
+                crate::graphrag::read::reports_of_members(snap, opts, graph, members, level, filter)
+            }
+            ReaderSource::Evidence { view, ds } => {
+                crate::graphrag::read::reports_of_members_source(
+                    &view.read_source(),
+                    ds.dataset.store(),
+                    opts,
+                    graph,
+                    members,
+                    level,
+                    filter,
+                )
+            }
+        }
     }
 
     /// The rows of a SELECT query with `bindings` substituted, under the remaining time.
@@ -90,7 +221,8 @@ impl Reader {
         opts.aggregate_errors = Some(sparkles::sparql::AggregateErrors::Sparkles);
         // An application copy, as before the retained row owners. Retaining these
         // MCP consumer rows under their query credit is a separate migration.
-        Ok(sparql::query(self.snap.clone(), q, &opts)?
+        Ok(self
+            .execute(q, opts)?
             .rows()?
             .iter()
             .map(|row| row.values().to_vec())
@@ -102,7 +234,7 @@ impl Reader {
         let mut opts = self.opts.clone();
         opts.timeout = Some(remaining(self.deadline)?);
         opts.initial_bindings = bindings;
-        Ok(sparql::query(self.snap.clone(), q, &opts)?.boolean)
+        Ok(self.execute(q, opts)?.boolean)
     }
 
     /// `pattern` in every graph of the view, with `?g` bound to the graph: the default
@@ -281,12 +413,38 @@ impl Tools<'_> {
             .map_err(|e| ctx.engine(e))?;
         opts.union_default_graph = Some(false);
         opts.default_graph_extra.clear();
-        Ok(Reader {
-            snap,
+        Ok(Reader::from_snapshot(snap, opts, deadline, reasoning))
+    }
+
+    /// The reader of an authenticated [`sparkles::store::BoundEvidenceView`], keeping
+    /// the view's reservation alive without extracting a raw snapshot.
+    pub(crate) fn reader_on_evidence(
+        &self,
+        ds: &Arc<Dataset>,
+        view: sparkles::store::BoundEvidenceView,
+        reasoning: Option<bool>,
+        deadline: Instant,
+        ctx: &ErrorContext,
+    ) -> Result<Reader, ToolError> {
+        let reasoning = Self::reasoning(ds, reasoning);
+        let mut opts = self
+            .query_options(
+                &ds.name,
+                crate::auth::Endpoint::Query,
+                reasoning,
+                deadline,
+                &BTreeMap::new(),
+            )
+            .map_err(|e| ctx.engine(e))?;
+        opts.union_default_graph = Some(false);
+        opts.default_graph_extra.clear();
+        Ok(Reader::from_evidence(
+            view,
+            ds.clone(),
             opts,
             deadline,
             reasoning,
-        })
+        ))
     }
 
     /// The schema report of the caller's view over every graph, or `None` when the
@@ -304,7 +462,7 @@ impl Tools<'_> {
         let timeout = r.deadline.saturating_duration_since(self.call.arrived);
         self.schema_report(
             ds,
-            &r.snap,
+            r.snap(),
             sparkles::schema::GraphSelection::Union,
             r.reasoning,
             false,

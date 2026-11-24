@@ -372,7 +372,7 @@ fn answers(
         }
         if a.relevance.uses() {
             // an access mask hides quads that the check below would count
-            if snap.mask.is_some() {
+            if snap.has_mask() {
                 relevant = true;
                 return false;
             }

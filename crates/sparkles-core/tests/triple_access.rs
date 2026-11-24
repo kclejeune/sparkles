@@ -1070,14 +1070,14 @@ fn masks_are_kept_per_commit() {
     let m1 = a.masked(&snap).unwrap();
     let m2 = a.masked(&snap).unwrap();
     assert!(Arc::ptr_eq(&m1, &m2));
-    assert_eq!(m1.mask.as_ref().unwrap().hidden.len(), 2);
+    assert_eq!(m1.hidden_quad_count(), 2);
     ok(
         &s,
         "INSERT DATA { ex:carol ex:salary 3 }",
         &QueryOptions::default(),
     );
     let m3 = a.masked(&s.snapshot()).unwrap();
-    assert_eq!(m3.mask.as_ref().unwrap().hidden.len(), 3);
+    assert_eq!(m3.hidden_quad_count(), 3);
 }
 
 /// Diffs show the changes of the triples the view sees; with protections that depend on

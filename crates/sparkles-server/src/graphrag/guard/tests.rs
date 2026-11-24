@@ -379,11 +379,12 @@ fn controlled_exemptions(
     v: &GraphAccess,
     p: &sparkles::access::Preparation,
 ) -> sparkles::Result<Vec<String>> {
+    let guard_snap = sparkles::access::GuardSnapshot::new(snap);
     let output = Decide {
         guard: g.clone(),
         view: v.clone(),
     }
-    .exempt_controlled(snap, p)?;
+    .exempt_controlled(&guard_snap, p)?;
     let mut values: Vec<_> = output.iter().map(str::to_string).collect();
     values.sort();
     Ok(values)
@@ -486,11 +487,11 @@ fn controlled_guarded_access_uses_actual_provider_without_changing_write_permiss
             &Preparation::new(Control::none(), 16 << 20).unwrap(),
         )
         .unwrap();
-    assert_eq!(prepared.access(), old.as_ref());
-    assert!(prepared.access().read.allows_iri(REPORTS));
-    assert!(prepared.access().write.allows_iri(A));
-    assert!(!prepared.access().write.allows_iri(REPORTS));
-    assert!(std::ptr::eq(prepared.snapshot(), s.snapshot().as_ref()));
+    assert!(prepared.policy_matches(&old));
+    assert!(prepared.allows_read_iri(REPORTS));
+    assert!(prepared.writable_iri(A));
+    assert!(!prepared.writable_iri(REPORTS));
+    assert!(prepared.same_snapshot(&s.snapshot()));
 }
 
 #[test]

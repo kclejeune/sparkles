@@ -1045,13 +1045,36 @@ fn projection_cache_successive_transaction_views_are_fresh() {
 
 #[test]
 fn projection_cache_masked_readthrough_pending_view_stays_uncached() {
+    use sparkles_core::access::{
+        Caller, GraphAccess, Graphs, Limits, Protection, Rule, TripleRules,
+    };
     let s = projection_cache_store();
+    let policy = GraphAccess::with_triples(
+        Graphs::All,
+        Graphs::none(),
+        TripleRules {
+            rules: vec![Rule {
+                protection: Arc::new(Protection {
+                    name: "r1-empty-mask".into(),
+                    predicates: Some(vec!["urn:never-matches".into()]),
+                    classes: None,
+                    subclasses: false,
+                    graphs: None,
+                    pattern: None,
+                    prefixes: Default::default(),
+                    hide_inferences: false,
+                }),
+                read: Graphs::none(),
+                write: Graphs::none(),
+            }],
+            caller: Caller::default(),
+            limits: Limits::default(),
+        },
+    );
     let derived = |snap: &sparkles_core::store::Snapshot| {
-        Arc::new(sparkles_core::access::triples::apply(
-            &snap.without_cache_fill(),
-            Vec::new(),
-            "r1-empty-mask".into(),
-        ))
+        let masked = policy.masked(&Arc::new(snap.without_cache_fill())).unwrap();
+        assert!(masked.has_mask());
+        masked
     };
     assert_eq!(
         projection_cache_read(

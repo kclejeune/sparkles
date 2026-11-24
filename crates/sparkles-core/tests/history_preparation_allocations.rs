@@ -450,8 +450,8 @@ fn controlled_permission_preparation_cost_diagnostic() {
                         .unwrap();
                     (result, start.elapsed().as_nanos())
                 });
-                assert_eq!(prepared.snapshot().len(), legacy.len());
-                assert_eq!(prepared.snapshot().len(), rows / 2);
+                assert_eq!(prepared.len(), legacy.len());
+                assert_eq!(prepared.len(), rows / 2);
                 let render = |snapshot: &sparkles_core::store::Snapshot| {
                     let mut lines = snapshot
                         .scan_keys(sparkles_core::index::Perm::Spo, &[])
@@ -474,7 +474,31 @@ fn controlled_permission_preparation_cost_diagnostic() {
                     lines.sort();
                     lines
                 };
-                assert_eq!(render(prepared.snapshot()), render(&legacy));
+                let render_prepared =
+                    |view: &sparkles_core::access::PreparedView,
+                     base: &sparkles_core::store::Snapshot| {
+                        let mut lines = Vec::new();
+                        view.for_each_visible_quad(|quad| {
+                            let line = quad
+                                .iter()
+                                .map(|id| {
+                                    base.term(*id)
+                                        .map(|term| term.to_string())
+                                        .unwrap_or_else(|| format!("{id:?}"))
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            lines.push(line);
+                            Ok(())
+                        })
+                        .unwrap();
+                        lines.sort();
+                        lines
+                    };
+                assert_eq!(
+                    render_prepared(&prepared, &bounded.snapshot()),
+                    render(&legacy)
+                );
                 // The preceding allocation attribution lines carry actual peak
                 // above the pre-call live baseline, including moving reallocs.
                 eprintln!(

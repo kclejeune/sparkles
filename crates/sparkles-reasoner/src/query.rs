@@ -772,7 +772,7 @@ impl Session {
                 format!(
                     "{}|{}|{:?}",
                     snap.generation.uid,
-                    snap.mask.as_ref().map_or("", |m| m.key.as_str()),
+                    snap.mask_key().unwrap_or(""),
                     graphs
                 ),
                 shared.digest,
@@ -784,7 +784,7 @@ impl Session {
                     "{}|{}|{}|{:?}",
                     snap.generation.uid,
                     snap.commit,
-                    snap.mask.as_ref().map_or("", |m| m.key.as_str()),
+                    snap.mask_key().unwrap_or(""),
                     graphs
                 );
                 let (v, known) = crate::reuse::view_key(key, &snap, &graphs, own, &*req.stop);

@@ -253,3 +253,273 @@ fn recall_citation_source_rejects_reifiers_without_parsing_unregistered_fragment
         );
     }
 }
+
+#[test]
+fn pooled_server_grantless_recall_with_review_policy_succeeds() {
+    use sparkles::evidence::{ClaimKind, ConflictMode, Policy, Settings};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = McpConfig::default();
+    let mut st = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        cfg.max_timeout,
+        Some(64 << 20),
+    )
+    .unwrap();
+    st.read_only = false;
+    st.limits.query_memory_bytes = cfg.query_memory_bytes;
+    let st = Arc::new(st);
+    let ds = st.attach("mem", DbType::Mem, None).unwrap();
+    let prep =
+        sparkles::access::Preparation::new(sparkles::task::Control::none(), 64 << 20).unwrap();
+    ds.dataset
+        .store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    drop(prep);
+    let settings = Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        decisions: vec!["urn:ev:decisions".into()],
+        supports: vec!["urn:ev:supports".into()],
+        projections: vec!["urn:ev:accepted".into()],
+        policies: [(
+            "main".into(),
+            Policy {
+                version: 1,
+                admitted_kinds: vec![ClaimKind::Reported],
+                required_scope: vec![],
+                conflicts: ConflictMode::AdmitLabelled,
+                boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+                decisions: "urn:ev:decisions".into(),
+                supports: "urn:ev:supports".into(),
+                output: "urn:ev:accepted".into(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    sparkles::evidence::configure(&ds.dataset, &settings, &sparkles::task::Control::none())
+        .unwrap();
+    load_trig(
+        &ds,
+        &format!(
+            "{PREFIXES}\n<urn:g:facts> {{ <urn:cite:entity> <urn:cite:predicate> \"hello\" . }}\n"
+        ),
+    );
+    let server = McpServer::new(st.clone(), cfg);
+    let result = read(&server, Principal::local(), json!({"reviewPolicy": "main"}));
+    assert!(
+        result.get("entities").is_some(),
+        "expected recall result JSON, got: {result}"
+    );
+    assert_eq!(st.catalog.pool().unwrap().granted(), 0);
+}
+
+#[test]
+fn pooled_server_recall_keeps_selection_ceiling_distinct_from_query_memory_cap() {
+    use sparkles::evidence::{ClaimKind, ConflictMode, Policy, Settings};
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(128 << 20),
+    )
+    .unwrap();
+    st.read_only = false;
+    let st = Arc::new(st);
+    let ds = st.attach("mem", DbType::Mem, None).unwrap();
+    let prep =
+        sparkles::access::Preparation::new(sparkles::task::Control::none(), 64 << 20).unwrap();
+    ds.dataset
+        .store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    drop(prep);
+    let settings = Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        decisions: vec!["urn:ev:decisions".into()],
+        supports: vec!["urn:ev:supports".into()],
+        projections: vec!["urn:ev:accepted".into()],
+        policies: [(
+            "main".into(),
+            Policy {
+                version: 1,
+                admitted_kinds: vec![ClaimKind::Reported],
+                required_scope: vec![],
+                conflicts: ConflictMode::AdmitLabelled,
+                boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+                decisions: "urn:ev:decisions".into(),
+                supports: "urn:ev:supports".into(),
+                output: "urn:ev:accepted".into(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    sparkles::evidence::configure(&ds.dataset, &settings, &sparkles::task::Control::none())
+        .unwrap();
+    load_trig(
+        &ds,
+        &format!(
+            "{PREFIXES}\n<urn:g:facts> {{ <urn:cite:entity> <urn:cite:predicate> \"hello\" . }}\n"
+        ),
+    );
+    let pool = st.catalog.pool().unwrap();
+    for query_memory_bytes in [Some(256 << 20), None] {
+        let cfg = McpConfig {
+            query_memory_bytes,
+            ..Default::default()
+        };
+        let server = McpServer::new(st.clone(), cfg);
+        let grant = Arc::new(pool.empty_grant());
+        let mut call = Call {
+            arrived: Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            request_id: "selection-ceiling".into(),
+            principal: Principal::local(),
+            headers: None,
+            held: None,
+            grant: Some(grant.clone()),
+            preparation: None,
+        };
+        let args = json!({
+            "dataset": "mem",
+            "seeds": ["urn:cite:entity"],
+            "hops": 0,
+            "format": "json",
+            "reviewPolicy": "main"
+        });
+        let outcome = server
+            .run_now("recall", args.as_object().unwrap().clone(), &mut call)
+            .unwrap();
+        let Outcome::Text(text) = outcome else {
+            panic!("recall JSON is a text block");
+        };
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            parsed.get("entities").is_some(),
+            "expected recall JSON for query_memory_bytes={query_memory_bytes:?}, got: {parsed}"
+        );
+        // Call preparation shares the same grant, so peak granted is bounded by
+        // the 64 MiB selection ceiling plus at most one 4 MiB pool granule, never
+        // the 128 MiB pool capacity.
+        assert!(
+            grant.peak() <= (64 << 20) + sparkles::sparql::pool::GRANULE,
+            "MCP evidence selection exceeded 64 MiB ceiling for query_memory_bytes={query_memory_bytes:?}: peak={}",
+            grant.peak()
+        );
+        drop(call);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn recall_conflicts_use_historical_reader_state_and_evidence_view() {
+    use sparkles::evidence::{ClaimKind, ConflictMode, Policy, Settings};
+    let server = server_with(&[], McpConfig::default());
+    let ds = server.state.attach("mem", DbType::Mem, None).unwrap();
+    let prep =
+        sparkles::access::Preparation::new(sparkles::task::Control::none(), 64 << 20).unwrap();
+    ds.dataset
+        .store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    drop(prep);
+    let settings = Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        decisions: vec!["urn:ev:decisions".into()],
+        supports: vec!["urn:ev:supports".into()],
+        projections: vec!["urn:ev:accepted".into()],
+        policies: [(
+            "main".into(),
+            Policy {
+                version: 1,
+                admitted_kinds: vec![ClaimKind::Reported],
+                required_scope: vec![],
+                conflicts: ConflictMode::AdmitLabelled,
+                boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+                decisions: "urn:ev:decisions".into(),
+                supports: "urn:ev:supports".into(),
+                output: "urn:ev:accepted".into(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    sparkles::evidence::configure(&ds.dataset, &settings, &sparkles::task::Control::none())
+        .unwrap();
+    load_trig(
+        &ds,
+        &format!(
+            "{PREFIXES}\n<urn:g:a> {{ <urn:cite:entity> a <urn:Person> ; <urn:email> \"a@example.org\" . }}\n<urn:g:b> {{ <urn:cite:entity> <urn:email> \"b@example.org\" . }}\n"
+        ),
+    );
+    let commit_with_conflict = ds.store.head_commit().seq;
+    ds.store
+        .create_snapshot_opts(
+            "before-conflict-fix",
+            &sparkles::history::At::Commit(commit_with_conflict),
+            &Default::default(),
+        )
+        .unwrap();
+    // Install a SHACL write guard limiting <urn:email> to maxCount 1 for <urn:Person>.
+    let cfg: sparkles_shacl::guard::ValidationConfig = serde_json::from_value(json!({
+        "format": 2,
+        "language": "shacl",
+        "mode": "warn",
+        "dataGraph": "union",
+        "shapes": {
+            "inline": "@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:shape:person> a sh:NodeShape ; sh:targetClass <urn:Person> ; sh:property [ sh:path <urn:email> ; sh:maxCount 1 ] ."
+        }
+    }))
+    .unwrap();
+    ds.dataset.validation().guard().set_shacl(cfg).unwrap();
+    // Resolve the conflict at HEAD by deleting the second graph's email.
+    ds.dataset
+        .update(
+            "DELETE DATA { GRAPH <urn:g:b> { <urn:cite:entity> <urn:email> \"b@example.org\" } }",
+        )
+        .unwrap();
+
+    // At HEAD, there is no conflict; at the historical commit, both snapshot recall
+    // and evidence-backed recall report the conflict cleanly.
+    let head = read(&server, Principal::local(), json!({}));
+    assert!(
+        head.get("conflicts")
+            .is_none_or(|c| c.as_array().unwrap().is_empty()),
+        "expected no conflict at HEAD: {head}"
+    );
+    let hist_snap = read(
+        &server,
+        Principal::local(),
+        json!({"atCommit": commit_with_conflict}),
+    );
+    assert_eq!(
+        hist_snap["conflicts"].as_array().unwrap().len(),
+        1,
+        "expected historical snapshot conflict: {hist_snap}"
+    );
+    let hist_ev = read(
+        &server,
+        Principal::local(),
+        json!({"atCommit": commit_with_conflict, "reviewPolicy": "main"}),
+    );
+    assert_eq!(
+        hist_ev["conflicts"].as_array().unwrap().len(),
+        1,
+        "expected historical evidence-backed conflict: {hist_ev}"
+    );
+}

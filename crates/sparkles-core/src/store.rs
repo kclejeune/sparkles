@@ -33,7 +33,7 @@ pub use control_store::{ControlOwner, ControlStamp, ControlWrite};
 #[cfg(test)]
 mod compaction_tests;
 pub(crate) mod configuration_history;
-pub use bound_read_source::BoundReadSource;
+pub use bound_read_source::{BoundReadSource, PreparedTxnView, ScopedQueryResult};
 mod evidence_view;
 pub use evidence_view::BoundEvidenceView;
 mod aggregates;
@@ -600,6 +600,25 @@ impl Delta {
 }
 
 /// A consistent, immutable view of the store.
+///
+/// Retaining a `Snapshot` (or cloning its `generation` or `delta` fields) pins the
+/// generation and delta storage it references until dropped. Internal count caches and
+/// triple-level access masks are crate-private so callers cannot retain them apart from
+/// the snapshot or forge an uncredited mask:
+///
+/// ```compile_fail
+/// use sparkles_core::store::Snapshot;
+/// fn escape_mask(snap: &Snapshot) {
+///     let _ = snap.mask.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use sparkles_core::store::Snapshot;
+/// fn escape_counts(snap: &Snapshot) {
+///     let _ = snap.counts.clone();
+/// }
+/// ```
 #[derive(Clone)]
 pub struct Snapshot {
     /// Dataset family identity (shared by its branches and derived views).
@@ -633,10 +652,10 @@ pub struct Snapshot {
     pub historical: bool,
     /// exact counts from the statistics corrected for this snapshot's delta, worked out
     /// once per snapshot
-    pub counts: Arc<crate::sparql::stats::CountCache>,
+    pub(crate) counts: Arc<crate::sparql::stats::CountCache>,
     /// the quads a triple-level access view hides, when this snapshot is such a view's
     /// (they are in the delta as deletions; see [`crate::access::triples`])
-    pub mask: Option<Arc<crate::access::Mask>>,
+    pub(crate) mask: Option<Arc<crate::access::Mask>>,
     /// the store's change log, which history queries read (see [`ChangeLog`])
     pub change_log: Option<Arc<ChangeLog>>,
 }
@@ -695,6 +714,26 @@ pub enum Chunk<'a> {
 }
 
 impl Snapshot {
+    /// Whether this snapshot carries a triple-level access mask.
+    pub fn has_mask(&self) -> bool {
+        self.mask.is_some()
+    }
+
+    /// Process-unique identifier of this snapshot's triple-level access mask, if masked.
+    pub fn mask_id(&self) -> Option<u64> {
+        self.mask.as_ref().map(|m| m.id)
+    }
+
+    /// View key of this snapshot's triple-level access mask, if masked.
+    pub fn mask_key(&self) -> Option<&str> {
+        self.mask.as_ref().map(|m| m.key.as_str())
+    }
+
+    /// Number of quads hidden by this snapshot's triple-level access mask.
+    pub fn hidden_quad_count(&self) -> usize {
+        self.mask.as_ref().map_or(0, |m| m.hidden.len())
+    }
+
     /// The same snapshot, reading through the block cache without filling it: for full
     /// scans such as exports, which would evict the blocks queries use.
     pub fn without_cache_fill(&self) -> Snapshot {
@@ -6690,14 +6729,54 @@ impl WriteTxn<'_> {
         self.store.aggregate_errors()
     }
 
-    /// The graph view of this transaction's writes, if it does not cover every graph.
-    pub fn graphs(&self) -> Option<&Arc<crate::access::GraphAccess>> {
-        self.opts.graphs.as_ref()
+    /// Prepare a scoped, budgeted read view of this transaction under `preparation`,
+    /// reserving the transaction snapshot's delta and generation storage before
+    /// constructing the view.
+    ///
+    /// The returned [`PreparedTxnView`] borrows this [`WriteTxn`], preventing mutations,
+    /// commits, [`Self::discard_terms`], or dry-run vocabulary rollback while the view or
+    /// any [`ScopedQueryResult`] derived from it is alive. When the transaction has no
+    /// uncommitted changes yet, the prepared view reads `self.base` so a policy bound
+    /// against `self.base` remains valid; once dirty, policies bound to an earlier state
+    /// are refused.
+    pub fn prepare_read_view<'a>(
+        &'a self,
+        preparation: &crate::access::Preparation,
+    ) -> Result<PreparedTxnView<'a>> {
+        let selection = preparation.selection_scope();
+        selection.check()?;
+        let limit = crate::history::ReadLimit {
+            options: &selection,
+            memory: Some(selection.selection_room()),
+            held: 0,
+        };
+        let delta_bytes = crate::store::history_limited::preparation_delta_bytes(&self.delta);
+        let retained = delta_bytes
+            .checked_add(self.base.generation.retained_bytes_limited(&limit)?)
+            .and_then(|bytes| bytes.checked_add(crate::history::READ_METADATA_BYTES))
+            .ok_or_else(|| selection.exhausted())?;
+        let held = selection.reserve(retained)?;
+        let snap = if self.is_dirty() {
+            Arc::new(self.view())
+        } else {
+            self.base.clone()
+        };
+        let txn = bound_read_source::PreparedTxn::new(snap, self.store, held);
+        let all = crate::access::GraphAccess::all();
+        let access = self.opts.graphs.as_deref().unwrap_or(&all);
+        let view = crate::access::triples::controlled::prepare_txn(
+            txn,
+            access,
+            &preparation.without_selection_scope(),
+        )?;
+        Ok(PreparedTxnView::new(self.store, view))
     }
 
-    /// The state the transaction's reads see: [`view`](Self::view), without the triples
-    /// the graph view's protections hide. Before the first change it is the committed
-    /// snapshot's masked view, built once per commit.
+    /// Legacy unbudgeted helper returning the state the transaction's reads see:
+    /// [`view`](Self::view), without the triples the graph view's protections hide.
+    /// The returned snapshot is not bound to a [`crate::access::Preparation`] and must
+    /// not be retained past [`Self::discard_terms`]; prefer [`Self::prepare_read_view`]
+    /// for budgeted read paths.
     pub fn read_view(&self) -> Result<Arc<Snapshot>> {
         match self.opts.graphs.as_ref().filter(|a| a.hides_triples()) {
             Some(a) if !self.is_dirty() => a.masked(&self.base),

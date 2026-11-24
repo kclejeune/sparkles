@@ -176,13 +176,13 @@ impl Tools<'_> {
         }
         let graph = settings.reports_graph;
         let opts = r.timed().map_err(eng)?;
-        if !read::readable(&r.snap, &opts, &graph) {
+        if !read::readable(r.snap(), &opts, &graph) {
             return Ok(Selection::Unavailable(
                 "unavailable",
                 "the community reports are not available to you, because your access does not cover everything their build read".into(),
             ));
         }
-        let counts = read::level_counts(&r.snap, &opts, &graph, filter).map_err(eng)?;
+        let counts = read::level_counts(r.snap(), &opts, &graph, filter).map_err(eng)?;
         let Some(level) = level.or_else(|| read::choose_level(&counts, read::DEFAULT_MAX_REPORTS))
         else {
             return Ok(Selection::Unavailable(
@@ -202,7 +202,7 @@ impl Tools<'_> {
             if !hits.is_empty() {
                 let names: Vec<String> = hits.iter().map(|(r, _)| r.clone()).collect();
                 let found =
-                    read::reports_named(&r.snap, &opts, &graph, &names, filter).map_err(eng)?;
+                    read::reports_named(r.snap(), &opts, &graph, &names, filter).map_err(eng)?;
                 let by: HashMap<&str, &ReportRef> =
                     found.iter().map(|x| (x.iri.as_str(), x)).collect();
                 for (iri, score) in &hits {
@@ -220,7 +220,7 @@ impl Tools<'_> {
         // reports the search did not find follow, best rated first
         if reports.len() < limit {
             let rest = read::reports_at(
-                &r.snap,
+                r.snap(),
                 &opts,
                 &graph,
                 Some(level),
@@ -239,7 +239,7 @@ impl Tools<'_> {
         }
         reports.truncate(limit);
         if findings {
-            read::with_findings(&r.snap, &opts, &graph, &mut reports).map_err(eng)?;
+            read::with_findings(r.snap(), &opts, &graph, &mut reports).map_err(eng)?;
         }
         Ok(Selection::Reports {
             graph,

@@ -216,7 +216,7 @@ impl Tools<'_> {
         let entities = labelled(&r, &subjects).map_err(eng)?;
         let mut out = json!({
             "dataset": ds.name,
-            "commit": r.snap.commit,
+            "commit": r.commit(),
             "agentGraphs": graphs.len(),
             "scanned": scanned,
             "truncated": truncated || more || graphs.len() >= MAX_GRAPHS,
@@ -323,7 +323,7 @@ impl Tools<'_> {
         }
         Ok(Outcome::Structured(json!({
             "dataset": ds.name,
-            "commit": r.snap.commit,
+            "commit": r.commit(),
             "after": a.after,
             "afterDays": after,
             "requireConsolidated": rule.require_consolidated,

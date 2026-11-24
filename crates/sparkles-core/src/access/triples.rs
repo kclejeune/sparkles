@@ -176,8 +176,25 @@ impl TripleRules {
     }
 }
 
+/// Link back to the base snapshot's non-owning mask deduplication slot so dropping
+/// the last masked snapshot evicts its dead entry on a best-effort basis.
+pub(crate) struct MaskCacheLink {
+    cache: std::sync::Weak<crate::sparql::stats::CountCache>,
+    kind: crate::sparql::stats::MaskCacheKind,
+    slot: crate::sparql::stats::MaskSlot,
+}
+
 /// The quads a view hides at one commit: what a masked snapshot leaves out.
-#[derive(Debug)]
+///
+/// External callers cannot forge a masked snapshot directly:
+///
+/// ```compile_fail
+/// use sparkles_core::access::triples;
+/// use sparkles_core::store::Snapshot;
+/// fn forge(snap: &Snapshot) -> Snapshot {
+///     triples::apply(snap, Vec::new(), String::new())
+/// }
+/// ```
 pub struct Mask {
     /// unique in the process (caches keyed by a snapshot's identity tell masks apart)
     pub id: u64,
@@ -188,6 +205,29 @@ pub struct Mask {
     /// the bytes of delta nodes the masked snapshot alone owns: those that hiding the
     /// quads copied or created
     pub(crate) retained: u64,
+    /// optional non-owning link to evict our dead slot from the base snapshot's cache
+    pub(crate) cache_link: std::sync::OnceLock<MaskCacheLink>,
+}
+
+impl std::fmt::Debug for Mask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mask")
+            .field("id", &self.id)
+            .field("key", &self.key)
+            .field("hidden", &self.hidden)
+            .field("retained", &self.retained)
+            .finish()
+    }
+}
+
+impl Drop for Mask {
+    fn drop(&mut self) {
+        if let Some(link) = self.cache_link.get()
+            && let Some(cache) = link.cache.upgrade()
+        {
+            cache.evict_mask_slot(link.kind, &self.key, &link.slot);
+        }
+    }
 }
 
 impl Mask {
@@ -195,11 +235,25 @@ impl Mask {
     pub fn hides(&self, q: &[u64; 4]) -> bool {
         self.hidden.binary_search(q).is_ok()
     }
+
+    pub(crate) fn attach_cache(
+        &self,
+        cache: &Arc<crate::sparql::stats::CountCache>,
+        kind: crate::sparql::stats::MaskCacheKind,
+        slot: crate::sparql::stats::MaskSlot,
+    ) {
+        let _ = self.cache_link.set(MaskCacheLink {
+            cache: Arc::downgrade(cache),
+            kind,
+            slot,
+        });
+    }
 }
 
 static MASK_IDS: AtomicU64 = AtomicU64::new(1);
 
-/// `snap` with the quads the view hides taken out, kept with `snap` per view.
+/// `snap` with the quads the view hides taken out, deduplicated on `snap` while live
+/// without retaining the masked snapshot after its last caller drops.
 pub(super) fn masked(
     access: &GraphAccess,
     rules: &TripleRules,
@@ -208,12 +262,27 @@ pub(super) fn masked(
     let key = format!("{:?}|{}", access.read, rules.read_key());
     let slot = snap.counts.mask_slot(&key);
     let mut held = slot.lock();
-    if let Some(m) = &*held {
-        return Ok(m.clone());
+    if let Some(m) = held.upgrade() {
+        return Ok(m);
     }
-    let hidden = hidden_quads(access, rules, snap)?;
+    let hidden = match hidden_quads(access, rules, snap) {
+        Ok(hidden) => hidden,
+        Err(err) => {
+            drop(held);
+            snap.counts
+                .evict_mask_slot(crate::sparql::stats::MaskCacheKind::Legacy, &key, &slot);
+            return Err(err);
+        }
+    };
     let m = Arc::new(apply(snap, hidden, key));
-    *held = Some(m.clone());
+    *held = Arc::downgrade(&m);
+    if let Some(mask) = &m.mask {
+        mask.attach_cache(
+            &snap.counts,
+            crate::sparql::stats::MaskCacheKind::Legacy,
+            slot.clone(),
+        );
+    }
     Ok(m)
 }
 
@@ -221,7 +290,7 @@ pub(super) fn masked(
 /// those of the base become deletions, those the delta inserted leave it, and the delta's
 /// predicate statistics follow. The counts and the caches keyed by the snapshot start
 /// empty.
-pub fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot {
+pub(crate) fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot {
     use rayon::prelude::*;
     let spo = Perm::Spo.index();
     let (from_ins, from_base): (Vec<Key>, Vec<Key>) =
@@ -258,6 +327,7 @@ pub fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot {
             key,
             hidden,
             retained,
+            cache_link: std::sync::OnceLock::new(),
         })),
         ..snap.clone()
     }

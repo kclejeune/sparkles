@@ -172,6 +172,30 @@ fn quads(snap: &Snapshot) -> std::collections::BTreeSet<[u64; 4]> {
     rows
 }
 
+fn visible_quads_of(snap: &Snapshot, access: &GraphAccess) -> std::collections::BTreeSet<[u64; 4]> {
+    let mut rows = std::collections::BTreeSet::new();
+    snap.for_each_quad(|quad| {
+        if access.readable_id(snap, quad[3]) {
+            rows.insert(quad.map(|id| id.0));
+        }
+        Ok(())
+    })
+    .unwrap();
+    rows
+}
+
+fn prepared_quads(
+    view: &sparkles_core::access::PreparedView,
+) -> std::collections::BTreeSet<[u64; 4]> {
+    let mut rows = std::collections::BTreeSet::new();
+    view.for_each_visible_quad(|quad| {
+        rows.insert(quad.map(|id| id.0));
+        Ok(())
+    })
+    .unwrap();
+    rows
+}
+
 #[test]
 fn sufficient_caps_match_legacy_graph_predicate_class_subclass_and_exemption_rules() {
     use sparkles_core::access::GraphRule;
@@ -218,25 +242,27 @@ fn sufficient_caps_match_legacy_graph_predicate_class_subclass_and_exemption_rul
     for view in cases {
         let legacy_access = Arc::new(view.clone()).bound(&snapshot);
         let legacy = legacy_access.masked(&snapshot).unwrap();
-        // Fresh count/mask cache, same exact physical state. This requires real
-        // controlled construction even after the differential legacy read.
-        let cold = Arc::new(Snapshot {
-            counts: Default::default(),
-            ..(*snapshot).clone()
-        });
+        let legacy_len = legacy.len();
+        let legacy_visible = visible_quads_of(&legacy, &legacy_access);
+        // Drop legacy before controlled construction so its non-owning weak cache
+        // slot is evicted and controlled preparation performs a real cold build.
+        drop(legacy);
         let preparation = Preparation::new(Control::none(), 32 << 20).unwrap();
-        let actual = view.masked_controlled(&cold, &preparation).unwrap();
-        assert_eq!(actual.access(), legacy_access.as_ref());
-        assert_eq!(quads(actual.snapshot()), quads(&legacy));
-        assert_eq!(actual.snapshot().len(), legacy.len());
-        assert!(actual.snapshot().delta.predicates_consistent());
-        assert_eq!(actual.snapshot().commit, snapshot.commit);
+        let actual = view.masked_controlled(&snapshot, &preparation).unwrap();
+        assert!(actual.policy_matches(&legacy_access));
+        assert_eq!(prepared_quads(&actual), legacy_visible);
+        assert_eq!(actual.len(), legacy_len);
+        assert!(actual.delta_predicates_consistent());
+        assert_eq!(actual.commit(), snapshot.commit);
         let warm = view
-            .masked_controlled(&cold, &Preparation::new(Control::none(), 32 << 20).unwrap())
+            .masked_controlled(
+                &snapshot,
+                &Preparation::new(Control::none(), 32 << 20).unwrap(),
+            )
             .unwrap();
-        assert_eq!(quads(warm.snapshot()), quads(&legacy));
-        if actual.snapshot().mask.is_some() {
-            assert!(std::ptr::eq(actual.snapshot(), warm.snapshot()));
+        assert_eq!(prepared_quads(&warm), legacy_visible);
+        if actual.has_mask() {
+            assert!(actual.same_snapshot_as(&warm));
         }
     }
 }
@@ -247,11 +273,10 @@ fn static_public_rule_order_and_already_masked_scope_remain_unchanged() {
     let store = fixture();
     let mut rule = GraphRule::new(["urn:g1", "urn:g2"], &[]);
     rule.iris.reverse();
-    rule.guards.push(GraphGuard {
-        pattern: "urn:g*".into(),
-        exempt: vec!["urn:g2".into(), "urn:g1".into()],
-        decide: None,
-    });
+    rule.guards.push(GraphGuard::new(
+        "urn:g*",
+        vec!["urn:g2".into(), "urn:g1".into()],
+    ));
     let view = access(vec![(protection(), Graphs::none())], Graphs::Only(rule));
     let legacy = view.masked(&store.snapshot()).unwrap();
     let actual = view
@@ -260,15 +285,19 @@ fn static_public_rule_order_and_already_masked_scope_remain_unchanged() {
             &Preparation::new(Control::none(), 16 << 20).unwrap(),
         )
         .unwrap();
-    assert_eq!(actual.access().read, view.read);
-    assert_eq!(quads(actual.snapshot()), quads(&legacy));
+    assert!(actual.read_policy_matches(&view.read));
+    assert_eq!(prepared_quads(&actual), visible_quads_of(&legacy, &view));
     let again = GraphAccess::all()
         .masked_controlled(
             &legacy,
             &Preparation::new(Control::none(), 16 << 20).unwrap(),
         )
         .unwrap();
-    assert!(std::ptr::eq(actual.snapshot(), again.snapshot()));
+    // Controlled and legacy masks do not share cache slots, while preparing a policy
+    // that hides no triples over an already-masked snapshot preserves that snapshot.
+    assert!(!actual.same_snapshot(&legacy));
+    assert!(again.same_snapshot(&legacy));
+    assert_eq!(again.len(), actual.len());
 }
 
 #[test]
@@ -312,7 +341,7 @@ fn patterns_prepare_under_the_controlled_preparation() {
     // The legacy mask hides part of the data for this nested FILTER pattern. The
     // controlled path runs the same pattern under its preparation. The crate's
     // own test compares the hidden quads of both paths for several callers.
-    assert!(!legacy.mask.as_ref().unwrap().hidden.is_empty());
+    assert!(legacy.hidden_quad_count() > 0);
     assert!(legacy.len() < store.snapshot().len());
     let preparation = Preparation::new(Control::none(), 16 << 20).unwrap();
     view.masked_controlled(&store.snapshot(), &preparation)
@@ -354,7 +383,7 @@ fn retained_cache_caps_cancellation_and_deadlines_apply_to_successful_fast_paths
     let next = view
         .masked_controlled(&snap, &Preparation::new(Control::none(), 16 << 20).unwrap())
         .unwrap();
-    assert!(std::ptr::eq(first.snapshot(), next.snapshot()));
+    assert!(first.same_snapshot_as(&next));
 }
 
 #[test]
@@ -367,7 +396,7 @@ fn supported_providers_use_the_same_preparation_and_keep_legacy_exemptions() {
         }
         fn exempt_controlled(
             &self,
-            _: &Arc<Snapshot>,
+            _: &sparkles_core::access::GuardSnapshot<'_>,
             preparation: &Preparation,
         ) -> sparkles_core::Result<Exemptions> {
             let mut output = Exemptions::new(preparation)?;
@@ -389,8 +418,11 @@ fn supported_providers_use_the_same_preparation_and_keep_legacy_exemptions() {
             &Preparation::new(Control::none(), 16 << 20).unwrap(),
         )
         .unwrap();
-    assert_eq!(actual.access(), old.as_ref());
-    assert_eq!(quads(actual.snapshot()), quads(&store.snapshot()));
+    assert!(actual.policy_matches(&old));
+    assert_eq!(
+        prepared_quads(&actual),
+        visible_quads_of(&store.snapshot(), &old)
+    );
 }
 
 #[test]
@@ -560,7 +592,7 @@ fn mixed_static_and_undecided_rules_normalize_both_graph_sets_like_legacy_bindin
         }
         fn exempt_controlled(
             &self,
-            _: &Arc<Snapshot>,
+            _: &sparkles_core::access::GuardSnapshot<'_>,
             p: &Preparation,
         ) -> sparkles_core::Result<Exemptions> {
             let mut values = Exemptions::new(p)?;
@@ -586,9 +618,8 @@ fn mixed_static_and_undecided_rules_normalize_both_graph_sets_like_legacy_bindin
                 &Preparation::new(Control::none(), 8 << 20).unwrap(),
             )
             .unwrap();
-        assert_eq!(
-            actual.access(),
-            expected.as_ref(),
+        assert!(
+            actual.policy_matches(&expected),
             "undecided read: {undecided_read}"
         );
     }
@@ -639,11 +670,7 @@ fn retained_policy_capacities_include_all_owned_container_families() {
                     guards: Vec::with_capacity(100_000),
                     ..GraphRule::default()
                 };
-                rule.guards.push(GraphGuard {
-                    pattern: "urn:*".into(),
-                    exempt: Vec::new(),
-                    decide: None,
-                });
+                rule.guards.push(GraphGuard::new("urn:*", Vec::new()));
                 grants = Graphs::Only(rule);
             }
         }
@@ -696,7 +723,7 @@ fn retained_nested_provider_state_refuses_without_callbacks_or_a_returned_owner(
         }
         fn exempt_controlled(
             &self,
-            _: &Arc<Snapshot>,
+            _: &sparkles_core::access::GuardSnapshot<'_>,
             p: &Preparation,
         ) -> sparkles_core::Result<Exemptions> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -777,11 +804,7 @@ fn static_nested_guards_preserve_legacy_visibility_without_opaque_providers() {
         let nested = Graphs::Only(GraphRule {
             default_graph: true,
             patterns: vec!["urn:*".into()],
-            guards: vec![GraphGuard {
-                pattern: "urn:g*".into(),
-                exempt: vec!["urn:g1".into()],
-                decide: None,
-            }],
+            guards: vec![GraphGuard::new("urn:g*", vec!["urn:g1".into()])],
             ..GraphRule::default()
         });
         let mut p = protection();
@@ -806,17 +829,18 @@ fn static_nested_guards_preserve_legacy_visibility_without_opaque_providers() {
                 limits: Limits::default(),
             },
         );
-        let legacy = access.masked(&store.snapshot()).unwrap();
         let snapshot = store.snapshot();
-        let cold = Arc::new(Snapshot {
-            counts: Default::default(),
-            ..(*snapshot).clone()
-        });
+        let legacy = access.masked(&snapshot).unwrap();
+        let legacy_visible = visible_quads_of(&legacy, &access);
+        drop(legacy);
         let actual = access
-            .masked_controlled(&cold, &Preparation::new(Control::none(), 16 << 20).unwrap())
+            .masked_controlled(
+                &snapshot,
+                &Preparation::new(Control::none(), 16 << 20).unwrap(),
+            )
             .unwrap();
-        assert_eq!(actual.access(), &access);
-        assert_eq!(quads(actual.snapshot()), quads(&legacy));
+        assert!(actual.policy_matches(&access));
+        assert_eq!(prepared_quads(&actual), legacy_visible);
     }
 }
 
@@ -853,16 +877,16 @@ fn a_snapshot_masked_by_another_policy_is_refused() {
     let unhidden = GraphAccess::all()
         .masked_controlled(&masked, &preparation)
         .unwrap();
-    assert_eq!(unhidden.snapshot().len(), 1);
+    assert_eq!(unhidden.len(), 1);
     drop(unhidden);
     // A's own mask is the exact physical view of A.
     let same = a.masked_controlled(&masked, &preparation).unwrap();
-    assert_eq!(same.snapshot().len(), 1);
+    assert_eq!(same.len(), 1);
     drop(same);
     let fresh = b
         .masked_controlled(&store.snapshot(), &preparation)
         .unwrap();
-    assert_eq!(fresh.snapshot().len(), 1);
+    assert_eq!(fresh.len(), 1);
 }
 
 /// A store whose 20,000 quads and their terms stay in the uncompacted delta.
@@ -898,27 +922,22 @@ fn the_shared_input_delta_is_not_charged_to_the_view() {
     let graphs = GraphAccess::graphs(Graphs::All, Graphs::none());
     let small = Preparation::new(Control::none(), 64 << 10).unwrap();
     let view = graphs.masked_controlled(&snap, &small).unwrap();
-    assert!(std::ptr::eq(view.snapshot(), &*snap));
+    assert!(view.same_snapshot(&snap));
     drop(view);
     // A mask charges the nodes it copies, not the 20,000 shared quads at 2 KiB each.
     let masked = access(vec![(protection(), Graphs::none())], Graphs::All);
     let cap = 16 << 20;
     let preparation = Preparation::new(Control::none(), cap).unwrap();
     let view = masked.masked_controlled(&snap, &preparation).unwrap();
-    assert_eq!(view.snapshot().len(), 18_000);
+    assert_eq!(view.len(), 18_000);
     let legacy = masked.masked(&snap).unwrap();
-    assert_eq!(quads(view.snapshot()), quads(&legacy));
+    assert_eq!(prepared_quads(&view), quads(&legacy));
     // the planner statistics of the hidden inserted quads leave as the legacy path's do
-    assert!(view.snapshot().delta.predicates_consistent());
-    let stats = |s: &Snapshot| {
-        s.delta
-            .predicate_stats()
-            .map(|(p, d)| (p, *d))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(stats(view.snapshot()), stats(&legacy));
+    assert!(view.delta_predicates_consistent());
     drop(view);
-    // A cache hit is charged for the cached mask's own storage only.
+    // A cache hit while a live holder exists is charged for the cached mask's own storage only.
     let view = masked.masked_controlled(&snap, &preparation).unwrap();
-    assert_eq!(view.snapshot().len(), 18_000);
+    assert_eq!(view.len(), 18_000);
+    drop(legacy);
+    drop(view);
 }

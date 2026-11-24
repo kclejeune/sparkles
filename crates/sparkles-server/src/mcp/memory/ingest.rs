@@ -1163,12 +1163,7 @@ impl Tools<'_> {
         let mut ropts = opts.clone();
         ropts.union_default_graph = Some(false);
         ropts.default_graph_extra.clear();
-        let r = Reader {
-            snap: ds.store.snapshot(),
-            opts: ropts,
-            deadline,
-            reasoning: false,
-        };
+        let r = Reader::from_snapshot(ds.store.snapshot(), ropts, deadline, false);
         let eng = |e: Error| ctx.engine(e);
         let g1 = std::slice::from_ref(&graph);
         // what the graph already says of the source
@@ -1244,7 +1239,7 @@ impl Tools<'_> {
         if same && same_bytes {
             out["alreadyRegistered"] = true.into();
             out["committed"] = false.into();
-            out["head"] = r.snap.commit.into();
+            out["head"] = r.commit().into();
             out["chunks"] = chunk_json(&mut terms, false).into();
             out["elapsedMs"] = number((t0.elapsed().as_secs_f64() * 1e6).round() / 1000.0);
             out["prefixes"] = json!(terms.used());
@@ -1437,7 +1432,7 @@ impl Tools<'_> {
         out["chunks"] = chunk_json(&mut terms, false).into();
         if plan {
             out["committed"] = false.into();
-            out["head"] = r.snap.commit.into();
+            out["head"] = r.commit().into();
             out["update"] = update.into();
             out["elapsedMs"] = number((t0.elapsed().as_secs_f64() * 1e6).round() / 1000.0);
             out["prefixes"] = json!(terms.used());
@@ -1515,7 +1510,7 @@ impl Tools<'_> {
             .collect();
         let mut out = json!({
             "dataset": ds.name,
-            "commit": r.snap.commit,
+            "commit": r.commit(),
             "rendition": terms.iri(rend.as_str()),
             "length": rd.length,
             "total": total,
@@ -1562,7 +1557,7 @@ impl Tools<'_> {
             .collect();
         Ok(Outcome::Structured(json!({
             "dataset": ds.name,
-            "commit": r.snap.commit,
+            "commit": r.commit(),
             "sources": list,
             "truncated": truncated,
             "prefixes": terms.used(),
@@ -1705,7 +1700,7 @@ impl Tools<'_> {
                 for p in list {
                     let measured = match (report.as_deref(), report_pred(p)) {
                         (Some(rep), Some(e)) if !exact => Some(
-                            self.entry_objects(ds, &r.snap, rep, e, r.deadline, ctx)?
+                            self.entry_objects(ds, r.snap(), rep, e, r.deadline, ctx)?
                                 .0
                                 .into_owned(),
                         ),

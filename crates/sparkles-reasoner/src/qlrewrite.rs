@@ -572,7 +572,7 @@ pub(crate) fn tbox(req: &SessionRequest, inputs: &Inputs) -> Result<Arc<Tbox>> {
             "{}|{}|{}|{:?}",
             snap.generation.uid,
             snap.commit,
-            snap.mask.as_ref().map_or("", |m| m.key.as_str()),
+            snap.mask_key().unwrap_or(""),
             graphs
         )
     });

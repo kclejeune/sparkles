@@ -576,27 +576,23 @@ fn read_index(
 }
 
 /// What identifies a committed snapshot's content, for the index cache: its store's
-/// result cache, which each store owns, and the generation and commit that key that
-/// cache. The entry holds the result cache, so its address is not reused while cached.
-struct CacheKey {
-    store: Arc<sparkles::sparql::cache::ResultCache>,
-    generation: u64,
-    commit: u64,
-}
+/// result-cache identity, generation identity, and commit sequence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CacheKey(sparkles::access::SnapshotContentKey);
 
 impl CacheKey {
     fn of(snap: &Snapshot) -> Option<CacheKey> {
-        (snap.cacheable && snap.mask.is_none()).then(|| CacheKey {
-            store: snap.results.clone(),
-            generation: snap.generation.uid,
-            commit: snap.commit,
-        })
+        sparkles::access::GuardSnapshot::new(snap)
+            .content_key()
+            .map(CacheKey)
+    }
+
+    fn of_guard(snap: &sparkles::access::GuardSnapshot<'_>) -> Option<CacheKey> {
+        snap.content_key().map(CacheKey)
     }
 
     fn same(&self, o: &CacheKey) -> bool {
-        Arc::ptr_eq(&self.store, &o.store)
-            && self.generation == o.generation
-            && self.commit == o.commit
+        self.0 == o.0
     }
 }
 
@@ -691,7 +687,7 @@ impl GuardDecision for Decide {
 
     fn exempt_controlled(
         &self,
-        snap: &Arc<Snapshot>,
+        snap: &sparkles::access::GuardSnapshot<'_>,
         preparation: &sparkles::access::Preparation,
     ) -> sparkles::Result<sparkles::access::Exemptions> {
         controlled::exempt(&self.guard, snap, &self.view, preparation)

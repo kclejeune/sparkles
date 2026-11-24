@@ -1275,7 +1275,7 @@ pub fn review(
     let masked = caller_view(access.as_ref(), &head, &mask_preparation)?;
     state.seen = masked
         .as_ref()
-        .map(|v| Reads::new(&mask_preparation, v.snapshot()));
+        .map(|v| Reads::from_prepared(&mask_preparation, v));
     state.check_projection(&p, None)?;
     let mut resolution = Resolution::new(control.clone())?;
     let mut evidence = Evidence {
@@ -1619,6 +1619,24 @@ fn caller_view(
         None => Ok(None),
         Some(a) => a
             .masked_controlled(head, preparation)
+            .map(Some)
+            .map_err(|e| match e {
+                Error::Unsupported(m) => managed(ManagedErrorKind::IncompleteEvidence, m),
+                e => e,
+            }),
+    }
+}
+
+/// The caller's controlled view over an evidence view when its access hides triples.
+fn caller_view_evidence(
+    access: Option<&Arc<GraphAccess>>,
+    view: &sparkles_core::store::BoundEvidenceView,
+    preparation: &crate::access::Preparation,
+) -> Result<Option<crate::access::PreparedView>> {
+    match access.filter(|a| a.hides_triples()) {
+        None => Ok(None),
+        Some(a) => view
+            .prepare_view(a.clone(), preparation)
             .map(Some)
             .map_err(|e| match e {
                 Error::Unsupported(m) => managed(ManagedErrorKind::IncompleteEvidence, m),

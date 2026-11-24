@@ -420,8 +420,7 @@ pub(super) fn recorded_root_bytes(
     }
     // Reuse the existing controlled metadata reader. This is a registry
     // envelope, not a format1 generation and not a canonical subset of it.
-    let allowance = preparation.room();
-    let _held = preparation.reserve(allowance)?;
+    let (allowance, _held) = preparation.reserve_available()?;
     let options = HistoryOptions {
         cancel: Some(preparation.control().cancel.flag()),
         deadline: preparation.control().deadline,

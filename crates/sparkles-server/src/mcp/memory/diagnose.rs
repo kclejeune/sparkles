@@ -401,14 +401,14 @@ impl Tools<'_> {
             )
             .map_err(|e| ctx.engine(e))?;
         let asker = Asker {
-            snap: &reader.snap,
+            snap: reader.snap(),
             opts,
             query: &parsed,
             deadline,
             each: timeout / 10,
         };
         let mut terms = Terms::new(&prefixes, 200);
-        let mut out = json!({ "dataset": ds.name, "commit": reader.snap.commit });
+        let mut out = json!({ "dataset": ds.name, "commit": reader.commit() });
         let has_rows = asker
             .ask(whole(&parsed).clone())
             .map_err(|e| ctx.engine(e))?;
@@ -496,7 +496,7 @@ impl Tools<'_> {
                     continue;
                 }
                 let occurs = match c {
-                    Term::NamedNode(_) | Term::Literal(_) => match reader.snap.lookup_term(c) {
+                    Term::NamedNode(_) | Term::Literal(_) => match reader.snap().lookup_term(c) {
                         None => false,
                         Some(_) => reader
                             .ask(&exists_term(&reader), vec![("t".into(), c.clone())])
@@ -563,14 +563,14 @@ impl Tools<'_> {
                 // historical reads, instead of asking the current dataset head.
                 let snap = match &reader.opts.graphs {
                     Some(a) => a
-                        .bound(&reader.snap)
-                        .masked(&reader.snap)
+                        .bound(reader.snap())
+                        .masked(reader.snap())
                         .map_err(|e| ctx.engine(e))?,
-                    None => reader.snap.clone(),
+                    None => reader.snap().clone(),
                 };
                 let readable = reader.opts.graphs.as_ref().map(|a| {
                     let a = a.clone();
-                    let snap = reader.snap.clone();
+                    let snap = reader.snap().clone();
                     Arc::new(move |g| a.bound(&snap).readable_id(&snap, g))
                         as Arc<dyn Fn(sparkles::id::Id) -> bool + Send + Sync>
                 });
@@ -600,7 +600,7 @@ impl Tools<'_> {
                         if intensional {
                             sparkles::reasoning::hypotheses::check_consistency(
                                 &ds.dataset,
-                                &reader.snap,
+                                reader.snap(),
                                 &reasoner,
                                 &sparkles::reasoning::analysis::AnalysisOptions {
                                     timeout: Some(
@@ -617,7 +617,7 @@ impl Tools<'_> {
                             let e = sparkles::reasoning::explain::Explanation {
                                 explained: sparkles::explain::Explained::NotFound,
                                 why_not: Some(answer),
-                                commit: reader.snap.commit,
+                                commit: reader.commit(),
                                 source: Some(sparkles::reasoning::explain::ExplainSource::Demand),
                                 read_at_head: false,
                                 freshness: None,

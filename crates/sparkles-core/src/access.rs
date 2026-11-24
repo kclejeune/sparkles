@@ -75,8 +75,154 @@ pub struct GraphRule {
     pub guards: Vec<GraphGuard>,
 }
 
+/// Snapshot identity recorded when an undecided [`GraphGuard`] is bound to a snapshot,
+/// so checked read paths refuse applying that bound policy to another commit, dataset,
+/// uncommitted view, or masked derivative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct BoundSnapshot {
+    dataset_id: uuid::Uuid,
+    generation_uid: u64,
+    commit: u64,
+    mask_id: Option<u64>,
+    /// `0` for committed unmasked cacheable snapshots (so two snapshots of the same
+    /// committed state match); `snap.counts.uid()` for non-cacheable or masked views so
+    /// the exact view matches while any other uncommitted view or derivative is refused.
+    view_uid: u64,
+}
+
+impl BoundSnapshot {
+    pub(crate) fn of(snap: &Snapshot) -> Self {
+        let mask_id = snap.mask_id();
+        let view_uid = if snap.cacheable && mask_id.is_none() {
+            0
+        } else {
+            snap.counts.uid()
+        };
+        Self {
+            dataset_id: snap.dataset_id,
+            generation_uid: snap.generation.uid,
+            commit: snap.commit,
+            mask_id,
+            view_uid,
+        }
+    }
+
+    pub(crate) fn matches(&self, snap: &Snapshot) -> bool {
+        self.dataset_id == snap.dataset_id
+            && self.generation_uid == snap.generation.uid
+            && self.commit == snap.commit
+            && self.mask_id == snap.mask_id()
+            && if self.view_uid == 0 {
+                snap.cacheable
+            } else {
+                self.view_uid == snap.counts.uid()
+            }
+    }
+}
+
+/// Opaque cache identity of a cacheable, unmasked committed snapshot's content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SnapshotContentKey {
+    results_uid: u64,
+    generation_uid: u64,
+    commit: u64,
+}
+
+/// A scoped, non-escaping read handle passed to [`GuardDecision::exempt_controlled`].
+///
+/// Providers use this handle to inspect snapshot metadata and run controlled lookups
+/// and scans under the active [`Preparation`] without receiving a cloneable `Snapshot`
+/// or `Arc<Snapshot>` that could outlive the preparation's physical reservation.
+///
+/// ```compile_fail
+/// use sparkles_core::access::GuardSnapshot;
+/// use sparkles_core::store::Snapshot;
+/// fn escape(view: &GuardSnapshot<'_>) -> Snapshot {
+///     view.snapshot().clone()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use sparkles_core::access::GuardSnapshot;
+/// use sparkles_core::store::Snapshot;
+/// use std::sync::Arc;
+/// fn escape_arc(view: &GuardSnapshot<'_>) -> Arc<Snapshot> {
+///     view.clone()
+/// }
+/// ```
+pub struct GuardSnapshot<'a> {
+    snap: &'a Snapshot,
+}
+
+impl<'a> GuardSnapshot<'a> {
+    /// Wrap a borrowed snapshot in a scoped guard-read handle.
+    pub fn new(snap: &'a Snapshot) -> Self {
+        Self { snap }
+    }
+
+    /// Commit sequence reflected by this snapshot.
+    pub fn commit(&self) -> u64 {
+        self.snap.commit
+    }
+
+    /// Dataset family identity of this snapshot.
+    pub fn dataset_id(&self) -> uuid::Uuid {
+        self.snap.dataset_id
+    }
+
+    /// Process-unique generation identity of this snapshot.
+    pub fn generation_uid(&self) -> u64 {
+        self.snap.generation.uid
+    }
+
+    /// Whether this snapshot is a cacheable committed state.
+    pub fn cacheable(&self) -> bool {
+        self.snap.cacheable
+    }
+
+    /// Whether this snapshot carries a triple-level access mask.
+    pub fn has_mask(&self) -> bool {
+        self.snap.has_mask()
+    }
+
+    /// Cache key identifying a cacheable, unmasked committed snapshot's content.
+    pub fn content_key(&self) -> Option<SnapshotContentKey> {
+        (self.snap.cacheable && !self.snap.has_mask()).then(|| SnapshotContentKey {
+            results_uid: self.snap.results.uid(),
+            generation_uid: self.snap.generation.uid,
+            commit: self.snap.commit,
+        })
+    }
+
+    /// Look up an IRI's stored identifier under `preparation`.
+    pub fn lookup_iri(&self, preparation: &Preparation, iri: &str) -> Result<Option<Id>> {
+        preparation.lookup_iri(self.snap, iri)
+    }
+
+    /// Scan quads matching `prefix` on `perm` under `preparation`.
+    pub fn scan(
+        &self,
+        preparation: &Preparation,
+        perm: crate::index::Perm,
+        prefix: &[u64],
+        each: impl FnMut([Id; 4]) -> Result<bool>,
+    ) -> Result<()> {
+        preparation.scan(self.snap, perm, prefix, each)
+    }
+
+    /// Decode a term ID into a scoped [`Term`] under `preparation`.
+    pub fn with_term<R>(
+        &self,
+        preparation: &Preparation,
+        id: Id,
+        f: impl FnOnce(Option<&Term>) -> Result<R>,
+    ) -> Result<R> {
+        preparation.with_term(self.snap, id, f)
+    }
+}
+
 /// Graphs a guard keeps out of a set, except those it exempts by exact IRI.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct GraphGuard {
     /// an IRI pattern with `*`
     pub pattern: String,
@@ -86,6 +232,18 @@ pub struct GraphGuard {
     /// set the guard is undecided and lets nothing through, so a path that reads the
     /// view without [`GraphAccess::bound`] sees none of the guarded graphs.
     pub decide: Option<Decider>,
+    /// snapshot identity this guard was bound against when an undecided decider ran
+    pub(crate) bound_to: Option<BoundSnapshot>,
+}
+
+impl std::fmt::Debug for GraphGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphGuard")
+            .field("pattern", &self.pattern)
+            .field("exempt", &self.exempt)
+            .field("decide", &self.decide)
+            .finish()
+    }
 }
 
 /// Decides which graphs of a guard's pattern a snapshot proves for one reader.
@@ -95,12 +253,14 @@ pub trait GuardDecision: Send + Sync {
 
     /// Prepare exemptions under the request's shared budget and controls.
     ///
-    /// Providers must reserve their temporary and returned storage before growing
-    /// it and poll the same preparation through their work and lock waits. The
-    /// default refuses without calling the uncontrolled compatibility method.
+    /// Providers receive a scoped [`GuardSnapshot`] that exposes controlled lookup and
+    /// scan operations without a cloneable physical snapshot owner. Providers must
+    /// reserve their temporary and returned storage before growing it and poll the same
+    /// preparation through their work and lock waits. The default refuses without
+    /// calling the uncontrolled compatibility method.
     fn exempt_controlled(
         &self,
-        _snap: &Arc<Snapshot>,
+        _snap: &GuardSnapshot<'_>,
         preparation: &Preparation,
     ) -> Result<Exemptions> {
         preparation.check()?;
@@ -135,6 +295,27 @@ impl std::hash::Hash for Decider {
 }
 
 impl GraphGuard {
+    /// A decided guard that keeps out graphs matching `pattern` except `exempt`.
+    pub fn new(pattern: impl Into<String>, exempt: Vec<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            exempt,
+            decide: None,
+            bound_to: None,
+        }
+    }
+
+    /// An undecided guard that keeps out graphs matching `pattern` until `decide`
+    /// resolves its exemptions against a target snapshot.
+    pub fn with_decider(pattern: impl Into<String>, decide: Decider) -> Self {
+        Self {
+            pattern: pattern.into(),
+            exempt: Vec::new(),
+            decide: Some(decide),
+            bound_to: None,
+        }
+    }
+
     /// Whether the guard lets `iri` through.
     fn passes(&self, iri: &str) -> bool {
         !glob(&self.pattern, iri)
@@ -182,8 +363,9 @@ impl GraphRule {
             g.exempt.sort_unstable();
             g.exempt.dedup();
         }
-        self.guards
-            .sort_by(|a, b| (&a.pattern, &a.exempt).cmp(&(&b.pattern, &b.exempt)));
+        self.guards.sort_by(|a, b| {
+            (&a.pattern, &a.exempt, a.bound_to).cmp(&(&b.pattern, &b.exempt, b.bound_to))
+        });
         self.guards.dedup();
     }
 
@@ -346,6 +528,7 @@ impl Graphs {
             pattern: pattern.to_string(),
             exempt: exempt.to_vec(),
             decide: None,
+            bound_to: None,
         });
         r.normalize();
         Graphs::Only(r)
@@ -367,6 +550,7 @@ impl Graphs {
             pattern: pattern.to_string(),
             exempt: Vec::new(),
             decide: Some(decide),
+            bound_to: None,
         });
         r.normalize();
         Graphs::Only(r)
@@ -378,7 +562,7 @@ impl Graphs {
     }
 
     /// The set with every undecided guard decided against `snap`.
-    fn bound(&self, snap: &Arc<Snapshot>) -> Graphs {
+    fn bound(&self, snap: &Arc<Snapshot>, bound: BoundSnapshot) -> Graphs {
         let Graphs::Only(r) = self else {
             return Graphs::All;
         };
@@ -386,10 +570,27 @@ impl Graphs {
         for g in &mut r.guards {
             if let Some(d) = g.decide.take() {
                 g.exempt = d.0.exempt(snap);
+                g.bound_to = Some(bound);
             }
         }
         r.normalize();
         Graphs::Only(r)
+    }
+
+    /// Refuse any guard in this graph set that was bound against a different snapshot.
+    pub(crate) fn check_bound_snapshot(&self, snap: &Snapshot) -> Result<()> {
+        if let Graphs::Only(rule) = self {
+            for guard in &rule.guards {
+                if let Some(bound) = guard.bound_to
+                    && !bound.matches(snap)
+                {
+                    return Err(Error::invalid(
+                        "access policy was bound to a different snapshot; bind the original policy against the target snapshot",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether the graph named by `iri` is in the set (`urn:x-arq:DefaultGraph` is the
@@ -452,15 +653,44 @@ impl GraphAccess {
     /// This view with its undecided guards decided against `snap`, the snapshot the
     /// request reads (spec C22 §6.3). A view without undecided guards is returned as it
     /// is.
+    ///
+    /// A policy bound against `snap` is valid only for that snapshot's commit and
+    /// dataset; checked read paths refuse applying it to a different commit or
+    /// uncommitted view. Prefer [`crate::store::Store::prepare_read`] or
+    /// [`Self::masked_controlled`] for budgeted read paths.
     pub fn bound(self: &Arc<Self>, snap: &Arc<Snapshot>) -> Arc<GraphAccess> {
         if !self.read.undecided() && !self.write.undecided() {
             return self.clone();
         }
+        let bound = BoundSnapshot::of(snap);
         Arc::new(GraphAccess {
-            read: self.read.bound(snap),
-            write: self.write.bound(snap),
+            read: self.read.bound(snap, bound),
+            write: self.write.bound(snap, bound),
             triples: self.triples.clone(),
         })
+    }
+
+    /// Refuse applying a policy whose top-level or nested guards were bound against a
+    /// different snapshot.
+    pub fn validate_bound_snapshot(&self, snap: &Snapshot) -> Result<()> {
+        self.check_bound_snapshot(snap)
+    }
+
+    /// Refuse applying a policy whose guards were bound against a different snapshot,
+    /// including nested graph rules inside triple protections.
+    pub(crate) fn check_bound_snapshot(&self, snap: &Snapshot) -> Result<()> {
+        self.read.check_bound_snapshot(snap)?;
+        self.write.check_bound_snapshot(snap)?;
+        if let Some(rules) = &self.triples {
+            for rule in &rules.rules {
+                rule.read.check_bound_snapshot(snap)?;
+                rule.write.check_bound_snapshot(snap)?;
+                if let Some(graphs) = &rule.protection.graphs {
+                    graphs.check_bound_snapshot(snap)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// This view with every undecided guard keeping all its graphs out, for readers
@@ -533,9 +763,13 @@ impl GraphAccess {
         format!("{:?}", self.read)
     }
 
-    /// The snapshot as this view reads it: `snap` with the quads its protections hide
-    /// taken out (see [`triples`]). Kept with the snapshot per view, so repeated
-    /// requests at one commit build it once. `snap` itself when nothing is hidden.
+    /// Legacy unbudgeted helper returning `snap` with the quads its protections hide
+    /// taken out (see [`triples`]), or `snap` itself when nothing is hidden. Deduplicates
+    /// concurrent live callers on `snap` without retaining the masked snapshot after its
+    /// last caller drops.
+    ///
+    /// Prefer [`crate::store::Store::prepare_read`] or [`Self::masked_controlled`] for
+    /// budgeted read paths so mask storage stays bound to a [`Preparation`].
     pub fn masked(&self, snap: &Arc<Snapshot>) -> Result<Arc<Snapshot>> {
         match self.triples.as_ref().filter(|t| t.hides()) {
             Some(t) if snap.mask.is_none() => triples::masked(self, t, snap),
@@ -622,7 +856,7 @@ impl GraphAccess {
         v.sort_unstable();
         let v = (Arc::new(v), false);
         let v = (v.0.clone(), v.0.len() == n);
-        snap.counts.put_view(key, v.clone());
+        snap.counts.put_view(key, &v);
         Ok(v)
     }
 

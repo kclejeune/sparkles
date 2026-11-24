@@ -97,8 +97,12 @@ impl ResultStore {
     }
 }
 
+static RESULT_CACHE_UIDS: AtomicU64 = AtomicU64::new(1);
+
 /// A store's view of the cache of query results. Hits and misses are the view's own.
 pub struct ResultCache {
+    /// process-unique identity of this result cache view
+    uid: u64,
     /// the cache of remote SERVICE results, cleared with this one
     pub service: super::svccache::ServiceCache,
     store: Arc<ResultStore>,
@@ -121,6 +125,7 @@ impl ResultCache {
     pub fn with_service(bytes: u64, min_ms: f64, service_bytes: u64) -> ResultCache {
         let store = Arc::new(ResultStore::new(bytes, service_bytes));
         ResultCache {
+            uid: RESULT_CACHE_UIDS.fetch_add(1, Ordering::Relaxed),
             service: super::svccache::ServiceCache::view(store.service().clone(), 0, false),
             store,
             ns: 0,
@@ -134,6 +139,7 @@ impl ResultCache {
     /// A view of `store` for namespace `ns`.
     pub fn attach(store: &Arc<ResultStore>, ns: u32, min_ms: f64) -> ResultCache {
         ResultCache {
+            uid: RESULT_CACHE_UIDS.fetch_add(1, Ordering::Relaxed),
             service: super::svccache::ServiceCache::attach(store.service(), ns),
             store: store.clone(),
             ns,
@@ -142,6 +148,10 @@ impl ResultCache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn uid(&self) -> u64 {
+        self.uid
     }
 
     pub fn enabled(&self) -> bool {

@@ -471,7 +471,7 @@ impl GuardDecision for Exempt {
     }
     fn exempt_controlled(
         &self,
-        _: &Arc<Snapshot>,
+        _: &crate::access::GuardSnapshot<'_>,
         preparation: &Preparation,
     ) -> Result<Exemptions> {
         let mut out = Exemptions::new(preparation)?;

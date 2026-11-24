@@ -49,8 +49,7 @@ pub(super) fn validate(root: &Path, required: bool, preparation: &Preparation) -
             "required copied configuration history is missing",
         ));
     }
-    let allowance = preparation.room();
-    let _held = preparation.reserve(allowance)?;
+    let (allowance, _held) = preparation.reserve_available()?;
     let options = HistoryOptions {
         cancel: Some(preparation.control().cancel.flag()),
         deadline: preparation.control().deadline,

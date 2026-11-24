@@ -13,6 +13,21 @@ use crate::managed::{ManagedState, OwnerEntry, OwnerKind};
 /// use sparkles_core::store::BoundEvidenceView;
 /// fn forge() -> BoundEvidenceView { BoundEvidenceView { inner: todo!() } }
 /// ```
+///
+/// ```compile_fail
+/// use sparkles_core::store::{BoundEvidenceView, Snapshot};
+/// fn escape(view: &BoundEvidenceView) -> Snapshot {
+///     view.snapshot().clone()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use sparkles_core::store::{BoundEvidenceView, Snapshot};
+/// use std::sync::Arc;
+/// fn escape(view: &BoundEvidenceView) -> Arc<Snapshot> {
+///     view.shared_snapshot().clone()
+/// }
+/// ```
 #[derive(Clone)]
 pub struct BoundEvidenceView {
     inner: Arc<BoundInner>,
@@ -31,6 +46,9 @@ struct BoundInner {
     original_data_binding: ConfigurationBinding,
     document: managed_history::Owned<managed_history::Generation>,
     _held: Reservation,
+    // Declared after `_held` and `document` so selection reservations release
+    // before the last `Preparation` handle drops.
+    preparation: Preparation,
 }
 
 impl std::fmt::Debug for BoundEvidenceView {
@@ -51,6 +69,21 @@ impl BoundEvidenceView {
         self.inner._held.bytes()
     }
 
+    /// The configured execution memory limit of the [`Preparation`] backing this evidence view.
+    pub fn preparation_limit(&self) -> u64 {
+        self.inner.preparation.limit()
+    }
+
+    /// The configured selection memory ceiling of the [`Preparation`] backing this evidence view.
+    pub fn selection_limit(&self) -> u64 {
+        self.inner.preparation.selection_limit()
+    }
+
+    /// Remaining local room in the execution allowance of the [`Preparation`] backing this view.
+    pub fn available_execution_bytes(&self) -> u64 {
+        self.inner.preparation.available_bytes()
+    }
+
     /// Retain the genuine RDF/configuration source and its original admission.
     /// This owner grants no current authorization or independent output credit.
     pub fn read_source(&self) -> super::BoundReadSource {
@@ -58,7 +91,7 @@ impl BoundEvidenceView {
     }
 
     pub(super) fn query_input(&self) -> (&Arc<Snapshot>, &Preparation) {
-        (&self.inner.snapshot, self.inner._held.preparation())
+        (&self.inner.snapshot, &self.inner.preparation)
     }
 
     pub fn dataset_id(&self) -> uuid::Uuid {
@@ -86,19 +119,35 @@ impl BoundEvidenceView {
         self.inner.original_data_binding
     }
 
-    /// Physical RDF only. Apply the caller's current mask as well. As with a
-    /// PreparedView, independently cloning raw data requires caller accounting;
-    /// a raw clone carries no authority to construct another BoundEvidenceView.
-    pub fn snapshot(&self) -> &Snapshot {
+    /// Physical RDF only, restricted to crate internals so callers cannot clone
+    /// an uncredited snapshot past this view's reservation.
+    pub(crate) fn snapshot(&self) -> &Snapshot {
         &self.inner.snapshot
     }
 
-    /// The shared physical snapshot, for preparing the caller's mask and running
-    /// reads while this view is alive. Cloning it gives no authority to construct
-    /// another view, and a reader that keeps it past this view needs its own
-    /// accounting, as [`Self::snapshot`] says.
-    pub fn shared_snapshot(&self) -> &Arc<Snapshot> {
+    /// Shared physical snapshot, restricted to crate internals. External callers
+    /// consume this view through [`Self::read_source`], [`Self::prepare_view`], or
+    /// [`crate::evidence::write::Reads::from_evidence`].
+    pub(crate) fn shared_snapshot(&self) -> &Arc<Snapshot> {
         &self.inner.snapshot
+    }
+
+    /// Refuse applying an access policy whose top-level or nested guards were bound
+    /// against a different snapshot than this evidence view.
+    pub fn validate_access(&self, access: &crate::access::GraphAccess) -> Result<()> {
+        access.check_bound_snapshot(&self.inner.snapshot)
+    }
+
+    /// Prepare a controlled access view over this evidence view under `preparation`.
+    /// The returned [`crate::access::PreparedView`] retains this evidence view and its
+    /// original reservation alongside the mask's own credit, and records a weak identity
+    /// of `policy` for strict cursor execution (`sparql::select_source_cursor`).
+    pub fn prepare_view(
+        &self,
+        policy: Arc<crate::access::GraphAccess>,
+        preparation: &Preparation,
+    ) -> Result<crate::access::PreparedView> {
+        crate::access::triples::controlled::prepare_evidence(self.clone(), policy, preparation)
     }
 
     /// Exact original owner bytes. These describe history and grant no access.
@@ -232,7 +281,8 @@ impl Store {
         at: &At,
         preparation: &Preparation,
     ) -> Result<BoundEvidenceView> {
-        let pair = self.select_configuration_pair(store, at, preparation)?;
+        let selection = preparation.selection_scope();
+        let pair = self.select_configuration_pair(store, at, &selection)?;
         let configuration = pair.semantic.configuration().ok_or_else(|| {
             managed_history::unavailable("historical evidence configuration is explicitly unbound")
         })?;
@@ -250,7 +300,7 @@ impl Store {
                 self.owner_dataset_id(),
                 history,
                 configuration,
-                preparation,
+                &selection,
             )?
         } else {
             let published = installed.history_memory.as_ref().ok_or_else(|| {
@@ -261,9 +311,9 @@ impl Store {
                     "configuration memory root differs",
                 ));
             }
-            managed_history::resolve_memory(published, configuration, preparation)?
+            managed_history::resolve_memory(published, configuration, &selection)?
         };
-        preparation.check()?;
+        selection.check()?;
         Ok(BoundEvidenceView {
             inner: Arc::new(BoundInner {
                 family: Arc::downgrade(&self.family),
@@ -278,6 +328,7 @@ impl Store {
                 original_data_binding: pair.data,
                 document,
                 _held: pair.held,
+                preparation: preparation.without_selection_scope(),
             }),
         })
     }
@@ -288,6 +339,7 @@ impl Store {
         at: &At,
         preparation: &Preparation,
     ) -> Result<SelectedPair> {
+        let preparation = &preparation.selection_scope();
         preparation.check()?;
         if self.is_branch() || !Arc::ptr_eq(&self.family, &store.family) {
             return Err(Error::invalid(
@@ -312,8 +364,7 @@ impl Store {
             .as_ref()
             .ok_or_else(inactive)?
             .identity(self.owner_dataset_id());
-        let allowance = preparation.room();
-        let mut held = preparation.reserve(allowance)?;
+        let (allowance, mut held) = preparation.reserve_available()?;
         let options = HistoryOptions {
             cancel: Some(preparation.control().cancel.flag()),
             deadline: preparation.control().deadline,
@@ -443,8 +494,7 @@ impl Store {
                 source = Source::Borrowed(self);
                 continue;
             }
-            let allowance = preparation.room();
-            let temporary = preparation.reserve(allowance)?;
+            let (allowance, temporary) = preparation.reserve_available()?;
             let options = HistoryOptions {
                 cancel: Some(preparation.control().cancel.flag()),
                 deadline: preparation.control().deadline,

@@ -175,7 +175,7 @@ fn controlled_preparation_cost_diagnostic() {
             let prepared = view.masked_controlled(&snap, &p).unwrap();
             cold.push(start.elapsed().as_nanos());
             cold_bytes = allocated() - a;
-            hidden = snap.len() - prepared.snapshot().len();
+            hidden = snap.len() - prepared.len();
             drop(prepared);
             views.push((view, p));
         }

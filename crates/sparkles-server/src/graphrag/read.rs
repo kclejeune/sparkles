@@ -12,7 +12,7 @@ use super::store::{self, Status};
 use oxrdf::Term;
 use sparkles::error::Error;
 use sparkles::sparql::{self, QueryOptions};
-use sparkles::store::Snapshot;
+use sparkles::store::{BoundReadSource, Snapshot, Store};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -88,12 +88,35 @@ impl Filter {
 
 pub use super::guard::readable;
 
+#[derive(Clone, Copy)]
+enum ReadInput<'a> {
+    Snapshot(&'a Arc<Snapshot>),
+    Source(&'a BoundReadSource, &'a Store),
+}
+
+fn rows_in(
+    input: ReadInput<'_>,
+    opts: &QueryOptions,
+    q: &str,
+) -> Result<sparql::output::OwnedRows, Error> {
+    match input {
+        ReadInput::Snapshot(snap) => sparql::query(snap.clone(), q, opts)?.rows(),
+        ReadInput::Source(source, store) => {
+            let mut source_opts = opts.clone();
+            if source_opts.graphs.is_none() {
+                source_opts.graphs = Some(Arc::new(sparkles::access::GraphAccess::all()));
+            }
+            sparql::query_source(source.clone(), store, q, &source_opts)?.rows()
+        }
+    }
+}
+
 fn rows(
     snap: &Arc<Snapshot>,
     opts: &QueryOptions,
     q: &str,
 ) -> Result<sparql::output::OwnedRows, Error> {
-    sparql::query(snap.clone(), q, opts)?.rows()
+    rows_in(ReadInput::Snapshot(snap), opts, q)
 }
 
 fn lit(t: &Option<Term>) -> Option<String> {
@@ -172,6 +195,16 @@ pub fn reports_named(
     reports: &[String],
     filter: Filter,
 ) -> Result<Vec<ReportRef>, Error> {
+    reports_named_in(ReadInput::Snapshot(snap), opts, graph, reports, filter)
+}
+
+fn reports_named_in(
+    input: ReadInput<'_>,
+    opts: &QueryOptions,
+    graph: &str,
+    reports: &[String],
+    filter: Filter,
+) -> Result<Vec<ReportRef>, Error> {
     let names: Vec<String> = reports
         .iter()
         .filter_map(|r| oxrdf::NamedNode::new(r.as_str()).ok())
@@ -181,11 +214,22 @@ pub fn reports_named(
         return Ok(Vec::new());
     }
     let values = format!("VALUES ?r {{ {} }}", names.join(" "));
-    reports_where(snap, opts, graph, &values, filter, names.len())
+    reports_where_in(input, opts, graph, &values, filter, names.len())
 }
 
 fn reports_where(
     snap: &Arc<Snapshot>,
+    opts: &QueryOptions,
+    graph: &str,
+    extra: &str,
+    filter: Filter,
+    limit: usize,
+) -> Result<Vec<ReportRef>, Error> {
+    reports_where_in(ReadInput::Snapshot(snap), opts, graph, extra, filter, limit)
+}
+
+fn reports_where_in(
+    input: ReadInput<'_>,
     opts: &QueryOptions,
     graph: &str,
     extra: &str,
@@ -207,7 +251,7 @@ fn reports_where(
         version = gr("policyVersion"),
         configuration = gr("evidenceConfiguration"),
     );
-    Ok(rows(snap, opts, &q)?
+    Ok(rows_in(input, opts, &q)?
         .into_iter()
         .filter_map(|r| {
             let r = r.values();
@@ -321,6 +365,44 @@ pub fn reports_of_members(
     level: Option<u32>,
     filter: Filter,
 ) -> Result<Vec<(String, ReportRef)>, Error> {
+    reports_of_members_in(
+        ReadInput::Snapshot(snap),
+        opts,
+        graph,
+        members,
+        level,
+        filter,
+    )
+}
+
+/// [`reports_of_members`] evaluated over a [`BoundReadSource`] without extracting a raw snapshot.
+pub fn reports_of_members_source(
+    source: &BoundReadSource,
+    store: &Store,
+    opts: &QueryOptions,
+    graph: &str,
+    members: &[String],
+    level: Option<u32>,
+    filter: Filter,
+) -> Result<Vec<(String, ReportRef)>, Error> {
+    reports_of_members_in(
+        ReadInput::Source(source, store),
+        opts,
+        graph,
+        members,
+        level,
+        filter,
+    )
+}
+
+fn reports_of_members_in(
+    input: ReadInput<'_>,
+    opts: &QueryOptions,
+    graph: &str,
+    members: &[String],
+    level: Option<u32>,
+    filter: Filter,
+) -> Result<Vec<(String, ReportRef)>, Error> {
     let names: Vec<String> = members
         .iter()
         .filter_map(|m| oxrdf::NamedNode::new(m.as_str()).ok())
@@ -340,7 +422,7 @@ pub fn reports_of_members(
         lv = gr("level"),
         report = gr("report"),
     );
-    let mut pairs: Vec<(String, String, u64)> = rows(snap, opts, &q)?
+    let mut pairs: Vec<(String, String, u64)> = rows_in(input, opts, &q)?
         .into_iter()
         .filter_map(|r| {
             let r = r.values();
@@ -352,7 +434,7 @@ pub fn reports_of_members(
     let mut wanted: Vec<String> = pairs.iter().map(|(_, r, _)| r.clone()).collect();
     wanted.sort();
     wanted.dedup();
-    let found = reports_named(snap, opts, graph, &wanted, filter)?;
+    let found = reports_named_in(input, opts, graph, &wanted, filter)?;
     let by: HashMap<&str, &ReportRef> = found.iter().map(|r| (r.iri.as_str(), r)).collect();
     let mut out = Vec::new();
     for m in members {
