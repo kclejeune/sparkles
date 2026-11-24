@@ -1267,10 +1267,11 @@ impl Norm<'_> {
     }
 
     /// Unfolds `≥n p.f` into `n` existential restrictions with fresh, pairwise disjoint
-    /// subclasses of `f` (Kazakov's Lemma 2). This stays sound and complete beside
-    /// individuals in the Horn fragment, as the direct power `I^κ` preserves every Horn
-    /// axiom and nominals while giving each instance at least `2^κ` distinct successors
-    /// to colour (F24, "The Horn rules with individuals", roadmap item 867).
+    /// subclasses of `f` (Kazakov's Lemma 2). This preserves satisfiability and named-class
+    /// subsumptions beside individuals in the Horn fragment, as the direct power `I^κ`
+    /// preserves every Horn axiom, nominals and EL data axioms while giving each tuple whose
+    /// coordinates satisfy `≥n p.f` in `I` at least `2^κ` distinct successors to colour
+    /// (F24, "The Horn rules with individuals", roadmap item 867).
     fn at_least(
         &mut self,
         n: u32,
