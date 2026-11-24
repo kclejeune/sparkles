@@ -1393,6 +1393,10 @@ fn blocked(dx: &DlIx, st: &State, d: Ex) -> bool {
 /// without counting or without the rooted rules, and `=0` turns both off, for
 /// measurement.
 pub fn late_unit_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(m) = LATE_UNIT_MODE_TEST.with(|c| c.get()) {
+        return m;
+    }
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("SPARKLES_COUNTING_LATE_UNIT")
@@ -1400,6 +1404,24 @@ pub fn late_unit_mode() -> u8 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2)
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static LATE_UNIT_MODE_TEST: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_late_unit_mode_override<R>(mode: u8, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u8>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LATE_UNIT_MODE_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = LATE_UNIT_MODE_TEST.with(|c| c.replace(Some(mode)));
+    let _reset = Reset(prev);
+    f()
 }
 
 /// Whether item 1061 phase 1 unit-only shared root facts and constants-only successor
@@ -1430,6 +1452,50 @@ pub(super) fn with_shared_facts_override<R>(on: bool, f: impl FnOnce() -> R) -> 
     let prev = SHARED_FACTS_TEST.with(|c| c.replace(Some(on)));
     let _reset = Reset(prev);
     f()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only failing-control bitmask for G6: bit 0 omits live non-root unit `PredC`,
+    /// bit 1 omits late non-root unit `PredC` replay in `dedge`/`back`.
+    static G6_SKIP_PREDC_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn with_g6_skip_predc_override<R>(mask: u8, f: impl FnOnce() -> R) -> R {
+    struct Reset(u8);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            G6_SKIP_PREDC_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = G6_SKIP_PREDC_TEST.with(|c| c.replace(mask));
+    let _reset = Reset(prev);
+    f()
+}
+
+#[inline]
+fn skip_non_root_live_predc() -> bool {
+    #[cfg(test)]
+    {
+        G6_SKIP_PREDC_TEST.with(|c| c.get() & 1 != 0)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[inline]
+fn skip_non_root_late_predc() -> bool {
+    #[cfg(test)]
+    {
+        G6_SKIP_PREDC_TEST.with(|c| c.get() & 2 != 0)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 /// Whether `st` (a non-root context) currently has at least one eligible ordinary edge
@@ -1496,7 +1562,7 @@ fn late_rules(dx: &DlIx) -> bool {
 /// whether the rule replayed the clauses, which then include the products with that
 /// literal.
 #[allow(clippy::too_many_arguments)]
-fn late<S: Sink>(
+pub(super) fn late<S: Sink>(
     ix: &Index,
     me: Ex,
     st: &State,
@@ -1676,6 +1742,49 @@ impl Found {
 impl Found {
     pub(super) fn push(&mut self, s: Side) {
         self.one.push((s, self.rule));
+    }
+    /// Pre-admits `Found::one` growth (including realloc overlap) plus `side_bytes` for
+    /// `add_count` forthcoming single conclusions through `guard`, then reserves `add_count`
+    /// slots in `self.one`. Returns `false` (leaving `self.one` untouched) on overflow or
+    /// refusal.
+    pub(super) fn reserve_one_admitted<S: Sink>(
+        &mut self,
+        add_count: usize,
+        side_bytes: usize,
+        guard: &mut Guard<'_, S>,
+    ) -> bool {
+        if add_count == 0 {
+            return true;
+        }
+        let Some(need_len) = self.one.len().checked_add(add_count) else {
+            guard.data_overflow();
+            return false;
+        };
+        let elem = std::mem::size_of::<(Side, &'static str)>();
+        let realloc_peak = if need_len > self.one.capacity() {
+            let Some(b) = need_len.checked_mul(elem) else {
+                guard.data_overflow();
+                return false;
+            };
+            b
+        } else {
+            0
+        };
+        let Some(peak) = self
+            .held_bytes()
+            .checked_add(realloc_peak)
+            .and_then(|b| b.checked_add(side_bytes))
+        else {
+            guard.data_overflow();
+            return false;
+        };
+        if !guard.ensure_admitted(peak) {
+            return false;
+        }
+        if need_len > self.one.capacity() {
+            self.one.reserve_exact(add_count);
+        }
+        true
     }
     /// Each choice of one premise from every list, merged with `base`.
     pub(super) fn products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
@@ -2278,7 +2387,19 @@ fn emit<S: Sink, D: Deriver>(
 /// and marks the context's store interrupted, a store made for the mark if the context has
 /// none, so that the dependency record of a partial answer counts the context as open.
 pub(super) fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
-    drain_with_covered(ix, st, found, out, &ContextDerive, false, 0);
+    drain_with_covered(ix, st, found, out, &ContextDerive, false, 0, 0);
+}
+
+/// [`drain`], when `guard` already holds `guard.bytes()` of `found`'s `held_bytes()` (e.g.
+/// pre-admitted inside `hyper_at`), so only the remaining delta is admitted here.
+pub(super) fn drain_admitted<S: Sink>(
+    ix: &Index,
+    st: &mut State,
+    found: Found,
+    guard: &mut Guard<'_, S>,
+) {
+    let already = guard.bytes();
+    drain_with_covered(ix, st, found, guard, &ContextDerive, false, 0, already);
 }
 
 /// [`drain`], when the caller has already reserved `held` and/or `slack_covered` bytes
@@ -2299,6 +2420,7 @@ pub(super) fn drain_covered<S: Sink>(
         &ContextDerive,
         held_covered,
         slack_covered,
+        0,
     );
 }
 
@@ -2312,9 +2434,23 @@ pub(super) fn drain_with<S: Sink, D: Deriver>(
     out: &mut S,
     deriver: &D,
 ) {
-    drain_with_covered(ix, st, found, out, deriver, false, 0);
+    drain_with_covered(ix, st, found, out, deriver, false, 0, 0);
 }
 
+/// [`drain_with`], when `guard` already holds `guard.bytes()` of `found`'s `held_bytes()`.
+#[inline(always)]
+pub(super) fn drain_with_admitted<S: Sink, D: Deriver>(
+    ix: &Index,
+    st: &mut State,
+    found: Found,
+    guard: &mut Guard<'_, S>,
+    deriver: &D,
+) {
+    let already = guard.bytes();
+    drain_with_covered(ix, st, found, guard, deriver, false, 0, already);
+}
+
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn drain_with_covered<S: Sink, D: Deriver>(
     ix: &Index,
@@ -2324,13 +2460,18 @@ fn drain_with_covered<S: Sink, D: Deriver>(
     deriver: &D,
     held_covered: bool,
     slack_covered: usize,
+    held_admitted: usize,
 ) {
     if found.over {
         out.dl().exhaust();
         mark_interrupted(st);
         return;
     }
-    let h = if held_covered { 0 } else { found.held_bytes() };
+    let h = if held_covered {
+        0
+    } else {
+        found.held_bytes().saturating_sub(held_admitted)
+    };
     // Declare `held_guard` before moving `found`'s collections into locals so LIFO drop
     // always frees both `one` and `prods` before releasing their reservation, including on
     // early stop or callback panic unwind during single-conclusion delivery.
@@ -2338,7 +2479,12 @@ fn drain_with_covered<S: Sink, D: Deriver>(
     let Found {
         one, prods, root, ..
     } = found;
-    if h > 0 && !held_guard.admit_add(h) {
+    if h > 0 {
+        if !held_guard.admit_add(h) {
+            mark_interrupted(st);
+            return;
+        }
+    } else if !held_covered && held_guard.stopped() {
         mark_interrupted(st);
         return;
     }
@@ -3708,8 +3854,12 @@ pub fn back<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, r: Role, out: &m
     let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) else {
         return;
     };
+    let skip_late = out.dl().shared_facts && skip_non_root_late_predc();
     for k in 0..x.store.preds.len() {
         let i = x.store.preds[k];
+        if skip_late && x.store.clauses[i as usize].fact {
+            continue;
+        }
         if let Some(cid) = pred_id(x, i, out)
             && meets(ix, &x.store.clauses[i as usize].c, r)
         {
@@ -3772,7 +3922,7 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
         return true;
     }
     let Some(r) = role_of(ix, e) else { return true };
-    let to_root = dix(ix).is_root(u) && out.dl().shared_facts;
+    let to_root = (dix(ix).is_root(u) || skip_non_root_late_predc()) && out.dl().shared_facts;
     for k in 0..x.store.preds.len() {
         let i = x.store.preds[k];
         if to_root && x.store.clauses[i as usize].fact {
@@ -4151,6 +4301,22 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
                 && s.c.head().len() == 1;
             x.given_fact = given_fact;
         }
+        let c_bytes = {
+            let c = &x.store.clauses[id as usize].c;
+            (c.body().len() + c.head().len()) * std::mem::size_of::<Lit>()
+        };
+        let Some(live_need) = (max.capacity() * std::mem::size_of::<Lit>()).checked_add(c_bytes)
+        else {
+            max_guard.data_overflow();
+            x.given_fact = false;
+            x.store.interrupted = true;
+            break;
+        };
+        if !max_guard.ensure_admitted(live_need) {
+            x.given_fact = false;
+            x.store.interrupted = true;
+            break;
+        }
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
         if given_fact {
@@ -4164,6 +4330,8 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
             }
         }
         process(ix, me, st, id, &c, &max, &mut max_guard);
+        drop(c);
+        max_guard.release_to(max.capacity() * std::mem::size_of::<Lit>());
         if let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) {
             x.given_fact = false;
         }
@@ -4190,9 +4358,12 @@ fn process<S: Sink>(
     let dx = dix(ix);
     // in a rooted run a clause can go to the predecessors and still have maximal literals
     let rooted = dx.root.is_some();
+    // Declare `found_guard` strictly before `found` so LIFO drop always frees `found`
+    // before releasing pre-admitted bytes, including on early return or panic unwind.
+    let mut found_guard = Guard::new(out);
     let mut found = Found::default();
     if tracing() {
-        let lits = &out.dl().lits;
+        let lits = &found_guard.dl().lits;
         eprintln!(
             "TR P {} {id} {} -> {}",
             tr_ctx(st, false),
@@ -4201,47 +4372,50 @@ fn process<S: Sink>(
         );
     }
     if rooted {
-        super::dl_root::join_body(ix, st, c, &mut found, &out.dl().lits);
-        super::dl_root::register_body(ix, me, st, c, out);
+        super::dl_root::join_body(ix, st, c, &mut found, &found_guard.dl().lits);
+        super::dl_root::register_body(ix, me, st, c, &mut found_guard);
     }
     let ready = if rooted {
-        pred_ready(ix, dx, &out.dl().lits, c)
+        pred_ready(ix, dx, &found_guard.dl().lits, c)
     } else {
         max.is_empty()
     };
     if ready {
         // Pred: the clause goes to the predecessors whose role meets its role atoms
         let x = ds(st);
-        let Some(cid) = pred_id(x, id, out) else {
-            drain(ix, st, found, out);
+        let Some(cid) = pred_id(x, id, &mut found_guard) else {
+            drain_admitted(ix, st, found, &mut found_guard);
             return;
         };
         // a predecessor of a rooted run may reach the context over f_e(u) and finds the
         // role premises itself, with every role over f_e(u). Ordinary Pred delivery and
         // late replay are preserved for every non-root predecessor (gap G6); only the root
         // itself has an independent witness that it already holds its own delivered unit.
+        let skip_live = x.given_fact && skip_non_root_live_predc();
         for &(u, e) in &x.dpreds {
-            if x.given_fact && dx.is_root(u) {
+            if x.given_fact && (dx.is_root(u) || skip_live) {
                 continue;
             }
             if rooted || role_of(ix, e).is_some_and(|r| meets(ix, c, r)) {
-                out.send(u, Concl::PredC(me, cid));
+                found_guard.send(u, Concl::PredC(me, cid));
             }
         }
-        for (r, srcs) in &st.back {
-            if meets(ix, c, *r) {
-                for &e in &srcs.list {
-                    out.send(e, Concl::PredC(me, cid));
+        if !skip_live {
+            for (r, srcs) in &st.back {
+                if meets(ix, c, *r) {
+                    for &e in &srcs.list {
+                        found_guard.send(e, Concl::PredC(me, cid));
+                    }
                 }
             }
         }
         // the predecessors that register later replay the clauses over the predecessor,
         // which a rooted run's store leaves to this test
-        if rooted && let Some(x) = ds_admit(st, out) {
-            let _ = x.store.push_pred_admitted(id, out);
+        if rooted && let Some(x) = ds_admit(st, &mut found_guard) {
+            let _ = x.store.push_pred_admitted(id, &mut found_guard);
         }
         if !rooted || max.is_empty() {
-            drain(ix, st, found, out);
+            drain_admitted(ix, st, found, &mut found_guard);
             return;
         }
     }
@@ -4254,9 +4428,23 @@ fn process<S: Sink>(
     let mut ps: Vec<(Role, Ex)> = Vec::new();
     let mut es: Vec<Ex> = Vec::new();
     for &l in max {
+        if found_guard.stopped() {
+            mark_interrupted(st);
+            break;
+        }
         let prem = side(c, l);
         if dx.root.is_some() {
-            rooted_max(ix, me, st, l, &prem, &mut found, &out.dl().lits, sel, sel_x);
+            rooted_max(
+                ix,
+                me,
+                st,
+                l,
+                &prem,
+                &mut found,
+                &found_guard.dl().lits,
+                sel,
+                sel_x,
+            );
         }
         match l.kind() {
             X if sel_x => {
@@ -4284,7 +4472,7 @@ fn process<S: Sink>(
                     }
                     Node::Exist(r, _) => {
                         if let Some((r, v)) = into_nominal(ix, d) {
-                            let lits = &out.dl().lits;
+                            let lits = &found_guard.dl().lits;
                             let inv = |r| dx.inv(ix, r);
                             for l in [
                                 super::dl_clause::XLit::Role(r, RTerm::X, RTerm::C(v)),
@@ -4362,16 +4550,16 @@ fn process<S: Sink>(
                 let e = l.fun();
                 let had = dl(st).is_some_and(|x| x.edges.iter().any(|&(f, _)| f == e));
                 // Succ: the successor takes the marker
-                let v = target(ix, me, st, e, out);
+                let v = target(ix, me, st, e, &mut found_guard);
                 let edge_v = v;
                 // the late rule's replay takes the clauses with every partner, this
                 // premise included, so the replay below skips v
                 let replayed = late_rules(dx)
                     && !had
                     && dl(st).is_some_and(|x| x.edges.iter().any(|&(f, _)| f == e))
-                    && late(ix, me, st, e, v, "edge", &mut found, out);
+                    && late(ix, me, st, e, v, "edge", &mut found, &mut found_guard);
                 match l.kind() {
-                    F => send_hyp(ix, st, v, l.atom(), out),
+                    F => send_hyp(ix, st, v, l.atom(), &mut found_guard),
                     RL => on_rl(ix, st, e, l.atom(), &prem, &mut found),
                     _ => {}
                 }
@@ -4402,7 +4590,7 @@ fn process<S: Sink>(
                 if st.subs.contains(&e) && !es.contains(&ix.head(e).succ) {
                     es.push(ix.head(e).succ);
                 }
-                let table = &out.dl().table;
+                let table = &found_guard.dl().table;
                 for &v in &es {
                     if replayed && v == edge_v {
                         continue;
@@ -4418,16 +4606,18 @@ fn process<S: Sink>(
                             table.get(cid),
                             Some((l, &prem)),
                             &mut found,
-                            &out.dl().lits,
+                            &found_guard.dl().lits,
                         );
                     }
                 }
             }
-            XL if rooted => super::dl_root::on_max(ix, me, st, c, l, &prem, &mut found, out, sel),
+            XL if rooted => {
+                super::dl_root::on_max(ix, me, st, c, l, &prem, &mut found, &mut found_guard, sel)
+            }
             _ => {}
         }
     }
-    drain(ix, st, found, out);
+    drain_admitted(ix, st, found, &mut found_guard);
 }
 
 /// Sends the successor `v` the marker of `a`, unless the successor's core has it.

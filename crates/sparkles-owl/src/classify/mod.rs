@@ -2706,9 +2706,11 @@ impl Saturation {
         }
         // Count distinct visible named classes once from `met_classes` (excluding
         // owl:Thing, owl:Nothing, individuals/nominals, internal reduction classes, and
-        // any double-counting from explicit `Declaration(Class(...))` axioms).
-        let visible_named_classes = self.interner.met_classes().count();
+        // any double-counting from explicit `Declaration(Class(...))` axioms) without a
+        // second scan over `met_classes`.
+        let classes_before = ax.classes.len();
         ax.classes.extend(self.interner.met_classes());
+        let visible_named_classes = ax.classes.len() - classes_before;
         if let Some(b) = &self.interner.ranges.budget {
             b.baseline(self.interner.bytes() + ax.bytes())?;
         }
@@ -7787,6 +7789,8 @@ mod tests {
         assert_eq!(files.len(), 9);
         let z = Class::new("http://example.org/n#Z");
         let ans = Class::new("http://example.org/n#Ans");
+        let mut repair_off_checked = 0usize;
+        let mut repair_on_checked = 0usize;
         for path in &files {
             let ax = crate::ofn_read::parse(&std::fs::read_to_string(path).unwrap())
                 .unwrap()
@@ -7796,6 +7800,7 @@ mod tests {
                 (1, Expansion::Cautious, true, false),
                 (4, Expansion::Cautious, false, false),
                 (1, Expansion::Eager, true, false),
+                (1, Expansion::Cautious, true, true),
                 (4, Expansion::Eager, false, true),
             ] {
                 let limits = Limits {
@@ -7806,26 +7811,69 @@ mod tests {
                     rooted_marker_repair: repair,
                     ..Limits::default()
                 };
-                let off = dl_rules::with_shared_facts_override(false, || {
-                    let mut k = Classifier::of(&ax);
-                    (k.classify(&limits).unwrap(), k.excluded().len())
+                let off = dl_root::with_marker_diag_override(repair, || {
+                    dl_rules::with_shared_facts_override(false, || {
+                        let mut k = Classifier::of(&ax);
+                        (k.classify(&limits).unwrap(), k.excluded().len())
+                    })
                 });
-                let on = dl_rules::with_shared_facts_override(true, || {
-                    let mut k = Classifier::of(&ax);
-                    (k.classify(&limits).unwrap(), k.excluded().len())
+                let on = dl_root::with_marker_diag_override(repair, || {
+                    dl_rules::with_shared_facts_override(true, || {
+                        let mut k = Classifier::of(&ax);
+                        (k.classify(&limits).unwrap(), k.excluded().len())
+                    })
                 });
                 assert_eq!(off.0.consistency, on.0.consistency, "{name}");
                 assert_eq!(off.0.complete, on.0.complete, "{name}");
                 assert_eq!(off.1, on.1, "{name} excluded");
-                if on.0.complete && on.1 == 0 {
+                assert_eq!(off.0.stats.tier, Tier::Disjunctive, "{name} off tier");
+                assert_eq!(on.0.stats.tier, Tier::Disjunctive, "{name} on tier");
+                assert!(off.0.stats.dl_work > 0 && on.0.stats.dl_work > 0, "{name}");
+                if repair {
+                    repair_on_checked += 1;
+                    assert!(
+                        off.0.complete && on.0.complete,
+                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=true): must complete"
+                    );
+                    assert_eq!(
+                        off.1, 0,
+                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=true): must have 0 exclusions"
+                    );
+                    assert!(
+                        !on.0.stats.dl_rooted_declined && !on.0.stats.dl_over_budget,
+                        "{name}: must not decline or exhaust budget with repair=true"
+                    );
+                    assert!(
+                        off.0.taxonomy.is_subclass(&z, &ans),
+                        "{name}: OFF must entail Z ⊑ Ans with repair=true"
+                    );
                     assert!(
                         on.0.taxonomy.is_subclass(&z, &ans),
-                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair={repair}): misses Z ⊑ Ans"
+                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=true): misses Z ⊑ Ans"
+                    );
+                    assert_eq!(
+                        on.0.stats.dl_marker_deficits,
+                        [0, 0, 0],
+                        "{name}: real marker deficits must be zero with repair=true"
+                    );
+                } else if on.0.complete && on.1 == 0 {
+                    repair_off_checked += 1;
+                    assert!(
+                        on.0.taxonomy.is_subclass(&z, &ans),
+                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=false): misses Z ⊑ Ans"
                     );
                 }
-                assert_eq!(on.0.stats.dl_marker_deficits, [0, 0, 0], "{name}");
             }
         }
+        assert_eq!(
+            repair_on_checked,
+            files.len() * 2,
+            "every repair=true run across all 9 dl1061 fixtures must complete and be verified"
+        );
+        assert!(
+            repair_off_checked > 0,
+            "repair=false checks must be non-vacuous"
+        );
 
         // 2. Zero EL and non-rooted DL regression: identical taxonomy and work.
         let el_ofn = "Prefix(:=<http://example.org/el#>)\nOntology(<http://example.org/el>\n  SubClassOf(:A :B)\n  SubClassOf(:B :C)\n  SubClassOf(:C ObjectSomeValuesFrom(:r :D))\n)";
