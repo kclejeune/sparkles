@@ -31,6 +31,10 @@ pub const STREAM_AFTER: usize = 1 << 20;
 pub const FIRST_BYTES_AFTER: usize = 64 << 10;
 /// Size of the chunks of a streamed body.
 pub const CHUNK: usize = 64 << 10;
+/// Bounded in-flight chunks per streamed response (`16 × 64 KiB = 1 MiB`, matching
+/// [`STREAM_AFTER`]), so a pre-decoded cursor batch can enqueue without stalling the
+/// blocking producer while keeping per-stream serialized buffering bounded.
+pub const CHANNEL_CAP: usize = 16;
 /// A controlled writer checks its deadline whenever its buffer crosses a multiple of
 /// 2^CONTROL_SHIFT bytes.
 const CONTROL_SHIFT: u32 = 14;
@@ -229,7 +233,7 @@ impl SwitchWriter {
     /// Switch to streaming: hand the receiver to the handler, then send what is
     /// buffered.
     fn switch(&mut self) -> io::Result<()> {
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(CHANNEL_CAP);
         let signal = self.signal.take().expect("signal before the switch");
         if let Some(timeouts) = self.timeouts {
             let cancel = self
@@ -1144,7 +1148,7 @@ mod tests {
         usize,
     ) {
         let (signal, outcome) = oneshot::channel();
-        let size = CHUNK * 8 + 17;
+        let size = CHUNK * (CHANNEL_CAP + 4) + 17;
         let producer = tokio::task::spawn_blocking(move || {
             let mut w = SwitchWriter::new(100, Some(signal));
             w.write_all(&vec![b'x'; size])?;
@@ -1154,7 +1158,7 @@ mod tests {
             panic!("expected a stream");
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while rx.len() < 4 && !producer.is_finished() {
+            while rx.len() < CHANNEL_CAP && !producer.is_finished() {
                 tokio::task::yield_now().await;
             }
         })
@@ -1166,7 +1170,7 @@ mod tests {
     #[tokio::test]
     async fn a_single_large_write_has_bounded_chunks_and_backpressure() {
         let (mut rx, producer, size) = single_large_write().await;
-        assert_eq!(rx.len(), 4);
+        assert_eq!(rx.len(), CHANNEL_CAP);
         assert!(
             !producer.is_finished(),
             "the full channel must block writes"
@@ -1186,7 +1190,7 @@ mod tests {
     #[tokio::test]
     async fn disconnect_interrupts_a_single_large_write() {
         let (rx, producer, _) = single_large_write().await;
-        assert_eq!(rx.len(), 4);
+        assert_eq!(rx.len(), CHANNEL_CAP);
         assert!(!producer.is_finished());
         drop(rx);
         let error = tokio::time::timeout(std::time::Duration::from_secs(5), producer)
@@ -1257,9 +1261,9 @@ mod tests {
             Default::default(),
             Some(Duration::from_millis(150)),
         );
-        // The switch sends the first 101 bytes and three full chunks fill the channel of
-        // four, so the budget cuts the next chunk halfway while the channel is full.
-        let sent = 101 + (CHUNK * 3) as u64;
+        // The switch sends the first 101 bytes and `CHANNEL_CAP - 1` full chunks fill the
+        // channel, so the budget cuts the next chunk halfway while the channel is full.
+        let sent = 101 + (CHUNK * (CHANNEL_CAP - 1)) as u64;
         let limit = sent + (CHUNK / 2) as u64;
         let started = Instant::now();
         let Ok(Serialized::Streamed(body)) = serialize_inner(
@@ -1750,7 +1754,7 @@ mod timed_tests {
         let (send, end) = oneshot::channel();
         let control = StreamControl::new(Default::default(), None, Default::default(), None);
         // as in the untimed test, the budget cuts a chunk while the channel is full
-        let sent = 101 + (CHUNK * 3) as u64;
+        let sent = 101 + (CHUNK * (CHANNEL_CAP - 1)) as u64;
         let limit = sent + (CHUNK / 2) as u64;
         let result = serialize_inner_timed(
             100,
@@ -1854,7 +1858,7 @@ mod timed_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_body_cancels_and_joins_producer_timer() {
         let (body, _, end) = timed(timeouts(), None, |w| {
-            w.write_all(&[b'x'; 1 << 20])?;
+            w.write_all(&vec![b'x'; CHUNK * (CHANNEL_CAP + 4)])?;
             Ok(())
         })
         .await;

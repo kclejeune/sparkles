@@ -1808,16 +1808,19 @@ fn failed_budget_flush_case(rows: usize, len: usize, format: &str) {
             let s = server_with(|st| {
                 st.access_log = true;
                 st.stream_idle_timeout = Duration::from_millis(300);
-                // the switch, then three chunks fill the channel, and the budget cuts
-                // the next chunk halfway, while the reader reads nothing. A streaming
-                // request switches at its first bytes.
+                // the switch, then `CHANNEL_CAP - 1` chunks fill the channel, and the
+                // budget cuts the next chunk halfway, while the reader reads nothing. A
+                // streaming request switches at its first bytes.
                 let switch = if execution == "eager" {
                     super::stream::STREAM_AFTER
                 } else {
                     super::stream::FIRST_BYTES_AFTER
                 };
-                st.limits.max_result_bytes =
-                    Some((switch + super::stream::CHUNK * 3 + super::stream::CHUNK / 2) as u64);
+                st.limits.max_result_bytes = Some(
+                    (switch
+                        + super::stream::CHUNK * (super::stream::CHANNEL_CAP - 1)
+                        + super::stream::CHUNK / 2) as u64,
+                );
             });
             load(&s);
             let res = s

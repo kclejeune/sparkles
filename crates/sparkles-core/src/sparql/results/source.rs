@@ -395,10 +395,7 @@ pub(super) struct CursorSolutions<'c> {
 }
 
 struct CursorRows<'b> {
-    // Rust drops fields in declaration order: the row's owned fallbacks go before the
-    // reservation of their slots.
     terms: Vec<(usize, Cow<'b, Term>)>,
-    _row_storage: crate::sparql::ctx::OwnedCharge,
     cursor: &'b crate::sparql::QueryCursor,
     batch: &'b crate::sparql::QueryBatch,
     decoded: Option<&'b crate::sparql::cursor::DecodedBatch<'b>>,
@@ -455,18 +452,27 @@ impl SolutionSource for CursorSolutions<'_> {
     fn drive<V: BatchVisitor>(&mut self, send: Option<usize>, visitor: &mut V) -> Result<()> {
         let mut left = send.unwrap_or(usize::MAX);
         let mut row_charge = RowCharge::default();
+        // Hold one row's bound-cell slot reservation across batches so later batches do
+        // not contend on the query memory ledger against Rayon's decode-ahead term cache.
+        // Lazily initialized on the first batch so an empty cursor charges nothing.
+        let mut row_storage: Option<(u64, crate::sparql::ctx::OwnedCharge)> = None;
         let remaining = self
             .cursor
             .for_each_decoded(send, |cursor, batch, decoded| {
-                // the slots of one row's bound cells, held for the batch
-                let row_storage = cursor.charge(
-                    batch.width() as u64 * std::mem::size_of::<(usize, Cow<'_, Term>)>() as u64
-                        + 128,
-                )?;
+                let width = batch.width();
+                let needed =
+                    width as u64 * std::mem::size_of::<(usize, Cow<'_, Term>)>() as u64 + 128;
+                match &mut row_storage {
+                    Some((held, charge)) if *held < needed => {
+                        charge.resize(needed)?;
+                        *held = needed;
+                    }
+                    Some(_) => {}
+                    None => row_storage = Some((needed, cursor.charge(needed)?)),
+                }
                 let len = batch.len().min(left);
                 let mut rows = CursorRows {
-                    terms: Vec::with_capacity(batch.width()),
-                    _row_storage: row_storage,
+                    terms: Vec::with_capacity(width),
                     cursor,
                     batch,
                     decoded,
@@ -477,6 +483,7 @@ impl SolutionSource for CursorSolutions<'_> {
                 left -= len;
                 Ok(())
             })?;
+        drop(row_storage);
         if remaining == 0 {
             self.cursor.close();
         }
