@@ -1142,6 +1142,9 @@ pub struct Saturation {
     /// the clause table of the last run of Tier D whose contexts the next run may keep,
     /// which name its clauses by id
     dl_run: Option<dl_rules::DlRun>,
+    /// the high-water mark that the last completed [`Saturation::run_once`] paid to the
+    /// memory pool, used to offset post-run original-axiom accounting on kept rewrites
+    last_paid: usize,
 }
 
 /// The rules of a run whose contexts the next run may keep.
@@ -1824,6 +1827,7 @@ impl Saturation {
             kept: None,
             reused: false,
             dl_run: None,
+            last_paid: 0,
         }
     }
 
@@ -2579,9 +2583,21 @@ impl Saturation {
         // has no range that its last property lacks
         let mut named_domain_candidate = false;
         if !chains.is_empty() {
-            let ranges = range_table(axioms, &is_outside);
-            for k in chains {
-                if let Some((missing, sup, last)) = chain_missing_range(k, &ranges) {
+            let budget = self
+                .interner
+                .ranges
+                .budget
+                .clone()
+                .expect("build installs a numeric budget");
+            let mut scratch = BuildScratch {
+                guard: budget.scratch_guard(),
+                limits,
+            };
+            let missing =
+                check_chain_ranges(axioms, |i, _| is_outside[i], &chains, true, &mut scratch)?;
+            drop(scratch);
+            for (k, miss) in chains.into_iter().zip(missing) {
+                if let Some((missing, sup, last)) = miss {
                     index::intern_signature(k, &mut self.interner);
                     chain_ranges.push((
                         k,
@@ -2882,11 +2898,43 @@ impl Saturation {
                             && !red.excludes_rewritten(&self.excluded)) =>
                 {
                     red.restore(axioms, &mut self.excluded);
-                    r.2.added = self.source_len.unwrap_or(axioms.len());
-                    r.2.outside_el = red.outside_el(axioms, &self.excluded);
-                    r.2.tier = r.2.outside_el.tier();
                     self.reduced = true;
-                    return Ok(r);
+                    drop(all);
+                    drop(red);
+                    r.2.added = self.source_len.unwrap_or(axioms.len());
+                    let charge = limits
+                        .charge
+                        .as_deref()
+                        .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+                    let mut paid = self.last_paid;
+                    let mut scratch = PostRunScratch {
+                        base: r.2.memory,
+                        peak: &mut r.2.peak_memory,
+                        paid: &mut paid,
+                        limits,
+                        charge,
+                        check_stop: self.partial.is_none(),
+                        scratch: 0,
+                    };
+                    match dl_reduce::Reduction::outside_el(axioms, &self.excluded, &mut scratch) {
+                        Ok(outside_el) => {
+                            r.2.outside_el = outside_el;
+                            r.2.tier = r.2.outside_el.tier();
+                            return Ok(r);
+                        }
+                        Err(e) => {
+                            self.partial = None;
+                            if matches!(e, Error::Memory { .. })
+                                && limits.partial
+                                && self.dl_tried
+                                && with_taxonomy
+                            {
+                                self.partial_over = true;
+                                self.dirty = true;
+                            }
+                            return Err(e);
+                        }
+                    }
                 }
                 Err(e) => {
                     // the report of a run that stopped still names the original axioms
@@ -2966,6 +3014,7 @@ impl Saturation {
         self.dl_tried = false;
         self.partial_over = false;
         self.numeric_halt = false;
+        self.last_paid = 0;
         // the profile check of each axiom, which depends on it alone
         let outside: Vec<(usize, (String, String))> =
             par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
@@ -4311,6 +4360,7 @@ impl Saturation {
             stats.peak_memory = totals.peak.max(held);
             stats.contexts = self.context_count();
             poll(limits)?;
+            self.last_paid = totals.paid;
             return Ok(ControlFlow::Continue((consistent, None, stats)));
         }
         // a partial answer builds its taxonomy past the deadline that stopped it
@@ -4339,6 +4389,7 @@ impl Saturation {
         stats.peak_memory = totals.peak.max(stats.memory).max(paid.get());
         stats.taxonomy = t.elapsed();
         stats.contexts = self.context_count();
+        self.last_paid = paid.get();
         if let Some((incomplete, consistency)) = open {
             let mut classes: Vec<Class> = incomplete
                 .into_iter()
@@ -5113,117 +5164,562 @@ impl Gauge<'_> {
     }
 }
 
-/// The ranges of each object property through its superproperties, as class expressions,
-/// for the range restriction on chains.
-fn range_table(
-    axioms: &[&AxiomKind],
-    outside: &[bool],
-) -> FxHashMap<String, std::collections::BTreeSet<ClassExpression>> {
-    let mut sup: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
-    let mut direct: FxHashMap<&str, Vec<&ClassExpression>> = FxHashMap::default();
+/// Steps between cooperative deadline and cancellation polls in the chain-range scan.
+pub(super) const RANGE_POLL_STEP: usize = 1024;
+
+/// Budget and cooperative polling interface for temporary scratch allocations.
+pub(super) trait ScratchBudget {
+    fn poll(&self) -> Result<(), Error>;
+    fn grow(&mut self, more: usize) -> Result<(), Error>;
+    fn release(&mut self, less: usize);
+    fn overflow(&self) -> Error;
+}
+
+struct BuildScratch<'a> {
+    guard: numeric::ScratchGuard,
+    limits: &'a Limits,
+}
+
+impl ScratchBudget for BuildScratch<'_> {
+    fn poll(&self) -> Result<(), Error> {
+        poll(self.limits)
+    }
+
+    fn grow(&mut self, more: usize) -> Result<(), Error> {
+        self.guard.grow(more)
+    }
+
+    fn release(&mut self, less: usize) {
+        self.guard.release(less);
+    }
+
+    fn overflow(&self) -> Error {
+        Error::Memory {
+            limit: self.limits.max_memory.unwrap_or(usize::MAX),
+            used: usize::MAX,
+        }
+    }
+}
+
+struct PostRunScratch<'a> {
+    base: usize,
+    peak: &'a mut usize,
+    paid: &'a mut usize,
+    limits: &'a Limits,
+    charge: Option<&'a (dyn Fn(usize) -> bool + Sync)>,
+    check_stop: bool,
+    scratch: usize,
+}
+
+impl ScratchBudget for PostRunScratch<'_> {
+    fn poll(&self) -> Result<(), Error> {
+        if self.check_stop {
+            poll(self.limits)?;
+        }
+        Ok(())
+    }
+
+    fn grow(&mut self, more: usize) -> Result<(), Error> {
+        if more == 0 {
+            return Ok(());
+        }
+        self.poll()?;
+        let limit = self.limits.max_memory.unwrap_or(usize::MAX);
+        let next = self.scratch.checked_add(more).ok_or(Error::Memory {
+            limit,
+            used: usize::MAX,
+        })?;
+        let used = self.base.checked_add(next).ok_or(Error::Memory {
+            limit,
+            used: usize::MAX,
+        })?;
+        *self.peak = (*self.peak).max(used);
+        if !cover_memory(used, self.limits.max_memory, self.charge, self.paid) {
+            return Err(Error::Memory { limit, used });
+        }
+        self.scratch = next;
+        Ok(())
+    }
+
+    fn release(&mut self, less: usize) {
+        self.scratch = self.scratch.saturating_sub(less);
+    }
+
+    fn overflow(&self) -> Error {
+        Error::Memory {
+            limit: self.limits.max_memory.unwrap_or(usize::MAX),
+            used: usize::MAX,
+        }
+    }
+}
+
+struct ScopedScratch<'a, B: ScratchBudget + ?Sized> {
+    inner: &'a mut B,
+    bytes: usize,
+}
+
+impl<'a, B: ScratchBudget + ?Sized> ScopedScratch<'a, B> {
+    fn new(inner: &'a mut B) -> Self {
+        Self { inner, bytes: 0 }
+    }
+}
+
+impl<B: ScratchBudget + ?Sized> ScratchBudget for ScopedScratch<'_, B> {
+    fn poll(&self) -> Result<(), Error> {
+        self.inner.poll()
+    }
+
+    fn grow(&mut self, more: usize) -> Result<(), Error> {
+        self.inner.grow(more)?;
+        self.bytes = self.bytes.saturating_add(more);
+        Ok(())
+    }
+
+    fn release(&mut self, less: usize) {
+        let drop_bytes = less.min(self.bytes);
+        self.bytes -= drop_bytes;
+        self.inner.release(drop_bytes);
+    }
+
+    fn overflow(&self) -> Error {
+        self.inner.overflow()
+    }
+}
+
+impl<B: ScratchBudget + ?Sized> Drop for ScopedScratch<'_, B> {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            self.inner.release(self.bytes);
+            self.bytes = 0;
+        }
+    }
+}
+
+pub(super) fn vec_reserve<T>(
+    v: &mut Vec<T>,
+    extra: usize,
+    budget: &mut impl ScratchBudget,
+) -> Result<(), Error> {
+    let need = v
+        .len()
+        .checked_add(extra)
+        .ok_or_else(|| budget.overflow())?;
+    if need <= v.capacity() {
+        return Ok(());
+    }
+    let old_cap = v.capacity();
+    let new_cap = old_cap.saturating_mul(2).max(need).max(8);
+    let add_bytes = new_cap
+        .saturating_sub(old_cap)
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| budget.overflow())?;
+    budget.grow(add_bytes)?;
+    v.reserve_exact(new_cap - v.len());
+    Ok(())
+}
+
+pub(super) fn map_admit<K: Eq + std::hash::Hash, V>(
+    m: &mut FxHashMap<K, V>,
+    budget: &mut impl ScratchBudget,
+) -> Result<(), Error> {
+    if m.len() < m.capacity() {
+        return Ok(());
+    }
+    let old_cap = m.capacity();
+    let next_cap = old_cap.saturating_mul(2).max(14);
+    let add_slots = next_cap.saturating_sub(old_cap);
+    let entry_bytes = std::mem::size_of::<(K, V)>() + 1;
+    let add_bytes = add_slots
+        .checked_mul(entry_bytes)
+        .and_then(|b| b.checked_add(b / 7))
+        .ok_or_else(|| budget.overflow())?;
+    budget.grow(add_bytes)?;
+    m.reserve(next_cap - m.len());
+    Ok(())
+}
+
+pub(super) fn set_admit<K: Eq + std::hash::Hash>(
+    s: &mut FxHashSet<K>,
+    budget: &mut impl ScratchBudget,
+) -> Result<(), Error> {
+    if s.len() < s.capacity() {
+        return Ok(());
+    }
+    let old_cap = s.capacity();
+    let next_cap = old_cap.saturating_mul(2).max(14);
+    let add_slots = next_cap.saturating_sub(old_cap);
+    let entry_bytes = std::mem::size_of::<K>() + 1;
+    let add_bytes = add_slots
+        .checked_mul(entry_bytes)
+        .and_then(|b| b.checked_add(b / 7))
+        .ok_or_else(|| budget.overflow())?;
+    budget.grow(add_bytes)?;
+    s.reserve(next_cap - s.len());
+    Ok(())
+}
+
+enum Targets<'a> {
+    One(&'a str),
+    Many(Vec<&'a str>),
+}
+
+impl<'a> Targets<'a> {
+    fn as_slice(&self) -> &[&'a str] {
+        match self {
+            Self::One(s) => std::slice::from_ref(s),
+            Self::Many(v) => v.as_slice(),
+        }
+    }
+}
+
+enum DirectRanges<'a> {
+    One(&'a ClassExpression),
+    Many(Vec<&'a ClassExpression>),
+}
+
+impl<'a> DirectRanges<'a> {
+    fn as_slice(&self) -> &[&'a ClassExpression] {
+        match self {
+            Self::One(c) => std::slice::from_ref(c),
+            Self::Many(v) => v.as_slice(),
+        }
+    }
+}
+
+fn push_sup_edge<'a>(
+    sup: &mut FxHashMap<&'a str, Targets<'a>>,
+    a: &'a str,
+    b: &'a str,
+    budget: &mut impl ScratchBudget,
+) -> Result<(), Error> {
+    if let Some(t) = sup.get_mut(a) {
+        match t {
+            Targets::One(first) => {
+                let first = *first;
+                let mut v = Vec::new();
+                vec_reserve(&mut v, 2, budget)?;
+                v.push(first);
+                v.push(b);
+                *t = Targets::Many(v);
+            }
+            Targets::Many(v) => {
+                vec_reserve(v, 1, budget)?;
+                v.push(b);
+            }
+        }
+    } else {
+        map_admit(sup, budget)?;
+        sup.insert(a, Targets::One(b));
+    }
+    Ok(())
+}
+
+fn push_direct_range<'a>(
+    direct: &mut FxHashMap<&'a str, DirectRanges<'a>>,
+    p: &'a str,
+    c: &'a ClassExpression,
+    budget: &mut impl ScratchBudget,
+) -> Result<(), Error> {
+    if let Some(r) = direct.get_mut(p) {
+        match r {
+            DirectRanges::One(first) => {
+                let first = *first;
+                let mut v = Vec::new();
+                vec_reserve(&mut v, 2, budget)?;
+                v.push(first);
+                v.push(c);
+                *r = DirectRanges::Many(v);
+            }
+            DirectRanges::Many(v) => {
+                vec_reserve(v, 1, budget)?;
+                v.push(c);
+            }
+        }
+    } else {
+        map_admit(direct, budget)?;
+        direct.insert(p, DirectRanges::One(c));
+    }
+    Ok(())
+}
+
+type MissingRange<'a> = (&'a ClassExpression, &'a str, &'a str);
+
+/// Checks OWL 2 Profiles §2.2.6 for each candidate chain in `chains`, resolving
+/// inherited ranges only for properties reachable from candidate chains' superproperties
+/// and last properties.
+///
+/// When `need_first` is true, each violating chain gets its lexicographically first
+/// missing range expression (matching `BTreeSet` iteration order); when false, the
+/// search stops at the first missing range encountered.
+pub(super) fn check_chain_ranges<'a>(
+    axioms: &[&'a AxiomKind],
+    is_outside: impl Fn(usize, &'a AxiomKind) -> bool,
+    chains: &[&'a AxiomKind],
+    need_first: bool,
+    budget: &mut impl ScratchBudget,
+) -> Result<Vec<Option<MissingRange<'a>>>, Error> {
+    budget.poll()?;
+    let mut out: Vec<Option<MissingRange<'a>>> = Vec::new();
+    vec_reserve(&mut out, chains.len(), budget)?;
+    out.resize(chains.len(), None);
+
+    let mut work = ScopedScratch::new(budget);
+
+    // Collect only the (last, sup, chain_index) triples that can fail §2.2.6.
+    let mut entries: Vec<(&'a str, &'a str, usize)> = Vec::new();
+    for (idx, &k) in chains.iter().enumerate() {
+        if idx.is_multiple_of(RANGE_POLL_STEP) {
+            work.poll()?;
+        }
+        let AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Chain(ps),
+            ObjectPropertyExpression::Property(sup),
+        ) = k
+        else {
+            continue;
+        };
+        let Some(last) = ps.last() else {
+            continue;
+        };
+        vec_reserve(&mut entries, 1, &mut work)?;
+        entries.push((last.named().as_str(), sup.as_str(), idx));
+    }
+    if entries.is_empty() {
+        return Ok(out);
+    }
+
+    // Build the EL superproperty graph (linear in subproperty/equivalence axioms).
+    let mut sup_edges: FxHashMap<&'a str, Targets<'a>> = FxHashMap::default();
+    let mut has_any_range = false;
     for (i, &k) in axioms.iter().enumerate() {
-        if outside[i] {
+        if i.is_multiple_of(RANGE_POLL_STEP) {
+            work.poll()?;
+        }
+        if is_outside(i, k) {
             continue;
         }
         match k {
             AxiomKind::SubObjectPropertyOf(
                 SubObjectPropertyExpression::Expression(ObjectPropertyExpression::Property(a)),
                 ObjectPropertyExpression::Property(b),
-            ) => sup.entry(a.as_str()).or_default().push(b.as_str()),
-            AxiomKind::EquivalentObjectProperties(ps) => {
-                for a in ps {
-                    for b in ps {
-                        if a != b {
-                            sup.entry(a.named().as_str())
-                                .or_default()
-                                .push(b.named().as_str());
+            ) => {
+                if a.as_str() != b.as_str() {
+                    push_sup_edge(&mut sup_edges, a.as_str(), b.as_str(), &mut work)?;
+                }
+            }
+            AxiomKind::EquivalentObjectProperties(ps) if ps.len() >= 2 => {
+                let mut iter = ps.iter();
+                if let Some(first) = iter.next() {
+                    let first_s = first.named().as_str();
+                    let mut prev_s = first_s;
+                    for (j, cur) in iter.enumerate() {
+                        if j.is_multiple_of(RANGE_POLL_STEP) {
+                            work.poll()?;
                         }
+                        let cur_s = cur.named().as_str();
+                        if prev_s != cur_s {
+                            push_sup_edge(&mut sup_edges, prev_s, cur_s, &mut work)?;
+                        }
+                        prev_s = cur_s;
+                    }
+                    if prev_s != first_s {
+                        push_sup_edge(&mut sup_edges, prev_s, first_s, &mut work)?;
                     }
                 }
             }
-            AxiomKind::ObjectPropertyRange(ObjectPropertyExpression::Property(p), c) => {
-                direct.entry(p.as_str()).or_default().push(c)
+            AxiomKind::ObjectPropertyRange(ObjectPropertyExpression::Property(_), _) => {
+                has_any_range = true;
             }
             _ => {}
         }
     }
-    let mut out = FxHashMap::default();
-    let props: FxHashSet<&str> = sup.keys().chain(direct.keys()).copied().collect();
-    for p in props {
-        let mut seen = FxHashSet::default();
-        let mut stack = vec![p];
-        let mut rs = std::collections::BTreeSet::new();
-        while let Some(q) = stack.pop() {
-            if !seen.insert(q) {
-                continue;
-            }
-            if let Some(d) = direct.get(q) {
-                rs.extend(d.iter().map(|c| (*c).clone()));
-            }
-            if let Some(s) = sup.get(q) {
-                stack.extend(s.iter().copied());
+    if !has_any_range {
+        return Ok(out);
+    }
+
+    #[cfg(test)]
+    if !need_first {
+        admission_test::hit(admission_test::Point::OriginalRangeScan);
+        work.poll()?;
+    }
+
+    // Resolve only properties reachable from candidate chains' `sup` or `last`.
+    let mut needed: FxHashSet<&'a str> = FxHashSet::default();
+    let mut stack: Vec<&'a str> = Vec::new();
+    let mut steps = 0usize;
+    for &(last, sup, _) in &entries {
+        for seed in [last, sup] {
+            if !needed.contains(seed) {
+                set_admit(&mut needed, &mut work)?;
+                needed.insert(seed);
+                vec_reserve(&mut stack, 1, &mut work)?;
+                stack.push(seed);
             }
         }
-        out.insert(p.to_string(), rs);
+        while let Some(q) = stack.pop() {
+            steps += 1;
+            if steps.is_multiple_of(RANGE_POLL_STEP) {
+                work.poll()?;
+            }
+            if let Some(targets) = sup_edges.get(q) {
+                for &t in targets.as_slice() {
+                    steps += 1;
+                    if steps.is_multiple_of(RANGE_POLL_STEP) {
+                        work.poll()?;
+                    }
+                    if !needed.contains(t) {
+                        set_admit(&mut needed, &mut work)?;
+                        needed.insert(t);
+                        vec_reserve(&mut stack, 1, &mut work)?;
+                        stack.push(t);
+                    }
+                }
+            }
+        }
     }
-    out
-}
 
-/// The first range of a chain's superproperty missing from its last property under
-/// OWL 2 Profiles §2.2.6, with the superproperty and last property IRIs.
-fn chain_missing_range<'a, 'k>(
-    k: &'k AxiomKind,
-    ranges: &'a FxHashMap<String, std::collections::BTreeSet<ClassExpression>>,
-) -> Option<(&'a ClassExpression, &'k str, &'k str)> {
-    let AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), sup) = k else {
-        return None;
-    };
-    let (Some(last), ObjectPropertyExpression::Property(sup)) = (ps.last(), sup) else {
-        return None;
-    };
-    let want = ranges.get(sup.as_str())?;
-    let have = ranges.get(last.named().as_str());
-    let missing = want.iter().find(|c| have.is_none_or(|h| !h.contains(*c)))?;
-    Some((missing, sup.as_str(), last.named().as_str()))
-}
+    // Collect direct EL ranges only for properties in `needed`, borrowing expressions.
+    let mut direct: FxHashMap<&'a str, DirectRanges<'a>> = FxHashMap::default();
+    for (i, &k) in axioms.iter().enumerate() {
+        if i.is_multiple_of(RANGE_POLL_STEP) {
+            work.poll()?;
+        }
+        if let AxiomKind::ObjectPropertyRange(ObjectPropertyExpression::Property(p), c) = k
+            && needed.contains(p.as_str())
+            && !is_outside(i, k)
+        {
+            push_direct_range(&mut direct, p.as_str(), c, &mut work)?;
+        }
+    }
+    if direct.is_empty() {
+        return Ok(out);
+    }
+    drop(needed);
 
-/// The chains of `axioms` that are outside OWL 2 EL for their ranges alone
-/// (OWL 2 Profiles §2.2.6), matching [`Saturation::build_inner`].
-fn range_outside_chains<'a>(axioms: &[&'a AxiomKind]) -> Vec<&'a AxiomKind> {
-    let has_chain = axioms.iter().any(|k| {
-        matches!(
-            k,
-            AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
-        ) && !index::top_inclusion(k)
-    });
-    if !has_chain {
-        return Vec::new();
+    // Group candidate chains by `(last, sup)` so each `last` computes its inherited
+    // ranges once and each `(last, sup)` pair is checked once without materializing a
+    // full property x range table.
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+    let mut last_supers: FxHashSet<&'a str> = FxHashSet::default();
+    let mut have_ranges: FxHashSet<&'a ClassExpression> = FxHashSet::default();
+    let mut sup_seen: FxHashSet<&'a str> = FxHashSet::default();
+
+    let mut pos = 0;
+    while pos < entries.len() {
+        work.poll()?;
+        let last = entries[pos].0;
+        let mut last_end = pos + 1;
+        while last_end < entries.len() && entries[last_end].0 == last {
+            last_end += 1;
+        }
+
+        last_supers.clear();
+        have_ranges.clear();
+        stack.clear();
+        set_admit(&mut last_supers, &mut work)?;
+        last_supers.insert(last);
+        vec_reserve(&mut stack, 1, &mut work)?;
+        stack.push(last);
+        while let Some(q) = stack.pop() {
+            steps += 1;
+            if steps.is_multiple_of(RANGE_POLL_STEP) {
+                work.poll()?;
+            }
+            if let Some(rs) = direct.get(q) {
+                for &c in rs.as_slice() {
+                    steps += 1;
+                    if steps.is_multiple_of(RANGE_POLL_STEP) {
+                        work.poll()?;
+                    }
+                    if !have_ranges.contains(c) {
+                        set_admit(&mut have_ranges, &mut work)?;
+                        have_ranges.insert(c);
+                    }
+                }
+            }
+            if let Some(targets) = sup_edges.get(q) {
+                for &t in targets.as_slice() {
+                    steps += 1;
+                    if steps.is_multiple_of(RANGE_POLL_STEP) {
+                        work.poll()?;
+                    }
+                    if !last_supers.contains(t) {
+                        set_admit(&mut last_supers, &mut work)?;
+                        last_supers.insert(t);
+                        vec_reserve(&mut stack, 1, &mut work)?;
+                        stack.push(t);
+                    }
+                }
+            }
+        }
+
+        let mut sub = pos;
+        while sub < last_end {
+            work.poll()?;
+            let sup = entries[sub].1;
+            let mut sub_end = sub + 1;
+            while sub_end < last_end && entries[sub_end].1 == sup {
+                sub_end += 1;
+            }
+
+            let mut missing: Option<&'a ClassExpression> = None;
+            if !last_supers.contains(sup) {
+                sup_seen.clear();
+                stack.clear();
+                set_admit(&mut sup_seen, &mut work)?;
+                sup_seen.insert(sup);
+                vec_reserve(&mut stack, 1, &mut work)?;
+                stack.push(sup);
+                'walk: while let Some(q) = stack.pop() {
+                    steps += 1;
+                    if steps.is_multiple_of(RANGE_POLL_STEP) {
+                        work.poll()?;
+                    }
+                    if let Some(rs) = direct.get(q) {
+                        for &c in rs.as_slice() {
+                            steps += 1;
+                            if steps.is_multiple_of(RANGE_POLL_STEP) {
+                                work.poll()?;
+                            }
+                            if !have_ranges.contains(c) {
+                                if !need_first {
+                                    missing = Some(c);
+                                    break 'walk;
+                                }
+                                missing = Some(missing.map_or(c, |m| m.min(c)));
+                            }
+                        }
+                    }
+                    if let Some(targets) = sup_edges.get(q) {
+                        for &t in targets.as_slice() {
+                            steps += 1;
+                            if steps.is_multiple_of(RANGE_POLL_STEP) {
+                                work.poll()?;
+                            }
+                            if !last_supers.contains(t) && !sup_seen.contains(t) {
+                                set_admit(&mut sup_seen, &mut work)?;
+                                sup_seen.insert(t);
+                                vec_reserve(&mut stack, 1, &mut work)?;
+                                stack.push(t);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(c) = missing {
+                for &(_, _, idx) in &entries[sub..sub_end] {
+                    out[idx] = Some((c, sup, last));
+                }
+            }
+            sub = sub_end;
+        }
+
+        pos = last_end;
     }
-    let is_outside: Vec<bool> = axioms
-        .iter()
-        .map(|k| logical(k) && el_break(k).is_some())
-        .collect();
-    let chains: Vec<&'a AxiomKind> = axioms
-        .iter()
-        .enumerate()
-        .filter(|&(i, k)| {
-            !is_outside[i]
-                && matches!(
-                    k,
-                    AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
-                )
-                && !index::top_inclusion(k)
-        })
-        .map(|(_, &k)| k)
-        .collect();
-    if chains.is_empty() {
-        return Vec::new();
-    }
-    let ranges = range_table(axioms, &is_outside);
-    chains
-        .into_iter()
-        .filter(|k| chain_missing_range(k, &ranges).is_some())
-        .collect()
+
+    work.poll()?;
+    Ok(out)
 }
 
 /// The axioms normalized between two polls of the run's deadline and cancellation.
@@ -7886,6 +8382,207 @@ mod tests {
             it.individuals.iter().any(index::is_anonymous),
             "the anonymous individual is an individual of the run"
         );
+    }
+
+    #[test]
+    fn kept_rewritten_original_range_scan_stops_on_cancel_and_timeout_and_restarts_cleanly() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)
+             Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+             Ontology(
+                 DisjointUnion(:C
+                     ObjectSomeValuesFrom(:r owl:Thing)
+                     ObjectSomeValuesFrom(:r ObjectMinCardinality(0 owl:topObjectProperty :X)))
+                 SubObjectPropertyOf(ObjectPropertyChain(:p :q) :s)
+                 SubObjectPropertyOf(:s owl:topObjectProperty)
+                 ObjectPropertyRange(owl:topObjectProperty :T)
+             )",
+        )
+        .unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let c_cls = Class::new("http://ex.org/C");
+        let rooted = Limits {
+            threads: 1,
+            rooted: true,
+            strict: true,
+            ..Limits::default()
+        };
+        let baseline = Saturation::new().classify(&kinds, None, &rooted).unwrap();
+        let plain_baseline = Saturation::new()
+            .classify(&kinds, None, &Limits::default())
+            .unwrap();
+
+        // 1. Cancellation raised right inside the original range scan stops the run.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let trigger = cancelled.clone();
+        let check = cancelled.clone();
+        let mut sat = Saturation::new();
+        let res = admission_test::with_hook(
+            move |pt| {
+                if pt == admission_test::Point::OriginalRangeScan {
+                    trigger.store(true, Ordering::Relaxed);
+                }
+            },
+            || {
+                sat.classify(
+                    &kinds,
+                    None,
+                    &Limits {
+                        cancelled: Some(Arc::new(move || check.load(Ordering::Relaxed))),
+                        ..rooted.clone()
+                    },
+                )
+            },
+        );
+        assert!(matches!(res, Err(Error::Cancelled)), "{res:?}");
+        assert!(sat.reduced);
+        if let Some(desc) = sat.describe(&c_cls) {
+            for cls in desc
+                .equivalents
+                .iter()
+                .chain(&desc.superclasses)
+                .chain(&desc.subclasses)
+            {
+                assert!(
+                    !cls.as_str().starts_with(dl_reduce::PREFIX),
+                    "internal class leaked after cancel: {cls:?}"
+                );
+            }
+        }
+        // Unrooted restart resets the reduced interner cleanly.
+        let after_unrooted = sat.classify(&kinds, None, &Limits::default()).unwrap();
+        assert_eq!(after_unrooted.taxonomy, plain_baseline.taxonomy);
+        assert_eq!(
+            after_unrooted.stats.outside_el,
+            plain_baseline.stats.outside_el
+        );
+        assert!(!sat.reduced);
+
+        // 2. Deadline expiring during the original range scan stops with Timeout.
+        let mut sat_timeout = Saturation::new();
+        let deadline = Instant::now() + Duration::from_millis(60);
+        let res = admission_test::with_hook(
+            move |pt| {
+                if pt == admission_test::Point::OriginalRangeScan {
+                    while Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            },
+            || {
+                sat_timeout.classify(
+                    &kinds,
+                    None,
+                    &Limits {
+                        deadline: Some(deadline),
+                        ..rooted.clone()
+                    },
+                )
+            },
+        );
+        assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
+        assert!(sat_timeout.reduced);
+        let after_rooted = sat_timeout.classify(&kinds, None, &rooted).unwrap();
+        assert_eq!(after_rooted.taxonomy, baseline.taxonomy);
+        assert_eq!(after_rooted.stats.outside_el, baseline.stats.outside_el);
+        assert_eq!(after_rooted.stats.outside_el.horn, 1);
+        assert_eq!(after_rooted.stats.outside_el.taken, 2);
+    }
+
+    #[test]
+    fn post_run_scratch_respects_paid_offset_and_partial_stop_flag() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)
+             Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+             Ontology(
+                 SubObjectPropertyOf(ObjectPropertyChain(:p :q) :s)
+                 SubObjectPropertyOf(:s owl:topObjectProperty)
+                 ObjectPropertyRange(owl:topObjectProperty :B)
+                 ObjectPropertyRange(owl:topObjectProperty :A)
+             )",
+        )
+        .unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+
+        // When check_stop is false (partial answer), an already-expired deadline and
+        // active cancellation do not abort original outside_el accounting.
+        let charged = Arc::new(AtomicUsize::new(0));
+        let counter = charged.clone();
+        let limits = Limits {
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+            cancelled: Some(Arc::new(|| true)),
+            charge: Some(Arc::new(move |bytes| {
+                counter.fetch_add(bytes, Ordering::Relaxed);
+                true
+            })),
+            ..Limits::default()
+        };
+        let charge_ref = limits
+            .charge
+            .as_deref()
+            .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+        let mut peak = 2000usize;
+        let mut paid = 1000usize;
+        let mut scratch = PostRunScratch {
+            base: 1000,
+            peak: &mut peak,
+            paid: &mut paid,
+            limits: &limits,
+            charge: charge_ref,
+            check_stop: false,
+            scratch: 0,
+        };
+        let out = dl_reduce::Reduction::outside_el(&kinds, &[], &mut scratch).unwrap();
+        assert_eq!(out.horn, 1);
+        assert_eq!(out.taken, 1);
+        // Only paid (1000), not refused peak (2000), offset the pool charge.
+        assert!(charged.load(Ordering::Relaxed) > 0);
+        assert_eq!(paid, 1000 + charged.load(Ordering::Relaxed));
+
+        // When check_stop is true, the same expired deadline fails immediately.
+        let mut peak2 = 1000usize;
+        let mut paid2 = 1000usize;
+        let mut scratch2 = PostRunScratch {
+            base: 1000,
+            peak: &mut peak2,
+            paid: &mut paid2,
+            limits: &limits,
+            charge: charge_ref,
+            check_stop: true,
+            scratch: 0,
+        };
+        let err = dl_reduce::Reduction::outside_el(&kinds, &[], &mut scratch2);
+        assert!(matches!(err, Err(Error::Timeout)), "{err:?}");
+
+        // build_inner mode (`need_first = true`) selects the lexicographically smallest
+        // missing range (`:A` before `:B`), matching the prior BTreeSet ordering.
+        let unlimited = Limits::default();
+        let mut peak3 = 0usize;
+        let mut paid3 = 0usize;
+        let mut scratch3 = PostRunScratch {
+            base: 0,
+            peak: &mut peak3,
+            paid: &mut paid3,
+            limits: &unlimited,
+            charge: None,
+            check_stop: true,
+            scratch: 0,
+        };
+        let chains = [kinds[0]];
+        let missing =
+            check_chain_ranges(&kinds, |_, _| false, &chains, true, &mut scratch3).unwrap();
+        let Some((expr, sup, last)) = missing[0] else {
+            panic!("expected missing range for chain");
+        };
+        assert_eq!(expr, &ClassExpression::Class(Class::new("http://ex.org/A")));
+        assert_eq!(sup, "http://ex.org/s");
+        assert_eq!(last, "http://ex.org/q");
     }
 }
 

@@ -298,6 +298,14 @@ impl ScratchGuard {
         Ok(())
     }
 
+    pub fn release(&mut self, less: usize) {
+        let drop_bytes = less.min(self.bytes);
+        if drop_bytes != 0 {
+            self.bytes -= drop_bytes;
+            self.budget.release_scratch(drop_bytes);
+        }
+    }
+
     /// Atomically transfers `retained` bytes from this scratch guard into the budget's
     /// retained baseline and releases any remaining scratch bytes, without polling
     /// cancellation or leaving an uncharged window.

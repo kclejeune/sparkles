@@ -141,27 +141,64 @@ impl Reduction {
     /// report of the axioms the run left out.
     /// Original chains outside OWL 2 EL for their ranges alone are determined from the
     /// original axioms with the ordinary range check and counted as Horn.
-    pub fn outside_el(&self, axioms: &[&AxiomKind], excluded: &[Excluded]) -> dl::OutsideEl {
+    pub(super) fn outside_el(
+        axioms: &[&AxiomKind],
+        excluded: &[Excluded],
+        budget: &mut impl super::ScratchBudget,
+    ) -> Result<dl::OutsideEl, super::Error> {
+        budget.poll()?;
         let mut out = dl::OutsideEl::default();
-        let mut seen: BTreeSet<&AxiomKind> = BTreeSet::new();
-        for k in axioms {
-            if super::logical(k) && super::el_break(k).is_some() && seen.insert(k) {
-                out.add(dl::shape(k));
+        let mut seen: FxHashSet<&AxiomKind> = FxHashSet::default();
+        let mut chains: Vec<&AxiomKind> = Vec::new();
+        for (i, &k) in axioms.iter().enumerate() {
+            if i.is_multiple_of(super::RANGE_POLL_STEP) {
+                budget.poll()?;
+            }
+            if super::logical(k) && super::el_break(k).is_some() {
+                if !seen.contains(k) {
+                    super::set_admit(&mut seen, budget)?;
+                    seen.insert(k);
+                    out.add(dl::shape(k));
+                }
+            } else if matches!(
+                k,
+                AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
+            ) && !super::index::top_inclusion(k)
+            {
+                super::vec_reserve(&mut chains, 1, budget)?;
+                chains.push(k);
             }
         }
-        for k in super::range_outside_chains(axioms) {
-            if seen.insert(k) {
-                out.horn += 1;
+        if !chains.is_empty() {
+            let missing =
+                super::check_chain_ranges(axioms, |_, k| seen.contains(k), &chains, false, budget)?;
+            for (i, (&k, miss)) in chains.iter().zip(missing).enumerate() {
+                if i.is_multiple_of(super::RANGE_POLL_STEP) {
+                    budget.poll()?;
+                }
+                if miss.is_some() && !seen.contains(k) {
+                    super::set_admit(&mut seen, budget)?;
+                    seen.insert(k);
+                    out.horn += 1;
+                }
             }
         }
-        let left: BTreeSet<&AxiomKind> = excluded
-            .iter()
-            .filter(|e| matches!(e.gap, Gap::Outside { .. }))
-            .map(|e| &e.axiom)
-            .filter(|k| seen.contains(k))
-            .collect();
+        let mut left: FxHashSet<&AxiomKind> = FxHashSet::default();
+        for (i, e) in excluded.iter().enumerate() {
+            if i.is_multiple_of(super::RANGE_POLL_STEP) {
+                budget.poll()?;
+            }
+            if matches!(e.gap, Gap::Outside { .. })
+                && seen.contains(&e.axiom)
+                && !left.contains(&e.axiom)
+            {
+                super::set_admit(&mut left, budget)?;
+                left.insert(&e.axiom);
+            }
+        }
+        budget.poll()?;
         out.taken = seen.len() - left.len();
-        out
+        Ok(out)
     }
 }
 

@@ -6,7 +6,9 @@
 //! is off by default, since item 804 lands it as an option: without it, a run with
 //! individuals takes the EL path and leaves the disjunctive axiom out.
 
-use sparkles_owl::classify::{Classification, Classifier, Consistency, Expansion, Limits, Tier};
+use sparkles_owl::classify::{
+    Classification, Classifier, Consistency, Error, Expansion, Limits, Saturation, Tier,
+};
 use sparkles_owl::model::*;
 use sparkles_owl::ofn_read;
 use sparkles_owl::vocab;
@@ -3375,4 +3377,217 @@ fn kept_rewritten_chain_range_stats_do_not_overcount_original_el_chains() {
         assert!(k.describe(&Class::thing()).unwrap().instances.is_empty());
         no_internal_names(&k, &out, &[Class::thing(), c("C"), c("T"), c("X")]);
     }
+}
+
+/// Builds the item-1313 undercount fixture extended with `n_roles` fresh roles included in
+/// `owl:topObjectProperty` and `n_ranges` distinct named ranges on `owl:topObjectProperty`.
+/// Rewriting drops the role inclusions and turns the ranges into global subclass axioms,
+/// so only the original range scan sees the added role hierarchy.
+fn chain_range_scan_fixture(include_chain: bool, n_roles: usize, n_ranges: usize) -> Vec<Axiom> {
+    let mut body = String::from(
+        "DisjointUnion(:C
+             ObjectSomeValuesFrom(:r owl:Thing)
+             ObjectSomeValuesFrom(:r ObjectMinCardinality(0 owl:topObjectProperty :X)))\n",
+    );
+    if include_chain {
+        body.push_str(
+            "SubObjectPropertyOf(ObjectPropertyChain(:p :q) :s)
+             SubObjectPropertyOf(:s owl:topObjectProperty)\n",
+        );
+    }
+    for i in 0..n_roles {
+        body.push_str(&format!(
+            "SubObjectPropertyOf(:extra{i} owl:topObjectProperty)\n"
+        ));
+    }
+    for j in 0..n_ranges {
+        body.push_str(&format!(
+            "ObjectPropertyRange(owl:topObjectProperty :T{j})\n"
+        ));
+    }
+    direct_axioms(&body)
+}
+
+/// On the kept-rewrite path, the original range scan resolves ranges only for properties
+/// needed by candidate chains, admits its scratch against `max_memory` and the pool,
+/// reflects its peak in `Stats::peak_memory`, polls limits cooperatively, and preserves
+/// clean restart behavior after a stop (row 1313).
+#[test]
+fn kept_rewritten_original_range_scan_respects_budget_polling_and_restart() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const N_ROLES: usize = 4000;
+    const N_RANGES: usize = 200;
+
+    let no_chain_ax = chain_range_scan_fixture(false, N_ROLES, N_RANGES);
+    let with_chain_ax = chain_range_scan_fixture(true, N_ROLES, N_RANGES);
+    let no_chain: Vec<&AxiomKind> = no_chain_ax.iter().map(|a| &a.kind).collect();
+    let with_chain: Vec<&AxiomKind> = with_chain_ax.iter().map(|a| &a.kind).collect();
+
+    let base_limits = Limits {
+        threads: 1,
+        rooted: true,
+        strict: true,
+        ..Limits::default()
+    };
+
+    // Baseline without the candidate chain: the original range scan skips the hierarchy.
+    let mut sat_no_chain = Saturation::new();
+    let no_chain_out = sat_no_chain
+        .classify(&no_chain, None, &base_limits)
+        .unwrap();
+    let no_chain_peak = no_chain_out.stats.peak_memory;
+
+    // With the single candidate chain: scratch is linear (not N_ROLES * N_RANGES),
+    // reflected in peak_memory, and charged to the memory pool.
+    let granted = Arc::new(AtomicUsize::new(0));
+    let charge_counter = granted.clone();
+    let mut sat_full = Saturation::new();
+    let full = sat_full
+        .classify(
+            &with_chain,
+            None,
+            &Limits {
+                charge: Some(Arc::new(move |bytes| {
+                    charge_counter.fetch_add(bytes, Ordering::Relaxed);
+                    true
+                })),
+                ..base_limits.clone()
+            },
+        )
+        .unwrap();
+    assert!(sat_full.excluded().is_empty(), "{:#?}", sat_full.excluded());
+    assert!(full.complete && full.complete_for_taken);
+    assert_eq!(full.consistency, Consistency::Consistent);
+    assert!(full.taxonomy.is_unsatisfiable(&c("C")));
+    assert!(full.taxonomy.is_subclass(&Class::thing(), &c("T0")));
+    assert_eq!(full.stats.tier, Tier::Disjunctive);
+    assert_eq!(full.stats.outside_el.horn, 1);
+    assert_eq!(full.stats.outside_el.disjunctive, 1);
+    assert_eq!(full.stats.outside_el.taken, 2);
+    assert!(
+        full.stats.peak_memory > no_chain_peak + 32 * 1024,
+        "original range scan scratch missing from peak_memory: with_chain={} no_chain={}",
+        full.stats.peak_memory,
+        no_chain_peak,
+    );
+    assert_eq!(
+        granted.load(Ordering::Relaxed),
+        full.stats.peak_memory,
+        "pool grants must match peak_memory including original range scan scratch",
+    );
+    assert!(
+        full.stats.peak_memory < 4 * 1024 * 1024,
+        "original range scan must avoid N*M expansion: peak={}",
+        full.stats.peak_memory,
+    );
+
+    // Cap sits above the rewritten run's peak and below the original range scan's peak.
+    let cap = no_chain_peak + (full.stats.peak_memory - no_chain_peak) / 2;
+    assert!(cap > no_chain_peak && cap < full.stats.peak_memory);
+
+    // 1. max_memory refusal during the original range scan, followed by clean restarts.
+    let mut sat_mem = Saturation::new();
+    let mem_err = sat_mem.classify(
+        &with_chain,
+        None,
+        &Limits {
+            max_memory: Some(cap),
+            ..base_limits.clone()
+        },
+    );
+    assert!(
+        matches!(mem_err, Err(Error::Memory { .. })),
+        "expected Error::Memory during original range scan, got {mem_err:?}"
+    );
+    if let Some(desc) = sat_mem.describe(&c("C")) {
+        for cls in desc
+            .equivalents
+            .iter()
+            .chain(&desc.superclasses)
+            .chain(&desc.subclasses)
+        {
+            assert!(
+                !cls.as_str().starts_with("urn:sparkles:internal:"),
+                "internal class leaked after stop: {cls:?}"
+            );
+        }
+    }
+    let restarted_rooted = sat_mem.classify(&with_chain, None, &base_limits).unwrap();
+    assert_eq!(restarted_rooted.taxonomy, full.taxonomy);
+    assert_eq!(restarted_rooted.stats.outside_el, full.stats.outside_el);
+
+    // 2. Pool refusal during the original range scan, followed by an unrooted restart.
+    let pool_used = Arc::new(AtomicUsize::new(0));
+    let pool_tracker = pool_used.clone();
+    let mut sat_pool = Saturation::new();
+    let pool_err = sat_pool.classify(
+        &with_chain,
+        None,
+        &Limits {
+            charge: Some(Arc::new(move |bytes| {
+                let prev = pool_tracker.load(Ordering::Relaxed);
+                if prev.saturating_add(bytes) > cap {
+                    return false;
+                }
+                pool_tracker.fetch_add(bytes, Ordering::Relaxed);
+                true
+            })),
+            ..base_limits.clone()
+        },
+    );
+    assert!(
+        matches!(pool_err, Err(Error::Memory { .. })),
+        "expected pool Error::Memory during original range scan, got {pool_err:?}"
+    );
+    let plain_fresh = Saturation::new()
+        .classify(&with_chain, None, &Limits::default())
+        .unwrap();
+    let restarted_plain = sat_pool
+        .classify(&with_chain, None, &Limits::default())
+        .unwrap();
+    assert_eq!(restarted_plain.taxonomy, plain_fresh.taxonomy);
+    assert_eq!(restarted_plain.consistency, plain_fresh.consistency);
+    assert_eq!(
+        restarted_plain.stats.outside_el,
+        plain_fresh.stats.outside_el
+    );
+
+    // 3. Cancellation triggered during original range scan admission stops cooperatively
+    //    and leaves the classifier able to restart cleanly on both rooted and unrooted runs.
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let cancel_trigger = cancel_flag.clone();
+    let cancel_check = cancel_flag.clone();
+    let cancel_used = Arc::new(AtomicUsize::new(0));
+    let mut sat_cancel = Saturation::new();
+    let cancel_err = sat_cancel.classify(
+        &with_chain,
+        None,
+        &Limits {
+            charge: Some(Arc::new(move |bytes| {
+                let total = cancel_used.fetch_add(bytes, Ordering::Relaxed) + bytes;
+                if total > cap {
+                    cancel_trigger.store(true, Ordering::Relaxed);
+                }
+                true
+            })),
+            cancelled: Some(Arc::new(move || cancel_check.load(Ordering::Relaxed))),
+            ..base_limits.clone()
+        },
+    );
+    assert!(
+        matches!(cancel_err, Err(Error::Cancelled)),
+        "expected Error::Cancelled during original range scan, got {cancel_err:?}"
+    );
+    cancel_flag.store(false, Ordering::Relaxed);
+    let recovered_rooted = sat_cancel
+        .classify(&with_chain, None, &base_limits)
+        .unwrap();
+    assert_eq!(recovered_rooted.taxonomy, full.taxonomy);
+    assert_eq!(recovered_rooted.stats.outside_el, full.stats.outside_el);
+    let recovered_plain = sat_cancel
+        .classify(&with_chain, None, &Limits::default())
+        .unwrap();
+    assert_eq!(recovered_plain.taxonomy, plain_fresh.taxonomy);
 }

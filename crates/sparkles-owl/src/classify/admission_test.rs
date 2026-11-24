@@ -38,6 +38,7 @@ pub(super) enum Point {
     TopChainScan,
     TopChainGlobalMessage,
     TopChainWorldMessage,
+    OriginalRangeScan,
     BeforePanicWake,
     Idle,
 }
