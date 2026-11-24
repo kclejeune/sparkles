@@ -1473,3 +1473,202 @@ fn rebuilt_construct_keeps_retained_template_charged_between_batches() {
     cursor.close();
     assert!(cursor.memory_meter().live_bytes() < total_payload as u64);
 }
+
+#[test]
+fn rebuilt_exists_ordered_window_on_shared_variable_matches_maintained_and_direct() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s);
+    let cases = [
+        (
+            "shared_reduced_exists",
+            "SELECT ?x WHERE {
+                VALUES ?x { 2 }
+                FILTER EXISTS {
+                    { SELECT REDUCED ?x WHERE { VALUES ?x { 1 2 2 } }
+                      ORDER BY ?x LIMIT 1 OFFSET 1 }
+                }
+            }",
+            1usize,
+        ),
+        (
+            "shared_reduced_not_exists",
+            "SELECT ?x WHERE {
+                VALUES ?x { 2 }
+                FILTER NOT EXISTS {
+                    { SELECT REDUCED ?x WHERE { VALUES ?x { 1 2 2 } }
+                      ORDER BY ?x LIMIT 1 OFFSET 1 }
+                }
+            }",
+            0usize,
+        ),
+        (
+            "shared_distinct_exists",
+            "SELECT ?x WHERE {
+                VALUES ?x { 2 }
+                FILTER EXISTS {
+                    { SELECT DISTINCT ?x WHERE { VALUES ?x { 1 2 2 } }
+                      ORDER BY ?x LIMIT 1 OFFSET 1 }
+                }
+            }",
+            0usize,
+        ),
+        (
+            "shared_distinct_not_exists",
+            "SELECT ?x WHERE {
+                VALUES ?x { 2 }
+                FILTER NOT EXISTS {
+                    { SELECT DISTINCT ?x WHERE { VALUES ?x { 1 2 2 } }
+                      ORDER BY ?x LIMIT 1 OFFSET 1 }
+                }
+            }",
+            1usize,
+        ),
+        (
+            "shared_plain_window_exists",
+            "SELECT ?x WHERE {
+                VALUES ?x { 2 }
+                FILTER EXISTS {
+                    { SELECT ?x WHERE { VALUES ?x { 1 2 } }
+                      ORDER BY ?x LIMIT 1 OFFSET 1 }
+                }
+            }",
+            0usize,
+        ),
+    ];
+    for (name, def, _) in cases {
+        rt.put(&s, name, ViewDef::table(def)).unwrap();
+    }
+    rt.round(&s);
+    let snap = s.snapshot();
+    let opts = QueryOptions {
+        views: Some(rt),
+        ..Default::default()
+    };
+    let alternate = QueryOptions {
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        ..opts.clone()
+    };
+    for (name, def, expected_len) in cases {
+        let direct = drain(&snap, def, &QueryOptions::default(), 1).unwrap().0;
+        assert_eq!(direct.len(), expected_len, "direct query {name}");
+        let q = format!(
+            "{P}SELECT ?x {{ SERVICE view:read {{ [] view:name '{name}'; view:bind ?x }} }}"
+        );
+        let maintained = drain(&snap, &q, &opts, 1).unwrap().0;
+        assert_eq!(bag(maintained.clone()), bag(direct), "maintained {name}");
+        let rebuilt = drain(&snap, &q, &alternate, 1).unwrap().0;
+        assert_eq!(bag(rebuilt), bag(maintained), "rebuilt {name}");
+    }
+}
+
+#[test]
+fn rebuilt_exists_keeps_retained_syntax_and_patterns_charged() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s);
+    rt.set_host(Arc::new(ProtectedHost(Arc::new(
+        GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "private".into(),
+                        predicates: Some(vec!["http://example.org/hidden".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Default::default(),
+            },
+        ),
+    ))));
+
+    // Twenty copies of the same 32 KiB literal total 640 KiB in the retained EXISTS
+    // syntax while staying under the 1 MiB view definition limit. VALUES planning
+    // interns the repeated string once (~32 KiB) and REDUCED deduplicates by ID without
+    // decoding the string, so live bytes >= 640 KiB between batches proves the retained
+    // EXISTS syntax and projected occurrence set stay charged across batches and drop
+    // with the child, while staying far below the ~10 MiB planning staging peak.
+    let copy_len = 32 << 10;
+    let copies = 20usize;
+    let total_payload = copy_len * copies;
+    let payload = "y".repeat(copy_len);
+    let values = std::iter::repeat_n(format!("\"{payload}\""), copies)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let def = format!(
+        "SELECT ?outer WHERE {{
+            VALUES ?outer {{ 1 2 }}
+            FILTER EXISTS {{
+                {{ SELECT REDUCED ?x WHERE {{ VALUES ?x {{ {values} }} }} }}
+            }}
+        }}"
+    );
+    rt.put(&s, "big_exists", ViewDef::table(def.clone()))
+        .unwrap();
+    rt.put(
+        &s,
+        "big_exists_protected",
+        ViewDef {
+            principal: Some("reader".into()),
+            ..ViewDef::table(def)
+        },
+    )
+    .unwrap();
+    rt.round(&s);
+
+    for name in ["big_exists", "big_exists_protected"] {
+        let q = format!(
+            "{P}SELECT ?outer {{ SERVICE view:read {{ [] view:name '{name}'; view:bind ?outer }} }}"
+        );
+        let opts = QueryOptions {
+            views: Some(rt.clone()),
+            aggregate_errors: Some(AggregateErrors::Sparkles),
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(s.snapshot(), &q, &opts, &strict(1)).unwrap();
+        let first = cursor.next_batch().unwrap().unwrap();
+        assert_eq!(first.len(), 1, "{name}: first batch");
+        let live_between = cursor.memory_meter().live_bytes();
+        assert!(
+            live_between >= total_payload as u64,
+            "{name}: expected retained EXISTS syntax ({total_payload} bytes) to stay charged between batches, got {live_between}"
+        );
+        assert!(
+            live_between < 2 << 20,
+            "{name}: expected transient planning staging to be released before streaming, got {live_between}"
+        );
+        let second = cursor.next_batch().unwrap().unwrap();
+        assert_eq!(second.len(), 1, "{name}: second batch");
+        assert!(cursor.next_batch().unwrap().is_none(), "{name}: eof");
+        let live_after_eof = cursor.memory_meter().live_bytes();
+        assert!(
+            live_after_eof < total_payload as u64,
+            "{name}: expected retained EXISTS syntax charge to release with child at EOF, got {live_after_eof}"
+        );
+        cursor.close();
+        assert!(cursor.memory_meter().live_bytes() < total_payload as u64);
+
+        // A tight memory budget refuses before cloning oversized EXISTS syntax.
+        let tight = QueryOptions {
+            max_memory_bytes: Some(256 << 10),
+            ..opts
+        };
+        let mut tight_cursor = select_cursor(s.snapshot(), &q, &tight, &strict(1)).unwrap();
+        let err = tight_cursor
+            .next_batch()
+            .err()
+            .expect("expected memory limit error under tight budget");
+        assert!(
+            matches!(err, Error::BudgetExceeded(ref b) if b.kind == BudgetKind::Memory),
+            "{name}: expected memory BudgetExceeded under tight budget, got {err:?}"
+        );
+    }
+}

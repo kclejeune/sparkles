@@ -4752,3 +4752,77 @@ fn checked_graph_r12_placed_filter_credit_outlives_refusal_storage() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[test]
+fn checked_exists_rebinding_retains_projected_view_patterns_credit() {
+    let parsed = parse_query(
+        "SELECT ?outer WHERE {
+            VALUES ?outer { 1 }
+            FILTER EXISTS {
+                { SELECT REDUCED ?x WHERE { VALUES ?x { 1 1 } } ORDER BY ?x LIMIT 1 }
+            }
+        }",
+        None,
+        &[],
+    )
+    .unwrap();
+    let spargebra::Query::Select { pattern, .. } = &parsed else {
+        unreachable!();
+    };
+    let compiled = crate::incr::compile::compile(&parsed, None).unwrap();
+    let mut exists_gp = None;
+    super::walk::visit_algebra_ordinary::<()>(super::walk::Algebra::Pattern(pattern), |item| {
+        if let super::walk::Algebra::Expr(spargebra::algebra::Expression::Exists(p)) = item {
+            exists_gp = Some(p.as_ref());
+        }
+        Ok(())
+    })
+    .unwrap();
+    let exists_gp = exists_gp.expect("EXISTS pattern");
+
+    let preparation = Preparation::new(Control::none(), 2 << 20).unwrap();
+    let baseline = preparation.inner_used();
+    let mut sources = super::checked_syntax::Sources::new(pattern, &preparation).unwrap();
+    let checked_pattern = sources.get(exists_gp, &preparation).unwrap();
+    drop(sources);
+    let after_pattern = preparation.inner_used();
+    assert!(after_pattern > baseline);
+
+    let (projected, vp_charge) = compiled
+        .rebuild_patterns
+        .project_checked(exists_gp, &checked_pattern.syntax, &preparation)
+        .unwrap()
+        .expect("projected REDUCED occurrence");
+    let vp_bytes = vp_charge.bytes();
+    assert!(vp_bytes > 0);
+    let retained_vp = Arc::new(super::expr::RetainedViewPatterns::from_reservation(
+        projected, vp_charge,
+    ));
+    let spec_held = super::expr::ExistsSpec::reserve_checked(&preparation, 1, 0).unwrap();
+    let original = super::expr::ExistsSpec::new_checked(
+        checked_pattern,
+        super::plan::ActiveGraph::Default,
+        vec![0],
+        Vec::new(),
+        Some(retained_vp),
+        spec_held,
+    );
+    let rebound = original
+        .with_bound_checked(0, crate::id::Id::from_i64(1).unwrap())
+        .unwrap();
+    drop(original);
+
+    // Dropping the original ExistsSpec must keep both the syntax and projected
+    // ViewPatterns reservations charged while the rebound ExistsSpec still shares them.
+    let used_while_rebound = preparation.inner_used();
+    assert!(
+        used_while_rebound >= after_pattern + vp_bytes,
+        "expected rebound spec to retain syntax + ViewPatterns credit (>= {}), got {}",
+        after_pattern + vp_bytes,
+        used_while_rebound
+    );
+    assert!(rebound.view_patterns().is_some());
+
+    drop(rebound);
+    assert_eq!(preparation.inner_used(), baseline);
+}

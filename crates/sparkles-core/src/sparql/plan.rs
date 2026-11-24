@@ -10,7 +10,7 @@
 
 use super::ctx::Ctx;
 use super::exec::PlanPattern;
-use super::expr::{Compiler, ExistsSpec, Expr};
+use super::expr::{ExistsSpec, Expr};
 use super::table::{Table, VarId};
 use crate::access::{
     Preparation, PreparationBuffer, PreparationMap, PreparationText, Reservation, sort_by_prepared,
@@ -1100,10 +1100,10 @@ impl<'a> Planner<'a> {
         mentions != 1
     }
 
-    pub fn compile(&self, e: &Expression, graph: &ActiveGraph) -> Expr {
+    pub fn compile(&self, e: &Expression, graph: &ActiveGraph) -> Result<Expr> {
         let ctx = self.ctx;
         let subst = &self.subst;
-        let exists = |p: &GraphPattern| -> Arc<ExistsSpec> {
+        let exists = |p: &GraphPattern| -> Result<Arc<ExistsSpec>> {
             let mut names = Vec::new();
             collect_pattern_vars(p, &mut names);
             let mut vars: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
@@ -1113,25 +1113,28 @@ impl<'a> Planner<'a> {
                 .iter()
                 .filter_map(|v| subst.get(v).map(|id| (*v, *id)))
                 .collect();
-            Arc::new(ExistsSpec::new_with_view_patterns(
+            Ok(Arc::new(ExistsSpec::new_ordinary_charged(
+                ctx,
                 p,
                 self.view_patterns,
                 graph.clone(),
                 vars,
                 bound,
-            ))
+            )?))
         };
-        Compiler {
+        super::expr::compile_expression(
             ctx,
             subst,
-            exists: &exists,
-        }
-        .compile(e)
+            &exists,
+            &|_| Ok(()),
+            &|name| Ok(ctx.var(name)),
+            e,
+        )
     }
 
     fn compile_in_branch(&self, e: &Expression, graph: &ActiveGraph) -> Result<Expr> {
         if self.checked_exists.borrow().is_none() {
-            return Ok(self.compile(e, graph));
+            return self.compile(e, graph);
         }
         let ctx = self.ctx;
         let subst = &self.subst;
@@ -1159,15 +1162,15 @@ impl<'a> Planner<'a> {
             sort_by_prepared(&mut ids, preparation, |a, b| Ok(a.cmp(b)))?;
             ids.dedup();
             let bound_len = ids.iter().filter(|id| subst.contains_key(id)).count();
-            let mut held = ExistsSpec::reserve_checked(preparation, ids.len(), bound_len)?;
+            let held = ExistsSpec::reserve_checked(preparation, ids.len(), bound_len)?;
             let view_patterns = match self.view_patterns {
-                Some(vp) => match vp.project_checked(p, &pattern.syntax, preparation)? {
-                    Some((projected, charge)) => {
-                        held.merge(charge);
-                        Some(Arc::new(projected))
-                    }
-                    None => None,
-                },
+                Some(vp) => vp.project_checked(p, &pattern.syntax, preparation)?.map(
+                    |(projected, charge)| {
+                        Arc::new(super::expr::RetainedViewPatterns::from_reservation(
+                            projected, charge,
+                        ))
+                    },
+                ),
                 None => None,
             };
             let mut vars = Vec::with_capacity(ids.len());

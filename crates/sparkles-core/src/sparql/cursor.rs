@@ -12,6 +12,7 @@ use crate::id::Id;
 use crate::index::{Key, pad};
 use crate::store::{Chunk, Snapshot};
 use oxrdf::Term;
+use rustc_hash::FxHashSet;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -2775,15 +2776,196 @@ fn pull_planned<'ctx>(
 }
 
 pub(super) fn plan_bytes(node: &Node) -> u64 {
-    let values = match &node.kind {
-        Kind::Values(t) => capacity_bytes(t),
-        _ => 0,
-    };
-    (node.desc.len() as u64)
-        .saturating_add(node.vars.len() as u64 * 32)
-        .saturating_add(1024)
-        .saturating_add(values)
-        .saturating_add(node.children.iter().map(plan_bytes).sum::<u64>())
+    fn expr_exists_bytes(
+        expr: &Expr,
+        seen_specs: &mut FxHashSet<usize>,
+        seen_patterns: &mut FxHashSet<usize>,
+        seen_view_patterns: &mut FxHashSet<usize>,
+    ) -> u64 {
+        match expr {
+            Expr::Exists(spec) => {
+                if seen_specs.insert(Arc::as_ptr(spec) as usize) {
+                    spec.uncharged_retained_bytes(seen_patterns, seen_view_patterns)
+                } else {
+                    0
+                }
+            }
+            Expr::Or(a, b)
+            | Expr::And(a, b)
+            | Expr::Eq(a, b)
+            | Expr::SameTerm(a, b)
+            | Expr::Cmp(a, b, _)
+            | Expr::Arith(a, b, _) => {
+                expr_exists_bytes(a, seen_specs, seen_patterns, seen_view_patterns).saturating_add(
+                    expr_exists_bytes(b, seen_specs, seen_patterns, seen_view_patterns),
+                )
+            }
+            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => {
+                expr_exists_bytes(a, seen_specs, seen_patterns, seen_view_patterns)
+            }
+            Expr::If(a, b, c) => {
+                expr_exists_bytes(a, seen_specs, seen_patterns, seen_view_patterns)
+                    .saturating_add(expr_exists_bytes(
+                        b,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+                    .saturating_add(expr_exists_bytes(
+                        c,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+            }
+            Expr::In(a, list) => list.iter().fold(
+                expr_exists_bytes(a, seen_specs, seen_patterns, seen_view_patterns),
+                |acc, e| {
+                    acc.saturating_add(expr_exists_bytes(
+                        e,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+                },
+            ),
+            Expr::Coalesce(list) | Expr::Call(_, list) => list.iter().fold(0u64, |acc, e| {
+                acc.saturating_add(expr_exists_bytes(
+                    e,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => 0,
+        }
+    }
+
+    fn walk_node(
+        node: &Node,
+        seen_specs: &mut FxHashSet<usize>,
+        seen_patterns: &mut FxHashSet<usize>,
+        seen_view_patterns: &mut FxHashSet<usize>,
+    ) -> u64 {
+        let mut extra = match &node.kind {
+            Kind::Values(t) => capacity_bytes(t),
+            Kind::Filter(exprs) | Kind::CountFilterScan { filter: exprs, .. } => {
+                exprs.iter().fold(0u64, |acc, e| {
+                    acc.saturating_add(expr_exists_bytes(
+                        e,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+                })
+            }
+            Kind::Extend(_, e)
+            | Kind::Assign(_, e)
+            | Kind::Unfold { expr: e, .. }
+            | Kind::KeyedLeftJoin { expr: e, .. }
+            | Kind::KeyedJoin { expr: e, .. } => {
+                expr_exists_bytes(e, seen_specs, seen_patterns, seen_view_patterns)
+            }
+            Kind::LeftJoin { expr: Some(e) } => {
+                expr_exists_bytes(e, seen_specs, seen_patterns, seen_view_patterns)
+            }
+            Kind::RangeScan(_, range) => range.filter.iter().fold(0u64, |acc, e| {
+                acc.saturating_add(expr_exists_bytes(
+                    e,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            Kind::OrderedTopK(top) => top
+                .filter
+                .iter()
+                .chain(&top.range_filter)
+                .fold(0u64, |acc, e| {
+                    acc.saturating_add(expr_exists_bytes(
+                        e,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+                })
+                .saturating_add(walk_node(
+                    &top.fallback,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                )),
+            Kind::OrderBy { keys, .. } => keys.iter().fold(0u64, |acc, (e, _)| {
+                acc.saturating_add(expr_exists_bytes(
+                    e,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            Kind::Group { aggs, .. } => aggs.iter().fold(0u64, |acc, (_, agg)| {
+                let mut total = acc;
+                if let Some(e) = &agg.expr {
+                    total = total.saturating_add(expr_exists_bytes(
+                        e,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ));
+                }
+                if let Some(fold) = &agg.fold {
+                    if let Some(v) = &fold.value {
+                        total = total.saturating_add(expr_exists_bytes(
+                            v,
+                            seen_specs,
+                            seen_patterns,
+                            seen_view_patterns,
+                        ));
+                    }
+                    for (e, _) in &fold.order {
+                        total = total.saturating_add(expr_exists_bytes(
+                            e,
+                            seen_specs,
+                            seen_patterns,
+                            seen_view_patterns,
+                        ));
+                    }
+                }
+                total
+            }),
+            Kind::GraphBranches(branches) => branches.inputs.iter().fold(0u64, |acc, branch| {
+                acc.saturating_add(walk_node(
+                    branch,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            _ => 0,
+        };
+        for child in &node.children {
+            extra = extra.saturating_add(walk_node(
+                child,
+                seen_specs,
+                seen_patterns,
+                seen_view_patterns,
+            ));
+        }
+        (node.desc.len() as u64)
+            .saturating_add(node.vars.len() as u64 * 32)
+            .saturating_add(1024)
+            .saturating_add(extra)
+    }
+
+    let mut seen_specs = FxHashSet::default();
+    let mut seen_patterns = FxHashSet::default();
+    let mut seen_view_patterns = FxHashSet::default();
+    walk_node(
+        node,
+        &mut seen_specs,
+        &mut seen_patterns,
+        &mut seen_view_patterns,
+    )
 }
 
 enum State {

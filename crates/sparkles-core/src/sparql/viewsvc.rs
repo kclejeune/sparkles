@@ -259,24 +259,52 @@ impl ViewPatterns {
             .contains(&(std::ptr::from_ref(pattern) as usize))
     }
 
+    fn allocation_bytes(count: usize) -> u64 {
+        let cap = sparkles_budget::sizes::table_grown(0, 0, count);
+        (sparkles_budget::sizes::table_bytes(cap, std::mem::size_of::<usize>()) as u64)
+            .saturating_add(std::mem::size_of::<Self>() as u64 + 128)
+    }
+
     /// Remap recorded occurrences from `source` onto a structurally identical heap-pinned
-    /// clone `cloned` (such as an `ExistsSpec`'s owned pattern).
-    pub(crate) fn project(&self, source: &GraphPattern, cloned: &GraphPattern) -> Option<Self> {
+    /// clone `cloned`, charging the projected hash set through `ctx` before allocating it.
+    pub(super) fn project_retained(
+        &self,
+        source: &GraphPattern,
+        cloned: &GraphPattern,
+        ctx: &super::ctx::Ctx,
+    ) -> Result<Option<(Self, u64, Option<super::ctx::RetainedCharge>)>> {
         if self.native.is_empty() {
-            return None;
+            return Ok(None);
         }
+        let mut count = 0usize;
+        walk_gp_pair(source, cloned, &mut |s, _| {
+            ctx.check()?;
+            if self.contains(s) {
+                count = count.saturating_add(1);
+            }
+            Ok(())
+        })?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let bytes = Self::allocation_bytes(count);
+        let charge = ctx.retained_charge(bytes)?;
         let mut native = rustc_hash::FxHashSet::default();
-        let _ = walk_gp_pair(source, cloned, &mut |s, c| {
+        native
+            .try_reserve(count)
+            .map_err(|_| ctx.memory_exceeded(bytes))?;
+        walk_gp_pair(source, cloned, &mut |s, c| {
+            ctx.check()?;
             if self.contains(s) {
                 native.insert(std::ptr::from_ref(c) as usize);
             }
             Ok(())
-        });
-        (!native.is_empty()).then_some(Self { native })
+        })?;
+        Ok(Some((Self { native }, bytes, charge)))
     }
 
-    /// Checked variant of [`Self::project`] that polls `preparation` and admits the
-    /// projected set's storage before allocating it.
+    /// Checked variant of [`Self::project_retained`] that polls `preparation` and admits
+    /// the projected set's storage before allocating it.
     pub(crate) fn project_checked(
         &self,
         source: &GraphPattern,
@@ -297,9 +325,7 @@ impl ViewPatterns {
         if count == 0 {
             return Ok(None);
         }
-        let cap = sparkles_budget::sizes::table_grown(0, 0, count);
-        let bytes = (sparkles_budget::sizes::table_bytes(cap, std::mem::size_of::<usize>()) as u64)
-            .saturating_add(std::mem::size_of::<Self>() as u64 + 64);
+        let bytes = Self::allocation_bytes(count);
         let held = preparation.reserve(bytes)?;
         let mut native = rustc_hash::FxHashSet::default();
         native

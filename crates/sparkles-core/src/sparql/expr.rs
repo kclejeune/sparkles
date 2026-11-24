@@ -11,7 +11,7 @@ use oxrdf::vocab::xsd;
 use oxrdf::{Literal, NamedNode, Term};
 use oxsdatatypes::*;
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::{Expression, Function, GraphPattern};
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -44,17 +44,74 @@ pub struct ExistsSpec {
     /// the key set answering the EXISTS for every outer row (see [`super::exists`])
     pub decor: super::exists::Decor,
     /// Native REDUCED / VALUES occurrences projected onto this spec's heap-pinned pattern.
-    view_patterns: Option<Arc<super::viewsvc::ViewPatterns>>,
-    _held: Option<Reservation>,
+    view_patterns: Option<Arc<RetainedViewPatterns>>,
+    _held: BackingCredit,
+}
+
+enum BackingCredit {
+    None,
+    Reservation(Reservation),
+    Retained(super::ctx::RetainedCharge),
+}
+
+struct OrdinaryPattern {
+    syntax: GraphPattern,
+    bytes: u64,
+    _charge: Option<super::ctx::RetainedCharge>,
+}
+
+/// Shared projected view-pattern occurrence set with its own backing credit, so
+/// rebinding an [`ExistsSpec`] keeps the set charged for as long as any copy shares it.
+pub(super) struct RetainedViewPatterns {
+    patterns: super::viewsvc::ViewPatterns,
+    bytes: u64,
+    _charge: BackingCredit,
+}
+
+impl RetainedViewPatterns {
+    pub(super) fn from_reservation(
+        patterns: super::viewsvc::ViewPatterns,
+        charge: Reservation,
+    ) -> Self {
+        let bytes = charge.bytes();
+        Self {
+            patterns,
+            bytes,
+            _charge: BackingCredit::Reservation(charge),
+        }
+    }
+
+    pub(super) fn from_retained(
+        patterns: super::viewsvc::ViewPatterns,
+        bytes: u64,
+        charge: Option<super::ctx::RetainedCharge>,
+    ) -> Self {
+        Self {
+            patterns,
+            bytes,
+            _charge: charge.map_or(BackingCredit::None, BackingCredit::Retained),
+        }
+    }
 }
 
 enum ExistsPattern {
     // Arc-pinned so moving or sharing ExistsSpec keeps the root GraphPattern address stable.
-    Ordinary(Arc<GraphPattern>),
+    Ordinary(Arc<OrdinaryPattern>),
     Checked(Arc<super::checked_syntax::Pattern>),
 }
 
 impl ExistsSpec {
+    fn spec_bytes(vars: usize, bound: usize) -> u64 {
+        (size_of::<Self>() + 2 * size_of::<usize>())
+            .saturating_add(vars.saturating_mul(size_of::<VarId>()))
+            .saturating_add(bound.saturating_mul(size_of::<(VarId, Id)>())) as u64
+    }
+
+    fn ordinary_pattern_bytes(pattern: &GraphPattern) -> u64 {
+        super::checked_layout::pattern_bytes(pattern)
+            .saturating_add((size_of::<OrdinaryPattern>() + 2 * size_of::<usize>()) as u64)
+    }
+
     pub fn new(
         pattern: GraphPattern,
         graph: super::plan::ActiveGraph,
@@ -62,38 +119,59 @@ impl ExistsSpec {
         bound: Vec<(VarId, Id)>,
     ) -> ExistsSpec {
         let calls_service = super::cursor::calls_service(&pattern);
+        let bytes = Self::ordinary_pattern_bytes(&pattern);
         Self::from_pattern(
-            ExistsPattern::Ordinary(Arc::new(pattern)),
+            ExistsPattern::Ordinary(Arc::new(OrdinaryPattern {
+                syntax: pattern,
+                bytes,
+                _charge: None,
+            })),
             calls_service,
             graph,
             vars,
             bound,
             None,
-            None,
+            BackingCredit::None,
         )
     }
 
-    pub(super) fn new_with_view_patterns(
+    pub(super) fn new_ordinary_charged(
+        ctx: &Ctx,
         pattern: &GraphPattern,
         view_patterns: Option<&super::viewsvc::ViewPatterns>,
         graph: super::plan::ActiveGraph,
         vars: Vec<VarId>,
         bound: Vec<(VarId, Id)>,
-    ) -> ExistsSpec {
-        let owned = Arc::new(pattern.clone());
-        let projected = view_patterns
-            .and_then(|vp| vp.project(pattern, &owned))
-            .map(Arc::new);
-        let calls_service = super::cursor::calls_service(&owned);
-        Self::from_pattern(
+    ) -> Result<ExistsSpec> {
+        ctx.check()?;
+        let pattern_bytes = Self::ordinary_pattern_bytes(pattern);
+        let pattern_charge = ctx.retained_charge(pattern_bytes)?;
+        let owned = Arc::new(OrdinaryPattern {
+            syntax: pattern.clone(),
+            bytes: pattern_bytes,
+            _charge: pattern_charge,
+        });
+        let projected = match view_patterns {
+            Some(vp) => vp.project_retained(pattern, &owned.syntax, ctx)?.map(
+                |(projected, bytes, charge)| {
+                    Arc::new(RetainedViewPatterns::from_retained(
+                        projected, bytes, charge,
+                    ))
+                },
+            ),
+            None => None,
+        };
+        let spec_charge = ctx.retained_charge(Self::spec_bytes(vars.len(), bound.len()))?;
+        let calls_service = super::cursor::calls_service(&owned.syntax);
+        Ok(Self::from_pattern(
             ExistsPattern::Ordinary(owned),
             calls_service,
             graph,
             vars,
             bound,
             projected,
-            None,
-        )
+            spec_charge.map_or(BackingCredit::None, BackingCredit::Retained),
+        ))
     }
 
     fn from_pattern(
@@ -102,8 +180,8 @@ impl ExistsSpec {
         graph: super::plan::ActiveGraph,
         vars: Vec<VarId>,
         bound: Vec<(VarId, Id)>,
-        view_patterns: Option<Arc<super::viewsvc::ViewPatterns>>,
-        held: Option<Reservation>,
+        view_patterns: Option<Arc<RetainedViewPatterns>>,
+        held: BackingCredit,
     ) -> Self {
         Self {
             pattern,
@@ -125,7 +203,7 @@ impl ExistsSpec {
         graph: super::plan::ActiveGraph,
         vars: Vec<VarId>,
         bound: Vec<(VarId, Id)>,
-        view_patterns: Option<Arc<super::viewsvc::ViewPatterns>>,
+        view_patterns: Option<Arc<RetainedViewPatterns>>,
         held: Reservation,
     ) -> Self {
         let calls_service = pattern.calls_service;
@@ -136,7 +214,7 @@ impl ExistsSpec {
             vars,
             bound,
             view_patterns,
-            Some(held),
+            BackingCredit::Reservation(held),
         )
     }
 
@@ -156,14 +234,41 @@ impl ExistsSpec {
     /// The immutable algebra of this EXISTS, before per-row substitution.
     pub fn pattern(&self) -> &GraphPattern {
         match &self.pattern {
-            ExistsPattern::Ordinary(pattern) => pattern,
+            ExistsPattern::Ordinary(pattern) => &pattern.syntax,
             ExistsPattern::Checked(pattern) => &pattern.syntax,
         }
     }
 
     /// Native REDUCED and VALUES occurrences projected onto [`Self::pattern`].
     pub(super) fn view_patterns(&self) -> Option<&super::viewsvc::ViewPatterns> {
-        self.view_patterns.as_deref()
+        self.view_patterns.as_deref().map(|vp| &vp.patterns)
+    }
+
+    /// Bytes owned by this spec and its shared backing that are not already covered by
+    /// an active [`RetainedCharge`] or [`Reservation`] (for `plan_bytes` when a spec was
+    /// built before `ctx.attach_owner()`).
+    pub(super) fn uncharged_retained_bytes(
+        &self,
+        seen_patterns: &mut FxHashSet<usize>,
+        seen_view_patterns: &mut FxHashSet<usize>,
+    ) -> u64 {
+        let mut bytes = 0u64;
+        if let ExistsPattern::Ordinary(pattern) = &self.pattern
+            && pattern._charge.is_none()
+            && seen_patterns.insert(Arc::as_ptr(pattern) as usize)
+        {
+            bytes = bytes.saturating_add(pattern.bytes);
+        }
+        if let Some(vp) = &self.view_patterns
+            && matches!(vp._charge, BackingCredit::None)
+            && seen_view_patterns.insert(Arc::as_ptr(vp) as usize)
+        {
+            bytes = bytes.saturating_add(vp.bytes);
+        }
+        if matches!(self._held, BackingCredit::None) {
+            bytes = bytes.saturating_add(Self::spec_bytes(self.vars.len(), self.bound.len()));
+        }
+        bytes
     }
 
     /// Memoize the answer for `key`, charging the entry first, in both accounting modes.
@@ -225,40 +330,68 @@ impl ExistsSpec {
             self.vars.clone(),
             bound,
             self.view_patterns.clone(),
-            None,
+            BackingCredit::None,
         )
     }
 
     pub(super) fn with_bound_checked(&self, v: VarId, c: Id) -> Result<Self> {
-        let ExistsPattern::Checked(pattern) = &self.pattern else {
-            return Ok(self.with_bound(v, c));
-        };
-        let preparation = self._held.as_ref().expect("checked EXISTS").preparation();
-        let new_len = self
-            .bound
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| preparation.exhausted())?;
-        let held = Self::reserve_checked(preparation, self.vars.len(), new_len)?;
-        let mut bound = Vec::with_capacity(new_len);
-        for part in self.bound.chunks(1024) {
-            preparation.check()?;
-            bound.extend_from_slice(part);
+        match &self.pattern {
+            ExistsPattern::Checked(pattern) => {
+                let BackingCredit::Reservation(held) = &self._held else {
+                    unreachable!("checked EXISTS must hold a reservation");
+                };
+                let preparation = held.preparation();
+                let new_len = self
+                    .bound
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(|| preparation.exhausted())?;
+                let held = Self::reserve_checked(preparation, self.vars.len(), new_len)?;
+                let mut bound = Vec::with_capacity(new_len);
+                for part in self.bound.chunks(1024) {
+                    preparation.check()?;
+                    bound.extend_from_slice(part);
+                }
+                bound.push((v, c));
+                let mut vars = Vec::with_capacity(self.vars.len());
+                for part in self.vars.chunks(1024) {
+                    preparation.check()?;
+                    vars.extend_from_slice(part);
+                }
+                Ok(Self::new_checked(
+                    pattern.clone(),
+                    self.graph.clone(),
+                    vars,
+                    bound,
+                    self.view_patterns.clone(),
+                    held,
+                ))
+            }
+            ExistsPattern::Ordinary(pattern) => {
+                let new_len = self.bound.len().saturating_add(1);
+                let credit = match &self._held {
+                    BackingCredit::Retained(held) => match held.owner() {
+                        Some(ctx) => ctx
+                            .retained_charge(Self::spec_bytes(self.vars.len(), new_len))?
+                            .map_or(BackingCredit::None, BackingCredit::Retained),
+                        None => BackingCredit::None,
+                    },
+                    BackingCredit::None | BackingCredit::Reservation(_) => BackingCredit::None,
+                };
+                let mut bound = Vec::with_capacity(new_len);
+                bound.extend_from_slice(&self.bound);
+                bound.push((v, c));
+                Ok(Self::from_pattern(
+                    ExistsPattern::Ordinary(pattern.clone()),
+                    self.calls_service,
+                    self.graph.clone(),
+                    self.vars.clone(),
+                    bound,
+                    self.view_patterns.clone(),
+                    credit,
+                ))
+            }
         }
-        bound.push((v, c));
-        let mut vars = Vec::with_capacity(self.vars.len());
-        for part in self.vars.chunks(1024) {
-            preparation.check()?;
-            vars.extend_from_slice(part);
-        }
-        Ok(Self::new_checked(
-            pattern.clone(),
-            self.graph.clone(),
-            vars,
-            bound,
-            self.view_patterns.clone(),
-            held,
-        ))
     }
 
     /// The value of `v` in the outer solution of `row`: its column, else the constant

@@ -3,7 +3,7 @@
 use super::expr::{Expr, Func};
 use super::plan::{Agg, GraphFilter, Kind, Node, ScanSpec, TextSpec, VectorSpec};
 use super::table::Table;
-use super::walk::{Algebra, visit_algebra};
+use super::walk::{Algebra, visit_algebra, visit_algebra_ordinary};
 use crate::access::Preparation;
 use crate::error::Result;
 use oxrdf::{Literal, Term};
@@ -734,4 +734,239 @@ impl<'a> Layout<'a> {
             Kind::PatternScan(_) => self.slots::<super::patternplan::PatternScanSpec>(1),
         }
     }
+}
+
+/// Owned heap bytes of a cloned [`GraphPattern`] beyond its root slot (mirrors
+/// [`Layout::syntax`] without requiring a checked [`Preparation`]).
+pub(super) fn pattern_bytes(pattern: &GraphPattern) -> u64 {
+    fn literal_bytes(literal: &Literal) -> u64 {
+        let mut bytes = literal.value().len() as u64;
+        if let Some(language) = literal.language() {
+            bytes = bytes.saturating_add(language.len() as u64);
+        } else if literal.datatype() != oxrdf::vocab::xsd::STRING {
+            bytes = bytes.saturating_add(literal.datatype().as_str().len() as u64);
+        }
+        bytes
+    }
+
+    fn named_pattern_bytes(pattern: &NamedNodePattern) -> u64 {
+        match pattern {
+            NamedNodePattern::NamedNode(node) => node.as_str().len() as u64,
+            NamedNodePattern::Variable(var) => var.as_str().len() as u64,
+        }
+    }
+
+    fn term_pattern_bytes(term: &TermPattern) -> u64 {
+        match term {
+            TermPattern::NamedNode(node) => node.as_str().len() as u64,
+            TermPattern::BlankNode(node) => node.as_str().len() as u64,
+            TermPattern::Variable(var) => var.as_str().len() as u64,
+            TermPattern::Literal(literal) => literal_bytes(literal),
+            TermPattern::Triple(triple) => {
+                (size_of::<TriplePattern>() as u64).saturating_add(triple_bytes(triple))
+            }
+        }
+    }
+
+    fn triple_bytes(triple: &TriplePattern) -> u64 {
+        term_pattern_bytes(&triple.subject)
+            .saturating_add(named_pattern_bytes(&triple.predicate))
+            .saturating_add(term_pattern_bytes(&triple.object))
+    }
+
+    fn ground_bytes(term: &GroundTerm) -> u64 {
+        match term {
+            GroundTerm::NamedNode(node) => node.as_str().len() as u64,
+            GroundTerm::Literal(literal) => literal_bytes(literal),
+            GroundTerm::Triple(triple) => (size_of::<spargebra::term::GroundTriple>() as u64)
+                .saturating_add(triple.subject.as_str().len() as u64)
+                .saturating_add(triple.predicate.as_str().len() as u64)
+                .saturating_add(ground_bytes(&triple.object)),
+        }
+    }
+
+    fn path_bytes(path: &PropertyPathExpression) -> u64 {
+        use PropertyPathExpression as P;
+        match path {
+            P::NamedNode(node) => node.as_str().len() as u64,
+            P::Reverse(inner)
+            | P::ZeroOrMore(inner)
+            | P::OneOrMore(inner)
+            | P::ZeroOrOne(inner)
+            | P::Range { path: inner, .. }
+            | P::Distinct(inner)
+            | P::Multi(inner)
+            | P::Shortest(inner) => (size_of::<P>() as u64).saturating_add(path_bytes(inner)),
+            P::Sequence(left, right) | P::Alternative(left, right) => (size_of::<P>() as u64 * 2)
+                .saturating_add(path_bytes(left))
+                .saturating_add(path_bytes(right)),
+            P::NegatedPropertySet(nodes) => nodes.iter().fold(
+                (nodes.len().saturating_mul(size_of::<oxrdf::NamedNode>())) as u64,
+                |acc, node| acc.saturating_add(node.as_str().len() as u64),
+            ),
+        }
+    }
+
+    fn variables_bytes(variables: &[oxrdf::Variable]) -> u64 {
+        variables.iter().fold(
+            (variables.len().saturating_mul(size_of::<oxrdf::Variable>())) as u64,
+            |acc, var| acc.saturating_add(var.as_str().len() as u64),
+        )
+    }
+
+    fn aggregate_name_bytes(name: &AggregateFunction) -> u64 {
+        match name {
+            AggregateFunction::Custom(node) => node.as_str().len() as u64,
+            AggregateFunction::GroupConcat { separator } => {
+                separator.as_ref().map_or(0, |s| s.len() as u64)
+            }
+            AggregateFunction::Count
+            | AggregateFunction::Sum
+            | AggregateFunction::Avg
+            | AggregateFunction::Min
+            | AggregateFunction::Max
+            | AggregateFunction::Sample => 0,
+        }
+    }
+
+    let mut bytes = 0u64;
+    let Ok(()) =
+        visit_algebra_ordinary::<std::convert::Infallible>(Algebra::Pattern(pattern), |item| {
+            let add = match item {
+                Algebra::Pattern(gp) => {
+                    use GraphPattern as P;
+                    match gp {
+                        P::Bgp { patterns } => patterns.iter().fold(
+                            (patterns.len().saturating_mul(size_of::<TriplePattern>())) as u64,
+                            |acc, tp| acc.saturating_add(triple_bytes(tp)),
+                        ),
+                        P::Path {
+                            subject,
+                            path,
+                            object,
+                        } => term_pattern_bytes(subject)
+                            .saturating_add(path_bytes(path))
+                            .saturating_add(term_pattern_bytes(object)),
+                        P::Join { .. }
+                        | P::LeftJoin { .. }
+                        | P::Lateral { .. }
+                        | P::Union { .. }
+                        | P::Minus { .. }
+                        | P::SemiJoin { .. }
+                        | P::AntiJoin { .. } => (size_of::<P>() as u64).saturating_mul(2),
+                        P::Filter { .. }
+                        | P::Distinct { .. }
+                        | P::Reduced { .. }
+                        | P::Slice { .. } => size_of::<P>() as u64,
+                        P::Graph { name, .. } | P::Service { name, .. } => {
+                            (size_of::<P>() as u64).saturating_add(named_pattern_bytes(name))
+                        }
+                        P::Extend { variable, .. } | P::Assign { variable, .. } => {
+                            (size_of::<P>() as u64).saturating_add(variable.as_str().len() as u64)
+                        }
+                        P::Unfold {
+                            variable, second, ..
+                        } => (size_of::<P>() as u64)
+                            .saturating_add(variable.as_str().len() as u64)
+                            .saturating_add(second.as_ref().map_or(0, |v| v.as_str().len() as u64)),
+                        P::OrderBy { expression, .. } => (size_of::<P>() as u64).saturating_add(
+                            (expression
+                                .len()
+                                .saturating_mul(size_of::<spargebra::algebra::OrderExpression>()))
+                                as u64,
+                        ),
+                        P::Project { variables, .. } => {
+                            (size_of::<P>() as u64).saturating_add(variables_bytes(variables))
+                        }
+                        P::Group {
+                            variables,
+                            aggregates,
+                            ..
+                        } => {
+                            let mut total = (size_of::<P>() as u64)
+                                .saturating_add(variables_bytes(variables))
+                                .saturating_add(
+                                    (aggregates.len().saturating_mul(size_of::<(
+                                        oxrdf::Variable,
+                                        AggregateExpression,
+                                    )>(
+                                    ))) as u64,
+                                );
+                            for (var, _) in aggregates {
+                                total = total.saturating_add(var.as_str().len() as u64);
+                            }
+                            total
+                        }
+                        P::Values {
+                            variables,
+                            bindings,
+                        } => {
+                            let mut total = variables_bytes(variables).saturating_add(
+                                (bindings
+                                    .len()
+                                    .saturating_mul(size_of::<Vec<Option<GroundTerm>>>()))
+                                    as u64,
+                            );
+                            for row in bindings {
+                                total = total.saturating_add(
+                                    (row.len().saturating_mul(size_of::<Option<GroundTerm>>()))
+                                        as u64,
+                                );
+                                for term in row.iter().flatten() {
+                                    total = total.saturating_add(ground_bytes(term));
+                                }
+                            }
+                            total
+                        }
+                    }
+                }
+                Algebra::Expr(expression) => {
+                    use Expression as E;
+                    match expression {
+                        E::NamedNode(node) => node.as_str().len() as u64,
+                        E::Literal(literal) => literal_bytes(literal),
+                        E::Variable(var) | E::Bound(var) => var.as_str().len() as u64,
+                        E::Or(..)
+                        | E::And(..)
+                        | E::Equal(..)
+                        | E::SameTerm(..)
+                        | E::Greater(..)
+                        | E::GreaterOrEqual(..)
+                        | E::Less(..)
+                        | E::LessOrEqual(..)
+                        | E::Add(..)
+                        | E::Subtract(..)
+                        | E::Multiply(..)
+                        | E::Divide(..) => (size_of::<E>() as u64).saturating_mul(2),
+                        E::Not(_) | E::UnaryPlus(_) | E::UnaryMinus(_) => size_of::<E>() as u64,
+                        E::If(..) => (size_of::<E>() as u64).saturating_mul(3),
+                        E::Exists(_) => size_of::<GraphPattern>() as u64,
+                        E::In(_, args) => (size_of::<E>() as u64)
+                            .saturating_add((args.len().saturating_mul(size_of::<E>())) as u64),
+                        E::Coalesce(args) => (args.len().saturating_mul(size_of::<E>())) as u64,
+                        E::FunctionCall(function, args) => {
+                            let fn_bytes = match function {
+                                Function::Custom(node) => node.as_str().len() as u64,
+                                _ => 0,
+                            };
+                            fn_bytes
+                                .saturating_add((args.len().saturating_mul(size_of::<E>())) as u64)
+                        }
+                    }
+                }
+                Algebra::Aggregate(aggregate) => match aggregate {
+                    AggregateExpression::CountSolutions { .. } => 0,
+                    AggregateExpression::FunctionCall { name, .. } => aggregate_name_bytes(name),
+                    AggregateExpression::Fold { order, .. } => {
+                        (order
+                            .len()
+                            .saturating_mul(size_of::<spargebra::algebra::OrderExpression>()))
+                            as u64
+                    }
+                },
+            };
+            bytes = bytes.saturating_add(add);
+            Ok(())
+        });
+    bytes
 }

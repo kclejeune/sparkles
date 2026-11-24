@@ -843,22 +843,153 @@ fn mentioned(gp: &GP, out: &mut Vec<String>) {
             inner, aggregates, ..
         } => {
             for (_, a) in aggregates {
-                if let AggregateExpression::FunctionCall { expr: e, .. } = a {
-                    expr(e, out);
+                match a {
+                    AggregateExpression::FunctionCall { expr: e, .. } => expr(e, out),
+                    AggregateExpression::Fold {
+                        expr: e,
+                        value,
+                        order,
+                        ..
+                    } => {
+                        expr(e, out);
+                        if let Some(v) = value {
+                            expr(v, out);
+                        }
+                        for o in order {
+                            let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                            expr(e, out);
+                        }
+                    }
+                    AggregateExpression::CountSolutions { .. } => {}
                 }
             }
             mentioned(inner, out);
         }
-        GP::OrderBy { inner, .. }
-        | GP::Graph { inner, .. }
+        GP::OrderBy { inner, expression } => {
+            for o in expression {
+                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                expr(e, out);
+            }
+            mentioned(inner, out);
+        }
+        GP::Assign {
+            inner, expression, ..
+        }
+        | GP::Unfold {
+            inner, expression, ..
+        } => {
+            expr(expression, out);
+            mentioned(inner, out);
+        }
+        GP::Graph { inner, .. }
         | GP::Project { inner, .. }
         | GP::Distinct { inner }
         | GP::Reduced { inner }
         | GP::Slice { inner, .. }
-        | GP::Assign { inner, .. }
-        | GP::Unfold { inner, .. }
         | GP::Service { inner, .. } => mentioned(inner, out),
         _ => {}
+    }
+}
+
+/// Whether `gp` contains a `LIMIT` / `OFFSET` slice whose inner pattern mentions a
+/// variable in `outer`.
+///
+/// Join semantics (`Op::Match`) evaluate the slice over all right-hand rows before
+/// matching against the outer row, while SPARQL `EXISTS` substitution prunes the
+/// inner pattern to the outer row's bindings before deduplication and slicing.
+fn slice_uses_outer(gp: &GP, outer: &[String]) -> bool {
+    fn expr(e: &Expression, outer: &[String]) -> bool {
+        use Expression as E;
+        match e {
+            E::Exists(p) => slice_uses_outer(p, outer),
+            E::Or(a, b)
+            | E::And(a, b)
+            | E::Equal(a, b)
+            | E::SameTerm(a, b)
+            | E::Greater(a, b)
+            | E::GreaterOrEqual(a, b)
+            | E::Less(a, b)
+            | E::LessOrEqual(a, b)
+            | E::Add(a, b)
+            | E::Subtract(a, b)
+            | E::Multiply(a, b)
+            | E::Divide(a, b) => expr(a, outer) || expr(b, outer),
+            E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr(a, outer),
+            E::In(a, l) => expr(a, outer) || l.iter().any(|x| expr(x, outer)),
+            E::If(a, b, c) => expr(a, outer) || expr(b, outer) || expr(c, outer),
+            E::Coalesce(l) | E::FunctionCall(_, l) => l.iter().any(|x| expr(x, outer)),
+            _ => false,
+        }
+    }
+    if outer.is_empty() {
+        return false;
+    }
+    match gp {
+        GP::Slice { inner, .. } => {
+            let mut vars = Vec::new();
+            mentioned(inner, &mut vars);
+            vars.iter().any(|v| outer.contains(v)) || slice_uses_outer(inner, outer)
+        }
+        GP::Filter { expr: e, inner } => expr(e, outer) || slice_uses_outer(inner, outer),
+        GP::Extend {
+            inner, expression, ..
+        }
+        | GP::Assign {
+            inner, expression, ..
+        }
+        | GP::Unfold {
+            inner, expression, ..
+        } => expr(expression, outer) || slice_uses_outer(inner, outer),
+        GP::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            expression.as_ref().is_some_and(|e| expr(e, outer))
+                || slice_uses_outer(left, outer)
+                || slice_uses_outer(right, outer)
+        }
+        GP::Join { left, right }
+        | GP::Union { left, right }
+        | GP::Minus { left, right }
+        | GP::Lateral { left, right }
+        | GP::SemiJoin { left, right }
+        | GP::AntiJoin { left, right } => {
+            slice_uses_outer(left, outer) || slice_uses_outer(right, outer)
+        }
+        GP::Group {
+            inner, aggregates, ..
+        } => {
+            aggregates.iter().any(|(_, a)| match a {
+                AggregateExpression::FunctionCall { expr: e, .. } => expr(e, outer),
+                AggregateExpression::Fold {
+                    expr: e,
+                    value,
+                    order,
+                    ..
+                } => {
+                    expr(e, outer)
+                        || value.as_ref().is_some_and(|v| expr(v, outer))
+                        || order.iter().any(|o| {
+                            let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                            expr(e, outer)
+                        })
+                }
+                AggregateExpression::CountSolutions { .. } => false,
+            }) || slice_uses_outer(inner, outer)
+        }
+        GP::OrderBy { inner, expression } => {
+            expression.iter().any(|o| {
+                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                expr(e, outer)
+            }) || slice_uses_outer(inner, outer)
+        }
+        GP::Graph { inner, .. }
+        | GP::Project { inner, .. }
+        | GP::Distinct { inner }
+        | GP::Reduced { inner }
+        | GP::Service { inner, .. } => slice_uses_outer(inner, outer),
+        GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => false,
     }
 }
 
@@ -1794,8 +1925,9 @@ impl C {
         }
         for (p, mode) in exists {
             // join semantics equal substitution only when the pattern shares nothing but
-            // variables both sides always bind, its expressions read only its own, and
-            // no path of it that matches the empty path ends at an outer variable
+            // variables both sides always bind, its expressions read only its own, no
+            // path of it that matches the empty path ends at an outer variable, and no
+            // LIMIT/OFFSET slice inside it mentions an outer variable
             let outer: Vec<String> = node
                 .schema
                 .iter()
@@ -1809,6 +1941,7 @@ impl C {
             let mut ends = Vec::new();
             nullable_ends(p, &mut ends);
             let nullable_outer = ends.iter().any(|v| outer.contains(v));
+            let slice_outer = slice_uses_outer(p, &outer);
             let mark = self.native_patterns.len();
             let right = self.compile(p, scope);
             let shared_ok = right.schema.iter().all(|v| {
@@ -1817,6 +1950,7 @@ impl C {
             if free_outer
                 || !shared_ok
                 || nullable_outer
+                || slice_outer
                 || right.has_recompute() && matches!(scope, Scope::Var(_))
             {
                 self.native_patterns.truncate(mark);

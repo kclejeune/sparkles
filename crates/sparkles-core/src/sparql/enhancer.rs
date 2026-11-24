@@ -1526,7 +1526,7 @@ impl RemoteRun {
             .collect();
         rvars.dedup();
         let expr = match &spec.optional {
-            Some(Some(e)) => Some(Planner::new(ctx).compile(e, &spec.graph)),
+            Some(Some(e)) => Some(Planner::new(ctx).compile(e, &spec.graph)?),
             _ => None,
         };
         let mut out = Table::new(vars.to_vec());
