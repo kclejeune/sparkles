@@ -626,7 +626,7 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
             root: true,
             query: None,
         };
-        q.on_max(st, l, &prem, &mut found, false);
+        q.on_max(st, l, &prem, &mut found, false, false);
         join_head(ix, st, c, l, &prem, &mut found, &out.dl().lits, false);
         let v = out.dl().lits.view(l, inv_of(ix, dx));
         if ground_trigger(v) {
@@ -652,7 +652,7 @@ fn at_consts<S: Sink>(
     prem: &Side,
     found: &mut Found,
     out: &mut S,
-    sel: bool,
+    gbody: bool,
 ) {
     let dx = dix(ix);
     let (ts, n) = terms_of(v);
@@ -673,10 +673,10 @@ fn at_consts<S: Sink>(
         }
     }
     match v {
-        XLit::Atom(d, RTerm::C(u)) => hyper_at(ix, st, out, d, u, prem, found, sel),
+        XLit::Atom(d, RTerm::C(u)) => hyper_at(ix, st, out, d, u, prem, found, gbody),
         v @ XLit::Role(..) => {
             for (u, s, t) in from(v, inv_of(ix, dx)) {
-                on_role(ix, st, out, s, u, t, prem, found, sel);
+                on_role(ix, st, out, s, u, t, prem, found, gbody);
             }
             if let Some((s, u)) = to_const(v, inv_of(ix, dx)) {
                 univ_to_const(ix, st, out, s, u, prem, found);
@@ -787,14 +787,9 @@ pub(super) fn univ_from_x(
     }
 }
 
-/// The premises of a ground inference whose maximal literal is `l`, the selected clauses
-/// and the markers left out.
+/// The premises of a ground Hyper inference whose maximal literal is `l`, leaving out
+/// clauses cut by [`super::dl_clause::Stored::gbody`] (including markers).
 fn partners(st: &State, l: Lit) -> Vec<Side> {
-    partners_of(st, l, false)
-}
-
-/// [`partners`], with the selected clauses too when `sel` is set.
-fn partners_of(st: &State, l: Lit, sel: bool) -> Vec<Side> {
     let Some(d) = dl(st) else {
         return Vec::new();
     };
@@ -805,7 +800,27 @@ fn partners_of(st: &State, l: Lit, sel: bool) -> Vec<Side> {
         .flatten()
         .filter(|&&i| {
             let s = &d.store.clauses[i as usize];
-            !s.dead && (sel || !s.sel)
+            !s.dead && !s.gbody
+        })
+        .map(|&i| side(&d.store.clauses[i as usize].c, l))
+        .collect()
+}
+
+/// The atom premises over `f_e(u)` for [`root_pred_of`] whose maximal literal is `l`.
+/// Fully selected clauses (`s.sel`) are included when `include_selected` is set (item
+/// 1220's R1); clauses cut only by `s.gbody` with `s.sel == false` remain eligible.
+fn pred_partners(st: &State, l: Lit, include_selected: bool) -> Vec<Side> {
+    let Some(d) = dl(st) else {
+        return Vec::new();
+    };
+    d.store
+        .by_xl
+        .get(&l)
+        .into_iter()
+        .flatten()
+        .filter(|&&i| {
+            let s = &d.store.clauses[i as usize];
+            !s.dead && (include_selected || !s.sel)
         })
         .map(|&i| side(&d.store.clauses[i as usize].c, l))
         .collect()
@@ -830,8 +845,8 @@ fn put<S: Sink>(ix: &Index, out: &S, found: &mut Found, s: Side) {
 
 /// Hyper on a new premise `prem` of `d(u)`: the ontology clauses with d in the body, with
 /// their x bound to u. A conclusion is a ground inference's unless it holds x or y. A
-/// selected premise, a marker included, takes only the universals over the role atoms
-/// from u that are local to the context ([`super::dl_rules::local`]).
+/// premise cut by `gbody` (including a marker) takes only the universals over the role
+/// atoms from u that are local to the context ([`super::dl_rules::local`]).
 #[allow(clippy::too_many_arguments)]
 fn hyper_at<S: Sink>(
     ix: &Index,
@@ -841,12 +856,12 @@ fn hyper_at<S: Sink>(
     u: u32,
     prem: &Side,
     found: &mut Found,
-    sel: bool,
+    gbody: bool,
 ) {
     found.rule = "hyperc";
     let dx = dix(ix);
-    if sel {
-        hyper_roles(ix, st, out, d, u, prem, found, sel);
+    if gbody {
+        hyper_roles(ix, st, out, d, u, prem, found, gbody);
         return;
     }
     let at = |a: Ex| atom(ix, out, a, u);
@@ -919,12 +934,12 @@ fn hyper_at<S: Sink>(
             found.ground_products(lists, base);
         }
     }
-    hyper_roles(ix, st, out, d, u, prem, found, sel);
+    hyper_roles(ix, st, out, d, u, prem, found, gbody);
 }
 
 /// The universals `d(u)` stands for, over the role atoms from u in the context. A role atom
 /// whose other end is a constant or a successor term of one makes a ground inference, which
-/// takes no selected premise, and any other is local and takes every premise.
+/// takes no `gbody`-cut premise, and any other is local and takes every premise.
 #[allow(clippy::too_many_arguments)]
 fn hyper_roles<S: Sink>(
     ix: &Index,
@@ -934,7 +949,7 @@ fn hyper_roles<S: Sink>(
     u: u32,
     prem: &Side,
     found: &mut Found,
-    sel: bool,
+    gbody: bool,
 ) {
     found.rule = "hyperr";
     let dx = dix(ix);
@@ -956,7 +971,7 @@ fn hyper_roles<S: Sink>(
                 if w != u {
                     continue;
                 }
-                if matches!(f, RTerm::C(_) | RTerm::Fc(..)) && (sel || s.sel) {
+                if matches!(f, RTerm::C(_) | RTerm::Fc(..)) && (gbody || s.gbody) {
                     continue;
                 }
                 for &(a, b) in &ps {
@@ -990,7 +1005,7 @@ fn from(v: XLit, inv: impl Fn(Role) -> Option<Role>) -> Vec<(u32, Role, RTerm)> 
 
 /// Hyper on a new premise `prem` of the role atom `s(u, f)`: the universals of the holders
 /// of u, `owl:Thing` included, and the disjoint roles. The inference is ground when f is a
-/// constant or a successor term of one, and the restriction then applies and no selected
+/// constant or a successor term of one, and the restriction then applies and no `gbody`-cut
 /// premise takes part; otherwise it is local and every premise takes part.
 #[allow(clippy::too_many_arguments)]
 fn on_role<S: Sink>(
@@ -1002,13 +1017,13 @@ fn on_role<S: Sink>(
     f: RTerm,
     prem: &Side,
     found: &mut Found,
-    sel: bool,
+    gbody: bool,
 ) {
     found.rule = "onrole";
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
     let ground = matches!(f, RTerm::C(_) | RTerm::Fc(..));
-    if ground && sel {
+    if ground && gbody {
         return;
     }
     let add = |found: &mut Found, c: Side| {
@@ -1032,7 +1047,7 @@ fn on_role<S: Sink>(
     if let Some(r) = x.root.as_deref() {
         for &i in r.by_const.get(&u).into_iter().flatten() {
             let c = &x.store.clauses[i as usize];
-            if c.dead || ground && c.sel {
+            if c.dead || ground && c.gbody {
                 continue;
             }
             for &l in x.store.maxima(i) {
@@ -1049,7 +1064,7 @@ fn on_role<S: Sink>(
             }
             for &i in r.roles_of.get(&u).into_iter().flatten() {
                 let c = &x.store.clauses[i as usize];
-                if c.dead || ground && c.sel {
+                if c.dead || ground && c.gbody {
                     continue;
                 }
                 for &l in x.store.maxima(i) {
@@ -1142,10 +1157,10 @@ pub(super) fn join_head(
     prem: &Side,
     found: &mut Found,
     lits: &super::dl_clause::Lits,
-    sel: bool,
+    gbody: bool,
 ) {
     found.rule = "joinh";
-    if is_marker(c) || sel {
+    if is_marker(c) || gbody {
         return;
     }
     let inv = inv_of(ix, dix(ix));
@@ -1192,7 +1207,7 @@ pub(super) fn join_body(
         let Some(x) = dl(st) else { return };
         for &i in x.store.by_xl.get(&l).into_iter().flatten() {
             let s = &x.store.clauses[i as usize];
-            if !s.dead && !s.sel && !is_marker(&s.c) {
+            if !s.dead && !s.gbody && !is_marker(&s.c) {
                 let c = merge(&side(&s.c, l), &rest);
                 if !super::dl_rules::join_restricted(lits, inv, s.c.body(), &c) {
                     found.push(c);
@@ -1227,7 +1242,7 @@ pub(super) fn on_max<S: Sink>(
     prem: &Side,
     found: &mut Found,
     out: &mut S,
-    sel: bool,
+    gbody: bool,
 ) {
     let dx = dix(ix);
     let v = out.dl().lits.view(l, inv_of(ix, dx));
@@ -1246,8 +1261,8 @@ pub(super) fn on_max<S: Sink>(
             return;
         }
     }
-    join_head(ix, st, c, l, prem, found, &out.dl().lits, sel);
-    at_consts(ix, me, st, l, v, prem, found, out, sel);
+    join_head(ix, st, c, l, prem, found, &out.dl().lits, gbody);
+    at_consts(ix, me, st, l, v, prem, found, out, gbody);
 }
 
 /// A context other than the root takes a clause the root sent, a processed root clause with
@@ -1765,8 +1780,9 @@ pub(super) fn root_pred(
     );
 }
 
-/// [`root_pred`], whose premises over `f_e(u)` include the selected clauses when `sel` is
-/// set, as Hyper over x has them under [`super::dl_rules::sel_partners_x`].
+/// [`root_pred`], whose premises over `f_e(u)` include the fully selected clauses (`s.sel`)
+/// when `include_selected` is set, as Hyper over x has them under
+/// [`super::dl_rules::sel_partners_x`].
 #[allow(clippy::too_many_arguments)]
 fn root_pred_of(
     ix: &Index,
@@ -1777,7 +1793,7 @@ fn root_pred_of(
     fixed: Option<(Lit, &Side)>,
     found: &mut Found,
     lits: &super::dl_clause::Lits,
-    sel: bool,
+    include_selected: bool,
 ) {
     found.rule = "rpredc";
     use super::dl_clause::{RY, X as KX};
@@ -1859,7 +1875,7 @@ fn root_pred_of(
     let free: Vec<Vec<Side>> = need
         .iter()
         .map(|n| match n {
-            Need::Atom(k) => partners_of(st, *k, sel),
+            Need::Atom(k) => pred_partners(st, *k, include_selected),
             Need::Role(s) => roles(*s),
         })
         .collect();
@@ -1878,11 +1894,25 @@ fn root_pred_of(
     }
 }
 
+/// Resolves the active marker-repair bitmask from explicit environment override `env`,
+/// test override `test` (`0` = unset), and [`Limits::rooted_marker_repair`](super::Limits)
+/// flag `on`.
+fn marker_repair_mode(env: Option<u8>, test: u8, on: bool) -> u8 {
+    env.unwrap_or(if test != 0 {
+        test
+    } else if on {
+        MREPAIR_ON | MREPAIR_CF
+    } else {
+        0
+    })
+}
+
 /// Row 1231's marker repair for a run, as [`DlRun::mrepair`](super::dl_rules::DlRun)
-/// holds it: `on` is [`Limits::rooted_marker_repair`](super::Limits), and
-/// `SPARKLES_ROOTED_MARKER_REPAIR` overrides it for measurements with `0`, `1` or a sum of
-/// the bits [`MREPAIR_ON`], [`MREPAIR_HOLDER`], [`MREPAIR_UNITS`], [`MREPAIR_WIDE`] and
-/// [`MREPAIR_CF`].
+/// holds it: `on` is [`Limits::rooted_marker_repair`](super::Limits), which defaults to
+/// [`MREPAIR_ON`] | [`MREPAIR_CF`] (M-return-cf, item 1250), and
+/// `SPARKLES_ROOTED_MARKER_REPAIR` overrides it for measurements with `0` (off), `1`
+/// (unfiltered [`MREPAIR_ON`]) or a sum of the bits [`MREPAIR_ON`], [`MREPAIR_HOLDER`],
+/// [`MREPAIR_UNITS`], [`MREPAIR_WIDE`] and [`MREPAIR_CF`].
 pub(super) fn marker_repair(on: bool) -> u8 {
     static ENV: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
     let env = *ENV.get_or_init(|| {
@@ -1891,13 +1921,7 @@ pub(super) fn marker_repair(on: bool) -> u8 {
             .and_then(|v| v.parse().ok())
     });
     let test = TEST_MODE.load(std::sync::atomic::Ordering::Relaxed);
-    env.unwrap_or(if test != 0 {
-        test
-    } else if on {
-        MREPAIR_ON
-    } else {
-        0
-    })
+    marker_repair_mode(env, test, on)
 }
 
 /// The repair's mode and the diagnostic that [`marker_test_mode`] sets, for the deficits'
@@ -5221,6 +5245,705 @@ pub(super) mod tests {
                 sel,
             );
             assert_eq!(found.products_len(), want, "fixed premise, sel {sel}");
+        }
+    }
+
+    /// Item 1250 Layer 1: split partner policies between Ground Hyper (`!s.gbody`) and Fc
+    /// Pred (`include_selected || !s.sel`), plus `gbody` gating on `hyper_at`,
+    /// `hyper_roles`, `on_role`, and `join_head`/`join_body` when `sel = false, gbody = true`.
+    #[test]
+    fn gbody_and_sel_partner_policies_differ() {
+        use super::super::dl_clause::Rooted;
+        let mut sig = Sig::new();
+        let a = sig.class("A");
+        let b = sig.class("B");
+        let h = sig.class("H");
+        let k = sig.class("K");
+        let z = sig.class("Z");
+        let t_cls = sig.class("T");
+        let v = sig.ind("v");
+        let w = sig.ind("w");
+        let r = sig.role("r");
+        let e = sig.some_h(r, a);
+        let all_r_t = sig.all(r, t_cls);
+        sig.sub(a, t_cls);
+        let (ix, _) = probe_ix(sig);
+        let run = DlRun::new(false, Default::default());
+        let lits = &run.lits;
+        let inv = inv_of(&ix, dix(&ix));
+        let RTerm::C(u) = c(v, &ix) else {
+            unreachable!()
+        };
+        let RTerm::C(u2) = c(w, &ix) else {
+            unreachable!()
+        };
+        let literal = |x| match lits.lit(x, inv) {
+            Made::Lit(l) => l,
+            _ => panic!("literal"),
+        };
+        let hyp = literal(XLit::Atom(h, RTerm::C(u)));
+        let fa = literal(XLit::Atom(a, RTerm::Fc(e, u)));
+        let fb = literal(XLit::Atom(b, RTerm::Fc(e, u)));
+        let ga = literal(XLit::Atom(a, RTerm::C(u)));
+        let gb = literal(XLit::Atom(b, RTerm::C(u)));
+        let answer = literal(XLit::Atom(z, RTerm::C(u)));
+        let r_uv = literal(XLit::Role(r, RTerm::C(u), RTerm::C(u2)));
+        let r_ux = literal(XLit::Role(r, RTerm::C(u), RTerm::X));
+        let all_u = literal(XLit::Atom(all_r_t, RTerm::C(u)));
+
+        let mut st = State::default();
+        let o = Rooted {
+            ix: &ix,
+            lits,
+            inv: &inv,
+            ground_total: true,
+        };
+        // Two Fc-headed clauses with ground bodies: sel = false, gbody = true.
+        for l in [fa, fb] {
+            ds(&mut st)
+                .store
+                .add(Clause::new(vec![hyp], vec![l, Lit::x(z)]));
+        }
+        // A ground-bodied clause with maximal A(u) and a ground-bodied role clause r(u, u2).
+        ds(&mut st)
+            .store
+            .add(Clause::new(vec![hyp, Lit::x(k)], vec![ga]));
+        ds(&mut st)
+            .store
+            .add(Clause::new(vec![hyp, Lit::x(k)], vec![r_uv]));
+        ds(&mut st)
+            .store
+            .add(Clause::new(vec![hyp, Lit::x(k)], vec![r_ux]));
+        ds(&mut st)
+            .store
+            .add(Clause::new(vec![hyp, Lit::x(k)], vec![all_u]));
+        // A body-side Join target: B(u) -> Z(x), and an empty-body producer: -> B(u).
+        ds(&mut st)
+            .store
+            .add(Clause::new(vec![gb], vec![Lit::x(z)]));
+        let prod_id = {
+            ds(&mut st).store.add(Clause::new(vec![], vec![gb]));
+            ds(&mut st).store.clauses.len() - 1
+        };
+
+        let mut out = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let mut maxima = Vec::new();
+        while let Some(i) = ds(&mut st).store.next(&ix, Some(&o), &mut maxima) {
+            index_consts(&ix, ds(&mut st), &maxima, i, &mut out);
+            let s = &mut ds(&mut st).store.clauses[i as usize];
+            let has_gbody = super::super::dl_rules::selected_always(lits, inv, &s.c);
+            s.sel = false;
+            s.gbody = has_gbody;
+        }
+        assert!(!ds(&mut st).store.clauses[prod_id].gbody);
+
+        // 1. Fc Pred with sel=false, gbody=true, include_selected=false STILL takes both
+        //    partners: no fixed premise, first fixed, and second fixed.
+        let succ = Clause::new(vec![Lit::x(a), Lit::x(b)], vec![answer]);
+        let fixed_a = side(&ds(&mut st).store.clauses[0].c, fa);
+        let fixed_b = side(&ds(&mut st).store.clauses[1].c, fb);
+        let mut found = Found::default();
+        root_pred_of(&ix, &st, e, u, &succ, None, &mut found, lits, false);
+        assert_eq!(
+            found.products_len(),
+            1,
+            "Fc Pred must keep gbody-only partners with no fixed premise"
+        );
+        for (lit, fixed) in [(fa, &fixed_a), (fb, &fixed_b)] {
+            let mut found = Found::default();
+            root_pred_of(
+                &ix,
+                &st,
+                e,
+                u,
+                &succ,
+                Some((lit, fixed)),
+                &mut found,
+                lits,
+                false,
+            );
+            assert_eq!(
+                found.products_len(),
+                1,
+                "Fc Pred must keep gbody-only partners with either fixed premise"
+            );
+        }
+
+        // 2. Ground Hyper partners in the EXACT same flag state (sel=false, gbody=true)
+        //    must exclude the gbody-cut clause.
+        assert!(
+            partners(&st, ga).is_empty(),
+            "ground Hyper partners must exclude gbody=true clauses even when sel=false"
+        );
+        assert_eq!(
+            partners(&st, gb).len(),
+            1,
+            "ground Hyper partners must still accept empty-body (gbody=false) clauses"
+        );
+
+        // 3. hyper_at with gbody=true skips told_of (A ⊑ T) and skips C-filler universals,
+        //    while still firing local X-filler universals.
+        let prem_a: Side = (vec![hyp, Lit::x(k)], vec![]);
+        let mut found = Found::default();
+        hyper_at(&ix, &st, &out, a, u, &prem_a, &mut found, true);
+        assert!(
+            found.one_sides().is_empty(),
+            "hyper_at(gbody=true) must skip told_of A(u)->T(u)"
+        );
+        let mut found = Found::default();
+        hyper_at(&ix, &st, &out, all_r_t, u, &prem_a, &mut found, true);
+        let t_x = literal(XLit::Atom(t_cls, RTerm::X));
+        let t_u2 = literal(XLit::Atom(t_cls, RTerm::C(u2)));
+        let sides = found.one_sides();
+        assert!(
+            sides.iter().any(|s| s.1.contains(&t_x)),
+            "hyper_roles(gbody=true) must still fire local X-filler universal"
+        );
+        assert!(
+            !sides.iter().any(|s| s.1.contains(&t_u2)),
+            "hyper_roles(gbody=true) must skip C-filler universal"
+        );
+
+        // 4. on_role with gbody=true skips C-filler but keeps local X-filler.
+        let mut found = Found::default();
+        on_role(
+            &ix,
+            &st,
+            &out,
+            r,
+            u,
+            RTerm::C(u2),
+            &prem_a,
+            &mut found,
+            true,
+        );
+        assert!(
+            found.one_sides().is_empty(),
+            "on_role(gbody=true) must skip C-filler"
+        );
+        let mut found = Found::default();
+        on_role(&ix, &st, &out, r, u, RTerm::X, &prem_a, &mut found, true);
+        assert!(
+            found.one_sides().iter().any(|s| s.1.contains(&t_x)),
+            "on_role(gbody=true) must still fire local X-filler"
+        );
+
+        // 5. Join: gbody=true is blocked on head side (join_head & join_body) while still
+        //    discharged on body side against an empty-body (gbody=false) producer.
+        let head_gbody = Clause::new(vec![hyp, Lit::x(k)], vec![gb]);
+        let mut found = Found::default();
+        join_head(
+            &ix,
+            &st,
+            &head_gbody,
+            gb,
+            &side(&head_gbody, gb),
+            &mut found,
+            lits,
+            true,
+        );
+        assert!(
+            found.one_sides().is_empty(),
+            "join_head(gbody=true) must block gbody head premise"
+        );
+        let body_gbody = Clause::new(vec![gb, Lit::x(k)], vec![Lit::x(z)]);
+        let mut found = Found::default();
+        join_body(&ix, &st, &body_gbody, &mut found, lits);
+        assert_eq!(
+            found.one_sides().len(),
+            1,
+            "join_body must resolve body-side gbody clause against empty-body producer only"
+        );
+    }
+
+    /// Item 1250 Layer 1 (`dl_eq.rs`): classify binary Eq by both participating literals
+    /// in both arrival directions, preserve implicit unit `(false, false)` flags, classify
+    /// Factor purity per pair inside the loop (so mixed `x ≈ b ∨ a ≈ b` stays available for
+    /// either maximal pivot under `sel=false, gbody=true`), and preserve full selection's
+    /// asymmetry (testing locality only on the maximal equality) when `sel=true`.
+    #[test]
+    fn eq_and_factor_split_pure_no_xy_from_mixed_non_local() {
+        use super::super::dl_clause::Rooted;
+        use super::super::dl_eq::Eqs;
+        let mut sig = Sig::new();
+        let [k, a_cls, b_cls, h_cls] = ["K", "A", "B", "H"].map(|n| sig.class(n));
+        let r = sig.role("r");
+        let e = sig.some_h(r, a_cls);
+        let [na, nb, nc] = ["a", "b", "c"].map(|n| sig.ind(n));
+        let (ix, _) = probe_ix(sig);
+        let run = DlRun::new(false, Default::default());
+        let lits = &run.lits;
+        let dx = dix(&ix);
+        let inv = inv_of(&ix, dx);
+        let (ca, cb, cc) = (c(na, &ix), c(nb, &ix), c(nc, &ix));
+        // Order constants c > b > a so orientations are deterministic.
+        let mut cs = [ca, cb, cc];
+        cs.sort_by(|&x, &y| {
+            if Rooted::a_gt(x, y) {
+                std::cmp::Ordering::Less
+            } else if Rooted::a_gt(y, x) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        let [hi, mid, lo] = cs;
+        assert!(Rooted::a_gt(hi, mid) && Rooted::a_gt(mid, lo));
+
+        let lit_of = |v: XLit| match lits.lit(v, inv) {
+            Made::Lit(l) => l,
+            _ => panic!("literal"),
+        };
+        let hyp = lit_of(XLit::Atom(h_cls, lo));
+        let eq_hi_mid = lit_of(XLit::Eq(hi, mid));
+        let eq_hi_lo = lit_of(XLit::Eq(hi, lo));
+        let eq_x_hi = lit_of(XLit::Eq(RTerm::X, hi));
+        let eq_fx_hi = lit_of(XLit::Eq(RTerm::Fx(e), hi));
+        let eq_fx_mid = lit_of(XLit::Eq(RTerm::Fx(e), mid));
+        let b_hi = lit_of(XLit::Atom(b_cls, hi));
+        let r_x_hi = lit_of(XLit::Role(r, RTerm::X, hi));
+
+        let eqs = Eqs {
+            ix: &ix,
+            dx,
+            lits,
+            root: false,
+            query: Some(k),
+        };
+        let o = Rooted {
+            ix: &ix,
+            lits,
+            inv: &inv,
+            ground_total: true,
+        };
+
+        // Helper: build a store containing one processed stored clause with chosen flags.
+        let mk_store = |clause: Clause, sel: bool, gbody: bool| -> State {
+            let mut st = State::default();
+            ds(&mut st).store.add(clause);
+            let mut maxima = Vec::new();
+            while let Some(i) = ds(&mut st).store.next(&ix, Some(&o), &mut maxima) {
+                let s = &mut ds(&mut st).store.clauses[i as usize];
+                s.sel = sel;
+                s.gbody = gbody;
+            }
+            st
+        };
+
+        // --- A. Pure no_xy Eq (hi ≈ mid rewriting B(hi)), both arrival directions ---
+        let prem_eq: Side = (vec![hyp, Lit::x(k)], vec![]);
+        let prem_b: Side = (vec![hyp, Lit::x(k)], vec![]);
+        // Direction 1 (on_max): new eq rewrites stored B(hi)
+        let st_b_gbody = mk_store(Clause::new(vec![hyp, Lit::x(k)], vec![b_hi]), false, true);
+        let st_b_plain = mk_store(Clause::new(vec![Lit::x(k)], vec![b_hi]), false, false);
+        let mut f = Found::default();
+        eqs.on_max(&st_b_plain, eq_hi_mid, &prem_eq, &mut f, false, true);
+        assert!(
+            f.one_sides().is_empty(),
+            "pure Eq blocked when new premise has gbody=true"
+        );
+        let mut f = Found::default();
+        eqs.on_max(
+            &st_b_gbody,
+            eq_hi_mid,
+            &(vec![Lit::x(k)], vec![]),
+            &mut f,
+            false,
+            false,
+        );
+        assert!(
+            f.one_sides().is_empty(),
+            "pure Eq blocked when target has gbody=true"
+        );
+        let mut f = Found::default();
+        eqs.on_max(
+            &st_b_plain,
+            eq_hi_mid,
+            &(vec![Lit::x(k)], vec![]),
+            &mut f,
+            false,
+            false,
+        );
+        assert!(
+            !f.one_sides().is_empty(),
+            "pure Eq allowed when both have sel=false, gbody=false"
+        );
+
+        // Direction 2 (into): new B(hi) rewritten by stored eq hi ≈ mid
+        let st_eq_gbody = mk_store(
+            Clause::new(vec![hyp, Lit::x(k)], vec![eq_hi_mid]),
+            false,
+            true,
+        );
+        let st_eq_plain = mk_store(Clause::new(vec![Lit::x(k)], vec![eq_hi_mid]), false, false);
+        let mut f = Found::default();
+        eqs.on_max(&st_eq_plain, b_hi, &prem_b, &mut f, false, true);
+        assert!(
+            f.one_sides().is_empty(),
+            "pure Eq(into) blocked when new target has gbody=true"
+        );
+        let mut f = Found::default();
+        eqs.on_max(
+            &st_eq_gbody,
+            b_hi,
+            &(vec![Lit::x(k)], vec![]),
+            &mut f,
+            false,
+            false,
+        );
+        assert!(
+            f.one_sides().is_empty(),
+            "pure Eq(into) blocked when stored eq has gbody=true"
+        );
+        let mut f = Found::default();
+        eqs.on_max(
+            &st_eq_plain,
+            b_hi,
+            &(vec![Lit::x(k)], vec![]),
+            &mut f,
+            false,
+            false,
+        );
+        assert!(
+            !f.one_sides().is_empty(),
+            "pure Eq(into) allowed when both have sel=false, gbody=false"
+        );
+
+        // --- B. Mixed non-local Eq (plain-ground hi ≈ mid rewriting x ≈ hi), both directions ---
+        let st_xhi_gbody = mk_store(
+            Clause::new(vec![hyp, Lit::x(k)], vec![eq_x_hi]),
+            false,
+            true,
+        );
+        let mut f = Found::default();
+        eqs.on_max(&st_xhi_gbody, eq_hi_mid, &prem_eq, &mut f, false, true);
+        assert!(
+            !f.one_sides().is_empty(),
+            "mixed non-local Eq (hi≈mid into x≈hi) must remain allowed under sel=false, gbody=true"
+        );
+        let mut f = Found::default();
+        eqs.on_max(&st_xhi_gbody, eq_hi_mid, &prem_eq, &mut f, true, true);
+        assert!(
+            f.one_sides().is_empty(),
+            "mixed non-local Eq must be blocked under sel=true"
+        );
+        // Reverse arrival direction (into): new x ≈ hi rewritten by stored hi ≈ mid
+        let mut f = Found::default();
+        eqs.on_max(&st_eq_gbody, eq_x_hi, &prem_eq, &mut f, false, true);
+        assert!(
+            !f.one_sides().is_empty(),
+            "mixed non-local Eq(into) must remain allowed under sel=false, gbody=true"
+        );
+        let mut f = Found::default();
+        eqs.on_max(&st_eq_gbody, eq_x_hi, &prem_eq, &mut f, true, true);
+        assert!(
+            f.one_sides().is_empty(),
+            "mixed non-local Eq(into) must be blocked under sel=true"
+        );
+
+        // --- C. Query x ≈ hi rewriting implicit unit K(x) (unit has flags (false, false)) ---
+        let mut st_unit = State::default();
+        st_unit.subs.insert(k);
+        let mut f = Found::default();
+        eqs.on_max(&st_unit, eq_x_hi, &(vec![hyp], vec![]), &mut f, false, true);
+        assert!(
+            !f.one_sides().is_empty(),
+            "query x≈hi rewriting implicit unit K(x) must remain allowed under sel=false, gbody=true"
+        );
+        let mut f = Found::default();
+        eqs.on_max(&st_unit, eq_x_hi, &(vec![hyp], vec![]), &mut f, true, true);
+        assert!(
+            f.one_sides().is_empty(),
+            "query x≈hi rewriting implicit unit K(x) must be blocked under sel=true"
+        );
+
+        // --- D. Local Eq (hi ≈ mid rewriting r(x, hi)), allowed even under sel=true ---
+        let st_local = mk_store(Clause::new(vec![hyp, Lit::x(k)], vec![r_x_hi]), true, true);
+        let mut f = Found::default();
+        eqs.on_max(&st_local, eq_hi_mid, &prem_eq, &mut f, true, true);
+        assert!(
+            !f.one_sides().is_empty(),
+            "local Eq allowed under sel=true, gbody=true"
+        );
+        let mut f = Found::default();
+        eqs.on_max(&st_eq_gbody, r_x_hi, &prem_eq, &mut f, true, true);
+        assert!(
+            !f.one_sides().is_empty(),
+            "local Eq(into) allowed under sel=true, gbody=true"
+        );
+
+        // --- E. Factor: pure no_xy vs mixed x ≈ hi ∨ hi ≈ mid vs sel=true asymmetry ---
+        let empty_st = State::default();
+        // Pure no_xy Factor: hi ≈ mid ∨ hi ≈ lo (prem has hi ≈ lo in head, pivot is hi ≈ mid)
+        let prem_pure: Side = (vec![hyp, Lit::x(k)], vec![eq_hi_lo]);
+        let mut f = Found::default();
+        eqs.on_max(&empty_st, eq_hi_mid, &prem_pure, &mut f, false, true);
+        assert!(
+            f.one_sides().is_empty(),
+            "pure no_xy Factor must be blocked when gbody=true (even if sel=false)"
+        );
+        let mut f = Found::default();
+        eqs.on_max(&empty_st, eq_hi_mid, &prem_pure, &mut f, false, false);
+        assert!(
+            !f.one_sides().is_empty(),
+            "pure no_xy Factor allowed when sel=false, gbody=false"
+        );
+
+        // Mixed Factor: x ≈ hi ∨ hi ≈ mid under sel=false, gbody=true for BOTH pivots!
+        // Pivot 1: x ≈ hi maximal, second is hi ≈ mid
+        let prem_mix1: Side = (vec![hyp, Lit::x(k)], vec![eq_hi_mid]);
+        let mut f = Found::default();
+        eqs.on_max(&empty_st, eq_x_hi, &prem_mix1, &mut f, false, true);
+        assert!(
+            !f.one_sides().is_empty(),
+            "mixed Factor with x≈hi maximal must stay allowed under sel=false, gbody=true"
+        );
+        // Pivot 2: hi ≈ mid (plain ground!) maximal, second is x ≈ hi
+        let prem_mix2: Side = (vec![hyp, Lit::x(k)], vec![eq_x_hi]);
+        let mut f = Found::default();
+        eqs.on_max(&empty_st, eq_hi_mid, &prem_mix2, &mut f, false, true);
+        assert!(
+            !f.one_sides().is_empty(),
+            "mixed Factor with plain-ground hi≈mid maximal must stay allowed under sel=false, gbody=true"
+        );
+
+        // Full-selection asymmetry under sel=true, gbody=true:
+        // Maximal pivot hi ≈ mid (non-local, s=hi) + second f(x) ≈ hi (local, shares hi):
+        // fires under sel=false, gbody=true (non-vacuous), MUST be blocked under sel=true
+        // because locality of the second equality does not exempt Factor!
+        let prem_asym_blocked: Side = (vec![hyp, Lit::x(k)], vec![eq_fx_hi]);
+        let mut f = Found::default();
+        eqs.on_max(
+            &empty_st,
+            eq_hi_mid,
+            &prem_asym_blocked,
+            &mut f,
+            false,
+            true,
+        );
+        assert!(
+            !f.one_sides().is_empty(),
+            "non-vacuous control: hi≈mid + f(x)≈hi factors under sel=false, gbody=true"
+        );
+        let mut f = Found::default();
+        eqs.on_max(&empty_st, eq_hi_mid, &prem_asym_blocked, &mut f, true, true);
+        assert!(
+            f.one_sides().is_empty(),
+            "under sel=true, locality of the second equality must NOT exempt Factor"
+        );
+        // Maximal pivot f(x) ≈ hi (local, s=f(x)) + second f(x) ≈ mid -> allowed under sel=true!
+        let prem_asym_ok: Side = (vec![hyp, Lit::x(k)], vec![eq_fx_mid]);
+        let mut f = Found::default();
+        eqs.on_max(&empty_st, eq_fx_hi, &prem_asym_ok, &mut f, true, true);
+        assert!(
+            !f.one_sides().is_empty(),
+            "under sel=true, locality of the maximal equality exempts Factor"
+        );
+    }
+
+    /// Root clauses must never set `sel` or `gbody` even when their bodies contain ground
+    /// literals, and `Stored` keeps its layout size and `Store::owned_bytes == scan_bytes`.
+    #[test]
+    fn root_flags_stay_false_and_stored_owned_bytes_matches_scan() {
+        assert_eq!(
+            std::mem::size_of::<super::super::dl_clause::Stored>(),
+            64,
+            "adding gbody: bool must fit inside Stored's existing alignment padding"
+        );
+        let mut sig = Sig::new();
+        let [a, b, z] = ["A", "B", "Z"].map(|n| sig.class(n));
+        let u = sig.ind("u");
+        sig.sub(u, a);
+        sig.sub(a, b);
+        sig.dl.clauses.push((vec![a], vec![b, z]));
+        let done = saturate_seeded(sig, None, |ix, _| {
+            let cu = c(u, ix);
+            vec![
+                (vec![XLit::Atom(a, cu)], vec![XLit::Atom(b, cu)]),
+                (vec![], vec![XLit::Atom(a, cu)]),
+            ]
+        });
+        let st = done.ctx[done.root as usize].get().unwrap().st.lock();
+        let store = &dl(&st).expect("root store").store;
+        assert_eq!(store.bytes(), store.scan_bytes());
+        assert!(
+            store.clauses.iter().any(|s| !s.c.body().is_empty()),
+            "root store must have processed a ground-bodied clause"
+        );
+        assert!(
+            store.clauses.iter().all(|s| !s.sel && !s.gbody),
+            "root clauses must keep sel=false and gbody=false"
+        );
+    }
+
+    /// Item 1250 Layer 3: `marker_repair(true)` defaults to `MREPAIR_ON | MREPAIR_CF` (129),
+    /// preserves mode 0 / mode 1 / TEST_MODE precedence, and handles all three M-return-cf
+    /// arrival orders: denial-before-producer, producer-before-denial, and ineligible
+    /// ground/Fc-bodied holder followed by an eligible holder.
+    #[test]
+    fn marker_repair_defaults_to_cf_and_handles_denial_arrival_orders() {
+        use super::super::dl_clause::Rooted;
+        assert_eq!(marker_repair_mode(None, 0, true), MREPAIR_ON | MREPAIR_CF);
+        assert_eq!(marker_repair_mode(None, 0, false), 0);
+        assert_eq!(marker_repair_mode(None, MREPAIR_ON, true), MREPAIR_ON);
+        assert_eq!(marker_repair_mode(None, MREPAIR_ON, false), MREPAIR_ON);
+        assert_eq!(marker_repair_mode(Some(0), MREPAIR_ON, true), 0);
+        assert_eq!(marker_repair_mode(Some(MREPAIR_ON), 0, true), MREPAIR_ON);
+        assert_eq!(
+            marker_repair_mode(Some(MREPAIR_ON | MREPAIR_CF), MREPAIR_ON, false),
+            MREPAIR_ON | MREPAIR_CF
+        );
+        if std::env::var_os("SPARKLES_ROOTED_MARKER_REPAIR").is_none() {
+            assert_eq!(marker_repair(true), MREPAIR_ON | MREPAIR_CF);
+            assert_eq!(marker_repair(false), 0);
+        }
+
+        let mut sig = Sig::new();
+        let [a, b, h, k] = ["A", "B", "H", "K"].map(|n| sig.class(n));
+        let r = sig.role("r");
+        let e = sig.some_h(r, a);
+        let u = sig.ind("u");
+        let (ix, root) = probe_ix(sig);
+        let mut run = DlRun::new(false, Default::default());
+        run.mrepair = MREPAIR_ON | MREPAIR_CF;
+        let inv = inv_of(&ix, dix(&ix));
+        let RTerm::C(cu) = c(u, &ix) else {
+            unreachable!()
+        };
+        let lit_of = |v: XLit| match run.lits.lit(v, inv) {
+            Made::Lit(l) => l,
+            _ => panic!("literal"),
+        };
+        let ga = lit_of(XLit::Atom(a, RTerm::C(cu)));
+        let gh = lit_of(XLit::Atom(h, RTerm::C(cu)));
+        let gfc = lit_of(XLit::Atom(b, RTerm::Fc(e, cu)));
+        let denial = Clause::new(vec![ga], vec![]);
+        let cid = run.table.push(denial);
+        let order = Rooted {
+            ix: &ix,
+            lits: &run.lits,
+            inv: &inv,
+            ground_total: true,
+        };
+
+        // Order 1: denial returned BEFORE eligible empty-body producer arrives.
+        {
+            let mut st = State::default();
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            assert!(rret(&ix, &mut st, cid, &mut out));
+            assert!(out.mine.is_empty(), "no product before any producer exists");
+            assert!(
+                m_note(&ix, root, k, &mut st, ga, &(vec![], vec![]), &mut out),
+                "late eligible producer must replay saved denial"
+            );
+            assert!(
+                out.mine
+                    .iter()
+                    .any(|m| matches!(m, Concl::Sub(x) if *x == super::super::index::BOTTOM)),
+                "denial-before-producer must derive BOTTOM"
+            );
+        }
+
+        // Order 2: eligible empty-body producer processed BEFORE denial returns.
+        {
+            let mut st = State::default();
+            ds(&mut st).store.add(Clause::new(vec![], vec![ga]));
+            let mut max = Vec::new();
+            while ds(&mut st)
+                .store
+                .next(&ix, Some(&order), &mut max)
+                .is_some()
+            {}
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            assert!(rret(&ix, &mut st, cid, &mut out));
+            assert!(
+                out.mine
+                    .iter()
+                    .any(|m| matches!(m, Concl::Sub(x) if *x == super::super::index::BOTTOM)),
+                "producer-before-denial must derive BOTTOM immediately"
+            );
+        }
+
+        // Order 3: ineligible ground-bodied (H(u) -> A(u)) and Fc-bodied (B(f_e(u)) -> A(u))
+        // holders arrive FIRST, then denial returns (producing nothing, keeping `rets`),
+        // then an eligible x-only holder (K(x) -> A(u)) arrives and derives K(x) -> ⊥!
+        {
+            let mut st = State::default();
+            let inelig_g = Clause::new(vec![gh], vec![ga]);
+            let inelig_fc = Clause::new(vec![gfc], vec![ga]);
+            ds(&mut st).store.add(inelig_g.clone());
+            ds(&mut st).store.add(inelig_fc.clone());
+            let mut max = Vec::new();
+            while ds(&mut st)
+                .store
+                .next(&ix, Some(&order), &mut max)
+                .is_some()
+            {}
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            // Ineligible holders still register in `mheld` (sending RMark to root).
+            assert!(m_note(
+                &ix,
+                root,
+                k,
+                &mut st,
+                ga,
+                &side(&inelig_g, ga),
+                &mut out
+            ));
+            assert!(m_note(
+                &ix,
+                root,
+                k,
+                &mut st,
+                ga,
+                &side(&inelig_fc, ga),
+                &mut out
+            ));
+            assert!(
+                out.sent
+                    .iter()
+                    .any(|(to, m)| *to == root && matches!(m, Concl::RMark(from, _) if *from == k)),
+                "m_note must register holder before rejecting ineligible ground-bodied premise"
+            );
+            // Denial returns: recorded in `rets`, but produces NO ground-bodied conclusion.
+            assert!(rret(&ix, &mut st, cid, &mut out));
+            assert!(
+                dl(&st)
+                    .unwrap()
+                    .store
+                    .clauses
+                    .iter()
+                    .all(|s| !s.c.head().is_empty()),
+                "M-return-cf must not derive ground-bodied denials from ineligible holders"
+            );
+            // Eligible x-only holder arrives later: m_late derives K(x) -> ⊥.
+            let x_only: Side = (vec![Lit::x(k)], vec![]);
+            assert!(m_note(&ix, root, k, &mut st, ga, &x_only, &mut out));
+            assert!(
+                dl(&st)
+                    .unwrap()
+                    .store
+                    .clauses
+                    .iter()
+                    .any(|s| s.c.body() == [Lit::x(k)] && s.c.head().is_empty()),
+                "late x-only eligible holder must derive K(x) -> ⊥ under M-return-cf"
+            );
         }
     }
 

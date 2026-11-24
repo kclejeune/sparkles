@@ -362,8 +362,11 @@ pub struct Limits {
     /// without [`rooted`](Limits::rooted). A context that holds a ground literal as a
     /// condition tells the root, which sends the literal's marker to the contexts
     /// registered for its individuals, and the root returns its clauses whose bodies are
-    /// such literals to the contexts that hold them. `SPARKLES_ROOTED_MARKER_REPAIR`
-    /// overrides it for measurements, with `0`, `1`, or a sum of the bits of
+    /// such literals to the contexts that hold them. By default this runs M-return-cf
+    /// (`MREPAIR_ON | MREPAIR_CF`, item 1250), resolving returned clauses only against
+    /// holder premises whose body has no ground or `f_e(u)` literal (at both initial return
+    /// arrival and late-premise replay). `SPARKLES_ROOTED_MARKER_REPAIR` overrides it for
+    /// measurements, with `0` (off), `1` (unfiltered `MREPAIR_ON`), or a sum of the bits of
     /// [`dl_rules::DlRun::mrepair`].
     pub rooted_marker_repair: bool,
     /// whether a run that counts without the root orders its number restrictions by

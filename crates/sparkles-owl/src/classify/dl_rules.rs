@@ -579,10 +579,10 @@ pub struct DlRun {
     /// derived conclusions, zero for no limit (roadmap item 1011)
     width_limit: AtomicUsize,
     /// row 1231's marker repair (PLAN v3.1's rule M), which is off unless
-    /// [`Limits::rooted_marker_repair`](super::Limits) turns it on: [`MREPAIR_ON`], with
-    /// [`MREPAIR_HOLDER`], [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`] for measurements, and
-    /// [`MREPAIR_NO_RETURN`] and [`MREPAIR_NO_REPLAY`] for the diagnostic's tests, and
-    /// [`MREPAIR_CF`] for M-return's restriction to premises without ground body literals
+    /// [`Limits::rooted_marker_repair`](super::Limits) turns it on: [`MREPAIR_ON`] with
+    /// [`MREPAIR_CF`] by default (M-return-cf, item 1250), with [`MREPAIR_HOLDER`],
+    /// [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`] for measurements, and [`MREPAIR_NO_RETURN`]
+    /// and [`MREPAIR_NO_REPLAY`] for the diagnostic's tests
     pub mrepair: u8,
     /// the repair's counts, for measurements: the notices of held triggers the root took,
     /// the markers it sent and the clauses it returned
@@ -607,15 +607,13 @@ pub const MREPAIR_NO_RETURN: u8 = 32;
 /// reaches late takes no marker sent before, so that a missing marker shows in the first.
 pub const MREPAIR_NO_REPLAY: u8 = 64;
 /// [`DlRun::mrepair`]: M-return-cf. M-return resolves a returned clause only with premises
-/// of the holder whose body has no ground literal, a literal over constants and function
-/// terms of constants alone, at the return and at the late premise. A product with a ground
-/// body then never arises, which would go back to the root and out again through each
-/// alternative condition of its body atoms. A measurement bit, off by default: with the
-/// selection of ground body literals off it loses no answer against [`MREPAIR_ON`] alone,
-/// finishes ten more runs within the bound and takes a purpose-built ontology's cost from 24% to 10.5%,
-/// but g1-051_p0012 still passes the bound (roadmap item 1250) and g1-051_p0121 derives
-/// 1.42 million conclusions against 1.17 million. Which of the two the default takes is
-/// for item 1231 to decide on evidence.
+/// of the holder whose body has no ground literal (no `no_xy` literal over constants or
+/// function terms of constants, while permitting `x`-only bodies), at both initial return
+/// arrival and late-premise replay. A product with a ground body then never arises, which
+/// would go back to the root and out again through each alternative condition of its body
+/// atoms. Enabled by default whenever [`Limits::rooted_marker_repair`](super::Limits) is on
+/// (`MREPAIR_ON | MREPAIR_CF`, item 1250); `SPARKLES_ROOTED_MARKER_REPAIR=1` selects
+/// unfiltered [`MREPAIR_ON`] for comparison.
 pub const MREPAIR_CF: u8 = 128;
 
 impl DlRun {
@@ -1457,6 +1455,18 @@ pub fn select_ground() -> bool {
     *ON.get_or_init(|| !std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_some_and(|v| v == "0"))
 }
 
+/// Whether a context other than the root cuts clauses with a ground or `f_e(u)` body
+/// literal from non-local ground Hyper, head-side Join, and purely ground/Fc Eq/Factor
+/// even when [`select_ground`] is off (item 1250). On by default; setting both
+/// `SPARKLES_ROOTED_SELECT_GROUND=0` and `SPARKLES_ROOTED_GROUND_BODY_CUT=0` reproduces
+/// the original uncut containment arm for measurement.
+pub fn ground_body_cut() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var_os("SPARKLES_ROOTED_GROUND_BODY_CUT").is_some_and(|v| v == "0")
+    })
+}
+
 /// Whether Hyper over x takes selected clauses as partners, item 1220's repair R1 of the
 /// selection: the partners of an atom over x, and in Pred from a successor over `f_e(u)`
 /// the partners of an atom over `f_e(u)` ([`super::dl_root::root_pred`]). Without it two
@@ -1507,18 +1517,25 @@ pub(super) fn join_restricted(
     }
 }
 
-/// Whether a clause of a context other than the root is selected: its body holds a literal
-/// that holds neither x nor y, a ground marker among them. A selected clause, a marker
-/// included, is a premise only of a local inference ([`local`]), of Join on its ground
-/// body literal, of Pred and of Succ. The predecessor receives the clause by Pred,
-/// discharges its ground body with its actual clauses and sends the hypotheses and markers
-/// that let the context go on, so that the context never combines the markers of its
-/// predecessors in one body.
-pub(super) fn selected(lits: &Lits, inv: impl Fn(Role) -> Option<Role> + Copy, c: &Clause) -> bool {
-    select_ground() && selected_always(lits, inv, c)
+/// Computes `(sel, gbody)` for a clause of a context other than the root. A clause whose
+/// body holds a literal without x or y (a ground or `f_e(u)` literal, a ground marker
+/// among them) gets `sel = select_ground()` and `gbody = select_ground() || ground_body_cut()`.
+/// `gbody` cuts non-local ground Hyper, head-side Join, and purely ground/Fc Eq/Factor
+/// even when `select_ground` is off (item 1250), while `sel` gates mixed non-local
+/// Eq/Factor and (without [`sel_partners_x`]) Hyper-over-x / Fc-Pred partners.
+pub(super) fn selection_flags(
+    lits: &Lits,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    c: &Clause,
+) -> (bool, bool) {
+    let has_gbody = selected_always(lits, inv, c);
+    (
+        select_ground() && has_gbody,
+        (select_ground() || ground_body_cut()) && has_gbody,
+    )
 }
 
-/// [`selected`] whatever [`select_ground`] says.
+/// Whether `c`'s body holds a literal mentioning neither x nor y (plain ground or `f_e(u)`).
 pub(super) fn selected_always(
     lits: &Lits,
     inv: impl Fn(Role) -> Option<Role> + Copy,
@@ -1566,6 +1583,10 @@ impl Found {
     /// The number of products, for tests.
     pub(super) fn products_len(&self) -> usize {
         self.prods.len()
+    }
+    /// The direct (non-product) conclusions collected so far, for tests.
+    pub(super) fn one_sides(&self) -> Vec<Side> {
+        self.one.iter().map(|(s, _)| s.clone()).collect()
     }
 }
 
@@ -3320,6 +3341,7 @@ fn rooted_max(
     found: &mut Found,
     lits: &Lits,
     sel: bool,
+    gbody: bool,
     sel_x: bool,
 ) {
     let dx = dix(ix);
@@ -3336,7 +3358,7 @@ fn rooted_max(
         root: false,
         query: query_of(ix, me),
     };
-    q.on_max(st, l, prem, found, sel);
+    q.on_max(st, l, prem, found, sel, gbody);
 }
 
 /// The named class whose context `me` is, which is a query context of the journal with that
@@ -4009,7 +4031,9 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
             let inv = |r: Role| dx.inv(ix, r);
             x.empty_core = dx.of_hyp.contains_key(&me);
             let s = &mut x.store.clauses[id as usize];
-            s.sel = selected(&max_guard.dl().lits, inv, &s.c);
+            let (sel, gbody) = selection_flags(&max_guard.dl().lits, inv, &s.c);
+            s.sel = sel;
+            s.gbody = gbody;
         }
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
@@ -4087,18 +4111,36 @@ fn process<S: Sink>(
             return;
         }
     }
-    // a selected clause takes only the local inferences, Join, Pred and Succ, except that
-    // one Pred cannot carry, whose head holds an atom over x, takes the Hyper over x too,
-    // since no predecessor sees it (with sel_partners_x its partners include selected
-    // clauses, as do those of Pred from a successor over `f_e(u)`)
-    let sel = rooted && dl(st).is_some_and(|x| x.store.clauses[id as usize].sel);
+    // a clause with a ground body literal is cut by `gbody` from non-local ground Hyper,
+    // head-side Join, and purely ground/Fc Eq/Factor even when `select_ground` is off
+    // (item 1250), while `sel` gates mixed non-local Eq/Factor and (without
+    // `sel_partners_x`) Hyper-over-x and Fc-Pred partners
+    let (sel, gbody) = if rooted {
+        dl(st).map_or((false, false), |x| {
+            let s = &x.store.clauses[id as usize];
+            (s.sel, s.gbody)
+        })
+    } else {
+        (false, false)
+    };
     let sel_x = sel && ready;
     let mut ps: Vec<(Role, Ex)> = Vec::new();
     let mut es: Vec<Ex> = Vec::new();
     for &l in max {
         let prem = side(c, l);
         if dx.root.is_some() {
-            rooted_max(ix, me, st, l, &prem, &mut found, &out.dl().lits, sel, sel_x);
+            rooted_max(
+                ix,
+                me,
+                st,
+                l,
+                &prem,
+                &mut found,
+                &out.dl().lits,
+                sel,
+                gbody,
+                sel_x,
+            );
         }
         match l.kind() {
             X if sel_x => {
@@ -4265,7 +4307,7 @@ fn process<S: Sink>(
                     }
                 }
             }
-            XL if rooted => super::dl_root::on_max(ix, me, st, c, l, &prem, &mut found, out, sel),
+            XL if rooted => super::dl_root::on_max(ix, me, st, c, l, &prem, &mut found, out, gbody),
             _ => {}
         }
     }

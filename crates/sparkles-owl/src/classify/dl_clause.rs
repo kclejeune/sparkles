@@ -1284,9 +1284,15 @@ pub struct Stored {
     /// its maximal literal once processed, when it has one
     pub max: Option<Lit>,
     /// in a context other than the root of a rooted run, the processed clause has a
-    /// ground literal in its body and is selected: it takes part only in the local
-    /// inferences, Join on that literal, Pred and Succ ([`super::dl_rules::selected`])
+    /// ground literal in its body and is fully selected ([`super::dl_rules::selection_flags`]):
+    /// controls non-local mixed Eq/Factor and (without [`super::dl_rules::sel_partners_x`])
+    /// Hyper-over-x / Fc-Pred partner eligibility
     pub sel: bool,
+    /// in a context other than the root of a rooted run, the processed clause has a
+    /// ground or `f_e(u)` literal in its body and is cut from non-local ground Hyper,
+    /// head-side Join, and purely ground/Fc Eq/Factor ([`super::dl_rules::ground_body_cut`]),
+    /// even when [`super::dl_rules::select_ground`] is off (item 1250)
+    pub gbody: bool,
 }
 
 /// A context's clause store, with the indexes the rules read.
@@ -1565,6 +1571,7 @@ impl Store {
                 sent: None,
                 max: None,
                 sel: false,
+                gbody: false,
             },
         );
         self.owned_bytes += delta;
