@@ -1044,6 +1044,31 @@ struct Out {
 }
 
 impl Out {
+    fn bytes(&self) -> usize {
+        self.subs.capacity() * 8
+            + self
+                .disjoint
+                .iter()
+                .map(|d| 24 + d.capacity() * 4)
+                .sum::<usize>()
+            + self.disjoint.capacity() * 24
+            + self.ranges.capacity() * 8
+            + self.role_subs.capacity() * 8
+            + self
+                .chains
+                .iter()
+                .map(|(c, _)| 32 + c.capacity() * 4)
+                .sum::<usize>()
+            + self.chains.capacity() * 32
+            + self.reflexive.capacity() * 4
+            + self.clash.capacity() * 8
+            + self.premises.capacity() * 4
+            + self.dt_ranges.capacity() * 8
+            + self.dt_disjoint.capacity() * 8
+            + self.functional.capacity() * 4
+            + self.individuals.capacity() * 4
+    }
+
     fn commit(self, ax: &mut Axioms, h: &mut HornAx) {
         ax.subs.extend(self.subs);
         ax.disjoint.extend(self.disjoint);
@@ -1060,69 +1085,198 @@ impl Out {
     }
 }
 
-struct Norm<'a> {
+/// Lazily initialized memory budget tracker for role-pair generation.
+///
+/// When `limit` is `None` or no candidate emits role pairs, neither `ax.bytes()` nor
+/// `it.dt_run_static_bytes()` is walked. Once a bounded pair-emitting path first checks
+/// the budget, both immutable baselines are cached so every subsequent check is O(1)
+/// using the live interner size and incrementally tracked output bytes.
+pub(super) struct PairBudget<'a> {
+    limit: Option<usize>,
+    ax: &'a Axioms,
+    ax_bytes: Option<usize>,
+    dt_static_bytes: Option<usize>,
+    accum_bytes: usize,
+}
+
+impl<'a> PairBudget<'a> {
+    pub(super) fn new(limit: Option<usize>, ax: &'a Axioms) -> Self {
+        Self {
+            limit,
+            ax,
+            ax_bytes: None,
+            dt_static_bytes: None,
+            accum_bytes: 0,
+        }
+    }
+
+    pub(super) fn is_bounded(&self) -> bool {
+        self.limit.is_some()
+    }
+
+    pub(super) fn add_accum(&mut self, bytes: usize) {
+        if self.limit.is_some() {
+            self.accum_bytes = self.accum_bytes.saturating_add(bytes);
+        }
+    }
+
+    pub(super) fn check(&mut self, it: &Interner, extra_bytes: usize) -> Result<(), Halt> {
+        let Some(limit) = self.limit else {
+            return Ok(());
+        };
+        let ax_bytes = *self.ax_bytes.get_or_insert_with(|| self.ax.bytes());
+        let dt_static = *self
+            .dt_static_bytes
+            .get_or_insert_with(|| it.dt_run_static_bytes());
+        let it_bytes = it
+            .core_bytes()
+            .saturating_add(dt_static)
+            .saturating_add(it.dt_run_memo_bytes());
+        let total = it_bytes
+            .saturating_add(ax_bytes)
+            .saturating_add(self.accum_bytes)
+            .saturating_add(extra_bytes);
+        if total > limit {
+            return Err(Halt::Memory(total));
+        }
+        Ok(())
+    }
+}
+
+struct Norm<'a, 'b> {
     it: &'a mut Interner,
     rb: Option<&'a RoleBox>,
     out: Out,
     /// whether the ontology has individuals, which leaves at-least restrictions above
     /// one out (F24, "The Horn rules with individuals")
     individuals: bool,
-    base_bytes: usize,
-    limit: Option<usize>,
+    budget: Option<&'a mut PairBudget<'b>>,
     stop: &'a dyn Fn() -> bool,
     halt: Option<Halt>,
 }
 
-/// Emits self-pairs once per repeated role and pairwise disjoint pairs over distinct roles,
-/// checking memory budget before reserving and polling cancellation inside the pair loop.
-pub(super) fn emit_role_pairs(
-    mut rs: Vec<Role>,
+/// Scans a sorted multiset slice of property operands, resolves each distinct operand
+/// once into a [`Role`], emits self-pairs once per repeated role and pairwise disjoint
+/// pairs over distinct roles, checks the live post-interning memory budget (including
+/// temporary pair-building buffers) before growing or reserving, and polls cancellation
+/// during operand scanning, before reserve, and throughout pair emission.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_role_pairs<T: Eq>(
+    ps: &[T],
     symmetric: bool,
+    it: &mut Interner,
+    mut resolve: impl FnMut(&mut Interner, &T) -> Result<Role, Why>,
     out: &mut Vec<(Role, Role)>,
-    base_bytes: usize,
-    limit: Option<usize>,
+    out_other_bytes: usize,
+    mut budget: Option<&mut PairBudget<'_>>,
     stop: &dyn Fn() -> bool,
     halt: &mut Option<Halt>,
 ) -> Result<(), Why> {
-    rs.sort_unstable();
-    let mut repeated: Vec<Role> = Vec::new();
-    let mut distinct: Vec<Role> = Vec::new();
-    let mut i = 0;
-    while i < rs.len() {
-        let a = rs[i];
+    let mut entries: Vec<(Role, bool)> = Vec::new();
+    let mut work = 0usize;
+    let mut i = 0usize;
+    while i < ps.len() {
+        work += 1;
+        if work.is_multiple_of(POLL_WORK) && stop() {
+            *halt = Some(Halt::Stopped);
+            return Err("cancelled");
+        }
         let mut j = i + 1;
-        while j < rs.len() && rs[j] == a {
+        while j < ps.len() && ps[j] == ps[i] {
+            work += 1;
+            if work.is_multiple_of(POLL_WORK) && stop() {
+                *halt = Some(Halt::Stopped);
+                return Err("cancelled");
+            }
             j += 1;
         }
-        if j - i >= 2 {
-            repeated.push(a);
+        let r = resolve(it, &ps[i])?;
+        if entries.len() == entries.capacity()
+            && let Some(b) = budget.as_deref_mut()
+        {
+            let next_cap = entries.capacity().saturating_mul(2).max(4);
+            let extra = out_other_bytes
+                .saturating_add(
+                    out.capacity()
+                        .saturating_mul(std::mem::size_of::<(Role, Role)>()),
+                )
+                .saturating_add(next_cap.saturating_mul(std::mem::size_of::<(Role, bool)>()));
+            if let Err(h) = b.check(it, extra) {
+                *halt = Some(h);
+                return Err("memory budget exceeded");
+            }
         }
-        distinct.push(a);
+        entries.push((r, j - i >= 2));
         i = j;
     }
-    let d = distinct.len();
+
+    if stop() {
+        *halt = Some(Halt::Stopped);
+        return Err("cancelled");
+    }
+
+    entries.sort_unstable_by_key(|&(r, _)| r);
+    let mut write = 0usize;
+    let mut read = 0usize;
+    let mut repeated_count = 0usize;
+    while read < entries.len() {
+        let r = entries[read].0;
+        let mut rep = entries[read].1;
+        let mut next = read + 1;
+        while next < entries.len() && entries[next].0 == r {
+            rep = true;
+            next += 1;
+        }
+        if rep {
+            repeated_count += 1;
+        }
+        entries[write] = (r, rep);
+        write += 1;
+        read = next;
+    }
+    entries.truncate(write);
+
+    let d = entries.len();
     let distinct_pairs = if symmetric {
         d.saturating_mul(d.saturating_sub(1))
     } else {
         d.saturating_mul(d.saturating_sub(1)) / 2
     };
-    let pair_count = repeated.len().saturating_add(distinct_pairs);
-    let pair_bytes = out
-        .len()
-        .saturating_add(pair_count)
-        .saturating_mul(std::mem::size_of::<(Role, Role)>());
-    let needed = base_bytes.saturating_add(pair_bytes);
-    if limit.is_some_and(|l| needed > l) {
-        *halt = Some(Halt::Memory(needed));
-        return Err("memory budget exceeded");
+    let pair_count = repeated_count.saturating_add(distinct_pairs);
+
+    if stop() {
+        *halt = Some(Halt::Stopped);
+        return Err("cancelled");
     }
-    out.reserve(pair_count);
-    for a in repeated {
-        out.push((a, a));
+
+    if let Some(b) = budget {
+        let scratch_bytes = entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(Role, bool)>());
+        let target_out_cap = out.len().saturating_add(pair_count).max(out.capacity());
+        let target_out_bytes = target_out_cap.saturating_mul(std::mem::size_of::<(Role, Role)>());
+        let extra = out_other_bytes
+            .saturating_add(scratch_bytes)
+            .saturating_add(target_out_bytes);
+        if let Err(h) = b.check(it, extra) {
+            *halt = Some(h);
+            return Err("memory budget exceeded");
+        }
     }
-    let mut work = 0usize;
-    for (idx, &a) in distinct.iter().enumerate() {
-        for &b in &distinct[idx + 1..] {
+
+    out.reserve_exact(pair_count);
+    for &(a, rep) in &entries {
+        if rep {
+            work += 1;
+            if work.is_multiple_of(POLL_WORK) && stop() {
+                *halt = Some(Halt::Stopped);
+                return Err("cancelled");
+            }
+            out.push((a, a));
+        }
+    }
+    for (idx, &(a, _)) in entries.iter().enumerate() {
+        for &(b, _) in &entries[idx + 1..] {
             work += 1;
             if work.is_multiple_of(POLL_WORK) && stop() {
                 *halt = Some(Halt::Stopped);
@@ -1137,31 +1291,43 @@ pub(super) fn emit_role_pairs(
     Ok(())
 }
 
-impl Norm<'_> {
+fn role_in(it: &mut Interner, p: &ObjectPropertyExpression) -> Result<Role, Why> {
+    let named = p.named();
+    if named.as_str() == vocab::OWL_BOTTOM_OBJECT_PROPERTY {
+        return Err("the bottom object property");
+    }
+    let r = it.role(RoleName::Object(named.clone()));
+    let i = it.role(RoleName::Inverse(named.clone()));
+    Ok(match p {
+        ObjectPropertyExpression::Property(_) => r,
+        ObjectPropertyExpression::InverseOf(_) => i,
+    })
+}
+
+fn simple_role_in(
+    it: &mut Interner,
+    rb: Option<&RoleBox>,
+    p: &ObjectPropertyExpression,
+) -> Result<Role, Why> {
+    if is_top(p) {
+        return Err("the top object property where OWL 2 DL needs a simple one");
+    }
+    let r = role_in(it, p)?;
+    match rb {
+        Some(rb) if !rb.simple(r) => Err("a role that is not simple where OWL 2 DL needs one"),
+        _ => Ok(r),
+    }
+}
+
+impl Norm<'_, '_> {
     /// The role of an object property expression, with its inverse interned beside it.
     fn role(&mut self, p: &ObjectPropertyExpression) -> Result<Role, Why> {
-        let named = p.named();
-        if named.as_str() == vocab::OWL_BOTTOM_OBJECT_PROPERTY {
-            return Err("the bottom object property");
-        }
-        let r = self.it.role(RoleName::Object(named.clone()));
-        let i = self.it.role(RoleName::Inverse(named.clone()));
-        Ok(match p {
-            ObjectPropertyExpression::Property(_) => r,
-            ObjectPropertyExpression::InverseOf(_) => i,
-        })
+        role_in(self.it, p)
     }
 
     /// The role of an expression that OWL 2 DL requires to be simple.
     fn simple_role(&mut self, p: &ObjectPropertyExpression) -> Result<Role, Why> {
-        if is_top(p) {
-            return Err("the top object property where OWL 2 DL needs a simple one");
-        }
-        let r = self.role(p)?;
-        match self.rb {
-            Some(rb) if !rb.simple(r) => Err("a role that is not simple where OWL 2 DL needs one"),
-            _ => Ok(r),
-        }
+        simple_role_in(self.it, self.rb, p)
     }
 
     fn conj(&mut self, mut es: Vec<Ex>) -> Ex {
@@ -1684,17 +1850,44 @@ impl Norm<'_> {
             // the pairs of a disjointness of checker properties, which the pre-pass puts
             // in one component; one with the top or bottom data property, which have no
             // component, is left out
-            K::DisjointDataProperties(ps) if ps.iter().all(|d| self.it.dt_checker(d)) => {
-                let rs: Vec<Role> = ps
-                    .iter()
-                    .map(|d| self.it.role(RoleName::Data(d.clone())))
-                    .collect();
+            K::DisjointDataProperties(ps) => {
+                // Verify every distinct property is in a checker component (polling stop
+                // during long duplicate runs) before interning any role.
+                let slice = ps.as_slice();
+                let mut work = 0usize;
+                let mut i = 0usize;
+                while i < slice.len() {
+                    work += 1;
+                    if work.is_multiple_of(POLL_WORK) && (self.stop)() {
+                        self.halt = Some(Halt::Stopped);
+                        return Err("cancelled");
+                    }
+                    if !self.it.dt_checker(&slice[i]) {
+                        return Err("an axiom the Horn rules do not take");
+                    }
+                    let mut j = i + 1;
+                    while j < slice.len() && slice[j] == slice[i] {
+                        work += 1;
+                        if work.is_multiple_of(POLL_WORK) && (self.stop)() {
+                            self.halt = Some(Halt::Stopped);
+                            return Err("cancelled");
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                }
+                let other_bytes = self
+                    .out
+                    .bytes()
+                    .saturating_sub(self.out.dt_disjoint.capacity() * 8);
                 emit_role_pairs(
-                    rs,
+                    slice,
                     false,
+                    self.it,
+                    |it, d| Ok(it.role(RoleName::Data(d.clone()))),
                     &mut self.out.dt_disjoint,
-                    self.base_bytes,
-                    self.limit,
+                    other_bytes,
+                    self.budget.as_deref_mut(),
                     self.stop,
                     &mut self.halt,
                 )
@@ -1754,7 +1947,7 @@ impl Norm<'_> {
             K::DisjointClasses(cs) => {
                 let (unique, repeated) = super::dl::split_multiset(cs);
                 for &r in &repeated {
-                    self.sub(vec![r.clone()], vec![])?;
+                    self.empty(r)?;
                 }
                 if unique.len() >= 2 {
                     self.disjoint_distinct(&unique)?;
@@ -1772,7 +1965,7 @@ impl Norm<'_> {
                     self.sub(vec![d.clone()], vec![c.clone()])?;
                 }
                 for &r in &repeated {
-                    self.sub(vec![r.clone()], vec![])?;
+                    self.empty(r)?;
                 }
                 if unique.len() >= 2 {
                     self.disjoint_distinct(&unique)?;
@@ -1830,16 +2023,19 @@ impl Norm<'_> {
                 Ok(())
             }
             K::DisjointObjectProperties(ps) => {
-                let rs = ps
-                    .iter()
-                    .map(|p| self.simple_role(p))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let rb = self.rb;
+                let other_bytes = self
+                    .out
+                    .bytes()
+                    .saturating_sub(self.out.clash.capacity() * 8);
                 emit_role_pairs(
-                    rs,
+                    ps.as_slice(),
                     true,
+                    self.it,
+                    |it, p| simple_role_in(it, rb, p),
                     &mut self.out.clash,
-                    self.base_bytes,
-                    self.limit,
+                    other_bytes,
+                    self.budget.as_deref_mut(),
                     self.stop,
                     &mut self.halt,
                 )
@@ -1848,28 +2044,59 @@ impl Norm<'_> {
         }
     }
 
+    /// `c ⊑ ⊥`, using `neg` directly when it succeeds so wide shallow conjunctions do not
+    /// hit `sub`'s flattening step cap, and falling back to `sub` for expressions that
+    /// need polarity transfer (such as complements).
+    fn empty(&mut self, c: &ClassExpression) -> Result<(), Why> {
+        let subs_len = self.out.subs.len();
+        match self.neg(c, 0) {
+            Ok(e) => {
+                if e != BOTTOM {
+                    self.out.subs.push((e, BOTTOM));
+                }
+                Ok(())
+            }
+            Err(err) => {
+                self.out.subs.truncate(subs_len);
+                if self.it.dt_stopped() || self.it.ranges.check().is_err() {
+                    return Err(err);
+                }
+                self.sub(vec![c.clone()], vec![])
+            }
+        }
+    }
+
     /// Pairwise disjointness over distinct surviving operands.
     fn disjoint_distinct(&mut self, unique: &[&ClassExpression]) -> Result<(), Why> {
         // operands with a negative form make one disjointness set
-        if let Ok(mut es) = unique
+        let subs_len = self.out.subs.len();
+        match unique
             .iter()
             .map(|c| self.neg(c, 0))
             .collect::<Result<Vec<_>, _>>()
         {
-            es.sort_unstable();
-            let mut last_empty = None;
-            for w in es.windows(2) {
-                if w[0] == w[1] && w[0] != BOTTOM && last_empty != Some(w[0]) {
-                    self.out.subs.push((w[0], BOTTOM));
-                    last_empty = Some(w[0]);
+            Ok(mut es) => {
+                es.sort_unstable();
+                let mut last_empty = None;
+                for w in es.windows(2) {
+                    if w[0] == w[1] && w[0] != BOTTOM && last_empty != Some(w[0]) {
+                        self.out.subs.push((w[0], BOTTOM));
+                        last_empty = Some(w[0]);
+                    }
+                }
+                es.dedup();
+                es.retain(|&e| e != BOTTOM);
+                if es.len() >= 2 {
+                    self.out.disjoint.push(es);
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                self.out.subs.truncate(subs_len);
+                if self.it.dt_stopped() || self.it.ranges.check().is_err() {
+                    return Err(err);
                 }
             }
-            es.dedup();
-            es.retain(|&e| e != BOTTOM);
-            if es.len() >= 2 {
-                self.out.disjoint.push(es);
-            }
-            return Ok(());
         }
         let mut work = 0usize;
         for i in 0..unique.len() {
@@ -1936,8 +2163,7 @@ pub fn normalize(
             rb: None,
             out: Out::default(),
             individuals,
-            base_bytes: 0,
-            limit,
+            budget: None,
             stop,
             halt: None,
         };
@@ -2007,7 +2233,10 @@ pub fn normalize(
     // the class axioms and the role axioms that need simple roles, which go to `ax` only
     // once one is taken
     let mut class_out: Vec<Out> = Vec::new();
-    let mut class_pair_bytes = 0usize;
+    let mut budget = PairBudget::new(limit, ax);
+    if budget.is_bounded() {
+        budget.add_accum(roles.bytes());
+    }
     for (i, k) in axioms.iter().enumerate() {
         if taken[i] || Norm::is_role_axiom(k) {
             continue;
@@ -2015,17 +2244,12 @@ pub fn normalize(
         // the fresh classes of an axiom are those of its last run (roadmap item 753)
         let scope = Scope::Horn(it.scope_axiom(k));
         it.begin_scope(scope);
-        let base_bytes = it
-            .bytes()
-            .saturating_add(ax.bytes())
-            .saturating_add(class_pair_bytes);
         let mut n = Norm {
             it,
             rb: Some(&rb),
             out: Out::default(),
             individuals,
-            base_bytes,
-            limit,
+            budget: Some(&mut budget),
             stop,
             halt: None,
         };
@@ -2040,14 +2264,11 @@ pub fn normalize(
             return Err(Halt::Stopped);
         }
         if accepted {
-            class_pair_bytes = class_pair_bytes.saturating_add(
-                n.out
-                    .clash
-                    .len()
-                    .saturating_add(n.out.dt_disjoint.len())
-                    .saturating_mul(std::mem::size_of::<(Role, Role)>()),
-            );
-            class_out.push(n.out);
+            let out = n.out;
+            if budget.is_bounded() {
+                budget.add_accum(out.bytes());
+            }
+            class_out.push(out);
             taken[i] = true;
         }
     }
@@ -2543,5 +2764,144 @@ mod reduction_tests {
         assert_eq!(taken, vec![true]);
         // (d, d) and (d, e)
         assert_eq!(ax.dt_disjoint.len(), 2);
+    }
+
+    #[test]
+    fn role_pair_normalization_enforces_post_interning_budget_and_cancellation() {
+        use std::cell::Cell;
+
+        // 1. Stale pre-interning baseline gap: 400 fresh distinct object properties
+        // produce 400 * 399 = 159,600 symmetric pairs (1,276,800 bytes), while interning
+        // those 400 properties + inverses adds > 38 KiB to the interner. A limit just
+        // above pre-interning baseline + pair bytes must reject rather than admit an
+        // allocation that exceeds the post-normalization budget.
+        let distinct_400: Vec<ObjectPropertyExpression> = (0..400)
+            .map(|i| {
+                ObjectPropertyExpression::Property(ObjectProperty::new(format!(
+                    "http://ex.org/prop_{i:04}"
+                )))
+            })
+            .collect();
+        let disjoint_400 = AxiomKind::DisjointObjectProperties(distinct_400.into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        // Pre-register the scope axiom so `pre_baseline` matches the exact pre-interning
+        // baseline that would be observed right before resolving the role operands.
+        it.scope_axiom(&disjoint_400);
+        let pre_baseline = it.bytes() + ax.bytes();
+        let pair_bytes = 400usize * 399 * std::mem::size_of::<(Role, Role)>();
+        let tight_limit = pre_baseline + pair_bytes + 1024;
+        let err = normalize(
+            &[&disjoint_400],
+            &mut it,
+            &mut ax,
+            Some(tight_limit),
+            &|| false,
+        );
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory when post-interning + scratch + pairs exceed limit, got {err:?}"
+        );
+
+        // Verify a limit above post-interning + scratch + pairs succeeds.
+        let mut it_ok = Interner::new();
+        let mut ax_ok = Axioms::default();
+        let taken = normalize(
+            &[&disjoint_400],
+            &mut it_ok,
+            &mut ax_ok,
+            Some(pre_baseline + pair_bytes + 512 * 1024),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(taken, vec![true]);
+        assert_eq!(ax_ok.horn.as_ref().unwrap().clash.len(), 400 * 399);
+
+        // 2. Cancellation before reserve: pre-cancelled stop on a small list of distinct
+        // roles must halt before reserving pairs.
+        let distinct_20: Vec<ObjectPropertyExpression> = (0..20)
+            .map(|i| {
+                ObjectPropertyExpression::Property(ObjectProperty::new(format!(
+                    "http://ex.org/cancel_{i}"
+                )))
+            })
+            .collect();
+        let disjoint_20 = AxiomKind::DisjointObjectProperties(distinct_20.into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let err = normalize(&[&disjoint_20], &mut it, &mut ax, None, &|| true);
+        assert!(
+            matches!(err, Err(Halt::Stopped)),
+            "expected Halt::Stopped before reserve, got {err:?}"
+        );
+
+        // 3. Cancellation during operand scan of > POLL_WORK copies of a single object
+        // property (zero cross-pairs).
+        let p = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/dup_p"));
+        let many_same = AxiomKind::DisjointObjectProperties(vec![p; POLL_WORK + 10].into());
+        let polls = Cell::new(0usize);
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let err = normalize(&[&many_same], &mut it, &mut ax, None, &|| {
+            polls.set(polls.get() + 1);
+            true
+        });
+        assert!(
+            matches!(err, Err(Halt::Stopped)),
+            "expected Halt::Stopped during duplicate object-property scan, got {err:?}"
+        );
+        assert!(polls.get() >= 1, "expected stop() to be polled during scan");
+
+        // 4. Same scan cancellation for DisjointDataProperties.
+        let d = DataProperty::new("http://ex.org/dup_d");
+        let many_data = AxiomKind::DisjointDataProperties(vec![d; POLL_WORK + 10].into());
+        let polls = Cell::new(0usize);
+        let mut it = Interner::new();
+        let defs = super::super::dtcheck::range::Defs::new(FxHashMap::default());
+        let comps =
+            super::super::dtcheck::comp::Comps::of(&[&many_data], &defs, &|| false).unwrap();
+        it.dt_run = Some(Box::new(super::super::dtcheck::atoms::DtRun {
+            comps,
+            defs,
+            stop: super::super::dtcheck::atoms::Stop::default(),
+            budget: None,
+            stopped: None,
+        }));
+        let mut ax = Axioms::default();
+        let err = normalize(&[&many_data], &mut it, &mut ax, None, &|| {
+            polls.set(polls.get() + 1);
+            true
+        });
+        assert!(
+            matches!(err, Err(Halt::Stopped)),
+            "expected Halt::Stopped during duplicate data-property scan, got {err:?}"
+        );
+        assert!(polls.get() >= 1, "expected stop() to be polled during scan");
+    }
+
+    #[test]
+    fn pair_budget_stays_lazy_when_unbounded_or_unused_and_caches_once() {
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        for i in 0..200 {
+            let a = it.class(&Class::new(format!("http://ex.org/A{i}")));
+            let b = it.class(&Class::new(format!("http://ex.org/B{i}")));
+            ax.disjoint.push(vec![a, b]);
+        }
+
+        // Unbounded budget never scans ax.bytes() or dt_run_static_bytes().
+        let mut unbounded = PairBudget::new(None, &ax);
+        unbounded.check(&it, 1_000_000).unwrap();
+        assert!(unbounded.ax_bytes.is_none());
+        assert!(unbounded.dt_static_bytes.is_none());
+
+        // Bounded budget stays lazy until check() is actually invoked, then caches once.
+        let mut bounded = PairBudget::new(Some(64 * 1024 * 1024), &ax);
+        assert!(bounded.ax_bytes.is_none());
+        assert!(bounded.dt_static_bytes.is_none());
+        bounded.check(&it, 0).unwrap();
+        let cached_ax = bounded.ax_bytes.expect("cached ax.bytes()");
+        assert_eq!(cached_ax, ax.bytes());
+        assert_eq!(bounded.dt_static_bytes, Some(0));
     }
 }

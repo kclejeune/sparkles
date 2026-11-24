@@ -361,8 +361,12 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   with `BTreeSet<T>`. Rust callers constructing those five `AxiomKind` variants directly
   from a typed `BTreeSet<T>` convert with `.into()`, `Ontology::disjoint_unions` returns
   `Vec<Multiset<ClassExpression>>`, and `Axiom::disjoint_classes` keeps its generic
-  `IntoIterator` signature. The `ontology` cargo feature, which is on by default in the
-  server, builds it into the library and the server.
+  `IntoIterator` signature. During classification, repeated class operands force the
+  repeated expression empty in `DisjointClasses` and `DisjointUnion`, repeated properties
+  make the property empty in `DisjointObjectProperties` and `DisjointDataProperties`, and
+  repeated individuals make the ontology inconsistent in `DifferentIndividuals`, subject to
+  each tier's existing role, counting and datatype restrictions. The `ontology` cargo
+  feature, which is on by default in the server, builds it into the library and the server.
 * An OWL 2 functional-style document loads as the triples its axioms map to, one axiom
   at a time. A `.ofn` file, compressed or not, is read by `sparkles load`,
   `sparkles ontology check FILE`, the library's and the bindings' file loaders, SPARQL

@@ -100,8 +100,17 @@ impl<T: Ord> FromIterator<T> for Multiset<T> {
 
 impl<T: Ord> Extend<T> for Multiset<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        self.0.extend(iter);
-        self.0.sort();
+        let mut incoming: Vec<T> = iter.into_iter().collect();
+        if incoming.is_empty() {
+            return;
+        }
+        if self.0.is_empty() {
+            incoming.sort();
+            self.0 = incoming;
+        } else {
+            self.0.append(&mut incoming);
+            self.0.sort();
+        }
     }
 }
 
@@ -1341,4 +1350,41 @@ pub struct Header {
     pub version_iri: Option<Iri>,
     pub imports: BTreeSet<Iri>,
     pub annotations: BTreeSet<Annotation>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiset_extend_preserves_sorted_invariant_on_iterator_panic() {
+        struct PanicAfterOne(bool);
+        impl Iterator for PanicAfterOne {
+            type Item = i32;
+            fn next(&mut self) -> Option<Self::Item> {
+                if !self.0 {
+                    self.0 = true;
+                    Some(2)
+                } else {
+                    panic!("iterator failed mid-extend");
+                }
+            }
+        }
+
+        let mut ms = Multiset::from([2, 4]);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ms.extend(PanicAfterOne(false));
+        }));
+        assert!(res.is_err());
+        assert!(
+            ms.as_slice().is_sorted(),
+            "Multiset must remain sorted after iterator panic, got {:?}",
+            ms.as_slice()
+        );
+        assert_eq!(ms, Multiset::from(ms.as_slice().to_vec()));
+        assert_eq!(
+            ms.has_duplicates(),
+            ms.as_slice().windows(2).any(|w| w[0] == w[1])
+        );
+    }
 }

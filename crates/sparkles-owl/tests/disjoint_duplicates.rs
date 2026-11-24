@@ -981,3 +981,72 @@ fn rdf_shared_expression_bnode_and_repeated_anonymous_individual() {
     bag.extend([ce("A"), ce("B"), ce("A")]);
     assert_eq!(bag.as_slice(), &[ce("A"), ce("A"), ce("B"), ce("B")]);
 }
+
+#[test]
+fn wide_shallow_repeated_disjoint_class_keeps_emptiness_in_horn_and_tier_d() {
+    let classes: Vec<Class> = (0..4096).map(|i| c(&format!("C{i}"))).collect();
+    let inv_exist = ClassExpression::ObjectSomeValuesFrom(
+        ObjectPropertyExpression::InverseOf(ObjectProperty::new(ex("p"))),
+        Box::new(ClassExpression::Class(Class::thing())),
+    );
+    let mut conjuncts: std::collections::BTreeSet<ClassExpression> = classes
+        .iter()
+        .cloned()
+        .map(ClassExpression::Class)
+        .collect();
+    conjuncts.insert(inv_exist.clone());
+    let wide = ClassExpression::ObjectIntersectionOf(conjuncts);
+
+    // Put Witness in every conjunct individually (depth 1 in positive position) so the
+    // only wide conjunction lives in the negative position of the repeated disjointness.
+    let mut witness_axioms = Vec::with_capacity(4098);
+    witness_axioms.push(Axiom::declaration(Entity::Class(c("Witness"))));
+    for k in &classes {
+        witness_axioms.push(Axiom::sub_class_of(
+            ce("Witness"),
+            ClassExpression::Class(k.clone()),
+        ));
+    }
+    witness_axioms.push(Axiom::sub_class_of(ce("Witness"), inv_exist));
+
+    let strict = Limits {
+        strict: true,
+        ..Limits::default()
+    };
+
+    // Horn DisjointClasses(R, R)
+    let mut horn_dc = witness_axioms.clone();
+    horn_dc.push(Axiom::disjoint_classes([wide.clone(), wide.clone()]));
+    let mut k = Classifier::of(&horn_dc);
+    let out = k.classify(&strict).expect("Horn wide DisjointClasses");
+    assert!(out.complete);
+    assert_eq!(out.stats.tier, Tier::Horn);
+    assert!(out.taxonomy.is_unsatisfiable(&c("Witness")));
+
+    // Horn DisjointUnion(:U, R, R)
+    let mut horn_du = witness_axioms.clone();
+    horn_du.push(Axiom::declaration(Entity::Class(c("U"))));
+    horn_du.push(Axiom::new(AxiomKind::DisjointUnion(
+        c("U"),
+        [wide.clone(), wide.clone()].into(),
+    )));
+    let mut k = Classifier::of(&horn_du);
+    let out = k.classify(&strict).expect("Horn wide DisjointUnion");
+    assert!(out.complete);
+    assert_eq!(out.stats.tier, Tier::Horn);
+    assert!(out.taxonomy.is_unsatisfiable(&c("Witness")));
+    assert!(out.taxonomy.is_unsatisfiable(&c("U")));
+
+    // Tier D DisjointClasses(R, R) beside a disjunctive axiom
+    let mut dl_dc = witness_axioms;
+    dl_dc.push(Axiom::sub_class_of(
+        ce("X"),
+        ClassExpression::ObjectUnionOf([ce("Y"), ce("Z")].into()),
+    ));
+    dl_dc.push(Axiom::disjoint_classes([wide.clone(), wide]));
+    let mut k = Classifier::of(&dl_dc);
+    let out = k.classify(&strict).expect("Tier D wide DisjointClasses");
+    assert!(out.complete);
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert!(out.taxonomy.is_unsatisfiable(&c("Witness")));
+}

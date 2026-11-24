@@ -136,8 +136,18 @@ pub const REFUSED: &str = "a data range or literal outside the datatype checker"
 pub const STOPPED: &str = "the run stopped while it converted a data range";
 
 impl DtRun {
+    /// Bytes of the immutable component and definition tables.
+    pub fn static_bytes(&self) -> usize {
+        self.comps.bytes().saturating_add(self.defs.map_bytes())
+    }
+
+    /// O(1) bytes of the mutable conversion memo table.
+    pub fn memo_bytes(&self) -> usize {
+        self.defs.memo_bytes()
+    }
+
     pub fn bytes(&self) -> usize {
-        self.comps.bytes() + self.defs.bytes()
+        self.static_bytes().saturating_add(self.memo_bytes())
     }
 
     fn admit_with<T>(

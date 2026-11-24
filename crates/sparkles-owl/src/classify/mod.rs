@@ -1522,14 +1522,23 @@ fn multiset_bytes(ax: &AxiomKind) -> usize {
                         size_of::<ClassExpression>().saturating_add(ce_extra(f))
                     }))
             }
-            C::DataSomeValuesFrom(ps, _) | C::DataAllValuesFrom(ps, _) => ps
+            C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => ps
                 .len()
                 .saturating_mul(size_of::<DataProperty>())
-                .saturating_add(ps.iter().map(|d| d.as_str().len()).sum()),
-            C::DataHasValue(d, l) => d.as_str().len().saturating_add(l.value().len()),
-            C::DataMinCardinality(_, d, _)
-            | C::DataMaxCardinality(_, d, _)
-            | C::DataExactCardinality(_, d, _) => d.as_str().len(),
+                .saturating_add(ps.iter().map(|d| d.as_str().len()).sum())
+                .saturating_add(dtcheck::range::data_range_bytes(r)),
+            C::DataHasValue(d, l) => d
+                .as_str()
+                .len()
+                .saturating_add(l.value().len())
+                .saturating_add(l.datatype().len())
+                .saturating_add(l.language().map_or(0, str::len)),
+            C::DataMinCardinality(_, d, r)
+            | C::DataMaxCardinality(_, d, r)
+            | C::DataExactCardinality(_, d, r) => d
+                .as_str()
+                .len()
+                .saturating_add(r.as_ref().map_or(0, dtcheck::range::data_range_bytes)),
         }
     }
     fn ind_extra(i: &Individual) -> usize {
@@ -7624,6 +7633,53 @@ mod tests {
         assert!(
             excluded_copy_bytes(&large_ex)
                 >= excluded_copy_bytes(&small_ex) + 998 * std::mem::size_of::<ClassExpression>()
+        );
+    }
+
+    #[test]
+    fn held_and_excluded_byte_estimates_count_repeated_data_range_payloads() {
+        let d = DataProperty::new("http://ex.org/d");
+        let short_lit = Literal::typed("x".repeat(10), crate::vocab::XSD_STRING);
+        let long_lit = Literal::typed("x".repeat(1010), crate::vocab::XSD_STRING);
+
+        let some_short = ClassExpression::DataSomeValuesFrom(
+            vec![d.clone()],
+            DataRange::OneOf([short_lit.clone()].into()),
+        );
+        let some_long = ClassExpression::DataSomeValuesFrom(
+            vec![d.clone()],
+            DataRange::OneOf([long_lit.clone()].into()),
+        );
+        let ax_short = AxiomKind::DisjointClasses(vec![some_short; 200].into());
+        let ax_long = AxiomKind::DisjointClasses(vec![some_long; 200].into());
+        let delta = held_bytes_of(&ax_long).saturating_sub(held_bytes_of(&ax_short));
+        assert!(
+            delta >= 199 * 1000,
+            "expected DataSomeValuesFrom DataRange payload growth across repeats, delta={delta}"
+        );
+        let ex_short = vec![Excluded {
+            axiom: ax_short,
+            gap: Gap::Partial("test"),
+        }];
+        let ex_long = vec![Excluded {
+            axiom: ax_long,
+            gap: Gap::Partial("test"),
+        }];
+        assert!(excluded_copy_bytes(&ex_long) >= excluded_copy_bytes(&ex_short) + 199 * 1000);
+
+        let card_short = ClassExpression::DataMinCardinality(
+            1,
+            d.clone(),
+            Some(DataRange::OneOf([short_lit].into())),
+        );
+        let card_long =
+            ClassExpression::DataMinCardinality(1, d, Some(DataRange::OneOf([long_lit].into())));
+        let card_ax_short = AxiomKind::DisjointClasses(vec![card_short; 200].into());
+        let card_ax_long = AxiomKind::DisjointClasses(vec![card_long; 200].into());
+        let card_delta = held_bytes_of(&card_ax_long).saturating_sub(held_bytes_of(&card_ax_short));
+        assert!(
+            card_delta >= 199 * 1000,
+            "expected DataMinCardinality DataRange payload growth across repeats, delta={card_delta}"
         );
     }
 }
