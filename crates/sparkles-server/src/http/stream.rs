@@ -119,6 +119,7 @@ enum Outcome {
     Stream(mpsc::Receiver<Chunk>),
     Timed(lifetime::Receiver),
     Failed(Error),
+    EarlyReturn,
 }
 
 /// The writer serializers write to: buffers until the threshold, then streams.
@@ -128,6 +129,10 @@ pub struct SwitchWriter {
     signal: Option<oneshot::Sender<Outcome>>,
     tx: Option<mpsc::Sender<Chunk>>,
     deferred: bool,
+    /// In-place cursor trial: keep accepting writes past `threshold` without failing with
+    /// `WouldBlock`, so the cursor can pause cleanly at a row/batch boundary and hand off
+    /// this writer to a blocking streaming task.
+    handoff: bool,
     control: Option<StreamControl>,
     /// Whether a flush before the switch switches to streaming, so that the bytes of a
     /// cursor's first batch reach the client before the next batch is computed.
@@ -202,7 +207,7 @@ impl StreamControl {
         }
         Ok(())
     }
-    fn classify(&self, error: Error) -> Error {
+    pub(super) fn classify(&self, error: Error) -> Error {
         if let Error::Io(io) = &error {
             if io.kind() == io::ErrorKind::TimedOut {
                 return Error::Timeout;
@@ -275,6 +280,67 @@ impl SwitchWriter {
         self.ledger.clone()
     }
 
+    /// A writer for draining a cursor in place: buffers into `buf` up to `threshold`,
+    /// checks `control` on writes, and never fails with `WouldBlock` so the cursor can
+    /// stop at a row or batch boundary and move `self` to a blocking streaming task.
+    pub(super) fn new_in_place_cursor(threshold: usize, control: StreamControl) -> Self {
+        SwitchWriter {
+            buf: Vec::new(),
+            threshold,
+            signal: None,
+            tx: None,
+            deferred: false,
+            handoff: true,
+            control: Some(control),
+            commit_on_flush: false,
+            timeouts: None,
+            timed: None,
+            held: None,
+            ledger: RowLedger::new(),
+            copied: 0,
+            after_send: None,
+            #[cfg(test)]
+            producer_gate: None,
+            #[cfg(test)]
+            queued_producer_gate: None,
+        }
+    }
+
+    /// Extract the completed buffered body after an in-place cursor finished whole,
+    /// marking every copied row as delivered in its ledger.
+    pub(super) fn into_whole_body(self) -> Vec<u8> {
+        self.ledger.handed_over(self.copied);
+        self.buf
+    }
+
+    fn attach_for_handoff(
+        &mut self,
+        signal: oneshot::Sender<Outcome>,
+        timeouts: Timeouts,
+        held: crate::ratelimit::Held,
+        #[cfg(test)] probe: &super::algo::probe::Probe,
+    ) {
+        self.handoff = false;
+        self.signal = Some(signal);
+        self.timeouts = Some(timeouts);
+        self.held = Some(held);
+        #[cfg(test)]
+        {
+            if probe.producer.is_some() || probe.queued_producer.is_some() {
+                self.threshold = 1;
+            }
+            self.producer_gate = probe.producer.clone();
+            self.queued_producer_gate = probe.queued_producer.clone();
+        }
+    }
+
+    fn switch_if_over_threshold(&mut self) -> io::Result<()> {
+        if self.tx.is_none() && self.buf.len() > self.threshold {
+            self.switch()?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn new(threshold: usize, signal: Option<oneshot::Sender<Outcome>>) -> Self {
         SwitchWriter {
@@ -283,6 +349,7 @@ impl SwitchWriter {
             signal,
             tx: None,
             deferred: false,
+            handoff: false,
             control: None,
             commit_on_flush: false,
             timeouts: None,
@@ -426,7 +493,9 @@ impl Write for SwitchWriter {
             // A quick result is tried synchronously, but its row count says nothing
             // about literal size. Stop before allocating beyond the byte threshold;
             // the caller retries this immutable result through the bounded stream.
-            if b.len() > self.threshold.saturating_sub(self.buf.len()) {
+            // An in-place cursor trial keeps writing until its row/batch boundary and
+            // then moves `self` onto the blocking pool.
+            if !self.handoff && b.len() > self.threshold.saturating_sub(self.buf.len()) {
                 self.deferred = true;
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -634,6 +703,7 @@ where
             signal: Some(signal),
             tx: None,
             deferred: false,
+            handoff: false,
             control: control.clone(),
             commit_on_flush,
             timeouts,
@@ -664,142 +734,171 @@ where
         if let Some(gate) = &probe.after_write {
             gate.wait();
         }
-        let result = result
-            .map_err(|e| w.classify(e))
-            .map_err(|e| match &control {
-                Some(c) => c.classify(e),
-                None => e,
-            });
-        let mut bytes = w.written();
-        let mut sw = w.into_inner();
-        if let (Some(producer), Err(error)) = (&sw.timed, &result) {
-            producer.record_error(error);
-        }
-        let result = match result {
-            Ok(()) => sw.send_chunk().map_err(Error::from),
-            Err(e) => {
-                // A body stopped by the result-size budget sends what it buffered before
-                // it aborts, so that the client receives every row the report counts,
-                // which are the rows the size limit let through. Its writes already
-                // waited for the reader, so this wait is one more chunk of the same kind,
-                // under a cursor's deadline and stall bound. Any other failure ends the
-                // body at once. The bytes reported leave out what was not sent.
-                let pending = sw.buf.len() as u64;
-                let flushed = matches!(e, Error::BudgetExceeded(_))
-                    && sw.tx.is_some()
-                    && sw.send_chunk().is_ok();
-                if sw.tx.is_some() && !flushed {
-                    bytes = bytes.saturating_sub(pending);
-                }
-                Err(e)
-            }
-        };
-        let result = result.map_err(|e| match &control {
+        finish_producer(
+            w,
+            result,
+            control.as_ref(),
+            t0,
+            &terminal,
+            span,
+            on_stream_end,
+        );
+    });
+    receive_outcome(outcome, body_terminal, t0).await
+}
+
+fn finish_producer<D>(
+    w: LimitedWriter<SwitchWriter>,
+    result: sparkles::Result<()>,
+    control: Option<&StreamControl>,
+    t0: Instant,
+    terminal: &Arc<std::sync::Mutex<Option<String>>>,
+    span: tracing::span::EnteredSpan,
+    on_stream_end: D,
+) where
+    D: FnOnce(StreamEnd),
+{
+    let result = result
+        .map_err(|e| w.classify(e))
+        .map_err(|e| match control {
             Some(c) => c.classify(e),
             None => e,
         });
-        let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        if let Some(mut producer) = sw.timed.take() {
-            // the producer is installed before the handoff, which can fail
-            let committed = sw.tx.is_some();
-            drop(sw.tx.take());
-            let result = producer.finish(result);
-            let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let disconnected = producer.disconnected();
-            producer.release_permit();
-            on_stream_end(StreamEnd {
-                bytes,
-                serialize_ms,
-                error: result.err(),
-                disconnected,
-                // a handoff that failed committed nothing, so no row reached a client
-                rows: committed.then(|| sw.ledger.delivered()).flatten(),
-                committed,
-            });
-            drop(span);
-            producer.publish();
-            return;
-        }
-        match (sw.tx.take(), result) {
-            (None, Ok(())) => {
-                let body = std::mem::take(&mut sw.buf);
-                if control.is_some() {
-                    // a whole body delivers every row it holds
-                    sw.ledger.handed_over(sw.copied);
-                    on_stream_end(StreamEnd {
-                        bytes,
-                        serialize_ms,
-                        error: None,
-                        disconnected: false,
-                        rows: sw.ledger.delivered(),
-                        committed: true,
-                    });
-                }
-                drop(span);
-                // Completion may wake the handler immediately. Release the
-                // producer's share before publishing the buffered result.
-                drop(sw.held.take());
-                if let Some(s) = sw.signal.take() {
-                    let _ = s.send(Outcome::Whole(body));
-                }
+    let mut bytes = w.written();
+    let mut sw = w.into_inner();
+    if let (Some(producer), Err(error)) = (&sw.timed, &result) {
+        producer.record_error(error);
+    }
+    let result = match result {
+        Ok(()) => sw.send_chunk().map_err(Error::from),
+        Err(e) => {
+            // A body stopped by the result-size budget sends what it buffered before
+            // it aborts, so that the client receives every row the report counts,
+            // which are the rows the size limit let through. Its writes already
+            // waited for the reader, so this wait is one more chunk of the same kind,
+            // under a cursor's deadline and stall bound. Any other failure ends the
+            // body at once. The bytes reported leave out what was not sent.
+            let pending = sw.buf.len() as u64;
+            let flushed =
+                matches!(e, Error::BudgetExceeded(_)) && sw.tx.is_some() && sw.send_chunk().is_ok();
+            if sw.tx.is_some() && !flushed {
+                bytes = bytes.saturating_sub(pending);
             }
-            (None, Err(e)) => {
-                if control.is_some() {
-                    on_stream_end(StreamEnd {
-                        bytes,
-                        serialize_ms,
-                        error: Some(copy_error(&e)),
-                        disconnected: false,
-                        // the response is an error status, and none of its rows was sent
-                        rows: None,
-                        committed: false,
-                    });
-                    drop(span);
-                    drop(sw.held.take());
-                    if let Some(s) = sw.signal.take() {
-                        let _ = s.send(Outcome::Failed(e));
-                    }
-                    return;
-                }
+            Err(e)
+        }
+    };
+    let result = result.map_err(|e| match control {
+        Some(c) => c.classify(e),
+        None => e,
+    });
+    let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if let Some(mut producer) = sw.timed.take() {
+        // the producer is installed before the handoff, which can fail
+        let committed = sw.tx.is_some();
+        drop(sw.tx.take());
+        let result = producer.finish(result);
+        let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let disconnected = producer.disconnected();
+        producer.release_permit();
+        on_stream_end(StreamEnd {
+            bytes,
+            serialize_ms,
+            error: result.err(),
+            disconnected,
+            // a handoff that failed committed nothing, so no row reached a client
+            rows: committed.then(|| sw.ledger.delivered()).flatten(),
+            committed,
+        });
+        drop(span);
+        producer.publish();
+        return;
+    }
+    match (sw.tx.take(), result) {
+        (None, Ok(())) => {
+            let body = std::mem::take(&mut sw.buf);
+            if control.is_some() {
+                // a whole body delivers every row it holds
+                sw.ledger.handed_over(sw.copied);
+                on_stream_end(StreamEnd {
+                    bytes,
+                    serialize_ms,
+                    error: None,
+                    disconnected: false,
+                    rows: sw.ledger.delivered(),
+                    committed: true,
+                });
+            }
+            drop(span);
+            // Completion may wake the handler immediately. Release the
+            // producer's share before publishing the buffered result.
+            drop(sw.held.take());
+            if let Some(s) = sw.signal.take() {
+                let _ = s.send(Outcome::Whole(body));
+            }
+        }
+        (None, Err(e)) => {
+            if control.is_some() {
+                on_stream_end(StreamEnd {
+                    bytes,
+                    serialize_ms,
+                    error: Some(copy_error(&e)),
+                    disconnected: false,
+                    // the response is an error status, and none of its rows was sent
+                    rows: None,
+                    committed: false,
+                });
                 drop(span);
                 drop(sw.held.take());
                 if let Some(s) = sw.signal.take() {
                     let _ = s.send(Outcome::Failed(e));
                 }
+                return;
             }
-            (Some(tx), result) => {
-                let disconnected = tx.is_closed();
-                let error = result.err();
-                let abort = error
-                    .as_ref()
-                    .filter(|_| !disconnected)
-                    .map(|e| e.to_string());
-                // reported before the client can see the end of the body
-                on_stream_end(StreamEnd {
-                    bytes,
-                    serialize_ms,
-                    error,
-                    disconnected,
-                    rows: sw.ledger.delivered(),
-                    committed: true,
-                });
-                drop(span);
-                if let Some(msg) = abort {
-                    // an error item aborts the response: the client sees a truncated
-                    // transfer rather than a complete-looking one
-                    if control.is_some() {
-                        *terminal.lock().expect("terminal error lock") = Some(msg);
-                    } else {
-                        let _ = tx.blocking_send(Err(io::Error::other(msg)));
-                    }
-                }
-                // Closing the sender publishes EOF. The next request must not
-                // observe the completed producer's concurrency permit.
-                drop(sw.held.take());
-                drop(tx);
+            drop(span);
+            drop(sw.held.take());
+            if let Some(s) = sw.signal.take() {
+                let _ = s.send(Outcome::Failed(e));
             }
         }
-    });
+        (Some(tx), result) => {
+            let disconnected = tx.is_closed();
+            let error = result.err();
+            let abort = error
+                .as_ref()
+                .filter(|_| !disconnected)
+                .map(|e| e.to_string());
+            // reported before the client can see the end of the body
+            on_stream_end(StreamEnd {
+                bytes,
+                serialize_ms,
+                error,
+                disconnected,
+                rows: sw.ledger.delivered(),
+                committed: true,
+            });
+            drop(span);
+            if let Some(msg) = abort {
+                // an error item aborts the response: the client sees a truncated
+                // transfer rather than a complete-looking one
+                if control.is_some() {
+                    *terminal.lock().expect("terminal error lock") = Some(msg);
+                } else {
+                    let _ = tx.blocking_send(Err(io::Error::other(msg)));
+                }
+            }
+            // Closing the sender publishes EOF. The next request must not
+            // observe the completed producer's concurrency permit.
+            drop(sw.held.take());
+            drop(tx);
+        }
+    }
+}
+
+async fn receive_outcome(
+    outcome: oneshot::Receiver<Outcome>,
+    body_terminal: Arc<std::sync::Mutex<Option<String>>>,
+    t0: Instant,
+) -> ApiResult<Serialized> {
     match outcome.await {
         Ok(Outcome::Whole(body)) => Ok(Serialized::Whole {
             body,
@@ -820,11 +919,305 @@ where
             })
         }
         Ok(Outcome::Failed(e)) => Err(ApiError::from(e)),
+        Ok(Outcome::EarlyReturn) => unreachable!("early return handled by open_and_serialize"),
         Err(_) => Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the serializer stopped unexpectedly",
         )),
     }
+}
+
+/// What the open closure of [`open_and_serialize_controlled`] produced inside the single
+/// blocking producer task.
+pub(super) enum Opened<E, M, S> {
+    /// Automatic execution chose an eager result: return it to the handler without
+    /// invoking `on_end`.
+    Eager(E),
+    /// A cursor opened and will be serialized in this same blocking task.
+    Cursor {
+        meta: M,
+        control: StreamControl,
+        state: S,
+    },
+}
+
+/// Result returned to the async handler from [`open_and_serialize_controlled`].
+pub(super) enum OpenedSerialized<E, M> {
+    Eager(E),
+    Cursor {
+        meta: M,
+        serialized: ApiResult<Serialized>,
+    },
+}
+
+enum OpenSlot<E, M> {
+    Eager(E),
+    OpenErr(ApiError),
+    Cursor(M),
+}
+
+/// Open a query execution and, if it yields a cursor, serialize its body in the same
+/// blocking-pool task (item 534). Removes the return wake and second blocking-pool wake
+/// between opening a cursor and writing its body.
+pub(super) async fn open_and_serialize_controlled<E, M, S, O, W, D>(
+    limit: Option<u64>,
+    early: bool,
+    timeouts: Timeouts,
+    open: O,
+    write: W,
+    on_end: D,
+) -> ApiResult<OpenedSerialized<E, M>>
+where
+    E: Send + 'static,
+    M: Send + 'static,
+    S: Send + 'static,
+    O: FnOnce() -> ApiResult<Opened<E, M, S>> + Send + 'static,
+    W: FnOnce(S, &mut LimitedWriter<SwitchWriter>) -> sparkles::Result<()> + Send + 'static,
+    D: FnOnce(StreamEnd) + Send + 'static,
+{
+    let (signal, outcome) = oneshot::channel();
+    let terminal: Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let body_terminal = terminal.clone();
+    let open_slot: Arc<parking_lot::Mutex<Option<OpenSlot<E, M>>>> = Default::default();
+    let producer_slot = open_slot.clone();
+    let span = tracing::Span::current();
+    let held = crate::ratelimit::hold();
+    #[cfg(test)]
+    let probe = super::algo::probe::current();
+    let base_threshold = if early {
+        FIRST_BYTES_AFTER
+    } else {
+        STREAM_AFTER
+    };
+    #[cfg(test)]
+    let threshold = if probe.producer.is_some() || probe.queued_producer.is_some() {
+        1
+    } else {
+        base_threshold
+    };
+    #[cfg(not(test))]
+    let threshold = base_threshold;
+    let t0 = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _blocking_completion = probe.blocking.clone().map(super::algo::probe::Completion);
+        // Permit drops before the blocking test completion observer, including unwinding.
+        #[cfg(test)]
+        #[allow(clippy::redundant_locals)]
+        let held = held;
+        #[cfg(test)]
+        if let Some(gate) = probe.blocking {
+            gate.wait();
+        }
+        crate::cpus::place_request();
+        let span = span.entered();
+        let opened = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(open)) {
+            Ok(res) => res,
+            Err(p) => {
+                let msg = p
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                Err(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("the request panicked: {msg}"),
+                ))
+            }
+        };
+        let (control, state) = match opened {
+            Ok(Opened::Eager(eager)) => {
+                *producer_slot.lock() = Some(OpenSlot::Eager(eager));
+                drop(span);
+                drop(held);
+                let _ = signal.send(Outcome::EarlyReturn);
+                return;
+            }
+            Err(open_err) => {
+                *producer_slot.lock() = Some(OpenSlot::OpenErr(open_err));
+                drop(span);
+                drop(held);
+                let _ = signal.send(Outcome::EarlyReturn);
+                return;
+            }
+            Ok(Opened::Cursor {
+                meta,
+                control,
+                state,
+            }) => {
+                *producer_slot.lock() = Some(OpenSlot::Cursor(meta));
+                (control, state)
+            }
+        };
+        // Producer completion observers are installed only once this task actually becomes
+        // the cursor producer; an eager return hands serialization to `serialize_timed`.
+        #[cfg(test)]
+        let _completion = probe.producer.clone().map(super::algo::probe::Completion);
+        #[cfg(test)]
+        let _queued_completion = probe
+            .queued_producer
+            .clone()
+            .map(super::algo::probe::Completion);
+        #[cfg(test)]
+        let _completion_only = probe.completion.clone().map(super::algo::probe::Completion);
+        #[cfg(test)]
+        let _after_write_completion = probe
+            .after_write
+            .clone()
+            .map(super::algo::probe::Completion);
+        let sw = SwitchWriter {
+            buf: Vec::new(),
+            threshold,
+            signal: Some(signal),
+            tx: None,
+            deferred: false,
+            handoff: false,
+            control: Some(control.clone()),
+            commit_on_flush: early,
+            timeouts: Some(timeouts),
+            timed: None,
+            held: Some(held),
+            ledger: RowLedger::new(),
+            copied: 0,
+            after_send: None,
+            #[cfg(test)]
+            producer_gate: probe.producer,
+            #[cfg(test)]
+            queued_producer_gate: probe.queued_producer,
+        };
+        let mut w = LimitedWriter::new(sw, limit, None::<Arc<AtomicBool>>);
+        let write_t0 = Instant::now();
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write(state, &mut w)))
+                .unwrap_or_else(|_| {
+                    Err(Error::Io(io::Error::other(
+                        "query producer stopped unexpectedly",
+                    )))
+                });
+        #[cfg(test)]
+        if let Some(gate) = &probe.after_write {
+            gate.wait();
+        }
+        finish_producer(w, result, Some(&control), write_t0, &terminal, span, on_end);
+    });
+    match outcome.await {
+        Ok(Outcome::EarlyReturn) => match open_slot.lock().take().expect("early return payload") {
+            OpenSlot::Eager(eager) => Ok(OpenedSerialized::Eager(eager)),
+            OpenSlot::OpenErr(e) => Err(e),
+            OpenSlot::Cursor(_) => unreachable!("cursor metadata with early return"),
+        },
+        other => {
+            let Some(OpenSlot::Cursor(meta)) = open_slot.lock().take() else {
+                return Err(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the serializer stopped unexpectedly",
+                ));
+            };
+            let serialized = match other {
+                Ok(Outcome::Whole(body)) => Ok(Serialized::Whole {
+                    body,
+                    serialize_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                }),
+                Ok(Outcome::Stream(rx)) => Ok(Serialized::Streamed(axum::body::Body::from_stream(
+                    ChunkStream {
+                        receiver: rx,
+                        terminal: body_terminal,
+                        done: false,
+                    },
+                ))),
+                Ok(Outcome::Timed(receiver)) => {
+                    let abort = receiver.abort_handle();
+                    Ok(Serialized::Timed {
+                        body: axum::body::Body::from_stream(receiver),
+                        abort,
+                    })
+                }
+                Ok(Outcome::Failed(e)) => Err(ApiError::from(e)),
+                Ok(Outcome::EarlyReturn) => unreachable!(),
+                Err(_) => Err(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the serializer stopped unexpectedly",
+                )),
+            };
+            Ok(OpenedSerialized::Cursor { meta, serialized })
+        }
+    }
+}
+
+/// Continue streaming a cursor body that crossed its byte threshold during in-place
+/// execution (item 534). Moves the already-buffered [`SwitchWriter`] onto a blocking task,
+/// switches to streaming immediately when buffered bytes exceed the threshold, and drains
+/// the remainder through `write`.
+pub(super) async fn finish_handoff_controlled<F, D>(
+    mut writer: LimitedWriter<SwitchWriter>,
+    control: StreamControl,
+    timeouts: Timeouts,
+    began: Instant,
+    write: F,
+    on_end: D,
+) -> ApiResult<Serialized>
+where
+    F: FnOnce(
+            sparkles::Result<()>,
+            LimitedWriter<SwitchWriter>,
+        ) -> (LimitedWriter<SwitchWriter>, sparkles::Result<()>)
+        + Send
+        + 'static,
+    D: FnOnce(StreamEnd) + Send + 'static,
+{
+    let (signal, outcome) = oneshot::channel();
+    let terminal: Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let body_terminal = terminal.clone();
+    let span = tracing::Span::current();
+    let held = crate::ratelimit::hold();
+    #[cfg(test)]
+    let probe = super::algo::probe::current();
+    tokio::task::spawn_blocking(move || {
+        crate::cpus::place_request();
+        #[cfg(test)]
+        let _completion = probe.producer.clone().map(super::algo::probe::Completion);
+        #[cfg(test)]
+        let _queued_completion = probe
+            .queued_producer
+            .clone()
+            .map(super::algo::probe::Completion);
+        #[cfg(test)]
+        let _completion_only = probe.completion.clone().map(super::algo::probe::Completion);
+        #[cfg(test)]
+        let _after_write_completion = probe
+            .after_write
+            .clone()
+            .map(super::algo::probe::Completion);
+        let span = span.entered();
+        writer.get_mut().attach_for_handoff(
+            signal,
+            timeouts,
+            held,
+            #[cfg(test)]
+            &probe,
+        );
+        let switched = writer
+            .get_mut()
+            .switch_if_over_threshold()
+            .map_err(Error::from);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            write(switched, writer)
+        }));
+        match caught {
+            Ok((w, result)) => {
+                #[cfg(test)]
+                if let Some(gate) = &probe.after_write {
+                    gate.wait();
+                }
+                finish_producer(w, result, Some(&control), began, &terminal, span, on_end);
+            }
+            Err(_) => {
+                // Unwind already dropped `writer` (including `Producer::drop` if timed).
+                drop(span);
+            }
+        }
+    });
+    receive_outcome(outcome, body_terminal, began).await
 }
 
 /// Try a quick result on the current thread, buffering at most [`STREAM_AFTER`]
@@ -910,6 +1303,7 @@ where
         signal: None,
         tx: None,
         deferred: false,
+        handoff: false,
         control: None,
         commit_on_flush: false,
         timeouts: None,

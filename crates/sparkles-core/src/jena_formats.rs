@@ -1750,6 +1750,12 @@ impl<W: Write> ThriftResults<W> {
         Ok(ThriftResults { out })
     }
 
+    /// Resume writing `RDF_DataTuple` rows to `w` after the `RDF_VarTuple` header has
+    /// already been emitted.
+    pub(crate) fn resume(w: W) -> Self {
+        ThriftResults { out: TOut::new(w) }
+    }
+
     pub fn row(&mut self, row: &[Option<Term>]) -> io::Result<()> {
         self.row_cells(row.len(), row.iter().map(Option::as_ref))
     }

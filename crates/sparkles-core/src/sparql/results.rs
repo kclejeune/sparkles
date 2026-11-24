@@ -146,6 +146,11 @@ impl<W: Write> LimitedWriter<W> {
         &self.inner
     }
 
+    /// Mutably borrow the underlying writer without consuming it.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
     /// Check for cancellation if this writer has reached its next byte checkpoint.
     ///
     /// This uses the writer's cumulative byte count and records observed cancellation
@@ -263,12 +268,14 @@ impl<W: Write> Write for LimitedWriter<W> {
 
 mod encode;
 mod rowout;
+mod session;
 mod source;
 mod writers;
 #[cfg(test)]
 use rowout::{MARK_BYTES, OUTPUT_BUFFER};
 pub use rowout::{RowCount, RowLedger};
 pub(in crate::sparql) use rowout::{RowOut, write_buffered};
+pub use session::{CursorWriteOptions, CursorWriter, OwnedNativeJsonMetadata, WriteStep};
 pub use writers::{Format, Source, WriteOptions, write, write_with_completion};
 
 /// The reservation for the cells of a streamed row that the batch's term cache does not

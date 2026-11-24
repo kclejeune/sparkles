@@ -5,10 +5,17 @@
 
 use super::rowout::Explicit;
 use super::source::RowView;
-use crate::sparql::ctx::{Charge, Ctx};
+use crate::sparql::ctx::{Charge, Ctx, OwnedCharge};
 use oxrdf::vocab::xsd;
 use oxrdf::{BaseDirection, TermRef};
 use std::io::Result;
+use std::sync::Arc;
+
+#[allow(dead_code)]
+enum KeyCharge<'a> {
+    Borrowed(Charge<'a>),
+    Owned(OwnedCharge),
+}
 
 /// The tabs between the cells of a TSV row, written a slice at a time.
 const TABS: &[u8; 32] = b"\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t";
@@ -119,7 +126,7 @@ pub(super) struct Json<'a> {
     /// no row has been written, so the next one starts without a comma
     first: bool,
     /// the reservation for `keys`, declared after them so that they drop first
-    _charge: Option<Charge<'a>>,
+    _charge: Option<KeyCharge<'a>>,
 }
 
 impl<'a> Json<'a> {
@@ -127,8 +134,25 @@ impl<'a> Json<'a> {
     /// the table of keys are allocated once at their exact size and never grow.
     pub(super) fn new(ctx: Option<&'a Ctx>, variables: &[String]) -> crate::error::Result<Self> {
         let charge = ctx
-            .map(|ctx| ctx.charge(Self::charged(variables)))
+            .map(|ctx| {
+                ctx.charge(Self::charged(variables))
+                    .map(KeyCharge::Borrowed)
+            })
             .transpose()?;
+        Ok(Self::from_charge(charge, variables))
+    }
+
+    /// An owned encoder whose reservation is charged to `ctx`, so it can move across
+    /// threads between batches.
+    pub(super) fn new_owned(
+        ctx: &Arc<Ctx>,
+        variables: &[String],
+    ) -> crate::error::Result<Json<'static>> {
+        let charge = OwnedCharge::new(ctx, Self::charged(variables))?;
+        Ok(Json::from_charge(Some(KeyCharge::Owned(charge)), variables))
+    }
+
+    fn from_charge(charge: Option<KeyCharge<'a>>, variables: &[String]) -> Self {
         let keys = variables
             .iter()
             .map(|v| {
@@ -140,11 +164,11 @@ impl<'a> Json<'a> {
                 key.into_boxed_slice()
             })
             .collect();
-        Ok(Json {
+        Json {
             keys,
             first: true,
             _charge: charge,
-        })
+        }
     }
 
     /// The bytes [`Json::new`] charges for the keys of `variables`: each key's bytes and
@@ -509,7 +533,7 @@ pub(super) struct Xml<'a> {
     /// a cell copies its tag with one lookup
     tags: Box<[Box<[u8]>]>,
     /// the reservation for `tags`, declared after them so that they drop first
-    _charge: Option<Charge<'a>>,
+    _charge: Option<KeyCharge<'a>>,
 }
 
 const BINDING_OPEN: &[u8] = b"<binding name=\"";
@@ -520,8 +544,25 @@ impl<'a> Xml<'a> {
     /// tag and the table of tags are allocated once at their exact size and never grow.
     pub(super) fn new(ctx: Option<&'a Ctx>, variables: &[String]) -> crate::error::Result<Self> {
         let charge = ctx
-            .map(|ctx| ctx.charge(Self::charged(variables)))
+            .map(|ctx| {
+                ctx.charge(Self::charged(variables))
+                    .map(KeyCharge::Borrowed)
+            })
             .transpose()?;
+        Ok(Self::from_charge(charge, variables))
+    }
+
+    /// An owned encoder whose reservation is charged to `ctx`, so it can move across
+    /// threads between batches.
+    pub(super) fn new_owned(
+        ctx: &Arc<Ctx>,
+        variables: &[String],
+    ) -> crate::error::Result<Xml<'static>> {
+        let charge = OwnedCharge::new(ctx, Self::charged(variables))?;
+        Ok(Xml::from_charge(Some(KeyCharge::Owned(charge)), variables))
+    }
+
+    fn from_charge(charge: Option<KeyCharge<'a>>, variables: &[String]) -> Self {
         let tags = variables
             .iter()
             .map(|v| {
@@ -533,10 +574,10 @@ impl<'a> Xml<'a> {
                 tag.into_boxed_slice()
             })
             .collect();
-        Ok(Xml {
+        Xml {
             tags,
             _charge: charge,
-        })
+        }
     }
 
     fn tag_len(name: &str) -> usize {

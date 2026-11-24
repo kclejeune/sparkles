@@ -34,6 +34,7 @@ mod geo;
 #[cfg(feature = "geo")]
 mod geo_convert;
 mod group_commit;
+mod handoff;
 mod inline;
 mod loads;
 mod mappings;

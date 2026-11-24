@@ -134,7 +134,7 @@ impl RowLedger {
     }
 
     /// The stream offset at which a writer starts, which marks it as recording here.
-    fn start(&self) -> u64 {
+    pub(super) fn start(&self) -> u64 {
         self.0.state.lock().used = true;
         self.0.copied.load(Ordering::Relaxed)
     }
@@ -144,7 +144,7 @@ impl RowLedger {
     /// handed over, copied, or not yet copied. The marks of earlier pieces, whose bytes
     /// the transport has accepted, count as copied, so the queue holds at most this
     /// piece's marks.
-    fn register(&self, start: u64, marks: impl Iterator<Item = (u64, u64)>) {
+    pub(super) fn register(&self, start: u64, marks: impl Iterator<Item = (u64, u64)>) {
         let copied = self.0.copied.load(Ordering::Relaxed);
         let mut s = self.0.state.lock();
         let reached = copied.max(start);
@@ -170,7 +170,7 @@ impl RowLedger {
     }
 
     /// Make room in the queue for `marks` marks, after the writer has charged it.
-    fn reserve_pending(&self, marks: usize) {
+    pub(super) fn reserve_pending(&self, marks: usize) {
         let mut s = self.0.state.lock();
         let more = marks.saturating_sub(s.pending.len());
         s.pending.reserve_exact(more);
@@ -179,7 +179,7 @@ impl RowLedger {
     /// The writer stops: marks the copies have reached count as copied, and the rest,
     /// whose bytes no transport accepted and nothing will write, are dropped with the
     /// queue's storage.
-    fn settle(&self) {
+    pub(super) fn settle(&self) {
         let copied = self.0.copied.load(Ordering::Relaxed);
         let mut s = self.0.state.lock();
         let pending = std::mem::take(&mut s.pending);
@@ -277,6 +277,12 @@ impl<'a> RowOut<'a> {
     /// The query whose memory this writer is charged to, when there is one.
     pub(crate) fn ctx(&self) -> Option<&'a Ctx> {
         self.ctx
+    }
+
+    /// Total bytes already written to `inner` plus bytes currently staged in `buf`.
+    #[inline]
+    pub(super) fn written_and_buffered(&self) -> u64 {
+        self.taken.saturating_add(self.buf.len() as u64)
     }
 
     /// Cover `bytes` of buffer and marks before they are allocated.
@@ -780,6 +786,12 @@ impl<'o, 'a> Explicit<'o, 'a> {
     pub(crate) fn put(&mut self, b: &[u8]) -> std::io::Result<()> {
         self.0.put(b)
     }
+
+    /// Total bytes already written to the sink plus bytes currently staged in the buffer.
+    #[inline]
+    pub(super) fn written_and_buffered(&self) -> u64 {
+        self.0.written_and_buffered()
+    }
 }
 
 impl Write for Explicit<'_, '_> {
@@ -811,6 +823,16 @@ pub(in crate::sparql) fn write_buffered(
     ctx: Option<Arc<Ctx>>,
     f: &mut dyn FnMut(&mut RowOut<'_>, &Cell<u64>) -> Result<()>,
 ) -> Result<()> {
+    write_buffered_counted(w, count, ctx, f).map(drop)
+}
+
+/// [`write_buffered`], returning the bytes written to `w` during this call.
+pub(super) fn write_buffered_counted(
+    w: &mut dyn Write,
+    count: &RowCount,
+    ctx: Option<Arc<Ctx>>,
+    f: &mut dyn FnMut(&mut RowOut<'_>, &Cell<u64>) -> Result<()>,
+) -> Result<u64> {
     let staged = Cell::new(0);
     let mut out = RowOut::new(w, &staged, count, ctx.as_deref());
     let result = f(&mut out, &staged);
@@ -835,7 +857,9 @@ pub(in crate::sparql) fn write_buffered(
                     Err(e)
                 }
             };
-            written.map_err(|e| out.refused.take().unwrap_or(Error::Io(e)))
+            written
+                .map(|()| out.taken)
+                .map_err(|e| out.refused.take().unwrap_or(Error::Io(e)))
         }
         Err(e) => {
             // the output stops here, with the bytes before the error written on and the
