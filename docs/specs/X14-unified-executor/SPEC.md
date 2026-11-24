@@ -1056,7 +1056,12 @@ measurement of item 570's conditional OPTIONAL in both modes on the benchmark wo
 which the plan asks of this phase, was taken after the cursor gained a conditional
 merge, and the
 [X05 outcome](../X05-streaming-query-execution.md#the-cursors-conditional-merge-optional-2026-11-19)
-records it.
+records it. A follow-up in the
+[pair-condition X05 outcome](../X05-streaming-query-execution.md#pair-conditions-in-the-streamed-merge-2026-11-23)
+enables `merge_pair_conditions` by default to test eligible single-key pairs before
+copying output rows; measuring the streamed-to-eager ratio on `knows-*` and admitting
+eligible EXISTS conditions once item 1105 unifies merge-order derivation remain under
+item 570.
 
 ### One grouping operator
 

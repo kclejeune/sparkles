@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Streamed conditional merge OPTIONAL tests eligible pairs before copying output
+
+The cursor's conditional merge OPTIONAL now enables `merge_pair_conditions` by default
+for partial progress on roadmap item 570. When both sides share only the merge key, the
+query references no registered scalar, aggregate or property function, and the condition
+has no observable side effects, volatility, timezone reads, SERVICE calls or unrecognized
+IRI functions inside EXISTS, the merge evaluates the condition on the pairs decided by
+the loaded right batch before copying output rows. Runs that cross a right batch, left
+rows whose pairs exceed a batch, spooled runs and ineligible conditions keep the
+post-copy path. Merge buffer memory can rise by at most one output batch and its
+pair-test scratch, while the condition's own evaluation charge stays outside that bound.
+Automatic execution still keeps an OPTIONAL whose condition holds an EXISTS eager until
+the streamed-to-eager comparison and item 1105's unified merge-order derivation finish.
+
+On quiet `atlas` at 10.5M quads with one Rayon thread and forced streaming across six
+A, B, B, A rounds (4,320 timings and 360 answer checks, all five queries agreeing), the
+integrated candidate merging `445a7f11` into `fc7b0bb9` (tree `40c5aaaf`) reduced
+`knows-fail` to 0.7375 of base time (145.41 against 197.15 ms), `knows-exists` to 0.7720
+(130.64 against 169.22 ms) and `knows-mixed` to 0.9341 (603.50 against 646.09 ms), with
+switch on/off ratios of 0.7491, 0.7880 and 0.9391 and every round improving in both
+comparisons. The same-binary check ranged from 0.9991 to 1.0008 and `class-exists` stayed
+neutral. Streamed `class-fail` increased by 0.59 ms or 0.78% against `fc7b0bb9` (76.71
+against 76.12 ms, round-paired 95% interval 1.0060 to 1.0112) while its switch on/off
+ratio was 1.0005 (0.9976 to 1.0074), which item 1143 tracks for recovery or layout
+attribution by the end of Batch 57.
+
 ### Cold small scans at 1.05M measured again against Fluree
 
 Sparkles at b47b582b and Fluree 4.2.2 were measured cold in one run on forge at 1.05M
