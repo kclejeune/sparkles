@@ -13,7 +13,7 @@
 //!    taxonomies asserted by `dl_ground_body_cut_contain`.
 
 use sparkles_owl::classify::{Classifier, Consistency, Expansion, Limits, Tier, marker_test_mode};
-use sparkles_owl::model::{Axiom, AxiomKind, Class, Entity};
+use sparkles_owl::model::{Axiom, Class, Entity};
 use sparkles_owl::ofn_read;
 use std::collections::BTreeSet;
 
@@ -162,17 +162,18 @@ SubClassOf(:N ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
 SameIndividual(:u :v)
 )";
 
-fn declared_classes(ax: &[Axiom]) -> Vec<Class> {
+fn signature_classes(ax: &[Axiom]) -> Vec<Class> {
     let mut out: BTreeSet<Class> = BTreeSet::new();
     for a in ax {
-        if let AxiomKind::Declaration(Entity::Class(c)) = &a.kind {
-            out.insert(c.clone());
+        for entity in a.signature() {
+            if let Entity::Class(c) = entity {
+                out.insert(c);
+            }
         }
     }
-    let mut classes: Vec<Class> = out.into_iter().collect();
-    classes.push(Class::thing());
-    classes.push(Class::nothing());
-    classes
+    out.insert(Class::thing());
+    out.insert(Class::nothing());
+    out.into_iter().collect()
 }
 
 fn pairs(tax: &sparkles_owl::classify::Taxonomy, classes: &[Class]) -> BTreeSet<(Class, Class)> {
@@ -215,6 +216,13 @@ fn a_tautological_return_product_is_owed_nothing() {
         std::env::set_var("SPARKLES_ROOTED_SEL_PARTNERS_X", "0");
     }
     let ax = ofn_read::parse(CASE).unwrap().axioms;
+    let case_classes = signature_classes(&ax);
+    assert_eq!(
+        case_classes.len(),
+        11,
+        "CASE signature should include all 9 named classes plus owl:Thing and owl:Nothing"
+    );
+    let case_want = oracle_pairs("http://example.org/f#", &case_classes, &[]);
     for (threads, expansion, dl_steps) in [
         (1, Expansion::Cautious, true),
         (1, Expansion::Eager, true),
@@ -247,6 +255,11 @@ fn a_tautological_return_product_is_owed_nothing() {
             assert_eq!(out.consistency, Consistency::Consistent, "{at}");
             assert!(out.complete && !out.stats.dl_over_budget, "{at}: no answer");
             assert_eq!(out.stats.dl_marker_deficits, [0, 0, 0], "{at}");
+            assert_eq!(
+                pairs(&out.taxonomy, &case_classes),
+                case_want,
+                "{at}: CASE taxonomy mismatch vs HermiT oracle"
+            );
         }
     }
 
@@ -274,7 +287,7 @@ fn a_tautological_return_product_is_owed_nothing() {
         ),
     ] {
         let ax = ofn_read::parse(src).expect(name).axioms;
-        let classes = declared_classes(&ax);
+        let classes = signature_classes(&ax);
         let want = oracle_pairs(prefix, &classes, subs);
         for (label, mode, repair) in [("repair_off", 0u8, false), ("unfiltered_1", 1u8, true)] {
             let at = format!("uncut 0/0 {name} [{label}]");
