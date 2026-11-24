@@ -1029,6 +1029,10 @@ fn hash_growth<T>(capacity: usize, len: usize) -> u64 {
     }
 }
 
+fn lit_pass_bytes(lit_pass: &FxHashMap<Id, bool>) -> u64 {
+    table_bytes(lit_pass.capacity(), size_of::<(Id, bool)>()) as u64
+}
+
 struct RelateItem {
     lit: Id,
     geom: GeomRef,
@@ -1375,7 +1379,7 @@ impl SpatialRelateReader {
                 bytes = bytes
                     .saturating_add(const_lit_bytes(lits))
                     .saturating_add(pending_sers.capacity() as u64 * size_of::<Ser>() as u64)
-                    .saturating_add(lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64);
+                    .saturating_add(lit_pass_bytes(lit_pass));
             }
             RelateStage::BothConst { left, right, .. } => {
                 bytes = bytes
@@ -1436,8 +1440,8 @@ impl SpatialRelateReader {
         if let Some(g) = self.geoms.get(&lit) {
             return Ok(g.clone());
         }
-        if self.geoms.len() == self.geoms.capacity() {
-            let add = hash_growth::<(Id, Option<GeomRef>)>(self.geoms.capacity(), self.geoms.len());
+        let add = hash_growth::<(Id, Option<GeomRef>)>(self.geoms.capacity(), self.geoms.len());
+        if add != 0 {
             self.charge.resize(
                 self.base_retained_bytes()
                     .saturating_add(extra_bytes)
@@ -1454,6 +1458,10 @@ impl SpatialRelateReader {
             Some(g)
         })();
         self.geoms.insert(lit, parsed.clone());
+        if add != 0 {
+            self.charge
+                .resize(self.base_retained_bytes().saturating_add(extra_bytes))?;
+        }
         Ok(parsed)
     }
 
@@ -2263,7 +2271,7 @@ impl SpatialRelateReader {
             fixed_stage_bytes
                 .saturating_add(iter_bytes)
                 .saturating_add(pending_sers.capacity() as u64 * size_of::<Ser>() as u64)
-                .saturating_add(lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64)
+                .saturating_add(lit_pass_bytes(lit_pass))
         };
         let res: Result<()> = (|| {
             loop {
@@ -2304,9 +2312,7 @@ impl SpatialRelateReader {
                                     .saturating_add(
                                         pending_sers.capacity() as u64 * size_of::<Ser>() as u64,
                                     )
-                                    .saturating_add(
-                                        lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64,
-                                    );
+                                    .saturating_add(lit_pass_bytes(&lit_pass));
                                 let base_now =
                                     self.base_retained_bytes().saturating_add(non_iter_stage);
                                 let charge = &mut self.charge;
@@ -2317,31 +2323,24 @@ impl SpatialRelateReader {
                                     &mut |b| charge.resize(base_now.saturating_add(b)),
                                 )?;
                                 let iter_bytes = iter.retained_bytes();
+                                let hits_bytes = hits.capacity() as u64 * size_of::<Hit>() as u64;
                                 for h in hits {
                                     if !self.geoms.contains_key(&h.o)
                                         && let Ok(g) = noted(ctx, h.entry.geom(&ctx.snap))
                                     {
-                                        if self.geoms.len() == self.geoms.capacity() {
-                                            let add = (next_cap(
-                                                self.geoms.len(),
-                                                self.geoms.capacity(),
-                                                1,
-                                            ) - self.geoms.capacity())
-                                                as u64
-                                                * (size_of::<Id>()
-                                                    + size_of::<Option<GeomRef>>()
-                                                    + 1)
-                                                    as u64;
+                                        let add = hash_growth::<(Id, Option<GeomRef>)>(
+                                            self.geoms.capacity(),
+                                            self.geoms.len(),
+                                        );
+                                        if add != 0 {
                                             let cur_stage = fixed_stage_bytes
                                                 .saturating_add(iter_bytes)
+                                                .saturating_add(hits_bytes)
                                                 .saturating_add(
                                                     pending_sers.capacity() as u64
                                                         * size_of::<Ser>() as u64,
                                                 )
-                                                .saturating_add(
-                                                    lit_pass.capacity() as u64
-                                                        * (size_of::<Id>() + 2) as u64,
-                                                );
+                                                .saturating_add(lit_pass_bytes(&lit_pass));
                                             self.charge.resize(
                                                 self.base_retained_bytes()
                                                     .saturating_add(cur_stage)
@@ -2349,8 +2348,24 @@ impl SpatialRelateReader {
                                             )?;
                                         }
                                         self.geoms.insert(h.o, Some(g));
+                                        if add != 0 {
+                                            let cur_stage = fixed_stage_bytes
+                                                .saturating_add(iter_bytes)
+                                                .saturating_add(hits_bytes)
+                                                .saturating_add(
+                                                    pending_sers.capacity() as u64
+                                                        * size_of::<Ser>() as u64,
+                                                )
+                                                .saturating_add(lit_pass_bytes(&lit_pass));
+                                            self.charge.resize(
+                                                self.base_retained_bytes()
+                                                    .saturating_add(cur_stage),
+                                            )?;
+                                        }
                                     }
                                     if pending_sers.len() == pending_sers.capacity() {
+                                        let cur_ps = pending_sers.capacity() as u64
+                                            * size_of::<Ser>() as u64;
                                         let next_ps = next_cap(
                                             pending_sers.len(),
                                             pending_sers.capacity(),
@@ -2360,11 +2375,10 @@ impl SpatialRelateReader {
                                             * size_of::<Ser>() as u64;
                                         let cur_stage = fixed_stage_bytes
                                             .saturating_add(iter_bytes)
+                                            .saturating_add(hits_bytes)
+                                            .saturating_add(cur_ps)
                                             .saturating_add(next_ps)
-                                            .saturating_add(
-                                                lit_pass.capacity() as u64
-                                                    * (size_of::<Id>() + 2) as u64,
-                                            );
+                                            .saturating_add(lit_pass_bytes(&lit_pass));
                                         self.charge.resize(
                                             self.base_retained_bytes().saturating_add(cur_stage),
                                         )?;
@@ -2421,10 +2435,7 @@ impl SpatialRelateReader {
                                                 pending_sers.capacity() as u64
                                                     * size_of::<Ser>() as u64,
                                             )
-                                            .saturating_add(
-                                                lit_pass.capacity() as u64
-                                                    * (size_of::<Id>() + 2) as u64,
-                                            );
+                                            .saturating_add(lit_pass_bytes(&lit_pass));
                                         if let Some(w) = win
                                             && let Some(g) = self.geom_charged(
                                                 ctx,
@@ -2437,6 +2448,8 @@ impl SpatialRelateReader {
                                         }
                                         self.st.candidates += 1;
                                         if pending_sers.len() == pending_sers.capacity() {
+                                            let cur_ps = pending_sers.capacity() as u64
+                                                * size_of::<Ser>() as u64;
                                             let next_ps = next_cap(
                                                 pending_sers.len(),
                                                 pending_sers.capacity(),
@@ -2448,11 +2461,9 @@ impl SpatialRelateReader {
                                                 .base_retained_bytes()
                                                 .saturating_add(fixed_stage_bytes)
                                                 .saturating_add(raw_bytes)
+                                                .saturating_add(cur_ps)
                                                 .saturating_add(next_ps)
-                                                .saturating_add(
-                                                    lit_pass.capacity() as u64
-                                                        * (size_of::<Id>() + 2) as u64,
-                                                );
+                                                .saturating_add(lit_pass_bytes(&lit_pass));
                                             self.charge.resize(projected)?;
                                         }
                                         pending_sers.push_back(ser);
@@ -2485,18 +2496,17 @@ impl SpatialRelateReader {
                             let pass = if let Some(&v) = lit_pass.get(&r.o) {
                                 v
                             } else {
-                                if lit_pass.len() == lit_pass.capacity() {
-                                    let add = (next_cap(lit_pass.len(), lit_pass.capacity(), 1)
-                                        - lit_pass.capacity())
-                                        as u64
-                                        * (size_of::<Id>() + 2) as u64;
+                                let geom = self.geom_charged(ctx, r.o, stage_bytes)?;
+                                let add =
+                                    hash_growth::<(Id, bool)>(lit_pass.capacity(), lit_pass.len());
+                                if add != 0 {
                                     self.charge.resize(
                                         self.base_retained_bytes()
                                             .saturating_add(stage_bytes)
                                             .saturating_add(add),
                                     )?;
                                 }
-                                if let Some(w) = self.geom_charged(ctx, r.o, stage_bytes)? {
+                                let ok = if let Some(w) = geom {
                                     self.st.refined += 1;
                                     refined_since += 1;
                                     if refined_since.is_multiple_of(CHECK_EVERY) {
@@ -2506,12 +2516,19 @@ impl SpatialRelateReader {
                                     if ok {
                                         self.pairs += 1;
                                     }
-                                    lit_pass.insert(r.o, ok);
                                     ok
                                 } else {
-                                    lit_pass.insert(r.o, false);
                                     false
+                                };
+                                lit_pass.insert(r.o, ok);
+                                if add != 0 {
+                                    let updated_stage =
+                                        one_const_stage_bytes(&cand, &pending_sers, &lit_pass);
+                                    self.charge.resize(
+                                        self.base_retained_bytes().saturating_add(updated_stage),
+                                    )?;
                                 }
+                                ok
                             };
                             if !pass {
                                 continue;
@@ -2576,9 +2593,7 @@ impl SpatialRelateReader {
                             .saturating_add(
                                 pending_sers.capacity() as u64 * size_of::<Ser>() as u64,
                             )
-                            .saturating_add(
-                                lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64,
-                            );
+                            .saturating_add(lit_pass_bytes(&lit_pass));
                         let charge = &mut self.charge;
                         OneConstCand::Indexed(Box::new(WindowIter::open(
                             ctx,
@@ -3490,7 +3505,7 @@ impl ActiveProbe {
         self.iter
             .retained_bytes()
             .saturating_add(self.hits.capacity() as u64 * size_of::<Hit>() as u64)
-            .saturating_add(self.lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64)
+            .saturating_add(lit_pass_bytes(&self.lit_pass))
             .saturating_add(pm)
     }
 }
@@ -4227,9 +4242,7 @@ impl SpatialJoinEngine {
                     .other_bytes
                     .saturating_add(sink.pending_out_bytes())
                     .saturating_add(active.hits.capacity() as u64 * size_of::<Hit>() as u64)
-                    .saturating_add(
-                        active.lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64,
-                    );
+                    .saturating_add(lit_pass_bytes(&active.lit_pass));
                 let charge = &mut *sink.charge;
                 let ended =
                     active
@@ -4238,9 +4251,11 @@ impl SpatialJoinEngine {
                             charge.resize(non_iter.saturating_add(b))
                         })?;
                 let iter_bytes = active.iter.retained_bytes();
+                let buf_bytes = buf.capacity() as u64 * size_of::<Hit>() as u64;
                 for h in buf {
                     if ix.subj.is_none_or(|s| s == h.s) {
                         if active.hits.len() == active.hits.capacity() {
+                            let cur_h = active.hits.capacity() as u64 * size_of::<Hit>() as u64;
                             let next_h = next_cap(active.hits.len(), active.hits.capacity(), 1)
                                 as u64
                                 * size_of::<Hit>() as u64;
@@ -4248,11 +4263,10 @@ impl SpatialJoinEngine {
                                 .other_bytes
                                 .saturating_add(sink.pending_out_bytes())
                                 .saturating_add(iter_bytes)
+                                .saturating_add(buf_bytes)
+                                .saturating_add(cur_h)
                                 .saturating_add(next_h)
-                                .saturating_add(
-                                    active.lit_pass.capacity() as u64
-                                        * (size_of::<Id>() + 2) as u64,
-                                );
+                                .saturating_add(lit_pass_bytes(&active.lit_pass));
                             sink.charge.resize(projected)?;
                         }
                         active.hits.push_back(h);
@@ -4284,10 +4298,11 @@ impl SpatialJoinEngine {
                     if sink.st.refined.is_multiple_of(CHECK_EVERY as u64) {
                         sink.ctx.check()?;
                     }
-                    if active.lit_pass.len() == active.lit_pass.capacity() {
-                        let add = (next_cap(active.lit_pass.len(), active.lit_pass.capacity(), 1)
-                            - active.lit_pass.capacity()) as u64
-                            * (size_of::<Id>() + 2) as u64;
+                    let add = hash_growth::<(Id, bool)>(
+                        active.lit_pass.capacity(),
+                        active.lit_pass.len(),
+                    );
+                    if add != 0 {
                         let projected = sink
                             .other_bytes
                             .saturating_add(sink.pending_out_bytes())
@@ -4305,6 +4320,13 @@ impl SpatialJoinEngine {
                         Err(_) => false,
                     };
                     active.lit_pass.insert(h.o, pass);
+                    if add != 0 {
+                        let settled = sink
+                            .other_bytes
+                            .saturating_add(sink.pending_out_bytes())
+                            .saturating_add(active.retained_bytes());
+                        sink.charge.resize(settled)?;
+                    }
                     pass
                 };
                 if !ok {
@@ -4990,5 +5012,184 @@ mod tests {
         assert!(matches!(res, Err(Error::Cancelled)));
         assert_eq!(pe.bi, CHECK_EVERY - 1);
         assert!(reader.pending_out.is_empty());
+    }
+
+    #[test]
+    fn r3_one_const_lit_pass_uses_physical_table_growth_after_geom_lookup() {
+        use crate::io::Source;
+        use oxrdfio::RdfFormat;
+
+        let store = Store::in_memory(StoreOptions::default());
+        // L-shaped query polygon whose bbox [0, 0, 10, 10] contains every candidate point,
+        // while every stored point at (5.xxxx, 5) is disjoint from the polygon and emits no rows.
+        let mut data = String::from("@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n");
+        for i in 0..4000 {
+            data.push_str(&format!(
+                "<urn:p:{i}> geo:asWKT \"POINT(5.{i:04} 5)\"^^geo:wktLiteral .\n"
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let poly_term: oxrdf::Term = oxrdf::Literal::new_typed_literal(
+            "POLYGON((0 0, 10 0, 10 1, 1 1, 1 10, 0 10, 0 0))",
+            oxrdf::NamedNode::new_unchecked(vocab::WKT_LITERAL),
+        )
+        .into();
+        let make_spec = |q_lit: Id, q_geom: GeomRef| SpatialRelateSpec {
+            rel: Relation::SfIntersects,
+            subject: RelateEnd::Geometry(q_lit, q_geom),
+            object: RelateEnd::Var(0),
+            property: None,
+            graph: GraphFilter::Default,
+            graph_var: None,
+            dedup: false,
+            key: 0,
+        };
+
+        // Part 1: simultaneous `self.geoms` + `lit_pass` growth at capacity 7 -> 14.
+        // Pre-warm `ctx.geo` so the step exercises only `self.geoms` and `lit_pass` growth.
+        let mut ctx = Ctx::new(snap.clone());
+        let q_lit = ctx.intern_term(&poly_term);
+        let mut reader_geoms = FxHashMap::default();
+        let mut lit_pass = FxHashMap::default();
+        let point_lits: Vec<Id> = (0..8)
+            .map(|i| {
+                let lit = oxrdf::Literal::new_typed_literal(
+                    format!("POINT(5.{i:04} 5)"),
+                    oxrdf::NamedNode::new_unchecked(vocab::WKT_LITERAL),
+                );
+                snap.lookup_term(&lit.into()).unwrap()
+            })
+            .collect();
+        let q_geom = {
+            let v = ctx.value(q_lit).unwrap();
+            ctx.geo
+                .get_or_parse_charged(&ctx, MemoKey::Id(q_lit), || {
+                    parse_value(&v, max_vertices(&ctx))
+                })
+                .unwrap()
+        };
+        let spec = make_spec(q_lit, q_geom.clone());
+        let extra_lit = point_lits[7];
+        {
+            let v = ctx.value(extra_lit).unwrap();
+            let _ = ctx
+                .geo
+                .get_or_parse_charged(&ctx, MemoKey::Id(extra_lit), || {
+                    parse_value(&v, max_vertices(&ctx))
+                })
+                .unwrap();
+        }
+        let warm_geo_bytes = ctx.live_bytes();
+        for &id in &point_lits[..7] {
+            reader_geoms.insert(id, None);
+            lit_pass.insert(id, false);
+        }
+        assert_eq!(reader_geoms.capacity(), 7);
+        assert_eq!(lit_pass.capacity(), 7);
+        let pending_sers = VecDeque::from([Ser {
+            s: Id(1),
+            o: extra_lit,
+            g: Id::DEFAULT_GRAPH,
+        }]);
+        let old_geoms_bytes = table_bytes(7, size_of::<(Id, Option<GeomRef>)>()) as u64;
+        let new_geoms_bytes = table_bytes(14, size_of::<(Id, Option<GeomRef>)>()) as u64;
+        let old_lit_pass_bytes = table_bytes(7, size_of::<(Id, bool)>()) as u64;
+        let new_lit_pass_bytes = table_bytes(14, size_of::<(Id, bool)>()) as u64;
+        assert_eq!(
+            table_bytes(7168, size_of::<(Id, bool)>()),
+            139_280,
+            "physical table sizing for FxHashMap<Id, bool> at usable capacity 7,168"
+        );
+        let lits = vec![ConstLit {
+            lit: q_lit,
+            g: None,
+        }];
+        let fixed_stage = const_lit_bytes(&lits)
+            + pending_sers.capacity() as u64 * size_of::<Ser>() as u64
+            + old_lit_pass_bytes;
+        let geoms_peak = warm_geo_bytes + old_geoms_bytes + fixed_stage + new_geoms_bytes;
+        let lit_pass_peak = warm_geo_bytes + new_geoms_bytes + fixed_stage + new_lit_pass_bytes;
+        assert!(lit_pass_peak > geoms_peak);
+        ctx.mem_limit = lit_pass_peak - 1;
+        let ctx = Arc::new(ctx);
+        let mut reader = SpatialRelateReader::open(&ctx, &spec, &[0]).unwrap();
+        reader.geoms = reader_geoms;
+        reader.stage = RelateStage::OneConst {
+            cid: q_lit,
+            subject_const: true,
+            lits,
+            q_at: 1,
+            qg: Some(q_geom.clone()),
+            cand: OneConstCand::Done,
+            pending_sers,
+            active_ser: None,
+            lit_pass,
+        };
+        reader.update_charge().unwrap();
+        let err = reader.step_one_const(&ctx, 64).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory && b.requested == lit_pass_peak
+        ));
+        // `self.geoms` grew, while `lit_pass` refused BEFORE growing past capacity 7.
+        assert_eq!(reader.geoms.capacity(), 14);
+        let RelateStage::OneConst { lit_pass, .. } = &reader.stage else {
+            panic!("expected OneConst stage");
+        };
+        assert_eq!(lit_pass.capacity(), 7);
+        drop(reader);
+        assert_eq!(ctx.live_bytes(), warm_geo_bytes);
+
+        // Part 2: full one-constant scan over 4,000 distinct non-matching literals refuses
+        // before `lit_pass` grows from 3,584 to 7,168 under a budget below `new_geoms + old_lit_pass + new_lit_pass`.
+        let full_ctx_unbounded = Arc::new(Ctx::new(snap.clone()));
+        let full_spec_unbounded =
+            make_spec(full_ctx_unbounded.intern_term(&poly_term), q_geom.clone());
+        let mut out = Table::new(vec![0]);
+        let mut probe_reader =
+            SpatialRelateReader::open(&full_ctx_unbounded, &full_spec_unbounded, &[0]).unwrap();
+        assert!(
+            probe_reader
+                .next(&full_ctx_unbounded, &mut out, 64)
+                .unwrap()
+        );
+        assert!(out.is_empty());
+        let held = probe_reader.charge.bytes();
+        let before_drop = full_ctx_unbounded.live_bytes();
+        drop(probe_reader);
+        assert_eq!(full_ctx_unbounded.live_bytes(), before_drop - held);
+
+        // At 4,000 distinct literals, `new_geoms (204,816) + old_lit_pass (69,648) + new_lit_pass (139,280)`
+        // alone exceeds 400 KiB even if caches stay empty, whereas the old 10-byte `lit_pass` estimate
+        // only charged 71,680 bytes total across old + delta.
+        let mut full_ctx = Ctx::new(snap);
+        full_ctx.mem_limit = 400 * 1024;
+        let full_ctx = Arc::new(full_ctx);
+        let full_spec = make_spec(full_ctx.intern_term(&poly_term), q_geom);
+        let mut tight_reader = SpatialRelateReader::open(&full_ctx, &full_spec, &[0]).unwrap();
+        let mut out = Table::new(vec![0]);
+        let err = tight_reader.next(&full_ctx, &mut out, 64).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory
+        ));
+        if let RelateStage::OneConst { lit_pass, .. } = &tight_reader.stage {
+            assert!(
+                lit_pass.capacity() < 7168,
+                "lit_pass grew to {} past tight budget",
+                lit_pass.capacity()
+            );
+        }
+        let held = tight_reader.charge.bytes();
+        let before_drop = full_ctx.live_bytes();
+        drop(tight_reader);
+        assert_eq!(full_ctx.live_bytes(), before_drop - held);
     }
 }

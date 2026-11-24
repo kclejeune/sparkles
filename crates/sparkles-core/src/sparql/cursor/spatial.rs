@@ -389,6 +389,62 @@ impl KnnState {
         let bytes = self.retained_bytes();
         self.charge.resize(bytes)
     }
+
+    fn gather_nearest_batch(&mut self, ctx: &Ctx, batch_target: usize) -> Result<f64> {
+        use crate::id::Id;
+        self.pending_cands.clear();
+        let mut bound = f64::INFINITY;
+        while self.pending_cands.len() < batch_target {
+            let base_bytes = self.retained_bytes_without_nearest();
+            let Some(iter) = &mut self.nearest else {
+                break;
+            };
+            let mut chunk = Vec::new();
+            let charge = &mut self.charge;
+            match iter.next_chunk(ctx, &mut chunk, &mut |b| {
+                charge.resize(base_bytes.saturating_add(b))
+            })? {
+                Some(b) => {
+                    bound = b;
+                    let keep = |h: &&crate::geo::search::Hit| {
+                        self.subj.is_none_or(|s| s == h.s) && !self.taken.contains(&h.o)
+                    };
+                    let kept = chunk.iter().filter(keep).count();
+                    let elem = size_of::<[Id; 3]>();
+                    let capacity = self.pending_cands.capacity();
+                    if self.pending_cands.len().saturating_add(kept) > capacity {
+                        let next = sparkles_budget::sizes::vec_grown(
+                            capacity,
+                            self.pending_cands.len(),
+                            kept,
+                            elem,
+                        );
+                        let chunk_bytes =
+                            chunk.capacity() as u64 * size_of::<crate::geo::search::Hit>() as u64;
+                        self.charge.resize(
+                            self.retained_bytes()
+                                .saturating_add(chunk_bytes)
+                                .saturating_add(next as u64 * elem as u64),
+                        )?;
+                        self.pending_cands.reserve(kept);
+                    }
+                    self.pending_cands
+                        .extend(chunk.iter().filter(keep).map(|h| [h.s, h.o, h.g]));
+                    drop(chunk);
+                    self.update_charge()?;
+                    if !bound.is_finite() {
+                        break;
+                    }
+                }
+                None => {
+                    bound = f64::INFINITY;
+                    break;
+                }
+            }
+        }
+        self.update_charge()?;
+        Ok(bound)
+    }
 }
 
 impl SpatialKnn {
@@ -455,7 +511,6 @@ impl SpatialKnn {
         use crate::geo::exec::state;
         use crate::geo::knn::rows_without_distance_charged;
         use crate::geo::search::NearestIter;
-        use crate::id::Id;
         use crate::sparql::ctx::OwnedCharge;
         use crate::sparql::expr::{Row as ExprRow, eval};
         use crate::sparql::geopf::{ScanShape, number};
@@ -659,54 +714,7 @@ impl SpatialKnn {
                 st.update_charge()?;
             }
             // Gather next batch of candidates from NearestIter.
-            st.pending_cands.clear();
-            let mut bound = f64::INFINITY;
-            while st.pending_cands.len() < batch_target {
-                let base_bytes = st.retained_bytes_without_nearest();
-                let Some(iter) = &mut st.nearest else {
-                    break;
-                };
-                let mut chunk = Vec::new();
-                let charge = &mut st.charge;
-                match iter.next_chunk(ctx, &mut chunk, &mut |b| {
-                    charge.resize(base_bytes.saturating_add(b))
-                })? {
-                    Some(b) => {
-                        bound = b;
-                        let keep = |h: &&crate::geo::search::Hit| {
-                            st.subj.is_none_or(|s| s == h.s) && !st.taken.contains(&h.o)
-                        };
-                        let kept = chunk.iter().filter(keep).count();
-                        let elem = size_of::<[Id; 3]>();
-                        let capacity = st.pending_cands.capacity();
-                        if st.pending_cands.len().saturating_add(kept) > capacity {
-                            let next = sparkles_budget::sizes::vec_grown(
-                                capacity,
-                                st.pending_cands.len(),
-                                kept,
-                                elem,
-                            );
-                            let chunk_bytes = chunk.capacity() as u64
-                                * size_of::<crate::geo::search::Hit>() as u64;
-                            st.charge.resize(
-                                st.retained_bytes()
-                                    .saturating_add(chunk_bytes)
-                                    .saturating_add(next as u64 * elem as u64),
-                            )?;
-                        }
-                        st.pending_cands
-                            .extend(chunk.iter().filter(keep).map(|h| [h.s, h.o, h.g]));
-                        if !bound.is_finite() {
-                            break;
-                        }
-                    }
-                    None => {
-                        bound = f64::INFINITY;
-                        break;
-                    }
-                }
-            }
-            st.update_charge()?;
+            let bound = st.gather_nearest_batch(ctx, batch_target)?;
             if st.pending_cands.is_empty() {
                 Self::finalize(
                     ctx,
@@ -879,4 +887,98 @@ fn build_template_batch(
     leaf.est = rows.len() as f64;
     leaf.kind = Kind::Values(batch);
     Ok(t)
+}
+
+#[cfg(all(test, feature = "geo"))]
+mod tests {
+    use super::*;
+    use crate::error::{BudgetKind, Error};
+    use crate::geo::index::Row;
+    use crate::geo::search::{Hit, NearestIter};
+    use crate::id::Id;
+    use crate::sparql::ctx::OwnedCharge;
+    use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn r3_knn_candidate_transfer_reserves_admitted_capacity_across_two_chunks() {
+        let store = Store::in_memory(StoreOptions::default());
+        let entry = crate::geo::wgs84::point(0.0, 1.0).unwrap();
+        let make_hits = || {
+            (0..48u64)
+                .map(|i| {
+                    Hit::new(
+                        &Row {
+                            s: i + 1,
+                            p: 1,
+                            o: i + 100,
+                            g: 0,
+                        },
+                        entry.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let make_state = |ctx: &Arc<Ctx>| -> KnnState {
+            let nearest = NearestIter::fallback_for_test(ctx.snap.clone(), make_hits(), 16);
+            let mut charge = OwnedCharge::new(ctx, 0).unwrap();
+            charge.resize(nearest.retained_bytes()).unwrap();
+            KnnState {
+                subj: None,
+                state_name: String::new(),
+                error_rows: Vec::new(),
+                error_at: 0,
+                errors_found: 0,
+                error_rows_total: 0,
+                taken: rustc_hash::FxHashSet::default(),
+                nearest: Some(nearest),
+                nearest_opened: true,
+                pending_cands: Vec::new(),
+                current_bound: f64::INFINITY,
+                best: std::collections::BinaryHeap::new(),
+                active_op: None,
+                active_phase_error: false,
+                active_rows: 0,
+                batches: 0,
+                empty_batches: 0,
+                keyed: 0,
+                matched: 0,
+                runs: Vec::new(),
+                charge,
+            }
+        };
+
+        let elem = size_of::<[Id; 3]>() as u64;
+        let hit_bytes = size_of::<Hit>() as u64;
+        let probe_ctx = Arc::new(Ctx::new(store.snapshot()));
+        let nearest_bytes = NearestIter::fallback_for_test(probe_ctx.snap.clone(), make_hits(), 16)
+            .retained_bytes();
+        let second_chunk_peak = nearest_bytes + 32 * hit_bytes + (16 + 48) * elem;
+
+        // Exact peak budget succeeds and keeps capacity at the admitted 48 slots (never doubling to 64).
+        let mut ctx_ok = Ctx::new(store.snapshot());
+        ctx_ok.mem_limit = second_chunk_peak;
+        let ctx_ok = Arc::new(ctx_ok);
+        let mut st = make_state(&ctx_ok);
+        let bound = st.gather_nearest_batch(&ctx_ok, 48).unwrap();
+        assert!(!bound.is_finite());
+        assert_eq!(st.pending_cands.len(), 48);
+        assert_eq!(st.pending_cands.capacity(), 48);
+        drop(st);
+        assert_eq!(ctx_ok.live_bytes(), 0);
+
+        // One byte below the second-chunk peak refuses before growing `pending_cands` past 16.
+        let mut ctx_tight = Ctx::new(store.snapshot());
+        ctx_tight.mem_limit = second_chunk_peak - 1;
+        let ctx_tight = Arc::new(ctx_tight);
+        let mut st = make_state(&ctx_tight);
+        let err = st.gather_nearest_batch(&ctx_tight, 48).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory && b.requested == second_chunk_peak
+        ));
+        assert_eq!(st.pending_cands.len(), 16);
+        assert_eq!(st.pending_cands.capacity(), 16);
+        drop(st);
+        assert_eq!(ctx_tight.live_bytes(), 0);
+    }
 }

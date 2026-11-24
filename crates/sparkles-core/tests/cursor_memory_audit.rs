@@ -1092,3 +1092,37 @@ fn native_constant_basic_geo_keeps_longitude_scratch_bounded() {
     let failures = audit.check("constant-subject Basic Geo", &Allowance::EXACT);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[cfg(feature = "geo")]
+#[test]
+fn native_one_constant_relation_admits_lit_pass_memo() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n");
+    for i in 0..4000 {
+        data.push_str(&format!(
+            "<urn:p:{i}> geo:asWKT \"POINT(5.{i:04} 5)\"^^geo:wktLiteral .\n"
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.enable_geo(sparkles_core::geo::GeoConfig {
+        query_rewrite: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let q = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> SELECT ?s { ?s geo:sfIntersects \"POLYGON((0 0, 10 0, 10 1, 1 1, 1 10, 0 10, 0 0))\"^^geo:wktLiteral }";
+    let _ = run_under(&s, q, false, 1, 512 << 10, None);
+    let audit = run_under(&s, q, false, 1, 512 << 10, None);
+    assert_eq!(audit.rows, 0);
+    target(&audit.plan, "SpatialRelate", true).unwrap();
+    let failures = audit.check(
+        "one-constant SpatialRelate lit_pass memo",
+        &Allowance::EXACT,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

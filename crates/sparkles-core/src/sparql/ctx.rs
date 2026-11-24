@@ -1477,7 +1477,7 @@ impl Ctx {
 
     /// The query's live estimate, from the ledger once it exists.
     #[inline]
-    pub(super) fn live_bytes(&self) -> u64 {
+    pub(crate) fn live_bytes(&self) -> u64 {
         match self.memory.get() {
             Some(ledger) => ledger.live.load(Ordering::Relaxed),
             None => self.fast.live.load(Ordering::Relaxed) & !PROMOTED,
@@ -4220,7 +4220,7 @@ pub(crate) struct OwnedCharge {
     lease: QueryMemoryLease,
 }
 impl OwnedCharge {
-    pub(super) fn bytes(&self) -> u64 {
+    pub(crate) fn bytes(&self) -> u64 {
         self.lease.bytes
     }
     pub(crate) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {

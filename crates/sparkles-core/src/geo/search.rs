@@ -2369,6 +2369,32 @@ impl NearestIter {
         Ok(iter)
     }
 
+    /// Construct a deterministic fallback iterator for unit tests that exercise
+    /// chunk-to-candidate transfer admission.
+    #[cfg(test)]
+    pub(crate) fn fallback_for_test(
+        snap: Arc<Snapshot>,
+        hits: Vec<Hit>,
+        first_chunk: usize,
+    ) -> Self {
+        Self {
+            snap,
+            preds: Vec::new(),
+            graph: GraphFilter::All,
+            dedup: false,
+            st: SearchStats::default(),
+            mode: NearestMode::Fallback {
+                all: hits
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, h)| (i as f64, h))
+                    .collect(),
+                at: 0,
+                size: first_chunk,
+            },
+        }
+    }
+
     pub(crate) fn retained_bytes(&self) -> u64 {
         match &self.mode {
             NearestMode::Empty => 0,

@@ -5561,7 +5561,6 @@ impl Scan {
             }
         }
         if !exact && !out.table.is_empty() {
-            let _scratch = ctx.charge(out.table.len as u64 * 16 + ctx.nvars() as u64 * 16)?;
             exec::apply_range_filter(ctx, &mut out.table, self.var, &self.filter)?;
         }
         out.reconcile()?;
@@ -5640,9 +5639,7 @@ impl Scan {
             self.position = None;
         }
         if !exact && !b.table.is_empty() {
-            let scratch = ctx.charge(b.table.len as u64 * 16 + ctx.nvars() as u64 * 16)?;
             exec::apply_range_filter(ctx, &mut b.table, self.var, &self.filter)?;
-            drop(scratch);
         }
         ctx.check()?;
         b.reconcile()?;

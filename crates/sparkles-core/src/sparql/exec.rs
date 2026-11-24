@@ -3236,10 +3236,24 @@ pub(super) fn apply_range_filter(
         t.col_of(var),
         num_atoms(ctx, var, exprs),
     ) else {
+        let _scratch = ctx.charge((t.len() as u64).saturating_add(
+            (ctx.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
+        ))?;
         apply_filter(ctx, t, exprs)?;
         return Ok(());
     };
     let col = &t.cols[c];
+    let n = col.len();
+    let vocab_count = col.iter().filter(|x| x.tag() == Tag::Vocab).count();
+    let decided_bytes = n.saturating_mul(size_of::<Option<bool>>()) as u64;
+    let par_extra = if n > PAR_THRESHOLD { decided_bytes } else { 0 };
+    let vocab_bytes = (vocab_count as u64)
+        .saturating_mul((size_of::<u64>() + size_of::<(u8, u64)>() + size_of::<Numeric>()) as u64);
+    let scratch = ctx.charge(
+        decided_bytes
+            .saturating_add(par_extra)
+            .saturating_add(vocab_bytes),
+    )?;
     use super::value::Num;
     let test = |x: Id, v: Num| atoms.iter().all(|a| a.holds(x, v));
     // `Some(passes)`, or `None` for the generic filter
@@ -3263,17 +3277,25 @@ pub(super) fn apply_range_filter(
     // the distinct vocabulary ids of a run of rows read from the column at once, and
     // runs of one id (the scan's sorted column) decided once
     let chunk = |ids: &[Id]| -> Vec<Option<bool>> {
-        let mut vocab: Vec<u64> = ids
-            .iter()
-            .filter(|x| x.tag() == Tag::Vocab)
-            .map(|x| x.payload())
-            .collect();
-        // already sorted when the column is the scan's sorted column
-        if !vocab.is_sorted() {
-            vocab.sort_unstable();
+        let vocab_len = ids.iter().filter(|x| x.tag() == Tag::Vocab).count();
+        let mut vocab = Vec::with_capacity(vocab_len);
+        if vocab_len > 0 {
+            vocab.extend(
+                ids.iter()
+                    .filter(|x| x.tag() == Tag::Vocab)
+                    .map(|x| x.payload()),
+            );
+            // already sorted when the column is the scan's sorted column
+            if !vocab.is_sorted() {
+                vocab.sort_unstable();
+            }
+            vocab.dedup();
         }
-        vocab.dedup();
-        let found = num.get_many(&vocab);
+        let found = if vocab.is_empty() {
+            Vec::new()
+        } else {
+            num.get_many(&vocab)
+        };
         let mut at = 0;
         let mut last: Option<(Id, Option<bool>)> = None;
         ids.iter()
@@ -3307,20 +3329,52 @@ pub(super) fn apply_range_filter(
     } else {
         chunk(col)
     };
-    let rest: Vec<usize> = (0..decided.len())
-        .filter(|&i| decided[i].is_none())
-        .collect();
-    let mut keep: Vec<bool> = decided.iter().map(|d| d.unwrap_or(false)).collect();
+    let rest_len = decided.iter().filter(|d| d.is_none()).count();
+    let keep_bytes = n.saturating_mul(size_of::<bool>()) as u64;
+    let rest_bytes = rest_len.saturating_mul(size_of::<usize>()) as u64;
+    scratch.resize(
+        decided_bytes
+            .saturating_add(keep_bytes)
+            .saturating_add(rest_bytes),
+    )?;
+    let mut rest = Vec::with_capacity(rest_len);
+    let mut keep = Vec::with_capacity(n);
+    for (i, d) in decided.into_iter().enumerate() {
+        match d {
+            Some(k) => keep.push(k),
+            None => {
+                keep.push(false);
+                rest.push(i);
+            }
+        }
+    }
+    scratch.resize(keep_bytes.saturating_add(rest_bytes))?;
     if !rest.is_empty() {
+        let sub_bytes = topk_table_bytes(rest.len(), t.width());
+        let mask_bytes =
+            rest.len()
+                .saturating_mul(size_of::<bool>())
+                .saturating_add(ctx.nvars().saturating_mul(size_of::<Option<usize>>()))
+                .saturating_add(exprs.len().saturating_mul(size_of::<&Expr>())) as u64;
+        scratch.resize(
+            keep_bytes
+                .saturating_add(rest_bytes)
+                .saturating_add(sub_bytes)
+                .saturating_add(mask_bytes),
+        )?;
         let sub = t.take_rows(&rest);
         let mask = filter_mask(ctx, &sub, exprs)?;
         for (&i, k) in rest.iter().zip(mask) {
             keep[i] = k;
         }
     }
-    let sorted = t.sorted.clone();
+    drop(rest);
+    scratch.resize(keep_bytes)?;
+    let sorted = std::mem::take(&mut t.sorted);
     t.filter_rows(&keep);
     t.sorted = sorted;
+    drop(keep);
+    drop(scratch);
     Ok(())
 }
 
@@ -3512,6 +3566,9 @@ fn topk_read_keys_last<'ctx>(
         apply_range_filter(ctx, table, spec.var, &spec.range_filter)?;
     }
     if !spec.filter.is_empty() && !table.is_empty() {
+        let _filter_scratch = ctx.charge((table.len() as u64).saturating_add(
+            (ctx.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
+        ))?;
         apply_filter(ctx, table, &spec.filter)?;
     }
     Ok((t, scanned, last))
@@ -10207,6 +10264,102 @@ mod paid_eager_producer_tests {
             ));
             assert_eq!(ctx.live_bytes(), 0);
         }
+    }
+
+    #[test]
+    fn r3_topk_residual_range_filter_refuses_before_copying_delta_rows() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, expr::CmpOp, update::update};
+        use oxrdfio::RdfFormat;
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:base> <urn:p> \"9999.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                    .to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let data = (0..512)
+            .map(|i| {
+                format!(
+                    "<urn:delta:{i}> <urn:p> \"{i}.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                )
+            })
+            .collect::<String>();
+        update(
+            &store,
+            &format!("INSERT DATA {{ {data} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.numeric().is_some());
+        let probe = Ctx::new(snap.clone());
+        let pred = probe.snap.lookup_iri("urn:p").unwrap();
+        let delta = probe
+            .snap
+            .lookup_term(&oxrdf::Literal::from(0.5_f32).into())
+            .unwrap();
+        assert_eq!(delta.tag(), crate::id::Tag::Delta);
+        let [lo, hi] = [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(delta.tag(), payload).0);
+        let threshold = Id::from_i64(100).unwrap();
+        let spec = OrderedTopK {
+            scan: ScanSpec {
+                perm: Perm::Pos,
+                prefix: vec![pred.0],
+                cols: vec![(1, 0), (2, 1)],
+                eqs: Vec::new(),
+                graph: GraphFilter::Default,
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            },
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: vec![Expr::Cmp(
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Const(threshold)),
+                CmpOp::Ge,
+            )],
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+
+        // Measure the raw delta table's admitted charge with no residual copy.
+        let (raw, scanned) = topk_read(&probe, &spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, 512);
+        let raw_bytes = probe.live_bytes();
+        drop(raw);
+        assert_eq!(probe.live_bytes(), 0);
+
+        // Allow the raw table plus `decided`/`keep`/`rest`, but not the residual `sub` table copy.
+        let mut tight = Ctx::new(snap.clone());
+        let scratch_without_copy = 512u64 * (1 + 1 + size_of::<usize>() as u64);
+        tight.mem_limit = raw_bytes + scratch_without_copy + 256;
+        let err = topk_read(&tight, &spec, lo, hi, false, &[0, 1])
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory && b.requested > tight.mem_limit
+        ));
+        assert_eq!(tight.live_bytes(), 0);
+
+        // With room for the residual copy, the non-exact range filter keeps the 412 matching rows.
+        let ok_ctx = Ctx::new(snap);
+        let (filtered, scanned) = topk_read(&ok_ctx, &spec, lo, hi, false, &[0, 1]).unwrap();
+        assert_eq!(scanned, 512);
+        assert_eq!(filtered.table.len(), 412);
+        let before_drop = ok_ctx.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ok_ctx.live_bytes(), raw_bytes);
     }
 
     #[test]
