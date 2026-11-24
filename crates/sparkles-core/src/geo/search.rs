@@ -830,3 +830,883 @@ fn nearest_fallback(
     }
     Ok(())
 }
+
+/// The smallest key strictly greater than `k`, or `None` at `[u64::MAX; 4]`.
+pub(crate) fn next_key_after(mut k: [u64; 4]) -> Option<[u64; 4]> {
+    for c in (0..4).rev() {
+        if k[c] < u64::MAX {
+            k[c] += 1;
+            k[c + 1..].fill(0);
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// Resumable, owned, `Send` window search over a snapshot's spatial index (or predicate
+/// scan fallback). Holds only the tree DFS stack (or scan cursor key) and dedup/recheck
+/// state, reporting its retained bytes through `admit` as it grows.
+pub(crate) struct WindowIter {
+    snap: Arc<Snapshot>,
+    preds: Vec<Id>,
+    windows: Vec<[f64; 4]>,
+    ws_f32: Vec<[f32; 4]>,
+    graph: GraphFilter,
+    dedup: bool,
+    pub(crate) st: SearchStats,
+    mode: WindowMode,
+}
+
+enum WindowMode {
+    Indexed {
+        view: Arc<GeoView>,
+        base: Arc<GeoBase>,
+        stage: IndexStage,
+        pending: std::collections::VecDeque<Hit>,
+        triples: FxHashSet<(u64, u64, u64)>,
+        quads: FxHashSet<Row>,
+        rechecked: FxHashMap<u64, Option<Arc<ColumnEntry>>>,
+    },
+    Fallback {
+        pred_at: usize,
+        lo: Option<[u64; 4]>,
+        pending: std::collections::VecDeque<Hit>,
+        memo: FxHashMap<u64, Slot>,
+        rechecked: FxHashMap<u64, Option<Arc<ColumnEntry>>>,
+        triples: FxHashSet<(u64, u64, u64)>,
+        cfg: Arc<GeoConfig>,
+        lat: Option<Id>,
+    },
+}
+
+enum IndexStage {
+    BaseTree { stack: Vec<usize> },
+    OverlayTree { stack: Vec<usize> },
+    Tail { at: usize },
+    BaseSkipped { at: usize },
+    OverlaySkipped { at: usize },
+    ViewSkipped { at: usize },
+    Done,
+}
+
+impl WindowIter {
+    pub(crate) fn open(
+        ctx: &Ctx,
+        preds: Vec<Id>,
+        windows: Vec<[f64; 4]>,
+        graph: GraphFilter,
+        dedup: bool,
+        admit: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Self> {
+        let snap = ctx.snap.clone();
+        let ws_f32: Vec<[f32; 4]> = windows.iter().map(super::index::window_f32).collect();
+        let mut st = SearchStats::default();
+        let mode = if let Some((_, base)) = indexed(&snap, &preds) {
+            let view = snap.geo.clone().expect("indexed snapshot has geo view");
+            let base = base.clone();
+            let stage = match &base.tree {
+                Some(t) => IndexStage::BaseTree {
+                    stack: vec![t.tree().root()],
+                },
+                None => match &view.overlay.tree {
+                    Some(t) => IndexStage::OverlayTree {
+                        stack: vec![t.tree().root()],
+                    },
+                    None => IndexStage::Tail { at: 0 },
+                },
+            };
+            WindowMode::Indexed {
+                view,
+                base,
+                stage,
+                pending: std::collections::VecDeque::new(),
+                triples: FxHashSet::default(),
+                quads: FxHashSet::default(),
+                rechecked: FxHashMap::default(),
+            }
+        } else {
+            st.fallback = true;
+            let cfg = snap
+                .geo
+                .as_ref()
+                .map_or_else(|| Arc::new(GeoConfig::default()), |v| v.config.clone());
+            let lat = wgs84_lat(&snap);
+            WindowMode::Fallback {
+                pred_at: 0,
+                lo: None,
+                pending: std::collections::VecDeque::new(),
+                memo: FxHashMap::default(),
+                rechecked: FxHashMap::default(),
+                triples: FxHashSet::default(),
+                cfg,
+                lat,
+            }
+        };
+        let iter = Self {
+            snap,
+            preds,
+            windows,
+            ws_f32,
+            graph,
+            dedup,
+            st,
+            mode,
+        };
+        admit(iter.retained_bytes())?;
+        Ok(iter)
+    }
+
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        match &self.mode {
+            WindowMode::Indexed {
+                stage,
+                pending,
+                triples,
+                quads,
+                rechecked,
+                ..
+            } => {
+                let stack = match stage {
+                    IndexStage::BaseTree { stack } | IndexStage::OverlayTree { stack } => {
+                        stack.capacity() as u64 * size_of::<usize>() as u64
+                    }
+                    _ => 0,
+                };
+                stack
+                    .saturating_add(pending.capacity() as u64 * size_of::<Hit>() as u64)
+                    .saturating_add(
+                        triples.capacity() as u64 * (size_of::<(u64, u64, u64)>() + 1) as u64,
+                    )
+                    .saturating_add(quads.capacity() as u64 * (size_of::<Row>() + 1) as u64)
+                    .saturating_add(
+                        rechecked.capacity() as u64
+                            * (size_of::<u64>() + size_of::<Option<Arc<ColumnEntry>>>() + 1) as u64,
+                    )
+            }
+            WindowMode::Fallback {
+                pending,
+                memo,
+                rechecked,
+                triples,
+                ..
+            } => (pending.capacity() as u64 * size_of::<Hit>() as u64)
+                .saturating_add(
+                    memo.capacity() as u64 * (size_of::<u64>() + size_of::<Slot>() + 1) as u64,
+                )
+                .saturating_add(
+                    rechecked.capacity() as u64
+                        * (size_of::<u64>() + size_of::<Option<Arc<ColumnEntry>>>() + 1) as u64,
+                )
+                .saturating_add(
+                    triples.capacity() as u64 * (size_of::<(u64, u64, u64)>() + 1) as u64,
+                ),
+        }
+    }
+
+    /// Pull up to `want` hits into `out`. Returns `true` when the iterator is exhausted.
+    pub(crate) fn next_hits(
+        &mut self,
+        ctx: &Ctx,
+        out: &mut Vec<Hit>,
+        want: usize,
+        admit: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<bool> {
+        let want = want.max(1);
+        let start_len = out.len();
+        let target_len = start_len.saturating_add(want);
+        match &mut self.mode {
+            WindowMode::Indexed {
+                view,
+                base,
+                stage,
+                pending,
+                triples,
+                quads,
+                rechecked,
+            } => {
+                let ws_f32 = &self.ws_f32;
+                let windows = &self.windows;
+                let preds = &self.preds;
+                let graph = &self.graph;
+                let dedup = self.dedup;
+                let snap = &self.snap;
+                let hits_f32 = |b: [f32; 4]| {
+                    ws_f32
+                        .iter()
+                        .any(|w| b[0] <= w[2] && b[2] >= w[0] && b[1] <= w[3] && b[3] >= w[1])
+                };
+                let wanted = |r: &Row| graph.accepts(r.g) && preds.iter().any(|p| p.0 == r.p);
+                let pair_live = |r: &Row| base.column.pair(r.o).is_some_and(|p| p.live(snap, r));
+                let base_valid = |r: &Row| {
+                    if !wanted(r) {
+                        return false;
+                    }
+                    if super::wgs84::is_pair(r.o) {
+                        return pair_live(r);
+                    }
+                    let del = &snap.delta.del[Perm::Pso.index()];
+                    del.is_empty() || !del.contains(&r.pso())
+                };
+                let delta_valid = |r: &Row, quads: &mut FxHashSet<Row>| {
+                    wanted(r)
+                        && if super::wgs84::is_pair(r.o) {
+                            pair_live(r)
+                        } else {
+                            snap.delta.ins[Perm::Pso.index()].contains(&r.pso())
+                        }
+                        && quads.insert(*r)
+                };
+                let mut steps = 0usize;
+                loop {
+                    while out.len() < target_len {
+                        let Some(h) = pending.pop_front() else {
+                            break;
+                        };
+                        self.st.candidates += 1;
+                        out.push(h);
+                    }
+                    if out.len() >= target_len {
+                        let bytes = self.retained_bytes();
+                        admit(bytes)?;
+                        return Ok(false);
+                    }
+                    steps += 1;
+                    if steps.is_multiple_of(CHUNK) {
+                        ctx.check()?;
+                    }
+                    match stage {
+                        IndexStage::BaseTree { stack } => {
+                            let Some(t_packed) = &base.tree else {
+                                *stage = match &view.overlay.tree {
+                                    Some(t) => IndexStage::OverlayTree {
+                                        stack: vec![t.tree().root()],
+                                    },
+                                    None => IndexStage::Tail { at: 0 },
+                                };
+                                continue;
+                            };
+                            let Some(n) = stack.pop() else {
+                                *stage = match &view.overlay.tree {
+                                    Some(t) => IndexStage::OverlayTree {
+                                        stack: vec![t.tree().root()],
+                                    },
+                                    None => IndexStage::Tail { at: 0 },
+                                };
+                                continue;
+                            };
+                            let t = t_packed.tree();
+                            if t.is_item(n) {
+                                if hits_f32(t.bbox(n)) {
+                                    let r = &base.rows[t.item(n)];
+                                    if base_valid(r)
+                                        && (!dedup || triples.insert((r.s, r.p, r.o)))
+                                        && let Some(e) = base.column.base_entry(r.o)
+                                    {
+                                        pending.push_back(Hit::new(r, e.clone()));
+                                    }
+                                }
+                            } else {
+                                self.st.nodes += 1;
+                                for c in t.children(n) {
+                                    if !hits_f32(t.bbox(c)) {
+                                        continue;
+                                    }
+                                    if t.is_item(c) {
+                                        let r = &base.rows[t.item(c)];
+                                        if base_valid(r)
+                                            && (!dedup || triples.insert((r.s, r.p, r.o)))
+                                            && let Some(e) = base.column.base_entry(r.o)
+                                        {
+                                            pending.push_back(Hit::new(r, e.clone()));
+                                        }
+                                    } else {
+                                        stack.push(c);
+                                    }
+                                }
+                            }
+                        }
+                        IndexStage::OverlayTree { stack } => {
+                            let Some(t_packed) = &view.overlay.tree else {
+                                *stage = IndexStage::Tail { at: 0 };
+                                continue;
+                            };
+                            let Some(n) = stack.pop() else {
+                                *stage = IndexStage::Tail { at: 0 };
+                                continue;
+                            };
+                            let t = t_packed.tree();
+                            if t.is_item(n) {
+                                if hits_f32(t.bbox(n)) {
+                                    let r = &view.overlay.rows[t.item(n)];
+                                    if delta_valid(&r.row, quads)
+                                        && (!dedup || triples.insert((r.row.s, r.row.p, r.row.o)))
+                                    {
+                                        pending.push_back(Hit::new(&r.row, r.entry.clone()));
+                                    }
+                                }
+                            } else {
+                                self.st.nodes += 1;
+                                for c in t.children(n) {
+                                    if !hits_f32(t.bbox(c)) {
+                                        continue;
+                                    }
+                                    if t.is_item(c) {
+                                        let r = &view.overlay.rows[t.item(c)];
+                                        if delta_valid(&r.row, quads)
+                                            && (!dedup
+                                                || triples.insert((r.row.s, r.row.p, r.row.o)))
+                                        {
+                                            pending.push_back(Hit::new(&r.row, r.entry.clone()));
+                                        }
+                                    } else {
+                                        stack.push(c);
+                                    }
+                                }
+                            }
+                        }
+                        IndexStage::Tail { at } => {
+                            if *at >= view.tail.len() {
+                                *stage = IndexStage::BaseSkipped { at: 0 };
+                                continue;
+                            }
+                            let r = &view.tail[*at];
+                            *at += 1;
+                            let b = r.entry.bbox();
+                            if windows.iter().any(|w| intersects(&b, w))
+                                && delta_valid(&r.row, quads)
+                                && (!dedup || triples.insert((r.row.s, r.row.p, r.row.o)))
+                            {
+                                pending.push_back(Hit::new(&r.row, r.entry.clone()));
+                            }
+                        }
+                        IndexStage::BaseSkipped { at } => {
+                            if *at >= base.skipped.len() {
+                                *stage = IndexStage::OverlaySkipped { at: 0 };
+                                continue;
+                            }
+                            let r = &base.skipped[*at];
+                            *at += 1;
+                            if base_valid(r) && (!dedup || triples.insert((r.s, r.p, r.o))) {
+                                let entry = rechecked
+                                    .entry(r.o)
+                                    .or_insert_with(|| recheck(&snap.key(Id(r.o))?, &view.config))
+                                    .clone();
+                                if let Some(e) = entry {
+                                    self.st.rechecked += 1;
+                                    pending.push_back(Hit::new(r, e));
+                                }
+                            }
+                        }
+                        IndexStage::OverlaySkipped { at } => {
+                            if *at >= view.overlay.skipped.len() {
+                                *stage = IndexStage::ViewSkipped { at: 0 };
+                                continue;
+                            }
+                            let r = &view.overlay.skipped[*at];
+                            *at += 1;
+                            if delta_valid(r, quads) && (!dedup || triples.insert((r.s, r.p, r.o)))
+                            {
+                                let entry = rechecked
+                                    .entry(r.o)
+                                    .or_insert_with(|| recheck(&snap.key(Id(r.o))?, &view.config))
+                                    .clone();
+                                if let Some(e) = entry {
+                                    self.st.rechecked += 1;
+                                    pending.push_back(Hit::new(r, e));
+                                }
+                            }
+                        }
+                        IndexStage::ViewSkipped { at } => {
+                            if *at >= view.skipped.len() {
+                                *stage = IndexStage::Done;
+                                continue;
+                            }
+                            let r = &view.skipped[*at];
+                            *at += 1;
+                            if delta_valid(r, quads) && (!dedup || triples.insert((r.s, r.p, r.o)))
+                            {
+                                let entry = rechecked
+                                    .entry(r.o)
+                                    .or_insert_with(|| recheck(&snap.key(Id(r.o))?, &view.config))
+                                    .clone();
+                                if let Some(e) = entry {
+                                    self.st.rechecked += 1;
+                                    pending.push_back(Hit::new(r, e));
+                                }
+                            }
+                        }
+                        IndexStage::Done => {
+                            let bytes = self.retained_bytes();
+                            admit(bytes)?;
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            WindowMode::Fallback {
+                pred_at,
+                lo,
+                pending,
+                memo,
+                rechecked,
+                triples,
+                cfg,
+                lat,
+            } => {
+                let snap = &self.snap;
+                let view = snap.geo.as_deref();
+                let base_opt = view.and_then(|v| v.base.as_ref());
+                let windows = &self.windows;
+                let graph = &self.graph;
+                let dedup = self.dedup;
+                loop {
+                    while out.len() < target_len {
+                        let Some(h) = pending.pop_front() else {
+                            break;
+                        };
+                        self.st.candidates += 1;
+                        out.push(h);
+                    }
+                    if out.len() >= target_len {
+                        let bytes = self.retained_bytes();
+                        admit(bytes)?;
+                        return Ok(false);
+                    }
+                    if *pred_at >= self.preds.len() {
+                        let bytes = self.retained_bytes();
+                        admit(bytes)?;
+                        return Ok(true);
+                    }
+                    let p = self.preds[*pred_at];
+                    if Some(p) == *lat {
+                        let mut points = Points::default();
+                        let mut chunk_hits = Vec::new();
+                        let mut dummy_st = SearchStats::default();
+                        points.scan(
+                            ctx,
+                            p,
+                            Some(windows),
+                            graph,
+                            dedup,
+                            &mut dummy_st,
+                            &mut chunk_hits,
+                            &mut |hs| {
+                                pending.extend(hs.iter().cloned());
+                                Ok(())
+                            },
+                        )?;
+                        pending.extend(chunk_hits);
+                        *pred_at += 1;
+                        *lo = None;
+                        let bytes = fallback_retained_bytes(pending, memo, rechecked, triples);
+                        admit(bytes)?;
+                        continue;
+                    }
+                    let start_key = lo.unwrap_or([p.0, 0, 0, 0]);
+                    let end_key = [p.0, u64::MAX, u64::MAX, u64::MAX];
+                    let target_pending = want.clamp(64, CHUNK);
+                    let mut last_seen: Option<[u64; 4]> = None;
+                    let mut stopped_early = false;
+                    let mut scanned = 0usize;
+                    let mut err: Option<crate::error::Error> = None;
+                    let mut process = |k: [u64; 4]| -> Result<bool> {
+                        last_seen = Some(k);
+                        scanned += 1;
+                        if scanned.is_multiple_of(CHUNK) {
+                            ctx.check()?;
+                        }
+                        let r = Row {
+                            s: k[1],
+                            p: k[0],
+                            o: k[2],
+                            g: k[3],
+                        };
+                        if !graph.accepts(r.g) {
+                            return Ok(true);
+                        }
+                        if let Some(v) = view
+                            && !v.lookup.graph(Id(r.g), snap, &v.config)
+                        {
+                            return Ok(true);
+                        }
+                        if !matches!(Id(r.o).tag(), Tag::Vocab | Tag::Delta) {
+                            return Ok(true);
+                        }
+                        let slot = match base_opt.and_then(|b| b.column.get(r.o)) {
+                            Some(s) => s,
+                            None => memo
+                                .entry(r.o)
+                                .or_insert_with(|| match snap.key(Id(r.o)) {
+                                    Some(k) => classify(&k, cfg),
+                                    None => Slot::Other,
+                                })
+                                .clone(),
+                        };
+                        let found = match slot {
+                            Slot::Geom(e) => Some((e, false)),
+                            s if s.rechecked() => rechecked
+                                .entry(r.o)
+                                .or_insert_with(|| recheck(&snap.key(Id(r.o))?, cfg))
+                                .clone()
+                                .map(|e| (e, true)),
+                            _ => None,
+                        };
+                        let Some((e, skipped)) = found else {
+                            return Ok(true);
+                        };
+                        if !windows.iter().any(|w| intersects(&e.bbox(), w)) {
+                            return Ok(true);
+                        }
+                        if dedup && !triples.insert((r.s, r.p, r.o)) {
+                            return Ok(true);
+                        }
+                        if skipped {
+                            self.st.rechecked += 1;
+                        }
+                        pending.push_back(Hit::new(&r, e));
+                        if pending.len() >= target_pending {
+                            stopped_early = true;
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    };
+                    snap.scan_between(Perm::Pso, start_key, end_key, |c| {
+                        let cont = match c {
+                            Chunk::Block(b, s, e) => {
+                                let mut go = true;
+                                for i in s..e {
+                                    match process(b.key(i)) {
+                                        Ok(true) => {}
+                                        Ok(false) => {
+                                            go = false;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            err = Some(e);
+                                            return Ok(false);
+                                        }
+                                    }
+                                }
+                                go
+                            }
+                            Chunk::Row(k) => match process(k) {
+                                Ok(go) => go,
+                                Err(e) => {
+                                    err = Some(e);
+                                    return Ok(false);
+                                }
+                            },
+                        };
+                        Ok(cont)
+                    })?;
+                    if let Some(e) = err {
+                        return Err(e);
+                    }
+                    if stopped_early && let Some(next) = last_seen.and_then(next_key_after) {
+                        *lo = Some(next);
+                    } else {
+                        *pred_at += 1;
+                        *lo = None;
+                    }
+                    let bytes = fallback_retained_bytes(pending, memo, rechecked, triples);
+                    admit(bytes)?;
+                }
+            }
+        }
+    }
+}
+
+fn fallback_retained_bytes(
+    pending: &std::collections::VecDeque<Hit>,
+    memo: &FxHashMap<u64, Slot>,
+    rechecked: &FxHashMap<u64, Option<Arc<ColumnEntry>>>,
+    triples: &FxHashSet<(u64, u64, u64)>,
+) -> u64 {
+    (pending.capacity() as u64 * size_of::<Hit>() as u64)
+        .saturating_add(memo.capacity() as u64 * (size_of::<u64>() + size_of::<Slot>() + 1) as u64)
+        .saturating_add(
+            rechecked.capacity() as u64
+                * (size_of::<u64>() + size_of::<Option<Arc<ColumnEntry>>>() + 1) as u64,
+        )
+        .saturating_add(triples.capacity() as u64 * (size_of::<(u64, u64, u64)>() + 1) as u64)
+}
+
+/// Resumable, owned, `Send` nearest-first search over a snapshot's spatial index (or
+/// sorted predicate scan fallback).
+pub(crate) struct NearestIter {
+    snap: Arc<Snapshot>,
+    preds: Vec<Id>,
+    graph: GraphFilter,
+    dedup: bool,
+    pub(crate) st: SearchStats,
+    mode: NearestMode,
+}
+
+enum NearestMode {
+    Empty,
+    Indexed {
+        view: Arc<GeoView>,
+        base: Arc<GeoBase>,
+        lb: Bound,
+        heap: BinaryHeap<Entry>,
+        triples: FxHashSet<(u64, u64, u64)>,
+        quads: FxHashSet<Row>,
+        size: usize,
+    },
+    Fallback {
+        all: Vec<(f64, Hit)>,
+        at: usize,
+        size: usize,
+    },
+}
+
+impl NearestIter {
+    pub(crate) fn open(
+        ctx: &Ctx,
+        preds: Vec<Id>,
+        q: &Geom,
+        graph: GraphFilter,
+        dedup: bool,
+        admit: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Self> {
+        let snap = ctx.snap.clone();
+        let mut st = SearchStats::default();
+        let Some(lb) = Bound::of(q) else {
+            return Ok(Self {
+                snap,
+                preds,
+                graph,
+                dedup,
+                st,
+                mode: NearestMode::Empty,
+            });
+        };
+        let mode = if let Some((_, base)) = indexed(&snap, &preds) {
+            let view = snap.geo.clone().expect("indexed snapshot has geo view");
+            let base = base.clone();
+            let mut heap: BinaryHeap<Entry> = BinaryHeap::new();
+            if let Some(t) = base.tree.as_ref().map(PackedTree::tree) {
+                heap.push(Entry::node(&lb, &t, t.root(), Src::Base));
+            }
+            if let Some(t) = view.overlay.tree.as_ref().map(PackedTree::tree) {
+                heap.push(Entry::node(&lb, &t, t.root(), Src::Overlay));
+            }
+            for r in view.tail.iter() {
+                let mut e = Entry::row(&lb, &r.row, r.entry.clone());
+                e.from_tail = true;
+                heap.push(e);
+            }
+            let f = Filter::new(&snap, &preds, &graph, dedup);
+            let mut re = Rechecked::new(&snap);
+            for r in &base.skipped {
+                if f.base_valid(r)
+                    && let Some(en) = re.entry(r.o)
+                {
+                    st.rechecked += 1;
+                    heap.push(Entry::row(&lb, r, en));
+                }
+            }
+            for r in view.overlay.skipped.iter().chain(view.skipped.iter()) {
+                if let Some(en) = re.entry(r.o) {
+                    st.rechecked += 1;
+                    let mut e = Entry::row(&lb, r, en);
+                    e.from_tail = true;
+                    heap.push(e);
+                }
+            }
+            NearestMode::Indexed {
+                view,
+                base,
+                lb,
+                heap,
+                triples: FxHashSet::default(),
+                quads: FxHashSet::default(),
+                size: 16,
+            }
+        } else {
+            let mut all: Vec<(f64, Hit)> = Vec::new();
+            let mut scan = SearchStats::default();
+            scan_fallback(ctx, &preds, None, &graph, dedup, &mut scan, &mut |hits| {
+                all.extend(hits.iter().map(|h| (lb.of_box(h.entry.bbox()), h.clone())));
+                admit((all.capacity() * size_of::<(f64, Hit)>()) as u64)
+            })?;
+            st.fallback = true;
+            st.rechecked += scan.rechecked;
+            all.sort_by(|a, b| {
+                a.0.total_cmp(&b.0)
+                    .then_with(|| (a.1.s, a.1.o, a.1.g).cmp(&(b.1.s, b.1.o, b.1.g)))
+            });
+            NearestMode::Fallback {
+                all,
+                at: 0,
+                size: 16,
+            }
+        };
+        let iter = Self {
+            snap,
+            preds,
+            graph,
+            dedup,
+            st,
+            mode,
+        };
+        admit(iter.retained_bytes())?;
+        Ok(iter)
+    }
+
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        match &self.mode {
+            NearestMode::Empty => 0,
+            NearestMode::Indexed {
+                heap,
+                triples,
+                quads,
+                ..
+            } => (heap.capacity() as u64 * size_of::<Entry>() as u64)
+                .saturating_add(
+                    triples.capacity() as u64 * (size_of::<(u64, u64, u64)>() + 1) as u64,
+                )
+                .saturating_add(quads.capacity() as u64 * (size_of::<Row>() + 1) as u64),
+            NearestMode::Fallback { all, .. } => (all.capacity() * size_of::<(f64, Hit)>()) as u64,
+        }
+    }
+
+    /// Pull the next chunk of nearest-first hits into `out` and return the lower bound
+    /// (in metres) on every hit not yet returned (`f64::INFINITY` if exhausted), or
+    /// `None` if no more hits exist.
+    pub(crate) fn next_chunk(
+        &mut self,
+        ctx: &Ctx,
+        out: &mut Vec<Hit>,
+        admit: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Option<f64>> {
+        out.clear();
+        match &mut self.mode {
+            NearestMode::Empty => Ok(None),
+            NearestMode::Fallback { all, at, size } => {
+                if *at >= all.len() {
+                    return Ok(None);
+                }
+                ctx.check()?;
+                let end = (*at + *size).min(all.len());
+                out.extend(all[*at..end].iter().map(|(_, h)| h.clone()));
+                *at = end;
+                *size = (*size * 2).min(CHUNK);
+                self.st.candidates += out.len() as u64;
+                let bound = all.get(*at).map_or(f64::INFINITY, |(b, _)| *b);
+                Ok(Some(bound))
+            }
+            NearestMode::Indexed {
+                view,
+                base,
+                lb,
+                heap,
+                triples,
+                quads,
+                size,
+            } => {
+                let snap = &self.snap;
+                let preds = &self.preds;
+                let graph = &self.graph;
+                let dedup = self.dedup;
+                let wanted = |r: &Row| graph.accepts(r.g) && preds.iter().any(|p| p.0 == r.p);
+                let pair_live = |r: &Row| base.column.pair(r.o).is_some_and(|p| p.live(snap, r));
+                let base_valid = |r: &Row| {
+                    if !wanted(r) {
+                        return false;
+                    }
+                    if super::wgs84::is_pair(r.o) {
+                        return pair_live(r);
+                    }
+                    let del = &snap.delta.del[Perm::Pso.index()];
+                    del.is_empty() || !del.contains(&r.pso())
+                };
+                let delta_valid = |r: &Row, quads: &mut FxHashSet<Row>| {
+                    wanted(r)
+                        && if super::wgs84::is_pair(r.o) {
+                            pair_live(r)
+                        } else {
+                            snap.delta.ins[Perm::Pso.index()].contains(&r.pso())
+                        }
+                        && quads.insert(*r)
+                };
+                let trees = [
+                    base.tree.as_ref().map(PackedTree::tree),
+                    view.overlay.tree.as_ref().map(PackedTree::tree),
+                ];
+                let mut pops = 0usize;
+                while let Some(e) = heap.pop() {
+                    pops += 1;
+                    if pops.is_multiple_of(CHUNK) {
+                        ctx.check()?;
+                    }
+                    match e.item {
+                        Item::Node(n, src) => {
+                            let Some(t) = &trees[src as usize] else {
+                                continue;
+                            };
+                            let items: Vec<usize> = if t.is_item(n) {
+                                vec![n]
+                            } else {
+                                self.st.nodes += 1;
+                                let mut items = Vec::new();
+                                for c in t.children(n) {
+                                    if t.is_item(c) {
+                                        items.push(c);
+                                    } else {
+                                        heap.push(Entry::node(lb, t, c, src));
+                                    }
+                                }
+                                items
+                            };
+                            for c in items {
+                                let i = t.item(c);
+                                match src {
+                                    Src::Base => {
+                                        let r = &base.rows[i];
+                                        if base_valid(r)
+                                            && let Some(en) = base.column.base_entry(r.o)
+                                        {
+                                            heap.push(Entry::row(lb, r, en.clone()));
+                                        }
+                                    }
+                                    Src::Overlay => {
+                                        let r = &view.overlay.rows[i];
+                                        if delta_valid(&r.row, quads) {
+                                            heap.push(Entry::row(lb, &r.row, r.entry.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Item::Row(r, entry) => {
+                            if e.from_tail && !delta_valid(&r, quads) {
+                                continue;
+                            }
+                            if dedup && !triples.insert((r.s, r.p, r.o)) {
+                                continue;
+                            }
+                            out.push(Hit::new(&r, entry));
+                            if out.len() >= *size {
+                                let bound = heap.peek().map_or(f64::INFINITY, |e| e.lb);
+                                self.st.candidates += out.len() as u64;
+                                *size = (*size * 2).min(CHUNK);
+                                let bytes = self.retained_bytes();
+                                admit(bytes)?;
+                                return Ok(Some(bound));
+                            }
+                        }
+                    }
+                }
+                let bytes = self.retained_bytes();
+                admit(bytes)?;
+                if out.is_empty() {
+                    Ok(None)
+                } else {
+                    self.st.candidates += out.len() as u64;
+                    Ok(Some(f64::INFINITY))
+                }
+            }
+        }
+    }
+}

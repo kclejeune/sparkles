@@ -223,12 +223,11 @@ const FIXTURES: &[(&str, &str, &str, bool)] = &[
         "Limit",
         true,
     ),
-    // item 1189: a path search under a cursor runs as a materialized fallback
     (
         "path search",
         "PREFIX path: <urn:x-sparkles:path#> SELECT ?b ?p { SERVICE path:search { [] path:source <urn:c:0> ; path:target ?b ; path:predicate <urn:n> ; path:algorithm path:all ; path:maxLength 3000 ; path:pathIndex ?p } }",
         "PathSearch",
-        false,
+        true,
     ),
 ];
 

@@ -260,7 +260,7 @@ pub(crate) fn spatial_knn_materialized<'ctx>(
 /// The scan's rows `(s, o, g)` whose literal has no distance to the constant, in scan
 /// order (what the nearest-first search never hands out, and what it hands out but
 /// cannot be measured), and those literals.
-fn rows_without_distance(
+pub(crate) fn rows_without_distance(
     ctx: &Ctx,
     spec: &SpatialKnnSpec,
     subj: Option<Id>,

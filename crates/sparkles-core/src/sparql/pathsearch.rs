@@ -3522,6 +3522,1117 @@ pub fn run(
     Ok((out, counters))
 }
 
+/// Whether a path search without input or an edge pattern and without a limit runs as a
+/// resumable cursor reader (item 829, group 5):
+/// - `path:shortest` or `path:kShortest` between two constant endpoints (bounded by 1 or k paths)
+/// - `path:all` with at least one constant endpoint (streamed DFS under a memory charge).
+pub(crate) fn stream_eligible(spec: &PathSearchSpec) -> bool {
+    if spec.limit.is_some() || spec.edge_pattern.is_some() {
+        return false;
+    }
+    match spec.algorithm {
+        Algorithm::Shortest | Algorithm::KShortest => {
+            matches!(spec.source, PathEnd::Const(_)) && matches!(spec.target, PathEnd::Const(_))
+        }
+        Algorithm::All => {
+            matches!(spec.source, PathEnd::Const(_)) || matches!(spec.target, PathEnd::Const(_))
+        }
+        Algorithm::AllShortest => false,
+    }
+}
+
+/// Owned, `Send` resumable reader for eligible `SERVICE path:search` leaves (item 829).
+pub(crate) struct Reader {
+    spec: PathSearchSpec,
+    vars: Vec<VarId>,
+    mode: ReaderMode,
+    current: Option<(u32, Found, usize)>,
+    next_path_id: u32,
+    terms: FxHashMap<(u64, u64, u64), Id>,
+    cols: RowCols,
+    charge: super::ctx::OwnedCharge,
+    counters: serde_json::Map<String, serde_json::Value>,
+}
+
+struct RowCols {
+    src_c: Option<usize>,
+    tgt_c: Option<usize>,
+    pi_c: Option<usize>,
+    ei_c: Option<usize>,
+    es_c: Option<usize>,
+    ep_c: Option<usize>,
+    eo_c: Option<usize>,
+    edge_c: Option<usize>,
+    len_c: Option<usize>,
+    cost_c: Option<usize>,
+}
+
+impl RowCols {
+    fn new(spec: &PathSearchSpec, vars: &[VarId]) -> Self {
+        let pos = |v: Option<VarId>| v.and_then(|v| vars.iter().position(|x| *x == v));
+        Self {
+            src_c: match spec.source {
+                PathEnd::Var(v) => pos(Some(v)),
+                _ => None,
+            },
+            tgt_c: match spec.target {
+                PathEnd::Var(v) => pos(Some(v)),
+                _ => None,
+            },
+            pi_c: pos(spec.path_index),
+            ei_c: pos(spec.edge_index),
+            es_c: pos(spec.edge_s),
+            ep_c: pos(spec.edge_p),
+            eo_c: pos(spec.edge_o),
+            edge_c: pos(spec.edge),
+            len_c: pos(spec.length),
+            cost_c: pos(spec.cost),
+        }
+    }
+}
+
+enum ReaderMode {
+    /// Bounded list of paths (`Shortest` / `KShortest` between two constants), served
+    /// edge-by-edge without materializing the full edge table at once.
+    Bounded(std::collections::VecDeque<Found>),
+    /// Resumable DFS for `Algorithm::All` with at least one constant end.
+    All(Box<AllPathsState>),
+}
+
+/// Owned, `Send` DFS state for `Algorithm::All` without input or edge pattern.
+struct AllPathsState {
+    dedup: bool,
+    succ: Vec<Side>,
+    pred: Vec<Side>,
+    sinks: bool,
+    degree: DegreeCount,
+    forward: bool,
+    root: u64,
+    target: Option<u64>,
+    close: bool,
+    max_len: u32,
+    min_len: u32,
+    pending_zero: bool,
+    pending_push: Option<u64>,
+    dist: Option<FxHashMap<u64, u32>>,
+    cache: FxHashMap<(u64, bool), std::sync::Arc<[Step]>>,
+    cache_step_bytes: u64,
+    weights: FxHashMap<(u64, u64, u64), f64>,
+    hubs: FxHashMap<u64, bool>,
+    roots: Vec<u64>,
+    on_path: FxHashSet<u64>,
+    stack: Vec<(u64, std::sync::Arc<[Step]>, usize)>,
+    edges: Vec<Edge>,
+    visited: u64,
+    visited_total: u64,
+    searches: u64,
+    sweeps: u64,
+    skipped_hubs: u64,
+    paths_found: u64,
+    steps: u64,
+    done: bool,
+}
+
+impl AllPathsState {
+    fn open(
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        charge: &mut super::ctx::OwnedCharge,
+    ) -> Result<Self> {
+        let (forward, root, target) = match (&spec.source, &spec.target) {
+            (PathEnd::Const(s), PathEnd::Const(t)) => (true, s.0, Some(t.0)),
+            (PathEnd::Const(s), PathEnd::Var(_)) => (true, s.0, None),
+            (PathEnd::Var(_), PathEnd::Const(t)) => (false, t.0, None),
+            _ => unreachable!("stream_eligible requires at least one constant end"),
+        };
+        let lane = |p: Option<u64>, subject_side: bool| Lane {
+            perm: match (p.is_some(), subject_side) {
+                (true, true) => Perm::Pso,
+                (true, false) => Perm::Pos,
+                (false, true) => Perm::Spo,
+                (false, false) => Perm::Osp,
+            },
+            p,
+            subject_side,
+            pattern: false,
+        };
+        let groups: Vec<(Lane, Lane, Direction)> = match &spec.predicates {
+            Some(ps) => ps
+                .iter()
+                .zip(&spec.directions)
+                .map(|(&p, &d)| (lane(Some(p), true), lane(Some(p), false), d))
+                .collect(),
+            None => vec![(lane(None, true), lane(None, false), spec.direction)],
+        };
+        let side = |lane: Lane, rev: bool, skip_self: bool| Side {
+            lane,
+            rev,
+            skip_self,
+        };
+        let (mut succ, mut pred) = (Vec::new(), Vec::new());
+        for &(s, o, d) in &groups {
+            match d {
+                Direction::Forward | Direction::Both => {
+                    succ.push(side(s, false, false));
+                    pred.push(side(o, false, false));
+                }
+                Direction::Backward => {
+                    succ.push(side(o, true, false));
+                    pred.push(side(s, true, false));
+                }
+            }
+        }
+        for &(s, o, d) in &groups {
+            if d == Direction::Both {
+                succ.push(side(o, true, true));
+                pred.push(side(s, true, true));
+            }
+        }
+        let sinks =
+            succ.iter().any(|s| !s.lane.subject_side) || pred.iter().any(|s| s.lane.subject_side);
+        let degree = match spec.max_degree {
+            None => DegreeCount::Scan,
+            Some(_) => degree_count(ctx, &spec.graph)?,
+        };
+        let max_len = spec.max_len.unwrap_or(0);
+        let min_len = spec.min_len;
+        let close = target.is_none_or(|t| t == root);
+        let mut st = Self {
+            dedup: spec.graph.multi(),
+            succ,
+            pred,
+            sinks,
+            degree,
+            forward,
+            root,
+            target,
+            close,
+            max_len,
+            min_len,
+            pending_zero: min_len == 0 && close,
+            pending_push: None,
+            dist: None,
+            cache: FxHashMap::default(),
+            cache_step_bytes: 0,
+            weights: FxHashMap::default(),
+            hubs: FxHashMap::default(),
+            roots: Vec::new(),
+            on_path: FxHashSet::default(),
+            stack: Vec::new(),
+            edges: Vec::new(),
+            visited: 0,
+            visited_total: 0,
+            searches: 1,
+            sweeps: 0,
+            skipped_hubs: 0,
+            paths_found: 0,
+            steps: 0,
+            done: false,
+        };
+        if max_len == 0 {
+            st.done = !st.pending_zero;
+            return Ok(st);
+        }
+        if let Some(t) = target {
+            let mut d: FxHashMap<u64, u32> = FxHashMap::default();
+            d.insert(t, 0);
+            let mut frontier = vec![t];
+            st.set_roots(spec, &frontier);
+            let mut level = 0;
+            while !frontier.is_empty() && level < max_len {
+                let mut found = Vec::new();
+                st.expand(ctx, spec, &frontier, !forward, &mut found, charge)?;
+                level += 1;
+                let mut next = Vec::new();
+                for (_, step) in found {
+                    if let std::collections::hash_map::Entry::Vacant(v) = d.entry(step.node) {
+                        v.insert(level);
+                        next.push(step.node);
+                    }
+                }
+                st.visit(spec, next.len() as u64)?;
+                next.sort_unstable();
+                frontier = next;
+                let extra = d.capacity() as u64 * 16 + frontier.capacity() as u64 * 8;
+                charge.resize(st.retained_bytes().saturating_add(extra))?;
+            }
+            st.dist = Some(d);
+            charge.resize(st.retained_bytes())?;
+        }
+        st.set_roots(spec, &[root]);
+        st.on_path.insert(root);
+        let root_ns = st.neighbours(ctx, spec, root, forward, charge)?;
+        st.stack.push((root, root_ns, 0));
+        charge.resize(st.retained_bytes())?;
+        Ok(st)
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        let dist = self.dist.as_ref().map_or(0, |d| {
+            d.capacity() as u64 * (size_of::<u64>() + size_of::<u32>() + 1) as u64
+        });
+        let cache = self.cache_step_bytes.saturating_add(
+            self.cache.capacity() as u64
+                * (size_of::<(u64, bool)>() + size_of::<std::sync::Arc<[Step]>>() + 1) as u64,
+        );
+        let stack =
+            self.stack.capacity() as u64 * size_of::<(u64, std::sync::Arc<[Step]>, usize)>() as u64;
+        let on_path = self.on_path.capacity() as u64 * (size_of::<u64>() + 1) as u64;
+        let edges = self.edges.capacity() as u64 * size_of::<Edge>() as u64;
+        let hubs = self.hubs.capacity() as u64 * (size_of::<u64>() + 2) as u64;
+        let weights = self.weights.capacity() as u64
+            * (size_of::<(u64, u64, u64)>() + size_of::<f64>() + 1) as u64;
+        dist.saturating_add(cache)
+            .saturating_add(stack)
+            .saturating_add(on_path)
+            .saturating_add(edges)
+            .saturating_add(hubs)
+            .saturating_add(weights)
+    }
+
+    fn set_roots(&mut self, spec: &PathSearchSpec, roots: &[u64]) {
+        if spec.max_degree.is_some() || self.sinks {
+            self.roots.clear();
+            self.roots.extend_from_slice(roots);
+        }
+    }
+
+    fn sink(&self, ctx: &Ctx, x: u64, succ: bool) -> bool {
+        self.sinks
+            && ctx.snap.term_kind(Id(x)) == crate::store::TermKind::Literal
+            && (succ || !self.roots.contains(&x))
+    }
+
+    fn blocked(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        x: u64,
+        charge: &mut super::ctx::OwnedCharge,
+    ) -> Result<bool> {
+        if spec.max_degree.is_none() || self.roots.contains(&x) {
+            return Ok(false);
+        }
+        let Some(limit) = spec.max_degree else {
+            return Ok(false);
+        };
+        if let Some(&h) = self.hubs.get(&x) {
+            return Ok(h);
+        }
+        let h = self.degree_above(ctx, spec, x, limit)?;
+        self.hubs.insert(x, h);
+        charge.resize(self.retained_bytes())?;
+        Ok(h)
+    }
+
+    fn degree_above(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        x: u64,
+        limit: u64,
+    ) -> Result<bool> {
+        if self.degree == DegreeCount::Zero {
+            return Ok(false);
+        }
+        let snap = &ctx.snap;
+        let key = |lane: &Lane, x: u64| -> Vec<u64> { lane.p.into_iter().chain([x]).collect() };
+        let mut upper = 0u64;
+        for s in &self.succ {
+            upper += snap.count(s.lane.perm, &key(&s.lane, x))?;
+        }
+        if upper <= limit {
+            return Ok(false);
+        }
+        if self.degree == DegreeCount::Index {
+            let excl = &spec.exclude;
+            let mut less = 0u64;
+            for s in &self.succ {
+                let lane = &s.lane;
+                if lane.p.is_none() {
+                    let by = if lane.subject_side {
+                        Perm::Pso
+                    } else {
+                        Perm::Pos
+                    };
+                    for &pe in excl {
+                        less += snap.count(by, &[pe, x])?;
+                    }
+                }
+                if s.skip_self {
+                    less += match lane.p {
+                        Some(p) => snap.count(Perm::Pso, &[p, x, x])?,
+                        None => {
+                            let mut loops = snap.count(Perm::Sop, &[x, x])?;
+                            for &pe in excl {
+                                loops = loops.saturating_sub(snap.count(Perm::Pso, &[pe, x, x])?);
+                            }
+                            loops
+                        }
+                    };
+                }
+            }
+            return Ok(upper.saturating_sub(less) > limit);
+        }
+        let cap = usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let mut out = Count(0);
+        let sides = self.succ.clone();
+        for s in &sides {
+            self.scan_lane(ctx, spec, &s.lane, &[x], s.rev, s.skip_self, &mut out, cap)?;
+            if out.0 >= cap {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn visit(&mut self, spec: &PathSearchSpec, n: u64) -> Result<()> {
+        let v = self.visited + n;
+        self.visited = v;
+        self.visited_total += n;
+        if v > spec.max_visited {
+            return Err(bad(format!(
+                "a search visited more than {} nodes; raise path:maxVisited, lower path:maxLength or add predicates",
+                spec.max_visited
+            )));
+        }
+        Ok(())
+    }
+
+    fn expand(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        frontier: &[u64],
+        succ: bool,
+        out: &mut Vec<(u64, Step)>,
+        charge: &mut super::ctx::OwnedCharge,
+    ) -> Result<()> {
+        if spec.max_degree.is_none() && !self.sinks {
+            return self.expand_all(ctx, spec, frontier, succ, out);
+        }
+        let mut kept: Option<Vec<u64>> = None;
+        for (i, &x) in frontier.iter().enumerate() {
+            let skip = if self.sink(ctx, x, succ) {
+                true
+            } else if self.blocked(ctx, spec, x, charge)? {
+                self.skipped_hubs += 1;
+                true
+            } else {
+                false
+            };
+            if skip {
+                kept.get_or_insert_with(|| frontier[..i].to_vec());
+            } else if let Some(k) = &mut kept {
+                k.push(x);
+            }
+        }
+        match kept {
+            None => self.expand_all(ctx, spec, frontier, succ, out),
+            Some(k) => self.expand_all(ctx, spec, &k, succ, out),
+        }
+    }
+
+    fn expand_all(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        frontier: &[u64],
+        succ: bool,
+        out: &mut Vec<(u64, Step)>,
+    ) -> Result<()> {
+        if frontier.is_empty() {
+            return Ok(());
+        }
+        let sides = if succ {
+            self.succ.clone()
+        } else {
+            self.pred.clone()
+        };
+        for s in &sides {
+            let start = out.len();
+            self.scan_lane(
+                ctx,
+                spec,
+                &s.lane,
+                frontier,
+                s.rev,
+                s.skip_self,
+                out,
+                usize::MAX,
+            )?;
+            if !succ && s.lane.subject_side {
+                let snap = &ctx.snap;
+                let mut w = start;
+                for r in start..out.len() {
+                    if snap.term_kind(Id(out[r].1.node)) != crate::store::TermKind::Literal {
+                        out[w] = out[r];
+                        w += 1;
+                    }
+                }
+                out.truncate(w);
+            }
+        }
+        ctx.check()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_lane<O: Sink>(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        lane: &Lane,
+        frontier: &[u64],
+        rev: bool,
+        skip_self: bool,
+        out: &mut O,
+        cap: usize,
+    ) -> Result<()> {
+        let snap = &ctx.snap;
+        let (kc, nc, pc) = lane.cols();
+        let gc = lane.perm.col_of(crate::index::G);
+        let prefix: Vec<u64> = lane.p.into_iter().collect();
+        let mask = (1 << kc) | (1 << nc) | (1 << gc) | pc.map_or(0, |c| 1 << c);
+        let graph = &spec.graph;
+        let dedup = self.dedup;
+        let fixed_p = lane.p.unwrap_or(0);
+        let excl: &[u64] = if lane.p.is_none() { &spec.exclude } else { &[] };
+        let mut last: Option<(u64, u64, u64)> = None;
+        let mut emit = |x: u64, node: u64, p: u64, g: u64, out: &mut O| {
+            if !graph.accepts(g) || (skip_self && node == x) {
+                return;
+            }
+            if !excl.is_empty() && excl.binary_search(&p).is_ok() {
+                return;
+            }
+            if dedup && last == Some((x, node, p)) {
+                return;
+            }
+            last = Some((x, node, p));
+            out.put(x, Step { node, p, rev });
+        };
+        let rows = match lane.p {
+            Some(p) => snap.estimate(lane.perm, &[p]),
+            None => snap.len(),
+        };
+        let sweep = ctx.opt.batched_paths
+            && frontier.len() >= 64
+            && (frontier.len() as u64).saturating_mul(SWEEP_RATIO) >= rows;
+        if !sweep {
+            for &x in frontier {
+                let mut key = prefix.clone();
+                key.push(x);
+                snap.scan_between_cols(lane.perm, pad(&key, 0), pad(&key, u64::MAX), mask, |c| {
+                    match c {
+                        Chunk::Block(b, s, e) => {
+                            for i in s..e {
+                                let p = pc.map_or(fixed_p, |c| b.cols[c][i]);
+                                emit(x, b.cols[nc][i], p, b.cols[gc][i], out);
+                            }
+                        }
+                        Chunk::Row(k) => emit(x, k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out),
+                    }
+                    if O::CHECKS {
+                        ctx.check()?;
+                    }
+                    Ok(out.len() < cap)
+                })?;
+            }
+            return Ok(());
+        }
+        self.sweeps += 1;
+        let (first, last_node) = (frontier[0], frontier[frontier.len() - 1]);
+        let (mut lo, mut hi) = (prefix.clone(), prefix);
+        lo.push(first);
+        hi.push(last_node);
+        let mut j = 0;
+        snap.scan_between_cols(lane.perm, pad(&lo, 0), pad(&hi, u64::MAX), mask, |c| {
+            match c {
+                Chunk::Block(b, s, e) => {
+                    let keys = &b.cols[kc][s..e];
+                    let mut i = 0;
+                    while i < keys.len() && j < frontier.len() {
+                        let (k, f) = (keys[i], frontier[j]);
+                        if k < f {
+                            i += keys[i..].partition_point(|&x| x < f);
+                        } else if k > f {
+                            j += frontier[j..].partition_point(|&x| x < k);
+                        } else {
+                            while i < keys.len() && keys[i] == f {
+                                let r = s + i;
+                                let p = pc.map_or(fixed_p, |c| b.cols[c][r]);
+                                emit(f, b.cols[nc][r], p, b.cols[gc][r], out);
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                Chunk::Row(k) => {
+                    j += frontier[j..].partition_point(|&x| x < k[kc]);
+                    if j < frontier.len() && frontier[j] == k[kc] {
+                        emit(k[kc], k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out);
+                    }
+                }
+            }
+            Ok(j < frontier.len())
+        })?;
+        Ok(())
+    }
+
+    fn neighbours(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        x: u64,
+        succ: bool,
+        charge: &mut super::ctx::OwnedCharge,
+    ) -> Result<std::sync::Arc<[Step]>> {
+        if self.sink(ctx, x, succ) {
+            return Ok(std::sync::Arc::from(Vec::new()));
+        }
+        if self.blocked(ctx, spec, x, charge)? {
+            self.skipped_hubs += 1;
+            return Ok(std::sync::Arc::from(Vec::new()));
+        }
+        if let Some(n) = self.cache.get(&(x, succ)) {
+            return Ok(n.clone());
+        }
+        let mut out = Vec::new();
+        self.expand_all(ctx, spec, &[x], succ, &mut out)?;
+        let steps: std::sync::Arc<[Step]> = out.into_iter().map(|(_, s)| s).collect();
+        let added = steps.len() as u64 * size_of::<Step>() as u64 + (2 * size_of::<usize>()) as u64;
+        let next_cache_bytes = self.cache_step_bytes.saturating_add(added);
+        let growth = if self.cache.len() == self.cache.capacity() {
+            (self.cache.capacity().max(4) * 2) as u64
+                * (size_of::<(u64, bool)>() + size_of::<std::sync::Arc<[Step]>>() + 1) as u64
+        } else {
+            0
+        };
+        charge.resize(
+            self.retained_bytes()
+                .saturating_add(added)
+                .saturating_add(growth),
+        )?;
+        self.cache_step_bytes = next_cache_bytes;
+        self.cache.insert((x, succ), steps.clone());
+        charge.resize(self.retained_bytes())?;
+        Ok(steps)
+    }
+
+    fn path_cost(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        edges: &[Edge],
+        charge: &mut super::ctx::OwnedCharge,
+    ) -> Result<f64> {
+        let Some(w) = spec.weight else {
+            return Ok(edges.len() as f64);
+        };
+        let mut sum = Cost::ZERO;
+        for e in edges {
+            let weight = if w.is_none() || spec.reifies.is_none() {
+                spec.default_weight
+            } else {
+                let key = e.triple();
+                if let Some(&x) = self.weights.get(&key) {
+                    x
+                } else {
+                    let x = lookup_weight_standalone(ctx, spec, w, key)?;
+                    self.weights.insert(key, x);
+                    charge.resize(self.retained_bytes())?;
+                    x
+                }
+            };
+            sum = sum.add(Cost::of(weight));
+        }
+        Ok(sum.hi)
+    }
+
+    fn next_path(
+        &mut self,
+        ctx: &Ctx,
+        spec: &PathSearchSpec,
+        charge: &mut super::ctx::OwnedCharge,
+    ) -> Result<Option<Found>> {
+        if self.done {
+            return Ok(None);
+        }
+        if self.pending_zero {
+            self.pending_zero = false;
+            if self.max_len == 0 {
+                self.done = true;
+            }
+            self.paths_found += 1;
+            return Ok(Some(Found {
+                start: self.root,
+                end: self.root,
+                edges: Vec::new(),
+                len: 0,
+                cost: 0.0,
+            }));
+        }
+        if let Some(y) = self.pending_push.take() {
+            self.on_path.insert(y);
+            let ns = self.neighbours(ctx, spec, y, self.forward, charge)?;
+            self.stack.push((y, ns, 0));
+            charge.resize(self.retained_bytes())?;
+        }
+        let need_edges = spec.per_edge() || spec.weighted();
+        while let Some(top) = self.stack.last_mut() {
+            let (x, ns, i) = (top.0, top.1.clone(), top.2);
+            if i >= ns.len() {
+                self.stack.pop();
+                self.on_path.remove(&x);
+                self.edges.pop();
+                continue;
+            }
+            top.2 += 1;
+            let st = ns[i];
+            let y = st.node;
+            let len = self.edges.len() as u32 + 1;
+            let closing = self.close && y == self.root;
+            if !closing && self.on_path.contains(&y) {
+                continue;
+            }
+            if !closing
+                && let Some(d) = &self.dist
+                && d.get(&y).is_none_or(|&k| k > self.max_len - len)
+            {
+                continue;
+            }
+            self.steps += 1;
+            if self.steps.is_multiple_of(1024) {
+                self.visit(spec, 1024)?;
+                ctx.check()?;
+            }
+            let e = if self.forward {
+                Edge {
+                    from: x,
+                    to: y,
+                    p: st.p,
+                    rev: st.rev,
+                }
+            } else {
+                Edge {
+                    from: y,
+                    to: x,
+                    p: st.p,
+                    rev: st.rev,
+                }
+            };
+            self.edges.push(e);
+            let matched = (closing || self.target.is_none_or(|t| t == y)) && len >= self.min_len;
+            let stop_branch = closing || len >= self.max_len;
+            if matched {
+                let ordered: Vec<Edge> = if self.forward {
+                    self.edges.clone()
+                } else {
+                    self.edges.iter().rev().copied().collect()
+                };
+                if stop_branch {
+                    self.edges.pop();
+                } else {
+                    self.pending_push = Some(y);
+                }
+                let cost = self.path_cost(ctx, spec, &ordered, charge)?;
+                let plen = ordered.len();
+                let (start, end) = if self.forward {
+                    (self.root, y)
+                } else {
+                    (y, self.root)
+                };
+                self.paths_found += 1;
+                return Ok(Some(Found {
+                    start,
+                    end,
+                    edges: if need_edges { ordered } else { Vec::new() },
+                    len: plen,
+                    cost,
+                }));
+            }
+            if stop_branch {
+                self.edges.pop();
+                continue;
+            }
+            self.on_path.insert(y);
+            let child_ns = self.neighbours(ctx, spec, y, self.forward, charge)?;
+            self.stack.push((y, child_ns, 0));
+            charge.resize(self.retained_bytes())?;
+        }
+        self.done = true;
+        Ok(None)
+    }
+
+    fn counters(&self, spec: &PathSearchSpec) -> serde_json::Map<String, serde_json::Value> {
+        let mut c = serde_json::Map::new();
+        c.insert("searches".into(), self.searches.into());
+        c.insert("visited".into(), self.visited_total.into());
+        c.insert("paths".into(), self.paths_found.into());
+        if self.sweeps > 0 {
+            c.insert("sweeps".into(), self.sweeps.into());
+        }
+        if spec.max_degree.is_some() {
+            c.insert("skippedHubs".into(), self.skipped_hubs.into());
+        }
+        c
+    }
+}
+
+fn lookup_weight_standalone(
+    ctx: &Ctx,
+    spec: &PathSearchSpec,
+    w: Option<u64>,
+    (s, p, o): (u64, u64, u64),
+) -> Result<f64> {
+    let default = spec.default_weight;
+    let (Some(w), Some(reifies)) = (w, spec.reifies) else {
+        return Ok(default);
+    };
+    let terms = (ctx.term(Id(s)), ctx.term(Id(p)), ctx.term(Id(o)));
+    let (Some(s), Some(Term::NamedNode(p)), Some(o)) = terms else {
+        return Ok(default);
+    };
+    let s = match s {
+        Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+        Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+        _ => return Ok(default),
+    };
+    let tt = Term::Triple(Box::new(oxrdf::Triple::new(s, p, o)));
+    let Some(tt) = ctx.snap.lookup_term(&tt) else {
+        return Ok(default);
+    };
+    let graph = &spec.graph;
+    let mut reifiers = Vec::new();
+    for k in ctx.snap.scan_keys(Perm::Pos, &[reifies, tt.0])? {
+        if graph.accepts(k[3]) {
+            reifiers.push(k[2]);
+        }
+    }
+    let mut best: Option<f64> = None;
+    for r in reifiers {
+        for k in ctx.snap.scan_keys(Perm::Pso, &[w, r])? {
+            if !graph.accepts(k[3]) {
+                continue;
+            }
+            let v = ctx
+                .value(Id(k[2]))
+                .as_ref()
+                .and_then(super::value::approx_f64);
+            match v {
+                Some(v) if v >= 0.0 && v.is_finite() => {
+                    best = Some(best.map_or(v, |b: f64| b.min(v)));
+                }
+                _ => {
+                    let t = ctx
+                        .term(Id(k[2]))
+                        .map_or_else(|| "?".to_string(), |t| t.to_string());
+                    return Err(bad(format!("the weight {t} is not a non-negative number")));
+                }
+            }
+        }
+    }
+    Ok(best.unwrap_or(default))
+}
+
+fn find_const_bounded(
+    ctx: &Ctx,
+    spec: &PathSearchSpec,
+    s: u64,
+    t: u64,
+) -> Result<(
+    std::collections::VecDeque<Found>,
+    serde_json::Map<String, serde_json::Value>,
+)> {
+    let eng = Engine::new(ctx, spec, None)?;
+    let weighted = spec.weighted();
+    let need_edges = spec.per_edge() || weighted;
+    let mut found = std::collections::VecDeque::new();
+    let mut push = |edges: Vec<Edge>, len: Option<usize>| -> Result<bool> {
+        if !eng.take() {
+            return Ok(false);
+        }
+        let cost = eng.path_cost(&edges)?;
+        let plen = len.unwrap_or(edges.len());
+        let edges = if need_edges { edges } else { Vec::new() };
+        eng.charge.add(edges.len() as u64 * 32 + 64)?;
+        found.push_back(Found {
+            start: s,
+            end: t,
+            edges,
+            len: plen,
+            cost,
+        });
+        Ok(true)
+    };
+    match spec.algorithm {
+        Algorithm::Shortest => {
+            if weighted && spec.max_len.is_some() {
+                eng.begin();
+                if spec.min_len == 0 && s == t {
+                    push(Vec::new(), None)?;
+                } else {
+                    let mut best: Option<Cost> = None;
+                    let mut out = Vec::new();
+                    eng.yen(s, t, |p, c| {
+                        if p.len() as u32 > spec.max_len.unwrap() || (p.len() as u32) < spec.min_len
+                        {
+                            return Ok(true);
+                        }
+                        match best {
+                            None => best = Some(c),
+                            Some(b) if c > b => return Ok(false),
+                            Some(_) => {}
+                        }
+                        out.push(p.to_vec());
+                        Ok(false)
+                    })?;
+                    for p in out {
+                        if !push(p, None)? {
+                            break;
+                        }
+                    }
+                }
+            } else if !weighted {
+                eng.begin();
+                if spec.min_len == 0 && s == t {
+                    push(Vec::new(), None)?;
+                } else {
+                    for p in eng.bidirectional(s, t, false, 1)? {
+                        if !push(p, None)? {
+                            break;
+                        }
+                    }
+                }
+            } else if s == t {
+                eng.begin();
+                if spec.min_len == 0 {
+                    push(Vec::new(), None)?;
+                } else {
+                    let answered = eng.dijkstra_pair_all(s, t, false, &mut |p| {
+                        push(p, None)?;
+                        Ok(false)
+                    })?;
+                    if !answered {
+                        let mut tset = FxHashSet::default();
+                        tset.insert(t);
+                        let (tree, _) =
+                            eng.dijkstra(s, true, Some(&tset), false, true, None, None, s)?;
+                        for p in tree.paths(VIRT, false, 1, None, &|| eng.ctx.check())? {
+                            let p = p
+                                .into_iter()
+                                .map(|e| e.map(|x| if x == VIRT { s } else { x }))
+                                .collect();
+                            if !push(p, None)? {
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                eng.begin();
+                if let Some((p, _)) = eng.dijkstra_pair(s, t, None, None)? {
+                    push(p, None)?;
+                }
+            }
+        }
+        Algorithm::KShortest => {
+            eng.begin();
+            let mut n = 0usize;
+            if spec.min_len == 0 && s == t {
+                push(Vec::new(), None)?;
+                n += 1;
+            }
+            if n < spec.k {
+                let mut out = Vec::new();
+                let max = spec.max_len.unwrap_or(u32::MAX);
+                let cap = eng.left.get();
+                eng.yen(s, t, |p, _| {
+                    let len = p.len() as u32;
+                    if len >= spec.min_len && len <= max {
+                        out.push(p.to_vec());
+                        n += 1;
+                    }
+                    Ok(n < spec.k && out.len() < cap)
+                })?;
+                for p in out {
+                    if !push(p, None)? {
+                        break;
+                    }
+                }
+            }
+        }
+        _ => unreachable!("find_const_bounded handles Shortest and KShortest"),
+    }
+    let mut counters = serde_json::Map::new();
+    counters.insert("searches".into(), eng.searches.get().into());
+    counters.insert("visited".into(), eng.visited_total.get().into());
+    counters.insert("paths".into(), (found.len() as u64).into());
+    if eng.sweeps.get() > 0 {
+        counters.insert("sweeps".into(), eng.sweeps.get().into());
+    }
+    if spec.max_degree.is_some() {
+        counters.insert("skippedHubs".into(), eng.skipped_hubs.get().into());
+    }
+    Ok((found, counters))
+}
+
+impl Reader {
+    pub(crate) fn open(
+        ctx: &std::sync::Arc<Ctx>,
+        spec: &PathSearchSpec,
+        vars: &[VarId],
+    ) -> Result<Self> {
+        let mut charge = super::ctx::OwnedCharge::new(ctx, 0)?;
+        let cols = RowCols::new(spec, vars);
+        let (mode, counters) = match spec.algorithm {
+            Algorithm::Shortest | Algorithm::KShortest => {
+                let (PathEnd::Const(s), PathEnd::Const(t)) = (&spec.source, &spec.target) else {
+                    unreachable!("stream_eligible requires constant source and target")
+                };
+                let (paths, counters) = find_const_bounded(ctx, spec, s.0, t.0)?;
+                let bytes: u64 = paths
+                    .iter()
+                    .map(|f| (f.edges.capacity() * size_of::<Edge>() + size_of::<Found>()) as u64)
+                    .sum();
+                charge.resize(bytes)?;
+                (ReaderMode::Bounded(paths), counters)
+            }
+            Algorithm::All => {
+                let state = AllPathsState::open(ctx, spec, &mut charge)?;
+                let counters = state.counters(spec);
+                (ReaderMode::All(Box::new(state)), counters)
+            }
+            Algorithm::AllShortest => unreachable!("AllShortest is not stream_eligible"),
+        };
+        Ok(Self {
+            spec: spec.clone(),
+            vars: vars.to_vec(),
+            mode,
+            current: None,
+            next_path_id: 0,
+            terms: FxHashMap::default(),
+            cols,
+            charge,
+            counters,
+        })
+    }
+
+    pub(crate) fn counters(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.counters
+    }
+
+    fn update_charge(&mut self) -> Result<()> {
+        let terms_bytes = self.terms.capacity() as u64
+            * (size_of::<(u64, u64, u64)>() + size_of::<Id>() + 1) as u64;
+        let cur_bytes = self.current.as_ref().map_or(0, |(_, f, _)| {
+            (f.edges.capacity() * size_of::<Edge>() + size_of::<Found>()) as u64
+        });
+        let mode_bytes = match &self.mode {
+            ReaderMode::Bounded(q) => q
+                .iter()
+                .map(|f| (f.edges.capacity() * size_of::<Edge>() + size_of::<Found>()) as u64)
+                .sum(),
+            ReaderMode::All(st) => st.retained_bytes(),
+        };
+        self.charge.resize(
+            mode_bytes
+                .saturating_add(cur_bytes)
+                .saturating_add(terms_bytes),
+        )
+    }
+
+    /// Fill `out` with up to `cap` rows. Returns `true` when the search is exhausted.
+    pub(crate) fn next(&mut self, ctx: &Ctx, out: &mut Table, cap: usize) -> Result<bool> {
+        let per_edge = self.spec.per_edge();
+        let weighted = self.spec.weighted();
+        let width = self.vars.len();
+        let mut path_row = vec![Id::UNDEF; width];
+        let mut r = vec![Id::UNDEF; width];
+        let int = |n: usize| Id::from_i64(n as i64).unwrap_or(Id::UNDEF);
+        let set = |c: Option<usize>, id: Id, row: &mut [Id]| {
+            if let Some(c) = c {
+                row[c] = id;
+            }
+        };
+        while out.len() < cap {
+            ctx.check()?;
+            if self.current.is_none() {
+                let next = match &mut self.mode {
+                    ReaderMode::Bounded(q) => q.pop_front(),
+                    ReaderMode::All(st) => {
+                        let p = st.next_path(ctx, &self.spec, &mut self.charge)?;
+                        self.counters = st.counters(&self.spec);
+                        p
+                    }
+                };
+                let Some(found) = next else {
+                    self.update_charge()?;
+                    return Ok(true);
+                };
+                let pid = self.next_path_id;
+                self.next_path_id = self.next_path_id.saturating_add(1);
+                self.current = Some((pid, found, 0));
+            }
+            let (pid, found, edge_at) = self.current.as_mut().expect("current path");
+            let cost_id = if weighted {
+                Id::from_f64(found.cost)
+                    .unwrap_or_else(|| ctx.intern_value(&Value::Double(found.cost.into())))
+            } else {
+                int(found.len)
+            };
+            ctx.check()?;
+            path_row.fill(Id::UNDEF);
+            set(self.cols.src_c, Id(found.start), &mut path_row);
+            set(self.cols.tgt_c, Id(found.end), &mut path_row);
+            set(self.cols.pi_c, int(*pid as usize), &mut path_row);
+            set(self.cols.len_c, int(found.len), &mut path_row);
+            set(self.cols.cost_c, cost_id, &mut path_row);
+            let n_rows = if per_edge {
+                found.edges.len().max(1)
+            } else {
+                1
+            };
+            while *edge_at < n_rows && out.len() < cap {
+                let k = *edge_at;
+                *edge_at += 1;
+                r.copy_from_slice(&path_row);
+                if per_edge && let Some(e) = found.edges.get(k) {
+                    let (s, p, o) = e.triple();
+                    set(self.cols.ei_c, int(k), &mut r);
+                    set(self.cols.es_c, Id(s), &mut r);
+                    set(self.cols.ep_c, Id(p), &mut r);
+                    set(self.cols.eo_c, Id(o), &mut r);
+                    if self.cols.edge_c.is_some() {
+                        let tid = *self.terms.entry((s, p, o)).or_insert_with(|| {
+                            let parts = (ctx.term(Id(s)), ctx.term(Id(p)), ctx.term(Id(o)));
+                            let (Some(s), Some(Term::NamedNode(p)), Some(o)) = parts else {
+                                return Id::UNDEF;
+                            };
+                            let s = match s {
+                                Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                                Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                                _ => return Id::UNDEF,
+                            };
+                            ctx.intern_term(&Term::Triple(Box::new(oxrdf::Triple::new(s, p, o))))
+                        });
+                        ctx.check()?;
+                        set(self.cols.edge_c, tid, &mut r);
+                    }
+                }
+                out.push_row(&r);
+            }
+            if *edge_at >= n_rows {
+                self.current = None;
+                self.update_charge()?;
+            }
+        }
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tree_tests {
     use super::*;

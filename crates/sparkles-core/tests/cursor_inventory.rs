@@ -27,9 +27,6 @@ enum Why {
     Decision(&'static str),
     /// A roadmap row holds the change that would give it a reader.
     Row(u32),
-    /// A group of item 829 part 2 gives it a reader. Row 829 is not complete while any
-    /// form is pending.
-    Pending(&'static str),
 }
 
 /// What the strict policy does with a form.
@@ -70,15 +67,11 @@ impl Form {
 }
 
 /// The operators that may run their whole subtree eagerly, which the strict policy
-/// refuses. Each later group removes its kind, and the list ends empty.
-const EAGER_SUBTREES: &[&str] = &["SpatialKnn", "VectorSearch"];
+/// refuses. Every subtree fallback kind now has a native cursor, so this list is empty.
+const EAGER_SUBTREES: &[&str] = &[];
 
 /// The forms whose plan runs a subtree eagerly, which name one of [`EAGER_SUBTREES`].
-const SUBTREE_FORMS: &[&str] = &[
-    "vector ORDER BY answered by the index",
-    "vector ORDER BY with its generic fallback",
-    "nearest neighbours",
-];
+const SUBTREE_FORMS: &[&str] = &[];
 
 const P: &str = "PREFIX path: <urn:x-sparkles:path#> PREFIX algo: <urn:x-sparkles:algo#> \
     PREFIX hist: <urn:x-sparkles:history#> PREFIX apf: <http://jena.apache.org/ARQ/property#> \
@@ -426,7 +419,7 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             &format!(
                 "SELECT ?i {{ SERVICE path:search {{ [] {src} ; path:target <urn:s:9> ; path:predicate <urn:q> ; path:edgeIndex ?i }} }}"
             ),
-            Refused(Why::Pending("group 5")),
+            Native,
         ),
         form(
             "all paths between constants",
@@ -434,7 +427,7 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             &format!(
                 "SELECT ?p ?i {{ SERVICE path:search {{ [] {src} ; path:target <urn:s:9> ; path:predicate <urn:q> ; path:algorithm path:all ; path:maxLength 3 ; path:pathIndex ?p ; path:edgeIndex ?i }} }}"
             ),
-            Refused(Why::Pending("group 5")),
+            Native,
         ),
         form(
             "all shortest paths between constants",
@@ -484,14 +477,14 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             "vector ORDER BY answered by the index",
             "VectorSearch",
             "SELECT ?s { ?s ex:emb ?v } ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 2",
-            Refused(Why::Pending("group 6 (8b)")),
+            Native,
         ),
         // Four vectors have a score, so a limit of six runs the generic plan.
         form(
             "vector ORDER BY with its generic fallback",
             "VectorSearch",
             "SELECT ?s { ?s ex:emb ?v } ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 6",
-            Refused(Why::Pending("group 6 (8b)")),
+            Native,
         )
         .noting("ran the generic plan"),
     ];
@@ -520,19 +513,20 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
         "index top-k without its heap",
         "IndexTopK",
         "SELECT ?s ?v { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 3",
-        Refused(Why::Pending("group 6 (8a)")),
+        Native,
     )];
     refused.extend(check(&decimals.snapshot(), &without_heap, &forms));
     #[cfg(feature = "text")]
     refused.extend(text_forms());
     #[cfg(feature = "geo")]
     refused.extend(geo_forms());
-    // The pending forms are what remains of item 829.
-    let pending: Vec<_> = refused
-        .iter()
-        .filter(|(_, why)| matches!(why, Why::Pending(_)))
-        .collect();
-    eprintln!("pending forms: {pending:?}");
+    // Every refused form is now an explicit decision or a separate roadmap row.
+    assert!(
+        refused
+            .iter()
+            .all(|(_, why)| matches!(why, Why::Decision(_) | Why::Row(_))),
+        "unexpected refusal: {refused:?}"
+    );
 }
 
 #[cfg(feature = "text")]
@@ -648,7 +642,7 @@ fn geo_forms() -> Vec<(String, Why)> {
                 "spatial scan",
                 "SpatialScan",
                 &format!("SELECT ?g {{ ?g geo:asWKT ?w FILTER(geof:sfWithin(?w, {window})) }}"),
-                Refused(Why::Pending("group 4 (6a)")),
+                Native,
             ),
             form(
                 "spatial property function with a limit",
@@ -660,31 +654,31 @@ fn geo_forms() -> Vec<(String, Why)> {
                 "spatial property function without a limit",
                 "SpatialPf",
                 "SELECT ?f { ?f spatial:withinBox(0 0 6 6) }",
-                Refused(Why::Pending("group 4 (6a)")),
+                Native,
             ),
             form(
                 "spatial relation",
                 "SpatialRelate",
                 "SELECT ?x { ?x geo:sfContains ex:g1 }",
-                Refused(Why::Pending("group 4 (6b)")),
+                Native,
             ),
             form(
                 "spatial join of two index sides",
                 "SpatialJoin",
                 "SELECT ?a ?b { ?a geo:asWKT ?wa . ?b geo:asWKT ?wb FILTER(geof:sfContains(?wa, ?wb) && ?a != ?b) }",
-                Refused(Why::Pending("group 4 (6c)")),
+                Native,
             ),
             form(
                 "spatial join over a plan input",
                 "SpatialJoin",
                 "SELECT ?a ?b { ?a geo:hasGeometry ?ga . ?ga geo:asWKT ?wa . ?b geo:asWKT ?wb FILTER(geof:sfWithin(?wa, ?wb)) }",
-                Refused(Why::Pending("group 4 (6c)")),
+                Native,
             ),
             form(
                 "nearest neighbours",
                 "SpatialKnn",
                 "SELECT ?g ?d { ?g geo:asWKT ?w BIND(geof:metricDistance(?w, \"POINT(9 1)\"^^geo:wktLiteral) AS ?d) FILTER(BOUND(?d)) } ORDER BY ?d LIMIT 2",
-                Refused(Why::Pending("group 6 (8c)")),
+                Native,
             ),
         ],
     )

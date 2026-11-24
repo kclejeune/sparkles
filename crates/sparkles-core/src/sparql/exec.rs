@@ -4025,6 +4025,25 @@ pub(super) fn ordered_topk(
     spec: &OrderedTopK,
     out: &[VarId],
 ) -> Result<Option<(Table, usize)>> {
+    ordered_topk_inner(ctx, spec, out, heap_eligible(ctx))
+}
+
+/// [`ordered_topk`] using morsel-wise heap selection for non-monotone pieces regardless
+/// of `ctx.opt.topk_heap`, so a cursor never materializes those pieces whole.
+pub(super) fn ordered_topk_morsels(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    out: &[VarId],
+) -> Result<Option<(Table, usize)>> {
+    ordered_topk_inner(ctx, spec, out, true)
+}
+
+fn ordered_topk_inner(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    out: &[VarId],
+    morsels: bool,
+) -> Result<Option<(Table, usize)>> {
     let vars: Vec<VarId> = spec.scan.cols.iter().map(|c| c.1).collect();
     debug_assert_eq!(vars.first(), Some(&spec.var));
     let mut scanned = 0;
@@ -4048,7 +4067,7 @@ pub(super) fn ordered_topk(
             }),
         }
     }
-    let rest = if heap_eligible(ctx) {
+    let rest = if morsels {
         topk_rest_morsels(ctx, spec, &vars, &whole, &mut scanned)?
     } else {
         topk_rest(ctx, spec, &vars, &whole, &mut scanned)?

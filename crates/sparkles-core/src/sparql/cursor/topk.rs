@@ -262,6 +262,10 @@ impl IndexTopK {
         self.generic.as_deref()
     }
 
+    pub(super) fn release(&mut self) {
+        self.loaded = None;
+    }
+
     pub(super) fn done(&self, children: &[Operator]) -> bool {
         if self.generic.is_some() {
             return children[0].done;
@@ -281,7 +285,7 @@ impl IndexTopK {
             let Kind::OrderedTopK(spec) = &self.node.kind else {
                 unreachable!("an ordered top-k node")
             };
-            match exec::ordered_topk(ctx, spec, &self.node.vars)? {
+            match exec::ordered_topk_morsels(ctx, spec, &self.node.vars)? {
                 Some((table, read)) => {
                     info.description = format!("{} [read {read} rows]", info.description);
                     let charge = OwnedCharge::new(ctx, super::capacity_bytes(&table))?;
@@ -301,6 +305,130 @@ impl IndexTopK {
         let table = &self.loaded.as_ref().expect("loaded ordered top-k").table;
         let batch = copy_rows(ctx, table, self.at, cap)?;
         self.at += batch.as_ref().map_or(0, |b| b.table.len);
+        Ok(batch)
+    }
+}
+
+/// Whether `node` is a vector ORDER BY search with a generic scan fallback.
+pub(super) fn vector_order_eligible(node: &Node) -> bool {
+    matches!(&node.kind, Kind::VectorSearch(spec) if spec.order_fallback)
+        && node.children.len() == 1
+}
+
+/// A vector search below an `ORDER BY DESC(spk:cosine/dot) LIMIT k` (item 829).
+///
+/// On first pull it asks the vector index for the `k` best rows. When at least `k` rows
+/// have a score, the generic scan child is marked skipped and the charged top-`k` answer
+/// is served batch by batch. Otherwise the generic scan child streams its rows instead,
+/// carrying the same plan note as eager execution.
+pub(super) struct VectorOrder {
+    node: Node,
+    opened: bool,
+    fallback: bool,
+    loaded: Option<Buffer>,
+    at: usize,
+    pub(super) counters: Option<serde_json::Map<String, serde_json::Value>>,
+    note: Option<String>,
+}
+
+impl VectorOrder {
+    pub(super) fn new(node: Node) -> Self {
+        Self {
+            node,
+            opened: false,
+            fallback: false,
+            loaded: None,
+            at: 0,
+            counters: None,
+            note: None,
+        }
+    }
+
+    pub(super) fn release(&mut self) {
+        self.opened = true;
+        self.loaded = None;
+    }
+
+    pub(super) fn description(&self) -> Option<String> {
+        self.note
+            .as_ref()
+            .map(|note| format!("{} {note}", self.node.desc))
+    }
+
+    pub(super) fn done(&self, children: &[Operator]) -> bool {
+        if !self.opened {
+            return false;
+        }
+        if self.fallback {
+            children[0].done
+        } else {
+            self.loaded.is_none()
+        }
+    }
+
+    pub(super) fn next(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        children: &mut [Operator],
+        options: &CursorOptions,
+        vars: &[VarId],
+        cap: usize,
+    ) -> Result<Option<Buffer>> {
+        if !self.opened {
+            self.opened = true;
+            let Kind::VectorSearch(spec) = &self.node.kind else {
+                unreachable!("a vector order node")
+            };
+            let searched = match exec::vector_search(ctx, spec, None, &self.node.vars) {
+                Ok((t, c)) if t.len() >= spec.k => Some((t, c)),
+                Ok(_) => None,
+                Err(crate::error::Error::BudgetExceeded(_) | crate::error::Error::Invalid(_)) => {
+                    None
+                }
+                Err(e) => return Err(e),
+            };
+            match searched {
+                Some((table, counters)) => {
+                    children[0].mark_skipped("the vector index answered");
+                    self.counters = Some(counters);
+                    if !table.is_empty() {
+                        let charge = OwnedCharge::new(ctx, super::capacity_bytes(&table))?;
+                        let mut buffer = Buffer { table, charge };
+                        if buffer.table.vars != vars {
+                            buffer.project(vars)?;
+                        }
+                        self.loaded = Some(buffer);
+                    }
+                }
+                None => {
+                    self.fallback = true;
+                    self.note = Some(format!(
+                        "[fewer than {} rows have a score: ran the generic plan]",
+                        spec.k
+                    ));
+                }
+            }
+        }
+        if self.fallback {
+            let Some(mut batch) = children[0].next(ctx, options, cap)? else {
+                return Ok(None);
+            };
+            if batch.table.vars != vars {
+                batch.project(vars)?;
+            }
+            return Ok(Some(batch));
+        }
+        let Some(loaded) = &self.loaded else {
+            return Ok(None);
+        };
+        if self.at == 0 && loaded.table.len <= cap {
+            return Ok(self.loaded.take());
+        }
+        let batch = copy_rows(ctx, &loaded.table, self.at, cap)?;
+        self.at += batch.as_ref().map_or(0, |b| b.table.len);
+        if self.at >= loaded.table.len {
+            self.loaded = None;
+        }
         Ok(batch)
     }
 }

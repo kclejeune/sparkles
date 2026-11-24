@@ -4215,7 +4215,7 @@ impl Drop for RetainedCharge {
 }
 
 /// Cursor ownership can adopt an admitted algorithm lease without release/recharge.
-pub(super) struct OwnedCharge {
+pub(crate) struct OwnedCharge {
     ctx: Arc<Ctx>,
     lease: QueryMemoryLease,
 }
@@ -4223,7 +4223,7 @@ impl OwnedCharge {
     pub(super) fn bytes(&self) -> u64 {
         self.lease.bytes
     }
-    pub(super) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
+    pub(crate) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
         let ledger = ctx.memory();
         let owner = ledger.owner(ctx.grant.as_ref())?;
         ledger.reserve(&owner, ctx.mem_limit, bytes, false)?;
@@ -4247,7 +4247,7 @@ impl OwnedCharge {
             lease: slot.take().expect("admitted output"),
         })
     }
-    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+    pub(crate) fn resize(&mut self, bytes: u64) -> Result<()> {
         self.lease.resize(self.ctx.mem_limit, bytes)
     }
     /// Adopt the actual predecoded payload guard; the existing cursor ledger is

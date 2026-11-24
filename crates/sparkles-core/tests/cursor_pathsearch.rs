@@ -1,0 +1,364 @@
+//! Integration tests for native streaming `PathSearch` (group 5), `VectorSearch` ORDER BY
+//! fallback (group 6 / 8b), `IndexTopK` without heap (group 6 / 8a), and `SILENT SERVICE`
+//! parity / strict-refusal invariants (decision Q-SVC1).
+
+use oxrdf::Term;
+use oxrdfio::RdfFormat;
+use sparkles_core::io::Source;
+use sparkles_core::sparql::{
+    CursorOptions, FallbackPolicy, LocalEndpoints, LocalTarget, Optimizations, QueryOptions, query,
+    select_cursor,
+};
+use sparkles_core::store::{Snapshot, Store, StoreOptions};
+use sparkles_core::{BudgetKind, Error, Result};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+const P: &str = "PREFIX path: <urn:x-sparkles:path#> \
+    PREFIX ex: <http://example.org/> \
+    PREFIX spk: <urn:x-sparkles:> ";
+
+fn load(s: &Store, data: &str, format: RdfFormat) {
+    s.load(&[Source::from_bytes(data.as_bytes().to_vec(), format, None)])
+        .unwrap();
+}
+
+fn graph_store() -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix ex: <http://example.org/> .\n");
+    let n = 25;
+    for i in 0..n {
+        data.push_str(&format!("<urn:s:{i}> <urn:p> {i} .\n"));
+        data.push_str(&format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i + 1) % n));
+        data.push_str(&format!(
+            "<urn:s:{i}> <urn:q> <urn:s:{}> .\n",
+            (i * 3 + 2) % n
+        ));
+    }
+    for (i, v) in ["[1, 0, 0]", "[0.8, 0.6, 0]", "[0, 1, 0]", "[-1, 0, 0]"]
+        .iter()
+        .enumerate()
+    {
+        data.push_str(&format!(
+            "ex:v{i} ex:emb \"{v}\"^^<urn:x-sparkles:vector> .\n"
+        ));
+    }
+    // Add one non-vector literal to exercise generic fallback when limit > scored rows
+    data.push_str("ex:vBad ex:emb \"not-a-vector\" .\n");
+    load(&s, &data, RdfFormat::Turtle);
+    s
+}
+
+fn bag(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
+    let mut out: Vec<String> = rows.into_iter().map(|r| format!("{r:?}")).collect();
+    out.sort();
+    out
+}
+
+fn drain_strict(
+    snap: &Arc<Snapshot>,
+    q: &str,
+    opts: &QueryOptions,
+    batch_rows: usize,
+) -> (Vec<String>, sparkles_core::sparql::CursorPlan, u64) {
+    let work = Arc::new(AtomicU64::new(0));
+    let opts = QueryOptions {
+        no_cache: true,
+        work: Some(work.clone()),
+        ..opts.clone()
+    };
+    let cursor_opts = CursorOptions {
+        batch_rows,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let mut c = select_cursor(snap.clone(), q, &opts, &cursor_opts)
+        .unwrap_or_else(|e| panic!("strict cursor failed for `{q}`: {e}"));
+    let mut rows = Vec::new();
+    while let Some(batch) = c.next_batch().unwrap() {
+        for i in 0..batch.len() {
+            rows.push(batch.row(i).unwrap().values().to_vec());
+        }
+    }
+    let plan = c.plan().clone();
+    assert!(
+        !plan.has_materialization(),
+        "unexpected materialization for `{q}`: {plan:#?}"
+    );
+    (bag(rows), plan, work.load(Ordering::Relaxed))
+}
+
+fn assert_parity(snap: &Arc<Snapshot>, body: &str, opts: &QueryOptions, non_empty: bool) {
+    let q = format!("{P}{body}");
+    let work_eager = Arc::new(AtomicU64::new(0));
+    let eager_opts = QueryOptions {
+        no_cache: true,
+        work: Some(work_eager.clone()),
+        ..opts.clone()
+    };
+    let eager = query(snap.clone(), &q, &eager_opts).unwrap();
+    let expected = bag(eager
+        .rows()
+        .unwrap()
+        .iter()
+        .map(|r| r.values().to_vec())
+        .collect());
+    if non_empty {
+        assert!(!expected.is_empty(), "fixture returned 0 rows for `{body}`");
+    }
+    for batch_rows in [1, 2, 3, 4096] {
+        let (got, _, work_stream) = drain_strict(snap, &q, opts, batch_rows);
+        assert_eq!(
+            got, expected,
+            "mismatch at batch_rows={batch_rows} for `{body}`"
+        );
+        if batch_rows == 2 {
+            assert_eq!(
+                work_stream,
+                work_eager.load(Ordering::Relaxed),
+                "work mismatch for `{body}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn path_search_native_streaming_parity() {
+    let store = graph_store();
+    let snap = store.snapshot();
+    let opts = QueryOptions::default();
+
+    // Shortest path between constants (per-edge and per-path)
+    assert_parity(
+        &snap,
+        "SELECT ?i ?es ?eo ?len { SERVICE path:search { [] path:source <urn:s:0> ; path:target <urn:s:7> ; path:predicate <urn:q> ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:length ?len } }",
+        &opts,
+        true,
+    );
+    // Shortest path with minLength 0 to self
+    assert_parity(
+        &snap,
+        "SELECT ?len { SERVICE path:search { [] path:source <urn:s:0> ; path:target <urn:s:0> ; path:predicate <urn:q> ; path:minLength 0 ; path:length ?len } }",
+        &opts,
+        true,
+    );
+    // Shortest path to unreachable node (empty result)
+    assert_parity(
+        &snap,
+        "SELECT ?i { SERVICE path:search { [] path:source <urn:s:0> ; path:target <urn:missing> ; path:predicate <urn:q> ; path:edgeIndex ?i } }",
+        &opts,
+        false,
+    );
+    // kShortest between constants
+    assert_parity(
+        &snap,
+        "SELECT ?p ?i ?es ?eo { SERVICE path:search { [] path:source <urn:s:0> ; path:target <urn:s:7> ; path:predicate <urn:q> ; path:algorithm path:kShortest ; path:k 3 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo } }",
+        &opts,
+        true,
+    );
+    // All paths between constants with edge triple term
+    assert_parity(
+        &snap,
+        "SELECT ?p ?i ?e ?len { SERVICE path:search { [] path:source <urn:s:0> ; path:target <urn:s:5> ; path:predicate <urn:q> ; path:algorithm path:all ; path:maxLength 4 ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edge ?e ; path:length ?len } }",
+        &opts,
+        true,
+    );
+    // All paths from constant source to variable target
+    assert_parity(
+        &snap,
+        "SELECT ?t ?p ?len { SERVICE path:search { [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:algorithm path:all ; path:maxLength 3 ; path:pathIndex ?p ; path:length ?len } }",
+        &opts,
+        true,
+    );
+    // All paths from variable source into constant target (backward DFS)
+    assert_parity(
+        &snap,
+        "SELECT ?s ?p ?len { SERVICE path:search { [] path:source ?s ; path:target <urn:s:5> ; path:predicate <urn:q> ; path:algorithm path:all ; path:maxLength 3 ; path:pathIndex ?p ; path:length ?len } }",
+        &opts,
+        true,
+    );
+    // All paths joined with an outer pattern
+    assert_parity(
+        &snap,
+        "SELECT ?t ?v { { SELECT ?t { SERVICE path:search { [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:algorithm path:all ; path:maxLength 2 } } } ?t <urn:p> ?v }",
+        &opts,
+        true,
+    );
+    // Early stop via LIMIT on `path:all`
+    let q = format!(
+        "{P}SELECT ?t {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:algorithm path:all ; path:maxLength 4 }} }} LIMIT 3 OFFSET 1"
+    );
+    let (rows, plan, _) = drain_strict(&snap, &q, &opts, 1);
+    assert_eq!(rows.len(), 3);
+    assert!(!plan.has_materialization());
+}
+
+#[test]
+fn vector_order_fallback_and_index_topk_without_heap_parity() {
+    let store = graph_store();
+    let snap = store.snapshot();
+    let opts = QueryOptions::default();
+
+    // Vector ORDER BY answered by index (k=2 <= 4 scored vectors)
+    assert_parity(
+        &snap,
+        "SELECT ?s { ?s ex:emb ?v } ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 2",
+        &opts,
+        true,
+    );
+    // Vector ORDER BY falling back to generic scan (k=6 > 4 scored vectors)
+    let q_fb = format!(
+        "{P}SELECT ?s {{ ?s ex:emb ?v }} ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 6"
+    );
+    let (got, plan, _) = drain_strict(&snap, &q_fb, &opts, 2);
+    assert_eq!(got.len(), 5);
+    assert!(
+        format!("{plan:?}").contains("ran the generic plan"),
+        "expected generic fallback note in plan: {plan:#?}"
+    );
+    assert_parity(
+        &snap,
+        "SELECT ?s { ?s ex:emb ?v } ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 6",
+        &opts,
+        true,
+    );
+
+    // IndexTopK with `topk_heap = false`
+    let decimals = Store::in_memory(StoreOptions::default());
+    let data: String = (0..50_000)
+        .map(|i| {
+            format!(
+                "<urn:s:{i}> <urn:v> \"{}.{:02}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n",
+                (i * 7919) % 5000,
+                i % 100
+            )
+        })
+        .collect();
+    load(&decimals, &data, RdfFormat::Turtle);
+    let mut no_heap = Optimizations::ALL;
+    no_heap.topk_heap = false;
+    let no_heap_opts = QueryOptions {
+        optimizations: Some(no_heap),
+        ..Default::default()
+    };
+    assert_parity(
+        &decimals.snapshot(),
+        "SELECT ?s ?v { ?s <urn:v> ?v } ORDER BY DESC(?v) OFFSET 2 LIMIT 5",
+        &no_heap_opts,
+        true,
+    );
+}
+
+#[test]
+fn path_and_vector_cursors_enforce_memory_cancellation_and_timeout() {
+    let store = graph_store();
+    let snap = store.snapshot();
+    let queries = [
+        format!(
+            "{P}SELECT ?t ?p {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:algorithm path:all ; path:maxLength 5 ; path:pathIndex ?p }} }}"
+        ),
+        format!(
+            "{P}SELECT ?i {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target <urn:s:7> ; path:predicate <urn:q> ; path:edgeIndex ?i }} }}"
+        ),
+        format!(
+            "{P}SELECT ?s {{ ?s ex:emb ?v }} ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 2"
+        ),
+    ];
+    let strict = CursorOptions {
+        batch_rows: 4,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    for q in &queries {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let opts = QueryOptions {
+            no_cache: true,
+            cancel: Some(cancel),
+            ..Default::default()
+        };
+        let res = select_cursor(snap.clone(), q, &opts, &strict)
+            .and_then(|mut c| c.next_batch().map(|_| ()));
+        assert!(matches!(res, Err(Error::Cancelled)), "`{q}`: {res:?}");
+
+        let opts = QueryOptions {
+            no_cache: true,
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let res = select_cursor(snap.clone(), q, &opts, &strict)
+            .and_then(|mut c| c.next_batch().map(|_| ()));
+        assert!(matches!(res, Err(Error::Timeout)), "`{q}`: {res:?}");
+
+        let opts = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: Some(1),
+            ..Default::default()
+        };
+        let res = select_cursor(snap.clone(), q, &opts, &strict).and_then(|mut c| {
+            while c.next_batch()?.is_some() {}
+            Ok(())
+        });
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+            "`{q}`: {res:?}"
+        );
+    }
+}
+
+/// Decision Q-SVC1: `SERVICE SILENT` must buffer the entire remote answer before emitting
+/// its first row (to replace any mid-stream error with a single empty solution), so
+/// `RejectMaterialization` refuses it while `AllowMaterialization` matches eager error
+/// suppression identically.
+#[test]
+fn silent_service_respects_decision_q_svc1_and_error_suppression_parity() {
+    #[derive(Debug)]
+    struct FailingLocal;
+    impl LocalEndpoints for FailingLocal {
+        fn resolve(&self, iri: &str) -> Option<Result<LocalTarget>> {
+            (iri == "http://broken/sparql").then(|| Err(Error::Service("endpoint down".into())))
+        }
+    }
+
+    let store = graph_store();
+    let snap = store.snapshot();
+    let opts = QueryOptions {
+        no_cache: true,
+        allow_service: true,
+        local_endpoints: Some(Arc::new(FailingLocal)),
+        ..Default::default()
+    };
+    let q = "SELECT ?s ?o { SERVICE SILENT <http://broken/sparql> { ?s <urn:p> ?o } }";
+
+    // Strict policy refuses SILENT SERVICE by decision Q-SVC1.
+    let strict = CursorOptions {
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let err = select_cursor(snap.clone(), q, &opts, &strict)
+        .err()
+        .expect("SILENT SERVICE must be refused under RejectMaterialization");
+    assert!(
+        matches!(err, Error::Unsupported(ref m) if m.contains("materialization at Service")),
+        "unexpected error: {err:?}"
+    );
+
+    // Permissive policy matches eager error suppression (one empty binding).
+    let eager = query(snap.clone(), q, &opts).unwrap();
+    let expected = bag(eager
+        .rows()
+        .unwrap()
+        .iter()
+        .map(|r| r.values().to_vec())
+        .collect());
+    assert_eq!(expected.len(), 1);
+
+    let mut c = select_cursor(snap, q, &opts, &CursorOptions::default()).unwrap();
+    let mut rows = Vec::new();
+    while let Some(batch) = c.next_batch().unwrap() {
+        for i in 0..batch.len() {
+            rows.push(batch.row(i).unwrap().values().to_vec());
+        }
+    }
+    assert_eq!(bag(rows), expected);
+}
