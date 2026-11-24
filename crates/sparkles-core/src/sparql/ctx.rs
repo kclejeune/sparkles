@@ -2726,10 +2726,15 @@ impl Ctx {
         (len as u64).saturating_mul(8).saturating_add(128)
     }
 
-    /// Decode an id into an RDF term, propagating any memory or control refusal with
-    /// its original error instead of returning `None`.
-    pub(crate) fn term_checked(&self, id: Id) -> Result<Option<Term>> {
-        self.check_memory_failure()?;
+    /// Decode an id into an RDF term, checking live request controls and charging the
+    /// owned decoded bytes onto `credit` so output credit stays alive with its owner.
+    /// Vocabulary reconstruction scratch is charged separately while the key is rebuilt.
+    pub(crate) fn term_checked_into(&self, id: Id, credit: &Charge<'_>) -> Result<Option<Term>> {
+        assert!(
+            credit.belongs_to(self),
+            "decode credit belongs to its query"
+        );
+        self.check()?;
         match id.tag() {
             Tag::Undef | Tag::Special => Ok(None),
             Tag::Local => {
@@ -2737,17 +2742,15 @@ impl Ctx {
                 let Some(len) = len else {
                     return Ok(None);
                 };
-                let _decode = self.charge(Self::checked_decode_bytes(len))?;
+                credit.add(Self::checked_decode_bytes(len))?;
+                self.check()?;
                 Ok(self.local.read().get(id.payload()).map(id::key_to_term))
             }
-            Tag::Vocab => {
-                let decode = |key: &[u8]| -> Result<Term> {
-                    let _decode = self.charge(Self::checked_decode_bytes(key.len()))?;
-                    Ok(id::key_to_term(key))
-                };
-                self.with_cursor_vocab_key(id.payload(), decode)?
-                    .transpose()
-            }
+            Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| {
+                credit.add(Self::checked_decode_bytes(key.len()))?;
+                self.check()?;
+                Ok(id::key_to_term(key))
+            }),
             Tag::Delta => {
                 let len = self
                     .snap
@@ -2757,22 +2760,46 @@ impl Ctx {
                 let Some(len) = len else {
                     return Ok(None);
                 };
-                let _decode = self.charge(Self::checked_decode_bytes(len))?;
+                credit.add(Self::checked_decode_bytes(len))?;
+                self.check()?;
                 Ok(self
                     .snap
                     .generation
                     .dvocab
                     .with(|vocab| vocab.get(id.payload()).map(id::key_to_term)))
             }
-            Tag::BNode => Ok(Some(Term::BlankNode(bnode_for(id)))),
-            _ => Ok(self.snap.term(id)),
+            Tag::BNode => {
+                credit.add(Self::checked_decode_bytes(0))?;
+                Ok(Some(Term::BlankNode(bnode_for(id))))
+            }
+            _ => {
+                let term = self.snap.term(id);
+                if term.is_some() {
+                    credit.add(Self::checked_decode_bytes(0))?;
+                }
+                Ok(term)
+            }
         }
     }
 
-    /// Decode an id into a value, propagating any memory or control refusal with its
-    /// original error instead of returning `None`.
-    pub(crate) fn value_checked(&self, id: Id) -> Result<Option<Value>> {
-        self.check_memory_failure()?;
+    /// Decode one transient RDF term under live request controls and the query's memory
+    /// budget, propagating any memory or control refusal with its original error instead
+    /// of returning `None`. Callers that retain or decode multiple terms together should
+    /// pass a live [`Charge`] to [`Ctx::term_checked_into`].
+    pub(crate) fn term_checked(&self, id: Id) -> Result<Option<Term>> {
+        let decode = self.charge(0)?;
+        self.term_checked_into(id, &decode)
+    }
+
+    /// Decode an id into a value, checking live request controls and charging the owned
+    /// decoded bytes onto `credit` so output credit stays alive with its owner.
+    /// Vocabulary reconstruction scratch and optional value-cache admission stay separate.
+    pub(crate) fn value_checked_into(&self, id: Id, credit: &Charge<'_>) -> Result<Option<Value>> {
+        assert!(
+            credit.belongs_to(self),
+            "decode credit belongs to its query"
+        );
+        self.check()?;
         match id.tag() {
             Tag::Undef | Tag::Special => Ok(None),
             Tag::Int => Ok(Some(Value::Integer(id.as_i64().into()))),
@@ -2782,7 +2809,10 @@ impl Ctx {
             Tag::DateTime | Tag::Date => {
                 Ok(id::inline_to_literal(id).map(|l| Value::from_literal(&l)))
             }
-            Tag::BNode => Ok(Some(Value::BNode(bnode_for(id).as_str().into()))),
+            Tag::BNode => {
+                credit.add(Self::checked_decode_bytes(0))?;
+                Ok(Some(Value::BNode(bnode_for(id).as_str().into())))
+            }
             _ => {
                 if id.tag() == Tag::Vocab
                     && let Some(v) = self.column_value(id.payload())
@@ -2792,14 +2822,12 @@ impl Ctx {
                 if let Some(v) = self.values.get(id) {
                     return Ok(Some(v));
                 }
-                let decode = |key: &[u8]| -> Result<Value> {
-                    let _decode = self.charge(Self::checked_decode_bytes(key.len()))?;
-                    Ok(Value::from_key(key))
-                };
                 let v = match id.tag() {
-                    Tag::Vocab => self
-                        .with_cursor_vocab_key(id.payload(), decode)?
-                        .transpose()?,
+                    Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| {
+                        credit.add(Self::checked_decode_bytes(key.len()))?;
+                        self.check()?;
+                        Ok(Value::from_key(key))
+                    })?,
                     Tag::Delta => {
                         let len = self
                             .snap
@@ -2808,7 +2836,8 @@ impl Ctx {
                             .with(|v| v.get(id.payload()).map(<[u8]>::len));
                         match len {
                             Some(len) => {
-                                let _decode = self.charge(Self::checked_decode_bytes(len))?;
+                                credit.add(Self::checked_decode_bytes(len))?;
+                                self.check()?;
                                 self.snap
                                     .generation
                                     .dvocab
@@ -2821,7 +2850,8 @@ impl Ctx {
                         let len = self.local.read().get(id.payload()).map(<[u8]>::len);
                         match len {
                             Some(len) => {
-                                let _decode = self.charge(Self::checked_decode_bytes(len))?;
+                                credit.add(Self::checked_decode_bytes(len))?;
+                                self.check()?;
                                 self.local.read().get(id.payload()).map(Value::from_key)
                             }
                             None => None,
@@ -2837,6 +2867,15 @@ impl Ctx {
                 }
             }
         }
+    }
+
+    /// Decode one transient value under live request controls and the query's memory
+    /// budget, propagating any memory or control refusal with its original error instead
+    /// of returning `None`. Callers that retain or decode multiple values together should
+    /// pass a live [`Charge`] to [`Ctx::value_checked_into`].
+    pub(crate) fn value_checked(&self, id: Id) -> Result<Option<Value>> {
+        let decode = self.charge(0)?;
+        self.value_checked_into(id, &decode)
     }
 
     /// Decode one retained output cell after admitting its owned payload. Unlike the
@@ -3143,6 +3182,34 @@ impl Ctx {
             },
             f,
         )
+    }
+
+    /// Reconstruct one base vocabulary key with query-owned scratch credit and live
+    /// request-control checkpoints. Twice the requested size covers old and new buffers
+    /// during reallocation.
+    pub(super) fn with_controlled_vocab_key<T>(
+        &self,
+        id: u64,
+        mut f: impl FnMut(&[u8]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        self.check()?;
+        let scratch = self.charge(0)?;
+        let mut reserved = 0;
+        self.snap
+            .generation
+            .vocab
+            .get_with_controlled(
+                id,
+                |need| {
+                    let bytes = (need as u64).saturating_mul(2);
+                    scratch.add(bytes.saturating_sub(reserved))?;
+                    reserved = bytes;
+                    Ok(())
+                },
+                |_| self.check(),
+                &mut f,
+            )?
+            .transpose()
     }
 
     /// Algorithm-owned key reconstruction never populates the eager value cache.

@@ -297,15 +297,33 @@ impl RdfsOnRead {
         snap: &Snapshot,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Arc<RdfsSchema>> {
+        self.schema_controlled_with_memory(snap, None, check)
+    }
+
+    /// Read or build this snapshot's schema within the request's controls and an
+    /// optional explanation answer memory limit (bounded via [`ExplainWorkspace`]).
+    pub fn schema_controlled_with_memory(
+        &self,
+        snap: &Snapshot,
+        max_memory: Option<usize>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Arc<RdfsSchema>> {
+        let workspace = ExplainWorkspace::for_answer_limit(max_memory);
         self.schema_with(snap, check, &mut |id, check| {
-            snap.term_controlled(id, &mut |_| Ok(()), check)
+            let term = workspace.decode_term(snap, id, check)?;
+            if let Some(t) = &term {
+                workspace.retain(crate::explain::term_bytes(t))?;
+            }
+            Ok(term)
         })
     }
 
     /// Read or build this query's schema under its context's controls and decode budget.
     pub(crate) fn schema_in_ctx(&self, ctx: &Ctx) -> Result<Arc<RdfsSchema>> {
-        self.schema_with(&ctx.snap, &mut || ctx.check(), &mut |id, _| {
-            ctx.term_checked(id)
+        let decoded = ctx.charge(0)?;
+        self.schema_with(&ctx.snap, &mut || ctx.check(), &mut |id, check| {
+            check()?;
+            ctx.term_checked_into(id, &decoded)
         })
     }
 
@@ -335,6 +353,112 @@ impl RdfsOnRead {
         *self.last.lock() = Some((key, s.clone()));
         Ok(s)
     }
+}
+
+/// Explicit workspace accounting for vocabulary reconstruction and decoded terms
+/// during an explanation request.
+///
+/// When the caller sets an answer memory limit (`ExplainLimits::max_memory`), the
+/// answer itself stays checked against that exact limit (`Derivation::heap_bytes`),
+/// while the transient decode workspace is bounded to `2 * answer_limit + 256` bytes.
+/// That bound allows any term that fits the answer limit to be reconstructed while
+/// old and new scratch buffers or scratch and decoded output coexist, while refusing
+/// oversized keys and accumulated schema decodes before allocating.
+pub(crate) struct ExplainWorkspace {
+    limit: Option<usize>,
+    retained: Cell<usize>,
+    scratch: Cell<usize>,
+}
+
+impl ExplainWorkspace {
+    pub(crate) fn for_answer_limit(max_memory: Option<usize>) -> Self {
+        Self {
+            limit: max_memory.map(|limit| limit.saturating_mul(2).saturating_add(256)),
+            retained: Cell::new(0),
+            scratch: Cell::new(0),
+        }
+    }
+
+    fn check_total(&self, total: usize, what: &str) -> Result<()> {
+        if let Some(limit) = self.limit
+            && total > limit
+        {
+            return Err(explain::budget(format!(
+                "{what} needs {total} bytes, over its workspace memory limit of {limit}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Retain `bytes` for decoded output kept alive across the operation.
+    pub(crate) fn retain(&self, bytes: usize) -> Result<()> {
+        let next = self.retained.get().saturating_add(bytes);
+        self.check_total(
+            next.saturating_add(self.scratch.get()),
+            "retaining decoded explanation terms",
+        )?;
+        self.retained.set(next);
+        Ok(())
+    }
+
+    /// Reconcile retained bytes after replacing or dropping kept derivations.
+    pub(crate) fn set_retained(&self, bytes: usize) {
+        self.retained.set(bytes);
+    }
+
+    /// Decode one stored term while accounting for coexisting old/new scratch buffers,
+    /// coexisting scratch and decoded output, and already-retained bytes.
+    pub(crate) fn decode_term(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Term>> {
+        snap.term_controlled_owned(
+            id,
+            &mut |old_cap, new_cap| {
+                let peak = self
+                    .retained
+                    .get()
+                    .saturating_add(old_cap)
+                    .saturating_add(new_cap);
+                self.check_total(peak, "reconstructing an explanation vocabulary key")
+            },
+            &mut |cap| {
+                self.scratch.set(cap);
+                Ok(())
+            },
+            &mut |scratch_cap, key_len| {
+                let output_est = key_len.saturating_add(std::mem::size_of::<Term>());
+                let peak = self
+                    .retained
+                    .get()
+                    .saturating_add(scratch_cap)
+                    .saturating_add(output_est);
+                self.check_total(peak, "decoding an explanation term")
+            },
+            check,
+        )
+    }
+}
+
+/// Decode a graph id's display name for an explanation leaf under request controls and
+/// workspace memory accounting.
+pub fn explain_graph_name_controlled(
+    snap: &Snapshot,
+    graph: Id,
+    max_memory: Option<usize>,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<String>> {
+    check()?;
+    if graph == Id::DEFAULT_GRAPH {
+        return Ok(Some("default".to_string()));
+    }
+    let workspace = ExplainWorkspace::for_answer_limit(max_memory);
+    Ok(match workspace.decode_term(snap, graph, check)? {
+        Some(Term::NamedNode(name)) => Some(name.into_string()),
+        _ => None,
+    })
 }
 
 /// The schema in graph `graph` (`None`: the default graph) of a snapshot.

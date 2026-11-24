@@ -357,7 +357,7 @@ mod on {
             let hi = parts.remove(x.max(y));
             let lo = parts.remove(x.min(y));
             let (l, r) = if x < y { (lo, hi) } else { (hi, lo) };
-            let n = join_node(l, r, (a, b), shape, conj, ctx);
+            let n = join_node(l, r, (a, b), shape, conj, ctx)?;
             parts.push(n);
         }
         Ok(())
@@ -366,32 +366,40 @@ mod on {
     /// The join side of the component `n` for its geometry `v`: a plain scan of an
     /// indexed predicate is searched in the index (when it is ready and covers what the
     /// scan reads); anything else is planned as usual.
-    fn index_side(n: &Node, v: VarId, test: &JoinTest, ctx: &Ctx) -> Option<JoinSide> {
+    fn index_side(n: &Node, v: VarId, test: &JoinTest, ctx: &Ctx) -> Result<Option<JoinSide>> {
         let Kind::Scan(spec) = &n.kind else {
-            return None;
+            return Ok(None);
         };
-        let shape = ScanShape::of(spec)?;
+        let Some(shape) = ScanShape::of(spec) else {
+            return Ok(None);
+        };
         if shape.obj != v {
-            return None;
+            return Ok(None);
         }
-        let view = ctx.snap.geo.as_deref()?;
-        let base = view.usable()?;
-        view.predicate_slot(shape.pred)?;
-        if !scope_covers(&view.config, &shape.graph_filter(spec), ctx) {
-            return None;
+        let Some(view) = ctx.snap.geo.as_deref() else {
+            return Ok(None);
+        };
+        let Some(base) = view.usable() else {
+            return Ok(None);
+        };
+        if view.predicate_slot(shape.pred).is_none() {
+            return Ok(None);
+        }
+        if !scope_covers(&view.config, &shape.graph_filter(spec), ctx)? {
+            return Ok(None);
         }
         // literals in a CRS the index cannot place are not in it, but two of them in the
         // same CRS can be in a relation: such a scan is read instead
         if !matches!(test, JoinTest::Within { .. }) && base.column.counts().unknown_crs > 0 {
-            return None;
+            return Ok(None);
         }
-        Some(JoinSide::Index {
+        Ok(Some(JoinSide::Index {
             scan: spec.clone(),
             pred: shape.pred,
             geom_var: v,
             subj_var: shape.subj_var(),
             graph_var: shape.graph_var(),
-        })
+        }))
     }
 
     /// The share of the index's rows whose box a sample of its own boxes meets (within
@@ -429,7 +437,7 @@ mod on {
         shape: Shape,
         conj: Expr,
         ctx: &Ctx,
-    ) -> Node {
+    ) -> Result<Node> {
         let (n, m) = (l.est, r.est);
         // candidate pairs: as the index's own boxes meet each other, else each row of
         // the larger side meeting about one of the smaller
@@ -447,26 +455,28 @@ mod on {
         let mut cost = (n + m) * (n.min(m) + 2.0).log2() + cands;
         let mut children = Vec::new();
         let mut index_pred = None;
-        let mut side = |p: Node, v: VarId| match index_side(&p, v, &shape.test, ctx) {
-            Some(s) => {
-                if let JoinSide::Index { pred, .. } = &s {
-                    index_pred.get_or_insert(*pred);
+        let mut side = |p: Node, v: VarId| -> Result<JoinSide> {
+            Ok(match index_side(&p, v, &shape.test, ctx)? {
+                Some(s) => {
+                    if let JoinSide::Index { pred, .. } = &s {
+                        index_pred.get_or_insert(*pred);
+                    }
+                    s
                 }
-                s
-            }
-            None => {
-                cost += p.cost;
-                // the fusion of subject stars that follows the join ordering does not
-                // look into a spatial join
-                children.push(super::super::indexjoin::fuse_stars(p, ctx));
-                JoinSide::Plan {
-                    child: children.len() - 1,
-                    geom_var: v,
+                None => {
+                    cost += p.cost;
+                    // the fusion of subject stars that follows the join ordering does not
+                    // look into a spatial join
+                    children.push(super::super::indexjoin::fuse_stars(p, ctx));
+                    JoinSide::Plan {
+                        child: children.len() - 1,
+                        geom_var: v,
+                    }
                 }
-            }
+            })
         };
-        let left = side(l, a);
-        let right = side(r, b);
+        let left = side(l, a)?;
+        let right = side(r, b)?;
         let how = match index_pred {
             Some(p) => format!(
                 "index nested loop on {}",
@@ -495,7 +505,7 @@ mod on {
             filter: if shape.keep { vec![conj] } else { Vec::new() },
             key: h.finish(),
         };
-        Node {
+        Ok(Node {
             kind: Kind::SpatialJoin(Box::new(spec)),
             children,
             vars,
@@ -505,7 +515,7 @@ mod on {
             cost,
             dist,
             desc,
-        }
+        })
     }
 
     fn side_key(s: &JoinSide, ctx: &Ctx) -> String {
@@ -913,7 +923,7 @@ mod on {
                 .map_or_else(|| "?".into(), |t| short(&t));
             return Ok(Err(format!("{p} is not an indexed predicate")));
         }
-        if !scope_covers(&view.config, &shape.graph_filter(&spec), ctx) {
+        if !scope_covers(&view.config, &shape.graph_filter(&spec), ctx)? {
             return Ok(Err(
                 "the query reads graphs out of the spatial index's scope".into(),
             ));

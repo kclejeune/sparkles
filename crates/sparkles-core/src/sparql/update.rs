@@ -505,13 +505,16 @@ fn run_op(
                             id: Id|
              -> Result<Option<Id>> {
                 Ok(match id.tag() {
-                    Tag::Local => match ctx.term_checked(id)? {
-                        Some(t) => {
-                            let t = minted.stored(txn, &t);
-                            Some(txn.intern(&t)?)
+                    Tag::Local => {
+                        let decode = ctx.charge(0)?;
+                        match ctx.term_checked_into(id, &decode)? {
+                            Some(t) => {
+                                let t = minted.stored(txn, &t);
+                                Some(txn.intern(&t)?)
+                            }
+                            None => None,
                         }
-                        None => None,
-                    },
+                    }
                     Tag::BNode => Some(minted.id(txn, id)),
                     _ => Some(id),
                 })
@@ -532,12 +535,13 @@ fn run_op(
                             GroundTermPattern::Triple(tp) => {
                                 // a ground triple pattern is a template without blank nodes
                                 let pat = ground_pattern_to_term_pattern(tp);
+                                let decode = ctx.charge(0)?;
                                 let mut decode_err = None;
                                 let term = super::instantiate(
                                     &pat,
                                     &mut |v| {
                                         let id = get(&ctx, v, i)?;
-                                        match ctx.term_checked(id) {
+                                        match ctx.term_checked_into(id, &decode) {
                                             Ok(t) => t,
                                             Err(err) => {
                                                 decode_err.get_or_insert(err);
@@ -602,12 +606,13 @@ fn run_op(
                                     };
                                     Term::BlankNode(crate::store::bnode_for(id))
                                 };
+                                let decode = ctx.charge(0)?;
                                 let mut decode_err = None;
                                 let term = super::instantiate(
                                     t,
                                     &mut |v| {
                                         let id = get(&ctx, v, i)?;
-                                        match ctx.term_checked(id) {
+                                        match ctx.term_checked_into(id, &decode) {
                                             Ok(t) => t,
                                             Err(err) => {
                                                 decode_err.get_or_insert(err);
@@ -668,9 +673,9 @@ fn run_op(
                     ins.push([s, p, o, g]);
                 }
             }
-            // Decoding a template term records a refused memory budget on the context
-            // instead of returning it, so the context is checked before anything of the
-            // update is applied: a refused term must fail the update, not skip its quad.
+            // Template decoders propagate decode refusals directly; re-check the
+            // context before applying mutations in case another path latched a refusal
+            // or the request was cancelled or timed out.
             ctx.check()?;
             req.check()?;
             for (i, q) in dels.into_iter().enumerate() {
@@ -756,6 +761,7 @@ fn run_op(
 /// [`Error::NotPermitted`] unless graph `g` (an id of the WHERE clause's context) may
 /// be written.
 pub(super) fn check_graph_id(access: &crate::access::GraphAccess, ctx: &Ctx, g: Id) -> Result<()> {
+    ctx.check()?;
     if g == Id::DEFAULT_GRAPH {
         return if access.writable(None) {
             Ok(())
@@ -763,11 +769,8 @@ pub(super) fn check_graph_id(access: &crate::access::GraphAccess, ctx: &Ctx, g: 
             Err(crate::access::GraphAccess::refused(None))
         };
     }
-    let t = match g.tag() {
-        Tag::BNode => Some(Term::BlankNode(crate::store::bnode_for(g))),
-        _ => ctx.term_checked(g)?,
-    };
-    let Some(t) = t else {
+    let decode = ctx.charge(0)?;
+    let Some(t) = ctx.term_checked_into(g, &decode)? else {
         return Err(Error::invalid("graph variable holds no RDF term"));
     };
     if access.writable(Some(&t)) {

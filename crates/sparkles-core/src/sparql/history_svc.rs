@@ -496,11 +496,12 @@ pub(super) fn run(
 pub(super) fn bind(ctx: &Ctx, spec: &HistorySpec, key: &[Id]) -> Result<Option<HistorySpec>> {
     let mut s = spec.clone();
     s.inputs.clear();
+    let decode = ctx.charge(0)?;
     for (v, k) in spec.inputs.iter().zip(key) {
         if k.is_undef() {
             continue;
         }
-        let Some(t) = ctx.term_checked(*k)? else {
+        let Some(t) = ctx.term_checked_into(*k, &decode)? else {
             return Ok(None);
         };
         for slot in [&mut s.s, &mut s.p, &mut s.o, &mut s.g] {

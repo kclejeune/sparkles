@@ -770,8 +770,11 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             let (Some(s), Some(re)) = (args[1], args[2]) else {
                 return Ok(Vec::new());
             };
-            let (Some(text), Some(pattern)) = (literal_lexical(ctx, s)?, literal_lexical(ctx, re)?)
-            else {
+            let decode = ctx.charge(0)?;
+            let (Some(text), Some(pattern)) = (
+                literal_lexical(ctx, s, &decode)?,
+                literal_lexical(ctx, re, &decode)?,
+            ) else {
                 return Ok(Vec::new());
             };
             let re = regex::Regex::new(&pattern).map_err(|e| bad(&e.to_string()))?;
@@ -781,7 +784,7 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
                     .iter()
                     .map(|t| vec![string(t), s, re_id(args[2])])
                     .collect(),
-                Some(x) => match ctx.value_checked(x)? {
+                Some(x) => match ctx.value_checked_into(x, &decode)? {
                     Some(Value::Str(v)) if tokens.iter().any(|t| **t == *v) => {
                         vec![vec![x, s, re_id(args[2])]]
                     }
@@ -790,12 +793,13 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             }
         }
         PfKind::Concat => {
+            let decode = ctx.charge(0)?;
             let mut text = String::new();
             for a in &args[1..] {
                 let Some(a) = a else {
                     return Ok(Vec::new());
                 };
-                match ctx.term_checked(*a)? {
+                match ctx.term_checked_into(*a, &decode)? {
                     Some(Term::NamedNode(n)) => text.push_str(n.as_str()),
                     Some(Term::Literal(l)) => text.push_str(l.value()),
                     _ => return Ok(Vec::new()),
@@ -821,7 +825,8 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             let Some(o) = args[1] else {
                 return Err(bad("the object is an unbound variable"));
             };
-            let v = match ctx.term_checked(o)? {
+            let decode = ctx.charge(0)?;
+            let v = match ctx.term_checked_into(o, &decode)? {
                 Some(Term::NamedNode(n)) => string(n.as_str()),
                 Some(Term::Literal(l)) => string(l.value()),
                 _ => return Err(bad("the object is a blank node")),
@@ -836,7 +841,8 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             let Some(s) = args[0] else {
                 return Ok(Vec::new());
             };
-            let Some(Term::NamedNode(iri)) = ctx.term_checked(s)? else {
+            let decode = ctx.charge(0)?;
+            let Some(Term::NamedNode(iri)) = ctx.term_checked_into(s, &decode)? else {
                 return Ok(Vec::new());
             };
             let at = super::fnlib::split_xml(iri.as_str());
@@ -844,9 +850,13 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             let nsv = match args[1] {
                 None => ctx.intern_term(&Term::NamedNode(NamedNode::new_unchecked(ns))),
                 Some(x) => {
-                    let text = match ctx.term_checked(x)? {
+                    let text = match ctx.term_checked_into(x, &decode)? {
                         Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
-                        Some(Term::Literal(_)) => string_literal(ctx, x)?,
+                        Some(Term::Literal(l))
+                            if l.datatype() == xsd::STRING || l.language().is_some() =>
+                        {
+                            Some(l.value().to_string())
+                        }
                         _ => None,
                     };
                     if text.as_deref() != Some(ns) {
@@ -858,7 +868,7 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             let lv = match args[2] {
                 None => string(local),
                 Some(x) => {
-                    if string_literal(ctx, x)?.as_deref() != Some(local) {
+                    if string_literal(ctx, x, &decode)?.as_deref() != Some(local) {
                         return Ok(Vec::new());
                     }
                     x
@@ -874,7 +884,11 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
                 let same = if s == o {
                     true
                 } else {
-                    match (ctx.term_checked(s)?, ctx.term_checked(o)?) {
+                    let decode = ctx.charge(0)?;
+                    match (
+                        ctx.term_checked_into(s, &decode)?,
+                        ctx.term_checked_into(o, &decode)?,
+                    ) {
                         (Some(a), Some(b)) => super::cdt::same_value(&a, &b).unwrap_or(false),
                         _ => false,
                     }
@@ -981,8 +995,8 @@ fn integer(ctx: &Ctx, id: Id) -> Result<Option<i64>> {
 }
 
 /// The lexical form of a literal.
-fn literal_lexical(ctx: &Ctx, id: Id) -> Result<Option<String>> {
-    Ok(match ctx.term_checked(id)? {
+fn literal_lexical(ctx: &Ctx, id: Id, credit: &super::ctx::Charge<'_>) -> Result<Option<String>> {
+    Ok(match ctx.term_checked_into(id, credit)? {
         Some(Term::Literal(l)) => Some(l.value().to_string()),
         _ => None,
     })
@@ -990,8 +1004,8 @@ fn literal_lexical(ctx: &Ctx, id: Id) -> Result<Option<String>> {
 
 /// The lexical form of a string literal (ARQ's `NodeUtils.stringLiteral`): a simple
 /// literal, an `xsd:string` or a language-tagged string.
-fn string_literal(ctx: &Ctx, id: Id) -> Result<Option<String>> {
-    Ok(match ctx.term_checked(id)? {
+fn string_literal(ctx: &Ctx, id: Id, credit: &super::ctx::Charge<'_>) -> Result<Option<String>> {
+    Ok(match ctx.term_checked_into(id, credit)? {
         Some(Term::Literal(l)) if l.datatype() == xsd::STRING || l.language().is_some() => {
             Some(l.value().to_string())
         }

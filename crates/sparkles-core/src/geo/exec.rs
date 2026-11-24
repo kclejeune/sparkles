@@ -76,6 +76,19 @@ pub(crate) fn graph_iri(ctx: &Ctx, g: Id) -> Option<String> {
     }
 }
 
+/// Checked variant of [`graph_iri`], propagating any memory or control refusal.
+pub(crate) fn graph_iri_checked(ctx: &Ctx, g: Id) -> Result<Option<String>> {
+    if g == Id::DEFAULT_GRAPH {
+        ctx.check()?;
+        return Ok(Some(crate::text::DEFAULT_GRAPH_IRI.to_string()));
+    }
+    let decode = ctx.charge(0)?;
+    Ok(match ctx.term_checked_into(g, &decode)? {
+        Some(Term::NamedNode(n)) => Some(n.into_string()),
+        _ => None,
+    })
+}
+
 /// The CRS84 geometry of an envelope: a point or a line when it is degenerate (as
 /// `geof:envelope`), else a rectangle.
 pub(crate) fn envelope_geom(b: [f64; 4]) -> Geom {

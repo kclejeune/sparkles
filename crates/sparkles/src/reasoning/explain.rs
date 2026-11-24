@@ -231,7 +231,9 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
         let schema = if leaves == SchemaLeaves::Hidden {
             std::sync::Arc::new(sparkles_core::sparql::rdfs::RdfsSchema::default())
         } else {
-            on.schema_controlled(&view, &mut || check_controls(req, deadline))?
+            on.schema_controlled_with_memory(&view, req.max_memory, &mut || {
+                check_controls(req, deadline)
+            })?
         };
         let read_at_head = std::cell::Cell::new(false);
         #[cfg(feature = "reasoning")]
@@ -252,14 +254,12 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
                         Explained::NotFound => Ok(None),
                     }
                 } else {
-                    let graph = if graph == Id::DEFAULT_GRAPH {
-                        Some("default".to_string())
-                    } else {
-                        match view.term(graph) {
-                            Some(Term::NamedNode(name)) => Some(name.into_string()),
-                            _ => None,
-                        }
-                    };
+                    let graph = sparkles_core::sparql::rdfs::explain_graph_name_controlled(
+                        &view,
+                        graph,
+                        req.max_memory,
+                        &mut || check_controls(req, deadline),
+                    )?;
                     Ok(Some(crate::explain::Derivation::asserted(
                         triple.clone(),
                         graph,

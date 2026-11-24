@@ -259,6 +259,7 @@ pub fn fold_const(e: &Expr, ctx: &Ctx) -> Option<super::value::Value> {
 pub(crate) fn fold_const_checked(e: &Expr, ctx: &Ctx) -> Result<Option<super::value::Value>> {
     use super::expr::{Row, Val, eval};
     use super::table::Table;
+    ctx.check()?;
     match e {
         Expr::Lit(_, v) => return Ok(Some(v.clone())),
         Expr::Const(id) => return ctx.value_checked(*id),
@@ -267,6 +268,8 @@ pub(crate) fn fold_const_checked(e: &Expr, ctx: &Ctx) -> Result<Option<super::va
     if !e.var_set().is_empty() || e.has_exists() || !super::cache::deterministic(e) {
         return Ok(None);
     }
+    let credit = ctx.charge(0)?;
+    let resolved = resolve_const_inputs(e, ctx, &credit)?;
     let t = Table::unit();
     let map = t.var_map(ctx.nvars());
     let row = Row {
@@ -276,15 +279,44 @@ pub(crate) fn fold_const_checked(e: &Expr, ctx: &Ctx) -> Result<Option<super::va
         dec: None,
         exists: None,
     };
-    let evaluated = eval(e, &row, ctx);
-    ctx.check_memory_failure()?;
+    let evaluated = eval(&resolved, &row, ctx);
+    ctx.check()?;
     let Ok(val) = evaluated else {
         return Ok(None);
     };
     match val {
-        Val::Id(id) => ctx.value_checked(id),
+        Val::Id(id) => ctx.value_checked_into(id, &credit),
         Val::V(v) | Val::Dec(_, v) => Ok(Some(v)),
     }
+}
+
+/// Replace every nested [`Expr::Const`] inside a deterministic constant expression with
+/// its checked decoded [`Expr::Lit`], so constant folding never falls back to eager
+/// unchecked decoding on nested operands.
+fn resolve_const_inputs(e: &Expr, ctx: &Ctx, credit: &super::ctx::Charge<'_>) -> Result<Expr> {
+    let r = |child: &Expr| resolve_const_inputs(child, ctx, credit);
+    let r_box = |child: &Expr| -> Result<Box<Expr>> { Ok(Box::new(r(child)?)) };
+    let r_vec = |children: &[Expr]| -> Result<Vec<Expr>> { children.iter().map(r).collect() };
+    Ok(match e {
+        Expr::Const(id) => match ctx.value_checked_into(*id, credit)? {
+            Some(v) => Expr::Lit(*id, v),
+            None => Expr::Const(*id),
+        },
+        Expr::Lit(_, _) | Expr::Var(_) | Expr::Bound(_) | Expr::Exists(_) => e.clone(),
+        Expr::Or(a, b) => Expr::Or(r_box(a)?, r_box(b)?),
+        Expr::And(a, b) => Expr::And(r_box(a)?, r_box(b)?),
+        Expr::Not(a) => Expr::Not(r_box(a)?),
+        Expr::Eq(a, b) => Expr::Eq(r_box(a)?, r_box(b)?),
+        Expr::SameTerm(a, b) => Expr::SameTerm(r_box(a)?, r_box(b)?),
+        Expr::Cmp(a, b, op) => Expr::Cmp(r_box(a)?, r_box(b)?, *op),
+        Expr::In(a, list) => Expr::In(r_box(a)?, r_vec(list)?),
+        Expr::Arith(a, b, op) => Expr::Arith(r_box(a)?, r_box(b)?, *op),
+        Expr::Neg(a) => Expr::Neg(r_box(a)?),
+        Expr::Pos(a) => Expr::Pos(r_box(a)?),
+        Expr::If(a, b, c) => Expr::If(r_box(a)?, r_box(b)?, r_box(c)?),
+        Expr::Coalesce(list) => Expr::Coalesce(r_vec(list)?),
+        Expr::Call(func, args) => Expr::Call(func.clone(), r_vec(args)?),
+    })
 }
 
 /// Helpers the spatial join and nearest-neighbour planning share.
@@ -343,7 +375,8 @@ mod on {
     use crate::error::Error;
     use crate::geo::crs::{CRS84, CrsRef};
     use crate::geo::exec::{
-        config, envelope_geom, graph_iri, malformed, pf_windows, radius_windows, summary, transpose,
+        config, envelope_geom, graph_iri_checked, malformed, pf_windows, radius_windows, summary,
+        transpose,
     };
     use crate::geo::ops::relate;
     use crate::geo::{Fnv, GeoConfig, Geom, IndexState, units, vocab};
@@ -426,13 +459,14 @@ mod on {
     fn decode(p: &Planner<'_>, c: &SpatialCall) -> Result<PfArgs> {
         let name = c.func.name();
         let (shape, _, _) = shape(c.func);
+        let decode_credit = p.ctx.charge(0)?;
         let mut vals = Vec::with_capacity(c.args.len());
         for a in &c.args {
             match p.term_pattern(a) {
                 PT::V(_) => unreachable!("planned with deferred arguments"),
                 PT::C(id) => vals.push(
                     p.ctx
-                        .value_checked(id)?
+                        .value_checked_into(id, &decode_credit)?
                         .ok_or_else(|| Error::invalid(format!("{name}: {shape}")))?,
                 ),
             }
@@ -1038,21 +1072,26 @@ mod on {
 
     /// Whether the index covers every graph of `gf` (the index skips graphs out of its
     /// scope, a plain scan does not).
-    pub(crate) fn scope_covers(cfg: &GeoConfig, gf: &GraphFilter, ctx: &Ctx) -> bool {
+    pub(crate) fn scope_covers(cfg: &GeoConfig, gf: &GraphFilter, ctx: &Ctx) -> Result<bool> {
         use crate::text::PredicateSet;
         if matches!(cfg.graphs.include, PredicateSet::All) && cfg.graphs.exclude.is_empty() {
-            return true;
+            return Ok(true);
         }
-        let iri = |g: u64| graph_iri(ctx, Id(g));
+        let in_scope = |g: u64| -> Result<bool> {
+            Ok(graph_iri_checked(ctx, Id(g))?.is_some_and(|i| cfg.graph_in_scope(&i)))
+        };
         match gf {
-            GraphFilter::Default => cfg.graph_in_scope(crate::text::DEFAULT_GRAPH_IRI),
-            GraphFilter::One(g) => iri(*g).is_some_and(|i| cfg.graph_in_scope(&i)),
-            GraphFilter::Set(_) | GraphFilter::PreparedSet(_) => gf
-                .set_ids()
-                .unwrap()
-                .iter()
-                .all(|g| iri(*g).is_some_and(|i| cfg.graph_in_scope(&i))),
-            GraphFilter::All | GraphFilter::Named => false,
+            GraphFilter::Default => Ok(cfg.graph_in_scope(crate::text::DEFAULT_GRAPH_IRI)),
+            GraphFilter::One(g) => in_scope(*g),
+            GraphFilter::Set(_) | GraphFilter::PreparedSet(_) => {
+                for &g in gf.set_ids().unwrap() {
+                    if !in_scope(g)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            GraphFilter::All | GraphFilter::Named => Ok(false),
         }
     }
 
@@ -1151,7 +1190,7 @@ mod on {
             return Ok((n, exprs));
         };
         let graph = shape.graph_filter(spec);
-        if !scope_covers(&cfg, &graph, ctx) {
+        if !scope_covers(&cfg, &graph, ctx)? {
             not_pushed("the query reads graphs out of the spatial index's scope");
             return Ok((n, exprs));
         }

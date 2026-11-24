@@ -44,7 +44,7 @@ struct Cx<'a> {
     leaves: SchemaLeaves,
     deadline: Option<Instant>,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    max_memory: Option<usize>,
+    workspace: super::ExplainWorkspace,
     reads: std::cell::Cell<usize>,
     resolve: Option<&'a AssertedResolver<'a>>,
 }
@@ -131,23 +131,9 @@ impl Cx<'_> {
         self.snap.lookup_term(t)
     }
 
-    fn check_decode_bytes(&self, len: usize) -> Result<()> {
-        if let Some(limit) = self.max_memory {
-            let need = len.saturating_mul(8).saturating_add(128);
-            if need > limit {
-                return Err(budget(format!(
-                    "decoding an explanation term needs {need} bytes, over its memory limit of {limit}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
     fn decode_term(&self, id: Id) -> Result<Option<Term>> {
-        self.snap
-            .term_controlled(id, &mut |len| self.check_decode_bytes(len), &mut || {
-                self.check()
-            })
+        self.workspace
+            .decode_term(self.snap, id, &mut || self.check())
     }
 
     fn graph_name(&self, g: Id) -> Result<Option<String>> {
@@ -435,7 +421,7 @@ impl Cx<'_> {
     }
 }
 
-fn budget(m: String) -> crate::error::Error {
+pub(super) fn budget(m: String) -> crate::error::Error {
     crate::error::Error::Component(Box::new(
         crate::error::ComponentError::new("reasoner", "reasoning-budget", m.clone())
             .with_source(ExplainBudgetExceeded(m)),
@@ -481,7 +467,7 @@ impl RdfsSchema {
             leaves,
             deadline,
             cancel,
-            max_memory,
+            workspace: super::ExplainWorkspace::for_answer_limit(max_memory),
             reads: std::cell::Cell::new(0),
             resolve,
         };
@@ -515,6 +501,8 @@ impl RdfsSchema {
                 Some(have) if have.depth <= d.depth => {}
                 _ => {
                     tops.insert(name, d);
+                    cx.workspace
+                        .set_retained(tops.values().map(Derivation::heap_bytes).sum());
                 }
             }
         };

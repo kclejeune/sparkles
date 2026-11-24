@@ -831,6 +831,76 @@ impl Snapshot {
         }
     }
 
+    /// Decode a stored id into an RDF term with explicit callbacks for vocabulary
+    /// scratch growth (`old_cap`, `new_cap`), settled scratch capacity (`cap`),
+    /// coexisting scratch and decoded-output bytes (`scratch_cap`, `key_len`), and
+    /// live request-control checkpoints.
+    pub(crate) fn term_controlled_owned(
+        &self,
+        id: Id,
+        grow: &mut dyn FnMut(usize, usize) -> Result<()>,
+        settled: &mut dyn FnMut(usize) -> Result<()>,
+        output: &mut dyn FnMut(usize, usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Term>> {
+        check()?;
+        match id.tag() {
+            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date => {
+                output(0, 0)?;
+                Ok(id::inline_to_literal(id).map(Term::Literal))
+            }
+            Tag::BNode => {
+                output(0, 0)?;
+                Ok(Some(Term::BlankNode(bnode_for(id))))
+            }
+            Tag::Vocab => {
+                let key = self.generation.vocab.get_owned_with_controlled(
+                    id.payload(),
+                    grow,
+                    &mut *settled,
+                    |_| check(),
+                    Ok,
+                );
+                let Some(key) = (match key {
+                    Ok(key) => key,
+                    Err(err) => {
+                        let _ = settled(0);
+                        return Err(err);
+                    }
+                }) else {
+                    settled(0)?;
+                    return Ok(None);
+                };
+                let cap = key.capacity();
+                if let Err(err) = output(cap, key.len()).and_then(|()| check()) {
+                    drop(key);
+                    let _ = settled(0);
+                    return Err(err);
+                }
+                let term = id::key_to_term(&key);
+                drop(key);
+                settled(0)?;
+                Ok(Some(term))
+            }
+            Tag::Delta => {
+                let len = self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(<[u8]>::len));
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                output(0, len)?;
+                check()?;
+                Ok(self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(id::key_to_term)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// The kind of term an id stands for, without decoding the term: from the tag of
     /// inline ids, the sort order of the base vocabulary, and the first byte of a delta
     /// key. [`TermKind::Other`] for UNDEF, specials, local ids and unknown ids.

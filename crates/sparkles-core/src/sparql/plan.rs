@@ -7293,7 +7293,7 @@ const LEXICAL_PROBE_ROWS: usize = 32;
 /// the plain sort for columns that do not start with plain strings, such
 /// as language-tagged labels. Only the plan depends on this check.
 pub(super) fn plain_strings_first(ctx: &Ctx, scan: &ScanSpec, lo: u64, hi: u64) -> Result<bool> {
-    ctx.check_memory_failure()?;
+    ctx.check()?;
     let col = scan.prefix.len();
     let bound = |id: u64, fill: u64| {
         let mut key = crate::index::pad(&scan.prefix, fill);
@@ -7321,8 +7321,8 @@ pub(super) fn plain_strings_first(ctx: &Ctx, scan: &ScanSpec, lo: u64, hi: u64) 
             return Ok(false);
         }
         let plain = ctx
-            .with_cursor_vocab_key(Id(id).payload(), |k| {
-                k.first() == Some(&b'"') && k.last() == Some(&crate::id::KEY_SEP)
+            .with_controlled_vocab_key(Id(id).payload(), |k| {
+                Ok(k.first() == Some(&b'"') && k.last() == Some(&crate::id::KEY_SEP))
             })?
             .unwrap_or(false);
         if !plain {

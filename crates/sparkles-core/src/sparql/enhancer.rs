@@ -1041,10 +1041,11 @@ pub(super) fn planner_subst(p: &Planner<'_>, inner: &GraphPattern) -> Result<Sub
     if p.subst.is_empty() {
         return Ok(s);
     }
+    let decode = p.ctx.charge(0)?;
     for n in all_vars(inner) {
         let v = p.ctx.var(&n);
         if let Some(id) = p.subst.get(&v)
-            && let Some(t) = p.ctx.term_checked(*id)?
+            && let Some(t) = p.ctx.term_checked_into(*id, &decode)?
         {
             if p.scoped.contains(&v) {
                 s.hidden.insert(n.clone());
@@ -1229,13 +1230,14 @@ impl RemoteRun {
     pub(super) fn new(ctx: &Ctx, spec: &LateralSpec, rl: &RemoteLoop) -> Result<Self> {
         check_allowed(ctx)?;
         let names: Vec<String> = spec.keys.iter().map(|k| ctx.var_name(*k)).collect();
+        let decode = ctx.charge(0)?;
         let mut outer = Subst::default();
         for (v, id) in &spec.outer {
             if spec.keys.contains(v) {
                 continue;
             }
             let n = ctx.var_name(*v);
-            if let Some(t) = ctx.term_checked(*id)? {
+            if let Some(t) = ctx.term_checked_into(*id, &decode)? {
                 if spec.outer_scoped.contains(v) {
                     outer.hidden.insert(n.clone());
                 }
@@ -1243,6 +1245,7 @@ impl RemoteRun {
             }
         }
         let pattern = substitute(&spec.pattern, &outer);
+        drop(decode);
         let text = spec.pattern.to_string();
         let cache = &ctx.snap.results.service;
         let caching = rl.cache != CacheMode::None
@@ -1284,6 +1287,7 @@ impl RemoteRun {
         l: &Table,
     ) -> Result<()> {
         let first = self.inputs.len();
+        let decode = ctx.charge(0)?;
         for i in 0..l.len() {
             let key = Self::key(spec, l, i);
             if self.by_key.contains_key(&key) {
@@ -1294,7 +1298,7 @@ impl RemoteRun {
                 let term = if id.is_undef() {
                     None
                 } else {
-                    ctx.term_checked(*id)?
+                    ctx.term_checked_into(*id, &decode)?
                         .filter(|t| matches!(t, Term::NamedNode(_) | Term::Literal(_)))
                 };
                 values.push(term);

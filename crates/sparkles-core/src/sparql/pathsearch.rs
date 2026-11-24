@@ -1913,22 +1913,26 @@ impl<'a> Engine<'a> {
             return Ok(default);
         };
         let ctx = self.ctx;
-        let terms = (
-            ctx.term_checked(Id(s))?,
-            ctx.term_checked(Id(p))?,
-            ctx.term_checked(Id(o))?,
-        );
-        let (Some(s), Some(Term::NamedNode(p)), Some(o)) = terms else {
-            return Ok(default);
-        };
-        let s = match s {
-            Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
-            Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
-            _ => return Ok(default),
-        };
-        let tt = Term::Triple(Box::new(oxrdf::Triple::new(s, p, o)));
-        let Some(tt) = ctx.snap.lookup_term(&tt) else {
-            return Ok(default);
+        let tt = {
+            let decode = ctx.charge(0)?;
+            let terms = (
+                ctx.term_checked_into(Id(s), &decode)?,
+                ctx.term_checked_into(Id(p), &decode)?,
+                ctx.term_checked_into(Id(o), &decode)?,
+            );
+            let (Some(s), Some(Term::NamedNode(p)), Some(o)) = terms else {
+                return Ok(default);
+            };
+            let s = match s {
+                Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+                Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+                _ => return Ok(default),
+            };
+            let tt = Term::Triple(Box::new(oxrdf::Triple::new(s, p, o)));
+            let Some(tt) = ctx.snap.lookup_term(&tt) else {
+                return Ok(default);
+            };
+            tt
         };
         let graph = &self.spec.graph;
         let mut reifiers = Vec::new();
@@ -3436,10 +3440,11 @@ pub fn run(
         if let Some(&id) = terms.get(&(s, p, o)) {
             return Ok(id);
         }
+        let decode = ctx.charge(0)?;
         let parts = (
-            ctx.term_checked(Id(s))?,
-            ctx.term_checked(Id(p))?,
-            ctx.term_checked(Id(o))?,
+            ctx.term_checked_into(Id(s), &decode)?,
+            ctx.term_checked_into(Id(p), &decode)?,
+            ctx.term_checked_into(Id(o), &decode)?,
         );
         let id =
             match parts {
@@ -3454,7 +3459,8 @@ pub fn run(
                 },
                 _ => Id::UNDEF,
             };
-        ctx.check_memory_failure()?;
+        drop(decode);
+        ctx.check()?;
         terms.insert((s, p, o), id);
         Ok(id)
     };
