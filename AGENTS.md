@@ -134,10 +134,17 @@ adds to this file and does not override it.
   row in [docs/ROADMAP.md](docs/ROADMAP.md), all in the same
   change. Update the affected feature guide too. A new known gap in feature documentation
   gets a roadmap item in the same commit.
-- Write documentation as plain technical prose in full sentences. Avoid fragment openers,
+- Write documentation as plain technical prose in full sentences. Describe Sparkles and
+  its behaviour directly rather than using "You can ..." phrasing. Avoid fragment openers,
   label-colon openers, chains of colons, parentheses or semicolons, "(yet)", marketing words
-  and filler. Keep table cells to one to three short sentences.
-  [docs/COMPARISON.md](docs/COMPARISON.md) is the reference voice.
+  and filler. [docs/COMPARISON.md](docs/COMPARISON.md) is the reference voice.
+- Keep table cells across [FEATURES.md](docs/FEATURES.md),
+  [COMPARISON.md](docs/COMPARISON.md), [BENCHMARKS.md](docs/BENCHMARKS.md) and other public
+  docs concise: one to two short sentences (roughly 15 to 35 words) and never multi-paragraph
+  walls. Link deeper flags, caveats and raw numbers to the category guide or workload report
+  instead of repeating them inline.
+- Avoid raw HTML in public Markdown (`<a id>`, `<table>`, `<img>`, `<details>`) so Markdown
+  previews such as Zed render cleanly. Use native Markdown headings, links, tables and images.
 - Public docs describe the project as it is now. README, FEATURES, BENCHMARKS, ROADMAP
   and the guides carry no progress dates, "Done (date)" notes, superseded measurements,
   review history or mentions of agents and lanes. History belongs in CHANGELOG.md and in
@@ -198,13 +205,14 @@ results separately from conversation events.
 | Second-look lanes and consults at critical decisions | Use Claude Fable 5.2 or GPT-6.2 Astra. Prefer the family that the stalled lane or the consulting session does not use. When neither is available, use the strongest available model in a separate session. |
 | Easy, nearly trivial tasks and the execution of a plan that fixes every step | GPT-6.1 Terra or Claude Sonnet 5.5 |
 | Code review and finding validation | Prefer GPT-6.2 Sol. GPT-6.1 Terra may review a nearly trivial change. Claude Opus 5.5 may review when an independent perspective helps. |
+| Technical writing, documentation and prose | Prefer Gemini 4 Neon. |
 | Mechanical tasks with an exact rule | A plain script. |
 | Easy tasks that need a lot of context, such as exploration, broad file scans, searches across many files and log triage | Claude Haiku 5.5 or GPT-6 Luna. |
 
 The table is the assignment policy, and it holds whatever model the orchestrator runs.
-Work defaults to Sol or Opus. Terra or Sonnet takes a task only when it is nearly
-trivial or its plan fixes every step, and Haiku or Luna takes easy work whose cost is
-mostly the context it must read.
+Work defaults to Sol or Opus. Prefer Gemini 4 Neon for technical writing, documentation and
+prose tasks. Terra or Sonnet takes a task only when it is nearly trivial or its plan fixes
+every step, and Haiku or Luna takes easy work whose cost is mostly the context it must read.
 
 A coordinating session delegates substantive plans, dependency decisions and validation
 strategy instead of taking them on because it controls the session. A plan names the

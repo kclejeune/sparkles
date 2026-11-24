@@ -1,6 +1,6 @@
 # Search and graph analysis
 
-Sparkles runs BM25 full-text search, HNSW vector search, hybrid reciprocal rank fusion, typo-tolerant ontology entity search, weighted path finding, graph algorithms, and GeoSPARQL 1.1 spatial queries directly inside SPARQL or over dedicated HTTP endpoints. Every search and algorithm respects MVCC snapshots and caller access grants, so results join cleanly with ordinary graph patterns. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+Sparkles runs BM25 full-text search, HNSW vector search, hybrid reciprocal rank fusion, typo-tolerant ontology entity search, weighted path search, graph algorithms, and GeoSPARQL 1.1 queries inside SPARQL or dedicated HTTP endpoints. Every search and algorithm respects MVCC snapshots and caller access grants. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
 
 | Section | What it covers |
 |---|---|

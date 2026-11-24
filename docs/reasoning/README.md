@@ -1,6 +1,6 @@
 # Reasoning and validation
 
-Sparkles derives inferred facts through incremental RDFS, OWL 2 RL, Jena, Datalog, and SHACL/SPIN rules alongside query-time RDFS rewriting, OWL 2 QL rewriting, and demand derivation. It also provides an OWL 2 axiom model and concurrent EL/Horn/ALCHI classifier, SHACL 1.2 and ShEx 2.2 validators with incremental write guards, schema discovery with shape drafting, and openCAESAR/OML compatibility. Use this guide to pick the right inference or validation mode, understand memory and completeness guarantees, and check remaining profile limits. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+Sparkles derives inferred facts through incremental RDFS, OWL 2 RL, Jena, Datalog, and SHACL/SPIN rules alongside query-time RDFS rewriting, OWL 2 QL rewriting, and demand derivation. It also ships an OWL 2 axiom model, concurrent EL/Horn/ALCHI classifier, SHACL 1.2 and ShEx 2.2 validators with incremental write guards, schema discovery, shape drafting, and openCAESAR/OML support. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
 
 | Section | What it covers |
 |---|---|

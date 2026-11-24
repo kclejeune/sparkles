@@ -5961,6 +5961,23 @@ pub(super) fn compute_column(
     e: &Expr,
     report: &mut ExprReport,
 ) -> Result<Vec<Id>> {
+    if let Expr::Var(v) = e {
+        // Like var_map, use the last column if the variable occurs more than once.
+        let column = t.vars.iter().rposition(|var| var == v).map(|c| &t.cols[c]);
+        let mut out = Vec::with_capacity(t.len());
+        loop {
+            ctx.check()?;
+            let start = out.len();
+            let end = (start + MAP_POLL_ROWS).min(t.len());
+            match column {
+                Some(ids) => out.extend_from_slice(&ids[start..end]),
+                None => out.resize(end, Id::UNDEF),
+            }
+            if end == t.len() {
+                return Ok(out);
+            }
+        }
+    }
     // `EXISTS { P }` from the key set of P when the rows have enough distinct keys
     if let Some(col) = super::exists::column(ctx, t, e)? {
         return Ok(col);
@@ -5994,6 +6011,69 @@ fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
         return map_batch(ctx, t.len(), batch_may_split(t.len()) && e.parallel(), f);
     }
     map_rows(ctx, t.len(), e.parallel(), f)
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+
+    #[test]
+    fn row_map_starts_at_an_aligned_address() {
+        assert!(std::mem::align_of::<Row<'_>>() >= 16);
+        assert_eq!(std::mem::offset_of!(Row<'_>, map), 0);
+    }
+
+    #[test]
+    fn variable_column_preserves_ids_and_unbound_rows() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let ctx = Ctx::new(store.snapshot());
+        let bound = ctx.var("bound");
+        let unbound = ctx.var("unbound");
+        let mut report = ExprReport::default();
+        let mut table = Table::new(vec![bound]);
+        assert!(
+            compute_column(&ctx, &table, &Expr::Var(bound), &mut report)
+                .unwrap()
+                .is_empty()
+        );
+
+        let ids = [Id::from_i64(42).unwrap(), Id::UNDEF, Id::from_bool(false)];
+        for id in ids {
+            table.push_row(&[id]);
+        }
+        assert_eq!(
+            compute_column(&ctx, &table, &Expr::Var(bound), &mut report).unwrap(),
+            ids
+        );
+        assert_eq!(
+            compute_column(&ctx, &table, &Expr::Var(unbound), &mut report).unwrap(),
+            [Id::UNDEF; 3]
+        );
+
+        table.vars.insert(0, bound);
+        table.cols.insert(0, vec![Id::UNDEF; table.len()]);
+        assert_eq!(
+            compute_column(&ctx, &table, &Expr::Var(bound), &mut report).unwrap(),
+            ids
+        );
+    }
+
+    #[test]
+    fn variable_column_checks_cancellation_on_empty_input() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let ctx = Ctx::new(store.snapshot());
+        let var = ctx.var("v");
+        ctx.cancel.store(true, AtomicOrdering::Relaxed);
+        assert!(matches!(
+            compute_column(
+                &ctx,
+                &Table::new(vec![var]),
+                &Expr::Var(var),
+                &mut ExprReport::default(),
+            ),
+            Err(Error::Cancelled)
+        ));
+    }
 }
 
 type Candidates = (Vec<usize>, Option<super::ctx::RetainedCharge>);

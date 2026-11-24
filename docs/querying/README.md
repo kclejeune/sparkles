@@ -1,6 +1,6 @@
 # Querying
 
-Sparkles evaluates SPARQL 1.1 and 1.2 queries and updates over compressed quad indexes, with Apache Jena ARQ extensions, federated `SERVICE` calls, automatic streaming with disk spill, incremental views, and built-in formatting and linting tools. Use this guide to understand what the query language supports, how the planner and streaming executor behave under memory budgets, and where compatibility or coverage stops. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+Sparkles evaluates SPARQL 1.1 and 1.2 queries and updates over compressed quad indexes, adding Apache Jena ARQ extensions, federated `SERVICE` calls, automatic streaming with disk spill, incremental views, and formatting and linting tools. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
 
 | Section | What it covers |
 |---|---|

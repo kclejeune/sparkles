@@ -1,9 +1,9 @@
 # Getting started and operations
 
-Sparkles is experimental and has no released packages. The on-disk format, HTTP API, CLI,
-and library APIs can change between commits without a migration path. Keep your original
-source data and the pipeline needed to regenerate it. Backups recover datasets within a
-compatible build, but they do not guarantee forward compatibility with a later commit.
+Sparkles is experimental with no released packages, and its on-disk format, HTTP API, CLI,
+and library APIs can change between commits without a migration path. Keep original source
+data and the pipeline to regenerate it. Backups restore within a compatible build without
+guaranteeing forward compatibility.
 
 ## Install and try Sparkles
 
@@ -41,9 +41,9 @@ tradeoffs across three references:
 
 ## Secure a server
 
-Without an authentication configuration, any caller who can reach the server can read,
-write, and administer datasets. Sparkles refuses to listen on a non-loopback address
-without authentication unless you explicitly opt in to an open network.
+Without authentication configured, any reachable caller can read, write, and administer
+datasets. Sparkles refuses to listen on a non-loopback address without authentication
+unless configured to allow an open network.
 
 Complete three steps before exposing a server beyond loopback.
 
@@ -55,7 +55,7 @@ Complete three steps before exposing a server beyond loopback.
 2. **Enable TLS.** Terminate HTTPS directly in Sparkles with rustls or behind a locked-down
    proxy. See [TLS](USAGE.md#tls).
 3. **Set explicit resource budgets.** Several query budgets and rate limits are disabled
-   or generous by default. Configure them to match your workload and caller trust level as
+   or generous by default. Configure them for the workload and caller trust level as
    described in [limits that are off by default](USAGE.md#limits-that-are-off-by-default).
 
 ## Protect and recover data
@@ -64,7 +64,7 @@ Operational tooling covers per-dataset backups, integrity verification, and form
 
 * **Backups and restore drills.** Configure filesystem or S3
   [backup repositories](USAGE.md#backup-repositories) for incremental, deduplicated
-  backups, and test restores in your target environment before relying on them.
+  backups, and test restores in the target environment before relying on them.
 * **Integrity checks.** Run `sparkles check` to verify WAL checksums and commit
   continuity, as described in [checking a database](USAGE.md#checking-a-database).
 * **Format upgrades.** Check stored format versions and run available migration commands

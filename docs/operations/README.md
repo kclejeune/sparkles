@@ -1,6 +1,6 @@
 # Deployment and operations
 
-Sparkles runs as a single binary packaged for NixOS, Home Manager, Docker, and Kubernetes (Helm), with layered configuration, outbound notifications, shared memory pools and dataset quotas, Prometheus and OpenTelemetry observability, incremental encrypted backup repositories, and degraded-safe startup and format migration. Use this guide to deploy, configure, monitor, back up, and upgrade Sparkles in production. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+Sparkles runs as a single binary packaged for NixOS, Home Manager, Docker, and Kubernetes (Helm), with layered configuration, outbound notifications, shared memory pools and quotas, Prometheus and OpenTelemetry observability, incremental encrypted backups, and degraded-safe startup and migration. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
 
 | Section | What it covers |
 |---|---|

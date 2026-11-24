@@ -602,10 +602,12 @@ impl Expr {
 }
 
 /// Access to the current solution.
+#[repr(C, align(16))]
 pub struct Row<'a> {
+    // Align the slice's 16-byte stack store so it cannot cross a 64-byte cache line.
+    pub map: &'a [Option<usize>],
     pub table: &'a Table,
     pub i: usize,
-    pub map: &'a [Option<usize>],
     /// values decoded up front for this operator, per table column and row
     pub dec: Option<&'a DecodedCols>,
     /// the answers of EXISTS patterns from their key sets, for this row's table
