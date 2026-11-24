@@ -207,10 +207,10 @@ packaging work.
 * Reasoning, incremental views, GeoSPARQL, GraphRAG, language bindings, and the web UI
   are available, with further phases planned.
 * Evidence and valid-time vocabularies, shapes, query resources, authenticated evidence
-  proposals, and reference resolution are available; review-controlled projections remain
-  planned.
-* Durable jobs, maintained analysis, temporal runtime helpers, and additional model
-  integrations remain planned.
+  proposals, reference resolution, review decisions with accepted projections, reversible
+  identity maps, and `quads` durable jobs are available.
+* Maintained analysis, transactional delivery outboxes and recurring job definitions,
+  temporal runtime helpers, and additional model integrations remain planned.
 
 Sparkles is licensed under the [Apache License 2.0](LICENSE). The vendored `spargebra`
 crate retains its MIT OR Apache-2.0 license. Third-party crate and npm package licenses

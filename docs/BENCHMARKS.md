@@ -74,7 +74,7 @@ complete, partial and planned implementation scope.
 | Spatial and query-time reasoning comparisons | Unmeasured against peers | Conformance suites and internal measurements do not establish comparative performance. |
 | OWL 2 EL classification | Measured against ELK, Konclude, Whelk, HermiT and ROBOT | [Times and memory beside ELK 0.6.0](benchmarks/el-classification/RESULTS.md#against-elk) and [beside the other reference reasoners](benchmarks/el-classification/RESULTS.md#reference-reasoners) on GO, ChEBI lite and the largest ORE 2015 EL ontologies are published. The classifier leads ELK and Konclude on every ontology and thread count measured. |
 | OWL 2 RL materialization | Measured against Nemo on a benchmark worker | [Full materialization times and memory beside Nemo 0.10.1](benchmarks/reasoning/RESULTS.md#against-nemo) on LUBM(10), LUBM(100) and OWL2Bench(1) and (5) are published for `owl-rl` and `rdfs`, with closures equal to Nemo's. Sparkles leads on every input and thread count. A reference-host run remains open. |
-| Evidence and maintained analysis | Unmeasured | Authenticated evidence proposals, resolution and temporal profile queries exist without peer benchmarks. Review-controlled projections and managed analysis remain planned. |
+| Evidence and maintained analysis | Unmeasured | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, `quads` durable jobs and temporal profile queries exist without peer benchmarks. Maintained analysis, transactional outboxes and recurring job definitions remain planned. |
 
 ## Reading the comparisons
 
