@@ -118,13 +118,6 @@ impl Saturation {
         let (bottom, mut subsumers) = self
             .named_subsumers(q)
             .unwrap_or((q == BOTTOM, vec![q, TOP]));
-        if self.reduced {
-            // the made-up classes of item 805's reductions take no part in the answer,
-            // whose direct superclasses are those among the visible ones
-            subsumers.retain(|&e| {
-                class_of(e).is_none_or(|k| !k.as_str().starts_with(super::dl_reduce::PREFIX))
-            });
-        }
         if bottom {
             let mut eq: Vec<Class> = named
                 .iter()
@@ -139,10 +132,32 @@ impl Saturation {
                 ..Default::default()
             });
         }
+        // Every class reachable upward from owl:Thing is equivalent to owl:Thing,
+        // including through hidden internal classes (item 1086).
+        let top = self.top_closure();
+        for &e in &top {
+            let visible = match self.interner.nodes[e as usize] {
+                Node::Top => true,
+                Node::Class(id) => self.interner.met.get(id as usize).copied().unwrap_or(false),
+                _ => false,
+            };
+            if visible {
+                subsumers.push(e);
+            }
+        }
+        if self.reduced {
+            // the made-up classes of item 805's reductions take no part in the answer,
+            // whose direct superclasses are those among the visible ones
+            subsumers.retain(|&e| {
+                class_of(e).is_none_or(|k| !k.as_str().starts_with(super::dl_reduce::PREFIX))
+            });
+        }
+        subsumers.sort_unstable();
+        subsumers.dedup();
         // `a ⊑ b` among saturated contexts, where a class classified in a world of its
         // own reads its subsumers from that world
         let below = |a: Ex, b: Ex| -> bool {
-            if b == TOP || a == b {
+            if b == TOP || a == b || top.contains(&b) {
                 return true;
             }
             if let Some((bottom, subs)) = self.worlds.get(&a) {
@@ -186,7 +201,7 @@ impl Saturation {
                 continue;
             }
             if let Some((false, ss)) = self.named_subsumers(*e)
-                && (q == TOP || ss.contains(&q))
+                && (top.contains(&q) || ss.contains(&q))
             {
                 subs.insert(*e, ss);
             }
@@ -216,5 +231,40 @@ impl Saturation {
             direct_subclasses: classes(&direct_subs),
             instances,
         })
+    }
+
+    /// `TOP` and every satisfiable `Node::Class` reachable upward from `TOP` through
+    /// `named_subsumers`, including through hidden internal classes (item 1086).
+    fn top_closure(&self) -> FxHashSet<Ex> {
+        let mut top = FxHashSet::default();
+        top.insert(TOP);
+        let Some((false, initial)) = self.named_subsumers(TOP) else {
+            return top;
+        };
+        let mut seen = FxHashSet::default();
+        seen.insert(TOP);
+        let mut stack: Vec<Ex> = Vec::new();
+        for e in initial {
+            if seen.insert(e) {
+                stack.push(e);
+            }
+        }
+        while let Some(e) = stack.pop() {
+            match self.named_subsumers(e) {
+                Some((true, _)) => continue,
+                Some((false, raw)) => {
+                    top.insert(e);
+                    for x in raw {
+                        if seen.insert(x) {
+                            stack.push(x);
+                        }
+                    }
+                }
+                None => {
+                    top.insert(e);
+                }
+            }
+        }
+        top
     }
 }

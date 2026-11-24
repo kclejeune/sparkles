@@ -285,13 +285,23 @@ pub(super) fn build(
     if stopped.load(Ordering::Relaxed) {
         return Err(Halt::Stopped);
     }
-    // the named subsumers of owl:Thing, as positions
+    // the named subsumers of owl:Thing, as positions, keeping hidden internal classes
+    // separately so upward lifting can cross them without putting them in the taxonomy
+    let mut top_hidden: Vec<Ex> = Vec::new();
     let mut top: Vec<u32> = k
         .named_subsumers(TOP)
         .map(|(_, s)| {
-            s.into_iter()
-                .filter_map(|x| pos.get(x as usize).copied().filter(|&p| p != NONE))
-                .collect()
+            let mut vis = Vec::new();
+            for x in s {
+                if x == TOP {
+                    continue;
+                }
+                match pos.get(x as usize).copied().unwrap_or(NONE) {
+                    NONE => top_hidden.push(x),
+                    p => vis.push(p),
+                }
+            }
+            vis
         })
         .unwrap_or_default();
     if close {
@@ -301,11 +311,20 @@ pub(super) fn build(
     if !budget(bytes) {
         return Err(Halt::Memory(bytes));
     }
-    // the classes equivalent to owl:Thing
+    // Every class above a class equivalent to owl:Thing is equivalent to owl:Thing too,
+    // transitively through visible classes, equivalence classes and hidden internal
+    // classes (item 1086).
     let mut at_top = vec![false; n];
-    for p in top {
-        at_top[p as usize] = true;
-    }
+    lift_top(
+        k,
+        &classes,
+        &pos,
+        &subs,
+        &top,
+        &top_hidden,
+        &mut at_top,
+        stop,
+    )?;
     let has = |a: u32, b: u32| a == b || subs[a as usize].1.binary_search(&b).is_ok();
     // each satisfiable class's equivalence class, by its first class in IRI order;
     // unsatisfiable classes and those equivalent to owl:Thing get NONE
@@ -451,6 +470,89 @@ pub(super) fn build(
         nodes[j + 2].parents = ps;
     }
     Ok((Taxonomy { nodes, at }, bytes))
+}
+
+/// Marks every satisfiable visible class reachable upward from `owl:Thing`'s subsumers
+/// (`top` and `top_hidden`) through `subs` and any hidden internal classes (`pos[e] ==
+/// NONE`). An unsatisfiable class goes to the bottom node rather than the top node, so it
+/// is neither marked at top nor expanded.
+#[allow(clippy::too_many_arguments)]
+fn lift_top(
+    k: &Saturation,
+    classes: &[(&Class, Ex)],
+    pos: &[u32],
+    subs: &[(bool, Vec<u32>)],
+    top: &[u32],
+    top_hidden: &[Ex],
+    at_top: &mut [bool],
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<(), Halt> {
+    if top.is_empty() && top_hidden.is_empty() {
+        return Ok(());
+    }
+    let has_hidden = k.interner.classes.len() > classes.len();
+    let mut hidden_seen: FxHashSet<Ex> = FxHashSet::default();
+    let mut stack: Vec<Ex> = Vec::with_capacity(top.len() + top_hidden.len());
+    let push_ex =
+        |e: Ex, at_top: &mut [bool], hidden_seen: &mut FxHashSet<Ex>, stack: &mut Vec<Ex>| {
+            if e == TOP {
+                return;
+            }
+            match pos.get(e as usize).copied().unwrap_or(NONE) {
+                NONE => {
+                    if hidden_seen.insert(e) {
+                        stack.push(e);
+                    }
+                }
+                p => {
+                    let pu = p as usize;
+                    if !subs[pu].0 && !at_top[pu] {
+                        at_top[pu] = true;
+                        stack.push(e);
+                    }
+                }
+            }
+        };
+    for &p in top {
+        let pu = p as usize;
+        if !subs[pu].0 && !at_top[pu] {
+            at_top[pu] = true;
+            stack.push(classes[pu].1);
+        }
+    }
+    for &e in top_hidden {
+        push_ex(e, at_top, &mut hidden_seen, &mut stack);
+    }
+    let mut steps = 0usize;
+    while let Some(e) = stack.pop() {
+        if steps.is_multiple_of(POLL_EVERY) && stop() {
+            return Err(Halt::Stopped);
+        }
+        steps += 1;
+        let p = pos.get(e as usize).copied().unwrap_or(NONE);
+        if p != NONE {
+            let pu = p as usize;
+            for &v in &subs[pu].1 {
+                let vu = v as usize;
+                if !subs[vu].0 && !at_top[vu] {
+                    at_top[vu] = true;
+                    stack.push(classes[vu].1);
+                }
+            }
+            if has_hidden && let Some((false, raw)) = k.named_subsumers(e) {
+                for x in raw {
+                    if pos.get(x as usize).copied().unwrap_or(NONE) == NONE {
+                        push_ex(x, at_top, &mut hidden_seen, &mut stack);
+                    }
+                }
+            }
+        } else if let Some((false, raw)) = k.named_subsumers(e) {
+            for x in raw {
+                push_ex(x, at_top, &mut hidden_seen, &mut stack);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The classes sorted by IRI on up to `threads` threads: a sample sort, whose buckets
@@ -959,17 +1061,190 @@ mod tests {
     #[test]
     fn a_class_goes_to_the_top_with_its_equivalence_class_when_the_run_missed_owl_thing() {
         // the rows as an incomplete run can leave them, with owl:Thing below A but not
-        // B. B's equivalence class starts at A, which has no node of its own, and the
-        // build placed B through a node that does not exist.
-        let mut k = equivalent_pair();
+        // B or C. Both B (equivalent to A) and C (above A and B) move to the top node,
+        // while a class D below C stays below the top node.
+        let mut k = saturated(&[
+            Axiom::equivalent_classes([c("A").into(), c("B").into()]),
+            Axiom::sub_class_of(c("B"), c("C")),
+            Axiom::sub_class_of(c("D"), c("C")),
+        ]);
         let a = k.interner.class_ex(&c("A")).unwrap();
         k.worlds.insert(TOP, (false, vec![TOP, a]));
         for threads in [1, 4] {
             let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
             assert_eq!(t.node_of(&c("A")), Some(TOP_NODE));
             assert_eq!(t.node_of(&c("B")), Some(TOP_NODE));
-            // a class above the pair stays where its own rows put it
-            assert!(t.node_of(&c("C")).is_some_and(|n| n != TOP_NODE));
+            assert_eq!(t.node_of(&c("C")), Some(TOP_NODE));
+            let d = t.node_of(&c("D")).unwrap();
+            assert_ne!(d, TOP_NODE);
+            assert_eq!(t.parents(&c("D")), &[TOP_NODE]);
+            assert_eq!(t.top().children, vec![d]);
+        }
+    }
+
+    #[test]
+    fn classes_above_a_top_class_are_lifted_transitively() {
+        // Multi-hop chain A ⊑ B ⊑ C ⊑ D where rows are not transitively closed:
+        // owl:Thing has only A, A has only B, B has only C, C has only D. X ⊑ C and
+        // Y ⊑ X sit below the lifted chain and U is unsatisfiable.
+        let mut k = saturated(&[
+            Axiom::sub_class_of(c("A"), c("A")),
+            Axiom::sub_class_of(c("B"), c("B")),
+            Axiom::sub_class_of(c("C"), c("C")),
+            Axiom::sub_class_of(c("D"), c("D")),
+            Axiom::sub_class_of(c("X"), c("C")),
+            Axiom::sub_class_of(c("Y"), c("X")),
+            Axiom::sub_class_of(c("U"), Class::nothing()),
+        ]);
+        let ex = |s: &str| k.interner.class_ex(&c(s)).unwrap();
+        let (a, b, cc, d, x, y) = (ex("A"), ex("B"), ex("C"), ex("D"), ex("X"), ex("Y"));
+        k.worlds.insert(TOP, (false, vec![TOP, a]));
+        k.worlds.insert(a, (false, vec![a, b]));
+        k.worlds.insert(b, (false, vec![b, cc]));
+        k.worlds.insert(cc, (false, vec![cc, d]));
+        k.worlds.insert(d, (false, vec![d]));
+        k.worlds.insert(x, (false, vec![x, cc]));
+        k.worlds.insert(y, (false, vec![y, x, cc]));
+        for threads in [1, 4] {
+            let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
+            assert_eq!(
+                t.top().classes,
+                vec![Class::thing(), c("A"), c("B"), c("C"), c("D")]
+            );
+            for name in ["A", "B", "C", "D"] {
+                assert_eq!(t.node_of(&c(name)), Some(TOP_NODE));
+            }
+            let xn = t.node_of(&c("X")).unwrap();
+            let yn = t.node_of(&c("Y")).unwrap();
+            assert_ne!(xn, TOP_NODE);
+            assert_ne!(yn, TOP_NODE);
+            assert_eq!(t.parents(&c("X")), &[TOP_NODE]);
+            assert_eq!(t.parents(&c("Y")), &[xn]);
+            assert_eq!(t.top().children, vec![xn]);
+            assert_eq!(t.node(xn).children, vec![yn]);
+            assert_eq!(t.node_of(&c("U")), Some(BOTTOM_NODE));
+        }
+    }
+
+    #[test]
+    fn equivalence_class_is_lifted_to_top_when_a_later_member_moves_to_top() {
+        // A ≡ B with A before B in IRI order, and B ⊑ C, when owl:Thing only names B.
+        let mut k = equivalent_pair();
+        let b = k.interner.class_ex(&c("B")).unwrap();
+        k.worlds.insert(TOP, (false, vec![TOP, b]));
+        for threads in [1, 4] {
+            let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
+            assert_eq!(t.node_of(&c("A")), Some(TOP_NODE));
+            assert_eq!(t.node_of(&c("B")), Some(TOP_NODE));
+            assert_eq!(t.node_of(&c("C")), Some(TOP_NODE));
+            assert_eq!(
+                t.top().classes,
+                vec![Class::thing(), c("A"), c("B"), c("C")]
+            );
+        }
+    }
+
+    #[test]
+    fn classes_above_a_top_class_through_a_hidden_internal_class_are_lifted() {
+        // TOP -> A -> H1 (hidden) -> B -> C and TOP -> H2 (hidden) -> D, with E ⊑ D.
+        let h1_cls = Class::new(format!("{}h1", super::super::dl_reduce::PREFIX));
+        let h2_cls = Class::new(format!("{}h2", super::super::dl_reduce::PREFIX));
+        let mut k = saturated(&[
+            Axiom::sub_class_of(c("A"), c("A")),
+            Axiom::sub_class_of(h1_cls.clone(), h1_cls.clone()),
+            Axiom::sub_class_of(h2_cls.clone(), h2_cls.clone()),
+            Axiom::sub_class_of(c("B"), c("B")),
+            Axiom::sub_class_of(c("C"), c("C")),
+            Axiom::sub_class_of(c("D"), c("D")),
+            Axiom::sub_class_of(c("E"), c("D")),
+        ]);
+        let a = k.interner.class_ex(&c("A")).unwrap();
+        let h1 = k.interner.class_ex(&h1_cls).unwrap();
+        let h2 = k.interner.class_ex(&h2_cls).unwrap();
+        let b = k.interner.class_ex(&c("B")).unwrap();
+        let cc = k.interner.class_ex(&c("C")).unwrap();
+        let d = k.interner.class_ex(&c("D")).unwrap();
+        let e = k.interner.class_ex(&c("E")).unwrap();
+        k.interner.hide_prefix(super::super::dl_reduce::PREFIX);
+        k.worlds.insert(TOP, (false, vec![TOP, a, h2]));
+        k.worlds.insert(a, (false, vec![a, h1]));
+        k.worlds.insert(h1, (false, vec![h1, b]));
+        k.worlds.insert(b, (false, vec![b, cc]));
+        k.worlds.insert(cc, (false, vec![cc]));
+        k.worlds.insert(h2, (false, vec![h2, d]));
+        k.worlds.insert(d, (false, vec![d]));
+        k.worlds.insert(e, (false, vec![e, d]));
+        for threads in [1, 4] {
+            let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
+            assert_eq!(
+                t.top().classes,
+                vec![Class::thing(), c("A"), c("B"), c("C"), c("D")]
+            );
+            assert_eq!(t.node_of(&h1_cls), None);
+            assert_eq!(t.node_of(&h2_cls), None);
+            assert!(
+                t.classes()
+                    .all(|cl| !cl.as_str().starts_with(super::super::dl_reduce::PREFIX))
+            );
+            let en = t.node_of(&c("E")).unwrap();
+            assert_ne!(en, TOP_NODE);
+            assert_eq!(t.parents(&c("E")), &[TOP_NODE]);
+            assert_eq!(t.top().children, vec![en]);
+        }
+        // `describe` lifts the same ancestors, including across hidden internal classes,
+        // without exposing internal names.
+        k.reduced = true;
+        let top_desc = k.describe(&Class::thing()).unwrap();
+        assert_eq!(top_desc.equivalents, vec![c("A"), c("B"), c("C"), c("D")]);
+        assert_eq!(top_desc.subclasses, vec![c("E")]);
+        assert_eq!(top_desc.direct_subclasses, vec![c("E")]);
+        for name in ["A", "B", "C", "D"] {
+            let d = k.describe(&c(name)).unwrap();
+            assert!(d.equivalents.contains(&Class::thing()), "{name}: {d:?}");
+            assert!(d.superclasses.is_empty(), "{name}: {d:?}");
+            assert!(d.direct_superclasses.is_empty(), "{name}: {d:?}");
+            assert_eq!(d.subclasses, vec![c("E")], "{name}: {d:?}");
+            assert_eq!(d.direct_subclasses, vec![c("E")], "{name}: {d:?}");
+        }
+        let e_desc = k.describe(&c("E")).unwrap();
+        assert!(e_desc.equivalents.is_empty());
+        assert_eq!(
+            e_desc.direct_superclasses,
+            vec![c("A"), c("B"), c("C"), c("D"), Class::thing()]
+        );
+    }
+
+    #[test]
+    fn inconsistent_ontology_keeps_top_empty_even_with_top_chain() {
+        let mut k = equivalent_pair();
+        let a = k.interner.class_ex(&c("A")).unwrap();
+        k.worlds.insert(TOP, (false, vec![TOP, a]));
+        for threads in [1, 4] {
+            let (t, _) = build(&k, false, threads, false, &|| false, &|_| true).unwrap();
+            assert!(t.top().classes.is_empty());
+            assert_eq!(t.node_of(&Class::thing()), Some(BOTTOM_NODE));
+            for name in ["A", "B", "C"] {
+                assert_eq!(t.node_of(&c(name)), Some(BOTTOM_NODE));
+            }
+        }
+    }
+
+    #[test]
+    fn unsatisfiable_class_in_top_does_not_lift_unrelated_superclasses() {
+        // Synthetic incomplete state: consistent=true, TOP names U, and U is unsatisfiable
+        // with U ⊑ C. U goes to BOTTOM_NODE rather than TOP_NODE, so C is not lifted.
+        let mut k = saturated(&[Axiom::sub_class_of(c("U"), c("C"))]);
+        let u = k.interner.class_ex(&c("U")).unwrap();
+        let cc = k.interner.class_ex(&c("C")).unwrap();
+        k.worlds.insert(TOP, (false, vec![TOP, u]));
+        k.worlds.insert(u, (true, vec![u, cc]));
+        for threads in [1, 4] {
+            let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
+            assert_eq!(t.node_of(&c("U")), Some(BOTTOM_NODE));
+            let cn = t.node_of(&c("C")).unwrap();
+            assert_ne!(cn, TOP_NODE);
+            assert_ne!(cn, BOTTOM_NODE);
+            assert_eq!(t.parents(&c("C")), &[TOP_NODE]);
         }
     }
 

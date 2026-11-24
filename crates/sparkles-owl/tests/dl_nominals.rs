@@ -2747,3 +2747,168 @@ fn the_marker_repair_delivers_in_the_run_without_counting_after_the_bound() {
         );
     }
 }
+
+/// Checks structural invariants of a taxonomy: no duplicate classes, every `node_of`
+/// agrees with the node's membership, parent/child edges are symmetric and sorted without
+/// self-loops or duplicates, and the top and bottom nodes hold no parents.
+fn assert_taxonomy_well_formed(t: &sparkles_owl::classify::Taxonomy) {
+    use std::collections::BTreeSet;
+    let mut seen_classes = BTreeSet::new();
+    for (idx, node) in t.nodes().iter().enumerate() {
+        for cl in &node.classes {
+            assert!(
+                seen_classes.insert(cl.clone()),
+                "duplicate class {cl:?} in taxonomy"
+            );
+            assert_eq!(t.node_of(cl), Some(idx), "node_of mismatch for {cl:?}");
+        }
+        assert!(
+            node.parents.windows(2).all(|w| w[0] < w[1]),
+            "unsorted or duplicate parents on node {idx}: {:?}",
+            node.parents
+        );
+        assert!(
+            node.children.windows(2).all(|w| w[0] < w[1]),
+            "unsorted or duplicate children on node {idx}: {:?}",
+            node.children
+        );
+        assert!(
+            !node.parents.contains(&idx) && !node.children.contains(&idx),
+            "self-loop on node {idx}"
+        );
+        for &p in &node.parents {
+            assert!(
+                p < t.nodes().len() && t.node(p).children.contains(&idx),
+                "broken parent edge {idx} -> {p}"
+            );
+        }
+        for &ch in &node.children {
+            assert!(
+                ch < t.nodes().len() && t.node(ch).parents.contains(&idx),
+                "broken child edge {idx} -> {ch}"
+            );
+        }
+    }
+    assert!(t.top().parents.is_empty());
+    assert!(t.bottom().parents.is_empty());
+    assert!(t.bottom().children.is_empty());
+}
+
+#[test]
+fn classes_above_a_top_equivalent_class_are_lifted_in_a_rooted_run() {
+    // Every element is a and an A, so owl:Thing ⊑ A. In A's context, x ≈ a rewrites the
+    // core atom A(x) to A(a), which with r(a, a) and A ⊑ ∀r.B derives B(a) and thus B(x),
+    // and then B ⊑ C ≡ D. In owl:Thing's context, x ↦ a does not rewrite A(x), so
+    // owl:Thing's context derives A without B, C or D. Lifting every class above A moves
+    // B, C and D to the top node with A, while keeping E and F below it and U at bottom.
+    let body = "SubClassOf(owl:Thing ObjectOneOf(:a))
+                SubClassOf(owl:Thing :A)
+                SubClassOf(:U owl:Nothing)
+                ObjectPropertyAssertion(:r :a :a)
+                SubClassOf(:A ObjectAllValuesFrom(:r :B))
+                SubClassOf(:B :C)
+                EquivalentClasses(:C :D)
+                SubClassOf(:E :C)
+                SubClassOf(:F :E)";
+    let ax = axioms(body);
+    let thing = Class::thing();
+    for (threads, expansion) in CONFIGS {
+        let at = format!("{threads} threads {expansion:?}");
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(k.excluded().is_empty(), "{at}: {:#?}", k.excluded());
+        assert_eq!(out.stats.tier, Tier::Disjunctive, "{at}");
+        assert!(out.complete, "{at}");
+        assert_eq!(out.consistency, Consistency::Consistent, "{at}");
+        assert_taxonomy_well_formed(&out.taxonomy);
+        let top = out.taxonomy.node_of(&thing).unwrap();
+        let bottom = out.taxonomy.node_of(&Class::nothing()).unwrap();
+        for name in ["A", "B", "C", "D"] {
+            assert_eq!(
+                out.taxonomy.node_of(&c(name)),
+                Some(top),
+                "{at}: {name} should be lifted to the top node"
+            );
+            assert!(
+                out.taxonomy.is_subclass(&thing, &c(name)),
+                "{at}: owl:Thing ⊑ {name}"
+            );
+        }
+        let e_node = out.taxonomy.node_of(&c("E")).unwrap();
+        let f_node = out.taxonomy.node_of(&c("F")).unwrap();
+        assert_ne!(e_node, top, "{at}: E is strictly below owl:Thing");
+        assert_ne!(f_node, top, "{at}: F is strictly below owl:Thing");
+        assert_eq!(out.taxonomy.parents(&c("E")), &[top], "{at}");
+        assert_eq!(out.taxonomy.parents(&c("F")), &[e_node], "{at}");
+        assert!(out.taxonomy.top().children.contains(&e_node), "{at}");
+        assert!(!out.taxonomy.top().children.contains(&f_node), "{at}");
+        assert_eq!(out.taxonomy.node_of(&c("U")), Some(bottom), "{at}");
+
+        // `describe` agrees with the taxonomy for lifted top classes and classes below them.
+        let top_desc = k.describe(&thing).unwrap();
+        for name in ["A", "B", "C", "D"] {
+            assert!(
+                top_desc.equivalents.contains(&c(name)),
+                "{at}: describe(owl:Thing) missing equivalent {name}: {top_desc:?}"
+            );
+            let d = k.describe(&c(name)).unwrap();
+            assert!(d.equivalents.contains(&thing), "{at}: {name} {d:?}");
+            assert!(d.superclasses.is_empty(), "{at}: {name} {d:?}");
+            assert!(d.direct_superclasses.is_empty(), "{at}: {name} {d:?}");
+            assert!(d.subclasses.contains(&c("E")), "{at}: {name} {d:?}");
+            assert!(d.direct_subclasses.contains(&c("E")), "{at}: {name} {d:?}");
+        }
+        let e_desc = k.describe(&c("E")).unwrap();
+        assert!(e_desc.equivalents.is_empty(), "{at}: {e_desc:?}");
+        for name in ["A", "B", "C", "D"] {
+            assert!(
+                e_desc.direct_superclasses.contains(&c(name)),
+                "{at}: E direct_superclasses missing {name}: {e_desc:?}"
+            );
+        }
+        assert!(
+            e_desc.direct_superclasses.contains(&thing),
+            "{at}: {e_desc:?}"
+        );
+    }
+}
+
+#[test]
+fn inconsistent_rooted_run_with_lifted_top_chain_keeps_top_empty() {
+    let body = "SubClassOf(owl:Thing ObjectOneOf(:a))
+                SubClassOf(owl:Thing :A)
+                ObjectPropertyAssertion(:r :a :a)
+                SubClassOf(:A ObjectAllValuesFrom(:r :B))
+                SubClassOf(:B :C)
+                SubClassOf(:C owl:Nothing)";
+    let ax = axioms(body);
+    let thing = Class::thing();
+    for (threads, expansion) in CONFIGS {
+        let at = format!("{threads} threads {expansion:?}");
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Inconsistent, "{at}");
+        assert!(!out.consistent, "{at}");
+        assert_taxonomy_well_formed(&out.taxonomy);
+        assert!(out.taxonomy.top().classes.is_empty(), "{at}");
+        let bottom = out.taxonomy.node_of(&Class::nothing()).unwrap();
+        assert_eq!(out.taxonomy.node_of(&thing), Some(bottom), "{at}");
+        for name in ["A", "B", "C"] {
+            assert_eq!(out.taxonomy.node_of(&c(name)), Some(bottom), "{at}");
+        }
+    }
+}
