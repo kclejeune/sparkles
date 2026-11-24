@@ -2806,7 +2806,6 @@ fn one_image_disjoint_union_becomes_horn_without_injected_disjunction() {
             .map(|i| i.as_str().to_string())
             .collect();
         assert_eq!(instances, [format!("{EX}b")]);
-        assert!(k.describe(&Class::new(format!("{INTERNAL}u"))).is_none());
         no_internal_names(
             &k,
             &out,
@@ -3125,6 +3124,14 @@ fn one_image_disjoint_union_with_key_keeps_rewritten_horn_and_hides_key_names() 
         instances,
         [format!("{EX}a"), format!("{EX}b"), format!("{EX}c")]
     );
+    assert!(
+        k.describe(&Class::new(format!("{INTERNAL}v0-0-1")))
+            .is_none()
+    );
+    assert!(
+        k.describe(&Class::new(format!("{INTERNAL}m0-0-0-1")))
+            .is_none()
+    );
     no_internal_names(
         &k,
         &out,
@@ -3273,4 +3280,99 @@ fn ineligible_lower_tier_rewrites_still_fall_back_to_original_axioms() {
         k.excluded()
     );
     no_internal_names(&k, &out, &[Class::thing(), c("C"), c("D"), c("G"), c("K")]);
+}
+
+/// Kept rewritten lower-tier runs must compute property-chain range violations for
+/// `outside_el` from the original ontology rather than the rewritten ontology (row 1313):
+/// rewriting drops `:s ⊑ owl:topObjectProperty` and turns `Range(top :T)` into `⊤ ⊑ :T`,
+/// which would hide an original chain range violation and undercount `horn` and `taken`.
+#[test]
+fn kept_rewritten_chain_range_stats_do_not_undercount_original_horn_chains() {
+    let under = direct_axioms(
+        "DisjointUnion(:C
+             ObjectSomeValuesFrom(:r owl:Thing)
+             ObjectSomeValuesFrom(:r ObjectMinCardinality(0 owl:topObjectProperty :X)))
+         SubObjectPropertyOf(ObjectPropertyChain(:p :q) :s)
+         SubObjectPropertyOf(:s owl:topObjectProperty)
+         ObjectPropertyRange(owl:topObjectProperty :T)",
+    );
+    let plain_under = Classifier::of(&under).classify(&Limits::default()).unwrap();
+    assert_eq!(plain_under.stats.tier, Tier::Disjunctive);
+    assert_eq!(plain_under.stats.outside_el.horn, 1);
+    assert_eq!(plain_under.stats.outside_el.disjunctive, 1);
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&under);
+        let out = k
+            .classify(&Limits {
+                threads,
+                rooted: true,
+                strict: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(k.excluded().is_empty(), "{threads}: {:#?}", k.excluded());
+        assert!(out.complete && out.complete_for_taken);
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(out.taxonomy.is_unsatisfiable(&c("C")));
+        assert!(out.taxonomy.is_subclass(&Class::thing(), &c("T")));
+        assert_eq!(out.stats.added, under.len());
+        assert_eq!(out.stats.tier, Tier::Disjunctive);
+        assert_eq!(out.stats.outside_el.horn, 1, "{threads}: undercounted horn");
+        assert_eq!(out.stats.outside_el.disjunctive, 1);
+        assert_eq!(out.stats.outside_el.global, 0);
+        assert_eq!(
+            out.stats.outside_el.taken, 2,
+            "{threads}: undercounted taken"
+        );
+        assert_eq!(out.stats.clauses, 0);
+        assert_eq!(out.stats.conjunctions, 0);
+        no_internal_names(&k, &out, &[Class::thing(), c("C"), c("T"), c("X")]);
+    }
+}
+
+/// Kept rewritten lower-tier runs must not overcount original EL chains whose rewritten
+/// form fails the range check on `U` after `Range(owl:topObjectProperty :T)` becomes
+/// `owl:Thing ⊑ :T` (row 1313).
+#[test]
+fn kept_rewritten_chain_range_stats_do_not_overcount_original_el_chains() {
+    let over = direct_axioms(
+        "DisjointUnion(:C
+             ObjectSomeValuesFrom(:r owl:Thing)
+             ObjectSomeValuesFrom(:r ObjectMinCardinality(0 owl:topObjectProperty :X)))
+         SubObjectPropertyOf(ObjectPropertyChain(:p owl:topObjectProperty) :s)
+         ObjectPropertyRange(:s :T)
+         ObjectPropertyRange(owl:topObjectProperty :T)",
+    );
+    let plain_over = Classifier::of(&over).classify(&Limits::default()).unwrap();
+    assert_eq!(plain_over.stats.tier, Tier::Disjunctive);
+    assert_eq!(plain_over.stats.outside_el.horn, 0);
+    assert_eq!(plain_over.stats.outside_el.disjunctive, 1);
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&over);
+        let out = k
+            .classify(&Limits {
+                threads,
+                rooted: true,
+                strict: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(k.excluded().is_empty(), "{threads}: {:#?}", k.excluded());
+        assert!(out.complete && out.complete_for_taken);
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(out.taxonomy.is_unsatisfiable(&c("C")));
+        assert!(out.taxonomy.is_subclass(&Class::thing(), &c("T")));
+        assert_eq!(out.stats.added, over.len());
+        assert_eq!(out.stats.tier, Tier::Disjunctive);
+        assert_eq!(out.stats.outside_el.horn, 0, "{threads}: overcounted horn");
+        assert_eq!(out.stats.outside_el.disjunctive, 1);
+        assert_eq!(out.stats.outside_el.global, 0);
+        assert_eq!(
+            out.stats.outside_el.taken, 1,
+            "{threads}: overcounted taken"
+        );
+        assert_eq!(out.stats.clauses, 0);
+        assert!(k.describe(&Class::thing()).unwrap().instances.is_empty());
+        no_internal_names(&k, &out, &[Class::thing(), c("C"), c("T"), c("X")]);
+    }
 }

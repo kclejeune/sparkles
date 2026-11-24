@@ -1112,9 +1112,6 @@ pub struct Saturation {
     /// set while a run classifies the axioms that item 805's reductions made, so that the
     /// classes they made up stay out of the taxonomy
     hide_internal: bool,
-    /// the chains outside OWL 2 EL for their ranges alone in a run of rewritten axioms,
-    /// which the statistics of the original axioms count
-    chain_ranged: Vec<AxiomKind>,
     /// whether the last run classified rewritten axioms, which the next run's changes
     /// do not describe and whose made-up names [`Saturation::describe`] leaves out
     pub(crate) reduced: bool,
@@ -1816,7 +1813,6 @@ impl Saturation {
             no_rooted: false,
             rooted_declined: false,
             hide_internal: false,
-            chain_ranged: Vec::new(),
             reduced: false,
             dl_rooted: false,
             dl_counted: false,
@@ -2585,26 +2581,15 @@ impl Saturation {
         if !chains.is_empty() {
             let ranges = range_table(axioms, &is_outside);
             for k in chains {
-                if let AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), sup) =
-                    k
-                    && let (Some(last), ObjectPropertyExpression::Property(sup)) = (ps.last(), sup)
-                {
-                    let want = ranges.get(sup.as_str());
-                    let have = ranges.get(last.named().as_str());
-                    if let Some(missing) =
-                        want.and_then(|w| w.iter().find(|c| have.is_none_or(|h| !h.contains(*c))))
-                    {
-                        index::intern_signature(k, &mut self.interner);
-                        chain_ranges.push((
-                            k,
-                            format!(
-                                "the range {missing} of <{}> is not a range of the chain's last property <{}> in OWL 2 EL",
-                                sup.as_str(),
-                                last.named().as_str()
-                            ),
-                        ));
-                        continue;
-                    }
+                if let Some((missing, sup, last)) = chain_missing_range(k, &ranges) {
+                    index::intern_signature(k, &mut self.interner);
+                    chain_ranges.push((
+                        k,
+                        format!(
+                            "the range {missing} of <{sup}> is not a range of the chain's last property <{last}> in OWL 2 EL"
+                        ),
+                    ));
+                    continue;
                 }
                 if let Some(why) = index::normalize(k, &mut self.interner, &mut ax) {
                     if matches!(attempt, AttemptProvenance::OriginalDefault)
@@ -2625,9 +2610,6 @@ impl Saturation {
         // list includes chains rejected by the central last-role range check.
         let plan_named_domains =
             named_domain_candidate && candidates.is_empty() && self.interner.dt_run.is_none();
-        if self.hide_internal {
-            self.chain_ranged = chain_ranges.iter().map(|(k, _)| (*k).clone()).collect();
-        }
         candidates.sort();
         candidates.dedup();
         let mut outside_el = OutsideEl::default();
@@ -2901,16 +2883,7 @@ impl Saturation {
                 {
                     red.restore(axioms, &mut self.excluded);
                     r.2.added = self.source_len.unwrap_or(axioms.len());
-                    let mut chains: Vec<Excluded> = std::mem::take(&mut self.chain_ranged)
-                        .into_iter()
-                        .map(|axiom| Excluded {
-                            axiom,
-                            gap: index::Gap::Partial("chain range"),
-                        })
-                        .collect();
-                    red.restore(axioms, &mut chains);
-                    let chains: Vec<&AxiomKind> = chains.iter().map(|e| &e.axiom).collect();
-                    r.2.outside_el = red.outside_el(axioms, &chains, &self.excluded);
+                    r.2.outside_el = red.outside_el(axioms, &self.excluded);
                     r.2.tier = r.2.outside_el.tier();
                     self.reduced = true;
                     return Ok(r);
@@ -2918,13 +2891,11 @@ impl Saturation {
                 Err(e) => {
                     // the report of a run that stopped still names the original axioms
                     red.restore(axioms, &mut self.excluded);
-                    self.chain_ranged.clear();
                     self.reduced = true;
                     return Err(e);
                 }
                 _ => {
                     red.restore(axioms, &mut self.excluded);
-                    self.chain_ranged.clear();
                     self.reset();
                 }
             }
@@ -5196,6 +5167,63 @@ fn range_table(
         out.insert(p.to_string(), rs);
     }
     out
+}
+
+/// The first range of a chain's superproperty missing from its last property under
+/// OWL 2 Profiles §2.2.6, with the superproperty and last property IRIs.
+fn chain_missing_range<'a, 'k>(
+    k: &'k AxiomKind,
+    ranges: &'a FxHashMap<String, std::collections::BTreeSet<ClassExpression>>,
+) -> Option<(&'a ClassExpression, &'k str, &'k str)> {
+    let AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), sup) = k else {
+        return None;
+    };
+    let (Some(last), ObjectPropertyExpression::Property(sup)) = (ps.last(), sup) else {
+        return None;
+    };
+    let want = ranges.get(sup.as_str())?;
+    let have = ranges.get(last.named().as_str());
+    let missing = want.iter().find(|c| have.is_none_or(|h| !h.contains(*c)))?;
+    Some((missing, sup.as_str(), last.named().as_str()))
+}
+
+/// The chains of `axioms` that are outside OWL 2 EL for their ranges alone
+/// (OWL 2 Profiles §2.2.6), matching [`Saturation::build_inner`].
+fn range_outside_chains<'a>(axioms: &[&'a AxiomKind]) -> Vec<&'a AxiomKind> {
+    let has_chain = axioms.iter().any(|k| {
+        matches!(
+            k,
+            AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
+        ) && !index::top_inclusion(k)
+    });
+    if !has_chain {
+        return Vec::new();
+    }
+    let is_outside: Vec<bool> = axioms
+        .iter()
+        .map(|k| logical(k) && el_break(k).is_some())
+        .collect();
+    let chains: Vec<&'a AxiomKind> = axioms
+        .iter()
+        .enumerate()
+        .filter(|&(i, k)| {
+            !is_outside[i]
+                && matches!(
+                    k,
+                    AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
+                )
+                && !index::top_inclusion(k)
+        })
+        .map(|(_, &k)| k)
+        .collect();
+    if chains.is_empty() {
+        return Vec::new();
+    }
+    let ranges = range_table(axioms, &is_outside);
+    chains
+        .into_iter()
+        .filter(|k| chain_missing_range(k, &ranges).is_some())
+        .collect()
 }
 
 /// The axioms normalized between two polls of the run's deadline and cancellation.

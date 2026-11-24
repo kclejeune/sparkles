@@ -139,14 +139,9 @@ impl Reduction {
 
     /// What the original axioms outside OWL 2 EL need, for the run's statistics, with the
     /// report of the axioms the run left out.
-    /// `chains` are the original chains outside OWL 2 EL for their ranges alone, which are
-    /// Horn, as the run without the rewriting counts them.
-    pub fn outside_el(
-        &self,
-        axioms: &[&AxiomKind],
-        chains: &[&AxiomKind],
-        excluded: &[Excluded],
-    ) -> dl::OutsideEl {
+    /// Original chains outside OWL 2 EL for their ranges alone are determined from the
+    /// original axioms with the ordinary range check and counted as Horn.
+    pub fn outside_el(&self, axioms: &[&AxiomKind], excluded: &[Excluded]) -> dl::OutsideEl {
         let mut out = dl::OutsideEl::default();
         let mut seen: BTreeSet<&AxiomKind> = BTreeSet::new();
         for k in axioms {
@@ -154,7 +149,7 @@ impl Reduction {
                 out.add(dl::shape(k));
             }
         }
-        for k in chains {
+        for k in super::range_outside_chains(axioms) {
             if seen.insert(k) {
                 out.horn += 1;
             }
