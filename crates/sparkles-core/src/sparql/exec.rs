@@ -157,6 +157,22 @@ impl Split {
             < self.sample_nanos.saturating_mul(self.rest_rows as u128)
     }
 
+    /// Whether a valid split observation (non-zero rows/durations, no overflow) beat the
+    /// serial sample projection (`rest_nanos * sample_rows < sample_nanos * rest_rows`).
+    /// Returns `None` for zero or overflowing inputs.
+    pub(super) fn valid_paid(&self) -> Option<bool> {
+        if self.sample_rows == 0
+            || self.rest_rows == 0
+            || self.sample_nanos == 0
+            || self.rest_nanos == 0
+        {
+            return None;
+        }
+        let p = self.sample_nanos.checked_mul(self.rest_rows as u128)?;
+        let q = self.rest_nanos.checked_mul(self.sample_rows as u128)?;
+        Some(q < p)
+    }
+
     /// Classify the split against a 20% clear-loss margin and a 10% clear-win margin,
     /// treating zero or overflowing inputs as unknown evidence.
     pub(super) fn classify(&self) -> SplitOutcome {

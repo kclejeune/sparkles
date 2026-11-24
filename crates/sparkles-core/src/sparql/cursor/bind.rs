@@ -6,16 +6,18 @@ use crate::id::{Id, PAYLOAD_MASK, Tag};
 use crate::index::{O, P, Perm, S};
 use crate::sparql::ctx::RetainedCharge;
 use crate::sparql::exec::{self, ColumnEval, Split, SplitOutcome};
-use crate::sparql::expr::Expr;
+use crate::sparql::expr::{Expr, Func};
 use crate::sparql::plan::{Kind, Node};
 use crate::sparql::table::VarId;
 use crate::sparql::{Ctx, Table};
 use rustc_hash::{FxHashMap, FxHashSet};
+use spargebra::algebra::Function;
 use std::time::Instant;
 
 pub(super) struct Admission {
     input: VarId,
     expected_reuse: bool,
+    direct_str_input: bool,
 }
 
 /// Entries of a general map, and of the sampled-key sketch times [`SAMPLE`].
@@ -42,6 +44,8 @@ const SCRATCH_BYTES: u64 = 28 + 40;
 const SPLIT_LOSSES: u8 = 2;
 /// Default eligible serial evaluations per cooldown before retrying a split.
 const SPLIT_COOLDOWN: u8 = 8;
+/// Default eligible serial evaluations per bounded IRI map-miss cooldown before retry.
+const IRI_SPLIT_COOLDOWN: u8 = 16;
 /// Largest evaluated row count in the small split/cost bucket (`768..=2047`).
 const SMALL_BUCKET_MAX: usize = 2047;
 /// Minimum estimated per-row evaluation saving (ns) for unhinted weak admission on
@@ -97,6 +101,7 @@ struct ReuseConfig {
     scope: SplitScope,
     admission: AdmissionMode,
     cooldown: u8,
+    iri_split_cooldown: Option<u8>,
     trace: bool,
 }
 
@@ -107,9 +112,30 @@ impl Default for ReuseConfig {
             scope: SplitScope::Bind,
             admission: AdmissionMode::Cost,
             cooldown: SPLIT_COOLDOWN,
+            iri_split_cooldown: None,
             trace: false,
         }
     }
+}
+
+fn parse_iri_split_cooldown(raw: Option<&str>) -> Option<u8> {
+    let raw = raw?.trim();
+    if raw.eq_ignore_ascii_case("1")
+        || raw.eq_ignore_ascii_case("on")
+        || raw.eq_ignore_ascii_case("true")
+        || raw.eq_ignore_ascii_case("yes")
+    {
+        return Some(IRI_SPLIT_COOLDOWN);
+    }
+    if raw.is_empty()
+        || raw.eq_ignore_ascii_case("0")
+        || raw.eq_ignore_ascii_case("off")
+        || raw.eq_ignore_ascii_case("false")
+        || raw.eq_ignore_ascii_case("no")
+    {
+        return None;
+    }
+    raw.parse::<u8>().ok().filter(|&n| (2..=64).contains(&n))
 }
 
 fn reuse_config() -> ReuseConfig {
@@ -135,6 +161,11 @@ fn reuse_config() -> ReuseConfig {
             .and_then(|s| s.parse::<u8>().ok())
             .filter(|&n| (1..=64).contains(&n))
             .unwrap_or(SPLIT_COOLDOWN);
+        let iri_split_cooldown = parse_iri_split_cooldown(
+            std::env::var("SPARKLES_BIND_IRI_SPLIT_COOLDOWN")
+                .ok()
+                .as_deref(),
+        );
         let trace = matches!(
             std::env::var("SPARKLES_BIND_TRACE").as_deref(),
             Ok("1" | "true" | "yes")
@@ -144,6 +175,7 @@ fn reuse_config() -> ReuseConfig {
             scope,
             admission,
             cooldown,
+            iri_split_cooldown,
             trace,
         }
     })
@@ -353,6 +385,118 @@ impl SplitController {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IriBucketPhase {
+    Active,
+    Cooldown { remaining: u8 },
+    Retry,
+}
+
+/// Bounded split cooldown dedicated to homogeneous base-vocabulary IRI misses of direct
+/// `STR(input)` inside [`Reuse::apply_map`]. Kept strictly separate from
+/// [`SplitController`] so override observations never affect fallback cooldown or cost
+/// contention evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IriSplitController {
+    cooldown: Option<u8>,
+    small: IriBucketPhase,
+    large: IriBucketPhase,
+}
+
+impl IriSplitController {
+    fn new(cooldown: Option<u8>) -> Self {
+        Self {
+            cooldown,
+            small: IriBucketPhase::Active,
+            large: IriBucketPhase::Active,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.cooldown.is_some()
+    }
+
+    fn bucket(&self, b: SplitBucket) -> IriBucketPhase {
+        match b {
+            SplitBucket::Small => self.small,
+            SplitBucket::Large => self.large,
+        }
+    }
+
+    fn bucket_mut(&mut self, b: SplitBucket) -> &mut IriBucketPhase {
+        match b {
+            SplitBucket::Small => &mut self.small,
+            SplitBucket::Large => &mut self.large,
+        }
+    }
+
+    fn allow(&self, b: SplitBucket) -> bool {
+        !matches!(self.bucket(b), IriBucketPhase::Cooldown { .. })
+    }
+
+    fn observe(
+        &mut self,
+        b: SplitBucket,
+        parallel_allowed: bool,
+        split: Option<Split>,
+    ) -> Option<&'static str> {
+        let cooldown = self.cooldown?;
+        let phase = self.bucket_mut(b);
+        match *phase {
+            IriBucketPhase::Cooldown { remaining } => {
+                if parallel_allowed {
+                    return None;
+                }
+                if remaining <= 1 {
+                    *phase = IriBucketPhase::Retry;
+                    Some("iri:cooldown->retry")
+                } else {
+                    *phase = IriBucketPhase::Cooldown {
+                        remaining: remaining - 1,
+                    };
+                    None
+                }
+            }
+            IriBucketPhase::Active => {
+                let split = split?;
+                match split.valid_paid()? {
+                    true => None,
+                    false => {
+                        if cooldown == 0 {
+                            *phase = IriBucketPhase::Retry;
+                            Some("iri:active->retry")
+                        } else {
+                            *phase = IriBucketPhase::Cooldown {
+                                remaining: cooldown,
+                            };
+                            Some("iri:active->cooldown")
+                        }
+                    }
+                }
+            }
+            IriBucketPhase::Retry => {
+                let split = split?;
+                match split.valid_paid()? {
+                    true => {
+                        *phase = IriBucketPhase::Active;
+                        Some("iri:retry->active")
+                    }
+                    false => {
+                        if cooldown == 0 {
+                            None
+                        } else {
+                            *phase = IriBucketPhase::Cooldown {
+                                remaining: cooldown,
+                            };
+                            Some("iri:retry->cooldown")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Evaluation-size buckets for fallback cost observations (`>= MIN_ROWS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CostBucket {
@@ -467,6 +611,7 @@ struct TraceStats {
 
 pub(super) struct Reuse {
     input: VarId,
+    direct_str_input: bool,
     config: ReuseConfig,
     mode: Mode,
     values: FxHashMap<Id, Id>,
@@ -495,6 +640,8 @@ pub(super) struct Reuse {
     misses: u64,
     /// Two-bucket split controller shared across map misses and controlled BIND fallback.
     split: SplitController,
+    /// Separate bounded split cooldown for homogeneous stored-IRI `STR(input)` map misses.
+    iri_split: IriSplitController,
     trace: TraceStats,
     #[cfg(test)]
     evaluations: usize,
@@ -514,7 +661,8 @@ impl Drop for Reuse {
             "[bind-reuse] batches={} mode={:?} admit={:?}@{:?} hits={} misses={} \
              persistent_hits={} pending_hits={} retained={} answer_us={} eval_us={} \
              scatter_us={} retain_us={} fb_batches={} fb_eval_rows={} splits={} \
-             wins={} losses={} inconc={} transitions={} small={:?} large={:?}",
+             wins={} losses={} inconc={} transitions={} small={:?} large={:?} \
+             iri_small={:?} iri_large={:?}",
             self.batch_index,
             self.mode,
             t.admit_reason,
@@ -537,6 +685,8 @@ impl Drop for Reuse {
             t.transitions,
             self.split.small,
             self.split.large,
+            self.iri_split.small,
+            self.iri_split.large,
         );
     }
 }
@@ -549,6 +699,7 @@ impl Reuse {
         let input = crate::sparql::exprcache::eligible(&[expr]).ok().flatten()?;
         Some(Admission {
             input,
+            direct_str_input: is_direct_str_input(expr, input),
             expected_reuse: source.is_some_and(|source| {
                 source.est.is_finite()
                     && source.est > 0.0
@@ -573,6 +724,7 @@ impl Reuse {
         };
         Some(Self {
             input: admission.input,
+            direct_str_input: admission.direct_str_input,
             config,
             mode,
             values: Default::default(),
@@ -591,6 +743,7 @@ impl Reuse {
             hits: 0,
             misses: 0,
             split: SplitController::new(config.split, config.cooldown),
+            iri_split: IriSplitController::new(config.iri_split_cooldown),
             trace: TraceStats::default(),
             #[cfg(test)]
             evaluations: 0,
@@ -599,6 +752,80 @@ impl Reuse {
             #[cfg(test)]
             last_fallback_dispatch: None,
         })
+    }
+
+    /// Whether a map-miss batch qualifies for the bounded stored-IRI `STR(input)` split
+    /// override, returning its sampled-split size bucket when it does.
+    fn iri_miss_bucket(
+        &self,
+        ctx: &Ctx,
+        miss_keys: &[Id],
+        multi_worker: bool,
+    ) -> Option<SplitBucket> {
+        if !self.iri_split.enabled()
+            || self.config.split != SplitMode::Retry
+            || !self.direct_str_input
+            || !multi_worker
+        {
+            return None;
+        }
+        let bucket = split_bucket(miss_keys.len())?;
+        all_stored_iris(ctx, miss_keys).then_some(bucket)
+    }
+
+    fn observe_iri_map_split(
+        &mut self,
+        bucket: SplitBucket,
+        rows: usize,
+        parallel_allowed: bool,
+        split: Option<Split>,
+    ) {
+        let transition = self.iri_split.observe(bucket, parallel_allowed, split);
+        if self.config.trace {
+            self.record_split_trace("map-iri", rows, split, transition);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn trace_weak_decision(
+        &self,
+        site: &'static str,
+        probe: Option<(usize, usize, bool)>,
+        exact: Option<(usize, usize, bool)>,
+        bucket_rows: usize,
+        confirmations: u8,
+        admit_batch: Option<u64>,
+    ) {
+        let fmt_sig = |sig: Option<(usize, usize, bool)>| match sig {
+            Some((n, r, ok)) => format!("{r}/{n}({ok})"),
+            None => "none".to_string(),
+        };
+        let fmt_rate = |rate: Option<EvalRate>| match rate {
+            Some(r) => format!(
+                "{}ns/{}r({:.1}ns/r)",
+                r.nanos,
+                r.rows,
+                r.nanos as f64 / r.rows.max(1) as f64
+            ),
+            None => "none".to_string(),
+        };
+        let cb = cost_bucket(bucket_rows);
+        let contended = self.split.is_contended(bucket_rows);
+        eprintln!(
+            "[bind-reuse] b={} weak site={site} probe={} exact={} bucket_rows={} cb={:?} \
+             cost_cb={:?} r0={} r1={} contended={} conf={} admit_batch={:?}",
+            self.batch_index,
+            fmt_sig(probe),
+            fmt_sig(exact),
+            bucket_rows,
+            cb,
+            self.cost.bucket,
+            fmt_rate(self.cost.samples[0]),
+            fmt_rate(self.cost.samples[1]),
+            contended,
+            confirmations,
+            admit_batch,
+        );
     }
 
     /// Whether the controlled BIND fallback may split an evaluation of `rows` rows.
@@ -799,18 +1026,33 @@ impl Reuse {
         let probe_ok = probe_win.is_some_and(|(n, r, _)| self.weak_passes(n, r, bucket_rows, true));
         let exact_ok = exact_signal.is_some_and(|(n, r)| self.weak_passes(n, r, bucket_rows, true));
 
-        if probe_ok || exact_ok {
+        let admit_reason = if probe_ok || exact_ok {
             self.weak_confirmations = self.weak_confirmations.saturating_add(1);
             if self.weak_confirmations >= WEAK_CONFIRMATIONS {
-                let reason = if exact_ok {
+                Some(if exact_ok {
                     "counted_weak"
                 } else {
                     "probe_weak"
-                };
-                self.admit(reason);
+                })
+            } else {
+                None
             }
         } else {
             self.weak_confirmations = 0;
+            None
+        };
+        if self.config.trace {
+            self.trace_weak_decision(
+                "fallback",
+                probe_win.map(|(n, r, _)| (n, r, probe_ok)),
+                exact_signal.map(|(n, r)| (n, r, exact_ok)),
+                bucket_rows,
+                self.weak_confirmations,
+                admit_reason.map(|_| self.batch_index),
+            );
+        }
+        if let Some(reason) = admit_reason {
+            self.admit(reason);
         }
     }
 
@@ -862,10 +1104,21 @@ impl Reuse {
         };
         if let Some((w_rows, w_repeats, bucket_rows)) = self.batch_probe_window.take() {
             let parallel_capable = expr.parallel() && rayon::current_num_threads() > 1;
-            if self.weak_passes(w_rows, w_repeats, bucket_rows, parallel_capable) {
+            let pass = self.weak_passes(w_rows, w_repeats, bucket_rows, parallel_capable);
+            if pass {
                 self.weak_confirmations = self.weak_confirmations.saturating_add(1);
             } else {
                 self.weak_confirmations = 0;
+            }
+            if self.config.trace {
+                self.trace_weak_decision(
+                    "apply_carry",
+                    Some((w_rows, w_repeats, pass)),
+                    None,
+                    bucket_rows,
+                    self.weak_confirmations,
+                    None,
+                );
             }
         }
         self.batch_index = self.batch_index.saturating_add(1);
@@ -1016,6 +1269,16 @@ impl Reuse {
         if self.weak_confirmations >= WEAK_CONFIRMATIONS - 1
             && self.weak_passes(rows, repeats, keys.len(), true)
         {
+            if self.config.trace {
+                self.trace_weak_decision(
+                    "probe",
+                    Some((rows, repeats, true)),
+                    None,
+                    keys.len(),
+                    self.weak_confirmations.saturating_add(1),
+                    Some(self.batch_index),
+                );
+            }
             self.admit("probe_weak");
             return Ok(true);
         }
@@ -1198,7 +1461,12 @@ impl Reuse {
             let mut misses = Table::new(vec![self.input]);
             misses.len = distinct.len();
             misses.cols[0] = distinct;
-            let par = self.allow_map_split(misses.len(), expr);
+            let multi_worker = rayon::current_num_threads() > 1;
+            let iri_bucket = self.iri_miss_bucket(ctx, &misses.cols[0], multi_worker);
+            let par = match iri_bucket {
+                Some(bucket) => self.iri_split.allow(bucket),
+                None => self.allow_map_split(misses.len(), expr),
+            };
             let t_eval = self.config.trace.then(Instant::now);
             let values = match exec::column_rows_split(ctx, &misses, expr, par)
                 .and_then(|values| ctx.check().map(|()| values))
@@ -1211,7 +1479,12 @@ impl Reuse {
                     if let Some(t) = t_eval {
                         self.trace.eval_nanos += t.elapsed().as_nanos();
                     }
-                    self.observe_map_split(misses.len(), expr, par, split);
+                    match iri_bucket {
+                        Some(bucket) => {
+                            self.observe_iri_map_split(bucket, misses.len(), par, split);
+                        }
+                        None => self.observe_map_split(misses.len(), expr, par, split),
+                    }
                     values
                 }
                 Err(error) => {
@@ -1255,6 +1528,26 @@ impl Reuse {
         }
         Ok(true)
     }
+}
+
+/// Whether `expr` is a direct `STR(input)` call on `input`.
+fn is_direct_str_input(expr: &Expr, input: VarId) -> bool {
+    matches!(
+        expr,
+        Expr::Call(Func::Builtin(Function::Str), args)
+            if matches!(args.as_slice(), [Expr::Var(var)] if *var == input)
+    )
+}
+
+/// Whether every key in `keys` is a base-vocabulary IRI (short-circuiting on the first
+/// literal, triple term, inline literal, blank node, delta, local or undefined term).
+fn all_stored_iris(ctx: &Ctx, keys: &[Id]) -> bool {
+    if keys.is_empty() {
+        return false;
+    }
+    let vocab = &ctx.snap.generation.vocab;
+    keys.iter()
+        .all(|id| id.tag() == Tag::Vocab && vocab.is_iri(id.payload()))
 }
 
 /// Whether a batch of inline integers spans few enough values for the integer map, or
@@ -1334,11 +1627,9 @@ fn distinct_bound(ctx: &Ctx, node: &Node, input: VarId, left: &mut usize) -> Opt
 mod tests {
     use super::*;
     use crate::io::Source;
-    use crate::sparql::expr::Func;
     use crate::store::{Store, StoreOptions};
     use oxrdf::{Literal, Term, vocab::xsd};
     use oxrdfio::RdfFormat;
-    use spargebra::algebra::Function;
 
     fn new_reuse(ctx: &Ctx, expr: &Expr, source: Option<&Node>) -> Option<Reuse> {
         Reuse::new_with_config(
@@ -1662,6 +1953,7 @@ mod tests {
             scope: SplitScope::Bind,
             admission: AdmissionMode::Cost,
             cooldown: 2,
+            iri_split_cooldown: None,
             trace: false,
         };
         let pool = rayon::ThreadPoolBuilder::new()
@@ -1754,6 +2046,7 @@ mod tests {
             scope: SplitScope::Bind,
             admission: AdmissionMode::Cost,
             cooldown: 2,
+            iri_split_cooldown: None,
             trace: false,
         };
         let pool = rayon::ThreadPoolBuilder::new()
@@ -2852,6 +3145,678 @@ mod tests {
                 1 + 4 * 767,
                 "uncached keys still evaluate normally after the cache fills"
             );
+        });
+    }
+
+    #[test]
+    fn iri_split_cooldown_controller_and_config_parser() {
+        assert_eq!(parse_iri_split_cooldown(None), None);
+        assert_eq!(parse_iri_split_cooldown(Some("")), None);
+        assert_eq!(parse_iri_split_cooldown(Some("0")), None);
+        assert_eq!(parse_iri_split_cooldown(Some("off")), None);
+        assert_eq!(parse_iri_split_cooldown(Some("false")), None);
+        assert_eq!(parse_iri_split_cooldown(Some("no")), None);
+        assert_eq!(
+            parse_iri_split_cooldown(Some("1")),
+            Some(IRI_SPLIT_COOLDOWN)
+        );
+        assert_eq!(
+            parse_iri_split_cooldown(Some("on")),
+            Some(IRI_SPLIT_COOLDOWN)
+        );
+        assert_eq!(
+            parse_iri_split_cooldown(Some("true")),
+            Some(IRI_SPLIT_COOLDOWN)
+        );
+        assert_eq!(
+            parse_iri_split_cooldown(Some("yes")),
+            Some(IRI_SPLIT_COOLDOWN)
+        );
+        assert_eq!(parse_iri_split_cooldown(Some("16")), Some(16));
+        assert_eq!(parse_iri_split_cooldown(Some("64")), Some(64));
+        assert_eq!(parse_iri_split_cooldown(Some("65")), None);
+        assert_eq!(parse_iri_split_cooldown(Some("invalid")), None);
+
+        // Projected serial rest time for split(100_000, rest) is 400_000 ns.
+        assert_eq!(split(100_000, 120_000).valid_paid(), Some(true));
+        assert_eq!(split(100_000, 399_999).valid_paid(), Some(true));
+        assert_eq!(split(100_000, 400_000).valid_paid(), Some(false));
+        // 1.05x is Inconclusive under classify(), but a valid nonpaying split under valid_paid().
+        assert_eq!(
+            split(100_000, 420_000).classify(),
+            SplitOutcome::Inconclusive
+        );
+        assert_eq!(split(100_000, 420_000).valid_paid(), Some(false));
+        assert_eq!(split(100_000, 1_200_000).valid_paid(), Some(false));
+        assert_eq!(split(0, 10).valid_paid(), None);
+        assert_eq!(split(100_000, 0).valid_paid(), None);
+        assert_eq!(split(u128::MAX, u128::MAX).valid_paid(), None);
+
+        let mut ctrl = IriSplitController::new(Some(IRI_SPLIT_COOLDOWN));
+        assert!(ctrl.enabled());
+        assert!(ctrl.allow(SplitBucket::Small));
+        assert!(ctrl.allow(SplitBucket::Large));
+
+        // Invalid and paying splits keep the bucket Active.
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(0, 1_000_000))),
+            None
+        );
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(100_000, 399_999))),
+            None
+        );
+        assert_eq!(ctrl.large, IriBucketPhase::Active);
+
+        // One valid nonpaying split (even within the ordinary Inconclusive band) enters cooldown.
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(100_000, 420_000))),
+            Some("iri:active->cooldown")
+        );
+        assert_eq!(
+            ctrl.large,
+            IriBucketPhase::Cooldown {
+                remaining: IRI_SPLIT_COOLDOWN
+            }
+        );
+        assert_eq!(ctrl.small, IriBucketPhase::Active);
+        assert!(ctrl.allow(SplitBucket::Small));
+
+        // Exactly 16 eligible suppressed batches transition to Retry.
+        for step in 0..IRI_SPLIT_COOLDOWN {
+            assert!(!ctrl.allow(SplitBucket::Large), "step {step} suppressed");
+            let tr = ctrl.observe(SplitBucket::Large, false, None);
+            if step + 1 == IRI_SPLIT_COOLDOWN {
+                assert_eq!(tr, Some("iri:cooldown->retry"));
+            } else {
+                assert_eq!(tr, None);
+            }
+        }
+        assert_eq!(ctrl.large, IriBucketPhase::Retry);
+        assert!(ctrl.allow(SplitBucket::Large));
+
+        // Missing or invalid retry observation keeps Retry pending.
+        assert_eq!(ctrl.observe(SplitBucket::Large, true, None), None);
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(0, 500_000))),
+            None
+        );
+        assert_eq!(ctrl.large, IriBucketPhase::Retry);
+
+        // Nonpaying retry re-enters cooldown immediately; paying retry recovers to Active.
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(100_000, 400_000))),
+            Some("iri:retry->cooldown")
+        );
+        assert_eq!(
+            ctrl.large,
+            IriBucketPhase::Cooldown {
+                remaining: IRI_SPLIT_COOLDOWN
+            }
+        );
+        for _ in 0..IRI_SPLIT_COOLDOWN {
+            ctrl.observe(SplitBucket::Large, false, None);
+        }
+        assert_eq!(ctrl.large, IriBucketPhase::Retry);
+        assert_eq!(
+            ctrl.observe(SplitBucket::Large, true, Some(split(100_000, 120_000))),
+            Some("iri:retry->active")
+        );
+        assert_eq!(ctrl.large, IriBucketPhase::Active);
+    }
+
+    #[test]
+    fn iri_map_miss_cooldown_dispatches_homogeneous_iris_isolates_mixed_and_retries_after_16() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::new();
+        for i in 0..64 {
+            ttl.push_str(&format!("<urn:seed:{i:04}> <urn:p> \"seed{i:04}\" .\n"));
+        }
+        for i in 0..2048 {
+            ttl.push_str(&format!("<urn:iri:{i:04}> <urn:p> \"lit{i:04}\" .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("v");
+        let target = ctx.var("s");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let non_str = Expr::Call(Func::Builtin(Function::Year), vec![Expr::Var(input)]);
+        let nested_str = Expr::Call(Func::Builtin(Function::UCase), vec![expr.clone()]);
+
+        let lookup_iri = |ctx: &Ctx, uri: &str| -> Id {
+            let id = ctx
+                .snap
+                .lookup_term(&Term::NamedNode(oxrdf::NamedNode::new(uri).unwrap()))
+                .unwrap();
+            assert_eq!(id.tag(), Tag::Vocab);
+            assert!(ctx.snap.generation.vocab.is_iri(id.payload()));
+            id
+        };
+        let lookup_lit = |ctx: &Ctx, val: &str| -> Id {
+            let id = ctx
+                .snap
+                .lookup_term(&Term::Literal(Literal::new_simple_literal(val)))
+                .unwrap();
+            assert_eq!(id.tag(), Tag::Vocab);
+            assert!(!ctx.snap.generation.vocab.is_iri(id.payload()));
+            id
+        };
+
+        let seed_iris: Vec<Id> = (0..64)
+            .map(|i| lookup_iri(&ctx, &format!("urn:seed:{i:04}")))
+            .collect();
+        let stored_iris: Vec<Id> = (0..2048)
+            .map(|i| lookup_iri(&ctx, &format!("urn:iri:{i:04}")))
+            .collect();
+        let stored_lits: Vec<Id> = (0..1024)
+            .map(|i| lookup_lit(&ctx, &format!("lit{i:04}")))
+            .collect();
+
+        let config = ReuseConfig {
+            iri_split_cooldown: Some(IRI_SPLIT_COOLDOWN),
+            ..ReuseConfig::default()
+        };
+
+        // Expression recognition happens once in prepare().
+        assert!(
+            !new_reuse_config(&ctx, &non_str, None, config)
+                .unwrap()
+                .direct_str_input
+        );
+        assert!(
+            !new_reuse_config(&ctx, &nested_str, None, config)
+                .unwrap()
+                .direct_str_input
+        );
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let mut reuse = new_reuse_config(&ctx, &expr, None, config).unwrap();
+            assert!(reuse.direct_str_input);
+
+            // Range, worker-count, switch and mode boundaries.
+            assert_eq!(
+                reuse.iri_miss_bucket(&ctx, &stored_iris[..767], true),
+                None,
+                "below sampled-split range uses ordinary policy"
+            );
+            assert_eq!(
+                reuse.iri_miss_bucket(&ctx, &stored_iris[..1024], false),
+                None,
+                "single-worker execution uses ordinary policy"
+            );
+            assert_eq!(
+                reuse.iri_miss_bucket(&ctx, &stored_iris[..1024], true),
+                Some(SplitBucket::Small)
+            );
+            assert_eq!(
+                reuse.iri_miss_bucket(&ctx, &stored_iris[..2048], true),
+                Some(SplitBucket::Large)
+            );
+            assert_eq!(
+                reuse.iri_miss_bucket(&ctx, &stored_lits, true),
+                None,
+                "Tag::Vocab literals must not match stored-IRI override"
+            );
+            let off_reuse = new_reuse(&ctx, &expr, None).unwrap();
+            assert_eq!(
+                off_reuse.iri_miss_bucket(&ctx, &stored_iris[..1024], true),
+                None,
+                "disabled switch must not activate IRI override"
+            );
+            let always_reuse = new_reuse_config(
+                &ctx,
+                &expr,
+                None,
+                ReuseConfig {
+                    split: SplitMode::Always,
+                    ..config
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                always_reuse.iri_miss_bucket(&ctx, &stored_iris[..1024], true),
+                None,
+                "non-retry split modes must not activate IRI override"
+            );
+
+            // Admit map on 64 dense seed IRIs and cap at 64 entries so subsequent batches
+            // exercise apply_map miss dispatch on full distinct miss columns.
+            let seed_rows: Vec<Id> = (0..4096).map(|i| seed_iris[i % 64]).collect();
+            let mut first = batch(input, &seed_rows);
+            assert!(reuse.apply(&ctx, &mut first, target, &expr).unwrap());
+            assert_eq!(reuse.mode, Mode::Map);
+            reuse.max_entries = 64;
+            assert_eq!(reuse.values.len(), 64);
+
+            // Initial homogeneous stored-IRI miss batch dispatches with par = true and
+            // produces fresh query-local string literals.
+            let mut iri_small = batch(input, &stored_iris[..1024]);
+            let expected_iri_small = exec::column_rows(&ctx, &iri_small, &expr).unwrap();
+            assert!(reuse.apply(&ctx, &mut iri_small, target, &expr).unwrap());
+            assert_eq!(iri_small.cols[1], expected_iri_small);
+            assert!(
+                iri_small.cols[1].iter().all(|id| id.tag() == Tag::Local),
+                "STR of IRIs whose lexical strings are absent from the store interns locally"
+            );
+            assert!(reuse.last_miss_dispatch.unwrap().0);
+
+            // One valid nonpaying split enters IRI Small cooldown without touching ordinary
+            // SplitController, fallback cooldown, or cost contention evidence.
+            reuse.iri_split.small = IriBucketPhase::Active;
+            reuse.observe_iri_map_split(
+                SplitBucket::Small,
+                1024,
+                true,
+                Some(split(100_000, 420_000)),
+            );
+            assert_eq!(
+                reuse.iri_split.small,
+                IriBucketPhase::Cooldown {
+                    remaining: IRI_SPLIT_COOLDOWN
+                }
+            );
+            assert_eq!(reuse.split.small, BucketPhase::Active { losses: 0 });
+            assert!(!reuse.split.is_contended(1024));
+            assert!(reuse.allow_fallback_split(1024, &expr));
+
+            // Cooldown step 1: actual dispatch on homogeneous stored-IRI misses runs par = false.
+            let mut step1 = batch(input, &stored_iris[..1024]);
+            assert!(reuse.apply(&ctx, &mut step1, target, &expr).unwrap());
+            assert_eq!(step1.cols[1], expected_iri_small);
+            assert_eq!(reuse.last_miss_dispatch, Some((false, None)));
+            assert_eq!(
+                reuse.iri_split.small,
+                IriBucketPhase::Cooldown {
+                    remaining: IRI_SPLIT_COOLDOWN - 1
+                }
+            );
+            assert_eq!(reuse.split.small, BucketPhase::Active { losses: 0 });
+
+            // All-hit batch does not dispatch misses or consume IRI cooldown.
+            reuse.last_miss_dispatch = None;
+            let mut all_hits = batch(input, &seed_rows);
+            assert!(reuse.apply(&ctx, &mut all_hits, target, &expr).unwrap());
+            assert_eq!(reuse.last_miss_dispatch, None);
+            assert_eq!(
+                reuse.iri_split.small,
+                IriBucketPhase::Cooldown {
+                    remaining: IRI_SPLIT_COOLDOWN - 1
+                }
+            );
+
+            // Stored-literal batch uses ordinary policy (par = true) and leaves IRI cooldown intact.
+            let mut lit_batch = batch(input, &stored_lits);
+            let expected_lits = exec::column_rows(&ctx, &lit_batch, &expr).unwrap();
+            assert!(reuse.apply(&ctx, &mut lit_batch, target, &expr).unwrap());
+            assert_eq!(lit_batch.cols[1], expected_lits);
+            assert!(reuse.last_miss_dispatch.unwrap().0);
+            assert_eq!(
+                reuse.iri_split.small,
+                IriBucketPhase::Cooldown {
+                    remaining: IRI_SPLIT_COOLDOWN - 1
+                }
+            );
+
+            // Mixed batch (1,023 stored IRIs + 1 stored literal at the end) uses ordinary policy.
+            reuse.split.small = BucketPhase::Active { losses: 0 };
+            let mut mixed_keys = stored_iris[..1023].to_vec();
+            mixed_keys.push(stored_lits[0]);
+            let mut mixed_batch = batch(input, &mixed_keys);
+            let expected_mixed = exec::column_rows(&ctx, &mixed_batch, &expr).unwrap();
+            assert!(reuse.apply(&ctx, &mut mixed_batch, target, &expr).unwrap());
+            assert_eq!(mixed_batch.cols[1], expected_mixed);
+            assert!(reuse.last_miss_dispatch.unwrap().0);
+            assert_eq!(
+                reuse.iri_split.small,
+                IriBucketPhase::Cooldown {
+                    remaining: IRI_SPLIT_COOLDOWN - 1
+                }
+            );
+
+            // Computed/query-local IRI mixed into stored IRIs uses ordinary policy.
+            reuse.split.small = BucketPhase::Active { losses: 0 };
+            let local_iri = ctx.intern_term(&Term::NamedNode(
+                oxrdf::NamedNode::new("urn:local:computed").unwrap(),
+            ));
+            assert_eq!(local_iri.tag(), Tag::Local);
+            let mut local_mixed = stored_iris[..1023].to_vec();
+            local_mixed.push(local_iri);
+            let mut local_batch = batch(input, &local_mixed);
+            assert!(reuse.apply(&ctx, &mut local_batch, target, &expr).unwrap());
+            assert!(reuse.last_miss_dispatch.unwrap().0);
+            assert_eq!(
+                reuse.iri_split.small,
+                IriBucketPhase::Cooldown {
+                    remaining: IRI_SPLIT_COOLDOWN - 1
+                }
+            );
+
+            // Large bucket (2,048 stored IRIs) is independent of Small IRI cooldown.
+            let mut iri_large = batch(input, &stored_iris[..2048]);
+            assert!(reuse.apply(&ctx, &mut iri_large, target, &expr).unwrap());
+            assert!(reuse.last_miss_dispatch.unwrap().0);
+            assert_eq!(
+                reuse.iri_split.small,
+                IriBucketPhase::Cooldown {
+                    remaining: IRI_SPLIT_COOLDOWN - 1
+                }
+            );
+
+            // Fallback losses stay strictly in ordinary SplitController without touching IRI cooldown.
+            let large_before_fb = reuse.iri_split.large;
+            let fb_loss = ColumnEval {
+                evaluated_rows: 4096,
+                elapsed_nanos: Some(4096 * 500),
+                split: Some(split(100_000, 1_200_000)),
+                parallel_allowed: true,
+            };
+            reuse.observe_fallback(4096, fb_loss, None, &expr);
+            reuse.observe_fallback(4096, fb_loss, None, &expr);
+            assert!(reuse.split.is_contended(4096));
+            assert_eq!(
+                reuse.iri_split.small,
+                IriBucketPhase::Cooldown {
+                    remaining: IRI_SPLIT_COOLDOWN - 1
+                }
+            );
+            assert_eq!(reuse.iri_split.large, large_before_fb);
+
+            // Remaining 15 eligible Small homogeneous stored-IRI batches stay serial and unlock Retry.
+            for step in 1..IRI_SPLIT_COOLDOWN {
+                let mut b = batch(input, &stored_iris[..1024]);
+                assert!(reuse.apply(&ctx, &mut b, target, &expr).unwrap());
+                assert_eq!(b.cols[1], expected_iri_small);
+                assert_eq!(
+                    reuse.last_miss_dispatch,
+                    Some((false, None)),
+                    "eligible step {step} must stay serial"
+                );
+            }
+            assert_eq!(reuse.iri_split.small, IriBucketPhase::Retry);
+
+            // Retry after 16 eligible batches restores par = true on actual dispatch.
+            let mut retry_batch = batch(input, &stored_iris[..1024]);
+            assert!(reuse.apply(&ctx, &mut retry_batch, target, &expr).unwrap());
+            assert_eq!(retry_batch.cols[1], expected_iri_small);
+            assert!(
+                reuse.last_miss_dispatch.unwrap().0,
+                "17th eligible batch must retry with par = true"
+            );
+            assert_eq!(pending_entries(&reuse), 0);
+
+            // Delta IRI mixed into stored IRIs also uses ordinary policy.
+            crate::sparql::update::update(
+                &store,
+                "INSERT DATA { <urn:delta:iri> <urn:p> \"delta\" }",
+                &crate::sparql::QueryOptions::default(),
+            )
+            .unwrap();
+            let delta_ctx = cursor_context(&store, 64 << 20);
+            let delta_input = delta_ctx.var("v");
+            let delta_target = delta_ctx.var("s");
+            let delta_expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(delta_input)]);
+            let delta_iri = delta_ctx
+                .snap
+                .lookup_term(&Term::NamedNode(
+                    oxrdf::NamedNode::new("urn:delta:iri").unwrap(),
+                ))
+                .unwrap();
+            assert_eq!(delta_iri.tag(), Tag::Delta);
+            let mut delta_reuse = new_reuse_config(&delta_ctx, &delta_expr, None, config).unwrap();
+            let mut delta_seed = batch(delta_input, &seed_rows);
+            assert!(
+                delta_reuse
+                    .apply(&delta_ctx, &mut delta_seed, delta_target, &delta_expr)
+                    .unwrap()
+            );
+            delta_reuse.max_entries = 64;
+            delta_reuse.observe_iri_map_split(
+                SplitBucket::Small,
+                1024,
+                true,
+                Some(split(100_000, 420_000)),
+            );
+            let mut delta_mixed = stored_iris[..1023].to_vec();
+            delta_mixed.push(delta_iri);
+            assert_eq!(
+                delta_reuse.iri_miss_bucket(&delta_ctx, &delta_mixed, true),
+                None,
+                "delta IRIs must use ordinary policy"
+            );
+            let mut delta_batch = batch(delta_input, &delta_mixed);
+            assert!(
+                delta_reuse
+                    .apply(&delta_ctx, &mut delta_batch, delta_target, &delta_expr)
+                    .unwrap()
+            );
+            assert!(delta_reuse.last_miss_dispatch.unwrap().0);
+            assert_eq!(
+                delta_reuse.iri_split.small,
+                IriBucketPhase::Cooldown {
+                    remaining: IRI_SPLIT_COOLDOWN
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn iri_map_miss_profitable_split_control_keeps_parallelism_active() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::new();
+        for i in 0..64 {
+            ttl.push_str(&format!(
+                "<urn:seed:{i:04}> <urn:p> \"urn:seed:{i:04}\" .\n"
+            ));
+        }
+        // Every STR(<urn:known:i>) string literal already exists in the base vocabulary.
+        for i in 0..1024 {
+            ttl.push_str(&format!(
+                "<urn:known:{i:04}> <urn:p> \"urn:known:{i:04}\" .\n"
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("v");
+        let target = ctx.var("s");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let seed_iris: Vec<Id> = (0..64)
+            .map(|i| {
+                ctx.snap
+                    .lookup_term(&Term::NamedNode(
+                        oxrdf::NamedNode::new(format!("urn:seed:{i:04}")).unwrap(),
+                    ))
+                    .unwrap()
+            })
+            .collect();
+        let known_iris: Vec<Id> = (0..1024)
+            .map(|i| {
+                let id = ctx
+                    .snap
+                    .lookup_term(&Term::NamedNode(
+                        oxrdf::NamedNode::new(format!("urn:known:{i:04}")).unwrap(),
+                    ))
+                    .unwrap();
+                assert_eq!(id.tag(), Tag::Vocab);
+                assert!(ctx.snap.generation.vocab.is_iri(id.payload()));
+                id
+            })
+            .collect();
+
+        let config = ReuseConfig {
+            iri_split_cooldown: Some(IRI_SPLIT_COOLDOWN),
+            ..ReuseConfig::default()
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let mut reuse = new_reuse_config(&ctx, &expr, None, config).unwrap();
+            let seed_rows: Vec<Id> = (0..4096).map(|i| seed_iris[i % 64]).collect();
+            let mut first = batch(input, &seed_rows);
+            assert!(reuse.apply(&ctx, &mut first, target, &expr).unwrap());
+            reuse.max_entries = 64;
+
+            // Actual dispatch on store-resident-output IRIs resolves outputs to Tag::Vocab
+            // (no query-local interning) with par = true.
+            let mut b1 = batch(input, &known_iris);
+            let expected = exec::column_rows(&ctx, &b1, &expr).unwrap();
+            assert!(
+                expected.iter().all(|id| id.tag() == Tag::Vocab),
+                "control fixture must already hold every STR(iri) literal in base vocab"
+            );
+            assert!(reuse.apply(&ctx, &mut b1, target, &expr).unwrap());
+            assert_eq!(b1.cols[1], expected);
+            assert!(reuse.last_miss_dispatch.unwrap().0);
+
+            // A paying split on this control keeps the IRI override Active and leaves the
+            // next actual dispatch parallel.
+            reuse.iri_split.small = IriBucketPhase::Active;
+            reuse.observe_iri_map_split(
+                SplitBucket::Small,
+                1024,
+                true,
+                Some(split(100_000, 120_000)),
+            );
+            assert_eq!(reuse.iri_split.small, IriBucketPhase::Active);
+
+            let mut b2 = batch(input, &known_iris);
+            assert!(reuse.apply(&ctx, &mut b2, target, &expr).unwrap());
+            assert_eq!(b2.cols[1], expected);
+            assert!(reuse.last_miss_dispatch.unwrap().0);
+
+            // A paying split during Retry recovers back to Active.
+            reuse.iri_split.small = IriBucketPhase::Retry;
+            reuse.observe_iri_map_split(
+                SplitBucket::Small,
+                1024,
+                true,
+                Some(split(100_000, 120_000)),
+            );
+            assert_eq!(reuse.iri_split.small, IriBucketPhase::Active);
+        });
+    }
+
+    #[test]
+    fn weak_decision_trace_preserves_admission_behavior() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+
+        let run_seq = |trace: bool| -> (Mode, u8, Option<u64>) {
+            let mut reuse = new_reuse_config(
+                &ctx,
+                &expr,
+                None,
+                ReuseConfig {
+                    trace,
+                    ..ReuseConfig::default()
+                },
+            )
+            .unwrap();
+            reuse.mode = Mode::Probe;
+            let expensive = ColumnEval {
+                evaluated_rows: 4096,
+                elapsed_nanos: Some(4096 * 480),
+                split: None,
+                parallel_allowed: true,
+            };
+            // First batch: only one cost sample -> weak decision fails, confirmations stay 0.
+            reuse.batch_index = 2;
+            reuse.batch_probe_window = Some((256, 64, 4096));
+            reuse.observe_fallback_with(4096, expensive, Some((4096, 3584)), true, true);
+            assert_eq!(reuse.mode, Mode::Probe);
+            assert_eq!(reuse.weak_confirmations, 0);
+
+            // Second batch: two cost samples -> first confirmation.
+            reuse.batch_index = 3;
+            reuse.batch_probe_window = Some((256, 64, 4096));
+            reuse.observe_fallback_with(4096, expensive, Some((4096, 3584)), true, true);
+            assert_eq!(reuse.mode, Mode::Probe);
+            assert_eq!(reuse.weak_confirmations, 1);
+
+            // Third batch: second confirmation admits on batch 4.
+            reuse.batch_index = 4;
+            reuse.observe_fallback_with(4096, expensive, Some((4096, 3584)), true, true);
+            (
+                reuse.mode,
+                reuse.weak_confirmations,
+                reuse.trace.admit_batch,
+            )
+        };
+
+        let (off_mode, off_conf, _) = run_seq(false);
+        let (on_mode, on_conf, on_admit_batch) = run_seq(true);
+        assert_eq!(off_mode, Mode::Map);
+        assert_eq!(on_mode, Mode::Map);
+        assert_eq!(off_conf, on_conf);
+        assert_eq!(on_admit_batch, Some(4));
+
+        // Probe-site immediate admission with trace enabled also leaves behavior identical.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let strings = local_strings(&ctx, 0..16_384);
+            let mut sampled_batch: Vec<Id> = strings
+                .iter()
+                .copied()
+                .filter(|id| sampled(*id))
+                .take(WINDOW as usize)
+                .collect();
+            sampled_batch.extend(
+                strings
+                    .iter()
+                    .copied()
+                    .filter(|id| !sampled(*id))
+                    .take(4096 - WINDOW as usize),
+            );
+            for trace in [false, true] {
+                let mut reuse = new_reuse_config(
+                    &ctx,
+                    &expr,
+                    None,
+                    ReuseConfig {
+                        trace,
+                        ..ReuseConfig::default()
+                    },
+                )
+                .unwrap();
+                let mut t1 = batch(input, &sampled_batch);
+                assert!(!reuse.apply(&ctx, &mut t1, target, &expr).unwrap());
+                assert_eq!(reuse.mode, Mode::Probe);
+                reuse.cost.record(4096, 4096 * 480);
+                reuse.cost.record(4096, 4096 * 480);
+                reuse.weak_confirmations = WEAK_CONFIRMATIONS - 1;
+                let mut t2 = batch(input, &sampled_batch);
+                assert!(reuse.apply(&ctx, &mut t2, target, &expr).unwrap());
+                assert_eq!(reuse.mode, Mode::Map);
+                if trace {
+                    assert_eq!(reuse.trace.admit_batch, Some(2));
+                    assert_eq!(reuse.trace.admit_reason, Some("probe_weak"));
+                }
+            }
         });
     }
 }
