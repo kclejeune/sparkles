@@ -24,25 +24,24 @@ See the [Web UI highlights](#web-ui) below or browse every workflow in the
 
 ## Philosophy
 
-Jena and Fuseki define the protocols, formats, and operational model that RDF applications
-depend on, while QLever provides a columnar storage and execution design built for high
-query throughput. Sparkles combines those two foundations inside an embeddable library.
+Sparkles is built around four engineering goals:
 
-1. **Jena and Fuseki compatibility.** Existing Fuseki clients keep their request format.
-   Sparkles implements the SPARQL 1.1 Query, Update, and Graph Store protocols, Fuseki's
-   `/$/` administration endpoints, Jena's RDF formats and dataset semantics, and Fuseki
-   configuration conversion. On the JVM, opening a Sparkles dataset lets existing Jena
-   code run in process without HTTP.
-2. **Columnar storage with transactions and history.** Terms use 64-bit IDs with inline
-   numbers and dates, indexes store sorted and compressed permutations, and a cost-based
-   planner drives column-at-a-time execution. Sparkles adds MVCC transactions, durable
-   commits, online compaction, and a commit history that supports point-in-time reads,
-   diffs, and branching.
-3. **Library first.** The core engine has no HTTP server dependency. The server, CLI, and
-   Rust, Python, JVM, and Node.js bindings all share its public API and query semantics,
-   using Oxigraph's crates for the term model, parsers, and SPARQL algebra. See
-   [libraries and bindings](docs/integrations/README.md#libraries-and-bindings) for the
-   surfaces each binding exposes.
+1. **Standards first, pragmatic interoperability.** Full W3C conformance across RDF 1.2,
+   SPARQL 1.0–1.2, SHACL, ShEx, and GeoSPARQL 1.1 pairs with Apache Jena and Fuseki
+   protocol and API compatibility. Existing Fuseki clients keep their request format, and
+   JVM applications keep using Jena's `Model`, RIOT, `Txn`, and `QueryExecution` APIs in
+   process without HTTP.
+2. **Predictable speed without sacrificing correctness.** QLever-style sorted, compressed
+   columnar permutations, 64-bit inline term IDs, cost-based planning, and disk-spilling
+   streaming execution deliver high throughput while preserving exact RDF term identity (no
+   lossy literal folding), durable MVCC commits, and explicit memory and work budgets.
+3. **One engine, every deployment shape.** The core engine is a synchronous library with
+   no HTTP server dependency. The Fuseki-compatible server, CLI, embedded web UI, and Rust,
+   Python, JVM, and Node.js bindings all run on the same public API and query semantics.
+4. **Versioned, explainable knowledge graphs.** Commit history, time travel, branches,
+   conflict-checked merges, write-time shape validation, reasoning with derivations, and
+   grant-checked AI/agent workflows live inside the database rather than in separate
+   layers.
 
 ## Highlights
 
@@ -123,6 +122,27 @@ running alone, result caches disabled, and answer checks qualifying the reported
   the JVM, Python, and Node.js bindings. See
   [where Sparkles loses](docs/BENCHMARKS.md#where-sparkles-loses) and the
   [benchmark summary](docs/BENCHMARKS.md).
+
+## How Sparkles compares
+
+* **vs. Apache Jena / Fuseki.** Replaces JVM/TDB2 B+trees with native Rust columnar
+  permutations and adds built-in versioning, branching, vector search, and an ontology
+  workbench; trades away Java plugin registries and TDB2 on-disk compatibility.
+* **vs. QLever.** Adds exact RDF term identity (no lossy double inlining), durable MVCC
+  writes, Graph Store and Fuseki endpoints, reasoning, SHACL/ShEx validation, and
+  embeddable bindings; QLever scales further on multi-billion-triple static loads and
+  streams every operator lazily.
+* **vs. Fluree.** Adds full W3C SPARQL 1.0–1.2 and SHACL/ShEx conformance, Fuseki
+  compatibility, GeoSPARQL 1.1 spatial joins, and multi-language in-process bindings;
+  Fluree provides JWS-signed commits, Raft clustering, and openCypher/JSON-LD query
+  frontends.
+* **vs. Oxigraph.** Builds on Oxigraph's RDF/SPARQL parser and term crates while replacing
+  RocksDB with compressed columnar permutations and adding reasoning, validation,
+  full-text/vector/spatial indexes, versioning, access control, and a web UI; Oxigraph is
+  lighter to embed and supports WebAssembly.
+
+See [docs/COMPARISON.md](docs/COMPARISON.md) for the full feature-by-feature breakdown and
+intentional divergences from Jena and QLever.
 
 ## Web UI
 
@@ -212,6 +232,38 @@ are not published to package registries.
 | [Design specs](docs/specs/README.md) | Design rationale, scope, and outcome of each major feature. |
 
 Browse [the documentation index](docs/README.md) for every guide and reference.
+
+## Acknowledgments and dependencies
+
+Sparkles builds directly on open-source projects and published database and reasoning
+research:
+
+* **[Oxigraph](https://github.com/oxigraph/oxigraph) ecosystem.** `oxrdf`, `oxttl`,
+  `oxrdfio`, `oxjsonld`, `oxiri`, `oxsdatatypes`, `oxilangtag`, `sparesults`, and vendored
+  `spargebra` provide the RDF 1.2 term model, parsers, serializers, datatypes, and SPARQL
+  algebra.
+* **[Apache Jena](https://jena.apache.org/) and Fuseki.** Defines the SPARQL, Graph
+  Store, and `/$/` administration protocols, ARQ extensions, `jena-text` conventions, and
+  the `DatasetGraph` and `jena-ontapi` interfaces targeted by the JVM binding.
+* **[QLever](https://github.com/ad-freiburg/qlever).** Inspired Sparkles' sorted
+  compressed quad permutations, 64-bit inline term encoding, predicate-pattern
+  optimization, and columnar execution model.
+* **Reasoning and ontology research.** Consequence-based and ordered-resolution OWL
+  classification draws on [ELK](https://github.com/liveontologies/elk-reasoner),
+  Sequoia, and [ROBOT](https://robot.obolibrary.org/) conventions, with
+  [HermiT](http://www.hermit-reasoner.com/) and [Nemo](https://github.com/knowsys/nemo)
+  serving as differential and benchmark references.
+* **[Fluree](https://github.com/fluree/db).** Public documentation inspired Sparkles'
+  clean-room commit history, branching, and versioned graph workflows.
+* **Core Rust and UI crates.** [Tantivy](https://github.com/quickwit-oss/tantivy) powers
+  BM25 full-text search, [GeoRust](https://georust.org/) (`geo`, `geo-index`,
+  `geographiclib-rs`, `proj4rs`) powers GeoSPARQL, `object_store` backs incremental S3 and
+  filesystem backups, `tokio`, `axum`, and `rayon` drive server and parallel execution,
+  `lsp-server` from rust-analyzer powers the language server, and SvelteKit powers the
+  embedded web UI.
+
+See [docs/specs/PROVENANCE.md](docs/specs/PROVENANCE.md) for per-feature design provenance
+and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for full dependency licenses.
 
 ## Status and license
 
