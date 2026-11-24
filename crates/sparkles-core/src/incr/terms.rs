@@ -21,9 +21,10 @@ pub struct Terms {
 
 /// An immutable term table frozen with one view version so streaming cursors can decode
 /// `Tag::Local` ids without touching the circuit's lock.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct ViewTerms {
     keys: Arc<[Arc<[u8]>]>,
+    pub(crate) published: Option<crate::sparql::viewsvc::PublishedBytes>,
 }
 
 impl ViewTerms {
@@ -53,12 +54,9 @@ impl ViewTerms {
 
     /// The bytes an unshared term table keeps allocated on the heap.
     pub fn retained_bytes(&self) -> u64 {
-        if self.keys.is_empty() {
-            return 0;
-        }
         let slice = self.keys.len() * std::mem::size_of::<Arc<[u8]>>() + 16;
         let keys: usize = self.keys.iter().map(|k| k.len() + 16).sum();
-        (slice + keys) as u64
+        (std::mem::size_of::<Self>() + slice + keys) as u64
     }
 }
 
@@ -86,6 +84,7 @@ impl Terms {
         }
         ViewTerms {
             keys: self.keys.iter().cloned().collect(),
+            published: None,
         }
     }
 

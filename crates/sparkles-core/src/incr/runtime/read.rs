@@ -8,24 +8,6 @@ use sparkles_budget::sizes::{table_bytes, table_grown};
 /// cancellation checks run promptly without busy-spinning.
 const WAIT_STEP: Duration = Duration::from_millis(20);
 
-/// Build the view's snapshot with the view's own `union_default_graph` setting.
-fn view_snapshot(
-    circuit: &Circuit,
-    snap: &Arc<crate::store::Snapshot>,
-) -> Arc<crate::store::Snapshot> {
-    let union = circuit
-        .snap
-        .as_ref()
-        .map_or(snap.union_default_graph, |s| s.union_default_graph);
-    if union == snap.union_default_graph {
-        snap.clone()
-    } else {
-        let mut s = (**snap).clone();
-        s.union_default_graph = union;
-        Arc::new(s)
-    }
-}
-
 /// Fold history diff slices outside the circuit lock while admitting every allocation
 /// through `admit` and polling `check`.
 fn build_rewound(
@@ -40,16 +22,19 @@ fn build_rewound(
     let mut net_map: FxHashMap<Vec<Option<Term>>, (i64, usize)> = FxHashMap::default();
     let mut entries_bytes = 0u64;
     let mut seq = 0usize;
+    let mut seen = 0usize;
+    let parts_bytes = (parts.capacity() * std::mem::size_of::<HistRows>()) as u64;
     for part in &parts {
         for (r, w) in part.iter() {
-            if seq.is_multiple_of(256) {
+            seen += 1;
+            if seen.is_multiple_of(256) {
                 check()?;
             }
             if *w == 0 {
                 continue;
             }
             if let Some((cur, _)) = net_map.get_mut(r) {
-                *cur += *w;
+                *cur = cur.checked_add(*w).ok_or_else(history_weight_overflow)?;
                 continue;
             }
             check()?;
@@ -66,17 +51,22 @@ fn build_rewound(
             admit(
                 entries_bytes
                     .saturating_add(row_b)
-                    .saturating_add(table_peak),
+                    .saturating_add(table_peak)
+                    .saturating_add(parts_bytes),
             )?;
             net_map.insert(r.clone(), (*w, seq));
             entries_bytes = entries_bytes.saturating_add(row_b);
             seq += 1;
         }
     }
+    drop(parts);
     check()?;
     let mut n_added = 0usize;
     let mut n_removed = 0usize;
-    for &(w, _) in net_map.values() {
+    for (i, &(w, _)) in net_map.values().enumerate() {
+        if i.is_multiple_of(256) {
+            check()?;
+        }
         if w > 0 {
             n_added += 1;
         } else if w < 0 {
@@ -108,16 +98,26 @@ fn build_rewound(
         added.reserve(n_added);
     }
     let mut removed_indexed: Vec<(usize, Vec<Option<Term>>, i64)> = Vec::with_capacity(n_removed);
-    for (row, (w, idx)) in net_map {
+    for (i, (row, (w, idx))) in net_map.into_iter().enumerate() {
+        if i.is_multiple_of(256) {
+            check()?;
+        }
         if w > 0 {
             added.insert(row, w);
         } else if w < 0 {
-            removed_indexed.push((idx, row, -w));
+            removed_indexed.push((
+                idx,
+                row,
+                w.checked_neg().ok_or_else(history_weight_overflow)?,
+            ));
         }
     }
     removed_indexed.sort_unstable_by_key(|(idx, _, _)| *idx);
     let mut removed: Vec<(Vec<Option<Term>>, i64)> = Vec::with_capacity(removed_indexed.len());
-    for (_, row, w) in removed_indexed {
+    for (i, (_, row, w)) in removed_indexed.into_iter().enumerate() {
+        if i.is_multiple_of(256) {
+            check()?;
+        }
         removed.push((row, w));
     }
     let rewound = RewoundView {
@@ -128,6 +128,10 @@ fn build_rewound(
     };
     admit(rewound.retained_bytes())?;
     Ok(rewound)
+}
+
+fn history_weight_overflow() -> Error {
+    crate::incr::error("view-failed", "view history multiplicity overflows")
 }
 
 impl Runtime {
@@ -143,10 +147,12 @@ impl Runtime {
                 deadline: r.deadline,
                 aggregate_errors: r.aggregate_errors,
             },
-            cancel: None,
-            max_memory_bytes: None,
         };
-        let opened = self.open_view(&open, &|| Ok(()), &mut |_| Ok(()))?;
+        let control = Control {
+            deadline: r.deadline,
+            ..Control::none()
+        };
+        let opened = self.open_view(&open, &|| control.check(), &mut |_| Ok(()))?;
         match opened {
             OpenedView::Shared(v) | OpenedView::Owned(v) => Ok(v.to_view_rows()),
             OpenedView::Rows(rows) => Ok(rows),
@@ -192,11 +198,19 @@ impl Runtime {
                 );
                 c.inference = rebuild.inference.clone();
                 c.aggregate_errors = Some(rebuild.aggregate_errors);
+                c.max_memory_bytes = rebuild.max_memory_bytes;
                 let control = Control {
-                    deadline: r.deadline.or(self.control().deadline),
+                    deadline: rebuild.deadline,
                     ..Control::none()
                 };
-                c.build(rebuild.snap, &control)?;
+                let snap = crate::sparql::with_union_default(
+                    rebuild.snap,
+                    &crate::sparql::QueryOptions {
+                        union_default_graph: Some(rebuild.union_default_graph),
+                        ..Default::default()
+                    },
+                );
+                c.build(snap, &control)?;
                 Ok(ViewRows {
                     columns: rebuild.columns.to_vec(),
                     rows: c.rows(),
@@ -221,79 +235,96 @@ impl Runtime {
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         loop {
             check()?;
-            let (cell, access, suspended, error, errors) = {
-                let mut reg = self.reg.lock();
-                self.sync_for_read(&mut reg);
-                let errors = reg.aggregate_errors;
-                let e = reg.view(r.name)?;
-                (
-                    e.cell.clone(),
-                    e.access.clone(),
-                    e.suspended.clone(),
-                    e.error.clone(),
-                    errors,
-                )
+            let host = self.host.read().clone();
+            let mode = host.map(|host| (host.aggregate_errors(), host.inference()));
+            let step = (Instant::now() + WAIT_STEP).min(until);
+            let entry = if let Some(reg) = self.reg.try_lock_until(step) {
+                check()?;
+                let mode_ready = mode.as_ref().is_none_or(|(errors, inference)| {
+                    reg.aggregate_errors == *errors
+                        && Inference::same(reg.inference.as_deref(), inference.as_ref())
+                });
+                if mode_ready {
+                    let e = reg.view(r.name)?;
+                    Some((
+                        e.cell.clone(),
+                        e.access.clone(),
+                        e.suspended.clone(),
+                        e.error.clone(),
+                        reg.aggregate_errors,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
             };
-            if let Some(why) = suspended {
-                return Err(crate::incr::error(
-                    "view-suspended",
-                    format!("the view {:?} is suspended ({why}); rebuild it", r.name),
-                ));
-            }
-            if let Some(err) = error {
-                return Err(crate::incr::error(
-                    "view-failed",
-                    format!("the view {:?} failed: {err}", r.name),
-                ));
-            }
-            if let Some(cell) = cell {
-                if !covers(r.caller, access.as_ref()) {
+            if let Some((cell, access, suspended, error, errors)) = entry {
+                if let Some(why) = suspended {
                     return Err(crate::incr::error(
-                        "view-access",
-                        format!("the view {:?} reads data your grants do not cover", r.name),
+                        "view-suspended",
+                        format!("the view {:?} is suspended ({why}); rebuild it", r.name),
                     ));
                 }
-                // The reading and the status are read under the state lock, which a
-                // switch of the reading takes to replace the circuit and mark it
-                // `building`, so they describe the circuit whose version is returned. A
-                // build holds that lock, so wait in short cooperative steps until `until`.
-                let step = (Instant::now() + WAIT_STEP).min(until);
-                if let Some(mut st) = cell.state.try_lock_until(step) {
-                    let held = st.circuit.aggregate_errors.unwrap_or(errors);
-                    // another reading of errors than the view's: evaluate the view's query
-                    // at the reader's snapshot without touching the view's state
-                    if let Some(m) = r.aggregate_errors.filter(|m| *m != held) {
-                        return self.open_evaluate_under(st, open, m, check, admit);
+                if let Some(err) = error {
+                    return Err(crate::incr::error(
+                        "view-failed",
+                        format!("the view {:?} failed: {err}", r.name),
+                    ));
+                }
+                if let Some(cell) = cell {
+                    if !covers(r.caller, access.as_ref()) {
+                        return Err(crate::incr::error(
+                            "view-access",
+                            format!("the view {:?} reads data your grants do not cover", r.name),
+                        ));
                     }
-                    let status = cell.info.lock().status.clone();
-                    match status {
-                        Status::Failed { code, message } => {
-                            let code = if code == "view-failed" {
-                                "view-failed"
-                            } else {
-                                "view-suspended"
-                            };
-                            return Err(crate::incr::error(
-                                code,
-                                format!("the view {:?}: {message}", r.name),
-                            ));
+                    // The reading and the status are read under the state lock, which a
+                    // switch of the reading takes to replace the circuit and mark it
+                    // `building`, so they describe the circuit whose version is returned. A
+                    // build holds that lock, so wait in short cooperative steps until `until`.
+                    let step = (Instant::now() + WAIT_STEP).min(until);
+                    if let Some(st) = cell.state.try_lock_until(step) {
+                        check()?;
+                        let held = st.circuit.aggregate_errors.unwrap_or(errors);
+                        // another reading of errors than the view's: evaluate the view's query
+                        // at the reader's snapshot without touching the view's state
+                        if let Some(m) = r.aggregate_errors.filter(|m| *m != held) {
+                            return self.open_evaluate_under(st, open, m, admit);
                         }
-                        Status::Ready => {
-                            if st.circuit.applied == r.at || r.allow_stale {
-                                let version = st.circuit.version_or_build().ok_or_else(|| {
-                                    crate::incr::error(
-                                        "view-failed",
-                                        format!("the view {:?} has no materialized result", r.name),
-                                    )
-                                })?;
-                                drop(st);
-                                return Ok(OpenedView::Shared(version));
+                        let status = cell.info.lock().status.clone();
+                        match status {
+                            Status::Failed { code, message } => {
+                                let code = if code == "view-failed" {
+                                    "view-failed"
+                                } else {
+                                    "view-suspended"
+                                };
+                                return Err(crate::incr::error(
+                                    code,
+                                    format!("the view {:?}: {message}", r.name),
+                                ));
                             }
-                            if st.circuit.applied > r.at {
-                                return self.open_read_back(st, open, held, check, admit);
+                            Status::Ready => {
+                                if st.circuit.applied == r.at || r.allow_stale {
+                                    let version = st.circuit.version.clone().ok_or_else(|| {
+                                        crate::incr::error(
+                                            "view-failed",
+                                            format!(
+                                                "the view {:?} has no materialized result",
+                                                r.name
+                                            ),
+                                        )
+                                    })?;
+                                    drop(st);
+                                    return Ok(OpenedView::Shared(version));
+                                }
+                                if st.circuit.applied > r.at {
+                                    return self.open_read_back(st, open, held, check, admit);
+                                }
                             }
+                            Status::Building => {}
                         }
-                        Status::Building => {}
                     }
                 }
             }
@@ -318,15 +349,35 @@ impl Runtime {
     /// outside the circuit lock, or prepare a snapshot evaluation when history expired.
     fn open_read_back(
         &self,
-        mut st: parking_lot::MutexGuard<'_, Slot>,
+        st: parking_lot::MutexGuard<'_, Slot>,
         open: &ViewOpen<'_>,
         held: crate::sparql::AggregateErrors,
         check: &dyn Fn() -> Result<()>,
         admit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<OpenedView> {
         let r = &open.read;
-        if let Some(parts) = st.history_parts_since(r.at) {
-            let version = st.circuit.version_or_build().ok_or_else(|| {
+        let parts = if let Some(spans) = st.history_spans_since(r.at) {
+            let count = spans.filter(|h| !h.rows.is_empty()).count();
+            admit((count * std::mem::size_of::<HistRows>()) as u64)?;
+            let mut parts = Vec::with_capacity(count);
+            for (i, h) in st
+                .history_spans_since(r.at)
+                .expect("same history")
+                .enumerate()
+            {
+                if i.is_multiple_of(256) {
+                    check()?;
+                }
+                if !h.rows.is_empty() {
+                    parts.push(h.rows.clone());
+                }
+            }
+            Some(parts)
+        } else {
+            None
+        };
+        if let Some(parts) = parts {
+            let version = st.circuit.version.clone().ok_or_else(|| {
                 crate::incr::error(
                     "view-failed",
                     format!("the view {:?} has no materialized result", r.name),
@@ -334,7 +385,12 @@ impl Runtime {
             })?;
             drop(st);
             if parts.is_empty() {
-                return Ok(OpenedView::Shared(Arc::new(version.at_commit(r.at))));
+                return Ok(OpenedView::Rewound(RewoundView {
+                    version,
+                    commit: r.at,
+                    added: Default::default(),
+                    removed: Vec::new(),
+                }));
             }
             let rewound = build_rewound(version, r.at, parts, check, admit)?;
             return Ok(OpenedView::Rewound(rewound));
@@ -351,24 +407,7 @@ impl Runtime {
         let Some(snap) = r.snap.filter(|s| s.commit == r.at) else {
             return Err(ahead());
         };
-        let snap = view_snapshot(&st.circuit, snap);
-        if matches!(st.query, Query::Select { .. }) {
-            let rebuild = ViewRebuild {
-                columns: st.vars.clone(),
-                query: st.query.clone(),
-                snap,
-                access: st.circuit.access.clone(),
-                inference: st.circuit.inference.clone(),
-                aggregate_errors: held,
-                commit: r.at,
-                evaluated_under: None,
-            };
-            drop(st);
-            return Ok(OpenedView::Rebuild(Box::new(rebuild)));
-        }
-        let c = st.fresh(st.circuit.inference.clone())?;
-        drop(st);
-        self.build_owned_version(c, open, snap, r.at, None, check, admit)
+        self.prepare_rebuild(&st, open, snap, held, None, admit)
     }
 
     /// Open a view evaluated under the reader's `AggregateErrors` reading `m`, which
@@ -378,7 +417,6 @@ impl Runtime {
         st: parking_lot::MutexGuard<'_, Slot>,
         open: &ViewOpen<'_>,
         m: crate::sparql::AggregateErrors,
-        check: &dyn Fn() -> Result<()>,
         admit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<OpenedView> {
         let r = &open.read;
@@ -391,67 +429,47 @@ impl Runtime {
                 ),
             ));
         };
-        let snap = view_snapshot(&st.circuit, snap);
-        let commit = snap.commit;
-        if matches!(st.query, Query::Select { .. }) {
-            let rebuild = ViewRebuild {
-                columns: st.vars.clone(),
-                query: st.query.clone(),
-                snap,
-                access: st.circuit.access.clone(),
-                inference: st.circuit.inference.clone(),
-                aggregate_errors: m,
-                commit,
-                evaluated_under: Some(m),
-            };
-            drop(st);
-            return Ok(OpenedView::Rebuild(Box::new(rebuild)));
-        }
-        let mut c = st.fresh(st.circuit.inference.clone())?;
-        drop(st);
-        c.aggregate_errors = Some(m);
-        self.build_owned_version(c, open, snap, commit, Some(m), check, admit)
+        self.prepare_rebuild(&st, open, snap, m, Some(m), admit)
     }
 
-    /// Evaluate a non-SELECT (`CONSTRUCT`) view circuit for one read under the caller's
-    /// deadline, cancellation and memory limit, admitting the owned version's bytes.
-    #[allow(clippy::too_many_arguments)]
-    fn build_owned_version(
+    fn prepare_rebuild(
         &self,
-        mut c: Circuit,
+        st: &Slot,
         open: &ViewOpen<'_>,
-        snap: Arc<crate::store::Snapshot>,
-        commit: u64,
+        snap: &Arc<crate::store::Snapshot>,
+        aggregate_errors: crate::sparql::AggregateErrors,
         evaluated_under: Option<crate::sparql::AggregateErrors>,
-        check: &dyn Fn() -> Result<()>,
         admit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<OpenedView> {
-        check()?;
-        if let Some(limit) = open.max_memory_bytes {
-            c.max_memory_bytes = Some(c.max_memory_bytes.map_or(limit, |m| m.min(limit)));
-        }
-        let deadline = open.read.deadline.or(self.control().deadline);
-        let control = match &open.cancel {
-            Some(flag) => Control {
-                deadline,
-                ..Control::with_cancel(flag.clone())
-            },
-            None => Control {
-                deadline,
-                ..Control::none()
-            },
+        let union_default_graph = st
+            .circuit
+            .snap
+            .as_ref()
+            .map_or(snap.union_default_graph, |s| s.union_default_graph);
+        let snapshot_bytes = if union_default_graph == snap.union_default_graph {
+            0
+        } else {
+            std::mem::size_of::<crate::store::Snapshot>() + 16
         };
-        c.build(snap, &control)?;
-        check()?;
-        let mut version = c
-            .version_or_build()
-            .map(|v| (*v).clone())
-            .ok_or_else(|| crate::incr::error("view-failed", "rebuilt view has no result"))?;
-        drop(c);
-        version.commit = commit;
-        version.evaluated_under = evaluated_under;
-        admit(version.retained_bytes())?;
-        Ok(OpenedView::Owned(Arc::new(version)))
+        // The planner clones algebra and template terms from the stored query.
+        // Cover that staging before handing the parsed query to the child.
+        let planning_bytes = (st.query_text_bytes as u64).saturating_mul(16);
+        admit((std::mem::size_of::<ViewRebuild>() + snapshot_bytes) as u64 + planning_bytes)?;
+        Ok(OpenedView::Rebuild(Box::new(ViewRebuild {
+            columns: st.vars.clone(),
+            query: st.query.clone(),
+            snap: snap.clone(),
+            access: st.circuit.access.clone(),
+            deadline: open.read.deadline.or_else(|| self.control().deadline),
+            max_memory_bytes: st.circuit.max_memory_bytes,
+            union_default_graph,
+            reductions: st.circuit.reductions.clone(),
+            template_columns: st.circuit.template_columns.clone(),
+            inference: st.circuit.inference.clone(),
+            aggregate_errors,
+            commit: snap.commit,
+            evaluated_under,
+        })))
     }
 }
 
@@ -477,7 +495,9 @@ impl Runtime {
         drop(host);
         let wait = Instant::now() + self.opts.read().view_wait;
         let until = deadline.map_or(wait, |d| d.min(wait));
-        let reg = self.reg.try_lock_until(until)?;
+        let reg = self
+            .reg
+            .try_lock_until(until.min(Instant::now() + WAIT_STEP))?;
         reg.view(name).ok()?;
         Some(host_reading.unwrap_or(reg.aggregate_errors))
     }
@@ -486,6 +506,9 @@ impl Runtime {
 impl ViewSource for Runtime {
     fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows> {
         self.read(r)
+    }
+    fn streams_views(&self) -> bool {
+        true
     }
     fn open_view(
         &self,
@@ -501,5 +524,142 @@ impl ViewSource for Runtime {
         deadline: Option<Instant>,
     ) -> Option<crate::sparql::AggregateErrors> {
         Runtime::view_reading(self, name, deadline)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::StoreOptions;
+
+    fn fixture() -> (Store, Arc<Runtime>) {
+        let s = Store::in_memory(StoreOptions::default());
+        let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+        rt.set_host(Arc::new(OpenHost));
+        rt.put(&s, "v", ViewDef::table("SELECT ?s WHERE { ?s <urn:p> ?o }"))
+            .unwrap();
+        let data = (0..512)
+            .map(|i| format!("<urn:s{i}> <urn:p> 1 . "))
+            .collect::<String>();
+        crate::sparql::update::update(
+            &s,
+            &format!("INSERT DATA {{ {data} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        rt.round(&s);
+        (s, rt)
+    }
+
+    #[test]
+    fn readers_check_controls_while_registry_is_busy() {
+        let (s, rt) = fixture();
+        let reader = rt.clone();
+        let reg = rt.reg.lock();
+        let (ready, entered) = std::sync::mpsc::channel();
+        let (sender, result) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let snap = s.snapshot();
+        let child = std::thread::spawn(move || {
+            let open = ViewOpen {
+                read: ViewRead {
+                    name: "v",
+                    at: snap.commit,
+                    snap: Some(&snap),
+                    allow_stale: true,
+                    caller: None,
+                    deadline: None,
+                    aggregate_errors: None,
+                },
+            };
+            let announced = std::cell::Cell::new(false);
+            let got = reader.open_view(
+                &open,
+                &|| {
+                    if !announced.replace(true) {
+                        ready.send(()).unwrap();
+                    }
+                    if flag.load(Ordering::Relaxed) {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                },
+                &mut |_| Ok(()),
+            );
+            sender.send(matches!(got, Err(Error::Cancelled))).unwrap();
+        });
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        let stopped = result.recv_timeout(Duration::from_secs(1));
+        drop(reg);
+        child.join().unwrap();
+        assert!(
+            stopped.unwrap(),
+            "the read must stop before the registry is released"
+        );
+    }
+
+    #[test]
+    fn paused_versions_spend_pool_credit_until_last_reader() {
+        let (s, rt) = fixture();
+        let version = {
+            let reg = rt.reg.lock();
+            let cell = reg.views.get("v").unwrap().cell.as_ref().unwrap();
+            cell.state.lock().circuit.version.clone().unwrap()
+        };
+        let second_reader = version.clone();
+        let before = rt.published_views.load(Ordering::Relaxed);
+        assert_eq!(before, version.published_bytes());
+        let state = rt.get(&s, "v").unwrap().state_bytes;
+        rt.set_options(RuntimeOptions {
+            views_memory: Some(state + before / 2),
+            ..rt.options()
+        });
+        crate::sparql::update::update(
+            &s,
+            "DELETE DATA { <urn:s0> <urn:p> 1 }",
+            &Default::default(),
+        )
+        .unwrap();
+        rt.round(&s);
+        assert!(matches!(
+            rt.get(&s, "v").unwrap().state,
+            ViewState::Suspended { .. }
+        ));
+        assert_eq!(rt.published_views.load(Ordering::Relaxed), before);
+        drop(version);
+        assert_eq!(rt.published_views.load(Ordering::Relaxed), before);
+        drop(second_reader);
+        assert_eq!(rt.published_views.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn repeated_history_keys_poll_controls_during_the_fold() {
+        let (_, rt) = fixture();
+        let version = {
+            let reg = rt.reg.lock();
+            let cell = reg.views.get("v").unwrap().cell.as_ref().unwrap();
+            cell.state.lock().circuit.version.clone().unwrap()
+        };
+        let part: HistRows = vec![(vec![None], 1); 1600].into();
+        let admitted = std::cell::Cell::new(0);
+        let outcome = build_rewound(
+            version,
+            0,
+            vec![part],
+            &|| {
+                let checks = admitted.get() + 1;
+                admitted.set(checks);
+                if checks == 5 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |_| Ok(()),
+        );
+        assert!(matches!(outcome, Err(Error::Cancelled)));
     }
 }

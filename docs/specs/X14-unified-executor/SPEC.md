@@ -1167,7 +1167,7 @@ run the eager kernel through `execute_with_inputs` or `execute_owned`, so the me
 move them. EXPLAIN gives each operator a reason that names what it reads whole or what
 bounds its answer.
 
-The strict policy refuses the unbounded forms, which are a SERVICE, a view read, a
+The strict policy originally refused the unbounded forms, which included SERVICE and view reads, a
 spatial scan or relation over constants, a search without a bound, a path search between
 constants without a limit, a spatial join, a property function over constants and a
 registered property function without prefix output. They are the second part of the item, whose [readers](#streamed-service-text-and-history-readers) serve a SERVICE without SILENT, a text search without a bound and a history query without a limit. Automatic execution keeps its base
@@ -1300,21 +1300,20 @@ Deleting the branch or dataset still removes the segments under a read, which
 decodes them, which [item 1124](../../ROADMAP.md) holds, and a read-only log's newest-first
 walk is [item 1175](../../ROADMAP.md).
 
-A view read, in `cursor/view.rs`, streams natively under the strict policy from an
-immutable shared `ViewVersion` that each circuit publishes with its frozen `ViewTerms`
-table, snapshot and flat row table whenever a pass applies. Current and `view:allowStale`
-reads take only a reference to the shared version and release the circuit lock at once,
-so updates arriving between pulls never alter an open cursor or block maintenance passes,
-and rows translate ids directly against the query snapshot without a whole-result copy.
-When a view has moved ahead of the query commit within its retained history, the reader
-folds the history slices outside the circuit lock under an admitted charge and streams
-the shared version while subtracting added rows and emitting removed rows after it. When
-history has expired or the reader asks for another `aggregate_errors` reading, a `SELECT`
-view streams through a child cursor charged to the caller's memory budget, and a
-`CONSTRUCT` view builds under the caller's deadline, cancellation and memory limit and
-admits its owned version. Multiplicities expand across batch boundaries with cooperative
-cancellation checks, and all three `ViewRead` forms are native in `cursor_inventory.rs`
-and audited in `cursor_memory_audit.rs` alongside `cursor_view.rs`. Path searches that
+A maintained view read streams from the immutable version published by its circuit.
+Current and stale readers release the circuit lock after taking a reference. A published
+row table and frozen term table count toward the view memory pool while readers still
+hold them. Readers of the same allocation share its charge. When the circuit has advanced
+within the retained history, the reader admits and folds history slices and applies the
+net change while streaming the shared table.
+
+When history has expired or the reader asks for another aggregate-errors reading, a
+child query runs under the caller's memory, row-work, spill, cancellation and deadline
+controls. SELECT rebuilds stream rows. CONSTRUCT rebuilds instantiate the maintained
+template and charge distinct graph state as the graph streams. Strict policy also
+applies inside the child. A custom source that only implements eager view reads requires
+the permissive policy. The cursor inventory and heap audit cover the maintained readers.
+Path searches that
 keep a set per pair of endpoints and path searches over their input without a limit stay
 refused under items [1122](../../ROADMAP.md) and [1123](../../ROADMAP.md). The inventory
 test `cursor_inventory.rs` lists every form as native or refused with its decision or row.

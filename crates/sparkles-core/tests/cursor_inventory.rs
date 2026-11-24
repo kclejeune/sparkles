@@ -145,13 +145,14 @@ impl LocalEndpoints for Local {
 
 /// A view source with one view whose column ?x holds the integers below 5.
 #[derive(Debug)]
-struct Integers;
+struct Integers(AtomicU64);
 
 impl sparkles_core::sparql::viewsvc::ViewSource for Integers {
     fn read_view(
         &self,
         _: &sparkles_core::sparql::viewsvc::ViewRead<'_>,
     ) -> Result<sparkles_core::sparql::viewsvc::ViewRows> {
+        self.0.fetch_add(1, Ordering::Relaxed);
         Ok(sparkles_core::sparql::viewsvc::ViewRows {
             columns: vec!["x".into()],
             rows: (0..5)
@@ -332,15 +333,51 @@ fn check(snap: &Arc<Snapshot>, opts: &QueryOptions, forms: &[Form]) -> Vec<(Stri
 }
 
 #[test]
+fn strict_view_read_refuses_legacy_sources_before_calling_them() {
+    let s = base();
+    let source = Arc::new(Integers(AtomicU64::new(0)));
+    let opts = QueryOptions {
+        views: Some(source.clone()),
+        ..Default::default()
+    };
+    let q = "SELECT ?x { SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"ints\" ; <urn:x-sparkles:view#bind> ?x } }";
+    let strict = CursorOptions {
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    assert!(select_cursor(s.snapshot(), q, &opts, &strict).is_err());
+    assert_eq!(source.0.load(Ordering::Relaxed), 0);
+    let permissive = CursorOptions {
+        fallback: FallbackPolicy::AllowMaterialization,
+        ..strict
+    };
+    let mut c = select_cursor(s.snapshot(), q, &opts, &permissive).unwrap();
+    assert!(c.plan().has_materialization());
+    assert_eq!(c.next_batch().unwrap().unwrap().len(), 5);
+    assert_eq!(source.0.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
     let s = base();
     let snap = s.snapshot();
     let remote = base();
+    use sparkles_core::incr::{OpenHost, Runtime, RuntimeOptions, ViewDef};
+    let views = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    views.set_host(Arc::new(OpenHost));
+    views
+        .put(
+            &s,
+            "ints",
+            ViewDef::table("SELECT ?x { VALUES ?x { 0 1 2 3 4 } }"),
+        )
+        .unwrap();
+    views.round(&s);
     let opts = QueryOptions {
         no_cache: true,
         allow_service: true,
         local_endpoints: Some(Arc::new(Local(remote.snapshot()))),
-        views: Some(Arc::new(Integers)),
+        views: Some(views),
         ..Default::default()
     };
     let src = "path:source <urn:s:1>";

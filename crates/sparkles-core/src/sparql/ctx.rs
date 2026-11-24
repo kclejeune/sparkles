@@ -1060,6 +1060,8 @@ pub struct Ctx {
     // their actual sources. A new mask can share its original source's backing.
     pub(super) source_view: Option<crate::access::PreparedView>,
     pub(super) read_source: Option<crate::store::BoundReadSource>,
+    pub(super) view_reductions: Option<Arc<super::viewsvc::ViewReductions>>,
+    pub(super) view_source_controls: Option<crate::access::Preparation>,
     pub(super) source_preparation: Option<crate::access::Preparation>,
     pub(super) source_setup: Option<crate::access::Reservation>,
     #[cfg(test)]
@@ -1509,6 +1511,8 @@ impl Ctx {
             snap,
             read_source: None,
             source_view: None,
+            view_reductions: None,
+            view_source_controls: None,
             source_preparation: None,
             source_setup: None,
             #[cfg(test)]
@@ -1807,7 +1811,11 @@ impl Ctx {
         #[cfg(test)]
         CHECKS.with(|n| n.set(n.get() + 1));
         self.check_memory_failure()?;
-        if let Some(preparation) = &self.source_preparation {
+        if let Some(preparation) = self
+            .source_preparation
+            .as_ref()
+            .or(self.view_source_controls.as_ref())
+        {
             // Both source and query absolute controls apply during preparation
             // and execution, without cursor wait extensions or renewed deadlines.
             preparation.check()?;

@@ -11,7 +11,7 @@
 //! Nothing opens before the first pull, because operators are also built only to learn
 //! whether an EXISTS pattern streams.
 
-use super::{Buffer, CursorOptions, FallbackPolicy, QueryBatch, QueryCursor};
+use super::{Buffer, CursorOptions, CursorPlan, QueryBatch, QueryCursor, graph};
 use crate::error::Result;
 use crate::id::{self, Id, Tag};
 use crate::sparql::QueryOptions;
@@ -26,13 +26,20 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 /// Every `ViewRead` leaf runs natively through this reader.
-pub(super) fn eligible(node: &Node) -> bool {
-    matches!(&node.kind, Kind::ViewRead(_)) && node.children.is_empty()
+pub(super) fn eligible(ctx: &Ctx, node: &Node) -> bool {
+    matches!(&node.kind, Kind::ViewRead(_))
+        && node.children.is_empty()
+        && ctx
+            .views
+            .as_ref()
+            .is_none_or(|source| source.streams_views())
 }
 
 pub(super) struct View {
     node: Node,
     opened: bool,
+    rebuilt: bool,
+    finished_plan: Option<CursorPlan>,
     source: Option<Source>,
     /// Column index in the view (or child cursor) for each variable in `node.vars`.
     cols: Vec<Option<usize>>,
@@ -42,8 +49,6 @@ pub(super) struct View {
     /// exceeds the remaining room in a batch.
     pending: Vec<Id>,
     pending_rem: u64,
-    /// Reused single-row decoded term buffer for probing `RewoundView::added`.
-    term_buf: Vec<Option<Term>>,
     /// Query memory charge for query-owned open state (rewound delta, owned version,
     /// custom source rows, and small cursor scratch).
     charge: Option<OwnedCharge>,
@@ -69,7 +74,11 @@ enum Source {
         batch: Option<(QueryBatch, usize)>,
         paused: u64,
     },
-    /// Pre-decoded term rows from a custom `ViewSource` implementing only `read_view`.
+    Graph {
+        cursor: Box<graph::GraphCursor>,
+        paused: u64,
+    },
+    /// Predecoded rows from a streaming source with a preadmission contract.
     Rows {
         rows: ViewRows,
         at: usize,
@@ -77,9 +86,19 @@ enum Source {
     },
 }
 
+impl Source {
+    fn rebuild_plan(&self) -> Option<&CursorPlan> {
+        match self {
+            Self::Rebuild { cursor, .. } => Some(cursor.plan()),
+            Self::Graph { cursor, .. } => Some(cursor.plan()),
+            _ => None,
+        }
+    }
+}
+
 #[inline]
-fn translate_id(ctx: &Ctx, version: &ViewVersion, id: Id) -> Id {
-    match id.tag() {
+fn translate_id(ctx: &Ctx, version: &ViewVersion, id: Id) -> Result<Id> {
+    Ok(match id.tag() {
         Tag::Undef
         | Tag::Special
         | Tag::Bool
@@ -89,34 +108,112 @@ fn translate_id(ctx: &Ctx, version: &ViewVersion, id: Id) -> Id {
         | Tag::DateTime
         | Tag::Date
         | Tag::BNode => id,
+        Tag::Vocab if version.snap.generation.uid == ctx.snap.generation.uid => id,
+        Tag::Delta
+            if version.snap.generation.uid == ctx.snap.generation.uid
+                && id.payload() < ctx.snap.dvocab_len =>
+        {
+            id
+        }
         Tag::Vocab => {
-            if version.snap.generation.uid == ctx.snap.generation.uid {
-                id
-            } else {
-                version
-                    .snap
-                    .key(id)
-                    .map_or(Id::UNDEF, |k| ctx.intern_key(&k))
-            }
+            with_version_key(ctx, version, id, |key| Ok(ctx.intern_key(key)))?.unwrap_or(Id::UNDEF)
         }
         Tag::Delta => {
-            if version.snap.generation.uid == ctx.snap.generation.uid
-                && id.payload() < ctx.snap.dvocab_len
-            {
-                id
-            } else {
-                version
-                    .snap
-                    .key(id)
-                    .map_or(Id::UNDEF, |k| ctx.intern_key(&k))
-            }
+            // Release the read lock before interning into a potentially shared vocabulary.
+            let held = ctx.charge(0)?;
+            let key = with_version_key(ctx, version, id, |key| {
+                held.resize(key.len() as u64)?;
+                Ok(key.to_vec())
+            })?;
+            key.as_deref().map_or(Id::UNDEF, |k| ctx.intern_key(k))
         }
         Tag::Local => match version.terms.key_bytes(id.payload() as usize) {
-            Some(k) if k.first() == Some(&b'_') => ctx.intern_term(&id::key_to_term(k)),
+            Some(k) if k.first() == Some(&b'_') => {
+                let _held = ctx.charge(k.len() as u64 + 64)?;
+                ctx.intern_term(&id::key_to_term(k))
+            }
             Some(k) => ctx.intern_key(k),
             None => Id::UNDEF,
         },
+    })
+}
+
+/// Borrow a key from the version, covering vocabulary reconstruction scratch.
+fn with_version_key<T>(
+    ctx: &Ctx,
+    version: &ViewVersion,
+    id: Id,
+    f: impl FnMut(&[u8]) -> Result<T>,
+) -> Result<Option<T>> {
+    let generation = &version.snap.generation;
+    let mut f = f;
+    match id.tag() {
+        Tag::Local => version
+            .terms
+            .key_bytes(id.payload() as usize)
+            .map(f)
+            .transpose(),
+        Tag::Vocab => {
+            let held = ctx.charge(0)?;
+            generation
+                .vocab
+                .get_with_controlled(
+                    id.payload(),
+                    |need| held.resize((need as u64).saturating_mul(2)),
+                    |_| ctx.check(),
+                    f,
+                )?
+                .transpose()
+        }
+        Tag::Delta => generation
+            .dvocab
+            .with(|v| v.get(id.payload()).map(&mut f).transpose()),
+        _ => Ok(None),
     }
+}
+
+/// Probe the decoded delta with one admitted row. Its terms die before the charge.
+fn subtract_added(
+    ctx: &Ctx,
+    rewound: &mut RewoundView,
+    ids: &[Id],
+    weight: i64,
+    charge: &mut OwnedCharge,
+) -> Result<i64> {
+    let held = ctx.charge((ids.len() * std::mem::size_of::<Option<Term>>()) as u64)?;
+    let mut terms = Vec::with_capacity(ids.len());
+    for &id in ids {
+        ctx.check()?;
+        let term =
+            match id.tag() {
+                Tag::Local | Tag::Vocab | Tag::Delta => {
+                    with_version_key(ctx, &rewound.version, id, |key| {
+                        held.resize(held.bytes().saturating_add(
+                            (key.len() as u64).saturating_mul(8).saturating_add(128),
+                        ))?;
+                        Ok(id::key_to_term(key))
+                    })?
+                }
+                Tag::Undef | Tag::Special => None,
+                _ => {
+                    held.resize(held.bytes().saturating_add(128))?;
+                    rewound.version.snap.term(id)
+                }
+            };
+        terms.push(term);
+    }
+    let Some(delta) = rewound.added.get_mut(&terms) else {
+        return Ok(weight);
+    };
+    let take = weight.min(*delta);
+    *delta -= take;
+    if *delta == 0 {
+        let (row, _) = rewound.added.remove_entry(&terms).expect("matched delta");
+        let freed = viewsvc::row_retained_bytes(&row);
+        drop(row);
+        charge.resize(charge.bytes().saturating_sub(freed))?;
+    }
+    Ok(weight - take)
 }
 
 fn validate_and_map_columns(
@@ -153,26 +250,35 @@ impl View {
         Self {
             node,
             opened: false,
+            rebuilt: false,
+            finished_plan: None,
             source: None,
             cols: Vec::new(),
             commit_id: Id::UNDEF,
             commit_var: None,
             pending: Vec::new(),
             pending_rem: 0,
-            term_buf: Vec::new(),
             charge: None,
             scratch_bytes: 0,
         }
     }
 
+    pub(super) fn rebuild_plan(&self) -> Option<&CursorPlan> {
+        self.source
+            .as_ref()
+            .and_then(Source::rebuild_plan)
+            .or(self.finished_plan.as_ref())
+    }
+
     /// Release the view version, child cursor, rewound delta and memory charge.
     pub(super) fn release(&mut self) {
         self.opened = true;
-        self.source = None;
+        if let Some(source) = self.source.take() {
+            self.finished_plan = source.rebuild_plan().cloned();
+        }
         self.cols = Vec::new();
         self.pending = Vec::new();
         self.pending_rem = 0;
-        self.term_buf = Vec::new();
         self.charge = None;
         self.scratch_bytes = 0;
     }
@@ -211,7 +317,6 @@ impl View {
             * (std::mem::size_of::<Option<usize>>() + std::mem::size_of::<Id>()))
             as u64;
         let mut charge = OwnedCharge::new(ctx, scratch)?;
-        let remaining = ctx.mem_limit.saturating_sub(ctx.live_bytes());
         let open = ViewOpen {
             read: ViewRead {
                 name: &spec.name,
@@ -222,8 +327,6 @@ impl View {
                 deadline: ctx.current_deadline(),
                 aggregate_errors: Some(ctx.aggregate_errors),
             },
-            cancel: Some(ctx.cancel.clone()),
-            max_memory_bytes: Some(remaining),
         };
         let opened = source.open_view(&open, &|| ctx.check(), &mut |bytes| {
             charge.resize(scratch.saturating_add(bytes))
@@ -272,18 +375,31 @@ impl View {
                 if let Some(m) = rebuild.evaluated_under {
                     ctx.warn(viewsvc::evaluated(&spec.name, m));
                 }
-                // Validate column names against the view's schema before opening the child cursor.
-                validate_and_map_columns(spec, &self.node.vars, &rebuild.columns)?;
+                self.cols = validate_and_map_columns(spec, &self.node.vars, &rebuild.columns)?;
                 self.commit_id = Id::from_i64(rebuild.commit as i64).unwrap_or(Id::UNDEF);
-                let (cursor, paused) = Self::open_rebuild(ctx, options, *rebuild)?;
-                let child_vars: Vec<String> = cursor.variables().to_vec();
-                self.cols = validate_and_map_columns(spec, &self.node.vars, &child_vars)?;
+                let paused = ctx.deadline_pause.load(Ordering::Relaxed);
+                let (cursor, graph) = Self::open_rebuild(ctx, options, &rebuild)?;
+                let source = if let Some(graph) = graph {
+                    Source::Graph {
+                        cursor: Box::new(graph::GraphCursor::for_view(
+                            cursor,
+                            graph,
+                            rebuild.template_columns.as_deref(),
+                        )?),
+                        paused,
+                    }
+                } else {
+                    self.cols =
+                        validate_and_map_columns(spec, &self.node.vars, cursor.variables())?;
+                    Source::Rebuild {
+                        cursor: Box::new(cursor),
+                        batch: None,
+                        paused,
+                    }
+                };
+                self.rebuilt = true;
                 self.charge = Some(charge);
-                self.source = Some(Source::Rebuild {
-                    cursor,
-                    batch: None,
-                    paused,
-                });
+                self.source = Some(source);
             }
             OpenedView::Rows(rows) => {
                 if let Some(m) = rows.evaluated_under {
@@ -314,17 +430,23 @@ impl View {
     fn open_rebuild(
         ctx: &Arc<Ctx>,
         options: &CursorOptions,
-        rebuild: ViewRebuild,
-    ) -> Result<(Box<QueryCursor>, u64)> {
-        let paused = ctx.deadline_pause.load(Ordering::Relaxed);
+        rebuild: &ViewRebuild,
+    ) -> Result<(QueryCursor, Option<graph::Spec>)> {
         let child_opts = QueryOptions {
-            graphs: rebuild.access,
-            deadline: ctx.current_deadline(),
+            graphs: rebuild.access.clone(),
+            deadline: rebuild.deadline,
             cancel: Some(ctx.cancel.clone()),
             cancellation: ctx.cancellation.clone(),
             no_cache: true,
-            max_memory_bytes: Some(ctx.mem_limit),
+            max_memory_bytes: Some(
+                rebuild
+                    .max_memory_bytes
+                    .map_or(ctx.mem_limit, |limit| limit.min(ctx.mem_limit)),
+            ),
+            max_rows: Some(ctx.max_rows),
             max_rows_produced: Some(ctx.max_rows_produced),
+            work: Some(ctx.rows_produced.clone()),
+            union_default_graph: Some(rebuild.union_default_graph),
             grant: ctx.grant().cloned(),
             pool: None,
             allow_service: false,
@@ -343,17 +465,25 @@ impl View {
         let child_cursor = CursorOptions {
             batch_rows: options.batch_rows,
             batch_bytes: options.batch_bytes,
-            fallback: FallbackPolicy::AllowMaterialization,
+            fallback: options.fallback.at_pull(ctx),
         };
-        let parent = ctx.memory_parent()?;
-        let cursor = super::call_parsed_cursor(
-            rebuild.snap,
-            rebuild.query,
+        let inherited = crate::sparql::ViewExecution {
+            preparation: ctx.source_preparation.clone().or_else(|| {
+                ctx.read_source
+                    .as_ref()
+                    .map(|source| source.query_input().2.clone())
+            }),
+            spill: ctx.spill.clone(),
+            reductions: rebuild.reductions.clone(),
+        };
+        super::call_parsed_cursor(
+            rebuild.snap.clone(),
+            &rebuild.query,
             &child_opts,
             &child_cursor,
-            parent,
-        )?;
-        Ok((Box::new(cursor), paused))
+            ctx.memory_parent()?,
+            &inherited,
+        )
     }
 
     fn push_pending(&mut self, ctx: &Arc<Ctx>, b: &mut Buffer, cap: usize) -> Result<()> {
@@ -390,14 +520,20 @@ impl View {
         Ok(())
     }
 
-    fn fill_ids_from_version(&mut self, ctx: &Ctx, version: &ViewVersion, row_ids: &[Id]) {
+    fn fill_ids_from_version(
+        &mut self,
+        ctx: &Ctx,
+        version: &ViewVersion,
+        row_ids: &[Id],
+    ) -> Result<()> {
         for ((dst, v), col) in self.pending.iter_mut().zip(&self.node.vars).zip(&self.cols) {
             *dst = match col {
-                Some(i) => translate_id(ctx, version, row_ids[*i]),
+                Some(i) => translate_id(ctx, version, row_ids[*i])?,
                 None if Some(*v) == self.commit_var => self.commit_id,
                 None => Id::UNDEF,
             };
         }
+        Ok(())
     }
 
     fn fill_ids_from_terms(&mut self, ctx: &Ctx, terms: &[Option<Term>]) {
@@ -453,7 +589,9 @@ impl View {
                 match res {
                     Ok(source_ended) => {
                         ended = source_ended;
-                        if !source_ended {
+                        if source_ended {
+                            self.finished_plan = source.rebuild_plan().cloned();
+                        } else {
                             self.source = Some(source);
                         }
                     }
@@ -472,7 +610,9 @@ impl View {
                 // Eager `viewsvc::run` counts its rows once itself and once more as the
                 // executor's node, which the cursor counts above; count once here so
                 // `work` matches eager execution.
-                ctx.produced(b.table.len)?;
+                if !self.rebuilt {
+                    ctx.produced(b.table.len)?;
+                }
                 return Ok(Some(b));
             }
             if self.done() {
@@ -503,7 +643,7 @@ impl View {
                         continue;
                     }
                     *remaining_rows = remaining_rows.saturating_sub(w);
-                    self.fill_ids_from_version(ctx, version, row_ids);
+                    self.fill_ids_from_version(ctx, version, row_ids)?;
                     ctx.check()?;
                     self.emit_row_copies(ctx, b, cap, w)?;
                 }
@@ -515,9 +655,10 @@ impl View {
                 removed_at,
             } => {
                 // Phase 1: stream the shared version, subtracting positive net deltas.
-                while b.table.len < cap && *version_at < rewound.version.table.len() {
+                let version = rewound.version.clone();
+                while b.table.len < cap && *version_at < version.table.len() {
                     ctx.check()?;
-                    let (row_ids, w) = rewound.version.table.row(*version_at);
+                    let (row_ids, w) = version.table.row(*version_at);
                     *version_at += 1;
                     let w = w.max(0);
                     if w == 0 {
@@ -526,38 +667,31 @@ impl View {
                     let emit = if rewound.added.is_empty() {
                         w
                     } else {
-                        self.term_buf.clear();
-                        self.term_buf.extend(
-                            row_ids
-                                .iter()
-                                .map(|&id| rewound.version.terms.term(&rewound.version.snap, id)),
-                        );
-                        if let Some(d) = rewound.added.get_mut(&self.term_buf) {
-                            let take = w.min(*d);
-                            *d -= take;
-                            if *d == 0 {
-                                rewound.added.remove(&self.term_buf);
-                            }
-                            w - take
-                        } else {
-                            w
-                        }
+                        subtract_added(
+                            ctx,
+                            rewound,
+                            row_ids,
+                            w,
+                            self.charge.as_mut().expect("rewind admission"),
+                        )?
                     };
                     if emit <= 0 {
                         continue;
                     }
-                    self.fill_ids_from_version(ctx, &rewound.version, row_ids);
+                    self.fill_ids_from_version(ctx, &version, row_ids)?;
                     ctx.check()?;
                     self.emit_row_copies(ctx, b, cap, emit as u64)?;
                 }
                 // Release `added` hash map once Phase 1 finishes so its charge is freed early.
-                if *version_at >= rewound.version.table.len() && !rewound.added.is_empty() {
+                if (*version_at >= version.table.len() || rewound.added.is_empty())
+                    && rewound.added.capacity() > 0
+                {
                     rewound.added = Default::default();
                     if let Some(charge) = &mut self.charge {
-                        let _ = charge.resize(
+                        charge.resize(
                             self.scratch_bytes
                                 .saturating_add(rewound.removed_retained_bytes()),
-                        );
+                        )?;
                     }
                 }
                 // Phase 2: stream rows removed since `rewound.commit`.
@@ -610,6 +744,31 @@ impl View {
                     *at += 1;
                 }
             },
+            Source::Graph { cursor, paused } => {
+                cursor.deadline_pause().store(
+                    ctx.deadline_pause
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(*paused),
+                    Ordering::Relaxed,
+                );
+                let Some(batch) = cursor.next_at_most(cap - b.table.len)? else {
+                    return Ok(true);
+                };
+                for quad in batch.quads() {
+                    ctx.check()?;
+                    let _term =
+                        ctx.charge(crate::sparql::graph_quad_bytes(quad).saturating_mul(2))?;
+                    let terms = [
+                        Some(quad.subject.clone().into()),
+                        Some(quad.predicate.clone().into()),
+                        Some(quad.object.clone()),
+                    ];
+                    self.fill_ids_from_terms(ctx, &terms);
+                    ctx.check()?;
+                    b.table.push_row(&self.pending);
+                }
+                Ok(false)
+            }
             Source::Rows {
                 rows,
                 at,
@@ -631,5 +790,118 @@ impl View {
                 Ok(*at >= rows.rows.len())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::Preparation;
+    use crate::error::Error;
+    use crate::sparql::{AggregateErrors, parse_query};
+    use crate::store::{Store, StoreOptions};
+    use crate::task::{Cancellation, Control};
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    fn rebuild(s: &Store, query: &str) -> ViewRebuild {
+        ViewRebuild {
+            columns: Default::default(),
+            query: Arc::new(parse_query(query, None, &[]).unwrap()),
+            access: None,
+            inference: None,
+            deadline: None,
+            max_memory_bytes: None,
+            reductions: None,
+            union_default_graph: false,
+            template_columns: None,
+            aggregate_errors: AggregateErrors::Sparkles,
+            commit: 0,
+            snap: s.snapshot(),
+            evaluated_under: None,
+        }
+    }
+
+    #[test]
+    fn rebuilt_children_poll_original_controls_without_a_parent_pull() {
+        let s = Store::in_memory(StoreOptions::default());
+        let source = Arc::new(AtomicBool::new(false));
+        let additional = Arc::new(AtomicBool::new(false));
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.source_preparation =
+            Some(Preparation::new(Control::with_cancel(source.clone()), 16 << 20).unwrap());
+        ctx.cancellation = Some(Cancellation::from_flags([additional.clone()]));
+        let ctx = ctx.into_shared();
+        let select = rebuild(&s, "SELECT ?x { VALUES ?x { 1 } }");
+        let (mut child, _) = View::open_rebuild(&ctx, &CursorOptions::default(), &select).unwrap();
+        source.store(true, Ordering::Relaxed);
+        assert!(matches!(child.next_batch(), Err(Error::Cancelled)));
+        source.store(false, Ordering::Relaxed);
+
+        let construct = rebuild(
+            &s,
+            "CONSTRUCT { <urn:s> <urn:p> ?x } WHERE { VALUES ?x { 1 } }",
+        );
+        let (child, spec) =
+            View::open_rebuild(&ctx, &CursorOptions::default(), &construct).unwrap();
+        let mut graph = graph::GraphCursor::for_view(child, spec.unwrap(), None).unwrap();
+        additional.store(true, Ordering::Relaxed);
+        assert!(matches!(graph.next_batch(), Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn rebuild_caps_rows_and_memory_and_shares_the_spill_account() {
+        use crate::spill::{Spill, SpillOptions};
+
+        let s = Store::in_memory(StoreOptions::default());
+        let dir = tempfile::tempdir().unwrap();
+        let spill = Spill::open(&SpillOptions {
+            dir: dir.path().to_path_buf(),
+            max_bytes: 8 << 20,
+            query_bytes: 4 << 20,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.spill = Some(Arc::new(spill.query(Some(1 << 20))));
+        ctx.max_rows = 71;
+        ctx.mem_limit = 8 << 20;
+        let ctx = ctx.into_shared();
+        let mut query = rebuild(&s, "SELECT ?x { VALUES ?x { 1 } }");
+        query.max_memory_bytes = Some(3 << 20);
+        let (child, _) = View::open_rebuild(&ctx, &CursorOptions::default(), &query).unwrap();
+        assert_eq!(child.ctx.max_rows, 71);
+        assert_eq!(child.ctx.mem_limit, 3 << 20);
+        assert!(Arc::ptr_eq(
+            child.ctx.spill.as_ref().unwrap(),
+            ctx.spill.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn consumer_pause_cannot_extend_an_absolute_source_deadline_in_a_rebuild() {
+        let s = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(s.snapshot());
+        let end = Instant::now() + Duration::from_millis(200);
+        ctx.source_preparation = Some(
+            Preparation::new(
+                Control {
+                    deadline: Some(end),
+                    ..Control::none()
+                },
+                16 << 20,
+            )
+            .unwrap(),
+        );
+        let ctx = ctx.into_shared();
+        let mut select = rebuild(&s, "SELECT ?x { VALUES ?x { 1 } }");
+        select.deadline = Some(end);
+        let (mut child, _) = View::open_rebuild(&ctx, &CursorOptions::default(), &select).unwrap();
+        child
+            .deadline_pause()
+            .store(10_000_000_000, Ordering::Relaxed);
+        std::thread::sleep(end.saturating_duration_since(Instant::now()));
+        assert!(matches!(child.next_batch(), Err(Error::Timeout)));
     }
 }

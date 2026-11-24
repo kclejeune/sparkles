@@ -21,6 +21,7 @@ use super::ops::window::Window;
 use super::ops::{Node, Op};
 use super::zset::ZSet;
 use crate::error::{ComponentError, Error, Result};
+use crate::sparql::viewsvc::ViewReductions;
 use oxrdf::{NamedNode, Term, Variable};
 use rustc_hash::FxHashMap;
 use spargebra::Query;
@@ -59,6 +60,7 @@ pub struct Compiled {
     /// its footprint from
     pub pattern: GP,
     pub dataset: Option<QueryDataset>,
+    pub(crate) reductions: ViewReductions,
 }
 
 /// The footprint of `gp` read in the default graph.
@@ -956,6 +958,7 @@ struct C {
     vars: Vec<String>,
     index: FxHashMap<String, u32>,
     hidden: usize,
+    reductions: ViewReductions,
 }
 
 impl C {
@@ -985,6 +988,17 @@ impl C {
         reason: &str,
         dataset: Option<&QueryDataset>,
     ) -> Node {
+        if crate::sparql::visit_graph_patterns(gp, |pattern| {
+            if matches!(pattern, GP::Reduced { .. }) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        })
+        .is_err()
+        {
+            self.reductions.recomputed.insert(gp.clone());
+        }
         let pattern = scope.wrap(gp.clone());
         let names = scope_vars(&pattern);
         let certain_names = certain_of(&pattern);
@@ -1520,6 +1534,9 @@ impl C {
                 if matches!(scope, Scope::Var(_)) {
                     return self.recompute(gp, scope, "DISTINCT under GRAPH ?g", None);
                 }
+                if matches!(gp, GP::Reduced { .. }) {
+                    self.reductions.native.insert(gp.clone());
+                }
                 let i = self.compile(inner, scope);
                 let (schema, certain) = (i.schema.clone(), i.certain.clone());
                 Node {
@@ -1644,6 +1661,9 @@ impl C {
             below = GP::Distinct {
                 inner: Box::new(below),
             };
+        }
+        if matches!(inner, GP::Reduced { .. }) {
+            self.reductions.native.insert(inner.clone());
         }
         let i = self.compile(&below, scope);
         let key_cols = keys
@@ -1953,6 +1973,7 @@ pub fn compile(q: &Query, whole: Option<&str>) -> Result<Compiled> {
         vars: Vec::new(),
         index: FxHashMap::default(),
         hidden: 0,
+        reductions: ViewReductions::default(),
     };
     let mut footprint = Footprint::default();
     footprint_of(pattern, &Scope::Default, &mut footprint);
@@ -2052,5 +2073,6 @@ pub fn compile(q: &Query, whole: Option<&str>) -> Result<Compiled> {
         base,
         pattern: pattern.clone(),
         dataset: dataset.cloned(),
+        reductions: c.reductions,
     })
 }

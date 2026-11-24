@@ -27,7 +27,7 @@ use spargebra::Query;
 use spargebra::algebra::GraphPattern;
 use spargebra::term::{NamedNodePattern, TermPattern};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// The view vocabulary.
@@ -70,6 +70,33 @@ pub struct ViewRows {
     pub evaluated_under: Option<super::AggregateErrors>,
 }
 
+/// A single charge shared by every version that uses the same allocation.
+#[derive(Debug)]
+pub(crate) struct PublishedBytes {
+    total: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl PublishedBytes {
+    pub(crate) fn new(total: &Arc<AtomicU64>, bytes: u64) -> Self {
+        total.fetch_add(bytes, Ordering::Relaxed);
+        Self {
+            total: total.clone(),
+            bytes,
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for PublishedBytes {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 /// Flat row ids and multiplicities of one immutable view version.
 #[derive(Debug, Default)]
 pub struct ViewTable {
@@ -78,6 +105,7 @@ pub struct ViewTable {
     pub weights: Vec<i64>,
     /// Sum of positive weights across all rows.
     pub total_rows: u64,
+    pub(crate) published: Option<PublishedBytes>,
 }
 
 impl ViewTable {
@@ -112,6 +140,8 @@ pub struct ViewVersion {
     pub terms: Arc<ViewTerms>,
     pub table: Arc<ViewTable>,
     pub evaluated_under: Option<super::AggregateErrors>,
+    pub(crate) published: Option<Arc<PublishedBytes>>,
+    pub(crate) published_columns: Option<Arc<PublishedBytes>>,
 }
 
 impl std::fmt::Debug for ViewVersion {
@@ -126,16 +156,22 @@ impl std::fmt::Debug for ViewVersion {
 }
 
 impl ViewVersion {
-    /// A version sharing this version's columns, snapshot, terms and rows at `commit`.
-    pub fn at_commit(&self, commit: u64) -> Self {
-        Self {
-            columns: self.columns.clone(),
-            commit,
-            snap: self.snap.clone(),
-            terms: self.terms.clone(),
-            table: self.table.clone(),
-            evaluated_under: self.evaluated_under,
-        }
+    pub(crate) fn published_bytes(&self) -> u64 {
+        self.published.as_deref().map_or(0, PublishedBytes::bytes)
+            + self
+                .published_columns
+                .as_deref()
+                .map_or(0, PublishedBytes::bytes)
+            + self
+                .table
+                .published
+                .as_ref()
+                .map_or(0, PublishedBytes::bytes)
+            + self
+                .terms
+                .published
+                .as_ref()
+                .map_or(0, PublishedBytes::bytes)
     }
 
     /// Decode all rows into owned RDF terms for callers of [`ViewSource::read_view`].
@@ -157,11 +193,16 @@ impl ViewVersion {
         }
     }
 
-    /// The heap bytes an unshared version owns (used for rebuilt `CONSTRUCT` views).
+    /// Size of a published version, including Arc headers. Frozen term tables may
+    /// share individual keys with other tables and the circuit.
     pub fn retained_bytes(&self) -> u64 {
+        let published = self.published_bytes();
+        if published != 0 {
+            return published;
+        }
         let cols = self.columns.len() * std::mem::size_of::<String>()
             + self.columns.iter().map(String::capacity).sum::<usize>();
-        (std::mem::size_of::<Self>() + cols) as u64
+        (std::mem::size_of::<Self>() + cols + 64) as u64
             + self.terms.retained_bytes()
             + self.table.retained_bytes()
     }
@@ -209,14 +250,27 @@ impl RewoundView {
     }
 }
 
-/// A `SELECT` view that must be evaluated directly at the query's snapshot (expired
+/// The compiler's treatment of REDUCED nodes in a view.
+#[derive(Clone, Debug, Default)]
+pub struct ViewReductions {
+    pub(crate) native: rustc_hash::FxHashSet<GraphPattern>,
+    pub(crate) recomputed: rustc_hash::FxHashSet<GraphPattern>,
+}
+
+/// A view that must be evaluated directly at the query's snapshot (expired
 /// history or another `AggregateErrors` reading), streamed as a child cursor charged to
 /// the caller's query memory budget.
 pub struct ViewRebuild {
     pub columns: Arc<[String]>,
-    pub query: Query,
+    pub query: Arc<Query>,
     pub snap: Arc<crate::store::Snapshot>,
     pub access: Option<Arc<GraphAccess>>,
+    pub deadline: Option<Instant>,
+    pub max_memory_bytes: Option<u64>,
+    pub union_default_graph: bool,
+    pub reductions: Option<Arc<ViewReductions>>,
+    /// The solution column order used by the maintained CONSTRUCT template hash.
+    pub template_columns: Option<Arc<[String]>>,
     pub inference: Option<Arc<Inference>>,
     pub aggregate_errors: super::AggregateErrors,
     pub commit: u64,
@@ -231,17 +285,15 @@ pub enum OpenedView {
     Owned(Arc<ViewVersion>),
     /// A shared version rewound to an earlier commit using admitted history deltas.
     Rewound(RewoundView),
-    /// A `SELECT` view evaluated directly at the query's snapshot as a child cursor.
+    /// A view evaluated directly at the query's snapshot as a child cursor.
     Rebuild(Box<ViewRebuild>),
-    /// Pre-decoded term rows from a source that only implements [`ViewSource::read_view`].
+    /// Predecoded rows admitted by a streaming source before allocation.
     Rows(ViewRows),
 }
 
 /// Parameters for opening a streaming view read.
 pub struct ViewOpen<'a> {
     pub read: ViewRead<'a>,
-    pub cancel: Option<Arc<AtomicBool>>,
-    pub max_memory_bytes: Option<u64>,
 }
 
 fn term_heap_bytes(t: &Term) -> usize {
@@ -291,6 +343,11 @@ pub fn view_rows_retained_bytes(rows: &ViewRows) -> u64 {
 /// What answers `SERVICE view:read`: a dataset's views.
 pub trait ViewSource: Send + Sync + std::fmt::Debug {
     fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows>;
+
+    /// Whether this source implements preadmitted streaming opens for cursors.
+    fn streams_views(&self) -> bool {
+        false
+    }
     /// Open a view for streaming batch-by-batch reads without holding the view's lock
     /// or decoding its whole result upfront.
     ///
@@ -299,15 +356,13 @@ pub trait ViewSource: Send + Sync + std::fmt::Debug {
     /// allocated for this read before allocation.
     fn open_view(
         &self,
-        open: &ViewOpen<'_>,
-        check: &dyn Fn() -> Result<()>,
-        admit: &mut dyn FnMut(u64) -> Result<()>,
+        _open: &ViewOpen<'_>,
+        _check: &dyn Fn() -> Result<()>,
+        _admit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<OpenedView> {
-        check()?;
-        let rows = self.read_view(&open.read)?;
-        check()?;
-        admit(view_rows_retained_bytes(&rows))?;
-        Ok(OpenedView::Rows(rows))
+        Err(Error::Unsupported(
+            "this view source only supports eager reads".into(),
+        ))
     }
     /// The reading of errors in aggregates that view `name` keeps, `None` when the
     /// source does not say or has no such view. Planning reads it to note, also under

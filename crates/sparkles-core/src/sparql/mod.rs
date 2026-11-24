@@ -698,7 +698,7 @@ fn make_ctx_input(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<Ctx> {
-    make_ctx_input_policy(snap, opts, dataset, base, source, None, None, None)
+    make_ctx_input_policy(snap, opts, dataset, base, source, None, None, None, None)
 }
 
 // Only the application root which just prepared this policy supplies the override.
@@ -713,6 +713,7 @@ fn make_ctx_input_policy(
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
     parent: Option<sparkles_budget::ParentHandle>,
     selector_graphs: Option<&GraphSel>,
+    inherited: Option<&ViewExecution>,
 ) -> Result<Ctx> {
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
@@ -732,6 +733,11 @@ fn make_ctx_input_policy(
     // the store's limit on one geometry operation
     #[cfg(feature = "geo")]
     ctx.geo.set_op_vertices(op_vertices);
+    if let Some(inherited) = inherited {
+        ctx.view_source_controls = inherited.preparation.clone();
+        ctx.view_reductions = inherited.reductions.clone();
+        ctx.check()?;
+    }
     if ctx.read_source.is_none() {
         ctx.deadline = match opts.timeout {
             Some(_) => opts.effective_deadline(Instant::now())?,
@@ -748,10 +754,11 @@ fn make_ctx_input_policy(
     if let Some(m) = opts.max_memory_bytes {
         ctx.mem_limit = m;
     }
-    ctx.spill = opts
-        .spill
-        .as_ref()
-        .map(|spill| Arc::new(spill.query(opts.max_spill_bytes)));
+    ctx.spill = inherited.and_then(|view| view.spill.clone()).or_else(|| {
+        opts.spill
+            .as_ref()
+            .map(|spill| Arc::new(spill.query(opts.max_spill_bytes)))
+    });
     if ctx.read_source.is_none() {
         ctx.set_grant(opts.query_grant());
     }
@@ -1395,6 +1402,7 @@ fn execute_retained_source(
             None,
             None,
             selector_graphs,
+            None,
         )?;
         let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
         depth::with_stack(prepared.plan_depth, || {
@@ -1644,7 +1652,14 @@ fn prepare_query_input(
         None,
         None,
         None,
+        None,
     )
+}
+
+struct ViewExecution {
+    preparation: Option<crate::access::Preparation>,
+    spill: Option<Arc<crate::spill::QuerySpill>>,
+    reductions: Option<Arc<viewsvc::ViewReductions>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1658,7 +1673,11 @@ fn prepare_query_input_policy(
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
     parent: Option<sparkles_budget::ParentHandle>,
     selector_graphs: Option<&GraphSel>,
+    inherited: Option<&ViewExecution>,
 ) -> Result<PreparedQuery> {
+    if let Some(preparation) = inherited.and_then(|view| view.preparation.as_ref()) {
+        preparation.check()?;
+    }
     let (_, dataset, base) = split(parsed);
     extensions::check_family(snap.dataset_id)?;
     let (demand_opts, rdfs_skipped) = demand_options(opts);
@@ -1671,6 +1690,7 @@ fn prepare_query_input_policy(
         prepared_policy,
         parent,
         selector_graphs,
+        inherited,
     )?;
     if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
         ctx.enable_cursor_accounting()?;
@@ -2315,6 +2335,7 @@ fn construct(
             i,
             template,
             graphs,
+            None,
             &mut work,
             &mut |q, incoming| {
                 let held = out.credit.as_ref().expect("live graph credit");
@@ -2403,6 +2424,7 @@ struct ConstructRow<'a> {
     bnodes: FxHashMap<String, BlankNode>,
     storage: u64,
     held: ctx::Charge<'a>,
+    mint: Option<&'a dyn Fn(&str) -> BlankNode>,
 }
 
 /// Shared eager/cursor instantiation hands the emitter each quad together with
@@ -2415,6 +2437,7 @@ fn construct_row<'a>(
     row: usize,
     template: &[TriplePattern],
     graphs: &[GraphTemplate],
+    mint: Option<&'a dyn Fn(&str) -> BlankNode>,
     work: &mut usize,
     emit: &mut dyn FnMut(Quad, &mut Option<ctx::Charge<'a>>) -> Result<()>,
 ) -> Result<()> {
@@ -2427,6 +2450,7 @@ fn construct_row<'a>(
         bnodes: FxHashMap::default(),
         storage: 0,
         held: ctx.charge(0)?,
+        mint,
     };
     for tp in template {
         check()?;
@@ -2573,7 +2597,10 @@ fn template_term(
                     }
                     state.bnodes.insert(
                         b.as_str().to_owned(),
-                        crate::store::bnode_for(ctx.fresh_bnode()),
+                        state.mint.map_or_else(
+                            || crate::store::bnode_for(ctx.fresh_bnode()),
+                            |mint| mint(b.as_str()),
+                        ),
                     );
                 }
                 let node = state.bnodes.get(b.as_str()).expect("row blank node");

@@ -4,7 +4,7 @@
 use super::compile::{Compiled, Kind};
 use super::footprint::{Footprint, Resolved};
 use super::inference::{Inference, InferredFootprint};
-use super::ops::{Node, PlanNode};
+use super::ops::{Node, Op, PlanNode};
 use super::pass::{Pass, PassStats, Vis};
 use super::persist::{Reader, Writer};
 use super::prov::{self, AChanges, AnnMap, Annotation, FactCache, FactKey, Provenance};
@@ -13,11 +13,12 @@ use super::zset::{Changes, Row, ZSet, consolidate};
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::sparql::viewsvc::{ViewTable, ViewVersion};
+use crate::sparql::viewsvc::{PublishedBytes, ViewReductions, ViewTable, ViewVersion};
 use crate::store::{ChangesOptions, Snapshot, Store};
 use crate::task::Control;
 use oxrdf::Term;
 use rustc_hash::FxHashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 
 /// The most net changes a pass applies; more are cheaper to evaluate from scratch.
@@ -261,6 +262,8 @@ pub enum Advance {
 pub struct Circuit {
     pub kind: Kind,
     pub vars: Vec<String>,
+    pub(crate) template_columns: Option<Arc<[String]>>,
+    pub(crate) reductions: Option<Arc<ViewReductions>>,
     pub root: Node,
     pub footprint: Footprint,
     resolved: Option<Resolved>,
@@ -295,6 +298,7 @@ pub struct Circuit {
     /// The latest immutable shared view version, replaced whenever a pass updates the
     /// result so streaming cursors read without holding the circuit's lock.
     pub(crate) version: Option<Arc<ViewVersion>>,
+    pub(crate) version_pool: Option<Arc<AtomicU64>>,
     /// the annotation the circuit keeps besides the weights (spec F13 §5)
     prov: Provenance,
     /// the annotations of the result's rows
@@ -321,8 +325,25 @@ impl Circuit {
     /// commit.
     pub fn new(c: Compiled, access: Option<Arc<GraphAccess>>) -> Circuit {
         let access = access.map(|a| a.settled());
+        let template_columns = if let Op::Distinct(distinct) = &c.root.op
+            && let Op::Template(template) = &distinct.inner.op
+            && template.has_blanks()
+        {
+            Some(
+                template
+                    .inner
+                    .schema
+                    .iter()
+                    .map(|&i| c.vars[i as usize].clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
         Circuit {
             kind: c.kind,
+            template_columns,
+            reductions: (!c.reductions.native.is_empty()).then(|| Arc::new(c.reductions)),
             vars: c.vars,
             root: c.root,
             footprint: c.footprint,
@@ -342,6 +363,7 @@ impl Circuit {
             inferred: InferredFootprint::default(),
             keep_result: true,
             version: None,
+            version_pool: None,
             prov: Provenance::None,
             ann: AnnMap::default(),
             facts: FactCache::default(),
@@ -551,10 +573,7 @@ impl Circuit {
         self.root.bytes()
             + self.result.bytes(self.root.schema.len())
             + self.terms.bytes()
-            + self
-                .version
-                .as_ref()
-                .map_or(0, |v| v.table.retained_bytes())
+            + self.version.as_ref().map_or(0, |v| v.retained_bytes())
             + prov::map_bytes(&self.ann, self.root.schema.len())
             + self.facts.bytes()
     }
@@ -587,6 +606,7 @@ impl Circuit {
                 ids,
                 weights,
                 total_rows,
+                published: None,
             };
         }
         let mut ids = Vec::with_capacity(self.result.len() * width);
@@ -604,116 +624,110 @@ impl Circuit {
             ids,
             weights,
             total_rows,
+            published: None,
         }
     }
 
-    /// Replace the immutable shared version from scratch (after `build` or `decode`).
     fn publish_fresh_version(&mut self) {
-        if !self.keep_result {
-            self.version = None;
-            return;
-        }
-        let Some(snap) = self.snap.clone() else {
-            self.version = None;
-            return;
-        };
-        let columns: Arc<[String]> = self
-            .version
-            .as_ref()
-            .map(|v| v.columns.clone())
-            .unwrap_or_else(|| self.columns().into());
-        let terms = Arc::new(self.terms.snapshot());
-        let table = Arc::new(self.build_view_table());
-        self.version = Some(Arc::new(ViewVersion {
-            columns,
-            commit: self.applied,
-            snap,
-            terms,
-            table,
-            evaluated_under: None,
-        }));
+        self.publish_version(false);
     }
 
-    /// Replace the immutable shared version after an incremental change, reusing the
-    /// frozen term table when no local terms were added and no remap occurred.
     fn publish_updated_version(&mut self, remapped: bool) {
-        if !self.keep_result {
-            self.version = None;
-            return;
-        }
-        let Some(snap) = self.snap.clone() else {
+        self.publish_version(!remapped);
+    }
+
+    fn publish_version(&mut self, reuse_terms: bool) {
+        let Some(snap) = self.snap.clone().filter(|_| self.keep_result) else {
             self.version = None;
             return;
         };
-        let columns: Arc<[String]> = self
-            .version
-            .as_ref()
-            .map(|v| v.columns.clone())
-            .unwrap_or_else(|| self.columns().into());
+        let pool = self.version_pool.as_ref();
+        let (columns, published_columns) = if let Some(prev) = &self.version {
+            (prev.columns.clone(), prev.published_columns.clone())
+        } else {
+            let columns: Arc<[String]> = self.columns().into();
+            let bytes = columns.len() * std::mem::size_of::<String>()
+                + columns.iter().map(String::capacity).sum::<usize>()
+                + 32
+                + std::mem::size_of::<PublishedBytes>();
+            (
+                columns,
+                pool.map(|p| Arc::new(PublishedBytes::new(p, bytes as u64))),
+            )
+        };
         let terms = match self.version.as_ref() {
-            Some(prev) if !remapped && prev.terms.len() == self.terms.key_count() => {
+            Some(prev) if reuse_terms && prev.terms.len() == self.terms.key_count() => {
                 prev.terms.clone()
             }
-            _ => Arc::new(self.terms.snapshot()),
+            _ => {
+                let mut terms = self.terms.snapshot();
+                terms.published = pool.map(|p| PublishedBytes::new(p, terms.retained_bytes() + 16));
+                Arc::new(terms)
+            }
         };
-        let table = Arc::new(self.build_view_table());
+        let mut table = self.build_view_table();
+        table.published = pool.map(|p| PublishedBytes::new(p, table.retained_bytes() + 16));
+        let published = self.version_charge();
         self.version = Some(Arc::new(ViewVersion {
             columns,
             commit: self.applied,
             snap,
             terms,
-            table,
+            table: Arc::new(table),
             evaluated_under: None,
+            published,
+            published_columns,
         }));
     }
 
-    /// Advance the immutable shared version's commit and snapshot without copying rows or
-    /// terms (when a pass was skipped or left the result unchanged without remapping).
+    fn version_charge(&self) -> Option<Arc<PublishedBytes>> {
+        self.version_pool.as_ref().map(|p| {
+            Arc::new(PublishedBytes::new(
+                p,
+                (std::mem::size_of::<ViewVersion>()
+                    + 16
+                    + std::mem::size_of::<PublishedBytes>()
+                    + 16) as u64,
+            ))
+        })
+    }
+
+    pub(crate) fn set_version_pool(&mut self, pool: Option<Arc<AtomicU64>>) {
+        self.version_pool = pool;
+        self.version = None;
+        if self.version_pool.is_some() && self.snap.is_some() {
+            self.publish_fresh_version();
+        }
+    }
+
+    /// Advance the version's commit and snapshot without copying rows or terms.
     fn bump_version(&mut self, commit: u64, snap: Arc<Snapshot>) {
         if !self.keep_result {
             self.version = None;
             return;
         }
         if let Some(prev) = self.version.as_ref() {
-            self.version = Some(Arc::new(ViewVersion {
-                columns: prev.columns.clone(),
-                commit,
-                snap,
-                terms: prev.terms.clone(),
-                table: prev.table.clone(),
-                evaluated_under: None,
-            }));
+            let mut version = (**prev).clone();
+            version.commit = commit;
+            version.snap = snap;
+            version.published = self.version_charge();
+            self.version = Some(Arc::new(version));
         } else {
             self.publish_fresh_version();
         }
     }
 
-    /// Update `applied` and keep the published version's commit in sync (used after
-    /// checkpoint recovery).
+    /// Update the published commit after checkpoint recovery.
     pub(crate) fn set_applied(&mut self, commit: u64) {
         self.applied = commit;
-        if let Some(prev) = self.version.as_ref() {
-            if prev.commit != commit {
-                self.version = Some(Arc::new(prev.at_commit(commit)));
-            }
-        } else if self.keep_result && self.snap.is_some() {
-            self.publish_fresh_version();
-        }
-    }
-
-    /// The current immutable shared version, building it lazily if the circuit has a
-    /// snapshot and no version published yet.
-    pub(crate) fn version_or_build(&mut self) -> Option<Arc<ViewVersion>> {
-        if !self.keep_result {
-            return None;
-        }
-        if let Some(v) = self.version.as_ref()
-            && v.commit == self.applied
+        if let Some(snap) = &self.snap
+            && self
+                .version
+                .as_ref()
+                .is_none_or(|version| version.commit != commit)
         {
-            return Some(v.clone());
+            self.bump_version(commit, snap.clone());
         }
-        self.publish_fresh_version();
-        self.version.clone()
     }
 
     fn pass<'a>(

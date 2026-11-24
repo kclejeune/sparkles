@@ -775,3 +775,191 @@ fn cancellation_timeout_and_checked_source_enforcement() {
     src_cancel.store(true, Ordering::Relaxed);
     assert!(matches!(c.next_batch(), Err(Error::Cancelled)));
 }
+
+#[test]
+fn reduced_rebuild_preserves_multiplicity_and_commit() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, "INSERT DATA { ex:a ex:p 1 . ex:b ex:p 1 }");
+    let rt = runtime(&s);
+    rt.put(
+        &s,
+        "reduced",
+        ViewDef::table(format!("{P}SELECT REDUCED ?x {{ ?s ex:p ?x }}")),
+    )
+    .unwrap();
+    rt.put(
+        &s,
+        "reduced-limit",
+        ViewDef::table(format!("{P}SELECT REDUCED ?x {{ ?s ex:p ?x }} LIMIT 2")),
+    )
+    .unwrap();
+    rt.put(
+        &s,
+        "reduced-mixed",
+        ViewDef::table(format!("{P}SELECT ?x {{ {{ SELECT REDUCED ?x {{ ?s ex:p ?x }} }} UNION {{ SELECT REDUCED ?x {{ ?s ex:p ?x }} LIMIT 2 }} }}")),
+    )
+    .unwrap();
+    rt.round(&s);
+    let snap = s.snapshot();
+    let opts = QueryOptions {
+        views: Some(rt.clone()),
+        ..Default::default()
+    };
+    let q = format!(
+        "{P}SELECT ?x ?c {{ SERVICE view:read {{ [] view:name \"reduced\" ; view:bind ?x ; view:commit ?c }} }}"
+    );
+    let expected = drain(&snap, &q, &opts, 1).unwrap().0;
+    assert_eq!(expected.len(), 1);
+    let alternate = QueryOptions {
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        ..opts.clone()
+    };
+    assert_eq!(drain(&snap, &q, &alternate, 1).unwrap().0, expected);
+    let limited = q.replace("\"reduced\"", "\"reduced-limit\"");
+    let before = drain(&snap, &limited, &opts, 1).unwrap().0;
+    assert_eq!(before.len(), 2, "the maintained recompute keeps both rows");
+    assert_eq!(drain(&snap, &limited, &alternate, 1).unwrap().0, before);
+    let mixed = q.replace("\"reduced\"", "\"reduced-mixed\"");
+    let before = drain(&snap, &mixed, &opts, 1).unwrap().0;
+    assert_eq!(before.len(), 3, "only the native branch reduces duplicates");
+    assert_eq!(drain(&snap, &mixed, &alternate, 1).unwrap().0, before);
+    for i in 0..18 {
+        upd(&s, &format!("INSERT DATA {{ ex:new{i} ex:p {i} }}"));
+        rt.round(&s);
+    }
+    assert_eq!(drain(&snap, &q, &opts, 1).unwrap().0, expected);
+    assert_eq!(eager_rows(&snap, &q, &opts), expected);
+}
+
+#[test]
+fn rebuilt_view_inherits_strict_fallback_and_reports_permissive_child() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s);
+    rt.put(&s, "split", ViewDef::table(
+        "PREFIX apf: <http://jena.apache.org/ARQ/property#> SELECT ?x { ?x apf:strSplit ('one,two' ',') }",
+    )).unwrap();
+    rt.round(&s);
+    let q =
+        format!("{P}SELECT ?x {{ SERVICE view:read {{ [] view:name \"split\" ; view:bind ?x }} }}");
+    let opts = QueryOptions {
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        views: Some(rt),
+        ..Default::default()
+    };
+    let snap = s.snapshot();
+    let mut c = select_cursor(snap.clone(), &q, &opts, &strict(1)).unwrap();
+    assert!(matches!(c.next_batch(), Err(Error::Unsupported(s)) if s.contains("materialization")));
+    let permissive = CursorOptions {
+        fallback: FallbackPolicy::AllowMaterialization,
+        ..strict(1)
+    };
+    let mut c = select_cursor(snap, &q, &opts, &permissive).unwrap();
+    assert_eq!(c.next_batch().unwrap().unwrap().len(), 1);
+    assert!(c.plan().has_materialization());
+}
+
+#[test]
+fn rebuilt_view_preserves_template_blank_nodes_and_occurrences() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s);
+    rt.put(
+        &s,
+        "blank",
+        ViewDef::table(format!(
+            "{P}CONSTRUCT {{ _:b ex:q ?x ; ex:r ?x }} WHERE {{ VALUES ?x {{ 1 1 2 }} }}"
+        )),
+    )
+    .unwrap();
+    rt.round(&s);
+    let q = format!(
+        "{P}SELECT ?subject ?predicate ?object ?c {{ SERVICE view:read {{ [] view:name \"blank\" ; view:bind ?subject, ?predicate, ?object ; view:commit ?c }} }}"
+    );
+    let opts = QueryOptions {
+        views: Some(rt),
+        ..Default::default()
+    };
+    let snap = s.snapshot();
+    let now = drain(&snap, &q, &opts, 1).unwrap().0;
+    assert_eq!(now.len(), 6);
+    assert!(
+        now.iter()
+            .all(|row| matches!(row[0], Some(Term::BlankNode(_))))
+    );
+    let alternate = QueryOptions {
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        ..opts
+    };
+    assert_eq!(bag(drain(&snap, &q, &alternate, 1).unwrap().0), bag(now));
+}
+
+#[test]
+fn stale_view_translates_across_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    upd(&s, "INSERT DATA { _:b ex:p \"from-before-compaction\" }");
+    let rt = runtime(&s);
+    rt.put(
+        &s,
+        "items",
+        ViewDef::table(format!("{P}SELECT ?s ?o {{ ?s ex:p ?o }}")),
+    )
+    .unwrap();
+    rt.round(&s);
+    let before = s.snapshot();
+    let opts = QueryOptions {
+        views: Some(rt),
+        ..Default::default()
+    };
+    let q = format!(
+        "{P}SELECT ?s ?o {{ SERVICE view:read {{ [] view:name \"items\" ; view:bind ?s, ?o ; view:allowStale true }} }}"
+    );
+    let expected = drain(&before, &q, &opts, 1).unwrap().0;
+    s.compact().unwrap();
+    let after = s.snapshot();
+    assert!(!Arc::ptr_eq(&before.generation, &after.generation));
+    assert_eq!(drain(&after, &q, &opts, 1).unwrap().0, expected);
+}
+
+#[test]
+fn rebuilt_views_share_a_work_budget_in_both_execution_modes() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s);
+    for name in ["left", "right"] {
+        rt.put(
+            &s,
+            name,
+            ViewDef::table("SELECT ?x { VALUES ?x { 1 2 3 4 5 6 7 8 } FILTER(?x = 1) }"),
+        )
+        .unwrap();
+    }
+    rt.round(&s);
+    let opts = QueryOptions {
+        views: Some(rt),
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        no_cache: true,
+        ..Default::default()
+    };
+    let snap = s.snapshot();
+    let left = "SERVICE view:read { [] view:name \"left\" ; view:bind ?x }";
+    let right = "SERVICE view:read { [] view:name \"right\" ; view:bind ?x }";
+    let one = format!("{P}SELECT ?x {{ {left} }}");
+    let both = format!("{P}SELECT ?x {{ {{ {left} }} UNION {{ {right} }} }}");
+    let mut c = select_cursor(snap.clone(), &one, &opts, &strict(1)).unwrap();
+    while c.next_batch().unwrap().is_some() {}
+    let one_work = c.stats().rows_produced;
+    assert!(one_work > 2, "the child scan contributes work");
+    let limited = QueryOptions {
+        max_rows_produced: Some(one_work + 2),
+        ..opts
+    };
+    assert_eq!(drain(&snap, &one, &limited, 1).unwrap().0.len(), 1);
+    assert_eq!(eager_rows(&snap, &one, &limited).len(), 1);
+    assert!(matches!(
+        drain(&snap, &both, &limited, 1),
+        Err(Error::BudgetExceeded(_))
+    ));
+    assert!(matches!(
+        query(snap, &both, &limited),
+        Err(Error::BudgetExceeded(_))
+    ));
+}

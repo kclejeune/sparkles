@@ -803,6 +803,53 @@ fn capacity_bytes(table: &Table) -> u64 {
         .saturating_add(128)
 }
 
+/// Materialize the native view reader for eager execution. Rebuilds therefore
+/// spend the same request work budget in both execution modes.
+pub(super) fn eager_view(
+    ctx: &Arc<Ctx>,
+    node: &Node,
+    held: &super::ctx::Charge<'_>,
+) -> Result<Table> {
+    let options = CursorOptions {
+        batch_rows: 256,
+        ..Default::default()
+    };
+    let mut view = view::View::new(node.clone());
+    let mut table = Table::new(node.vars.clone());
+    held.resize(capacity_bytes(&table))?;
+    while let Some(batch) = view.next(ctx, &options, options.batch_rows)? {
+        let rows = table.len.saturating_add(batch.table.len);
+        ctx.check_rows(rows)?;
+        let old = capacity_bytes(&table);
+        let growth = table
+            .cols
+            .iter()
+            .map(|col| {
+                let next = sparkles_budget::sizes::vec_grown(
+                    col.capacity(),
+                    col.len(),
+                    batch.table.len,
+                    8,
+                );
+                if next > col.capacity() {
+                    next as u64 * 8
+                } else {
+                    0
+                }
+            })
+            .sum::<u64>();
+        let empty_width = if table.width() == 0 {
+            rows as u64 * 8
+        } else {
+            0
+        };
+        held.resize(old.saturating_add(growth).saturating_add(empty_width))?;
+        table.append(batch.table);
+        held.resize(capacity_bytes(&table))?;
+    }
+    Ok(table)
+}
+
 impl Buffer {
     fn new(ctx: &Arc<Ctx>, vars: &[VarId], rows: usize) -> Result<Self> {
         let bytes = super::ctx::table_bytes(rows, vars.len())
@@ -962,34 +1009,29 @@ pub(super) fn call_cursor(
     .map(|(cursor, _, _)| cursor)
 }
 
-/// A SELECT cursor for an already-parsed query (such as a rebuilt `table` view),
-/// charged against its caller's query from its first allocation.
-pub(super) fn call_parsed_cursor(
+/// Open a view's saved parsed query with caller-owned accounting and controls.
+fn call_parsed_cursor(
     snapshot: Arc<Snapshot>,
-    parsed: spargebra::Query,
+    parsed: &spargebra::Query,
     options: &QueryOptions,
     cursor: &CursorOptions,
     parent: sparkles_budget::ParentHandle,
-) -> Result<QueryCursor> {
-    if cursor.batch_rows == 0 || cursor.batch_bytes == 0 {
-        return Err(Error::invalid(
-            "cursor batch rows and bytes must be positive",
-        ));
-    }
-    let started = Instant::now();
+    inherited: &super::ViewExecution,
+) -> Result<(QueryCursor, Option<graph::Spec>)> {
     open_parsed_cursor_input(
         snapshot,
         parsed,
         "",
         options,
         cursor,
-        Some(QueryKind::Select),
+        None,
         None,
         Some(parent),
-        started,
+        Instant::now(),
         0.0,
+        Some(inherited),
     )
-    .map(|(cursor, _, _)| cursor)
+    .map(|(cursor, graph, _)| (cursor, graph))
 }
 
 fn open_pattern_cursor_input(
@@ -1017,7 +1059,8 @@ fn open_pattern_cursor_input(
         let parsed = super::parse_query(query, options.base_iri.as_deref(), &options.prefixes)?;
         let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
         open_parsed_cursor_input(
-            snapshot, parsed, query, options, cursor, expected, source, parent, started, parse_ms,
+            snapshot, &parsed, query, options, cursor, expected, source, parent, started, parse_ms,
+            None,
         )
     })
 }
@@ -1025,7 +1068,7 @@ fn open_pattern_cursor_input(
 #[allow(clippy::too_many_arguments)]
 fn open_parsed_cursor_input(
     snapshot: Arc<Snapshot>,
-    parsed: spargebra::Query,
+    parsed: &spargebra::Query,
     query: &str,
     options: &QueryOptions,
     cursor: &CursorOptions,
@@ -1034,8 +1077,9 @@ fn open_parsed_cursor_input(
     parent: Option<sparkles_budget::ParentHandle>,
     started: Instant,
     parse_ms: f64,
+    inherited: Option<&super::ViewExecution>,
 ) -> Result<(QueryCursor, Option<graph::Spec>, QueryKind)> {
-    let kind = match &parsed {
+    let kind = match parsed {
         spargebra::Query::Select { .. } => QueryKind::Select,
         spargebra::Query::Ask { .. } => QueryKind::Ask,
         spargebra::Query::Construct { .. } => QueryKind::Construct,
@@ -1048,7 +1092,7 @@ fn open_parsed_cursor_input(
             "a {expected:?} cursor requires a {expected:?} query"
         )));
     }
-    let levels = depth::check_query(&parsed)?;
+    let levels = depth::check_query(parsed)?;
     depth::with_stack(levels, || {
         let planning = Instant::now();
         // The public strict boundary validated the original invocation Arc.
@@ -1063,7 +1107,7 @@ fn open_parsed_cursor_input(
             .cloned();
         let prepared = super::prepare_query_input_policy(
             snapshot,
-            &parsed,
+            parsed,
             options,
             Some(started),
             None,
@@ -1071,11 +1115,12 @@ fn open_parsed_cursor_input(
             bound_policy.as_ref(),
             parent,
             None,
+            inherited,
         )?;
         let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
         let levels = levels.max(prepared.plan_depth);
         from_prepared(
-            prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels, kind,
+            prepared, parsed, query, options, cursor, started, parse_ms, plan_ms, levels, kind,
         )
     })
 }
@@ -3395,7 +3440,7 @@ impl Operator {
         // A history query without a limit holds a page of its changes at a time.
         let history_reader = history::eligible(&node);
         // A view read streams from an immutable shared view version without copying.
-        let view_reader = view::eligible(&node);
+        let view_reader = view::eligible(ctx, &node);
         // A native sort consumes cursor batches into charged state. It blocks before
         // its first output but is not an eager fallback, so strict policy admits it.
         let materializes = !(exists_streams && supported(&node.kind))
@@ -4187,6 +4232,12 @@ impl Operator {
         }
         if let State::GraphBranches(branches) = &mut self.state {
             branches.update_plan(plan);
+        }
+        if let State::View(view) = &self.state
+            && let Some(child) = view.rebuild_plan()
+        {
+            plan.children.clear();
+            plan.children.push(child.clone());
         }
         for (child, plan) in self.children.iter_mut().zip(&mut plan.children) {
             child.update_plan(plan);

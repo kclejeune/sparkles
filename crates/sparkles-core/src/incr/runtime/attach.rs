@@ -32,6 +32,7 @@ impl Runtime {
             applied: 0,
             rows: 0,
             bytes: 0,
+            published_bytes: 0,
             passes: 0,
             skipped: 0,
             pass_time: Duration::ZERO,
@@ -45,7 +46,8 @@ impl Runtime {
             key,
             state: Mutex::new(Slot {
                 circuit,
-                query: q,
+                query: Arc::new(q),
+                query_text_bytes: text.len(),
                 whole,
                 vars,
                 history: VecDeque::new(),
@@ -82,13 +84,27 @@ impl Runtime {
         let q = self.parse(host.as_ref(), &text)?;
         let access = host.access(def.principal.as_deref())?;
         let (cell, new) = self.cell_for(reg, q, &text, access.clone(), None)?;
+        {
+            let mut st = cell.state.lock();
+            if st.views == 0 {
+                st.circuit
+                    .set_version_pool(Some(self.published_views.clone()));
+                let mut info = cell.info.lock();
+                info.bytes = st.circuit.bytes();
+                info.published_bytes = st
+                    .circuit
+                    .version
+                    .as_ref()
+                    .map_or(0, |v| v.published_bytes());
+            }
+            st.views += 1;
+        }
         if new {
             self.ensure_subscription(store);
             if let Some(root) = &self.root {
                 self.recover(store, &cell, &views::dir(root, name).join(BRANCH), name);
             }
         }
-        cell.state.lock().views += 1;
         let entry = reg.views.get_mut(name).expect("checked above");
         entry.cell = Some(cell);
         entry.access = access;
@@ -132,6 +148,11 @@ impl Runtime {
                     info.applied = h.commit;
                     info.rows = st.circuit.result.total().max(0) as u64;
                     info.bytes = st.circuit.bytes();
+                    info.published_bytes = st
+                        .circuit
+                        .version
+                        .as_ref()
+                        .map_or(0, |v| v.published_bytes());
                     tracing::info!(
                         target: "sparkles::incr::runtime",
                         "view {name}: loaded its state at commit {}; {} commits to apply",

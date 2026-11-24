@@ -184,6 +184,7 @@ pub struct Runtime {
     live_total: Arc<AtomicUsize>,
     live_by: Arc<Mutex<FxHashMap<String, usize>>>,
     counters: Counters,
+    published_views: Arc<AtomicU64>,
     last_checkpoint: Mutex<Instant>,
     closed: AtomicBool,
     /// the host's epoch the attached views resolved their principals under
@@ -229,6 +230,7 @@ impl Runtime {
             live_total: Arc::new(AtomicUsize::new(0)),
             live_by: Default::default(),
             counters: Counters::default(),
+            published_views: Arc::new(AtomicU64::new(0)),
             last_checkpoint: Mutex::new(Instant::now()),
             closed: AtomicBool::new(false),
             host_epoch: AtomicU64::new(0),

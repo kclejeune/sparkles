@@ -108,6 +108,9 @@ impl ViewSource for Source {
         drop(state);
         rt.read(r)
     }
+    fn streams_views(&self) -> bool {
+        true
+    }
     fn open_view(
         &self,
         open: &ViewOpen<'_>,

@@ -983,6 +983,7 @@ pub struct Planner<'a> {
     pub scoped: FxHashSet<VarId>,
     pub(super) property_inputs: FxHashSet<VarId>,
     bnode_scope: u32,
+    recomputing_view: bool,
     /// RDF 1.2 triple-term patterns created while translating triple patterns
     unpacks: std::cell::RefCell<Vec<UnpackItem>>,
     /// the whole query being planned, if known: a search output it mentions nowhere else
@@ -1056,6 +1057,7 @@ impl<'a> Planner<'a> {
             scoped: FxHashSet::default(),
             property_inputs: FxHashSet::default(),
             bnode_scope: 0,
+            recomputing_view: false,
             unpacks: Default::default(),
             source: None,
             source_sse: Default::default(),
@@ -1462,6 +1464,28 @@ impl<'a> Planner<'a> {
     // ------------------------------------------------------------------ plan ------
 
     pub fn plan(&mut self, gp: &GraphPattern, g: &ActiveGraph, filters: Vec<Expr>) -> Result<Node> {
+        if !self.recomputing_view
+            && self
+                .ctx
+                .view_reductions
+                .as_ref()
+                .is_some_and(|patterns| patterns.recomputed.contains(gp))
+        {
+            self.recomputing_view = true;
+            let plan = self.plan_pattern(gp, g, filters);
+            self.recomputing_view = false;
+            plan
+        } else {
+            self.plan_pattern(gp, g, filters)
+        }
+    }
+
+    fn plan_pattern(
+        &mut self,
+        gp: &GraphPattern,
+        g: &ActiveGraph,
+        filters: Vec<Expr>,
+    ) -> Result<Node> {
         self.ctx.check()?;
         use GraphPattern as GP;
         match gp {
@@ -1940,7 +1964,19 @@ impl<'a> Planner<'a> {
                 let n = self.project_for_branch(child?, vars)?;
                 self.apply_filters(n, filters)
             }
-            GP::Distinct { inner } => {
+            GP::Reduced { inner }
+                if self.recomputing_view
+                    || matches!(g, ActiveGraph::Var(_))
+                    || self
+                        .ctx
+                        .view_reductions
+                        .as_ref()
+                        .is_none_or(|patterns| !patterns.native.contains(gp)) =>
+            {
+                let child = self.plan(inner, g, Vec::new())?;
+                self.apply_filters(child, filters)
+            }
+            GP::Distinct { inner } | GP::Reduced { inner } => {
                 // SELECT DISTINCT ?p over ?s ?p ?o: the predicates the patterns list
                 if let GP::Project {
                     inner: pinner,
@@ -1961,10 +1997,6 @@ impl<'a> Planner<'a> {
                     n = super::demand::distinct_below_order(self.ctx, n);
                 }
                 self.apply_filters(n, filters)
-            }
-            GP::Reduced { inner } => {
-                let child = self.plan(inner, g, Vec::new())?;
-                self.apply_filters(child, filters)
             }
             GP::Slice {
                 inner,

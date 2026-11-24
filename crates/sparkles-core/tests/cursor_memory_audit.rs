@@ -786,20 +786,7 @@ fn the_view_reader_holds_its_ledger_and_no_more() {
     del.push('}');
     update(&s, &del, &QueryOptions::default()).unwrap();
     rt.round(&s);
-    for granted in [false, true] {
-        let mut a = run_view(&snap_base, q_cur, granted, 256);
-        for _ in 0..2 {
-            a = run_view(&snap_base, q_cur, granted, 256);
-        }
-        print(
-            "view history",
-            if granted { "granted" } else { "local" },
-            &a,
-        );
-        assert_eq!(a.rows, 2000);
-        found.extend(a.check("view history", &allowance("view")));
-    }
-    // 3) Stale read ahead of snap_base.
+    // Stale read ahead of snap_base before introducing new terms.
     for granted in [false, true] {
         let mut a = run_view(&snap_base, q_stale, granted, 256);
         for _ in 0..2 {
@@ -808,6 +795,31 @@ fn the_view_reader_holds_its_ledger_and_no_more() {
         print("view stale", if granted { "granted" } else { "local" }, &a);
         assert_eq!(a.rows, 1800);
         found.extend(a.check("view stale", &allowance("view")));
+    }
+    let snap_before_add = s.snapshot();
+    let mut add = String::from("INSERT DATA { ");
+    for i in 0..200 {
+        add.push_str(&format!(
+            "<urn:added:{i}> <urn:p> \"{}-{i}\" . ",
+            "added".repeat(20)
+        ));
+    }
+    add.push('}');
+    update(&s, &add, &QueryOptions::default()).unwrap();
+    rt.round(&s);
+    for (label, snap, rows) in [
+        ("view history (mixed)", &snap_base, 2000),
+        ("view history (inserts)", &snap_before_add, 1800),
+    ] {
+        for granted in [false, true] {
+            let mut a = run_view(snap, q_cur, granted, 256);
+            for _ in 0..2 {
+                a = run_view(snap, q_cur, granted, 256);
+            }
+            print(label, if granted { "granted" } else { "local" }, &a);
+            assert_eq!(a.rows, rows);
+            found.extend(a.check(label, &allowance("view")));
+        }
     }
     // 4) Rebuilt read (history expired > 16 commits).
     for i in 0..18 {
@@ -1115,4 +1127,42 @@ fn meter_race(site: usize) -> bool {
     heap::HOOK.store(0, Ordering::SeqCst);
     other.join().unwrap();
     moved
+}
+
+#[test]
+fn a_rebuilt_construct_does_not_build_its_whole_circuit_for_one_row() {
+    use sparkles_core::incr::{OpenHost, Runtime, RuntimeOptions, ViewDef};
+    use sparkles_core::sparql::{AggregateErrors, FallbackPolicy};
+    let _serial = heap::serial();
+    let s = store(12_000);
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    rt.set_host(Arc::new(OpenHost));
+    rt.put(
+        &s,
+        "graph",
+        ViewDef::table("CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }"),
+    )
+    .unwrap();
+    rt.round(&s);
+    let snap = s.snapshot();
+    let opts = QueryOptions {
+        views: Some(rt),
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        max_memory_bytes: Some(1 << 20),
+        pool: Some(QueryPool::new(1 << 20)),
+        no_cache: true,
+        ..Default::default()
+    };
+    let cursor = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let q = "PREFIX view: <urn:x-sparkles:view#> SELECT ?subject { SERVICE view:read { [] view:name \"graph\" ; view:bind ?subject } } LIMIT 1";
+    let (rows, peak) = heap::peak(|| {
+        let mut c = select_cursor(snap, q, &opts, &cursor).unwrap();
+        c.next_batch().unwrap().unwrap().len()
+    });
+    assert_eq!(rows, 1);
+    assert!(peak < 1 << 20, "the first pull allocated {peak} bytes");
 }

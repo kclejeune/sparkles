@@ -21,6 +21,7 @@ pub(super) struct Info {
     pub(super) applied: u64,
     pub(super) rows: u64,
     pub(super) bytes: u64,
+    pub(super) published_bytes: u64,
     pub(super) passes: u64,
     pub(super) skipped: u64,
     pub(super) pass_time: Duration,
@@ -36,7 +37,7 @@ pub(super) type HistRows = Arc<[(Vec<Option<Term>>, i64)]>;
 pub(super) struct Hist {
     from: u64,
     to: u64,
-    rows: HistRows,
+    pub(super) rows: HistRows,
 }
 
 pub(super) struct Sub {
@@ -49,7 +50,8 @@ pub(super) struct Sub {
 /// A circuit's state, shared by its views and live queries.
 pub(crate) struct Slot {
     pub(super) circuit: Circuit,
-    pub(super) query: Query,
+    pub(super) query: Arc<Query>,
+    pub(super) query_text_bytes: usize,
     /// why the access makes the whole query be evaluated again, when it does
     pub(super) whole: Option<String>,
     pub(super) vars: Arc<[String]>,
@@ -81,6 +83,7 @@ impl Slot {
             self.circuit.access.clone(),
         );
         c.max_memory_bytes = self.circuit.max_memory_bytes;
+        c.version_pool = self.circuit.version_pool.clone();
         c.inference = inference;
         c.aggregate_errors = self.circuit.aggregate_errors;
         Ok(c)
@@ -231,34 +234,26 @@ impl Slot {
         }
     }
 
-    /// The history slices from commit `after` to the circuit's commit, without merging
-    /// them under the circuit lock. An empty vector means every commit since `after`
-    /// left the result unchanged.
-    pub(super) fn history_parts_since(&self, after: u64) -> Option<Vec<HistRows>> {
+    /// The history spans from `after` to the circuit's commit, if they still connect.
+    pub(super) fn history_spans_since(&self, after: u64) -> Option<impl Iterator<Item = &Hist>> {
         let start = self.history.iter().position(|h| {
             h.from == after || (h.rows.is_empty() && h.from <= after && after < h.to)
         })?;
+        let spans = self.history.iter().skip(start);
         let mut at = after;
-        let mut parts = Vec::new();
-        for h in self.history.iter().skip(start) {
+        for h in spans.clone() {
             if h.from > at {
                 return None;
             }
-            if !h.rows.is_empty() {
-                parts.push(h.rows.clone());
-            }
             at = h.to;
         }
-        if at != self.circuit.applied {
-            return None;
-        }
-        Some(parts)
+        (at == self.circuit.applied).then_some(spans)
     }
 
     /// The net change from commit `after` to the circuit's commit from the history.
     pub(super) fn history_since(&self, after: u64) -> Option<Vec<(Vec<Option<Term>>, i64)>> {
-        let parts = self.history_parts_since(after)?;
-        Some(net(parts.iter().flat_map(|r| r.iter().cloned())))
+        let spans = self.history_spans_since(after)?;
+        Some(net(spans.flat_map(|h| h.rows.iter().cloned())))
     }
 }
 
@@ -301,6 +296,9 @@ impl Cell {
     pub(super) fn release_view(&self) -> usize {
         let mut st = self.state.lock();
         st.views = st.views.saturating_sub(1);
+        if st.views == 0 {
+            st.circuit.set_version_pool(None);
+        }
         st.views
     }
 }
