@@ -51,6 +51,9 @@ const SMALL_BUCKET_MAX: usize = 2047;
 /// Minimum estimated per-row evaluation saving (ns) for unhinted weak admission on
 /// parallel-capable expressions (`R * T >= COST_MIN_SAVING_NANOS * N * M`).
 const COST_MIN_SAVING_NANOS: u128 = 50;
+/// Default minimum estimated per-row evaluation saving (ns) that lets one completed
+/// weak decision admit immediately when two usable same-bucket rates exist.
+const COST_FAST_SAVING_NANOS: u128 = COST_MIN_SAVING_NANOS * 2;
 /// Consecutive completed batch decisions that must pass the weak cost rule.
 const WEAK_CONFIRMATIONS: u8 = 2;
 
@@ -100,6 +103,7 @@ struct ReuseConfig {
     split: SplitMode,
     scope: SplitScope,
     admission: AdmissionMode,
+    admission_fast_nanos: Option<u128>,
     cooldown: u8,
     iri_split_cooldown: Option<u8>,
     trace: bool,
@@ -111,11 +115,34 @@ impl Default for ReuseConfig {
             split: SplitMode::Retry,
             scope: SplitScope::Bind,
             admission: AdmissionMode::Cost,
+            admission_fast_nanos: None,
             cooldown: SPLIT_COOLDOWN,
             iri_split_cooldown: None,
             trace: false,
         }
     }
+}
+
+fn parse_admission_fast_nanos(raw: Option<&str>) -> Option<u128> {
+    let raw = raw?.trim();
+    if raw.eq_ignore_ascii_case("1")
+        || raw.eq_ignore_ascii_case("on")
+        || raw.eq_ignore_ascii_case("true")
+        || raw.eq_ignore_ascii_case("yes")
+    {
+        return Some(COST_FAST_SAVING_NANOS);
+    }
+    if raw.is_empty()
+        || raw.eq_ignore_ascii_case("0")
+        || raw.eq_ignore_ascii_case("off")
+        || raw.eq_ignore_ascii_case("false")
+        || raw.eq_ignore_ascii_case("no")
+    {
+        return None;
+    }
+    raw.parse::<u128>()
+        .ok()
+        .filter(|&n| n >= COST_MIN_SAVING_NANOS)
 }
 
 fn parse_iri_split_cooldown(raw: Option<&str>) -> Option<u8> {
@@ -156,6 +183,11 @@ fn reuse_config() -> ReuseConfig {
             Ok("off") => AdmissionMode::Off,
             _ => AdmissionMode::Cost,
         };
+        let admission_fast_nanos = parse_admission_fast_nanos(
+            std::env::var("SPARKLES_BIND_ADMISSION_FAST")
+                .ok()
+                .as_deref(),
+        );
         let cooldown = std::env::var("SPARKLES_BIND_COOLDOWN")
             .ok()
             .and_then(|s| s.parse::<u8>().ok())
@@ -174,6 +206,7 @@ fn reuse_config() -> ReuseConfig {
             split,
             scope,
             admission,
+            admission_fast_nanos,
             cooldown,
             iri_split_cooldown,
             trace,
@@ -534,19 +567,48 @@ impl EvalRate {
     /// Exact rational check `r * E >= COST_MIN_SAVING_NANOS`, i.e.,
     /// `repeats * self.nanos >= COST_MIN_SAVING_NANOS * observed_rows * self.rows`.
     fn meets_saving(&self, observed_rows: usize, repeats: usize) -> bool {
-        if observed_rows == 0 || repeats == 0 || self.rows == 0 || self.nanos == 0 {
+        self.meets_saving_nanos(observed_rows, repeats, COST_MIN_SAVING_NANOS)
+    }
+
+    /// Exact rational check `r * E >= min_saving_nanos`, i.e.,
+    /// `repeats * self.nanos >= min_saving_nanos * observed_rows * self.rows`.
+    fn meets_saving_nanos(
+        &self,
+        observed_rows: usize,
+        repeats: usize,
+        min_saving_nanos: u128,
+    ) -> bool {
+        if observed_rows == 0
+            || repeats == 0
+            || self.rows == 0
+            || self.nanos == 0
+            || min_saving_nanos == 0
+        {
             return false;
         }
         let Some(lhs) = (repeats as u128).checked_mul(self.nanos) else {
             return false;
         };
-        let Some(rhs) = COST_MIN_SAVING_NANOS
+        let Some(rhs) = min_saving_nanos
             .checked_mul(observed_rows as u128)
             .and_then(|v| v.checked_mul(self.rows as u128))
         else {
             return false;
         };
         lhs >= rhs
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeakDecision {
+    Fail,
+    Pass,
+    FastAdmit,
+}
+
+impl WeakDecision {
+    fn passed(self) -> bool {
+        !matches!(self, Self::Fail)
     }
 }
 
@@ -1023,8 +1085,16 @@ impl Reuse {
             batch_rows
         };
 
-        let probe_ok = probe_win.is_some_and(|(n, r, _)| self.weak_passes(n, r, bucket_rows, true));
-        let exact_ok = exact_signal.is_some_and(|(n, r)| self.weak_passes(n, r, bucket_rows, true));
+        let probe_dec = probe_win
+            .map(|(n, r, _)| self.weak_decision(n, r, bucket_rows, true))
+            .unwrap_or(WeakDecision::Fail);
+        let exact_dec = exact_signal
+            .map(|(n, r)| self.weak_decision(n, r, bucket_rows, true))
+            .unwrap_or(WeakDecision::Fail);
+        let probe_ok = probe_dec.passed();
+        let exact_ok = exact_dec.passed();
+        let fast_admit = matches!(probe_dec, WeakDecision::FastAdmit)
+            || matches!(exact_dec, WeakDecision::FastAdmit);
 
         let admit_reason = if probe_ok || exact_ok {
             self.weak_confirmations = self.weak_confirmations.saturating_add(1);
@@ -1033,6 +1103,12 @@ impl Reuse {
                     "counted_weak"
                 } else {
                     "probe_weak"
+                })
+            } else if fast_admit {
+                Some(if matches!(exact_dec, WeakDecision::FastAdmit) {
+                    "counted_weak_fast"
+                } else {
+                    "probe_weak_fast"
                 })
             } else {
                 None
@@ -1056,33 +1132,40 @@ impl Reuse {
         }
     }
 
-    /// Whether a weak unhinted repetition signal `(repeats / observed_rows)` passes the
-    /// `1/8` floor and (for parallel-capable cost mode) either bucket contention or the
-    /// rational `r * E >= 50 ns` guard.
-    fn weak_passes(
+    /// Evaluates a weak unhinted repetition signal `(repeats / observed_rows)` against the
+    /// `1/8` floor and (for parallel-capable cost mode) the rational saving and contention
+    /// guards. Returns [`WeakDecision::FastAdmit`] only when `admission_fast_nanos` is
+    /// enabled and the lower of two usable same-bucket rates meets that margin, keeping
+    /// contention-only evidence on the ordinary two-confirmation guard.
+    fn weak_decision(
         &self,
         observed_rows: usize,
         repeats: usize,
         bucket_rows: usize,
         parallel_capable: bool,
-    ) -> bool {
+    ) -> WeakDecision {
         if observed_rows == 0 || repeats.saturating_mul(ADMIT as usize) < observed_rows {
-            return false;
+            return WeakDecision::Fail;
         }
         match self.config.admission {
-            AdmissionMode::Off => false,
-            AdmissionMode::Legacy => true,
-            AdmissionMode::Cost if !parallel_capable => true,
+            AdmissionMode::Off => WeakDecision::Fail,
+            AdmissionMode::Legacy => WeakDecision::Pass,
+            AdmissionMode::Cost if !parallel_capable => WeakDecision::Pass,
             AdmissionMode::Cost => {
-                if self.split.is_contended(bucket_rows) {
-                    return true;
+                let rate = cost_bucket(bucket_rows).and_then(|cb| self.cost.lower_rate(cb));
+                if let (Some(fast_nanos), Some(rate)) = (self.config.admission_fast_nanos, rate)
+                    && rate.meets_saving_nanos(observed_rows, repeats, fast_nanos)
+                {
+                    return WeakDecision::FastAdmit;
                 }
-                let Some(cb) = cost_bucket(bucket_rows) else {
-                    return false;
-                };
-                self.cost
-                    .lower_rate(cb)
-                    .is_some_and(|rate| rate.meets_saving(observed_rows, repeats))
+                if self.split.is_contended(bucket_rows) {
+                    return WeakDecision::Pass;
+                }
+                if rate.is_some_and(|rate| rate.meets_saving(observed_rows, repeats)) {
+                    WeakDecision::Pass
+                } else {
+                    WeakDecision::Fail
+                }
             }
         }
     }
@@ -1104,8 +1187,9 @@ impl Reuse {
         };
         if let Some((w_rows, w_repeats, bucket_rows)) = self.batch_probe_window.take() {
             let parallel_capable = expr.parallel() && rayon::current_num_threads() > 1;
-            let pass = self.weak_passes(w_rows, w_repeats, bucket_rows, parallel_capable);
-            if pass {
+            let decision = self.weak_decision(w_rows, w_repeats, bucket_rows, parallel_capable);
+            let admit_now = self.mode == Mode::Probe && matches!(decision, WeakDecision::FastAdmit);
+            if decision.passed() {
                 self.weak_confirmations = self.weak_confirmations.saturating_add(1);
             } else {
                 self.weak_confirmations = 0;
@@ -1113,12 +1197,15 @@ impl Reuse {
             if self.config.trace {
                 self.trace_weak_decision(
                     "apply_carry",
-                    Some((w_rows, w_repeats, pass)),
+                    Some((w_rows, w_repeats, decision.passed())),
                     None,
                     bucket_rows,
                     self.weak_confirmations,
-                    None,
+                    admit_now.then_some(self.batch_index),
                 );
+            }
+            if admit_now {
+                self.admit("probe_weak_fast");
             }
         }
         self.batch_index = self.batch_index.saturating_add(1);
@@ -1266,9 +1353,18 @@ impl Reuse {
             }
             return Ok(false);
         }
-        if self.weak_confirmations >= WEAK_CONFIRMATIONS - 1
-            && self.weak_passes(rows, repeats, keys.len(), true)
-        {
+        let decision = self.weak_decision(rows, repeats, keys.len(), true);
+        let admit_now = matches!(decision, WeakDecision::FastAdmit)
+            || (matches!(decision, WeakDecision::Pass)
+                && self.weak_confirmations >= WEAK_CONFIRMATIONS - 1);
+        if admit_now {
+            let reason = if matches!(decision, WeakDecision::FastAdmit)
+                && self.weak_confirmations < WEAK_CONFIRMATIONS - 1
+            {
+                "probe_weak_fast"
+            } else {
+                "probe_weak"
+            };
             if self.config.trace {
                 self.trace_weak_decision(
                     "probe",
@@ -1279,7 +1375,7 @@ impl Reuse {
                     Some(self.batch_index),
                 );
             }
-            self.admit("probe_weak");
+            self.admit(reason);
             return Ok(true);
         }
         self.batch_probe_window = Some((rows, repeats, keys.len()));
@@ -1952,6 +2048,7 @@ mod tests {
             split: SplitMode::Retry,
             scope: SplitScope::Bind,
             admission: AdmissionMode::Cost,
+            admission_fast_nanos: None,
             cooldown: 2,
             iri_split_cooldown: None,
             trace: false,
@@ -2045,6 +2142,7 @@ mod tests {
             split: SplitMode::Retry,
             scope: SplitScope::Bind,
             admission: AdmissionMode::Cost,
+            admission_fast_nanos: None,
             cooldown: 2,
             iri_split_cooldown: None,
             trace: false,
@@ -3818,5 +3916,440 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn admission_fast_config_parser_and_default_off() {
+        assert_eq!(parse_admission_fast_nanos(None), None);
+        assert_eq!(parse_admission_fast_nanos(Some("")), None);
+        assert_eq!(parse_admission_fast_nanos(Some("0")), None);
+        assert_eq!(parse_admission_fast_nanos(Some("off")), None);
+        assert_eq!(parse_admission_fast_nanos(Some("false")), None);
+        assert_eq!(parse_admission_fast_nanos(Some("no")), None);
+        assert_eq!(parse_admission_fast_nanos(Some("49")), None);
+        assert_eq!(parse_admission_fast_nanos(Some("invalid")), None);
+        assert_eq!(
+            parse_admission_fast_nanos(Some("1")),
+            Some(COST_FAST_SAVING_NANOS)
+        );
+        assert_eq!(
+            parse_admission_fast_nanos(Some("on")),
+            Some(COST_FAST_SAVING_NANOS)
+        );
+        assert_eq!(
+            parse_admission_fast_nanos(Some("TRUE")),
+            Some(COST_FAST_SAVING_NANOS)
+        );
+        assert_eq!(
+            parse_admission_fast_nanos(Some("yes")),
+            Some(COST_FAST_SAVING_NANOS)
+        );
+        assert_eq!(parse_admission_fast_nanos(Some("50")), Some(50));
+        assert_eq!(parse_admission_fast_nanos(Some("100")), Some(100));
+        assert_eq!(parse_admission_fast_nanos(Some("250")), Some(250));
+        assert_eq!(ReuseConfig::default().admission_fast_nanos, None);
+
+        // Default-off preserves exact two-confirmation behavior even when predicted saving
+        // is far above 100 ns/row at both fallback and probe sites.
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+
+        let mut fb = new_reuse(&ctx, &expr, None).unwrap();
+        fb.mode = Mode::Probe;
+        fb.cost.record(4096, 4096 * 2_000);
+        let high_eval = ColumnEval {
+            evaluated_rows: 4096,
+            elapsed_nanos: Some(4096 * 2_000),
+            split: None,
+            parallel_allowed: true,
+        };
+        fb.batch_probe_window = Some((257, 33, 4096));
+        fb.observe_fallback_with(4096, high_eval, Some((4096, 3584)), true, true);
+        assert_eq!(fb.mode, Mode::Probe);
+        assert_eq!(fb.weak_confirmations, 1);
+        fb.observe_fallback_with(4096, high_eval, Some((4096, 3584)), true, true);
+        assert_eq!(fb.mode, Mode::Map);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let strings = local_strings(&ctx, 0..16_384);
+            let mut sampled_batch: Vec<Id> = strings
+                .iter()
+                .copied()
+                .filter(|id| sampled(*id))
+                .take(WINDOW as usize)
+                .collect();
+            sampled_batch.extend(
+                strings
+                    .iter()
+                    .copied()
+                    .filter(|id| !sampled(*id))
+                    .take(4096 - WINDOW as usize),
+            );
+            let mut probe = new_reuse(&ctx, &expr, None).unwrap();
+            let mut t1 = batch(input, &sampled_batch);
+            assert!(!probe.apply(&ctx, &mut t1, target, &expr).unwrap());
+            assert_eq!(probe.mode, Mode::Probe);
+            probe.cost.record(4096, 4096 * 2_000);
+            probe.cost.record(4096, 4096 * 2_000);
+            // First completed weak decision at probe site must NOT admit when switch is off.
+            let mut t2 = batch(input, &sampled_batch);
+            assert!(!probe.apply(&ctx, &mut t2, target, &expr).unwrap());
+            assert_eq!(probe.mode, Mode::Probe);
+            assert_eq!(probe.weak_confirmations, 0);
+            assert!(probe.batch_probe_window.is_some());
+        });
+    }
+
+    #[test]
+    fn fast_weak_admission_admits_on_single_decision_at_probe_and_fallback_sites() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let fast_cfg = ReuseConfig {
+            admission_fast_nanos: Some(COST_FAST_SAVING_NANOS),
+            trace: true,
+            ..ReuseConfig::default()
+        };
+
+        // 1. Exact rational boundary around 100 ns/row and 1/8 repeat floor.
+        let mut boundary = new_reuse_config(&ctx, &expr, None, fast_cfg).unwrap();
+        boundary.mode = Mode::Probe;
+        // Single rate is not usable for fast admission.
+        boundary.cost.record(4096, 4096 * 3_000);
+        assert_eq!(
+            boundary.weak_decision(4096, 512, 4096, true),
+            WeakDecision::Fail
+        );
+        // Lower of (3000, 799) = 799 ns/row at 1/8 repeat -> 99.875 ns/row (< 100 ns, >= 50 ns).
+        boundary.cost.record(4096, 4096 * 799);
+        assert_eq!(
+            boundary.weak_decision(4096, 512, 4096, true),
+            WeakDecision::Pass
+        );
+        // Lower of (799, 800) = 799 ns/row still < 100 ns.
+        boundary.cost.record(4096, 4096 * 800);
+        assert_eq!(
+            boundary.weak_decision(4096, 512, 4096, true),
+            WeakDecision::Pass
+        );
+        // Lower of (800, 1200) = 800 ns/row at 1/8 repeat -> exact 100 ns/row.
+        boundary.cost.record(4096, 4096 * 1_200);
+        assert_eq!(
+            boundary.weak_decision(4096, 512, 4096, true),
+            WeakDecision::FastAdmit
+        );
+        // Below 1/8 repeat floor (511/4096) fails even when rate is 3,000 ns/row.
+        boundary.cost.record(4096, 4096 * 3_000);
+        boundary.cost.record(4096, 4096 * 3_000);
+        assert_eq!(
+            boundary.weak_decision(4096, 511, 4096, true),
+            WeakDecision::Fail
+        );
+        // Mismatched bucket (Small vs Large) cannot use Large rates.
+        assert_eq!(
+            boundary.weak_decision(1024, 512, 1024, true),
+            WeakDecision::Fail
+        );
+
+        // 2. Fallback site (probe window deferred while only r0 exists, then r1 arrives):
+        //    matches sha-stride-8 at batch 2 (33/257 at min(2924, 1156) -> 148.4 ns/row).
+        let mut fb_probe = new_reuse_config(&ctx, &expr, None, fast_cfg).unwrap();
+        fb_probe.mode = Mode::Probe;
+        fb_probe.batch_index = 2;
+        fb_probe.cost.record(4096, 4096 * 2_924);
+        fb_probe.batch_probe_window = Some((257, 33, 4096));
+        fb_probe.observe_fallback_with(
+            4096,
+            ColumnEval {
+                evaluated_rows: 4096,
+                elapsed_nanos: Some(4096 * 1_156),
+                split: None,
+                parallel_allowed: true,
+            },
+            Some((4096, 3585)), // exact 511/4096 fails 1/8 floor
+            true,
+            true,
+        );
+        assert_eq!(fb_probe.mode, Mode::Map);
+        assert_eq!(fb_probe.trace.admit_batch, Some(2));
+        assert_eq!(fb_probe.trace.admit_reason, Some("probe_weak_fast"));
+
+        // 3. Fallback site (counted exact signal alone at exact 100 ns/row saving).
+        let mut fb_counted = new_reuse_config(&ctx, &expr, None, fast_cfg).unwrap();
+        fb_counted.mode = Mode::Probe;
+        fb_counted.batch_index = 3;
+        fb_counted.cost.record(4096, 4096 * 900);
+        fb_counted.observe_fallback_with(
+            4096,
+            ColumnEval {
+                evaluated_rows: 4096,
+                elapsed_nanos: Some(4096 * 800),
+                split: None,
+                parallel_allowed: true,
+            },
+            Some((4096, 3584)), // 512/4096 * 800 = 100 ns/row
+            true,
+            true,
+        );
+        assert_eq!(fb_counted.mode, Mode::Map);
+        assert_eq!(fb_counted.trace.admit_batch, Some(3));
+        assert_eq!(fb_counted.trace.admit_reason, Some("counted_weak_fast"));
+
+        // 4. Sub-100 ns/row saving (e.g. 94 ns/row matching join-str-random-60-65536) still
+        //    requires two confirmations, and probe + counted on the same batch count at most once.
+        let mut sub_fast = new_reuse_config(&ctx, &expr, None, fast_cfg).unwrap();
+        sub_fast.mode = Mode::Probe;
+        sub_fast.batch_index = 5;
+        sub_fast.cost.record(4096, 4096 * 210);
+        let str_eval = ColumnEval {
+            evaluated_rows: 4096,
+            elapsed_nanos: Some(4096 * 212),
+            split: None,
+            parallel_allowed: true,
+        };
+        // probe: 129/288 * 210 = 94.06 ns/row (< 100 ns); exact: 1400/4096 * 210 = 71.78 ns/row.
+        sub_fast.batch_probe_window = Some((288, 129, 4096));
+        sub_fast.observe_fallback_with(4096, str_eval, Some((4096, 2696)), true, true);
+        assert_eq!(
+            sub_fast.mode,
+            Mode::Probe,
+            "94 ns/row with both probe and counted on one batch must still need two confirmations"
+        );
+        assert_eq!(sub_fast.weak_confirmations, 1);
+
+        // Second consecutive passing batch (< 100 ns/row) admits via ordinary two-confirmation.
+        sub_fast.batch_index = 6;
+        sub_fast.batch_probe_window = Some((288, 129, 4096));
+        sub_fast.observe_fallback_with(4096, str_eval, None, true, true);
+        assert_eq!(sub_fast.mode, Mode::Map);
+        assert_eq!(sub_fast.trace.admit_batch, Some(6));
+        assert_eq!(sub_fast.trace.admit_reason, Some("probe_weak"));
+
+        // 5. Probe site under multi-worker pool (modeling join-sha-random-60-65536 at batch 3
+        //    vs join-str-random-60-65536 at 94 ns/row).
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let strings = local_strings(&ctx, 0..16_384);
+            let sampled_keys: Vec<Id> = strings
+                .iter()
+                .copied()
+                .filter(|id| sampled(*id))
+                .take(WINDOW as usize * 2)
+                .collect();
+            let unsampled_keys: Vec<Id> = strings
+                .iter()
+                .copied()
+                .filter(|id| !sampled(*id))
+                .take(4096)
+                .collect();
+
+            // Build a batch of 4,096 distinct keys with WINDOW sampled keys, then a second
+            // batch where 129/288 (~44.8%) of sampled keys repeat from the sketch.
+            let mut pilot_keys = sampled_keys[..WINDOW as usize].to_vec();
+            pilot_keys.extend_from_slice(&unsampled_keys[..4096 - WINDOW as usize]);
+
+            let mut repeat_keys = sampled_keys[..129].to_vec();
+            repeat_keys.extend_from_slice(&sampled_keys[WINDOW as usize..WINDOW as usize + 159]);
+            repeat_keys.extend_from_slice(&unsampled_keys[..4096 - 288]);
+            assert_eq!(repeat_keys.len(), 4096);
+
+            // High rate (1,394 ns/row -> 129/288 * 1394 = 624 ns/row >= 100 ns): admits
+            // immediately at the probe site on a single completed weak decision.
+            let mut fast_probe = new_reuse_config(&ctx, &expr, None, fast_cfg).unwrap();
+            let mut t1 = batch(input, &pilot_keys);
+            assert!(!fast_probe.apply(&ctx, &mut t1, target, &expr).unwrap());
+            assert_eq!(fast_probe.mode, Mode::Probe);
+            fast_probe.cost.record(4096, 4096 * 1_876);
+            fast_probe.cost.record(4096, 4096 * 1_394);
+            assert_eq!(fast_probe.weak_confirmations, 0);
+
+            let mut t2 = batch(input, &repeat_keys);
+            let expected = exec::column_rows(&ctx, &t2, &expr).unwrap();
+            assert!(
+                fast_probe.apply(&ctx, &mut t2, target, &expr).unwrap(),
+                "single probe weak decision >= 100 ns/row must admit directly at probe site"
+            );
+            assert_eq!(t2.cols[1], expected);
+            assert_eq!(fast_probe.mode, Mode::Map);
+            assert_eq!(fast_probe.trace.admit_batch, Some(2));
+            assert_eq!(fast_probe.trace.admit_reason, Some("probe_weak_fast"));
+
+            // Sub-100 ns rate (210 ns/row -> 129/288 * 210 = 94.06 ns/row < 100 ns): does NOT
+            // admit at probe site on 1st window; defers to fallback for at-most-once counting.
+            let mut slow_probe = new_reuse_config(&ctx, &expr, None, fast_cfg).unwrap();
+            let mut s1 = batch(input, &pilot_keys);
+            assert!(!slow_probe.apply(&ctx, &mut s1, target, &expr).unwrap());
+            slow_probe.cost.record(4096, 4096 * 210);
+            slow_probe.cost.record(4096, 4096 * 212);
+            let mut s2 = batch(input, &repeat_keys);
+            assert!(
+                !slow_probe.apply(&ctx, &mut s2, target, &expr).unwrap(),
+                "94 ns/row at probe site must not admit on first completed weak decision"
+            );
+            assert_eq!(slow_probe.mode, Mode::Probe);
+            assert_eq!(slow_probe.weak_confirmations, 0);
+            assert_eq!(slow_probe.batch_probe_window, Some((288, 129, 4096)));
+            // Fallback consumes that probe window as 1 confirmation, not 2.
+            slow_probe.observe_fallback_with(
+                4096,
+                ColumnEval {
+                    evaluated_rows: 4096,
+                    elapsed_nanos: Some(4096 * 210),
+                    split: None,
+                    parallel_allowed: true,
+                },
+                Some((4096, 2696)),
+                true,
+                true,
+            );
+            assert_eq!(slow_probe.mode, Mode::Probe);
+            assert_eq!(slow_probe.weak_confirmations, 1);
+            // Next batch's probe window is the 2nd confirmation and admits at probe site.
+            let mut s3 = batch(input, &repeat_keys);
+            assert!(slow_probe.apply(&ctx, &mut s3, target, &expr).unwrap());
+            assert_eq!(slow_probe.mode, Mode::Map);
+            assert_eq!(slow_probe.trace.admit_batch, Some(3));
+            assert_eq!(slow_probe.trace.admit_reason, Some("probe_weak"));
+        });
+    }
+
+    #[test]
+    fn fast_weak_admission_preserves_ordinary_guard_on_contention_only_evidence() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let fast_cfg = ReuseConfig {
+            admission_fast_nanos: Some(COST_FAST_SAVING_NANOS),
+            trace: true,
+            ..ReuseConfig::default()
+        };
+
+        let enter_large_contention = |reuse: &mut Reuse| {
+            reuse
+                .split
+                .observe(4096, true, true, true, Some(split(100_000, 1_200_000)));
+            reuse
+                .split
+                .observe(4096, true, true, true, Some(split(100_000, 1_200_000)));
+            assert!(reuse.split.is_contended(4096));
+        };
+
+        // 1. Contention with no cost history, single rate, mismatched bucket, or sub-100 ns
+        //    rates all yield WeakDecision::Pass (never FastAdmit).
+        let mut r = new_reuse_config(&ctx, &expr, None, fast_cfg).unwrap();
+        r.mode = Mode::Probe;
+        enter_large_contention(&mut r);
+        assert_eq!(r.weak_decision(4096, 512, 4096, true), WeakDecision::Pass);
+
+        // Single high rate still lacks two usable same-bucket rates -> contention-only -> Pass.
+        r.cost.record(4096, 4096 * 2_000);
+        assert_eq!(r.weak_decision(4096, 512, 4096, true), WeakDecision::Pass);
+
+        // Two rates in the wrong bucket (Small) -> contention-only for Large -> Pass.
+        r.cost.record(1024, 1024 * 2_000);
+        r.cost.record(1024, 1024 * 2_000);
+        assert_eq!(r.weak_decision(4096, 512, 4096, true), WeakDecision::Pass);
+
+        // Two cheap same-bucket rates (200 ns/row -> 25 ns/row saving) -> contention passes
+        // ordinary guard only (Pass, not FastAdmit).
+        r.cost.record(4096, 4096 * 200);
+        r.cost.record(4096, 4096 * 200);
+        assert_eq!(r.weak_decision(4096, 512, 4096, true), WeakDecision::Pass);
+
+        // Contention in Retry phase behaves the same.
+        r.split.large = BucketPhase::Retry;
+        assert!(r.split.is_contended(4096));
+        assert_eq!(r.weak_decision(4096, 512, 4096, true), WeakDecision::Pass);
+
+        // 2. Fallback site on contention-only evidence requires two confirmations.
+        let mut fb = new_reuse_config(&ctx, &expr, None, fast_cfg).unwrap();
+        fb.mode = Mode::Probe;
+        enter_large_contention(&mut fb);
+        let untimed = ColumnEval {
+            evaluated_rows: 4096,
+            elapsed_nanos: None,
+            split: None,
+            parallel_allowed: false,
+        };
+        fb.batch_index = 2;
+        fb.batch_probe_window = Some((256, 64, 4096));
+        fb.observe_fallback_with(4096, untimed, Some((4096, 3584)), true, true);
+        assert_eq!(
+            fb.mode,
+            Mode::Probe,
+            "contention-only fallback decision must keep two-confirmation guard"
+        );
+        assert_eq!(fb.weak_confirmations, 1);
+
+        fb.batch_index = 3;
+        fb.observe_fallback_with(4096, untimed, Some((4096, 3584)), true, true);
+        assert_eq!(fb.mode, Mode::Map);
+        assert_eq!(fb.trace.admit_batch, Some(3));
+        assert_eq!(fb.trace.admit_reason, Some("counted_weak"));
+
+        // 3. Probe site on contention-only evidence also requires two confirmations.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let strings = local_strings(&ctx, 0..16_384);
+            let mut sampled_batch: Vec<Id> = strings
+                .iter()
+                .copied()
+                .filter(|id| sampled(*id))
+                .take(WINDOW as usize)
+                .collect();
+            sampled_batch.extend(
+                strings
+                    .iter()
+                    .copied()
+                    .filter(|id| !sampled(*id))
+                    .take(4096 - WINDOW as usize),
+            );
+            let mut probe = new_reuse_config(&ctx, &expr, None, fast_cfg).unwrap();
+            let mut t1 = batch(input, &sampled_batch);
+            assert!(!probe.apply(&ctx, &mut t1, target, &expr).unwrap());
+            enter_large_contention(&mut probe);
+            // First window on contention-only evidence must NOT fast-admit at probe site.
+            let mut t2 = batch(input, &sampled_batch);
+            assert!(!probe.apply(&ctx, &mut t2, target, &expr).unwrap());
+            assert_eq!(probe.mode, Mode::Probe);
+            assert_eq!(probe.weak_confirmations, 0);
+            probe.observe_fallback_with(4096, untimed, None, true, true);
+            assert_eq!(probe.mode, Mode::Probe);
+            assert_eq!(probe.weak_confirmations, 1);
+            // Second window admits under ordinary two-confirmation.
+            let mut t3 = batch(input, &sampled_batch);
+            assert!(probe.apply(&ctx, &mut t3, target, &expr).unwrap());
+            assert_eq!(probe.mode, Mode::Map);
+            assert_eq!(probe.trace.admit_reason, Some("probe_weak"));
+        });
+
+        // 4. Contended bucket that ALSO has two usable same-bucket rates predicting >= 100 ns/row
+        //    is not penalized by contention and fast-admits on one decision.
+        let mut both = new_reuse_config(&ctx, &expr, None, fast_cfg).unwrap();
+        both.mode = Mode::Probe;
+        enter_large_contention(&mut both);
+        both.cost.record(4096, 4096 * 900);
+        both.cost.record(4096, 4096 * 800);
+        assert_eq!(
+            both.weak_decision(4096, 512, 4096, true),
+            WeakDecision::FastAdmit
+        );
     }
 }
