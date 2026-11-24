@@ -13,7 +13,7 @@ use crate::vocab::AppendVocab;
 use oxrdf::Term;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -1040,6 +1040,9 @@ pub struct Ctx {
     /// whether the query streams through pull cursors, whose grant follows their live
     /// bytes (see [`Ctx::streams`])
     streams: bool,
+    /// active scoped strict-decode guards (such as constant folding) that refuse eager
+    /// decode envelope overflows instead of silently dropping them
+    strict_decode: AtomicU32,
     // Data and weak retained caches drop before final ledger ownership.
     fast: FastMemory,
     memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
@@ -1472,6 +1475,7 @@ impl Ctx {
             owner: Default::default(),
             regex: Default::default(),
             streams: false,
+            strict_decode: AtomicU32::new(0),
             fast: Default::default(),
             memory: Default::default(),
             snap,
@@ -2104,6 +2108,21 @@ impl Ctx {
         self.streams()
     }
 
+    /// Whether a scoped strict-decode guard is active on this context (for example,
+    /// constant folding during planning), requiring eager decodes to refuse on budget
+    /// overflow and check live controls during vocabulary reconstruction.
+    #[inline]
+    fn is_strict_decode(&self) -> bool {
+        self.strict_decode.load(Ordering::Relaxed) != 0
+    }
+
+    /// Enable strict decoding for the lifetime of the returned guard so evaluator term
+    /// and value decodes propagate budget and control refusals even in eager mode.
+    pub(super) fn strict_decode_guard(&self) -> StrictDecodeGuard<'_> {
+        self.strict_decode.fetch_add(1, Ordering::AcqRel);
+        StrictDecodeGuard { ctx: self }
+    }
+
     #[cold]
     #[inline(never)]
     fn grow_decode(&self, need: u64) -> Result<()> {
@@ -2121,10 +2140,12 @@ impl Ctx {
                 // Eager callers of `term` and `value`, the planner's plan text and the
                 // readers of a finished result among them, cannot report a refusal. An
                 // eager envelope is therefore charged when the budget and the pool allow
-                // it, and otherwise the key is decoded without it, as eager decoding
-                // always was. The next growth tries the charge again.
-                let Ok(charge) = self.charge(need - *peak) else {
-                    return Ok(());
+                // it, and otherwise the key is decoded without it, unless a scoped
+                // strict-decode guard is active. The next growth tries the charge again.
+                let charge = match self.charge(need - *peak) {
+                    Ok(charge) => charge,
+                    Err(error) if self.is_strict_decode() => return Err(error),
+                    Err(_) => return Ok(()),
                 };
                 let id = charge.disarm();
                 debug_assert!(owner.is_none() || id.is_none() || *owner == id);
@@ -2156,7 +2177,8 @@ impl Ctx {
     /// decoding inside the envelope. A refusal records a failure and gives `None`.
     #[inline]
     fn with_vocab_key<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
-        if !self.envelope_refuses() {
+        let strict = self.is_strict_decode();
+        if !self.envelope_refuses() && !strict {
             // An envelope that never refuses is charged after the key is rebuilt, on the
             // vocabulary's unchecked path. Checking it before each step of the rebuild
             // made an eager `term` about a quarter slower, which writing a large answer
@@ -2170,7 +2192,12 @@ impl Ctx {
         }
         match self.snap.generation.vocab.get_with_checked(
             id,
-            |need| self.reserve_decode_checked(need),
+            |need| {
+                if strict {
+                    self.check()?;
+                }
+                self.reserve_decode_checked(need)
+            },
             |key| self.reserve_decode(key.len()).then(|| f(key)),
         ) {
             Ok(found) => found.flatten(),
@@ -3909,6 +3936,17 @@ fn output_key_bytes_inner(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
 #[inline]
 pub fn table_bytes(rows: usize, width: usize) -> u64 {
     (rows as u64).saturating_mul(width.max(1) as u64 * 8)
+}
+
+/// RAII guard returned by [`Ctx::strict_decode_guard`].
+pub(super) struct StrictDecodeGuard<'a> {
+    ctx: &'a Ctx,
+}
+
+impl Drop for StrictDecodeGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.strict_decode.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Estimated memory held by a running operator (its input tables), released when the

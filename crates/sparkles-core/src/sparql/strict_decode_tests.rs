@@ -911,6 +911,149 @@ fn enhancer_planner_subst_and_remote_run_propagate_memory_error() {
     }
 }
 
+#[test]
+fn remote_and_history_consumers_retain_decoded_output_credit_until_release() {
+    let long_outer = "o".repeat(2048);
+    let long_input = "i".repeat(2048);
+    let long_hist = format!("http://example.org/hist/{}", "h".repeat(2048));
+    let ttl = format!(
+        "<http://example.org/s> <http://example.org/p> \"{long_outer}\" .\n\
+         <http://example.org/s> <http://example.org/q> \"{long_input}\" .\n\
+         <{long_hist}> <http://example.org/p> <http://example.org/o> .\n"
+    );
+    let store = store_with_turtle(&ttl, true);
+    let snap = store.snapshot();
+    let outer_id = snap
+        .lookup_term(&Term::Literal(Literal::new_simple_literal(&long_outer)))
+        .unwrap();
+    let input_id = snap
+        .lookup_term(&Term::Literal(Literal::new_simple_literal(&long_input)))
+        .unwrap();
+    let hist_id = snap.lookup_iri(&long_hist).unwrap();
+    assert_eq!(outer_id.tag(), Tag::Vocab);
+    assert_eq!(input_id.tag(), Tag::Vocab);
+    assert_eq!(hist_id.tag(), Tag::Vocab);
+
+    let pattern = GraphPattern::Bgp {
+        patterns: vec![TriplePattern {
+            subject: TermPattern::Variable(Variable::new_unchecked("x")),
+            predicate: NamedNodePattern::NamedNode(NamedNode::new_unchecked(
+                "http://example.org/p",
+            )),
+            object: TermPattern::Variable(Variable::new_unchecked("y")),
+        }],
+    };
+    let rl = super::enhancer::RemoteLoop {
+        endpoint: NamedNode::new_unchecked("http://example.org/sparql"),
+        bulk: 10,
+        cache: super::enhancer::CacheMode::None,
+        silent: false,
+        values: true,
+        idx: "__idx".into(),
+    };
+
+    // 1. RemoteRun::new keeps outer decoded credit alive, and RemoteRun::add keeps input
+    //    decoded credit alive, until RemoteRun drops (both eager and cursor modes).
+    for cursor in [false, true] {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = MIB;
+        ctx.allow_service = true;
+        if cursor {
+            ctx.enable_cursor_accounting().unwrap();
+        }
+        let v_x = ctx.var("x");
+        let v_y = ctx.var("y");
+        let spec = LateralSpec {
+            pattern: pattern.clone(),
+            keys: vec![v_y],
+            outer: vec![(v_x, outer_id)],
+            outer_scoped: Vec::new(),
+            graph: ActiveGraph::Default,
+            optional: None,
+            unscoped: false,
+            service: Some(Box::new(rl.clone())),
+        };
+        let baseline = ctx.live_bytes();
+        let mut run = super::enhancer::RemoteRun::new(&ctx, &spec, &rl).unwrap();
+        let after_new = ctx.live_bytes();
+        assert!(
+            after_new > baseline,
+            "RemoteRun::new must keep outer decode credit alive while RemoteRun is alive (cursor={cursor}, baseline={baseline}, after_new={after_new})"
+        );
+
+        let mut left = Table::new(vec![v_y]);
+        left.push_row(&[input_id]);
+        run.add(&ctx, &spec, &rl, &left).unwrap();
+        let after_add = ctx.live_bytes();
+        assert!(
+            after_add > after_new,
+            "RemoteRun::add must keep input decode credit alive while RemoteRun is alive (cursor={cursor}, after_new={after_new}, after_add={after_add})"
+        );
+
+        drop(run);
+        assert_eq!(
+            ctx.live_bytes(),
+            baseline,
+            "dropping RemoteRun must release retained decode credit (cursor={cursor})"
+        );
+    }
+
+    // 2. planner_subst keeps decoded term credit alive while the returned Subst is alive.
+    {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = MIB;
+        let v_x = ctx.var("x");
+        let mut planner = Planner::new(&ctx);
+        planner.subst.insert(v_x, outer_id);
+        let baseline = ctx.live_bytes();
+        let subst = super::enhancer::planner_subst(&planner, &pattern).unwrap();
+        assert!(
+            ctx.live_bytes() > baseline,
+            "planner_subst must keep decoded credit alive while returned Subst is alive (baseline={baseline}, live={})",
+            ctx.live_bytes()
+        );
+        drop(subst);
+        assert_eq!(ctx.live_bytes(), baseline);
+    }
+
+    // 3. history_svc::bind keeps decoded term credit alive while the returned HistorySpec is alive.
+    {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = MIB;
+        let v_s = ctx.var("s");
+        let spec = super::history_svc::HistorySpec {
+            s: super::history_svc::Slot::Var(v_s),
+            p: super::history_svc::Slot::Any,
+            o: super::history_svc::Slot::Any,
+            g: super::history_svc::Slot::Any,
+            op: super::history_svc::Slot::Any,
+            commit: None,
+            time: None,
+            kind: None,
+            author: None,
+            message: None,
+            from: None,
+            to: None,
+            from_var: None,
+            to_var: None,
+            limit: None,
+            descending: false,
+            inputs: vec![v_s],
+        };
+        let baseline = ctx.live_bytes();
+        let bound = super::history_svc::bind(&ctx, &spec, &[hist_id])
+            .unwrap()
+            .expect("bound history spec");
+        assert!(
+            ctx.live_bytes() > baseline,
+            "history_svc::bind must keep decoded credit alive while returned spec is alive (baseline={baseline}, live={})",
+            ctx.live_bytes()
+        );
+        drop(bound);
+        assert_eq!(ctx.live_bytes(), baseline);
+    }
+}
+
 #[cfg(feature = "geo")]
 #[test]
 fn geopf_and_georewrite_propagate_memory_error() {
@@ -1211,6 +1354,77 @@ fn rdfs_schema_and_explain_propagate_memory_error() {
             }
             other => panic!("expected Explained::Found, got {other:?}"),
         }
+    }
+
+    // 5. Cx::chain must account for decoded neighbours retained in back/queue across BFS.
+    {
+        let ont = "http://example.org/ont";
+        let mut nq = String::new();
+        for i in 0..30 {
+            let pad = format!("http://example.org/A{i:02}/{}", "n".repeat(300));
+            nq.push_str(&format!(
+                "<http://example.org/Start> <{}> <{pad}> <{ont}> .\n",
+                rdfs::SUB_CLASS_OF.as_str()
+            ));
+        }
+        nq.push_str(&format!(
+            "<http://example.org/Start> <{0}> <http://example.org/Mid> <{ont}> .\n\
+             <http://example.org/Mid> <{0}> <http://example.org/End> <{ont}> .\n",
+            rdfs::SUB_CLASS_OF.as_str()
+        ));
+        let wide = Store::in_memory(StoreOptions::default());
+        wide.load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        wide.compact().unwrap();
+        let snap = wide.snapshot();
+        let schema = super::rdfs::schema_of_graph(&snap, Some(ont)).unwrap();
+        let gid = snap.lookup_iri(ont).unwrap();
+        let triple = [
+            Term::NamedNode(NamedNode::new_unchecked("http://example.org/Start")),
+            Term::NamedNode(rdfs::SUB_CLASS_OF.into_owned()),
+            Term::NamedNode(NamedNode::new_unchecked("http://example.org/End")),
+        ];
+        // Positive control: unbounded proof is short (~500 bytes, well under 4096).
+        let unbounded = schema
+            .explain(
+                &snap,
+                super::rdfs::SchemaLeaves::Graph(gid),
+                &[gid],
+                &triple,
+                crate::explain::ExplainLimits {
+                    max_trees: 1,
+                    max_depth: 8,
+                    deadline: None,
+                    cancel: None,
+                    max_memory: None,
+                },
+            )
+            .unwrap();
+        match unbounded {
+            crate::explain::Explained::Found { trees, .. } => {
+                assert!(trees[0].heap_bytes() < 4096);
+            }
+            other => panic!("expected Explained::Found, got {other:?}"),
+        }
+        // Under 4096 answer limit (workspace 8448), 30 distinct ~325 B neighbours individually fit
+        // but cumulatively exceed the workspace cap while retained in back + queue.
+        let res = schema.explain(
+            &snap,
+            super::rdfs::SchemaLeaves::Graph(gid),
+            &[gid],
+            &triple,
+            crate::explain::ExplainLimits {
+                max_trees: 1,
+                max_depth: 8,
+                deadline: None,
+                cancel: None,
+                max_memory: Some(4096),
+            },
+        );
+        assert!(
+            matches!(&res, Err(Error::Component(c)) if c.code == "reasoning-budget"),
+            "Cx::chain must fail with reasoning-budget when retained neighbours exceed workspace cap, got {res:?}"
+        );
     }
 }
 
@@ -1530,6 +1744,132 @@ fn geopf_fold_const_checked_propagates_memory_error_on_nested_const_in_eager_mod
         super::geopf::fold_const_checked(&expr, &ctx),
         "geopf::fold_const_checked nested Expr::Const in eager mode",
     );
+}
+
+#[cfg(feature = "geo")]
+#[test]
+fn geopf_fold_const_checked_str_refuses_and_if_skips_unselected_branch_in_eager_mode() {
+    let payload = "w".repeat(2048);
+    let long_iri1 = format!("http://example.org/large1/{}", "a".repeat(2048));
+    let long_iri2 = format!("http://example.org/large2/{}", "b".repeat(2048));
+    let ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         <{long_iri1}> ex:p \"POINT(0 0) {payload}\" .\n\
+         <{long_iri2}> ex:q \"POINT(1 2)\"^^<{}> .\n",
+        crate::geo::vocab::WKT_LITERAL,
+    );
+    let store = store_with_turtle(&ttl, true);
+    let snap = store.snapshot();
+    let long_lit_text = format!("POINT(0 0) {payload}");
+    let long_lit_id = snap
+        .lookup_term(&Term::Literal(Literal::new_simple_literal(&long_lit_text)))
+        .unwrap();
+    let large_const1 = snap.lookup_iri(&long_iri1).unwrap();
+    let large_const2 = snap.lookup_iri(&long_iri2).unwrap();
+    let small_geom_id = snap
+        .lookup_term(&Term::Literal(Literal::new_typed_literal(
+            "POINT(1 2)",
+            NamedNode::new_unchecked(crate::geo::vocab::WKT_LITERAL),
+        )))
+        .unwrap();
+    let small_geom_val = super::value::Value::Other {
+        lex: "POINT(1 2)".into(),
+        dt: crate::geo::vocab::WKT_LITERAL.into(),
+    };
+    assert_eq!(long_lit_id.tag(), Tag::Vocab);
+    assert_eq!(large_const1.tag(), Tag::Vocab);
+
+    // 1. Eager mode: STR over an existing long Expr::Lit must propagate Memory refusal.
+    {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = MIB;
+        let expr = super::expr::Expr::Call(
+            super::expr::Func::Builtin(spargebra::algebra::Function::Str),
+            vec![super::expr::Expr::Lit(
+                long_lit_id,
+                super::value::Value::Str(long_lit_text.clone().into()),
+            )],
+        );
+        let _held = hold_all_but(&ctx, 100);
+        assert_memory_budget_error(
+            super::geopf::fold_const_checked(&expr, &ctx),
+            "geopf::fold_const_checked STR over long Expr::Lit in eager mode",
+        );
+    }
+
+    // 2. Eager mode: DATATYPE over an existing long Expr::Lit must propagate Memory refusal.
+    {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = MIB;
+        let expr = super::expr::Expr::Call(
+            super::expr::Func::Builtin(spargebra::algebra::Function::Datatype),
+            vec![super::expr::Expr::Lit(
+                long_lit_id,
+                super::value::Value::Str(long_lit_text.into()),
+            )],
+        );
+        let _held = hold_all_but(&ctx, 100);
+        assert_memory_budget_error(
+            super::geopf::fold_const_checked(&expr, &ctx),
+            "geopf::fold_const_checked DATATYPE over long Expr::Lit in eager mode",
+        );
+    }
+
+    // 3. Eager mode: IF(true, <small geometry>, <large Expr::Const>) must NOT decode the
+    //    unselected branch and must fold to the small geometry.
+    {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = MIB;
+        let expr = super::expr::Expr::If(
+            Box::new(super::expr::Expr::Const(Id::from_bool(true))),
+            Box::new(super::expr::Expr::Lit(
+                small_geom_id,
+                small_geom_val.clone(),
+            )),
+            Box::new(super::expr::Expr::Const(large_const1)),
+        );
+        let _held = hold_all_but(&ctx, 100);
+        let folded = super::geopf::fold_const_checked(&expr, &ctx)
+            .expect("unselected IF branch must not be decoded during constant folding");
+        assert_eq!(folded.map(|v| v.to_term()), Some(small_geom_val.to_term()));
+    }
+
+    // 4. Eager mode: ID-only sameTerm comparison + unselected IF branch must not decode either.
+    {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = MIB;
+        let expr = super::expr::Expr::If(
+            Box::new(super::expr::Expr::SameTerm(
+                Box::new(super::expr::Expr::Const(large_const1)),
+                Box::new(super::expr::Expr::Const(large_const1)),
+            )),
+            Box::new(super::expr::Expr::Lit(
+                small_geom_id,
+                small_geom_val.clone(),
+            )),
+            Box::new(super::expr::Expr::Const(large_const2)),
+        );
+        let _held = hold_all_but(&ctx, 100);
+        let folded = super::geopf::fold_const_checked(&expr, &ctx)
+            .expect("ID-only sameTerm and unselected branch must not decode");
+        assert_eq!(folded.map(|v| v.to_term()), Some(small_geom_val.to_term()));
+    }
+
+    // 5. Eager mode: IF(true, <large Expr::Const>, <small geometry>) must refuse on the selected branch.
+    {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = MIB;
+        let expr = super::expr::Expr::If(
+            Box::new(super::expr::Expr::Const(Id::from_bool(true))),
+            Box::new(super::expr::Expr::Const(large_const1)),
+            Box::new(super::expr::Expr::Lit(small_geom_id, small_geom_val)),
+        );
+        let _held = hold_all_but(&ctx, 100);
+        assert_memory_budget_error(
+            super::geopf::fold_const_checked(&expr, &ctx),
+            "geopf::fold_const_checked selected large IF branch in eager mode",
+        );
+    }
 }
 
 #[cfg(feature = "geo")]

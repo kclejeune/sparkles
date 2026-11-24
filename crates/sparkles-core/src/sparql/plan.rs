@@ -2102,7 +2102,7 @@ impl<'a> Planner<'a> {
                     };
                 // the constants in force (initial bindings, the row of an EXISTS or a
                 // LATERAL) are sent as values
-                let subst = super::enhancer::planner_subst(self, inner)?;
+                let (subst, subst_credit) = super::enhancer::planner_subst(self, inner)?;
                 let mut names = Vec::new();
                 collect_pattern_vars(inner, &mut names);
                 let mut vars: Vec<VarId> = names
@@ -2122,6 +2122,8 @@ impl<'a> Planner<'a> {
                 } else {
                     super::enhancer::single_request(&super::enhancer::substitute(inner, &subst))
                 };
+                drop(subst);
+                drop(subst_credit);
                 let mut n = Node::leaf(
                     Kind::Service {
                         endpoint,

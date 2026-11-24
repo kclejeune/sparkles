@@ -18,10 +18,11 @@
 //! The options are IRIs with a scheme that is neither `http` nor `https`, so no query
 //! that could reach an endpoint before means something else now.
 
-use super::ctx::Ctx;
+use super::ctx::{Charge, Ctx};
 use super::exec::{join_tables, left_join};
 use super::lateral::LateralSpec;
 use super::plan::{ActiveGraph, Kind, Node, Planner, collect_pattern_vars};
+use super::query_memory::QueryMemoryLease;
 use super::svccache::{self, Rows};
 use super::table::{Table, VarId};
 use crate::error::{Error, Result};
@@ -1035,13 +1036,17 @@ pub(super) fn plan_loop(
 }
 
 /// The substitutions of the planner's constants (initial bindings, the row of an
-/// enclosing `EXISTS` or `LATERAL`) into a SERVICE pattern.
-pub(super) fn planner_subst(p: &Planner<'_>, inner: &GraphPattern) -> Result<Subst> {
+/// enclosing `EXISTS` or `LATERAL`) into a SERVICE pattern, together with the decode
+/// credit that must stay alive until the returned map is dropped.
+pub(super) fn planner_subst<'a>(
+    p: &Planner<'a>,
+    inner: &GraphPattern,
+) -> Result<(Subst, Charge<'a>)> {
+    let decode = p.ctx.charge(0)?;
     let mut s = Subst::default();
     if p.subst.is_empty() {
-        return Ok(s);
+        return Ok((s, decode));
     }
-    let decode = p.ctx.charge(0)?;
     for n in all_vars(inner) {
         let v = p.ctx.var(&n);
         if let Some(id) = p.subst.get(&v)
@@ -1053,7 +1058,7 @@ pub(super) fn planner_subst(p: &Planner<'_>, inner: &GraphPattern) -> Result<Sub
             s.add(&n, t);
         }
     }
-    Ok(s)
+    Ok((s, decode))
 }
 
 // ------------------------------------------------------------- execution ------
@@ -1203,6 +1208,9 @@ pub(super) struct RemoteRun {
     /// the bytes of the keys and inputs the loop keeps, summed as they are added
     kept: u64,
     pub stats: LoopStats,
+    /// retained credit for decoded outer constants and input terms, dropped last after
+    /// `outer`, `pattern`, `inputs` and `by_values`
+    decode_lease: Option<QueryMemoryLease>,
 }
 
 /// The bytes one distinct key of `width` identifiers holds in `by_key`: the key, its
@@ -1245,7 +1253,11 @@ impl RemoteRun {
             }
         }
         let pattern = substitute(&spec.pattern, &outer);
-        drop(decode);
+        let decode_lease = if decode.bytes() > 0 {
+            Some(decode.output_lease(decode.bytes())?)
+        } else {
+            None
+        };
         let text = spec.pattern.to_string();
         let cache = &ctx.snap.results.service;
         let caching = rl.cache != CacheMode::None
@@ -1266,6 +1278,7 @@ impl RemoteRun {
             held: 0,
             kept: 0,
             stats: LoopStats::default(),
+            decode_lease,
         })
     }
 
@@ -1347,6 +1360,13 @@ impl RemoteRun {
                 self.missing.push(i);
             }
             self.kept = self.kept.saturating_add(input_bytes(&self.inputs[i]));
+        }
+        if decode.bytes() > 0 {
+            let mut lease = Some(decode.output_lease(decode.bytes())?);
+            match &mut self.decode_lease {
+                Some(held) => held.merge(&mut lease)?,
+                None => self.decode_lease = lease,
+            }
         }
         Ok(())
     }

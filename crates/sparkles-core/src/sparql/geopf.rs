@@ -268,8 +268,6 @@ pub(crate) fn fold_const_checked(e: &Expr, ctx: &Ctx) -> Result<Option<super::va
     if !e.var_set().is_empty() || e.has_exists() || !super::cache::deterministic(e) {
         return Ok(None);
     }
-    let credit = ctx.charge(0)?;
-    let resolved = resolve_const_inputs(e, ctx, &credit)?;
     let t = Table::unit();
     let map = t.var_map(ctx.nvars());
     let row = Row {
@@ -279,44 +277,17 @@ pub(crate) fn fold_const_checked(e: &Expr, ctx: &Ctx) -> Result<Option<super::va
         dec: None,
         exists: None,
     };
-    let evaluated = eval(&resolved, &row, ctx);
+    let strict = ctx.strict_decode_guard();
+    let evaluated = eval(e, &row, ctx);
+    drop(strict);
     ctx.check()?;
     let Ok(val) = evaluated else {
         return Ok(None);
     };
     match val {
-        Val::Id(id) => ctx.value_checked_into(id, &credit),
+        Val::Id(id) => ctx.value_checked(id),
         Val::V(v) | Val::Dec(_, v) => Ok(Some(v)),
     }
-}
-
-/// Replace every nested [`Expr::Const`] inside a deterministic constant expression with
-/// its checked decoded [`Expr::Lit`], so constant folding never falls back to eager
-/// unchecked decoding on nested operands.
-fn resolve_const_inputs(e: &Expr, ctx: &Ctx, credit: &super::ctx::Charge<'_>) -> Result<Expr> {
-    let r = |child: &Expr| resolve_const_inputs(child, ctx, credit);
-    let r_box = |child: &Expr| -> Result<Box<Expr>> { Ok(Box::new(r(child)?)) };
-    let r_vec = |children: &[Expr]| -> Result<Vec<Expr>> { children.iter().map(r).collect() };
-    Ok(match e {
-        Expr::Const(id) => match ctx.value_checked_into(*id, credit)? {
-            Some(v) => Expr::Lit(*id, v),
-            None => Expr::Const(*id),
-        },
-        Expr::Lit(_, _) | Expr::Var(_) | Expr::Bound(_) | Expr::Exists(_) => e.clone(),
-        Expr::Or(a, b) => Expr::Or(r_box(a)?, r_box(b)?),
-        Expr::And(a, b) => Expr::And(r_box(a)?, r_box(b)?),
-        Expr::Not(a) => Expr::Not(r_box(a)?),
-        Expr::Eq(a, b) => Expr::Eq(r_box(a)?, r_box(b)?),
-        Expr::SameTerm(a, b) => Expr::SameTerm(r_box(a)?, r_box(b)?),
-        Expr::Cmp(a, b, op) => Expr::Cmp(r_box(a)?, r_box(b)?, *op),
-        Expr::In(a, list) => Expr::In(r_box(a)?, r_vec(list)?),
-        Expr::Arith(a, b, op) => Expr::Arith(r_box(a)?, r_box(b)?, *op),
-        Expr::Neg(a) => Expr::Neg(r_box(a)?),
-        Expr::Pos(a) => Expr::Pos(r_box(a)?),
-        Expr::If(a, b, c) => Expr::If(r_box(a)?, r_box(b)?, r_box(c)?),
-        Expr::Coalesce(list) => Expr::Coalesce(r_vec(list)?),
-        Expr::Call(func, args) => Expr::Call(func.clone(), r_vec(args)?),
-    })
 }
 
 /// Helpers the spatial join and nearest-neighbour planning share.

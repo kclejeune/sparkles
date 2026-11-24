@@ -38,7 +38,7 @@
 //! changes of its binding. `hist:limit` applies to each lookup. A variable of `hist:from`
 //! or `hist:to` must be bound by the group.
 
-use super::ctx::Ctx;
+use super::ctx::{Charge, Ctx};
 use super::plan::{Kind, Node, PT, Planner};
 use super::table::{Table, VarId};
 use crate::error::{Error, Result};
@@ -463,7 +463,12 @@ pub(super) fn run(
             let t = match bind(ctx, spec, &key)? {
                 // the lookup binds the call's variables but those whose values the row
                 // gave as constants
-                Some(s) => lookup(ctx, &s, &s.outputs())?,
+                Some((s, decode)) => {
+                    let t = lookup(ctx, &s, &s.outputs())?;
+                    drop(s);
+                    drop(decode);
+                    t
+                }
                 None => Table::empty(outputs.clone()),
             };
             rows += t.len();
@@ -490,10 +495,15 @@ pub(super) fn run(
     Ok(out)
 }
 
-/// The call with the values of one binding of its input variables as constants. An
+/// The call with the values of one binding of its input variables as constants, together
+/// with the decode credit that must stay alive until the bound spec is dropped. An
 /// unbound value leaves its variable to the lookup. `None` when no change can match,
 /// such as a literal in the predicate's place.
-pub(super) fn bind(ctx: &Ctx, spec: &HistorySpec, key: &[Id]) -> Result<Option<HistorySpec>> {
+pub(super) fn bind<'a>(
+    ctx: &'a Ctx,
+    spec: &HistorySpec,
+    key: &[Id],
+) -> Result<Option<(HistorySpec, Charge<'a>)>> {
     let mut s = spec.clone();
     s.inputs.clear();
     let decode = ctx.charge(0)?;
@@ -529,7 +539,7 @@ pub(super) fn bind(ctx: &Ctx, spec: &HistorySpec, key: &[Id]) -> Result<Option<H
         _ => true,
     } && !matches!(&s.g, Slot::Const(Term::Literal(_)))
         && !matches!(&s.s, Slot::Const(Term::Literal(_)));
-    Ok(ok.then_some(s))
+    Ok(ok.then_some((s, decode)))
 }
 
 /// One lookup in the change log: the changes that match the call's constants, as rows

@@ -39,7 +39,7 @@
 //! query does not call.
 
 mod explain;
-pub use explain::{AssertedResolver, SchemaLeaves};
+pub use explain::{AssertedResolver, SchemaLeaves, WorkspaceResolver};
 
 use super::ctx::Ctx;
 use crate::error::Result;
@@ -309,10 +309,22 @@ impl RdfsOnRead {
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Arc<RdfsSchema>> {
         let workspace = ExplainWorkspace::for_answer_limit(max_memory);
+        self.schema_controlled_with_workspace(snap, &workspace, check)
+    }
+
+    /// Read or build this snapshot's schema within the request's controls and a shared
+    /// [`ExplainWorkspace`], releasing the temporary build triples once the schema is built.
+    pub(crate) fn schema_controlled_with_workspace(
+        &self,
+        snap: &Snapshot,
+        workspace: &ExplainWorkspace,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Arc<RdfsSchema>> {
+        let mut hold = workspace.hold(0)?;
         self.schema_with(snap, check, &mut |id, check| {
             let term = workspace.decode_term(snap, id, check)?;
             if let Some(t) = &term {
-                workspace.retain(crate::explain::term_bytes(t))?;
+                hold.add(crate::explain::term_bytes(t))?;
             }
             Ok(term)
         })
@@ -363,20 +375,93 @@ impl RdfsOnRead {
 /// while the transient decode workspace is bounded to `2 * answer_limit + 256` bytes.
 /// That bound allows any term that fits the answer limit to be reconstructed while
 /// old and new scratch buffers or scratch and decoded output coexist, while refusing
-/// oversized keys and accumulated schema decodes before allocating.
-pub(crate) struct ExplainWorkspace {
+/// oversized keys and accumulated proof-search or schema decodes before allocating.
+pub struct ExplainWorkspace {
     limit: Option<usize>,
     retained: Cell<usize>,
     scratch: Cell<usize>,
 }
 
+/// Scoped hold of retained decoded bytes on an [`ExplainWorkspace`], automatically
+/// released when dropped.
+pub(crate) struct WorkspaceHold<'a> {
+    workspace: &'a ExplainWorkspace,
+    bytes: usize,
+}
+
+impl<'a> WorkspaceHold<'a> {
+    pub(crate) fn add(&mut self, bytes: usize) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let next = self.workspace.retained.get().saturating_add(bytes);
+        self.workspace.check_total(
+            next.saturating_add(self.workspace.scratch.get()),
+            "retaining decoded explanation terms",
+        )?;
+        self.workspace.retained.set(next);
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn release(&mut self, bytes: usize) {
+        let drop_bytes = bytes.min(self.bytes);
+        if drop_bytes == 0 {
+            return;
+        }
+        self.bytes -= drop_bytes;
+        self.workspace
+            .retained
+            .set(self.workspace.retained.get().saturating_sub(drop_bytes));
+    }
+
+    pub(crate) fn resize(&mut self, bytes: usize) -> Result<()> {
+        if bytes > self.bytes {
+            self.add(bytes - self.bytes)
+        } else {
+            self.release(self.bytes - bytes);
+            Ok(())
+        }
+    }
+
+    pub(crate) fn absorb(&mut self, mut other: WorkspaceHold<'a>) {
+        debug_assert!(std::ptr::eq(self.workspace, other.workspace));
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        other.bytes = 0;
+    }
+
+    pub(crate) fn split(&mut self, bytes: usize) -> WorkspaceHold<'a> {
+        let moved = bytes.min(self.bytes);
+        self.bytes -= moved;
+        WorkspaceHold {
+            workspace: self.workspace,
+            bytes: moved,
+        }
+    }
+}
+
+impl Drop for WorkspaceHold<'_> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.workspace
+                .retained
+                .set(self.workspace.retained.get().saturating_sub(self.bytes));
+        }
+    }
+}
+
 impl ExplainWorkspace {
-    pub(crate) fn for_answer_limit(max_memory: Option<usize>) -> Self {
+    pub fn for_answer_limit(max_memory: Option<usize>) -> Self {
         Self {
             limit: max_memory.map(|limit| limit.saturating_mul(2).saturating_add(256)),
             retained: Cell::new(0),
             scratch: Cell::new(0),
         }
+    }
+
+    /// Bytes currently retained in this workspace by live proof-search state.
+    pub fn retained(&self) -> usize {
+        self.retained.get()
     }
 
     fn check_total(&self, total: usize, what: &str) -> Result<()> {
@@ -390,20 +475,31 @@ impl ExplainWorkspace {
         Ok(())
     }
 
-    /// Retain `bytes` for decoded output kept alive across the operation.
-    pub(crate) fn retain(&self, bytes: usize) -> Result<()> {
-        let next = self.retained.get().saturating_add(bytes);
-        self.check_total(
-            next.saturating_add(self.scratch.get()),
-            "retaining decoded explanation terms",
-        )?;
-        self.retained.set(next);
-        Ok(())
+    /// Hold `bytes` of retained decoded state in this workspace until the returned guard drops.
+    pub(crate) fn hold(&self, bytes: usize) -> Result<WorkspaceHold<'_>> {
+        let mut guard = WorkspaceHold {
+            workspace: self,
+            bytes: 0,
+        };
+        guard.add(bytes)?;
+        Ok(guard)
     }
 
-    /// Reconcile retained bytes after replacing or dropping kept derivations.
-    pub(crate) fn set_retained(&self, bytes: usize) {
-        self.retained.set(bytes);
+    /// Decode a graph id's display name within this workspace and request controls.
+    pub fn graph_name(
+        &self,
+        snap: &Snapshot,
+        graph: Id,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<String>> {
+        check()?;
+        if graph == Id::DEFAULT_GRAPH {
+            return Ok(Some("default".to_string()));
+        }
+        Ok(match self.decode_term(snap, graph, check)? {
+            Some(Term::NamedNode(name)) => Some(name.into_string()),
+            _ => None,
+        })
     }
 
     /// Decode one stored term while accounting for coexisting old/new scratch buffers,
@@ -450,15 +546,7 @@ pub fn explain_graph_name_controlled(
     max_memory: Option<usize>,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<String>> {
-    check()?;
-    if graph == Id::DEFAULT_GRAPH {
-        return Ok(Some("default".to_string()));
-    }
-    let workspace = ExplainWorkspace::for_answer_limit(max_memory);
-    Ok(match workspace.decode_term(snap, graph, check)? {
-        Some(Term::NamedNode(name)) => Some(name.into_string()),
-        _ => None,
-    })
+    ExplainWorkspace::for_answer_limit(max_memory).graph_name(snap, graph, check)
 }
 
 /// The schema in graph `graph` (`None`: the default graph) of a snapshot.

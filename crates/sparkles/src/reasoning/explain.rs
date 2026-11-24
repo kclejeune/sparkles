@@ -116,6 +116,7 @@ pub struct Explanation {
     pub why_not: Option<sparkles_reasoner::whynot::WhyNot>,
 }
 
+#[cfg(feature = "reasoning")]
 fn budget_error(m: String) -> crate::Error {
     crate::Error::Component(Box::new(
         crate::error::ComponentError::new("reasoner", REASONING_BUDGET, m.clone())
@@ -124,6 +125,7 @@ fn budget_error(m: String) -> crate::Error {
 }
 
 /// Fail when the request was cancelled or passed its deadline.
+#[cfg(feature = "reasoning")]
 fn check_controls(req: &ExplainRequest, deadline: Option<Instant>) -> Result<()> {
     if req
         .cancel
@@ -226,57 +228,51 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
             }
         };
         graphs.retain(|&g| (include_inferred || Some(g) != inferred) && readable(access, &head, g));
-        // every RDFS derivation needs a schema fact, so a schema the caller cannot read is
-        // not built, and an empty one still finds a triple a readable graph asserts
-        let schema = if leaves == SchemaLeaves::Hidden {
-            std::sync::Arc::new(sparkles_core::sparql::rdfs::RdfsSchema::default())
-        } else {
-            on.schema_controlled_with_memory(&view, req.max_memory, &mut || {
-                check_controls(req, deadline)
-            })?
-        };
         let read_at_head = std::cell::Cell::new(false);
         #[cfg(feature = "reasoning")]
-        let resolver =
-            |graph: Id, triple: &[Term; 3]| -> Result<Option<crate::explain::Derivation>> {
-                if Some(graph) == inferred {
-                    let mut premise = req.clone();
-                    premise.triple = triple.clone();
-                    premise.max_trees = 1;
-                    premise.source = Some(ExplainSource::Materialized);
-                    let Some(answer) = materialized(ds, &premise, &head, deadline)? else {
-                        return Ok(None);
-                    };
-                    read_at_head.set(read_at_head.get() || answer.read_at_head);
-                    match answer.explained {
-                        Explained::Found { mut trees, .. } => Ok(trees.pop()),
-                        Explained::Partial { reason, .. } => Err(budget_error(reason)),
-                        Explained::NotFound => Ok(None),
-                    }
-                } else {
-                    let graph = sparkles_core::sparql::rdfs::explain_graph_name_controlled(
-                        &view,
-                        graph,
-                        req.max_memory,
-                        &mut || check_controls(req, deadline),
-                    )?;
-                    Ok(Some(crate::explain::Derivation::asserted(
-                        triple.clone(),
-                        graph,
-                    )))
+        let resolver = |graph: Id,
+                        triple: &[Term; 3],
+                        workspace: &sparkles_core::sparql::rdfs::ExplainWorkspace|
+         -> Result<Option<crate::explain::Derivation>> {
+            if Some(graph) == inferred {
+                let mut premise = req.clone();
+                premise.triple = triple.clone();
+                premise.max_trees = 1;
+                premise.source = Some(ExplainSource::Materialized);
+                premise.max_memory = req
+                    .max_memory
+                    .map(|limit| limit.saturating_sub(workspace.retained()));
+                let Some(answer) = materialized(ds, &premise, &head, deadline)? else {
+                    return Ok(None);
+                };
+                read_at_head.set(read_at_head.get() || answer.read_at_head);
+                match answer.explained {
+                    Explained::Found { mut trees, .. } => Ok(trees.pop()),
+                    Explained::Partial { reason, .. } => Err(budget_error(reason)),
+                    Explained::NotFound => Ok(None),
                 }
-            };
+            } else {
+                let graph =
+                    workspace.graph_name(&view, graph, &mut || check_controls(req, deadline))?;
+                Ok(Some(crate::explain::Derivation::asserted(
+                    triple.clone(),
+                    graph,
+                )))
+            }
+        };
         let resolve = {
             #[cfg(feature = "reasoning")]
             {
-                include_inferred.then_some(&resolver as &crate::sparql::rdfs::AssertedResolver<'_>)
+                include_inferred.then_some(&resolver as &crate::sparql::rdfs::WorkspaceResolver<'_>)
             }
             #[cfg(not(feature = "reasoning"))]
             {
                 None
             }
         };
-        let found = schema.explain_resolving(
+        // Check visible asserted answers before building a cold graph-backed schema they
+        // do not need, and share one ExplainWorkspace across proof search and resolver.
+        let found = on.explain_resolving(
             &view,
             leaves,
             &graphs,

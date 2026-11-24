@@ -945,3 +945,123 @@ fn hypothesis_consistency_uses_the_verified_geometry_program() {
         .expect("the implicit default rule supplies a hasGeometry hypothesis");
     assert_eq!(hypothesis.inconsistent, Some(true), "{hypotheses:?}");
 }
+
+#[test]
+fn rdfs_on_read_asserted_answer_succeeds_with_cold_and_warm_large_schema() {
+    let (_dir, ds) = open();
+    let graph_4k = format!("http://ex.org/g4k/{}", "g".repeat(4070));
+    let mut nq = format!("<http://ex.org/s> <http://ex.org/p> <http://ex.org/o> <{graph_4k}> .\n");
+    // Unrelated ontology graph whose distinct IRIs exceed 2 * 8192 + 256 = 16640 bytes.
+    for i in 0..30 {
+        let a = format!("http://ex.org/C{i}/{}", "a".repeat(1024));
+        let b = format!("http://ex.org/D{i}/{}", "b".repeat(1024));
+        nq.push_str(&format!(
+            "<{a}> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{b}> <{ONTO}> .\n"
+        ));
+    }
+    ds.load_str(&nq, RdfFormat::NQuads).unwrap();
+    ds.store().compact().unwrap();
+    ds.reasoning()
+        .rdfs()
+        .set(sparkles::reasoning::rdfs::NewSchema::Graph(ONTO.into()))
+        .unwrap();
+
+    // 1. Cold schema cache: fitting asserted answer in 4 KiB named graph must succeed inside 8 KiB.
+    let mut req = ExplainRequest::new([ex("s"), ex("p"), ex("o")]);
+    req.max_memory = Some(8192);
+    let cold = ds
+        .reasoning()
+        .explain(&req)
+        .expect("fitting asserted answer must succeed when schema cache is cold");
+    let trees = found(cold.explained);
+    assert_eq!(trees.len(), 1);
+    assert_eq!(trees[0].graph.as_deref(), Some(graph_4k.as_str()));
+    assert!(trees[0].heap_bytes() <= 8192);
+
+    // 2. Warm the schema cache with an unbounded lookup, then verify warm cache succeeds too.
+    let warm_probe = ExplainRequest::new([ex("missing"), ty(), ex("Thing")]);
+    let _ = ds.reasoning().explain(&warm_probe).unwrap();
+    let warm = ds
+        .reasoning()
+        .explain(&req)
+        .expect("fitting asserted answer must succeed when schema cache is warm");
+    let trees = found(warm.explained);
+    assert_eq!(trees.len(), 1);
+    assert_eq!(trees[0].graph.as_deref(), Some(graph_4k.as_str()));
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn rdfs_on_read_resolver_shares_workspace_with_proof_search() {
+    use sparkles::reasoning::ReasonRequest;
+    use sparkles::reasoning::reasoner::{GraphRef, Inputs};
+
+    let (_dir, ds) = open();
+    // 1800-byte schema graph name: a 2-step proof (~5.8 KiB) fits a 6144-byte answer limit,
+    // and decoding the graph name alone (~3.6 KiB) fits the 12544-byte workspace.
+    // Ten ~450-byte neighbours retained in Cx::chain (~10.4 KiB) also fit alone,
+    // but neighbours + coexisting graph-name decode (~14 KiB) exceed 12544 bytes when
+    // sharing one ExplainWorkspace across proof search and the dataset resolver.
+    let schema_g = format!("http://ex.org/ont/{}", "s".repeat(1780));
+    let mut nq =
+        format!("<http://ex.org/hr_a> <http://ex.org/hr_p> <http://ex.org/hr_b> <{HR}> .\n");
+    for i in 0..10 {
+        let pad = format!("http://ex.org/N{i:02}/{}", "n".repeat(450));
+        nq.push_str(&format!(
+            "<http://ex.org/Start> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{pad}> <{schema_g}> .\n"
+        ));
+    }
+    nq.push_str(&format!(
+        "<http://ex.org/Start> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/Mid> <{schema_g}> .\n\
+         <http://ex.org/Mid> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/End> <{schema_g}> .\n"
+    ));
+    ds.load_str(&nq, RdfFormat::NQuads).unwrap();
+    ds.store().compact().unwrap();
+
+    // Run materialized reasoning so ds.reasoning_record().is_some() activates the dataset resolver.
+    let reason_req = ReasonRequest {
+        inputs: Inputs {
+            data_graphs: vec![GraphRef::Named(HR.into())],
+            ontology_graphs: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    ds.reasoning().run(&reason_req).unwrap();
+    ds.reasoning()
+        .rdfs()
+        .set(sparkles::reasoning::rdfs::NewSchema::Graph(
+            schema_g.clone(),
+        ))
+        .unwrap();
+
+    let triple = [
+        ex("Start"),
+        Term::NamedNode(NamedNode::new_unchecked(
+            "http://www.w3.org/2000/01/rdf-schema#subClassOf",
+        )),
+        ex("End"),
+    ];
+
+    // Warm schema cache and confirm the 2-step proof fits under 6144 bytes of answer memory.
+    let unbounded = ds
+        .reasoning()
+        .explain(&ExplainRequest::new(triple.clone()))
+        .unwrap();
+    let trees = found(unbounded.explained);
+    assert!(
+        trees[0].heap_bytes() <= 6144,
+        "2-step proof should fit 6144 answer budget, got {} bytes",
+        trees[0].heap_bytes()
+    );
+
+    // With max_memory = 6144 (workspace 12544), retained BFS neighbours + shared resolver
+    // graph-name decode must exceed the shared workspace cap and return reasoning-budget.
+    let mut tight = ExplainRequest::new(triple);
+    tight.max_memory = Some(6144);
+    let err = ds.reasoning().explain(&tight).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "shared workspace across proof search and resolver must fail with reasoning-budget, got {err:?}"
+    );
+}
