@@ -5760,7 +5760,10 @@ dataset's own settings go in the `changeLog` member of `PUT /$/history/{ds}`:
 commit of the given age, and `maxBytes` caps the total (0 is unlimited), winning over the
 other two. A field that is left out takes the server's default, and `"changeLog": null`
 restores every default. Turning the log off deletes it, and turning it on starts it at
-the next commit. `GET /$/history/{ds}` reports the log as `changeLog`: `enabled`, the
+the next commit. A streamed history query without `hist:limit` or input holds the
+commits from the start of its range until it has read them or is closed. While it does,
+retention keeps the segments that hold them, past `maxBytes` too, and turning the log
+off is refused with `409 Conflict`. `GET /$/history/{ds}` reports the log as `changeLog`: `enabled`, the
 `first` and `last` commits covered, `segments`, `bytes`, `pending` commits not yet
 written, `maxBytes`, `settings` and an `error` if the log stopped. Backups and clones do
 not copy the log.

@@ -1170,7 +1170,7 @@ bounds its answer.
 The strict policy refuses the unbounded forms, which are a SERVICE, a view read, a
 spatial scan or relation over constants, a search without a bound, a path search between
 constants without a limit, a spatial join, a property function over constants and a
-registered property function without prefix output. They are the second part of the item. Automatic execution keeps its base
+registered property function without prefix output. They are the second part of the item, whose [readers](#streamed-service-text-and-history-readers) serve a SERVICE without SILENT, a text search without a bound and a history query without a limit. Automatic execution keeps its base
 set of expanding kinds, and each new kind joins it only after a same-host A/B of eager
 against streamed runs. The text, geo and vector benchmark scripts send an `EXECUTION`
 mode with every request, and the vector script fingerprints its exact and approximate
@@ -1246,6 +1246,125 @@ alone, with 12 server processes per build and mode, put the tip at cde29b37 at 0
 its merge base with main, 5f3f69c2, streamed and 1.006 eager, so no query is 5% or more
 slower at 12 threads, which is the stage's acceptance gate. The
 [synthetic results](../../benchmarks/synthetic/RESULTS.md#leaf-cursors) list each query.
+
+### Streamed SERVICE, text and history readers
+
+The second part of item 829 gives three of the refused kinds resumable readers that hold
+one page of their answer between pulls. They serve explicit streaming, and automatic
+execution runs these forms eagerly until a same-host A/B admits them. Each opens nothing
+until its first pull, because operators are also built to learn whether an EXISTS
+pattern streams, so its checks, its request and its errors come when an eager run would
+reach the node.
+
+A SERVICE without SILENT, in `cursor/service.rs`, parses a remote response as it arrives
+and holds one output batch and the parser's buffer. A query endpoint of the same process
+opens as a cursor of its own under the caller's policy, charged to the caller's memory
+budget, and the reader pulls one of its batches per batch. One blank-node map spans the
+whole answer, as in one eager call. A cached answer is read from its entry, which the
+reader keeps charged while it reads, since the cache may evict the entry meanwhile. Three
+things differ from an eager run. A failure after rows were emitted fails the cursor. An
+answer enters the cache only when it was read to its end, and the copy for the cache is
+dropped once it grows past the largest entry the cache keeps or past what the budget
+holds beside the answer. The outbound timeout counts from the start of the request, while
+the query's deadline leaves out the time a consumer keeps the cursor waiting, so a slow
+consumer can expire a transfer that an eager run would finish. The strict policy refuses
+a SILENT SERVICE, which needs its whole answer before its first row, and a JSON response
+whose results come before its head, which [item 1125](../../ROADMAP.md) decodes in either
+order. Under the permissive policy, a late-head JSON response is buffered under a memory
+charge, and the runtime plan reports and retains `fullInputBeforeOutput` on that SERVICE
+node after the response is released. Its refusal inside an EXISTS fails the query, as it
+does outside one.
+
+A text search with a constant query and no limit, in `cursor/text.rs`, collects its
+scored hits in one pass over each index segment, charging the hit list before each growth,
+and decodes rows from it a page at a time. The row state that eager execution keeps for
+one call, which holds the duplicate set, the default graph's filter, the stale hits and
+the rank, lasts across pages, so ties and duplicates that span a batch keep their eager
+answers. A search over more hits than the index's `maxHits` fails with eager's row error.
+A search with a limit keeps the bounded leaf of the first part, and
+[item 1155](../../ROADMAP.md) routes a limit above `maxHits` through the reader. An
+earlier form counted the hits without scores before it collected them, which built the
+query's automaton and scorers twice and cost about 2.2 million instructions per request,
+and the [experiments page](../../PERFORMANCE-EXPERIMENTS.md#query-execution) records it.
+
+A history query without a limit or input, in `cursor/history.rs`, reads the change log a
+page of whole commits at a time through `store::HistoryPages`. Each record's frame is
+admitted before it is read and its decoded size before it is decoded, and the page stays
+charged until its rows are handed out. A commit larger than a page is held whole, as eager
+execution holds it. The reader pins the log at the first commit of its range until the
+range ends or the reader is released, so retention keeps the segments it has still to
+read, past `maxBytes` too, and turning the log off is refused meanwhile. It counts the
+changes it accepts and fails past the row budget at the change where an eager run fails.
+Deleting the branch or dataset still removes the segments under a read, which
+[item 1173](../../ROADMAP.md) holds, eager execution does not admit records before it
+decodes them, which [item 1124](../../ROADMAP.md) holds, and a read-only log's newest-first
+walk is [item 1175](../../ROADMAP.md).
+
+View reads stay refused under the strict policy, since a view's result is decoded under
+its lock against the circuit's latest pass, and [item 1121](../../ROADMAP.md) keeps a
+versioned result that a cursor can page through. Path searches that keep a set per pair
+of endpoints and path searches over their input without a limit stay refused under items
+[1122](../../ROADMAP.md) and [1123](../../ROADMAP.md). The inventory test
+`cursor_inventory.rs` lists every form as native or refused with its decision or row.
+
+Tests compare each reader with eager answers at batch sizes down to one row, refuse the
+budget and row limits where eager execution refuses, measure each reader's heap against
+its ledger in `cursor_text_heap.rs`, `cursor_history_heap.rs` and
+`cursor_memory_audit.rs`, and cover retention and disabling between pulls, a branch
+deleted under a read, endpoint failures, timeouts, cancellation and the cache.
+
+Checked history cursors honor source and query cancellation and absolute deadlines during
+read-only timestamp lookup as well as during page reads. To avoid allocating term tables
+while resolving time bounds on a read-only log, `ReadOnlyLog::commit_at_time` validates
+each frame's CRC, metadata, term framing and quad term references in place without
+materializing `Arc<[u8]>` term payloads, while preserving consecutive-prefix semantics,
+full-walk head-before-clamp selection and cooperative stop precedence. On `forge`, an
+Intel i5-13500 pinned to CPU 2 with one Rayon thread, matched release builds of
+`2233637a` and `01b46ba1` ran all 26 cells of the history timing matrix with 12 ABBA,
+12 BAAB and 12 same-binary rounds of 200 samples per process and 100% row-count
+agreement. Checked first pulls on archived ancestor logs became 9.9% faster on
+`ancestor-one`, at 0.901 of the base and 16.95 ms against 18.80 ms, and 15.1% faster on
+`ancestor-two`, at 0.849 and 20.90 ms against 24.61 ms. No cell failed the 2% bound.
+The 16 primary cells on writable history logs that showed a real slowdown between 0.46%
+and 1.13% are recorded below for [item 1074](../../ROADMAP.md) on host `forge` comparing
+`2233637a..01b46ba1`, to be recovered by profiling the checked cursor's per-entry control
+polls and timestamp-index lookup path within two batches or by 2026-12-08.
+
+| Query and route | Phase | Host | Commits | Baseline | Ratio and 95% interval | Added | Recovery and deadline |
+|---|---|---|---|---:|---|---:|---|
+| `commit-warm` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.26 ms | 1.0053, 1.0036 to 1.0063 | +43.9 µs | Item 1074, within two batches or by 2026-12-08 |
+| `commit-warm` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.50 ms | 1.0046, 1.0029 to 1.0059 | +34.5 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-first-one` checked | `first` | `forge` | `2233637a..01b46ba1` | 123.1 µs | 1.0103, 1.0080 to 1.0113 | +1.26 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-first-two` checked | `first` | `forge` | `2233637a..01b46ba1` | 123.6 µs | 1.0112, 1.0099 to 1.0121 | +1.38 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-one` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.12 ms | 1.0075, 1.0060 to 1.0089 | +60.8 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-one` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.37 ms | 1.0056, 1.0027 to 1.0090 | +41.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-one` eager | `eager` | `forge` | `2233637a..01b46ba1` | 31.48 ms | 1.0113, 1.0094 to 1.0126 | +354.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-two` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.23 ms | 1.0057, 1.0048 to 1.0069 | +46.8 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-two` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.49 ms | 1.0046, 1.0030 to 1.0061 | +34.4 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-two` eager | `eager` | `forge` | `2233637a..01b46ba1` | 30.99 ms | 1.0103, 1.0083 to 1.0141 | +320.7 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-one` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.21 ms | 1.0083, 1.0050 to 1.0117 | +68.0 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-one` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.43 ms | 1.0089, 1.0064 to 1.0108 | +66.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-one` eager | `eager` | `forge` | `2233637a..01b46ba1` | 31.56 ms | 1.0107, 1.0090 to 1.0120 | +337.0 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-two` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.45 ms | 1.0060, 1.0042 to 1.0089 | +50.4 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-two` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.71 ms | 1.0104, 1.0061 to 1.0126 | +80.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-two` eager | `eager` | `forge` | `2233637a..01b46ba1` | 31.17 ms | 1.0104, 1.0084 to 1.0119 | +325.0 µs | Item 1074, within two batches or by 2026-12-08 |
+
+All three streamed readers report `growingState` from construction onward because the
+batch cap does not bound their retained state. An in-process SERVICE call clears the
+target's pool alongside inheriting the caller's grant so an unpooled caller keeps its
+unpooled accounting domain and a pooled caller charges only its own grant, and
+`Service::fill` polls stop conditions between remote solutions, before cache
+publication and across cached and local rows. The history reader uses the same execution
+check when it opens on first demand, resolves timestamp bounds, reads pages and converts
+changes to rows. Writable timestamp lookup polls during cold index reads, CRC and
+decoding. Read-only timestamp lookup polls while walking the captured log. Both page
+backends poll during record reads, CRC, footprint calculation, decoding and filtering.
+Consumer wait credit still extends ordinary query deadlines. A checked source retains
+its original cancellation controls and absolute source and query deadlines. A zero
+internal page budget asks for at least one matching change. Read-only paging skips
+segments above the clamped upper commit bound and stops once a validated record covers
+that bound, while [item 1175](../../ROADMAP.md) retains the valid-prefix limitation for
+earlier records in an overlapping segment.
 
 ### Readings of errors in aggregates
 

@@ -350,17 +350,21 @@ fn allowance(name: &str) -> Allowance {
             under: 360 * K,
             ..exact
         },
-        // item 1190: the change log's reader holds what it decodes outside its ledger
+        // items 1190 and 1192: the streamed change-log reader stays within its ledger
+        // except for small uncharged scratch, and overcharges per-change quad_bytes
+        // that count term Arcs shared with the record (bounded per page)
         "history" => Allowance {
-            under: 430 * K,
-            over: 72 * K,
+            under: 16 * K,
+            over: 260 * K,
             ..exact
         },
-        // item 1191: the text reader holds its index searcher's state outside its ledger
+        // items 1191 and 1192: the streamed text reader stays within its ledger except
+        // for small Tantivy searcher scratch, and overcharges its page estimate
+        // min(hits, 4096) * 192 bytes in text::Reader::open
         "text" => Allowance {
-            under: 470 * K,
-            over: 72 * K,
-            ..exact
+            under: 24 * K,
+            over: 880 * K,
+            peak: 520 * K,
         },
         // item 1193: the external sort holds its pieces' sorts outside its ledger inside a
         // pull and charges its merge a formula above what it holds, and its runs are

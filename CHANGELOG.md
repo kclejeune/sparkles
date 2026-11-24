@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Streamed SERVICE, text and history readers with non-materializing timestamp lookup
+
+Explicit streaming execution now serves SERVICE without SILENT, unbounded constant-query
+text searches and unbounded history queries through resumable page readers, as part of
+roadmap item 829. Checked history cursors honor cancellation and absolute deadlines
+during both paging and read-only timestamp lookup, and `ReadOnlyLog::commit_at_time`
+validates frames, metadata, term framing and quad term references in place without
+materializing term payloads. Across all 26 cells of the history timing matrix on `forge`
+for `2233637a..01b46ba1`, checked first pulls on archived ancestor logs ran 9.9% faster
+on `ancestor-one` and 15.1% faster on `ancestor-two`, while the writable history cases
+stayed within the 2% bound at +0.46% to +1.13% and are tracked under roadmap item 1074.
+
 ### Default OWL classification derives named domains of top-object-property chains
 
 The default OWL classification path now derives named-domain consequences of two-link

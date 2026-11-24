@@ -1004,13 +1004,22 @@ impl Store {
             n += 1;
             if n & 0xFF == 0 { o.check() } else { Ok(()) }
         };
-        let holes = log.scan(lo + 1, hi, &filter, false, &mut check, &mut |_, add, k| {
-            found.push((k.clone(), add));
-            if found.len() & 0xFFFF == 0 {
-                o.over(found.len() as u64)?;
-            }
-            Ok(true)
-        })?;
+        let holes = log.scan(
+            lo + 1,
+            hi,
+            &filter,
+            false,
+            true,
+            &mut check,
+            None,
+            &mut |_, add, k| {
+                found.push((k.clone(), add));
+                if found.len() & 0xFFFF == 0 {
+                    o.over(found.len() as u64)?;
+                }
+                Ok(true)
+            },
+        )?;
         if !holes.is_empty() {
             return Ok(None);
         }

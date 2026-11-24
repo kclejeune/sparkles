@@ -133,7 +133,7 @@ fn graph_filter_key(g: &GraphName) -> Vec<u8> {
 }
 
 impl HistoryQuery {
-    fn filter(&self) -> LogFilter {
+    pub(super) fn filter(&self) -> LogFilter {
         let list = |v: Vec<Vec<u8>>| (!v.is_empty()).then_some(v);
         LogFilter {
             keys: [
@@ -150,7 +150,7 @@ impl HistoryQuery {
         }
     }
 
-    fn check(&self) -> Result<()> {
+    pub(super) fn check(&self) -> Result<()> {
         if self
             .cancel
             .as_ref()
@@ -185,14 +185,30 @@ pub(crate) fn check_history_access(a: Option<&Arc<crate::access::GraphAccess>>) 
 }
 
 impl ChangeLog {
-    /// Run a history query against the commits up to `upto` (the state the caller
-    /// reads). Bounds given as [`HistoryBound::At`] must already be resolved.
-    pub fn query(&self, q: &HistoryQuery, upto: u64) -> Result<HistoryResult> {
-        let upto = self
-            .read_only_through()
-            .map_or(upto, |through| upto.min(through));
-        if self.read_only_through().is_some() {
-            q.check()?;
+    /// The checks a history query makes before it reads, and its range of commits:
+    /// `(from, to, upto)`, with `upto` clipped to what a read-only log holds. It flushes
+    /// the queued commits, so the log covers the state the caller reads.
+    pub(crate) fn range(&self, q: &HistoryQuery, upto: u64) -> Result<(u64, u64, u64)> {
+        let upto = self.prepare(q, upto, None)?;
+        let (from, to) = self.bounds(q, upto, &|| q.check())?;
+        Ok((from, to, upto))
+    }
+
+    /// The checks of [`ChangeLog::range`] and its flush, which can run retention.
+    /// Returns `upto` clipped to what a read-only log holds.
+    pub(super) fn prepare(
+        &self,
+        q: &HistoryQuery,
+        upto: u64,
+        check: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<u64> {
+        let through = self.read_only_through();
+        let upto = through.map_or(upto, |through| upto.min(through));
+        if through.is_some() {
+            match check {
+                Some(check) => check()?,
+                None => q.check()?,
+            }
         }
         if !self.is_enabled() {
             return Err(Error::HistoryUnsupported(
@@ -200,13 +216,31 @@ impl ChangeLog {
             ));
         }
         check_history_access(q.access.as_ref())?;
-        // what the commits up to now queued
+        #[cfg(test)]
+        super::changelog::open_tests::observe(super::changelog::open_tests::Event::BeforeFlush);
+        if through.is_none()
+            && let Some(check) = check
+        {
+            check()?;
+        }
+        // Write what the commits up to now queued.
         self.flush(false)?;
+        Ok(upto)
+    }
+
+    /// The range of commits of [`ChangeLog::range`], once [`ChangeLog::prepare`] has
+    /// run: `(from, to)`.
+    pub(super) fn bounds(
+        &self,
+        q: &HistoryQuery,
+        upto: u64,
+        mut check: &dyn Fn() -> Result<()>,
+    ) -> Result<(u64, u64)> {
         let from = match &q.from {
             None => 1,
             Some(HistoryBound::Commit(n)) => (*n).max(1),
             Some(HistoryBound::Time(ms)) => self
-                .commit_at_time_checked(ms.saturating_sub(1), &mut || q.check())?
+                .commit_at_time_checked(ms.saturating_sub(1), &mut check)?
                 .map_or(1, |c| c + 1),
             Some(HistoryBound::At(a)) => {
                 return Err(Error::Invalid(format!(
@@ -218,7 +252,7 @@ impl ChangeLog {
             None => upto,
             Some(HistoryBound::Commit(n)) => (*n).min(upto),
             Some(HistoryBound::Time(ms)) => self
-                .commit_at_time_checked(*ms, &mut || q.check())?
+                .commit_at_time_checked(*ms, &mut check)?
                 .unwrap_or(0)
                 .min(upto),
             Some(HistoryBound::At(a)) => {
@@ -227,6 +261,13 @@ impl ChangeLog {
                 )));
             }
         };
+        Ok((from, to))
+    }
+
+    /// Run a history query against the commits up to `upto` (the state the caller
+    /// reads). Bounds given as [`HistoryBound::At`] must already be resolved.
+    pub fn query(&self, q: &HistoryQuery, upto: u64) -> Result<HistoryResult> {
+        let (from, to, upto) = self.range(q, upto)?;
         let filter = q.filter();
         let access = q.access.as_ref().filter(|a| !a.reads_everything());
         let mut readable: FxHashMap<Arc<[u8]>, bool> = FxHashMap::default();
@@ -262,7 +303,9 @@ impl ChangeLog {
             to,
             &filter,
             q.descending,
+            true,
             &mut check,
+            None,
             &mut |c, add, k: &QuadKey| {
                 let op = if add { DiffOp::Add } else { DiffOp::Remove };
                 if q.op.is_some_and(|o| o != op) {

@@ -57,6 +57,7 @@ mod sample;
 pub(crate) mod sortkey;
 pub mod stats;
 pub mod svccache;
+mod svcread;
 pub mod table;
 pub mod textpf;
 mod unionpush;
@@ -697,11 +698,12 @@ fn make_ctx_input(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<Ctx> {
-    make_ctx_input_policy(snap, opts, dataset, base, source, None, None)
+    make_ctx_input_policy(snap, opts, dataset, base, source, None, None, None)
 }
 
 // Only the application root which just prepared this policy supplies the override.
 // Checked public sources retain the existing exact-policy replacement refusal.
+#[allow(clippy::too_many_arguments)]
 fn make_ctx_input_policy(
     snap: Arc<Snapshot>,
     opts: &QueryOptions,
@@ -709,6 +711,7 @@ fn make_ctx_input_policy(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
+    parent: Option<sparkles_budget::ParentHandle>,
     selector_graphs: Option<&GraphSel>,
 ) -> Result<Ctx> {
     #[cfg(feature = "geo")]
@@ -751,6 +754,11 @@ fn make_ctx_input_policy(
         .map(|spill| Arc::new(spill.query(opts.max_spill_bytes)));
     if ctx.read_source.is_none() {
         ctx.set_grant(opts.query_grant());
+    }
+    // an in-process SERVICE call charges its caller's query too, from its first charge,
+    // once its grant is set
+    if let Some(parent) = parent {
+        ctx.set_memory_parent(parent)?;
     }
     if let Some(m) = opts.max_rows_produced {
         ctx.max_rows_produced = m;
@@ -1385,6 +1393,7 @@ fn execute_retained_source(
             None,
             Some(source),
             None,
+            None,
             selector_graphs,
         )?;
         let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1634,6 +1643,7 @@ fn prepare_query_input(
         source,
         None,
         None,
+        None,
     )
 }
 
@@ -1646,6 +1656,7 @@ fn prepare_query_input_policy(
     automatic: Option<&CursorOptions>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
+    parent: Option<sparkles_budget::ParentHandle>,
     selector_graphs: Option<&GraphSel>,
 ) -> Result<PreparedQuery> {
     let (_, dataset, base) = split(parsed);
@@ -1658,6 +1669,7 @@ fn prepare_query_input_policy(
         base,
         source,
         prepared_policy,
+        parent,
         selector_graphs,
     )?;
     if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {

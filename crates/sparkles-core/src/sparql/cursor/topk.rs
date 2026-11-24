@@ -288,7 +288,8 @@ impl IndexTopK {
                     self.loaded = Some(Buffer { table, charge });
                 }
                 None => {
-                    let child = Operator::build(ctx, (*spec.fallback).clone(), self.fallback)?;
+                    let child =
+                        Operator::build(ctx, (*spec.fallback).clone(), self.fallback.at_pull(ctx))?;
                     self.generic = Some(Box::new(child.describe(ctx)));
                     children.push(child);
                 }

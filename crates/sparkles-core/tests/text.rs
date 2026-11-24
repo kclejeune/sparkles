@@ -1846,23 +1846,20 @@ fn text_searches_run_as_cursor_operators() {
             assert_eq!(bag(c), expected, "{q}; {rows}");
         }
     }
+    // without a limit, a search holds its hits, at most maxHits, and decodes their rows
+    // as they are read (item 829)
     let unbounded = format!("{P}SELECT ?s {{ ?s text:query \"fox\" }}");
-    assert!(
-        select_cursor(
+    for rows in [1, 2, 4096] {
+        let c = select_cursor(
             s.snapshot(),
             &unbounded,
             &QueryOptions::default(),
-            &strict(2)
+            &strict(rows),
         )
-        .is_err()
-    );
-    let allowed = CursorOptions {
-        batch_rows: 1,
-        ..Default::default()
-    };
-    let c = select_cursor(s.snapshot(), &unbounded, &QueryOptions::default(), &allowed).unwrap();
-    assert!(c.plan().has_materialization());
-    assert_eq!(bag(c), eager(&unbounded));
+        .unwrap();
+        assert!(!c.plan().has_materialization());
+        assert_eq!(bag(c), eager(&unbounded));
+    }
 }
 
 /// A streamed text search over its group holds the cap on distinct query strings across

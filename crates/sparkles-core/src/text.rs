@@ -924,6 +924,8 @@ pub use imp::{Staged, TextIndex};
 #[cfg(feature = "text")]
 pub(crate) use imp::{cleanup_staging, next_owner, seed_branch};
 #[cfg(feature = "text")]
+pub(crate) use search::Reader;
+#[cfg(feature = "text")]
 pub use search::{search, search_in};
 
 #[cfg(not(feature = "text"))]
@@ -1288,6 +1290,7 @@ mod imp {
     /// What the views of one batch search: a searcher at or after their commits, and
     /// the documents in it that may not match a view's commit (hashes of their subject
     /// and object keys), which are checked against the snapshot.
+    #[derive(Clone)]
     pub(crate) struct Resolved {
         pub(crate) searcher: tantivy::Searcher,
         pub(super) uncertain: Arc<FxHashSet<u64>>,

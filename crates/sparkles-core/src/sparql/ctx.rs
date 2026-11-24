@@ -940,6 +940,11 @@ pub struct Ctx {
     /// wait that is still in progress. A background reader of the deadline would need to
     /// credit a wait before it starts.
     pub deadline_pause: Arc<AtomicU64>,
+    /// Whether the query runs as a cursor under the strict policy. An operator that
+    /// decides at its first pull how to run, such as an in-process SERVICE call, reads
+    /// it, since the operators of an EXISTS pattern are built under the permissive
+    /// policy once their strict build has passed.
+    pub(crate) strict_cursor: AtomicBool,
     pub cancel: Arc<AtomicBool>,
     pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
@@ -1158,8 +1163,9 @@ struct MemoryFailure {
     failed: AtomicBool,
 }
 
-/// Resource and ownership refusals and the unconfigured extension refusal become sticky.
-/// Ordinary expression and service errors keep their existing semantics.
+/// Resource and ownership refusals, the unconfigured extension refusal and the strict
+/// cursor policy's refusals become sticky. Ordinary expression and SERVICE errors keep
+/// their existing semantics, so a failed SERVICE inside an EXISTS is still false.
 #[derive(Clone)]
 enum ResourceRefusal {
     Budget(Budget),
@@ -1171,15 +1177,31 @@ enum ResourceRefusal {
     },
     Cancelled,
     Timeout,
+    /// The strict cursor policy's refusal of an eager fallback, met where the operator
+    /// decides how to run at its first pull, such as an in-process SERVICE call inside
+    /// an EXISTS. It fails the query, as the same refusal does outside an expression.
+    Refused(String),
+    /// The strict cursor policy's refusal of a SERVICE response it cannot stream, such as
+    /// one that gives its results before its head. It keeps its SERVICE error.
+    ServiceRefused(String),
     UnconfiguredExtension,
 }
 
 impl ResourceRefusal {
-    fn from_error(error: &Error) -> Option<Self> {
+    /// The refusal `error` records, if any. A SERVICE refusal is recognised by its fixed
+    /// beginning, which no endpoint controls (see [`super::cursor::LATE_HEAD`]), and only
+    /// under a strict cursor, the only policy that makes it.
+    fn from_error(error: &Error, strict: bool) -> Option<Self> {
         match error {
+            Error::Service(message) if strict && message.starts_with(super::cursor::LATE_HEAD) => {
+                Some(Self::ServiceRefused(message.clone()))
+            }
             Error::BudgetExceeded(budget) => Some(Self::Budget(*budget)),
             Error::Cancelled => Some(Self::Cancelled),
             Error::Timeout => Some(Self::Timeout),
+            Error::Unsupported(message) if message.starts_with(super::cursor::REFUSAL) => {
+                Some(Self::Refused(message.clone()))
+            }
             error if super::extensions::is_unconfigured(error) => Some(Self::UnconfiguredExtension),
             Error::Component(component) => component
                 .source
@@ -1200,6 +1222,8 @@ impl ResourceRefusal {
             Self::Budget(budget) => Error::BudgetExceeded(budget),
             Self::Cancelled => Error::Cancelled,
             Self::Timeout => Error::Timeout,
+            Self::Refused(message) => Error::Unsupported(message),
+            Self::ServiceRefused(message) => Error::Service(message),
             Self::UnconfiguredExtension => super::extensions::unconfigured(),
             Self::Parent {
                 component,
@@ -1498,6 +1522,7 @@ impl Ctx {
             literal_bnodes: Default::default(),
             deadline: None,
             deadline_pause: Arc::new(AtomicU64::new(0)),
+            strict_cursor: AtomicBool::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
             cancellation: None,
             dataset: DatasetSpec::default(),
@@ -2052,7 +2077,8 @@ impl Ctx {
         if self.memory_failure.failed.load(Ordering::Acquire) {
             return;
         }
-        if let Some(refusal) = ResourceRefusal::from_error(error) {
+        let strict = self.strict_cursor.load(Ordering::Relaxed);
+        if let Some(refusal) = ResourceRefusal::from_error(error, strict) {
             let failure = &self.memory_failure;
             failure.failure.lock().get_or_insert(refusal);
             failure.failed.store(true, Ordering::Release);
@@ -2272,7 +2298,7 @@ impl Ctx {
         self.memory().check_output(&owner, self.mem_limit, bytes)
     }
 
-    pub(super) fn check_output_rows(&self, rows: usize) -> Result<()> {
+    pub(crate) fn check_output_rows(&self, rows: usize) -> Result<()> {
         self.check_rows(rows)?;
         if self.max_rows_produced != u64::MAX {
             let total = self

@@ -137,22 +137,16 @@ impl ReadOnlyLog {
 
 /// Positional reads do not share a cursor across concurrent queries. Every kernel
 /// request is at most 64 KiB, and an interrupted syscall polls controls before retry.
-fn read_exact_at_checked(
-    file: &File,
+pub(super) fn read_exact_at_checked_with(
     mut output: &mut [u8],
     mut offset: u64,
     check: &mut dyn FnMut() -> Result<()>,
+    mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
 ) -> Result<()> {
     while !output.is_empty() {
         check()?;
         let length = output.len().min(64 << 10);
-        #[cfg(unix)]
-        let result = std::os::unix::fs::FileExt::read_at(file, &mut output[..length], offset);
-        #[cfg(windows)]
-        let result = std::os::windows::fs::FileExt::seek_read(file, &mut output[..length], offset);
-        #[cfg(not(any(unix, windows)))]
-        let result: std::io::Result<usize> = Err(std::io::ErrorKind::Unsupported.into());
-        match result {
+        match read_at(&mut output[..length], offset) {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
             Ok(count) => {
                 offset = offset
@@ -167,6 +161,29 @@ fn read_exact_at_checked(
     check()
 }
 
+pub(super) fn read_exact_at_checked(
+    file: &File,
+    output: &mut [u8],
+    offset: u64,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    read_exact_at_checked_with(output, offset, check, |buf, at| {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(file, buf, at)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::FileExt::seek_read(file, buf, at)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (file, buf, at);
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    })
+}
+
 impl CapturedSegment {
     /// A torn or damaged suffix ends the valid prefix, as in the ordinary codec.
     /// The caller never scans past the captured file extent. Owned record memory
@@ -175,6 +192,17 @@ impl CapturedSegment {
         &self,
         offset: u64,
         check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Vec<u8>>> {
+        self.body_at_admitted(offset, check, None)
+    }
+
+    /// [`CapturedSegment::body_at`], telling `admit` the body's length before the body
+    /// is allocated (item 829).
+    fn body_at_admitted(
+        &self,
+        offset: u64,
+        check: &mut dyn FnMut() -> Result<()>,
+        admit: Option<&mut dyn FnMut(u64) -> Result<()>>,
     ) -> Result<Option<Vec<u8>>> {
         check()?;
         if offset.checked_add(8).is_none_or(|end| end > self.extent) {
@@ -192,6 +220,9 @@ impl CapturedSegment {
             return Ok(None);
         }
         check()?;
+        if let Some(admit) = admit {
+            admit(length as u64)?;
+        }
         let mut body = Vec::new();
         body.try_reserve_exact(length).map_err(|_| {
             Error::HistoryUnsupported("history-log record allocation was refused".into())
@@ -362,7 +393,9 @@ mod tests {
                                     to.min(through),
                                     &filter,
                                     descending,
+                                    true,
                                     &mut || Ok(()),
+                                    None,
                                     &mut |meta, add, quad| {
                                         expected.push((
                                             meta.seq,
@@ -715,6 +748,207 @@ mod tests {
         }
     }
 
+    fn timestamp_meta(seq: u64, timestamp_ms: i64) -> Arc<ChangeCommit> {
+        Arc::new(ChangeCommit {
+            seq,
+            timestamp_ms,
+            kind: CommitKind::Update,
+            bulk: false,
+            inserted: 2,
+            deleted: 0,
+            author: Some(Arc::from("test author")),
+            message: Some(Arc::from("é 🦀")),
+        })
+    }
+
+    fn timestamp_changes(seq: u64, timestamp_ms: i64, rows: usize) -> Vec<u8> {
+        let quad: QuadKey = [b"".as_slice(), b"<urn:s>", b"<urn:p>", b"\"value\""].map(Arc::from);
+        encode(&Record::Changes(
+            timestamp_meta(seq, timestamp_ms),
+            vec![(true, quad); rows],
+        ))
+    }
+
+    fn timestamp_segment(root: &Path, first: u64, records: &[&[u8]]) -> CapturedSegment {
+        let path = root.join(format!("{first}.log"));
+        let mut wire = seg_header(uuid::Uuid::nil()).to_vec();
+        for record in records {
+            wire.extend_from_slice(record);
+        }
+        std::fs::write(&path, &wire).unwrap();
+        CapturedSegment {
+            first,
+            extent: wire.len() as u64,
+            file: File::open(&path).unwrap(),
+        }
+    }
+
+    #[test]
+    fn timestamp_only_lookup_matches_owned_walk_without_building_term_owners() {
+        use std::{cell::Cell, rc::Rc};
+
+        let root = tempfile::tempdir().unwrap();
+        let gap = encode(&Record::Gap {
+            from: 3,
+            through: 4,
+        });
+        let first = timestamp_changes(5, i64::MIN, 1);
+        let tied = timestamp_changes(6, i64::MIN, 1);
+        let at_head = encode(&Record::Summary(timestamp_meta(7, i64::MAX)));
+        let after_head = timestamp_changes(8, i64::MAX, 1);
+        let log = ReadOnlyLog {
+            segments: vec![timestamp_segment(
+                root.path(),
+                3,
+                &[&gap, &first, &tied, &at_head, &after_head],
+            )],
+            through: 5,
+            head: 7,
+        };
+        let owned = Rc::new(Cell::new(0));
+        let witness = owned.clone();
+        let _observer = open_tests::Observe::new(move |event| {
+            if event == open_tests::Event::ReadOnlyTermOwned {
+                witness.set(witness.get() + 1);
+            }
+        });
+        for (ms, expected) in [(i64::MIN, 6), (i64::MAX - 1, 6), (i64::MAX, 7)] {
+            // Exercise the signed base's full-record walk. It even validates the
+            // first record past head before rejecting it by sequence.
+            let mut previous = None;
+            log.walk(log.head, &mut || Ok(()), &mut |_, _, record, _| {
+                if record.timestamp().is_some_and(|time| time <= ms) {
+                    previous = Some(record.last());
+                }
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(owned.replace(0), 12);
+            assert_eq!(previous, Some(expected));
+            assert_eq!(log.commit_at_time(ms, &mut || Ok(())).unwrap(), previous);
+            assert_eq!(owned.get(), 0);
+        }
+    }
+
+    #[test]
+    fn timestamp_only_lookup_rejects_malformed_crc_valid_suffixes() {
+        use crate::task::Control;
+        use std::{cell::Cell, rc::Rc};
+
+        let root = tempfile::tempdir().unwrap();
+        let first = timestamp_changes(4, 40, 1);
+        let good = timestamp_changes(5, 50, 2);
+        let after = encode(&Record::Summary(timestamp_meta(6, 60)));
+        let next_segment = encode(&Record::Summary(timestamp_meta(7, 70)));
+        let log = |middle: &[u8]| ReadOnlyLog {
+            segments: vec![
+                timestamp_segment(root.path(), 4, &[&first, middle, &after]),
+                timestamp_segment(root.path(), 7, &[&next_segment]),
+            ],
+            through: 7,
+            head: 7,
+        };
+        assert_eq!(
+            log(&good).commit_at_time(60, &mut || Ok(())).unwrap(),
+            Some(6)
+        );
+
+        let mut meta = Cur {
+            b: &good[8..],
+            i: 9,
+        };
+        assert!(
+            meta_checked(&mut meta, 5, &mut || Ok(()))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(meta.varint(), Some(4));
+        let term_length = meta.i;
+        let author = meta
+            .b
+            .windows(b"test author".len())
+            .position(|w| w == b"test author")
+            .unwrap();
+        for damage in [
+            "reference",
+            "truncated",
+            "trailing",
+            "metadata",
+            "term length",
+            "kind",
+            "sequence",
+        ] {
+            let mut body = good[8..].to_vec();
+            match damage {
+                "reference" => *body.last_mut().unwrap() = 127,
+                "truncated" => {
+                    body.pop().unwrap();
+                }
+                "trailing" => body.push(0),
+                "metadata" => body[author] = 0xff,
+                "term length" => body[term_length] = 127,
+                "kind" => body[0] = 0xff,
+                "sequence" => body[1..9].copy_from_slice(&6_u64.to_le_bytes()),
+                _ => unreachable!(),
+            }
+            let mut wire = (body.len() as u32).to_le_bytes().to_vec();
+            wire.extend_from_slice(&crc32(&body).to_le_bytes());
+            wire.extend_from_slice(&body);
+            assert_eq!(frame(&wire, 0).unwrap().0, body.as_slice(), "{damage}");
+            let log = log(&wire);
+            assert_eq!(
+                log.commit_at_time(39, &mut || Ok(())).unwrap(),
+                None,
+                "{damage}"
+            );
+            assert_eq!(
+                log.commit_at_time(60, &mut || Ok(())).unwrap(),
+                Some(4),
+                "{damage}"
+            );
+            assert_eq!(
+                log.commit_at_time(70, &mut || Ok(())).unwrap(),
+                Some(7),
+                "{damage}"
+            );
+
+            let mut rows = Vec::new();
+            log.scan(
+                4,
+                7,
+                &LogFilter {
+                    keys: [None, None, None, None],
+                },
+                false,
+                &mut || Ok(()),
+                &mut |meta, _, _| {
+                    rows.push(meta.seq);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(rows, [4], "{damage} exposed rows from a rejected record");
+
+            if damage == "reference" {
+                let flag = Arc::new(AtomicBool::new(false));
+                let control = Control::with_cancel(flag.clone());
+                let refs = Rc::new(Cell::new(0));
+                let witness = refs.clone();
+                let _observer = open_tests::Observe::new(move |event| {
+                    if event == open_tests::Event::ReadOnlyReference(5) {
+                        witness.set(witness.get() + 1);
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                });
+                assert!(matches!(
+                    log.commit_at_time(70, &mut || control.check()),
+                    Err(Error::Cancelled)
+                ));
+                assert_eq!(refs.get(), 1, "the bad reference followed the stop");
+            }
+        }
+    }
+
     #[test]
     fn checked_history_payload_copy_cancels_after_the_first_chunk() {
         let bytes = vec![b'x'; 4 << 20];
@@ -898,7 +1132,10 @@ mod tests {
 
 /// Copy opaque term payloads cooperatively. Allocation is owned by this query;
 /// no owner capability or trust is derived from these bytes.
-fn arc_bytes_checked(bytes: &[u8], check: &mut dyn FnMut() -> Result<()>) -> Result<Arc<[u8]>> {
+pub(super) fn arc_bytes_checked(
+    bytes: &[u8],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Arc<[u8]>> {
     check()?;
     let mut owned = Arc::<[u8]>::new_uninit_slice(bytes.len());
     let output = Arc::get_mut(&mut owned).expect("new byte storage is uniquely owned");
@@ -914,7 +1151,10 @@ fn arc_bytes_checked(bytes: &[u8], check: &mut dyn FnMut() -> Result<()>) -> Res
     Ok(unsafe { owned.assume_init() })
 }
 
-fn valid_utf8_checked(bytes: &[u8], check: &mut dyn FnMut() -> Result<()>) -> Result<bool> {
+pub(super) fn valid_utf8_checked(
+    bytes: &[u8],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<bool> {
     let mut start = 0;
     while start < bytes.len() {
         check()?;
@@ -935,7 +1175,7 @@ fn valid_utf8_checked(bytes: &[u8], check: &mut dyn FnMut() -> Result<()>) -> Re
     Ok(true)
 }
 
-fn arc_text_checked(
+pub(super) fn arc_text_checked(
     bytes: &[u8],
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<Arc<str>>> {
@@ -952,7 +1192,7 @@ fn arc_text_checked(
     Ok(Some(text))
 }
 
-fn meta_checked(
+pub(super) fn meta_checked(
     c: &mut Cur<'_>,
     seq: u64,
     check: &mut dyn FnMut() -> Result<()>,
@@ -1002,10 +1242,10 @@ fn meta_checked(
 
 /// A record's table is required for positional term references. Changes remain
 /// borrowed and are emitted one at a time instead of collecting all its quads.
-enum RecordView<'a> {
+enum RecordView<'a, Terms = Vec<Arc<[u8]>>> {
     Changes {
         meta: Arc<ChangeCommit>,
-        terms: Vec<Arc<[u8]>>,
+        terms: Terms,
         entries: &'a [u8],
         count: u64,
     },
@@ -1020,6 +1260,57 @@ fn decode_checked<'a>(
     body: &'a [u8],
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<RecordView<'a>>> {
+    decode_checked_with(body, check, false)
+}
+
+/// [`decode_checked`]; `exact` reserves the term table at its count, which the caller
+/// has admitted from [`footprint_checked`] (item 829).
+fn decode_checked_with<'a>(
+    body: &'a [u8],
+    check: &mut dyn FnMut() -> Result<()>,
+    exact: bool,
+) -> Result<Option<RecordView<'a>>> {
+    let allocation_refused =
+        || Error::HistoryUnsupported("history term-table allocation was refused".into());
+    decode_record(
+        body,
+        check,
+        |count| {
+            let mut terms = Vec::new();
+            if exact {
+                terms
+                    .try_reserve_exact(count)
+                    .map_err(|_| allocation_refused())?;
+            }
+            Ok(terms)
+        },
+        |terms, bytes, check| {
+            if terms.len() == terms.capacity() {
+                terms.try_reserve(1).map_err(|_| allocation_refused())?;
+            }
+            terms.push(arc_bytes_checked(bytes, check)?);
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::ReadOnlyTermOwned);
+            Ok(())
+        },
+    )
+}
+
+fn decode_timestamp<'a>(
+    body: &'a [u8],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<RecordView<'a, ()>>> {
+    // Opaque terms only need bounds checks. The frame reader already polls while
+    // reading and checksumming their bytes, and decoding still polls per term.
+    decode_record(body, check, |_| Ok(()), |_, _, _| Ok(()))
+}
+
+fn decode_record<'a, Terms>(
+    body: &'a [u8],
+    check: &mut dyn FnMut() -> Result<()>,
+    make_terms: impl FnOnce(usize) -> Result<Terms>,
+    mut keep_term: impl FnMut(&mut Terms, &[u8], &mut dyn FnMut() -> Result<()>) -> Result<()>,
+) -> Result<Option<RecordView<'a, Terms>>> {
     check()?;
     let mut c = Cur { b: body, i: 0 };
     let Some((ty, seq)) = c.u8().zip(c.u64()) else {
@@ -1048,7 +1339,7 @@ fn decode_checked<'a>(
             let Some(n) = c.varint().and_then(|n| usize::try_from(n).ok()) else {
                 return Ok(None);
             };
-            let mut terms = Vec::new();
+            let mut terms = make_terms(n)?;
             for _ in 0..n {
                 check()?;
                 let Some(length) = c.varint().and_then(|n| usize::try_from(n).ok()) else {
@@ -1057,14 +1348,7 @@ fn decode_checked<'a>(
                 let Some(bytes) = c.bytes(length) else {
                     return Ok(None);
                 };
-                if terms.len() == terms.capacity() {
-                    terms.try_reserve(1).map_err(|_| {
-                        Error::HistoryUnsupported(
-                            "history term-table allocation was refused".into(),
-                        )
-                    })?;
-                }
-                terms.push(arc_bytes_checked(bytes, check)?);
+                keep_term(&mut terms, bytes, check)?;
             }
             let Some(count) = c.varint() else {
                 return Ok(None);
@@ -1074,11 +1358,13 @@ fn decode_checked<'a>(
             // trailing reference must not expose a partial changes record.
             for _ in 0..count {
                 check()?;
+                #[cfg(test)]
+                open_tests::observe(open_tests::Event::ReadOnlyReference(seq));
                 if c.u8().is_none() {
                     return Ok(None);
                 }
                 for _ in 0..4 {
-                    if c.varint().is_none_or(|n| n >= terms.len() as u64) {
+                    if c.varint().is_none_or(|reference| reference >= n as u64) {
                         return Ok(None);
                     }
                 }
@@ -1096,7 +1382,7 @@ fn decode_checked<'a>(
     Ok((c.i == body.len()).then_some(record))
 }
 
-impl RecordView<'_> {
+impl<Terms> RecordView<'_, Terms> {
     fn first(&self) -> u64 {
         match self {
             Self::Changes { meta, .. } | Self::Summary(meta) => meta.seq,
@@ -1115,6 +1401,9 @@ impl RecordView<'_> {
             Self::Gap { .. } => None,
         }
     }
+}
+
+impl RecordView<'_> {
     fn emit(
         &self,
         filter: &LogFilter,
@@ -1148,8 +1437,11 @@ impl RecordView<'_> {
     }
 }
 
-type WalkVisitor<'a> =
-    dyn FnMut(usize, u64, &RecordView<'_>, &mut dyn FnMut() -> Result<()>) -> Result<bool> + 'a;
+type WalkVisitor<'a, Terms = Vec<Arc<[u8]>>> = dyn FnMut(usize, u64, &RecordView<'_, Terms>, &mut dyn FnMut() -> Result<()>) -> Result<bool>
+    + 'a;
+
+type RecordDecoder<Terms> =
+    for<'a> fn(&'a [u8], &mut dyn FnMut() -> Result<()>) -> Result<Option<RecordView<'a, Terms>>>;
 
 impl ReadOnlyLog {
     /// Walk each segment's valid consecutive prefix without retaining the log or
@@ -1160,13 +1452,23 @@ impl ReadOnlyLog {
         check: &mut dyn FnMut() -> Result<()>,
         visit: &mut WalkVisitor<'_>,
     ) -> Result<()> {
+        self.walk_with(maximum, check, decode_checked, visit)
+    }
+
+    fn walk_with<Terms>(
+        &self,
+        maximum: u64,
+        check: &mut dyn FnMut() -> Result<()>,
+        decode: RecordDecoder<Terms>,
+        visit: &mut WalkVisitor<'_, Terms>,
+    ) -> Result<()> {
         check()?;
         for (index, segment) in self.segments.iter().enumerate() {
             check()?;
             let mut offset = SEG_HEADER as u64;
             let mut previous = None;
             while let Some(body) = segment.body_at(offset, check)? {
-                let Some(record) = decode_checked(&body, check)? else {
+                let Some(record) = decode(&body, check)? else {
                     break;
                 };
                 if previous.is_some_and(|last: u64| last.checked_add(1) != Some(record.first())) {
@@ -1195,15 +1497,22 @@ impl ReadOnlyLog {
         ms: i64,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<u64>> {
+        #[cfg(test)]
+        open_tests::observe(open_tests::Event::ReadOnlyTimestamp(ms));
         let mut best = None;
-        self.walk(self.head, check, &mut |_, _, record, _| {
-            // Match the ordinary index's last recorded commit at or before time;
-            // gap records have no timestamp and cannot manufacture a time bound.
-            if record.timestamp().is_some_and(|timestamp| timestamp <= ms) {
-                best = Some(record.last());
-            }
-            Ok(true)
-        })?;
+        self.walk_with(
+            self.head,
+            check,
+            decode_timestamp,
+            &mut |_, _, record, _| {
+                // Match the ordinary index's last recorded commit at or before time;
+                // gap records have no timestamp and cannot manufacture a time bound.
+                if record.timestamp().is_some_and(|timestamp| timestamp <= ms) {
+                    best = Some(record.last());
+                }
+                Ok(true)
+            },
+        )?;
         Ok(best)
     }
 }
@@ -1630,5 +1939,221 @@ impl ChangeLog {
             budget.check()?;
             Ok(value)
         })
+    }
+}
+
+/// Where a read-only log's paged history read resumes (item 829).
+#[derive(Default)]
+pub(super) struct RoCursor {
+    /// oldest first: the segment, the offset of the next record and the last commit
+    /// read in that segment
+    seg: usize,
+    offset: Option<u64>,
+    previous: Option<u64>,
+    /// newest first: the offsets of the records left in the segment being read, and
+    /// the segment read before it (`None` before the first)
+    rev: Vec<RecordOffset>,
+    rev_seg: Option<usize>,
+}
+
+impl RoCursor {
+    /// What the cursor keeps allocated between pages.
+    pub(super) fn kept_bytes(&self) -> u64 {
+        (self.rev.capacity() * std::mem::size_of::<RecordOffset>()) as u64
+    }
+}
+
+impl ReadOnlyLog {
+    /// Read and decode the record at `offset` of `segment`, admitting its body and its
+    /// decoded form before each is allocated.
+    fn read_admitted(
+        &self,
+        segment: usize,
+        offset: u64,
+        check: &mut dyn FnMut() -> Result<()>,
+        held: &super::pager::Held<'_, '_>,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(body) = self.segments[segment].body_at_admitted(
+            offset,
+            check,
+            Some(&mut |b| held.record(b)),
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(f) = footprint_checked(&body, check)? else {
+            return Ok(None);
+        };
+        held.record(body.capacity() as u64 + f.meta + f.terms)?;
+        check()?;
+        Ok(Some(body))
+    }
+
+    /// One page of a paged history read of commits `from` through `to`: the records
+    /// whose changes `visit` takes, resuming where `cur` stopped, until `visit` stops
+    /// or the page holds `budget` changes before a record is read or a segment is
+    /// walked. A commit is one record (see `append_pending`), so stopping before a
+    /// record never splits a commit. Returns whether the range was read to its end.
+    /// The prefix of each segment that is read follows the rules of
+    /// [`ReadOnlyLog::walk`]. Newest first, the offsets of one segment's records are
+    /// kept, admitted as they grow, and read back from the newest.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn page(
+        &self,
+        cur: &mut RoCursor,
+        from: u64,
+        to: u64,
+        filter: &LogFilter,
+        descending: bool,
+        budget: usize,
+        check: &mut dyn FnMut() -> Result<()>,
+        held: &super::pager::Held<'_, '_>,
+        visit: &mut Visit<'_>,
+    ) -> Result<bool> {
+        check()?;
+        let to = to.min(self.through);
+        if from > to {
+            return Ok(true);
+        }
+        let damaged = || Error::Corrupt("captured history record is no longer valid".into());
+        if !descending {
+            while cur.seg < self.segments.len() {
+                check()?;
+                if self.segments[cur.seg].first > to {
+                    return Ok(true);
+                }
+                let mut offset = cur.offset.unwrap_or(SEG_HEADER as u64);
+                loop {
+                    if held.len.get() >= budget {
+                        cur.offset = Some(offset);
+                        return Ok(false);
+                    }
+                    let Some(body) = self.read_admitted(cur.seg, offset, check, held)? else {
+                        break;
+                    };
+                    let Some(record) = decode_checked_with(&body, check, true)? else {
+                        break;
+                    };
+                    if cur
+                        .previous
+                        .is_some_and(|last: u64| last.checked_add(1) != Some(record.first()))
+                        || record.first() > self.through
+                    {
+                        break;
+                    }
+                    if record.first() > to {
+                        drop(record);
+                        drop(body);
+                        held.record(0)?;
+                        return Ok(true);
+                    }
+                    if record.last() >= from
+                        && matches!(record, RecordView::Changes { .. })
+                        && !record.emit(filter, check, visit)?
+                    {
+                        cur.offset = Some(offset);
+                        return Ok(false);
+                    }
+                    let covered_to = record.last() >= to;
+                    cur.previous = Some(record.last());
+                    offset = offset
+                        .checked_add(8 + body.len() as u64)
+                        .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
+                    drop(record);
+                    drop(body);
+                    held.record(0)?;
+                    if covered_to {
+                        return Ok(true);
+                    }
+                }
+                held.record(0)?;
+                cur.seg += 1;
+                cur.offset = None;
+                cur.previous = None;
+            }
+            return Ok(true);
+        }
+        loop {
+            if let Some(item) = cur.rev.pop() {
+                if held.len.get() >= budget {
+                    cur.rev.push(item);
+                    return Ok(false);
+                }
+                let body = self
+                    .read_admitted(item.segment, item.offset, check, held)?
+                    .ok_or_else(damaged)?;
+                let record = decode_checked_with(&body, check, true)?.ok_or_else(damaged)?;
+                let more = record.emit(filter, check, visit)?;
+                drop(record);
+                drop(body);
+                held.record(0)?;
+                if !more {
+                    // a change of this record may be left: read it again next time
+                    cur.rev.push(item);
+                    return Ok(false);
+                }
+                continue;
+            }
+            let next = cur.rev_seg.unwrap_or(self.segments.len());
+            if next == 0 {
+                return Ok(true);
+            }
+            // a full page stops before it walks the next segment
+            if held.len.get() >= budget {
+                return Ok(false);
+            }
+            check()?;
+            let segment = next - 1;
+            cur.rev_seg = Some(segment);
+            if self.segments[segment].first > to {
+                continue;
+            }
+            let mut offset = SEG_HEADER as u64;
+            let mut previous = None;
+            loop {
+                let Some(body) = self.read_admitted(segment, offset, check, held)? else {
+                    break;
+                };
+                let Some(record) = decode_checked_with(&body, check, true)? else {
+                    break;
+                };
+                if previous.is_some_and(|last: u64| last.checked_add(1) != Some(record.first()))
+                    || record.first() > to
+                {
+                    drop(record);
+                    drop(body);
+                    break;
+                }
+                if record.last() >= from && matches!(record, RecordView::Changes { .. }) {
+                    if cur.rev.len() == cur.rev.capacity() {
+                        // a reallocation holds the old offsets beside the new ones
+                        let size = std::mem::size_of::<RecordOffset>() as u64;
+                        let old = cur.rev.capacity() as u64 * size;
+                        let more = cur.rev.capacity().max(16);
+                        let new = old + more as u64 * size;
+                        held.kept(old + new)?;
+                        cur.rev.try_reserve_exact(more).map_err(|_| {
+                            Error::HistoryUnsupported(
+                                "history offset allocation was refused".into(),
+                            )
+                        })?;
+                        held.kept(new)?;
+                    }
+                    cur.rev.push(RecordOffset { segment, offset });
+                }
+                let covered_to = record.last() >= to;
+                previous = Some(record.last());
+                offset = offset
+                    .checked_add(8 + body.len() as u64)
+                    .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
+                drop(record);
+                drop(body);
+                held.record(0)?;
+                if covered_to {
+                    break;
+                }
+            }
+            held.record(0)?;
+        }
     }
 }
