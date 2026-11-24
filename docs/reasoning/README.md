@@ -589,7 +589,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It takes
   keys over object properties and the universal object property by rewriting them into
   class axioms over fresh names, which never reach an answer, and a run of the rewritten
-  axioms rebuilds after every edit. A key whose rewriting passes its budget, about 60
+  axioms rebuilds after every edit. When a run places a class in the `owl:Thing` node,
+  taxonomy construction and class descriptions also lift every satisfiable class above it
+  transitively, including through internal classes from key rewriting. A key whose rewriting passes its budget, about 60
   individuals for a key with one property, and a cardinality, functionality or
   disjointness of the universal property leave the ontology to the default paths, as do
   keys over data properties, the top data property and functional data properties.

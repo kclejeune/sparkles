@@ -1075,6 +1075,9 @@ pub struct Saturation {
     /// the subsumers of the classes that the last run classified in worlds of their own,
     /// with whether each is unsatisfiable
     worlds: FxHashMap<Ex, (bool, Vec<Ex>)>,
+    /// cached upward closure of `owl:Thing`'s satisfiable named subsumers for
+    /// [`Saturation::describe`], cleared whenever a new run starts or finishes
+    top_cache: std::sync::OnceLock<FxHashSet<Ex>>,
     /// whether the last run's contexts depend on one another through individuals in ways
     /// the invalidation does not follow: a context merged with an individual, a world, a
     /// key or a fact of a universal role
@@ -1804,6 +1807,7 @@ impl Saturation {
             excluded: Vec::new(),
             dirty: true,
             worlds: FxHashMap::default(),
+            top_cache: std::sync::OnceLock::new(),
             entangled: false,
             stale_tier: false,
             consistent: true,
@@ -2985,6 +2989,7 @@ impl Saturation {
         let again = self.dirty || self.index.is_none();
         // until the saturation ends, a stop leaves the state for a run that starts again
         self.dirty = true;
+        self.top_cache = std::sync::OnceLock::new();
         self.horn_tried = false;
         self.dl_tried = false;
         self.partial_over = false;
@@ -3062,6 +3067,7 @@ impl Saturation {
         self.stale_tier = stale && !full;
         let kept = kept.filter(|_| !full);
         self.worlds.clear();
+        self.top_cache = std::sync::OnceLock::new();
         if full {
             self.interner = Interner::new();
             self.ctx = Vec::new();
@@ -4295,6 +4301,7 @@ impl Saturation {
         // the saturated state is complete: a stop from here on keeps it for the next run. A
         // partial answer's is not, and the next run starts again.
         self.dirty = open.is_some();
+        self.top_cache = std::sync::OnceLock::new();
         self.kept = kept_now;
         let ix_nominals = ix.nominals.clone();
         self.index = Some(ix);
@@ -4805,6 +4812,65 @@ impl Saturation {
             .filter(|&s| matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top))
             .collect();
         Some((st.bottom, named))
+    }
+
+    /// Whether a saturated context is marked unsatisfiable, without copying its row.
+    fn is_bottom(&self, e: Ex) -> bool {
+        if let Some((bottom, _)) = self.worlds.get(&e) {
+            return *bottom;
+        }
+        self.ctx
+            .get(e as usize)
+            .and_then(|c| c.get())
+            .is_some_and(|c| c.st.lock().bottom)
+    }
+
+    /// Streams the named subsumers (`Node::Class` or `Node::Top`) of a saturated context
+    /// without allocating an intermediate vector. Returns `Ok(None)` when `e` has no
+    /// context, `Ok(Some(true))` when `e` is unsatisfiable (without calling `f`), or
+    /// `Ok(Some(false))` after visiting every named subsumer.
+    ///
+    /// Callers must not lock any context inside `f`.
+    fn visit_satisfiable_named_subsumers<E>(
+        &self,
+        e: Ex,
+        mut f: impl FnMut(Ex) -> Result<(), E>,
+    ) -> Result<Option<bool>, E> {
+        if let Some((bottom, subs)) = self.worlds.get(&e) {
+            if *bottom {
+                return Ok(Some(true));
+            }
+            for &s in subs {
+                if matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top) {
+                    f(s)?;
+                }
+            }
+            return Ok(Some(false));
+        }
+        let Some(c) = self.ctx.get(e as usize).and_then(|c| c.get()) else {
+            return Ok(None);
+        };
+        let st = c.st.lock();
+        if st.bottom {
+            return Ok(Some(true));
+        }
+        for &s in st.subs.iter() {
+            if matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top) {
+                f(s)?;
+            }
+        }
+        Ok(Some(false))
+    }
+
+    /// Whether `owl:Thing`'s own row is guaranteed upward closed, so [`Saturation::describe`]
+    /// does not need to scan the rows of every class equivalent to `owl:Thing`.
+    fn top_row_closed(&self) -> bool {
+        self.worlds.is_empty()
+            && !self.entangled
+            && self
+                .index
+                .as_ref()
+                .is_some_and(|ix| ix.horn.is_none() && ix.dl.is_none())
     }
 }
 

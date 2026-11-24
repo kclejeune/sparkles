@@ -100,7 +100,7 @@ impl Saturation {
                 .filter(|(e, _)| self.named_subsumers(*e).is_some())
                 .collect()
         };
-        let unsatisfiable = |e: Ex| self.named_subsumers(e).is_some_and(|(b, _)| b);
+        let unsatisfiable = |e: Ex| self.is_bottom(e);
         if !self.consistent {
             let mut eq: Vec<Class> = named.iter().map(|(_, k)| k.clone()).collect();
             eq.push(Class::thing());
@@ -135,7 +135,7 @@ impl Saturation {
         // Every class reachable upward from owl:Thing is equivalent to owl:Thing,
         // including through hidden internal classes (item 1086).
         let top = self.top_closure();
-        for &e in &top {
+        for &e in top {
             let visible = match self.interner.nodes[e as usize] {
                 Node::Top => true,
                 Node::Class(id) => self.interner.met.get(id as usize).copied().unwrap_or(false),
@@ -145,6 +145,8 @@ impl Saturation {
                 subsumers.push(e);
             }
         }
+        // Unsatisfiable classes stay at bottom even if an incomplete row named one.
+        subsumers.retain(|&s| !unsatisfiable(s));
         if self.reduced {
             // the made-up classes of item 805's reductions take no part in the answer,
             // whose direct superclasses are those among the visible ones
@@ -234,37 +236,167 @@ impl Saturation {
     }
 
     /// `TOP` and every satisfiable `Node::Class` reachable upward from `TOP` through
-    /// `named_subsumers`, including through hidden internal classes (item 1086).
-    fn top_closure(&self) -> FxHashSet<Ex> {
+    /// named subsumers, including through hidden internal classes (item 1086), cached
+    /// across descriptions of the same saturated state.
+    fn top_closure(&self) -> &FxHashSet<Ex> {
+        self.top_cache.get_or_init(|| self.compute_top_closure())
+    }
+
+    fn compute_top_closure(&self) -> FxHashSet<Ex> {
         let mut top = FxHashSet::default();
         top.insert(TOP);
-        let Some((false, initial)) = self.named_subsumers(TOP) else {
+        if self.top_row_closed() {
+            #[cfg(test)]
+            top_closure_count_visit();
+            let _ = self.visit_satisfiable_named_subsumers(TOP, |e| {
+                top.insert(e);
+                Ok::<(), std::convert::Infallible>(())
+            });
+            top.retain(|&e| e == TOP || !self.is_bottom(e));
             return top;
-        };
+        }
         let mut seen = FxHashSet::default();
         seen.insert(TOP);
         let mut stack: Vec<Ex> = Vec::new();
-        for e in initial {
+        #[cfg(test)]
+        top_closure_count_visit();
+        let seed_ok = self.visit_satisfiable_named_subsumers(TOP, |e| {
             if seen.insert(e) {
                 stack.push(e);
             }
+            Ok::<(), std::convert::Infallible>(())
+        });
+        if !matches!(seed_ok, Ok(Some(false))) {
+            return top;
         }
         while let Some(e) = stack.pop() {
-            match self.named_subsumers(e) {
-                Some((true, _)) => continue,
-                Some((false, raw)) => {
-                    top.insert(e);
-                    for x in raw {
-                        if seen.insert(x) {
-                            stack.push(x);
-                        }
-                    }
+            #[cfg(test)]
+            top_closure_count_visit();
+            let visited = self.visit_satisfiable_named_subsumers(e, |x| {
+                if seen.insert(x) {
+                    stack.push(x);
                 }
-                None => {
+                Ok::<(), std::convert::Infallible>(())
+            });
+            match visited {
+                Ok(Some(true)) => continue,
+                Ok(Some(false)) | Ok(None) => {
                     top.insert(e);
                 }
+                Err(infallible) => match infallible {},
             }
         }
         top
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TOP_CLOSURE_ROW_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn top_closure_count_visit() {
+    TOP_CLOSURE_ROW_VISITS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+fn take_top_closure_row_visits() -> usize {
+    TOP_CLOSURE_ROW_VISITS.with(|c| c.replace(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classify::{Classifier, Limits};
+
+    fn c(s: &str) -> Class {
+        Class::new(format!("http://ex.org/{s}"))
+    }
+
+    #[test]
+    fn describe_thing_on_dense_el_top_node_does_not_rescan_quadratically() {
+        let n = 200usize;
+        let mut axioms: Vec<Axiom> = (0..n)
+            .map(|i| Axiom::sub_class_of(Class::thing(), c(&format!("C{i:04}"))))
+            .collect();
+        axioms.push(Axiom::sub_class_of(c("D"), Class::thing()));
+        let kinds: Vec<&AxiomKind> = axioms.iter().map(|a| &a.kind).collect();
+        let mut k = Saturation::new();
+        k.classify(&kinds, None, &Limits::default()).unwrap();
+
+        let _ = take_top_closure_row_visits();
+        let first = k.describe(&Class::thing()).unwrap();
+        let first_visits = take_top_closure_row_visits();
+        assert_eq!(first.equivalents.len(), n);
+        assert_eq!(first.subclasses, vec![c("D")]);
+        assert!(
+            first_visits <= 1,
+            "dense EL top node should read only TOP's row, visited {first_visits} rows"
+        );
+
+        for _ in 0..4 {
+            let repeated = k.describe(&Class::thing()).unwrap();
+            assert_eq!(repeated, first);
+        }
+        let repeat_visits = take_top_closure_row_visits();
+        assert_eq!(
+            repeat_visits, 0,
+            "repeated describe(owl:Thing) should reuse cached top closure, visited {repeat_visits} rows"
+        );
+    }
+
+    #[test]
+    fn describe_caches_top_closure_and_invalidates_on_reclassify() {
+        let a_ind = NamedIndividual::new("http://ex.org/a");
+        let r = ObjectProperty::new("http://ex.org/r");
+        let axioms = vec![
+            Axiom::sub_class_of(
+                Class::thing(),
+                ClassExpression::ObjectOneOf([Individual::Named(a_ind.clone())].into()),
+            ),
+            Axiom::sub_class_of(Class::thing(), c("A")),
+            Axiom::new(AxiomKind::ObjectPropertyAssertion(
+                r.clone().into(),
+                Individual::Named(a_ind.clone()),
+                Individual::Named(a_ind),
+            )),
+            Axiom::sub_class_of(c("A"), ClassExpression::all(r, c("B"))),
+            Axiom::sub_class_of(c("B"), c("C")),
+        ];
+        let limits = Limits {
+            rooted: true,
+            ..Limits::default()
+        };
+        let mut clf = Classifier::of(&axioms);
+        clf.classify(&limits).unwrap();
+
+        let _ = take_top_closure_row_visits();
+        let d1 = clf.describe(&Class::thing()).unwrap();
+        let first_visits = take_top_closure_row_visits();
+        assert!(first_visits >= 1);
+        assert_eq!(d1.equivalents, vec![c("A"), c("B"), c("C")]);
+
+        for _ in 0..3 {
+            assert_eq!(clf.describe(&Class::thing()).unwrap(), d1);
+            assert!(
+                clf.describe(&c("B"))
+                    .unwrap()
+                    .equivalents
+                    .contains(&Class::thing())
+            );
+        }
+        assert_eq!(
+            take_top_closure_row_visits(),
+            0,
+            "repeated describe calls should reuse cached top closure"
+        );
+
+        // Mutating axioms and reclassifying must invalidate the cached top closure.
+        let extra = Axiom::sub_class_of(c("C"), c("D"));
+        clf.add(std::iter::once(&extra));
+        clf.classify(&limits).unwrap();
+        let d2 = clf.describe(&Class::thing()).unwrap();
+        assert_eq!(d2.equivalents, vec![c("A"), c("B"), c("C"), c("D")]);
     }
 }
