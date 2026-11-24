@@ -22,7 +22,7 @@ timing rules and answer checks.
 | Ontology entity search | Typeahead prefix and typo-tolerant search over GO and ChEBI lite | [Methodology](entity-search/README.md) | [Results](entity-search/RESULTS.md) |
 | Vector search | Exact and HNSW approximate recall and latency | [Methodology](vector/README.md) | [Results](vector/RESULTS.md) |
 | Spatial queries | Indexed GeoSPARQL queries and GeoSPARQL compliance coverage | [Methodology](spatial/README.md) | [Results](spatial/RESULTS.md) |
-| Paths and graph algorithms | Shortest-path, weighted-pair and graph algorithm timings | [Methodology](graph/README.md) | [Results](graph/RESULTS.md) |
+| Paths and graph algorithms | Shortest-path, weighted-pair and graph algorithm timings | [Methodology](graph/README.md) | [Results](graph/README.md) |
 | Engine features and overheads | Focused execution, planning, serialization and rewrite-gate baselines | [Methodology](engine/README.md) | [Results](engine/RESULTS.md) |
 | Loading and index builds | Bulk loads across suites, compressed inputs and compaction | [Methodology](loading/README.md) | [Results](loading/RESULTS.md) |
 | Writes and updates | Durable commits, group commit, mixed read/write load and incremental views | [Methodology](writes/README.md) | [Results](writes/RESULTS.md) |
@@ -33,25 +33,19 @@ timing rules and answer checks.
 
 ## Evidence and generated reports
 
-`RESULTS.md` files are manually maintained reports unless they explicitly state that they
-are generated. Their tables retain original timing statistics, footnotes and
-qualifications, and a single report can combine multiple runs under distinct timing
-contracts. A raw record supports only the measurements and metadata it contains, so a
-claim that needs a missing build revision, host detail, durability setting or answer check
-requires a new run.
+`RESULTS.md` files are manually maintained unless marked as generated. Their tables retain
+original statistics, footnotes and qualifications across distinct timing contracts, and
+claims needing a missing build revision, host detail, durability setting or answer check
+require a new run.
 
-Each workload keeps a `RUNS.json` catalog. Every run ID is the SHA-256 of the raw record
-bytes, keeping multiple runs from the same day distinct. Existing JSON records remain at
-their original paths, while new runs belong under `<workload>/runs/<run-id>/record.json`
-beside their manifest and raw outputs. Retained runs are immutable; refresh a result by
-adding a new run and selecting it explicitly.
+Each workload tracks immutable runs in `RUNS.json`, keyed by the SHA-256 of the raw record
+bytes. Legacy records stay at their existing paths, while new runs live under
+`<workload>/runs/<run-id>/record.json` beside their manifest and raw outputs; refresh a
+result by adding and selecting a new run.
 
-The [synthetic record tables](synthetic/RECORDS.md) and charts are generated from selected
-common records. Their source hashes, eligibility rules and carried-over measurements are
-visible in the report and in [report.json](synthetic/report.json). They supplement the
-manual report rather than replacing its mean timings or establishing performance for a
-different build.
-
-Run `python3 scripts/bench-docs.py --check` from the repository root to verify source
-hashes and generated output. Run it without `--check` to regenerate only the selected
-tables and charts. A hash mismatch stops both modes.
+The generated [synthetic record tables](synthetic/RECORDS.md) and charts cite their source
+hashes, eligibility rules and carried-over measurements in [report.json](synthetic/report.json).
+They supplement the manual report without replacing its timing contract or standing for a
+different build. Run `python3 scripts/bench-docs.py --check` to verify hashes and generated
+output, or run it without `--check` to regenerate selected tables and charts; a hash
+mismatch stops both modes.

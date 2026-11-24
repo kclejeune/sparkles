@@ -1,6 +1,6 @@
 # Libraries and integrations
 
-Sparkles embeds directly inside Rust, Python, JVM (Apache Jena), and Node.js applications without running a separate server, and also provides a native Rust HTTP client (`sparkles-client`) and TypeScript HTTP client (`@sparkles-rdf/client`) for remote endpoints. Use this guide to choose an integration surface, understand shared runtime ownership and ontology handles, and check packaging or feature differences between languages. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+Sparkles embeds directly inside Rust, Python, JVM (Apache Jena), and Node.js applications without a separate server, alongside native Rust (`sparkles-client`) and TypeScript (`@sparkles-rdf/client`) HTTP clients for remote endpoints. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
 
 | Surface | Package / crate | Highlights |
 |---|---|---|

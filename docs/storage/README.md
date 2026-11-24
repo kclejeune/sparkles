@@ -1,6 +1,6 @@
 # Storage and history
 
-Sparkles stores RDF quads in QLever-style sorted, compressed permutation files paired with an MVCC write-ahead log, durable group commit, online compaction, and git-like versioning with time travel, diffs, change feeds, branches, and merges. Use this guide to understand how data is indexed and loaded, what durability and isolation guarantees apply, and how retained history and branches work. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+Sparkles stores RDF quads in QLever-style sorted, compressed permutation files with an MVCC write-ahead log, durable group commit, online compaction, and git-like versioning with time travel, diffs, change feeds, branches, and merges. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
 
 | Section | What it covers |
 |---|---|

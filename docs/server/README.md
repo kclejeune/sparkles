@@ -1,6 +1,6 @@
 # Server and security
 
-Sparkles serves Apache Jena Fuseki's HTTP protocols and administration API alongside read-only GraphQL, versioned stored queries, a DCAT 3 resource catalog, and layered access control over datasets, graphs, and triples. Use this guide to see how the server exposes datasets over HTTP, how authentication and authorization work, and which Fuseki or security features remain outside current scope. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+Sparkles serves Apache Jena Fuseki's HTTP protocols and administration API alongside read-only GraphQL, versioned stored queries, a DCAT 3 resource catalog, and layered access control over datasets, graphs, and triples. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
 
 | Section | What it covers |
 |---|---|

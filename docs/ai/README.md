@@ -1,6 +1,6 @@
 # AI and agents
 
-Sparkles connects AI agents to RDF datasets through a grant-checked MCP server, translates plain-language questions into verified SPARQL queries, stores cited agent memory with human review workflows, ingests documents into reviewed facts or claim proposals, generates Leiden GraphRAG community reports, and provides versioned evidence, entity-representation, valid-time, and durable-job primitives. Use this guide to configure agent access, understand how grounding and provenance work, and inspect current evaluation scores and limits. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+Sparkles exposes RDF datasets to AI agents through a grant-checked MCP server, grounded plain-language Ask queries, cited agent memory, document ingestion, Leiden GraphRAG community reports, and versioned evidence, entity, valid-time, and durable-job primitives. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
 
 | Section | What it covers |
 |---|---|
