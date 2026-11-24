@@ -142,12 +142,12 @@ impl HistorySpec {
     }
 }
 
-fn slot(p: &Planner<'_>, t: &TermPattern, name: &str) -> Result<Slot> {
+pub(super) fn slot(p: &Planner<'_>, t: &TermPattern, name: &str) -> Result<Slot> {
     Ok(match t {
         // a variable the planner replaced by its value is that value
         TermPattern::Variable(_) => match p.term_pattern(t) {
             PT::V(v) => Slot::Var(v),
-            PT::C(id) => match p.ctx.term(id) {
+            PT::C(id) => match p.ctx.term_checked(id)? {
                 Some(t) => Slot::Const(t),
                 None => return Err(bad(format!("{name} has no value"))),
             },
@@ -493,14 +493,14 @@ pub(super) fn run(
 /// The call with the values of one binding of its input variables as constants. An
 /// unbound value leaves its variable to the lookup. `None` when no change can match,
 /// such as a literal in the predicate's place.
-fn bind(ctx: &Ctx, spec: &HistorySpec, key: &[Id]) -> Result<Option<HistorySpec>> {
+pub(super) fn bind(ctx: &Ctx, spec: &HistorySpec, key: &[Id]) -> Result<Option<HistorySpec>> {
     let mut s = spec.clone();
     s.inputs.clear();
     for (v, k) in spec.inputs.iter().zip(key) {
         if k.is_undef() {
             continue;
         }
-        let Some(t) = ctx.term(*k) else {
+        let Some(t) = ctx.term_checked(*k)? else {
             return Ok(None);
         };
         for slot in [&mut s.s, &mut s.p, &mut s.o, &mut s.g] {

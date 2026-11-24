@@ -44,6 +44,7 @@ struct Cx<'a> {
     leaves: SchemaLeaves,
     deadline: Option<Instant>,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    max_memory: Option<usize>,
     reads: std::cell::Cell<usize>,
     resolve: Option<&'a AssertedResolver<'a>>,
 }
@@ -130,14 +131,33 @@ impl Cx<'_> {
         self.snap.lookup_term(t)
     }
 
-    fn graph_name(&self, g: Id) -> Option<String> {
+    fn check_decode_bytes(&self, len: usize) -> Result<()> {
+        if let Some(limit) = self.max_memory {
+            let need = len.saturating_mul(8).saturating_add(128);
+            if need > limit {
+                return Err(budget(format!(
+                    "decoding an explanation term needs {need} bytes, over its memory limit of {limit}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_term(&self, id: Id) -> Result<Option<Term>> {
+        self.snap
+            .term_controlled(id, &mut |len| self.check_decode_bytes(len), &mut || {
+                self.check()
+            })
+    }
+
+    fn graph_name(&self, g: Id) -> Result<Option<String>> {
         if g == Id::DEFAULT_GRAPH {
-            return Some("default".to_string());
+            return Ok(Some("default".to_string()));
         }
-        match self.snap.term(g)? {
-            Term::NamedNode(n) => Some(n.into_string()),
+        Ok(match self.decode_term(g)? {
+            Some(Term::NamedNode(n)) => Some(n.into_string()),
             _ => None,
-        }
+        })
     }
 
     fn leaf(&self, g: Id, triple: &[Term; 3]) -> Result<Option<Derivation>> {
@@ -146,7 +166,7 @@ impl Cx<'_> {
             Some(resolve) => resolve(g, triple),
             None => Ok(Some(Derivation::asserted(
                 triple.clone(),
-                self.graph_name(g),
+                self.graph_name(g)?,
             ))),
         }
     }
@@ -177,7 +197,7 @@ impl Cx<'_> {
         let mut found = None;
         self.scan_rows(Perm::Gspo, &[g.0, subject.0, predicate.0], |key| {
             self.read()?;
-            if let Some(object) = self.snap.term(Id(key[3])) {
+            if let Some(object) = self.decode_term(Id(key[3]))? {
                 let triple = [s.clone(), Term::NamedNode(p.clone()), object];
                 if let Some(proof) = self.leaf(g, &triple)? {
                     found = Some(proof);
@@ -200,7 +220,7 @@ impl Cx<'_> {
         self.scan_rows(Perm::Pos, &[predicate.0, object.0], |key| {
             let q = Perm::Pos.to_quad(key);
             if q[3] == g
-                && let Some(subject) = self.snap.term(q[0])
+                && let Some(subject) = self.decode_term(q[0])?
             {
                 let triple = [subject, Term::NamedNode(p.clone()), o.clone()];
                 if let Some(proof) = self.leaf(g, &triple)? {
@@ -317,7 +337,7 @@ impl Cx<'_> {
             // request's controls as the rows stream
             self.scan_rows(Perm::Gspo, &[g.0, xi.0, pi.0], |k| {
                 self.read()?;
-                if let Some(Term::NamedNode(y)) = self.snap.term(Id(k[3]))
+                if let Some(Term::NamedNode(y)) = self.decode_term(Id(k[3]))?
                     && &y != a
                     && !back.contains_key(&y)
                 {
@@ -461,6 +481,7 @@ impl RdfsSchema {
             leaves,
             deadline,
             cancel,
+            max_memory,
             reads: std::cell::Cell::new(0),
             resolve,
         };

@@ -107,20 +107,27 @@ pub struct SpatialKnnSpec {
 
 /// Join components of one group that a spatial conjunct of `filters` connects (the
 /// conjunct moves into the join).
-pub(super) fn spatial_joins(parts: &mut Vec<Node>, filters: &mut Vec<Expr>, ctx: &Ctx) {
+pub(super) fn spatial_joins(
+    parts: &mut Vec<Node>,
+    filters: &mut Vec<Expr>,
+    ctx: &Ctx,
+) -> crate::error::Result<()> {
     #[cfg(not(feature = "geo"))]
-    let _ = (parts, filters, ctx);
+    {
+        let _ = (parts, filters, ctx);
+        Ok(())
+    }
     #[cfg(feature = "geo")]
-    on::spatial_joins(parts, filters, ctx);
+    on::spatial_joins(parts, filters, ctx)
 }
 
 /// An `ORDER BY … LIMIT k` node as a k-nearest-neighbour search when its shape allows,
 /// else `n` unchanged.
-pub(super) fn spatial_knn(n: Node, ctx: &Ctx) -> Node {
+pub(super) fn spatial_knn(n: Node, ctx: &Ctx) -> crate::error::Result<Node> {
     #[cfg(not(feature = "geo"))]
     {
         let _ = ctx;
-        n
+        Ok(n)
     }
     #[cfg(feature = "geo")]
     on::spatial_knn(n, ctx)
@@ -130,13 +137,14 @@ pub(super) fn spatial_knn(n: Node, ctx: &Ctx) -> Node {
 mod on {
     use super::super::expr::CmpOp;
     use super::super::geopf::{
-        ScanShape, constant_geom, distance_text, fold_const, geof_call, number, scope_covers,
-        unit_iri, warn,
+        ScanShape, constant_geom, distance_text, fold_const_checked, geof_call, number,
+        scope_covers, unit_iri, warn,
     };
     use super::super::plan::{self, Kind, merge_dist, short};
     use super::super::table::Table;
     use super::super::value::Value;
     use super::*;
+    use crate::error::Result;
     use crate::geo::exec::{config, radius_windows, summary};
     use crate::geo::ops::relate;
     use crate::geo::units::{self, UnitKind};
@@ -176,22 +184,24 @@ mod on {
         text: String,
     }
 
+    type JoinConjunct = (VarId, VarId, std::result::Result<Shape, String>);
+
     /// A conjunct comparing two geometry variables `(a, b)` (in argument order) that a
     /// spatial join could serve: its test, or why it cannot serve it.
-    fn conjunct(e: &Expr, ctx: &Ctx) -> Option<(VarId, VarId, std::result::Result<Shape, String>)> {
+    fn conjunct(e: &Expr, ctx: &Ctx) -> Result<Option<JoinConjunct>> {
         if let Some((fname, args)) = geof_call(e) {
             let rel = Relation::from_local(fname);
             if rel.is_none() && fname != "relate" {
-                return None;
+                return Ok(None);
             }
             if args.len() != if rel.is_some() { 2 } else { 3 } {
-                return None;
+                return Ok(None);
             }
             let (Some(a), Some(b)) = (var(&args[0]), var(&args[1])) else {
-                return None;
+                return Ok(None);
             };
             if a == b {
-                return None;
+                return Ok(None);
             }
             let shape = match rel {
                 Some(r) if !r.index_usable() => Err(format!(
@@ -202,7 +212,7 @@ mod on {
                     keep: false,
                     text: fname.to_string(),
                 }),
-                None => match fold_const(&args[2], ctx) {
+                None => match fold_const_checked(&args[2], ctx)? {
                     Some(Value::Str(p)) => match relate::pattern_needs_intersection(&p) {
                         Ok(true) => Ok(Shape {
                             text: format!("relate {p}"),
@@ -217,31 +227,35 @@ mod on {
                     _ => Err("geof:relate: the pattern is not a constant string".into()),
                 },
             };
-            return Some((a, b, shape));
+            return Ok(Some((a, b, shape)));
         }
         // distance(?a, ?b, unit) < r and the mirrored forms
         let Expr::Cmp(x, y, op) = e else {
-            return None;
+            return Ok(None);
         };
         let (call, bound, upper) = match (geof_call(x), geof_call(y), op) {
             (Some(c), _, CmpOp::Lt | CmpOp::Le) => (c, &**y, true),
             (_, Some(c), CmpOp::Gt | CmpOp::Ge) => (c, &**x, true),
             (Some(c), _, _) => (c, &**y, false),
             (_, Some(c), _) => (c, &**x, false),
-            _ => return None,
+            _ => return Ok(None),
         };
         let (fname, args) = call;
         match (fname, args.len()) {
             ("distance", 3) | ("metricDistance", 2) => {}
-            _ => return None,
+            _ => return Ok(None),
         }
         let (Some(a), Some(b)) = (var(&args[0]), var(&args[1])) else {
-            return None;
+            return Ok(None);
         };
         if a == b {
-            return None;
+            return Ok(None);
         }
-        Some((a, b, distance_shape(fname, args, bound, upper, *op, ctx)))
+        Ok(Some((
+            a,
+            b,
+            distance_shape(fname, args, bound, upper, *op, ctx)?,
+        )))
     }
 
     /// The test of `geof:<fname>(?a, ?b[, unit]) < bound` (`upper`: the bound is above
@@ -253,26 +267,29 @@ mod on {
         upper: bool,
         op: CmpOp,
         ctx: &Ctx,
-    ) -> std::result::Result<Shape, String> {
+    ) -> Result<std::result::Result<Shape, String>> {
         if !upper {
-            return Err(format!(
+            return Ok(Err(format!(
                 "a lower bound on geof:{fname} keeps far geometries"
-            ));
+            )));
         }
-        let Some(r) = fold_const(bound, ctx).as_ref().and_then(number) else {
-            return Err(format!(
+        let Some(r) = fold_const_checked(bound, ctx)?.as_ref().and_then(number) else {
+            return Ok(Err(format!(
                 "the bound on geof:{fname} is not a constant number"
-            ));
+            )));
         };
         let (unit, unit_text) = if fname == "metricDistance" {
             (units::Unit::METRE, None)
         } else {
-            let iri = fold_const(&args[2], ctx)
+            let Some(iri) = fold_const_checked(&args[2], ctx)?
                 .as_ref()
                 .and_then(unit_iri)
-                .ok_or_else(|| format!("geof:{fname}: the unit is not a constant IRI"))?;
-            let u =
-                units::unit(&iri).ok_or_else(|| format!("geof:{fname}: unknown unit <{iri}>"))?;
+            else {
+                return Ok(Err(format!("geof:{fname}: the unit is not a constant IRI")));
+            };
+            let Some(u) = units::unit(&iri) else {
+                return Ok(Err(format!("geof:{fname}: unknown unit <{iri}>")));
+            };
             let local = iri.rsplit(['#', '/']).next().unwrap_or(&iri).to_string();
             (u, Some(local))
         };
@@ -283,27 +300,31 @@ mod on {
             UnitKind::Length if unit.factor == 1.0 => (r, false),
             UnitKind::Length => (r * unit.factor * (1.0 + 1e-9), true),
             UnitKind::Angle => (r * unit.factor * REACH_PER_RADIAN * (1.0 + 1e-9), true),
-            UnitKind::Area => return Err(format!("geof:{fname}: the unit is not a length")),
+            UnitKind::Area => return Ok(Err(format!("geof:{fname}: the unit is not a length"))),
         };
         let cmp = if inclusive { "≤" } else { "<" };
         let text = match unit_text {
             None => format!("{fname} {cmp} {}", distance_text(r)),
             Some(u) => format!("{fname} {cmp} {r} {u}"),
         };
-        Ok(Shape {
+        Ok(Ok(Shape {
             test: JoinTest::Within {
                 metres,
                 inclusive: inclusive || keep,
             },
             keep,
             text,
-        })
+        }))
     }
 
-    pub(super) fn spatial_joins(parts: &mut Vec<Node>, filters: &mut Vec<Expr>, ctx: &Ctx) {
+    pub(super) fn spatial_joins(
+        parts: &mut Vec<Node>,
+        filters: &mut Vec<Expr>,
+        ctx: &Ctx,
+    ) -> Result<()> {
         let mut i = 0;
         while parts.len() >= 2 && i < filters.len() {
-            let Some((a, b, shape)) = conjunct(&filters[i], ctx) else {
+            let Some((a, b, shape)) = conjunct(&filters[i], ctx)? else {
                 i += 1;
                 continue;
             };
@@ -339,6 +360,7 @@ mod on {
             let n = join_node(l, r, (a, b), shape, conj, ctx);
             parts.push(n);
         }
+        Ok(())
     }
 
     /// The join side of the component `n` for its geometry `v`: a plain scan of an
@@ -526,29 +548,34 @@ mod on {
         e: &Expr,
         ctx: &Ctx,
         cfg: &GeoConfig,
-    ) -> Option<std::result::Result<Distance, String>> {
-        let (fname, args) = geof_call(e)?;
+    ) -> Result<Option<std::result::Result<Distance, String>>> {
+        let Some((fname, args)) = geof_call(e) else {
+            return Ok(None);
+        };
         let fname = match (fname, args.len()) {
             ("metricDistance", 2) => "metricDistance",
             ("distance", 3) => "distance",
-            _ => return None,
+            _ => return Ok(None),
         };
         let (w, w_first, other) = match (var(&args[0]), var(&args[1])) {
             (Some(w), None) => (w, true, &args[1]),
             (None, Some(w)) => (w, false, &args[0]),
-            _ => return None,
+            _ => return Ok(None),
         };
         if !other.var_set().is_empty() || other.has_exists() {
-            return None;
+            return Ok(None);
         }
-        let q = match constant_geom(other, ctx, cfg) {
+        let q = match constant_geom(other, ctx, cfg)? {
             Ok(q) => q,
-            Err(m) => return Some(Err(format!("geof:{fname}: {m}"))),
+            Err(m) => return Ok(Some(Err(format!("geof:{fname}: {m}")))),
         };
         let (unit, unit_text) = if fname == "metricDistance" {
             (Ok(units::Unit::METRE), None)
         } else {
-            match fold_const(&args[2], ctx).as_ref().and_then(unit_iri) {
+            match fold_const_checked(&args[2], ctx)?
+                .as_ref()
+                .and_then(unit_iri)
+            {
                 Some(iri) => (
                     units::unit(&iri).ok_or_else(|| format!("unknown unit <{iri}>")),
                     Some(iri.rsplit(['#', '/']).next().unwrap_or(&iri).to_string()),
@@ -556,14 +583,14 @@ mod on {
                 None => (Err("the unit is not a constant IRI".to_string()), None),
             }
         };
-        Some(Ok(Distance {
+        Ok(Some(Ok(Distance {
             w,
             w_first,
             q,
             fname,
             unit,
             unit_text,
-        }))
+        })))
     }
 
     /// The unary operators over a group's joins (filters, binds, optional parts on the
@@ -710,7 +737,7 @@ mod on {
     }
 
     /// Apply lifted pure filters once their original bindings are certainly available.
-    fn ready_filters(n: Node, pending: &mut Vec<Expr>, ctx: &Ctx) -> Node {
+    fn ready_filters(n: Node, pending: &mut Vec<Expr>, ctx: &Ctx) -> Result<Node> {
         let mut ready = Vec::new();
         pending.retain(|e| {
             if e.var_set().iter().all(|v| n.certain.contains(v)) {
@@ -721,23 +748,23 @@ mod on {
             }
         });
         if ready.is_empty() {
-            n
+            Ok(n)
         } else {
-            plan::filter(n, ready, ctx)
+            plan::filter_checked(n, ready, ctx)
         }
     }
 
-    pub(super) fn spatial_knn(n: Node, ctx: &Ctx) -> Node {
+    pub(super) fn spatial_knn(n: Node, ctx: &Ctx) -> Result<Node> {
         let Kind::OrderBy {
             keys,
             limit: Some(k),
         } = &n.kind
         else {
-            return n;
+            return Ok(n);
         };
         let k = *k;
         let Some((key, asc)) = keys.first() else {
-            return n;
+            return Ok(n);
         };
         let child = &n.children[0];
         let (chain, _) = split_chain(child);
@@ -749,17 +776,17 @@ mod on {
                 });
                 match bound {
                     Some(e) => e,
-                    None => return n,
+                    None => return Ok(n),
                 }
             }
             e => e,
         };
         let cfg = config(ctx);
-        let Some(dist) = distance_call(call, ctx, &cfg) else {
-            return n;
+        let Some(dist) = distance_call(call, ctx, &cfg)? else {
+            return Ok(n);
         };
         if !ctx.opt.spatial_knn || k == 0 {
-            return n;
+            return Ok(n);
         }
         let dist = match dist {
             Ok(d) => d,
@@ -769,16 +796,16 @@ mod on {
                     NOT_KNN,
                     format!("nearest-neighbour order not used: {why}"),
                 );
-                return n;
+                return Ok(n);
             }
         };
         let w = dist.w;
         let knn = if *asc {
-            knn_node(child, key, call, dist, k, ctx)
+            knn_node(child, key, call, dist, k, ctx)?
         } else {
             Err("the order is descending".into())
         };
-        match knn {
+        Ok(match knn {
             Ok(node) => {
                 let mut n = n;
                 n.cost += node.cost - n.children[0].cost;
@@ -796,7 +823,7 @@ mod on {
                 );
                 n
             }
-        }
+        })
     }
 
     /// Whether the conjunct removes the rows whose ordering key is an error.
@@ -819,67 +846,77 @@ mod on {
         dist: Distance,
         k: usize,
         ctx: &Ctx,
-    ) -> std::result::Result<Node, String> {
+    ) -> Result<std::result::Result<Node, String>> {
         let w = dist.w;
         if ctx.calls_extensions {
-            return Err("the query calls application extensions".into());
+            return Ok(Err("the query calls application extensions".into()));
         }
-        let unit = dist.unit?;
+        let unit = match dist.unit {
+            Ok(u) => u,
+            Err(why) => return Ok(Err(why)),
+        };
         let metres_per_unit = match unit.kind {
             UnitKind::Length => unit.factor,
-            UnitKind::Angle => return Err("the unit is an angle".into()),
-            UnitKind::Area => return Err("the unit is not a length".into()),
+            UnitKind::Angle => return Ok(Err("the unit is an angle".into())),
+            UnitKind::Area => return Ok(Err("the unit is not a length".into())),
         };
         if dist.q.empty {
-            return Err("the constant geometry is empty".into());
+            return Ok(Err("the constant geometry is empty".into()));
         }
         if !dist.q.crs.known().is_some_and(|c| c.is_geographic()) {
-            return Err("the constant geometry is not in longitude and latitude".into());
+            return Ok(Err(
+                "the constant geometry is not in longitude and latitude".into(),
+            ));
         }
-        let view = ctx
-            .snap
-            .geo
-            .as_deref()
-            .ok_or("the dataset has no spatial index")?;
+        let Some(view) = ctx.snap.geo.as_deref() else {
+            return Ok(Err("the dataset has no spatial index".into()));
+        };
         match view.state() {
             IndexState::Ready => {}
             IndexState::Building(p) => {
-                return Err(format!("the spatial index is building ({:.0}%)", p * 100.0));
+                return Ok(Err(format!(
+                    "the spatial index is building ({:.0}%)",
+                    p * 100.0
+                )));
             }
-            s => return Err(format!("the spatial index is {s}")),
+            s => return Ok(Err(format!("the spatial index is {s}"))),
         }
         let (chain, core) = split_chain(child);
         let connected = connected_vars(core, w);
         let mut leaves = Vec::new();
         let mut filters = Vec::new();
         if !flatten(core, ctx, &connected, &mut leaves, &mut filters) {
-            return Err("the group is not a join of patterns under its filters and binds".into());
+            return Ok(Err(
+                "the group is not a join of patterns under its filters and binds".into(),
+            ));
         }
         let at: Vec<usize> = (0..leaves.len())
             .filter(|&i| leaves[i].vars.contains(&w))
             .collect();
         let [at] = at.as_slice() else {
-            return Err(format!(
+            return Ok(Err(format!(
                 "{} is bound by more than one pattern",
                 name(ctx, w)
-            ));
+            )));
         };
         let scan_node = leaves.remove(*at);
         let Kind::Scan(spec) = &scan_node.kind else {
-            return Err(format!("{} is not read by a plain scan", name(ctx, w)));
+            return Ok(Err(format!("{} is not read by a plain scan", name(ctx, w))));
         };
         let spec = spec.clone();
-        let shape = ScanShape::of(&spec)
-            .filter(|s| s.obj == w)
-            .ok_or_else(|| format!("{} is not the object of a scan", name(ctx, w)))?;
+        let Some(shape) = ScanShape::of(&spec).filter(|s| s.obj == w) else {
+            return Ok(Err(format!("{} is not the object of a scan", name(ctx, w))));
+        };
         if view.predicate_slot(shape.pred).is_none() {
             let p = ctx
                 .plan_term(shape.pred)
                 .map_or_else(|| "?".into(), |t| short(&t));
-            return Err(format!("{p} is not an indexed predicate"));
+            return Ok(Err(format!("{p} is not an indexed predicate")));
         }
         if !scope_covers(&view.config, &shape.graph_filter(&spec), ctx) {
-            return Err("the query reads graphs out of the spatial index's scope".into());
+            return Ok(Err(
+                "the query reads graphs out of the spatial index's scope".into(),
+            ));
         }
         // Read the scan's connected patterns per batch, probing the batch's keys.
         // Independent components are joined on their own keys before crossing them
@@ -912,10 +949,10 @@ mod on {
             .map(|&v| (v, batch.min(scan_node.d(v))))
             .collect();
         let mut pending = filters.clone();
-        let mut t = ready_filters(ph, &mut pending, ctx);
+        let mut t = ready_filters(ph, &mut pending, ctx)?;
         for leaf in joined {
             t = plan::join(t, leaf, ctx);
-            t = ready_filters(t, &mut pending, ctx);
+            t = ready_filters(t, &mut pending, ctx)?;
         }
         while !leaves.is_empty() {
             let mut component = leaves.remove(0);
@@ -926,10 +963,12 @@ mod on {
                 component = plan::join(component, leaves.remove(i), ctx);
             }
             t = plan::join(t, component, ctx);
-            t = ready_filters(t, &mut pending, ctx);
+            t = ready_filters(t, &mut pending, ctx)?;
         }
         if !pending.is_empty() {
-            return Err("a probe filter needs bindings outside its join group".into());
+            return Ok(Err(
+                "a probe filter needs bindings outside its join group".into()
+            ));
         }
         t = super::super::indexjoin::fuse_stars(t, ctx);
         for c in chain.iter().rev() {
@@ -941,7 +980,7 @@ mod on {
         }
         let mut placeholder = Vec::new();
         if !path_to(&t, &mut placeholder) {
-            return Err("the template lost its placeholder".into());
+            return Ok(Err("the template lost its placeholder".into()));
         }
         // rows whose distance is an error sort first, unless a filter on the key removes
         // them
@@ -993,7 +1032,7 @@ mod on {
             order: key.clone(),
             w_first: dist.w_first,
         };
-        Ok(Node {
+        Ok(Ok(Node {
             kind: Kind::SpatialKnn(Box::new(knn)),
             vars: child.vars.clone(),
             certain: child.certain.clone(),
@@ -1003,7 +1042,7 @@ mod on {
             dist: dists,
             desc,
             children: vec![t],
-        })
+        }))
     }
 
     /// The child positions from `n` to the placeholder leaf.

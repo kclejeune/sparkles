@@ -394,7 +394,7 @@ type Key = (Id, Id);
 
 /// One entry per key, its best score, ranked: one more than the number of keys with a
 /// better score.
-fn ranks(
+pub(super) fn ranks(
     ctx: &Ctx,
     t: &Table,
     s: VarId,
@@ -415,11 +415,17 @@ fn ranks(
             ctx.check()?;
         }
         let id = t.get(r, cscore);
-        let v = *values.entry(id).or_insert_with(|| match ctx.value(id) {
-            Some(Value::Float(f)) => f64::from(f32::from(f)),
-            Some(Value::Double(d)) => f64::from(d),
-            _ => f64::NAN,
-        });
+        let v = if let Some(&v) = values.get(&id) {
+            v
+        } else {
+            let v = match ctx.value_checked(id)? {
+                Some(Value::Float(f)) => f64::from(f32::from(f)),
+                Some(Value::Double(d)) => f64::from(d),
+                _ => f64::NAN,
+            };
+            values.insert(id, v);
+            v
+        };
         if v.is_nan() {
             continue;
         }
@@ -585,7 +591,7 @@ pub(super) fn search_bound(
         let rows = &groups[&(t, v)];
         let text = match (&fixed_text, &spec.text) {
             (Some(r), _) => r.clone(),
-            (None, Some(ts)) => match bound_text(ctx, ts, t) {
+            (None, Some(ts)) => match bound_text(ctx, ts, t)? {
                 Some(one) => text_ranks(ctx, spec, &one, true, &mut counters)?,
                 None => FxHashMap::default(),
             },
@@ -639,20 +645,20 @@ pub(super) fn search_bound(
 }
 
 /// The text search of a bound query string: `None` when the value is not a string.
-fn bound_text(ctx: &Ctx, ts: &TextSpec, value: Id) -> Option<TextSpec> {
-    let Some(oxrdf::Term::Literal(l)) = ctx.term(value) else {
-        return None;
+pub(super) fn bound_text(ctx: &Ctx, ts: &TextSpec, value: Id) -> Result<Option<TextSpec>> {
+    let Some(oxrdf::Term::Literal(l)) = ctx.term_checked(value)? else {
+        return Ok(None);
     };
     let lang = match l.language() {
         Some(t) => Some(t.to_ascii_lowercase()),
         None if l.datatype() == xsd::STRING => None,
-        None => return None,
+        None => return Ok(None),
     };
     let mut one = ts.clone();
     one.query = l.value().to_string();
     one.query_var = None;
     one.lang = ts.lang.clone().or(lang);
-    Some(one)
+    Ok(Some(one))
 }
 
 /// The fused rows of two rankings, best first, at most the call's limit.

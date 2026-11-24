@@ -459,7 +459,7 @@ fn run_op(
             // the WHERE clause reads the request's graph view only
             super::restrict_ctx(&mut ctx, req.opts.graphs.as_ref())?;
             if let Some(r) = &req.opts.rdfs {
-                ctx.rdfs = Some(r.schema_controlled(&ctx.snap, &mut || ctx.check())?);
+                ctx.rdfs = Some(r.schema_in_ctx(&ctx)?);
             }
             let pattern = super::rdfs::apply(&ctx, pattern);
             let node = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new())?;
@@ -505,7 +505,7 @@ fn run_op(
                             id: Id|
              -> Result<Option<Id>> {
                 Ok(match id.tag() {
-                    Tag::Local => match ctx.term(id) {
+                    Tag::Local => match ctx.term_checked(id)? {
                         Some(t) => {
                             let t = minted.stored(txn, &t);
                             Some(txn.intern(&t)?)
@@ -520,8 +520,8 @@ fn run_op(
             let mut ins = Vec::new();
             for i in 0..table.len() {
                 for q in delete {
-                    let gt = |t: &GroundTermPattern| -> Option<Id> {
-                        match t {
+                    let gt = |t: &GroundTermPattern| -> Result<Option<Id>> {
+                        Ok(match t {
                             GroundTermPattern::Variable(v) => get(&ctx, v.as_str(), i),
                             GroundTermPattern::NamedNode(n) => {
                                 ctx.snap.lookup_term(&Term::NamedNode(n.clone()))
@@ -532,21 +532,34 @@ fn run_op(
                             GroundTermPattern::Triple(tp) => {
                                 // a ground triple pattern is a template without blank nodes
                                 let pat = ground_pattern_to_term_pattern(tp);
+                                let mut decode_err = None;
                                 let term = super::instantiate(
                                     &pat,
-                                    &mut |v| get(&ctx, v, i).and_then(|id| ctx.term(id)),
+                                    &mut |v| {
+                                        let id = get(&ctx, v, i)?;
+                                        match ctx.term_checked(id) {
+                                            Ok(t) => t,
+                                            Err(err) => {
+                                                decode_err.get_or_insert(err);
+                                                None
+                                            }
+                                        }
+                                    },
                                     &mut |_| Term::BlankNode(oxrdf::BlankNode::default()),
-                                )?;
-                                ctx.snap.lookup_term(&term)
+                                );
+                                if let Some(err) = decode_err {
+                                    return Err(err);
+                                }
+                                term.and_then(|t| ctx.snap.lookup_term(&t))
                             }
-                        }
+                        })
                     };
                     if let GraphNamePattern::Variable(v) = &q.graph_name {
                         check(get(&ctx, v.as_str(), i))?;
                     }
-                    let s = gt(&q.subject);
+                    let s = gt(&q.subject)?;
                     let p = named_pat(&ctx, &q.predicate, |n| get(&ctx, n, i), true);
-                    let o = gt(&q.object);
+                    let o = gt(&q.object)?;
                     let g = graph_pat(&ctx, &q.graph_name, |n| get(&ctx, n, i), true);
                     if let (Some(s), Some(p), Some(o), Some(g)) = (s, p, o, g) {
                         dels.push([s, p, o, g]);
@@ -589,11 +602,25 @@ fn run_op(
                                     };
                                     Term::BlankNode(crate::store::bnode_for(id))
                                 };
-                                match super::instantiate(
+                                let mut decode_err = None;
+                                let term = super::instantiate(
                                     t,
-                                    &mut |v| get(&ctx, v, i).and_then(|id| ctx.term(id)),
+                                    &mut |v| {
+                                        let id = get(&ctx, v, i)?;
+                                        match ctx.term_checked(id) {
+                                            Ok(t) => t,
+                                            Err(err) => {
+                                                decode_err.get_or_insert(err);
+                                                None
+                                            }
+                                        }
+                                    },
                                     &mut bn,
-                                ) {
+                                );
+                                if let Some(err) = decode_err {
+                                    return Err(err);
+                                }
+                                match term {
                                     Some(term) => {
                                         let term = minted.stored(txn, &term);
                                         Some(txn.intern(&term)?)
@@ -728,7 +755,7 @@ fn run_op(
 
 /// [`Error::NotPermitted`] unless graph `g` (an id of the WHERE clause's context) may
 /// be written.
-fn check_graph_id(access: &crate::access::GraphAccess, ctx: &Ctx, g: Id) -> Result<()> {
+pub(super) fn check_graph_id(access: &crate::access::GraphAccess, ctx: &Ctx, g: Id) -> Result<()> {
     if g == Id::DEFAULT_GRAPH {
         return if access.writable(None) {
             Ok(())
@@ -738,12 +765,15 @@ fn check_graph_id(access: &crate::access::GraphAccess, ctx: &Ctx, g: Id) -> Resu
     }
     let t = match g.tag() {
         Tag::BNode => Some(Term::BlankNode(crate::store::bnode_for(g))),
-        _ => ctx.term(g),
+        _ => ctx.term_checked(g)?,
     };
-    if access.writable(t.as_ref()) {
+    let Some(t) = t else {
+        return Err(Error::invalid("graph variable holds no RDF term"));
+    };
+    if access.writable(Some(&t)) {
         Ok(())
     } else {
-        Err(crate::access::GraphAccess::refused(t.as_ref()))
+        Err(crate::access::GraphAccess::refused(Some(&t)))
     }
 }
 

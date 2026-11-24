@@ -348,7 +348,7 @@ impl Expand {
         if !child.done
             && let Some(batch) = child.next(ctx, options, options.batch_rows.max(1))?
         {
-            remote.run.add(ctx, spec, rl, &batch.table);
+            remote.run.add(ctx, spec, rl, &batch.table)?;
             // The keys and inputs the batch added are held before any request is sent.
             remote.answers.resize(remote.run.held_bytes())?;
             match &mut remote.held {

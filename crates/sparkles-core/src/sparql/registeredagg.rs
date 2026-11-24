@@ -180,7 +180,7 @@ fn aggregate_inner(
             distinct_charge.add(32)?;
             seen.insert(id);
         }
-        let Some(term) = ctx.term(id) else {
+        let Some(term) = ctx.term_checked(id)? else {
             domain_error = true;
             continue;
         };

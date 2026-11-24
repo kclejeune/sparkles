@@ -297,6 +297,24 @@ impl RdfsOnRead {
         snap: &Snapshot,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Arc<RdfsSchema>> {
+        self.schema_with(snap, check, &mut |id, check| {
+            snap.term_controlled(id, &mut |_| Ok(()), check)
+        })
+    }
+
+    /// Read or build this query's schema under its context's controls and decode budget.
+    pub(crate) fn schema_in_ctx(&self, ctx: &Ctx) -> Result<Arc<RdfsSchema>> {
+        self.schema_with(&ctx.snap, &mut || ctx.check(), &mut |id, _| {
+            ctx.term_checked(id)
+        })
+    }
+
+    fn schema_with(
+        &self,
+        snap: &Snapshot,
+        check: &mut dyn FnMut() -> Result<()>,
+        decode: &mut TermDecode<'_>,
+    ) -> Result<Arc<RdfsSchema>> {
         check()?;
         let graph = match &self.source {
             SchemaSource::Fixed(s) => return Ok(s.clone()),
@@ -313,7 +331,7 @@ impl RdfsOnRead {
         {
             return Ok(s.clone());
         }
-        let s = Arc::new(schema_of_graph_controlled(snap, graph.as_deref(), check)?);
+        let s = Arc::new(schema_of_graph_with(snap, graph.as_deref(), check, decode)?);
         *self.last.lock() = Some((key, s.clone()));
         Ok(s)
     }
@@ -328,6 +346,19 @@ fn schema_of_graph_controlled(
     snap: &Snapshot,
     graph: Option<&str>,
     check: &mut dyn FnMut() -> Result<()>,
+) -> Result<RdfsSchema> {
+    schema_of_graph_with(snap, graph, check, &mut |id, check| {
+        snap.term_controlled(id, &mut |_| Ok(()), check)
+    })
+}
+
+type TermDecode<'a> = dyn FnMut(Id, &mut dyn FnMut() -> Result<()>) -> Result<Option<Term>> + 'a;
+
+fn schema_of_graph_with(
+    snap: &Snapshot,
+    graph: Option<&str>,
+    check: &mut dyn FnMut() -> Result<()>,
+    decode: &mut TermDecode<'_>,
 ) -> Result<RdfsSchema> {
     check()?;
     let g = match graph {
@@ -353,7 +384,7 @@ fn schema_of_graph_controlled(
             if q[3] != g {
                 return Ok(());
             }
-            let (Some(s), Some(o)) = (snap.term(q[0]), snap.term(q[2])) else {
+            let (Some(s), Some(o)) = (decode(q[0], check)?, decode(q[2], check)?) else {
                 return Ok(());
             };
             let s = match s {

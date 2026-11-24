@@ -219,27 +219,53 @@ pub(super) fn spatial_leaf(p: &Planner<'_>, c: SpatialCall, g: &ActiveGraph) -> 
 /// Move spatial conjuncts over the object of an indexed predicate's scan into a
 /// `SpatialScan`; returns the plan and the conjuncts left for an ordinary filter.
 pub fn push_spatial(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
+    match push_spatial_checked(n.clone(), exprs.clone(), ctx) {
+        Ok(out) => out,
+        Err(error) => {
+            ctx.fail_memory(&error);
+            (n, exprs)
+        }
+    }
+}
+
+/// [`push_spatial`], propagating any memory or control refusal.
+pub(super) fn push_spatial_checked(
+    n: Node,
+    exprs: Vec<Expr>,
+    ctx: &Ctx,
+) -> Result<(Node, Vec<Expr>)> {
     #[cfg(not(feature = "geo"))]
     {
         let _ = ctx;
-        (n, exprs)
+        Ok((n, exprs))
     }
     #[cfg(feature = "geo")]
     on::push_spatial(n, exprs, ctx)
 }
 
 /// The value of an expression without variables, evaluated once at plan time (`None`:
-/// not constant, not deterministic, or an error).
+/// not constant, not deterministic, or an error). Latches any memory refusal onto `ctx`.
 pub fn fold_const(e: &Expr, ctx: &Ctx) -> Option<super::value::Value> {
-    use super::expr::{Row, eval};
+    match fold_const_checked(e, ctx) {
+        Ok(v) => v,
+        Err(error) => {
+            ctx.fail_memory(&error);
+            None
+        }
+    }
+}
+
+/// [`fold_const`], propagating any memory or control refusal with its original error.
+pub(crate) fn fold_const_checked(e: &Expr, ctx: &Ctx) -> Result<Option<super::value::Value>> {
+    use super::expr::{Row, Val, eval};
     use super::table::Table;
     match e {
-        Expr::Lit(_, v) => return Some(v.clone()),
-        Expr::Const(id) => return ctx.value(*id),
+        Expr::Lit(_, v) => return Ok(Some(v.clone())),
+        Expr::Const(id) => return ctx.value_checked(*id),
         _ => {}
     }
     if !e.var_set().is_empty() || e.has_exists() || !super::cache::deterministic(e) {
-        return None;
+        return Ok(None);
     }
     let t = Table::unit();
     let map = t.var_map(ctx.nvars());
@@ -250,7 +276,15 @@ pub fn fold_const(e: &Expr, ctx: &Ctx) -> Option<super::value::Value> {
         dec: None,
         exists: None,
     };
-    eval(e, &row, ctx).ok()?.value(ctx).ok()
+    let evaluated = eval(e, &row, ctx);
+    ctx.check_memory_failure()?;
+    let Ok(val) = evaluated else {
+        return Ok(None);
+    };
+    match val {
+        Val::Id(id) => ctx.value_checked(id),
+        Val::V(v) | Val::Dec(_, v) => Ok(Some(v)),
+    }
 }
 
 /// Helpers the spatial join and nearest-neighbour planning share.
@@ -398,7 +432,7 @@ mod on {
                 PT::V(_) => unreachable!("planned with deferred arguments"),
                 PT::C(id) => vals.push(
                     p.ctx
-                        .value(id)
+                        .value_checked(id)?
                         .ok_or_else(|| Error::invalid(format!("{name}: {shape}")))?,
                 ),
             }
@@ -789,16 +823,16 @@ mod on {
         e: &Expr,
         ctx: &Ctx,
         cfg: &GeoConfig,
-    ) -> std::result::Result<Geom, String> {
-        let Some(v) = fold_const(e, ctx) else {
-            return Err("the other geometry is not a constant".into());
+    ) -> Result<std::result::Result<Geom, String>> {
+        let Some(v) = fold_const_checked(e, ctx)? else {
+            return Ok(Err("the other geometry is not a constant".into()));
         };
-        match geometry(&v, cfg) {
+        Ok(match geometry(&v, cfg) {
             Some(Ok(g)) if g.empty || g.bbox84().is_some() => Ok(g),
             Some(Ok(_)) => Err("the constant geometry's CRS is not supported by the index".into()),
             Some(Err(m)) => Err(m),
             None => Err("the other argument is not a geometry literal".into()),
-        }
+        })
     }
 
     /// The conjunct `e` as an index atom over `w`: `None` when it is not a spatial test
@@ -808,45 +842,45 @@ mod on {
         w: VarId,
         ctx: &Ctx,
         cfg: &GeoConfig,
-    ) -> Option<std::result::Result<Atom, String>> {
+    ) -> Result<Option<std::result::Result<Atom, String>>> {
         let is_w = |x: &Expr| matches!(x, Expr::Var(v) if *v == w);
         // relations and relate
         if let Some((name, args)) = geof_call(e) {
             let rel = Relation::from_local(name);
             if rel.is_none() && name != "relate" {
-                return None;
+                return Ok(None);
             }
             if !args.iter().any(|a| mentions(a, w)) {
-                return None;
+                return Ok(None);
             }
             let wanted = if name == "relate" { 3 } else { 2 };
             if args.len() != wanted {
-                return None;
+                return Ok(None);
             }
             let first = if is_w(&args[0]) {
                 true
             } else if is_w(&args[1]) {
                 false
             } else {
-                return Some(Err(format!(
+                return Ok(Some(Err(format!(
                     "geof:{name} does not compare ?{} itself",
                     ctx.var_name(w)
-                )));
+                ))));
             };
             let other = &args[usize::from(first)];
             if mentions(other, w) {
-                return None;
+                return Ok(None);
             }
-            let q = match constant_geom(other, ctx, cfg) {
+            let q = match constant_geom(other, ctx, cfg)? {
                 Ok(q) => Arc::new(q),
-                Err(m) => return Some(Err(format!("geof:{name}: {m}"))),
+                Err(m) => return Ok(Some(Err(format!("geof:{name}: {m}")))),
             };
             let text = format!("{name} {}", summary(&q));
             if let Some(r) = rel {
                 if !r.index_usable() {
-                    return Some(Err(format!(
+                    return Ok(Some(Err(format!(
                         "geof:{name} holds away from the geometry, where the index has nothing to offer"
-                    )));
+                    ))));
                 }
                 // the test is r(?w, q); with the constant first, its converse
                 let test = if first {
@@ -867,28 +901,32 @@ mod on {
                 } else {
                     0.5
                 };
-                return Some(Ok(Atom {
+                return Ok(Some(Ok(Atom {
                     q,
                     radius_m: None,
                     test,
                     text,
                     sel,
-                }));
+                })));
             }
             // relate(…, pattern): the pattern must need an intersection
-            let Some(Value::Str(pattern)) = fold_const(&args[2], ctx) else {
-                return Some(Err(
-                    "geof:relate: the pattern is not a constant string".into()
-                ));
+            let Some(Value::Str(pattern)) = fold_const_checked(&args[2], ctx)? else {
+                return Ok(Some(Err(
+                    "geof:relate: the pattern is not a constant string".into(),
+                )));
             };
             match relate::pattern_needs_intersection(&pattern) {
                 Ok(true) => {}
                 Ok(false) => {
-                    return Some(Err(format!(
+                    return Ok(Some(Err(format!(
                         "geof:relate pattern {pattern:?} holds for geometries that do not intersect"
-                    )));
+                    ))));
                 }
-                Err(_) => return Some(Err(format!("geof:relate: invalid pattern {pattern:?}"))),
+                Err(_) => {
+                    return Ok(Some(Err(format!(
+                        "geof:relate: invalid pattern {pattern:?}"
+                    ))));
+                }
             }
             let pattern: Arc<str> = if first {
                 pattern
@@ -896,72 +934,75 @@ mod on {
                 transpose(&pattern).into()
             };
             let text = format!("relate {pattern} {}", summary(&q));
-            return Some(Ok(Atom {
+            return Ok(Some(Ok(Atom {
                 test: Some(SpatialTest::Relate(pattern, q.clone())),
                 q,
                 radius_m: None,
                 text,
                 sel: 0.5,
-            }));
+            })));
         }
         // distance(?w, C, unit) < r and the mirrored forms
         let Expr::Cmp(a, b, op) = e else {
-            return None;
+            return Ok(None);
         };
         let (call, bound, upper) = match (geof_call(a), geof_call(b), op) {
             (Some(c), _, CmpOp::Lt | CmpOp::Le) => (c, &**b, true),
             (_, Some(c), CmpOp::Gt | CmpOp::Ge) => (c, &**a, true),
             (Some(c), _, _) | (_, Some(c), _) => (c, &**b, false),
-            _ => return None,
+            _ => return Ok(None),
         };
         let (name, args) = call;
         if !matches!(name, "distance" | "metricDistance")
             || !args.iter().take(2).any(|a| mentions(a, w))
         {
-            return None;
+            return Ok(None);
         }
         if !upper {
-            return Some(Err(format!(
+            return Ok(Some(Err(format!(
                 "a lower bound on geof:{name} keeps far geometries"
-            )));
+            ))));
         }
         let wanted = if name == "distance" { 3 } else { 2 };
         if args.len() != wanted {
-            return None;
+            return Ok(None);
         }
         let other = if is_w(&args[0]) {
             &args[1]
         } else if is_w(&args[1]) {
             &args[0]
         } else {
-            return Some(Err(format!(
+            return Ok(Some(Err(format!(
                 "geof:{name} does not measure from ?{} itself",
                 ctx.var_name(w)
-            )));
+            ))));
         };
         if mentions(other, w) {
-            return None;
+            return Ok(None);
         }
-        let q = match constant_geom(other, ctx, cfg) {
+        let q = match constant_geom(other, ctx, cfg)? {
             Ok(q) => Arc::new(q),
-            Err(m) => return Some(Err(format!("geof:{name}: {m}"))),
+            Err(m) => return Ok(Some(Err(format!("geof:{name}: {m}")))),
         };
-        let Some(r) = fold_const(bound, ctx).as_ref().and_then(number) else {
-            return Some(Err(format!(
+        let Some(r) = fold_const_checked(bound, ctx)?.as_ref().and_then(number) else {
+            return Ok(Some(Err(format!(
                 "the bound on geof:{name} is not a constant number"
-            )));
+            ))));
         };
         let r_m = if name == "metricDistance" {
             Ok(r)
         } else {
-            match fold_const(&args[2], ctx).as_ref().and_then(unit_iri) {
+            match fold_const_checked(&args[2], ctx)?
+                .as_ref()
+                .and_then(unit_iri)
+            {
                 Some(u) => metres(r, &u),
                 None => Err("the unit is not a constant IRI".into()),
             }
         };
         let r_m = match r_m {
             Ok(m) => m.max(0.0),
-            Err(m) => return Some(Err(format!("geof:{name}: {m}"))),
+            Err(m) => return Ok(Some(Err(format!("geof:{name}: {m}")))),
         };
         let text = format!(
             "{name} {} {} of {}",
@@ -973,13 +1014,13 @@ mod on {
             distance_text(r_m),
             summary(&q)
         );
-        Some(Ok(Atom {
+        Ok(Some(Ok(Atom {
             q,
             radius_m: Some(r_m),
             test: None,
             text,
             sel: 0.5,
-        }))
+        })))
     }
 
     /// area(q) / area(envelope(q)), for points within a polygon.
@@ -1033,19 +1074,19 @@ mod on {
         out
     }
 
-    pub(super) fn push_spatial(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
+    pub(super) fn push_spatial(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Result<(Node, Vec<Expr>)> {
         let Kind::Scan(spec) = &n.kind else {
-            return (n, exprs);
+            return Ok((n, exprs));
         };
         if !ctx.opt.spatial_pushdown || exprs.is_empty() {
-            return (n, exprs);
+            return Ok((n, exprs));
         }
         let Some(shape) = ScanShape::of(spec) else {
-            return (n, exprs);
+            return Ok((n, exprs));
         };
         let w = shape.obj;
         if !exprs.iter().any(|e| spatial_conjunct(e, w)) {
-            return (n, exprs);
+            return Ok((n, exprs));
         }
         let cfg = config(ctx);
         let mut atoms = Vec::new();
@@ -1053,7 +1094,7 @@ mod on {
         let mut rest = Vec::new();
         let mut reasons = Vec::new();
         for e in exprs.iter().cloned().flat_map(Expr::conjuncts) {
-            match atom(&e, w, ctx, &cfg) {
+            match atom(&e, w, ctx, &cfg)? {
                 Some(Ok(a)) => {
                     atoms.push(a);
                     pushed.push(e);
@@ -1078,11 +1119,11 @@ mod on {
         }
         // nothing pushed: the filter as it was
         if atoms.is_empty() {
-            return (n, exprs);
+            return Ok((n, exprs));
         }
         let Some(view) = ctx.snap.geo.as_ref() else {
             not_pushed("the dataset has no spatial index");
-            return (n, exprs);
+            return Ok((n, exprs));
         };
         match view.state() {
             IndexState::Ready => {}
@@ -1095,11 +1136,11 @@ mod on {
                         p * 100.0
                     ),
                 );
-                return (n, exprs);
+                return Ok((n, exprs));
             }
             s => {
                 not_pushed(&format!("the spatial index is {s}"));
-                return (n, exprs);
+                return Ok((n, exprs));
             }
         }
         let Some(slot) = view.predicate_slot(shape.pred) else {
@@ -1107,12 +1148,12 @@ mod on {
                 .plan_term(shape.pred)
                 .map_or_else(|| "?".into(), |t| short(&t));
             not_pushed(&format!("{p} is not an indexed predicate"));
-            return (n, exprs);
+            return Ok((n, exprs));
         };
         let graph = shape.graph_filter(spec);
         if !scope_covers(&cfg, &graph, ctx) {
             not_pushed("the query reads graphs out of the spatial index's scope");
-            return (n, exprs);
+            return Ok((n, exprs));
         }
         // windows: every match lies in each atom's window
         let world = vec![[-180.0, -90.0, 180.0, 90.0]];
@@ -1136,7 +1177,7 @@ mod on {
         // the plain scan reads every row and tests it in the filter
         let plain = n.est * (1.0 + refine);
         if cost >= plain {
-            return (n, exprs);
+            return Ok((n, exprs));
         }
         // conjuncts whose exact test the operator does not run stay in the filter
         let mut tests = Vec::new();
@@ -1196,7 +1237,7 @@ mod on {
             dist,
             desc,
         };
-        (node, rest)
+        Ok((node, rest))
     }
 }
 

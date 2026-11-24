@@ -286,7 +286,7 @@ impl<'q> PropertyScan<'q> {
                 let decoded = ctx.charge(256)?;
                 let terms = spo
                     .map(|id| {
-                        ctx.term(id)
+                        ctx.term_checked(id)?
                             .ok_or_else(|| Error::invalid("invalid captured RDF term"))
                     })
                     .into_iter()
@@ -373,6 +373,21 @@ pub struct Spec {
 }
 
 impl Spec {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        descriptor: Arc<PropertyDescriptor>,
+        subject: Vec<PT>,
+        object: Vec<PT>,
+        graph: Arc<GraphFilter>,
+    ) -> Self {
+        Self {
+            descriptor,
+            subject,
+            object,
+            graph,
+        }
+    }
+
     pub(super) fn copy_layout(&self, layout: &mut super::checked_layout::Layout<'_>) -> Result<()> {
         layout.slots::<Self>(1)?;
         layout.vector(&self.subject)?;
@@ -733,7 +748,7 @@ fn run_inner(ctx: &Ctx, spec: &Spec, input: &Table, vars: &[VarId]) -> Result<Ta
                         return Ok(None);
                     }
                     let term = ctx
-                        .term(*id)
+                        .term_checked(*id)?
                         .ok_or_else(|| Error::invalid("invalid property input RDF term"))?;
                     // term_bytes includes this value's inline RDF slot; add only
                     // its remainder because even None slots were charged up front.

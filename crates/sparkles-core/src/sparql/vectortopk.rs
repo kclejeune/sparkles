@@ -16,12 +16,13 @@ use super::ctx::Ctx;
 use super::expr::{Expr, Func};
 use super::plan::{GraphFilter, Kind, Node, PathEnd, ScanSpec, VectorQuery, VectorSpec};
 use super::table::VarId;
+use crate::error::Result;
 use crate::id::Id;
 use crate::vector::{self, Metric};
 
 /// The ORDER BY with LIMIT `n`, its child rewritten when it is the shape above.
-pub(super) fn vector_topk(n: Node, ctx: &Ctx) -> Node {
-    match rewrite(&n, ctx) {
+pub(super) fn vector_topk(n: Node, ctx: &Ctx) -> Result<Node> {
+    Ok(match rewrite(&n, ctx)? {
         Some(child) => {
             let mut n = n;
             n.cost += child.cost - n.children[0].cost;
@@ -29,19 +30,19 @@ pub(super) fn vector_topk(n: Node, ctx: &Ctx) -> Node {
             n
         }
         None => n,
-    }
+    })
 }
 
-fn rewrite(n: &Node, ctx: &Ctx) -> Option<Node> {
+fn rewrite(n: &Node, ctx: &Ctx) -> Result<Option<Node>> {
     let Kind::OrderBy {
         keys,
         limit: Some(k),
     } = &n.kind
     else {
-        return None;
+        return Ok(None);
     };
     if !ctx.opt.vector_topk || keys.len() != 1 || keys[0].1 || !(1..=vector::MAX_K).contains(k) {
-        return None;
+        return Ok(None);
     }
     // BINDs (which drop no row) over one scan
     let mut chain = Vec::new();
@@ -51,23 +52,30 @@ fn rewrite(n: &Node, ctx: &Ctx) -> Option<Node> {
         core = &core.children[0];
     }
     let Kind::Scan(scan) = &core.kind else {
-        return None;
+        return Ok(None);
     };
     let key = match &keys[0].0 {
-        Expr::Var(d) => chain.iter().find_map(|c| match &c.kind {
+        Expr::Var(d) => match chain.iter().find_map(|c| match &c.kind {
             Kind::Extend(v, e) if v == d => Some(e),
             _ => None,
-        })?,
+        }) {
+            Some(e) => e,
+            None => return Ok(None),
+        },
         e => e,
     };
-    let (metric, v, query) = vector_call(key, ctx)?;
-    let (s, p, o) = scan_triple(scan)?;
+    let Some((metric, v, query)) = vector_call(key, ctx)? else {
+        return Ok(None);
+    };
+    let Some((s, p, o)) = scan_triple(scan) else {
+        return Ok(None);
+    };
     // a constant subject would be applied after the search's top k
     if !matches!(o, PathEnd::Var(x) if x == v) || !matches!(s, PathEnd::Var(x) if x != v) {
-        return None;
+        return Ok(None);
     }
     let PathEnd::Const(pred) = p else {
-        return None;
+        return Ok(None);
     };
     // an index of another dimension refuses the query: keep the generic plan
     if let Some((_, c)) = ctx
@@ -77,7 +85,7 @@ fn rewrite(n: &Node, ctx: &Ctx) -> Option<Node> {
         .configured_for(&ctx.snap, pred.0)
         && c.dimension != query.len()
     {
-        return None;
+        return Ok(None);
     }
     let vars: Vec<VarId> = core.vars.clone();
     let spec = VectorSpec {
@@ -122,39 +130,44 @@ fn rewrite(n: &Node, ctx: &Ctx) -> Option<Node> {
         c.children[0] = out;
         out = c;
     }
-    Some(out)
+    Ok(Some(out))
 }
 
 /// `spk:cosine` or `spk:dot` of a variable and a constant vector, in either order.
-fn vector_call(e: &Expr, ctx: &Ctx) -> Option<(Metric, VarId, Vec<f32>)> {
+fn vector_call(e: &Expr, ctx: &Ctx) -> Result<Option<(Metric, VarId, Vec<f32>)>> {
     let Expr::Call(Func::Ext(iri), args) = e else {
-        return None;
+        return Ok(None);
     };
-    let metric = match iri.strip_prefix(vector::NS)? {
+    let Some(local) = iri.strip_prefix(vector::NS) else {
+        return Ok(None);
+    };
+    let metric = match local {
         "cosine" => Metric::Cosine,
         "dot" => Metric::Dot,
-        _ => return None,
+        _ => return Ok(None),
     };
     let [a, b] = args.as_slice() else {
-        return None;
+        return Ok(None);
     };
     let (v, c) = match (a, b) {
         (Expr::Var(v), c) | (c, Expr::Var(v)) => (*v, c),
-        _ => return None,
+        _ => return Ok(None),
     };
     let id = match c {
         Expr::Const(id) | Expr::Lit(id, _) => *id,
-        _ => return None,
+        _ => return Ok(None),
     };
-    let Some(oxrdf::Term::Literal(l)) = ctx.term(id) else {
-        return None;
+    let Some(oxrdf::Term::Literal(l)) = ctx.term_checked(id)? else {
+        return Ok(None);
     };
-    let q = vector::parse_typed(l.value(), l.datatype().as_str())?.ok()?;
+    let Some(Ok(q)) = vector::parse_typed(l.value(), l.datatype().as_str()) else {
+        return Ok(None);
+    };
     // a zero vector has no cosine: every row's key is an error
     if metric == Metric::Cosine && vector::norm(&q) == 0.0 {
-        return None;
+        return Ok(None);
     }
-    Some((metric, v, q))
+    Ok(Some((metric, v, q)))
 }
 
 /// The subject, predicate and object of a scan of one triple pattern without a graph

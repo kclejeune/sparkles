@@ -500,7 +500,7 @@ pub(super) fn leaf(
                 PathEnd::Var(v) => format!("?{}", p.ctx.var_name(*v)),
                 PathEnd::Const(id) => p
                     .ctx
-                    .term(*id)
+                    .plan_term(*id)
                     .map_or_else(|| "UNDEF".into(), |t| t.to_string()),
             })
             .collect::<Vec<_>>()
@@ -707,7 +707,7 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
                     let n = int(n as i64);
                     match o {
                         None => vec![vec![l, n]],
-                        Some(x) if integer(ctx, x) == integer(ctx, n) => vec![vec![l, x]],
+                        Some(x) if integer(ctx, x)? == integer(ctx, n)? => vec![vec![l, x]],
                         Some(_) => Vec::new(),
                     }
                 }
@@ -736,7 +736,7 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
                             None => Vec::new(),
                         }
                     }
-                    (Some(i), m) => match integer(ctx, i) {
+                    (Some(i), m) => match integer(ctx, i)? {
                         Some(p) if p >= 0 => match lists.members(l)?.get(p as usize) {
                             Some(&x) if m.is_none_or(|m| m == x) => vec![vec![l, i, x]],
                             _ => Vec::new(),
@@ -770,7 +770,7 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             let (Some(s), Some(re)) = (args[1], args[2]) else {
                 return Ok(Vec::new());
             };
-            let (Some(text), Some(pattern)) = (literal_lexical(ctx, s), literal_lexical(ctx, re))
+            let (Some(text), Some(pattern)) = (literal_lexical(ctx, s)?, literal_lexical(ctx, re)?)
             else {
                 return Ok(Vec::new());
             };
@@ -781,7 +781,7 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
                     .iter()
                     .map(|t| vec![string(t), s, re_id(args[2])])
                     .collect(),
-                Some(x) => match ctx.value(x) {
+                Some(x) => match ctx.value_checked(x)? {
                     Some(Value::Str(v)) if tokens.iter().any(|t| **t == *v) => {
                         vec![vec![x, s, re_id(args[2])]]
                     }
@@ -795,7 +795,7 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
                 let Some(a) = a else {
                     return Ok(Vec::new());
                 };
-                match ctx.term(*a) {
+                match ctx.term_checked(*a)? {
                     Some(Term::NamedNode(n)) => text.push_str(n.as_str()),
                     Some(Term::Literal(l)) => text.push_str(l.value()),
                     _ => return Ok(Vec::new()),
@@ -814,14 +814,14 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
         }
         PfKind::Str => {
             if let Some(s) = args[0]
-                && !matches!(ctx.term(s), Some(Term::Literal(_)))
+                && !matches!(ctx.term_checked(s)?, Some(Term::Literal(_)))
             {
                 return Ok(Vec::new());
             }
             let Some(o) = args[1] else {
                 return Err(bad("the object is an unbound variable"));
             };
-            let v = match ctx.term(o) {
+            let v = match ctx.term_checked(o)? {
                 Some(Term::NamedNode(n)) => string(n.as_str()),
                 Some(Term::Literal(l)) => string(l.value()),
                 _ => return Err(bad("the object is a blank node")),
@@ -836,7 +836,7 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             let Some(s) = args[0] else {
                 return Ok(Vec::new());
             };
-            let Some(Term::NamedNode(iri)) = ctx.term(s) else {
+            let Some(Term::NamedNode(iri)) = ctx.term_checked(s)? else {
                 return Ok(Vec::new());
             };
             let at = super::fnlib::split_xml(iri.as_str());
@@ -844,9 +844,9 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             let nsv = match args[1] {
                 None => ctx.intern_term(&Term::NamedNode(NamedNode::new_unchecked(ns))),
                 Some(x) => {
-                    let text = match ctx.term(x) {
+                    let text = match ctx.term_checked(x)? {
                         Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
-                        Some(Term::Literal(_)) => string_literal(ctx, x),
+                        Some(Term::Literal(_)) => string_literal(ctx, x)?,
                         _ => None,
                     };
                     if text.as_deref() != Some(ns) {
@@ -858,7 +858,7 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             let lv = match args[2] {
                 None => string(local),
                 Some(x) => {
-                    if string_literal(ctx, x).as_deref() != Some(local) {
+                    if string_literal(ctx, x)?.as_deref() != Some(local) {
                         return Ok(Vec::new());
                     }
                     x
@@ -871,9 +871,14 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             (None, Some(o)) => vec![vec![o, o]],
             (Some(s), None) => vec![vec![s, s]],
             (Some(s), Some(o)) => {
-                let same = s == o
-                    || matches!((ctx.term(s), ctx.term(o)), (Some(a), Some(b))
-                        if super::cdt::same_value(&a, &b).unwrap_or(false));
+                let same = if s == o {
+                    true
+                } else {
+                    match (ctx.term_checked(s)?, ctx.term_checked(o)?) {
+                        (Some(a), Some(b)) => super::cdt::same_value(&a, &b).unwrap_or(false),
+                        _ => false,
+                    }
+                };
                 if same { vec![vec![s, o]] } else { Vec::new() }
             }
         },
@@ -881,7 +886,7 @@ fn solve(ctx: &Ctx, lists: &Lists<'_>, kind: PfKind, args: &[Option<Id>]) -> Res
             let Some(s) = args[0] else {
                 return Err(bad("the subject is an unbound variable"));
             };
-            let Some(Term::BlankNode(b)) = ctx.term(s) else {
+            let Some(Term::BlankNode(b)) = ctx.term_checked(s)? else {
                 return Ok(Vec::new());
             };
             let label = string(b.as_str());
@@ -968,30 +973,30 @@ fn dedup(mut v: Vec<Id>) -> Vec<Id> {
 }
 
 /// An `xsd:integer`'s value, as ARQ's `NodeFactoryExtra.nodeToInt` reads it.
-fn integer(ctx: &Ctx, id: Id) -> Option<i64> {
-    match ctx.value(id)? {
-        Value::Integer(i) => Some(i64::from(i)),
+fn integer(ctx: &Ctx, id: Id) -> Result<Option<i64>> {
+    Ok(match ctx.value_checked(id)? {
+        Some(Value::Integer(i)) => Some(i64::from(i)),
         _ => None,
-    }
+    })
 }
 
 /// The lexical form of a literal.
-fn literal_lexical(ctx: &Ctx, id: Id) -> Option<String> {
-    match ctx.term(id)? {
-        Term::Literal(l) => Some(l.value().to_string()),
+fn literal_lexical(ctx: &Ctx, id: Id) -> Result<Option<String>> {
+    Ok(match ctx.term_checked(id)? {
+        Some(Term::Literal(l)) => Some(l.value().to_string()),
         _ => None,
-    }
+    })
 }
 
 /// The lexical form of a string literal (ARQ's `NodeUtils.stringLiteral`): a simple
 /// literal, an `xsd:string` or a language-tagged string.
-fn string_literal(ctx: &Ctx, id: Id) -> Option<String> {
-    match ctx.term(id)? {
-        Term::Literal(l) if l.datatype() == xsd::STRING || l.language().is_some() => {
+fn string_literal(ctx: &Ctx, id: Id) -> Result<Option<String>> {
+    Ok(match ctx.term_checked(id)? {
+        Some(Term::Literal(l)) if l.datatype() == xsd::STRING || l.language().is_some() => {
             Some(l.value().to_string())
         }
         _ => None,
-    }
+    })
 }
 
 /// Java's `String.split(regex)` followed by trimming each token, as ARQ's
@@ -1112,20 +1117,21 @@ impl<'a> Lists<'a> {
     }
 
     /// The number `n` of a predicate `rdf:_n`.
-    fn number(&self, p: Id) -> Option<u64> {
-        *self
-            .numbers
-            .borrow_mut()
-            .entry(p)
-            .or_insert_with(|| match self.ctx.term(p) {
-                Some(Term::NamedNode(n)) => n
-                    .as_str()
-                    .strip_prefix(RDF_NS)
-                    .and_then(|l| l.strip_prefix('_'))
-                    .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-                    .and_then(|d| d.parse().ok()),
-                _ => None,
-            })
+    fn number(&self, p: Id) -> Result<Option<u64>> {
+        if let Some(&cached) = self.numbers.borrow().get(&p) {
+            return Ok(cached);
+        }
+        let n = match self.ctx.term_checked(p)? {
+            Some(Term::NamedNode(n)) => n
+                .as_str()
+                .strip_prefix(RDF_NS)
+                .and_then(|l| l.strip_prefix('_'))
+                .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|d| d.parse().ok()),
+            _ => None,
+        };
+        self.numbers.borrow_mut().insert(p, n);
+        Ok(n)
     }
 
     /// Whether `c` is typed as a container of type `ty` (any type: `None`).
@@ -1147,11 +1153,13 @@ impl<'a> Lists<'a> {
 
     /// The numbered members of `c`: (number, member) for each `rdf:_n` triple.
     fn container_members(&self, c: Id) -> Result<Vec<(u64, Id)>> {
-        Ok(self
-            .scan_pairs(Perm::Spo, &[c.0], [1, 2])?
-            .into_iter()
-            .filter_map(|(p, o)| self.number(p).map(|n| (n, o)))
-            .collect())
+        let mut out = Vec::new();
+        for (p, o) in self.scan_pairs(Perm::Spo, &[c.0], [1, 2])? {
+            if let Some(n) = self.number(p)? {
+                out.push((n, o));
+            }
+        }
+        Ok(out)
     }
 
     /// The resources typed as containers of type `ty` (any type: `None`), each once.

@@ -1036,15 +1036,15 @@ pub(super) fn plan_loop(
 
 /// The substitutions of the planner's constants (initial bindings, the row of an
 /// enclosing `EXISTS` or `LATERAL`) into a SERVICE pattern.
-pub(super) fn planner_subst(p: &Planner<'_>, inner: &GraphPattern) -> Subst {
+pub(super) fn planner_subst(p: &Planner<'_>, inner: &GraphPattern) -> Result<Subst> {
     let mut s = Subst::default();
     if p.subst.is_empty() {
-        return s;
+        return Ok(s);
     }
     for n in all_vars(inner) {
         let v = p.ctx.var(&n);
         if let Some(id) = p.subst.get(&v)
-            && let Some(t) = p.ctx.term(*id)
+            && let Some(t) = p.ctx.term_checked(*id)?
         {
             if p.scoped.contains(&v) {
                 s.hidden.insert(n.clone());
@@ -1052,7 +1052,7 @@ pub(super) fn planner_subst(p: &Planner<'_>, inner: &GraphPattern) -> Subst {
             s.add(&n, t);
         }
     }
-    s
+    Ok(s)
 }
 
 // ------------------------------------------------------------- execution ------
@@ -1170,7 +1170,7 @@ pub(super) fn run_remote(
     vars: &[VarId],
 ) -> Result<(Table, LoopStats)> {
     let mut run = RemoteRun::new(ctx, spec, rl)?;
-    run.add(ctx, spec, rl, l);
+    run.add(ctx, spec, rl, l)?;
     // The eager loop keeps its answers outside the memory charge until it joins them,
     // and admits the joined rows.
     run.send(ctx, spec, rl, true, &mut |_| Ok(()))?;
@@ -1235,7 +1235,7 @@ impl RemoteRun {
                 continue;
             }
             let n = ctx.var_name(*v);
-            if let Some(t) = ctx.term(*id) {
+            if let Some(t) = ctx.term_checked(*id)? {
                 if spec.outer_scoped.contains(v) {
                     outer.hidden.insert(n.clone());
                 }
@@ -1276,22 +1276,29 @@ impl RemoteRun {
 
     /// Take the left rows `l`: their new distinct inputs, answered from the cache where
     /// it has them.
-    pub(super) fn add(&mut self, ctx: &Ctx, spec: &LateralSpec, rl: &RemoteLoop, l: &Table) {
+    pub(super) fn add(
+        &mut self,
+        ctx: &Ctx,
+        spec: &LateralSpec,
+        rl: &RemoteLoop,
+        l: &Table,
+    ) -> Result<()> {
         let first = self.inputs.len();
         for i in 0..l.len() {
             let key = Self::key(spec, l, i);
             if self.by_key.contains_key(&key) {
                 continue;
             }
-            let values: Vec<Option<Term>> = key
-                .iter()
-                .map(|id| {
-                    (!id.is_undef())
-                        .then(|| ctx.term(*id))
-                        .flatten()
+            let mut values = Vec::with_capacity(key.len());
+            for id in &key {
+                let term = if id.is_undef() {
+                    None
+                } else {
+                    ctx.term_checked(*id)?
                         .filter(|t| matches!(t, Term::NamedNode(_) | Term::Literal(_)))
-                })
-                .collect();
+                };
+                values.push(term);
+            }
             let n = self.inputs.len();
             let input = *self.by_values.entry(values.clone()).or_insert_with(|| {
                 self.inputs.push(Input {
@@ -1337,6 +1344,7 @@ impl RemoteRun {
             }
             self.kept = self.kept.saturating_add(input_bytes(&self.inputs[i]));
         }
+        Ok(())
     }
 
     /// Send the requests for the unanswered inputs: the full bulk requests among them,

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
+
+Term and value decoding in SPARQL UPDATE, ARQ property functions, registered property and aggregate extensions, custom aggregates, hybrid search, history service, path search, vector top-k, remote SERVICE and LATERAL enhancers, GeoSPARQL planner rewrites, planner range and lexical probes and RDFS schema and explanation decoding now uses checked decode helpers that propagate a memory or control refusal with its original error instead of returning an absent value, falling back to a default-graph permission check, dropping quads or reporting an invalid term. This lands the first wave of roadmap item 1308.
+
 ### A classification is complete only for the whole ontology
 
 `complete` in a classification answer now means complete for the whole input ontology, as

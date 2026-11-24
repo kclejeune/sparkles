@@ -2040,7 +2040,7 @@ impl Ctx {
 
     /// Record the first supported execution refusal met by infallible code, so
     /// the next check preserves its original typed outcome in both modes.
-    pub(super) fn fail_memory(&self, error: &Error) {
+    pub(crate) fn fail_memory(&self, error: &Error) {
         if self.memory_failure.failed.load(Ordering::Acquire) {
             return;
         }
@@ -2718,6 +2718,124 @@ impl Ctx {
             }),
             Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
             _ => self.snap.term(id),
+        }
+    }
+
+    #[inline]
+    fn checked_decode_bytes(len: usize) -> u64 {
+        (len as u64).saturating_mul(8).saturating_add(128)
+    }
+
+    /// Decode an id into an RDF term, propagating any memory or control refusal with
+    /// its original error instead of returning `None`.
+    pub(crate) fn term_checked(&self, id: Id) -> Result<Option<Term>> {
+        self.check_memory_failure()?;
+        match id.tag() {
+            Tag::Undef | Tag::Special => Ok(None),
+            Tag::Local => {
+                let len = self.local.read().get(id.payload()).map(<[u8]>::len);
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                let _decode = self.charge(Self::checked_decode_bytes(len))?;
+                Ok(self.local.read().get(id.payload()).map(id::key_to_term))
+            }
+            Tag::Vocab => {
+                let decode = |key: &[u8]| -> Result<Term> {
+                    let _decode = self.charge(Self::checked_decode_bytes(key.len()))?;
+                    Ok(id::key_to_term(key))
+                };
+                self.with_cursor_vocab_key(id.payload(), decode)?
+                    .transpose()
+            }
+            Tag::Delta => {
+                let len = self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|vocab| vocab.get(id.payload()).map(<[u8]>::len));
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                let _decode = self.charge(Self::checked_decode_bytes(len))?;
+                Ok(self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|vocab| vocab.get(id.payload()).map(id::key_to_term)))
+            }
+            Tag::BNode => Ok(Some(Term::BlankNode(bnode_for(id)))),
+            _ => Ok(self.snap.term(id)),
+        }
+    }
+
+    /// Decode an id into a value, propagating any memory or control refusal with its
+    /// original error instead of returning `None`.
+    pub(crate) fn value_checked(&self, id: Id) -> Result<Option<Value>> {
+        self.check_memory_failure()?;
+        match id.tag() {
+            Tag::Undef | Tag::Special => Ok(None),
+            Tag::Int => Ok(Some(Value::Integer(id.as_i64().into()))),
+            Tag::Bool => Ok(Some(Value::Bool(id.as_bool()))),
+            Tag::Double => Ok(Some(Value::Double(id.as_f64().into()))),
+            Tag::Decimal => Ok(Some(Value::Decimal(id::unpack_decimal(id.payload())))),
+            Tag::DateTime | Tag::Date => {
+                Ok(id::inline_to_literal(id).map(|l| Value::from_literal(&l)))
+            }
+            Tag::BNode => Ok(Some(Value::BNode(bnode_for(id).as_str().into()))),
+            _ => {
+                if id.tag() == Tag::Vocab
+                    && let Some(v) = self.column_value(id.payload())
+                {
+                    return Ok(Some(v));
+                }
+                if let Some(v) = self.values.get(id) {
+                    return Ok(Some(v));
+                }
+                let decode = |key: &[u8]| -> Result<Value> {
+                    let _decode = self.charge(Self::checked_decode_bytes(key.len()))?;
+                    Ok(Value::from_key(key))
+                };
+                let v = match id.tag() {
+                    Tag::Vocab => self
+                        .with_cursor_vocab_key(id.payload(), decode)?
+                        .transpose()?,
+                    Tag::Delta => {
+                        let len = self
+                            .snap
+                            .generation
+                            .dvocab
+                            .with(|v| v.get(id.payload()).map(<[u8]>::len));
+                        match len {
+                            Some(len) => {
+                                let _decode = self.charge(Self::checked_decode_bytes(len))?;
+                                self.snap
+                                    .generation
+                                    .dvocab
+                                    .with(|v| v.get(id.payload()).map(Value::from_key))
+                            }
+                            None => None,
+                        }
+                    }
+                    Tag::Local => {
+                        let len = self.local.read().get(id.payload()).map(<[u8]>::len);
+                        match len {
+                            Some(len) => {
+                                let _decode = self.charge(Self::checked_decode_bytes(len))?;
+                                self.local.read().get(id.payload()).map(Value::from_key)
+                            }
+                            None => None,
+                        }
+                    }
+                    _ => unreachable!("dictionary value tag"),
+                };
+                if let Some(v) = v {
+                    self.cache_value(id, &v);
+                    Ok(Some(v))
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 

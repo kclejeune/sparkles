@@ -792,6 +792,45 @@ impl Snapshot {
         }
     }
 
+    /// Decode a stored id into an RDF term under explicit memory and control callbacks,
+    /// propagating any refusal with its original error instead of returning `None`.
+    pub(crate) fn term_controlled(
+        &self,
+        id: Id,
+        reserve: &mut dyn FnMut(usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Term>> {
+        check()?;
+        match id.tag() {
+            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date => {
+                Ok(id::inline_to_literal(id).map(Term::Literal))
+            }
+            Tag::BNode => Ok(Some(Term::BlankNode(bnode_for(id)))),
+            Tag::Vocab => self.generation.vocab.get_with_controlled(
+                id.payload(),
+                reserve,
+                |_| check(),
+                id::key_to_term,
+            ),
+            Tag::Delta => {
+                let len = self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(<[u8]>::len));
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                reserve(len)?;
+                check()?;
+                Ok(self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(id::key_to_term)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// The kind of term an id stands for, without decoding the term: from the tag of
     /// inline ids, the sort order of the base vocabulary, and the first byte of a delta
     /// key. [`TermKind::Other`] for UNDEF, specials, local ids and unknown ids.

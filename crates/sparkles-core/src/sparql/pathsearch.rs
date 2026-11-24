@@ -648,7 +648,7 @@ pub(super) fn path_search_leaf(
     let end = |e: &PathEnd| match e {
         PathEnd::Var(v) => format!("?{}", ctx.var_name(*v)),
         PathEnd::Const(id) => ctx
-            .term(*id)
+            .plan_term(*id)
             .map_or_else(|| format!("{id:?}"), |t| t.to_string()),
     };
     let desc = format!(
@@ -1913,7 +1913,11 @@ impl<'a> Engine<'a> {
             return Ok(default);
         };
         let ctx = self.ctx;
-        let terms = (ctx.term(Id(s)), ctx.term(Id(p)), ctx.term(Id(o)));
+        let terms = (
+            ctx.term_checked(Id(s))?,
+            ctx.term_checked(Id(p))?,
+            ctx.term_checked(Id(o))?,
+        );
         let (Some(s), Some(Term::NamedNode(p)), Some(o)) = terms else {
             return Ok(default);
         };
@@ -1940,7 +1944,7 @@ impl<'a> Engine<'a> {
                     continue;
                 }
                 let v = ctx
-                    .value(Id(k[2]))
+                    .value_checked(Id(k[2]))?
                     .as_ref()
                     .and_then(super::value::approx_f64);
                 match v {
@@ -1949,7 +1953,7 @@ impl<'a> Engine<'a> {
                     }
                     _ => {
                         let t = ctx
-                            .term(Id(k[2]))
+                            .plan_term(Id(k[2]))
                             .map_or_else(|| "?".to_string(), |t| t.to_string());
                         return Err(bad(format!("the weight {t} is not a non-negative number")));
                     }
@@ -3428,19 +3432,31 @@ pub fn run(
     let edge_c = pos(spec.edge);
     // the triple term of each edge, built once
     let mut terms: FxHashMap<(u64, u64, u64), Id> = FxHashMap::default();
-    let mut triple_term = |(s, p, o): (u64, u64, u64)| -> Id {
-        *terms.entry((s, p, o)).or_insert_with(|| {
-            let parts = (ctx.term(Id(s)), ctx.term(Id(p)), ctx.term(Id(o)));
-            let (Some(s), Some(Term::NamedNode(p)), Some(o)) = parts else {
-                return Id::UNDEF;
+    let mut triple_term = |(s, p, o): (u64, u64, u64)| -> Result<Id> {
+        if let Some(&id) = terms.get(&(s, p, o)) {
+            return Ok(id);
+        }
+        let parts = (
+            ctx.term_checked(Id(s))?,
+            ctx.term_checked(Id(p))?,
+            ctx.term_checked(Id(o))?,
+        );
+        let id =
+            match parts {
+                (Some(s), Some(Term::NamedNode(p)), Some(o)) => match s {
+                    Term::NamedNode(n) => ctx.intern_term(&Term::Triple(Box::new(
+                        oxrdf::Triple::new(oxrdf::NamedOrBlankNode::NamedNode(n), p, o),
+                    ))),
+                    Term::BlankNode(b) => ctx.intern_term(&Term::Triple(Box::new(
+                        oxrdf::Triple::new(oxrdf::NamedOrBlankNode::BlankNode(b), p, o),
+                    ))),
+                    _ => Id::UNDEF,
+                },
+                _ => Id::UNDEF,
             };
-            let s = match s {
-                Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
-                Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
-                _ => return Id::UNDEF,
-            };
-            ctx.intern_term(&Term::Triple(Box::new(oxrdf::Triple::new(s, p, o))))
-        })
+        ctx.check_memory_failure()?;
+        terms.insert((s, p, o), id);
+        Ok(id)
     };
     let int = |n: usize| Id::from_i64(n as i64).unwrap_or(Id::UNDEF);
     let cost_id = |f: &Found| -> Id {
@@ -3491,7 +3507,7 @@ pub fn run(
                     set(ep_c, Id(p), &mut r);
                     set(eo_c, Id(o), &mut r);
                     if edge_c.is_some() {
-                        set(edge_c, triple_term((s, p, o)), &mut r);
+                        set(edge_c, triple_term((s, p, o))?, &mut r);
                     }
                 }
                 // join with the input row: equal values or one side unbound
