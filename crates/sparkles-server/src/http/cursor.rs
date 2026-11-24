@@ -825,6 +825,23 @@ enum InPlaceWork {
 /// or handing off the cursor and buffered bytes to a blocking streaming task otherwise
 /// (item 534).
 pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiResult<AutoOutcome> {
+    run_in_place_mode(ds, req, ExecutionMode::Auto).await
+}
+
+#[cfg(test)]
+pub(super) async fn run_in_place_with_mode(
+    ds: Arc<Dataset>,
+    req: AutoRequest<'_>,
+    mode: ExecutionMode,
+) -> ApiResult<AutoOutcome> {
+    run_in_place_mode(ds, req, mode).await
+}
+
+async fn run_in_place_mode(
+    ds: Arc<Dataset>,
+    req: AutoRequest<'_>,
+    mode: ExecutionMode,
+) -> ApiResult<AutoOutcome> {
     let AutoRequest {
         timeouts,
         query,
@@ -877,7 +894,7 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
             &query,
             &options,
             &Default::default(),
-            ExecutionMode::Auto,
+            mode,
         ) {
             Ok(exec) => exec,
             Err(f) => return InPlaceWork::OpenErr(query_failure_error(f, failed_plan_flag, seq)),
@@ -908,12 +925,13 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
             quick_began: t,
         };
         let began = Instant::now();
-        let sw = stream::SwitchWriter::new_in_place_cursor(threshold, control.clone());
-        let ledger = sw.ledger();
-        let mut w = LimitedWriter::new(sw, limit, None);
         match execution {
             QueryExecution::Eager(_) => unreachable!(),
             QueryExecution::Ask(result) => {
+                // Bounded trial: stop before buffering past `threshold` so oversized ASK
+                // documents (e.g. large EXPLAIN plans) fall back without buffering twice.
+                let sw = stream::SwitchWriter::new_in_place_trial(threshold, control.clone());
+                let mut w = LimitedWriter::new(sw, limit, None);
                 let metadata = Some(results::NativeJsonMetadata {
                     commit: seq,
                     dataset_id: &dataset_id,
@@ -926,6 +944,12 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
                 }
                 .map_err(|e| control.classify(w.classify(e)));
                 let exec_stats = QueryExecution::Ask(result);
+                if w.get_ref().deferred() {
+                    return InPlaceWork::CursorFallback {
+                        cursor: Box::new(exec_stats),
+                        meta,
+                    };
+                }
                 let stats = exec_stats.stats();
                 let serialize_ms =
                     (began.elapsed().as_secs_f64() * 1000.0 - stats.timing.exec_ms).max(0.0);
@@ -960,6 +984,9 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
                 }
             }
             QueryExecution::Select(cursor) => {
+                let sw = stream::SwitchWriter::new_in_place_cursor(threshold, control.clone());
+                let ledger = sw.ledger();
+                let mut w_slot = Some(LimitedWriter::new(sw, limit, None));
                 let metadata =
                     (format == SolutionsFormat::Sparkles).then(|| OwnedNativeJsonMetadata {
                         commit: seq,
@@ -973,23 +1000,11 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
                     metadata,
                     ledger: Some(ledger),
                 };
-                let mut cursor_writer = match CursorWriter::select(*cursor, opts) {
-                    Ok(cw) => cw,
-                    Err(error) => {
-                        let serialize_ms = began.elapsed().as_secs_f64() * 1000.0;
-                        return InPlaceWork::CursorFailed {
-                            error,
-                            plan: None,
-                            bytes: 0,
-                            meta,
-                            stats: None,
-                            serialize_ms,
-                        };
-                    }
-                };
-                let (w, step) = cursor_writer.write_until(w, threshold as u64);
+                let mut cursor_writer = CursorWriter::select(*cursor, opts);
+                let step = cursor_writer.write_until(&mut w_slot, threshold as u64);
+                let w = w_slot.expect("in-place writer preserved");
                 match step {
-                    Ok(WriteStep::Done(stats)) => {
+                    Ok(WriteStep::Done(stats)) if w.written() <= threshold as u64 => {
                         let bytes = w.written();
                         let body = w.into_inner().into_whole_body();
                         let serialize_ms = (began.elapsed().as_secs_f64() * 1000.0
@@ -1004,7 +1019,7 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
                             serialize_ms,
                         }
                     }
-                    Ok(WriteStep::Paused) => InPlaceWork::CursorHandoff {
+                    Ok(WriteStep::Paused) | Ok(WriteStep::Done(_)) => InPlaceWork::CursorHandoff {
                         writer: cursor_writer,
                         w,
                         control,
@@ -1035,6 +1050,9 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
                 }
             }
             QueryExecution::Graph(cursor) => {
+                let sw = stream::SwitchWriter::new_in_place_cursor(threshold, control.clone());
+                let ledger = sw.ledger();
+                let mut w_slot = Some(LimitedWriter::new(sw, limit, None));
                 let graph_format = if native_graph {
                     results::Format::Solutions(SolutionsFormat::Sparkles)
                 } else {
@@ -1053,23 +1071,11 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
                     metadata,
                     ledger: Some(ledger),
                 };
-                let mut cursor_writer = match CursorWriter::graph(*cursor, opts) {
-                    Ok(cw) => cw,
-                    Err(error) => {
-                        let serialize_ms = began.elapsed().as_secs_f64() * 1000.0;
-                        return InPlaceWork::CursorFailed {
-                            error,
-                            plan: None,
-                            bytes: 0,
-                            meta,
-                            stats: None,
-                            serialize_ms,
-                        };
-                    }
-                };
-                let (w, step) = cursor_writer.write_until(w, threshold as u64);
+                let mut cursor_writer = CursorWriter::graph(*cursor, opts);
+                let step = cursor_writer.write_until(&mut w_slot, threshold as u64);
+                let w = w_slot.expect("in-place writer preserved");
                 match step {
-                    Ok(WriteStep::Done(stats)) => {
+                    Ok(WriteStep::Done(stats)) if w.written() <= threshold as u64 => {
                         let bytes = w.written();
                         let body = w.into_inner().into_whole_body();
                         let serialize_ms = (began.elapsed().as_secs_f64() * 1000.0
@@ -1084,7 +1090,7 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
                             serialize_ms,
                         }
                     }
-                    Ok(WriteStep::Paused) => InPlaceWork::CursorHandoff {
+                    Ok(WriteStep::Paused) | Ok(WriteStep::Done(_)) => InPlaceWork::CursorHandoff {
                         writer: cursor_writer,
                         w,
                         control,
@@ -1172,7 +1178,9 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
                 transport_wait_ms: Some(0.0),
                 ..Default::default()
             };
-            let response = build_cursor_headers(
+            let deferred = DeferredReport::default();
+            deferred.producer_done(report);
+            let mut response = build_cursor_headers(
                 &ds,
                 params,
                 uri,
@@ -1183,7 +1191,8 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
                 meta.fmt.content_type,
                 Body::from(body),
             );
-            Ok(AutoOutcome::Responded(report.attach(response)))
+            response.extensions_mut().insert(deferred);
+            Ok(AutoOutcome::Responded(response))
         }
         InPlaceWork::CursorFailed {
             error,
@@ -1227,14 +1236,16 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
                 transport_wait_ms: Some(0.0),
                 ..Default::default()
             };
+            let deferred = DeferredReport::default();
+            deferred.producer_done(report);
             let mut api_err = with_timeout(ApiError::from(error), timeout);
             if let (Some(plan), Some(body)) = (plan, api_err.1.as_object_mut()) {
                 body.insert("plan".into(), plan);
                 body.insert("commit".into(), meta.seq.into());
             }
-            Ok(AutoOutcome::Responded(
-                report.attach(api_err.into_response()),
-            ))
+            let mut response = api_err.into_response();
+            response.extensions_mut().insert(deferred);
+            Ok(AutoOutcome::Responded(response))
         }
         InPlaceWork::CursorHandoff {
             mut writer,
@@ -1273,17 +1284,22 @@ pub(super) async fn run_in_place(ds: Arc<Dataset>, req: AutoRequest<'_>) -> ApiR
                     if let Err(error) = switched {
                         writer.fail_output(&error);
                         *sent_slot.lock() = Some(writer.rows_written());
+                        if sparkles_error_plan {
+                            *plan_slot.lock() = writer.plan_value();
+                        }
                         *stats_slot.lock() = Some(writer.stats());
-                        return (w, Err(error));
+                        return Err(error);
                     }
-                    let (w, res) = writer.finish(w);
-                    let res = res.map(|_| ()).map_err(|e| w.classify(e));
+                    let res = writer.finish(w);
+                    let res = res
+                        .map(|_| ())
+                        .map_err(|e| w.as_ref().expect("handoff writer").classify(e));
                     *sent_slot.lock() = Some(writer.rows_written());
                     if res.is_err() && sparkles_error_plan {
                         *plan_slot.lock() = writer.plan_value();
                     }
                     *stats_slot.lock() = Some(writer.stats());
-                    (w, res)
+                    res
                 },
                 move |end| {
                     finish_stream_end(

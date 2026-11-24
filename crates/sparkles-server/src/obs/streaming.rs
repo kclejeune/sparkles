@@ -1,8 +1,8 @@
 //! Complete a cursor request once both its producer and response body terminate.
 
 use super::{Outcome, Pending, RequestReport};
-use axum::body::{Body, BodyDataStream, Bytes};
-use futures_util::Stream;
+use axum::body::{Body, Bytes};
+use http_body::Frame;
 use parking_lot::Mutex;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -86,8 +86,8 @@ impl DeferredReport {
     }
 
     pub(super) fn wrap(&self, body: Body) -> Body {
-        Body::from_stream(ObservedBody {
-            inner: body.into_data_stream(),
+        Body::new(ObservedBody {
+            inner: body,
             report: self.clone(),
             ended: false,
         })
@@ -95,19 +95,24 @@ impl DeferredReport {
 }
 
 struct ObservedBody {
-    inner: BodyDataStream,
+    inner: Body,
     report: DeferredReport,
     ended: bool,
 }
 
-impl Stream for ObservedBody {
-    type Item = Result<Bytes, axum::Error>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+impl http_body::Body for ObservedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
         if this.ended {
             return Poll::Ready(None);
         }
-        let result = Pin::new(&mut this.inner).poll_next(cx);
+        let result = Pin::new(&mut this.inner).poll_frame(cx);
         match &result {
             Poll::Ready(None) => {
                 this.ended = true;
@@ -120,6 +125,10 @@ impl Stream for ObservedBody {
             _ => (),
         }
         result
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 

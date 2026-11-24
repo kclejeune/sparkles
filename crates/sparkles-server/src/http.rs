@@ -1510,6 +1510,15 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
     caller::request_options(st, ds, params)
 }
 
+#[cfg(test)]
+pub(super) fn query_options_for_test(st: &AppState, ds: &Dataset) -> (QueryOptions, CancelOnDrop) {
+    let params = Params(Vec::new());
+    let mut options = query_options(st, ds, &params);
+    let (cancel, guard) = cancel_on_drop();
+    options.cancel = Some(cancel);
+    (options, guard)
+}
+
 /// The reasoning mode a request's `reasoning` parameter names. An unknown value reads
 /// the dataset's materialized inferences, `false` reads the asserted data alone, and an
 /// absent value is the dataset's query-time default (spec F17 §2.2), which is

@@ -634,3 +634,538 @@ async fn graph_formats_exact_parity_across_auto_and_streaming() {
     }
     assert!(wait_pool_zero(&s.state, Duration::from_secs(2)).await);
 }
+
+async fn read_metrics(app: &Router) -> String {
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/$/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+fn metric_sample(text: &str, series: &str) -> Option<f64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' '))
+        .map(|v| v.parse().unwrap())
+}
+
+async fn wait_metric(app: &Router, series: &str, want: f64) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let m = read_metrics(app).await;
+        if metric_sample(&m, series) == Some(want) {
+            return m;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {series} == {want}:\n{m}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A single row larger than `STREAM_AFTER` hands off without buffering the entire row as
+/// one oversized initial chunk; the initial chunk stays `<= STREAM_AFTER + 1` and every
+/// subsequent chunk stays `<= CHUNK`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_oversized_row_hands_off_with_bounded_initial_chunk() {
+    let s = pool_server(None, None);
+    let huge = "H".repeat(crate::http::stream::STREAM_AFTER + 200_000);
+    // Load 2,000 tiny triples (~150 KiB total, well below STREAM_AFTER) plus one >1.2 MiB
+    // literal so `execution=auto` chooses a SELECT cursor and the single oversized row is
+    // what crosses STREAM_AFTER.
+    let mut data = String::new();
+    for i in 0..2000 {
+        data.push_str(&format!("<urn:huge:s{i:04}> <urn:huge:p> \"s{i}\" .\n"));
+    }
+    data.push_str(&format!("<urn:huge:big> <urn:huge:p> \"{huge}\" .\n"));
+    load_turtle(&s.state, "big_row", data);
+
+    for (idx, accept) in [
+        "application/sparql-results+json",
+        "text/tab-separated-values",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let q = format!("# huge-row-{idx}\nSELECT ?s ?o WHERE {{ ?s <urn:huge:p> ?o }}");
+        let key = QuickQueries::key("big_row", &q);
+        let req = Request::post("/big_row/sparql?execution=auto")
+            .header(header::CONTENT_TYPE, "application/sparql-query")
+            .header(header::ACCEPT, *accept)
+            .body(Body::from(q.clone()))
+            .unwrap();
+        let resp = s.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(header::CONTENT_LENGTH).is_none(),
+            "oversized single row must stream, not return a whole body"
+        );
+        assert_eq!(route_stats::in_place_handoff(key), 1);
+        assert_eq!(route_stats::in_place_whole(key), 0);
+
+        let mut stream = resp.into_body().into_data_stream();
+        let mut chunks = Vec::new();
+        let mut body = Vec::new();
+        while let Some(item) = stream.next().await {
+            let chunk = item.unwrap();
+            chunks.push(chunk.len());
+            body.extend_from_slice(&chunk);
+        }
+        assert!(
+            chunks.len() >= 2,
+            "expected multiple chunks, got {chunks:?}"
+        );
+        assert!(
+            chunks[0] <= crate::http::stream::STREAM_AFTER + 1,
+            "initial chunk {} exceeded STREAM_AFTER + 1",
+            chunks[0]
+        );
+        for (i, &len) in chunks.iter().enumerate().skip(1) {
+            assert!(
+                len <= crate::http::stream::CHUNK,
+                "chunk {i} ({len} bytes) exceeded CHUNK"
+            );
+        }
+
+        let (st_stream, _, expected) =
+            post_query(&s.app, "/big_row/sparql?execution=streaming", &q, accept).await;
+        assert_eq!(st_stream, StatusCode::OK);
+        assert_eq!(body, expected);
+    }
+    assert!(wait_pool_zero(&s.state, Duration::from_secs(2)).await);
+}
+
+/// When the rows themselves end at or just below `STREAM_AFTER` and the JSON footer is what
+/// first pushes total size past `STREAM_AFTER`, `execution=auto` still hands off to the
+/// streaming producer with a bounded initial chunk rather than returning an oversized whole
+/// body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn footer_crossing_threshold_hands_off_with_bounded_initial_chunk() {
+    let s = pool_server(None, None);
+    let base_q = "SELECT ?o WHERE { ?s <urn:ft:p> ?o }";
+    // Load 2,000 rows with no sort barrier so `execution=auto` selects a SELECT cursor,
+    // then pad row 0 so the full JSON document is `STREAM_AFTER + 2` (total length is
+    // order-independent: all 2,000 rows + header end at `STREAM_AFTER - 1`, and only the
+    // 3-byte JSON footer `]}` crosses `STREAM_AFTER`).
+    let mut probe_data = String::from("<urn:ft:s0000> <urn:ft:p> \"a\" .\n");
+    for i in 1..2000 {
+        probe_data.push_str(&format!("<urn:ft:s{i:04}> <urn:ft:p> \"v\" .\n"));
+    }
+    load_turtle(&s.state, "ft_probe", probe_data);
+    let (_, _, probe_body) = post_query(
+        &s.app,
+        "/ft_probe/sparql?execution=streaming",
+        base_q,
+        "application/sparql-results+json",
+    )
+    .await;
+    let target_total = crate::http::stream::STREAM_AFTER + 2;
+    let pad = target_total - probe_body.len();
+    let padded = "a".repeat(1 + pad);
+    let mut exact_data = format!("<urn:ft:s0000> <urn:ft:p> \"{padded}\" .\n");
+    for i in 1..2000 {
+        exact_data.push_str(&format!("<urn:ft:s{i:04}> <urn:ft:p> \"v\" .\n"));
+    }
+    load_turtle(&s.state, "ft_exact", exact_data);
+
+    let key = QuickQueries::key("ft_exact", base_q);
+    let req = Request::post("/ft_exact/sparql?execution=auto")
+        .header(header::CONTENT_TYPE, "application/sparql-query")
+        .header(header::ACCEPT, "application/sparql-results+json")
+        .body(Body::from(base_q))
+        .unwrap();
+    let resp = s.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get(header::CONTENT_LENGTH).is_none(),
+        "body crossing STREAM_AFTER on its footer must stream, not return whole"
+    );
+    assert_eq!(route_stats::in_place_handoff(key), 1);
+    assert_eq!(route_stats::in_place_whole(key), 0);
+
+    let mut stream = resp.into_body().into_data_stream();
+    let mut chunks = Vec::new();
+    let mut body = Vec::new();
+    while let Some(item) = stream.next().await {
+        let chunk = item.unwrap();
+        chunks.push(chunk.len());
+        body.extend_from_slice(&chunk);
+    }
+    assert_eq!(body.len(), target_total);
+    assert!(
+        chunks[0] <= crate::http::stream::STREAM_AFTER + 1,
+        "initial chunk {} exceeded STREAM_AFTER + 1",
+        chunks[0]
+    );
+    let parsed: J = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        parsed["results"]["bindings"].as_array().unwrap().len(),
+        2000
+    );
+    assert!(wait_pool_zero(&s.state, Duration::from_secs(2)).await);
+}
+
+/// Dropping an unread whole in-place cursor response records `cancelled` (499), matching
+/// the pool route's body-aware observation contract (X05 §6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_unread_in_place_whole_cursor_body_records_cancelled() {
+    let s = pool_server(None, None);
+    let mut data = String::new();
+    for i in 0..2000 {
+        data.push_str(&format!("<urn:drop:s{i}> <urn:drop:p> {i} .\n"));
+    }
+    load_turtle(&s.state, "drop_whole", data);
+
+    let q = "SELECT ?s ?o WHERE { ?s <urn:drop:p> ?o }";
+    let key = QuickQueries::key("drop_whole", q);
+    let req = Request::post("/drop_whole/sparql?execution=auto")
+        .header(header::CONTENT_TYPE, "application/sparql-query")
+        .header(header::ACCEPT, "text/tab-separated-values")
+        .body(Body::from(q))
+        .unwrap();
+    let resp = s.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().contains_key(header::CONTENT_LENGTH));
+    assert_eq!(route_stats::in_place_whole(key), 1);
+
+    // Drop the whole cursor response without reading any body bytes.
+    drop(resp);
+
+    let m = wait_metric(
+        &s.app,
+        r#"sparkles_requests_total{dataset="drop_whole",operation="query",outcome="cancelled"}"#,
+        1.0,
+    )
+    .await;
+    assert_eq!(
+        metric_sample(
+            &m,
+            r#"sparkles_requests_total{dataset="drop_whole",operation="query",outcome="ok"}"#
+        )
+        .unwrap_or(0.0),
+        0.0,
+        "dropping an unread whole cursor body must not record ok:\n{m}"
+    );
+    assert!(wait_pool_zero(&s.state, Duration::from_secs(2)).await);
+}
+
+/// When the client disconnects after the hand-off signal commits headers but before the
+/// initial chunk enqueues, metrics record 0 response bytes, 0 result rows, and a cancelled
+/// outcome, while releasing both query memory and the HTTP concurrency permit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_initial_handoff_send_reports_zero_bytes_zero_rows_and_releases_resources() {
+    use crate::http::algo::probe::{CURRENT, Gate, Probe, Release};
+
+    let s = pool_server(None, Some("query=concurrency=1"));
+    let payload = "p".repeat(800);
+    let mut data = String::new();
+    for i in 0..2000 {
+        data.push_str(&format!(
+            "<urn:fail0:s{i:04}> <urn:fail0:p> \"{payload}-{i}\" .\n"
+        ));
+    }
+    load_turtle(&s.state, "fail_init", data);
+
+    let q = "SELECT ?s ?o WHERE { ?s <urn:fail0:p> ?o }";
+    let key = QuickQueries::key("fail_init", q);
+    let gate = Arc::new(Gate::default());
+    let _release = Release(gate.clone());
+    let probe = Probe {
+        producer: Some(gate.clone()),
+        ..Default::default()
+    };
+    let req = Request::post("/fail_init/sparql?execution=auto")
+        .header(header::CONTENT_TYPE, "application/sparql-query")
+        .header(header::ACCEPT, "text/tab-separated-values")
+        .body(Body::from(q))
+        .unwrap();
+
+    let entered = gate.entered.notified();
+    tokio::pin!(entered);
+    entered.as_mut().enable();
+    let resp = CURRENT
+        .scope(probe, s.app.clone().oneshot(req))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(route_stats::in_place_handoff(key), 1);
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .unwrap();
+
+    // Drop response before the first chunk enqueues, then release the producer gate.
+    drop(resp);
+    let done = gate.done.notified();
+    tokio::pin!(done);
+    done.as_mut().enable();
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), done)
+        .await
+        .unwrap();
+
+    let m = wait_metric(
+        &s.app,
+        r#"sparkles_requests_total{dataset="fail_init",operation="query",outcome="cancelled"}"#,
+        1.0,
+    )
+    .await;
+    assert_eq!(
+        metric_sample(
+            &m,
+            r#"sparkles_response_bytes_total{dataset="fail_init",operation="query"}"#
+        )
+        .unwrap_or(0.0),
+        0.0,
+        "failed initial send must report 0 response bytes:\n{m}"
+    );
+    assert_eq!(
+        metric_sample(&m, r#"sparkles_result_rows_total{dataset="fail_init"}"#).unwrap_or(0.0),
+        0.0,
+        "failed initial send must report 0 result rows:\n{m}"
+    );
+    assert!(wait_pool_zero(&s.state, Duration::from_secs(5)).await);
+
+    // Concurrency slot must be released promptly.
+    let (st, _, _) = post_query(
+        &s.app,
+        "/fail_init/sparql?execution=auto",
+        "ASK { ?s <urn:fail0:p> ?o }",
+        "application/sparql-results+json",
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+/// Real >1 MiB `GraphCursor` in-place + hand-off across N-Triples, Turtle, deferred
+/// RDF/JSON, native JSON, DESCRIBE, and `max_result_bytes`, plus >1 MiB HTTP router parity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_cursor_over_threshold_in_place_handoff_and_http_parity() {
+    use crate::http::cursor::{AutoOutcome, AutoRequest, run_in_place_with_mode};
+    use crate::http::{OutFormat, Params, stream};
+    use sparkles::sparql::ExecutionMode;
+    use sparkles::sparql::results::SolutionsFormat;
+
+    let s = pool_server(None, None);
+    let payload = "g".repeat(650);
+    let mut data = String::new();
+    // 2,200 statements * ~700 bytes ≈ 1.54 MiB (> STREAM_AFTER = 1 MiB)
+    for i in 0..2200 {
+        data.push_str(&format!(
+            "<urn:gbig:s{i:04}> <urn:gbig:p> \"{payload}-{i}\" .\n"
+        ));
+    }
+    load_turtle(&s.state, "gbig_ds", data);
+    let ds = s.state.get("gbig_ds").unwrap();
+
+    let cases = [
+        (
+            "nt",
+            OutFormat::Rdf(oxrdfio::RdfFormat::NTriples),
+            false,
+            "application/n-triples",
+        ),
+        (
+            "ttl",
+            OutFormat::Rdf(oxrdfio::RdfFormat::Turtle),
+            false,
+            "text/turtle",
+        ),
+        (
+            "rj",
+            OutFormat::Jena(sparkles::jena_formats::JenaFormat::RdfJson),
+            false,
+            "application/rdf+json",
+        ),
+        (
+            "native",
+            OutFormat::Rdf(oxrdfio::RdfFormat::NTriples),
+            true,
+            "application/x-sparkles+json",
+        ),
+    ];
+    for (idx, (name, rdf_format, native_graph, accept)) in cases.iter().enumerate() {
+        let q = format!(
+            "# gbig-{idx}\nCONSTRUCT {{ ?s <urn:gbig:p> ?o }} WHERE {{ ?s <urn:gbig:p> ?o }} ORDER BY ?s ?o"
+        );
+        let key = QuickQueries::key("gbig_ds", &q);
+        let params = Params(Default::default());
+        let uri: axum::http::Uri = "/gbig_ds/sparql?execution=auto".parse().unwrap();
+        let (options, guard) = crate::http::query_options_for_test(&s.state, &ds);
+        let outcome = run_in_place_with_mode(
+            ds.clone(),
+            AutoRequest {
+                timeouts: stream::Timeouts::default(),
+                query: q.clone(),
+                options,
+                at: None,
+                params: &params,
+                uri: &uri,
+                guard,
+                limit: None,
+                format: if *native_graph {
+                    SolutionsFormat::Sparkles
+                } else {
+                    SolutionsFormat::Json
+                },
+                thrift: false,
+                rdf_format: *rdf_format,
+                native_graph: *native_graph,
+                prefixes: Default::default(),
+                io: None,
+                quick_key: key,
+                auto: true,
+                trial: false,
+                claim: None,
+            },
+            ExecutionMode::Streaming,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("graph handoff {name} failed: {} {}", e.0, e.1));
+        let AutoOutcome::Responded(resp) = outcome else {
+            panic!("expected GraphCursor response for {name}");
+        };
+        assert_eq!(resp.status(), StatusCode::OK, "graph handoff {name}");
+        assert_eq!(
+            route_stats::in_place_handoff(key),
+            1,
+            "graph {name} >1 MiB must trigger in-place hand-off"
+        );
+        assert_eq!(route_stats::in_place_whole(key), 0);
+
+        let mut stream = resp.into_body().into_data_stream();
+        let mut chunks = Vec::new();
+        let mut body_handoff = Vec::new();
+        while let Some(item) = stream.next().await {
+            let chunk = item.unwrap();
+            chunks.push(chunk.len());
+            body_handoff.extend_from_slice(&chunk);
+        }
+        assert!(
+            body_handoff.len() > stream::STREAM_AFTER,
+            "{name} body {} must exceed STREAM_AFTER",
+            body_handoff.len()
+        );
+        assert!(
+            chunks[0] <= stream::STREAM_AFTER + 1,
+            "{name} initial chunk {} exceeded STREAM_AFTER + 1",
+            chunks[0]
+        );
+        for (i, &len) in chunks.iter().enumerate().skip(1) {
+            assert!(
+                len <= stream::CHUNK,
+                "{name} chunk {i} ({len}) exceeded CHUNK"
+            );
+        }
+
+        // Compare byte-for-byte with explicit HTTP `execution=streaming`.
+        let (st_stream, _, body_stream) =
+            post_query(&s.app, "/gbig_ds/sparql?execution=streaming", &q, accept).await;
+        assert_eq!(st_stream, StatusCode::OK, "streaming {name}");
+        if *native_graph {
+            assert_eq!(
+                scrub_native_meta(&body_handoff)["quads"],
+                scrub_native_meta(&body_stream)["quads"]
+            );
+        } else {
+            assert_eq!(body_handoff, body_stream, "graph handoff parity {name}");
+        }
+    }
+
+    // DESCRIBE over >1 MiB via GraphCursor in-place hand-off.
+    let desc_q = "DESCRIBE ?s WHERE { ?s <urn:gbig:p> ?o }";
+    let desc_key = QuickQueries::key("gbig_ds", desc_q);
+    let params = Params(Default::default());
+    let uri: axum::http::Uri = "/gbig_ds/sparql?execution=auto".parse().unwrap();
+    let (options, guard) = crate::http::query_options_for_test(&s.state, &ds);
+    let AutoOutcome::Responded(resp) = run_in_place_with_mode(
+        ds.clone(),
+        AutoRequest {
+            timeouts: stream::Timeouts::default(),
+            query: desc_q.into(),
+            options,
+            at: None,
+            params: &params,
+            uri: &uri,
+            guard,
+            limit: None,
+            format: SolutionsFormat::Json,
+            thrift: false,
+            rdf_format: OutFormat::Rdf(oxrdfio::RdfFormat::NTriples),
+            native_graph: false,
+            prefixes: Default::default(),
+            io: None,
+            quick_key: desc_key,
+            auto: true,
+            trial: false,
+            claim: None,
+        },
+        ExecutionMode::Streaming,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("DESCRIBE handoff failed: {} {}", e.0, e.1)) else {
+        panic!("expected GraphCursor response for DESCRIBE");
+    };
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(route_stats::in_place_handoff(desc_key), 1);
+    let desc_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(desc_body.len() > stream::STREAM_AFTER);
+
+    // max_result_bytes on GraphCursor hand-off: 1.2 MiB limit aborts cleanly <= limit.
+    let limit = 1_200_000u64;
+    let lim_q = "CONSTRUCT { ?s <urn:gbig:p> ?o } WHERE { ?s <urn:gbig:p> ?o }";
+    let lim_key = QuickQueries::key("gbig_ds", lim_q);
+    let (options, guard) = crate::http::query_options_for_test(&s.state, &ds);
+    let AutoOutcome::Responded(resp) = run_in_place_with_mode(
+        ds.clone(),
+        AutoRequest {
+            timeouts: stream::Timeouts::default(),
+            query: lim_q.into(),
+            options,
+            at: None,
+            params: &params,
+            uri: &uri,
+            guard,
+            limit: Some(limit),
+            format: SolutionsFormat::Json,
+            thrift: false,
+            rdf_format: OutFormat::Rdf(oxrdfio::RdfFormat::NTriples),
+            native_graph: false,
+            prefixes: Default::default(),
+            io: None,
+            quick_key: lim_key,
+            auto: true,
+            trial: false,
+            claim: None,
+        },
+        ExecutionMode::Streaming,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("max_result_bytes graph handoff failed: {} {}", e.0, e.1)) else {
+        panic!("expected GraphCursor response for max_result_bytes");
+    };
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(route_stats::in_place_handoff(lim_key), 1);
+    let mut stream = resp.into_body().into_data_stream();
+    let mut received = 0u64;
+    let mut saw_err = false;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(c) => received += c.len() as u64,
+            Err(_) => {
+                saw_err = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_err, "graph handoff must abort past max_result_bytes");
+    assert!(received <= limit, "received {received} > limit {limit}");
+    assert!(wait_pool_zero(&s.state, Duration::from_secs(2)).await);
+}

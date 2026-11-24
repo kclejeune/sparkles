@@ -144,6 +144,8 @@ pub struct SwitchWriter {
     ledger: RowLedger,
     /// the bytes copied into `buf` since the start
     copied: u64,
+    /// the bytes that have been enqueued into `tx`
+    sent: u64,
     /// An error of a send that had already enqueued its chunk, such as the body timer
     /// aborting the transfer just after. The chunk's rows count, and the error is
     /// returned from the next write, flush or send.
@@ -239,7 +241,9 @@ fn gone() -> io::Error {
 
 impl SwitchWriter {
     /// Switch to streaming: hand the receiver to the handler, then send what is
-    /// buffered.
+    /// buffered. The initial chunk is capped at `threshold + 1` bytes so an in-place
+    /// hand-off preserves the ordinary pool switch bound; any remaining full `CHUNK`
+    /// slices drain through the bounded channel with backpressure.
     fn switch(&mut self) -> io::Result<()> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAP);
         let signal = self.signal.take().expect("signal before the switch");
@@ -261,10 +265,24 @@ impl SwitchWriter {
         if let Some(gate) = self.producer_gate.take() {
             gate.wait();
         }
-        self.send_chunk()?;
+        let max_first = self.threshold.saturating_add(1);
+        let mut pending = Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK)));
+        let first = if pending.len() > max_first {
+            pending.split_to(max_first)
+        } else {
+            std::mem::take(&mut pending)
+        };
+        self.send_bytes(first)?;
         #[cfg(test)]
         if let Some(gate) = self.queued_producer_gate.take() {
             gate.wait();
+        }
+        while pending.len() >= CHUNK {
+            let piece = pending.split_to(CHUNK);
+            self.send_bytes(piece)?;
+        }
+        if !pending.is_empty() {
+            self.buf.extend_from_slice(&pending);
         }
         Ok(())
     }
@@ -298,12 +316,23 @@ impl SwitchWriter {
             held: None,
             ledger: RowLedger::new(),
             copied: 0,
+            sent: 0,
             after_send: None,
             #[cfg(test)]
             producer_gate: None,
             #[cfg(test)]
             queued_producer_gate: None,
         }
+    }
+
+    /// A bounded synchronous trial writer for repeatable results (such as ASK native JSON):
+    /// checks `control`, stops immediately with `WouldBlock` (`deferred() == true`) before
+    /// buffering past `threshold`, so oversized responses fall back to the pool without
+    /// serializing the whole document twice.
+    pub(super) fn new_in_place_trial(threshold: usize, control: StreamControl) -> Self {
+        let mut sw = Self::new_in_place_cursor(threshold, control);
+        sw.handoff = false;
+        sw
     }
 
     /// Extract the completed buffered body after an in-place cursor finished whole,
@@ -336,6 +365,9 @@ impl SwitchWriter {
 
     fn switch_if_over_threshold(&mut self) -> io::Result<()> {
         if self.tx.is_none() && self.buf.len() > self.threshold {
+            if let Some(control) = &self.control {
+                control.check()?;
+            }
             self.switch()?;
         }
         Ok(())
@@ -357,6 +389,7 @@ impl SwitchWriter {
             held: None,
             ledger: RowLedger::new(),
             copied: 0,
+            sent: 0,
             after_send: None,
             #[cfg(test)]
             producer_gate: None,
@@ -378,31 +411,31 @@ impl SwitchWriter {
         }
     }
 
-    /// The chunk enqueued: its rows count. A check that then fails is kept for the next
-    /// call, so that the write that sent the chunk still counts its bytes.
-    fn enqueued(&mut self, after: io::Result<()>) {
-        self.ledger.handed_over(self.copied);
+    /// The chunk enqueued: its bytes and rows count. A check that then fails is kept for
+    /// the next call, so that the write that sent the chunk still counts its bytes.
+    fn enqueued(&mut self, len: usize, after: io::Result<()>) {
+        self.sent += len as u64;
+        self.ledger.handed_over(self.sent);
         if let Err(e) = after {
             self.after_send = Some(e);
         }
     }
 
-    fn send_chunk(&mut self) -> io::Result<()> {
+    fn send_bytes(&mut self, chunk: Bytes) -> io::Result<()> {
         self.failed_send()?;
         let Some(tx) = &self.tx else {
             return Ok(());
         };
-        if self.buf.is_empty() {
+        if chunk.is_empty() {
             return Ok(());
         }
-        let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK));
+        let len = chunk.len();
         if self.control.is_none() && self.timed.is_none() {
-            tx.blocking_send(Ok(Bytes::from(chunk)))
-                .map_err(|_| gone())?;
-            self.enqueued(Ok(()));
+            tx.blocking_send(Ok(chunk)).map_err(|_| gone())?;
+            self.enqueued(len, Ok(()));
             return Ok(());
         }
-        let mut item = Ok(Bytes::from(chunk));
+        let mut item = Ok(chunk);
         let stalled = Instant::now();
         let after = loop {
             if let Some(control) = &self.control {
@@ -466,8 +499,22 @@ impl SwitchWriter {
                 }
             }
         };
-        self.enqueued(after);
+        self.enqueued(len, after);
         Ok(())
+    }
+
+    fn send_chunk(&mut self) -> io::Result<()> {
+        self.failed_send()?;
+        if self.tx.is_none() || self.buf.is_empty() {
+            return Ok(());
+        }
+        let mut remaining =
+            Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK)));
+        while remaining.len() > CHUNK {
+            let piece = remaining.split_to(CHUNK);
+            self.send_bytes(piece)?;
+        }
+        self.send_bytes(remaining)
     }
 }
 
@@ -539,6 +586,9 @@ impl Write for SwitchWriter {
             && self.signal.is_some()
             && !self.buf.is_empty()
         {
+            if let Some(control) = &self.control {
+                control.check()?;
+            }
             self.switch()?;
         }
         Ok(())
@@ -711,6 +761,7 @@ where
             held: Some(held),
             ledger: RowLedger::new(),
             copied: 0,
+            sent: 0,
             after_send: None,
             #[cfg(test)]
             producer_gate: probe.producer,
@@ -764,7 +815,7 @@ fn finish_producer<D>(
             Some(c) => c.classify(e),
             None => e,
         });
-    let mut bytes = w.written();
+    let w_written = w.written();
     let mut sw = w.into_inner();
     if let (Some(producer), Err(error)) = (&sw.timed, &result) {
         producer.record_error(error);
@@ -778,15 +829,13 @@ fn finish_producer<D>(
             // waited for the reader, so this wait is one more chunk of the same kind,
             // under a cursor's deadline and stall bound. Any other failure ends the
             // body at once. The bytes reported leave out what was not sent.
-            let pending = sw.buf.len() as u64;
-            let flushed =
-                matches!(e, Error::BudgetExceeded(_)) && sw.tx.is_some() && sw.send_chunk().is_ok();
-            if sw.tx.is_some() && !flushed {
-                bytes = bytes.saturating_sub(pending);
+            if matches!(e, Error::BudgetExceeded(_)) && sw.tx.is_some() {
+                let _ = sw.send_chunk();
             }
             Err(e)
         }
     };
+    let bytes = if sw.tx.is_some() { sw.sent } else { w_written };
     let result = result.map_err(|e| match control {
         Some(c) => c.classify(e),
         None => e,
@@ -1079,6 +1128,7 @@ where
             held: Some(held),
             ledger: RowLedger::new(),
             copied: 0,
+            sent: 0,
             after_send: None,
             #[cfg(test)]
             producer_gate: probe.producer,
@@ -1159,8 +1209,8 @@ pub(super) async fn finish_handoff_controlled<F, D>(
 where
     F: FnOnce(
             sparkles::Result<()>,
-            LimitedWriter<SwitchWriter>,
-        ) -> (LimitedWriter<SwitchWriter>, sparkles::Result<()>)
+            &mut Option<LimitedWriter<SwitchWriter>>,
+        ) -> sparkles::Result<()>
         + Send
         + 'static,
     D: FnOnce(StreamEnd) + Send + 'static,
@@ -1196,26 +1246,30 @@ where
             #[cfg(test)]
             &probe,
         );
-        let switched = writer
+        let mut writer_slot = Some(writer);
+        let switched = writer_slot
+            .as_mut()
+            .expect("handoff writer installed")
             .get_mut()
             .switch_if_over_threshold()
-            .map_err(Error::from);
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            write(switched, writer)
-        }));
-        match caught {
-            Ok((w, result)) => {
-                #[cfg(test)]
-                if let Some(gate) = &probe.after_write {
-                    gate.wait();
-                }
-                finish_producer(w, result, Some(&control), began, &terminal, span, on_end);
-            }
-            Err(_) => {
-                // Unwind already dropped `writer` (including `Producer::drop` if timed).
-                drop(span);
-            }
+            .map_err(|e| {
+                let w = writer_slot.as_ref().expect("handoff writer installed");
+                control.classify(w.classify(Error::from(e)))
+            });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write(switched, &mut writer_slot)
+        }))
+        .unwrap_or_else(|_| {
+            Err(Error::Io(io::Error::other(
+                "query producer stopped unexpectedly",
+            )))
+        });
+        #[cfg(test)]
+        if let Some(gate) = &probe.after_write {
+            gate.wait();
         }
+        let w = writer_slot.expect("handoff writer preserved across unwind");
+        finish_producer(w, result, Some(&control), began, &terminal, span, on_end);
     });
     receive_outcome(outcome, body_terminal, began).await
 }
@@ -1311,6 +1365,7 @@ where
         held: None,
         ledger: RowLedger::new(),
         copied: 0,
+        sent: 0,
         after_send: None,
         #[cfg(test)]
         producer_gate: None,
@@ -1422,7 +1477,8 @@ mod tests {
         .unwrap();
         assert_eq!(rows.get(), 3);
         assert_eq!(sw.ledger().delivered(), Some(0), "nothing was sent");
-        sw.enqueued(Err(io::Error::new(io::ErrorKind::TimedOut, "aborted")));
+        let len = sw.buf.len();
+        sw.enqueued(len, Err(io::Error::new(io::ErrorKind::TimedOut, "aborted")));
         assert_eq!(sw.ledger().delivered(), Some(3));
         for _ in 0..2 {
             assert_eq!(sw.send_chunk().unwrap_err().kind(), io::ErrorKind::TimedOut);
@@ -2263,5 +2319,229 @@ mod timed_tests {
         let report = ended(end).await;
         assert!(report.error.is_some());
         assert!(report.disconnected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_writer_unwind_reports_error_and_joins_timer() {
+        let control = StreamControl::new(Default::default(), None, Default::default(), None);
+        let mut w = LimitedWriter::new(
+            SwitchWriter::new_in_place_cursor(1, control.clone()),
+            None,
+            None,
+        );
+        w.write_all(b"prefix").unwrap();
+        let (send, end) = oneshot::channel();
+        let res = finish_handoff_controlled(
+            w,
+            control,
+            timeouts(),
+            Instant::now(),
+            |switched, _w| {
+                switched?;
+                panic!("injected handoff writer unwind");
+            },
+            move |e| {
+                let _ = send.send(e);
+            },
+        )
+        .await;
+        let Ok(Serialized::Timed { body, .. }) = res else {
+            panic!("expected timed stream after handoff switch");
+        };
+        let failed = axum::body::to_bytes(body, usize::MAX).await.is_err();
+        let report = ended(end).await;
+        assert!(failed, "panicking handoff producer must abort body");
+        assert!(report.committed);
+        // Initial chunk is capped at threshold + 1 (2 bytes); remaining 4 bytes never sent.
+        assert_eq!(report.bytes, 2);
+        assert!(
+            report
+                .error
+                .unwrap()
+                .to_string()
+                .contains("producer stopped unexpectedly")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_pre_switch_timeout_and_cancel_fail_pre_commit() {
+        for is_timeout in [true, false] {
+            let cancel = Arc::new(AtomicBool::new(!is_timeout));
+            let deadline = is_timeout.then(|| Instant::now() - Duration::from_secs(1));
+            let control = StreamControl::new(cancel, deadline, Default::default(), None);
+            // Buffer over threshold before handoff while control is not yet expired/cancelled,
+            // by using a fresh uncancelled control to fill, then swapping in the expired one.
+            let mut sw = SwitchWriter::new_in_place_cursor(
+                10,
+                StreamControl::new(Default::default(), None, Default::default(), None),
+            );
+            sw.write_all(&[b'a'; 64]).unwrap();
+            sw.control = Some(control.clone());
+            let w = LimitedWriter::new(sw, None, None);
+            let (send, end) = oneshot::channel();
+            let observed_err = Arc::new(std::sync::Mutex::new(None::<String>));
+            let observed = observed_err.clone();
+            let res = finish_handoff_controlled(
+                w,
+                control,
+                timeouts(),
+                Instant::now(),
+                move |switched, _w| {
+                    if let Err(e) = switched {
+                        *observed.lock().unwrap() = Some(format!("{e:?}"));
+                        return Err(e);
+                    }
+                    Ok(())
+                },
+                move |e| {
+                    let _ = send.send(e);
+                },
+            )
+            .await;
+            let report = ended(end).await;
+            assert!(!report.committed, "must fail pre-commit, not send 200 OK");
+            assert_eq!(report.rows, None);
+            if is_timeout {
+                assert!(matches!(res, Err(ApiError(StatusCode::REQUEST_TIMEOUT, _))));
+                assert!(matches!(report.error, Some(Error::Timeout)));
+                assert_eq!(
+                    observed_err.lock().unwrap().as_deref(),
+                    Some("Timeout"),
+                    "switched error must be classified before fail_output"
+                );
+            } else {
+                assert!(res.is_err());
+                assert!(matches!(report.error, Some(Error::Cancelled)));
+                assert_eq!(
+                    observed_err.lock().unwrap().as_deref(),
+                    Some("Cancelled"),
+                    "switched error must be classified before fail_output"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_failed_initial_send_reports_zero_bytes_and_zero_rows() {
+        use crate::http::algo::probe::{CURRENT, Gate, Probe, Release};
+        use sparkles::sparql::results as res;
+
+        let store = sparkles::store::Store::in_memory(Default::default());
+        let r = sparkles::sparql::query(
+            store.snapshot(),
+            "SELECT ?x WHERE { VALUES ?x { 1 2 3 } }",
+            &Default::default(),
+        )
+        .unwrap();
+        let control = StreamControl::new(Default::default(), None, Default::default(), None);
+        let sw = SwitchWriter::new_in_place_cursor(1, control.clone());
+        let ledger = sw.ledger();
+        let mut w = LimitedWriter::new(sw, None, None);
+        let rows = res::RowCount::with_ledger(ledger);
+        res::write(
+            res::Source::Result(&r),
+            res::WriteOptions::new(res::Format::Solutions(res::SolutionsFormat::Tsv), &rows),
+            &mut w,
+        )
+        .unwrap();
+        assert_eq!(rows.get(), 3);
+        assert!(w.written() > 1);
+
+        let gate = Arc::new(Gate::default());
+        let _release = Release(gate.clone());
+        let probe = Probe {
+            producer: Some(gate.clone()),
+            ..Default::default()
+        };
+        let (send, end) = oneshot::channel();
+        let serialized = CURRENT
+            .scope(
+                probe,
+                finish_handoff_controlled(
+                    w,
+                    control,
+                    timeouts(),
+                    Instant::now(),
+                    |switched, _w| switched,
+                    move |e| {
+                        let _ = send.send(e);
+                    },
+                ),
+            )
+            .await;
+        let Ok(Serialized::Timed { body, .. }) = serialized else {
+            panic!("expected timed stream");
+        };
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        // Drop the receiver before the first chunk enqueues.
+        drop(body);
+        gate.release();
+        let report = ended(end).await;
+        assert!(report.committed);
+        assert!(report.disconnected);
+        assert_eq!(report.bytes, 0, "failed initial send must report 0 bytes");
+        assert_eq!(
+            report.rows,
+            Some(0),
+            "failed initial send must report 0 rows"
+        );
+        assert_eq!(
+            report.outcome(),
+            (Some(crate::obs::Outcome::Cancelled), None)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_initial_chunk_is_bounded_and_overflow_drains_in_chunks() {
+        let control = StreamControl::new(Default::default(), None, Default::default(), None);
+        let threshold = 100usize;
+        let total = threshold + CHUNK * 3 + 17;
+        let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let mut w = LimitedWriter::new(
+            SwitchWriter::new_in_place_cursor(threshold, control.clone()),
+            None,
+            None,
+        );
+        w.write_all(&payload).unwrap();
+        let (send, end) = oneshot::channel();
+        let Ok(Serialized::Timed { body, .. }) = finish_handoff_controlled(
+            w,
+            control,
+            timeouts(),
+            Instant::now(),
+            |switched, _w| switched,
+            move |e| {
+                let _ = send.send(e);
+            },
+        )
+        .await
+        else {
+            panic!("expected timed stream");
+        };
+        let mut stream = body.into_data_stream();
+        let mut chunks = Vec::new();
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let bytes = item.unwrap();
+            chunks.push(bytes.len());
+            out.extend_from_slice(&bytes);
+        }
+        let report = ended(end).await;
+        assert!(report.error.is_none());
+        assert_eq!(report.bytes, total as u64);
+        assert_eq!(out, payload);
+        assert_eq!(
+            chunks[0],
+            threshold + 1,
+            "initial handoff chunk must not exceed threshold + 1"
+        );
+        for (idx, &len) in chunks.iter().enumerate().skip(1) {
+            assert!(
+                len <= CHUNK,
+                "post-switch chunk {idx} had {len} bytes > CHUNK ({CHUNK})"
+            );
+        }
     }
 }

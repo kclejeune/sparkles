@@ -70,34 +70,35 @@ pub enum CursorWriter<W: Write + Send + 'static> {
 }
 
 impl<W: Write + Send + 'static> CursorWriter<W> {
-    pub fn select(cursor: QueryCursor, options: CursorWriteOptions) -> Result<Self> {
-        SelectWriter::new(cursor, options).map(|w| Self::Select(Box::new(w)))
+    pub fn select(cursor: QueryCursor, options: CursorWriteOptions) -> Self {
+        Self::Select(Box::new(SelectWriter::new(cursor, options)))
     }
 
-    pub fn graph(cursor: GraphCursor, options: CursorWriteOptions) -> Result<Self> {
-        GraphWriter::new(cursor, options).map(|w| Self::Graph(Box::new(w)))
+    pub fn graph(cursor: GraphCursor, options: CursorWriteOptions) -> Self {
+        Self::Graph(Box::new(GraphWriter::new(cursor, options)))
     }
 
     /// Pull and serialize rows/statements into `writer` until the cursor ends or total
-    /// output exceeds `limit_bytes`. Always returns `writer` so the caller can inspect
-    /// errors, counts and buffered bytes.
-    pub fn write_until(&mut self, mut writer: W, limit_bytes: u64) -> (W, Result<WriteStep>) {
+    /// output exceeds `limit_bytes`. Keeps `writer` inside the caller's `Option<W>` across
+    /// normal returns and panic unwinds so the caller can always recover it.
+    pub fn write_until(&mut self, writer: &mut Option<W>, limit_bytes: u64) -> Result<WriteStep> {
         match self {
             Self::Select(s) => {
-                let res = s.write_until(&mut writer, limit_bytes);
-                (writer, res)
+                let w = writer.as_mut().expect("cursor writer present");
+                s.write_until(w, limit_bytes)
             }
             Self::Graph(g) => g.write_until(writer, limit_bytes),
         }
     }
 
     /// Finish writing all remaining rows/statements and the format footer/trailer into
-    /// `writer`, using full decode-ahead parallelism on `SELECT` cursors.
-    pub fn finish(&mut self, mut writer: W) -> (W, Result<CursorStats>) {
+    /// `writer`, using full decode-ahead parallelism on `SELECT` cursors. Keeps `writer`
+    /// inside the caller's `Option<W>` across normal returns and panic unwinds.
+    pub fn finish(&mut self, writer: &mut Option<W>) -> Result<CursorStats> {
         match self {
             Self::Select(s) => {
-                let res = s.finish(&mut writer);
-                (writer, res)
+                let w = writer.as_mut().expect("cursor writer present");
+                s.finish(w)
             }
             Self::Graph(g) => g.finish(writer),
         }
@@ -150,6 +151,11 @@ struct PendingSelectBatch {
 }
 
 enum SelectState {
+    Pending {
+        format: Format,
+        started: Instant,
+        initial_exec: f64,
+    },
     Tsv,
     Csv,
     Json(Json<'static>),
@@ -175,48 +181,20 @@ pub struct SelectWriter {
     rows_written: u64,
     emitted_bytes: u64,
     header_written: bool,
+    rows_done: bool,
     finished: bool,
 }
 
 impl SelectWriter {
-    pub fn new(mut cursor: QueryCursor, options: CursorWriteOptions) -> Result<Self> {
-        let ctx = cursor.output_ctx();
-        let state = match options.format {
-            Format::Solutions(SolutionsFormat::Tsv) => SelectState::Tsv,
-            Format::Solutions(SolutionsFormat::Csv) => SelectState::Csv,
-            Format::Solutions(SolutionsFormat::Json) => {
-                match Json::new_owned(&ctx, cursor.variables()) {
-                    Ok(enc) => SelectState::Json(enc),
-                    Err(e) => {
-                        cursor.fail_output(&e);
-                        return Err(e);
-                    }
-                }
-            }
-            Format::Solutions(SolutionsFormat::Xml) => {
-                match Xml::new_owned(&ctx, cursor.variables()) {
-                    Ok(enc) => SelectState::Xml(enc),
-                    Err(e) => {
-                        cursor.fail_output(&e);
-                        return Err(e);
-                    }
-                }
-            }
-            Format::Solutions(SolutionsFormat::Sparkles) => SelectState::Native {
-                sent: 0,
-                started: Instant::now(),
-                initial_exec: cursor.stats().timing.exec_ms,
-            },
-            Format::ResultsThrift => SelectState::Thrift,
-            Format::Rdf(_) | Format::Jena(_) => {
-                let e = Error::invalid("a SELECT cursor is written in a result format");
-                cursor.fail_output(&e);
-                return Err(e);
-            }
-        };
-        Ok(Self {
+    pub fn new(cursor: QueryCursor, options: CursorWriteOptions) -> Self {
+        let initial_exec = cursor.stats().timing.exec_ms;
+        Self {
             pending: None,
-            state,
+            state: SelectState::Pending {
+                format: options.format,
+                started: Instant::now(),
+                initial_exec,
+            },
             cursor,
             send: options.send,
             remaining: options.send.unwrap_or(usize::MAX),
@@ -225,8 +203,43 @@ impl SelectWriter {
             rows_written: 0,
             emitted_bytes: 0,
             header_written: false,
+            rows_done: false,
             finished: false,
-        })
+        }
+    }
+
+    fn ensure_initialized(&mut self) -> Result<()> {
+        let SelectState::Pending {
+            format,
+            started,
+            initial_exec,
+        } = self.state
+        else {
+            return Ok(());
+        };
+        let ctx = self.cursor.output_ctx();
+        self.state = match format {
+            Format::Solutions(SolutionsFormat::Tsv) => SelectState::Tsv,
+            Format::Solutions(SolutionsFormat::Csv) => SelectState::Csv,
+            Format::Solutions(SolutionsFormat::Json) => {
+                SelectState::Json(Json::new_owned(&ctx, self.cursor.variables())?)
+            }
+            Format::Solutions(SolutionsFormat::Xml) => {
+                SelectState::Xml(Xml::new_owned(&ctx, self.cursor.variables())?)
+            }
+            Format::Solutions(SolutionsFormat::Sparkles) => SelectState::Native {
+                sent: 0,
+                started,
+                initial_exec,
+            },
+            Format::ResultsThrift => SelectState::Thrift,
+            Format::Rdf(_) | Format::Jena(_) => {
+                return Err(Error::invalid(
+                    "a SELECT cursor is written in a result format",
+                ));
+            }
+        };
+        Ok(())
     }
 
     pub fn rows_written(&self) -> u64 {
@@ -235,7 +248,15 @@ impl SelectWriter {
 
     pub fn write_until(&mut self, writer: &mut dyn Write, limit_bytes: u64) -> Result<WriteStep> {
         if self.finished {
-            return Ok(WriteStep::Done(self.cursor.stats()));
+            return Ok(if self.emitted_bytes > limit_bytes {
+                WriteStep::Paused
+            } else {
+                WriteStep::Done(self.cursor.stats())
+            });
+        }
+        if let Err(error) = self.ensure_initialized() {
+            self.cursor.fail_output(&error);
+            return Err(error);
         }
         let ctx = self.cursor.output_ctx();
         let count = match &self.ledger {
@@ -253,36 +274,46 @@ impl SelectWriter {
                 paused = true;
                 return Ok(());
             }
-            let mut row_charge = RowCharge::default();
-            // Finish any batch that paused on an earlier `write_until` call.
-            if let Some(pending) = self.pending.take()
-                && self.write_pending_until(pending, out, &mut row_charge, limit_bytes)?
-            {
-                paused = true;
-                return Ok(());
-            }
-            while self.remaining > 0 {
-                let Some(batch) = self.cursor.next_batch_at_most(self.remaining)? else {
-                    break;
-                };
-                let cache = batch.term_cache()?;
-                let end_row = batch.len().min(self.remaining);
-                let pending = PendingSelectBatch {
-                    cache,
-                    batch,
-                    next_row: 0,
-                    end_row,
-                };
-                if self.write_pending_until(pending, out, &mut row_charge, limit_bytes)? {
+            if !self.rows_done {
+                let mut row_charge = RowCharge::default();
+                // Finish any batch that paused on an earlier `write_until` call.
+                if let Some(pending) = self.pending.take()
+                    && self.write_pending_until(pending, out, &mut row_charge, limit_bytes)?
+                {
                     paused = true;
                     return Ok(());
                 }
+                while self.remaining > 0 {
+                    let Some(batch) = self.cursor.next_batch_at_most(self.remaining)? else {
+                        break;
+                    };
+                    let cache = batch.term_cache()?;
+                    let end_row = batch.len().min(self.remaining);
+                    let pending = PendingSelectBatch {
+                        cache,
+                        batch,
+                        next_row: 0,
+                        end_row,
+                    };
+                    if self.write_pending_until(pending, out, &mut row_charge, limit_bytes)? {
+                        paused = true;
+                        return Ok(());
+                    }
+                }
+                drop(row_charge);
+                self.rows_done = true;
             }
-            drop(row_charge);
             if self.remaining == 0 {
                 self.cursor.close();
             }
             self.cursor.check()?;
+            let current = self
+                .emitted_bytes
+                .saturating_add(out.written_and_buffered());
+            if current.saturating_add(select_footer_min_bytes(&self.state)) > limit_bytes {
+                paused = true;
+                return Ok(());
+            }
             self.write_footer(out)?;
             self.finished = true;
             Ok(())
@@ -291,7 +322,7 @@ impl SelectWriter {
         match result {
             Ok(taken) => {
                 self.emitted_bytes = self.emitted_bytes.saturating_add(taken);
-                if paused {
+                if paused || self.emitted_bytes > limit_bytes {
                     Ok(WriteStep::Paused)
                 } else {
                     Ok(WriteStep::Done(self.cursor.stats()))
@@ -308,6 +339,10 @@ impl SelectWriter {
         if self.finished {
             return Ok(self.cursor.stats());
         }
+        if let Err(error) = self.ensure_initialized() {
+            self.cursor.fail_output(&error);
+            return Err(error);
+        }
         let ctx = self.cursor.output_ctx();
         let count = match &self.ledger {
             Some(l) => RowCount::with_ledger(l.clone()),
@@ -315,54 +350,57 @@ impl SelectWriter {
         };
         let result = write_buffered_counted(writer, &count, Some(ctx), &mut |out, _| {
             self.write_header_if_needed(out)?;
-            let mut row_charge = RowCharge::default();
-            let width = self.cursor.variables().len();
-            if let Some(PendingSelectBatch {
-                cache,
-                batch,
-                next_row,
-                end_row,
-            }) = self.pending.take()
-            {
-                let decoded = cache.map(|c| DecodedBatch::new(&batch, c));
-                let mut rows = CursorRows::new(
-                    &self.cursor,
-                    &batch,
-                    decoded.as_ref(),
-                    &mut row_charge,
+            if !self.rows_done {
+                let mut row_charge = RowCharge::default();
+                let width = self.cursor.variables().len();
+                if let Some(PendingSelectBatch {
+                    cache,
+                    batch,
+                    next_row,
                     end_row,
-                )?;
-                let mut explicit = Explicit::new(&mut *out);
-                for i in next_row..end_row {
-                    let row = rows.row(i)?;
-                    write_select_row(&mut self.state, &mut explicit, row, width)?;
-                    self.remaining -= 1;
+                }) = self.pending.take()
+                {
+                    let decoded = cache.map(|c| DecodedBatch::new(&batch, c));
+                    let mut rows = CursorRows::new(
+                        &self.cursor,
+                        &batch,
+                        decoded.as_ref(),
+                        &mut row_charge,
+                        end_row,
+                    )?;
+                    let mut explicit = Explicit::new(&mut *out);
+                    for i in next_row..end_row {
+                        let row = rows.row(i)?;
+                        write_select_row(&mut self.state, &mut explicit, row, width)?;
+                        self.remaining -= 1;
+                    }
+                    drop(rows);
+                    drop(decoded);
+                    drop(batch);
                 }
-                drop(rows);
-                drop(decoded);
-                drop(batch);
+                if self.remaining > 0 {
+                    let send_left = self.send.map(|_| self.remaining);
+                    let mut left = self.remaining;
+                    let state = &mut self.state;
+                    let remaining =
+                        self.cursor
+                            .for_each_decoded(send_left, |cursor, batch, decoded| {
+                                let len = batch.len().min(left);
+                                let mut rows =
+                                    CursorRows::new(cursor, batch, decoded, &mut row_charge, len)?;
+                                let mut explicit = Explicit::new(&mut *out);
+                                for i in 0..len {
+                                    let row = rows.row(i)?;
+                                    write_select_row(state, &mut explicit, row, width)?;
+                                }
+                                left -= len;
+                                Ok(())
+                            })?;
+                    self.remaining = remaining;
+                }
+                drop(row_charge);
+                self.rows_done = true;
             }
-            if self.remaining > 0 {
-                let send_left = self.send.map(|_| self.remaining);
-                let mut left = self.remaining;
-                let state = &mut self.state;
-                let remaining =
-                    self.cursor
-                        .for_each_decoded(send_left, |cursor, batch, decoded| {
-                            let len = batch.len().min(left);
-                            let mut rows =
-                                CursorRows::new(cursor, batch, decoded, &mut row_charge, len)?;
-                            let mut explicit = Explicit::new(&mut *out);
-                            for i in 0..len {
-                                let row = rows.row(i)?;
-                                write_select_row(state, &mut explicit, row, width)?;
-                            }
-                            left -= len;
-                            Ok(())
-                        })?;
-                self.remaining = remaining;
-            }
-            drop(row_charge);
             if self.remaining == 0 {
                 self.cursor.close();
             }
@@ -391,6 +429,7 @@ impl SelectWriter {
         self.cursor.check()?;
         let vars = self.cursor.variables();
         match &self.state {
+            SelectState::Pending { .. } => unreachable!("select writer initialized"),
             SelectState::Tsv => {
                 let mut explicit = Explicit::new(out);
                 Tsv::header(&mut explicit, vars).map_err(io)?;
@@ -447,6 +486,20 @@ impl SelectWriter {
         let mut explicit = Explicit::new(&mut *out);
         for i in next_row..end_row {
             let row = rows.row(i)?;
+            let current = self
+                .emitted_bytes
+                .saturating_add(explicit.written_and_buffered());
+            if current.saturating_add(row_min_bytes(&row)) > limit_bytes {
+                drop(rows);
+                let cache = decoded.map(DecodedBatch::into_cache);
+                self.pending = Some(PendingSelectBatch {
+                    cache,
+                    batch,
+                    next_row: i,
+                    end_row,
+                });
+                return Ok(true);
+            }
             write_select_row(&mut self.state, &mut explicit, row, width)?;
             self.remaining -= 1;
             if self
@@ -475,6 +528,7 @@ impl SelectWriter {
 
     fn write_footer(&mut self, out: &mut RowOut<'_>) -> Result<()> {
         match &self.state {
+            SelectState::Pending { .. } => unreachable!("select writer initialized"),
             SelectState::Tsv | SelectState::Csv => Ok(()),
             SelectState::Json(_) => {
                 let mut explicit = Explicit::new(out);
@@ -507,6 +561,39 @@ impl SelectWriter {
     }
 }
 
+fn term_ref_min_bytes(term: oxrdf::TermRef<'_>) -> u64 {
+    match term {
+        oxrdf::TermRef::NamedNode(n) => n.as_str().len() as u64,
+        oxrdf::TermRef::BlankNode(b) => b.as_str().len() as u64,
+        oxrdf::TermRef::Literal(l) => l.value().len() as u64,
+        oxrdf::TermRef::Triple(t) => term_ref_min_bytes(t.subject.as_ref().into())
+            .saturating_add(term_ref_min_bytes(t.predicate.as_ref().into()))
+            .saturating_add(term_ref_min_bytes(t.object.as_ref())),
+    }
+}
+
+fn row_min_bytes(row: &RowView<'_>) -> u64 {
+    match row {
+        RowView::Dense(terms) => terms.iter().flatten().fold(0u64, |acc, t| {
+            acc.saturating_add(term_ref_min_bytes(t.as_ref()))
+        }),
+        RowView::Sparse(terms) => terms.iter().fold(0u64, |acc, (_, t)| {
+            acc.saturating_add(term_ref_min_bytes(t.as_ref().as_ref()))
+        }),
+    }
+}
+
+fn select_footer_min_bytes(state: &SelectState) -> u64 {
+    match state {
+        SelectState::Pending { .. } | SelectState::Tsv | SelectState::Csv | SelectState::Thrift => {
+            0
+        }
+        SelectState::Json(_) => 3,
+        SelectState::Xml(_) => 19,
+        SelectState::Native { .. } => 10,
+    }
+}
+
 fn write_select_row(
     state: &mut SelectState,
     out: &mut Explicit<'_, '_>,
@@ -515,6 +602,7 @@ fn write_select_row(
 ) -> Result<()> {
     out.begin_row()?;
     match state {
+        SelectState::Pending { .. } => unreachable!("select writer initialized"),
         SelectState::Tsv => Tsv::row(out, row, width).map_err(io)?,
         SelectState::Csv => Csv::row(out, row, width).map_err(io)?,
         SelectState::Json(enc) => enc.row(out, row, width).map_err(io)?,
@@ -574,30 +662,28 @@ type SinkSlot<W> = Arc<Mutex<Option<W>>>;
 
 struct SlotGuard<'a, W> {
     slot: &'a SinkSlot<W>,
+    out: &'a mut Option<W>,
 }
 
 impl<'a, W> SlotGuard<'a, W> {
-    fn install(slot: &'a SinkSlot<W>, w: W) -> Self {
+    fn install(slot: &'a SinkSlot<W>, out: &'a mut Option<W>) -> Self {
+        let w = out.take().expect("graph writer sink present");
         *slot.lock() = Some(w);
-        Self { slot }
-    }
-
-    fn take(self) -> W {
-        let w = self.slot.lock().take().expect("sink writer installed");
-        std::mem::forget(self);
-        w
+        Self { slot, out }
     }
 }
 
 impl<W> Drop for SlotGuard<'_, W> {
     fn drop(&mut self) {
-        let _ = self.slot.lock().take();
+        if let Some(w) = self.slot.lock().take() {
+            *self.out = Some(w);
+        }
     }
 }
 
-/// Owned, `Send` staged-mode row buffer for graph serializers (`oxrdfio` and Jena) that
-/// own their `Write` sink and move across threads on hand-off.
-struct GraphSink<W: Write + Send + 'static> {
+/// Inner state of [`GraphSink`]: drop settles only the ledger and never writes to the
+/// external writer, so an inner-writer panic during unwind cannot double-panic/abort.
+struct GraphSinkInner<W: Write + Send + 'static> {
     // Drop buffer and marks before their OwnedCharge.
     buf: Vec<u8>,
     marks: Vec<(usize, u64)>,
@@ -615,6 +701,24 @@ struct GraphSink<W: Write + Send + 'static> {
     failed: bool,
 }
 
+impl<W: Write + Send + 'static> Drop for GraphSinkInner<W> {
+    fn drop(&mut self) {
+        if let Some(ledger) = &self.ledger {
+            ledger.settle();
+        }
+    }
+}
+
+/// Owned, `Send` staged-mode row buffer for graph serializers (`oxrdfio` and Jena) that
+/// own their `Write` sink and move across threads on hand-off.
+struct GraphSink<W: Write + Send + 'static>(Arc<Mutex<GraphSinkInner<W>>>);
+
+impl<W: Write + Send + 'static> Clone for GraphSink<W> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 impl<W: Write + Send + 'static> GraphSink<W> {
     fn new(
         slot: SinkSlot<W>,
@@ -626,7 +730,7 @@ impl<W: Write + Send + 'static> GraphSink<W> {
         ledger: Option<RowLedger>,
     ) -> Self {
         let base = ledger.as_ref().map_or(0, RowLedger::start);
-        Self {
+        Self(Arc::new(Mutex::new(GraphSinkInner {
             buf: Vec::new(),
             marks: Vec::new(),
             charge: None,
@@ -641,9 +745,40 @@ impl<W: Write + Send + 'static> GraphSink<W> {
             base,
             taken: 0,
             failed: false,
+        })))
+    }
+
+    fn finish_drain(self) -> Result<()> {
+        let mut inner = self.0.lock();
+        let written = match inner.note() {
+            Ok(()) => inner.drain(),
+            Err(e) => {
+                if !inner.failed {
+                    let _ = inner.drain();
+                }
+                Err(e)
+            }
+        };
+        written.map_err(|e| inner.refused.lock().take().unwrap_or(Error::Io(e)))
+    }
+
+    /// Explicit error-path drainage (called on normal `Err` return, never from `Drop`).
+    fn drain_on_error(&self) {
+        let mut inner = self.0.lock();
+        if !inner.failed && inner.slot.lock().is_some() {
+            let _ = inner.note();
+            if !inner.buf.is_empty() || !inner.marks.is_empty() {
+                let _ = inner.drain();
+            }
         }
     }
 
+    fn taken(&self) -> u64 {
+        self.0.lock().taken
+    }
+}
+
+impl<W: Write + Send + 'static> GraphSinkInner<W> {
     fn held(&self, buf: usize, marks: usize) -> u64 {
         let slot = if self.ledger.is_some() {
             MARK_BYTES + LEDGER_MARK_BYTES
@@ -791,36 +926,7 @@ impl<W: Write + Send + 'static> GraphSink<W> {
         Ok(())
     }
 
-    fn finish_drain(mut self) -> Result<()> {
-        let written = match self.note() {
-            Ok(()) => self.drain(),
-            Err(e) => {
-                if !self.failed {
-                    let _ = self.drain();
-                }
-                Err(e)
-            }
-        };
-        written.map_err(|e| self.refused.lock().take().unwrap_or(Error::Io(e)))
-    }
-}
-
-impl<W: Write + Send + 'static> Drop for GraphSink<W> {
-    fn drop(&mut self) {
-        if !self.failed && self.slot.lock().is_some() {
-            let _ = self.note();
-            if !self.buf.is_empty() || !self.marks.is_empty() {
-                let _ = self.drain();
-            }
-        }
-        if let Some(ledger) = &self.ledger {
-            ledger.settle();
-        }
-    }
-}
-
-impl<W: Write + Send + 'static> Write for GraphSink<W> {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+    fn write_slice(&mut self, b: &[u8]) -> std::io::Result<usize> {
         self.note()?;
         if b.len() <= self.buf.capacity() - self.buf.len() {
             self.buf.extend_from_slice(b);
@@ -863,7 +969,7 @@ impl<W: Write + Send + 'static> Write for GraphSink<W> {
         Ok(b.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush_inner(&mut self) -> std::io::Result<()> {
         self.note()?;
         self.drain()?;
         let mut guard = self.slot.lock();
@@ -874,12 +980,26 @@ impl<W: Write + Send + 'static> Write for GraphSink<W> {
     }
 }
 
+impl<W: Write + Send + 'static> Write for GraphSink<W> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().write_slice(b)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().flush_inner()
+    }
+}
+
 struct PendingGraphBatch {
     batch: GraphBatch,
     next: usize,
 }
 
 enum GraphState<W: Write + Send + 'static> {
+    Pending {
+        format: Format,
+        prefixes: Vec<(String, String)>,
+    },
     Native {
         _charge: OwnedCharge,
         sent: u64,
@@ -888,7 +1008,9 @@ enum GraphState<W: Write + Send + 'static> {
     },
     Rdf {
         serializer: Option<oxrdfio::WriterQuadSerializer<GraphSink<W>>>,
+        sink: GraphSink<W>,
         _charge: OwnedCharge,
+        format: oxrdfio::RdfFormat,
         datasets: bool,
         slot: SinkSlot<W>,
         staged: Arc<AtomicU64>,
@@ -898,6 +1020,7 @@ enum GraphState<W: Write + Send + 'static> {
     },
     Jena {
         writer: Option<RdfWriter<GraphSink<W>>>,
+        sink: GraphSink<W>,
         charge: CursorCharge,
         format: JenaFormat,
         deferred: bool,
@@ -921,25 +1044,40 @@ pub struct GraphWriter<W: Write + Send + 'static> {
     ledger: Option<RowLedger>,
     rows_written: u64,
     emitted_bytes: u64,
+    rows_done: bool,
     finished: bool,
 }
 
 impl<W: Write + Send + 'static> GraphWriter<W> {
-    pub fn new(mut cursor: GraphCursor, options: CursorWriteOptions) -> Result<Self> {
-        let ctx = cursor.output_ctx();
-        let state = match options.format {
+    pub fn new(cursor: GraphCursor, options: CursorWriteOptions) -> Self {
+        Self {
+            pending: None,
+            state: GraphState::Pending {
+                format: options.format,
+                prefixes: options.prefixes,
+            },
+            cursor,
+            send: options.send,
+            sent: 0,
+            metadata: options.metadata,
+            ledger: options.ledger,
+            rows_written: 0,
+            emitted_bytes: 0,
+            rows_done: false,
+            finished: false,
+        }
+    }
+
+    fn ensure_initialized(&mut self) -> Result<()> {
+        let (format, prefixes) = match &mut self.state {
+            GraphState::Pending { format, prefixes } => (*format, std::mem::take(prefixes)),
+            _ => return Ok(()),
+        };
+        let ctx = self.cursor.output_ctx();
+        self.state = match format {
             Format::Solutions(SolutionsFormat::Sparkles) => {
-                if let Err(e) = cursor.check() {
-                    cursor.fail_output(&e);
-                    return Err(e);
-                }
-                let charge = match cursor.charge(4096) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        cursor.fail_output(&e);
-                        return Err(e);
-                    }
-                };
+                self.cursor.check()?;
+                let charge = self.cursor.charge(4096)?;
                 GraphState::Native {
                     _charge: charge,
                     sent: 0,
@@ -949,18 +1087,11 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
             }
             Format::Rdf(format) => {
                 let bytes = (128 << 10)
-                    + options
-                        .prefixes
+                    + prefixes
                         .iter()
                         .map(|(a, b)| (a.len() + b.len()) as u64 * 4 + 128)
                         .sum::<u64>();
-                let charge = match cursor.charge(bytes) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        cursor.fail_output(&e);
-                        return Err(e);
-                    }
-                };
+                let charge = self.cursor.charge(bytes)?;
                 let slot: SinkSlot<W> = Arc::new(Mutex::new(None));
                 let staged = Arc::new(AtomicU64::new(0));
                 let rows_taken = Arc::new(AtomicU64::new(0));
@@ -973,16 +1104,16 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
                     rows_taken.clone(),
                     progress_bytes.clone(),
                     refused.clone(),
-                    options.ledger.clone(),
+                    self.ledger.clone(),
                 );
-                let serializer = crate::io::with_prefixes(
-                    oxrdfio::RdfSerializer::from_format(format),
-                    options.prefixes,
-                )
-                .for_writer(sink);
+                let serializer =
+                    crate::io::with_prefixes(oxrdfio::RdfSerializer::from_format(format), prefixes)
+                        .for_writer(sink.clone());
                 GraphState::Rdf {
                     serializer: Some(serializer),
+                    sink,
                     _charge: charge,
+                    format,
                     datasets: format.supports_datasets(),
                     slot,
                     staged,
@@ -993,12 +1124,9 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
             }
             Format::Jena(format) => {
                 let bytes = 128 << 10;
-                let charge = match cursor.charge(bytes) {
-                    Ok(c) => CursorCharge { charge: c, bytes },
-                    Err(e) => {
-                        cursor.fail_output(&e);
-                        return Err(e);
-                    }
+                let charge = CursorCharge {
+                    charge: self.cursor.charge(bytes)?,
+                    bytes,
                 };
                 let slot: SinkSlot<W> = Arc::new(Mutex::new(None));
                 let staged = Arc::new(AtomicU64::new(0));
@@ -1012,11 +1140,12 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
                     rows_taken.clone(),
                     progress_bytes.clone(),
                     refused.clone(),
-                    options.ledger.clone(),
+                    self.ledger.clone(),
                 );
-                let writer = RdfWriter::new(format, sink);
+                let writer = RdfWriter::new(format, sink.clone());
                 GraphState::Jena {
                     writer: Some(writer),
+                    sink,
                     charge,
                     format,
                     deferred: format == JenaFormat::RdfJson,
@@ -1028,72 +1157,70 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
                 }
             }
             Format::Solutions(_) | Format::ResultsThrift => {
-                let e = Error::invalid(
+                return Err(Error::invalid(
                     "a graph cursor is written in an RDF syntax or the native document",
-                );
-                cursor.fail_output(&e);
-                return Err(e);
+                ));
             }
         };
-        Ok(Self {
-            pending: None,
-            state,
-            cursor,
-            send: options.send,
-            sent: 0,
-            metadata: options.metadata,
-            ledger: options.ledger,
-            rows_written: 0,
-            emitted_bytes: 0,
-            finished: false,
-        })
+        Ok(())
     }
 
     pub fn rows_written(&self) -> u64 {
         match &self.state {
-            GraphState::Native { .. } => self.rows_written,
+            GraphState::Pending { .. } | GraphState::Native { .. } => self.rows_written,
             GraphState::Rdf { rows_taken, .. } | GraphState::Jena { rows_taken, .. } => {
                 rows_taken.load(Ordering::Relaxed)
             }
         }
     }
 
-    pub fn write_until(&mut self, writer: W, limit_bytes: u64) -> (W, Result<WriteStep>) {
+    pub fn write_until(&mut self, writer: &mut Option<W>, limit_bytes: u64) -> Result<WriteStep> {
         if self.finished {
-            return (writer, Ok(WriteStep::Done(self.cursor.stats())));
+            let final_bytes = self.total_emitted_bytes();
+            return Ok(if final_bytes > limit_bytes {
+                WriteStep::Paused
+            } else {
+                WriteStep::Done(self.cursor.stats())
+            });
         }
         let depth = self.cursor.stack_depth();
         crate::sparql::depth::with_stack(depth, || self.drive(writer, Some(limit_bytes)))
     }
 
-    pub fn finish(&mut self, writer: W) -> (W, Result<CursorStats>) {
+    pub fn finish(&mut self, writer: &mut Option<W>) -> Result<CursorStats> {
         if self.finished {
-            return (writer, Ok(self.cursor.stats()));
+            return Ok(self.cursor.stats());
         }
         let depth = self.cursor.stack_depth();
-        let (writer, res) = crate::sparql::depth::with_stack(depth, || self.drive(writer, None));
-        (
-            writer,
-            res.map(|step| match step {
-                WriteStep::Done(stats) => stats,
-                WriteStep::Paused => unreachable!("finish runs without a byte pause limit"),
-            }),
-        )
+        let res = crate::sparql::depth::with_stack(depth, || self.drive(writer, None));
+        res.map(|step| match step {
+            WriteStep::Done(stats) => stats,
+            WriteStep::Paused => unreachable!("finish runs without a byte pause limit"),
+        })
     }
 
-    fn drive(&mut self, mut writer: W, limit_bytes: Option<u64>) -> (W, Result<WriteStep>) {
+    fn total_emitted_bytes(&self) -> u64 {
+        match &self.state {
+            GraphState::Pending { .. } | GraphState::Native { .. } => self.emitted_bytes,
+            GraphState::Rdf { sink, .. } | GraphState::Jena { sink, .. } => sink.taken(),
+        }
+    }
+
+    fn drive(&mut self, writer: &mut Option<W>, limit_bytes: Option<u64>) -> Result<WriteStep> {
+        if let Err(error) = self.ensure_initialized() {
+            self.cursor.fail_output(&error);
+            return Err(error);
+        }
         if matches!(self.state, GraphState::Native { .. }) {
-            let res = self.drive_native(&mut writer, limit_bytes);
-            return (writer, res);
+            let w = writer.as_mut().expect("graph writer present");
+            return self.drive_native(w, limit_bytes);
         }
         let slot = match &self.state {
             GraphState::Rdf { slot, .. } | GraphState::Jena { slot, .. } => slot.clone(),
-            GraphState::Native { .. } => unreachable!(),
+            GraphState::Pending { .. } | GraphState::Native { .. } => unreachable!(),
         };
-        let guard = SlotGuard::install(&slot, writer);
-        let res = self.drive_sink(limit_bytes);
-        let writer = guard.take();
-        (writer, res)
+        let _guard = SlotGuard::install(&slot, writer);
+        self.drive_sink(limit_bytes)
     }
 
     fn drive_native(
@@ -1131,75 +1258,111 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
                     return Ok(());
                 }
             }
-            if let Some(PendingGraphBatch { batch, next }) = self.pending.take() {
-                for (offset, quad) in batch.quads()[next..].iter().enumerate() {
-                    if self.send.is_some_and(|max| self.sent == max) {
-                        break;
-                    }
-                    if self.sent.is_multiple_of(1024) {
-                        self.cursor.check()?;
-                    }
-                    write_native_quad(out, quad, *section)?;
-                    staged.set(staged.get() + 1);
-                    *section += 1;
-                    *sent += 1;
-                    self.sent += 1;
-                    if limit_bytes.is_some_and(|l| {
-                        self.emitted_bytes
-                            .saturating_add(out.written_and_buffered())
-                            > l
-                    }) {
-                        let next_idx = next + offset + 1;
-                        if next_idx < batch.len() && self.send.is_none_or(|max| self.sent < max) {
+            if !self.rows_done {
+                if let Some(PendingGraphBatch { batch, next }) = self.pending.take() {
+                    for (offset, quad) in batch.quads()[next..].iter().enumerate() {
+                        if self.send.is_some_and(|max| self.sent == max) {
+                            break;
+                        }
+                        if self.sent.is_multiple_of(1024) {
+                            self.cursor.check()?;
+                        }
+                        let current = self
+                            .emitted_bytes
+                            .saturating_add(out.written_and_buffered());
+                        if limit_bytes
+                            .is_some_and(|l| current.saturating_add(quad_min_bytes(quad)) > l)
+                        {
+                            let next_idx = next + offset;
                             self.pending = Some(PendingGraphBatch {
                                 batch,
                                 next: next_idx,
                             });
+                            paused = true;
+                            return Ok(());
                         }
-                        paused = true;
-                        return Ok(());
+                        write_native_quad(out, quad, *section)?;
+                        staged.set(staged.get() + 1);
+                        *section += 1;
+                        *sent += 1;
+                        self.sent += 1;
+                        if limit_bytes.is_some_and(|l| {
+                            self.emitted_bytes
+                                .saturating_add(out.written_and_buffered())
+                                > l
+                        }) {
+                            let next_idx = next + offset + 1;
+                            if next_idx < batch.len() && self.send.is_none_or(|max| self.sent < max)
+                            {
+                                self.pending = Some(PendingGraphBatch {
+                                    batch,
+                                    next: next_idx,
+                                });
+                            }
+                            paused = true;
+                            return Ok(());
+                        }
                     }
                 }
-            }
-            while self.send.is_none_or(|max| self.sent < max) {
-                let Some(batch) = self.cursor.next_at_most(
-                    self.send
-                        .map_or(usize::MAX, |max| max.saturating_sub(self.sent)),
-                )?
-                else {
-                    break;
-                };
-                for (i, quad) in batch.quads().iter().enumerate() {
-                    if self.send.is_some_and(|max| self.sent == max) {
+                while self.send.is_none_or(|max| self.sent < max) {
+                    let Some(batch) = self.cursor.next_at_most(
+                        self.send
+                            .map_or(usize::MAX, |max| max.saturating_sub(self.sent)),
+                    )?
+                    else {
                         break;
-                    }
-                    if self.sent.is_multiple_of(1024) {
-                        self.cursor.check()?;
-                    }
-                    write_native_quad(out, quad, *section)?;
-                    staged.set(staged.get() + 1);
-                    *section += 1;
-                    *sent += 1;
-                    self.sent += 1;
-                    if limit_bytes.is_some_and(|l| {
-                        self.emitted_bytes
-                            .saturating_add(out.written_and_buffered())
-                            > l
-                    }) {
-                        let next_idx = i + 1;
-                        if next_idx < batch.len() && self.send.is_none_or(|max| self.sent < max) {
-                            self.pending = Some(PendingGraphBatch {
-                                batch,
-                                next: next_idx,
-                            });
+                    };
+                    for (i, quad) in batch.quads().iter().enumerate() {
+                        if self.send.is_some_and(|max| self.sent == max) {
+                            break;
                         }
-                        paused = true;
-                        return Ok(());
+                        if self.sent.is_multiple_of(1024) {
+                            self.cursor.check()?;
+                        }
+                        let current = self
+                            .emitted_bytes
+                            .saturating_add(out.written_and_buffered());
+                        if limit_bytes
+                            .is_some_and(|l| current.saturating_add(quad_min_bytes(quad)) > l)
+                        {
+                            self.pending = Some(PendingGraphBatch { batch, next: i });
+                            paused = true;
+                            return Ok(());
+                        }
+                        write_native_quad(out, quad, *section)?;
+                        staged.set(staged.get() + 1);
+                        *section += 1;
+                        *sent += 1;
+                        self.sent += 1;
+                        if limit_bytes.is_some_and(|l| {
+                            self.emitted_bytes
+                                .saturating_add(out.written_and_buffered())
+                                > l
+                        }) {
+                            let next_idx = i + 1;
+                            if next_idx < batch.len() && self.send.is_none_or(|max| self.sent < max)
+                            {
+                                self.pending = Some(PendingGraphBatch {
+                                    batch,
+                                    next: next_idx,
+                                });
+                            }
+                            paused = true;
+                            return Ok(());
+                        }
                     }
                 }
+                self.rows_done = true;
             }
             if self.send.is_some_and(|max| self.sent >= max) {
                 self.cursor.close();
+            }
+            let current = self
+                .emitted_bytes
+                .saturating_add(out.written_and_buffered());
+            if limit_bytes.is_some_and(|l| current.saturating_add(10) > l) {
+                paused = true;
+                return Ok(());
             }
             out.write_all(b"]")?;
             write_graph_cursor_native_trailer(
@@ -1215,7 +1378,7 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
         match result {
             Ok(taken) => {
                 self.emitted_bytes = self.emitted_bytes.saturating_add(taken);
-                if paused {
+                if paused || limit_bytes.is_some_and(|l| self.emitted_bytes > l) {
                     Ok(WriteStep::Paused)
                 } else {
                     Ok(WriteStep::Done(self.cursor.stats()))
@@ -1231,61 +1394,94 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
     fn drive_sink(&mut self, limit_bytes: Option<u64>) -> Result<WriteStep> {
         let mut paused = false;
         let step_result = (|| -> Result<()> {
-            if let Some(PendingGraphBatch { batch, next }) = self.pending.take() {
-                for (offset, quad) in batch.quads()[next..].iter().enumerate() {
-                    if self.send.is_some_and(|max| self.sent == max) {
-                        break;
-                    }
-                    if self.sent.is_multiple_of(1024) {
-                        self.cursor.check()?;
-                    }
-                    write_sink_quad(&mut self.state, quad)?;
-                    self.sent += 1;
-                    if limit_bytes.is_some_and(|l| sink_progress(&self.state) > l) {
-                        let next_idx = next + offset + 1;
-                        if next_idx < batch.len() && self.send.is_none_or(|max| self.sent < max) {
+            if !self.rows_done {
+                if let Some(PendingGraphBatch { batch, next }) = self.pending.take() {
+                    for (offset, quad) in batch.quads()[next..].iter().enumerate() {
+                        if self.send.is_some_and(|max| self.sent == max) {
+                            break;
+                        }
+                        if self.sent.is_multiple_of(1024) {
+                            self.cursor.check()?;
+                        }
+                        if limit_bytes.is_some_and(|l| {
+                            sink_progress(&self.state)
+                                .saturating_add(sink_quad_min_bytes(&self.state, quad))
+                                > l
+                        }) {
+                            let next_idx = next + offset;
                             self.pending = Some(PendingGraphBatch {
                                 batch,
                                 next: next_idx,
                             });
+                            paused = true;
+                            return Ok(());
                         }
-                        paused = true;
-                        return Ok(());
+                        write_sink_quad(&mut self.state, quad)?;
+                        self.sent += 1;
+                        if limit_bytes.is_some_and(|l| sink_progress(&self.state) > l) {
+                            let next_idx = next + offset + 1;
+                            if next_idx < batch.len() && self.send.is_none_or(|max| self.sent < max)
+                            {
+                                self.pending = Some(PendingGraphBatch {
+                                    batch,
+                                    next: next_idx,
+                                });
+                            }
+                            paused = true;
+                            return Ok(());
+                        }
                     }
                 }
-            }
-            while self.send.is_none_or(|max| self.sent < max) {
-                let Some(batch) = self.cursor.next_at_most(
-                    self.send
-                        .map_or(usize::MAX, |max| max.saturating_sub(self.sent)),
-                )?
-                else {
-                    break;
-                };
-                for (i, quad) in batch.quads().iter().enumerate() {
-                    if self.send.is_some_and(|max| self.sent == max) {
+                while self.send.is_none_or(|max| self.sent < max) {
+                    let Some(batch) = self.cursor.next_at_most(
+                        self.send
+                            .map_or(usize::MAX, |max| max.saturating_sub(self.sent)),
+                    )?
+                    else {
                         break;
-                    }
-                    if self.sent.is_multiple_of(1024) {
-                        self.cursor.check()?;
-                    }
-                    write_sink_quad(&mut self.state, quad)?;
-                    self.sent += 1;
-                    if limit_bytes.is_some_and(|l| sink_progress(&self.state) > l) {
-                        let next_idx = i + 1;
-                        if next_idx < batch.len() && self.send.is_none_or(|max| self.sent < max) {
-                            self.pending = Some(PendingGraphBatch {
-                                batch,
-                                next: next_idx,
-                            });
+                    };
+                    for (i, quad) in batch.quads().iter().enumerate() {
+                        if self.send.is_some_and(|max| self.sent == max) {
+                            break;
                         }
-                        paused = true;
-                        return Ok(());
+                        if self.sent.is_multiple_of(1024) {
+                            self.cursor.check()?;
+                        }
+                        if limit_bytes.is_some_and(|l| {
+                            sink_progress(&self.state)
+                                .saturating_add(sink_quad_min_bytes(&self.state, quad))
+                                > l
+                        }) {
+                            self.pending = Some(PendingGraphBatch { batch, next: i });
+                            paused = true;
+                            return Ok(());
+                        }
+                        write_sink_quad(&mut self.state, quad)?;
+                        self.sent += 1;
+                        if limit_bytes.is_some_and(|l| sink_progress(&self.state) > l) {
+                            let next_idx = i + 1;
+                            if next_idx < batch.len() && self.send.is_none_or(|max| self.sent < max)
+                            {
+                                self.pending = Some(PendingGraphBatch {
+                                    batch,
+                                    next: next_idx,
+                                });
+                            }
+                            paused = true;
+                            return Ok(());
+                        }
                     }
                 }
+                self.rows_done = true;
             }
             if self.send.is_some_and(|max| self.sent >= max) {
                 self.cursor.close();
+            }
+            if limit_bytes.is_some_and(|l| {
+                sink_progress(&self.state).saturating_add(sink_footer_min_bytes(&self.state)) > l
+            }) {
+                paused = true;
+                return Ok(());
             }
             match &mut self.state {
                 GraphState::Rdf { serializer, .. } => {
@@ -1306,7 +1502,7 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
                         .map_err(io)?;
                     sink.finish_drain()?;
                 }
-                GraphState::Native { .. } => unreachable!(),
+                GraphState::Pending { .. } | GraphState::Native { .. } => unreachable!(),
             }
             self.finished = true;
             Ok(())
@@ -1315,7 +1511,7 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
             GraphState::Rdf { refused, .. } | GraphState::Jena { refused, .. } => {
                 refused.lock().take()
             }
-            GraphState::Native { .. } => None,
+            GraphState::Pending { .. } | GraphState::Native { .. } => None,
         };
         let step_result = match (step_result, refused) {
             (Err(Error::Io(_)), Some(refused)) => Err(refused),
@@ -1323,23 +1519,87 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
         };
         match step_result {
             Ok(()) => {
-                if paused {
+                let final_bytes = self.total_emitted_bytes();
+                if paused || limit_bytes.is_some_and(|l| final_bytes > l) {
                     Ok(WriteStep::Paused)
                 } else {
                     Ok(WriteStep::Done(self.cursor.stats()))
                 }
             }
             Err(error) => {
-                // Drop any remaining serializer/sink so buffered marks settle cleanly.
+                // Explicitly drain any buffered bytes before dropping the serializer/sink;
+                // `GraphSinkInner::drop` only settles the ledger and never writes externally.
                 match &mut self.state {
-                    GraphState::Rdf { serializer, .. } => drop(serializer.take()),
-                    GraphState::Jena { writer, .. } => drop(writer.take()),
-                    GraphState::Native { .. } => {}
+                    GraphState::Rdf {
+                        serializer, sink, ..
+                    } => {
+                        sink.drain_on_error();
+                        drop(serializer.take());
+                    }
+                    GraphState::Jena { writer, sink, .. } => {
+                        sink.drain_on_error();
+                        drop(writer.take());
+                    }
+                    GraphState::Pending { .. } | GraphState::Native { .. } => {}
                 }
                 self.cursor.fail_output(&error);
                 Err(error)
             }
         }
+    }
+}
+
+fn quad_min_bytes(quad: &Quad) -> u64 {
+    let q = quad.as_ref();
+    let base = term_ref_min_bytes(q.subject.into())
+        .saturating_add(term_ref_min_bytes(q.predicate.into()))
+        .saturating_add(term_ref_min_bytes(q.object));
+    match q.graph_name {
+        oxrdf::GraphNameRef::NamedNode(n) => base.saturating_add(n.as_str().len() as u64),
+        oxrdf::GraphNameRef::BlankNode(b) => base.saturating_add(b.as_str().len() as u64),
+        oxrdf::GraphNameRef::DefaultGraph => base,
+    }
+}
+
+fn sink_quad_min_bytes<W: Write + Send + 'static>(state: &GraphState<W>, quad: &Quad) -> u64 {
+    match state {
+        GraphState::Rdf { datasets, .. } => {
+            if *datasets || quad.graph_name.is_default_graph() {
+                quad_min_bytes(quad)
+            } else {
+                0
+            }
+        }
+        GraphState::Jena {
+            format, deferred, ..
+        } => {
+            if !format.quads() && !quad.graph_name.is_default_graph() {
+                return 0;
+            }
+            if *deferred {
+                crate::sparql::graph_quad_bytes(quad)
+                    .saturating_mul(4)
+                    .saturating_add(1024)
+            } else {
+                quad_min_bytes(quad)
+            }
+        }
+        GraphState::Pending { .. } | GraphState::Native { .. } => 0,
+    }
+}
+
+fn sink_footer_min_bytes<W: Write + Send + 'static>(state: &GraphState<W>) -> u64 {
+    match state {
+        GraphState::Rdf { format, .. } => match format {
+            oxrdfio::RdfFormat::RdfXml => 10,
+            _ => 0,
+        },
+        GraphState::Jena { format, .. } => match format {
+            JenaFormat::TriX => 7,
+            JenaFormat::RdfJson => 2,
+            _ => 0,
+        },
+        GraphState::Pending { .. } | GraphState::Native { .. } => 0,
     }
 }
 
@@ -1416,7 +1676,7 @@ fn write_sink_quad<W: Write + Send + 'static>(
             }
             Ok(())
         }
-        GraphState::Native { .. } => unreachable!(),
+        GraphState::Pending { .. } | GraphState::Native { .. } => unreachable!(),
     }
 }
 
@@ -1435,7 +1695,7 @@ fn sink_progress<W: Write + Send + 'static>(state: &GraphState<W>) -> u64 {
                 progress_bytes.load(Ordering::Relaxed)
             }
         }
-        GraphState::Native { .. } => 0,
+        GraphState::Pending { .. } | GraphState::Native { .. } => 0,
     }
 }
 
@@ -1578,11 +1838,17 @@ mod tests {
                             metadata: None,
                             ledger: Some(ledger.clone()),
                         },
-                    )
-                    .unwrap();
-                    let (mut out, step) = writer.write_until(LedgerVec::new(ledger.clone()), limit);
+                    );
+                    let mut out_slot = Some(LedgerVec::new(ledger.clone()));
+                    let step = writer.write_until(&mut out_slot, limit);
+                    let mut out = out_slot.expect("writer returned");
                     let stats = match step.unwrap() {
                         WriteStep::Done(stats) => {
+                            assert!(
+                                out.buf.len() as u64 <= limit,
+                                "Done exceeded limit: {} > {limit}",
+                                out.buf.len()
+                            );
                             ledger.handed_over(out.buf.len() as u64);
                             stats
                         }
@@ -1590,9 +1856,11 @@ mod tests {
                             ledger.handed_over(out.buf.len() as u64);
                             let ledger_bg = ledger.clone();
                             let (finished_out, stats) = std::thread::spawn(move || {
-                                let (out, res) = writer.finish(out);
+                                let mut slot = Some(out);
+                                let stats = writer.finish(&mut slot).unwrap();
+                                let out = slot.expect("writer returned");
                                 ledger_bg.handed_over(out.buf.len() as u64);
-                                (out, res.unwrap())
+                                (out, stats)
                             })
                             .join()
                             .unwrap();
@@ -1692,19 +1960,26 @@ mod tests {
                             metadata: None,
                             ledger: Some(ledger.clone()),
                         },
-                    )
-                    .unwrap();
-                    let (mut out, step) = writer.write_until(LedgerVec::new(ledger.clone()), limit);
+                    );
+                    let mut out_slot = Some(LedgerVec::new(ledger.clone()));
+                    let step = writer.write_until(&mut out_slot, limit);
+                    let mut out = out_slot.expect("writer returned");
                     match step.unwrap() {
                         WriteStep::Done(_) => {
+                            assert!(
+                                out.buf.len() as u64 <= limit,
+                                "graph Done exceeded limit: {} > {limit}",
+                                out.buf.len()
+                            );
                             ledger.handed_over(out.buf.len() as u64);
                         }
                         WriteStep::Paused => {
                             ledger.handed_over(out.buf.len() as u64);
                             let ledger_bg = ledger.clone();
                             out = std::thread::spawn(move || {
-                                let (out, res) = writer.finish(out);
-                                res.unwrap();
+                                let mut slot = Some(out);
+                                writer.finish(&mut slot).unwrap();
+                                let out = slot.expect("writer returned");
                                 ledger_bg.handed_over(out.buf.len() as u64);
                                 out
                             })
@@ -1728,5 +2003,304 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn graph_sink_panicking_writer_unwinds_without_double_panic() {
+        struct PanicWriter {
+            calls: Arc<AtomicU64>,
+        }
+        impl Write for PanicWriter {
+            fn write(&mut self, _b: &[u8]) -> std::io::Result<usize> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                panic!("always-panicking writer");
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let store = Store::in_memory(Default::default());
+        store
+            .load(&[LoadSource::from_bytes(
+                b"<urn:s:1> <urn:p:1> \"small\" .\n".to_vec(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let cursor = match query_execution(
+            store.snapshot(),
+            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+            &QueryOptions::default(),
+            &CursorOptions::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap()
+        {
+            QueryExecution::Graph(c) => *c,
+            _ => unreachable!(),
+        };
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut writer = CursorWriter::graph(
+            cursor,
+            CursorWriteOptions {
+                format: Format::Rdf(RdfFormat::NTriples),
+                send: None,
+                prefixes: Vec::new(),
+                metadata: None,
+                ledger: Some(RowLedger::new()),
+            },
+        );
+        let mut slot = Some(PanicWriter {
+            calls: calls.clone(),
+        });
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = writer.finish(&mut slot);
+        }));
+        assert!(caught.is_err(), "panic should unwind cleanly");
+        assert!(
+            slot.is_some(),
+            "SlotGuard must restore writer into Option<W> on unwind"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "GraphSink::drop must not invoke external writes again during unwind"
+        );
+    }
+
+    #[test]
+    fn single_oversized_row_and_quad_pause_before_copying_in_place() {
+        let store = Store::in_memory(Default::default());
+        let big = "x".repeat(32_768);
+        store
+            .load(&[LoadSource::from_bytes(
+                format!("<urn:s:big> <urn:p:big> \"{big}\" .\n").into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+
+        // SELECT single oversized row pauses before copying the 32 KiB value in place.
+        let select_q = "SELECT ?s ?o WHERE { ?s <urn:p:big> ?o }";
+        let select_cursor = match query_execution(
+            store.snapshot(),
+            select_q,
+            &QueryOptions::default(),
+            &CursorOptions::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap()
+        {
+            QueryExecution::Select(c) => *c,
+            _ => unreachable!(),
+        };
+        let mut sw = CursorWriter::select(
+            select_cursor,
+            CursorWriteOptions {
+                format: Format::Solutions(SolutionsFormat::Json),
+                send: None,
+                prefixes: Vec::new(),
+                metadata: None,
+                ledger: None,
+            },
+        );
+        let mut slot = Some(Vec::<u8>::new());
+        let step = sw.write_until(&mut slot, 1024).unwrap();
+        assert!(matches!(step, WriteStep::Paused));
+        assert!(
+            slot.as_ref().unwrap().len() <= 1024,
+            "oversized row must not be copied in place: {} bytes",
+            slot.as_ref().unwrap().len()
+        );
+        sw.finish(&mut slot).unwrap();
+        let out = slot.unwrap();
+        assert!(out.len() > 32_768);
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["results"]["bindings"][0]["o"]["value"], big);
+
+        // Graph single oversized quad pauses before copying the 32 KiB value in place.
+        for fmt in [
+            Format::Rdf(RdfFormat::NTriples),
+            Format::Solutions(SolutionsFormat::Sparkles),
+            Format::Jena(JenaFormat::RdfJson),
+        ] {
+            let graph_cursor = match query_execution(
+                store.snapshot(),
+                "CONSTRUCT { ?s <urn:p:big> ?o } WHERE { ?s <urn:p:big> ?o }",
+                &QueryOptions::default(),
+                &CursorOptions::default(),
+                ExecutionMode::Streaming,
+            )
+            .unwrap()
+            {
+                QueryExecution::Graph(c) => *c,
+                _ => unreachable!(),
+            };
+            let mut gw = CursorWriter::graph(
+                graph_cursor,
+                CursorWriteOptions {
+                    format: fmt,
+                    send: None,
+                    prefixes: Vec::new(),
+                    metadata: None,
+                    ledger: None,
+                },
+            );
+            let mut slot = Some(Vec::<u8>::new());
+            let step = gw.write_until(&mut slot, 1024).unwrap();
+            assert!(matches!(step, WriteStep::Paused), "graph {fmt:?}");
+            assert!(
+                slot.as_ref().unwrap().len() <= 1024,
+                "graph {fmt:?} oversized quad copied {} bytes in place",
+                slot.as_ref().unwrap().len()
+            );
+            gw.finish(&mut slot).unwrap();
+            assert!(slot.unwrap().len() > 32_768, "graph {fmt:?}");
+        }
+    }
+
+    #[test]
+    fn final_footer_crossing_threshold_pauses_select_and_graph() {
+        let store = sample_store();
+
+        // SELECT JSON: set limit to (full_len - 2) so header + rows fit, and only the
+        // 3-byte `]}` footer crosses the limit.
+        let select_q = "SELECT ?s ?o WHERE { ?s <urn:ex:num> ?o } LIMIT 3";
+        let mut full_json = Vec::new();
+        let mut base = match query_execution(
+            store.snapshot(),
+            select_q,
+            &QueryOptions::default(),
+            &CursorOptions::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap()
+        {
+            QueryExecution::Select(c) => *c,
+            _ => unreachable!(),
+        };
+        write(
+            Source::Select(&mut base),
+            WriteOptions::new(Format::Solutions(SolutionsFormat::Json), &RowCount::new()),
+            &mut full_json,
+        )
+        .unwrap();
+        let limit = (full_json.len() - 2) as u64;
+        let cursor = match query_execution(
+            store.snapshot(),
+            select_q,
+            &QueryOptions::default(),
+            &CursorOptions::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap()
+        {
+            QueryExecution::Select(c) => *c,
+            _ => unreachable!(),
+        };
+        let mut writer = CursorWriter::select(
+            cursor,
+            CursorWriteOptions {
+                format: Format::Solutions(SolutionsFormat::Json),
+                send: None,
+                prefixes: Vec::new(),
+                metadata: None,
+                ledger: None,
+            },
+        );
+        let mut slot = Some(Vec::<u8>::new());
+        let step = writer.write_until(&mut slot, limit).unwrap();
+        assert!(
+            matches!(step, WriteStep::Paused),
+            "JSON footer crossing limit must return Paused, not Done"
+        );
+        writer.finish(&mut slot).unwrap();
+        assert_eq!(slot.unwrap(), full_json);
+
+        // Graph RdfXml: set limit to (full_len - 5) so closing `</rdf:RDF>` crosses limit.
+        let graph_q = "CONSTRUCT { ?s <urn:ex:num> ?o } WHERE { ?s <urn:ex:num> ?o } LIMIT 3";
+        let mut full_xml = Vec::new();
+        let mut base_g = match query_execution(
+            store.snapshot(),
+            graph_q,
+            &QueryOptions::default(),
+            &CursorOptions::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap()
+        {
+            QueryExecution::Graph(c) => *c,
+            _ => unreachable!(),
+        };
+        write(
+            Source::Graph(&mut base_g),
+            WriteOptions::new(Format::Rdf(RdfFormat::RdfXml), &RowCount::new()),
+            &mut full_xml,
+        )
+        .unwrap();
+        let g_limit = (full_xml.len() - 5) as u64;
+        let g_cursor = match query_execution(
+            store.snapshot(),
+            graph_q,
+            &QueryOptions::default(),
+            &CursorOptions::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap()
+        {
+            QueryExecution::Graph(c) => *c,
+            _ => unreachable!(),
+        };
+        let mut gw = CursorWriter::graph(
+            g_cursor,
+            CursorWriteOptions {
+                format: Format::Rdf(RdfFormat::RdfXml),
+                send: None,
+                prefixes: Vec::new(),
+                metadata: None,
+                ledger: None,
+            },
+        );
+        let mut slot = Some(Vec::<u8>::new());
+        let step = gw.write_until(&mut slot, g_limit).unwrap();
+        assert!(
+            matches!(step, WriteStep::Paused),
+            "RdfXml closing tag crossing limit must return Paused"
+        );
+        gw.finish(&mut slot).unwrap();
+        assert_eq!(slot.unwrap(), full_xml);
+    }
+
+    #[test]
+    fn lazy_init_failure_preserves_cursor_stats_and_plan() {
+        let store = sample_store();
+        let cursor = match query_execution(
+            store.snapshot(),
+            "SELECT ?s WHERE { ?s <urn:ex:num> ?o } LIMIT 1",
+            &QueryOptions::default(),
+            &CursorOptions::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap()
+        {
+            QueryExecution::Select(c) => *c,
+            _ => unreachable!(),
+        };
+        let mut sw = CursorWriter::select(
+            cursor,
+            CursorWriteOptions {
+                format: Format::Rdf(RdfFormat::NTriples),
+                send: None,
+                prefixes: Vec::new(),
+                metadata: None,
+                ledger: None,
+            },
+        );
+        let mut slot = Some(Vec::<u8>::new());
+        let err = sw.write_until(&mut slot, 4096).err().unwrap();
+        assert!(matches!(err, Error::Invalid(_)));
+        assert_eq!(sw.stats().status, crate::sparql::CursorStatus::Failed);
+        assert!(sw.plan_value().is_some());
     }
 }
