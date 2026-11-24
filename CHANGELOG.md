@@ -45,16 +45,17 @@ cancellation that is due. `RowCount` and `RowLedger` carry the row counts.
 
 The HTTP streaming path also removes per-chunk idle timer wakeups, waking the stream timer
 only when the idle deadline starts, moves earlier or enters a terminal or aborted state,
-hoists `CursorSolutions::drive`'s row-storage charge out of the per-batch decode callback,
-and raises `SwitchWriter`'s bounded stream channel from 4 to 16 chunks of 64 KiB
-(`CHANNEL_CAP = 16`). That increases the live channel buffer cap per active streamed
-response from 256 KiB to 1 MiB, matching `STREAM_AFTER` and released when the stream ends
-or aborts, so a pre-decoded 4,096-row cursor batch can enqueue without stalling the
-producer. On quiet `atlas` at 10.5M triples with 12 threads, native streaming runs
-`export-500k` at 0.3710×, `optional-chain` at 0.9420×, `order-by-full` at 0.7782× and
-`star-join` at 0.8508×, and with one thread `optional-chain` runs at 0.4381× in streamed
-SPARQL JSON and 0.5691× in streamed XML while `long-literal` runs at 0.4234× in streamed
-SPARQL JSON. All 1,274 W3C streaming conformance tests pass.
+and raises `SwitchWriter`'s bounded stream channel from 4 to 16 entries (`CHANNEL_CAP =
+16`). Post-switch chunks are at most 64 KiB, while a threshold-driven switch queues its
+initial buffer as one entry (up to `STREAM_AFTER` + 1 byte before the remaining 15
+chunks). That trades up to 768 KiB more queued payload per active streamed response,
+released when the stream ends or aborts, so decoded cursor batches can enqueue without
+stalling the producer when queue space allows. On quiet `atlas` at 10.5M triples with 12
+threads, native streaming runs `export-500k` at 0.3710×, `optional-chain` at 0.9420×,
+`order-by-full` at 0.7782× and `star-join` at 0.8508×, and with one thread
+`optional-chain` runs at 0.4381× in streamed SPARQL JSON and 0.5691× in streamed XML while
+`long-literal` runs at 0.4234× in streamed SPARQL JSON. All 1,274 W3C streaming
+conformance tests pass.
 
 ### Cold small scans at 1.05M measured again against Fluree
 

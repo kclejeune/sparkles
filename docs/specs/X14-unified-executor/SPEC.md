@@ -1607,37 +1607,41 @@ per-row cost of whole-row output remains under item 1195.
 
 Initial quiet `atlas` timing of `fd47b7ae` against `726563ad` confirmed a 1.1919×
 regression (+43.73 ms, 16/16 slower) on 12-thread native streaming `optional-chain`
-entirely inside serialization. Commit `a6814599` resolved that backpressure cliff with
-three changes: `Shared::timer` in `http/stream/lifetime.rs` no longer wakes on every
+entirely inside serialization. Commit `a6814599` resolved that backpressure cliff by
+changing `Shared::timer` in `http/stream/lifetime.rs` so it no longer wakes on every
 64 KiB chunk or `Err(Full)` and instead notifies only when `idle_at` starts, moves
-earlier or enters a terminal or aborted state; `SwitchWriter`'s bounded stream channel
-grew from 4 to 16 chunks of 64 KiB (`CHANNEL_CAP = 16`); and `CursorSolutions::drive`
-hoisted its `row_storage` `OwnedCharge` out of the per-batch decode callback to avoid
-per-batch `QueryMemoryLedger` lock contention with Rayon's decode-ahead term cache.
-Raising the channel capacity trades up to 768 KiB more live buffer memory per active
-streamed HTTP response, from 256 KiB to 1 MiB matching `STREAM_AFTER` and released when
-the stream ends or aborts, so a pre-decoded 4,096-row cursor batch can enqueue without
-stalling the blocking producer inside `rayon::in_place_scope`.
+earlier or enters a terminal or aborted state, and by growing `SwitchWriter`'s bounded
+stream channel from 4 to 16 entries (`CHANNEL_CAP = 16`). A row-storage charge hoist
+also included in `a6814599` was reverted afterward so `CursorSolutions::drive` releases
+row-storage credit between batches instead of holding it across subsequent pulls and
+decode-ahead checks. Each post-switch channel entry holds at most 64 KiB, while a
+threshold-driven switch queues its initial buffer as one entry (up to `STREAM_AFTER` + 1
+byte before the remaining 15 chunks). Raising the queue from 4 to 16 entries trades up to
+768 KiB more queued payload per active streamed HTTP response, released when the stream
+ends or aborts, so decoded cursor batches can enqueue without stalling the blocking
+producer inside `rayon::in_place_scope` when their encoded bytes fit in the available
+queue space.
 
 Quiet `atlas` order-corrected ABBA measurements with matched `wally` release builds
-(8 rounds of 10 requests in both orders at 10.5M triples) confirmed the gains across
-both streaming and format encoders with identical answer fingerprints. In the 12-thread
-native streaming confirmation cell comparing `fd47b7ae` with `a6814599`, all four
-workload queries improved with 0/16 rounds slower: `export-500k` ran at 0.3710× (250.94
-against 676.68 ms), `optional-chain` at 0.9420× (211.72 against 224.86 ms),
-`order-by-full` at 0.7782× (794.14 against 1,018.84 ms) and `star-join` at 0.8508×
-(53.87 against 63.35 ms). Across the full 34-pair `atlas` matrix comparing `fd47b7ae`
-with `726563ad`, 1-thread `optional-chain` ran at 0.4381× streamed and 0.5658× eager in
-SPARQL JSON, 0.5691× streamed and 0.7154× eager in XML, 0.9078× streamed in TSV and
-0.8979× streamed in CSV; on the `literals` dataset, `long-literal` ran at 0.4234×
-streamed and 0.4447× eager in SPARQL JSON, 0.7580× eager and 0.8632× streamed in CSV
-and 0.8381× streamed in TSV. The streamed Thrift probe passed with matching HTTP
-chunked framing and identical body fingerprints across base eager, tip eager and tip
-streaming. Three confirmed small costs on quiet `atlas` (`fd47b7ae..726563ad`) that
-passed the gate are tracked in roadmap item 1195: `workload-native-eager-1t`
-`order-by-full` at 1.0029× (+2.43 ms, 13/16), `literal-tsv-eager-1t` `escape-straddle`
-at 1.0017× (+3.76 µs, 14/16) and `short-native-streaming-1t` `predicate-counts` at
-1.0010× (+2.00 µs, 23/24). Non-Intel gates passed on `726563ad`: `mise run
-test:w3c:streaming` passed 1,274 of 1,274 tests with zero regressions and 24 unchanged
-fallbacks, and `py:test`, `jvm:test`, `node:test` and `bench:bindings` across all five
-Sparkles engines passed with zero answer discrepancies.
+(8 rounds of 10 requests in both orders at 10.5M triples, recorded with full provenance
+in the [engine benchmark report](../../benchmarks/engine/RESULTS.md#unified-result-writers-and-exact-row-accounting))
+confirmed the gains across both streaming and format encoders with identical answer
+fingerprints. In the 12-thread native streaming confirmation cell comparing `fd47b7ae`
+with `a6814599`, all four workload queries improved with 0/16 rounds slower: `export-500k`
+ran at 0.3710× (250.94 against 676.68 ms), `optional-chain` at 0.9420× (211.72 against
+224.86 ms), `order-by-full` at 0.7782× (794.14 against 1,018.84 ms) and `star-join` at
+0.8508× (53.87 against 63.35 ms). Across the full 34-pair `atlas` matrix comparing
+`fd47b7ae` with `726563ad`, 1-thread `optional-chain` ran at 0.4381× streamed and 0.5658×
+eager in SPARQL JSON, 0.5691× streamed and 0.7154× eager in XML, 0.9078× streamed in TSV
+and 0.8979× streamed in CSV; on the `literals` dataset, `long-literal` ran at 0.4234×
+streamed and 0.4447× eager in SPARQL JSON, 0.7580× eager and 0.8632× streamed in CSV and
+0.8381× streamed in TSV. The streamed Thrift probe passed with matching HTTP chunked
+framing and identical body fingerprints across base eager, tip eager and tip streaming.
+Three confirmed small costs on quiet `atlas` (`fd47b7ae..726563ad`) that passed the gate
+are tracked in roadmap item 1195: `workload-native-eager-1t` `order-by-full` at 1.0029×
+(+2.43 ms, 13/16), `literal-tsv-eager-1t` `escape-straddle` at 1.0017× (+3.76 µs, 14/16)
+and `short-native-streaming-1t` `predicate-counts` at 1.0010× (+2.00 µs, 23/24). Non-Intel
+gates passed on `726563ad`: `mise run test:w3c:streaming` passed 1,274 of 1,274 tests
+with zero regressions and 24 unchanged fallbacks, and `py:test`, `jvm:test`, `node:test`
+and `bench:bindings` across all five Sparkles engines passed with zero answer
+discrepancies.

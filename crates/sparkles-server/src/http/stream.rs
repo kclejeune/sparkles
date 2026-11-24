@@ -31,9 +31,12 @@ pub const STREAM_AFTER: usize = 1 << 20;
 pub const FIRST_BYTES_AFTER: usize = 64 << 10;
 /// Size of the chunks of a streamed body.
 pub const CHUNK: usize = 64 << 10;
-/// Bounded in-flight chunks per streamed response (`16 × 64 KiB = 1 MiB`, matching
-/// [`STREAM_AFTER`]), so a pre-decoded cursor batch can enqueue without stalling the
-/// blocking producer while keeping per-stream serialized buffering bounded.
+/// Bounded in-flight channel entries per streamed response (16 entries). Post-switch
+/// chunks are at most [`CHUNK`] (64 KiB), while a threshold-driven switch queues its
+/// initial buffer as one entry (up to [`STREAM_AFTER`] + 1 byte before the remaining 15
+/// chunks). Raising the queue from 4 to 16 entries adds at most 768 KiB of queued payload
+/// per active streamed response so decoded cursor batches can enqueue without stalling the
+/// blocking producer when queue space allows.
 pub const CHANNEL_CAP: usize = 16;
 /// A controlled writer checks its deadline whenever its buffer crosses a multiple of
 /// 2^CONTROL_SHIFT bytes.

@@ -303,11 +303,14 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   library pulls SELECT results. Result writers share one columnar implementation per
   format across eager and cursor sources, including streamed SPARQL Results Thrift, and
   stop when the client disconnects. Each active streamed HTTP response uses a bounded
-  channel of 16 chunks of 64 KiB, up to 1 MiB of live buffer memory released when the
-  stream ends or aborts, trading that buffer memory per active stream so a pre-decoded
-  4,096-row cursor batch can enqueue without stalling the producer. The stream idle timer
-  wakes only when the idle deadline starts, moves earlier or enters a terminal or aborted
-  state rather than on every chunk.
+  channel of 16 entries, released when the stream ends or aborts. Post-switch chunks are
+  at most 64 KiB, and a threshold-driven switch queues its initial buffer (up to
+  `STREAM_AFTER` + 1 byte) as the first entry before the remaining 15 chunks. Sizing the
+  queue to 16 entries instead of 4 trades up to 768 KiB more queued payload per active
+  stream so decoded cursor batches can enqueue without stalling the producer when their
+  encoded bytes fit in the available queue space. The stream idle timer wakes only when
+  the idle deadline starts, moves earlier or enters a terminal or aborted state rather
+  than on every chunk.
 * Rust callers can use `sparql::results::write_with_completion` to check a writer
   after serialization finishes and the writer has accepted the final rows. With a
   `LimitedWriter`, the callback can call `check_completion` to observe a pending

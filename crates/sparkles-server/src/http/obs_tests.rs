@@ -1804,23 +1804,57 @@ fn failed_budget_flush_case(rows: usize, len: usize, format: &str) {
                     .to_vec();
             }
         });
+        let ends: Vec<usize> = if format == "thrift" {
+            thrift_row_ends(&tsv, &whole)
+        } else {
+            whole
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &b)| (b == b'\n').then_some(i + 1))
+                .skip(1)
+                .collect()
+        };
+        // The switch sends `switch + 1` bytes, then `CHANNEL_CAP - 1` full chunks fill
+        // the channel while the reader reads nothing. A streaming request switches at
+        // `FIRST_BYTES_AFTER`. Choose the budget at the first encoded row end strictly
+        // past the full queue so the admitted prefix leaves a partial chunk buffered for
+        // the final flush and the next row fails the budget.
+        let switch = if execution == "eager" {
+            super::stream::STREAM_AFTER
+        } else {
+            super::stream::FIRST_BYTES_AFTER
+        };
+        let full_queue = switch + 1 + super::stream::CHUNK * (super::stream::CHANNEL_CAP - 1);
+        // `RowOut` buffers short rows in 8 KiB pieces before writing to `LimitedWriter`,
+        // so leave at least two pieces past `full_queue` for short rows while keeping the
+        // admitted tail under one `CHUNK` so the producer blocks in the final budget flush.
+        let min_accepted = if len < (8 << 10) {
+            full_queue + (16 << 10)
+        } else {
+            full_queue + 1
+        };
+        let accepted = *ends
+            .iter()
+            .find(|&&end| end >= min_accepted)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{execution} {format} {len}: body ({}) did not reach min_accepted ({min_accepted})",
+                    whole.len()
+                )
+            });
+        assert!(
+            accepted < whole.len(),
+            "{execution} {format} {len}: accepted ({accepted}) must leave a refused row"
+        );
+        assert!(
+            accepted - full_queue < super::stream::CHUNK,
+            "{execution} {format} {len}: accepted ({accepted}) must leave a partial chunk beyond full_queue ({full_queue})"
+        );
         let lines = access_lines_of(|| async {
             let s = server_with(|st| {
                 st.access_log = true;
                 st.stream_idle_timeout = Duration::from_millis(300);
-                // the switch, then `CHANNEL_CAP - 1` chunks fill the channel, and the
-                // budget cuts the next chunk halfway, while the reader reads nothing. A
-                // streaming request switches at its first bytes.
-                let switch = if execution == "eager" {
-                    super::stream::STREAM_AFTER
-                } else {
-                    super::stream::FIRST_BYTES_AFTER
-                };
-                st.limits.max_result_bytes = Some(
-                    (switch
-                        + super::stream::CHUNK * (super::stream::CHANNEL_CAP - 1)
-                        + super::stream::CHUNK / 2) as u64,
-                );
+                st.limits.max_result_bytes = Some(accepted as u64);
             });
             load(&s);
             let res = s
@@ -1842,16 +1876,12 @@ fn failed_budget_flush_case(rows: usize, len: usize, format: &str) {
         let f = &j["fields"];
         assert_eq!(f["outcome"], "budget", "{execution} {format} {len}: {f}");
         let bytes = f["response_bytes"].as_u64().unwrap() as usize;
-        assert!(bytes < whole.len(), "{execution} {format} {len}: {f}");
+        assert_eq!(
+            bytes, full_queue,
+            "{execution} {format} {len}: logged bytes must exclude the unsent partial chunk ({accepted} - {full_queue} bytes): {f}"
+        );
         // every whole row within the bytes the transport accepted
-        let sent = if format == "thrift" {
-            thrift_row_ends(&tsv, &whole)
-                .iter()
-                .filter(|&&end| end <= bytes)
-                .count() as u64
-        } else {
-            whole[..bytes].iter().filter(|&&b| b == b'\n').count() as u64 - 1
-        };
+        let sent = ends.iter().filter(|&&end| end <= bytes).count() as u64;
         assert_eq!(
             f["rows"].as_u64(),
             Some(sent),
