@@ -290,13 +290,13 @@ shuffled order the first 4,096 rows of `str-pair-names` repeat as few values as
 names query's 2x. A profile of the per-worker maps put most of the floors' time in
 `Ctx::with_vocab_key_prev` and `Vocab::get_with_prev_checked`, which read the key and its
 predecessor. The shared table has not been profiled, so that read is the suspected cause
-of its cost. Item 1088's implementation admits the checked walk's initial scratch before
-reconstruction. Both vocabulary codecs store the exact common prefix length between
-adjacent keys in a block. If that length covers the current key's lexical prefix, the
-preceding key extends it. The floor lookup uses that length directly. At a block boundary
-it reads the preceding key when needed. The cursor retains the 4 KiB cap and retries
-an oversized or refused walk as a single-key read under the decoding envelope. The
-shared table still serves every eligible mask. The timing comparison is pending.
+of its cost. Item 1088 uses the exact common prefix length that both vocabulary codecs
+store between adjacent keys in a block. If that length covers the current key's lexical
+prefix, the preceding key extends it. At a block boundary the lookup reads the preceding
+key when needed. A cursor uses a single-key walk to obtain the key and its stored prefix
+length. The decoding envelope admits scratch before allocation. The cursor reports any
+refusal on the next query check. The shared table still serves every eligible mask. The
+timing comparison is pending.
 
 Queries that the floors do not reach also became slower in every round, and item 1089
 holds these costs. The 37-query screens compared 174de1f8, before the shared table, with

@@ -4666,6 +4666,17 @@ mod tests {
                     Ok(Some(()))
                 );
             }
+            for id in [v.len(), v.len() + 1] {
+                let unchecked: Option<()> =
+                    v.get_with_shared_prefix(id, |_, _| panic!("out-of-bounds lookup"));
+                assert_eq!(unchecked, None);
+                let checked: Result<Option<()>, ()> = v.get_with_shared_prefix_checked(
+                    id,
+                    |_| panic!("out-of-bounds scratch admission"),
+                    |_, _| panic!("out-of-bounds checked lookup"),
+                );
+                assert_eq!(checked, Ok(None));
+            }
         }
     }
 
@@ -4694,18 +4705,32 @@ mod tests {
             );
             assert_eq!(result, Ok(Some(())));
             assert_eq!(admissions, [cap]);
-            assert_eq!(
-                v.get_with_shared_prefix_checked(1, Err, |_, _| panic!("initial scratch refused")),
-                Err(cap)
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let observed = Arc::new(AtomicUsize::new(0));
+            let seen = observed.clone();
+            crate::algo::set_projection_observer(Some(Arc::new(move |event| {
+                if let crate::algo::ProjectionEvent::Materialized(
+                    "checked-vocab-scratch-allocated",
+                    _,
+                ) = event
+                {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                }
+            })));
+            let refused_initial: Result<Option<()>, _> =
+                v.get_with_shared_prefix_checked(1, Err, |_, _| panic!("initial scratch refused"));
+            let initial_allocations = observed.load(Ordering::Relaxed);
+            let refused_growth: Result<Option<()>, _> = v.get_with_shared_prefix_checked(
+                0,
+                |need| if need <= cap { Ok(()) } else { Err(need) },
+                |_, _| panic!("scratch growth refused"),
             );
-            assert_eq!(
-                v.get_with_shared_prefix_checked(
-                    0,
-                    |need| if need <= cap { Ok(()) } else { Err(need) },
-                    |_, _| panic!("scratch growth refused"),
-                ),
-                Err(keys[0].len())
-            );
+            crate::algo::set_projection_observer(None);
+            assert_eq!(refused_initial, Err(cap));
+            assert_eq!(initial_allocations, 0);
+            assert_eq!(refused_growth, Err(keys[0].len()));
+            assert_eq!(observed.load(Ordering::Relaxed), 1);
         }
     }
 

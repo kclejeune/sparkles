@@ -229,10 +229,6 @@ impl ValueCache {
 /// (see [`FloorCache::cap`]).
 const FLOOR_CACHE_BYTES: u64 = 64 << 20;
 
-/// The most reconstruction a cursor's floor lookup admits on its first attempt (see
-/// [`Ctx::with_vocab_key_prefix`]).
-const FLOOR_WALK_BYTES: usize = 4096;
-
 /// The slots of the floor table a query starts with, 512 KiB of words.
 const FLOOR_TABLE_FIRST: usize = 1 << 16;
 
@@ -3454,10 +3450,8 @@ impl Ctx {
     }
 
     /// Read a vocabulary key and, within its block, its common prefix length with
-    /// the preceding key. A cursor uses the decoding envelope for the walk. If the
-    /// walk exceeds its scratch cap or the envelope refuses it, read the key alone.
-    /// That read records any memory refusal, and the caller reads the preceding
-    /// key only if needed.
+    /// the preceding key. A cursor admits scratch through the decoding envelope
+    /// before allocation and records any refusal for the next check.
     fn with_vocab_key_prefix<T>(
         &self,
         id: u64,
@@ -3475,22 +3469,13 @@ impl Ctx {
                 })
                 .flatten();
         }
-        let mut f = Some(f);
-        let walked = vocab.get_with_shared_prefix_checked(
-            id,
-            |need| {
-                if need > FLOOR_WALK_BYTES {
-                    return Err(());
-                }
-                self.reserve_decode_checked(need).map_err(|_| ())
-            },
-            |shared, key| f.take().map(|f| f(shared, key)),
-        );
-        match walked {
-            Ok(found) => found.flatten(),
-            Err(()) => self
-                .with_vocab_key(id, |key| f.take().map(|f| f(None, key)))
-                .flatten(),
+        match vocab.get_with_shared_prefix_checked(id, |need| self.reserve_decode_checked(need), f)
+        {
+            Ok(found) => found,
+            Err(error) => {
+                self.fail_memory(&error);
+                None
+            }
         }
     }
 
@@ -4287,6 +4272,7 @@ pub enum TermKind {
 #[cfg(test)]
 mod charge_tests {
     use super::*;
+    use crate::builder::{BuildOptions, VocabCodec};
     use crate::store::{Store, StoreOptions};
 
     #[test]
@@ -5123,6 +5109,107 @@ mod charge_tests {
                 assert!(ctx.check().is_ok());
             }
             drop(held);
+        }
+    }
+
+    fn store_with_floor_literals(literals: &[oxrdf::Term], codec: VocabCodec) -> Store {
+        use std::fmt::Write;
+
+        let store = Store::in_memory(StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(codec),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut nt = String::new();
+        for literal in literals {
+            writeln!(nt, "<urn:s> <urn:p> {literal} .").unwrap();
+        }
+        store
+            .load(&[crate::io::Source::from_bytes(
+                nt.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        assert_eq!(store.snapshot().generation.vocab_codec(), codec);
+        store
+    }
+
+    #[test]
+    fn a_cursor_floor_reads_a_long_literal_without_reading_its_huge_predecessor() {
+        let literals = [
+            oxrdf::Literal::new_simple_literal(format!("a{}", "x".repeat(1 << 20))).into(),
+            oxrdf::Literal::new_simple_literal(format!("b{}", "y".repeat(5 << 10))).into(),
+        ];
+        for codec in [VocabCodec::Front, VocabCodec::Fsst] {
+            let store = store_with_floor_literals(&literals, codec);
+            let snap = store.snapshot();
+            let [huge, long] = literals
+                .each_ref()
+                .map(|term| snap.lookup_term(term).unwrap());
+            assert_eq!(long.payload(), huge.payload() + 1);
+            assert!(!(long.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+
+            let mut ctx = Ctx::new(snap);
+            ctx.mem_limit = 2 * MIB;
+            ctx.enable_cursor_accounting().unwrap();
+            assert_eq!(ctx.string_floor(long), Some(long.payload()), "{codec:?}");
+            assert!(ctx.check().is_ok());
+            assert_eq!(ctx.with_vocab_key(huge.payload(), |_| ()), None);
+            assert!(
+                matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
+            );
+        }
+    }
+
+    #[test]
+    fn string_floors_use_adjacent_prefixes_in_both_codecs() {
+        use oxrdf::{BaseDirection, Literal, NamedNode};
+
+        let literals = [
+            Literal::new_language_tagged_literal("ab", "en")
+                .unwrap()
+                .into(),
+            Literal::new_simple_literal("a").into(),
+            Literal::new_directional_language_tagged_literal("bb", "ar", BaseDirection::Rtl)
+                .unwrap()
+                .into(),
+            Literal::new_simple_literal("b").into(),
+            Literal::new_typed_literal("cb", NamedNode::new("urn:dt").unwrap()).into(),
+            Literal::new_simple_literal("c").into(),
+            Literal::new_simple_literal("dè").into(),
+            Literal::new_simple_literal("dé").into(),
+        ];
+        for codec in [VocabCodec::Front, VocabCodec::Fsst] {
+            let store = store_with_floor_literals(&literals, codec);
+            let snap = store.snapshot();
+            let ids = literals
+                .each_ref()
+                .map(|term| snap.lookup_term(term).unwrap());
+            for pair in ids.as_chunks::<2>().0 {
+                assert_eq!(pair[1].payload(), pair[0].payload() + 1);
+                assert!(!(pair[1].payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+            }
+            for cursor in [false, true] {
+                let mut ctx = Ctx::new(snap.clone());
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                for pair in ids[..6].as_chunks::<2>().0 {
+                    assert_eq!(ctx.string_floor(pair[0]), None);
+                    assert_eq!(ctx.string_floor(pair[1]), Some(pair[0].payload()));
+                }
+                // These keys share the first byte of è and é, but neither extends the other.
+                assert_eq!(ctx.string_floor(ids[6]), Some(ids[6].payload()));
+                assert_eq!(ctx.string_floor(ids[7]), Some(ids[7].payload()));
+                assert_eq!(
+                    ctx.string_floor(Id::vocab(snap.generation.vocab.len())),
+                    None
+                );
+                assert!(ctx.check().is_ok(), "{codec:?} cursor {cursor}");
+            }
         }
     }
 
