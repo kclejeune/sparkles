@@ -1720,7 +1720,13 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
         let _ = k.classify(&baseline_limits).expect("calibrate classifier");
         last_adaptive_preadmit().expect("classifier must record pre-box adaptive admission")
     });
-    assert!(clf_pre_sat > state_bytes);
+    assert!(
+        clf_pre_sat > state_bytes
+            && clf_norm_peak < clf_pre_sat
+            && clf_pre_more == clf_pre_sat - clf_norm_peak
+            && clf_pre_more > 0,
+        "classifier pre-box adaptive admission must require a positive delta above normalization peak: clf_norm_peak={clf_norm_peak}, clf_pre_sat={clf_pre_sat}, clf_pre_more={clf_pre_more}"
+    );
     // Pre-allocate the trace buffer so the test harness itself performs zero heap
     // allocations inside `measure(|| ...)` when recording `Charge`/`Observed`/`BeforeDebit`.
     let events_b4: Arc<parking_lot::Mutex<Vec<MemEvent>>> =
@@ -1816,26 +1822,19 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
         b4_first_debit > b4_first_obs,
         "b4 saturation entry must precede first worker debit"
     );
-    let b4_last_pre_charge = log_b4[..b4_first_obs]
-        .iter()
-        .rev()
-        .find(|e| matches!(e, MemEvent::Charge { .. }))
-        .copied();
-    assert!(
-        matches!(
-            b4_last_pre_charge,
-            Some(MemEvent::Charge {
-                accepted: true,
-                paid_after,
-                ..
-            }) if paid_after >= clf_pre_sat
-        ),
-        "b4 must grant pre-box admission covering clf_pre_sat ({clf_pre_sat}) before saturation entry: {b4_last_pre_charge:?}"
+    assert_eq!(
+        log_b4[..b4_first_obs]
+            .iter()
+            .rev()
+            .find(|e| matches!(e, MemEvent::Charge { .. }))
+            .copied(),
+        Some(MemEvent::Charge {
+            bytes: clf_pre_more,
+            accepted: true,
+            paid_after: clf_pre_sat,
+        }),
+        "b4 must grant exact pre-box adaptive delta up to clf_pre_sat before saturation entry"
     );
-    let b4_paid_before_obs = match b4_last_pre_charge.unwrap() {
-        MemEvent::Charge { paid_after, .. } => paid_after,
-        _ => unreachable!(),
-    };
     assert!(
         !log_b4[b4_first_obs..b4_first_debit]
             .iter()
@@ -1854,9 +1853,9 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
                 bytes,
                 accepted: true,
                 paid_after,
-            }) if bytes > 0 && paid_after == b4_paid_before_obs + bytes
+            }) if bytes > 0 && paid_after == clf_pre_sat + bytes
         ),
-        "b4 first saturation charge must occur after worker BeforeDebit and grow above pre-entry paid ({b4_paid_before_obs}): {b4_first_sat_charge:?}"
+        "b4 first saturation charge must occur after worker BeforeDebit and grow above clf_pre_sat ({clf_pre_sat}): {b4_first_sat_charge:?}"
     );
     assert_eq!(allocs_tight, 1, "AdaptiveState must be allocated once");
     assert!(
