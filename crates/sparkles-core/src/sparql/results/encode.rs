@@ -8,7 +8,7 @@ use super::source::RowView;
 use crate::sparql::ctx::{Charge, Ctx, OwnedCharge};
 use oxrdf::vocab::xsd;
 use oxrdf::{BaseDirection, TermRef};
-use std::io::Result;
+use std::io::{self, Result, Write};
 use std::sync::Arc;
 
 #[allow(dead_code)]
@@ -606,12 +606,21 @@ impl<'a> Xml<'a> {
 
     /// One solution, the bound cells in column order.
     pub(super) fn row(
-        &mut self,
+        &self,
         out: &mut Explicit<'_, '_>,
         row: RowView<'_>,
         _width: usize,
     ) -> Result<()> {
-        out.put(b"<result>")?;
+        self.write_row(out, &row)
+    }
+
+    /// Check the exact row size without allocating or writing any of its output.
+    pub(super) fn row_fits(&self, row: &RowView<'_>, remaining: u64) -> bool {
+        self.write_row(&mut XmlSize { remaining }, row).is_ok()
+    }
+
+    fn write_row(&self, out: &mut impl Write, row: &RowView<'_>) -> Result<()> {
+        out.write_all(b"<result>")?;
         match row {
             RowView::Dense(terms) => {
                 for (c, term) in terms.iter().enumerate() {
@@ -621,19 +630,19 @@ impl<'a> Xml<'a> {
                 }
             }
             RowView::Sparse(terms) => {
-                for (c, term) in terms {
+                for (c, term) in *terms {
                     self.cell(out, *c, term.as_ref().as_ref())?;
                 }
             }
         }
-        out.put(b"</result>")
+        out.write_all(b"</result>")
     }
 
     #[inline]
-    fn cell(&self, out: &mut Explicit<'_, '_>, column: usize, term: TermRef<'_>) -> Result<()> {
-        out.put(&self.tags[column])?;
+    fn cell(&self, out: &mut impl Write, column: usize, term: TermRef<'_>) -> Result<()> {
+        out.write_all(&self.tags[column])?;
         xml_term(out, term)?;
-        out.put(b"</binding>")
+        out.write_all(b"</binding>")
     }
 
     /// The end of the results element and of the document.
@@ -642,49 +651,75 @@ impl<'a> Xml<'a> {
     }
 }
 
-fn xml_term(out: &mut Explicit<'_, '_>, term: TermRef<'_>) -> Result<()> {
+fn xml_term(out: &mut impl Write, term: TermRef<'_>) -> Result<()> {
     match term {
         TermRef::NamedNode(node) => {
-            out.put(b"<uri>")?;
+            out.write_all(b"<uri>")?;
             xml_text(out, node.as_str())?;
-            out.put(b"</uri>")
+            out.write_all(b"</uri>")
         }
         TermRef::BlankNode(node) => {
-            out.put(b"<bnode>")?;
+            out.write_all(b"<bnode>")?;
             xml_text(out, node.as_str())?;
-            out.put(b"</bnode>")
+            out.write_all(b"</bnode>")
         }
         TermRef::Literal(literal) => {
-            out.put(b"<literal")?;
+            out.write_all(b"<literal")?;
             if let Some(language) = literal.language() {
-                out.put(b" xml:lang=\"")?;
+                out.write_all(b" xml:lang=\"")?;
                 xml_text(out, language)?;
-                out.put(b"\"")?;
+                out.write_all(b"\"")?;
                 if let Some(direction) = literal.direction() {
-                    out.put(match direction {
+                    out.write_all(match direction {
                         BaseDirection::Ltr => b" its:dir=\"ltr\"",
                         BaseDirection::Rtl => b" its:dir=\"rtl\"",
                     })?;
-                    out.put(b" xmlns:its=\"http://www.w3.org/2005/11/its\" its:version=\"2.0\"")?;
+                    out.write_all(
+                        b" xmlns:its=\"http://www.w3.org/2005/11/its\" its:version=\"2.0\"",
+                    )?;
                 }
             } else if literal.datatype() != xsd::STRING {
-                out.put(b" datatype=\"")?;
+                out.write_all(b" datatype=\"")?;
                 xml_text(out, literal.datatype().as_str())?;
-                out.put(b"\"")?;
+                out.write_all(b"\"")?;
             }
-            out.put(b">")?;
+            out.write_all(b">")?;
             xml_literal_value(out, literal.value())?;
-            out.put(b"</literal>")
+            out.write_all(b"</literal>")
         }
         TermRef::Triple(triple) => {
-            out.put(b"<triple><subject>")?;
+            out.write_all(b"<triple><subject>")?;
             xml_term(out, triple.subject.as_ref().into())?;
-            out.put(b"</subject><predicate>")?;
+            out.write_all(b"</subject><predicate>")?;
             xml_term(out, triple.predicate.as_ref().into())?;
-            out.put(b"</predicate><object>")?;
+            out.write_all(b"</predicate><object>")?;
             xml_term(out, triple.object.as_ref())?;
-            out.put(b"</object></triple>")
+            out.write_all(b"</object></triple>")
         }
+    }
+}
+
+/// The XML row probe counts the encoder's writes up to the remaining allowance.
+struct XmlSize {
+    remaining: u64,
+}
+
+impl Write for XmlSize {
+    fn write(&mut self, bytes: &[u8]) -> Result<usize> {
+        self.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len() as u64)
+            .ok_or(io::ErrorKind::WriteZero)?;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -703,17 +738,17 @@ fn xml_escape(b: u8) -> Option<&'static [u8]> {
 
 /// Text or an attribute value, escaped, the runs between escapes copied whole. Only ASCII
 /// bytes are escaped, so a run never splits a character.
-fn xml_text(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
+fn xml_text(out: &mut impl Write, s: &str) -> Result<()> {
     let bytes = s.as_bytes();
     let mut start = 0;
     for (i, &b) in bytes.iter().enumerate() {
         if let Some(escaped) = xml_escape(b) {
-            out.put(&bytes[start..i])?;
-            out.put(escaped)?;
+            out.write_all(&bytes[start..i])?;
+            out.write_all(escaped)?;
             start = i + 1;
         }
     }
-    out.put(&bytes[start..])
+    out.write_all(&bytes[start..])
 }
 
 /// The character reference sparesults writes for a tab, line feed, carriage return or
@@ -732,7 +767,7 @@ fn xml_bound_space(b: u8) -> Option<&'static [u8]> {
 /// A literal's value, its leading and trailing whitespace as character references so that
 /// a reader keeps it, and the rest escaped as text. A value of only whitespace is all
 /// references.
-fn xml_literal_value(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
+fn xml_literal_value(out: &mut impl Write, s: &str) -> Result<()> {
     let bytes = s.as_bytes();
     let start = bytes
         .iter()
@@ -743,12 +778,12 @@ fn xml_literal_value(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
         .rposition(|&b| xml_bound_space(b).is_none())
         .map_or(start, |i| i + 1);
     for &b in &bytes[..start] {
-        out.put(xml_bound_space(b).unwrap_or_default())?;
+        out.write_all(xml_bound_space(b).unwrap_or_default())?;
     }
     // both ends are ASCII bytes or the ends of the value, so the middle is a whole str
     xml_text(out, &s[start..end])?;
     for &b in &bytes[end..] {
-        out.put(xml_bound_space(b).unwrap_or_default())?;
+        out.write_all(xml_bound_space(b).unwrap_or_default())?;
     }
     Ok(())
 }

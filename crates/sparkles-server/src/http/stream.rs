@@ -314,7 +314,7 @@ impl SwitchWriter {
             timeouts: None,
             timed: None,
             held: None,
-            ledger: RowLedger::new(),
+            ledger: RowLedger::with_split_prefix(threshold.saturating_add(1) as u64),
             copied: 0,
             sent: 0,
             after_send: None,
@@ -508,13 +508,12 @@ impl SwitchWriter {
         if self.tx.is_none() || self.buf.is_empty() {
             return Ok(());
         }
-        let mut remaining =
-            Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK)));
-        while remaining.len() > CHUNK {
-            let piece = remaining.split_to(CHUNK);
-            self.send_bytes(piece)?;
-        }
-        self.send_bytes(remaining)
+        // The switch already drained the split prefix down to less than one chunk.
+        // Subsequent writes fill the chunk a piece at a time, so the send covers the
+        // entire copied buffer.
+        debug_assert!(self.buf.len() <= CHUNK);
+        let chunk = Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK)));
+        self.send_bytes(chunk)
     }
 }
 
@@ -2491,6 +2490,69 @@ mod timed_tests {
             report.outcome(),
             (Some(crate::obs::Outcome::Cancelled), None)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_disconnect_after_partial_prefix_counts_only_complete_rows() {
+        use crate::http::algo::probe::{CURRENT, Gate, Probe, Release};
+        use sparkles::sparql::results as res;
+
+        let store = sparkles::store::Store::in_memory(Default::default());
+        let result = sparkles::sparql::query(
+            store.snapshot(),
+            "SELECT ?x WHERE { VALUES ?x { <urn:a> <urn:b> <urn:c> } } ORDER BY ?x",
+            &Default::default(),
+        )
+        .unwrap();
+        let control = StreamControl::new(Default::default(), None, Default::default(), None);
+        let prefix = b"?x";
+        let sw = SwitchWriter::new_in_place_cursor(prefix.len() - 1, control.clone());
+        let rows = res::RowCount::with_ledger(sw.ledger());
+        let mut writer = LimitedWriter::new(sw, None, None);
+        res::write(
+            res::Source::Result(&result),
+            res::WriteOptions::new(res::Format::Solutions(res::SolutionsFormat::Tsv), &rows),
+            &mut writer,
+        )
+        .unwrap();
+        assert_eq!(rows.get(), 3);
+
+        let gate = Arc::new(Gate::default());
+        let _release = Release(gate.clone());
+        let (send, end) = oneshot::channel();
+        let serialized = CURRENT
+            .scope(
+                Probe {
+                    queued_producer: Some(gate.clone()),
+                    ..Default::default()
+                },
+                finish_handoff_controlled(
+                    writer,
+                    control,
+                    timeouts(),
+                    Instant::now(),
+                    |switched, _| switched,
+                    move |report| {
+                        let _ = send.send(report);
+                    },
+                ),
+            )
+            .await;
+        let Ok(Serialized::Timed { body, .. }) = serialized else {
+            panic!("expected timed stream");
+        };
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        let mut body = body.into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap().as_ref(), prefix);
+        drop(body);
+        gate.release();
+
+        let report = ended(end).await;
+        assert!(report.committed && report.disconnected);
+        assert_eq!(report.bytes, prefix.len() as u64);
+        assert_eq!(report.rows, Some(0));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

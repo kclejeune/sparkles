@@ -467,7 +467,11 @@ written so far to the producer on the pool. The hand-off needs a writer whose st
 move to another thread between batches, which item 828's writers over a batch source
 give, so the route lands with item 828 and is measured there. A cursor knows it has
 ended only when a pull returns no batch, so the loop pulls once more after the last
-batch, which costs a check of a finished cursor's state.
+batch, which costs a check of a finished cursor's state. The XML writer measures a row's
+encoded size before buffering it in place. It resumes serialization on the pool when
+escaping would put the row over the threshold. When the producer splits a buffered
+prefix across frames, the row ledger keeps the end offsets beyond the first frame
+under a query charge. It releases those marks once the corresponding bytes enqueue.
 
 The third would have let a request with `execution=streaming` take the in-place route
 too, and it is not taken. Such a request opens on the pool, so its work stops when its

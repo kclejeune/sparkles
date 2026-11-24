@@ -8,7 +8,7 @@
 //! bytes up to its end, so a body that stops partway reports the rows it delivered.
 
 use crate::error::{Error, Result};
-use crate::sparql::ctx::{Charge, Ctx};
+use crate::sparql::ctx::{Charge, Ctx, RetainedCharge};
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io::Write;
@@ -27,8 +27,7 @@ pub(in crate::sparql) const FIRST_MARKS: usize = 64;
 
 pub(in crate::sparql) const MARK_BYTES: u64 = std::mem::size_of::<(usize, u64)>() as u64;
 
-/// A slot of a [`RowLedger`]'s queue of marks not yet copied, which a writer with a
-/// ledger charges for each of its own mark slots.
+/// A slot in a [`RowLedger`] queue that keeps a row's absolute offset.
 pub(in crate::sparql) const LEDGER_MARK_BYTES: u64 = std::mem::size_of::<(u64, u64)>() as u64;
 
 /// [`RowOut`]'s open offset when no row or piece is open.
@@ -96,13 +95,72 @@ struct LedgerState {
     /// the ones before the piece's start, so the writer reserves room for as many as it
     /// has mark slots, under its charge, and frees it when it drops.
     pending: VecDeque<(u64, u64)>,
+    /// Offset marks beyond the first frame of a split buffered prefix.
+    split: Option<SplitPrefix>,
     /// a writer registered with this ledger
     used: bool,
+}
+
+struct SplitPrefix {
+    first_frame: u64,
+    rows: VecDeque<(u64, u64)>,
+    // May outlive the serializer that recorded the marks during the in-place trial.
+    charge: Option<RetainedCharge>,
+}
+
+impl SplitPrefix {
+    fn record(&mut self, start: u64, marks: &[(usize, u64)], ctx: Option<&Ctx>) -> Result<()> {
+        let old = self.rows.capacity();
+        let needed = self.rows.len() + marks.len();
+        if needed > old {
+            let capacity = needed.max(old * 2);
+            let peak = (old + capacity) as u64 * LEDGER_MARK_BYTES;
+            if let Some(charge) = &mut self.charge {
+                charge.resize(peak)?;
+            } else if let Some(ctx) = ctx {
+                self.charge = ctx.retained_charge(peak)?;
+            }
+            self.rows.reserve_exact(capacity - self.rows.len());
+            if let Some(charge) = &mut self.charge {
+                charge.resize(self.rows.capacity() as u64 * LEDGER_MARK_BYTES)?;
+            }
+        }
+        self.rows
+            .extend(marks.iter().map(|&(offset, n)| (start + offset as u64, n)));
+        Ok(())
+    }
+
+    fn discard_uncopied(&mut self, copied: u64) {
+        while self.rows.back().is_some_and(|&(offset, _)| offset > copied) {
+            self.rows.pop_back();
+        }
+        if self.rows.is_empty() {
+            self.rows = VecDeque::new();
+            self.charge = None;
+        }
+    }
 }
 
 impl RowLedger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Track a buffered prefix that may take several sends to drain. The first frame
+    /// has `first_frame` bytes when the prefix is split. Once the prefix drain finishes,
+    /// each send covers the whole buffer.
+    pub fn with_split_prefix(first_frame: u64) -> Self {
+        Self(Arc::new(LedgerShared {
+            copied: AtomicU64::new(0),
+            state: parking_lot::Mutex::new(LedgerState {
+                split: Some(SplitPrefix {
+                    first_frame,
+                    rows: VecDeque::new(),
+                    charge: None,
+                }),
+                ..LedgerState::default()
+            }),
+        }))
     }
 
     /// The transport has copied `total` bytes of the stream into its buffer.
@@ -111,8 +169,8 @@ impl RowLedger {
         self.0.copied.store(total, Ordering::Relaxed);
     }
 
-    /// The transport has handed over the stream's first `total` bytes, every byte it had
-    /// copied, in a send that enqueued.
+    /// The transport has handed over the stream's first `total` bytes. Each send
+    /// covers every copied byte unless the transport is draining a split prefix.
     pub fn handed_over(&self, total: u64) {
         let mut s = self.0.state.lock();
         s.sent = s.sent.max(total);
@@ -122,6 +180,17 @@ impl RowLedger {
         {
             s.pending.pop_front();
             delivered += n;
+        }
+        if let Some(split) = &mut s.split {
+            while let Some(&(offset, n)) = split.rows.front()
+                && offset <= total
+            {
+                split.rows.pop_front();
+                delivered += n;
+            }
+            if split.rows.is_empty() {
+                s.split = None;
+            }
         }
         s.delivered += delivered;
     }
@@ -139,14 +208,28 @@ impl RowLedger {
         self.0.copied.load(Ordering::Relaxed)
     }
 
-    /// Register the row ends of a piece that starts at stream offset `start`,
-    /// `(stream offset, rows)` in stream order. Each counts by where its offset lies:
-    /// handed over, copied, or not yet copied. The marks of earlier pieces, whose bytes
-    /// the transport has accepted, count as copied, so the queue holds at most this
-    /// piece's marks.
-    pub(super) fn register(&self, start: u64, marks: impl Iterator<Item = (u64, u64)>) {
+    /// Register a piece's row ends as `(offset within the piece, rows)` in stream order.
+    /// Copied marks can be reduced to a count once the next send covers their offsets.
+    pub(super) fn register(
+        &self,
+        start: u64,
+        marks: &[(usize, u64)],
+        ctx: Option<&Ctx>,
+    ) -> Result<()> {
         let copied = self.0.copied.load(Ordering::Relaxed);
         let mut s = self.0.state.lock();
+        let mut prefix = marks;
+        if s.sent == 0
+            && let Some(split) = &mut s.split
+            && marks
+                .last()
+                .is_some_and(|&(offset, _)| start + offset as u64 > split.first_frame)
+        {
+            let end =
+                marks.partition_point(|&(offset, _)| start + offset as u64 <= split.first_frame);
+            split.record(start, &marks[end..], ctx)?;
+            prefix = &marks[..end];
+        }
         let reached = copied.max(start);
         while let Some(&(offset, n)) = s.pending.front()
             && offset <= reached
@@ -154,7 +237,8 @@ impl RowLedger {
             s.pending.pop_front();
             s.in_buffer += n;
         }
-        for (offset, n) in marks {
+        for &(offset, n) in prefix {
+            let offset = start + offset as u64;
             if offset <= s.sent {
                 s.delivered += n;
             } else if offset <= copied {
@@ -167,6 +251,7 @@ impl RowLedger {
                 s.pending.push_back((offset, n));
             }
         }
+        Ok(())
     }
 
     /// Make room in the queue for `marks` marks, after the writer has charged it.
@@ -177,8 +262,8 @@ impl RowLedger {
     }
 
     /// The writer stops: marks the copies have reached count as copied, and the rest,
-    /// whose bytes no transport accepted and nothing will write, are dropped with the
-    /// queue's storage.
+    /// whose bytes no transport accepted and nothing will write, are dropped. Keep the
+    /// copied offsets of a split prefix for the sends that can still reach them.
     pub(super) fn settle(&self) {
         let copied = self.0.copied.load(Ordering::Relaxed);
         let mut s = self.0.state.lock();
@@ -188,6 +273,9 @@ impl RowLedger {
             .take_while(|&&(offset, _)| offset <= copied)
             .map(|&(_, n)| n)
             .sum::<u64>();
+        if let Some(split) = &mut s.split {
+            split.discard_uncopied(copied);
+        }
     }
 }
 
@@ -631,18 +719,15 @@ impl<'a> RowOut<'a> {
 
     /// Hand the marks to the ledger as stream offsets, before the piece they lie in is
     /// written.
-    fn register(&mut self) {
+    fn register(&mut self) -> std::io::Result<()> {
         if let Some(ledger) = &self.count.ledger
             && !self.marks.is_empty()
+            && let Err(error) = ledger.register(self.base + self.taken, &self.marks, self.ctx)
         {
-            let start = self.base + self.taken;
-            ledger.register(
-                start,
-                self.marks
-                    .iter()
-                    .map(|&(offset, n)| (start + offset as u64, n)),
-            );
+            self.failed = true;
+            return Err(self.refuse(error));
         }
+        Ok(())
     }
 
     /// Write the collected bytes on. Each row counts as soon as the caller's writer has
@@ -663,7 +748,7 @@ impl<'a> RowOut<'a> {
             return Err(std::io::Error::other("the output already failed"));
         }
         debug_assert!(self.marks.last().is_none_or(|&(offset, _)| offset <= end));
-        self.register();
+        self.register()?;
         let mut done = 0;
         let mut mark = 0;
         loop {

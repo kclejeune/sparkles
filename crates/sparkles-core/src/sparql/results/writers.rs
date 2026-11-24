@@ -310,7 +310,7 @@ fn select<S: SolutionSource>(
             )
         }
         SolutionsFormat::Xml => {
-            let mut xml = Xml::new(out.ctx(), source.variables())?;
+            let xml = Xml::new(out.ctx(), source.variables())?;
             encoded(
                 source,
                 out,

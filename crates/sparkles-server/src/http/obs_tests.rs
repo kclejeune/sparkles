@@ -928,6 +928,13 @@ fn access_lines(access_log: bool) -> Vec<String> {
 
 /// The `sparkles::access` lines logged while `run` runs on a current-thread runtime.
 fn access_lines_of<F: std::future::Future<Output = ()>>(run: impl FnOnce() -> F) -> Vec<String> {
+    access_lines_with_runtime(tokio::runtime::Builder::new_current_thread(), run)
+}
+
+fn access_lines_with_runtime<F: std::future::Future<Output = ()>>(
+    mut runtime: tokio::runtime::Builder,
+    run: impl FnOnce() -> F,
+) -> Vec<String> {
     // While a single dispatcher exists, tracing computes the interest of a callsite first
     // hit on another thread from that thread's default (none, in parallel tests) and
     // caches it for everyone; a second live dispatcher turns that shortcut off.
@@ -943,11 +950,7 @@ fn access_lines_of<F: std::future::Future<Output = ()>>(run: impl FnOnce() -> F)
         // callsites first hit by tests running in parallel (without a subscriber) may
         // have cached that they are disabled
         tracing::callsite::rebuild_interest_cache();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(run());
+        runtime.enable_all().build().unwrap().block_on(run());
     });
     let text = String::from_utf8(buf.0.lock().clone()).unwrap();
     text.lines()
@@ -1743,6 +1746,170 @@ fn a_budget_error_before_the_commit_reports_no_rows() {
             );
         }
     }
+}
+
+#[test]
+fn http1_fixed_length_cursor_responses_keep_their_status() {
+    use super::cursor::{AutoOutcome, AutoRequest, run_in_place_with_mode};
+    use super::{OutFormat, Params, inline::QuickQueries, stream};
+    use sparkles::sparql::{ExecutionMode, results::SolutionsFormat};
+    use tracing::instrument::WithSubscriber;
+
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.worker_threads(2);
+    let lines = access_lines_with_runtime(runtime, || async {
+        let s = server_with(|st| st.access_log = true);
+        let ds = s.state.get("ds").unwrap();
+        let payload = "x".repeat(256);
+        let data: String = (0..2000)
+            .map(|i| format!("<urn:fixed:{i}> <urn:fixed:p> \"{payload}\" .\n"))
+            .collect();
+        ds.store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+
+        // Exercise the in-place cursor response path independently of auto admission.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let app = Router::new()
+            .route(
+                "/ds/sparql",
+                axum::routing::post({
+                    let state = s.state.clone();
+                    move |uri: axum::http::Uri, query: String| {
+                        let (options, guard) = super::query_options_for_test(&state, &ds);
+                        let ds = ds.clone();
+                        async move {
+                            let key = QuickQueries::key(&ds.name, &query);
+                            let outcome = run_in_place_with_mode(
+                                ds,
+                                AutoRequest {
+                                    timeouts: stream::Timeouts::default(),
+                                    query,
+                                    options,
+                                    at: None,
+                                    params: &Params(Default::default()),
+                                    uri: &uri,
+                                    guard,
+                                    limit: Some(48 << 10),
+                                    format: SolutionsFormat::Tsv,
+                                    thrift: false,
+                                    rdf_format: OutFormat::Rdf(oxrdfio::RdfFormat::NTriples),
+                                    native_graph: false,
+                                    prefixes: Default::default(),
+                                    io: None,
+                                    quick_key: key,
+                                    auto: true,
+                                    trial: false,
+                                    claim: None,
+                                },
+                                ExecutionMode::Streaming,
+                            )
+                            .await
+                            .unwrap_or_else(|e| panic!("cursor failed to open: {} {}", e.0, e.1));
+                            let AutoOutcome::Responded(response) = outcome else {
+                                panic!("expected a cursor response");
+                            };
+                            if response.status().is_success() {
+                                assert_eq!(super::cursor::route_stats::in_place_whole(key), 1);
+                            }
+                            response
+                        }
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                s.state.clone(),
+                crate::obs::observe,
+            ))
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    next.run(req).with_subscriber(dispatch.clone())
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/ds/sparql", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        for (id, query, status, empty) in [
+            (
+                "fixed-whole",
+                "SELECT ?s WHERE { ?s <urn:fixed:p> ?o }",
+                StatusCode::OK,
+                false,
+            ),
+            (
+                "fixed-empty",
+                "CONSTRUCT { ?s <urn:fixed:empty> ?o } WHERE { ?s <urn:fixed:empty> ?o }",
+                StatusCode::OK,
+                true,
+            ),
+            (
+                "fixed-budget",
+                "SELECT ?s ?o WHERE { ?s <urn:fixed:p> ?o }",
+                StatusCode::INSUFFICIENT_STORAGE,
+                false,
+            ),
+        ] {
+            let response = client
+                .post(&url)
+                .header(header::CONTENT_TYPE, "application/sparql-query")
+                .header("x-request-id", id)
+                .body(query)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.version(), reqwest::Version::HTTP_11);
+            assert_eq!(response.status(), status);
+            let len: usize = response.headers()[header::CONTENT_LENGTH]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(len == 0, empty);
+            assert_eq!(response.bytes().await.unwrap().len(), len);
+        }
+
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    });
+
+    let mut observed = lines
+        .iter()
+        .map(|line| {
+            let log: J = serde_json::from_str(line).unwrap();
+            (
+                log["span"]["request_id"].as_str().unwrap().to_owned(),
+                log["fields"]["status"].as_u64().unwrap(),
+                log["fields"]["outcome"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    observed.sort_unstable();
+    assert_eq!(
+        observed,
+        [
+            ("fixed-budget".into(), 507, "budget".into()),
+            ("fixed-empty".into(), 200, "ok".into()),
+            ("fixed-whole".into(), 200, "ok".into()),
+        ]
+    );
 }
 
 /// The end offset of every row of a whole SPARQL Results Thrift body of `?s ?o`, whose rows

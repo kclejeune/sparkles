@@ -489,7 +489,11 @@ impl SelectWriter {
             let current = self
                 .emitted_bytes
                 .saturating_add(explicit.written_and_buffered());
-            if current.saturating_add(row_min_bytes(&row)) > limit_bytes {
+            let available = limit_bytes.saturating_sub(current);
+            let xml = matches!(&self.state, SelectState::Xml(_));
+            if row_min_bytes(&row, xml) > available
+                || matches!(&self.state, SelectState::Xml(enc) if !enc.row_fits(&row, available))
+            {
                 drop(rows);
                 let cache = decoded.map(DecodedBatch::into_cache);
                 self.pending = Some(PendingSelectBatch {
@@ -561,24 +565,48 @@ impl SelectWriter {
     }
 }
 
-fn term_ref_min_bytes(term: oxrdf::TermRef<'_>) -> u64 {
+fn term_ref_min_bytes(term: oxrdf::TermRef<'_>, include_literal_metadata: bool) -> u64 {
     match term {
         oxrdf::TermRef::NamedNode(n) => n.as_str().len() as u64,
         oxrdf::TermRef::BlankNode(b) => b.as_str().len() as u64,
-        oxrdf::TermRef::Literal(l) => l.value().len() as u64,
-        oxrdf::TermRef::Triple(t) => term_ref_min_bytes(t.subject.as_ref().into())
-            .saturating_add(term_ref_min_bytes(t.predicate.as_ref().into()))
-            .saturating_add(term_ref_min_bytes(t.object.as_ref())),
+        oxrdf::TermRef::Literal(l) => {
+            let mut bytes = l.value().len() as u64;
+            if include_literal_metadata {
+                let metadata = if let Some(language) = l.language() {
+                    language.len()
+                } else if l.datatype() != oxrdf::vocab::xsd::STRING {
+                    l.datatype().as_str().len()
+                } else {
+                    0
+                };
+                bytes = bytes.saturating_add(metadata as u64);
+            }
+            bytes
+        }
+        oxrdf::TermRef::Triple(t) => {
+            term_ref_min_bytes(t.subject.as_ref().into(), include_literal_metadata)
+                .saturating_add(term_ref_min_bytes(
+                    t.predicate.as_ref().into(),
+                    include_literal_metadata,
+                ))
+                .saturating_add(term_ref_min_bytes(
+                    t.object.as_ref(),
+                    include_literal_metadata,
+                ))
+        }
     }
 }
 
-fn row_min_bytes(row: &RowView<'_>) -> u64 {
+fn row_min_bytes(row: &RowView<'_>, include_literal_metadata: bool) -> u64 {
     match row {
         RowView::Dense(terms) => terms.iter().flatten().fold(0u64, |acc, t| {
-            acc.saturating_add(term_ref_min_bytes(t.as_ref()))
+            acc.saturating_add(term_ref_min_bytes(t.as_ref(), include_literal_metadata))
         }),
         RowView::Sparse(terms) => terms.iter().fold(0u64, |acc, (_, t)| {
-            acc.saturating_add(term_ref_min_bytes(t.as_ref().as_ref()))
+            acc.saturating_add(term_ref_min_bytes(
+                t.as_ref().as_ref(),
+                include_literal_metadata,
+            ))
         }),
     }
 }
@@ -868,25 +896,23 @@ impl<W: Write + Send + 'static> GraphSinkInner<W> {
         Ok(())
     }
 
-    fn register(&self) {
+    fn register(&mut self) -> std::io::Result<()> {
         if let Some(ledger) = &self.ledger
             && !self.marks.is_empty()
+            && let Err(error) =
+                ledger.register(self.base + self.taken, &self.marks, Some(&self.ctx))
         {
-            let start = self.base + self.taken;
-            ledger.register(
-                start,
-                self.marks
-                    .iter()
-                    .map(|&(offset, n)| (start + offset as u64, n)),
-            );
+            self.failed = true;
+            return Err(self.refuse(error));
         }
+        Ok(())
     }
 
     fn drain(&mut self) -> std::io::Result<()> {
         if self.failed {
             return Err(std::io::Error::other("the output already failed"));
         }
-        self.register();
+        self.register()?;
         let end = self.buf.len();
         let mut done = 0;
         let mut mark = 0;
@@ -1551,9 +1577,9 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
 
 fn quad_min_bytes(quad: &Quad) -> u64 {
     let q = quad.as_ref();
-    let base = term_ref_min_bytes(q.subject.into())
-        .saturating_add(term_ref_min_bytes(q.predicate.into()))
-        .saturating_add(term_ref_min_bytes(q.object));
+    let base = term_ref_min_bytes(q.subject.into(), false)
+        .saturating_add(term_ref_min_bytes(q.predicate.into(), false))
+        .saturating_add(term_ref_min_bytes(q.object, false));
     match q.graph_name {
         oxrdf::GraphNameRef::NamedNode(n) => base.saturating_add(n.as_str().len() as u64),
         oxrdf::GraphNameRef::BlankNode(b) => base.saturating_add(b.as_str().len() as u64),
@@ -2158,6 +2184,65 @@ mod tests {
             gw.finish(&mut slot).unwrap();
             assert!(slot.unwrap().len() > 32_768, "graph {fmt:?}");
         }
+    }
+
+    #[test]
+    fn xml_escape_expansion_pauses_before_buffering_the_row() {
+        let store = sample_store();
+        let threshold = 1 << 20;
+        let literal = "&".repeat(800 << 10);
+        let query = format!("SELECT ?x WHERE {{ VALUES ?x {{ \"{literal}\" }} }}");
+        let open_cursor = || match query_execution(
+            store.snapshot(),
+            &query,
+            &QueryOptions::default(),
+            &CursorOptions::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap()
+        {
+            QueryExecution::Select(cursor) => *cursor,
+            _ => unreachable!(),
+        };
+        let format = Format::Solutions(SolutionsFormat::Xml);
+        let mut expected = Vec::new();
+        write(
+            Source::Select(&mut open_cursor()),
+            WriteOptions::new(format, &RowCount::new()),
+            &mut expected,
+        )
+        .unwrap();
+        assert!(expected.len() > 3 << 20);
+
+        let mut writer = CursorWriter::select(
+            open_cursor(),
+            CursorWriteOptions {
+                format,
+                send: None,
+                prefixes: Vec::new(),
+                metadata: None,
+                ledger: None,
+            },
+        );
+        let mut slot = Some(Vec::new());
+        assert!(matches!(
+            writer.write_until(&mut slot, threshold).unwrap(),
+            WriteStep::Paused
+        ));
+        let prefix = slot.as_ref().unwrap();
+        assert!(
+            prefix.ends_with(b"</head><results>"),
+            "buffered {} bytes before hand-off",
+            prefix.len()
+        );
+
+        let output = std::thread::spawn(move || {
+            writer.finish(&mut slot).unwrap();
+            slot.unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(output, expected);
     }
 
     #[test]

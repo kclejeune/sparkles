@@ -571,7 +571,7 @@ async fn client_disconnect_cancels_explicit_streaming_and_releases_resources() {
 
 /// Graph formats (Turtle, N-Triples, N-Quads, TriG, RDF/XML, RDF Thrift, RDF Protobuf,
 /// RDF/JSON, TriX, native JSON) keep exact parity between `execution=auto` and explicit
-/// `execution=streaming` (single-task pool), both under and over the streaming threshold.
+/// `execution=streaming` below the streaming threshold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graph_formats_exact_parity_across_auto_and_streaming() {
     let s = pool_server(None, None);
