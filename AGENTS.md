@@ -192,10 +192,10 @@ results separately from conversation events.
 
 | Role | Model |
 |---|---|
-| Coordination, dispatch, monitoring and handoff maintenance | GPT-6.1 Sol or Claude Opus 5.5 |
-| Substantive planning, dependencies, validation gates and difficult consults | GPT-6.1 Sol or Claude Opus 5.5 |
-| Implementation requiring substantial engineering judgment | GPT-6.1 Sol or Claude Opus 5.5 |
-| Second-look lanes and consults at critical decisions | Use Claude Fable 5.2 or GPT-6 Astra. Prefer the family that the stalled lane or the consulting session does not use. When neither is available, use the strongest available model in a separate session. |
+| Coordination, dispatch, monitoring and handoff maintenance | GPT-6.2 Sol or Claude Opus 5.5 |
+| Substantive planning, dependencies, validation gates and difficult consults | GPT-6.2 Sol or Claude Opus 5.5 |
+| Implementation requiring substantial engineering judgment | GPT-6.2 Sol or Claude Opus 5.5 |
+| Second-look lanes and consults at critical decisions | Use Claude Fable 5.2 or GPT-6.2 Astra. Prefer the family that the stalled lane or the consulting session does not use. When neither is available, use the strongest available model in a separate session. |
 | Easy, nearly trivial tasks and the execution of a plan that fixes every step | GPT-6.1 Terra or Claude Sonnet 5.5 |
 | Code review and finding validation | Prefer GPT-6.2 Sol. GPT-6.1 Terra may review a nearly trivial change. Claude Opus 5.5 may review when an independent perspective helps. |
 | Mechanical tasks with an exact rule | A plain script. |
@@ -226,7 +226,7 @@ perspective on difficult work. Model availability or
 quota pressure must not lower the required standard of reasoning or verification, and
 review always uses a separate agent, even when it runs the author's model.
 
-Codex runs GPT-6.1 Sol and Terra at high effort for every task, and GPT-6 Astra at high
+Codex runs GPT-6.2 Sol and GPT-6.1 Terra at high effort for every task, and GPT-6.2 Astra at high
 effort when it takes a second-look lane or a consult at a critical decision. Claude Opus
 runs at medium effort by default, and at high effort for the judgment-sensitive work
 above and for validating findings and planning fixes on that work.
