@@ -190,24 +190,26 @@ impl Eqs<'_> {
         }
     }
 
-    /// The premises whose maximal literals mention `t`, each with its literal and whether
+    /// Visits each premise whose maximal literal mentions `t`, with its literal and whether
     /// its clause is selected: the stored clauses, and the units in place of a context
-    /// other than the root.
-    fn targets(&self, st: &State, t: RTerm, out: &mut Vec<(Side, XLit, bool)>) {
-        out.clear();
+    /// other than the root, without cloning the whole target list upfront.
+    fn for_each_target(&self, st: &State, t: RTerm, mut f: impl FnMut(&Side, XLit, bool)) {
         if !self.root {
+            let u = unit();
             match t {
                 RTerm::X => {
                     for &a in &st.subs {
                         if a != TOP {
-                            out.push((unit(), XLit::Atom(a, RTerm::X), false));
+                            f(&u, XLit::Atom(a, RTerm::X), false);
                         }
                     }
                 }
                 RTerm::Fx(e) => {
                     let mut us = Vec::new();
                     unit_lits(self, st, e, &mut us);
-                    out.extend(us.into_iter().map(|l| (unit(), l, false)));
+                    for l in us {
+                        f(&u, l, false);
+                    }
                 }
                 _ => {}
             }
@@ -222,7 +224,8 @@ impl Eqs<'_> {
                 continue;
             }
             for &l in d.store.maxima(i) {
-                out.push((side(&s.c, l), self.view(l), s.sel));
+                let c2 = side(&s.c, l);
+                f(&c2, self.view(l), s.sel);
             }
         }
     }
@@ -236,7 +239,6 @@ impl Eqs<'_> {
         found.rule = "eqmax";
         let v = self.view(l);
         let mut made = Vec::new();
-        let mut ts = Vec::new();
         if let XLit::Eq(a, b) = v {
             for (s1, t1) in [(a, b), (b, a)] {
                 if Rooted::a_gt(t1, s1) {
@@ -250,19 +252,18 @@ impl Eqs<'_> {
                 if !Eqs::orients(s1, t1) {
                     continue;
                 }
-                self.targets(st, s1, &mut ts);
-                for (c2, v2, sel2) in &ts {
-                    if *v2 == v && c2 == prem || !self.admits(s1, t1, *v2, c2) {
-                        continue;
+                self.for_each_target(st, s1, |c2, v2, sel2| {
+                    if v2 == v && c2 == prem || !self.admits(s1, t1, v2, c2) {
+                        return;
                     }
-                    if (sel || *sel2) && !(local(v) || local(*v2)) {
-                        continue;
+                    if (sel || sel2) && !(local(v) || local(v2)) {
+                        return;
                     }
                     made.clear();
-                    self.rewrites(*v2, s1, t1, &mut made);
+                    self.rewrites(v2, s1, t1, &mut made);
                     found.rule = shape("eq", s1, t1);
-                    self.push(found, prem, c2, &made, no_xy(v) && no_xy(*v2));
-                }
+                    self.push(found, prem, c2, &made, no_xy(v) && no_xy(v2));
+                });
             }
         }
         self.into(st, v, prem, found, sel);

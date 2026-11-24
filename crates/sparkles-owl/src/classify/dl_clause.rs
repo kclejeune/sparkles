@@ -17,10 +17,204 @@
 //! with `RF` above `F` within one symbol, and `F` literals by atom.
 
 use super::index::{Ex, Index, Node, Role};
+use super::saturate::Sink;
+#[cfg(test)]
 use super::saturate::table_bytes;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+/// Bucket count of a hashbrown table with `capacity` usable slots.
+#[inline]
+fn hash_buckets(capacity: usize) -> Option<usize> {
+    if capacity == 0 {
+        Some(0)
+    } else if capacity < 4 {
+        Some(4)
+    } else if capacity < 8 {
+        Some(8)
+    } else {
+        capacity
+            .checked_mul(8)?
+            .checked_div(7)?
+            .checked_next_power_of_two()
+    }
+}
+
+/// Allocation size of a hashbrown table with `buckets` slots of `entry_size` bytes plus
+/// its control bytes and 16-byte SIMD clone trailer.
+#[inline]
+fn table_layout_bytes(buckets: usize, entry_size: usize) -> Option<usize> {
+    if buckets == 0 {
+        return Some(0);
+    }
+    let data = buckets.checked_mul(entry_size)?;
+    let ctrl_offset = data.checked_add(15)? & !15;
+    ctrl_offset.checked_add(buckets)?.checked_add(16)
+}
+
+/// Exact heap allocation size of a `FxHashMap`/`FxHashSet` with `capacity` slots of
+/// `entry_size` bytes.
+#[inline]
+pub(super) fn hash_table_bytes(capacity: usize, entry_size: usize) -> usize {
+    hash_buckets(capacity)
+        .and_then(|b| table_layout_bytes(b, entry_size))
+        .unwrap_or(usize::MAX)
+}
+
+/// Allocation size of the next hashbrown table when a table at `capacity` rehashes.
+#[inline]
+pub(super) fn next_hash_table_bytes(capacity: usize, entry_size: usize) -> Option<usize> {
+    let cur = hash_buckets(capacity)?;
+    let next = if cur == 0 { 4 } else { cur.checked_mul(2)? };
+    table_layout_bytes(next, entry_size)
+}
+
+/// Upper bound on peak new-table allocation when inserting `add` new keys into a hashbrown
+/// table with current `len` and `cap`.
+pub(super) fn hash_table_grow_bound(
+    len: usize,
+    cap: usize,
+    add: usize,
+    entry_size: usize,
+) -> Option<usize> {
+    if add == 0 {
+        return Some(0);
+    }
+    let end = len.checked_add(add)?;
+    if end <= cap {
+        return Some(0);
+    }
+    let cur = hash_buckets(cap)?;
+    let next = if cur == 0 { 4 } else { cur.checked_mul(2)? };
+    let target = hash_buckets(end)?.max(next);
+    let full = table_layout_bytes(target, entry_size)?;
+    if target > next {
+        full.checked_add(table_layout_bytes(target / 2, entry_size)?)
+    } else {
+        Some(full)
+    }
+}
+
+/// Next capacity of a `Vec<T>` when `len == cap` (matching `alloc::raw_vec` growth).
+#[inline]
+pub(super) fn next_vec_cap(cap: usize, elem_size: usize) -> Option<usize> {
+    if cap == 0 {
+        Some(if elem_size == 1 {
+            8
+        } else if elem_size <= 1024 {
+            4
+        } else {
+            1
+        })
+    } else {
+        cap.checked_mul(2)
+    }
+}
+
+/// Upper bound on the new buffer allocation when pushing one element to `v` (0 when spare
+/// capacity remains, full new buffer size when reallocating).
+#[inline]
+pub(super) fn vec_grow_bound<T>(v: &Vec<T>) -> Option<usize> {
+    if v.len() < v.capacity() {
+        Some(0)
+    } else {
+        next_vec_cap(v.capacity(), std::mem::size_of::<T>())?.checked_mul(std::mem::size_of::<T>())
+    }
+}
+
+/// Pushes `x` to `v` and returns the exact retained capacity increase in bytes.
+#[inline]
+pub(super) fn vec_push_delta<T>(v: &mut Vec<T>, x: T) -> usize {
+    let before = v.capacity();
+    v.push(x);
+    (v.capacity() - before) * std::mem::size_of::<T>()
+}
+
+/// Upper bound on peak allocation when inserting `x` into `set` (0 when already present or
+/// spare capacity remains).
+#[inline]
+pub(super) fn set_insert_bound<T: Eq + std::hash::Hash>(s: &FxHashSet<T>, x: &T) -> Option<usize> {
+    if s.contains(x) || s.len() < s.capacity() {
+        Some(0)
+    } else {
+        next_hash_table_bytes(s.capacity(), std::mem::size_of::<T>())
+    }
+}
+
+/// Inserts `x` into `set` and returns `Some(delta_bytes)` when `x` was new, `None` when
+/// already present.
+#[inline]
+pub(super) fn set_insert_delta<T: Eq + std::hash::Hash>(
+    s: &mut FxHashSet<T>,
+    x: T,
+) -> Option<usize> {
+    let before = s.capacity();
+    if !s.insert(x) {
+        return None;
+    }
+    let sz = std::mem::size_of::<T>();
+    Some(hash_table_bytes(s.capacity(), sz).saturating_sub(hash_table_bytes(before, sz)))
+}
+
+/// Upper bound on peak allocation when pushing one element into `m.entry(k).or_default()`.
+pub(super) fn map_vec_push_bound<K: Eq + std::hash::Hash, T>(
+    m: &FxHashMap<K, Vec<T>>,
+    k: &K,
+) -> Option<usize> {
+    if let Some(v) = m.get(k) {
+        vec_grow_bound(v)
+    } else {
+        let map_grow = if m.len() >= m.capacity() {
+            next_hash_table_bytes(m.capacity(), std::mem::size_of::<(K, Vec<T>)>())?
+        } else {
+            0
+        };
+        let vec_alloc =
+            next_vec_cap(0, std::mem::size_of::<T>())?.checked_mul(std::mem::size_of::<T>())?;
+        map_grow.checked_add(vec_alloc)
+    }
+}
+
+/// Pushes `x` into `m.entry(k).or_default()` and returns exact retained byte growth.
+#[inline]
+pub(super) fn map_vec_push<K: Eq + std::hash::Hash, T>(
+    m: &mut FxHashMap<K, Vec<T>>,
+    k: K,
+    x: T,
+) -> usize {
+    let entry = std::mem::size_of::<(K, Vec<T>)>();
+    let before_table = hash_table_bytes(m.capacity(), entry);
+    let v = m.entry(k).or_default();
+    let list_delta = vec_push_delta(v, x);
+    hash_table_bytes(m.capacity(), entry).saturating_sub(before_table) + list_delta
+}
+
+/// Pushes `x` into `m.entry(k).or_default()` unless it is already the last element, and
+/// returns exact retained byte growth.
+#[inline]
+pub(super) fn map_vec_push_dedup<K: Eq + std::hash::Hash, T: PartialEq>(
+    m: &mut FxHashMap<K, Vec<T>>,
+    k: K,
+    x: T,
+) -> usize {
+    let entry = std::mem::size_of::<(K, Vec<T>)>();
+    let before_table = hash_table_bytes(m.capacity(), entry);
+    let v = m.entry(k).or_default();
+    if v.last() == Some(&x) {
+        return hash_table_bytes(m.capacity(), entry).saturating_sub(before_table);
+    }
+    let list_delta = vec_push_delta(v, x);
+    hash_table_bytes(m.capacity(), entry).saturating_sub(before_table) + list_delta
+}
+
+/// Exact retained bytes of a `FxHashMap<K, Vec<T>>` (table + inner vector capacities).
+pub(super) fn map_vec_bytes<K, T>(m: &FxHashMap<K, Vec<T>>) -> usize {
+    hash_table_bytes(m.capacity(), std::mem::size_of::<(K, Vec<T>)>())
+        + m.values()
+            .map(|v| v.capacity() * std::mem::size_of::<T>())
+            .sum::<usize>()
+}
 
 /// One literal, packed: its kind in the top three bits, a function symbol in the next 29,
 /// and an atom, a role or a term in the low 32. The packed order sorts a clause's literals.
@@ -290,9 +484,78 @@ impl Lits {
             id
         });
         let entry = std::mem::size_of::<(XLit, u32)>();
-        let grown = table_bytes(ids.capacity(), entry).saturating_sub(table_bytes(cap, entry));
+        let grown =
+            hash_table_bytes(ids.capacity(), entry).saturating_sub(hash_table_bytes(cap, entry));
         self.bytes.fetch_add(grown, Ordering::Relaxed);
         Made::Lit(Lit::xl(id))
+    }
+
+    /// [`Lits::lit`], pre-admitting any hash-table rehash or new segment allocation against
+    /// Checks whether `l` is already packed or interned without allocating. Returns
+    /// `Ok(made)` if no interning allocation is needed, or `Err(bound)` with the peak
+    /// growth bound (`None` on overflow) required before calling [`Lits::lit`].
+    pub fn lit_prepare(
+        &self,
+        l: XLit,
+        inv: impl Fn(Role) -> Option<Role> + Copy,
+    ) -> Result<Made, Option<usize>> {
+        use RTerm::*;
+        let packed = match l {
+            XLit::Atom(a, X) => Some(Lit::x(a)),
+            XLit::Atom(a, Y) => Some(Lit::y(a)),
+            XLit::Atom(a, Fx(e)) => Some(Lit::f(e, a)),
+            XLit::Role(s, Y, X) => Some(Lit::ry(s)),
+            XLit::Role(s, X, Y) => inv(s).map(Lit::ry),
+            XLit::Role(s, X, Fx(f)) => Some(Lit::rl(f, s)),
+            XLit::Role(s, Fx(f), X) => inv(s).map(|i| Lit::rl(f, i)),
+            XLit::Eq(a, b) if a == b => return Ok(Made::True),
+            XLit::Ne(a, b) if a == b => return Ok(Made::False),
+            XLit::Eq(a, b) => packed_pair(EQ, a, b),
+            XLit::Ne(a, b) => packed_pair(NE, a, b),
+            _ => None,
+        };
+        if let Some(p) = packed {
+            return Ok(Made::Lit(p));
+        }
+        let l = l.canon(inv);
+        let entry = std::mem::size_of::<(XLit, u32)>();
+        let ids = self.ids.lock();
+        if let Some(&id) = ids.get(&l) {
+            return Ok(Made::Lit(Lit::xl(id)));
+        }
+        let map_grow = if ids.len() >= ids.capacity() {
+            next_hash_table_bytes(ids.capacity(), entry)
+        } else {
+            Some(0)
+        };
+        let seg_grow = self.recs.next_seg_bytes(self.next.load(Ordering::Relaxed));
+        Err(map_grow.and_then(|m| m.checked_add(seg_grow)))
+    }
+
+    /// `out` before growing `self`. Returns `None` when the run refuses the growth.
+    pub fn lit_admitted<S: Sink>(
+        &self,
+        l: XLit,
+        inv: impl Fn(Role) -> Option<Role> + Copy,
+        out: &mut S,
+    ) -> Option<Made> {
+        match self.lit_prepare(l, inv) {
+            Ok(m) => Some(m),
+            Err(None) => {
+                out.data_overflow();
+                None
+            }
+            Err(Some(need)) => {
+                if need > 0 && !out.admit_dl(need) {
+                    return None;
+                }
+                let made = self.lit(l, inv);
+                if need > 0 {
+                    out.commit_dl(need, 0);
+                }
+                Some(made)
+            }
+        }
     }
 
     /// Whether a head holds an equality and the inequality of the same terms, in any
@@ -771,6 +1034,17 @@ impl<T> Default for Segs<T> {
 }
 
 impl<T> Segs<T> {
+    /// Bytes of the segment that `id` would allocate if not yet initialized.
+    fn next_seg_bytes(&self, id: u32) -> usize {
+        let off = id as usize;
+        let k = (off / SEG0 + 1).ilog2() as usize;
+        if self.segs[k].get().is_some() {
+            0
+        } else {
+            (SEG0 << k) * std::mem::size_of::<OnceLock<T>>()
+        }
+    }
+
     /// The slot of entry `id`, whose segment is made on first use and its bytes added to
     /// `bytes`.
     fn slot(&self, id: u32, bytes: &AtomicUsize) -> &OnceLock<T> {
@@ -859,6 +1133,7 @@ pub struct Store {
     by_succ: FxHashMap<Lit, Vec<u32>>,
     /// the bytes that processing added to the indexes beyond what [`Store::add`]
     /// answered, which [`Store::take_grown`] hands to the run's estimate
+    #[cfg(test)]
     grown: usize,
     /// the processed clauses whose maximal literal is a role literal `s(x, f(x))`, by s
     pub by_rl: FxHashMap<u32, Vec<u32>>,
@@ -889,7 +1164,9 @@ pub struct Store {
     by_last: FxHashMap<Lit, Vec<u32>>,
     /// the clauses with an empty head
     empty: Vec<u32>,
-    bytes: usize,
+    /// exact heap bytes owned by this store across `clauses`, `c.lits`, `queue`, `preds`,
+    /// `empty`, all index maps and their inner vectors, `multi`, and `terms`
+    owned_bytes: usize,
     /// whether a stop of the run cut off an inference of the rules, whose conclusions the
     /// store may lack
     pub interrupted: bool,
@@ -897,27 +1174,42 @@ pub struct Store {
 
 impl Store {
     pub fn bytes(&self) -> usize {
-        self.bytes
-            + self.clauses.capacity() * std::mem::size_of::<Stored>()
-            + table_bytes(self.by_x.capacity(), 32)
-            + table_bytes(self.by_f.capacity(), 32)
-            + table_bytes(self.by_succ.capacity(), 32)
-            + table_bytes(self.by_rl.capacity(), 32)
-            + table_bytes(self.by_cert.capacity(), 32)
-            + table_bytes(self.by_eq.capacity(), 32)
-            + table_bytes(self.by_lit.capacity(), 32)
-            + table_bytes(self.by_last.capacity(), 32)
-            + table_bytes(self.multi.capacity(), 24)
-            + self.multi.values().map(|m| m.len() * 8).sum::<usize>()
-            + table_bytes(self.by_xl.capacity(), 32)
-            + self.by_xl.values().map(|v| v.capacity() * 4).sum::<usize>()
-            + self.terms.as_ref().map_or(0, |t| t.bytes())
-            + table_bytes(self.by_ground.capacity(), 32)
+        self.owned_bytes
+    }
+
+    /// Full independent scan of every heap allocation owned by this store, for invariant
+    /// assertions and tests.
+    #[cfg(test)]
+    pub(super) fn scan_bytes(&self) -> usize {
+        self.clauses.capacity() * std::mem::size_of::<Stored>()
             + self
-                .by_ground
-                .values()
-                .map(|v| v.capacity() * 4)
+                .clauses
+                .iter()
+                .map(|s| s.c.lits.len() * std::mem::size_of::<Lit>())
                 .sum::<usize>()
+            + self.queue.capacity() * std::mem::size_of::<std::cmp::Reverse<(u32, u32)>>()
+            + self.preds.capacity() * std::mem::size_of::<u32>()
+            + self.empty.capacity() * std::mem::size_of::<u32>()
+            + map_vec_bytes(&self.by_x)
+            + map_vec_bytes(&self.by_f)
+            + map_vec_bytes(&self.by_succ)
+            + map_vec_bytes(&self.by_rl)
+            + map_vec_bytes(&self.by_cert)
+            + map_vec_bytes(&self.by_eq)
+            + map_vec_bytes(&self.by_lit)
+            + map_vec_bytes(&self.by_last)
+            + hash_table_bytes(
+                self.multi.capacity(),
+                std::mem::size_of::<(u32, Box<[Lit]>)>(),
+            )
+            + self
+                .multi
+                .values()
+                .map(|m| m.len() * std::mem::size_of::<Lit>())
+                .sum::<usize>()
+            + map_vec_bytes(&self.by_xl)
+            + self.terms.as_ref().map_or(0, |t| t.bytes())
+            + map_vec_bytes(&self.by_ground)
     }
 
     pub fn is_idle(&self) -> bool {
@@ -941,161 +1233,488 @@ impl Store {
             .any(|l| self.by_last.get(l).is_some_and(|ids| check(ids)))
     }
 
-    /// Adds a clause that is not subsumed, marks dead those it subsumes, and queues it.
-    /// The answer is the number of bytes it added, or `None` when it was subsumed.
-    pub fn add(&mut self, c: Clause) -> Option<usize> {
-        let sig = c.sig();
-        if self.subsumed(&c, sig) {
-            return None;
+    /// Upper bound on peak allocation (including reallocation overlap) needed by
+    /// [`Store::add_unchecked`] for `c`.
+    fn add_growth_bound(&self, c: &Clause) -> Option<usize> {
+        let mut bound = c.lits.len().checked_mul(std::mem::size_of::<Lit>())?;
+        bound = bound.checked_add(vec_grow_bound(&self.clauses)?)?;
+        if self.queue.len() >= self.queue.capacity() {
+            let q = next_vec_cap(
+                self.queue.capacity(),
+                std::mem::size_of::<std::cmp::Reverse<(u32, u32)>>(),
+            )?
+            .checked_mul(std::mem::size_of::<std::cmp::Reverse<(u32, u32)>>())?;
+            bound = bound.checked_add(q)?;
         }
+        match c.head().last() {
+            None => bound = bound.checked_add(vec_grow_bound(&self.empty)?)?,
+            Some(l) => bound = bound.checked_add(map_vec_push_bound(&self.by_last, l)?)?,
+        }
+        let new_vec =
+            next_vec_cap(0, std::mem::size_of::<u32>())?.checked_mul(std::mem::size_of::<u32>())?;
+        let mut new_lit_keys = 0usize;
+        let mut new_eq_keys = 0usize;
+        for &l in c.head() {
+            if let Some(v) = self.by_lit.get(&l) {
+                bound = bound.checked_add(vec_grow_bound(v)?)?;
+            } else {
+                new_lit_keys += 1;
+                bound = bound.checked_add(new_vec)?;
+            }
+            if matches!(l.kind(), EQ | NE)
+                && let Term::Fun(g) = l.term()
+            {
+                for f in [l.fun(), g] {
+                    if let Some(v) = self.by_eq.get(&f) {
+                        bound = bound.checked_add(vec_grow_bound(v)?)?;
+                    } else {
+                        new_eq_keys += 1;
+                        bound = bound.checked_add(new_vec)?;
+                    }
+                }
+            }
+        }
+        bound = bound.checked_add(hash_table_grow_bound(
+            self.by_lit.len(),
+            self.by_lit.capacity(),
+            new_lit_keys,
+            std::mem::size_of::<(Lit, Vec<u32>)>(),
+        )?)?;
+        bound = bound.checked_add(hash_table_grow_bound(
+            self.by_eq.len(),
+            self.by_eq.capacity(),
+            new_eq_keys,
+            std::mem::size_of::<(Ex, Vec<u32>)>(),
+        )?)?;
+        Some(bound)
+    }
+
+    /// Inserts an unsubsumed clause `c` with signature `sig`, marking backward-subsumed
+    /// clauses dead, and returns the exact retained byte increase.
+    fn add_unchecked(&mut self, c: Clause, sig: u64) -> usize {
         // the clauses it subsumes have every literal of its head
-        let every: Vec<u32>;
-        let weaker: &[u32] = match c.head().first() {
+        match c.head().first() {
             Some(l) => {
                 let pick = c
                     .head()
                     .iter()
                     .min_by_key(|l| self.by_lit.get(l).map_or(0, |v| v.len()))
                     .unwrap_or(l);
-                self.by_lit.get(pick).map_or(&[][..], |v| v.as_slice())
+                if let Some(weaker) = self.by_lit.get(pick) {
+                    for &i in weaker {
+                        let s = &mut self.clauses[i as usize];
+                        if sig & !s.sig == 0 && !s.dead && c.subsumes(&s.c) {
+                            s.dead = true;
+                        }
+                    }
+                }
             }
             None => {
-                every = (0..self.clauses.len() as u32).collect();
-                &every
-            }
-        };
-        for &i in weaker {
-            let s = &mut self.clauses[i as usize];
-            if sig & !s.sig == 0 && !s.dead && c.subsumes(&s.c) {
-                s.dead = true;
+                for s in &mut self.clauses {
+                    if sig & !s.sig == 0 && !s.dead && c.subsumes(&s.c) {
+                        s.dead = true;
+                    }
+                }
             }
         }
         let id = self.clauses.len() as u32;
-        // the head's entries in the literal indexes, the queue's entry, and the entries in
-        // the maximal-literal indexes once processed; the index by successor literal counts
-        // its own growth as it is made
-        let bytes = c.bytes() + 8 * (c.head().len() + 2) + 8;
+        let mut delta = c.lits.len() * std::mem::size_of::<Lit>();
         match c.head().last() {
-            None => self.empty.push(id),
-            Some(&l) => self.by_last.entry(l).or_default().push(id),
+            None => delta += vec_push_delta(&mut self.empty, id),
+            Some(&l) => delta += map_vec_push(&mut self.by_last, l, id),
         }
         for &l in c.head() {
-            self.by_lit.entry(l).or_default().push(id);
+            delta += map_vec_push(&mut self.by_lit, l, id);
             if matches!(l.kind(), EQ | NE)
                 && let Term::Fun(g) = l.term()
             {
                 for f in [l.fun(), g] {
-                    let v = self.by_eq.entry(f).or_default();
-                    if v.last() != Some(&id) {
-                        v.push(id);
+                    delta += map_vec_push_dedup(&mut self.by_eq, f, id);
+                }
+            }
+        }
+        let q_cap = self.queue.capacity();
+        self.queue.push(std::cmp::Reverse((priority(&c), id)));
+        delta +=
+            (self.queue.capacity() - q_cap) * std::mem::size_of::<std::cmp::Reverse<(u32, u32)>>();
+        delta += vec_push_delta(
+            &mut self.clauses,
+            Stored {
+                c,
+                sig,
+                dead: false,
+                done: false,
+                sent: None,
+                max: None,
+                sel: false,
+            },
+        );
+        self.owned_bytes += delta;
+        delta
+    }
+
+    /// Adds a clause that is not subsumed, marks dead those it subsumes, and queues it.
+    /// The answer is the exact retained bytes it added, or `None` when it was subsumed.
+    #[cfg(test)]
+    pub fn add(&mut self, c: Clause) -> Option<usize> {
+        let sig = c.sig();
+        if self.subsumed(&c, sig) {
+            return None;
+        }
+        Some(self.add_unchecked(c, sig))
+    }
+
+    /// Pre-admits peak growth against `out`, then adds `c` if not subsumed and commits its
+    /// exact retained growth. Returns `false` and marks `interrupted` without mutating or
+    /// allocating when `out` refuses the growth.
+    pub fn add_admitted<S: Sink>(&mut self, c: Clause, out: &mut S) -> bool {
+        let sig = c.sig();
+        if self.subsumed(&c, sig) {
+            return true;
+        }
+        let Some(bound) = self.add_growth_bound(&c) else {
+            out.data_overflow();
+            self.interrupted = true;
+            return false;
+        };
+        if !out.admit_dl(bound) {
+            self.interrupted = true;
+            return false;
+        }
+        let delta = self.add_unchecked(c, sig);
+        out.commit_dl(bound, delta);
+        true
+    }
+
+    /// Upper bound on peak allocation needed to index processed clause `id` with maximal
+    /// literals `max`.
+    fn next_growth_bound(
+        &self,
+        ix: &Index,
+        rooted: Option<&Rooted>,
+        id: u32,
+        max: &[Lit],
+    ) -> Option<usize> {
+        let mut bound = 0usize;
+        if max.is_empty() && rooted.is_none() {
+            bound = bound.checked_add(vec_grow_bound(&self.preds)?)?;
+        }
+        if max.len() > 1 {
+            bound = bound.checked_add(max.len().checked_mul(std::mem::size_of::<Lit>())?)?;
+            bound = bound.checked_add(hash_table_grow_bound(
+                self.multi.len(),
+                self.multi.capacity(),
+                1,
+                std::mem::size_of::<(u32, Box<[Lit]>)>(),
+            )?)?;
+        }
+        let new_vec =
+            next_vec_cap(0, std::mem::size_of::<u32>())?.checked_mul(std::mem::size_of::<u32>())?;
+        let (mut nx, mut nxl, mut nf, mut nsucc, mut nrl) = (0usize, 0, 0, 0, 0);
+        for &l in max {
+            match l.kind() {
+                X => {
+                    if let Some(v) = self.by_x.get(&l.atom()) {
+                        bound = bound.checked_add(vec_grow_bound(v)?)?;
+                    } else {
+                        nx += 1;
+                        bound = bound.checked_add(new_vec)?;
+                    }
+                }
+                XL => {
+                    if let Some(v) = self.by_xl.get(&l) {
+                        bound = bound.checked_add(vec_grow_bound(v)?)?;
+                    } else {
+                        nxl += 1;
+                        bound = bound.checked_add(new_vec)?;
+                    }
+                }
+                RL => {
+                    if let Some(v) = self.by_f.get(&l.fun()) {
+                        bound = bound.checked_add(vec_grow_bound(v)?)?;
+                    } else {
+                        nf += 1;
+                        bound = bound.checked_add(new_vec)?;
+                    }
+                    if let Some(v) = self.by_succ.get(&l) {
+                        bound = bound.checked_add(vec_grow_bound(v)?)?;
+                    } else {
+                        nsucc += 1;
+                        bound = bound.checked_add(new_vec)?;
+                    }
+                    if let Some(v) = self.by_rl.get(&l.atom()) {
+                        bound = bound.checked_add(vec_grow_bound(v)?)?;
+                    } else {
+                        nrl += 1;
+                        bound = bound.checked_add(new_vec)?;
+                    }
+                }
+                _ => {
+                    if let Some(v) = self.by_f.get(&l.fun()) {
+                        bound = bound.checked_add(vec_grow_bound(v)?)?;
+                    } else {
+                        nf += 1;
+                        bound = bound.checked_add(new_vec)?;
+                    }
+                    if let Some(v) = self.by_succ.get(&l) {
+                        bound = bound.checked_add(vec_grow_bound(v)?)?;
+                    } else {
+                        nsucc += 1;
+                        bound = bound.checked_add(new_vec)?;
                     }
                 }
             }
         }
-        self.queue.push(std::cmp::Reverse((priority(&c), id)));
-        self.clauses.push(Stored {
-            c,
-            sig,
-            dead: false,
-            done: false,
-            sent: None,
-            max: None,
-            sel: false,
-        });
-        self.bytes += bytes;
-        Some(bytes)
+        bound = bound.checked_add(hash_table_grow_bound(
+            self.by_x.len(),
+            self.by_x.capacity(),
+            nx,
+            std::mem::size_of::<(Ex, Vec<u32>)>(),
+        )?)?;
+        bound = bound.checked_add(hash_table_grow_bound(
+            self.by_xl.len(),
+            self.by_xl.capacity(),
+            nxl,
+            std::mem::size_of::<(Lit, Vec<u32>)>(),
+        )?)?;
+        bound = bound.checked_add(hash_table_grow_bound(
+            self.by_f.len(),
+            self.by_f.capacity(),
+            nf,
+            std::mem::size_of::<(Ex, Vec<u32>)>(),
+        )?)?;
+        bound = bound.checked_add(hash_table_grow_bound(
+            self.by_succ.len(),
+            self.by_succ.capacity(),
+            nsucc,
+            std::mem::size_of::<(Lit, Vec<u32>)>(),
+        )?)?;
+        bound = bound.checked_add(hash_table_grow_bound(
+            self.by_rl.len(),
+            self.by_rl.capacity(),
+            nrl,
+            std::mem::size_of::<(u32, Vec<u32>)>(),
+        )?)?;
+        if let Some(o) = rooted {
+            let terms_bound = match self.terms.as_deref() {
+                Some(t) => t.index_all_bound(o, max)?,
+                None => std::mem::size_of::<ByTerm>()
+                    .checked_add(ByTerm::fresh_index_all_bound(o, max)?)?,
+            };
+            bound = bound.checked_add(terms_bound)?;
+            let mut ng = 0usize;
+            for &l in self.clauses[id as usize].c.body() {
+                if l.kind() == XL && o.view(l).is_ground() {
+                    if let Some(v) = self.by_ground.get(&l) {
+                        bound = bound.checked_add(vec_grow_bound(v)?)?;
+                    } else {
+                        ng += 1;
+                        bound = bound.checked_add(new_vec)?;
+                    }
+                }
+            }
+            bound = bound.checked_add(hash_table_grow_bound(
+                self.by_ground.len(),
+                self.by_ground.capacity(),
+                ng,
+                std::mem::size_of::<(Lit, Vec<u32>)>(),
+            )?)?;
+        }
+        if let Some(&l) = max.iter().find(|l| l.kind() == F)
+            && !ix.disjoint_of(ix.head(l.atom())).is_empty()
+        {
+            bound = bound.checked_add(map_vec_push_bound(&self.by_cert, &l.fun())?)?;
+        }
+        Some(bound)
+    }
+
+    /// Marks clause `id` processed and updates every processing index, returning exact
+    /// retained byte growth.
+    fn index_processed(
+        &mut self,
+        ix: &Index,
+        rooted: Option<&Rooted>,
+        id: u32,
+        max: &[Lit],
+    ) -> usize {
+        let mut delta = 0usize;
+        {
+            let s = &mut self.clauses[id as usize];
+            s.done = true;
+            s.max = max.first().copied();
+        }
+        // a rooted run lists the clauses over the predecessor by its own test
+        if max.is_empty() && rooted.is_none() {
+            delta += vec_push_delta(&mut self.preds, id);
+        }
+        if max.len() > 1 {
+            let entry = std::mem::size_of::<(u32, Box<[Lit]>)>();
+            let before = hash_table_bytes(self.multi.capacity(), entry);
+            self.multi.insert(id, max.into());
+            delta += std::mem::size_of_val(max)
+                + hash_table_bytes(self.multi.capacity(), entry).saturating_sub(before);
+        }
+        for &l in max {
+            match l.kind() {
+                X => delta += map_vec_push(&mut self.by_x, l.atom(), id),
+                XL => delta += map_vec_push(&mut self.by_xl, l, id),
+                RL => {
+                    delta += map_vec_push(&mut self.by_f, l.fun(), id);
+                    delta += map_vec_push(&mut self.by_succ, l, id);
+                    delta += map_vec_push(&mut self.by_rl, l.atom(), id);
+                }
+                _ => {
+                    delta += map_vec_push(&mut self.by_f, l.fun(), id);
+                    delta += map_vec_push(&mut self.by_succ, l, id);
+                }
+            }
+        }
+        if let Some(o) = rooted {
+            let fresh = self.terms.is_none();
+            let t = self.terms.get_or_insert_with(Box::default);
+            if fresh {
+                delta += std::mem::size_of::<ByTerm>();
+            }
+            for &l in max {
+                delta += t.index(o.view(l), id);
+            }
+            for &l in self.clauses[id as usize].c.body() {
+                if l.kind() == XL && o.view(l).is_ground() {
+                    delta += map_vec_push(&mut self.by_ground, l, id);
+                }
+            }
+        }
+        if let Some(l) = self.max_of(id, |l| l.kind() == F)
+            && !ix.disjoint_of(ix.head(l.atom())).is_empty()
+        {
+            delta += map_vec_push(&mut self.by_cert, l.fun(), id);
+        }
+        self.owned_bytes += delta;
+        delta
     }
 
     /// The next clause to process, which is marked processed and indexed by its maximal
     /// literals, under the order of a rooted run when `rooted` is given.
+    #[cfg(test)]
     pub fn next(&mut self, ix: &Index, rooted: Option<&Rooted>, max: &mut Vec<Lit>) -> Option<u32> {
         while let Some(std::cmp::Reverse((_, id))) = self.queue.pop() {
-            let s = &mut self.clauses[id as usize];
+            let s = &self.clauses[id as usize];
             if s.dead {
                 continue;
             }
-            s.done = true;
             match rooted {
                 None => s.c.maximal(ix, max),
                 Some(o) => s.c.maximal_rooted(o, max),
             }
-            s.max = max.first().copied();
-            // a rooted run lists the clauses over the predecessor by its own test
-            if max.is_empty() && rooted.is_none() {
-                self.preds.push(id);
-            }
-            if max.len() > 1 {
-                let bytes = table_bytes(self.multi.capacity(), 24);
-                self.multi.insert(id, max.as_slice().into());
-                self.grown +=
-                    max.len() * 8 + table_bytes(self.multi.capacity(), 24).saturating_sub(bytes);
-            }
-            for &l in max.iter() {
-                match l.kind() {
-                    X => self.by_x.entry(l.atom()).or_default().push(id),
-                    XL => {
-                        let table = table_bytes(self.by_xl.capacity(), 32);
-                        let v = self.by_xl.entry(l).or_default();
-                        let cap = v.capacity();
-                        v.push(id);
-                        let list = (v.capacity() - cap) * 4;
-                        self.grown +=
-                            table_bytes(self.by_xl.capacity(), 32).saturating_sub(table) + list;
-                    }
-                    RL => {
-                        self.by_f.entry(l.fun()).or_default().push(id);
-                        self.index_succ(l, id);
-                        self.by_rl.entry(l.atom()).or_default().push(id);
-                    }
-                    _ => {
-                        self.by_f.entry(l.fun()).or_default().push(id);
-                        self.index_succ(l, id);
-                    }
-                }
-            }
-            if let Some(o) = rooted {
-                let before = self.terms.as_ref().map_or(0, |t| t.bytes());
-                let t = self.terms.get_or_insert_with(Box::default);
-                for &l in max.iter() {
-                    t.index(o.view(l), id);
-                }
-                self.grown += t.bytes().saturating_sub(before);
-                let body = self.clauses[id as usize].c.body();
-                let ground: Vec<Lit> = body
-                    .iter()
-                    .copied()
-                    .filter(|&l| l.kind() == XL && o.view(l).is_ground())
-                    .collect();
-                for l in ground {
-                    let table = table_bytes(self.by_ground.capacity(), 32);
-                    let v = self.by_ground.entry(l).or_default();
-                    let cap = v.capacity();
-                    v.push(id);
-                    let list = (v.capacity() - cap) * 4;
-                    self.grown +=
-                        table_bytes(self.by_ground.capacity(), 32).saturating_sub(table) + list;
-                }
-            }
-            if let Some(l) = self.max_of(id, |l| l.kind() == F)
-                && !ix.disjoint_of(ix.head(l.atom())).is_empty()
-            {
-                self.by_cert.entry(l.fun()).or_default().push(id);
-            }
+            let delta = self.index_processed(ix, rooted, id, max);
+            self.grown += delta;
             return Some(id);
         }
         None
     }
 
+    /// Peeks the next live queued clause, computes its maximal literals into `max`, and
+    /// returns `(id, growth_bound)` without popping or mutating processing indexes.
+    pub fn next_prepare(
+        &mut self,
+        ix: &Index,
+        rooted: Option<&Rooted>,
+        max: &mut Vec<Lit>,
+    ) -> Option<(u32, Option<usize>)> {
+        while let Some(&std::cmp::Reverse((_, id))) = self.queue.peek() {
+            if self.clauses[id as usize].dead {
+                self.queue.pop();
+                continue;
+            }
+            match rooted {
+                None => self.clauses[id as usize].c.maximal(ix, max),
+                Some(o) => self.clauses[id as usize].c.maximal_rooted(o, max),
+            }
+            let bound = self.next_growth_bound(ix, rooted, id, max);
+            return Some((id, bound));
+        }
+        None
+    }
+
+    /// Pops and indexes the clause prepared by [`Store::next_prepare`], returning the
+    /// exact retained byte delta.
+    pub fn next_commit(
+        &mut self,
+        ix: &Index,
+        rooted: Option<&Rooted>,
+        id: u32,
+        max: &[Lit],
+    ) -> usize {
+        let popped = self.queue.pop();
+        debug_assert_eq!(popped.map(|r| r.0.1), Some(id));
+        self.index_processed(ix, rooted, id, max)
+    }
+
+    /// Whether the processing queue still holds at least one entry.
+    #[cfg(test)]
+    pub fn has_queued(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// [`Store::next`], pre-admitting peak index growth against `out` before popping or
+    /// mutating any processing index. Leaves the clause queued and marks `interrupted` on
+    /// refusal.
+    pub fn next_admitted<S: Sink>(
+        &mut self,
+        ix: &Index,
+        rooted: Option<&Rooted>,
+        max: &mut Vec<Lit>,
+        out: &mut S,
+    ) -> Option<u32> {
+        let (id, bound) = self.next_prepare(ix, rooted, max)?;
+        let Some(bound) = bound else {
+            out.data_overflow();
+            self.interrupted = true;
+            return None;
+        };
+        if !out.admit_dl(bound) {
+            self.interrupted = true;
+            return None;
+        }
+        let delta = self.next_commit(ix, rooted, id, max);
+        out.commit_dl(bound, delta);
+        Some(id)
+    }
+
+    /// Appends `id` to `self.preds`, pre-admitting vector growth against `out`.
+    pub fn push_pred_admitted<S: Sink>(&mut self, id: u32, out: &mut S) -> bool {
+        let Some(bound) = vec_grow_bound(&self.preds) else {
+            out.data_overflow();
+            self.interrupted = true;
+            return false;
+        };
+        if !out.admit_dl(bound) {
+            self.interrupted = true;
+            return false;
+        }
+        let delta = vec_push_delta(&mut self.preds, id);
+        self.owned_bytes += delta;
+        out.commit_dl(bound, delta);
+        true
+    }
+
+    /// Marks every clause with `l` in its head dead in place, without allocating.
+    pub fn kill_head(&mut self, l: Lit) {
+        if let Some(ids) = self.by_lit.get(&l) {
+            for &i in ids {
+                self.clauses[i as usize].dead = true;
+            }
+        }
+    }
+
     /// Indexes a processed clause by its maximal literal over a successor term, and adds
     /// what the table and the list grew by to the bytes the run's estimate has not seen,
     /// since a store can hold as many keys as clauses.
+    #[cfg(test)]
     fn index_succ(&mut self, l: Lit, id: u32) {
-        let table = table_bytes(self.by_succ.capacity(), 32);
-        let list = self.by_succ.entry(l).or_default();
-        let cap = list.capacity();
-        list.push(id);
-        let list = (list.capacity() - cap) * 4;
-        self.grown += table_bytes(self.by_succ.capacity(), 32).saturating_sub(table) + list;
+        let delta = map_vec_push(&mut self.by_succ, l, id);
+        self.owned_bytes += delta;
+        self.grown += delta;
     }
 
     /// The maximal literals of a processed clause.
@@ -1128,21 +1747,9 @@ impl Store {
 
     /// The bytes processing added to the indexes since the last call, for the run's
     /// estimate.
+    #[cfg(test)]
     pub fn take_grown(&mut self) -> usize {
         std::mem::take(&mut self.grown)
-    }
-
-    /// The clauses that are not dead with `l` in the head.
-    pub fn with_head(&self, l: Lit) -> Vec<u32> {
-        self.by_lit
-            .get(&l)
-            .map(|v| {
-                v.iter()
-                    .copied()
-                    .filter(|&i| !self.clauses[i as usize].dead)
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     /// The processed clauses that are not dead whose maximal literals include `X(a)`.
@@ -1198,37 +1805,117 @@ impl Store {
 /// The processed clauses of a rooted run's store by the terms of their maximal literals,
 /// which the Eq rule reads: every clause by each term of a maximal literal, a constant
 /// inside `f(u)` included, and the clauses with a maximal equality by each of its terms.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ByTerm {
     pub any: FxHashMap<RTerm, Vec<u32>>,
     pub eqs: FxHashMap<RTerm, Vec<u32>>,
+    owned_bytes: usize,
+}
+
+impl Default for ByTerm {
+    fn default() -> ByTerm {
+        ByTerm {
+            any: FxHashMap::default(),
+            eqs: FxHashMap::default(),
+            owned_bytes: std::mem::size_of::<ByTerm>(),
+        }
+    }
 }
 
 impl ByTerm {
+    #[cfg(test)]
     pub fn bytes(&self) -> usize {
-        let map = |m: &FxHashMap<RTerm, Vec<u32>>| {
-            table_bytes(m.capacity(), 40) + m.values().map(|v| v.capacity() * 4).sum::<usize>()
-        };
-        std::mem::size_of::<ByTerm>() + map(&self.any) + map(&self.eqs)
+        self.owned_bytes
     }
 
-    fn index(&mut self, l: XLit, id: u32) {
-        let add = |m: &mut FxHashMap<RTerm, Vec<u32>>, t: RTerm| {
-            let v = m.entry(t).or_default();
-            if v.last() != Some(&id) {
-                v.push(id);
-            }
-        };
-        let (ts, n) = terms_of(l);
-        for &t in &ts[..n] {
-            add(&mut self.any, t);
-            if let RTerm::Fc(_, u) = t {
-                add(&mut self.any, RTerm::C(u));
-            }
-            if matches!(l, XLit::Eq(..)) {
-                add(&mut self.eqs, t);
+    fn index_all_bound(&self, o: &Rooted, max: &[Lit]) -> Option<usize> {
+        let new_vec =
+            next_vec_cap(0, std::mem::size_of::<u32>())?.checked_mul(std::mem::size_of::<u32>())?;
+        let mut bound = 0usize;
+        let (mut n_any, mut n_eqs) = (0usize, 0usize);
+        for &l in max {
+            let v = o.view(l);
+            let (ts, n) = terms_of(v);
+            for &t in &ts[..n] {
+                if let Some(list) = self.any.get(&t) {
+                    bound = bound.checked_add(vec_grow_bound(list)?)?;
+                } else {
+                    n_any += 1;
+                    bound = bound.checked_add(new_vec)?;
+                }
+                if let RTerm::Fc(_, u) = t {
+                    let c = RTerm::C(u);
+                    if let Some(list) = self.any.get(&c) {
+                        bound = bound.checked_add(vec_grow_bound(list)?)?;
+                    } else {
+                        n_any += 1;
+                        bound = bound.checked_add(new_vec)?;
+                    }
+                }
+                if matches!(v, XLit::Eq(..)) {
+                    if let Some(list) = self.eqs.get(&t) {
+                        bound = bound.checked_add(vec_grow_bound(list)?)?;
+                    } else {
+                        n_eqs += 1;
+                        bound = bound.checked_add(new_vec)?;
+                    }
+                }
             }
         }
+        let entry = std::mem::size_of::<(RTerm, Vec<u32>)>();
+        bound = bound.checked_add(hash_table_grow_bound(
+            self.any.len(),
+            self.any.capacity(),
+            n_any,
+            entry,
+        )?)?;
+        bound = bound.checked_add(hash_table_grow_bound(
+            self.eqs.len(),
+            self.eqs.capacity(),
+            n_eqs,
+            entry,
+        )?)?;
+        Some(bound)
+    }
+
+    fn fresh_index_all_bound(o: &Rooted, max: &[Lit]) -> Option<usize> {
+        let new_vec =
+            next_vec_cap(0, std::mem::size_of::<u32>())?.checked_mul(std::mem::size_of::<u32>())?;
+        let (mut n_any, mut n_eqs) = (0usize, 0usize);
+        for &l in max {
+            let v = o.view(l);
+            let (ts, n) = terms_of(v);
+            for &t in &ts[..n] {
+                n_any += 1;
+                if matches!(t, RTerm::Fc(..)) {
+                    n_any += 1;
+                }
+                if matches!(v, XLit::Eq(..)) {
+                    n_eqs += 1;
+                }
+            }
+        }
+        let entry = std::mem::size_of::<(RTerm, Vec<u32>)>();
+        let mut bound = n_any.checked_add(n_eqs)?.checked_mul(new_vec)?;
+        bound = bound.checked_add(hash_table_grow_bound(0, 0, n_any, entry)?)?;
+        bound = bound.checked_add(hash_table_grow_bound(0, 0, n_eqs, entry)?)?;
+        Some(bound)
+    }
+
+    fn index(&mut self, l: XLit, id: u32) -> usize {
+        let mut delta = 0usize;
+        let (ts, n) = terms_of(l);
+        for &t in &ts[..n] {
+            delta += map_vec_push_dedup(&mut self.any, t, id);
+            if let RTerm::Fc(_, u) = t {
+                delta += map_vec_push_dedup(&mut self.any, RTerm::C(u), id);
+            }
+            if matches!(l, XLit::Eq(..)) {
+                delta += map_vec_push_dedup(&mut self.eqs, t, id);
+            }
+        }
+        self.owned_bytes += delta;
+        delta
     }
 }
 

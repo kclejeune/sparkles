@@ -47,14 +47,18 @@
 //!
 //! The at-most restrictions and the qualified roles of counting are not read in the root.
 
-use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, XL, XLit, terms_of};
+use super::dl_clause::{
+    Clause, Lit, Made, RTerm, Rooted, XL, XLit, hash_table_bytes, map_vec_bytes,
+    map_vec_push_bound, map_vec_push_dedup, set_insert_bound, set_insert_delta, terms_of,
+    vec_grow_bound, vec_push_delta,
+};
 use super::dl_rules::{
     DlIx, DlSt, Found, MREPAIR_CF, MREPAIR_HOLDER, MREPAIR_NO_REPLAY, MREPAIR_NO_RETURN,
     MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, RECORD_SLACK, Side, WORK_READS, alls, dix, dl, drain,
-    drain_with, ds, merge, pred_id, restricted, side, unit, with,
+    drain_with, ds, ds_admit, merge, pred_id, restricted, side, unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
-use super::saturate::{Concl, Sink, State, table_bytes};
+use super::saturate::{Concl, Sink, State};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// What a context of a rooted run keeps for the rules at the constants and over `f_e(u)`.
@@ -131,20 +135,17 @@ struct MRep {
 
 impl MRep {
     fn bytes(&self) -> usize {
-        fn lists<K>(m: &FxHashMap<K, Vec<u32>>) -> usize {
-            table_bytes(m.capacity(), 32) + m.values().map(|v| v.capacity() * 4).sum::<usize>()
-        }
         std::mem::size_of::<MRep>()
-            + table_bytes(self.mheld.capacity(), 8)
-            + lists(&self.rets)
-            + lists(&self.holders)
-            + table_bytes(self.hold_set.capacity(), 16)
-            + lists(&self.held_at)
-            + lists(&self.gbody)
-            + table_bytes(self.reach_set.capacity(), 4)
-            + lists(&self.regs)
-            + table_bytes(self.told.capacity(), 4)
-            + lists(&self.units)
+            + hash_table_bytes(self.mheld.capacity(), std::mem::size_of::<Lit>())
+            + map_vec_bytes(&self.rets)
+            + map_vec_bytes(&self.holders)
+            + hash_table_bytes(self.hold_set.capacity(), std::mem::size_of::<(Ex, Lit)>())
+            + map_vec_bytes(&self.held_at)
+            + map_vec_bytes(&self.gbody)
+            + hash_table_bytes(self.reach_set.capacity(), std::mem::size_of::<Ex>())
+            + map_vec_bytes(&self.regs)
+            + hash_table_bytes(self.told.capacity(), std::mem::size_of::<Ex>())
+            + map_vec_bytes(&self.units)
     }
 }
 
@@ -156,28 +157,20 @@ impl RootSt {
     }
 
     pub fn bytes(&self) -> usize {
-        fn lists<K>(m: &FxHashMap<K, Vec<u32>>) -> usize {
-            table_bytes(m.capacity(), 32) + m.values().map(|v| v.capacity() * 4).sum::<usize>()
-        }
         std::mem::size_of::<RootSt>()
-            + lists(&self.by_const)
-            + lists(&self.roles_of)
-            + lists(&self.edges)
-            + table_bytes(self.edge_set.capacity(), 8)
-            + lists(&self.ready)
-            + table_bytes(self.seen.capacity(), 4)
-            + table_bytes(self.edged.capacity(), 4)
-            + self.ground.capacity() * 8
-            + table_bytes(self.ground_set.capacity(), 8)
-            + table_bytes(self.gsent.capacity(), 16)
-            + table_bytes(self.gmarks.capacity(), 8)
-            + table_bytes(self.succ_set.capacity(), 8)
-            + table_bytes(self.by_succ.capacity(), 32)
-            + self
-                .by_succ
-                .values()
-                .map(|v| v.capacity() * 8)
-                .sum::<usize>()
+            + map_vec_bytes(&self.by_const)
+            + map_vec_bytes(&self.roles_of)
+            + map_vec_bytes(&self.edges)
+            + hash_table_bytes(self.edge_set.capacity(), std::mem::size_of::<(Ex, u32)>())
+            + map_vec_bytes(&self.ready)
+            + hash_table_bytes(self.seen.capacity(), std::mem::size_of::<u32>())
+            + hash_table_bytes(self.edged.capacity(), std::mem::size_of::<u32>())
+            + self.ground.capacity() * std::mem::size_of::<Lit>()
+            + hash_table_bytes(self.ground_set.capacity(), std::mem::size_of::<Lit>())
+            + hash_table_bytes(self.gsent.capacity(), std::mem::size_of::<(Ex, Lit)>())
+            + hash_table_bytes(self.gmarks.capacity(), std::mem::size_of::<Lit>())
+            + hash_table_bytes(self.succ_set.capacity(), std::mem::size_of::<(Ex, u32)>())
+            + map_vec_bytes(&self.by_succ)
             + self.m.as_deref().map_or(0, MRep::bytes)
     }
 
@@ -189,28 +182,52 @@ impl RootSt {
         self.m.as_deref_mut().expect("made by mrep_new")
     }
 
-    /// Inserts `v` into `set`, whose entries take `size` bytes, and answers the bytes the
-    /// set grew by, or `None` when it held v.
-    fn ins<T: std::hash::Hash + Eq>(set: &mut FxHashSet<T>, v: T, size: usize) -> Option<usize> {
-        let cap = set.capacity();
-        if !set.insert(v) {
+    /// Pre-admits and inserts `v` into `set`. Returns `Some(true)` when inserted,
+    /// `Some(false)` when already present, and `None` when refused.
+    fn ins_admit<T: std::hash::Hash + Eq, S: Sink>(
+        set: &mut FxHashSet<T>,
+        v: T,
+        out: &mut S,
+    ) -> Option<bool> {
+        if set.contains(&v) {
+            return Some(false);
+        }
+        let Some(bound) = set_insert_bound(set, &v) else {
+            out.data_overflow();
+            return None;
+        };
+        if bound > 0 && !out.admit_dl(bound) {
             return None;
         }
-        Some(table_bytes(set.capacity(), size).saturating_sub(table_bytes(cap, size)))
+        let delta = set_insert_delta(set, v).unwrap_or(0);
+        if bound > 0 {
+            out.commit_dl(bound, delta);
+        }
+        Some(true)
     }
 
-    /// Adds `id` to the list of `k` in `map`, and answers the bytes the map and the list
-    /// grew by.
-    fn push<K: std::hash::Hash + Eq>(map: &mut FxHashMap<K, Vec<u32>>, k: K, id: u32) -> usize {
-        let table = table_bytes(map.capacity(), 32);
-        let v = map.entry(k).or_default();
-        if v.last() == Some(&id) {
-            return 0;
+    /// Pre-admits and pushes `id` to the list of `k` in `map` unless already last.
+    fn push_admit<K: std::hash::Hash + Eq, S: Sink>(
+        map: &mut FxHashMap<K, Vec<u32>>,
+        k: K,
+        id: u32,
+        out: &mut S,
+    ) -> bool {
+        if map.get(&k).is_some_and(|v| v.last() == Some(&id)) {
+            return true;
         }
-        let cap = v.capacity();
-        v.push(id);
-        let list = (v.capacity() - cap) * 4;
-        table_bytes(map.capacity(), 32).saturating_sub(table) + list
+        let Some(bound) = map_vec_push_bound(map, &k) else {
+            out.data_overflow();
+            return false;
+        };
+        if bound > 0 && !out.admit_dl(bound) {
+            return false;
+        }
+        let delta = map_vec_push_dedup(map, k, id);
+        if bound > 0 {
+            out.commit_dl(bound, delta);
+        }
+        true
     }
 }
 
@@ -236,23 +253,180 @@ fn atom<S: Sink>(ix: &Index, out: &S, a: Ex, u: u32) -> Lit {
     }
 }
 
+/// The literal of `l`, pre-admitting any `Lits` growth against `out`.
+#[inline]
+fn lit_admitted<S: Sink>(ix: &Index, out: &mut S, l: XLit) -> Option<Made> {
+    let inv = inv_of(ix, dix(ix));
+    match out.dl().lits.lit_prepare(l, inv) {
+        Ok(m) => Some(m),
+        Err(None) => {
+            out.data_overflow();
+            None
+        }
+        Err(Some(need)) => {
+            if need > 0 && !out.admit_dl(need) {
+                return None;
+            }
+            let made = out.dl().lits.lit(l, inv);
+            if need > 0 {
+                out.commit_dl(need, 0);
+            }
+            Some(made)
+        }
+    }
+}
+
+/// The literal of a ground atom `a(u)`, pre-admitting any `Lits` growth against `out`.
+#[inline]
+fn atom_admitted<S: Sink>(ix: &Index, out: &mut S, a: Ex, u: u32) -> Option<Lit> {
+    match lit_admitted(ix, out, XLit::Atom(a, RTerm::C(u)))? {
+        Made::Lit(l) => Some(l),
+        _ => unreachable!("an atom is a literal"),
+    }
+}
+
 /// Starts the root: `⊤ → N_u(u)` for every constant u, and what the ontology's clauses with
-/// the body `owl:Thing` give u.
+/// the body `owl:Thing` give u, streamed directly through [`derive`] with pre-admission of
+/// `Lits` and `Store` growth so large constants-times-TOP inputs never accumulate an
+/// unbounded `Found` collection before checking bounds.
 pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
+    const INIT_POLL: usize = 256;
     st.init = true;
-    let r = root_of(ds(st), out);
+    let Some(x) = ds_admit(st, out) else {
+        return;
+    };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return;
+    };
     if out.dl().mrepair & MREPAIR_ON != 0 {
-        mrep_new(r, out);
+        if !mrep_admit(r, out) {
+            x.store.interrupted = true;
+            return;
+        }
         r.mw().reached = true;
     }
-    let mut found = Found::default();
-    found.root = true;
-    found.rule = "init";
-    for &(u, n) in &dix(ix).consts {
-        found.push((Vec::new(), vec![atom(ix, out, n, u)]));
-        hyper_at(ix, st, out, TOP, u, &unit(), &mut found, false);
+    let dx = dix(ix);
+    let top_h = ix.head(TOP);
+    let trace = super::dl_rules::tracing();
+    let emit = |st: &mut State, head: Vec<Lit>, rule: &'static str, out: &mut S| -> bool {
+        if st.bottom {
+            return false;
+        }
+        if out.stopped() {
+            ds(st).store.interrupted = true;
+            return false;
+        }
+        if trace {
+            let lits = &out.dl().lits;
+            eprintln!("TR R {rule} [] -> {}", super::dl_rules::tr(ix, lits, &head));
+        }
+        derive(ix, st, (Vec::new(), head), out);
+        if st.bottom {
+            return false;
+        }
+        if out.stopped() {
+            ds(st).store.interrupted = true;
+            return false;
+        }
+        st.dl_choices += 1;
+        if st.dl_choices as usize >= INIT_POLL {
+            st.dl_choices = 0;
+            if !out.go_on() {
+                ds(st).store.interrupted = true;
+                return false;
+            }
+        }
+        true
+    };
+    for &(u, n) in &dx.consts {
+        if st.bottom {
+            break;
+        }
+        if out.stopped() {
+            ds(st).store.interrupted = true;
+            return;
+        }
+        let Some(nu) = atom_admitted(ix, out, n, u) else {
+            ds(st).store.interrupted = true;
+            return;
+        };
+        if !emit(st, vec![nu], "init", out) {
+            return;
+        }
+        if let Some(es) = dx.ne_of.get(&TOP) {
+            for (i, &a) in es.iter().enumerate() {
+                for &b in &es[i + 1..] {
+                    let Some(m) = lit_admitted(ix, out, XLit::Ne(RTerm::Fc(a, u), RTerm::Fc(b, u)))
+                    else {
+                        ds(st).store.interrupted = true;
+                        return;
+                    };
+                    if let Made::Lit(l) = m
+                        && !emit(st, vec![l], "hyperc", out)
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        for &t in ix.told_of(top_h) {
+            let Some(l) = atom_admitted(ix, out, t, u) else {
+                ds(st).store.interrupted = true;
+                return;
+            };
+            if !emit(st, vec![l], "hyperc", out) {
+                return;
+            }
+        }
+        for &(p, k) in ix.conj_of(top_h) {
+            if p == TOP {
+                let Some(l) = atom_admitted(ix, out, k, u) else {
+                    ds(st).store.interrupted = true;
+                    return;
+                };
+                if !emit(st, vec![l], "hyperc", out) {
+                    return;
+                }
+            }
+        }
+        if let Some(ids) = dx.by_body.get(&TOP) {
+            for &cl in ids {
+                let (body, head) = &dx.clauses[cl as usize];
+                // During init no clause has been processed yet, so only `TOP` has a partner.
+                if !body.iter().all(|&a| a == TOP) {
+                    continue;
+                }
+                let Some(head_bytes) = head.len().checked_mul(std::mem::size_of::<Lit>()) else {
+                    out.data_overflow();
+                    ds(st).store.interrupted = true;
+                    return;
+                };
+                if head_bytes > 0 && !out.admit_data(head_bytes) {
+                    ds(st).store.interrupted = true;
+                    return;
+                }
+                let mut lits = Vec::with_capacity(head.len());
+                for &a in head.iter() {
+                    let Some(l) = atom_admitted(ix, out, a, u) else {
+                        if head_bytes > 0 {
+                            out.release_data(head_bytes);
+                        }
+                        ds(st).store.interrupted = true;
+                        return;
+                    };
+                    lits.push(l);
+                }
+                let ok = emit(st, lits, "hyperc", out);
+                if head_bytes > 0 {
+                    out.release_data(head_bytes);
+                }
+                if !ok {
+                    return;
+                }
+            }
+        }
     }
-    drain_with(ix, st, found, out, derive);
 }
 
 /// Runs the root's rules on up to `budget` clauses of its store, as
@@ -269,23 +443,42 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
         let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) else {
             break;
         };
-        let id = {
+        let ground_total = super::dl_clause::ground_total();
+        let prep = {
             let o = Rooted {
                 ix,
                 lits: &out.dl().lits,
                 inv: &inv,
-                ground_total: super::dl_clause::ground_total(),
+                ground_total,
             };
-            x.store.next(ix, Some(&o), &mut max)
+            x.store.next_prepare(ix, Some(&o), &mut max)
         };
-        let Some(id) = id else {
+        let Some((id, bound)) = prep else {
             break;
         };
-        let grown = x.store.take_grown();
-        if grown > 0 {
-            out.dl().grow(grown);
+        let Some(bound) = bound else {
+            out.data_overflow();
+            x.store.interrupted = true;
+            break;
+        };
+        if !out.admit_dl(bound) {
+            x.store.interrupted = true;
+            break;
         }
+        let delta = {
+            let o = Rooted {
+                ix,
+                lits: &out.dl().lits,
+                inv: &inv,
+                ground_total,
+            };
+            x.store.next_commit(ix, Some(&o), id, &max)
+        };
+        out.commit_dl(bound, delta);
         index_consts(ix, x, &max, id, out);
+        if out.stopped() {
+            break;
+        }
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
         process(ix, st, &c, &max, out);
@@ -306,26 +499,33 @@ pub(super) fn index_consts<S: Sink>(
     x: &mut super::dl_rules::DlSt,
     max: &[Lit],
     id: u32,
-    out: &S,
+    out: &mut S,
 ) {
     let inv = inv_of(ix, dix(ix));
-    let mut grown = 0;
-    let r = root_of(x, out);
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return;
+    };
     for &l in max {
         match out.dl().lits.view(l, inv) {
-            XLit::Atom(_, RTerm::C(u)) => grown += RootSt::push(&mut r.by_const, u, id),
+            XLit::Atom(_, RTerm::C(u)) => {
+                if !RootSt::push_admit(&mut r.by_const, u, id, out) {
+                    x.store.interrupted = true;
+                    return;
+                }
+            }
             XLit::Role(_, a, b) => {
                 for t in [a, b] {
-                    if let RTerm::C(u) = t {
-                        grown += RootSt::push(&mut r.roles_of, u, id);
+                    if let RTerm::C(u) = t
+                        && !RootSt::push_admit(&mut r.roles_of, u, id, out)
+                    {
+                        x.store.interrupted = true;
+                        return;
                     }
                 }
             }
             _ => {}
         }
-    }
-    if grown > 0 {
-        out.dl().grow(grown);
     }
 }
 
@@ -392,13 +592,11 @@ fn at_consts<S: Sink>(
         if let XLit::Atom(a, _) = v {
             super::dl_rules::send_hyp(ix, st, w, a, out);
         }
-        let cids = dl(st)
-            .and_then(|x| x.pred_in.get(&w))
-            .cloned()
-            .unwrap_or_default();
-        for cid in cids {
-            let c = out.dl().table.get(cid);
-            root_pred(ix, st, e, u, c, Some((l, prem)), found, &out.dl().lits);
+        if let Some(cids) = dl(st).and_then(|x| x.pred_in.get(&w)) {
+            for &cid in cids {
+                let c = out.dl().table.get(cid);
+                root_pred(ix, st, e, u, c, Some((l, prem)), found, &out.dl().lits);
+            }
         }
     }
     match v {
@@ -828,8 +1026,8 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
         out.me(Concl::Sub(BOTTOM));
         return;
     }
-    if let Some(bytes) = ds(st).store.add(Clause::new(body, head)) {
-        out.dl().grow(bytes);
+    if let Some(x) = ds_admit(st, out) {
+        let _ = x.store.add_admitted(Clause::new(body, head), out);
     }
 }
 
@@ -968,10 +1166,20 @@ pub fn rpred_c<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bo
     if st.bottom {
         return false;
     }
-    let r = root_of(ds(st), out);
-    match RootSt::ins(&mut r.seen, cid, 4) {
-        Some(b) => out.dl().grow(b),
-        None => return false,
+    let Some(x) = ds_admit(st, out) else {
+        return false;
+    };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return false;
+    };
+    match RootSt::ins_admit(&mut r.seen, cid, out) {
+        Some(true) => {}
+        Some(false) => return false,
+        None => {
+            x.store.interrupted = true;
+            return false;
+        }
     }
     let c = out.dl().table.get(cid);
     debug_assert!(c.body().is_empty(), "the root sends its facts");
@@ -1015,27 +1223,44 @@ fn register<S: Sink>(st: &mut State, v: Ex, mut us: Vec<u32>, out: &mut S) -> bo
     us.sort_unstable();
     us.dedup();
     let bottom = st.bottom;
-    let x = ds(st);
-    let r = root_of(x, out);
-    let mut grown = 0;
+    let Some(x) = ds_admit(st, out) else {
+        return false;
+    };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return false;
+    };
     let mut new = Vec::new();
     let pairs = out.dl().mrepair & (MREPAIR_ON | MREPAIR_WIDE) == MREPAIR_ON;
     for &u in &us {
-        if let Some(b) = RootSt::ins(&mut r.edge_set, (v, u), 8) {
-            grown += b + RootSt::push(&mut r.edges, u, v);
-            // a context the root reaches already takes its markers below, so only one
-            // that it does not reach yet waits for its reach
-            if pairs {
-                mrep_new(r, out);
-                if !r.mr().reach_set.contains(&v) {
-                    grown += RootSt::push(&mut r.mw().regs, v, u);
+        match RootSt::ins_admit(&mut r.edge_set, (v, u), out) {
+            Some(true) => {
+                if !RootSt::push_admit(&mut r.edges, u, v, out) {
+                    x.store.interrupted = true;
+                    return false;
                 }
+                // a context the root reaches already takes its markers below, so only one
+                // that it does not reach yet waits for its reach
+                if pairs {
+                    if !mrep_admit(r, out) {
+                        x.store.interrupted = true;
+                        return false;
+                    }
+                    if !r.mr().reach_set.contains(&v)
+                        && !RootSt::push_admit(&mut r.mw().regs, v, u, out)
+                    {
+                        x.store.interrupted = true;
+                        return false;
+                    }
+                }
+                new.push(u);
             }
-            new.push(u);
+            Some(false) => {}
+            None => {
+                x.store.interrupted = true;
+                return false;
+            }
         }
-    }
-    if grown > 0 {
-        out.dl().grow(grown);
     }
     if new.is_empty() {
         return false;
@@ -1090,14 +1315,16 @@ fn offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S) 
     }
     keys.sort_unstable();
     keys.dedup();
-    let x = ds(st);
-    let r = root_of(x, out);
-    let mut grown = 0;
+    let Some(x) = ds_admit(st, out) else { return };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return;
+    };
     for &u in &keys {
-        grown += RootSt::push(&mut r.ready, u, id);
-    }
-    if grown > 0 {
-        out.dl().grow(grown);
+        if !RootSt::push_admit(&mut r.ready, u, id, out) {
+            x.store.interrupted = true;
+            return;
+        }
     }
     let mut to: Vec<Ex> = keys
         .iter()
@@ -1146,16 +1373,49 @@ fn ground_trigger(v: XLit) -> bool {
 
 /// The context's state for the rules that involve the root, made with its first use and
 /// counted then.
+#[cfg(test)]
 fn rst<'a, S: Sink>(st: &'a mut State, out: &S) -> &'a mut RootSt {
     root_of(ds(st), out)
 }
 
 /// [`rst`] for a context's state for Tier D.
+#[cfg(test)]
 fn root_of<'a, S: Sink>(x: &'a mut super::dl_rules::DlSt, out: &S) -> &'a mut RootSt {
     if x.root.is_none() {
         out.dl().grow(std::mem::size_of::<RootSt>());
     }
     x.root.get_or_insert_with(Box::default)
+}
+
+/// Pre-admits and ensures `x.root` is allocated.
+fn root_admit<'a, S: Sink>(
+    x: &'a mut super::dl_rules::DlSt,
+    out: &mut S,
+) -> Option<&'a mut RootSt> {
+    if x.root.is_some() {
+        return x.root.as_deref_mut();
+    }
+    let need = std::mem::size_of::<RootSt>();
+    if !out.admit_dl(need) {
+        return None;
+    }
+    let r = x.root.get_or_insert_with(Box::default);
+    out.commit_dl(need, need);
+    Some(r)
+}
+
+/// Pre-admits and ensures `r.m` is allocated.
+fn mrep_admit<S: Sink>(r: &mut RootSt, out: &mut S) -> bool {
+    if r.m.is_some() {
+        return true;
+    }
+    let need = std::mem::size_of::<MRep>();
+    if !out.admit_dl(need) {
+        return false;
+    }
+    r.m = Some(Box::default());
+    out.commit_dl(need, need);
+    true
 }
 
 /// The successors of a context: those it registered with over `f_e(x)` and over `f_e(u)`,
@@ -1185,14 +1445,29 @@ fn successors(ix: &Index, st: &State) -> Vec<Ex> {
 /// Succ's ground triggers: a new maximal ground atom or equality of constants of the
 /// context goes to each of its successors as a marker.
 fn ground_out<S: Sink>(ix: &Index, st: &mut State, l: Lit, out: &mut S) {
-    let r = rst(st, out);
-    match RootSt::ins(&mut r.ground_set, l, 8) {
-        Some(b) => {
-            let cap = r.ground.capacity();
-            r.ground.push(l);
-            out.dl().grow(b + (r.ground.capacity() - cap) * 8);
-        }
-        None => return,
+    let Some(x) = ds_admit(st, out) else { return };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return;
+    };
+    if r.ground_set.contains(&l) {
+        return;
+    }
+    let Some(bound) = set_insert_bound(&r.ground_set, &l)
+        .and_then(|a| vec_grow_bound(&r.ground).and_then(|b| a.checked_add(b)))
+    else {
+        out.data_overflow();
+        x.store.interrupted = true;
+        return;
+    };
+    if bound > 0 && !out.admit_dl(bound) {
+        x.store.interrupted = true;
+        return;
+    }
+    let delta =
+        set_insert_delta(&mut r.ground_set, l).unwrap_or(0) + vec_push_delta(&mut r.ground, l);
+    if bound > 0 {
+        out.commit_dl(bound, delta);
     }
     for w in successors(ix, st) {
         send_ground(st, w, l, out);
@@ -1201,10 +1476,15 @@ fn ground_out<S: Sink>(ix: &Index, st: &mut State, l: Lit, out: &mut S) {
 
 /// Sends the successor w the marker of the ground literal l, once.
 fn send_ground<S: Sink>(st: &mut State, w: Ex, l: Lit, out: &mut S) {
-    let r = rst(st, out);
-    if let Some(b) = RootSt::ins(&mut r.gsent, (w, l), 16) {
-        out.dl().grow(b);
-        out.send(w, Concl::HypL(l.xid()));
+    let Some(x) = ds_admit(st, out) else { return };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return;
+    };
+    match RootSt::ins_admit(&mut r.gsent, (w, l), out) {
+        Some(true) => out.send(w, Concl::HypL(l.xid())),
+        Some(false) => {}
+        None => x.store.interrupted = true,
     }
 }
 
@@ -1236,14 +1516,22 @@ pub fn hyp_l<S: Sink>(st: &mut State, xid: u32, out: &mut S) -> bool {
         return false;
     }
     let l = Lit::xl(xid);
-    let r = rst(st, out);
-    let Some(b) = RootSt::ins(&mut r.gmarks, l, 8) else {
+    let Some(x) = ds_admit(st, out) else {
         return false;
     };
-    out.dl().grow(b);
-    if let Some(b) = ds(st).store.add(Clause::new(vec![l], vec![l])) {
-        out.dl().grow(b);
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return false;
+    };
+    match RootSt::ins_admit(&mut r.gmarks, l, out) {
+        Some(true) => {}
+        Some(false) => return false,
+        None => {
+            x.store.interrupted = true;
+            return false;
+        }
     }
+    let _ = x.store.add_admitted(Clause::new(vec![l], vec![l]), out);
     true
 }
 
@@ -1271,11 +1559,19 @@ fn edge_to<S: Sink>(root: Ex, me: Ex, st: &mut State, us: Vec<u32>, out: &mut S)
     if us.is_empty() {
         return;
     }
-    let r = rst(st, out);
+    let Some(x) = ds_admit(st, out) else { return };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return;
+    };
     for u in us {
-        if let Some(b) = RootSt::ins(&mut r.edged, u, 4) {
-            out.dl().grow(b);
-            out.send(root, Concl::REdge(me, u));
+        match RootSt::ins_admit(&mut r.edged, u, out) {
+            Some(true) => out.send(root, Concl::REdge(me, u)),
+            Some(false) => {}
+            None => {
+                x.store.interrupted = true;
+                return;
+            }
         }
     }
 }
@@ -1296,38 +1592,50 @@ fn succ_at<S: Sink>(
     found.rule = "succ";
     let dx = dix(ix);
     let w = dx.hyp.get(&e).copied().unwrap_or(TOP);
-    let r = rst(st, out);
-    let Some(b) = RootSt::ins(&mut r.succ_set, (e, u), 8) else {
+    let Some(x) = ds_admit(st, out) else {
         return w;
     };
-    let table = table_bytes(r.by_succ.capacity(), 32);
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return w;
+    };
+    if r.succ_set.contains(&(e, u)) {
+        return w;
+    }
+    let Some(bound) = set_insert_bound(&r.succ_set, &(e, u))
+        .and_then(|a| map_vec_push_bound(&r.by_succ, &w).and_then(|b| a.checked_add(b)))
+    else {
+        out.data_overflow();
+        x.store.interrupted = true;
+        return w;
+    };
+    if bound > 0 && !out.admit_dl(bound) {
+        x.store.interrupted = true;
+        return w;
+    }
     let fresh = !r.by_succ.contains_key(&w);
-    let list = r.by_succ.entry(w).or_default();
-    let cap = list.capacity();
-    list.push((e, u));
-    let grown = b
-        + (list.capacity() - cap) * 8
-        + table_bytes(r.by_succ.capacity(), 32).saturating_sub(table);
-    out.dl().grow(grown);
+    let delta = set_insert_delta(&mut r.succ_set, (e, u)).unwrap_or(0)
+        + map_vec_push_dedup(&mut r.by_succ, w, (e, u));
+    if bound > 0 {
+        out.commit_dl(bound, delta);
+    }
     out.send(w, Concl::DEdge(me, e));
     if fresh {
         new_succ(st, w, out);
     }
-    let cids = dl(st)
-        .and_then(|x| x.pred_in.get(&w))
-        .cloned()
-        .unwrap_or_default();
-    for cid in cids {
-        root_pred(
-            ix,
-            st,
-            e,
-            u,
-            out.dl().table.get(cid),
-            None,
-            found,
-            &out.dl().lits,
-        );
+    if let Some(cids) = dl(st).and_then(|x| x.pred_in.get(&w)) {
+        for &cid in cids {
+            root_pred(
+                ix,
+                st,
+                e,
+                u,
+                out.dl().table.get(cid),
+                None,
+                found,
+                &out.dl().lits,
+            );
+        }
     }
     w
 }
@@ -1528,12 +1836,27 @@ fn m_note<S: Sink>(
     if m_stopped(st, out) {
         return false;
     }
-    let r = rst(st, out);
-    mrep_new(r, out);
-    if let Some(b) = RootSt::ins(&mut r.mw().mheld, l, 8) {
-        out.worked(1);
-        out.dl().grow(b);
-        out.send(root, Concl::RMark(me, l.xid()));
+    let Some(x) = ds_admit(st, out) else {
+        return false;
+    };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return false;
+    };
+    if !mrep_admit(r, out) {
+        x.store.interrupted = true;
+        return false;
+    }
+    match RootSt::ins_admit(&mut r.mw().mheld, l, out) {
+        Some(true) => {
+            out.worked(1);
+            out.send(root, Concl::RMark(me, l.xid()));
+        }
+        Some(false) => {}
+        None => {
+            x.store.interrupted = true;
+            return false;
+        }
     }
     let cf = cf_of(ix, out);
     if cf.is_some_and(|cf| ground_body(cf, &prem.0)) {
@@ -1562,10 +1885,10 @@ fn m_late<S: Sink>(ix: &Index, st: &mut State, l: Lit, prem: &Side, out: &mut S)
         if st.bottom {
             return true;
         }
-        let Some(cid) = rst(st, out)
-            .mr()
-            .rets
-            .get(&l)
+        let Some(cid) = dl(st)
+            .and_then(|x| x.root.as_deref())
+            .and_then(|r| r.m.as_deref())
+            .and_then(|m| m.rets.get(&l))
             .and_then(|v| v.get(k).copied())
         else {
             break;
@@ -1607,7 +1930,7 @@ fn m_flush<S: Sink>(ix: &Index, st: &mut State, batch: &mut Found, out: &mut S) 
         return false;
     }
     let was = ds(st).store.interrupted;
-    drain(ix, st, b, out);
+    super::dl_rules::drain_covered(ix, st, b, out, true, slack);
     if need > 0 {
         out.release_data(need);
     }
@@ -1627,13 +1950,25 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
     }
     if me == root {
         let bottom = st.bottom;
-        let x = m_dl(st, out);
-        let r = root_of(x, out);
-        mrep_new(r, out);
-        let Some(b) = RootSt::ins(&mut r.mw().reach_set, e, 4) else {
+        let Some(x) = ds_admit(st, out) else {
             return false;
         };
-        out.dl().grow(b);
+        let Some(r) = root_admit(x, out) else {
+            x.store.interrupted = true;
+            return false;
+        };
+        if !mrep_admit(r, out) {
+            x.store.interrupted = true;
+            return false;
+        }
+        match RootSt::ins_admit(&mut r.mw().reach_set, e, out) {
+            Some(true) => {}
+            Some(false) => return false,
+            None => {
+                x.store.interrupted = true;
+                return false;
+            }
+        }
         if bottom {
             return true;
         }
@@ -1643,8 +1978,17 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
         m_registered(x, e, &us, out);
         return true;
     }
-    let r = root_of(m_dl(st, out), out);
-    mrep_new(r, out);
+    let Some(x) = ds_admit(st, out) else {
+        return false;
+    };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return false;
+    };
+    if !mrep_admit(r, out) {
+        x.store.interrupted = true;
+        return false;
+    }
     if r.mr().reached {
         return false;
     }
@@ -1662,11 +2006,22 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
 
 /// A context that the root reaches tells its successor `w` so, once.
 fn m_tell<S: Sink>(st: &mut State, w: Ex, out: &mut S) {
-    let m = rst(st, out).mw();
-    if let Some(b) = RootSt::ins(&mut m.told, w, 4) {
-        out.dl().grow(b);
-        out.send(w, Concl::RReach(TOP));
-        out.worked(1);
+    let Some(x) = ds_admit(st, out) else { return };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return;
+    };
+    if !mrep_admit(r, out) {
+        x.store.interrupted = true;
+        return;
+    }
+    match RootSt::ins_admit(&mut r.mw().told, w, out) {
+        Some(true) => {
+            out.send(w, Concl::RReach(TOP));
+            out.worked(1);
+        }
+        Some(false) => {}
+        None => x.store.interrupted = true,
     }
 }
 
@@ -1678,26 +2033,11 @@ fn m_stopped<S: Sink>(st: &mut State, out: &S) -> bool {
     if !out.stopped() {
         return false;
     }
+    st.interrupted = true;
     if let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) {
         x.store.interrupted = true;
     }
     true
-}
-
-/// The context's state for Tier D, which the repair's reach makes in a context that has
-/// none, such as one of the EL rules only: the run's memory takes the parts it makes.
-fn m_dl<'a, S: Sink>(st: &'a mut State, out: &S) -> &'a mut DlSt {
-    let mut made = 0;
-    if st.extra.is_none() {
-        made += std::mem::size_of::<super::saturate::Extra>();
-    }
-    if dl(st).is_none() {
-        made += std::mem::size_of::<DlSt>();
-    }
-    if made > 0 {
-        out.dl().grow(made);
-    }
-    ds(st)
 }
 
 /// A scan of the repair whose reads mostly send nothing: it counts them, charges a
@@ -1761,6 +2101,7 @@ const M_POLL: usize = 64;
 const M_SCAN: usize = 1024;
 
 /// Makes the repair's state of a context with its first use, and counts it.
+#[cfg(test)]
 fn mrep_new<S: Sink>(r: &mut RootSt, out: &S) {
     if r.m.is_none() {
         out.dl().grow(std::mem::size_of::<MRep>());
@@ -1778,13 +2119,18 @@ fn root_unit(x: &DlSt, l: Lit) -> bool {
         .is_some_and(|v| v.iter().any(|&i| !x.store.clauses[i as usize].dead))
 }
 
-/// The root sends the marker of `l` to the context `d`, once.
-fn m_fwd<S: Sink>(r: &mut RootSt, d: Ex, l: Lit, out: &mut S) {
-    if let Some(b) = RootSt::ins(&mut r.gsent, (d, l), 16) {
-        out.dl().grow(b);
-        out.send(d, Concl::HypL(l.xid()));
-        out.worked(1);
-        out.dl().mcount[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// The root sends the marker of `l` to the context `d`, once. Returns `false` if pre-admission
+/// refused the marker-tracking table growth.
+fn m_fwd<S: Sink>(r: &mut RootSt, d: Ex, l: Lit, out: &mut S) -> bool {
+    match RootSt::ins_admit(&mut r.gsent, (d, l), out) {
+        Some(true) => {
+            out.send(d, Concl::HypL(l.xid()));
+            out.worked(1);
+            out.dl().mcount[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        Some(false) => true,
+        None => false,
     }
 }
 
@@ -1818,26 +2164,39 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
     us.sort_unstable();
     us.dedup();
     let mode = out.dl().mrepair;
-    let x = ds(st);
-    mrep_new(root_of(x, out), out);
-    let r = x.root.as_deref_mut().expect("made above");
-    let Some(mut grown) = RootSt::ins(&mut r.mw().hold_set, (h, l), 16) else {
+    let Some(x) = ds_admit(st, out) else {
         return false;
     };
-    out.dl().mcount[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let table = table_bytes(r.mr().holders.capacity(), 32);
-    let first = !r.mr().holders.contains_key(&l);
-    let hs = r.mw().holders.entry(l).or_default();
-    let cap = hs.capacity();
-    hs.push(h);
-    grown += (hs.capacity() - cap) * 4
-        + table_bytes(r.mr().holders.capacity(), 32).saturating_sub(table);
-    if first {
-        for &u in &us {
-            grown += RootSt::push(&mut r.mw().held_at, u, xid);
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return false;
+    };
+    if !mrep_admit(r, out) {
+        x.store.interrupted = true;
+        return false;
+    }
+    match RootSt::ins_admit(&mut r.mw().hold_set, (h, l), out) {
+        Some(true) => {}
+        Some(false) => return false,
+        None => {
+            x.store.interrupted = true;
+            return false;
         }
     }
-    out.dl().grow(grown);
+    out.dl().mcount[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let first = !r.mr().holders.contains_key(&l);
+    if !RootSt::push_admit(&mut r.mw().holders, l, h, out) {
+        x.store.interrupted = true;
+        return true;
+    }
+    if first {
+        for &u in &us {
+            if !RootSt::push_admit(&mut r.mw().held_at, u, xid, out) {
+                x.store.interrupted = true;
+                return true;
+            }
+        }
+    }
     let unit = mode & MREPAIR_UNITS == 0 && root_unit(x, l);
     if !unit {
         // the destinations, admitted before they are listed
@@ -1876,7 +2235,10 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
                     cut = true;
                     break;
                 }
-                m_fwd(r, d, l, out);
+                if !m_fwd(r, d, l, out) {
+                    cut = true;
+                    break;
+                }
             }
         }
         out.release_data(bytes);
@@ -2007,7 +2369,10 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
         if !held || (mode & MREPAIR_UNITS == 0 && root_unit(x, l)) {
             continue;
         }
-        m_fwd(x.root.as_deref_mut().expect("read above"), v, l, out);
+        if !m_fwd(x.root.as_deref_mut().expect("read above"), v, l, out) {
+            cut = true;
+            break;
+        }
     }
     scan.end(out);
     out.release_data(bytes);
@@ -2029,10 +2394,14 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
         if let &[l] = c.head()
             && l.kind() == XL
         {
-            let r = root_of(ds(st), out);
-            mrep_new(r, out);
-            let b = RootSt::push(&mut r.mw().units, l, id);
-            out.dl().grow(b);
+            let Some(x) = ds_admit(st, out) else { return };
+            let Some(r) = root_admit(x, out) else {
+                x.store.interrupted = true;
+                return;
+            };
+            if !mrep_admit(r, out) || !RootSt::push_admit(&mut r.mw().units, l, id, out) {
+                x.store.interrupted = true;
+            }
         }
         return;
     }
@@ -2047,14 +2416,21 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
     {
         return;
     }
-    let x = ds(st);
-    let r = root_of(x, out);
-    mrep_new(r, out);
-    let mut grown = 0;
-    for &l in c.body() {
-        grown += RootSt::push(&mut r.mw().gbody, l, id);
+    let Some(x) = ds_admit(st, out) else { return };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return;
+    };
+    if !mrep_admit(r, out) {
+        x.store.interrupted = true;
+        return;
     }
-    out.dl().grow(grown);
+    for &l in c.body() {
+        if !RootSt::push_admit(&mut r.mw().gbody, l, id, out) {
+            x.store.interrupted = true;
+            return;
+        }
+    }
     // the holders of the body literal with the fewest, admitted before they are listed,
     // and the scan of the others' charged and polled
     let len = |l: &Lit| r.mr().holders.get(l).map_or(0, Vec::len);
@@ -2115,18 +2491,32 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
     if st.bottom || m_stopped(st, out) {
         return false;
     }
-    let r = root_of(m_dl(st, out), out);
-    match RootSt::ins(&mut r.seen, cid, 4) {
-        Some(b) => out.dl().grow(b),
-        None => return false,
+    let Some(x) = ds_admit(st, out) else {
+        return false;
+    };
+    let Some(r) = root_admit(x, out) else {
+        x.store.interrupted = true;
+        return false;
+    };
+    match RootSt::ins_admit(&mut r.seen, cid, out) {
+        Some(true) => {}
+        Some(false) => return false,
+        None => {
+            x.store.interrupted = true;
+            return false;
+        }
     }
-    mrep_new(r, out);
+    if !mrep_admit(r, out) {
+        x.store.interrupted = true;
+        return true;
+    }
     let c = out.dl().table.get(cid).clone();
-    let mut grown = 0;
     for &l in c.body() {
-        grown += RootSt::push(&mut r.mw().rets, l, cid);
+        if !RootSt::push_admit(&mut r.mw().rets, l, cid, out) {
+            x.store.interrupted = true;
+            return true;
+        }
     }
-    out.dl().grow(grown);
     let mut found = Found::default();
     ret_products(st, &c, None, cf_of(ix, out), &mut found);
     // fold's tables on M-return's wide products grow past its charge, so their bound is
@@ -2143,7 +2533,7 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
         ds(st).store.interrupted = true;
         return true;
     }
-    drain(ix, st, found, out);
+    super::dl_rules::drain_covered(ix, st, found, out, false, slack);
     if slack > 0 {
         out.release_data(slack);
     }

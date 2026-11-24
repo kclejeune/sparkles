@@ -195,6 +195,69 @@ impl DtIx {
             .saturating_add(cache_bytes)
     }
 
+    pub fn logical_bytes(&self) -> usize {
+        std::mem::size_of::<DtIx>()
+            .saturating_add(self.keys.len().saturating_mul(std::mem::size_of::<DtKey>()))
+            .saturating_add(
+                self.roles
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(Role, RoleIx)>()),
+            )
+            .saturating_add(
+                self.roles
+                    .values()
+                    .map(|r| {
+                        r.supers
+                            .len()
+                            .saturating_mul(std::mem::size_of::<Role>())
+                            .saturating_add(
+                                r.ranges.len().saturating_mul(std::mem::size_of::<Rid>()),
+                            )
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.body
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Vec<Body>>()),
+            )
+            .saturating_add(
+                self.body
+                    .iter()
+                    .map(|v| {
+                        v.len()
+                            .saturating_mul(std::mem::size_of::<Body>())
+                            .saturating_add(
+                                v.iter()
+                                    .map(|b| {
+                                        b.told
+                                            .as_ref()
+                                            .map_or(0, |t| t.len() * std::mem::size_of::<Ex>())
+                                    })
+                                    .sum::<usize>(),
+                            )
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.disjoint
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(Role, Role)>()),
+            )
+            .saturating_add(
+                self.refire
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(u32, Vec<u32>)>()),
+            )
+            .saturating_add(
+                self.refire
+                    .values()
+                    .map(|v| v.len().saturating_mul(std::mem::size_of::<u32>()))
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.sticky.lock().len())
+    }
+
     fn atom(&self, a: DtKey, at: &FxHashMap<Role, usize>) -> Atom {
         let i = at[&a.role];
         if a.at_least {

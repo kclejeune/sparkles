@@ -335,6 +335,11 @@ pub struct State {
     pub bottom: bool,
     /// whether the context has an instance in every model
     pub real: bool,
+    /// whether a Tier D stop or memory refusal cut work short before a store was created
+    pub interrupted: bool,
+    /// choices derived by Tier D since the last bounds poll (kept inline to avoid boxing
+    /// `DlSt` solely to count choices)
+    pub dl_choices: u16,
     /// the negative existential restrictions whose filler is a subsumer, which a new
     /// backward link propagates to its source
     pub props: Vec<(Role, Ex)>,
@@ -1374,6 +1379,18 @@ pub trait Sink {
     /// Releases bytes previously granted by [`Sink::reserve_data`] or [`Sink::admit_data`]
     /// or charged by [`Sink::keep_data`]. Refused reservations need no release.
     fn release_data(&mut self, _bytes: usize) {}
+    /// Pre-admits `bytes` of peak allocation (including reallocation overlap) before Tier D
+    /// grows a retained structure. Returns `false` and leaves no debit active on refusal.
+    fn admit_dl(&mut self, _bytes: usize) -> bool {
+        !self.stopped()
+    }
+    /// Commits `kept` retained bytes (`<= admitted`) from a granted [`Sink::admit_dl`]
+    /// reservation and releases the unused overlap atomically.
+    fn commit_dl(&mut self, _admitted: usize, kept: usize) {
+        if kept > 0 {
+            self.dl().grow(kept);
+        }
+    }
     /// Records an unrepresentable memory reservation or total, raising peak memory to
     /// `usize::MAX` and stopping the run with a memory stop without changing the shared
     /// memory count.
@@ -1528,6 +1545,24 @@ impl Sink for Out<'_, '_> {
         self.kept -= waiting;
         let bytes = bytes - waiting;
         self.run.credit(bytes);
+    }
+    fn admit_dl(&mut self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return !self.stopped();
+        }
+        self.admit_data(bytes)
+    }
+    fn commit_dl(&mut self, admitted: usize, kept: usize) {
+        debug_assert!(
+            kept <= admitted,
+            "Tier D growth {kept} exceeded admitted bound {admitted}"
+        );
+        if kept > 0 {
+            self.dl().grow(kept);
+        }
+        if admitted > 0 {
+            self.run.credit(admitted);
+        }
     }
 
     #[inline]
@@ -2829,6 +2864,10 @@ impl<'a> Run<'a> {
                 let core = self.dynamic.expect("a run with the Horn rules").core(me);
                 init_conjunction(self.ix, core, &mut st, self.universal, &mut out);
             } else if R::DISJ && self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
+                if !self.flush_sends(&mut out, tally) {
+                    st.interrupted = true;
+                    return;
+                }
                 dl_root::init(self.ix, &mut st, &mut out);
             } else {
                 init(self.ix, me, &mut st, self.universal, &mut out);
@@ -3225,7 +3264,7 @@ fn apply_rules<S: Sink, R: Rules>(
                 _ => {}
             }
             let wait = if R::DISJ && matches!(h.node, Node::Fresh(_)) {
-                dl_rules::defer(ix, st, d)
+                dl_rules::defer(ix, st, d, out)
             } else {
                 None
             };

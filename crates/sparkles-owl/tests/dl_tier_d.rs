@@ -935,6 +935,20 @@ fn partial_memory_completion_preserves_tier_and_reuse() {
 
 #[test]
 fn partial_memory_pool_and_taxonomy_refusals_preserve_tier_and_reuse() {
+    // Taxonomy refusal after completed Tier D saturation: use a disjunctive ontology
+    // whose taxonomy exceeds saturation's transient peak headroom so `taxonomy_cap`
+    // reliably admits saturation's peak while refusing its taxonomy on both 1 and 8 threads.
+    let mut tax_src = String::from(
+        "SubClassOf(:A ObjectUnionOf(:B :C))\n\
+         SubClassOf(:B :D)\n\
+         SubClassOf(:C :D)\n",
+    );
+    for i in 0..160 {
+        tax_src.push_str(&format!("SubClassOf(:T{i} :T{})\n", i + 1));
+    }
+    let tax_ax = axioms(&tax_src);
+    let tax_cs = classes(&tax_ax);
+
     let ax = axioms(&many(if cfg!(debug_assertions) { 40 } else { 120 }, false));
     let cs = classes(&ax);
     for threads in [1, 8] {
@@ -942,18 +956,24 @@ fn partial_memory_pool_and_taxonomy_refusals_preserve_tier_and_reuse() {
             threads,
             ..Limits::default()
         };
-        let full = Classifier::of(&ax).classify(&limits).unwrap();
-        let saturated = Classifier::of(&ax).saturate(&limits).unwrap();
-        // This cap admits completed saturation's retained state, but not its taxonomy.
-        let taxonomy_cap = full.stats.memory - 1;
-        assert!(taxonomy_cap >= saturated.stats.memory);
-        assert!(full.stats.taxonomy_memory > 0);
-        let mut k = Classifier::of(&ax);
+        let tax_full = Classifier::of(&tax_ax).classify(&limits).unwrap();
+        let tax_sat = Classifier::of(&tax_ax).saturate(&limits).unwrap();
+        // This cap admits completed saturation (including its peak), but not its taxonomy.
+        let taxonomy_cap = tax_full.stats.memory - 1;
+        assert!(
+            taxonomy_cap >= tax_sat.stats.peak_memory,
+            "threads={threads}: taxonomy_cap ({taxonomy_cap}) < sat_peak ({})",
+            tax_sat.stats.peak_memory
+        );
+        assert!(tax_full.stats.taxonomy_memory > 0);
+        let mut k = Classifier::of(&tax_ax);
         assert!(
             matches!(k.classify(&Limits { partial: true, max_memory: Some(taxonomy_cap), ..limits.clone() }),
             Err(sparkles_owl::classify::Error::Memory { limit, used }) if limit == taxonomy_cap && used > limit)
         );
-        check_memory_recovery(&mut k, &full, &cs, threads);
+        check_memory_recovery(&mut k, &tax_full, &tax_cs, threads);
+
+        let full = Classifier::of(&ax).classify(&limits).unwrap();
 
         // Model a cumulative shared grant, without a hard-limit shortcut.
         let cap = 1_635_748;

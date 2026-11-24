@@ -98,6 +98,8 @@ mod saturate;
 #[cfg(test)]
 mod scratch_admission_tests;
 mod taxonomy;
+#[cfg(test)]
+mod tierd_memory_tests;
 mod world;
 
 pub use dl::{OutsideEl, Tier};
@@ -3220,6 +3222,15 @@ impl Saturation {
             + dynamic
                 .as_ref()
                 .map_or(0, |d| d.retained_bytes() - d.bytes());
+        // A deterministic logical input-size measure determines the classifier's
+        // discretionary Horn/Tier D memory allowance, independent of thread-count or
+        // allocator container capacities, while `base` continues to charge actual
+        // retained capacities against the caller's memory cap and reservation callback.
+        let allowance_base = self.logical_index_bytes(&ix)
+            + held_bytes
+            + ax.logical_bytes()
+            + roots.len() * 4
+            + self.ctx.len() * std::mem::size_of::<OnceLock<Box<saturate::Ctx>>>();
         let cancelled = limits.cancelled.clone();
         let cancel_fn = cancelled
             .as_deref()
@@ -3266,7 +3277,9 @@ impl Saturation {
             }
         }
         let max_memory = if horn || disj {
-            let own = HORN_MEMORY_FLOOR.max(base.saturating_mul(HORN_MEMORY_FACTOR));
+            let own = HORN_MEMORY_FLOOR.max(allowance_base.saturating_mul(HORN_MEMORY_FACTOR));
+            #[cfg(test)]
+            LAST_ALLOWANCE.with(|c| c.set((base, allowance_base, own)));
             Some(limits.max_memory.map_or(own, |m| m.min(own)))
         } else {
             limits.max_memory
@@ -4158,13 +4171,31 @@ impl Saturation {
                 .sum::<usize>()
     }
 
+    fn logical_index_bytes(&self, ix: &Index) -> usize {
+        self.interner.len() * 40
+            + self.interner.classes.logical_bytes()
+            + self.interner.classes.name_bytes()
+            + self.interner.logical_data_bytes()
+            + ix.numeric_ledger
+                .as_ref()
+                .or(self.interner.ranges.ledger.as_ref())
+                .map_or(0, |l| l.bytes())
+            + ix.logical_bytes()
+            + self.interner.logical_scope_bytes()
+            + self.disjoint.len() * 24
+            + self.disjoint.iter().map(|d| d.len() * 4).sum::<usize>()
+    }
+
     fn retained_bytes(&self, held_bytes: usize, root_bytes: usize, world_bytes: usize) -> usize {
         self.index_bytes(self.index.as_ref().expect("completed index"))
             + held_bytes
             + root_bytes
             + self.context_bytes()
             + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes())
-            + self.dl_run.as_ref().map_or(0, |d| d.table.bytes())
+            + self
+                .dl_run
+                .as_ref()
+                .map_or(0, |d| d.table.bytes() + d.lits.bytes())
             + world_bytes
     }
 
@@ -5095,6 +5126,9 @@ thread_local! {
     /// Bytes that a test adds to the estimate of item 1231's scan, so that it can reach
     /// the memory budget and the pool's refusal.
     static SCAN_EXTRA: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `(base, allowance_base, own)` observed by the last Horn/Tier D run on this thread.
+    pub(super) static LAST_ALLOWANCE: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 fn poll(limits: &Limits) -> Result<(), Error> {

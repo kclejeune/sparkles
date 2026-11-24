@@ -66,6 +66,16 @@ impl HornAx {
                 .map(|a| 64 + a.trans.capacity() * 16)
                 .sum::<usize>()
     }
+
+    pub fn logical_bytes(&self) -> usize {
+        self.clash.len() * 8
+            + self.premises.len() * 4
+            + self
+                .autos
+                .values()
+                .map(|a| 64 + a.trans.len() * 16)
+                .sum::<usize>()
+    }
 }
 
 /// What the Horn rules read in the index.
@@ -108,6 +118,10 @@ impl HornIx {
 
     pub fn bytes(&self) -> usize {
         self.flags.capacity() + self.dead.capacity() * size_of::<Role>()
+    }
+
+    pub fn logical_bytes(&self) -> usize {
+        self.flags.len() + self.dead.len() * size_of::<Role>()
     }
 
     /// Whether `r` is under a role whose transitions the automata lost, for the checks
