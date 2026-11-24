@@ -270,7 +270,11 @@ impl Out {
         self.chains.extend(o.chains);
         self.clauses.extend(o.clauses);
         self.atmost.extend(o.atmost);
-        self.rdis.extend(o.rdis);
+        if self.rdis.is_empty() && self.rdis.capacity() == 0 {
+            self.rdis = o.rdis;
+        } else {
+            self.rdis.extend(o.rdis);
+        }
         self.irreflexive.extend(o.irreflexive);
         self.ne.extend(o.ne);
         self.lazy.extend(o.lazy);
@@ -1351,6 +1355,7 @@ fn normalize_within(
         it.role(RoleName::Inverse(p));
     }
     let mut all = Out::default();
+    let mut all_chain_inner_bytes = 0usize;
     let mut budget = super::horn::PairBudget::new(limit, ax);
     for (i, k) in axioms.iter().enumerate() {
         if !Norm::is_role_axiom(k) {
@@ -1380,9 +1385,37 @@ fn normalize_within(
         if ok {
             let out = n.out;
             if budget.is_bounded() {
-                budget.add_accum(out.bytes());
+                if !out.rdis.is_empty() && (!all.rdis.is_empty() || all.rdis.capacity() > 0) {
+                    let old_cap = all.rdis.capacity();
+                    let needed = all.rdis.len().saturating_add(out.rdis.len());
+                    if needed > old_cap {
+                        let next_cap = old_cap.saturating_mul(2).max(needed).max(4);
+                        let growth_bytes = next_cap
+                            .saturating_sub(old_cap)
+                            .saturating_mul(std::mem::size_of::<(Role, Role)>());
+                        budget.check(it, out.bytes().saturating_add(growth_bytes))?;
+                    }
+                }
+                if !out.chains.is_empty() {
+                    all_chain_inner_bytes = all_chain_inner_bytes.saturating_add(
+                        out.chains
+                            .iter()
+                            .map(|(c, _)| 32 + c.capacity() * 4)
+                            .sum::<usize>(),
+                    );
+                }
             }
             all.extend(out);
+            if budget.is_bounded() {
+                let retained = all.role_subs.capacity() * 8
+                    + all.chains.capacity() * 32
+                    + all_chain_inner_bytes
+                    + all.atmost.capacity() * 16
+                    + all.subs.capacity() * 8
+                    + all.rdis.capacity() * 8
+                    + all.irreflexive.capacity() * 4;
+                budget.set_accum(retained);
+            }
             taken[i] = true;
         }
     }
@@ -2823,5 +2856,95 @@ mod tests {
             err.err()
         );
         assert!(polls.get() >= 1, "expected stop() to be polled during scan");
+    }
+
+    #[test]
+    fn role_pair_aggregate_growth_respects_memory_budget_in_dl_norm() {
+        let disj = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("http://ex.org/A")),
+            ClassExpression::ObjectUnionOf(
+                [
+                    ClassExpression::Class(Class::new("http://ex.org/B")),
+                    ClassExpression::Class(Class::new("http://ex.org/C")),
+                ]
+                .into(),
+            ),
+        );
+        let allowed = Allowed {
+            counting: true,
+            ..Allowed::default()
+        };
+
+        let distinct_400: Vec<ObjectPropertyExpression> = (0..400)
+            .map(|i| {
+                ObjectPropertyExpression::Property(ObjectProperty::new(format!(
+                    "http://ex.org/dl_agg_{i:04}"
+                )))
+            })
+            .collect();
+        let disjoint_400 = AxiomKind::DisjointObjectProperties(distinct_400.clone().into());
+        let dup_first = AxiomKind::DisjointObjectProperties(
+            vec![distinct_400[0].clone(), distinct_400[0].clone()].into(),
+        );
+        let disjoint_200 = AxiomKind::DisjointObjectProperties(distinct_400[..200].to_vec().into());
+
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let pre_baseline = it.bytes() + ax.bytes();
+        let pair_bytes = (400usize * 399 / 2) * std::mem::size_of::<(Role, Role)>();
+
+        // 1. Extending `all.rdis` from 79,800 to 159,600 slots (~1.22 MiB) when adding 1 pair
+        // must fail under a budget that fits the first axiom + overhead (~894 KiB) but not the
+        // doubled aggregate buffer.
+        let growth_limit = pre_baseline + pair_bytes + 256 * 1024;
+        let err = normalize(
+            &[&disj, &disjoint_400, &dup_first],
+            &mut it,
+            &mut ax,
+            Some(growth_limit),
+            &|| false,
+            allowed,
+        );
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory when aggregate rdis growth exceeds limit, got {:?}",
+            err.err()
+        );
+
+        // 2. When the limit allows the doubled aggregate (2 * pair_bytes) + 128 KiB headroom,
+        // a third axiom emitting 19,900 pairs (159,200 bytes) must see the retained 159,600-slot
+        // capacity of `all.rdis` and fail rather than charging only 79,801 slots.
+        let mut it2 = Interner::new();
+        let mut ax2 = Axioms::default();
+        let retained_limit = pre_baseline + 2 * pair_bytes + 128 * 1024;
+        let err2 = normalize(
+            &[&disj, &disjoint_400, &dup_first, &disjoint_200],
+            &mut it2,
+            &mut ax2,
+            Some(retained_limit),
+            &|| false,
+            allowed,
+        );
+        assert!(
+            matches!(err2, Err(Halt::Memory(_))),
+            "expected Halt::Memory when third axiom exceeds budget over retained aggregate capacity, got {:?}",
+            err2.err()
+        );
+
+        // 3. With enough headroom for the retained aggregate + third axiom buffer, all succeed.
+        let mut it_ok = Interner::new();
+        let mut ax_ok = Axioms::default();
+        let (taken, dl) = normalize(
+            &[&disj, &disjoint_400, &dup_first, &disjoint_200],
+            &mut it_ok,
+            &mut ax_ok,
+            Some(pre_baseline + 3 * pair_bytes + 512 * 1024),
+            &|| false,
+            allowed,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(taken, vec![true, true, true, true]);
+        assert_eq!(dl.rdis.len(), 400 * 399 / 2 + 1 + 200 * 199 / 2);
     }
 }

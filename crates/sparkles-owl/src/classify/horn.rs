@@ -1076,10 +1076,18 @@ impl Out {
         ax.role_subs.extend(self.role_subs);
         ax.chains.extend(self.chains);
         ax.reflexive.extend(self.reflexive);
-        h.clash.extend(self.clash);
+        if h.clash.is_empty() && h.clash.capacity() == 0 {
+            h.clash = self.clash;
+        } else {
+            h.clash.extend(self.clash);
+        }
         h.premises.extend(self.premises);
         ax.dt_ranges.extend(self.dt_ranges);
-        ax.dt_disjoint.extend(self.dt_disjoint);
+        if ax.dt_disjoint.is_empty() && ax.dt_disjoint.capacity() == 0 {
+            ax.dt_disjoint = self.dt_disjoint;
+        } else {
+            ax.dt_disjoint.extend(self.dt_disjoint);
+        }
         ax.functional.extend(self.functional);
         ax.individuals.extend(self.individuals);
     }
@@ -1117,6 +1125,12 @@ impl<'a> PairBudget<'a> {
     pub(super) fn add_accum(&mut self, bytes: usize) {
         if self.limit.is_some() {
             self.accum_bytes = self.accum_bytes.saturating_add(bytes);
+        }
+    }
+
+    pub(super) fn set_accum(&mut self, bytes: usize) {
+        if self.limit.is_some() {
+            self.accum_bytes = bytes;
         }
     }
 
@@ -2275,7 +2289,43 @@ pub fn normalize(
     if !taken.contains(&true) {
         return Ok(taken);
     }
+    let clash_sources = class_out.iter().filter(|o| !o.clash.is_empty()).count();
+    let total_clash: usize = class_out.iter().map(|o| o.clash.len()).sum();
+    let dt_sources = class_out
+        .iter()
+        .filter(|o| !o.dt_disjoint.is_empty())
+        .count();
+    let total_dt_disjoint: usize = class_out.iter().map(|o| o.dt_disjoint.len()).sum();
+    let pair_size = std::mem::size_of::<(Role, Role)>();
+    let clash_extra = if clash_sources > 1 {
+        total_clash.saturating_mul(pair_size)
+    } else {
+        0
+    };
+    let dt_needs_reserve = total_dt_disjoint > 0
+        && (dt_sources > 1 || !ax.dt_disjoint.is_empty() || ax.dt_disjoint.capacity() > 0);
+    let dt_extra = if dt_needs_reserve {
+        let needed = ax.dt_disjoint.len().saturating_add(total_dt_disjoint);
+        if needed > ax.dt_disjoint.capacity() {
+            needed
+                .saturating_sub(ax.dt_disjoint.capacity())
+                .saturating_mul(pair_size)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    if clash_extra > 0 || dt_extra > 0 {
+        budget.check(it, clash_extra.saturating_add(dt_extra))?;
+    }
     ax.role_subs.clear();
+    if clash_sources > 1 {
+        h.clash.reserve_exact(total_clash);
+    }
+    if dt_needs_reserve {
+        ax.dt_disjoint.reserve_exact(total_dt_disjoint);
+    }
     for o in class_out {
         o.commit(ax, &mut h);
     }
@@ -2903,5 +2953,115 @@ mod reduction_tests {
         let cached_ax = bounded.ax_bytes.expect("cached ax.bytes()");
         assert_eq!(cached_ax, ax.bytes());
         assert_eq!(bounded.dt_static_bytes, Some(0));
+    }
+
+    #[test]
+    fn role_pair_aggregate_commit_respects_memory_budget_in_horn() {
+        // 1. Multiple DisjointObjectProperties axioms committing into `h.clash`.
+        let distinct_400: Vec<ObjectPropertyExpression> = (0..400)
+            .map(|i| {
+                ObjectPropertyExpression::Property(ObjectProperty::new(format!(
+                    "http://ex.org/horn_agg_{i:04}"
+                )))
+            })
+            .collect();
+        let disjoint_400 = AxiomKind::DisjointObjectProperties(distinct_400.clone().into());
+        let dup_first = AxiomKind::DisjointObjectProperties(
+            vec![distinct_400[0].clone(), distinct_400[0].clone()].into(),
+        );
+        let pair_bytes = 400usize * 399 * std::mem::size_of::<(Role, Role)>();
+
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let pre_baseline = it.bytes() + ax.bytes();
+        // Fits the per-axiom buffers (~1.22 MiB + overhead) but not simultaneous source +
+        // destination buffers (~2.44 MiB) during commit.
+        let tight_commit_limit = pre_baseline + pair_bytes + 512 * 1024;
+        let err = normalize(
+            &[&disjoint_400, &dup_first],
+            &mut it,
+            &mut ax,
+            Some(tight_commit_limit),
+            &|| false,
+        );
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory when Horn clash commit exceeds budget, got {err:?}"
+        );
+        assert!(
+            ax.horn.is_none(),
+            "ax must remain unmodified on Halt::Memory"
+        );
+
+        let mut it_ok = Interner::new();
+        let mut ax_ok = Axioms::default();
+        let taken = normalize(
+            &[&disjoint_400, &dup_first],
+            &mut it_ok,
+            &mut ax_ok,
+            Some(pre_baseline + 2 * pair_bytes + 512 * 1024),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(taken, vec![true, true]);
+        assert_eq!(ax_ok.horn.as_ref().unwrap().clash.len(), 400 * 399 + 1);
+
+        // 2. Multiple DisjointDataProperties axioms committing into `ax.dt_disjoint`.
+        let dt_400_props: Vec<DataProperty> = (0..400)
+            .map(|i| DataProperty::new(format!("http://ex.org/horn_dt_agg_{i:04}")))
+            .collect();
+        let dt_400 = AxiomKind::DisjointDataProperties(dt_400_props.clone().into());
+        let dt_dup = AxiomKind::DisjointDataProperties(
+            vec![dt_400_props[0].clone(), dt_400_props[0].clone()].into(),
+        );
+        let dt_pair_bytes = (400usize * 399 / 2) * std::mem::size_of::<(Role, Role)>();
+
+        let make_dt_interner = || {
+            let mut it = Interner::new();
+            let defs = super::super::dtcheck::range::Defs::new(FxHashMap::default());
+            let comps =
+                super::super::dtcheck::comp::Comps::of(&[&dt_400, &dt_dup], &defs, &|| false)
+                    .unwrap();
+            it.dt_run = Some(Box::new(super::super::dtcheck::atoms::DtRun {
+                comps,
+                defs,
+                stop: super::super::dtcheck::atoms::Stop::default(),
+                budget: None,
+                stopped: None,
+            }));
+            it
+        };
+
+        let mut it_dt = make_dt_interner();
+        let mut ax_dt = Axioms::default();
+        let dt_baseline = it_dt.bytes() + ax_dt.bytes();
+        let err_dt = normalize(
+            &[&dt_400, &dt_dup],
+            &mut it_dt,
+            &mut ax_dt,
+            Some(dt_baseline + dt_pair_bytes + 256 * 1024),
+            &|| false,
+        );
+        assert!(
+            matches!(err_dt, Err(Halt::Memory(_))),
+            "expected Halt::Memory when Horn dt_disjoint commit exceeds budget, got {err_dt:?}"
+        );
+        assert!(
+            ax_dt.dt_disjoint.is_empty(),
+            "ax.dt_disjoint must remain empty on Halt::Memory"
+        );
+
+        let mut it_dt_ok = make_dt_interner();
+        let mut ax_dt_ok = Axioms::default();
+        let taken_dt = normalize(
+            &[&dt_400, &dt_dup],
+            &mut it_dt_ok,
+            &mut ax_dt_ok,
+            Some(dt_baseline + 2 * dt_pair_bytes + 512 * 1024),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(taken_dt, vec![true, true]);
+        assert_eq!(ax_dt_ok.dt_disjoint.len(), 400 * 399 / 2 + 1);
     }
 }

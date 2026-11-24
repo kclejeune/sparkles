@@ -108,8 +108,10 @@ impl<T: Ord> Extend<T> for Multiset<T> {
             incoming.sort();
             self.0 = incoming;
         } else {
-            self.0.append(&mut incoming);
-            self.0.sort();
+            let mut v = std::mem::take(&mut self.0);
+            v.append(&mut incoming);
+            v.sort();
+            self.0 = v;
         }
     }
 }
@@ -1379,6 +1381,61 @@ mod tests {
         assert!(
             ms.as_slice().is_sorted(),
             "Multiset must remain sorted after iterator panic, got {:?}",
+            ms.as_slice()
+        );
+        assert_eq!(ms, Multiset::from(ms.as_slice().to_vec()));
+        assert_eq!(
+            ms.has_duplicates(),
+            ms.as_slice().windows(2).any(|w| w[0] == w[1])
+        );
+    }
+
+    #[test]
+    fn multiset_extend_preserves_sorted_invariant_on_ord_panic() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        #[derive(Clone, Debug)]
+        struct PanicOrd {
+            value: i32,
+            should_panic: Arc<AtomicBool>,
+        }
+
+        impl PartialEq for PanicOrd {
+            fn eq(&self, other: &Self) -> bool {
+                self.value == other.value
+            }
+        }
+        impl Eq for PanicOrd {}
+        impl PartialOrd for PanicOrd {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for PanicOrd {
+            fn cmp(&self, other: &Self) -> Ordering {
+                if self.should_panic.load(AtomicOrdering::SeqCst) {
+                    panic!("Ord::cmp panicked during extend");
+                }
+                self.value.cmp(&other.value)
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let item = |value| PanicOrd {
+            value,
+            should_panic: Arc::clone(&flag),
+        };
+        let mut ms = Multiset::from([item(2), item(4)]);
+        flag.store(true, AtomicOrdering::SeqCst);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ms.extend([item(2)]);
+        }));
+        flag.store(false, AtomicOrdering::SeqCst);
+        assert!(res.is_err());
+        assert!(
+            ms.as_slice().is_sorted(),
+            "Multiset must remain sorted after Ord panic, got {:?}",
             ms.as_slice()
         );
         assert_eq!(ms, Multiset::from(ms.as_slice().to_vec()));
