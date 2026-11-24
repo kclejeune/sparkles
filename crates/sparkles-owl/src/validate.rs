@@ -70,8 +70,8 @@ pub fn axiom(ax: &Axiom) -> Result<(), ModelError> {
             class_expression(b)
         }
         // an equivalence of one operand, such as EquivalentClasses(C C), is legal and
-        // trivial; a disjointness of one would claim that its operand is empty, which
-        // a set of operands cannot express
+        // trivial; disjointness axioms keep repeated operands in a Multiset, so fewer
+        // than two operands means an axiom is missing an operand
         K::EquivalentClasses(cs) => {
             need(cs.len(), 1, name)?;
             cs.iter().try_for_each(class_expression)

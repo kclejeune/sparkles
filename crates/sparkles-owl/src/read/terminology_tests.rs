@@ -123,10 +123,9 @@ fn a_terminology_read_reports_each_root_it_cannot_map() {
             "rdfs:subClassOf a owl:AnnotationProperty . :C rdfs:subClassOf :A .",
             "a subclass axiom read as an annotation",
         ),
-        (":C owl:disjointWith :C .", "a class disjoint with itself"),
         (
-            "[] a owl:AllDisjointClasses ; owl:members ( :C :C ) .",
-            "a disjointness that collapses to one class",
+            "[] a owl:AllDisjointClasses ; owl:members ( :C ) .",
+            "a disjointness with only one member",
         ),
         (
             ":C rdfs:subClassOf _:a . _:a owl:intersectionOf ( :A _:a ) .",
@@ -174,10 +173,12 @@ fn a_terminology_read_reports_each_root_it_cannot_map() {
         let full = lenient(&format!("{base} {body}"));
         assert_eq!(full.error_count, 0, "{what}: {:?}", full.diagnostics);
     }
-    // a tautology, a typed rdf:nil and duplicate operands lose nothing
+    // a tautology, a typed rdf:nil and repeated disjointness operands map without losing meaning
     for body in [
         ":C owl:intersectionOf ( :C ) .",
         "rdf:nil a rdf:List .",
+        ":C owl:disjointWith :C .",
+        "[] a owl:AllDisjointClasses ; owl:members ( :C :C ) .",
         "[] a owl:AllDisjointClasses ; owl:members ( :A :A :C ) .",
     ] {
         let o = terminology(&format!("{base} {body}"));

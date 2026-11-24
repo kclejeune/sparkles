@@ -80,9 +80,8 @@ pub(super) fn axiom_kind_with(kind: &AxiomKind, anonymous: bool) -> Vec<Broken> 
             ce(a, &mut out);
             ce(b, &mut out);
         }
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
-            cs.iter().for_each(|c| ce(c, &mut out))
-        }
+        K::EquivalentClasses(cs) => cs.iter().for_each(|c| ce(c, &mut out)),
+        K::DisjointClasses(cs) => cs.iter().for_each(|c| ce(c, &mut out)),
         K::SubObjectPropertyOf(sub, sup) => {
             match sub {
                 SubObjectPropertyExpression::Expression(p) => ope(p, &mut out),
@@ -167,7 +166,8 @@ pub(super) fn certainly_el(kind: &AxiomKind) -> bool {
         // a declaration names a datatype without using it
         K::Declaration(_) => true,
         K::SubClassOf(a, b) => ce(a) && ce(b),
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs.iter().all(ce),
+        K::EquivalentClasses(cs) => cs.iter().all(ce),
+        K::DisjointClasses(cs) => cs.iter().all(ce),
         K::SubObjectPropertyOf(sub, sup) => {
             plain(sup)
                 && match sub {
@@ -182,7 +182,8 @@ pub(super) fn certainly_el(kind: &AxiomKind) -> bool {
         K::ObjectPropertyAssertion(p, a, b) | K::NegativeObjectPropertyAssertion(p, a, b) => {
             plain(p) && named(a) && named(b)
         }
-        K::SameIndividual(is) | K::DifferentIndividuals(is) => is.iter().all(named),
+        K::SameIndividual(is) => is.iter().all(named),
+        K::DifferentIndividuals(is) => is.iter().all(named),
         // the remaining types are left to the full check
         _ => false,
     }

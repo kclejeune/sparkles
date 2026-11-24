@@ -1518,6 +1518,81 @@ fn equalities_stream_once_and_fill_each_list_on_its_own() {
 }
 
 #[test]
+fn streamed_different_from_self_appears_in_equalities_and_entity_wire() {
+    let ds = dataset(":o a owl:Ontology . :a a owl:NamedIndividual ; owl:differentFrom :a .");
+    let o = ds
+        .ontology()
+        .graph("default")
+        .mode(Mode::Strict)
+        .open()
+        .unwrap();
+    let mut seen = Vec::new();
+    o.equalities(&Individual::named(ex("a")), &opts(), |ax, _| {
+        seen.push(ax.kind);
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(
+        seen,
+        vec![AxiomKind::DifferentIndividuals(
+            [Individual::named(ex("a")), Individual::named(ex("a"))].into()
+        )]
+    );
+
+    let body = wire::call(
+        &ds,
+        "entity",
+        &serde_json::json!({"iri": ex("a"), "assertions": true, "mode": "strict"}),
+        &opts(),
+    )
+    .unwrap();
+    let diff = body["namedIndividual"]["differentIndividuals"]
+        .as_array()
+        .unwrap();
+    assert_eq!(diff.len(), 1, "assertions=true {body}");
+    assert_eq!(diff[0]["expression"], ex("a"), "assertions=true {body}");
+
+    // With assertions=false, bare owl:differentFrom triples stay out of the eager read,
+    // while an AllDifferent blank-node axiom is held in `o.ontology` and exercises the
+    // eager `onto.different_individuals(&i)` wire path.
+    let body_no_assert = wire::call(
+        &ds,
+        "entity",
+        &serde_json::json!({"iri": ex("a"), "assertions": false, "mode": "strict"}),
+        &opts(),
+    )
+    .unwrap();
+    assert!(
+        body_no_assert["namedIndividual"]["differentIndividuals"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "bare triple should not appear with assertions=false: {body_no_assert}"
+    );
+
+    let ds_all_diff = dataset(
+        ":o a owl:Ontology . :a a owl:NamedIndividual . \
+         [] a owl:AllDifferent ; owl:members ( :a :a ) .",
+    );
+    let body_eager = wire::call(
+        &ds_all_diff,
+        "entity",
+        &serde_json::json!({"iri": ex("a"), "assertions": false, "mode": "strict"}),
+        &opts(),
+    )
+    .unwrap();
+    let diff_eager = body_eager["namedIndividual"]["differentIndividuals"]
+        .as_array()
+        .unwrap();
+    assert_eq!(diff_eager.len(), 1, "eager assertions=false {body_eager}");
+    assert_eq!(
+        diff_eager[0]["expression"],
+        ex("a"),
+        "eager assertions=false {body_eager}"
+    );
+}
+
+#[test]
 fn streams_give_every_graph_of_an_assertion() {
     let held = ":o a owl:Ontology . :A a owl:Class . :p a owl:ObjectProperty .
         :a a owl:NamedIndividual , [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :A ] .

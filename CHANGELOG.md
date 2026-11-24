@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Disjointness and inequality axioms preserve repeated operands
+
+`DisjointClasses`, `DisjointUnion`, `DisjointObjectProperties`, `DisjointDataProperties`
+and `DifferentIndividuals` now keep repeated operands in a sorted `Multiset<T>` instead of
+deduplicating them into a `BTreeSet<T>`, so axioms such as `DisjointClasses(:A :A)`,
+`DisjointUnion(:C :A :A)`, `DisjointObjectProperties(:p :p)`,
+`DisjointDataProperties(:d :d)` and `DifferentIndividuals(:a :a)` retain their semantics
+across the functional-style, RDF and JSON codecs, Manchester's four binary disjointness and
+inequality forms, entity accessors and the classifier, as roadmap item 1314. Structural
+equality, ordering, hashing and serialized output remain order-independent, and
+equivalences, unions, intersections, `SameIndividual` and `HasKey` continue to deduplicate
+with `BTreeSet<T>`. In the classifier, repeated class and property operands force the
+repeated class or property empty within each tier's existing rules, repeated individuals make
+`DifferentIndividuals` inconsistent, and Horn shape detection and normalization reduce
+repeated `DisjointClasses` and `DisjointUnion` members without escalating Horn ontologies
+to Tier D. In Rust, callers that construct the five `AxiomKind` variants directly from a
+typed `BTreeSet<T>` now convert with `.into()`, and `Ontology::disjoint_unions` now returns
+`Vec<Multiset<ClassExpression>>`; `Axiom::disjoint_classes` keeps its generic signature.
+
 ### One result writer per format, with the engine's own SPARQL encoders
 
 Roadmap items 828 and 243 write every SELECT, ASK and graph answer through one writer per

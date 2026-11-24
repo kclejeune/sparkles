@@ -212,6 +212,27 @@ axiom can equal an axiom that the ontology states unchanged or the rewriting of 
 axiom, so the report of the axioms left out now names every original axiom that a left-out
 rewritten axiom stands for, and names each original once for each kind of gap.
 
+Item 1314 preserves repeated operands in disjointness and inequality axioms at parsing and
+model construction. `DisjointClasses`, `DisjointUnion`, `DisjointObjectProperties`,
+`DisjointDataProperties` and `DifferentIndividuals` now store their operands in a sorted
+`Multiset<T>` instead of a `BTreeSet<T>`, so structural equality, ordering, hashing and
+serialized output remain order-independent while duplicate occurrences are kept across the
+functional-style, RDF and JSON codecs, Manchester's four binary disjointness and inequality
+forms and public constructors. Manchester continues to render `None` for `DisjointUnion`
+and n-ary forms longer than two and carries no axiom annotation round-trip. Equivalences,
+unions, intersections, `SameIndividual` and `HasKey` keep `BTreeSet` deduplication.
+Classification forces repeated class operands empty in `DisjointClasses` and
+`DisjointUnion`, marks repeated properties empty in `DisjointObjectProperties` and
+`DisjointDataProperties`, and derives inconsistency for repeated individuals in
+`DifferentIndividuals` with rooted rules off and on, subject to each tier's existing role
+and datatype restrictions such as top and bottom data properties in the datatype checker
+and counting for `DisjointObjectProperties` in Tier D. `dl::clauses`, Horn normalization,
+Tier D normalization and `dl_reduce` reduce repeated class operands to emptiness
+constraints beside surviving distinct members so Horn ontologies do not escalate to Tier D,
+property disjointness emits each self-pair once over distinct roles under the run's memory
+and cancellation limits, retained-axiom estimates include repeated operand storage, and
+round-tripping, annotations and original-axiom diagnostics preserve the original operands.
+
 Item 822 adds a fifth departure, [the constant of a restriction into a
 singleton](#item-822s-departure-the-constant-of-a-restriction-into-a-singleton), and item
 1070 makes the context of `owl:Thing` a query context. With both, 48 of the 50 `shoi`

@@ -273,10 +273,10 @@ impl Walk<'_> {
                 self.class(a);
                 self.class(b);
             }
-            K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
+            K::EquivalentClasses(cs) => cs.iter().for_each(|c| self.class(c)),
+            K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
                 cs.iter().for_each(|c| self.class(c))
             }
-            K::DisjointUnion(_, cs) => cs.iter().for_each(|c| self.class(c)),
             K::ObjectPropertyDomain(_, c) | K::ObjectPropertyRange(_, c) => self.class(c),
             K::ClassAssertion(c, _) => self.class(c),
             K::SubDataPropertyOf(a, b) => self.join(a, b),
@@ -531,7 +531,8 @@ fn props_of(k: &AxiomKind, f: &mut dyn FnMut(&DataProperty)) {
             class_props(a, f);
             class_props(b, f);
         }
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
+        K::EquivalentClasses(cs) => cs.iter().for_each(|c| class_props(c, f)),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
             cs.iter().for_each(|c| class_props(c, f))
         }
         K::ObjectPropertyDomain(_, c) | K::ObjectPropertyRange(_, c) | K::ClassAssertion(c, _) => {
@@ -541,9 +542,8 @@ fn props_of(k: &AxiomKind, f: &mut dyn FnMut(&DataProperty)) {
             f(a);
             f(b);
         }
-        K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
-            ps.iter().for_each(&mut *f)
-        }
+        K::EquivalentDataProperties(ps) => ps.iter().for_each(&mut *f),
+        K::DisjointDataProperties(ps) => ps.iter().for_each(&mut *f),
         K::DataPropertyDomain(d, c) => {
             f(d);
             class_props(c, f);
@@ -604,9 +604,8 @@ fn axiom_may_trigger(k: &AxiomKind) -> bool {
     use AxiomKind as K;
     match k {
         K::SubClassOf(a, b) => class_may_trigger(a) || class_may_trigger(b),
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
-            cs.iter().any(class_may_trigger)
-        }
+        K::EquivalentClasses(cs) => cs.iter().any(class_may_trigger),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => cs.iter().any(class_may_trigger),
         K::ObjectPropertyDomain(_, c)
         | K::ObjectPropertyRange(_, c)
         | K::ClassAssertion(c, _)

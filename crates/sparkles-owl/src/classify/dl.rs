@@ -263,22 +263,30 @@ fn clauses(ax: &AxiomKind) -> (u8, bool) {
             let global = !(cs.iter().all(bottom) || cs.iter().all(top));
             (most, global)
         }
-        K::DisjointClasses(cs) => (
-            pairs(cs.iter().map(|c| class(c).neg)),
-            cs.iter().filter(|c| !bottom(c)).count() > 1,
-        ),
+        K::DisjointClasses(cs) => {
+            let (unique, repeated) = split_multiset(cs);
+            let repeated_most = repeated.iter().map(|c| class(c).neg).max().unwrap_or(0);
+            let most = pairs(unique.iter().map(|c| class(c).neg)).max(repeated_most);
+            (most, cs.iter().filter(|c| !bottom(c)).count() > 1)
+        }
         K::DisjointUnion(c, cs) => {
-            let parts: Vec<Pl> = cs.iter().map(class).collect();
+            // Each repeated operand `r` satisfies `r ⊓ r ⊑ ⊥`, i.e. `r ⊑ ⊥`, so it drops
+            // from the union and from every pairwise disjointness clause, leaving only the
+            // surviving unique members beside each repeated member's emptiness constraint.
+            let (unique, repeated) = split_multiset(cs);
+            let parts: Vec<Pl> = unique.iter().map(|c| class(c)).collect();
             let union = pl(
                 sum(parts.iter().map(|p| p.pos)),
                 parts.iter().map(|p| p.neg).max().unwrap_or(0),
             );
             let named = ClassExpression::Class(c.clone());
+            let repeated_most = repeated.iter().map(|c| class(c).neg).max().unwrap_or(0);
             let most = sub(class(&named), union)
                 .max(sub(union, class(&named)))
-                .max(pairs(parts.iter().map(|p| p.neg)));
+                .max(pairs(parts.iter().map(|p| p.neg)))
+                .max(repeated_most);
             // c ≡ ⊔cs is local when both sides are emptied or both are everything, and
-            // the disjointness of the parts when at most one of them is not emptied
+            // the disjointness of the parts when at most one occurrence is not emptied
             let equal =
                 (bottom(&named) && cs.iter().all(bottom)) || (top(&named) && cs.iter().any(top));
             let apart = cs.iter().filter(|c| !bottom(c)).count() <= 1;
@@ -305,11 +313,36 @@ fn clauses(ax: &AxiomKind) -> (u8, bool) {
     }
 }
 
+/// Partitions a sorted multiset into its surviving single-occurrence members and the
+/// distinct members that occur at least twice.
+pub(super) fn split_multiset<T: Eq>(ms: &Multiset<T>) -> (Vec<&T>, Vec<&T>) {
+    let mut unique = Vec::new();
+    let mut repeated = Vec::new();
+    let slice = ms.as_slice();
+    let mut i = 0;
+    while i < slice.len() {
+        let mut j = i + 1;
+        while j < slice.len() && slice[j] == slice[i] {
+            j += 1;
+        }
+        if j - i == 1 {
+            unique.push(&slice[i]);
+        } else {
+            repeated.push(&slice[i]);
+        }
+        i = j;
+    }
+    (unique, repeated)
+}
+
 /// The most that two of the counts add up to, from the two largest, which is the largest
-/// clause of a set of pairwise disjointness conditions.
+/// clause of a set of pairwise disjointness conditions. Returns `0` when fewer than two
+/// items are present because there are no pairwise clauses.
 fn pairs(ns: impl Iterator<Item = u8>) -> u8 {
     let (mut a, mut b) = (0, 0);
+    let mut count = 0usize;
     for n in ns {
+        count += 1;
         if n > a {
             b = a;
             a = n;
@@ -317,7 +350,7 @@ fn pairs(ns: impl Iterator<Item = u8>) -> u8 {
             b = n;
         }
     }
-    add(a, b)
+    if count < 2 { 0 } else { add(a, b) }
 }
 
 /// The largest clause of an equivalence: the negative count of one operand and the
@@ -597,6 +630,84 @@ mod tests {
                 disjunctive: 1,
                 global: 1,
                 taken: 0
+            }
+        );
+    }
+
+    #[test]
+    fn repeated_disjoint_shapes_follow_surviving_members() {
+        assert_eq!(
+            of("DisjointUnion(:C :A :A)"),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert_eq!(
+            of("DisjointUnion(:C :A :A :B)"),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert_eq!(
+            of("DisjointUnion(:C :A :A :B :B)"),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert!(!horn("DisjointUnion(:C :A :A :B :D)"));
+        assert_eq!(
+            of("DisjointClasses(ObjectComplementOf(:A) ObjectComplementOf(:A))"),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(ObjectComplementOf(:A) ObjectComplementOf(:A) ObjectComplementOf(:B))"
+            ),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(ObjectComplementOf(:A) ObjectComplementOf(:A) ObjectComplementOf(:B) ObjectComplementOf(:C))"
+            ),
+            Shape {
+                horn: false,
+                global: true
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(ObjectIntersectionOf(ObjectComplementOf(:A) ObjectComplementOf(:B)) ObjectIntersectionOf(ObjectComplementOf(:A) ObjectComplementOf(:B)))"
+            ),
+            Shape {
+                horn: false,
+                global: true
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(:A :A ObjectIntersectionOf(ObjectComplementOf(:B) ObjectComplementOf(:C)))"
+            ),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(ObjectComplementOf(:A) ObjectComplementOf(:A) ObjectComplementOf(ObjectUnionOf(:B :C)))"
+            ),
+            Shape {
+                horn: true,
+                global: false
             }
         );
     }

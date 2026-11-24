@@ -1283,8 +1283,8 @@ fn tier_neutral(ax: &AxiomKind) -> bool {
             Entity::ObjectProperty(p) if *p == ObjectProperty::top() || *p == ObjectProperty::bottom()
         ),
         AxiomKind::SubClassOf(a, b) => plain(a) && plain(b),
-        AxiomKind::EquivalentClasses(cs) | AxiomKind::DisjointClasses(cs) => cs.iter().all(plain),
-        AxiomKind::DisjointUnion(_, cs) => cs.iter().all(plain),
+        AxiomKind::EquivalentClasses(cs) => cs.iter().all(plain),
+        AxiomKind::DisjointClasses(cs) | AxiomKind::DisjointUnion(_, cs) => cs.iter().all(plain),
         AxiomKind::ObjectPropertyDomain(p, c) => named(p) && plain(c),
         _ => false,
     }
@@ -1498,12 +1498,94 @@ pub fn logical(ax: &AxiomKind) -> bool {
     )
 }
 
-/// The bytes the classifier's copy of an axiom takes, roughly: the axiom, its entry and
-/// each entity's IRI with the expression that holds it.
+/// Rough heap and inline storage of the operands in a `Multiset`-backed axiom, counting
+/// backing vector slots and repeated operand allocations that a distinct-entity signature
+/// alone omits. Depends only on the axiom's value, never on `Vec::capacity()`.
+fn multiset_bytes(ax: &AxiomKind) -> usize {
+    use std::mem::size_of;
+    fn ce_extra(c: &ClassExpression) -> usize {
+        use ClassExpression as C;
+        match c {
+            C::Class(k) => k.as_str().len(),
+            C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs
+                .len()
+                .saturating_mul(size_of::<ClassExpression>())
+                .saturating_add(cs.iter().map(ce_extra).sum()),
+            C::ObjectComplementOf(f) => size_of::<ClassExpression>().saturating_add(ce_extra(f)),
+            C::ObjectOneOf(is) => is
+                .len()
+                .saturating_mul(size_of::<Individual>())
+                .saturating_add(is.iter().map(ind_extra).sum()),
+            C::ObjectSomeValuesFrom(p, f) | C::ObjectAllValuesFrom(p, f) => p
+                .named()
+                .as_str()
+                .len()
+                .saturating_add(size_of::<ClassExpression>())
+                .saturating_add(ce_extra(f)),
+            C::ObjectHasValue(p, i) => p.named().as_str().len().saturating_add(ind_extra(i)),
+            C::ObjectHasSelf(p) => p.named().as_str().len(),
+            C::ObjectMinCardinality(_, p, f)
+            | C::ObjectMaxCardinality(_, p, f)
+            | C::ObjectExactCardinality(_, p, f) => {
+                p.named()
+                    .as_str()
+                    .len()
+                    .saturating_add(f.as_deref().map_or(0, |f| {
+                        size_of::<ClassExpression>().saturating_add(ce_extra(f))
+                    }))
+            }
+            C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => ps
+                .len()
+                .saturating_mul(size_of::<DataProperty>())
+                .saturating_add(ps.iter().map(|d| d.as_str().len()).sum())
+                .saturating_add(dtcheck::range::data_range_bytes(r)),
+            C::DataHasValue(d, l) => d
+                .as_str()
+                .len()
+                .saturating_add(l.value().len())
+                .saturating_add(l.datatype().len())
+                .saturating_add(l.language().map_or(0, str::len)),
+            C::DataMinCardinality(_, d, r)
+            | C::DataMaxCardinality(_, d, r)
+            | C::DataExactCardinality(_, d, r) => d
+                .as_str()
+                .len()
+                .saturating_add(r.as_ref().map_or(0, dtcheck::range::data_range_bytes)),
+        }
+    }
+    fn ind_extra(i: &Individual) -> usize {
+        match i {
+            Individual::Named(n) => n.as_str().len(),
+            Individual::Anonymous(a) => a.0.as_str().len(),
+        }
+    }
+    fn dup_extra<T: Eq>(ms: &Multiset<T>, extra: impl Fn(&T) -> usize) -> usize {
+        let slice = ms.as_slice();
+        let slots = slice.len().saturating_mul(size_of::<T>());
+        let dup_heap: usize = slice
+            .windows(2)
+            .filter(|w| w[0] == w[1])
+            .map(|w| extra(&w[1]))
+            .sum();
+        slots.saturating_add(dup_heap)
+    }
+    match ax {
+        AxiomKind::DisjointClasses(cs) | AxiomKind::DisjointUnion(_, cs) => dup_extra(cs, ce_extra),
+        AxiomKind::DisjointObjectProperties(ps) => dup_extra(ps, |p| p.named().as_str().len()),
+        AxiomKind::DisjointDataProperties(ps) => dup_extra(ps, |d| d.as_str().len()),
+        AxiomKind::DifferentIndividuals(is) => dup_extra(is, ind_extra),
+        _ => 0,
+    }
+}
+
+/// The bytes the classifier's copy of an axiom takes, roughly: the axiom, its entry,
+/// each entity's IRI with the expression that holds it, and repeated multiset operand
+/// storage.
 fn held_bytes_of(ax: &AxiomKind) -> usize {
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
-    let mut bytes = std::mem::size_of::<AxiomKind>() + std::mem::size_of::<Held>() + 16;
+    let mut bytes =
+        std::mem::size_of::<AxiomKind>() + std::mem::size_of::<Held>() + 16 + multiset_bytes(ax);
     for e in &sig.0 {
         bytes += e.iri().as_str().len() + 64;
     }
@@ -7851,6 +7933,77 @@ mod tests {
         assert!(
             it.individuals.iter().any(index::is_anonymous),
             "the anonymous individual is an individual of the run"
+        );
+    }
+
+    #[test]
+    fn held_and_excluded_byte_estimates_count_repeated_multiset_operands() {
+        let a = ClassExpression::Class(Class::new("http://ex.org/RepeatedClass"));
+        let small = AxiomKind::DisjointClasses(vec![a.clone(); 2].into());
+        let large = AxiomKind::DisjointClasses(vec![a; 1000].into());
+        let delta = held_bytes_of(&large).saturating_sub(held_bytes_of(&small));
+        assert!(
+            delta >= 998 * std::mem::size_of::<ClassExpression>(),
+            "expected held_bytes_of to grow with repeated operands, delta={delta}"
+        );
+        let small_ex = vec![Excluded {
+            axiom: small,
+            gap: Gap::Partial("test"),
+        }];
+        let large_ex = vec![Excluded {
+            axiom: large,
+            gap: Gap::Partial("test"),
+        }];
+        assert!(
+            excluded_copy_bytes(&large_ex)
+                >= excluded_copy_bytes(&small_ex) + 998 * std::mem::size_of::<ClassExpression>()
+        );
+    }
+
+    #[test]
+    fn held_and_excluded_byte_estimates_count_repeated_data_range_payloads() {
+        let d = DataProperty::new("http://ex.org/d");
+        let short_lit = Literal::typed("x".repeat(10), crate::vocab::XSD_STRING);
+        let long_lit = Literal::typed("x".repeat(1010), crate::vocab::XSD_STRING);
+
+        let some_short = ClassExpression::DataSomeValuesFrom(
+            vec![d.clone()],
+            DataRange::OneOf([short_lit.clone()].into()),
+        );
+        let some_long = ClassExpression::DataSomeValuesFrom(
+            vec![d.clone()],
+            DataRange::OneOf([long_lit.clone()].into()),
+        );
+        let ax_short = AxiomKind::DisjointClasses(vec![some_short; 200].into());
+        let ax_long = AxiomKind::DisjointClasses(vec![some_long; 200].into());
+        let delta = held_bytes_of(&ax_long).saturating_sub(held_bytes_of(&ax_short));
+        assert!(
+            delta >= 199 * 1000,
+            "expected DataSomeValuesFrom DataRange payload growth across repeats, delta={delta}"
+        );
+        let ex_short = vec![Excluded {
+            axiom: ax_short,
+            gap: Gap::Partial("test"),
+        }];
+        let ex_long = vec![Excluded {
+            axiom: ax_long,
+            gap: Gap::Partial("test"),
+        }];
+        assert!(excluded_copy_bytes(&ex_long) >= excluded_copy_bytes(&ex_short) + 199 * 1000);
+
+        let card_short = ClassExpression::DataMinCardinality(
+            1,
+            d.clone(),
+            Some(DataRange::OneOf([short_lit].into())),
+        );
+        let card_long =
+            ClassExpression::DataMinCardinality(1, d, Some(DataRange::OneOf([long_lit].into())));
+        let card_ax_short = AxiomKind::DisjointClasses(vec![card_short; 200].into());
+        let card_ax_long = AxiomKind::DisjointClasses(vec![card_long; 200].into());
+        let card_delta = held_bytes_of(&card_ax_long).saturating_sub(held_bytes_of(&card_ax_short));
+        assert!(
+            card_delta >= 199 * 1000,
+            "expected DataMinCardinality DataRange payload growth across repeats, delta={card_delta}"
         );
     }
 }

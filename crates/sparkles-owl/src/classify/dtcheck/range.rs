@@ -1666,17 +1666,26 @@ impl Defs {
             .saturating_add(self.map.keys().map(|d| d.as_str().len()).sum::<usize>())
     }
 
+    /// The bytes of the definition map and shared `DataRange` ASTs (immutable after
+    /// construction).
+    pub fn map_bytes(&self) -> usize {
+        map_backing_bytes(&self.map).saturating_add(
+            self.map
+                .iter()
+                .map(|(d, r)| d.as_str().len() + data_range_bytes(r) + 16)
+                .sum::<usize>(),
+        )
+    }
+
+    /// The bytes of the memoized conversions table.
+    pub fn memo_bytes(&self) -> usize {
+        map_backing_bytes(&self.memo)
+    }
+
     /// The bytes the definitions (including full bucket capacities and shared `DataRange`
     /// ASTs) and converted ranges take.
     pub fn bytes(&self) -> usize {
-        map_backing_bytes(&self.map)
-            .saturating_add(
-                self.map
-                    .iter()
-                    .map(|(d, r)| d.as_str().len() + data_range_bytes(r) + 16)
-                    .sum::<usize>(),
-            )
-            .saturating_add(map_backing_bytes(&self.memo))
+        self.map_bytes().saturating_add(self.memo_bytes())
     }
 }
 

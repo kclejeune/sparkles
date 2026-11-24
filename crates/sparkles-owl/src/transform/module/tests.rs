@@ -388,3 +388,34 @@ fn an_ill_typed_literal_is_never_local() {
     );
     assert!(!top_local(&bad, &s));
 }
+
+#[test]
+fn repeated_disjointness_locality_counts_occurrences() {
+    let (k, _) = read(
+        "DisjointClasses(:A :A)
+         DisjointObjectProperties(:p :p)
+         DisjointDataProperties(:d :d)",
+    );
+    let only_b = |name: &str| name == "http://e/#B";
+    let only_a = |name: &str| name == "http://e/#A";
+    let only_p = |name: &str| name == "http://e/#p";
+    let only_d = |name: &str| name == "http://e/#d";
+
+    // DisjointClasses(:A :A): bottom-local for {:B} (:A = ⊥), non-bottom-local for {:A},
+    // non-top-local for {:B} (:A = ⊤ gives ⊤ ⊓ ⊤ ⊑ ⊥, false).
+    assert!(bottom_local(&k[0], &Sig(&only_b)));
+    assert!(!bottom_local(&k[0], &Sig(&only_a)));
+    assert!(!top_local(&k[0], &Sig(&only_b)));
+
+    // DisjointObjectProperties(:p :p): bottom-local for {:B}, non-bottom-local for {:p},
+    // non-top-local for {:B}.
+    assert!(bottom_local(&k[1], &Sig(&only_b)));
+    assert!(!bottom_local(&k[1], &Sig(&only_p)));
+    assert!(!top_local(&k[1], &Sig(&only_b)));
+
+    // DisjointDataProperties(:d :d): bottom-local for {:B}, non-bottom-local for {:d},
+    // non-top-local for {:B}.
+    assert!(bottom_local(&k[2], &Sig(&only_b)));
+    assert!(!bottom_local(&k[2], &Sig(&only_d)));
+    assert!(!top_local(&k[2], &Sig(&only_b)));
+}

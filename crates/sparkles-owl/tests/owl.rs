@@ -211,9 +211,10 @@ fn self_equivalence_has_one_operand() {
     let o = strict(&decl(":A owl:equivalentClass :A . :a owl:sameAs :a ."));
     assert!(o.unmapped.is_empty());
     assert!(o.contains(&Axiom::equivalent_classes([class("A")])));
-    // a disjointness of one operand cannot be expressed as a set
+    // a self-disjointness preserves both operands rather than collapsing to a singleton
     let o = strict(&decl(":A owl:disjointWith :A ."));
-    assert_eq!(o.unmapped.len(), 1);
+    assert!(o.unmapped.is_empty());
+    assert!(o.contains(&Axiom::disjoint_classes([class("A"), class("A")])));
 }
 
 // ---- strict and lenient reads --------------------------------------------------
@@ -1193,9 +1194,8 @@ mod random {
             (class_expression(), class_expression())
                 .prop_filter("distinct", |(a, b)| a != b)
                 .prop_map(|(a, b)| AxiomKind::EquivalentClasses([a, b].into())),
-            prop::collection::btree_set(class_expression(), 2..4)
-                .prop_filter("two operands", |s| s.len() >= 2)
-                .prop_map(AxiomKind::DisjointClasses),
+            prop::collection::vec(class_expression(), 2..4)
+                .prop_map(|v| AxiomKind::DisjointClasses(v.into())),
             (ope(), class_expression()).prop_map(|(p, c)| AxiomKind::ObjectPropertyDomain(p, c)),
             (prop::collection::vec(ope(), 2..4), ope()).prop_map(|(c, p)| {
                 AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(c), p)
@@ -1587,7 +1587,7 @@ fn ofn_reports_errors_with_positions() {
             .contains("entity kind")
     );
     assert!(
-        err("Ontology(DisjointClasses(owl:Thing owl:Thing))")
+        err("Ontology(DisjointClasses(owl:Thing))")
             .message
             .contains("operands")
     );

@@ -664,28 +664,42 @@ pub fn entity_body(
                     // once both are cut
                     let (mut same_cut, mut different_cut) = (false, false);
                     o.equalities(&i, opts, |ax, _| {
-                        let (into, cut) = match &ax.kind {
-                            AxiomKind::SameIndividual(_) => (&mut same, &mut same_cut),
-                            AxiomKind::DifferentIndividuals(_) => {
-                                (&mut different, &mut different_cut)
+                        match &ax.kind {
+                            AxiomKind::SameIndividual(set) => {
+                                for x in set.iter().filter(|x| **x != i) {
+                                    if same.contains(x) {
+                                        continue;
+                                    }
+                                    if same.len() >= q.limit {
+                                        same_cut = true;
+                                        truncated = true;
+                                        break;
+                                    }
+                                    same.insert(x.clone());
+                                }
+                            }
+                            AxiomKind::DifferentIndividuals(bag) => {
+                                let mut skipped = false;
+                                for x in bag.iter().filter(|x| {
+                                    if !skipped && **x == i {
+                                        skipped = true;
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                }) {
+                                    if different.contains(x) {
+                                        continue;
+                                    }
+                                    if different.len() >= q.limit {
+                                        different_cut = true;
+                                        truncated = true;
+                                        break;
+                                    }
+                                    different.insert(x.clone());
+                                }
                             }
                             _ => return Ok(true),
-                        };
-                        let (AxiomKind::SameIndividual(set) | AxiomKind::DifferentIndividuals(set)) =
-                            &ax.kind
-                        else {
-                            return Ok(true);
-                        };
-                        for x in set.iter().filter(|x| **x != i) {
-                            if into.contains(x) {
-                                continue;
-                            }
-                            if into.len() >= q.limit {
-                                *cut = true;
-                                truncated = true;
-                                break;
-                            }
-                            into.insert(x.clone());
                         }
                         Ok(!(same_cut && different_cut))
                     })?;

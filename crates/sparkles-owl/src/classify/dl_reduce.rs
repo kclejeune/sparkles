@@ -189,9 +189,8 @@ fn ax_has_top(k: &AxiomKind) -> bool {
     use AxiomKind as K;
     match k {
         K::SubClassOf(a, b) => ce_has_top(a) || ce_has_top(b),
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
-            cs.iter().any(ce_has_top)
-        }
+        K::EquivalentClasses(cs) => cs.iter().any(ce_has_top),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => cs.iter().any(ce_has_top),
         K::ClassAssertion(c, _) => ce_has_top(c),
         K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => is_top(p) || ce_has_top(c),
         K::SubObjectPropertyOf(s, p) => {
@@ -201,9 +200,8 @@ fn ax_has_top(k: &AxiomKind) -> bool {
                     SubObjectPropertyExpression::Chain(qs) => qs.iter().any(is_top),
                 }
         }
-        K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
-            ps.iter().any(is_top)
-        }
+        K::EquivalentObjectProperties(ps) => ps.iter().any(is_top),
+        K::DisjointObjectProperties(ps) => ps.iter().any(is_top),
         K::InverseObjectProperties(p, q) => is_top(p) || is_top(q),
         K::FunctionalObjectProperty(p)
         | K::InverseFunctionalObjectProperty(p)
@@ -246,12 +244,13 @@ impl Cx {
         cs.iter().map(|c| self.ce(c)).collect()
     }
 
-    /// The images of the members of a disjointness, and an axiom `D ⊑ ⊥` for each image
-    /// `D` of more than one member. Two members with one image are equivalent, so their
-    /// disjointness makes the image empty, which the set of images alone would lose.
+    /// The surviving distinct images of the members of a disjointness, and an axiom
+    /// `D ⊑ ⊥` for each image `D` of more than one member. Two members with one image are
+    /// equivalent, so their disjointness makes the image empty, which drops it from the
+    /// surviving disjointness and union while preserving the emptiness constraint.
     fn disjoint(
         &mut self,
-        cs: &BTreeSet<ClassExpression>,
+        cs: &Multiset<ClassExpression>,
     ) -> Result<(BTreeSet<ClassExpression>, Vec<AxiomKind>), ()> {
         let mut images = BTreeSet::new();
         let mut empty = BTreeSet::new();
@@ -263,6 +262,7 @@ impl Cx {
                 images.insert(d);
             }
         }
+        images.retain(|d| !empty.contains(d));
         let empty = empty
             .into_iter()
             .map(|d| AxiomKind::SubClassOf(d, ClassExpression::Class(Class::nothing())))
@@ -325,21 +325,26 @@ impl Cx {
             K::DisjointClasses(cs) => {
                 let (images, mut out) = self.disjoint(cs)?;
                 if images.len() >= 2 {
-                    out.push(K::DisjointClasses(images));
+                    out.push(K::DisjointClasses(images.into()));
                 }
                 return Ok(Rt::New(out));
             }
-            // the union keeps the set of images, and the disjointness of its members
-            // follows the rule of `DisjointClasses`
+            // the union keeps the surviving non-repeated images, and the repeated images
+            // become emptiness inclusions
             K::DisjointUnion(c, cs) => {
                 let (images, mut out) = self.disjoint(cs)?;
                 if images.len() >= 2 {
-                    out.push(K::DisjointUnion(c.clone(), images));
+                    out.push(K::DisjointUnion(c.clone(), images.into()));
                 } else if let Some(d) = images.into_iter().next() {
                     let c = ClassExpression::Class(c.clone());
                     if c != d {
                         out.push(K::EquivalentClasses([c, d].into()));
                     }
+                } else if c.as_str() != vocab::OWL_NOTHING {
+                    out.push(K::SubClassOf(
+                        ClassExpression::Class(c.clone()),
+                        ClassExpression::Class(Class::nothing()),
+                    ));
                 }
                 return Ok(Rt::New(out));
             }

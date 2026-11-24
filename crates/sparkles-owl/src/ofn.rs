@@ -248,13 +248,25 @@ impl Renderer {
         let ces = |cs: &std::collections::BTreeSet<ClassExpression>| -> Vec<String> {
             cs.iter().map(|c| self.class_expression(c)).collect()
         };
+        let ces_bag = |cs: &Multiset<ClassExpression>| -> Vec<String> {
+            cs.iter().map(|c| self.class_expression(c)).collect()
+        };
         let opes = |ps: &std::collections::BTreeSet<ObjectPropertyExpression>| -> Vec<String> {
+            ps.iter().map(|p| self.ope(p)).collect()
+        };
+        let opes_bag = |ps: &Multiset<ObjectPropertyExpression>| -> Vec<String> {
             ps.iter().map(|p| self.ope(p)).collect()
         };
         let dps = |ps: &std::collections::BTreeSet<DataProperty>| -> Vec<String> {
             ps.iter().map(|p| self.iri(p.as_str())).collect()
         };
+        let dps_bag = |ps: &Multiset<DataProperty>| -> Vec<String> {
+            ps.iter().map(|p| self.iri(p.as_str())).collect()
+        };
         let inds = |is: &std::collections::BTreeSet<Individual>| -> Vec<String> {
+            is.iter().map(|i| self.individual(i)).collect()
+        };
+        let inds_bag = |is: &Multiset<Individual>| -> Vec<String> {
             is.iter().map(|i| self.individual(i)).collect()
         };
         match &ax.kind {
@@ -263,10 +275,11 @@ impl Renderer {
                 args.push(self.class_expression(a));
                 args.push(self.class_expression(b));
             }
-            K::EquivalentClasses(cs) | K::DisjointClasses(cs) => args.extend(ces(cs)),
+            K::EquivalentClasses(cs) => args.extend(ces(cs)),
+            K::DisjointClasses(cs) => args.extend(ces_bag(cs)),
             K::DisjointUnion(c, cs) => {
                 args.push(self.iri(c.as_str()));
-                args.extend(ces(cs));
+                args.extend(ces_bag(cs));
             }
             K::SubObjectPropertyOf(sub, sup) => {
                 args.push(match sub {
@@ -277,9 +290,8 @@ impl Renderer {
                 });
                 args.push(self.ope(sup));
             }
-            K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
-                args.extend(opes(ps))
-            }
+            K::EquivalentObjectProperties(ps) => args.extend(opes(ps)),
+            K::DisjointObjectProperties(ps) => args.extend(opes_bag(ps)),
             K::InverseObjectProperties(a, b) => {
                 args.push(self.ope(a));
                 args.push(self.ope(b));
@@ -299,7 +311,8 @@ impl Renderer {
                 args.push(self.iri(a.as_str()));
                 args.push(self.iri(b.as_str()));
             }
-            K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => args.extend(dps(ps)),
+            K::EquivalentDataProperties(ps) => args.extend(dps(ps)),
+            K::DisjointDataProperties(ps) => args.extend(dps_bag(ps)),
             K::DataPropertyDomain(p, c) => {
                 args.push(self.iri(p.as_str()));
                 args.push(self.class_expression(c));
@@ -318,7 +331,8 @@ impl Renderer {
                 args.push(format!("({})", opes(ops).join(" ")));
                 args.push(format!("({})", dps(dprops).join(" ")));
             }
-            K::SameIndividual(is) | K::DifferentIndividuals(is) => args.extend(inds(is)),
+            K::SameIndividual(is) => args.extend(inds(is)),
+            K::DifferentIndividuals(is) => args.extend(inds_bag(is)),
             K::ClassAssertion(c, i) => {
                 args.push(self.class_expression(c));
                 args.push(self.individual(i));

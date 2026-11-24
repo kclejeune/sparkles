@@ -399,9 +399,8 @@ impl Interner {
             .checked_add(self.dt.bytes())
     }
 
-    /// The bytes the interner takes, roughly: each expression with its entry in the
-    /// table, the names with their IRIs, and a chunk's intersections.
-    pub fn bytes(&self) -> usize {
+    /// O(1) bytes of the interner excluding [`Interner::dt_run`].
+    pub fn core_bytes(&self) -> usize {
         self.data_bytes()
             + self.nodes.capacity() * 40
             + self.classes.bytes()
@@ -416,7 +415,22 @@ impl Interner {
             + self.and_ops * 4
             + self.scope_bytes()
             + self.prefix_roles.capacity() * 16
-            + self.dt_run.as_ref().map_or(0, |r| r.bytes())
+    }
+
+    /// Bytes of the immutable `dt_run` tables (`comps` and `defs.map`).
+    pub fn dt_run_static_bytes(&self) -> usize {
+        self.dt_run.as_ref().map_or(0, |r| r.static_bytes())
+    }
+
+    /// O(1) bytes of the mutable `dt_run` conversion memo table.
+    pub fn dt_run_memo_bytes(&self) -> usize {
+        self.dt_run.as_ref().map_or(0, |r| r.memo_bytes())
+    }
+
+    /// The bytes the interner takes, roughly: each expression with its entry in the
+    /// table, the names with their IRIs, and a chunk's intersections.
+    pub fn bytes(&self) -> usize {
+        self.core_bytes() + self.dt_run.as_ref().map_or(0, |r| r.bytes())
     }
 
     /// Whether a chunk met data ranges or literals, whose ids its merge does not map, so
@@ -1627,18 +1641,12 @@ fn normalize_axiom(
                 .map(|c| ce(c, it, &mut partial))
                 .collect::<Result<_, _>>()?;
             es.sort_unstable();
-            let before = es.len();
-            es.dedup();
-            if es.len() < before {
-                // two operands that normalize to one expression make it unsatisfiable
-                let mut seen = FxHashSet::default();
-                for c in cs {
-                    let e = ce(c, it, &mut partial)?;
-                    if !seen.insert(e) {
-                        out.subs.push((e, BOTTOM));
-                    }
+            for w in es.windows(2) {
+                if w[0] == w[1] {
+                    out.subs.push((w[0], BOTTOM));
                 }
             }
+            es.dedup();
             if es.len() >= 2 {
                 out.disjoint.push(es);
             }
@@ -1924,6 +1932,11 @@ fn normalize_axiom(
             let mut es: Vec<Ex> = is.iter().map(|i| it.individual(i)).collect();
             out.individuals.extend(es.iter().copied());
             es.sort_unstable();
+            for w in es.windows(2) {
+                if w[0] == w[1] {
+                    out.subs.push((w[0], BOTTOM));
+                }
+            }
             es.dedup();
             if es.len() >= 2 {
                 out.disjoint.push(es);

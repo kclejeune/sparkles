@@ -169,8 +169,14 @@ pub fn axiom(ax: &Axiom) -> Value {
     };
     let ces =
         |cs: &BTreeSet<ClassExpression>| -> Value { cs.iter().map(class_expression).collect() };
+    let ces_bag =
+        |cs: &Multiset<ClassExpression>| -> Value { cs.iter().map(class_expression).collect() };
     let opes = |ps: &BTreeSet<ObjectPropertyExpression>| -> Value { ps.iter().map(ope).collect() };
+    let opes_bag =
+        |ps: &Multiset<ObjectPropertyExpression>| -> Value { ps.iter().map(ope).collect() };
     let dps = |ps: &BTreeSet<DataProperty>| -> Value { ps.iter().map(|p| iri_v(&p.0)).collect() };
+    let dps_bag =
+        |ps: &Multiset<DataProperty>| -> Value { ps.iter().map(|p| iri_v(&p.0)).collect() };
     match &ax.kind {
         K::Declaration(e) => {
             put("kind", e.kind().name().into());
@@ -180,10 +186,11 @@ pub fn axiom(ax: &Axiom) -> Value {
             put("subClass", class_expression(a));
             put("superClass", class_expression(b));
         }
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => put("classes", ces(cs)),
+        K::EquivalentClasses(cs) => put("classes", ces(cs)),
+        K::DisjointClasses(cs) => put("classes", ces_bag(cs)),
         K::DisjointUnion(c, cs) => {
             put("class", iri_v(&c.0));
-            put("classes", ces(cs));
+            put("classes", ces_bag(cs));
         }
         K::SubObjectPropertyOf(sub, sup) => {
             match sub {
@@ -194,9 +201,8 @@ pub fn axiom(ax: &Axiom) -> Value {
             }
             put("superProperty", ope(sup));
         }
-        K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
-            put("properties", opes(ps))
-        }
+        K::EquivalentObjectProperties(ps) => put("properties", opes(ps)),
+        K::DisjointObjectProperties(ps) => put("properties", opes_bag(ps)),
         K::InverseObjectProperties(a, b) => {
             put("first", ope(a));
             put("second", ope(b));
@@ -220,9 +226,8 @@ pub fn axiom(ax: &Axiom) -> Value {
             put("subProperty", iri_v(&a.0));
             put("superProperty", iri_v(&b.0));
         }
-        K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
-            put("properties", dps(ps))
-        }
+        K::EquivalentDataProperties(ps) => put("properties", dps(ps)),
+        K::DisjointDataProperties(ps) => put("properties", dps_bag(ps)),
         K::DataPropertyDomain(p, c) => {
             put("property", iri_v(&p.0));
             put("domain", class_expression(c));
@@ -241,9 +246,8 @@ pub fn axiom(ax: &Axiom) -> Value {
             put("objectProperties", opes(ops));
             put("dataProperties", dps(dprops));
         }
-        K::SameIndividual(is) | K::DifferentIndividuals(is) => {
-            put("individuals", is.iter().map(individual).collect())
-        }
+        K::SameIndividual(is) => put("individuals", is.iter().map(individual).collect()),
+        K::DifferentIndividuals(is) => put("individuals", is.iter().map(individual).collect()),
         K::ClassAssertion(c, i) => {
             put("class", class_expression(c));
             put("individual", individual(i));
@@ -556,12 +560,20 @@ pub fn read_axiom(v: &Value) -> R<Axiom> {
     let ces = |k: &str| -> R<BTreeSet<ClassExpression>> {
         array(m, k)?.iter().map(read_class_expression).collect()
     };
+    let ces_bag = |k: &str| -> R<Multiset<ClassExpression>> {
+        array(m, k)?.iter().map(read_class_expression).collect()
+    };
     let p = || read_ope(field(m, "property")?);
     let dp = || read_dp(field(m, "property")?);
     let opes = |k: &str| -> R<BTreeSet<ObjectPropertyExpression>> {
         array(m, k)?.iter().map(read_ope).collect()
     };
+    let opes_bag = |k: &str| -> R<Multiset<ObjectPropertyExpression>> {
+        array(m, k)?.iter().map(read_ope).collect()
+    };
     let dps = |k: &str| -> R<BTreeSet<DataProperty>> { array(m, k)?.iter().map(read_dp).collect() };
+    let dps_bag =
+        |k: &str| -> R<Multiset<DataProperty>> { array(m, k)?.iter().map(read_dp).collect() };
     let ind = |k: &str| read_individual(field(m, k)?);
     let ap = |k: &str| Ok::<_, ModelError>(AnnotationProperty(read_iri(field(m, k)?)?));
     let kind = match t {
@@ -576,8 +588,10 @@ pub fn read_axiom(v: &Value) -> R<Axiom> {
         }
         "SubClassOf" => K::SubClassOf(ce("subClass")?, ce("superClass")?),
         "EquivalentClasses" => K::EquivalentClasses(ces("classes")?),
-        "DisjointClasses" => K::DisjointClasses(ces("classes")?),
-        "DisjointUnion" => K::DisjointUnion(Class(read_iri(field(m, "class")?)?), ces("classes")?),
+        "DisjointClasses" => K::DisjointClasses(ces_bag("classes")?),
+        "DisjointUnion" => {
+            K::DisjointUnion(Class(read_iri(field(m, "class")?)?), ces_bag("classes")?)
+        }
         "SubObjectPropertyOf" => {
             let sub = if let Some(c) = m.get("chain") {
                 SubObjectPropertyExpression::Chain(
@@ -593,7 +607,7 @@ pub fn read_axiom(v: &Value) -> R<Axiom> {
             K::SubObjectPropertyOf(sub, read_ope(field(m, "superProperty")?)?)
         }
         "EquivalentObjectProperties" => K::EquivalentObjectProperties(opes("properties")?),
-        "DisjointObjectProperties" => K::DisjointObjectProperties(opes("properties")?),
+        "DisjointObjectProperties" => K::DisjointObjectProperties(opes_bag("properties")?),
         "InverseObjectProperties" => K::InverseObjectProperties(
             read_ope(field(m, "first")?)?,
             read_ope(field(m, "second")?)?,
@@ -612,7 +626,7 @@ pub fn read_axiom(v: &Value) -> R<Axiom> {
             read_dp(field(m, "superProperty")?)?,
         ),
         "EquivalentDataProperties" => K::EquivalentDataProperties(dps("properties")?),
-        "DisjointDataProperties" => K::DisjointDataProperties(dps("properties")?),
+        "DisjointDataProperties" => K::DisjointDataProperties(dps_bag("properties")?),
         "DataPropertyDomain" => K::DataPropertyDomain(dp()?, ce("domain")?),
         "DataPropertyRange" => K::DataPropertyRange(dp()?, read_data_range(field(m, "range")?)?),
         "FunctionalDataProperty" => K::FunctionalDataProperty(dp()?),

@@ -166,7 +166,102 @@ struct Out {
     inverse: bool,
 }
 
+#[derive(Clone, Copy)]
+struct OutMark {
+    subs: usize,
+    disjoint: usize,
+    ranges: usize,
+    role_subs: usize,
+    chains: usize,
+    clauses: usize,
+    atmost: usize,
+    rdis: usize,
+    irreflexive: usize,
+    ne: usize,
+    lazy: usize,
+    low: usize,
+    least: usize,
+    inverse: bool,
+}
+
 impl Out {
+    fn mark(&self) -> OutMark {
+        OutMark {
+            subs: self.subs.len(),
+            disjoint: self.disjoint.len(),
+            ranges: self.ranges.len(),
+            role_subs: self.role_subs.len(),
+            chains: self.chains.len(),
+            clauses: self.clauses.len(),
+            atmost: self.atmost.len(),
+            rdis: self.rdis.len(),
+            irreflexive: self.irreflexive.len(),
+            ne: self.ne.len(),
+            lazy: self.lazy.len(),
+            low: self.low.len(),
+            least: self.least.len(),
+            inverse: self.inverse,
+        }
+    }
+
+    fn truncate(&mut self, m: OutMark) {
+        self.subs.truncate(m.subs);
+        self.disjoint.truncate(m.disjoint);
+        self.ranges.truncate(m.ranges);
+        self.role_subs.truncate(m.role_subs);
+        self.chains.truncate(m.chains);
+        self.clauses.truncate(m.clauses);
+        self.atmost.truncate(m.atmost);
+        self.rdis.truncate(m.rdis);
+        self.irreflexive.truncate(m.irreflexive);
+        self.ne.truncate(m.ne);
+        self.lazy.truncate(m.lazy);
+        self.low.truncate(m.low);
+        self.least.truncate(m.least);
+        self.inverse = m.inverse;
+    }
+
+    fn bytes(&self) -> usize {
+        self.subs.capacity() * 8
+            + self
+                .disjoint
+                .iter()
+                .map(|d| 24 + d.capacity() * 4)
+                .sum::<usize>()
+            + self.disjoint.capacity() * 24
+            + self.ranges.capacity() * 8
+            + self.role_subs.capacity() * 8
+            + self
+                .chains
+                .iter()
+                .map(|(c, _)| 32 + c.capacity() * 4)
+                .sum::<usize>()
+            + self.chains.capacity() * 32
+            + self
+                .clauses
+                .iter()
+                .map(|(b, h)| 48 + (b.capacity() + h.capacity()) * 4)
+                .sum::<usize>()
+            + self.clauses.capacity() * 48
+            + self.atmost.capacity() * 16
+            + self.rdis.capacity() * 8
+            + self.irreflexive.capacity() * 4
+            + self
+                .ne
+                .iter()
+                .map(|(_, es)| 32 + es.capacity() * 4)
+                .sum::<usize>()
+            + self.ne.capacity() * 32
+            + self
+                .lazy
+                .iter()
+                .map(|(_, _, _, h)| 40 + h.capacity() * 4)
+                .sum::<usize>()
+            + self.lazy.capacity() * 40
+            + self.low.capacity() * 4
+            + self.least.capacity() * 20
+    }
+
     fn extend(&mut self, o: Out) {
         self.subs.extend(o.subs);
         self.disjoint.extend(o.disjoint);
@@ -175,7 +270,11 @@ impl Out {
         self.chains.extend(o.chains);
         self.clauses.extend(o.clauses);
         self.atmost.extend(o.atmost);
-        self.rdis.extend(o.rdis);
+        if self.rdis.is_empty() && self.rdis.capacity() == 0 {
+            self.rdis = o.rdis;
+        } else {
+            self.rdis.extend(o.rdis);
+        }
         self.irreflexive.extend(o.irreflexive);
         self.ne.extend(o.ne);
         self.lazy.extend(o.lazy);
@@ -185,7 +284,7 @@ impl Out {
     }
 }
 
-struct Norm<'a> {
+struct Norm<'a, 'b> {
     it: &'a mut Interner,
     out: Out,
     /// whether the run takes number restrictions; without them a minimum is read as the
@@ -197,6 +296,9 @@ struct Norm<'a> {
     /// whether a minimum gets a name of its own, for [`number_order`]: a run that counts
     /// without the root and was asked for the order
     order: bool,
+    budget: Option<&'a mut super::horn::PairBudget<'b>>,
+    stop: &'a dyn Fn() -> bool,
+    halt: Option<Halt>,
 }
 
 /// The largest minimum that becomes that many existential restrictions.
@@ -234,8 +336,8 @@ fn axiom_counts(ax: &AxiomKind, rooted: bool) -> bool {
         |c: &ClassExpression| needs_counting(c, false, rooted) || needs_counting(c, true, rooted);
     match ax {
         K::SubClassOf(c, d) => needs_counting(c, false, rooted) || needs_counting(d, true, rooted),
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs.iter().any(either),
-        K::DisjointUnion(_, cs) => cs.iter().any(either),
+        K::EquivalentClasses(cs) => cs.iter().any(either),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => cs.iter().any(either),
         K::ObjectPropertyDomain(_, c) | K::ObjectPropertyRange(_, c) => {
             needs_counting(c, true, rooted)
         }
@@ -249,25 +351,33 @@ fn axiom_counts(ax: &AxiomKind, rooted: bool) -> bool {
     }
 }
 
-impl Norm<'_> {
+fn role_in(
+    it: &mut Interner,
+    inverse: &mut bool,
+    p: &ObjectPropertyExpression,
+) -> Result<Role, Why> {
+    let named = p.named();
+    if matches!(
+        named.as_str(),
+        vocab::OWL_TOP_OBJECT_PROPERTY | vocab::OWL_BOTTOM_OBJECT_PROPERTY
+    ) {
+        return Err("the top and bottom object properties");
+    }
+    let r = it.role(RoleName::Object(named.clone()));
+    let i = it.role(RoleName::Inverse(named.clone()));
+    Ok(match p {
+        ObjectPropertyExpression::Property(_) => r,
+        ObjectPropertyExpression::InverseOf(_) => {
+            *inverse = true;
+            i
+        }
+    })
+}
+
+impl Norm<'_, '_> {
     /// The role of an object property expression, with its inverse interned beside it.
     fn role(&mut self, p: &ObjectPropertyExpression) -> Result<Role, Why> {
-        let named = p.named();
-        if matches!(
-            named.as_str(),
-            vocab::OWL_TOP_OBJECT_PROPERTY | vocab::OWL_BOTTOM_OBJECT_PROPERTY
-        ) {
-            return Err("the top and bottom object properties");
-        }
-        let r = self.it.role(RoleName::Object(named.clone()));
-        let i = self.it.role(RoleName::Inverse(named.clone()));
-        Ok(match p {
-            ObjectPropertyExpression::Property(_) => r,
-            ObjectPropertyExpression::InverseOf(_) => {
-                self.out.inverse = true;
-                i
-            }
-        })
+        role_in(self.it, &mut self.out.inverse, p)
     }
 
     fn conj(&mut self, mut es: Vec<Ex>) -> Ex {
@@ -1022,15 +1132,22 @@ impl Norm<'_> {
                 self.out.subs.push((TOP, m));
             }
             K::DisjointObjectProperties(ps) => {
-                let rs = ps
-                    .iter()
-                    .map(|p| self.role(p))
-                    .collect::<Result<Vec<_>, _>>()?;
-                for (i, &a) in rs.iter().enumerate() {
-                    for &b in &rs[i + 1..] {
-                        self.out.rdis.push((a, b));
-                    }
-                }
+                let other_bytes = self
+                    .out
+                    .bytes()
+                    .saturating_sub(self.out.rdis.capacity() * 8);
+                let inverse = &mut self.out.inverse;
+                super::horn::emit_role_pairs(
+                    ps.as_slice(),
+                    false,
+                    self.it,
+                    |it, p| role_in(it, inverse, p),
+                    &mut self.out.rdis,
+                    other_bytes,
+                    self.budget.as_deref_mut(),
+                    self.stop,
+                    &mut self.halt,
+                )?;
             }
             K::AsymmetricObjectProperty(p) => {
                 let (r, i) = (self.role(p)?, self.role(&p.inverse())?);
@@ -1068,32 +1185,50 @@ impl Norm<'_> {
                 Ok(())
             }
             K::DisjointClasses(cs) => {
-                let cs: Vec<&ClassExpression> = cs.iter().collect();
-                let mut es = cs
-                    .iter()
-                    .map(|c| self.neg(c, 0))
-                    .collect::<Result<Vec<_>, _>>()?;
-                es.sort_unstable();
-                for w in es.windows(2) {
-                    if w[0] == w[1] {
-                        self.out.subs.push((w[0], BOTTOM));
-                    }
+                let (unique, repeated) = super::dl::split_multiset(cs);
+                for &r in &repeated {
+                    self.empty(r)?;
                 }
-                es.dedup();
-                es.retain(|&e| e != BOTTOM);
-                if es.len() >= 2 {
-                    self.out.disjoint.push(es);
+                if unique.len() >= 2 {
+                    let mut es = unique
+                        .iter()
+                        .map(|c| self.neg(c, 0))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    es.sort_unstable();
+                    let mut last_empty = None;
+                    for w in es.windows(2) {
+                        if w[0] == w[1] && w[0] != BOTTOM && last_empty != Some(w[0]) {
+                            self.out.subs.push((w[0], BOTTOM));
+                            last_empty = Some(w[0]);
+                        }
+                    }
+                    es.dedup();
+                    es.retain(|&e| e != BOTTOM);
+                    if es.len() >= 2 {
+                        self.out.disjoint.push(es);
+                    }
                 }
                 Ok(())
             }
             K::DisjointUnion(c, ds) => {
+                let (unique, repeated) = super::dl::split_multiset(ds);
                 let c = C::Class(c.clone());
-                let ds: Vec<ClassExpression> = ds.iter().cloned().collect();
-                self.sub(vec![c.clone()], ds.clone())?;
-                for d in &ds {
+                self.sub(
+                    vec![c.clone()],
+                    unique.iter().map(|d| (*d).clone()).collect(),
+                )?;
+                for &d in &unique {
                     self.sub(vec![d.clone()], vec![c.clone()])?;
                 }
-                self.axiom(&K::DisjointClasses(ds.into_iter().collect()))
+                for &r in &repeated {
+                    self.empty(r)?;
+                }
+                if unique.len() >= 2 {
+                    let surviving: Multiset<ClassExpression> =
+                        unique.into_iter().cloned().collect();
+                    self.axiom(&K::DisjointClasses(surviving))?;
+                }
+                Ok(())
             }
             K::ObjectPropertyDomain(p, c) => self.sub(
                 vec![C::ObjectSomeValuesFrom(
@@ -1126,6 +1261,24 @@ impl Norm<'_> {
                 vec![C::Class(Class::nothing())],
             ),
             _ => Err("an axiom Tier D does not take"),
+        }
+    }
+
+    /// `c ⊑ ⊥`, using `neg` directly when it succeeds so wide shallow conjunctions do not
+    /// hit `sub`'s flattening step cap, and falling back to `sub` otherwise.
+    fn empty(&mut self, c: &ClassExpression) -> Result<(), Why> {
+        let mark = self.out.mark();
+        match self.neg(c, 0) {
+            Ok(e) => {
+                if e != BOTTOM {
+                    self.out.subs.push((e, BOTTOM));
+                }
+                Ok(())
+            }
+            Err(_) => {
+                self.out.truncate(mark);
+                self.sub(vec![c.clone()], vec![])
+            }
         }
     }
 }
@@ -1202,11 +1355,13 @@ fn normalize_within(
         it.role(RoleName::Inverse(p));
     }
     let mut all = Out::default();
+    let mut all_chain_inner_bytes = 0usize;
+    let mut budget = super::horn::PairBudget::new(limit, ax);
     for (i, k) in axioms.iter().enumerate() {
         if !Norm::is_role_axiom(k) {
             continue;
         }
-        // the fresh classes of an axiom are those of the last run over this interner
+        // the fresh classes of an axiom are those of its last run over this interner
         // that normalized it, so that the contexts kept from that run name the same
         // classes (roadmap item 753)
         let scope = Scope::Dl(it.scope_axiom(k));
@@ -1217,11 +1372,50 @@ fn normalize_within(
             counting,
             rooted,
             order,
+            budget: Some(&mut budget),
+            stop,
+            halt: None,
         };
         let ok = n.role_axiom(k).is_ok();
+        let halted = n.halt;
         n.it.end_scope();
+        if let Some(h) = halted {
+            return Err(h);
+        }
         if ok {
-            all.extend(n.out);
+            let out = n.out;
+            if budget.is_bounded() {
+                if !out.rdis.is_empty() && (!all.rdis.is_empty() || all.rdis.capacity() > 0) {
+                    let old_cap = all.rdis.capacity();
+                    let needed = all.rdis.len().saturating_add(out.rdis.len());
+                    if needed > old_cap {
+                        let next_cap = old_cap.saturating_mul(2).max(needed).max(4);
+                        let growth_bytes = next_cap
+                            .saturating_sub(old_cap)
+                            .saturating_mul(std::mem::size_of::<(Role, Role)>());
+                        budget.check(it, out.bytes().saturating_add(growth_bytes))?;
+                    }
+                }
+                if !out.chains.is_empty() {
+                    all_chain_inner_bytes = all_chain_inner_bytes.saturating_add(
+                        out.chains
+                            .iter()
+                            .map(|(c, _)| 32 + c.capacity() * 4)
+                            .sum::<usize>(),
+                    );
+                }
+            }
+            all.extend(out);
+            if budget.is_bounded() {
+                let retained = all.role_subs.capacity() * 8
+                    + all.chains.capacity() * 32
+                    + all_chain_inner_bytes
+                    + all.atmost.capacity() * 16
+                    + all.subs.capacity() * 8
+                    + all.rdis.capacity() * 8
+                    + all.irreflexive.capacity() * 4;
+                budget.set_accum(retained);
+            }
             taken[i] = true;
         }
     }
@@ -1238,9 +1432,16 @@ fn normalize_within(
             counting,
             rooted,
             order,
+            budget: None,
+            stop,
+            halt: None,
         };
         let ok = n.axiom(k).is_ok();
+        let halted = n.halt;
         n.it.end_scope();
+        if let Some(h) = halted {
+            return Err(h);
+        }
         if ok {
             if !super::dl::shape(k).horn {
                 disjunctive += 1;
@@ -2500,5 +2701,250 @@ mod tests {
         let levels: Vec<(usize, usize)> = (0..3).map(|l| unfolding(body, Some(l))).collect();
         assert_eq!(levels, [(3, 6), (2, 4), (2, 2)]);
         assert_eq!(unfolding(body, None), (2, 2));
+    }
+
+    #[test]
+    fn repeated_property_pairs_do_not_expand_quadratically_in_dl_norm() {
+        let p = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/p"));
+        let q = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/q"));
+        let disj = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("http://ex.org/A")),
+            ClassExpression::ObjectUnionOf(
+                [
+                    ClassExpression::Class(Class::new("http://ex.org/B")),
+                    ClassExpression::Class(Class::new("http://ex.org/C")),
+                ]
+                .into(),
+            ),
+        );
+        let allowed = Allowed {
+            counting: true,
+            ..Allowed::default()
+        };
+
+        let same = AxiomKind::DisjointObjectProperties(vec![p.clone(); 500].into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let (taken, dl) = normalize(&[&disj, &same], &mut it, &mut ax, None, &|| false, allowed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken, vec![true, true]);
+        assert_eq!(dl.rdis.len(), 1);
+
+        let mut mix_vec = vec![p; 500];
+        mix_vec.push(q);
+        let mix = AxiomKind::DisjointObjectProperties(mix_vec.into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let (taken, dl) = normalize(&[&disj, &mix], &mut it, &mut ax, None, &|| false, allowed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken, vec![true, true]);
+        assert_eq!(dl.rdis.len(), 2);
+    }
+
+    #[test]
+    fn role_pair_normalization_enforces_post_interning_budget_and_cancellation_in_dl_norm() {
+        use std::cell::Cell;
+
+        let disj = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("http://ex.org/A")),
+            ClassExpression::ObjectUnionOf(
+                [
+                    ClassExpression::Class(Class::new("http://ex.org/B")),
+                    ClassExpression::Class(Class::new("http://ex.org/C")),
+                ]
+                .into(),
+            ),
+        );
+        let allowed = Allowed {
+            counting: true,
+            ..Allowed::default()
+        };
+
+        // 1. Stale pre-interning baseline gap in Tier D role pass.
+        let distinct_400: Vec<ObjectPropertyExpression> = (0..400)
+            .map(|i| {
+                ObjectPropertyExpression::Property(ObjectProperty::new(format!(
+                    "http://ex.org/dl_prop_{i:04}"
+                )))
+            })
+            .collect();
+        let disjoint_400 = AxiomKind::DisjointObjectProperties(distinct_400.into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        it.scope_axiom(&disjoint_400);
+        let pre_baseline = it.bytes() + ax.bytes();
+        let pair_bytes = (400usize * 399 / 2) * std::mem::size_of::<(Role, Role)>();
+        let tight_limit = pre_baseline + pair_bytes + 1024;
+        let err = normalize(
+            &[&disj, &disjoint_400],
+            &mut it,
+            &mut ax,
+            Some(tight_limit),
+            &|| false,
+            allowed,
+        );
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory in dl_norm when post-interning + scratch + pairs exceed limit, got {:?}",
+            err.err()
+        );
+
+        let mut it_ok = Interner::new();
+        let mut ax_ok = Axioms::default();
+        let (taken, dl) = normalize(
+            &[&disj, &disjoint_400],
+            &mut it_ok,
+            &mut ax_ok,
+            Some(pre_baseline + pair_bytes + 512 * 1024),
+            &|| false,
+            allowed,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(taken, vec![true, true]);
+        assert_eq!(dl.rdis.len(), 400 * 399 / 2);
+
+        // 2. Cancellation before reserve in Tier D.
+        let distinct_20: Vec<ObjectPropertyExpression> = (0..20)
+            .map(|i| {
+                ObjectPropertyExpression::Property(ObjectProperty::new(format!(
+                    "http://ex.org/dl_cancel_{i}"
+                )))
+            })
+            .collect();
+        let disjoint_20 = AxiomKind::DisjointObjectProperties(distinct_20.into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let err = normalize(
+            &[&disj, &disjoint_20],
+            &mut it,
+            &mut ax,
+            None,
+            &|| true,
+            allowed,
+        );
+        assert!(
+            matches!(err, Err(Halt::Stopped)),
+            "expected Halt::Stopped before reserve in dl_norm, got {:?}",
+            err.err()
+        );
+
+        // 3. Cancellation during duplicate operand scan of > POLL_WORK copies of a single role.
+        let p = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/dl_dup_p"));
+        let many_same = AxiomKind::DisjointObjectProperties(
+            vec![p; super::super::index::POLL_WORK + 10].into(),
+        );
+        let polls = Cell::new(0usize);
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let err = normalize(
+            &[&disj, &many_same],
+            &mut it,
+            &mut ax,
+            None,
+            &|| {
+                polls.set(polls.get() + 1);
+                true
+            },
+            allowed,
+        );
+        assert!(
+            matches!(err, Err(Halt::Stopped)),
+            "expected Halt::Stopped during duplicate scan in dl_norm, got {:?}",
+            err.err()
+        );
+        assert!(polls.get() >= 1, "expected stop() to be polled during scan");
+    }
+
+    #[test]
+    fn role_pair_aggregate_growth_respects_memory_budget_in_dl_norm() {
+        let disj = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("http://ex.org/A")),
+            ClassExpression::ObjectUnionOf(
+                [
+                    ClassExpression::Class(Class::new("http://ex.org/B")),
+                    ClassExpression::Class(Class::new("http://ex.org/C")),
+                ]
+                .into(),
+            ),
+        );
+        let allowed = Allowed {
+            counting: true,
+            ..Allowed::default()
+        };
+
+        let distinct_400: Vec<ObjectPropertyExpression> = (0..400)
+            .map(|i| {
+                ObjectPropertyExpression::Property(ObjectProperty::new(format!(
+                    "http://ex.org/dl_agg_{i:04}"
+                )))
+            })
+            .collect();
+        let disjoint_400 = AxiomKind::DisjointObjectProperties(distinct_400.clone().into());
+        let dup_first = AxiomKind::DisjointObjectProperties(
+            vec![distinct_400[0].clone(), distinct_400[0].clone()].into(),
+        );
+        let disjoint_200 = AxiomKind::DisjointObjectProperties(distinct_400[..200].to_vec().into());
+
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let pre_baseline = it.bytes() + ax.bytes();
+        let pair_bytes = (400usize * 399 / 2) * std::mem::size_of::<(Role, Role)>();
+
+        // 1. Extending `all.rdis` from 79,800 to 159,600 slots (~1.22 MiB) when adding 1 pair
+        // must fail under a budget that fits the first axiom + overhead (~894 KiB) but not the
+        // doubled aggregate buffer.
+        let growth_limit = pre_baseline + pair_bytes + 256 * 1024;
+        let err = normalize(
+            &[&disj, &disjoint_400, &dup_first],
+            &mut it,
+            &mut ax,
+            Some(growth_limit),
+            &|| false,
+            allowed,
+        );
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory when aggregate rdis growth exceeds limit, got {:?}",
+            err.err()
+        );
+
+        // 2. When the limit allows the doubled aggregate (2 * pair_bytes) + 128 KiB headroom,
+        // a third axiom emitting 19,900 pairs (159,200 bytes) must see the retained 159,600-slot
+        // capacity of `all.rdis` and fail rather than charging only 79,801 slots.
+        let mut it2 = Interner::new();
+        let mut ax2 = Axioms::default();
+        let retained_limit = pre_baseline + 2 * pair_bytes + 128 * 1024;
+        let err2 = normalize(
+            &[&disj, &disjoint_400, &dup_first, &disjoint_200],
+            &mut it2,
+            &mut ax2,
+            Some(retained_limit),
+            &|| false,
+            allowed,
+        );
+        assert!(
+            matches!(err2, Err(Halt::Memory(_))),
+            "expected Halt::Memory when third axiom exceeds budget over retained aggregate capacity, got {:?}",
+            err2.err()
+        );
+
+        // 3. With enough headroom for the retained aggregate + third axiom buffer, all succeed.
+        let mut it_ok = Interner::new();
+        let mut ax_ok = Axioms::default();
+        let (taken, dl) = normalize(
+            &[&disj, &disjoint_400, &dup_first, &disjoint_200],
+            &mut it_ok,
+            &mut ax_ok,
+            Some(pre_baseline + 3 * pair_bytes + 512 * 1024),
+            &|| false,
+            allowed,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(taken, vec![true, true, true, true]);
+        assert_eq!(dl.rdis.len(), 400 * 399 / 2 + 1 + 200 * 199 / 2);
     }
 }
