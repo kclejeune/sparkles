@@ -244,9 +244,10 @@ impl Cx {
         cs.iter().map(|c| self.ce(c)).collect()
     }
 
-    /// The images of the members of a disjointness, and an axiom `D ⊑ ⊥` for each image
-    /// `D` of more than one member. Two members with one image are equivalent, so their
-    /// disjointness makes the image empty, which the set of images alone would lose.
+    /// The surviving distinct images of the members of a disjointness, and an axiom
+    /// `D ⊑ ⊥` for each image `D` of more than one member. Two members with one image are
+    /// equivalent, so their disjointness makes the image empty, which drops it from the
+    /// surviving disjointness and union while preserving the emptiness constraint.
     fn disjoint(
         &mut self,
         cs: &Multiset<ClassExpression>,
@@ -261,6 +262,7 @@ impl Cx {
                 images.insert(d);
             }
         }
+        images.retain(|d| !empty.contains(d));
         let empty = empty
             .into_iter()
             .map(|d| AxiomKind::SubClassOf(d, ClassExpression::Class(Class::nothing())))
@@ -327,8 +329,8 @@ impl Cx {
                 }
                 return Ok(Rt::New(out));
             }
-            // the union keeps the set of images, and the disjointness of its members
-            // follows the rule of `DisjointClasses`
+            // the union keeps the surviving non-repeated images, and the repeated images
+            // become emptiness inclusions
             K::DisjointUnion(c, cs) => {
                 let (images, mut out) = self.disjoint(cs)?;
                 if images.len() >= 2 {
@@ -338,6 +340,11 @@ impl Cx {
                     if c != d {
                         out.push(K::EquivalentClasses([c, d].into()));
                     }
+                } else if c.as_str() != vocab::OWL_NOTHING {
+                    out.push(K::SubClassOf(
+                        ClassExpression::Class(c.clone()),
+                        ClassExpression::Class(Class::nothing()),
+                    ));
                 }
                 return Ok(Rt::New(out));
             }

@@ -353,8 +353,16 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   expressions, data ranges, axioms, annotations and the ontology header. It reads the
   model from triples by the reverse mapping of the OWL 2 Mapping to RDF Graphs and writes
   it back by the forward mapping. Its functional-style writer renders axioms and
-  documents, and its functional-style reader reads them. The `ontology` cargo feature,
-  which is on by default in the server, builds it into the library and the server.
+  documents, and its functional-style reader reads them. `DisjointClasses`, `DisjointUnion`,
+  `DisjointObjectProperties`, `DisjointDataProperties` and `DifferentIndividuals` keep
+  their operands in a sorted `Multiset<T>` rather than a `BTreeSet<T>` so repeated operands
+  retain their logical meaning while equality and serialized output stay order-independent.
+  Equivalences, unions, intersections, `SameIndividual` and `HasKey` continue to deduplicate
+  with `BTreeSet<T>`. Rust callers constructing those five `AxiomKind` variants directly
+  from a typed `BTreeSet<T>` convert with `.into()`, `Ontology::disjoint_unions` returns
+  `Vec<Multiset<ClassExpression>>`, and `Axiom::disjoint_classes` keeps its generic
+  `IntoIterator` signature. The `ontology` cargo feature, which is on by default in the
+  server, builds it into the library and the server.
 * An OWL 2 functional-style document loads as the triples its axioms map to, one axiom
   at a time. A `.ofn` file, compressed or not, is read by `sparkles load`,
   `sparkles ontology check FILE`, the library's and the bindings' file loaders, SPARQL

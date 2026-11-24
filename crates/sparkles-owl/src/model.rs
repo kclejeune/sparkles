@@ -98,6 +98,13 @@ impl<T: Ord> FromIterator<T> for Multiset<T> {
     }
 }
 
+impl<T: Ord> Extend<T> for Multiset<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.0.extend(iter);
+        self.0.sort();
+    }
+}
+
 impl<T> IntoIterator for Multiset<T> {
     type Item = T;
     type IntoIter = std::vec::IntoIter<T>;

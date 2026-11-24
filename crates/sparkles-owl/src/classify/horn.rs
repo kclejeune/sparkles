@@ -1067,6 +1067,74 @@ struct Norm<'a> {
     /// whether the ontology has individuals, which leaves at-least restrictions above
     /// one out (F24, "The Horn rules with individuals")
     individuals: bool,
+    base_bytes: usize,
+    limit: Option<usize>,
+    stop: &'a dyn Fn() -> bool,
+    halt: Option<Halt>,
+}
+
+/// Emits self-pairs once per repeated role and pairwise disjoint pairs over distinct roles,
+/// checking memory budget before reserving and polling cancellation inside the pair loop.
+pub(super) fn emit_role_pairs(
+    mut rs: Vec<Role>,
+    symmetric: bool,
+    out: &mut Vec<(Role, Role)>,
+    base_bytes: usize,
+    limit: Option<usize>,
+    stop: &dyn Fn() -> bool,
+    halt: &mut Option<Halt>,
+) -> Result<(), Why> {
+    rs.sort_unstable();
+    let mut repeated: Vec<Role> = Vec::new();
+    let mut distinct: Vec<Role> = Vec::new();
+    let mut i = 0;
+    while i < rs.len() {
+        let a = rs[i];
+        let mut j = i + 1;
+        while j < rs.len() && rs[j] == a {
+            j += 1;
+        }
+        if j - i >= 2 {
+            repeated.push(a);
+        }
+        distinct.push(a);
+        i = j;
+    }
+    let d = distinct.len();
+    let distinct_pairs = if symmetric {
+        d.saturating_mul(d.saturating_sub(1))
+    } else {
+        d.saturating_mul(d.saturating_sub(1)) / 2
+    };
+    let pair_count = repeated.len().saturating_add(distinct_pairs);
+    let pair_bytes = out
+        .len()
+        .saturating_add(pair_count)
+        .saturating_mul(std::mem::size_of::<(Role, Role)>());
+    let needed = base_bytes.saturating_add(pair_bytes);
+    if limit.is_some_and(|l| needed > l) {
+        *halt = Some(Halt::Memory(needed));
+        return Err("memory budget exceeded");
+    }
+    out.reserve(pair_count);
+    for a in repeated {
+        out.push((a, a));
+    }
+    let mut work = 0usize;
+    for (idx, &a) in distinct.iter().enumerate() {
+        for &b in &distinct[idx + 1..] {
+            work += 1;
+            if work.is_multiple_of(POLL_WORK) && stop() {
+                *halt = Some(Halt::Stopped);
+                return Err("cancelled");
+            }
+            out.push((a, b));
+            if symmetric {
+                out.push((b, a));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Norm<'_> {
@@ -1621,12 +1689,15 @@ impl Norm<'_> {
                     .iter()
                     .map(|d| self.it.role(RoleName::Data(d.clone())))
                     .collect();
-                for (i, &a) in rs.iter().enumerate() {
-                    for &b in &rs[i + 1..] {
-                        self.out.dt_disjoint.push((a.min(b), a.max(b)));
-                    }
-                }
-                Ok(())
+                emit_role_pairs(
+                    rs,
+                    false,
+                    &mut self.out.dt_disjoint,
+                    self.base_bytes,
+                    self.limit,
+                    self.stop,
+                    &mut self.halt,
+                )
             }
             // a definition outside OWL 2 EL makes every property it is used on a checker
             // property, whose atoms read it in place of its datatype, so the run takes it
@@ -1681,46 +1752,30 @@ impl Norm<'_> {
                 Ok(())
             }
             K::DisjointClasses(cs) => {
-                let cs: Vec<&ClassExpression> = cs.iter().collect();
-                // operands with a negative form make one disjointness set
-                if let Ok(mut es) = cs
-                    .iter()
-                    .map(|c| self.neg(c, 0))
-                    .collect::<Result<Vec<_>, _>>()
-                {
-                    es.sort_unstable();
-                    for w in es.windows(2) {
-                        if w[0] == w[1] {
-                            self.out.subs.push((w[0], BOTTOM));
-                        }
-                    }
-                    es.dedup();
-                    es.retain(|&e| e != BOTTOM);
-                    if es.len() >= 2 {
-                        self.out.disjoint.push(es);
-                    }
-                    return Ok(());
+                let (unique, repeated) = super::dl::split_multiset(cs);
+                for &r in &repeated {
+                    self.sub(vec![r.clone()], vec![])?;
                 }
-                for i in 0..cs.len() {
-                    for j in i + 1..cs.len() {
-                        self.sub(vec![cs[i].clone(), cs[j].clone()], vec![])?;
-                    }
+                if unique.len() >= 2 {
+                    self.disjoint_distinct(&unique)?;
                 }
                 Ok(())
             }
-            K::DisjointUnion(c, ds)
-                if ds.is_empty() || ds.iter().all(|d| d == &ds.as_slice()[0]) =>
-            {
-                let d = ds
-                    .iter()
-                    .next()
-                    .cloned()
-                    .unwrap_or(C::Class(Class::nothing()));
+            K::DisjointUnion(c, ds) => {
+                let (unique, repeated) = super::dl::split_multiset(ds);
                 let c = C::Class(c.clone());
-                self.sub(vec![c.clone()], vec![d.clone()])?;
-                self.sub(vec![d], vec![c])?;
-                if ds.len() >= 2 {
-                    self.axiom(&K::DisjointClasses(ds.clone()))?;
+                self.sub(
+                    vec![c.clone()],
+                    unique.iter().map(|d| (*d).clone()).collect(),
+                )?;
+                for &d in &unique {
+                    self.sub(vec![d.clone()], vec![c.clone()])?;
+                }
+                for &r in &repeated {
+                    self.sub(vec![r.clone()], vec![])?;
+                }
+                if unique.len() >= 2 {
+                    self.disjoint_distinct(&unique)?;
                 }
                 Ok(())
             }
@@ -1779,18 +1834,55 @@ impl Norm<'_> {
                     .iter()
                     .map(|p| self.simple_role(p))
                     .collect::<Result<Vec<_>, _>>()?;
-                for (i, &a) in rs.iter().enumerate() {
-                    for &b in &rs[i + 1..] {
-                        self.out.clash.push((a, b));
-                        if a != b {
-                            self.out.clash.push((b, a));
-                        }
-                    }
-                }
-                Ok(())
+                emit_role_pairs(
+                    rs,
+                    true,
+                    &mut self.out.clash,
+                    self.base_bytes,
+                    self.limit,
+                    self.stop,
+                    &mut self.halt,
+                )
             }
             _ => Err("an axiom the Horn rules do not take"),
         }
+    }
+
+    /// Pairwise disjointness over distinct surviving operands.
+    fn disjoint_distinct(&mut self, unique: &[&ClassExpression]) -> Result<(), Why> {
+        // operands with a negative form make one disjointness set
+        if let Ok(mut es) = unique
+            .iter()
+            .map(|c| self.neg(c, 0))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            es.sort_unstable();
+            let mut last_empty = None;
+            for w in es.windows(2) {
+                if w[0] == w[1] && w[0] != BOTTOM && last_empty != Some(w[0]) {
+                    self.out.subs.push((w[0], BOTTOM));
+                    last_empty = Some(w[0]);
+                }
+            }
+            es.dedup();
+            es.retain(|&e| e != BOTTOM);
+            if es.len() >= 2 {
+                self.out.disjoint.push(es);
+            }
+            return Ok(());
+        }
+        let mut work = 0usize;
+        for i in 0..unique.len() {
+            for j in i + 1..unique.len() {
+                work += 1;
+                if work.is_multiple_of(POLL_WORK) && (self.stop)() {
+                    self.halt = Some(Halt::Stopped);
+                    return Err("cancelled");
+                }
+                self.sub(vec![unique[i].clone(), unique[j].clone()], vec![])?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1844,9 +1936,17 @@ pub fn normalize(
             rb: None,
             out: Out::default(),
             individuals,
+            base_bytes: 0,
+            limit,
+            stop,
+            halt: None,
         };
         let accepted = n.role_axiom(k).is_ok();
+        let halted = n.halt;
         n.it.end_scope();
+        if let Some(h) = halted {
+            return Err(h);
+        }
         if accepted {
             let o = n.out;
             roles.role_subs.extend(o.role_subs);
@@ -1907,6 +2007,7 @@ pub fn normalize(
     // the class axioms and the role axioms that need simple roles, which go to `ax` only
     // once one is taken
     let mut class_out: Vec<Out> = Vec::new();
+    let mut class_pair_bytes = 0usize;
     for (i, k) in axioms.iter().enumerate() {
         if taken[i] || Norm::is_role_axiom(k) {
             continue;
@@ -1914,19 +2015,38 @@ pub fn normalize(
         // the fresh classes of an axiom are those of its last run (roadmap item 753)
         let scope = Scope::Horn(it.scope_axiom(k));
         it.begin_scope(scope);
+        let base_bytes = it
+            .bytes()
+            .saturating_add(ax.bytes())
+            .saturating_add(class_pair_bytes);
         let mut n = Norm {
             it,
             rb: Some(&rb),
             out: Out::default(),
             individuals,
+            base_bytes,
+            limit,
+            stop,
+            halt: None,
         };
         let accepted = n.axiom(k).is_ok();
+        let halted = n.halt;
         n.it.end_scope();
+        if let Some(h) = halted {
+            return Err(h);
+        }
         n.it.ranges.check_halt()?;
         if n.it.dt_stopped() {
             return Err(Halt::Stopped);
         }
         if accepted {
+            class_pair_bytes = class_pair_bytes.saturating_add(
+                n.out
+                    .clash
+                    .len()
+                    .saturating_add(n.out.dt_disjoint.len())
+                    .saturating_mul(std::mem::size_of::<(Role, Role)>()),
+            );
             class_out.push(n.out);
             taken[i] = true;
         }
@@ -2362,5 +2482,66 @@ mod reduction_tests {
             assert_eq!(marked, d);
         }
         assert!(merged > 300 && dropped > 300, "{merged} {dropped}");
+    }
+
+    #[test]
+    fn repeated_property_pairs_do_not_expand_quadratically_in_horn() {
+        let p = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/p"));
+        let q = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/q"));
+        let d = DataProperty::new("http://ex.org/d");
+        let e = DataProperty::new("http://ex.org/e");
+
+        let obj_same = AxiomKind::DisjointObjectProperties(vec![p.clone(); 500].into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let taken = normalize(&[&obj_same], &mut it, &mut ax, None, &|| false).unwrap();
+        assert_eq!(taken, vec![true]);
+        assert_eq!(ax.horn.as_ref().unwrap().clash.len(), 1);
+
+        let mut obj_mix_vec = vec![p; 500];
+        obj_mix_vec.push(q);
+        let obj_mix = AxiomKind::DisjointObjectProperties(obj_mix_vec.into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let taken = normalize(&[&obj_mix], &mut it, &mut ax, None, &|| false).unwrap();
+        assert_eq!(taken, vec![true]);
+        // (p, p), (p, q), (q, p)
+        assert_eq!(ax.horn.as_ref().unwrap().clash.len(), 3);
+
+        let data_same = AxiomKind::DisjointDataProperties(vec![d.clone(); 500].into());
+        let mut it = Interner::new();
+        let defs = super::super::dtcheck::range::Defs::new(FxHashMap::default());
+        let comps =
+            super::super::dtcheck::comp::Comps::of(&[&data_same], &defs, &|| false).unwrap();
+        it.dt_run = Some(Box::new(super::super::dtcheck::atoms::DtRun {
+            comps,
+            defs,
+            stop: super::super::dtcheck::atoms::Stop::default(),
+            budget: None,
+            stopped: None,
+        }));
+        let mut ax = Axioms::default();
+        let taken = normalize(&[&data_same], &mut it, &mut ax, None, &|| false).unwrap();
+        assert_eq!(taken, vec![true]);
+        assert_eq!(ax.dt_disjoint.len(), 1);
+
+        let mut data_mix_vec = vec![d; 500];
+        data_mix_vec.push(e);
+        let data_mix = AxiomKind::DisjointDataProperties(data_mix_vec.into());
+        let mut it = Interner::new();
+        let defs = super::super::dtcheck::range::Defs::new(FxHashMap::default());
+        let comps = super::super::dtcheck::comp::Comps::of(&[&data_mix], &defs, &|| false).unwrap();
+        it.dt_run = Some(Box::new(super::super::dtcheck::atoms::DtRun {
+            comps,
+            defs,
+            stop: super::super::dtcheck::atoms::Stop::default(),
+            budget: None,
+            stopped: None,
+        }));
+        let mut ax = Axioms::default();
+        let taken = normalize(&[&data_mix], &mut it, &mut ax, None, &|| false).unwrap();
+        assert_eq!(taken, vec![true]);
+        // (d, d) and (d, e)
+        assert_eq!(ax.dt_disjoint.len(), 2);
     }
 }

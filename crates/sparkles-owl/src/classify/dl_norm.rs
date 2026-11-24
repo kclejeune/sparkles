@@ -197,6 +197,10 @@ struct Norm<'a> {
     /// whether a minimum gets a name of its own, for [`number_order`]: a run that counts
     /// without the root and was asked for the order
     order: bool,
+    base_bytes: usize,
+    limit: Option<usize>,
+    stop: &'a dyn Fn() -> bool,
+    halt: Option<Halt>,
 }
 
 /// The largest minimum that becomes that many existential restrictions.
@@ -1026,11 +1030,15 @@ impl Norm<'_> {
                     .iter()
                     .map(|p| self.role(p))
                     .collect::<Result<Vec<_>, _>>()?;
-                for (i, &a) in rs.iter().enumerate() {
-                    for &b in &rs[i + 1..] {
-                        self.out.rdis.push((a, b));
-                    }
-                }
+                super::horn::emit_role_pairs(
+                    rs,
+                    false,
+                    &mut self.out.rdis,
+                    self.base_bytes,
+                    self.limit,
+                    self.stop,
+                    &mut self.halt,
+                )?;
             }
             K::AsymmetricObjectProperty(p) => {
                 let (r, i) = (self.role(p)?, self.role(&p.inverse())?);
@@ -1068,32 +1076,50 @@ impl Norm<'_> {
                 Ok(())
             }
             K::DisjointClasses(cs) => {
-                let cs: Vec<&ClassExpression> = cs.iter().collect();
-                let mut es = cs
-                    .iter()
-                    .map(|c| self.neg(c, 0))
-                    .collect::<Result<Vec<_>, _>>()?;
-                es.sort_unstable();
-                for w in es.windows(2) {
-                    if w[0] == w[1] {
-                        self.out.subs.push((w[0], BOTTOM));
-                    }
+                let (unique, repeated) = super::dl::split_multiset(cs);
+                for &r in &repeated {
+                    self.sub(vec![r.clone()], vec![])?;
                 }
-                es.dedup();
-                es.retain(|&e| e != BOTTOM);
-                if es.len() >= 2 {
-                    self.out.disjoint.push(es);
+                if unique.len() >= 2 {
+                    let mut es = unique
+                        .iter()
+                        .map(|c| self.neg(c, 0))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    es.sort_unstable();
+                    let mut last_empty = None;
+                    for w in es.windows(2) {
+                        if w[0] == w[1] && w[0] != BOTTOM && last_empty != Some(w[0]) {
+                            self.out.subs.push((w[0], BOTTOM));
+                            last_empty = Some(w[0]);
+                        }
+                    }
+                    es.dedup();
+                    es.retain(|&e| e != BOTTOM);
+                    if es.len() >= 2 {
+                        self.out.disjoint.push(es);
+                    }
                 }
                 Ok(())
             }
             K::DisjointUnion(c, ds) => {
+                let (unique, repeated) = super::dl::split_multiset(ds);
                 let c = C::Class(c.clone());
-                let ds: Vec<ClassExpression> = ds.iter().cloned().collect();
-                self.sub(vec![c.clone()], ds.clone())?;
-                for d in &ds {
+                self.sub(
+                    vec![c.clone()],
+                    unique.iter().map(|d| (*d).clone()).collect(),
+                )?;
+                for &d in &unique {
                     self.sub(vec![d.clone()], vec![c.clone()])?;
                 }
-                self.axiom(&K::DisjointClasses(ds.into_iter().collect()))
+                for &r in &repeated {
+                    self.sub(vec![r.clone()], vec![])?;
+                }
+                if unique.len() >= 2 {
+                    let surviving: Multiset<ClassExpression> =
+                        unique.into_iter().cloned().collect();
+                    self.axiom(&K::DisjointClasses(surviving))?;
+                }
+                Ok(())
             }
             K::ObjectPropertyDomain(p, c) => self.sub(
                 vec![C::ObjectSomeValuesFrom(
@@ -1211,15 +1237,28 @@ fn normalize_within(
         // classes (roadmap item 753)
         let scope = Scope::Dl(it.scope_axiom(k));
         it.begin_scope(scope);
+        let base_bytes = it.bytes().saturating_add(ax.bytes()).saturating_add(
+            all.rdis
+                .len()
+                .saturating_mul(std::mem::size_of::<(Role, Role)>()),
+        );
         let mut n = Norm {
             it,
             out: Out::default(),
             counting,
             rooted,
             order,
+            base_bytes,
+            limit,
+            stop,
+            halt: None,
         };
         let ok = n.role_axiom(k).is_ok();
+        let halted = n.halt;
         n.it.end_scope();
+        if let Some(h) = halted {
+            return Err(h);
+        }
         if ok {
             all.extend(n.out);
             taken[i] = true;
@@ -1232,15 +1271,28 @@ fn normalize_within(
         }
         let scope = Scope::Dl(it.scope_axiom(k));
         it.begin_scope(scope);
+        let base_bytes = it.bytes().saturating_add(ax.bytes()).saturating_add(
+            all.rdis
+                .len()
+                .saturating_mul(std::mem::size_of::<(Role, Role)>()),
+        );
         let mut n = Norm {
             it,
             out: Out::default(),
             counting,
             rooted,
             order,
+            base_bytes,
+            limit,
+            stop,
+            halt: None,
         };
         let ok = n.axiom(k).is_ok();
+        let halted = n.halt;
         n.it.end_scope();
+        if let Some(h) = halted {
+            return Err(h);
+        }
         if ok {
             if !super::dl::shape(k).horn {
                 disjunctive += 1;
@@ -2500,5 +2552,45 @@ mod tests {
         let levels: Vec<(usize, usize)> = (0..3).map(|l| unfolding(body, Some(l))).collect();
         assert_eq!(levels, [(3, 6), (2, 4), (2, 2)]);
         assert_eq!(unfolding(body, None), (2, 2));
+    }
+
+    #[test]
+    fn repeated_property_pairs_do_not_expand_quadratically_in_dl_norm() {
+        let p = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/p"));
+        let q = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/q"));
+        let disj = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("http://ex.org/A")),
+            ClassExpression::ObjectUnionOf(
+                [
+                    ClassExpression::Class(Class::new("http://ex.org/B")),
+                    ClassExpression::Class(Class::new("http://ex.org/C")),
+                ]
+                .into(),
+            ),
+        );
+        let allowed = Allowed {
+            counting: true,
+            ..Allowed::default()
+        };
+
+        let same = AxiomKind::DisjointObjectProperties(vec![p.clone(); 500].into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let (taken, dl) = normalize(&[&disj, &same], &mut it, &mut ax, None, &|| false, allowed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken, vec![true, true]);
+        assert_eq!(dl.rdis.len(), 1);
+
+        let mut mix_vec = vec![p; 500];
+        mix_vec.push(q);
+        let mix = AxiomKind::DisjointObjectProperties(mix_vec.into());
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let (taken, dl) = normalize(&[&disj, &mix], &mut it, &mut ax, None, &|| false, allowed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken, vec![true, true]);
+        assert_eq!(dl.rdis.len(), 2);
     }
 }

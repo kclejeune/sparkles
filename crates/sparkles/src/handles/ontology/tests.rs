@@ -1518,6 +1518,42 @@ fn equalities_stream_once_and_fill_each_list_on_its_own() {
 }
 
 #[test]
+fn streamed_different_from_self_appears_in_equalities_and_entity_wire() {
+    let ds = dataset(":o a owl:Ontology . :a a owl:NamedIndividual ; owl:differentFrom :a .");
+    let o = ds
+        .ontology()
+        .graph("default")
+        .mode(Mode::Strict)
+        .open()
+        .unwrap();
+    let mut seen = Vec::new();
+    o.equalities(&Individual::named(ex("a")), &opts(), |ax, _| {
+        seen.push(ax.kind);
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(
+        seen,
+        vec![AxiomKind::DifferentIndividuals(
+            [Individual::named(ex("a")), Individual::named(ex("a"))].into()
+        )]
+    );
+
+    let body = wire::call(
+        &ds,
+        "entity",
+        &serde_json::json!({"iri": ex("a"), "assertions": true, "mode": "strict"}),
+        &opts(),
+    )
+    .unwrap();
+    let diff = body["namedIndividual"]["differentIndividuals"]
+        .as_array()
+        .unwrap();
+    assert_eq!(diff.len(), 1, "{body}");
+    assert_eq!(diff[0]["expression"], ex("a"), "{body}");
+}
+
+#[test]
 fn streams_give_every_graph_of_an_assertion() {
     let held = ":o a owl:Ontology . :A a owl:Class . :p a owl:ObjectProperty .
         :a a owl:NamedIndividual , [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :A ] .
