@@ -487,6 +487,19 @@ pub fn write_literal_key(l: &Literal, out: &mut Vec<u8>) {
 
 /// [`write_literal_key`] for a borrowed literal, so that a lookup need not own its term.
 pub fn write_literal_ref_key(l: oxrdf::LiteralRef<'_>, out: &mut Vec<u8>) {
+    let suffix = if let Some(lang) = l.language() {
+        1 + lang.len() + if l.direction().is_some() { 5 } else { 0 }
+    } else if l.datatype() != xsd::STRING {
+        1 + l.datatype().as_str().len()
+    } else {
+        0
+    };
+    let needed = 2 + l.value().len() + suffix;
+    if out.capacity() == 0 {
+        out.reserve_exact(needed);
+    } else {
+        out.reserve(needed);
+    }
     out.push(b'"');
     out.extend_from_slice(l.value().as_bytes());
     out.push(KEY_SEP);

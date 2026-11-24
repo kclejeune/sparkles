@@ -1,5 +1,9 @@
 //! `Dataset::reasoning().explain` (spec U10 §3.3).
 
+#[cfg(feature = "reasoning")]
+#[path = "../../sparkles-core/tests/support/caller_allocations.rs"]
+mod caller_allocations;
+
 use oxrdf::{NamedNode, Term};
 use sparkles::Dataset;
 use sparkles::access::{GraphAccess, GraphRule, Graphs};
@@ -471,6 +475,179 @@ fn rdfs_on_read_grafts_a_materialized_premise_to_visible_assertions() {
     for t in trees {
         leaves(&t);
         assert!(t.depth >= 3);
+    }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn rdfs_on_read_materialized_resolver_does_not_clone_held_premise_over_workspace() {
+    use sparkles::reasoning::{
+        ReasonRequest,
+        rdfs::NewSchema,
+        reasoner::{GraphRef, Inputs, Profile},
+    };
+
+    // 1. Materialized rule derives `ex:s ex:p "<12 KiB>"` in urn:x-sparkles:inferred while
+    //    `ex:p rdfs:domain ex:C` exists only in the on-read schema. Explaining `ex:s a ex:C`
+    //    with an 8 KiB answer limit (16,640-byte workspace) misses the materialized search,
+    //    decodes and holds the 12 KiB inferred premise inside the workspace, and invokes the
+    //    production resolver. The resolver must not clone the held 12 KiB premise over the
+    //    16,640-byte workspace cap.
+    {
+        let (_dir, ds) = open();
+        ds.load_str(
+            "<http://ex.org/init> <http://ex.org/initp> <http://ex.org/inito> .\n",
+            RdfFormat::Turtle,
+        )
+        .unwrap();
+        ds.store().compact().unwrap();
+        let lit_12k = "m".repeat(12_288);
+        ds.load_str(
+            &format!(
+                "@prefix ex: <http://ex.org/> .\n\
+                 ex:hr {{ ex:s ex:seed \"{lit_12k}\" . }}\n"
+            ),
+            RdfFormat::TriG,
+        )
+        .unwrap();
+        ds.reasoning()
+            .run(&ReasonRequest {
+                profile: Profile::Rules(
+                    "@prefix ex: <http://ex.org/> . [derive: (?x ex:seed ?y) -> (?x ex:p ?y)]"
+                        .into(),
+                ),
+                inputs: Inputs {
+                    data_graphs: vec![GraphRef::Named(HR.into())],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        let snap = ds.store().snapshot();
+        let lit_id = snap
+            .lookup_term(&Term::Literal(oxrdf::Literal::new_simple_literal(&lit_12k)))
+            .expect("derived 12 KiB literal must be stored");
+        assert_eq!(lit_id.tag(), sparkles_core::id::Tag::Delta);
+        drop(snap);
+
+        ds.reasoning()
+            .rdfs()
+            .set(NewSchema::Triples(vec![oxrdf::Triple::new(
+                NamedNode::new("http://ex.org/p").unwrap(),
+                oxrdf::vocab::rdfs::DOMAIN.into_owned(),
+                NamedNode::new("http://ex.org/C").unwrap(),
+            )]))
+            .unwrap();
+
+        let unbounded = ds
+            .reasoning()
+            .explain(&ExplainRequest::new([ex("s"), ty(), ex("C")]))
+            .unwrap();
+        assert_eq!(unbounded.source, Some(ExplainSource::RdfsOnRead));
+        let trees = found(unbounded.explained);
+        assert_eq!(rule(&trees[0]), "rdfs2");
+        assert_eq!(rule(&trees[0].premises[0]), "derive");
+
+        let mut req = ExplainRequest::new([ex("s"), ty(), ex("C")]);
+        req.max_memory = Some(8192);
+        let (res, alloc) = caller_allocations::measure(|| ds.reasoning().explain(&req));
+        let err = res.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+            "expected reasoning-budget, got {err:?}"
+        );
+        assert!(
+            alloc.peak <= 16_640,
+            "materialized resolver must not clone held 12 KiB premise over workspace cap (peak_live={} > 16640, largest={})",
+            alloc.peak,
+            alloc.largest
+        );
+
+        // 2. With remaining budget > 0 (retained ~12.4 KiB < 13,000), the resolver enters the
+        //    materialized search and still passes the premise by reference without cloning it.
+        let mut req_remaining = ExplainRequest::new([ex("s"), ty(), ex("C")]);
+        req_remaining.max_memory = Some(13_000);
+        let (res, alloc) = caller_allocations::measure(|| ds.reasoning().explain(&req_remaining));
+        let err = res.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+            "expected reasoning-budget with small remaining budget, got {err:?}"
+        );
+        assert!(
+            alloc.peak < 24_000,
+            "materialized search must pass premise by reference without duplicating 12 KiB literal (peak_live={}, largest={})",
+            alloc.peak,
+            alloc.largest
+        );
+    }
+
+    // 3. Generalized materialized rule (using the demand fallback inside materialized search)
+    //    grafted under an on-read domain rule: succeeds unbounded and stays within the
+    //    16,640-byte workspace cap under an 8 KiB answer limit.
+    {
+        let (_dir, ds) = open();
+        ds.load_str(
+            "<http://ex.org/init> <http://ex.org/initp> <http://ex.org/inito> .\n",
+            RdfFormat::Turtle,
+        )
+        .unwrap();
+        ds.store().compact().unwrap();
+        let lit_12k = "g".repeat(12_288);
+        ds.load_str(
+            &format!(
+                "@prefix ex: <http://ex.org/> .\n\
+                 ex:hr {{ ex:s ex:seed \"{lit_12k}\" . }}\n"
+            ),
+            RdfFormat::TriG,
+        )
+        .unwrap();
+        ds.reasoning()
+            .run(&ReasonRequest {
+                profile: Profile::Rules(
+                    "@prefix ex: <http://ex.org/> . \
+                     [reverse: (?x ex:seed ?v) -> (?v ex:of ?x)] \
+                     [derive: (?v ex:of ?x) -> (?x ex:p ?v)]"
+                        .into(),
+                ),
+                inputs: Inputs {
+                    data_graphs: vec![GraphRef::Named(HR.into())],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        ds.reasoning()
+            .rdfs()
+            .set(NewSchema::Triples(vec![oxrdf::Triple::new(
+                NamedNode::new("http://ex.org/p").unwrap(),
+                oxrdf::vocab::rdfs::DOMAIN.into_owned(),
+                NamedNode::new("http://ex.org/C").unwrap(),
+            )]))
+            .unwrap();
+
+        let unbounded = ds
+            .reasoning()
+            .explain(&ExplainRequest::new([ex("s"), ty(), ex("C")]))
+            .unwrap();
+        assert_eq!(unbounded.source, Some(ExplainSource::RdfsOnRead));
+        let trees = found(unbounded.explained);
+        assert_eq!(rule(&trees[0]), "rdfs2");
+        assert_eq!(rule(&trees[0].premises[0]), "derive");
+
+        let mut req = ExplainRequest::new([ex("s"), ty(), ex("C")]);
+        req.max_memory = Some(8192);
+        let (res, alloc) = caller_allocations::measure(|| ds.reasoning().explain(&req));
+        let err = res.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+            "expected reasoning-budget on generalized mixed proof, got {err:?}"
+        );
+        assert!(
+            alloc.peak <= 16_640,
+            "generalized materialized resolver must stay within workspace cap (peak_live={} > 16640, largest={})",
+            alloc.peak,
+            alloc.largest
+        );
     }
 }
 

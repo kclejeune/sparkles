@@ -235,14 +235,32 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
                         workspace: &sparkles_core::sparql::rdfs::ExplainWorkspace|
          -> Result<Option<crate::explain::Derivation>> {
             if Some(graph) == inferred {
-                let mut premise = req.clone();
-                premise.triple = triple.clone();
-                premise.max_trees = 1;
-                premise.source = Some(ExplainSource::Materialized);
-                premise.max_memory = req
-                    .max_memory
-                    .map(|limit| limit.saturating_sub(workspace.retained()));
-                let Some(answer) = materialized(ds, &premise, &head, deadline)? else {
+                let max_memory = match req.max_memory {
+                    Some(limit) => {
+                        let retained = workspace.retained();
+                        if retained >= limit {
+                            check_controls(req, deadline)?;
+                            return Err(budget_error(format!(
+                                "explaining an inferred premise needs {retained} retained bytes, over its memory limit of {limit}"
+                            )));
+                        }
+                        Some(limit - retained)
+                    }
+                    None => None,
+                };
+                let Some(answer) = materialized_for(
+                    ds,
+                    MaterializedQuery {
+                        req,
+                        triple,
+                        max_trees: 1,
+                        max_memory,
+                        known_inferred: true,
+                    },
+                    &head,
+                    deadline,
+                )?
+                else {
                     return Ok(None);
                 };
                 read_at_head.set(read_at_head.get() || answer.read_at_head);
@@ -309,17 +327,51 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
 }
 
 #[cfg(feature = "reasoning")]
+#[derive(Clone, Copy)]
+struct MaterializedQuery<'a> {
+    req: &'a ExplainRequest,
+    triple: &'a [Term; 3],
+    max_trees: usize,
+    max_memory: Option<usize>,
+    known_inferred: bool,
+}
+
+#[cfg(feature = "reasoning")]
 fn materialized(
     ds: &Dataset,
     req: &ExplainRequest,
     head: &Arc<Snapshot>,
     deadline: Option<Instant>,
 ) -> Result<Option<Explanation>> {
+    materialized_for(
+        ds,
+        MaterializedQuery {
+            req,
+            triple: &req.triple,
+            max_trees: req.max_trees,
+            max_memory: req.max_memory,
+            known_inferred: false,
+        },
+        head,
+        deadline,
+    )
+}
+
+#[cfg(feature = "reasoning")]
+fn materialized_for(
+    ds: &Dataset,
+    query: MaterializedQuery<'_>,
+    head: &Arc<Snapshot>,
+    deadline: Option<Instant>,
+) -> Result<Option<Explanation>> {
+    let req = query.req;
+    let triple = query.triple;
     let store = ds.store();
     let access = req.access.as_ref();
-    let max_trees = req.max_trees.clamp(1, MAX_TREES);
+    let max_trees = query.max_trees.clamp(1, MAX_TREES);
     let max_depth = req.max_depth.min(MAX_DEPTH);
     if let Some(rec) = ds.reasoning_record() {
+        check_controls(req, deadline)?;
         let (snap, read_at_head) = match rec.commit {
             Some(c) if c != head.commit => match store.snapshot_at(
                 &crate::history::At::Commit(c),
@@ -363,6 +415,42 @@ fn materialized(
         let inferred = snap
             .lookup_iri(super::INFERRED_GRAPH)
             .filter(|&g| readable(access, &snap, g));
+        let generalized =
+            matches!(triple[0], Term::Literal(_)) || matches!(triple[1], Term::BlankNode(_));
+        let mut stored_inference = if query.known_inferred && snap.commit == head.commit {
+            Some(inferred.is_some())
+        } else {
+            None
+        };
+        if !query.known_inferred && !generalized {
+            let triple_ids = (
+                snap.lookup_term(&triple[0]),
+                snap.lookup_term(&triple[1]),
+                snap.lookup_term(&triple[2]),
+            );
+            let inferred_hit =
+                if let (Some(graph), (Some(s), Some(p), Some(o))) = (inferred, triple_ids) {
+                    snap.contains(&[s, p, o, graph])?
+                } else {
+                    false
+                };
+            stored_inference = Some(inferred_hit);
+            let in_inputs = if let (Some(s), Some(p), Some(o)) = triple_ids {
+                let mut held = false;
+                for &g in &inputs {
+                    if view.contains(&[s, p, o, g])? {
+                        held = true;
+                        break;
+                    }
+                }
+                held
+            } else {
+                false
+            };
+            if !in_inputs && !inferred_hit {
+                return Ok(None);
+            }
+        }
         let profile = rec.profile()?;
         let extras = rec.extras()?;
         let input = sparkles_reasoner::explain::ExplainInput {
@@ -378,10 +466,10 @@ fn materialized(
             max_instances: MAX_INSTANCES,
             deadline,
             cancel: req.cancel.clone(),
-            max_memory: req.max_memory,
+            max_memory: query.max_memory,
         };
         let mut found =
-            sparkles_reasoner::explain::explain(&input, &req.triple, &opts).map_err(|e| {
+            sparkles_reasoner::explain::explain(&input, triple, &opts).map_err(|e| {
                 match e.downcast::<crate::explain::ExplainBudgetExceeded>() {
                     Ok(b) => budget_error(b.0),
                     Err(e) => crate::handles::from_anyhow(e),
@@ -390,30 +478,33 @@ fn materialized(
         // Generalized premises and backward-only rules are kept by the demand engine.
         // Fall back over the same historical snapshot so a materialized request still
         // explains the run it selected.
-        let stored_inference = if let Some(graph) = inferred {
-            let ids: Option<Vec<Id>> = req.triple.iter().map(|t| snap.lookup_term(t)).collect();
-            match ids {
-                Some(t) => snap.contains(&[t[0], t[1], t[2], graph])?,
-                None => false,
+        if matches!(found, Explained::NotFound) {
+            let fallback_inferred = match stored_inference {
+                Some(hit) => hit,
+                None => {
+                    if let Some(graph) = inferred
+                        && let (Some(s), Some(p), Some(o)) = (
+                            snap.lookup_term(&triple[0]),
+                            snap.lookup_term(&triple[1]),
+                            snap.lookup_term(&triple[2]),
+                        )
+                    {
+                        snap.contains(&[s, p, o, graph])?
+                    } else {
+                        false
+                    }
+                }
+            };
+            if fallback_inferred || generalized {
+                let reasoner = sparkles_reasoner::query::QueryReasoner::new(
+                    profile.clone(),
+                    &extras,
+                    rec.run_inputs()?,
+                )
+                .map_err(crate::handles::from_anyhow)?;
+                let d = demand_with_for(ds, query, snap.clone(), deadline, &reasoner)?;
+                found = d.explained;
             }
-        } else {
-            false
-        };
-        if matches!(found, Explained::NotFound)
-            && (stored_inference
-                || matches!(req.triple[0], Term::Literal(_))
-                || matches!(req.triple[1], Term::BlankNode(_)))
-        {
-            let mut fallback = req.clone();
-            fallback.source = Some(ExplainSource::Demand);
-            let reasoner = sparkles_reasoner::query::QueryReasoner::new(
-                profile.clone(),
-                &extras,
-                rec.run_inputs()?,
-            )
-            .map_err(crate::handles::from_anyhow)?;
-            let d = demand_with(ds, &fallback, snap.clone(), deadline, &reasoner)?;
-            found = d.explained;
         }
         if !matches!(found, Explained::NotFound) {
             let read = crate::explain::DerivationRead {
@@ -475,7 +566,32 @@ fn demand_with(
     deadline: Option<Instant>,
     reasoner: &sparkles_reasoner::query::QueryReasoner,
 ) -> Result<Explanation> {
+    demand_with_for(
+        ds,
+        MaterializedQuery {
+            req,
+            triple: &req.triple,
+            max_trees: req.max_trees,
+            max_memory: req.max_memory,
+            known_inferred: false,
+        },
+        snap,
+        deadline,
+        reasoner,
+    )
+}
+
+#[cfg(feature = "reasoning")]
+fn demand_with_for(
+    ds: &Dataset,
+    query: MaterializedQuery<'_>,
+    snap: Arc<Snapshot>,
+    deadline: Option<Instant>,
+    reasoner: &sparkles_reasoner::query::QueryReasoner,
+) -> Result<Explanation> {
     use sparkles_reasoner::explain::{DemandInput, ExplainOptions};
+    let req = query.req;
+    let triple = query.triple;
     check_controls(req, deadline)?;
     let view = view_of(req.access.as_ref(), &snap)?;
     let readable = req.access.as_ref().map(|a| {
@@ -490,12 +606,12 @@ fn demand_with(
         readable,
     };
     let opts = ExplainOptions {
-        max_trees: req.max_trees.clamp(1, MAX_TREES),
+        max_trees: query.max_trees.clamp(1, MAX_TREES),
         max_depth: req.max_depth.min(MAX_DEPTH),
         max_instances: MAX_INSTANCES,
         deadline,
         cancel: req.cancel.clone(),
-        max_memory: req.max_memory,
+        max_memory: query.max_memory,
     };
     let convert = |e: anyhow::Error| match e.downcast::<crate::explain::ExplainBudgetExceeded>() {
         Ok(b) => budget_error(b.0),
@@ -509,7 +625,7 @@ fn demand_with(
             max_unfold: req.max_depth.min(MAX_DEPTH),
         };
         let mut answer =
-            sparkles_reasoner::whynot::why_not(&input, &req.triple, &opts).map_err(convert)?;
+            sparkles_reasoner::whynot::why_not(&input, triple, &opts).map_err(convert)?;
         super::hypotheses::check_consistency(
             ds,
             &snap,
@@ -519,7 +635,7 @@ fn demand_with(
                     .map(|deadline| deadline.saturating_duration_since(Instant::now())),
                 cancel: req.cancel.clone(),
                 access: req.access.clone(),
-                max_memory: req.max_memory,
+                max_memory: query.max_memory,
                 ..Default::default()
             },
             &mut answer,
@@ -527,8 +643,7 @@ fn demand_with(
         (Explained::NotFound, Some(answer))
     } else {
         (
-            sparkles_reasoner::explain::explain_demand(&input, &req.triple, &opts)
-                .map_err(convert)?,
+            sparkles_reasoner::explain::explain_demand(&input, triple, &opts).map_err(convert)?,
             None,
         )
     };

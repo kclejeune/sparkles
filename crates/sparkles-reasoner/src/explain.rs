@@ -1014,8 +1014,7 @@ fn materialized(
     let base = Arc::new(Base::new(snap.clone(), &graphs)?);
     let mut g = Graph::with_base(base);
     g.set_budget(&budget)?;
-    let terms = Terms::new(snap.clone());
-    terms.set_budget(&budget)?;
+    let terms = Terms::new_in(snap.clone(), &budget)?;
     let mut warnings = WorkingWarnings::new(&budget);
     let parsed = crate::profile_rules(input.profile, input.extras)?;
     let sources = crate::rule_sources(input.profile, input.extras)?;
@@ -1216,8 +1215,7 @@ fn program_search(
     let base = Arc::new(Base::new(snap.clone(), &graphs)?);
     let mut g = Graph::with_base(base);
     g.set_budget(&budget)?;
-    let terms = Terms::new(snap.clone());
-    terms.set_budget(&budget)?;
+    let terms = Terms::new_in(snap.clone(), &budget)?;
     // the generalized facts, saved as term keys, in this explanation's terms; the credit
     // also holds the metadata of the rules below while the search runs
     let mut held = Held::new(&budget);
