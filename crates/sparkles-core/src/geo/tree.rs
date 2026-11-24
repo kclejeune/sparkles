@@ -100,16 +100,27 @@ impl PackedTree {
         if n == 0 {
             return 0;
         }
-        // Flatbush stores 4 f32s (16B) + up to 4B index per node across all levels
-        // (<= n * 17/16 + 16 nodes), plus 4B/item Hilbert key scratch during finish().
         let n = n as u64;
-        let nodes = n
-            .saturating_add(n / u64::from(NODE_SIZE))
-            .saturating_add(32);
+        let mut level = n;
+        let mut nodes = n;
+        while level > 1 {
+            level = level.div_ceil(u64::from(NODE_SIZE));
+            nodes = nodes.saturating_add(level);
+        }
+        // Flatbush uses two-byte indices below 16,384 nodes.
+        let node_bytes = 16 + if nodes < 16_384 { 2 } else { 4 };
+        let hilbert = if n > u64::from(NODE_SIZE) {
+            // Applying the permutation keeps leaf coordinate and index copies
+            // alongside the (Hilbert key, insertion index) tuples.
+            n.saturating_mul(node_bytes + size_of::<(u32, u32)>() as u64)
+        } else {
+            0
+        };
+        // Leave room for the header and both copies of the level metadata.
         nodes
-            .saturating_mul(20)
-            .saturating_add(n.saturating_mul(4))
-            .saturating_add(128)
+            .saturating_mul(node_bytes)
+            .saturating_add(hilbert)
+            .saturating_add(256)
     }
 
     /// Height of the tree.
@@ -240,6 +251,20 @@ impl<'a> Tree<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_admits_tree_and_hilbert_scratch() {
+        let count = 65_536;
+        let tree = PackedTree::pack((0..count).map(|i| {
+            let x = i as f32;
+            [x, x, x + 1.0, x + 1.0]
+        }))
+        .unwrap();
+        let leaf_copies = count * (size_of::<[f32; 4]>() + size_of::<u32>());
+        let hilbert = count * size_of::<(u32, u32)>();
+        let peak = tree.bytes() + (leaf_copies + hilbert) as u64;
+        assert!(PackedTree::estimate_bytes(count) >= peak);
+    }
 
     #[test]
     fn layout_matches_geo_index() {

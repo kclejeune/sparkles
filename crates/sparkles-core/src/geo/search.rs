@@ -1052,6 +1052,56 @@ pub(crate) fn next_key_after(mut k: [u64; 4]) -> Option<[u64; 4]> {
     None
 }
 
+/// Visit a key range until exhausted or the visitor stops. Poll before scanning and
+/// during blocks, including keys the visitor rejects.
+pub(super) fn visit_keys(
+    snap: &Snapshot,
+    perm: Perm,
+    lo: [u64; 4],
+    hi: [u64; 4],
+    check: impl Fn() -> Result<()>,
+    mut each: impl FnMut([u64; 4]) -> Result<bool>,
+) -> Result<Option<[u64; 4]>> {
+    if lo > hi {
+        return Ok(None);
+    }
+    let mut ticks = 0usize;
+    let mut resume = None;
+    snap.scan_between_cols_checked(perm, lo, hi, crate::index::ALL_COLS, &check, |chunk| {
+        let mut visit = |key| {
+            ticks += 1;
+            if ticks.is_multiple_of(256) {
+                check()?;
+            }
+            if each(key)? {
+                Ok(true)
+            } else {
+                resume = next_key_after(key).filter(|&next| next <= hi);
+                Ok(false)
+            }
+        };
+        match chunk {
+            Chunk::Block(block, from, to) => {
+                for i in from..to {
+                    if !visit(block.key(i))? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Chunk::Row(key) => visit(key),
+        }
+    })?;
+    Ok(resume)
+}
+
+struct LongitudeScan {
+    subject: u64,
+    graph: u64,
+    latitude: f64,
+    next: [u64; 4],
+}
+
 /// Resumable, owned, `Send` window search over a snapshot's spatial index (or predicate
 /// scan fallback). Holds only the tree DFS stack (or scan cursor key) and dedup/recheck
 /// state, reporting its retained bytes through `admit` as it grows.
@@ -1083,8 +1133,9 @@ enum WindowMode {
         memo: FxHashMap<u64, Slot>,
         rechecked: FxHashMap<u64, Option<Arc<ColumnEntry>>>,
         triples: FxHashSet<(u64, u64, u64)>,
-        wgs84_ids: FxHashMap<[u64; 4], u64>,
-        wgs84_values: FxHashMap<u64, Option<f64>>,
+        longitude: Option<LongitudeScan>,
+        pair_at: u64,
+        lat_done: bool,
         cfg: Arc<GeoConfig>,
         lat: Option<Id>,
     },
@@ -1155,8 +1206,9 @@ impl WindowIter {
                 memo: FxHashMap::default(),
                 rechecked: FxHashMap::default(),
                 triples: FxHashSet::default(),
-                wgs84_ids: FxHashMap::default(),
-                wgs84_values: FxHashMap::default(),
+                longitude: None,
+                pair_at: 0,
+                lat_done: false,
                 cfg,
                 lat,
             }
@@ -1207,12 +1259,8 @@ impl WindowIter {
                 memo,
                 rechecked,
                 triples,
-                wgs84_ids,
-                wgs84_values,
                 ..
-            } => {
-                fallback_retained_bytes(pending, memo, rechecked, triples, wgs84_ids, wgs84_values)
-            }
+            } => fallback_retained_bytes(pending, memo, rechecked, triples),
         }
     }
 
@@ -1793,10 +1841,12 @@ impl WindowIter {
                 memo,
                 rechecked,
                 triples,
-                wgs84_ids,
-                wgs84_values,
+
                 cfg,
                 lat,
+                longitude,
+                pair_at,
+                lat_done,
             } => {
                 let snap = &self.snap;
                 let view = snap.geo.as_deref();
@@ -1824,206 +1874,113 @@ impl WindowIter {
                     }
                     let p = self.preds[*pred_at];
                     if Some(p) == *lat {
-                        let Some(v) = view else {
+                        if out.len() > start_len {
+                            // Return ordinary entries before producing owned points.
+                            admit(fallback_retained_bytes(pending, memo, rechecked, triples))?;
+                            return Ok(false);
+                        }
+                        if dedup && self.preds[..*pred_at].contains(&p) {
+                            *pred_at += 1;
+                            continue;
+                        }
+                        let pair = view.zip(super::wgs84::predicates(snap));
+                        let Some((v, (_, long))) = pair else {
                             *pred_at += 1;
                             *lo = None;
                             continue;
                         };
-                        let Some((_, long)) = super::wgs84::predicates(snap) else {
-                            *pred_at += 1;
-                            *lo = None;
-                            continue;
-                        };
-                        let start_key = lo.unwrap_or([p.0, 0, 0, 0]);
-                        let end_key = [p.0, u64::MAX, u64::MAX, u64::MAX];
-                        let chunk_lim = want.clamp(64, 256);
-                        let mut lats: Vec<[u64; 4]> = Vec::new();
-                        let mut last_seen = None;
-                        let mut stopped_early = false;
-                        ctx.check()?;
-                        snap.scan_between(Perm::Pso, start_key, end_key, |c| {
-                            match c {
-                                Chunk::Block(b, s, e) => {
-                                    for i in s..e {
-                                        let k = b.key(i);
-                                        last_seen = Some(k);
-                                        lats.push(k);
-                                        if lats.len() >= chunk_lim {
-                                            stopped_early = true;
-                                            return Ok(false);
-                                        }
-                                    }
-                                }
-                                Chunk::Row(k) => {
-                                    last_seen = Some(k);
-                                    lats.push(k);
-                                    if lats.len() >= chunk_lim {
-                                        stopped_early = true;
+                        if longitude.is_none() && !*lat_done {
+                            *lo = visit_keys(
+                                snap,
+                                Perm::Pso,
+                                lo.unwrap_or([p.0, 0, 0, 0]),
+                                [p.0, u64::MAX, u64::MAX, u64::MAX],
+                                || ctx.check(),
+                                |[_, subject, object, g]| {
+                                    if graph.accepts(g)
+                                        && v.lookup.graph(Id(g), snap, &v.config)
+                                        && let Some(latitude) =
+                                            super::wgs84::number(snap, Id(object))
+                                                .filter(|y| (-90.0..=90.0).contains(y))
+                                    {
+                                        *longitude = Some(LongitudeScan {
+                                            subject,
+                                            graph: g,
+                                            latitude,
+                                            next: [subject, long.0, 0, 0],
+                                        });
                                         return Ok(false);
                                     }
-                                }
+                                    Ok(true)
+                                },
+                            )?;
+                            *lat_done = lo.is_none();
+                        }
+                        if let Some(scan) = longitude {
+                            let (s, g, y) = (scan.subject, scan.graph, scan.latitude);
+                            let base = fallback_retained_bytes(pending, memo, rechecked, triples);
+                            let resume = super::wgs84::visit_objects(
+                                snap,
+                                scan.next,
+                                [s, long.0, u64::MAX, u64::MAX],
+                                g,
+                                || ctx.check(),
+                                |object| {
+                                    let Some(x) = super::wgs84::number(snap, Id(object))
+                                        .filter(|x| (-180.0..=180.0).contains(x))
+                                    else {
+                                        return Ok(true);
+                                    };
+                                    let bbox = super::column::round_out([x, y, x, y]);
+                                    if !windows.iter().any(|w| intersects(&bbox, w)) {
+                                        return Ok(true);
+                                    }
+                                    let elem = size_of::<Hit>();
+                                    let capacity = sparkles_budget::sizes::vec_grown(
+                                        out.capacity(),
+                                        out.len(),
+                                        1,
+                                        elem,
+                                    );
+                                    let growth = if capacity > out.capacity() {
+                                        out.capacity()
+                                    } else {
+                                        0
+                                    };
+                                    admit(
+                                        base.saturating_add(
+                                            (capacity + growth) as u64 * elem as u64,
+                                        )
+                                        .saturating_add(
+                                            (out.len() - start_len + 1) as u64
+                                                * super::wgs84::POINT_BYTES,
+                                        ),
+                                    )?;
+                                    let entry =
+                                        super::wgs84::point(y, x).expect("validated coordinates");
+                                    let o = super::wgs84::pair_id(*pair_at);
+                                    *pair_at += 1;
+                                    self.st.candidates += 1;
+                                    out.push(Hit::new(&Row { s, p: p.0, o, g }, entry));
+                                    Ok(out.len() < target_len)
+                                },
+                            )?;
+                            if let Some(next) = resume {
+                                scan.next = next;
+                            } else {
+                                *longitude = None;
                             }
-                            Ok(true)
-                        })?;
-                        if stopped_early && let Some(next) = last_seen.and_then(next_key_after) {
-                            *lo = Some(next);
-                        } else {
+                            if out.len() > start_len {
+                                // Keep generated points charged until the consumer gets the batch.
+                                return Ok(false);
+                            }
+                        }
+                        if *lat_done {
                             *pred_at += 1;
                             *lo = None;
+                            *lat_done = false;
+                            *pair_at = 0;
                         }
-                        let lats_bytes = lats.capacity() as u64 * size_of::<[u64; 4]>() as u64;
-                        for (idx, k) in lats.into_iter().enumerate() {
-                            if idx.is_multiple_of(CHUNK) {
-                                ctx.check()?;
-                            }
-                            let (s, lat_o, g) = (k[1], k[2], k[3]);
-                            if !graph.accepts(g) || !v.lookup.graph(Id(g), snap, &v.config) {
-                                continue;
-                            }
-                            let y = if let Some(&val) = wgs84_values.get(&lat_o) {
-                                val
-                            } else {
-                                if wgs84_values.len() == wgs84_values.capacity() {
-                                    let extra =
-                                        (next_cap(wgs84_values.len(), wgs84_values.capacity(), 1)
-                                            - wgs84_values.capacity())
-                                            as u64
-                                            * (size_of::<u64>() + size_of::<Option<f64>>() + 1)
-                                                as u64;
-                                    admit(
-                                        fallback_retained_bytes(
-                                            pending,
-                                            memo,
-                                            rechecked,
-                                            triples,
-                                            wgs84_ids,
-                                            wgs84_values,
-                                        )
-                                        .saturating_add(lats_bytes)
-                                        .saturating_add(extra),
-                                    )?;
-                                }
-                                let val = super::wgs84::number(snap, Id(lat_o));
-                                wgs84_values.insert(lat_o, val);
-                                val
-                            };
-                            let Some(y) = y else {
-                                continue;
-                            };
-                            for long_o in super::wgs84::objects(snap, s, long.0, g)? {
-                                let x = if let Some(&val) = wgs84_values.get(&long_o) {
-                                    val
-                                } else {
-                                    if wgs84_values.len() == wgs84_values.capacity() {
-                                        let extra = (next_cap(
-                                            wgs84_values.len(),
-                                            wgs84_values.capacity(),
-                                            1,
-                                        ) - wgs84_values.capacity())
-                                            as u64
-                                            * (size_of::<u64>() + size_of::<Option<f64>>() + 1)
-                                                as u64;
-                                        admit(
-                                            fallback_retained_bytes(
-                                                pending,
-                                                memo,
-                                                rechecked,
-                                                triples,
-                                                wgs84_ids,
-                                                wgs84_values,
-                                            )
-                                            .saturating_add(lats_bytes)
-                                            .saturating_add(extra),
-                                        )?;
-                                    }
-                                    let val = super::wgs84::number(snap, Id(long_o));
-                                    wgs84_values.insert(long_o, val);
-                                    val
-                                };
-                                let Some(e) = x.and_then(|x| super::wgs84::point(y, x)) else {
-                                    continue;
-                                };
-                                if !windows.iter().any(|w| intersects(&e.bbox(), w)) {
-                                    continue;
-                                }
-                                let id_key = [s, g, lat_o, long_o];
-                                if wgs84_ids.len() == wgs84_ids.capacity()
-                                    && !wgs84_ids.contains_key(&id_key)
-                                {
-                                    let extra = (next_cap(wgs84_ids.len(), wgs84_ids.capacity(), 1)
-                                        - wgs84_ids.capacity())
-                                        as u64
-                                        * (size_of::<[u64; 4]>() + size_of::<u64>() + 1) as u64;
-                                    admit(
-                                        fallback_retained_bytes(
-                                            pending,
-                                            memo,
-                                            rechecked,
-                                            triples,
-                                            wgs84_ids,
-                                            wgs84_values,
-                                        )
-                                        .saturating_add(lats_bytes)
-                                        .saturating_add(extra),
-                                    )?;
-                                }
-                                let next = super::wgs84::pair_id(wgs84_ids.len() as u64);
-                                let o = *wgs84_ids.entry(id_key).or_insert(next);
-                                if dedup {
-                                    if triples.len() == triples.capacity()
-                                        && !triples.contains(&(s, p.0, o))
-                                    {
-                                        let extra = (next_cap(triples.len(), triples.capacity(), 1)
-                                            - triples.capacity())
-                                            as u64
-                                            * (size_of::<(u64, u64, u64)>() + 1) as u64;
-                                        admit(
-                                            fallback_retained_bytes(
-                                                pending,
-                                                memo,
-                                                rechecked,
-                                                triples,
-                                                wgs84_ids,
-                                                wgs84_values,
-                                            )
-                                            .saturating_add(lats_bytes)
-                                            .saturating_add(extra),
-                                        )?;
-                                    }
-                                    if !triples.insert((s, p.0, o)) {
-                                        continue;
-                                    }
-                                }
-                                if pending.len() == pending.capacity() {
-                                    let extra = (next_cap(pending.len(), pending.capacity(), 1)
-                                        - pending.capacity())
-                                        as u64
-                                        * size_of::<Hit>() as u64;
-                                    admit(
-                                        fallback_retained_bytes(
-                                            pending,
-                                            memo,
-                                            rechecked,
-                                            triples,
-                                            wgs84_ids,
-                                            wgs84_values,
-                                        )
-                                        .saturating_add(lats_bytes)
-                                        .saturating_add(extra),
-                                    )?;
-                                }
-                                pending.push_back(Hit::new(&Row { s, p: p.0, o, g }, e));
-                            }
-                        }
-                        let bytes = fallback_retained_bytes(
-                            pending,
-                            memo,
-                            rechecked,
-                            triples,
-                            wgs84_ids,
-                            wgs84_values,
-                        );
-                        admit(bytes)?;
                         continue;
                     }
                     let start_key = lo.unwrap_or([p.0, 0, 0, 0]);
@@ -2069,12 +2026,7 @@ impl WindowIter {
                                             * (size_of::<u64>() + size_of::<Slot>() + 1) as u64;
                                         admit(
                                             fallback_retained_bytes(
-                                                pending,
-                                                memo,
-                                                rechecked,
-                                                triples,
-                                                wgs84_ids,
-                                                wgs84_values,
+                                                pending, memo, rechecked, triples,
                                             )
                                             .saturating_add(extra),
                                         )?;
@@ -2101,15 +2053,8 @@ impl WindowIter {
                                             + size_of::<Option<Arc<ColumnEntry>>>()
                                             + 1) as u64;
                                     admit(
-                                        fallback_retained_bytes(
-                                            pending,
-                                            memo,
-                                            rechecked,
-                                            triples,
-                                            wgs84_ids,
-                                            wgs84_values,
-                                        )
-                                        .saturating_add(extra),
+                                        fallback_retained_bytes(pending, memo, rechecked, triples)
+                                            .saturating_add(extra),
                                     )?;
                                 }
                                 rechecked
@@ -2135,15 +2080,8 @@ impl WindowIter {
                                     as u64
                                     * (size_of::<(u64, u64, u64)>() + 1) as u64;
                                 admit(
-                                    fallback_retained_bytes(
-                                        pending,
-                                        memo,
-                                        rechecked,
-                                        triples,
-                                        wgs84_ids,
-                                        wgs84_values,
-                                    )
-                                    .saturating_add(extra),
+                                    fallback_retained_bytes(pending, memo, rechecked, triples)
+                                        .saturating_add(extra),
                                 )?;
                             }
                             if !triples.insert((r.s, r.p, r.o)) {
@@ -2159,15 +2097,8 @@ impl WindowIter {
                                 as u64
                                 * size_of::<Hit>() as u64;
                             admit(
-                                fallback_retained_bytes(
-                                    pending,
-                                    memo,
-                                    rechecked,
-                                    triples,
-                                    wgs84_ids,
-                                    wgs84_values,
-                                )
-                                .saturating_add(extra),
+                                fallback_retained_bytes(pending, memo, rechecked, triples)
+                                    .saturating_add(extra),
                             )?;
                         }
                         pending.push_back(Hit::new(&r, e));
@@ -2215,14 +2146,7 @@ impl WindowIter {
                         *pred_at += 1;
                         *lo = None;
                     }
-                    let bytes = fallback_retained_bytes(
-                        pending,
-                        memo,
-                        rechecked,
-                        triples,
-                        wgs84_ids,
-                        wgs84_values,
-                    );
+                    let bytes = fallback_retained_bytes(pending, memo, rechecked, triples);
                     admit(bytes)?;
                 }
             }
@@ -2235,8 +2159,6 @@ fn fallback_retained_bytes(
     memo: &FxHashMap<u64, Slot>,
     rechecked: &FxHashMap<u64, Option<Arc<ColumnEntry>>>,
     triples: &FxHashSet<(u64, u64, u64)>,
-    wgs84_ids: &FxHashMap<[u64; 4], u64>,
-    wgs84_values: &FxHashMap<u64, Option<f64>>,
 ) -> u64 {
     (pending.capacity() as u64 * size_of::<Hit>() as u64)
         .saturating_add(memo.capacity() as u64 * (size_of::<u64>() + size_of::<Slot>() + 1) as u64)
@@ -2245,13 +2167,6 @@ fn fallback_retained_bytes(
                 * (size_of::<u64>() + size_of::<Option<Arc<ColumnEntry>>>() + 1) as u64,
         )
         .saturating_add(triples.capacity() as u64 * (size_of::<(u64, u64, u64)>() + 1) as u64)
-        .saturating_add(
-            wgs84_ids.capacity() as u64 * (size_of::<[u64; 4]>() + size_of::<u64>() + 1) as u64,
-        )
-        .saturating_add(
-            wgs84_values.capacity() as u64
-                * (size_of::<u64>() + size_of::<Option<f64>>() + 1) as u64,
-        )
 }
 
 /// Resumable, owned, `Send` nearest-first search over a snapshot's spatial index (or
@@ -2481,6 +2396,20 @@ impl NearestIter {
         admit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<Option<f64>> {
         out.clear();
+        let rows = match &self.mode {
+            NearestMode::Empty => 0,
+            NearestMode::Fallback { all, at, size } => (all.len() - *at).min(*size),
+            NearestMode::Indexed { size, .. } => *size,
+        };
+        let elem = size_of::<Hit>() as u64;
+        let retained = self.retained_bytes();
+        if rows > out.capacity() {
+            admit(retained.saturating_add((rows + out.capacity()) as u64 * elem))?;
+            out.reserve_exact(rows);
+        }
+        let chunk_bytes = out.capacity() as u64 * elem;
+        let mut admit = |bytes: u64| admit(bytes.saturating_add(chunk_bytes));
+        admit(retained)?;
         match &mut self.mode {
             NearestMode::Empty => Ok(None),
             NearestMode::Fallback { all, at, size } => {
@@ -2553,28 +2482,24 @@ impl NearestIter {
                             let Some(t) = &trees[src as usize] else {
                                 continue;
                             };
-                            let items: Vec<usize> = if t.is_item(n) {
-                                vec![n]
-                            } else {
-                                self.st.nodes += 1;
-                                let mut items = Vec::new();
-                                for c in t.children(n) {
-                                    if t.is_item(c) {
-                                        items.push(c);
-                                    } else {
-                                        if heap.len() == heap.capacity() {
-                                            admit(nearest_bytes(
-                                                next_cap(heap.len(), heap.capacity(), 1),
-                                                triples.capacity(),
-                                                quads.capacity(),
-                                            ))?;
-                                        }
-                                        heap.push(Entry::node(lb, t, c, src));
+                            let is_item = t.is_item(n);
+                            self.st.nodes += u64::from(!is_item);
+                            let children = is_item
+                                .then_some(n)
+                                .into_iter()
+                                .chain((!is_item).then(|| t.children(n)).into_iter().flatten());
+                            for c in children {
+                                if !t.is_item(c) {
+                                    if heap.len() == heap.capacity() {
+                                        admit(nearest_bytes(
+                                            next_cap(heap.len(), heap.capacity(), 1),
+                                            triples.capacity(),
+                                            quads.capacity(),
+                                        ))?;
                                     }
+                                    heap.push(Entry::node(lb, t, c, src));
+                                    continue;
                                 }
-                                items
-                            };
-                            for c in items {
                                 let i = t.item(c);
                                 match src {
                                     Src::Base => {
@@ -2666,5 +2591,131 @@ impl NearestIter {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::Source;
+    use crate::store::{Store, StoreOptions};
+    use oxrdfio::RdfFormat;
+
+    #[test]
+    fn r2_basic_geo_resumes_longitudes_under_one_row_admission() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = format!("<urn:s> <{}> 0 .\n", super::super::wgs84::LAT);
+        for i in 0..6000 {
+            data.push_str(&format!(
+                "<urn:s> <{}> 1.{i:04} .\n",
+                super::super::wgs84::LONG
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store
+            .enable_geo(GeoConfig {
+                wgs84: true,
+                ..GeoConfig::default()
+            })
+            .unwrap();
+        let ctx = Ctx::new(store.snapshot());
+        let lat = wgs84_lat(&ctx.snap).unwrap();
+        let mut refuse = |bytes| {
+            if bytes > 4096 {
+                return Err(crate::Error::invalid(format!(
+                    "unexpected reservation of {bytes} bytes"
+                )));
+            }
+            Ok(())
+        };
+        let mut iter = WindowIter::open(
+            &ctx,
+            vec![lat, Id::UNDEF],
+            vec![[0.0, -1.0, 2.0, 1.0]],
+            GraphFilter::Default,
+            false,
+            &mut refuse,
+        )
+        .unwrap();
+        assert!(iter.st.fallback);
+        let mut hits = Vec::new();
+        let mut prev = None;
+        for _ in 0..3 {
+            hits.clear();
+            assert!(!iter.next_hits(&ctx, &mut hits, 1, &mut refuse).unwrap());
+            assert_eq!(hits.len(), 1);
+            assert_ne!(prev, Some(hits[0].o));
+            prev = Some(hits[0].o);
+        }
+
+        // A rejected graph still reaches a physical polling boundary inside the scan.
+        let long = ctx.snap.lookup_iri(super::super::wgs84::LONG).unwrap().0;
+        let subject = ctx.snap.lookup_iri("urn:s").unwrap().0;
+        let polls = std::cell::Cell::new(0);
+        let result = super::super::wgs84::visit_objects(
+            &ctx.snap,
+            [subject, long, 0, 0],
+            [subject, long, u64::MAX, u64::MAX],
+            Id::UNDEF.0,
+            || {
+                polls.set(polls.get() + 1);
+                if polls.get() == 8 {
+                    Err(crate::Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            |_| panic!("object in rejected graph"),
+        );
+        assert!(matches!(result, Err(crate::Error::Cancelled)));
+        assert_eq!(polls.get(), 8);
+    }
+
+    #[test]
+    fn r2_nearest_fallback_reserves_output_before_writing() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let entry = super::super::wgs84::point(0.0, 1.0).unwrap();
+        let hit = Hit::new(
+            &Row {
+                s: 1,
+                p: 2,
+                o: 3,
+                g: 4,
+            },
+            entry,
+        );
+        let mut iter = NearestIter {
+            snap: ctx.snap.clone(),
+            preds: Vec::new(),
+            graph: GraphFilter::All,
+            dedup: false,
+            st: SearchStats::default(),
+            mode: NearestMode::Fallback {
+                all: vec![(0.0, hit)],
+                at: 0,
+                size: 32,
+            },
+        };
+        let retained = iter.retained_bytes();
+        let mut out = Vec::new();
+        let result = iter.next_chunk(&ctx, &mut out, &mut |bytes| {
+            assert_eq!(bytes, retained + size_of::<Hit>() as u64);
+            Err(crate::Error::Cancelled)
+        });
+        assert!(matches!(result, Err(crate::Error::Cancelled)));
+        assert_eq!(out.capacity(), 0);
+        assert_eq!(iter.st.candidates, 0);
+        assert_eq!(
+            iter.next_chunk(&ctx, &mut out, &mut |_| Ok(())).unwrap(),
+            Some(f64::INFINITY)
+        );
+        assert_eq!(out.len(), 1);
     }
 }

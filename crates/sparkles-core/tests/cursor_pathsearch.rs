@@ -642,3 +642,37 @@ fn path_search_extended_forms_and_native_topk_pre_admission() {
         );
     }
 }
+
+#[test]
+fn vector_order_budget_refusal_runs_the_generic_child_to_completion() {
+    let store = Store::in_memory(StoreOptions::default());
+    load(
+        &store,
+        "<http://example.org/base> <http://example.org/emb> \"[1,0,0]\"^^<urn:x-sparkles:vector> .",
+        RdfFormat::Turtle,
+    );
+    let inserts = (0..12_000)
+        .map(|i| format!("ex:d{i:05} ex:emb \"[0,1,0]\"^^spk:vector .\n"))
+        .collect::<String>();
+    sparkles_core::sparql::update::update(
+        &store,
+        &format!("{P}INSERT DATA {{ {inserts} }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let query = format!(
+        "{P}SELECT ?s {{ ?s ex:emb ?v }} ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 2"
+    );
+    let snap = store.snapshot();
+    let (expected, native_plan, _) = drain_strict(&snap, &query, &QueryOptions::default(), 4);
+    assert_eq!(expected.len(), 2);
+    assert!(format!("{native_plan:?}").contains("the vector index answered"));
+    let budget = QueryOptions {
+        max_memory_bytes: Some(256 << 10),
+        ..QueryOptions::default()
+    };
+    let (rows, generic_plan, _) = drain_strict(&snap, &query, &budget, 4);
+    assert_eq!(rows, expected);
+    assert!(format!("{generic_plan:?}").contains("ran the generic plan"));
+    assert!(!format!("{generic_plan:?}").contains("the vector index answered"));
+}

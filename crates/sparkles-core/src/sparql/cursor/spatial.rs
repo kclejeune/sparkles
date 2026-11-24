@@ -673,28 +673,29 @@ impl SpatialKnn {
                 })? {
                     Some(b) => {
                         bound = b;
-                        let kept: Vec<[Id; 3]> = chunk
-                            .into_iter()
-                            .filter(|h| {
-                                st.subj.is_none_or(|s| s == h.s) && !st.taken.contains(&h.o)
-                            })
-                            .map(|h| [h.s, h.o, h.g])
-                            .collect();
-                        if st.pending_cands.len().saturating_add(kept.len())
-                            > st.pending_cands.capacity()
-                        {
-                            let next_cap = st
-                                .pending_cands
-                                .capacity()
-                                .saturating_mul(2)
-                                .max(st.pending_cands.len().saturating_add(kept.len()))
-                                .max(8);
-                            let add = next_cap.saturating_sub(st.pending_cands.capacity()) as u64
-                                * size_of::<[Id; 3]>() as u64;
-                            let projected = st.retained_bytes().saturating_add(add);
-                            st.charge.resize(projected)?;
+                        let keep = |h: &&crate::geo::search::Hit| {
+                            st.subj.is_none_or(|s| s == h.s) && !st.taken.contains(&h.o)
+                        };
+                        let kept = chunk.iter().filter(keep).count();
+                        let elem = size_of::<[Id; 3]>();
+                        let capacity = st.pending_cands.capacity();
+                        if st.pending_cands.len().saturating_add(kept) > capacity {
+                            let next = sparkles_budget::sizes::vec_grown(
+                                capacity,
+                                st.pending_cands.len(),
+                                kept,
+                                elem,
+                            );
+                            let chunk_bytes = chunk.capacity() as u64
+                                * size_of::<crate::geo::search::Hit>() as u64;
+                            st.charge.resize(
+                                st.retained_bytes()
+                                    .saturating_add(chunk_bytes)
+                                    .saturating_add(next as u64 * elem as u64),
+                            )?;
                         }
-                        st.pending_cands.extend(kept);
+                        st.pending_cands
+                            .extend(chunk.iter().filter(keep).map(|h| [h.s, h.o, h.g]));
                         if !bound.is_finite() {
                             break;
                         }

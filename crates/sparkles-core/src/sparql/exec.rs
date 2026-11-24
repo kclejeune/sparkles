@@ -3327,14 +3327,14 @@ pub(super) fn apply_range_filter(
 // ---------------------------------------------------------- ordered top-k ------
 
 /// The unread part `[lo, hi]` of a monotone piece of an [`OrderedTopK`] scan.
-struct TopKRun {
+struct TopKRun<'ctx> {
     lo: u64,
     hi: u64,
     exact: bool,
     /// the best values are at the high end of the id range
     best_high: bool,
     /// the rows read so far that can still be among the first k
-    kept: Table,
+    kept: Materialized<'ctx>,
     /// base rows to read in the next step (grows geometrically)
     want: usize,
     /// no unread row of the piece can be among the first k
@@ -3379,7 +3379,7 @@ const LEXICAL_PREFIX_BYTES: usize = 256;
 fn lexical_check(
     ctx: &Ctx,
     spec: &OrderedTopK,
-    run: &TopKRun,
+    run: &TopKRun<'_>,
     kth: Option<&Value>,
 ) -> Result<Lexical> {
     let s = match kth {
@@ -3457,14 +3457,14 @@ fn lexical_check(
 
 /// Rows of an [`OrderedTopK`] scan whose order-column ids lie in `[lo, hi]`, in key order,
 /// with the filters applied; also returns how many rows were scanned.
-fn topk_read(
-    ctx: &Ctx,
+fn topk_read<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     lo: u64,
     hi: u64,
     exact: bool,
     vars: &[VarId],
-) -> Result<(Table, usize)> {
+) -> Result<(Materialized<'ctx>, usize)> {
     let scan = &spec.scan;
     let bound = |v: u64, fill: u64| {
         let mut k = pad(&scan.prefix, fill);
@@ -3475,38 +3475,44 @@ fn topk_read(
 }
 
 /// [`topk_read`] of the keys `[lo, hi]` of the scan.
-fn topk_read_keys(
-    ctx: &Ctx,
+fn topk_read_keys<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     lo: crate::index::Key,
     hi: crate::index::Key,
     exact: bool,
     vars: &[VarId],
-) -> Result<(Table, usize)> {
+) -> Result<(Materialized<'ctx>, usize)> {
     topk_read_keys_last(ctx, spec, lo, hi, exact, vars).map(|(t, n, _)| (t, n))
 }
 
 /// [`topk_read_keys`], with the last row the scan produced before any filter when the
 /// scan drops duplicate rows of a union default graph: the next read of the same piece
 /// must drop that row again if it starts with it.
-fn topk_read_keys_last(
-    ctx: &Ctx,
+fn topk_read_keys_last<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     lo: crate::index::Key,
     hi: crate::index::Key,
     exact: bool,
     vars: &[VarId],
-) -> Result<(Table, usize, Option<Vec<Id>>)> {
-    let mut t = Table::new(vars.to_vec());
+) -> Result<MorselBest<'ctx>> {
+    let mut t = Materialized::empty_fast(ctx, vars, &[])?;
     scan_into(ctx, &spec.scan, lo, hi, None, &mut t)?;
-    let scanned = t.len();
-    let last =
-        (spec.scan.dedup && scanned > 0).then(|| t.cols.iter().map(|c| c[scanned - 1]).collect());
-    if !exact && !spec.range_filter.is_empty() && !t.is_empty() {
-        apply_range_filter(ctx, &mut t, spec.var, &spec.range_filter)?;
+    let table = &mut t.table;
+    let scanned = table.len();
+    let last = (spec.scan.dedup && scanned > 0).then(|| {
+        let mut last = [Id::UNDEF; 4];
+        for (dst, col) in last.iter_mut().zip(&table.cols) {
+            *dst = col[scanned - 1];
+        }
+        last
+    });
+    if !exact && !spec.range_filter.is_empty() && !table.is_empty() {
+        apply_range_filter(ctx, table, spec.var, &spec.range_filter)?;
     }
-    if !spec.filter.is_empty() && !t.is_empty() {
-        apply_filter(ctx, &mut t, &spec.filter)?;
+    if !spec.filter.is_empty() && !table.is_empty() {
+        apply_filter(ctx, table, &spec.filter)?;
     }
     Ok((t, scanned, last))
 }
@@ -3566,7 +3572,37 @@ fn topk_boundary(
 
 /// Read the next rows of a monotone piece from its best end, keeping those that can
 /// still be among the first k; returns the rows scanned.
-fn topk_step(ctx: &Ctx, spec: &OrderedTopK, run: &mut TopKRun, vars: &[VarId]) -> Result<usize> {
+fn topk_table_bytes(rows: usize, width: usize) -> u64 {
+    128 + width as u64 * (size_of::<VarId>() * 2 + size_of::<Vec<Id>>()) as u64
+        + super::ctx::table_bytes(rows, width)
+}
+
+fn topk_append(ctx: &Ctx, dst: &mut Materialized<'_>, src: Materialized<'_>) -> Result<()> {
+    dst.reserve_rows(ctx, dst.table.len().saturating_add(src.table.len()))?;
+    dst.table.append(src.table);
+    Ok(())
+}
+
+fn topk_take_rows<'ctx>(
+    ctx: &'ctx Ctx,
+    source: &Table,
+    rows: &[usize],
+) -> Result<Materialized<'ctx>> {
+    let mut out = Materialized::empty_fast(ctx, &source.vars, &[])?;
+    out.reserve_rows(ctx, rows.len())?;
+    for (dst, src) in out.table.cols.iter_mut().zip(&source.cols) {
+        dst.extend(rows.iter().map(|&r| src[r]));
+    }
+    out.table.len = rows.len();
+    Ok(out)
+}
+
+fn topk_step(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    run: &mut TopKRun<'_>,
+    vars: &[VarId],
+) -> Result<usize> {
     // base rows only: delta rows in between are merged by the scan
     let edge = topk_boundary(ctx, spec, run.lo, run.hi, run.best_high, run.want)?;
     let (a, b) = if run.best_high {
@@ -3582,13 +3618,14 @@ fn topk_step(ctx: &Ctx, spec: &OrderedTopK, run: &mut TopKRun, vars: &[VarId]) -
         run.lo = b.saturating_add(1);
         run.want = run.want.saturating_mul(4);
         if !run.extra.is_empty() {
-            let keep: Vec<bool> = part.cols[0]
+            let _mask = ctx.charge(part.table.len() as u64)?;
+            let keep: Vec<bool> = part.table.cols[0]
                 .iter()
                 .map(|id| !run.extra.contains(&id.0))
                 .collect();
-            part.filter_rows(&keep);
+            part.table.filter_rows(&keep);
         }
-        run.kept.append(part);
+        topk_append(ctx, &mut run.kept, part)?;
         return Ok(scanned);
     }
     if run.best_high {
@@ -3603,20 +3640,24 @@ fn topk_step(ctx: &Ctx, spec: &OrderedTopK, run: &mut TopKRun, vars: &[VarId]) -
     // best row of this step and its ties complete the piece's best k, and every other
     // row of the piece has k rows with strictly better values ahead of it (distinct ids
     // of a monotone piece are distinct numbers)
-    let need = spec.k - run.kept.len();
-    if part.len() >= need {
-        let col = &part.cols[0];
-        let keep: Vec<bool> = if run.best_high {
-            let cut = col[part.len() - need];
-            col.iter().map(|&id| id >= cut).collect()
+    let need = spec.k - run.kept.table.len();
+    if part.table.len() >= need {
+        let col = &part.table.cols[0];
+        let (first, end) = if run.best_high {
+            let cut = col[part.table.len() - need];
+            (col.partition_point(|&id| id < cut), col.len())
         } else {
             let cut = col[need - 1];
-            col.iter().map(|&id| id <= cut).collect()
+            (0, col.partition_point(|&id| id <= cut))
         };
-        part.filter_rows(&keep);
+        for col in &mut part.table.cols {
+            col.copy_within(first..end, 0);
+            col.truncate(end - first);
+        }
+        part.table.len = end - first;
         run.done = true;
     }
-    run.kept.append(part);
+    topk_append(ctx, &mut run.kept, part)?;
     Ok(scanned)
 }
 
@@ -3654,36 +3695,36 @@ fn value_totally_ordered(value: Option<&Value>) -> bool {
 /// The best k rows of the pieces of an [`OrderedTopK`] scan without value order, which
 /// are read whole, in no particular order; `None` when one of their values is not
 /// totally ordered. Adds the rows read to `scanned`.
-fn topk_rest(
-    ctx: &Ctx,
+fn topk_rest<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     vars: &[VarId],
     pieces: &[&super::plan::TopKPiece],
     scanned: &mut usize,
-) -> Result<Option<Table>> {
-    let mut rest = Table::new(vars.to_vec());
+) -> Result<Option<Materialized<'ctx>>> {
+    let mut rest = Materialized::empty_fast(ctx, vars, &[])?;
     for p in pieces {
         let (t, n) = topk_read(ctx, spec, p.lo, p.hi, p.exact, vars)?;
         *scanned += n;
-        rest.append(t);
-        ctx.check_output(rest.len(), rest.width())?;
+        topk_append(ctx, &mut rest, t)?;
+        ctx.check_output(rest.table.len(), rest.table.width())?;
     }
     // Up to `PAR_THRESHOLD` rows, decode the dictionary ORDER values once each in key
     // order, in one charged, operation-local pass, for the checks and the prefilter
     // below. A larger input reads them through the value cache in parallel.
-    let decoded = if rest.len() <= PAR_THRESHOLD {
-        super::exprcache::dictionary_values(ctx, &rest, &Expr::Var(spec.var))?
+    let decoded = if rest.table.len() <= PAR_THRESHOLD {
+        super::exprcache::dictionary_values(ctx, &rest.table, &Expr::Var(spec.var))?
     } else {
         None
     };
     let total = match &decoded {
-        Some(values) => rest_total(ctx, &rest, values)?,
+        Some(values) => rest_total(ctx, &rest.table, values)?,
         None => {
             let total = |id: &Id| totally_ordered(ctx, *id);
-            if rest.len() > PAR_THRESHOLD / 4 {
-                rest.cols[0].par_iter().all(total)
+            if rest.table.len() > PAR_THRESHOLD / 4 {
+                rest.table.cols[0].par_iter().all(total)
             } else {
-                rest.cols[0].iter().all(total)
+                rest.table.cols[0].iter().all(total)
             }
         }
     };
@@ -3695,19 +3736,23 @@ fn topk_rest(
     // values again in the prefilter of `order_by`.
     if let Some(values) = &decoded
         && ctx.opt.topk_prefilter
-        && rest.len() > spec.k
-        && let Some((rows, charge)) = topk_candidates(ctx, &rest, &keys, spec.k, Some(values))?
-        && rows.len() < rest.len()
+        && rest.table.len() > spec.k
+        && let Some((rows, charge)) =
+            topk_candidates(ctx, &rest.table, &keys, spec.k, Some(values))?
+        && rows.len() < rest.table.len()
     {
-        ctx.check_output(rows.len(), rest.width())?;
-        rest = rest.take_rows(&rows);
+        ctx.check_output(rows.len(), rest.table.width())?;
+        rest = topk_take_rows(ctx, &rest.table, &rows)?;
         drop(charge);
     }
     drop(decoded);
     // only their first k can be among the first k of all rows (the order of two rows
     // does not depend on the others)
-    if rest.len() > spec.k {
-        rest = order_by(ctx, rest, &keys, Some(spec.k), &mut ExprReport::default())?.0;
+    if rest.table.len() > spec.k {
+        let (input, _input_charge) = rest.into_fast_parts()?;
+        let credit = ctx.charge(topk_table_bytes(spec.k, vars.len()))?;
+        let sorted = order_by(ctx, input, &keys, Some(spec.k), &mut ExprReport::default())?.0;
+        rest = Materialized::with_fast(sorted, credit)?;
     }
     Ok(Some(rest))
 }
@@ -3794,7 +3839,7 @@ const TOPK_MORSEL_ROWS: usize = crate::index::BLOCK_ROWS;
 
 /// The rows a morsel of [`topk_rest_morsels`] keeps, the rows its scan produced and, when
 /// the scan drops union-graph duplicates, the last of those rows.
-type MorselBest = (Table, usize, Option<Vec<Id>>);
+type MorselBest<'ctx> = (Materialized<'ctx>, usize, Option<[Id; 4]>);
 
 /// The keys `[first, last]` of one morsel of [`topk_rest_morsels`], the piece it belongs
 /// to and the rows of its blocks.
@@ -3803,7 +3848,6 @@ struct Morsel {
     last: Key,
     exact: bool,
     piece: usize,
-    rows: usize,
 }
 
 /// [`topk_rest`] with a heap. The pieces are split into morsels of whole index blocks,
@@ -3815,13 +3859,13 @@ struct Morsel {
 /// per worker thread and the rows they keep, instead of every row of the pieces. A morsel
 /// is checked for values that are not totally ordered before it ranks its rows, and one
 /// such value sends the whole query to the generic plan, as it does eagerly.
-fn topk_rest_morsels(
-    ctx: &Ctx,
+fn topk_rest_morsels<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     vars: &[VarId],
     pieces: &[&super::plan::TopKPiece],
     scanned: &mut usize,
-) -> Result<Option<Table>> {
+) -> Result<Option<Materialized<'ctx>>> {
     let keys = [(Expr::Var(spec.var), spec.asc)];
     let scan = &spec.scan;
     let perm = ctx.snap.perm(scan.perm);
@@ -3876,7 +3920,6 @@ fn topk_rest_morsels(
                 last,
                 exact: p.exact,
                 piece,
-                rows,
             });
             if e >= b1 {
                 break;
@@ -3903,7 +3946,7 @@ fn topk_rest_morsels(
     // scan drops duplicate rows of a union default graph. The copies of a triple are
     // adjacent in key order, and the scan of one morsel drops them within the morsel,
     // so a morsel can only repeat the previous one's last row, as its first row.
-    let mut carried: Option<(usize, Vec<Id>)> = None;
+    let mut carried: Option<(usize, [Id; 4])> = None;
     // A wave of one morsel per worker at a time: a worker that waits inside a morsel's
     // own parallel work could otherwise steal and start every other morsel.
     for wave in morsels.chunks(rayon::current_num_threads().max(1)) {
@@ -3917,22 +3960,23 @@ fn topk_rest_morsels(
         for (m, (mut t, mut n, last)) in wave.iter().zip(parts) {
             if let Some((piece, row)) = &carried
                 && *piece == m.piece
-                && !t.is_empty()
-                && t.cols.iter().zip(row).all(|(c, &id)| c[0] == id)
+                && !t.table.is_empty()
+                && t.table.cols.iter().zip(row).all(|(c, &id)| c[0] == id)
             {
                 // a read of the whole piece drops this copy, as eager execution does
-                let rows: Vec<usize> = (1..t.len()).collect();
-                t = t.take_rows(&rows);
+                let _rows = ctx.charge(t.table.len() as u64 * size_of::<usize>() as u64)?;
+                let rows: Vec<usize> = (1..t.table.len()).collect();
+                t = topk_take_rows(ctx, &t.table, &rows)?;
                 n -= 1;
             }
             if let Some(last) = last {
                 carried = Some((m.piece, last));
             }
             *scanned += n;
-            if t.is_empty() {
+            if t.table.is_empty() {
                 continue;
             }
-            let room = heap.k().saturating_add(1).min(t.len()) as u64;
+            let room = heap.k().saturating_add(1).min(t.table.len()) as u64;
             if let Some(held) = &mut held {
                 held.resize(
                     1024 + (heap.kept() as u64 + room) * entry_bytes
@@ -3942,12 +3986,12 @@ fn topk_rest_morsels(
             }
             let mut offer = RestOffer {
                 slots: &mut slots,
-                table: &t,
+                table: &t.table,
             };
             offer_rows(
                 ctx,
                 &mut heap,
-                &t,
+                &t.table,
                 &keys,
                 &mut ExprReport::default(),
                 &mut offer,
@@ -3958,76 +4002,69 @@ fn topk_rest_morsels(
     let width = slots.width;
     let entries = heap.into_sorted();
     ctx.check_output(entries.len(), width)?;
-    let out_bytes = (entries.len() as u64)
-        .saturating_mul(width as u64 * 8)
-        .saturating_add(vars.len() as u64 * 4);
-    let _rest_charge = ctx.charge(out_bytes)?;
-    let mut rest = Table::new(vars.to_vec());
-    for col in &mut rest.cols {
-        col.reserve_exact(entries.len());
-    }
-    for (j, col) in rest.cols.iter_mut().enumerate() {
+    let mut rest = Materialized::empty_fast(ctx, vars, &[])?;
+    rest.reserve_rows(ctx, entries.len())?;
+    for (j, col) in rest.table.cols.iter_mut().enumerate() {
         col.extend(
             entries
                 .iter()
                 .map(|e| slots.ids[e.payload as usize * width + j]),
         );
     }
-    rest.len = entries.len();
+    rest.table.len = entries.len();
     Ok(Some(rest))
 }
 
 /// The rows of one morsel of [`topk_rest_morsels`] that have fewer than k rows of the
 /// morsel ahead of them, in arrival order, and the rows the morsel read; `None` when one
 /// of its values is not totally ordered.
-fn morsel_best(
-    ctx: &Ctx,
+fn morsel_best<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &OrderedTopK,
     vars: &[VarId],
     keys: &[(Expr, bool)],
     m: &Morsel,
-) -> Result<Option<MorselBest>> {
-    // the morsel's rows, charged from its blocks before they are read and then at their
-    // real size
-    let estimate = (m.rows as u64).saturating_mul(vars.len() as u64 * 8);
-    let rows = ctx.charge(estimate)?;
+) -> Result<Option<MorselBest<'ctx>>> {
     let (mut t, n, last) = topk_read_keys_last(ctx, spec, m.first, m.last, m.exact, vars)?;
-    if t.is_empty() {
+    if t.table.is_empty() {
         return Ok(Some((t, n, last)));
     }
-    rows.add(t.mem_bytes().saturating_sub(estimate))?;
-    let decoded = super::exprcache::dictionary_values(ctx, &t, &Expr::Var(spec.var))?;
+    let decoded = super::exprcache::dictionary_values(ctx, &t.table, &Expr::Var(spec.var))?;
     let total = match &decoded {
-        Some(values) => rest_total(ctx, &t, values)?,
+        Some(values) => rest_total(ctx, &t.table, values)?,
         // without a decoded column, values are read one at a time, as eager execution
         // reads them
-        None => t.cols[0].iter().all(|&id| totally_ordered(ctx, id)),
+        None => t.table.cols[0].iter().all(|&id| totally_ordered(ctx, id)),
     };
     if !total {
         return Ok(None);
     }
     if ctx.opt.topk_prefilter
-        && t.len() > spec.k
-        && let Some((rows, charge)) = topk_candidates(ctx, &t, keys, spec.k, decoded.as_ref())?
-        && rows.len() < t.len()
+        && t.table.len() > spec.k
+        && let Some((rows, charge)) =
+            topk_candidates(ctx, &t.table, keys, spec.k, decoded.as_ref())?
+        && rows.len() < t.table.len()
     {
-        t = t.take_rows(&rows);
+        t = topk_take_rows(ctx, &t.table, &rows)?;
         drop(charge);
     }
     drop(decoded);
-    if t.len() > spec.k {
+    if t.table.len() > spec.k {
+        let row_bytes = size_of::<Entry<usize>>() + size_of::<SortKey>() + size_of::<usize>();
+        let _ranked =
+            ctx.charge((spec.k.saturating_add(1) as u64).saturating_mul(2 * row_bytes as u64))?;
         let mut heap: TopK<usize> = TopK::new(spec.k, vec![spec.asc]);
         offer_rows(
             ctx,
             &mut heap,
-            &t,
+            &t.table,
             keys,
             &mut ExprReport::default(),
             &mut RowIndex,
         )?;
         let mut rows: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
         rows.sort_unstable();
-        t = t.take_rows(&rows);
+        t = topk_take_rows(ctx, &t.table, &rows)?;
     }
     ctx.check()?;
     Ok(Some((t, n, last)))
@@ -4079,32 +4116,18 @@ fn ordered_topk_inner_charged(
     let scanned = ordered_topk_run(ctx, spec, out, morsels, &mut |top| {
         let len = top.len();
         let width = out.len();
-        let est = (len as u64)
-            .saturating_mul(width as u64 * 8)
-            .max(len as u64 * 8 * u64::from(width == 0))
-            .saturating_add(width as u64 * 4);
-        let mut charge = super::ctx::OwnedCharge::new(ctx, est)?;
+        let mut charge = super::ctx::OwnedCharge::new(ctx, topk_table_bytes(len, width))?;
         let mut projected = Table::new(out.to_vec());
-        for col in &mut projected.cols {
+        for (col, &var) in projected.cols.iter_mut().zip(out) {
             col.reserve_exact(len);
-        }
-        let col_map: Vec<Option<usize>> = out.iter().map(|v| top.col_of(*v)).collect();
-        for (dst, src) in projected.cols.iter_mut().zip(&col_map) {
-            match src {
-                Some(c) => dst.extend_from_slice(&top.cols[*c]),
-                None => dst.resize(len, Id::UNDEF),
+            if let Some(src) = top.col_of(var) {
+                col.extend_from_slice(&top.cols[src]);
+            } else {
+                col.resize(len, Id::UNDEF);
             }
         }
         projected.len = len;
-        let actual: u64 = projected
-            .cols
-            .iter()
-            .map(|c| c.capacity() as u64 * 8)
-            .sum::<u64>()
-            .max(projected.len as u64 * 8 * u64::from(projected.width() == 0))
-            .saturating_add(projected.vars.capacity() as u64 * 4)
-            .saturating_add(projected.sorted.capacity() as u64 * 4);
-        charge.resize(actual)?;
+        charge.resize(super::algosvc::table_capacity(&projected)?)?;
         result = Some((projected, charge));
         Ok(())
     })?;
@@ -4118,15 +4141,6 @@ fn ordered_topk_run(
     morsels: bool,
     finish: &mut dyn FnMut(Table) -> Result<()>,
 ) -> Result<usize> {
-    let table_cap_bytes = |t: &Table| -> u64 {
-        t.cols
-            .iter()
-            .map(|c| c.capacity() as u64 * 8)
-            .sum::<u64>()
-            .max(t.len as u64 * 8 * u64::from(t.width() == 0))
-            .saturating_add(t.vars.capacity() as u64 * 4)
-            .saturating_add(t.sorted.capacity() as u64 * 4)
-    };
     let vars: Vec<VarId> = spec.scan.cols.iter().map(|c| c.1).collect();
     debug_assert_eq!(vars.first(), Some(&spec.var));
     let mut scanned = 0;
@@ -4141,7 +4155,7 @@ fn ordered_topk_run(
                 hi: p.hi,
                 exact: p.exact,
                 best_high: mono.is_some_and(|up| up != spec.asc),
-                kept: Table::new(vars.clone()),
+                kept: Materialized::empty_fast(ctx, &vars, &[])?,
                 want: spec.k.max(16).saturating_mul(2),
                 done: false,
                 lexical: mono.is_none(),
@@ -4159,7 +4173,6 @@ fn ordered_topk_run(
         return Ok(scanned);
     };
     let keys = [(Expr::Var(spec.var), spec.asc)];
-    let mut held = ctx.retained_charge(table_cap_bytes(&rest))?;
     let better = if spec.asc {
         Ordering::Less
     } else {
@@ -4173,38 +4186,35 @@ fn ordered_topk_run(
             }
             scanned += topk_step(ctx, spec, run, &vars)?;
         }
-        let retained_runs: u64 = table_cap_bytes(&rest).saturating_add(
-            runs.iter()
-                .map(|r| table_cap_bytes(&r.kept))
-                .fold(0u64, u64::saturating_add),
-        );
-        if let Some(h) = &mut held {
-            h.resize(retained_runs)?;
-        }
         // the candidates in the generic plan's row order, ranked by the generic ORDER BY
-        let n = rest.len() + runs.iter().map(|r| r.kept.len()).sum::<usize>();
+        let n = rest.table.len() + runs.iter().map(|r| r.kept.table.len()).sum::<usize>();
         ctx.check_output(n, vars.len())?;
-        let cand_est = (n as u64)
-            .saturating_mul(vars.len() as u64 * 8)
-            .saturating_add(vars.len() as u64 * 4);
-        let _cand_charge = ctx.charge(cand_est)?;
+        let cand_est = topk_table_bytes(n, vars.len());
+        let cand_charge = ctx.charge(cand_est)?;
         let mut cand = Table::new(vars.clone());
         for col in &mut cand.cols {
             col.reserve_exact(n);
         }
-        for (dst, src) in cand.cols.iter_mut().zip(&rest.cols) {
+        for (dst, src) in cand.cols.iter_mut().zip(&rest.table.cols) {
             dst.extend_from_slice(src);
         }
-        cand.len = rest.len();
+        cand.len = rest.table.len();
         for run in &runs {
-            for (dst, src) in cand.cols.iter_mut().zip(&run.kept.cols) {
+            for (dst, src) in cand.cols.iter_mut().zip(&run.kept.table.cols) {
                 dst.extend_from_slice(src);
             }
-            cand.len += run.kept.len();
+            cand.len += run.kept.table.len();
         }
         cand.sorted.clear();
-        cand.sort_by_vars(&spec.tie_order);
+        {
+            let sort_cols = spec.tie_order.len() as u64 * size_of::<usize>() as u64;
+            let sort_rows = n as u64 * size_of::<usize>() as u64;
+            let _ties = ctx.charge(cand_est.saturating_add(sort_cols).saturating_add(sort_rows))?;
+            cand.sort_by_vars(&spec.tie_order);
+        }
+        let top_charge = ctx.charge(topk_table_bytes(n.min(spec.k), vars.len()))?;
         let (top, _) = order_by(ctx, cand, &keys, Some(spec.k), &mut ExprReport::default())?;
+        drop(cand_charge);
         if top.len() == spec.k {
             // a piece is finished once the k-th row is strictly better than its best
             // unread value, and so than every unread value
@@ -4218,7 +4228,7 @@ fn ordered_topk_run(
                             for id in ids {
                                 let (t, n) = topk_read(ctx, spec, id, id, run.exact, &vars)?;
                                 scanned += n;
-                                run.kept.append(t);
+                                topk_append(ctx, &mut run.kept, t)?;
                                 run.extra.push(id);
                             }
                             run.hold = true;
@@ -4235,66 +4245,27 @@ fn ordered_topk_run(
         }
         if runs.iter().all(|r| r.done) {
             finish(top)?;
-            drop(_cand_charge);
-            drop(held);
+            drop(top_charge);
             return Ok(scanned);
         }
     }
 }
 
-// The paid sink keeps its actual guard around every physical growth. Raw-table
-// callers remain explicit legacy internal paths until their producer migration.
-trait ScanSink {
-    fn table(&self) -> &Table;
-    fn table_mut(&mut self) -> &mut Table;
-    fn prepare(&mut self, ctx: &Ctx, rows: usize) -> Result<()>;
-    fn check_output(&self, ctx: &Ctx) -> Result<()>;
-}
-impl ScanSink for Table {
-    fn table(&self) -> &Table {
-        self
-    }
-    fn table_mut(&mut self) -> &mut Table {
-        self
-    }
-    fn prepare(&mut self, _ctx: &Ctx, _rows: usize) -> Result<()> {
-        Ok(())
-    }
-    fn check_output(&self, ctx: &Ctx) -> Result<()> {
-        ctx.check_output(self.len(), self.width())
-    }
-}
-impl ScanSink for Materialized<'_> {
-    fn table(&self) -> &Table {
-        &self.table
-    }
-    fn table_mut(&mut self) -> &mut Table {
-        &mut self.table
-    }
-    fn prepare(&mut self, ctx: &Ctx, rows: usize) -> Result<()> {
-        ctx.check_output_rows(rows)?;
-        self.reserve_rows(ctx, rows)
-    }
-    fn check_output(&self, ctx: &Ctx) -> Result<()> {
-        ctx.check_output_rows(self.table.len())
-    }
-}
-
 /// Append the scan's rows with keys in `[lo, hi]`, stopping at the row limit.
-fn scan_into<T: ScanSink>(
+fn scan_into(
     ctx: &Ctx,
     spec: &ScanSpec,
     lo: crate::index::Key,
     hi: crate::index::Key,
     limit: Option<usize>,
-    t: &mut T,
+    t: &mut Materialized<'_>,
 ) -> Result<bool> {
     let limit = limit.unwrap_or(usize::MAX);
     let mut truncated = false;
     let mut last: Option<[u64; 4]> = None;
     let mut n = 0usize;
-    let mut row = |k: &[u64; 4], t: &mut T| -> Result<()> {
-        if t.table().len >= limit || !spec.graph.accepts(k[spec.graph_col]) {
+    let mut row = |k: &[u64; 4], t: &mut Materialized<'_>| -> Result<()> {
+        if t.table.len >= limit || !spec.graph.accepts(k[spec.graph_col]) {
             return Ok(());
         }
         if spec.eqs.iter().any(|&(a, b)| k[a] != k[b]) {
@@ -4311,12 +4282,13 @@ fn scan_into<T: ScanSink>(
             last = Some(proj);
         }
         let rows = t
-            .table()
+            .table
             .len
             .checked_add(1)
             .ok_or_else(|| Error::invalid("scan output rows overflow"))?;
-        t.prepare(ctx, rows)?;
-        let table = t.table_mut();
+        ctx.check_output_rows(rows)?;
+        t.reserve_rows(ctx, rows)?;
+        let table = &mut t.table;
         for (c, &(kc, _)) in spec.cols.iter().enumerate() {
             table.cols[c].push(Id(k[kc]));
         }
@@ -4325,20 +4297,21 @@ fn scan_into<T: ScanSink>(
     };
     ctx.snap
         .scan_between_cols(spec.perm, lo, hi, scan_mask(spec), |chunk| {
-            if t.table().len >= limit {
+            if t.table.len >= limit {
                 truncated = true;
                 return Ok(false);
             }
             match chunk {
                 Chunk::Block(b, s, e) if !spec.dedup && block_passes(spec, b, s, e) => {
-                    let e = e.min(s.saturating_add(limit - t.table().len));
+                    let e = e.min(s.saturating_add(limit - t.table.len));
                     let rows = t
-                        .table()
+                        .table
                         .len
                         .checked_add(e - s)
                         .ok_or_else(|| Error::invalid("scan output rows overflow"))?;
-                    t.prepare(ctx, rows)?;
-                    let table = t.table_mut();
+                    ctx.check_output_rows(rows)?;
+                    t.reserve_rows(ctx, rows)?;
+                    let table = &mut t.table;
                     for (c, &(kc, _)) in spec.cols.iter().enumerate() {
                         table.cols[c].extend(b.cols[kc][s..e].iter().map(|&x| Id(x)));
                     }
@@ -4359,9 +4332,9 @@ fn scan_into<T: ScanSink>(
             if n > 1 << 16 {
                 n = 0;
                 ctx.check()?;
-                t.check_output(ctx)?;
+                ctx.check_output_rows(t.table.len())?;
             }
-            if t.table().len >= limit {
+            if t.table.len >= limit {
                 truncated = true;
                 return Ok(false);
             }
@@ -10164,6 +10137,77 @@ mod path_lookup_tests {
 mod paid_eager_producer_tests {
     use super::*;
     use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn r2_topk_scan_refuses_numeric_ties_and_delta_before_the_full_read() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, update::update};
+        use oxrdfio::RdfFormat;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..512)
+            .map(|i| format!("<urn:tie:{i}> <urn:p> 42 .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let data = (0..512)
+            .map(|i| format!("<urn:delta:{i}> <urn:p> \"value-{i}\" .\n"))
+            .collect::<String>();
+        update(
+            &store,
+            &format!("INSERT DATA {{ {data} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 512;
+        let pred = ctx.snap.lookup_iri("urn:p").unwrap();
+        let scan = ScanSpec {
+            perm: Perm::Pos,
+            prefix: vec![pred.0],
+            cols: vec![(1, 0), (2, 1)],
+            eqs: Vec::new(),
+            graph: GraphFilter::Default,
+            graph_col: 3,
+            dedup: false,
+            src: None,
+        };
+        let spec = OrderedTopK {
+            scan,
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: Vec::new(),
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+        let tied = ctx
+            .snap
+            .lookup_term(&oxrdf::Literal::from(42_i64).into())
+            .unwrap();
+        let delta = ctx
+            .snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal("value-0").into())
+            .unwrap();
+        let [lo, hi] = [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(delta.tag(), payload).0);
+        for (lower, upper) in [(tied.0, tied.0), (lo, hi)] {
+            let err = topk_read(&ctx, &spec, lower, upper, true, &[0, 1])
+                .err()
+                .unwrap();
+            assert!(matches!(
+                err,
+                Error::BudgetExceeded(b) if b.kind == crate::error::BudgetKind::Memory && b.requested > 512
+            ));
+            assert_eq!(ctx.live_bytes(), 0);
+        }
+    }
 
     #[test]
     fn eager_and_nested_limited_slice_keep_prepaid_columns_without_ledger() {

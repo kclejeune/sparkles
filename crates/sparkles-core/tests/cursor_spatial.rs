@@ -871,3 +871,51 @@ fn spatial_pre_admission_explain_children_and_extended_coverage() {
         "SpatialKnn template plan must preserve its child operators: {knn_node:#?}"
     );
 }
+
+#[test]
+fn both_constant_relation_stops_after_the_first_witness_in_each_graph() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from(
+        "@prefix ex: <http://example.org/> .\n@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n",
+    );
+    for graph in ["", "ex:g1", "ex:g2"] {
+        data.push_str(&format!("{graph} {{\n"));
+        for i in 0..32 {
+            data.push_str(&format!(
+                "ex:a geo:asWKT \"POLYGON((0 0, {} 0, {} 10, 0 10, 0 0))\"^^geo:wktLiteral .\n\
+                 ex:b geo:asWKT \"POINT(1.{i:02} 1)\"^^geo:wktLiteral .\n",
+                i + 3,
+                i + 3,
+            ));
+        }
+        data.push_str("}\n");
+    }
+    load(&s, &data, RdfFormat::TriG);
+    s.enable_geo(GeoConfig {
+        query_rewrite: true,
+        ..GeoConfig::default()
+    })
+    .unwrap();
+    let snap = s.snapshot();
+    for (body, rows) in [
+        ("SELECT * { ex:a geo:sfIntersects ex:b } LIMIT 1", 1),
+        (
+            "SELECT ?g { GRAPH ?g { ex:a geo:sfIntersects ex:b } } LIMIT 1",
+            1,
+        ),
+        ("SELECT ?g { GRAPH ?g { ex:a geo:sfIntersects ex:b } }", 2),
+        (
+            "SELECT ?g { GRAPH ?g { ex:a geo:sfIntersects \"POINT(1 1)\"^^geo:wktLiteral } }",
+            2,
+        ),
+    ] {
+        let (got, plan, _) =
+            drain_strict(&snap, &format!("{P}{body}"), &QueryOptions::default(), 1);
+        assert_eq!(got.len(), rows, "{body}: {plan:#?}");
+        assert_eq!(
+            find_counter(&plan, "SpatialRelate", "pairs"),
+            Some(rows as u64),
+            "{body}"
+        );
+    }
+}

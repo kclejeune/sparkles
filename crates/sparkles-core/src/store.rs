@@ -889,7 +889,7 @@ impl Snapshot {
         self.scan_between_cols_checked(perm, lo, hi, mask, || Ok(()), f)
     }
 
-    fn scan_between_cols_checked(
+    pub(crate) fn scan_between_cols_checked(
         &self,
         perm: Perm,
         lo: Key,

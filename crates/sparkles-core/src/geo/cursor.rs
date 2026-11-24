@@ -37,6 +37,7 @@ use crate::sparql::plan::{GraphFilter, PathEnd, ScanSpec};
 use crate::sparql::table::{Table, VarId};
 use crate::store::Chunk;
 use rustc_hash::{FxHashMap, FxHashSet};
+use sparkles_budget::sizes::{table_bytes, table_grown, vec_grown};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -510,51 +511,64 @@ impl SpatialPfReader {
                     let Some(y) = super::wgs84::number(&ctx.snap, Id(lat_o)) else {
                         return Ok(());
                     };
-                    for long_o in super::wgs84::objects(&ctx.snap, f.0, long_p.0, g)? {
-                        scanned += 1;
-                        if scanned.is_multiple_of(CHECK_EVERY) {
-                            ctx.check()?;
-                        }
-                        let e = super::wgs84::number(&ctx.snap, Id(long_o))
-                            .and_then(|x| super::wgs84::point(y, x));
-                        if let Some(e) = e {
-                            st.candidates += 1;
-                            if st.candidates.is_multiple_of(CHECK_CANDIDATES) {
-                                ctx.check()?;
-                                ctx.check_rows(st.candidates as usize)?;
-                            }
-                            st.refined += 1;
-                            if noted(ctx, e.geom(&ctx.snap))
-                                .ok()
-                                .and_then(|geom| tester.check(&geom))
-                                .is_some()
-                            {
-                                st.matched += 1;
-                                let g_key = if spec.graph_var.is_some() {
-                                    Id(g)
-                                } else {
-                                    Id::UNDEF
-                                };
-                                if !seen_feat.contains(&(*f, g_key)) {
-                                    if seen_feat.len() == seen_feat.capacity()
-                                        || pending_feats.len() == pending_feats.capacity()
-                                    {
-                                        charge.resize(open_bytes(
-                                            lit_memo.capacity(),
-                                            next_cap(seen_feat.len(), seen_feat.capacity(), 1),
-                                            next_cap(
-                                                pending_feats.len(),
-                                                pending_feats.capacity(),
-                                                1,
-                                            ),
-                                        ))?;
+                    super::wgs84::visit_objects(
+                        &ctx.snap,
+                        [f.0, long_p.0, 0, 0],
+                        [f.0, long_p.0, u64::MAX, u64::MAX],
+                        g,
+                        || ctx.check(),
+                        |long_o| {
+                            let mut point_charge = None;
+                            let e = if let Some(x) = super::wgs84::number(&ctx.snap, Id(long_o))
+                                .filter(|x| {
+                                    (-180.0..=180.0).contains(x) && (-90.0..=90.0).contains(&y)
+                                }) {
+                                point_charge = Some(ctx.charge(super::wgs84::POINT_BYTES)?);
+                                super::wgs84::point(y, x)
+                            } else {
+                                None
+                            };
+                            if let Some(e) = e {
+                                st.candidates += 1;
+                                if st.candidates.is_multiple_of(CHECK_CANDIDATES) {
+                                    ctx.check()?;
+                                    ctx.check_rows(st.candidates as usize)?;
+                                }
+                                st.refined += 1;
+                                if noted(ctx, e.geom(&ctx.snap))
+                                    .ok()
+                                    .and_then(|geom| tester.check(&geom))
+                                    .is_some()
+                                {
+                                    st.matched += 1;
+                                    let g_key = if spec.graph_var.is_some() {
+                                        Id(g)
+                                    } else {
+                                        Id::UNDEF
+                                    };
+                                    if !seen_feat.contains(&(*f, g_key)) {
+                                        if seen_feat.len() == seen_feat.capacity()
+                                            || pending_feats.len() == pending_feats.capacity()
+                                        {
+                                            charge.resize(open_bytes(
+                                                lit_memo.capacity(),
+                                                next_cap(seen_feat.len(), seen_feat.capacity(), 1),
+                                                next_cap(
+                                                    pending_feats.len(),
+                                                    pending_feats.capacity(),
+                                                    1,
+                                                ),
+                                            ))?;
+                                        }
+                                        seen_feat.insert((*f, g_key));
+                                        pending_feats.push_back((*f, g_key));
                                     }
-                                    seen_feat.insert((*f, g_key));
-                                    pending_feats.push_back((*f, g_key));
                                 }
                             }
-                        }
-                    }
+                            drop(point_charge);
+                            Ok(true)
+                        },
+                    )?;
                     Ok(())
                 })?;
             }
@@ -644,6 +658,17 @@ impl SpatialPfReader {
             }
             out.push_row(row);
         };
+        // Fallback Basic Geo hits own their point data. Indexed entries are shared.
+        let generated = std::cell::Cell::new(
+            self.pending_hits.len() as u64
+                * u64::from(
+                    self.iter.as_ref().is_some_and(|it| it.st.fallback)
+                        && self
+                            .pending_hits
+                            .front()
+                            .is_some_and(|h| super::wgs84::is_pair(h.o.0)),
+                ),
+        );
         let bytes_for = |iter: &Option<WindowIter>,
                          hits_cap: usize,
                          feats_cap: usize,
@@ -659,6 +684,7 @@ impl SpatialPfReader {
             let seen = seen_cap as u64 * (size_of::<(Id, Id)>() + 1) as u64;
             iter_bytes
                 .saturating_add(hits)
+                .saturating_add(generated.get() * super::wgs84::POINT_BYTES)
                 .saturating_add(feats)
                 .saturating_add(lits)
                 .saturating_add(geoms)
@@ -811,6 +837,9 @@ impl SpatialPfReader {
                 let ended = iter.next_hits(ctx, &mut buf, chunk_want, &mut |b| {
                     charge.resize(b.saturating_add(base_bytes))
                 })?;
+                if iter.st.fallback && buf.first().is_some_and(|h| super::wgs84::is_pair(h.o.0)) {
+                    generated.set(buf.len() as u64);
+                }
                 if ended {
                     self.st.nodes = iter.st.nodes;
                     self.st.rechecked = iter.st.rechecked;
@@ -823,14 +852,23 @@ impl SpatialPfReader {
                         self.pending_hits.capacity(),
                         buf.len(),
                     );
-                    self.charge.resize(bytes_for(
-                        &self.iter,
-                        next_h,
-                        self.pending_feats.capacity(),
-                        self.seen_lit.capacity(),
-                        self.seen_geom.capacity(),
-                        self.seen_feat.capacity(),
-                    ))?;
+                    let retired = if next_h > self.pending_hits.capacity() {
+                        self.pending_hits.capacity()
+                    } else {
+                        0
+                    };
+                    let scratch = (buf.capacity() + retired) as u64 * size_of::<Hit>() as u64;
+                    self.charge.resize(
+                        bytes_for(
+                            &self.iter,
+                            next_h,
+                            self.pending_feats.capacity(),
+                            self.seen_lit.capacity(),
+                            self.seen_geom.capacity(),
+                            self.seen_feat.capacity(),
+                        )
+                        .saturating_add(scratch),
+                    )?;
                     self.pending_hits.extend(buf);
                 }
                 resize_charge(
@@ -850,12 +888,22 @@ impl SpatialPfReader {
                 let Some(h) = self.pending_hits.pop_front() else {
                     break;
                 };
+                let generated_point = generated.get() > 0;
+                if generated_point {
+                    generated.set(self.pending_hits.len() as u64 + 1);
+                }
                 self.st.candidates += 1;
                 if self.st.candidates.is_multiple_of(CHECK_CANDIDATES) {
                     ctx.check()?;
                     ctx.check_rows(self.st.candidates as usize)?;
                 }
-                let ok = if let Some(&v) = self.seen_lit.get(&h.o) {
+                let ok = if generated_point {
+                    self.st.refined += 1;
+                    noted(ctx, h.entry.geom(&ctx.snap))
+                        .ok()
+                        .and_then(|g| tester.check(&g))
+                        .is_some()
+                } else if let Some(&v) = self.seen_lit.get(&h.o) {
                     v
                 } else {
                     self.st.refined += 1;
@@ -936,6 +984,7 @@ impl SpatialPfReader {
                     });
                 }
             }
+            generated.set(generated.get().min(self.pending_hits.len() as u64));
             resize_charge(
                 &self.iter,
                 &self.pending_hits,
@@ -965,6 +1014,19 @@ struct Ser {
 struct ConstLit {
     lit: Id,
     g: Option<Id>,
+}
+
+fn const_lit_bytes(lits: &Vec<ConstLit>) -> u64 {
+    lits.capacity() as u64 * size_of::<ConstLit>() as u64
+}
+
+fn hash_growth<T>(capacity: usize, len: usize) -> u64 {
+    let next = table_grown(capacity, len, 1);
+    if next == capacity {
+        0
+    } else {
+        table_bytes(next, size_of::<T>()) as u64
+    }
 }
 
 struct RelateItem {
@@ -1130,15 +1192,26 @@ enum RelateStage {
     OneConst {
         cid: Id,
         subject_const: bool,
-        qs: Vec<Id>,
-        by_lit: FxHashMap<Id, Vec<Option<Id>>>,
-        by_lit_elem_bytes: u64,
+        lits: Vec<ConstLit>,
         q_at: usize,
         qg: Option<GeomRef>,
         cand: OneConstCand,
         pending_sers: VecDeque<Ser>,
         active_ser: Option<(Ser, usize)>,
         lit_pass: FxHashMap<Id, bool>,
+    },
+    BothConst {
+        sid: Id,
+        oid: Id,
+        left: Vec<ConstLit>,
+        right: Vec<ConstLit>,
+        left_at: usize,
+        right_at: usize,
+    },
+    ConstantGraphs {
+        sid: Id,
+        oid: Id,
+        next_graph: u64,
     },
     BothVar {
         items: Vec<RelateItem>,
@@ -1273,27 +1346,24 @@ impl SpatialRelateReader {
     }
 
     fn base_retained_bytes(&self) -> u64 {
-        (self.emitted.capacity() as u64 * (size_of::<(Id, Id, Id)>() + 1) as u64)
+        (table_bytes(self.emitted.capacity(), size_of::<(Id, Id, Id)>()) as u64)
             .saturating_add(self.pending_out.capacity() as u64 * size_of::<(Id, Id, Id)>() as u64)
             .saturating_add(
-                self.geoms.capacity() as u64
-                    * (size_of::<Id>() + size_of::<Option<GeomRef>>() + 1) as u64,
+                table_bytes(self.geoms.capacity(), size_of::<(Id, Option<GeomRef>)>()) as u64,
             )
             .saturating_add(
                 self.features.capacity() as u64
                     * (size_of::<(Id, Id)>() + size_of::<Vec<Id>>() + 1) as u64,
             )
             .saturating_add(self.features_elem_bytes)
-            .saturating_add(self.scope.capacity() as u64 * (size_of::<u64>() + 2) as u64)
+            .saturating_add(table_bytes(self.scope.capacity(), size_of::<(u64, bool)>()) as u64)
     }
 
     fn retained_bytes(&self) -> u64 {
         let mut bytes = self.base_retained_bytes();
         match &self.stage {
             RelateStage::OneConst {
-                qs,
-                by_lit,
-                by_lit_elem_bytes,
+                lits,
                 cand,
                 pending_sers,
                 lit_pass,
@@ -1303,14 +1373,14 @@ impl SpatialRelateReader {
                     bytes = bytes.saturating_add(it.retained_bytes());
                 }
                 bytes = bytes
-                    .saturating_add(qs.capacity() as u64 * size_of::<Id>() as u64)
-                    .saturating_add(
-                        by_lit.capacity() as u64
-                            * (size_of::<Id>() + size_of::<Vec<Option<Id>>>() + 1) as u64,
-                    )
-                    .saturating_add(*by_lit_elem_bytes)
+                    .saturating_add(const_lit_bytes(lits))
                     .saturating_add(pending_sers.capacity() as u64 * size_of::<Ser>() as u64)
                     .saturating_add(lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64);
+            }
+            RelateStage::BothConst { left, right, .. } => {
+                bytes = bytes
+                    .saturating_add(const_lit_bytes(left))
+                    .saturating_add(const_lit_bytes(right));
             }
             RelateStage::BothVar {
                 items,
@@ -1367,9 +1437,7 @@ impl SpatialRelateReader {
             return Ok(g.clone());
         }
         if self.geoms.len() == self.geoms.capacity() {
-            let add = (next_cap(self.geoms.len(), self.geoms.capacity(), 1) - self.geoms.capacity())
-                as u64
-                * (size_of::<Id>() + size_of::<Option<GeomRef>>() + 1) as u64;
+            let add = hash_growth::<(Id, Option<GeomRef>)>(self.geoms.capacity(), self.geoms.len());
             self.charge.resize(
                 self.base_retained_bytes()
                     .saturating_add(extra_bytes)
@@ -1389,91 +1457,94 @@ impl SpatialRelateReader {
         Ok(parsed)
     }
 
-    fn sers_of(&mut self, ctx: &Ctx, s: Id) -> Result<Vec<Ser>> {
-        let mut out = Vec::new();
-        for p in self.preds.clone() {
-            let mut scan = PrefixScan::new(Perm::Spo, &[s.0, p.0]);
-            let mut raw = Vec::new();
-            loop {
-                let ended = scan.next_chunk(ctx, &mut raw, 4096)?;
-                for &k in &raw {
-                    if self.ser_graph(ctx, k[3]) {
-                        if out.len() == out.capacity() {
-                            let add = next_cap(out.len(), out.capacity(), 1) as u64
-                                * size_of::<Ser>() as u64;
-                            self.charge
-                                .resize(self.retained_bytes().saturating_add(add))?;
-                        }
-                        out.push(Ser {
-                            s,
-                            o: Id(k[2]),
-                            g: Id(k[3]),
-                        });
+    fn collect_const_serializations(
+        &mut self,
+        ctx: &Ctx,
+        subject: Id,
+        graph: Option<u64>,
+        out: &mut Vec<ConstLit>,
+        extra: u64,
+    ) -> Result<()> {
+        for at in 0..self.preds.len() {
+            let p = self.preds[at];
+            let mut scanned = 0usize;
+            scan_keys(ctx, Perm::Spo, &[subject.0, p.0], |k| {
+                scanned += 1;
+                if scanned.is_multiple_of(CHECK_EVERY) {
+                    ctx.check()?;
+                }
+                if graph.is_some_and(|g| g != k[3]) || !self.spec.graph.accepts(k[3]) {
+                    return Ok(());
+                }
+                if !self.scope.contains_key(&k[3]) {
+                    let growth =
+                        hash_growth::<(u64, bool)>(self.scope.capacity(), self.scope.len());
+                    if growth != 0 {
+                        self.charge.resize(
+                            self.base_retained_bytes()
+                                .saturating_add(extra)
+                                .saturating_add(const_lit_bytes(out))
+                                .saturating_add(growth),
+                        )?;
                     }
                 }
-                if ended {
-                    break;
+                if self.in_scope(ctx, k[3]) {
+                    if out.len() == out.capacity() {
+                        let elem = size_of::<ConstLit>();
+                        let next = vec_grown(out.capacity(), out.len(), 1, elem);
+                        self.charge.resize(
+                            self.base_retained_bytes()
+                                .saturating_add(extra)
+                                .saturating_add(const_lit_bytes(out))
+                                .saturating_add(next.saturating_mul(elem) as u64),
+                        )?;
+                    }
+                    out.push(ConstLit {
+                        lit: Id(k[2]),
+                        g: Some(Id(k[3])),
+                    });
                 }
-            }
+                Ok(())
+            })?;
         }
-        Ok(out)
+        Ok(())
     }
 
-    fn const_lits(&mut self, ctx: &Ctx, e: &RelateEnd) -> Result<Vec<ConstLit>> {
+    fn const_lits(&mut self, ctx: &Ctx, e: &RelateEnd, extra: u64) -> Result<Vec<ConstLit>> {
         let id = match e {
             RelateEnd::Geometry(id, g) => {
-                if self.geoms.len() == self.geoms.capacity() && !self.geoms.contains_key(id) {
-                    let add = (next_cap(self.geoms.len(), self.geoms.capacity(), 1)
-                        - self.geoms.capacity()) as u64
-                        * (size_of::<Id>() + size_of::<Option<GeomRef>>() + 1) as u64;
-                    self.charge
-                        .resize(self.retained_bytes().saturating_add(add))?;
-                }
+                let growth = if self.geoms.contains_key(id) {
+                    0
+                } else {
+                    hash_growth::<(Id, Option<GeomRef>)>(self.geoms.capacity(), self.geoms.len())
+                };
+                self.charge.resize(
+                    self.base_retained_bytes()
+                        .saturating_add(extra)
+                        .saturating_add(growth)
+                        .saturating_add(size_of::<ConstLit>() as u64),
+                )?;
                 self.geoms.insert(*id, Some(g.clone()));
                 return Ok(vec![ConstLit { lit: *id, g: None }]);
             }
             RelateEnd::Node(id) => *id,
             RelateEnd::Var(_) | RelateEnd::Absent => return Ok(Vec::new()),
         };
-        let mut out: Vec<ConstLit> = self
-            .sers_of(ctx, id)?
-            .into_iter()
-            .map(|r| ConstLit {
-                lit: r.o,
-                g: Some(r.g),
-            })
-            .collect();
+        let mut out = Vec::new();
+        self.collect_const_serializations(ctx, id, None, &mut out, extra)?;
         if let Some(link) = self.link {
-            let mut geoms = Vec::new();
-            let mut scan = PrefixScan::new(Perm::Spo, &[id.0, link.0]);
-            let mut raw = Vec::new();
-            loop {
-                let ended = scan.next_chunk(ctx, &mut raw, 4096)?;
-                for &k in &raw {
-                    if self.spec.graph.accepts(k[3]) {
-                        geoms.push((Id(k[2]), k[3]));
-                    }
+            let mut scanned = 0usize;
+            scan_keys(ctx, Perm::Spo, &[id.0, link.0], |k| {
+                scanned += 1;
+                if scanned.is_multiple_of(CHECK_EVERY) {
+                    ctx.check()?;
                 }
-                if ended {
-                    break;
+                if self.spec.graph.accepts(k[3]) {
+                    let graph = self.spec.graph_var.is_some().then_some(k[3]);
+                    self.collect_const_serializations(ctx, Id(k[2]), graph, &mut out, extra)?;
                 }
-            }
-            for (geom, g1) in geoms {
-                for r in self.sers_of(ctx, geom)? {
-                    if self.spec.graph_var.is_none() || r.g.0 == g1 {
-                        if out.len() == out.capacity() {
-                            let add = next_cap(out.len(), out.capacity(), 1) as u64
-                                * size_of::<ConstLit>() as u64;
-                            self.charge
-                                .resize(self.retained_bytes().saturating_add(add))?;
-                        }
-                        out.push(ConstLit {
-                            lit: r.o,
-                            g: Some(r.g),
-                        });
-                    }
-                }
-            }
+                Ok(())
+            })?;
         }
         out.sort_unstable_by_key(|c| (c.lit, c.g));
         out.dedup_by_key(|c| (c.lit, c.g));
@@ -1560,13 +1631,7 @@ impl SpatialRelateReader {
         if self.emitted.contains(&(s, o, g)) {
             return Ok(false);
         }
-        let emit_add = if self.emitted.len() == self.emitted.capacity() {
-            (next_cap(self.emitted.len(), self.emitted.capacity(), 1) - self.emitted.capacity())
-                as u64
-                * (size_of::<(Id, Id, Id)>() + 1) as u64
-        } else {
-            0
-        };
+        let emit_add = hash_growth::<(Id, Id, Id)>(self.emitted.capacity(), self.emitted.len());
         let pend_add = if self.pending_out.len() == self.pending_out.capacity() {
             (next_cap(self.pending_out.len(), self.pending_out.capacity(), 1)
                 - self.pending_out.capacity()) as u64
@@ -1867,28 +1932,11 @@ impl SpatialRelateReader {
                         return Ok(());
                     }
                 };
-                let lits = self.const_lits(ctx, c)?;
-                let mut by_lit: FxHashMap<Id, Vec<Option<Id>>> = FxHashMap::default();
-                let mut by_lit_elem_bytes = 0u64;
-                for l in lits {
-                    let v = by_lit.entry(l.lit).or_default();
-                    let old_cap = v.capacity();
-                    v.push(l.g);
-                    let new_cap = v.capacity();
-                    if new_cap > old_cap {
-                        by_lit_elem_bytes = by_lit_elem_bytes.saturating_add(
-                            (new_cap - old_cap) as u64 * size_of::<Option<Id>>() as u64,
-                        );
-                    }
-                }
-                let mut qs: Vec<Id> = by_lit.keys().copied().collect();
-                qs.sort_unstable();
+                let lits = self.const_lits(ctx, c, 0)?;
                 self.stage = RelateStage::OneConst {
                     cid,
                     subject_const,
-                    qs,
-                    by_lit,
-                    by_lit_elem_bytes,
+                    lits,
                     q_at: 0,
                     qg: None,
                     cand: OneConstCand::Done,
@@ -1909,54 +1957,129 @@ impl SpatialRelateReader {
                         return Ok(());
                     }
                 };
-                let la = self.const_lits(ctx, a)?;
-                let lb = self.const_lits(ctx, b)?;
-                let graph_var = self.spec.graph_var.is_some();
-                let mut graphs = Vec::new();
-                let mut any = false;
-                for x in &la {
-                    ctx.check()?;
-                    let Some(gx) = self.geom_charged(ctx, x.lit, 0)? else {
-                        continue;
-                    };
-                    let mut tester = ConstTest::new(gx, self.spec.rel, true, self.op_vertices);
-                    for (yi, y) in lb.iter().enumerate() {
-                        if yi.is_multiple_of(CHECK_EVERY) {
-                            ctx.check()?;
-                        }
-                        let g = match (x.g, y.g) {
-                            (Some(p), Some(q)) if graph_var && p != q => continue,
-                            (Some(p), _) | (None, Some(p)) => Some(p),
-                            (None, None) => None,
-                        };
-                        let Some(gy) = self.geom_charged(ctx, y.lit, 0)? else {
-                            continue;
-                        };
-                        self.st.refined += 1;
-                        if tester.holds(&gy) {
-                            self.pairs += 1;
-                            match g {
-                                Some(g) => graphs.push(g),
-                                None => any = true,
-                            }
-                        }
+                let mut left = self.const_lits(ctx, a, 0)?;
+                let mut right = self.const_lits(ctx, b, const_lit_bytes(&left))?;
+                let extra = const_lit_bytes(&left).saturating_add(const_lit_bytes(&right));
+                self.stage = if self.spec.graph_var.is_none() {
+                    let found = self.constant_match(ctx, &left, &right, extra)?;
+                    drop((left, right));
+                    if found {
+                        self.record_emit_charged(ctx, sid, oid, Id::UNDEF, 0)?;
                     }
-                }
-                if any {
-                    if graph_var {
-                        let ids = ctx.snap.graph_ids()?;
-                        graphs.extend(ids.into_iter().filter(|g| self.spec.graph.accepts(g.0)));
+                    RelateStage::Done
+                } else if left.first().is_some_and(|l| l.g.is_none())
+                    && right.first().is_some_and(|l| l.g.is_none())
+                {
+                    let found = self.constant_match(ctx, &left, &right, extra)?;
+                    drop((left, right));
+                    if found {
+                        RelateStage::ConstantGraphs {
+                            sid,
+                            oid,
+                            next_graph: 0,
+                        }
                     } else {
-                        graphs.push(Id::UNDEF);
+                        RelateStage::Done
                     }
-                }
-                graphs.sort_unstable();
-                graphs.dedup();
-                for g in graphs {
-                    self.record_emit_charged(ctx, sid, oid, g, 0)?;
-                }
-                self.stage = RelateStage::Done;
+                } else {
+                    left.sort_unstable_by_key(|l| l.g);
+                    right.sort_unstable_by_key(|l| l.g);
+                    RelateStage::BothConst {
+                        sid,
+                        oid,
+                        left,
+                        right,
+                        left_at: 0,
+                        right_at: 0,
+                    }
+                };
                 self.update_charge()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn constant_match(
+        &mut self,
+        ctx: &Ctx,
+        left: &[ConstLit],
+        right: &[ConstLit],
+        extra: u64,
+    ) -> Result<bool> {
+        for x in left {
+            ctx.check()?;
+            let Some(gx) = self.geom_charged(ctx, x.lit, extra)? else {
+                continue;
+            };
+            let mut tester = ConstTest::new(gx, self.spec.rel, true, self.op_vertices);
+            for (i, y) in right.iter().enumerate() {
+                if i.is_multiple_of(CHECK_EVERY) {
+                    ctx.check()?;
+                }
+                let Some(gy) = self.geom_charged(ctx, y.lit, extra)? else {
+                    continue;
+                };
+                self.st.refined += 1;
+                if tester.holds(&gy) {
+                    self.pairs += 1;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn step_both_const(&mut self, ctx: &Ctx) -> Result<()> {
+        let RelateStage::BothConst {
+            sid,
+            oid,
+            left,
+            right,
+            mut left_at,
+            mut right_at,
+        } = std::mem::replace(&mut self.stage, RelateStage::Done)
+        else {
+            unreachable!()
+        };
+        let extra = const_lit_bytes(&left).saturating_add(const_lit_bytes(&right));
+        while let (Some(a), Some(b)) = (left.get(left_at), right.get(right_at)) {
+            ctx.check()?;
+            let a_end = left_at + left[left_at..].partition_point(|l| l.g == a.g);
+            let b_end = right_at + right[right_at..].partition_point(|l| l.g == b.g);
+            if let (Some(ag), Some(bg)) = (a.g, b.g) {
+                match ag.cmp(&bg) {
+                    std::cmp::Ordering::Less => {
+                        left_at = a_end;
+                        continue;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        right_at = b_end;
+                        continue;
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+            let graph = a.g.or(b.g).expect("at least one constant has a graph");
+            let a_start = left_at;
+            let b_start = right_at;
+            if a.g.is_some() {
+                left_at = a_end;
+            }
+            if b.g.is_some() {
+                right_at = b_end;
+            }
+            if self.constant_match(ctx, &left[a_start..a_end], &right[b_start..b_end], extra)?
+                && self.record_emit_charged(ctx, sid, oid, graph, extra)?
+            {
+                self.stage = RelateStage::BothConst {
+                    sid,
+                    oid,
+                    left,
+                    right,
+                    left_at,
+                    right_at,
+                };
+                return Ok(());
             }
         }
         Ok(())
@@ -1980,6 +2103,10 @@ impl SpatialRelateReader {
                 pe.oa_len = 1 + self.ensure_features(ctx, ra.s, ra.g, stage_bytes)?;
             }
             while pe.bi < b_sers.len() {
+                steps += 1;
+                if steps.is_multiple_of(CHECK_EVERY) {
+                    ctx.check()?;
+                }
                 let rb = b_sers[pe.bi];
                 if graph_var && ra.g != rb.g {
                     pe.bi += 1;
@@ -2062,6 +2189,43 @@ impl SpatialRelateReader {
                     self.step_one_const(ctx, cap)?;
                     self.update_charge()?;
                 }
+                RelateStage::BothConst { .. } => {
+                    self.step_both_const(ctx)?;
+                    self.update_charge()?;
+                }
+                RelateStage::ConstantGraphs {
+                    sid,
+                    oid,
+                    next_graph,
+                } => {
+                    let (sid, oid, start) = (*sid, *oid, *next_graph);
+                    let mut graph = None;
+                    ctx.snap.scan_between(
+                        Perm::Gspo,
+                        [start, 0, 0, 0],
+                        [u64::MAX; 4],
+                        |chunk| {
+                            graph = Some(match chunk {
+                                Chunk::Block(b, from, _) => b.key(from)[0],
+                                Chunk::Row(k) => k[0],
+                            });
+                            Ok(false)
+                        },
+                    )?;
+                    self.stage = RelateStage::Done;
+                    if let Some(g) = graph {
+                        if let Some(next_graph) = g.checked_add(1) {
+                            self.stage = RelateStage::ConstantGraphs {
+                                sid,
+                                oid,
+                                next_graph,
+                            };
+                        }
+                        if Id(g) != Id::DEFAULT_GRAPH && self.spec.graph.accepts(g) {
+                            self.record_emit_charged(ctx, sid, oid, Id(g), 0)?;
+                        }
+                    }
+                }
                 RelateStage::BothVar { .. } => {
                     self.step_both_var(ctx, cap)?;
                     self.update_charge()?;
@@ -2075,9 +2239,7 @@ impl SpatialRelateReader {
         let RelateStage::OneConst {
             cid,
             subject_const,
-            qs,
-            by_lit,
-            by_lit_elem_bytes,
+            lits,
             mut q_at,
             mut qg,
             mut cand,
@@ -2089,12 +2251,7 @@ impl SpatialRelateReader {
             unreachable!()
         };
         let graph_var = self.spec.graph_var.is_some();
-        let fixed_stage_bytes = (qs.capacity() as u64 * size_of::<Id>() as u64)
-            .saturating_add(
-                by_lit.capacity() as u64
-                    * (size_of::<Id>() + size_of::<Vec<Option<Id>>>() + 1) as u64,
-            )
-            .saturating_add(by_lit_elem_bytes);
+        let fixed_stage_bytes = const_lit_bytes(&lits);
         let one_const_stage_bytes = |cand: &OneConstCand,
                                      pending_sers: &VecDeque<Ser>,
                                      lit_pass: &FxHashMap<Id, bool>|
@@ -2309,8 +2466,9 @@ impl SpatialRelateReader {
                         }
                     }
                     if !pending_sers.is_empty() {
-                        let q_id = qs[q_at - 1];
-                        let graphs = by_lit[&q_id].clone();
+                        let q_id = lits[q_at - 1].lit;
+                        let start = lits[..q_at].partition_point(|l| l.lit < q_id);
+                        let graphs = &lits[start..q_at];
                         let mut tester = ConstTest::new(
                             q_geom.clone(),
                             self.spec.rel,
@@ -2358,7 +2516,10 @@ impl SpatialRelateReader {
                             if !pass {
                                 continue;
                             }
-                            if graph_var && !graphs.iter().any(|g| g.is_none_or(|g| g == r.g)) {
+                            if graph_var
+                                && graphs[0].g.is_some()
+                                && graphs.binary_search_by_key(&Some(r.g), |l| l.g).is_err()
+                            {
                                 continue;
                             }
                             self.st.matched += 1;
@@ -2396,11 +2557,11 @@ impl SpatialRelateReader {
                         continue;
                     }
                 }
-                if q_at >= qs.len() {
+                if q_at >= lits.len() {
                     return Ok(());
                 }
-                let q = qs[q_at];
-                q_at += 1;
+                let q = lits[q_at].lit;
+                q_at += lits[q_at..].partition_point(|l| l.lit == q);
                 lit_pass.clear();
                 let stage_bytes = one_const_stage_bytes(&cand, &pending_sers, &lit_pass);
                 let Some(q_geom) = self.geom_charged(ctx, q, stage_bytes)? else {
@@ -2443,7 +2604,7 @@ impl SpatialRelateReader {
                 qg = Some(q_geom);
             }
         })();
-        stage = if q_at >= qs.len()
+        stage = if q_at >= lits.len()
             && qg.is_none()
             && active_ser.is_none()
             && pending_sers.is_empty()
@@ -2454,9 +2615,7 @@ impl SpatialRelateReader {
             RelateStage::OneConst {
                 cid,
                 subject_const,
-                qs,
-                by_lit,
-                by_lit_elem_bytes,
+                lits,
                 q_at,
                 qg,
                 cand,
@@ -4675,5 +4834,161 @@ impl SpatialJoinEngine {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn r2_reverse_links_poll_inside_a_resumed_prefix() {
+        use crate::io::Source;
+        use oxrdfio::RdfFormat;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..4200)
+            .map(|i| {
+                format!(
+                    "<urn:f:{i}> <{}> <urn:geometry> .\n",
+                    vocab::HAS_DEFAULT_GEOMETRY
+                )
+            })
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let ctx = Ctx::new(store.snapshot());
+        let link = ctx.snap.lookup_iri(vocab::HAS_DEFAULT_GEOMETRY).unwrap();
+        let geom = ctx.snap.lookup_iri("urn:geometry").unwrap();
+        let mut scan = PrefixScan::new(Perm::Pos, &[link.0, geom.0]);
+        let mut raw = Vec::new();
+        assert!(!scan.next_chunk(&ctx, &mut raw, 64).unwrap());
+        assert_eq!(raw.len(), 64);
+        ctx.cancel.store(true, Ordering::Relaxed);
+        let result = scan.next_chunk(&ctx, &mut raw, 4096);
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(raw.len(), 4095);
+    }
+
+    #[test]
+    fn r2_join_probe_resumes_one_row_and_polls_unplaced_rejections() {
+        let geoms = |crs| {
+            Arc::new(Geom::from_geometry(
+                super::super::crs::CrsRef::Unknown(Arc::from(crs)),
+                georust::Geometry::Point(georust::Point::new(0.0, 0.0)),
+            ))
+        };
+        let mut side = JoinSideData::new(vec![0]);
+        side.items.push(JoinItem {
+            row: 0,
+            id: Id(1),
+            bbox84: [f64::NAN; 4],
+            geom: geoms("urn:build-frame"),
+        });
+        let count = 4096;
+        side.table.cols[0] = vec![Id(1); count];
+        side.table.len = count;
+        side.rows.push((0..count as u32).collect());
+        side.unplaced_idx = vec![0; 2 * CHECK_EVERY];
+        let side_bytes = side.retained_bytes();
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = side_bytes + 1024;
+        let ctx = Arc::new(ctx);
+        let mut charge = OwnedCharge::new(&ctx, side_bytes).unwrap();
+        let relation = JoinTest::Relation(Relation::SfIntersects);
+        let exact = ExactTest::new(&ctx, &relation);
+        let mut sink = ProbeSink {
+            ctx: &ctx,
+            exact: &exact,
+            st: &mut SearchStats::default(),
+            npairs: &mut 0,
+            map: &OutputMap::new(&[0], &[], &[0]),
+            vars_len: 1,
+            pending_out: &mut VecDeque::new(),
+            charge: &mut charge,
+            other_bytes: side_bytes,
+        };
+        let mut probe = SideProbeState::open(
+            &side,
+            &relation,
+            geoms("urn:probe-frame"),
+            [f64::NAN; 4],
+            Vec::new(),
+            true,
+        );
+        probe.active_match = Some((0, 0));
+        assert!(!SpatialJoinEngine::step_side_probe(&mut sink, &side, &mut probe, 1).unwrap());
+        assert_eq!(sink.pending_out.pop_front(), Some(vec![Id(1)]));
+        assert_eq!(probe.active_match, Some((0, 1)));
+
+        probe.active_match = None;
+        ctx.cancel.store(true, Ordering::Relaxed);
+        let res = SpatialJoinEngine::step_side_probe(&mut sink, &side, &mut probe, 1);
+        assert!(matches!(res, Err(Error::Cancelled)));
+        assert_eq!(probe.unplaced_at, CHECK_EVERY - 1);
+        assert!(sink.pending_out.is_empty());
+    }
+
+    #[test]
+    fn r2_pair_emitter_polls_when_every_graph_is_rejected() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Arc::new(Ctx::new(store.snapshot()));
+        let spec = SpatialRelateSpec {
+            rel: Relation::SfIntersects,
+            subject: RelateEnd::Var(0),
+            object: RelateEnd::Var(1),
+            property: None,
+            graph: GraphFilter::Named,
+            graph_var: Some(2),
+            dedup: false,
+            key: 0,
+        };
+        let mut reader = SpatialRelateReader::open(&ctx, &spec, &[0, 1, 2]).unwrap();
+        let (a, b) = (Id(1), Id(2));
+        let by_lit = FxHashMap::from_iter([
+            (
+                a,
+                vec![Ser {
+                    s: a,
+                    o: a,
+                    g: Id(3),
+                }],
+            ),
+            (
+                b,
+                vec![
+                    Ser {
+                        s: b,
+                        o: b,
+                        g: Id(4)
+                    };
+                    2 * CHECK_EVERY
+                ],
+            ),
+        ]);
+        let mut pe = PairEmit {
+            a_lit: a,
+            b_lit: b,
+            ai: 0,
+            bi: 0,
+            oai: 0,
+            obi: 0,
+            oa_len: 0,
+            ob_len: 0,
+            matched_counted: false,
+        };
+        ctx.cancel.store(true, Ordering::Relaxed);
+        let res = reader.step_pair_emit(&ctx, &by_lit, &mut pe, 1, 0);
+        assert!(matches!(res, Err(Error::Cancelled)));
+        assert_eq!(pe.bi, CHECK_EVERY - 1);
+        assert!(reader.pending_out.is_empty());
     }
 }

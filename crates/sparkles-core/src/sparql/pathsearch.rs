@@ -43,6 +43,7 @@ use oxrdf::Term;
 use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::GraphPattern;
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
+use sparkles_budget::sizes::{table_bytes as physical_table_bytes, table_grown, vec_grown};
 use std::cell::{Cell, RefCell};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -3643,16 +3644,18 @@ fn next_cap(len: usize, cap: usize, extra: usize) -> usize {
     }
 }
 
-/// Physical bytes allocated by a hashbrown `FxHashMap`/`FxHashSet` at `cap`.
-#[inline]
-fn table_bytes(cap: usize, entry_size: usize) -> u64 {
-    if cap == 0 {
-        return 0;
+fn table_bytes<T>(capacity: usize) -> u64 {
+    physical_table_bytes(capacity, size_of::<T>()) as u64
+}
+
+/// Additional bytes while the old and new tables are both live.
+fn table_growth<T>(capacity: usize, len: usize) -> u64 {
+    let new = table_grown(capacity, len, 1);
+    if new == capacity {
+        0
+    } else {
+        table_bytes::<T>(new)
     }
-    let buckets = (cap.saturating_mul(8) / 7).next_power_of_two().max(4) as u64;
-    buckets
-        .saturating_mul(entry_size as u64 + 1)
-        .saturating_add(16)
 }
 
 impl AllPathsState {
@@ -3758,20 +3761,20 @@ impl AllPathsState {
         }
         if let Some(t) = target {
             let mut d: FxHashMap<u64, u32> = FxHashMap::default();
-            let d_entry_bytes = (size_of::<u64>() + size_of::<u32>() + 1) as u64;
             let step_bytes = size_of::<(u64, Step)>() as u64;
+            let node_bytes = size_of::<u64>() as u64;
             charge.resize(
                 st.retained_bytes()
-                    .saturating_add(8 * d_entry_bytes)
-                    .saturating_add(8),
+                    .saturating_add(table_growth::<(u64, u32)>(0, 0))
+                    .saturating_add(2 * node_bytes),
             )?;
             d.insert(t, 0);
             let mut frontier = vec![t];
             st.set_roots(spec, &frontier);
             let mut level = 0;
             while !frontier.is_empty() && level < max_len {
-                let d_bytes = d.capacity() as u64 * d_entry_bytes;
-                let frontier_bytes = frontier.capacity() as u64 * size_of::<u64>() as u64;
+                let d_bytes = table_bytes::<(u64, u32)>(d.capacity());
+                let frontier_bytes = frontier.capacity() as u64 * node_bytes;
                 let base_bfs = d_bytes.saturating_add(frontier_bytes);
                 let mut found = Vec::new();
                 st.expand(ctx, spec, &frontier, !forward, &mut found, charge, base_bfs)?;
@@ -3784,24 +3787,22 @@ impl AllPathsState {
                         ctx.check()?;
                     }
                     if !d.contains_key(&step.node) {
-                        let next_d_cap = if d.len() == d.capacity() {
-                            next_cap(d.len(), d.capacity(), 1)
+                        let d_growth = table_growth::<(u64, u32)>(d.capacity(), d.len());
+                        let next_growth = if next.len() == next.capacity() {
+                            next_cap(next.len(), next.capacity(), 1) as u64 * node_bytes
                         } else {
-                            d.capacity()
+                            0
                         };
-                        let next_vec_cap = if next.len() == next.capacity() {
-                            next_cap(next.len(), next.capacity(), 1)
-                        } else {
-                            next.capacity()
-                        };
-                        if next_d_cap != d.capacity() || next_vec_cap != next.capacity() {
-                            let projected = st
-                                .retained_bytes()
-                                .saturating_add(found_bytes)
-                                .saturating_add(frontier_bytes)
-                                .saturating_add(next_d_cap as u64 * d_entry_bytes)
-                                .saturating_add(next_vec_cap as u64 * size_of::<u64>() as u64);
-                            charge.resize(projected)?;
+                        if d_growth != 0 || next_growth != 0 {
+                            charge.resize(
+                                st.retained_bytes()
+                                    .saturating_add(found_bytes)
+                                    .saturating_add(frontier_bytes)
+                                    .saturating_add(table_bytes::<(u64, u32)>(d.capacity()))
+                                    .saturating_add(d_growth)
+                                    .saturating_add(next.capacity() as u64 * node_bytes)
+                                    .saturating_add(next_growth),
+                            )?;
                         }
                         d.insert(step.node, level);
                         next.push(step.node);
@@ -3817,17 +3818,23 @@ impl AllPathsState {
                 }
                 next.sort_unstable();
                 frontier = next;
-                let extra = d.capacity() as u64 * d_entry_bytes
-                    + frontier.capacity() as u64 * size_of::<u64>() as u64;
+                let extra = table_bytes::<(u64, u32)>(d.capacity())
+                    .saturating_add(frontier.capacity() as u64 * node_bytes);
                 charge.resize(st.retained_bytes().saturating_add(extra))?;
             }
             st.dist = Some(d);
             charge.resize(st.retained_bytes())?;
         }
+        charge.resize(
+            st.retained_bytes()
+                .saturating_add(table_growth::<u64>(st.on_path.capacity(), st.on_path.len()))
+                .saturating_add(if st.roots.capacity() == 0 {
+                    size_of::<u64>() as u64
+                } else {
+                    0
+                }),
+        )?;
         st.set_roots(spec, &[root]);
-        let on_path_add = next_cap(st.on_path.len(), st.on_path.capacity(), 1) as u64
-            * (size_of::<u64>() + 1) as u64;
-        charge.resize(st.retained_bytes().saturating_add(on_path_add))?;
         st.on_path.insert(root);
         let root_ns = st.neighbours(ctx, spec, root, forward, charge, 0)?;
         if st.stack.len() == st.stack.capacity() {
@@ -3842,33 +3849,34 @@ impl AllPathsState {
     }
 
     fn retained_bytes(&self) -> u64 {
-        let dist = self.dist.as_ref().map_or(0, |d| {
-            table_bytes(d.capacity(), size_of::<u64>() + size_of::<u32>())
-        });
-        let cache = self.cache_step_bytes.saturating_add(table_bytes(
-            self.cache.capacity(),
-            size_of::<(u64, bool)>() + size_of::<std::sync::Arc<[Step]>>(),
-        ));
+        let dist = self
+            .dist
+            .as_ref()
+            .map_or(0, |d| table_bytes::<(u64, u32)>(d.capacity()));
+        let cache = self
+            .cache_step_bytes
+            .saturating_add(table_bytes::<((u64, bool), std::sync::Arc<[Step]>)>(
+                self.cache.capacity(),
+            ));
         let stack =
             self.stack.capacity() as u64 * size_of::<(u64, std::sync::Arc<[Step]>, usize)>() as u64;
-        let on_path = table_bytes(self.on_path.capacity(), size_of::<u64>());
+        let on_path = table_bytes::<u64>(self.on_path.capacity());
         let edges = self.edges.capacity() as u64 * size_of::<Edge>() as u64;
-        let hubs = table_bytes(self.hubs.capacity(), size_of::<u64>() + size_of::<bool>());
-        let weights = table_bytes(
-            self.weights.capacity(),
-            size_of::<(u64, u64, u64)>() + size_of::<f64>(),
-        );
+        let hubs = table_bytes::<(u64, bool)>(self.hubs.capacity());
+        let weights = table_bytes::<((u64, u64, u64), f64)>(self.weights.capacity());
         dist.saturating_add(cache)
             .saturating_add(stack)
             .saturating_add(on_path)
             .saturating_add(edges)
             .saturating_add(hubs)
             .saturating_add(weights)
+            .saturating_add(self.roots.capacity() as u64 * size_of::<u64>() as u64)
     }
 
     fn set_roots(&mut self, spec: &PathSearchSpec, roots: &[u64]) {
         if spec.max_degree.is_some() || self.sinks {
             self.roots.clear();
+            self.roots.reserve_exact(roots.len());
             self.roots.extend_from_slice(roots);
         }
     }
@@ -3898,9 +3906,7 @@ impl AllPathsState {
         }
         let h = self.degree_above(ctx, spec, x, limit)?;
         if self.hubs.len() == self.hubs.capacity() {
-            let add = (next_cap(self.hubs.len(), self.hubs.capacity(), 1) - self.hubs.capacity())
-                as u64
-                * (size_of::<u64>() + 2) as u64;
+            let add = table_growth::<(u64, bool)>(self.hubs.capacity(), self.hubs.len());
             charge.resize(
                 extra_bytes
                     .saturating_add(self.retained_bytes())
@@ -4013,22 +4019,50 @@ impl AllPathsState {
             return self.expand_all(ctx, spec, frontier, succ, out, charge, extra_bytes);
         }
         let mut kept: Option<Vec<u64>> = None;
+        let mut filtered_bytes = 0;
         for (i, &x) in frontier.iter().enumerate() {
             if i.is_multiple_of(4096) {
                 ctx.check()?;
             }
             let skip = if self.sink(ctx, x, succ) {
                 true
-            } else if self.blocked(ctx, spec, x, charge, extra_bytes)? {
+            } else if self.blocked(
+                ctx,
+                spec,
+                x,
+                charge,
+                extra_bytes.saturating_add(filtered_bytes),
+            )? {
                 self.skipped_hubs += 1;
                 true
             } else {
                 false
             };
-            if skip {
-                kept.get_or_insert_with(|| frontier[..i].to_vec());
-            } else if let Some(k) = &mut kept {
-                k.push(x);
+            if skip && kept.is_none() {
+                // The first rejection needs a copy of the accepted prefix.
+                filtered_bytes = i as u64 * size_of::<u64>() as u64;
+                charge.resize(
+                    self.retained_bytes()
+                        .saturating_add(extra_bytes)
+                        .saturating_add(filtered_bytes),
+                )?;
+                let mut filtered = Vec::with_capacity(i);
+                filtered.extend_from_slice(&frontier[..i]);
+                kept = Some(filtered);
+            } else if !skip && let Some(filtered) = &mut kept {
+                if filtered.len() == filtered.capacity() {
+                    let elem = size_of::<u64>();
+                    let next = vec_grown(filtered.capacity(), filtered.len(), 1, elem);
+                    let next_bytes = next as u64 * elem as u64;
+                    charge.resize(
+                        self.retained_bytes()
+                            .saturating_add(extra_bytes)
+                            .saturating_add(filtered_bytes)
+                            .saturating_add(next_bytes),
+                    )?;
+                    filtered_bytes = next_bytes;
+                }
+                filtered.push(x);
             }
         }
         match kept {
@@ -4082,9 +4116,12 @@ impl AllPathsState {
                 usize::MAX,
                 &mut |new_len| {
                     if new_len > cur_cap {
-                        let next_c = next_cap(new_len.saturating_sub(1), cur_cap, 1);
+                        let elem = size_of::<(u64, Step)>();
+                        let next_c = vec_grown(cur_cap, new_len - 1, 1, elem);
                         charge.resize(
-                            base.saturating_add(next_c as u64 * size_of::<(u64, Step)>() as u64),
+                            base.saturating_add(
+                                next_c.saturating_add(cur_cap) as u64 * elem as u64,
+                            ),
                         )?;
                         cur_cap = next_c;
                     }
@@ -4264,14 +4301,10 @@ impl AllPathsState {
         let added = out.len() as u64 * size_of::<Step>() as u64 + (2 * size_of::<usize>()) as u64;
         let next_cache_bytes = self.cache_step_bytes.saturating_add(added);
         // During HashMap rehash both old and new tables are simultaneously live.
-        let growth = if self.cache.len() == self.cache.capacity() {
-            table_bytes(
-                next_cap(self.cache.len(), self.cache.capacity(), 1),
-                size_of::<(u64, bool)>() + size_of::<std::sync::Arc<[Step]>>(),
-            )
-        } else {
-            0
-        };
+        let growth = table_growth::<((u64, bool), std::sync::Arc<[Step]>)>(
+            self.cache.capacity(),
+            self.cache.len(),
+        );
         charge.resize(
             extra_bytes
                 .saturating_add(self.retained_bytes())
@@ -4308,9 +4341,10 @@ impl AllPathsState {
                 } else {
                     let x = lookup_weight_standalone(ctx, spec, w, key)?;
                     if self.weights.len() == self.weights.capacity() {
-                        let add = (next_cap(self.weights.len(), self.weights.capacity(), 1)
-                            - self.weights.capacity()) as u64
-                            * (size_of::<(u64, u64, u64)>() + size_of::<f64>() + 1) as u64;
+                        let add = table_growth::<((u64, u64, u64), f64)>(
+                            self.weights.capacity(),
+                            self.weights.len(),
+                        );
                         charge.resize(
                             extra_bytes
                                 .saturating_add(self.retained_bytes())
@@ -4353,10 +4387,7 @@ impl AllPathsState {
         }
         if let Some(y) = self.pending_push.take() {
             if self.on_path.len() == self.on_path.capacity() && !self.on_path.contains(&y) {
-                let add = table_bytes(
-                    next_cap(self.on_path.len(), self.on_path.capacity(), 1),
-                    size_of::<u64>(),
-                );
+                let add = table_growth::<u64>(self.on_path.capacity(), self.on_path.len());
                 charge.resize(
                     extra_bytes
                         .saturating_add(self.retained_bytes())
@@ -4486,10 +4517,7 @@ impl AllPathsState {
                 continue;
             }
             if self.on_path.len() == self.on_path.capacity() && !self.on_path.contains(&y) {
-                let add = table_bytes(
-                    next_cap(self.on_path.len(), self.on_path.capacity(), 1),
-                    size_of::<u64>(),
-                );
+                let add = table_growth::<u64>(self.on_path.capacity(), self.on_path.len());
                 charge.resize(
                     extra_bytes
                         .saturating_add(self.retained_bytes())
@@ -4939,6 +4967,93 @@ impl Reader {
 #[cfg(test)]
 mod tree_tests {
     use super::*;
+
+    #[test]
+    fn r2_backward_frontier_admission_and_pruned_dfs_poll() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        use oxrdfio::RdfFormat;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("<urn:other> <urn:p> <urn:target>, \"a literal\" .\n");
+        for i in 0..2048 {
+            data.push_str(&format!("<urn:root> <urn:p> <urn:dead:{i}> .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let find = |iri| snap.lookup_iri(iri).unwrap();
+        let (root, target, p) = (find("urn:root"), find("urn:target"), find("urn:p"));
+        let spec = PathSearchSpec {
+            algorithm: Algorithm::All,
+            source: PathEnd::Const(root),
+            target: PathEnd::Const(target),
+            predicates: Some(vec![p.0]),
+            directions: vec![Direction::Forward],
+            direction: Direction::Forward,
+            exclude: Vec::new(),
+            max_degree: None,
+            edge_pattern: None,
+            min_len: 1,
+            max_len: Some(2),
+            k: 1,
+            limit: None,
+            max_visited: 100_000,
+            weight: None,
+            default_weight: 1.0,
+            reifies: None,
+            path_index: Some(0),
+            edge_index: None,
+            edge_s: None,
+            edge_p: None,
+            edge_o: None,
+            edge: None,
+            length: None,
+            cost: None,
+            graph: GraphFilter::Default,
+        };
+        let ctx = Arc::new(Ctx::new(snap.clone()));
+        let mut held = super::super::ctx::OwnedCharge::new(&ctx, 0).unwrap();
+        let mut state = AllPathsState::open(&ctx, &spec, &mut held).unwrap();
+        ctx.cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            state.next_path(&ctx, &spec, &mut held, 0),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(
+            state.steps, 0,
+            "the distance map must reject all visited neighbors"
+        );
+        assert_eq!(state.poll_ticks, 1024);
+
+        let literal = snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal("a literal").into())
+            .unwrap();
+        let mut limited = Ctx::new(snap);
+        let retained = state.retained_bytes();
+        limited.mem_limit = retained + 128;
+        let limited = Arc::new(limited);
+        let mut held = super::super::ctx::OwnedCharge::new(&limited, retained).unwrap();
+        state.sinks = true;
+        let mut frontier = vec![target.0; 1024];
+        frontier.push(literal.0);
+        let mut edges = Vec::new();
+        let result = state.expand(&limited, &spec, &frontier, false, &mut edges, &mut held, 0);
+        assert!(matches!(
+            result,
+            Err(Error::BudgetExceeded(b))
+                if b.kind == crate::error::BudgetKind::Memory && b.requested == retained + 8192
+        ));
+        assert_eq!(edges.capacity(), 0);
+        assert_eq!(held.bytes(), retained);
+    }
 
     fn parent(node: u64) -> Parent {
         Parent {
