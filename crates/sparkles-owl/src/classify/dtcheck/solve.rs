@@ -57,6 +57,8 @@ pub enum Why {
     Bound,
     /// the answer turns on the size of a cell the checker has not counted exactly
     Uncounted,
+    /// the caller's stop flag was set: its deadline, cancellation or memory budget
+    Stopped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,11 +100,64 @@ enum Run {
     Sat,
     Unsat,
     Bound,
+    Stopped,
+}
+
+/// How many search nodes pass between two reads of the stop flag.
+const POLL: u64 = 1024;
+
+/// Scoped temporary-memory reservation over a signed admission callback (`+n` reserves,
+/// `-n` releases). Releases all bytes it reserved when dropped.
+pub(super) struct MemScope<'a> {
+    mem: &'a dyn Fn(isize) -> bool,
+    held: usize,
+}
+
+impl<'a> MemScope<'a> {
+    pub(super) fn new(mem: &'a dyn Fn(isize) -> bool) -> Self {
+        Self { mem, held: 0 }
+    }
+
+    pub(super) fn take(&mut self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let Ok(delta) = isize::try_from(bytes) else {
+            return false;
+        };
+        if !(self.mem)(delta) {
+            return false;
+        }
+        self.held = self.held.saturating_add(bytes);
+        true
+    }
+}
+
+impl Drop for MemScope<'_> {
+    fn drop(&mut self) {
+        if self.held != 0 {
+            (self.mem)(-(self.held as isize));
+            self.held = 0;
+        }
+    }
 }
 
 /// Whether the integer program has a solution, by preprocessing and a bounded search.
-fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64) -> Run {
+fn solve(
+    nvars: usize,
+    mut cons: Vec<Lin>,
+    nodes: u64,
+    stop: &dyn Fn() -> bool,
+    mem: &dyn Fn(isize) -> bool,
+) -> Run {
     const INF: u128 = u128::MAX;
+    let mut scope = MemScope::new(mem);
+    let prep_bytes = nvars
+        .saturating_mul(std::mem::size_of::<u128>() * 2 + 4)
+        .saturating_add(64);
+    if !scope.take(prep_bytes) {
+        return Run::Stopped;
+    }
     // a count fixed at zero by a maximum of zero
     let mut ub = vec![INF; nvars];
     for c in &cons {
@@ -163,6 +218,14 @@ fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64) -> Run {
         ub[v] = ub[v].min(most);
     }
     // each minimum whose counts are all among those of a maximum
+    let mins = cons.iter().filter(|c| c.at_least).count();
+    let maxs = cons.len().saturating_sub(mins);
+    let pairs_est = mins
+        .saturating_mul(maxs)
+        .saturating_mul(std::mem::size_of::<(usize, usize)>());
+    if !scope.take(pairs_est) {
+        return Run::Stopped;
+    }
     let mut pairs = Vec::new();
     for (a, ca) in cons.iter().enumerate().filter(|(_, c)| c.at_least) {
         for (b, cb) in cons.iter().enumerate().filter(|(_, c)| !c.at_least) {
@@ -174,6 +237,7 @@ fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64) -> Run {
     let mut val = vec![0u128; nvars];
     let mut assigned = vec![false; nvars];
     let mut budget = nodes;
+    let mut stopped = false;
     match search(
         &vars,
         0,
@@ -183,9 +247,12 @@ fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64) -> Run {
         &mut val,
         &mut assigned,
         &mut budget,
+        &mut stopped,
+        stop,
     ) {
         Some(true) => Run::Sat,
         Some(false) => Run::Unsat,
+        None if stopped => Run::Stopped,
         None => Run::Bound,
     }
 }
@@ -236,8 +303,14 @@ fn search(
     val: &mut [u128],
     assigned: &mut [bool],
     budget: &mut u64,
+    stopped: &mut bool,
+    stop: &dyn Fn() -> bool,
 ) -> Option<bool> {
     if *budget == 0 {
+        return None;
+    }
+    if budget.is_multiple_of(POLL) && stop() {
+        *stopped = true;
         return None;
     }
     *budget -= 1;
@@ -274,7 +347,18 @@ fn search(
     let mut x = hi;
     while x >= lo && hi >= lo {
         val[v] = x;
-        match search(vars, i + 1, cons, pairs, ub, val, assigned, budget) {
+        match search(
+            vars,
+            i + 1,
+            cons,
+            pairs,
+            ub,
+            val,
+            assigned,
+            budget,
+            stopped,
+            stop,
+        ) {
             Some(true) => {
                 out = Some(true);
                 break;
@@ -298,6 +382,42 @@ fn search(
 
 /// Decides the problem.
 pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
+    check_stopping(r, p, b, &|| false)
+}
+
+/// Decides the problem, answering [`Why::Stopped`] once `stop` returns true. The flag is
+/// read between cells and every [`POLL`] search nodes.
+pub fn check_stopping(r: &mut Ranges, p: &Problem, b: &Bounds, stop: &dyn Fn() -> bool) -> Answer {
+    check_bounded(r, p, b, stop, &|_| true, &|_| true)
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_BOUND_CAPS: std::cell::Cell<(usize, usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0, 0)) };
+}
+
+/// Test-only observation of `(next.len(), next.capacity(), types.len(), types.capacity())`
+/// recorded immediately before returning `Answer::Unknown(Why::Bound)`.
+#[cfg(test)]
+pub(crate) fn last_bound_caps() -> (usize, usize, usize, usize) {
+    LAST_BOUND_CAPS.with(|c| c.get())
+}
+
+/// [`check_stopping`], also calling `admit_ranges(bytes)` before growing `r` and
+/// `mem(+/-bytes)` around scoped temporary solver allocations, returning
+/// [`Why::Stopped`] on refusal.
+pub fn check_bounded(
+    r: &mut Ranges,
+    p: &Problem,
+    b: &Bounds,
+    stop: &dyn Fn() -> bool,
+    admit_ranges: &dyn Fn(usize) -> bool,
+    mem: &dyn Fn(isize) -> bool,
+) -> Answer {
+    if stop() {
+        return Answer::Unknown(Why::Stopped);
+    }
     let np = p.props.len();
     // sets of properties are bit sets of a u64
     if np > b.props.min(63) {
@@ -314,6 +434,30 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
         .sum();
     if demand >= CAP {
         return Answer::Unknown(Why::Uncounted);
+    }
+    let mut scope = MemScope::new(mem);
+    let total_range_refs: usize = p
+        .props
+        .iter()
+        .map(|q| q.ranges.len())
+        .sum::<usize>()
+        .saturating_add(p.atoms.len());
+    let map_buckets = super::range::map_buckets_for(total_range_refs);
+    let index_backing = if map_buckets == 0 {
+        0
+    } else {
+        map_buckets
+            .saturating_mul(std::mem::size_of::<(Rid, usize)>() + 1)
+            .saturating_add(16)
+    };
+    let init_est = np
+        .saturating_mul(std::mem::size_of::<u64>())
+        .saturating_add(total_range_refs.saturating_mul(std::mem::size_of::<Rid>()))
+        .saturating_add(index_backing)
+        .saturating_add(std::mem::size_of::<(Rid, Vec<bool>)>())
+        .saturating_add(64);
+    if !scope.take(init_est) {
+        return Answer::Unknown(Why::Stopped);
     }
     // upward closure of the hierarchy
     let mut up: Vec<u64> = (0..np).map(|i| 1u64 << i).collect();
@@ -333,9 +477,10 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
             break;
         }
     }
-    // the distinct ranges involved, by index
-    let mut ranges: Vec<Rid> = Vec::new();
-    let mut index: FxHashMap<Rid, usize> = FxHashMap::default();
+    // the distinct ranges involved, by index; preallocated to the admitted capacities
+    let mut ranges: Vec<Rid> = Vec::with_capacity(total_range_refs);
+    let mut index: FxHashMap<Rid, usize> =
+        FxHashMap::with_capacity_and_hasher(total_range_refs, Default::default());
     let atom_ranges = p.atoms.iter().map(|a| {
         let (Atom::AtLeast(_, _, x) | Atom::AtMost(_, _, x)) = *a;
         x
@@ -355,26 +500,57 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
     // decides: whether a cell is within a range never rests on comparing ids. Cells of
     // different parents are disjoint, so no two are the same set.
     let mut cells: Vec<(Rid, Vec<bool>)> = vec![(Ranges::FULL, Vec::new())];
-    for &x in &ranges {
-        let nx = r.not(x);
-        let mut next = Vec::with_capacity(cells.len() * 2);
+    let mut cells_scope = MemScope::new(mem);
+    for (step, &x) in ranges.iter().enumerate() {
+        if stop() {
+            return Answer::Unknown(Why::Stopped);
+        }
+        let Ok(nx) = r.not_bounded(x, admit_ranges) else {
+            return Answer::Unknown(Why::Stopped);
+        };
+        let next_cap = cells.len().saturating_mul(2).min(b.types);
+        let next_est = next_cap
+            .saturating_mul(std::mem::size_of::<(Rid, Vec<bool>)>() + step.saturating_add(1));
+        let mut next_scope = MemScope::new(mem);
+        if !next_scope.take(next_est) {
+            return Answer::Unknown(Why::Stopped);
+        }
+        let mut next = Vec::with_capacity(next_cap);
         for (c, sides) in &cells {
-            for (part, inside) in [(r.meet(*c, x), true), (r.meet(*c, nx), false)] {
-                if r.is_empty(part) != Some(true) {
-                    let mut s = sides.clone();
-                    s.push(inside);
-                    next.push((part, s));
-                    if next.len() > b.types {
+            let Ok(p_in) = r.meet_bounded(*c, x, admit_ranges) else {
+                return Answer::Unknown(Why::Stopped);
+            };
+            let Ok(p_out) = r.meet_bounded(*c, nx, admit_ranges) else {
+                return Answer::Unknown(Why::Stopped);
+            };
+            for (part, inside) in [(p_in, true), (p_out, false)] {
+                let Ok(empty) = r.is_empty_bounded(part, admit_ranges) else {
+                    return Answer::Unknown(Why::Stopped);
+                };
+                if empty != Some(true) {
+                    if next.len() == b.types {
+                        #[cfg(test)]
+                        LAST_BOUND_CAPS.with(|c| c.set((next.len(), next.capacity(), 0, 0)));
                         return Answer::Unknown(Why::Bound);
                     }
+                    let mut s = Vec::with_capacity(step + 1);
+                    s.extend_from_slice(sides);
+                    s.push(inside);
+                    next.push((part, s));
                 }
             }
         }
         cells = next;
+        cells_scope = next_scope;
     }
     let within = |ci: usize, x: Rid| cells[ci].1[index[&x]];
     // the upward-closed sets of properties without a disjoint pair
-    let mut sets = Vec::new();
+    let sets_cap = 1usize.checked_shl(np as u32).unwrap_or(usize::MAX);
+    let sets_est = sets_cap.saturating_mul(std::mem::size_of::<u64>());
+    if !scope.take(sets_est) {
+        return Answer::Unknown(Why::Stopped);
+    }
+    let mut sets = Vec::with_capacity(sets_cap);
     for s in 1u64..(1 << np) {
         let closed = (0..np).all(|i| s & (1 << i) == 0 || s & up[i] == up[i]);
         let apart = p
@@ -388,44 +564,96 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
     if cells.len().saturating_mul(sets.len()) > b.types.saturating_mul(64) {
         return Answer::Unknown(Why::Bound);
     }
-    let mut types = Vec::new();
+    let types_cap = cells.len().saturating_mul(sets.len()).min(b.types);
+    let types_est = types_cap.saturating_mul(std::mem::size_of::<(usize, u64)>());
+    if !scope.take(types_est) {
+        return Answer::Unknown(Why::Stopped);
+    }
+    let mut types = Vec::with_capacity(types_cap);
     for ci in 0..cells.len() {
         for &s in &sets {
             let ok = (0..np)
                 .filter(|i| s & (1 << i) != 0)
                 .all(|i| p.props[i].ranges.iter().all(|&x| within(ci, x)));
             if ok {
-                types.push((ci, s));
-                if types.len() > b.types {
+                if types.len() == b.types {
+                    #[cfg(test)]
+                    LAST_BOUND_CAPS.with(|c| c.set((0, 0, types.len(), types.capacity())));
                     return Answer::Unknown(Why::Bound);
                 }
+                types.push((ci, s));
             }
         }
     }
-    let mut cons = Vec::new();
+    let cons_est = p
+        .atoms
+        .len()
+        .saturating_add(cells.len())
+        .saturating_mul(
+            std::mem::size_of::<Lin>() + types.len().saturating_mul(std::mem::size_of::<usize>()),
+        )
+        .saturating_add(cells.len().saturating_mul(
+            std::mem::size_of::<Rid>()
+                + std::mem::size_of::<super::sets::Size>()
+                + std::mem::size_of::<usize>(),
+        ));
+    if !scope.take(cons_est) {
+        return Answer::Unknown(Why::Stopped);
+    }
+    let mut cons = Vec::with_capacity(p.atoms.len());
     for a in &p.atoms {
         let (Atom::AtLeast(d, n, x) | Atom::AtMost(d, n, x)) = *a;
-        let vars = types
+        let nvars = types
             .iter()
-            .enumerate()
-            .filter(|(_, (ci, s))| s & (1 << d) != 0 && within(*ci, x))
-            .map(|(t, _)| t)
-            .collect();
+            .filter(|&&(ci, s)| s & (1 << d) != 0 && within(ci, x))
+            .count();
+        let mut vars = Vec::with_capacity(nvars);
+        for (t, &(ci, s)) in types.iter().enumerate() {
+            if s & (1 << d) != 0 && within(ci, x) {
+                vars.push(t);
+            }
+        }
         cons.push(Lin {
             vars,
             at_least: matches!(a, Atom::AtLeast(..)),
             n: u128::from(n),
         });
     }
-    let mut by_cell: Vec<Vec<usize>> = vec![Vec::new(); cells.len()];
+    let mut cell_counts = vec![0usize; cells.len()];
+    for &(ci, _) in &types {
+        cell_counts[ci] += 1;
+    }
+    let mut by_cell: Vec<Vec<usize>> = cell_counts.into_iter().map(Vec::with_capacity).collect();
     for (t, (ci, _)) in types.iter().enumerate() {
         by_cell[*ci].push(t);
     }
     let cells: Vec<Rid> = cells.into_iter().map(|(c, _)| c).collect();
-    let sizes: Vec<_> = cells.iter().map(|&c| r.size(c)).collect();
+    drop(cells_scope);
+    let mut sizes = Vec::with_capacity(cells.len());
+    for &c in &cells {
+        let Ok(s) = r.size_bounded(c, admit_ranges) else {
+            return Answer::Unknown(Why::Stopped);
+        };
+        sizes.push(s);
+    }
     let exact = sizes.iter().all(|s| s.is_exact());
+    let cons_clone_bytes: usize = cons
+        .iter()
+        .map(|c| std::mem::size_of::<Lin>() + c.vars.len() * std::mem::size_of::<usize>())
+        .sum::<usize>()
+        .saturating_add(
+            by_cell
+                .iter()
+                .map(|v| std::mem::size_of::<Lin>() + v.len() * std::mem::size_of::<usize>())
+                .sum(),
+        );
     let with_caps = |cap: &dyn Fn(usize) -> Option<u128>| {
-        let mut all = cons.clone();
+        let mut cap_scope = MemScope::new(mem);
+        if !cap_scope.take(cons_clone_bytes) {
+            return Run::Stopped;
+        }
+        let mut all = Vec::with_capacity(cons.len() + by_cell.len());
+        all.extend(cons.iter().cloned());
         for (ci, vars) in by_cell.iter().enumerate() {
             if let Some(n) = cap(ci) {
                 all.push(Lin {
@@ -435,12 +663,14 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
                 });
             }
         }
-        solve(types.len(), all, b.nodes)
+        solve(types.len(), all, b.nodes, stop, mem)
     };
     // at most the upper bound of each cell: unsatisfiable here is unsatisfiable
     let opt = with_caps(&|ci| sizes[ci].hi);
-    if let Run::Unsat = opt {
-        return Answer::Unsat;
+    match opt {
+        Run::Unsat => return Answer::Unsat,
+        Run::Stopped => return Answer::Unknown(Why::Stopped),
+        _ => {}
     }
     if exact {
         return match opt {
@@ -452,6 +682,7 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
     let pes = with_caps(&|ci| (sizes[ci].lo < CAP).then_some(sizes[ci].lo));
     match (opt, pes) {
         (_, Run::Sat) => Answer::Sat,
+        (_, Run::Stopped) => Answer::Unknown(Why::Stopped),
         (Run::Bound, _) | (_, Run::Bound) => Answer::Unknown(Why::Bound),
         _ => Answer::Unknown(Why::Uncounted),
     }
@@ -512,10 +743,10 @@ mod tests {
         ) {
             let most = cons.iter().filter(|c| c.at_least).map(|c| c.n).max().unwrap_or(0);
             let want = brute(nvars, &cons, most);
-            let got = match solve(nvars, cons.clone(), 1_000_000) {
+            let got = match solve(nvars, cons.clone(), 1_000_000, &|| false, &|_| true) {
                 Run::Sat => true,
                 Run::Unsat => false,
-                Run::Bound => panic!("bound on a small system"),
+                Run::Bound | Run::Stopped => panic!("bound on a small system"),
             };
             prop_assert_eq!(got, want);
         }

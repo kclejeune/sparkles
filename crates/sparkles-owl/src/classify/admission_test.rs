@@ -10,6 +10,7 @@ pub(super) enum Point {
     Observed,
     #[allow(dead_code)] // The test-only parent snapshot has no admission lock.
     Contended,
+    WorldDataReserve,
     BeforePanicWake,
     Idle,
 }

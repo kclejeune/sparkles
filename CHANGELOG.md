@@ -181,6 +181,26 @@ not slower, since on `wally` the test took 140 s at both 0779d666 and b47b582b. 
 cases now run as three tests of two seeds each, `..._part_1_of_3` to `..._part_3_of_3`,
 with the same seeds, checks and `SPARKLES_CLOSURE_CASES` setting, as roadmap item 1275.
 
+### The Horn rules decide OWL 2 DL datatypes and data cardinalities
+
+The classifier took only the data restrictions of OWL 2 EL and left out the literals and
+ranges of `xsd:double`, `xsd:int`, `xsd:boolean` and the other datatypes outside the
+profile, with data cardinalities, universal data restrictions, facets and
+`DisjointDataProperties`. A datatype checker now decides these in the Horn rules, so two
+values of a functional `xsd:double` property, a value outside an `xsd:int` range and a
+string in an `xsd:boolean` range make an ontology inconsistent, as roadmap item 972. The
+checker takes positive and negative assertions about named and anonymous individuals.
+An ontology whose data stays within OWL 2 EL runs as before. Three answers change beside
+the new decisions. In a run with a checker component, a `DatatypeDefinition` outside OWL
+2 EL that the checker converts and a `DisjointDataProperties` axiom over the checker's
+properties are used and no longer reported as left out. A case analysis over data values
+that a context needs is reported as used in part, but not when the context, or the world
+of the class it was found in, turns out to have no instance. `Stats::tier` reads
+`Disjunctive` for a run whose only axioms outside the Horn rules are data unions,
+enumerations of several values, complements on the left or higher data cardinalities,
+which the Horn rules now decide. Keys over the checker's properties are reported as used
+in part, and universal or maximum data restrictions on the left are left out.
+
 ### A kept EL classification over its memory budget starts again in full
 
 A kept OWL 2 EL run counts the contexts it keeps and its own new state against

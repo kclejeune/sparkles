@@ -81,6 +81,9 @@ mod dl_norm;
 mod dl_reduce;
 mod dl_root;
 mod dl_rules;
+mod dt_sat;
+#[cfg(test)]
+mod dt_wiring_tests;
 mod dtcheck;
 mod horn;
 #[cfg(test)]
@@ -536,7 +539,10 @@ pub struct Stats {
     /// the assertions, whose read stops at the first
     pub unmapped: usize,
     /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
-    /// rules of roadmap item 603 take; the others are left out and reported
+    /// rules of roadmap item 603 take; the others are left out and reported. The counts
+    /// go by each axiom's shape and by what the tiers take, not by what the run answers in
+    /// full. An axiom answered in part, such as one the datatype checker covers, is
+    /// reported as [`Gap::Partial`] among the run's excluded axioms.
     pub outside_el: OutsideEl,
     /// the rules the run's axioms need
     pub tier: Tier,
@@ -1308,7 +1314,12 @@ impl TierMark {
             || it.nodes[self.nodes..].iter().any(|n| {
                 matches!(
                     n,
-                    Node::Nominal(_) | Node::SelfLoop(_) | Node::DataSome(..) | Node::AtMost1(..)
+                    Node::Nominal(_)
+                        | Node::SelfLoop(_)
+                        | Node::DataSome(..)
+                        | Node::DtAtom(_)
+                        | Node::DtFire(_)
+                        | Node::AtMost1(..)
                 )
             })
     }
@@ -2304,6 +2315,8 @@ impl Saturation {
         budget.baseline(self.interner.bytes())?;
         self.interner.ranges.begin(budget.clone());
         let result = self.build_inner(axioms, outside, threads, held_bytes, limits);
+        // the run's components and definitions end with its normalization, on every exit
+        self.interner.dt_run = None;
         self.numeric_halt |= self.interner.ranges.check().is_err();
         self.interner.ranges.end();
         result.map(|(ax, ix, peak, outside)| (ax, ix, peak.max(budget.peak()), outside))
@@ -2342,6 +2355,51 @@ impl Saturation {
                     .insert(d.clone(), r.clone());
             }
         }
+        // The components of the data properties, and which of them the datatype checker
+        // takes, are chosen once from every axiom, inside the profile or outside it
+        // (F24, "The EL and Horn tiers"). The checker reads every non-reserved datatype
+        // definition, since a definition with a facet is outside the profile and still
+        // names the range its uses stand for. EL-only runs never activate the checker,
+        // and a zero-allocation pre-check skips component analysis on data-free and
+        // plain built-in EL data ontologies (while still letting `rdf:langString` and
+        // defined datatypes through).
+        self.interner.dt_run = None;
+        if !limits.el_only {
+            let may = match dtcheck::comp::Comps::may_trigger(axioms, &|| poll(limits).is_err()) {
+                Ok(v) => v,
+                Err(dtcheck::comp::CompFail::Stopped) => {
+                    poll(limits)?;
+                    return Err(Error::Cancelled);
+                }
+                Err(dtcheck::comp::CompFail::Memory) => {
+                    unreachable!("may_trigger allocates nothing")
+                }
+            };
+            if may {
+                let budget = self
+                    .interner
+                    .ranges
+                    .budget
+                    .clone()
+                    .expect("build installs a numeric budget");
+                let (comps, dt_defs, guard) = dt_comps(axioms, axioms, &budget, limits)?;
+                if comps.any() {
+                    let retained = comps.bytes().saturating_add(dt_defs.bytes());
+                    self.interner.dt_run = Some(Box::new(dtcheck::atoms::DtRun {
+                        comps,
+                        defs: dt_defs,
+                        stop: dtcheck::atoms::Stop {
+                            deadline: limits.deadline,
+                            cancelled: limits.cancelled.clone(),
+                        },
+                        budget: Some(budget.clone()),
+                        stopped: None,
+                    }));
+                    guard.commit_retained(retained)?;
+                }
+            }
+        }
+        let dt_mark = self.interner.nodes.len();
         // Chunks of the axioms normalize on the run's threads into interners of their
         // own, which merge in order into the run's, so that every id is the one a
         // normalization on one thread gives. Data ranges and literals have ids inside
@@ -2350,7 +2408,9 @@ impl Saturation {
         // grant, since each chunk holds the names it meets and the merge copies them.
         let mut merged = false;
         let mut peak = 0;
-        if threads > 1 && axioms.len() >= PARALLEL_AXIOMS {
+        // A chunk's interner has no checker components, so a run with them normalizes on
+        // one thread, where each axiom over a checker property gets its atoms or report.
+        if threads > 1 && axioms.len() >= PARALLEL_AXIOMS && self.interner.dt_run.is_none() {
             let gauge = Gauge {
                 limits,
                 numeric: self.interner.ranges.budget.clone(),
@@ -2438,6 +2498,7 @@ impl Saturation {
             partial.extend(out.partial);
             chains.extend(out.chains);
         }
+        self.interner.check_dt_stop(limits)?;
         poll(limits)?;
         // the range restriction of OWL 2 EL (Profiles §2.2.6): a chain's superproperty
         // has no range that its last property lacks
@@ -2543,18 +2604,27 @@ impl Saturation {
                 );
                 ax.dl = Some(Box::new(d));
                 dl_taken = true;
+                // Tier D leaves out data axioms and builds no checker atoms; drop dt_run
+                // so Index::build keeps ix.dt = None and preserves incremental Disj reuse.
+                self.interner.dt_run = None;
             }
         }
         if !dl_taken && !candidates.is_empty() && !limits.el_only {
             self.horn_tried = true;
-            let flags = horn::normalize(
+            let flags = match horn::normalize(
                 &candidates,
                 &mut self.interner,
                 &mut ax,
                 limits.max_memory,
                 &stop,
-            )
-            .map_err(halt)?;
+            ) {
+                Ok(flags) => flags,
+                Err(index::Halt::Stopped) => {
+                    self.interner.check_dt_stop(limits)?;
+                    return Err(poll(limits).err().unwrap_or(Error::Cancelled));
+                }
+                Err(h) => return Err(halt(h)),
+            };
             self.interner.ranges.check()?;
             taken.extend(
                 candidates
@@ -2565,6 +2635,10 @@ impl Saturation {
             );
         }
         self.interner.ranges.check()?;
+        // a datatype conversion that the run's deadline, cancellation or memory budget
+        // stopped stops the run, as the numeric construction's halt does, and is not an
+        // axiom used in part
+        self.interner.check_dt_stop(limits)?;
         // A fresh run decides its tier before these normalizations, so what they intern
         // that the decision reads would keep a later run over this interner from Tier D.
         // A run whose rules take it starts again anyway, as `entangled` says.
@@ -2576,7 +2650,27 @@ impl Saturation {
         if let Some(b) = &self.interner.ranges.budget {
             b.baseline(self.interner.bytes() + ax.bytes())?;
         }
+        if cfg!(debug_assertions)
+            && let Some(run) = &self.interner.dt_run
+        {
+            let checker = |r: index::Role| match &self.interner.roles[r as usize] {
+                index::RoleName::Data(d) => run.comps.checker(d),
+                _ => false,
+            };
+            for n in &self.interner.nodes[dt_mark..] {
+                if let Node::DataSome(r, _) = n {
+                    debug_assert!(
+                        !checker(*r),
+                        "a lattice data restriction over a checker property"
+                    );
+                }
+            }
+            for &(r, _) in &ax.data_ranges {
+                debug_assert!(!checker(r), "a lattice data range over a checker property");
+            }
+        }
         let ix = Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(halt)?;
+        self.interner.dt_run = None;
         self.interner.end_run();
         let mut excluded: Vec<Excluded> = Vec::new();
         for (i, (rule, message)) in outside {
@@ -2796,7 +2890,13 @@ impl Saturation {
                         .iter()
                         .any(|k| !tier_neutral(k) && el_break(k).is_some())
             });
+        // A run with checker components starts again, since what the premises below
+        // intern for a checker property would be the lattice's. Every edit that names a
+        // data property or datatype already satisfies `needs_full_run` inside
+        // `must_restart`, so `!full` guarantees no changed axiom can trigger a checker
+        // component.
         let full = self.entangled
+            || self.index.as_ref().is_some_and(|ix| ix.dt.is_some())
             || match (&kept, changes) {
                 (Some(k), Some(c)) => {
                     self.must_restart(k, c)
@@ -2841,6 +2941,12 @@ impl Saturation {
         // the new axioms is built
         let premises = match changes {
             Some(c) if !full && old_ix.is_none() => {
+                debug_assert!(
+                    !c.added.iter().chain(c.removed).any(|k| {
+                        dtcheck::comp::Comps::may_trigger(&[*k], &|| false).unwrap_or(false)
+                    }),
+                    "must_restart already forces a full run for any edit naming a data property or datatype"
+                );
                 let mut scratch = Axioms::default();
                 for &k in c.added.iter().chain(c.removed) {
                     index::normalize(k, &mut self.interner, &mut scratch);
@@ -3893,6 +3999,31 @@ impl Saturation {
                 stats.conjunctions = d.len();
             }
         }
+        // the checker's covers and the answers it could not give, from each kept
+        // context's last evaluation of a component and the worst of the others
+        if let Some(dt) = ix.dt.as_deref() {
+            let mut worst = Vec::new();
+            dt_sat::collect(&ix, &self.ctx, dynamic.as_ref(), &mut worst);
+            if worst.iter().any(|&w| w != dt_sat::FINE) {
+                for &k in axioms {
+                    let w = dt
+                        .comps
+                        .touched(k)
+                        .into_iter()
+                        .map(|c| worst[c as usize])
+                        .max()
+                        .unwrap_or(dt_sat::FINE);
+                    if w != dt_sat::FINE {
+                        self.excluded.push(Excluded {
+                            axiom: k.clone(),
+                            gap: Gap::Partial(dt_sat::reason(w)),
+                        });
+                    }
+                }
+                self.excluded.sort();
+                self.excluded.dedup();
+            }
+        }
         self.dynamic = dynamic;
         stats.marking = marking_start.elapsed();
         stats.saturation = t.elapsed();
@@ -4608,8 +4739,78 @@ fn normalize_axioms<'k>(
             out.partial.insert(k, why);
         }
         it.ranges.check()?;
+        it.check_dt_stop(limits)?;
     }
     tell(it, out)
+}
+
+/// Runs the datatype component pre-pass under `budget`, pre-admitting non-reserved
+/// datatype definitions and component scratch before allocation and propagating any
+/// cancellation, deadline or memory halt immediately.
+fn dt_comps(
+    axioms: &[&AxiomKind],
+    all_axioms: &[&AxiomKind],
+    budget: &std::sync::Arc<numeric::Budget>,
+    limits: &Limits,
+) -> Result<
+    (
+        dtcheck::comp::Comps,
+        dtcheck::range::Defs,
+        numeric::ScratchGuard,
+    ),
+    Error,
+> {
+    let mut guard = budget.scratch_guard();
+    let mut dt_defs: FxHashMap<Datatype, std::sync::Arc<DataRange>> = FxHashMap::default();
+    for &k in all_axioms {
+        if let AxiomKind::DatatypeDefinition(d, r) = k
+            && !crate::vocab::is_reserved(d.as_str())
+        {
+            let map_growth = if dt_defs.len() == dt_defs.capacity() {
+                dt_defs.capacity().max(8).saturating_add(8).saturating_mul(
+                    std::mem::size_of::<(Datatype, std::sync::Arc<DataRange>)>() + 1,
+                )
+            } else {
+                0
+            };
+            let est = map_growth
+                .saturating_add(std::mem::size_of::<(Datatype, std::sync::Arc<DataRange>)>())
+                .saturating_add(d.as_str().len())
+                .saturating_add(dtcheck::range::data_range_bytes(r))
+                .saturating_add(48);
+            guard.grow(est)?;
+            dt_defs.insert(d.clone(), std::sync::Arc::new(r.clone()));
+        }
+    }
+    let dt_defs = dtcheck::range::Defs::new(dt_defs);
+    let guard = std::cell::RefCell::new(guard);
+    let mem_used = std::cell::Cell::new(0usize);
+    let admit = |bytes: usize| -> bool {
+        match guard.borrow_mut().grow(bytes) {
+            Ok(()) => true,
+            Err(Error::Memory { used, .. }) => {
+                mem_used.set(used.max(1));
+                false
+            }
+            Err(_) => false,
+        }
+    };
+    let comps =
+        match dtcheck::comp::Comps::of_bounded(axioms, &dt_defs, &|| poll(limits).is_err(), &admit)
+        {
+            Ok(c) => c,
+            Err(dtcheck::comp::CompFail::Stopped) => {
+                poll(limits)?;
+                return Err(Error::Cancelled);
+            }
+            Err(dtcheck::comp::CompFail::Memory) => {
+                return Err(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: mem_used.get().max(1),
+                });
+            }
+        };
+    Ok((comps, dt_defs, guard.into_inner()))
 }
 
 /// The axioms a chunk of a parallel normalization reads between two reports of what it

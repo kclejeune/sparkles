@@ -1511,3 +1511,399 @@ fn unbounded_length_families_are_infinite() {
     p.min(0, (CAP - 2) as u64, &x);
     assert_eq!(p.check(), Answer::Sat);
 }
+
+// ------------------------------------------------------- the rule on units ----
+
+mod units_rule {
+    use super::*;
+    use crate::classify::dtcheck::range::Fail;
+    use crate::classify::dtcheck::rule::{Group, Units, units};
+    use crate::classify::dtcheck::solve::{Why, check_stopping};
+
+    fn atom(p: &mut P, d: usize, n: u64, r: &DataRange) -> Atom {
+        let r = p.t.of(r);
+        Atom::AtLeast(d, n, r)
+    }
+    fn run(p: &mut P, body: &[(Atom, Group)]) -> Units {
+        units(&mut p.t.r, &p.p, body, &Bounds::default(), &|| false).unwrap()
+    }
+    fn b(s: &str) -> Literal {
+        lit(s, "boolean")
+    }
+
+    #[test]
+    fn conflict_and_entailment() {
+        // ≥2 d.boolean entails ∃d.{true}
+        let mut p = P::new(1);
+        p.min(0, 2, &dt("boolean"));
+        let t = atom(&mut p, 0, 1, &one(&[b("true")]));
+        let u = run(&mut p, &[(t, Group::Other)]);
+        assert_eq!(u.entailed, vec![0]);
+        assert!(!u.conflict && !u.cover);
+        // ≥3 d.boolean is a conflict
+        p.min(0, 3, &dt("boolean"));
+        assert!(run(&mut p, &[]).conflict);
+    }
+
+    #[test]
+    fn covers_and_classes() {
+        // ∃d.boolean with ∃d.{true} and ∃d.{false} as body atoms
+        let mut p = P::new(1);
+        p.min(0, 1, &dt("boolean"));
+        let t = atom(&mut p, 0, 1, &one(&[b("true")]));
+        let f = atom(&mut p, 0, 1, &one(&[b("false")]));
+        // two classes: a cover remains
+        let u = run(&mut p, &[(t, Group::Only(1)), (f, Group::Only(2))]);
+        assert!(u.cover && u.classes.is_empty() && u.entailed.is_empty());
+        // one class for both: the class is given and no cover remains
+        let u = run(&mut p, &[(t, Group::Only(7)), (f, Group::Only(7))]);
+        assert_eq!(u.classes, vec![7]);
+        assert!(!u.cover);
+        // a free atom takes no part
+        let u = run(&mut p, &[(t, Group::Free), (f, Group::Other)]);
+        assert!(!u.cover && u.classes.is_empty());
+        // Neon's cover, whose first disjunct's range contains the others:
+        // ∃d.int[1,2] ⊓ ∃d.int[2,3] ⊑ ≥2 d.integer ⊔ ∃d.{2}
+        let i = |s: &str| lit(s, "int");
+        let mut p = P::new(1);
+        p.min(
+            0,
+            1,
+            &restr("int", &[("minInclusive", i("1")), ("maxInclusive", i("2"))]),
+        )
+        .min(
+            0,
+            1,
+            &restr("int", &[("minInclusive", i("2")), ("maxInclusive", i("3"))]),
+        );
+        let two = atom(&mut p, 0, 2, &dt("integer"));
+        let v2 = atom(&mut p, 0, 1, &one(&[i("2")]));
+        let u = run(&mut p, &[(two, Group::Other), (v2, Group::Other)]);
+        assert!(u.cover && u.entailed.is_empty());
+    }
+
+    #[test]
+    fn negative_assertions_are_conflicts() {
+        // ∃d.boolean with ∀d.¬{true} and ∀d.¬{false} on one constant
+        let mut p = P::new(1);
+        p.min(0, 1, &dt("boolean"))
+            .all(0, &not(one(&[b("true")])))
+            .all(0, &not(one(&[b("false")])));
+        assert!(run(&mut p, &[]).conflict);
+    }
+
+    #[test]
+    fn stop_flag() {
+        let mut p = P::new(1);
+        p.min(0, 1, &dt("boolean"));
+        assert_eq!(
+            check_stopping(&mut p.t.r, &p.p, &Bounds::default(), &|| true),
+            Answer::Unknown(Why::Stopped)
+        );
+        assert_eq!(
+            units(&mut p.t.r, &p.p, &[], &Bounds::default(), &|| true),
+            Err(Why::Stopped)
+        );
+        let r = one(&[b("true"), b("false")]);
+        assert_eq!(p.t.r.of_stopping(&r, &|| true), Err(Fail::Stopped));
+        // the flag set after the search starts still stops it: a pigeonhole over many
+        // types that needs more than one poll interval
+        let n = std::cell::Cell::new(0u32);
+        let stop = || {
+            n.set(n.get() + 1);
+            n.get() > 3
+        };
+        let mut p = P::new(3);
+        for d in 0..3 {
+            p.min(d, 40, &dt("integer"));
+        }
+        p.max(0, 100, &dt("integer"));
+        let got = check_stopping(&mut p.t.r, &p.p, &Bounds::default(), &stop);
+        assert!(matches!(got, Answer::Sat | Answer::Unknown(Why::Stopped)));
+    }
+
+    #[test]
+    fn one_shot_stop_in_search_returns_stopped_not_bound() {
+        // A one-shot stop firing once during search must still report Why::Stopped,
+        // never Why::Bound after a second poll returns false. Using `nodes = 1024` makes
+        // `budget.is_multiple_of(1024)` fire deterministically on the first search node.
+        let mut p = P::new(4);
+        for d in 0..4 {
+            p.min(d, 5, &dt("integer"));
+            p.max(d, 5, &dt("integer"));
+        }
+        // Poll 1: check_bounded entry; poll 2: cell loop; poll 3: first search node.
+        let polls = std::cell::Cell::new(0u32);
+        let one_shot = || {
+            let k = polls.get() + 1;
+            polls.set(k);
+            k == 3
+        };
+        let bounds = Bounds {
+            nodes: 1024,
+            ..Bounds::default()
+        };
+        let got = check_stopping(&mut p.t.r, &p.p, &bounds, &one_shot);
+        assert_eq!(got, Answer::Unknown(Why::Stopped));
+        assert_eq!(polls.get(), 3);
+    }
+
+    #[test]
+    fn large_one_of_stops_before_growing_past_admit_limit() {
+        let mut r = Ranges::new();
+        let mut defs = super::super::range::Defs::default();
+        let lits: std::collections::BTreeSet<Literal> = (0..200)
+            .map(|i| Literal::typed(format!("{i:0>200}"), vocab::XSD_STRING))
+            .collect();
+        let range = DataRange::OneOf(lits);
+        let admitted = std::cell::Cell::new(0usize);
+        let cap = 4096usize;
+        let got = r.of_defined_bounded(&range, &mut defs, &|| false, &|bytes| {
+            let next = admitted.get().saturating_add(bytes);
+            if next > cap {
+                false
+            } else {
+                admitted.set(next);
+                true
+            }
+        });
+        assert_eq!(got, Err(Fail::Memory));
+        assert!(admitted.get() <= cap);
+        // Refusal precedes interning, so no partial OneOf prefix was retained in Ranges.
+        assert_eq!(r.bytes(), Ranges::new().bytes());
+    }
+
+    #[test]
+    fn large_lang_range_facet_stops_before_building_facet_nf() {
+        let mut r = Ranges::new();
+        let mut defs = super::super::range::Defs::default();
+        // A long valid BCP 47 language range (subtags of 1..=8 alnum separated by '-').
+        let long_tag = std::iter::repeat_n("abcdef", 1000)
+            .collect::<Vec<_>>()
+            .join("-");
+        let range = plain_restr(&[(vocab::RDF_LANG_RANGE, Literal::simple(&long_tag))]);
+        let admitted = std::cell::Cell::new(0usize);
+        let cap = 1024usize;
+        let got = r.of_defined_bounded(&range, &mut defs, &|| false, &|bytes| {
+            let next = admitted.get().saturating_add(bytes);
+            if next > cap {
+                false
+            } else {
+                admitted.set(next);
+                true
+            }
+        });
+        assert_eq!(got, Err(Fail::Memory));
+        assert_eq!(admitted.get(), 0);
+        assert_eq!(r.bytes(), Ranges::new().bytes());
+    }
+
+    #[test]
+    fn atom_id_denies_capacity_growth_before_mutating_table() {
+        use super::super::atoms::{DtKey, DtRun, DtTable, Halted, Stop};
+        use super::super::comp::Comps;
+        use super::super::range::Defs;
+        use crate::classify::{Limits, numeric};
+
+        let mut table = DtTable::default();
+        // Fill until `atoms` is exactly at a large Vec capacity boundary (64).
+        for n in 0..64u64 {
+            table.id(DtKey {
+                role: 0,
+                at_least: true,
+                n,
+                range: Ranges::FULL,
+            });
+        }
+        assert_eq!(table.atoms.len(), 64);
+        assert_eq!(table.atoms.capacity(), 64);
+        let before_bytes = table.bytes();
+        let before_atoms_cap = table.atoms.capacity();
+        let growth = table.next_growth_bytes();
+        assert!(growth >= 64 * std::mem::size_of::<DtKey>());
+
+        // Set cap strictly above fixed entry size (64 B) but strictly below the planned
+        // Vec capacity doubling.
+        let cap = before_bytes + 64;
+        let limits = Limits {
+            max_memory: Some(cap),
+            ..Limits::default()
+        };
+        let budget = numeric::Budget::new(&limits, before_bytes, None);
+        let mut run = DtRun {
+            comps: Comps::default(),
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: Some(budget),
+            stopped: None,
+        };
+        let next = DtKey {
+            role: 0,
+            at_least: true,
+            n: 64,
+            range: Ranges::FULL,
+        };
+        assert_eq!(run.atom_id(&mut table, next), None);
+        assert!(matches!(run.stopped, Some(Halted::Memory(_))));
+        assert_eq!(table.atoms.len(), 64);
+        assert_eq!(table.atoms.capacity(), before_atoms_cap);
+        assert_eq!(table.bytes(), before_bytes);
+    }
+
+    #[test]
+    fn shared_def_expansion_does_not_double_charge_ast_in_el_range_or_of_in() {
+        use super::super::comp::{CompFail, Comps};
+        use super::super::range::Defs;
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty};
+        use rustc_hash::FxHashMap;
+        use std::sync::Arc;
+
+        let lits: std::collections::BTreeSet<Literal> = (0..250)
+            .map(|i| Literal::typed(format!("{i:0>200}"), vocab::XSD_STRING))
+            .collect();
+        let big = Arc::new(DataRange::OneOf(lits));
+        let dt_big = Datatype::new("urn:dt:big");
+        let mut map = FxHashMap::default();
+        map.insert(dt_big.clone(), Arc::clone(&big));
+        let defs = Defs::new(map);
+        let ast_bytes = super::super::range::data_range_bytes(&big);
+        assert!(ast_bytes > 40_000);
+
+        // Two uses of `:big` in EL-like positions. Under a tight scratch cap well below
+        // `ast_bytes`, `Walk::el_range` checks `el_defs` without cloning the AST, and
+        // `ensure_scratch` only pays shallow Arc-map bytes; conversion then stops cleanly
+        // inside `DataOneOf` literal admission without cloning the AST.
+        let ax = [
+            AxiomKind::SubClassOf(
+                ClassExpression::Class(Class::new("urn:dt:A")),
+                ClassExpression::DataSomeValuesFrom(
+                    vec![DataProperty::new("urn:dt:d")],
+                    DataRange::Datatype(dt_big.clone()),
+                ),
+            ),
+            AxiomKind::SubClassOf(
+                ClassExpression::Class(Class::new("urn:dt:B")),
+                ClassExpression::DataSomeValuesFrom(
+                    vec![DataProperty::new("urn:dt:d")],
+                    DataRange::Datatype(dt_big),
+                ),
+            ),
+        ];
+        let refs: Vec<&AxiomKind> = ax.iter().collect();
+        let admitted = std::cell::Cell::new(0usize);
+        let cap = 8192usize;
+        let res = Comps::of_bounded(&refs, &defs, &|| false, &|bytes| {
+            let next = admitted.get().saturating_add(bytes);
+            if next > cap {
+                false
+            } else {
+                admitted.set(next);
+                true
+            }
+        });
+        assert!(matches!(res, Err(CompFail::Memory)));
+        assert!(admitted.get() <= cap);
+        // The immutable AST Arc must have no stray cloned references after the call.
+        assert_eq!(Arc::strong_count(&big), 2);
+    }
+
+    #[test]
+    fn large_lang_range_facet_rejects_cap_below_simultaneous_copies() {
+        let mut r = Ranges::new();
+        let mut defs = super::super::range::Defs::default();
+        // ~70 KiB valid basic language range.
+        let long_tag = std::iter::repeat_n("abcdef", 10_000)
+            .collect::<Vec<_>>()
+            .join("-");
+        let len = long_tag.len();
+        let range = plain_restr(&[(vocab::RDF_LANG_RANGE, Literal::simple(&long_tag))]);
+        // Cap admits the old `1 * len + base + Nf + 128` estimate, but denies simultaneous
+        // facet + Tags::map2 meet copies (~2x len).
+        let cap = len + 4096;
+        let admitted = std::cell::Cell::new(0usize);
+        let got = r.of_defined_bounded(&range, &mut defs, &|| false, &|bytes| {
+            let next = admitted.get().saturating_add(bytes);
+            if next > cap {
+                false
+            } else {
+                admitted.set(next);
+                true
+            }
+        });
+        assert_eq!(got, Err(Fail::Memory));
+        assert_eq!(admitted.get(), 0);
+        assert_eq!(r.bytes(), Ranges::new().bytes());
+    }
+
+    #[test]
+    fn ranges_bytes_and_defs_shallow_bytes_include_cloned_hash_buckets() {
+        use super::super::comp::{CompFail, Comps};
+        use super::super::range::{Defs, Nf, Rid};
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty};
+        use rustc_hash::FxHashMap;
+        use std::sync::Arc;
+
+        // 897 distinct compact integer point ranges push hashbrown to 2048 buckets.
+        let mut r = Ranges::new();
+        for i in 0..895i64 {
+            let _ = r.of(&DataRange::OneOf(
+                [Literal::typed(format!("{i}"), vocab::XSD_INTEGER)]
+                    .into_iter()
+                    .collect(),
+            ));
+        }
+        // `r` now has 897 entries (EMPTY, FULL + 895 points) -> 2048 hashbrown buckets.
+        let min_cloned_backing =
+            1024 * std::mem::size_of::<Nf>() + 2048 * (std::mem::size_of::<(Nf, Rid)>() + 1);
+        assert!(
+            r.bytes() >= min_cloned_backing,
+            "Ranges::bytes() {} must cover cloned bucket backing >= {min_cloned_backing}",
+            r.bytes()
+        );
+
+        // 897 distinct datatype definitions -> 2048 hashbrown buckets in `Defs.map`.
+        let int_arc = Arc::new(DataRange::Datatype(Datatype::new(format!(
+            "{}int",
+            vocab::XSD
+        ))));
+        let mut map = FxHashMap::default();
+        let mut key_str_bytes = 0usize;
+        for i in 0..897usize {
+            let d = Datatype::new(format!("urn:dt:d{i}"));
+            key_str_bytes += d.as_str().len();
+            map.insert(d, Arc::clone(&int_arc));
+        }
+        let defs = Defs::new(map);
+        let min_defs_buckets =
+            2048 * (std::mem::size_of::<(Datatype, Arc<DataRange>)>() + 1) + key_str_bytes;
+        assert!(
+            defs.shallow_bytes() >= min_defs_buckets,
+            "Defs::shallow_bytes() {} must cover cloned buckets >= {min_defs_buckets}",
+            defs.shallow_bytes()
+        );
+        // A cap that would have admitted the old `len * (size_of + 16)` underestimate
+        // (plus scratch init) must refuse `ensure_scratch` before cloning `defs.map`.
+        let old_underest =
+            897 * (std::mem::size_of::<(Datatype, Arc<DataRange>)>() + 16) + key_str_bytes + 4096;
+        assert!(old_underest < min_defs_buckets);
+        let ax = [AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:dt:A")),
+            ClassExpression::DataSomeValuesFrom(
+                vec![DataProperty::new("urn:dt:p")],
+                DataRange::Datatype(Datatype::new("urn:dt:d0")),
+            ),
+        )];
+        let refs: Vec<&AxiomKind> = ax.iter().collect();
+        let admitted = std::cell::Cell::new(0usize);
+        let res = Comps::of_bounded(&refs, &defs, &|| false, &|bytes| {
+            let next = admitted.get().saturating_add(bytes);
+            if next > old_underest {
+                false
+            } else {
+                admitted.set(next);
+                true
+            }
+        });
+        assert!(matches!(res, Err(CompFail::Memory)));
+    }
+}

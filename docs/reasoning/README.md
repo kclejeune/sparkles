@@ -463,7 +463,18 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   reaches it, since a run composes only the property chains that a negative existential
   restriction needs and unfolds the others by their automata, and composes each pair of
   links into the least properties of a chain's result, so that a symmetric transitive
-  property, which is its own inverse, derives each link once. In an ontology
+  property, which is its own inverse, derives each link once. The Horn rules also take
+  the data restrictions outside OWL 2 EL, such as data cardinalities, universal data
+  restrictions, facets, unions and enumerations of several values, the datatypes outside
+  the profile, such as `xsd:double`, `xsd:int` and `xsd:boolean`, and
+  `DisjointDataProperties`, with the ranges, assertions and functional data properties
+  that share their properties. A datatype checker decides these together in each context,
+  so two values of a functional `xsd:double` property and a string in an `xsd:boolean`
+  range make the ontology inconsistent. A case analysis over data values, such as a
+  Boolean property whose two values give different classes, and a key over a property
+  that the checker takes are used in part and reported. A universal or maximum data
+  restriction on the left is left out and reported. An ontology whose data stays within
+  OWL 2 EL keeps the profile's data handling and builds nothing for the checker. In an ontology
   without individuals, data properties, self restrictions, reflexive properties or top
   properties, axioms that need case analysis, such as unions, complements and universal
   restrictions on the left, take the disjunctive rules of the consequence-based calculus
@@ -1038,9 +1049,9 @@ the normal selection of asserted data.
   between those graphs. On the OWL that openCAESAR's build writes for its Kepler16b
   sample, the classifier's taxonomy equals the one that `owl-reason` gets from Openllet.
   Its named types of individuals equal Openllet's apart from types it gives the SWRL
-  rules' variables, and the classifier finds the
-  inconsistencies that the bundle's disjointness, keys, functional properties, universal
-  restrictions and property characteristics raise
+  rules' variables, and the classifier finds the inconsistencies that the bundle's
+  disjointness, keys, functional properties, universal restrictions, property
+  characteristics and OWL 2 DL datatypes raise
   ([F24](../specs/F24-owl-classification/SPEC.md#oml-and-opencaesar-models)).
 * `sparkles serve --fuseki-config` starts from an openCAESAR project's `.fuseki.ttl`,
   with its in-memory dataset, union default graph, query timeout and SHACL endpoint. It
@@ -1055,9 +1066,9 @@ the normal selection of asserted data.
   Jena's rule engine derives from the file.
 * The SWRL rules are not read, so a reified relation's forward property and the facts of
   an OML rule are not derived, and the OWL RL materialization answers a query that needs
-  them with fewer rows. Rule-derived inconsistencies, enumerations beside keys, OWL 2 DL
-  datatypes such as `xsd:double` and `xsd:boolean`, and openCAESAR's closed-world
-  cardinality check are not covered. The known gaps below name the roadmap items.
+  them with fewer rows. Rule-derived inconsistencies, enumerations beside keys and
+  openCAESAR's closed-world cardinality check are not covered. The known gaps below name
+  the roadmap items.
 
 ## Known gaps
 
@@ -1306,9 +1317,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   answer complete while it ignores the rule. Roadmap item 1302.
 * A rooted run refuses keys over data properties and functional data properties, which
   OML vocabularies declare for their identifiers, as the Kepler16b sample and its
-  metrology library do. Roadmap item 768. The classifier leaves out the literals and
-  ranges of datatypes outside OWL 2 EL, such as `xsd:double` and `xsd:boolean`. Roadmap
-  item 972.
+  metrology library do. The disjunctive rules take no data properties, so a case
+  analysis over data values and a key over a data property that the datatype checker takes
+  are used in part, while a universal or maximum data restriction on the left is left out.
+  Roadmap item 768.
+  When an otherwise eligible ontology's data properties occur only in axioms outside
+  OWL 2 EL, one object axiom that needs case analysis sends it to the disjunctive rules.
+  These rules leave out the data axioms that the Horn rules would decide through the
+  datatype checker. Roadmap item 1303.
 * A lenient read maps no axiom for an `owl:AllDisjointClasses` with an undeclared member
   and reports no warning. Roadmap item 973. The `all-disjoint-classes` check of
   `sparkles infer --check` passes its intermediate-row limit on a 55-member list with a
@@ -1337,7 +1353,7 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 
 ## Roadmap
 
-The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 768](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md), [item 953](../ROADMAP.md), [item 954](../ROADMAP.md), [item 955](../ROADMAP.md), [item 958](../ROADMAP.md), [item 959](../ROADMAP.md), [item 970](../ROADMAP.md), [item 971](../ROADMAP.md), [item 972](../ROADMAP.md), [item 973](../ROADMAP.md), [item 974](../ROADMAP.md), [item 975](../ROADMAP.md), [item 976](../ROADMAP.md), [item 977](../ROADMAP.md).
+The remaining work described above refers to [item 9](../ROADMAP.md), [item 18](../ROADMAP.md), [item 19](../ROADMAP.md), [item 48](../ROADMAP.md), [item 53](../ROADMAP.md), [item 54](../ROADMAP.md), [item 75](../ROADMAP.md), [item 78](../ROADMAP.md), [item 190](../ROADMAP.md), [item 192](../ROADMAP.md), [item 193](../ROADMAP.md), [item 285](../ROADMAP.md), [item 286](../ROADMAP.md), [item 539](../ROADMAP.md), [item 559](../ROADMAP.md), [item 565](../ROADMAP.md), [item 578](../ROADMAP.md), [item 768](../ROADMAP.md), [item 941](../ROADMAP.md), [item 942](../ROADMAP.md), [item 953](../ROADMAP.md), [item 954](../ROADMAP.md), [item 955](../ROADMAP.md), [item 958](../ROADMAP.md), [item 959](../ROADMAP.md), [item 970](../ROADMAP.md), [item 971](../ROADMAP.md), [item 973](../ROADMAP.md), [item 974](../ROADMAP.md), [item 975](../ROADMAP.md), [item 976](../ROADMAP.md), [item 977](../ROADMAP.md), [item 1303](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

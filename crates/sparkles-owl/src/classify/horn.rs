@@ -1036,6 +1036,11 @@ struct Out {
     reflexive: Vec<Role>,
     clash: Vec<(Role, Role)>,
     premises: Vec<Ex>,
+    /// the data axioms of checker components, as the EL normalization keeps them
+    dt_ranges: Vec<(Role, super::dtcheck::range::Rid)>,
+    dt_disjoint: Vec<(Role, Role)>,
+    functional: Vec<Role>,
+    individuals: Vec<Ex>,
 }
 
 impl Out {
@@ -1048,6 +1053,10 @@ impl Out {
         ax.reflexive.extend(self.reflexive);
         h.clash.extend(self.clash);
         h.premises.extend(self.premises);
+        ax.dt_ranges.extend(self.dt_ranges);
+        ax.dt_disjoint.extend(self.dt_disjoint);
+        ax.functional.extend(self.functional);
+        ax.individuals.extend(self.individuals);
     }
 }
 
@@ -1113,6 +1122,48 @@ impl Norm<'_> {
             (e, None) => Ok(e),
             (_, Some(why)) => Err(why),
         }
+    }
+
+    /// Whether the run's checker takes the property of a data restriction.
+    fn dt_checker(&self, c: &ClassExpression) -> bool {
+        use ClassExpression as C;
+        match c {
+            C::DataAllValuesFrom(ps, _) if ps.len() == 1 => self.it.dt_checker(&ps[0]),
+            C::DataMinCardinality(_, d, _)
+            | C::DataMaxCardinality(_, d, _)
+            | C::DataExactCardinality(_, d, _) => self.it.dt_checker(d),
+            _ => false,
+        }
+    }
+
+    /// The checker's atom of a universal or cardinality data restriction, in a positive
+    /// position or, for a minimum, in a negative one. A universal or a maximum in a
+    /// negative position is not Horn, and is left out with its axiom.
+    fn dt(&mut self, c: &ClassExpression, positive: bool) -> Result<Ex, Why> {
+        use ClassExpression as C;
+        let range = |it: &mut Interner, r: &Option<DataRange>| match r {
+            Some(r) => it.dt_range(r),
+            None => Ok(super::dtcheck::range::Ranges::FULL),
+        };
+        let e = match c {
+            C::DataAllValuesFrom(ps, r) if positive => self.it.dt_universal(&ps[0], r)?,
+            C::DataMinCardinality(n, d, r) => {
+                let x = range(self.it, r)?;
+                self.it.dt_node(d, true, u64::from(*n), x)
+            }
+            C::DataMaxCardinality(n, d, r) if positive => {
+                let x = range(self.it, r)?;
+                self.it.dt_node(d, false, u64::from(*n), x)
+            }
+            C::DataExactCardinality(n, d, r) if positive => {
+                let x = range(self.it, r)?;
+                let a = self.it.dt_node(d, true, u64::from(*n), x);
+                let b = self.it.dt_node(d, false, u64::from(*n), x);
+                self.conj(vec![a, b])
+            }
+            _ => return Err("a universal or maximum data restriction in a negative position"),
+        };
+        Ok(e)
     }
 
     /// `x` with `x ⊑ c`.
@@ -1197,6 +1248,14 @@ impl Norm<'_> {
             }
             C::ObjectHasValue(p, a) => self.has_value(p, a)?,
             C::DataSomeValuesFrom(..) | C::DataHasValue(..) => self.el(c)?,
+            C::DataAllValuesFrom(..)
+            | C::DataMinCardinality(..)
+            | C::DataMaxCardinality(..)
+            | C::DataExactCardinality(..)
+                if self.dt_checker(c) =>
+            {
+                self.dt(c, true)?
+            }
             _ => return Err("a data restriction outside OWL 2 EL"),
         })
     }
@@ -1369,6 +1428,7 @@ impl Norm<'_> {
             }
             C::ObjectHasValue(p, a) => self.has_value(p, a)?,
             C::DataSomeValuesFrom(..) | C::DataHasValue(..) => self.el(c)?,
+            C::DataMinCardinality(..) if self.dt_checker(c) => self.dt(c, false)?,
             C::DataAllValuesFrom(..)
             | C::DataMinCardinality(..)
             | C::DataMaxCardinality(..)
@@ -1544,6 +1604,62 @@ impl Norm<'_> {
         let one = |a: &Individual| C::ObjectOneOf(std::iter::once(a.clone()).collect());
         match ax {
             K::SubClassOf(c, d) => self.sub(vec![c.clone()], vec![d.clone()]),
+            // the data axioms of a checker component that are outside OWL 2 EL, for a
+            // range or a literal of a DL datatype, as the EL normalization takes the
+            // others (F24, "The EL and Horn tiers")
+            K::DataPropertyRange(d, r) if self.it.dt_checker(d) => {
+                let x = self.it.dt_range(r)?;
+                let r = self.it.role(RoleName::Data(d.clone()));
+                self.out.dt_ranges.push((r, x));
+                Ok(())
+            }
+            // the pairs of a disjointness of checker properties, which the pre-pass puts
+            // in one component; one with the top or bottom data property, which have no
+            // component, is left out
+            K::DisjointDataProperties(ps) if ps.iter().all(|d| self.it.dt_checker(d)) => {
+                let rs: Vec<Role> = ps
+                    .iter()
+                    .map(|d| self.it.role(RoleName::Data(d.clone())))
+                    .collect();
+                for (i, &a) in rs.iter().enumerate() {
+                    for &b in &rs[i + 1..] {
+                        self.out.dt_disjoint.push((a.min(b), a.max(b)));
+                    }
+                }
+                Ok(())
+            }
+            // a definition outside OWL 2 EL makes every property it is used on a checker
+            // property, whose atoms read it in place of its datatype, so the run takes it
+            // when the checker converts it. Another definition of the same datatype, which
+            // the atoms do not read, and one of a reserved name stay out.
+            K::DatatypeDefinition(d, r)
+                if !vocab::is_reserved(d.as_str())
+                    && self.it.dt_run.as_ref().is_some_and(|run| {
+                        run.defs.map().get(d).map(std::sync::Arc::as_ref) == Some(r)
+                    }) =>
+            {
+                self.it.dt_range(&DataRange::Datatype(d.clone()))?;
+                Ok(())
+            }
+            K::FunctionalDataProperty(d) if self.it.dt_checker(d) => {
+                let r = self.it.role(RoleName::Data(d.clone()));
+                self.out.functional.push(r);
+                Ok(())
+            }
+            K::DataPropertyAssertion(d, a, v) | K::NegativeDataPropertyAssertion(d, a, v)
+                if self.it.dt_checker(d) =>
+            {
+                let positive = matches!(ax, K::DataPropertyAssertion(..));
+                let x = self.it.dt_literal(v)?;
+                // ¬d(a, v) is `{a} ⊑ ∀d.¬{v}`, which is `{a} ⊑ ≤ 0 d.{v}`
+                let e = self
+                    .it
+                    .dt_node(d, positive, if positive { 1 } else { 0 }, x);
+                let a = self.it.individual(a);
+                self.out.individuals.push(a);
+                self.out.subs.push((a, e));
+                Ok(())
+            }
             // the assertions with a Horn class expression or an inverse property, as the
             // class axioms they are: `{a} ⊑ C`, `{a} ⊑ ∃p.{b}` and `{a} ⊓ ∃p.{b} ⊑ ⊥`
             K::ClassAssertion(c, a) => self.sub(vec![one(a)], vec![c.clone()]),
@@ -1800,6 +1916,9 @@ pub fn normalize(
         let accepted = n.axiom(k).is_ok();
         n.it.end_scope();
         n.it.ranges.check_halt()?;
+        if n.it.dt_stopped() {
+            return Err(Halt::Stopped);
+        }
         if accepted {
             class_out.push(n.out);
             taken[i] = true;

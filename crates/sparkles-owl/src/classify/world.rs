@@ -754,6 +754,9 @@ impl WorldSink<'_> {
 
 impl Sink for WorldSink<'_> {
     fn reserve_data(&mut self, bytes: usize) -> bool {
+        if self.halted.get() {
+            return false;
+        }
         let Ok(add) = isize::try_from(bytes) else {
             self.data_overflow();
             return false;
@@ -763,6 +766,10 @@ impl Sink for WorldSink<'_> {
             return false;
         };
         self.data_growth.set(next);
+        #[cfg(test)]
+        if add > 0 {
+            super::admission_test::hit(super::admission_test::Point::WorldDataReserve);
+        }
         let ok = (self.bound)(add);
         if !ok {
             self.data_growth.set(next - add);
@@ -774,6 +781,21 @@ impl Sink for WorldSink<'_> {
     fn data_overflow(&mut self) {
         self.halted.set(true);
         self.overflow.set(true);
+    }
+    // what the run's tables keep stays charged after the world's copies go, until the
+    // worlds end
+    fn keep_shared(&mut self, bytes: usize) {
+        if bytes > isize::MAX as usize {
+            self.data_overflow();
+        } else if !(self.bound)(bytes as isize) {
+            self.halted.set(true);
+        }
+    }
+    // `reserve_data` already charged `self.bound` and added `bytes` to `data_growth`;
+    // taking `bytes` out of `data_growth` keeps the bound charged after the world drops.
+    fn retain_shared(&mut self, bytes: usize) {
+        self.data_growth
+            .set(self.data_growth.get() - bytes as isize);
     }
     fn release_data(&mut self, bytes: usize) {
         self.data_growth
@@ -1250,6 +1272,9 @@ impl<'a> World<'a> {
             found.bottom |= st.bottom;
             found.subs = st.subs.iter().copied().collect();
         });
+        if !found.bottom {
+            super::dt_sat::world(self.ix, self.slots.values().filter_map(|s| s.st.as_ref()));
+        }
         // the world's copies go when it does
         Ok(found)
     }
@@ -1317,7 +1342,11 @@ mod numeric_resource_tests {
             ..Totals::default()
         };
         let budget = WorldBudget::start(&limits, charge, 4096, &mut totals).unwrap();
-        let bound = |delta| budget.tell(delta);
+        let reports = parking_lot::Mutex::new(Vec::new());
+        let bound = |delta| {
+            reports.lock().push(delta);
+            budget.tell(delta)
+        };
         let mut world = World::new(
             sat.index.as_ref().unwrap(),
             &sat.ctx,
@@ -1342,17 +1371,21 @@ mod numeric_resource_tests {
             grown: &Cell::new(0),
             charged: &Cell::new(0),
         };
-        assert!(sink.reserve_data(64));
-        assert!(!sink.reserve_data(128));
+        assert!(sink.admit_data(64));
+        sink.retain_shared(32);
+        assert!(!sink.admit_data(128));
         assert!(halted.get());
-        assert_eq!(growth.get(), 64);
+        assert_eq!(growth.get(), 32);
         assert_eq!(budget.held.load(Ordering::Relaxed), 64);
+        // A later reservation at the halted sink makes no bound report.
+        assert!(!sink.admit_data(1));
         sink.release_data(16);
-        assert_eq!(growth.get(), 48);
+        assert_eq!(growth.get(), 16);
         // The activation transfers only its remaining local debit to the world.
         world.reported += growth.get() as usize;
         drop(world);
-        assert_eq!(budget.held.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 32);
+        assert_eq!(*reports.lock(), [64, 128, -128, -16, -16]);
         assert_eq!(
             budget.stopped(),
             Err(Error::Memory {

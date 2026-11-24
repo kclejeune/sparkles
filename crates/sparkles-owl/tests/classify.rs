@@ -2661,16 +2661,22 @@ fn a_range_on_links_that_are_not_loops() {
                     ..Limits::default()
                 };
                 let o = Classifier::of(&ofn(body)).classify(&limits).unwrap();
-                // a datatype restriction with a facet is outside OWL 2 EL, and no tier
-                // takes it: the run leaves it out and reports it, complete for what it
-                // took and not for the whole ontology
+                // The Horn tier takes these facets through the datatype checker.
+                // The EL-only run is complete for the axioms it takes.
+                let ok = o.taxonomy.is_subclass(&c(a), &c(g));
                 if name == "data told" || name == "data range exist" {
                     let out = &o.stats.outside_el;
-                    if !(o.complete_for_taken && !o.complete && out.horn == 1 && out.taken == 0) {
-                        bad.push(format!("{name} el_only={el_only}: not left out"));
+                    let fine = if el_only {
+                        !o.complete && out.horn == 1 && out.taken == 0 && !ok
+                    } else {
+                        o.complete && out.horn == 1 && out.taken == 1 && ok
+                    };
+                    if !(o.complete_for_taken && fine) {
+                        bad.push(format!(
+                            "{name} el_only={el_only} threads={threads}: {out:?}"
+                        ));
                     }
                 }
-                let ok = o.taxonomy.is_subclass(&c(a), &c(g));
                 if took_all(&o) && !ok {
                     bad.push(format!("{name} el_only={el_only} threads={threads}"));
                 }

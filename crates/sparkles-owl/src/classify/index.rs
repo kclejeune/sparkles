@@ -11,6 +11,8 @@
 //! incremental run can keep the contexts it does not touch.
 
 use super::data::{DataVal, Ranges};
+use super::dtcheck::atoms::{DtKey, DtRun, DtTable};
+use super::dtcheck::range::{Ranges as DtRanges, Rid};
 use crate::model::*;
 use crate::vocab;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -44,6 +46,13 @@ pub enum Node {
     /// [`Interner::vals`]. A data value has no successors, so it needs no context: the
     /// index gives a positive restriction its consequences as told subsumers.
     DataSome(Role, u32),
+    /// a data restriction over a property of a checker component, by its index in the
+    /// atoms of [`Interner::dt`] (F24, "The datatype checker")
+    DtAtom(u32),
+    /// a told subsumer of the checker's body atoms, by its expression, which the index
+    /// tells the subsumer so that a context re-evaluates the atoms' components when it
+    /// gains the subsumer
+    DtFire(Ex),
     /// Only in the interner of a chunk of a parallel normalization: an intersection, by
     /// its index in [`Interner::ands`]. Its binary form depends on the order of the
     /// operands' ids, so it waits for the ids of the merged interner.
@@ -268,6 +277,11 @@ pub struct Interner {
     val_opaque_bytes: usize,
     /// the opaque data atoms and the datatype definitions of the run
     pub ranges: Ranges,
+    /// the checker's data atoms, kept across runs like [`Interner::vals`]
+    pub dt: DtTable,
+    /// the run's checker components and definitions, while it normalizes, when one
+    /// component is the checker's
+    pub dt_run: Option<Box<DtRun>>,
     pub roles: Vec<RoleName>,
     /// the id of each name in [`Interner::roles`], by [`role_hash`], so that an object
     /// property is looked up without a copy of its IRI
@@ -381,7 +395,8 @@ impl Interner {
             / 7;
         vector
             .checked_add(table)?
-            .checked_add(self.val_opaque_bytes)
+            .checked_add(self.val_opaque_bytes)?
+            .checked_add(self.dt.bytes())
     }
 
     /// The bytes the interner takes, roughly: each expression with its entry in the
@@ -401,12 +416,13 @@ impl Interner {
             + self.and_ops * 4
             + self.scope_bytes()
             + self.prefix_roles.capacity() * 16
+            + self.dt_run.as_ref().map_or(0, |r| r.bytes())
     }
 
     /// Whether a chunk met data ranges or literals, whose ids its merge does not map, so
     /// that the run normalizes on one thread instead.
     pub fn chunk_has_data(&self) -> bool {
-        !self.vals.is_empty() || !self.ranges.opaque.is_empty()
+        !self.vals.is_empty() || !self.ranges.opaque.is_empty() || !self.dt.is_empty()
     }
 
     /// An intersection kept whole in a chunk's interner.
@@ -498,7 +514,9 @@ impl Interner {
                     Node::Conj(a, b) => self.conj(map[a as usize], map[b as usize]),
                     Node::Exist(r, f) => self.node(Node::Exist(roles[r as usize], map[f as usize])),
                     Node::SelfLoop(r) => self.node(Node::SelfLoop(roles[r as usize])),
-                    Node::DataSome(..) => unreachable!("a chunk with data merges on one thread"),
+                    Node::DataSome(..) | Node::DtAtom(_) | Node::DtFire(_) => {
+                        unreachable!("a chunk with data merges on one thread")
+                    }
                     Node::Forall(..) | Node::AtMost1(..) | Node::Fresh(_) => {
                         unreachable!("the Horn normalization runs on the merged interner")
                     }
@@ -955,6 +973,86 @@ impl Interner {
         self.scope_bytes = self.scope_bytes.saturating_sub(freed);
     }
 
+    /// Whether the run's checker takes the data property's component.
+    pub fn dt_checker(&self, d: &DataProperty) -> bool {
+        self.dt_run.as_ref().is_some_and(|r| r.comps.checker(d))
+    }
+
+    /// The checker's atom `≥ n d.R` or `≤ n d.R` over a property of a checker component,
+    /// with the forms that always or never hold folded to `owl:Thing` and `owl:Nothing`.
+    /// Only the interned empty range folds, since another empty form can have another id.
+    pub fn dt_node(&mut self, d: &DataProperty, at_least: bool, n: u64, range: Rid) -> Ex {
+        match (at_least, n, range) {
+            (true, 0, _) => return TOP,
+            (true, _, DtRanges::EMPTY) => return BOTTOM,
+            (false, _, DtRanges::EMPTY) | (false, u64::MAX, _) => return TOP,
+            _ => {}
+        }
+        let role = self.role(RoleName::Data(d.clone()));
+        let key = DtKey {
+            role,
+            at_least,
+            n,
+            range,
+        };
+        let id = if let Some(run) = self.dt_run.as_deref_mut() {
+            match run.atom_id(&mut self.dt, key) {
+                Some(id) => id,
+                None => return TOP,
+            }
+        } else {
+            self.dt.id(key)
+        };
+        self.node(Node::DtAtom(id))
+    }
+
+    /// The checker's range of a data range, with the run's definitions.
+    pub fn dt_range(&mut self, r: &DataRange) -> Result<Rid, &'static str> {
+        let run = self
+            .dt_run
+            .as_deref_mut()
+            .expect("a checker range in a run with checker components");
+        run.range(&mut self.dt, r)
+    }
+
+    /// The checker's point range of a literal.
+    pub fn dt_literal(&mut self, l: &Literal) -> Result<Rid, &'static str> {
+        let run = self
+            .dt_run
+            .as_deref_mut()
+            .expect("a checker literal in a run with checker components");
+        run.literal(&mut self.dt, l)
+    }
+
+    /// `∀d.R`, which is `≤ 0 d.¬R`.
+    pub fn dt_universal(&mut self, d: &DataProperty, r: &DataRange) -> Result<Ex, &'static str> {
+        let x = self.dt_range(r)?;
+        let run = self
+            .dt_run
+            .as_deref_mut()
+            .expect("a checker universal in a run with checker components");
+        let not = run.not(&mut self.dt, x)?;
+        Ok(self.dt_node(d, false, 0, not))
+    }
+
+    /// Whether a checker range conversion has latched a stop or memory halt.
+    pub fn dt_stopped(&self) -> bool {
+        self.dt_run.as_ref().is_some_and(|r| r.stopped.is_some())
+    }
+
+    /// Returns the latched checker stop or memory halt, if any.
+    pub fn check_dt_stop(&self, limits: &super::Limits) -> Result<(), super::Error> {
+        match self.dt_run.as_ref().and_then(|r| r.stopped) {
+            Some(super::dtcheck::atoms::Halted::Timeout) => Err(super::Error::Timeout),
+            Some(super::dtcheck::atoms::Halted::Cancelled) => Err(super::Error::Cancelled),
+            Some(super::dtcheck::atoms::Halted::Memory(used)) => Err(super::Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// The binary intersection of two expressions, with its operands ordered.
     pub fn conj(&mut self, a: Ex, b: Ex) -> Ex {
         if a == b {
@@ -1284,6 +1382,10 @@ pub struct Axioms {
     pub data_ranges: Vec<(Role, u32)>,
     /// the functional data roles
     pub functional: Vec<Role>,
+    /// `range(d) = R`, for a data role of a checker component and the checker's range
+    pub dt_ranges: Vec<(Role, Rid)>,
+    /// the pairs of disjoint data roles of checker components
+    pub dt_disjoint: Vec<(Role, Role)>,
     /// `HasKey(c (p…) (d…))`
     pub keys: Vec<Key>,
     /// the individuals of assertions, which classification checks for consistency
@@ -1303,7 +1405,11 @@ impl Axioms {
     pub fn append_mapped(&mut self, chunk: Axioms, nodes: &[Ex], roles: &[Role]) {
         let n = |e: Ex| nodes[e as usize];
         let r = |x: Role| roles[x as usize];
-        debug_assert!(chunk.data_ranges.is_empty());
+        debug_assert!(
+            chunk.data_ranges.is_empty()
+                && chunk.dt_ranges.is_empty()
+                && chunk.dt_disjoint.is_empty()
+        );
         self.subs
             .extend(chunk.subs.into_iter().map(|(a, b)| (n(a), n(b))));
         for mut d in chunk.disjoint {
@@ -1355,6 +1461,8 @@ impl Axioms {
             + self.reflexive.capacity() * 4
             + self.ranges.capacity() * 8
             + self.data_ranges.capacity() * 8
+            + self.dt_ranges.capacity() * 8
+            + self.dt_disjoint.capacity() * 8
             + self.functional.capacity() * 4
             + self.keys.capacity() * 72
             + self.individuals.capacity() * 4
@@ -1379,6 +1487,8 @@ impl Axioms {
             + self.reflexive.capacity() * 4
             + self.ranges.capacity() * 8
             + self.data_ranges.capacity() * 8
+            + self.dt_ranges.capacity() * 8
+            + self.dt_disjoint.capacity() * 8
             + self.functional.capacity() * 4
             + self
                 .keys
@@ -1605,6 +1715,62 @@ fn normalize_axiom(
                 whole = false;
             }
         }
+        K::SubDataPropertyOf(a, b)
+            if (b.as_str() == vocab::OWL_BOTTOM_DATA_PROPERTY && it.dt_checker(a))
+                || (a.as_str() == vocab::OWL_TOP_DATA_PROPERTY && it.dt_checker(b)) =>
+        {
+            return Err(DT_TOP);
+        }
+        K::EquivalentDataProperties(ps)
+            if it.dt_run.is_some()
+                && ps.iter().any(|p| it.dt_checker(p))
+                && ps.iter().any(|p| {
+                    matches!(
+                        p.as_str(),
+                        vocab::OWL_TOP_DATA_PROPERTY | vocab::OWL_BOTTOM_DATA_PROPERTY
+                    )
+                }) =>
+        {
+            return Err(DT_TOP);
+        }
+        K::DataPropertyDomain(d, _)
+        | K::DataPropertyRange(d, _)
+        | K::FunctionalDataProperty(d)
+        | K::DataPropertyAssertion(d, _, _)
+        | K::NegativeDataPropertyAssertion(d, _, _)
+            if it.dt_run.is_some() && d.as_str() == vocab::OWL_TOP_DATA_PROPERTY =>
+        {
+            return Err(DT_TOP);
+        }
+        K::DataPropertyDomain(d, c) if it.dt_checker(d) => {
+            let c = ce(c, it, &mut partial)?;
+            let e = it.dt_node(d, true, 1, DtRanges::FULL);
+            out.subs.push((e, c));
+        }
+        K::DataPropertyRange(d, range) if it.dt_checker(d) => {
+            let x = it.dt_range(range)?;
+            let r = it.role(RoleName::Data(d.clone()));
+            out.dt_ranges.push((r, x));
+        }
+        K::FunctionalDataProperty(d) if it.dt_checker(d) => {
+            let r = it.role(RoleName::Data(d.clone()));
+            out.functional.push(r);
+        }
+        K::DataPropertyAssertion(d, a, v) if it.dt_checker(d) => {
+            let x = it.dt_literal(v)?;
+            let e = it.dt_node(d, true, 1, x);
+            let a = it.individual(a);
+            out.individuals.push(a);
+            out.subs.push((a, e));
+        }
+        // ¬d(a, v) is `{a} ⊑ ∀d.¬{v}`, which is `{a} ⊑ ≤ 0 d.{v}`
+        K::NegativeDataPropertyAssertion(d, a, v) if it.dt_checker(d) => {
+            let x = it.dt_literal(v)?;
+            let e = it.dt_node(d, false, 0, x);
+            let a = it.individual(a);
+            out.individuals.push(a);
+            out.subs.push((a, e));
+        }
         K::SubDataPropertyOf(a, b) => {
             let a = it.role(RoleName::Data(a.clone()));
             let b = it.role(RoleName::Data(b.clone()));
@@ -1647,7 +1813,14 @@ fn normalize_axiom(
         }
         // the definitions are read before the axioms, and the data ranges that name a
         // defined datatype stand for its definition
-        K::DatatypeDefinition(_, range) => {
+        K::DatatypeDefinition(d, range) => {
+            if it
+                .dt_run
+                .as_ref()
+                .is_some_and(|run| run.defs.map().get(d).map(std::sync::Arc::as_ref) != Some(range))
+            {
+                partial = Some("another definition of the same datatype supersedes this one");
+            }
             if it.ranges.range(range).1 {
                 partial = Some(OPAQUE);
             }
@@ -1655,6 +1828,10 @@ fn normalize_axiom(
         }
         K::HasKey(c, ops, dps) => {
             let class = ce(c, it, &mut partial)?;
+            // the keys read the lattice's values, not the checker's atoms
+            if dps.iter().any(|d| it.dt_checker(d)) {
+                partial = Some(DT_KEY);
+            }
             let mut objects = Vec::with_capacity(ops.len());
             for p in ops {
                 let Some(r) = object_role(p, it) else {
@@ -1778,6 +1955,13 @@ fn object_role(p: &ObjectPropertyExpression, it: &mut Interner) -> Option<Role> 
 /// mapping bounds it.
 const MAX_DEPTH: usize = 256;
 const NUMERIC_HALTED: &str = "numeric construction halted";
+/// A restriction over the top data property, or an axiom that makes a checker property
+/// universal or empty, in a run with checker components. The top data property
+/// reaches each component, which the checker reads one at a time.
+pub const DT_TOP: &str =
+    "a data restriction or axiom over the top or bottom data property beside the datatype checker";
+/// A key over a property of a checker component, whose values the worlds do not compare.
+pub const DT_KEY: &str = "a key over a data property that the datatype checker takes";
 
 /// The interned form of a class expression and, when the classifier may miss some of
 /// its consequences, why. An expression the classifier cannot represent is an error
@@ -1852,6 +2036,26 @@ pub fn class_expression(
         C::ObjectHasSelf(ObjectPropertyExpression::Property(p)) => {
             let r = it.object_role(p);
             (it.node(Node::SelfLoop(r)), None)
+        }
+        C::DataSomeValuesFrom(ps, _) | C::DataAllValuesFrom(ps, _)
+            if ps.len() == 1
+                && it.dt_run.is_some()
+                && ps[0].as_str() == vocab::OWL_TOP_DATA_PROPERTY =>
+        {
+            return Err(DT_TOP);
+        }
+        C::DataHasValue(d, _)
+            if it.dt_run.is_some() && d.as_str() == vocab::OWL_TOP_DATA_PROPERTY =>
+        {
+            return Err(DT_TOP);
+        }
+        C::DataSomeValuesFrom(ps, r) if ps.len() == 1 && it.dt_checker(&ps[0]) => {
+            let x = it.dt_range(r)?;
+            (it.dt_node(&ps[0], true, 1, x), None)
+        }
+        C::DataHasValue(d, l) if it.dt_checker(d) => {
+            let x = it.dt_literal(l)?;
+            (it.dt_node(d, true, 1, x), None)
         }
         C::DataSomeValuesFrom(ps, r) if ps.len() == 1 => {
             let role = it.role(RoleName::Data(ps[0].clone()));
@@ -1944,6 +2148,9 @@ pub struct Index {
     pub horn: Option<Box<super::horn::HornIx>>,
     /// what the rules of Tier D read, when the run takes disjunctive axioms
     pub dl: Option<Box<super::dl_rules::DlIx>>,
+    /// what the checker's rule reads, when the run has checker components, whose atoms
+    /// no other run's contexts read
+    pub dt: Option<Box<super::dt_sat::DtIx>>,
 }
 
 impl Index {
@@ -1982,6 +2189,7 @@ impl Index {
             tops: a_tops,
             horn: a_horn,
             dl: a_dl,
+            dt: a_dt,
         } = self;
         let Index {
             numeric_ledger: b_ledger,
@@ -2002,7 +2210,9 @@ impl Index {
             tops: b_tops,
             horn: b_horn,
             dl: b_dl,
+            dt: b_dt,
         } = expected;
+        assert_eq!(a_dt.is_some(), b_dt.is_some());
         match (a_ledger, b_ledger) {
             (None, None) => {}
             (Some(a), Some(b)) => {
@@ -2233,6 +2443,7 @@ impl Index {
         self.roles.data_range.iter().all(|r| r.is_none())
             && self.roles.functional.iter().all(|f| f.is_empty())
             && self.vals.is_empty()
+            && self.dt.is_none()
             && self.neg_data.is_empty()
             && self.universal.is_empty()
             && self.keys.is_empty()
@@ -2284,6 +2495,8 @@ impl Index {
             && sorted(&old.selfs) == sorted(&self.selfs)
             && old.vals.is_empty()
             && self.vals.is_empty()
+            && old.dt.is_none()
+            && self.dt.is_none()
             && old.neg_data.is_empty()
             && self.neg_data.is_empty()
             && old.universal.is_empty()
@@ -2432,6 +2645,7 @@ impl Index {
             + self.roles.bytes()
             + self.horn.as_ref().map_or(0, |h| h.bytes())
             + self.dl.as_ref().map_or(0, |d| d.bytes())
+            + self.dt.as_ref().map_or(0, |d| d.bytes())
     }
 
     /// Builds the index of normalized axioms. It may intern new expressions: the
@@ -2454,7 +2668,7 @@ impl Index {
         // the negative occurrences first, so that the data restrictions that occur
         // positively find every negative one they meet
         for &(a, _) in &ax.subs {
-            b.negative(a, it);
+            b.negative_as(a, it, true);
         }
         let mut disj: Vec<(Ex, u32)> = Vec::new();
         for (s, set) in ax.disjoint.iter().enumerate() {
@@ -2621,6 +2835,16 @@ impl Index {
                 told.push((TOP, BOTTOM));
             }
         }
+        // the told subsumers of the checker's body atoms re-evaluate the atoms'
+        // components, whichever of a subsumer and an atom a context gains first. The
+        // markers are interned before the Horn index, whose conjunctions' contexts take
+        // the ids above every expression
+        let run = it.dt_run.take();
+        let refire = match run.as_deref() {
+            Some(run) => dt_fires(it, run, &b, &mut told),
+            None => FxHashMap::default(),
+        };
+        it.dt_run = run;
         if let Some(h) = &ax.horn {
             // the run takes the Horn rules only when one can fire: without universals,
             // at-most restrictions, loops or role clashes the EL rules derive all
@@ -2659,7 +2883,7 @@ impl Index {
         ix.exist = group(&b.exist, |h| &mut h.exist, &mut ix.heads);
         ix.disjoint = group(&disj, |h| &mut h.disj, &mut ix.heads);
         ix.nominal_selfs = !b.selfs.is_empty() && !it.individuals.is_empty();
-        ix.selfs = b.selfs;
+        ix.selfs = std::mem::take(&mut b.selfs);
         ix.keys = ax.keys.clone();
         ix.nominals = it.nominals().collect();
         ix.anonymous = it.anonymous_nominals();
@@ -2675,8 +2899,296 @@ impl Index {
         if let Some(h) = ix.horn.as_mut() {
             h.dominate = plain;
         }
+        if ax.dl.is_none()
+            && let Some(run) = it.dt_run.as_deref()
+        {
+            ix.dt = Some(Box::new(dt_index(ax, it, run, &ix, &b, refire)?));
+        }
         Ok(ix)
     }
+}
+
+/// What the checker's rule reads: the roles of the checker components with their
+/// superroles, ranges and functionality, and the body atoms with their told subsumers,
+/// from the atoms this run's axioms reach, never from the interner's whole table.
+fn dt_index(
+    ax: &Axioms,
+    it: &Interner,
+    run: &DtRun,
+    ix: &Index,
+    b: &Builder,
+    refire: FxHashMap<Ex, Vec<u32>>,
+) -> Result<super::dt_sat::DtIx, Halt> {
+    use super::dt_sat::{Body, DtIx, RoleIx};
+    use super::dtcheck::range::{map_backing_bytes, map_buckets_for};
+    let checker_comp = |r: Role| -> Option<u32> {
+        match it.roles.get(r as usize) {
+            Some(RoleName::Data(d)) if run.comps.checker(d) => run.comps.component(d),
+            _ => None,
+        }
+    };
+    let mut n_checker_roles = 0usize;
+    let mut exact_supers = 0usize;
+    for r in 0..it.roles.len() {
+        let role = r as Role;
+        if let Some(comp) = checker_comp(role) {
+            n_checker_roles += 1;
+            if let Some(sup) = ix.roles.sup.get(r) {
+                exact_supers = exact_supers.saturating_add(
+                    sup.iter()
+                        .filter(|&&s| s != role && checker_comp(s) == Some(comp))
+                        .count(),
+                );
+            }
+        }
+    }
+    let exact_ranges = ax
+        .dt_ranges
+        .iter()
+        .filter(|&&(r, _)| checker_comp(r).is_some())
+        .count();
+    let exact_disjoint = ax
+        .dt_disjoint
+        .iter()
+        .filter(|&&(a, b)| checker_comp(a).is_some() && checker_comp(b).is_some())
+        .count();
+    let roles_backing = if n_checker_roles == 0 {
+        0
+    } else {
+        map_buckets_for(n_checker_roles)
+            .saturating_mul(std::mem::size_of::<(Role, RoleIx)>() + 1)
+            .saturating_add(16)
+    };
+    // Pushing `k` items into `Vec::new()` reaches capacity <= 4*k (including min-4 for k=1)
+    // and peak growth <= 4*k for every k >= 0; `supers` is preallocated to exact length.
+    let roles_est = roles_backing
+        .saturating_add(n_checker_roles.saturating_mul(std::mem::size_of::<Role>()))
+        .saturating_add(exact_supers.saturating_mul(std::mem::size_of::<Role>()))
+        .saturating_add(
+            exact_ranges
+                .saturating_mul(4)
+                .saturating_mul(std::mem::size_of::<super::dtcheck::range::Rid>()),
+        );
+    let told_bytes: usize = b
+        .dt_body
+        .iter()
+        .map(|&e| ix.told_of(ix.head(e)).len().saturating_mul(4))
+        .sum();
+    let ncomps = run.comps.len();
+    let body_est = ncomps
+        .saturating_mul(std::mem::size_of::<Vec<Body>>() + 1)
+        .saturating_add(
+            b.dt_body
+                .len()
+                .saturating_mul(4)
+                .saturating_mul(std::mem::size_of::<Body>()),
+        )
+        .saturating_add(told_bytes);
+    let disjoint_est = exact_disjoint.saturating_mul(std::mem::size_of::<(Role, Role)>());
+    let clone_est = std::mem::size_of::<DtIx>()
+        .saturating_add(
+            it.dt
+                .atoms
+                .len()
+                .saturating_mul(std::mem::size_of::<DtKey>()),
+        )
+        .saturating_add(
+            it.dt
+                .ranges()
+                .map_or_else(super::dtcheck::range::Ranges::default_bytes, |r| r.bytes()),
+        )
+        .saturating_add(run.comps.bytes());
+    let refire_est = map_backing_bytes(&refire).saturating_add(
+        refire
+            .values()
+            .map(|v| v.capacity().saturating_mul(std::mem::size_of::<u32>()))
+            .sum::<usize>(),
+    );
+    let total_est = roles_est
+        .saturating_add(body_est)
+        .saturating_add(disjoint_est)
+        .saturating_add(clone_est)
+        .saturating_add(refire_est)
+        .saturating_add(256);
+    let mut guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    if let Some(g) = guard.as_mut() {
+        g.grow(total_est).map_err(|e| match e {
+            super::Error::Memory { used, .. } => Halt::Memory(used),
+            _ => Halt::Stopped,
+        })?;
+    }
+    let mut roles: FxHashMap<Role, RoleIx> =
+        FxHashMap::with_capacity_and_hasher(n_checker_roles, Default::default());
+    for (r, name) in it.roles.iter().enumerate() {
+        if let RoleName::Data(d) = name
+            && run.comps.checker(d)
+            && let Some(comp) = run.comps.component(d)
+        {
+            roles.insert(
+                r as Role,
+                RoleIx {
+                    comp,
+                    supers: Vec::new(),
+                    ranges: Vec::new(),
+                    functional: false,
+                },
+            );
+        }
+    }
+    let ids: Vec<Role> = roles.keys().copied().collect();
+    for r in ids {
+        let comp = roles[&r].comp;
+        let sup_slice = ix
+            .roles
+            .sup
+            .get(r as usize)
+            .map_or(&[][..], |v| v.as_slice());
+        let nsup = sup_slice
+            .iter()
+            .filter(|&&s| s != r && roles.get(&s).is_some_and(|x| x.comp == comp))
+            .count();
+        let mut supers = Vec::with_capacity(nsup);
+        for &s in sup_slice {
+            if s != r && roles.get(&s).is_some_and(|x| x.comp == comp) {
+                supers.push(s);
+            }
+        }
+        if let Some(x) = roles.get_mut(&r) {
+            x.supers = supers;
+        }
+    }
+    for &(r, x) in &ax.dt_ranges {
+        if let Some(ri) = roles.get_mut(&r) {
+            ri.ranges.push(x);
+        }
+    }
+    for &r in &ax.functional {
+        if let Some(ri) = roles.get_mut(&r) {
+            ri.functional = true;
+        }
+    }
+    let mut body: Vec<Vec<Body>> = (0..ncomps).map(|_| Vec::new()).collect();
+    for &e in &b.dt_body {
+        let Node::DtAtom(id) = it.nodes[e as usize] else {
+            continue;
+        };
+        let key = it.dt.atoms[id as usize];
+        let Some(comp) = roles.get(&key.role).map(|r| r.comp) else {
+            continue;
+        };
+        // an atom the Horn rules also read as a filler has more than its told uses
+        let other = b.dt_other.contains(&e)
+            || ix
+                .horn
+                .as_ref()
+                .is_some_and(|h| h.is(e, super::horn::HornIx::FILLER));
+        // a told subsumer that has no marker for the atom's component, such as one the
+        // Horn index tells after the markers are made, would make the rule's answer
+        // depend on the order of the conclusions, so the atom has more than its told uses
+        let told: Option<Box<[Ex]>> = (!other)
+            .then(|| {
+                let raw = ix.told_of(ix.head(e));
+                let ntold = raw
+                    .iter()
+                    .filter(|&&t| !matches!(it.nodes[t as usize], Node::DtFire(_)))
+                    .count();
+                let mut v = Vec::with_capacity(ntold);
+                for &t in raw {
+                    if !matches!(it.nodes[t as usize], Node::DtFire(_)) {
+                        v.push(t);
+                    }
+                }
+                v.into_boxed_slice()
+            })
+            .filter(|ts| {
+                ts.iter()
+                    .all(|&t| t == TOP || refire.get(&t).is_some_and(|cs| cs.contains(&comp)))
+            });
+        debug_assert!(
+            key.at_least,
+            "a body atom of the Horn tier is an at-least atom"
+        );
+        body[comp as usize].push(Body { e, told });
+    }
+    let mut disjoint: Vec<(Role, Role)> = Vec::with_capacity(exact_disjoint);
+    for &(a, b) in &ax.dt_disjoint {
+        if roles.contains_key(&a) && roles.contains_key(&b) {
+            disjoint.push((a, b));
+        }
+    }
+    disjoint.sort_unstable();
+    disjoint.dedup();
+    let dt_ix = DtIx::new(
+        it.dt.atoms.clone(),
+        roles,
+        body,
+        disjoint,
+        it.dt.ranges().cloned().unwrap_or_default(),
+        run.comps.clone(),
+        refire,
+    );
+    let retained = dt_ix.bytes();
+    debug_assert!(
+        total_est >= retained,
+        "dt_index upfront estimate {total_est} must cover retained DtIx::bytes() {retained}"
+    );
+    if let Some(g) = guard {
+        g.commit_retained(retained).map_err(|e| match e {
+            super::Error::Memory { used, .. } => Halt::Memory(used),
+            _ => Halt::Stopped,
+        })?;
+    }
+    Ok(dt_ix)
+}
+
+/// The component of a checker atom, by its role, when the run's axioms reach it.
+fn dt_comp(it: &Interner, run: &DtRun, e: Ex) -> Option<u32> {
+    let Node::DtAtom(id) = it.nodes[e as usize] else {
+        return None;
+    };
+    let role = it.dt.atoms[id as usize].role;
+    match &it.roles[role as usize] {
+        RoleName::Data(d) if run.comps.checker(d) => run.comps.component(d),
+        _ => None,
+    }
+}
+
+/// Tells each told subsumer of a body atom whose occurrences are all told its
+/// [`Node::DtFire`] marker, and gives for each subsumer the components it re-evaluates.
+fn dt_fires(
+    it: &mut Interner,
+    run: &DtRun,
+    b: &Builder,
+    told: &mut Vec<(Ex, Ex)>,
+) -> FxHashMap<Ex, Vec<u32>> {
+    let mut by: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
+    for &(a, c) in told.iter().chain(&b.told) {
+        if c != TOP && matches!(it.nodes[a as usize], Node::DtAtom(_)) {
+            by.entry(a).or_default().push(c);
+        }
+    }
+    let mut refire: FxHashMap<Ex, Vec<u32>> = FxHashMap::default();
+    for &e in &b.dt_body {
+        if b.dt_other.contains(&e) {
+            continue;
+        }
+        let Some(comp) = dt_comp(it, run, e) else {
+            continue;
+        };
+        for &t in by.get(&e).map_or(&[][..], |v| v.as_slice()) {
+            let cs = refire.entry(t).or_default();
+            if !cs.contains(&comp) {
+                cs.push(comp);
+            }
+        }
+    }
+    let mut ts: Vec<Ex> = refire.keys().copied().collect();
+    ts.sort_unstable();
+    for t in ts {
+        let f = it.node(Node::DtFire(t));
+        told.push((t, f));
+    }
+    refire
 }
 
 /// The index of the Horn rules, built after the occurrences of the normalized axioms:
@@ -3254,14 +3766,31 @@ struct Builder {
     /// the existential restrictions `∃r.{b}` that are told of an individual, over a
     /// role with a range
     asserted: FxHashSet<Ex>,
+    /// the checker's atoms in negative positions, in the order first met
+    dt_body: Vec<Ex>,
+    /// those with an occurrence other than as the left side of a told subsumption
+    dt_other: FxHashSet<Ex>,
 }
 
 impl Builder {
     /// Registers a negative occurrence: the rules that build the expression from its
     /// parts.
     fn negative(&mut self, e: Ex, it: &Interner) {
-        let mut stack = vec![e];
+        self.negative_as(e, it, false)
+    }
+
+    /// [`Builder::negative`], where `told` says that `e` is the left side of a told
+    /// subsumption, the one occurrence of a checker atom whose truth the rule can leave
+    /// to the subsumer.
+    fn negative_as(&mut self, root: Ex, it: &Interner, told: bool) {
+        let mut stack = vec![root];
         while let Some(e) = stack.pop() {
+            // marked before the dedup, since every occurrence counts
+            if let Node::DtAtom(_) = it.nodes[e as usize]
+                && !(told && e == root)
+            {
+                self.dt_other.insert(e);
+            }
             if !self.neg_seen.insert(e) {
                 continue;
             }
@@ -3278,6 +3807,7 @@ impl Builder {
                 }
                 Node::SelfLoop(r) => self.selfs.push((r, e)),
                 Node::DataSome(r, v) => self.neg_data.push((r, v, e)),
+                Node::DtAtom(_) => self.dt_body.push(e),
                 _ => {}
             }
         }

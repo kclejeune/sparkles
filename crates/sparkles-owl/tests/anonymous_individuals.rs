@@ -5,7 +5,9 @@
 //! anonymous individual, so the entailments that do not name one are those of the
 //! ontology with a fresh named individual in its place.
 
-use sparkles_owl::classify::{Classification, Classifier, Excluded, Limits, Tier};
+use sparkles_owl::classify::{
+    Classification, Classifier, Consistency, Error, Excluded, Limits, Tier,
+};
 use sparkles_owl::model::*;
 use sparkles_owl::ofn_read;
 
@@ -106,6 +108,113 @@ fn a_data_assertion_about_an_anonymous_individual_counts() {
          NegativeDataPropertyAssertion(:d _:x \"1\"^^xsd:integer)",
     );
     assert!(!out.consistent);
+}
+
+const CHECKER_EL_POSITIVE: &str =
+    "DataPropertyRange(:d xsd:boolean) DataPropertyAssertion(:d SUBJECT \"abc\"^^xsd:string)";
+
+fn assert_checker_inconsistency(body: &str) {
+    let [named, anonymous] = [":fresh", "_:x"].map(|subject| {
+        let ax = axioms(&format!(
+            "SubClassOf(:A :B) {}",
+            body.replace("SUBJECT", subject)
+        ));
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads: 1,
+                strict: true,
+                ..Limits::default()
+            })
+            .unwrap_or_else(|err| panic!("strict checker classification for {subject}: {err:?}"));
+        assert_eq!(
+            out.consistency,
+            Consistency::Inconsistent,
+            "checker consistency for {subject}"
+        );
+        assert!(!out.consistent, "{subject}");
+        assert!(out.complete && out.complete_for_taken, "{subject}");
+        assert!(k.excluded().is_empty(), "{subject}: {:?}", k.excluded());
+        out.taxonomy
+    });
+    assert_eq!(named, anonymous);
+}
+
+#[test]
+fn checker_el_positive_assertion_conflicts_with_its_range() {
+    assert_checker_inconsistency(CHECKER_EL_POSITIVE);
+}
+
+#[test]
+fn checker_el_negative_assertion_conflicts_with_an_equal_horn_value() {
+    assert_checker_inconsistency(
+        "ClassAssertion(DataHasValue(:d \"3\"^^xsd:int) SUBJECT)
+         NegativeDataPropertyAssertion(:d SUBJECT \"3\"^^xsd:integer)",
+    );
+}
+
+#[test]
+fn checker_horn_positive_assertions_conflict_under_functionality() {
+    assert_checker_inconsistency(
+        "FunctionalDataProperty(:d)
+         DataPropertyAssertion(:d SUBJECT \"true\"^^xsd:boolean)
+         DataPropertyAssertion(:d SUBJECT \"false\"^^xsd:boolean)",
+    );
+}
+
+#[test]
+fn checker_horn_negative_assertion_conflicts_with_an_equal_el_value() {
+    assert_checker_inconsistency(
+        "ClassAssertion(DataHasValue(:d \"3\"^^xsd:integer) SUBJECT)
+         NegativeDataPropertyAssertion(:d SUBJECT \"3\"^^xsd:int)",
+    );
+}
+
+#[test]
+fn checker_equal_values_do_not_conflict_across_distinct_anonymous_subjects() {
+    let ax = axioms(
+        "ClassAssertion(DataHasValue(:d \"3\"^^xsd:integer) _:x)
+         NegativeDataPropertyAssertion(:d _:y \"3\"^^xsd:int)",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            threads: 1,
+            strict: true,
+            ..Limits::default()
+        })
+        .expect("strict checker classification for distinct anonymous subjects");
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.consistent);
+    assert!(out.complete && out.complete_for_taken);
+    assert!(k.excluded().is_empty(), "{:?}", k.excluded());
+}
+
+#[test]
+fn checker_range_is_excluded_in_el_only_mode() {
+    let ax = axioms(&CHECKER_EL_POSITIVE.replace("SUBJECT", "_:x"));
+    let limits = Limits {
+        threads: 1,
+        el_only: true,
+        ..Limits::default()
+    };
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&limits).unwrap();
+    assert!(out.consistent);
+    assert!(out.complete_for_taken && !out.complete);
+    let excluded = k.excluded();
+    assert_eq!(excluded.len(), 1, "{excluded:?}");
+    assert_eq!(excluded[0].axiom, ax[0].kind);
+
+    let mut k = Classifier::of(&ax);
+    assert_eq!(
+        k.classify(&Limits {
+            strict: true,
+            ..limits
+        })
+        .unwrap_err(),
+        Error::Incomplete(excluded)
+    );
 }
 
 #[test]
