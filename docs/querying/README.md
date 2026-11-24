@@ -291,8 +291,23 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   also merges on a leading variable that is certainly bound when the inputs share
   further variables. The two modes test a merge OPTIONAL's condition in separate
   implementations, eager execution over all of the matched pairs at once and the cursor
-  over each batch's pairs. In the measured OPTIONALs over `foaf:knows`, with about 2.5
-  pairs per left row, the cursor took 1.18 to 1.36 times the eager time.
+  over each batch's pairs. With `merge_pair_conditions` on by default, an eligible
+  single-key conditional merge OPTIONAL in the cursor tests the pairs decided by the
+  loaded right batch before copying output rows, when the query references no registered
+  scalar, aggregate or property function and the condition has no observable side effects,
+  volatility, timezone reads, SERVICE calls or unrecognized IRI functions inside EXISTS.
+  Crossing runs, left rows whose pairs exceed a batch, spooled runs and ineligible
+  conditions keep the post-copy test path. With `merge_pair_conditions` on, the merge's
+  own buffers can need more memory than with it off, by at most one output batch and the
+  scratch for testing its pairs. What evaluating the condition charges is outside that
+  bound and grows with the pairs in one test, which can be more with the switch on, so a
+  budget that the query only just fits with the switch off can refuse it. In forced
+  streaming on `atlas`, `merge_pair_conditions` reduced the measured OPTIONALs over
+  `foaf:knows` to 0.7375, 0.7720 and 0.9341 of the preceding base's time on `knows-fail`,
+  `knows-exists` and `knows-mixed` and 0.7491, 0.7880 and 0.9391 with the switch on
+  against off. Automatic execution still keeps an OPTIONAL whose condition holds an
+  EXISTS eager until the streamed-to-eager comparison and shared merge-order admission
+  finish.
 * Both modes group through one operator. COUNT, SUM, AVG, MIN, MAX, SAMPLE,
   GROUP_CONCAT, ARQ's variance and standard-deviation aggregates and their DISTINCT forms
   keep one running state per group, on one key or several and with expression arguments,

@@ -1,0 +1,6 @@
+query	mode	a_ms	b_ms	b/a	round_min	round_max	a_spread	b_spread	n	answers
+class-exists	streaming	29.27	29.30	1.001	0.990	1.008	0.014	0.015	144/144	same
+class-fail	streaming	75.99	75.97	1.000	0.999	1.003	0.007	0.010	144/144	same
+knows-exists	streaming	169.20	169.13	1.000	0.999	1.002	0.003	0.008	144/144	same
+knows-fail	streaming	197.08	197.10	1.000	0.998	1.003	0.004	0.005	144/144	same
+knows-mixed	streaming	646.63	646.06	0.999	0.989	1.010	0.020	0.013	144/144	same

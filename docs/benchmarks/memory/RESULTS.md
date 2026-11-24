@@ -340,6 +340,39 @@ except eager `optional-cond`, which was faster on B in every round. With
 their server processes gave a 95% interval that reaches 1.0 on every query except
 streamed `knows-fail`, 305.3 ms on B against 302.5 ms on A, which item 1143 holds.
 
+With `merge_pair_conditions` on by default, an eligible single-key conditional merge
+OPTIONAL in the cursor tests its condition on the pairs decided by the loaded right batch
+before copying output rows. A quiet comparison on `atlas` measured forced streaming at
+10.5M quads with one Rayon thread, `--result-cache-mb 0`, six A, B, B, A rounds and twelve
+timed requests per query per process, comparing preceding base `fc7b0bb9` against the
+integrated candidate merging `445a7f11` into `fc7b0bb9` (tree `40c5aaaf`), comparing the
+candidate with `merge_pair_conditions` off against on, and checking `fc7b0bb9` against
+itself. All five queries agreed across all three arms across 4,320 timings and 360 answer
+checks, with four distinct answer digests because `class-exists` and `class-fail` return
+the same answer. The [run record](records/conditional-merge-atlas-445a7f11/README.md)
+holds the samples, answers, queries and scripts.
+
+| Forced streaming, 10.5M quads, one Rayon thread | Base (ms) | Cand (ms) | Cand / base | Off (ms) | On (ms) | On / off |
+|---|---:|---:|---:|---:|---:|---:|
+| `class-exists` (control) | 29.37 | 29.47 | 1.0031 | 29.35 | 29.38 | 1.0009 |
+| `class-fail` | 76.12 | 76.71 | 1.0078 | 76.71 | 76.75 | 1.0005 |
+| `knows-exists` | 169.22 | 130.64 | **0.7720** | 165.74 | 130.60 | **0.7880** |
+| `knows-fail` | 197.15 | 145.41 | **0.7375** | 194.07 | 145.37 | **0.7491** |
+| `knows-mixed` | 646.09 | 603.50 | **0.9341** | 641.95 | 602.85 | **0.9391** |
+
+*Measured on `atlas`.*
+
+All three `knows-*` queries improved in every round of both comparisons. The same-binary
+check of `fc7b0bb9` against itself ranged from 0.9991 to 1.0008 across all five queries
+with every round-paired 95% interval containing 1, and `class-exists` included 1 in both
+comparisons. Streamed `class-fail` rose by 0.59 ms or 0.78% against `fc7b0bb9`, with a
+round-paired 95% ratio interval of 1.0060 to 1.0112, while its switch on/off ratio was
+1.0005 with an interval of 0.9976 to 1.0074; item 1143 holds that binary-level cost.
+Because all three arms used forced streaming, item 570 still requires measuring the
+streamed-to-eager ratio on all three `knows-*` queries and, after item 1105 gives
+admission and the cursor build one merge order, admitting eligible EXISTS conditions in
+automatic execution.
+
 Spill was measured with the cursor under a 64 MiB budget and the eager run unlimited, at
 10.5M, with the spill directory on the instance's local disk.
 

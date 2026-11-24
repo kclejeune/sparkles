@@ -159,8 +159,47 @@ impl Report {
 
 /// Why `e` may differ between two evaluations on the same input, if it may.
 pub fn impurity(e: &Expr) -> Option<&'static str> {
+    impurity_with(e, false, &|_| Some("EXISTS"))
+}
+
+/// Why the order or the grouping of the rows that `e` is evaluated on can be observed
+/// in a query on `ctx`, if it can. The query references a registered scalar, aggregate
+/// or property function anywhere, or `e` calls a function with side effects or one
+/// whose value differs from call to call, the system's timezone included. An EXISTS is
+/// passed over unless its pattern holds such a call or a SERVICE or references a
+/// registration, and the calls beside it are still found.
+///
+/// The registry answers for the registrations
+/// ([`super::extensions::ExtensionRegistry::references`]), which is what the planner
+/// resolves a callback from, so no shape of pattern has to be listed here for them.
+/// `ctx.calls_extensions` is that answer for the whole query, and the EXISTS patterns
+/// are asked again for a context that plans a pattern without that flag.
+pub fn observable(ctx: &Ctx, e: &Expr) -> Option<&'static str> {
+    if ctx.calls_extensions {
+        return Some("a registered extension in the query");
+    }
+    impurity_with(e, true, &|spec| {
+        (super::cursor::pattern_observable(spec.pattern())
+            || ctx
+                .extensions
+                .as_ref()
+                .is_some_and(|r| r.references(spec.pattern())))
+        .then_some("a call in an EXISTS")
+    })
+}
+
+/// [`impurity`] with the reason, if any, that `exists` gives for an EXISTS. With
+/// `live`, a function that reads the system's timezone counts as well: its value can
+/// change while a query runs, which the caches that [`impurity`] guards do not treat
+/// as a difference (roadmap item 1196).
+fn impurity_with(
+    e: &Expr,
+    live: bool,
+    exists: &dyn Fn(&super::expr::ExistsSpec) -> Option<&'static str>,
+) -> Option<&'static str> {
+    let impurity = |e: &Expr| impurity_with(e, live, exists);
     match e {
-        Expr::Exists(_) => Some("EXISTS"),
+        Expr::Exists(spec) => exists(spec),
         Expr::Call(Func::Registered(_), _) => Some("application function"),
         Expr::Call(Func::Ext(iri), args) => {
             let afn = iri.strip_prefix(super::expr::AFN);
@@ -169,6 +208,7 @@ pub fn impurity(e: &Expr) -> Option<&'static str> {
                 Some("struuid") => Some("STRUUID"),
                 Some("wait" | "print" | "execTime") => Some("side effects"),
                 Some("eval") => Some("dynamic function"),
+                Some("system-timezone" | "nowtz") if live => Some("the system's timezone"),
                 _ if iri.strip_prefix(super::expr::FN) == Some("apply") => Some("dynamic function"),
                 _ => args.iter().find_map(impurity),
             }
@@ -2159,6 +2199,230 @@ mod tests {
         // NOW is fixed for a query
         assert_eq!(impurity(&call(Function::Now, vec![])), None);
         assert_eq!(impurity(&call(Function::UCase, vec![Expr::Var(1)])), None);
+    }
+
+    /// An EXISTS does not hide the calls beside it, and counts itself only when its
+    /// pattern holds a call or a SERVICE that can be observed.
+    #[test]
+    fn observable_calls_are_found_beside_and_inside_an_exists() {
+        use super::super::expr::ExistsSpec;
+        use spargebra::algebra::{Expression, GraphPattern};
+        let store = crate::store::Store::in_memory(Default::default());
+        let ctx = Ctx::new(store.snapshot());
+        let observable = |e: &Expr| observable(&ctx, e);
+        let exists = |filter: Option<Expression>| {
+            let bgp = GraphPattern::Bgp {
+                patterns: Vec::new(),
+            };
+            let pattern = match filter {
+                Some(expr) => GraphPattern::Filter {
+                    expr,
+                    inner: Box::new(bgp),
+                },
+                None => bgp,
+            };
+            Expr::Exists(std::sync::Arc::new(ExistsSpec::new(
+                pattern,
+                super::super::plan::ActiveGraph::Default,
+                vec![0],
+                Vec::new(),
+            )))
+        };
+        let custom = |iri: &str| {
+            Expression::FunctionCall(
+                Function::Custom(oxrdf::NamedNode::new(iri).unwrap()),
+                vec![Expression::Variable(oxrdf::Variable::new("x").unwrap())],
+            )
+        };
+        let plain = exists(None);
+        assert_eq!(impurity(&plain), Some("EXISTS"));
+        assert_eq!(observable(&plain), None);
+        let rand = Expr::Call(Func::Builtin(Function::Rand), vec![]);
+        let beside = Expr::Or(Box::new(plain.clone()), Box::new(rand.clone()));
+        // The first impurity is the EXISTS, which hides the call from `impurity`.
+        assert_eq!(impurity(&beside), Some("EXISTS"));
+        assert_eq!(observable(&beside), Some("RAND"));
+        let apply = Expr::Call(
+            Func::Ext(format!("{}wait", super::super::expr::AFN)),
+            vec![],
+        );
+        let nested = Expr::If(
+            Box::new(plain.clone()),
+            Box::new(Expr::Var(0)),
+            Box::new(Expr::Not(Box::new(apply))),
+        );
+        assert_eq!(observable(&nested), Some("side effects"));
+        let inside = "a call in an EXISTS";
+        assert_eq!(observable(&exists(Some(custom("urn:f")))), Some(inside));
+        let rand_inside = Expression::FunctionCall(Function::Rand, Vec::new());
+        assert_eq!(observable(&exists(Some(rand_inside))), Some(inside));
+        // An EXISTS in the pattern of an EXISTS is searched too.
+        let deep = Expression::Exists(Box::new(GraphPattern::Filter {
+            expr: custom("urn:f"),
+            inner: Box::new(GraphPattern::Bgp {
+                patterns: Vec::new(),
+            }),
+        }));
+        assert_eq!(observable(&exists(Some(deep))), Some(inside));
+        let cast = custom("http://www.w3.org/2001/XMLSchema#integer");
+        assert_eq!(observable(&exists(Some(cast))), None);
+        // A name in the XSD namespace that is not a supported cast can be a registered
+        // scalar, so it counts.
+        let named = custom("http://www.w3.org/2001/XMLSchema#myCallback");
+        assert_eq!(observable(&exists(Some(named))), Some(inside));
+        let ucase = Expression::FunctionCall(Function::UCase, Vec::new());
+        assert_eq!(observable(&exists(Some(ucase))), None);
+        assert_eq!(observable(&Expr::Var(0)), None);
+        // The system's timezone can change between two calls. The caches do not treat
+        // that as a difference, and the order of the calls can still show it.
+        for name in ["system-timezone", "nowtz"] {
+            let zone = Expr::Call(
+                Func::Ext(format!("{}{name}", super::super::expr::AFN)),
+                vec![],
+            );
+            let beside = Expr::And(Box::new(Expr::Var(0)), Box::new(zone));
+            assert_eq!(impurity(&beside), None, "{name}");
+            assert_eq!(observable(&beside), Some("the system's timezone"), "{name}");
+        }
+    }
+
+    /// A query that references a registration is observable whatever the condition
+    /// holds, and so is an EXISTS whose pattern references one in a context that was
+    /// not configured for the query: a property function in a triple pattern, an
+    /// aggregate tested by a HAVING, a scalar under an XSD name, and each inside the
+    /// pattern of another EXISTS.
+    #[test]
+    fn a_registration_in_the_query_or_in_an_exists_is_observable() {
+        use super::super::expr::ExistsSpec;
+        use super::super::extensions::{
+            AggregateAccumulator, AggregateContext, AggregateDescriptor, ArgumentShape,
+            ExtensionRegistry, PropertyContext, PropertyDescriptor, PropertyFunction,
+            PropertyInput, PropertyPosition, PropertyStream, ScalarContext, ScalarDescriptor,
+            ScalarError, ScalarResult,
+        };
+        use spargebra::algebra::{Expression, GraphPattern};
+        const SCALAR: &str = "http://www.w3.org/2001/XMLSchema#myCallback";
+        struct Refuses;
+        impl PropertyFunction for Refuses {
+            fn open<'q>(
+                &self,
+                _: PropertyContext<'q>,
+                _: PropertyInput,
+            ) -> std::result::Result<Box<dyn PropertyStream + 'q>, ScalarError> {
+                Err(ScalarError::Expression)
+            }
+        }
+        let mut registry = ExtensionRegistry::builder();
+        registry
+            .register_scalar(
+                ScalarDescriptor::new(
+                    SCALAR,
+                    1..=1,
+                    |_: &ScalarContext<'_>, args: &[oxrdf::Term]| -> ScalarResult {
+                        Ok(args[0].clone())
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .register_aggregate(
+                AggregateDescriptor::new("urn:agg", 1, |_: &AggregateContext<'_>| {
+                    Err::<Box<dyn AggregateAccumulator>, _>(ScalarError::Expression)
+                })
+                .unwrap(),
+            )
+            .unwrap()
+            .register_property(
+                PropertyDescriptor::new(
+                    "urn:property",
+                    ArgumentShape::Term,
+                    ArgumentShape::Term,
+                    vec![PropertyPosition::Subject(0)],
+                    vec![PropertyPosition::Object(0)],
+                    Refuses,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let registry = registry.build();
+        let store = crate::store::Store::in_memory(Default::default());
+        // The pattern of the first EXISTS in the OPTIONAL condition of `query`.
+        fn condition(p: &GraphPattern) -> Option<&GraphPattern> {
+            match p {
+                GraphPattern::LeftJoin {
+                    expression: Some(Expression::Exists(inner)),
+                    ..
+                } => Some(inner),
+                GraphPattern::Project { inner, .. }
+                | GraphPattern::Distinct { inner }
+                | GraphPattern::Filter { inner, .. } => condition(inner),
+                _ => None,
+            }
+        }
+        let cases = [
+            ("no registration", "?r <urn:p> ?k FILTER(?k > 1)", false),
+            ("scalar", "?r <urn:p> ?k FILTER(<{SCALAR}>(?k))", true),
+            ("property function", "?r <urn:property> ?k", true),
+            (
+                "aggregate in HAVING",
+                "SELECT ?r { ?r <urn:p> ?k } GROUP BY ?r HAVING(AGG <urn:agg>(?k) > 1)",
+                true,
+            ),
+            (
+                "nested property function",
+                "?r <urn:p> ?k FILTER NOT EXISTS { ?k <urn:property> ?x }",
+                true,
+            ),
+            (
+                "nested aggregate",
+                "?r <urn:p> ?k FILTER EXISTS { SELECT ?k { ?k <urn:p> ?x } GROUP BY ?k \
+                 HAVING(AGG <urn:agg>(?x) > 1) }",
+                true,
+            ),
+        ];
+        for (name, exists, references) in cases {
+            let query = format!(
+                "SELECT * {{ ?key <urn:l> ?left OPTIONAL {{ ?key <urn:r> ?r FILTER EXISTS {{ {} }} }} }}",
+                exists.replace("{SCALAR}", SCALAR)
+            );
+            let parsed = super::super::parse_query(&query, None, &[]).unwrap();
+            let spargebra::Query::Select { pattern, .. } = &parsed else {
+                unreachable!()
+            };
+            let inner = condition(pattern).unwrap_or_else(|| panic!("{name}: {pattern:?}"));
+            let spec = |ctx: &Ctx| {
+                Expr::Exists(std::sync::Arc::new(ExistsSpec::new(
+                    inner.clone(),
+                    super::super::plan::ActiveGraph::Default,
+                    vec![ctx.var("r")],
+                    Vec::new(),
+                )))
+            };
+            // The query's own context: the flag covers every condition of the query.
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.extensions = Some(registry.clone());
+            ctx.configure_extensions(pattern);
+            assert_eq!(ctx.calls_extensions, references, "{name}");
+            assert_eq!(
+                observable(&ctx, &Expr::Var(0)).is_some(),
+                references,
+                "{name}"
+            );
+            assert_eq!(
+                observable(&ctx, &spec(&ctx)).is_some(),
+                references,
+                "{name}"
+            );
+            // A context with the registry that was not configured for this query.
+            let mut bare = Ctx::new(store.snapshot());
+            bare.extensions = Some(registry.clone());
+            assert_eq!(observable(&bare, &Expr::Var(0)), None, "{name}");
+            assert_eq!(
+                observable(&bare, &spec(&bare)).is_some(),
+                references,
+                "{name}"
+            );
+        }
     }
 
     #[test]

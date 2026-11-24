@@ -1845,6 +1845,12 @@ Unit tests in `cursor/merge.rs` compare the conditional merge with eager executi
 batch caps from one row up, with left rows whose failing pairs span batches, unmatched
 rows and a second shared variable, and hold its peak within the budget at small batch
 caps over long runs of failing pairs.
+They check that a deciding batch ends before it collects a second crossing run beside
+staged pairs and flushes its results when the deciding scratch has no room. The stop
+checks cover cancellation and deadlines on unmatched rows and periodic polling in the
+pair scan, column gathering, pair compaction and output copy. A 31-column fixture checks
+fixed memory budgets with constant and changing batch caps while the consumer holds
+or releases earlier output.
 `tests/exists_auto.rs` checks that automatic execution keeps the EXISTS conditions
 eager and that a strict cursor returns the eager answers at one, three and 1,000 rows
 per batch with the merge on and off. A `tests/query_cursor.rs` test checks that the
@@ -1906,3 +1912,47 @@ triples a streamed request runs 0.46 to 0.69 times the instructions it ran befor
 2% of the eager request's count in native JSON or below it, and the
 [X14 Outcome](X14-unified-executor/SPEC.md#the-streamed-response-cost) gives the counts
 and where the short queries' remaining cost lies.
+
+### Pair conditions in the streamed merge (2026-11-23)
+
+The cursor's conditional merge OPTIONAL now enables `merge_pair_conditions` by default.
+When the two sides share only the merge key, the query references no registered scalar,
+aggregate or property function, and the condition has no observable side effects,
+volatility, timezone reads, SERVICE calls or unrecognized IRI functions inside EXISTS,
+the merge tests the condition over the pairs of the left rows decided by the loaded right
+batch before copying output rows. Runs that cross a right batch, left rows whose pairs
+exceed a batch, spooled runs and ineligible conditions keep the post-copy test path.
+Testing pairs first can require more merge buffer memory than the post-copy path, bounded
+by at most one output batch and the scratch used to test its pairs, while the condition's
+own evaluation charge stays outside that bound and scales with the pairs tested together.
+Automatic execution still keeps an OPTIONAL whose condition holds an EXISTS eager.
+
+A quiet comparison on `atlas` measured forced streaming at 10.5M quads with one Rayon
+thread, `--result-cache-mb 0`, six A, B, B, A rounds and twelve timed requests per query
+per process across 4,320 timings and 360 answer checks. It compared preceding base
+`fc7b0bb9` against the clean merge of `445a7f11` into `fc7b0bb9` (tree `40c5aaaf`),
+compared the candidate with `merge_pair_conditions` off against on, and checked
+`fc7b0bb9` against itself. All five queries agreed across all arms, with four distinct
+answer digests because `class-exists` and `class-fail` return the same answer. Against
+`fc7b0bb9`, `knows-fail` ran in 0.7375 of base time (145.41 against 197.15 ms),
+`knows-exists` in 0.7720 (130.64 against 169.22 ms) and `knows-mixed` in 0.9341 (603.50
+against 646.09 ms). Comparing the candidate with the switch on against off gave 0.7491 on
+`knows-fail` (145.37 against 194.07 ms), 0.7880 on `knows-exists` (130.60 against
+165.74 ms) and 0.9391 on `knows-mixed` (602.85 against 641.95 ms), with all three queries
+improving in every round of both comparisons. The same-binary check ranged from 0.9991 to
+1.0008 across all five queries with every round-paired 95% interval containing 1, and the
+`class-exists` control included 1 in both comparisons. Streamed `class-fail` rose from
+76.12 ms to 76.71 ms against `fc7b0bb9`, an increase of 0.59 ms or 0.78% with a
+round-paired 95% interval of 1.0060 to 1.0112, while its switch on/off ratio was 1.0005
+with an interval of 0.9976 to 1.0074; item 1143 records that binary-level cost with a
+Batch 57 recovery deadline. The
+[memory results](../benchmarks/memory/RESULTS.md#automatic-exists) summarize the tables,
+and the [run record](../benchmarks/memory/records/conditional-merge-atlas-445a7f11/README.md)
+holds the raw samples, answers, queries and scripts.
+
+Item 570 remains partial because all three arms used forced streaming. Finishing it
+requires measuring the shipping candidate's streamed-to-eager ratio on all three
+`knows-*` queries against the under-1.10 threshold in every round, and then admitting
+eligible EXISTS conditions in automatic execution once item 1105 gives admission and the
+cursor build the same guaranteed merge order. Item 1081 remains open for nested EXISTS
+beyond four levels.
