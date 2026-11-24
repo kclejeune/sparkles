@@ -136,6 +136,16 @@ pub(crate) fn el_first(ax: &AxiomKind) -> Option<Broken> {
     }
 }
 
+/// Whether `ax` breaks any rule of [`el_axiom_with_anonymous`], decided without
+/// allocating and polling `poll` every `poll_step` AST nodes.
+pub(crate) fn el_breaks_with_anonymous_polled<E>(
+    ax: &AxiomKind,
+    poll_step: usize,
+    poll: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    el::breaks_with_anonymous_polled(ax, poll_step, poll)
+}
+
 /// Checks axioms one at a time against several profiles. The ontology given to
 /// [`new`](Checker::new) supplies the typing, the property hierarchy and the datatype
 /// definitions that the global restrictions need; the axioms passed to
@@ -558,8 +568,17 @@ mod el_first_tests {
             1 => datatype().prop_map(|d| K::Declaration(Entity::Datatype(d))),
             1 => (0..2u8).prop_map(|c| K::Declaration(Entity::Class(Class::new(format!("urn:c{c}"))))),
             1 => (dp(), data_range()).prop_map(|(p, r)| K::DataPropertyRange(p, r)),
+            1 => (datatype(), data_range()).prop_map(|(d, r)| K::DatatypeDefinition(d, r)),
             1 => (dp(), class_expression()).prop_map(|(p, c)| K::DataPropertyDomain(p, c)),
             1 => (dp(), ind(), literal()).prop_map(|(p, a, l)| K::DataPropertyAssertion(p, a, l)),
+            1 => (dp(), ind(), literal()).prop_map(|(p, a, l)| K::NegativeDataPropertyAssertion(p, a, l)),
+            1 => literal().prop_map(|l| {
+                K::AnnotationAssertion(
+                    AnnotationProperty::new("urn:ap"),
+                    AnnotationSubject::Iri(Iri::new("urn:s").unwrap()),
+                    AnnotationValue::Literal(l),
+                )
+            }),
             1 => (class_expression(), prop::collection::btree_set(ope(), 0..2))
                 .prop_map(|(c, ops)| K::HasKey(c, ops, BTreeSet::new())),
         ]
@@ -578,6 +597,8 @@ mod el_first_tests {
             }
             let all = el_axiom_with_anonymous(&k);
             let first = el_first(&k);
+            let breaks = el_breaks_with_anonymous_polled(&k, 1, &mut || Ok::<(), ()>(())).unwrap();
+            prop_assert_eq!(breaks, !all.is_empty());
             prop_assert_eq!(
                 first.map(|b| (b.rule, b.message)),
                 all.into_iter().next().map(|b| (b.rule, b.message))

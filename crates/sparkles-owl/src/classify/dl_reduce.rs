@@ -154,11 +154,13 @@ impl Reduction {
             if i.is_multiple_of(super::RANGE_POLL_STEP) {
                 budget.poll()?;
             }
-            if super::logical(k) && super::el_break(k).is_some() {
+            if super::logical(k) && super::el_breaks_polled(k, budget)? {
                 if !seen.contains(k) {
                     super::set_admit(&mut seen, budget)?;
                     seen.insert(k);
-                    out.add(dl::shape(k));
+                    out.add(dl::shape_polled(k, super::RANGE_POLL_STEP, &mut || {
+                        budget.poll()
+                    })?);
                 }
             } else if matches!(
                 k,

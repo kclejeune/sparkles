@@ -1365,6 +1365,14 @@ fn el_break(ax: &AxiomKind) -> Option<profiles::Broken> {
     profiles::el_first(ax)
 }
 
+/// Allocation-free, cooperatively polled equivalent of `el_break(ax).is_some()`.
+pub(super) fn el_breaks_polled(ax: &AxiomKind, budget: &impl ScratchBudget) -> Result<bool, Error> {
+    if index::top_inclusion(ax) {
+        return Ok(false);
+    }
+    profiles::el_breaks_with_anonymous_polled(ax, RANGE_POLL_STEP, &mut || budget.poll())
+}
+
 /// The bytes of scratch that [`interchangeable`] counts for each class assertion it
 /// reads: the entry of its label and, at most, that of its class.
 const LABEL_BYTES: usize = 96;
@@ -2582,6 +2590,7 @@ impl Saturation {
         // the range restriction of OWL 2 EL (Profiles §2.2.6): a chain's superproperty
         // has no range that its last property lacks
         let mut named_domain_candidate = false;
+        let mut chain_ranges_bytes = 0usize;
         if !chains.is_empty() {
             let budget = self
                 .interner
@@ -2589,34 +2598,71 @@ impl Saturation {
                 .budget
                 .clone()
                 .expect("build installs a numeric budget");
+            let base = self
+                .interner
+                .bytes()
+                .checked_add(ax.bytes())
+                .ok_or(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: usize::MAX,
+                })?;
+            budget.refresh_base(base)?;
             let mut scratch = BuildScratch {
                 guard: budget.scratch_guard(),
                 limits,
             };
             let missing =
                 check_chain_ranges(axioms, |i, _| is_outside[i], &chains, true, &mut scratch)?;
-            drop(scratch);
-            for (k, miss) in chains.into_iter().zip(missing) {
-                if let Some((missing, sup, last)) = miss {
+            let mut chain_ranges_msg_bytes = 0usize;
+            for (i, (&k, miss)) in chains.iter().zip(missing.iter()).enumerate() {
+                if i.is_multiple_of(RANGE_POLL_STEP) {
+                    poll(limits)?;
+                }
+                if let Some((missing_ce, sup, last)) = miss {
                     index::intern_signature(k, &mut self.interner);
-                    chain_ranges.push((
-                        k,
-                        format!(
-                            "the range {missing} of <{sup}> is not a range of the chain's last property <{last}> in OWL 2 EL"
-                        ),
-                    ));
-                    continue;
-                }
-                if let Some(why) = index::normalize(k, &mut self.interner, &mut ax) {
-                    if matches!(attempt, AttemptProvenance::OriginalDefault)
-                        && !named_domain_candidate
-                    {
-                        named_domain_candidate = top_chain::shape(k, why).is_some();
+                    let msg = format!(
+                        "the range {missing_ce} of <{sup}> is not a range of the chain's last property <{last}> in OWL 2 EL"
+                    );
+                    chain_ranges_msg_bytes = chain_ranges_msg_bytes.saturating_add(msg.capacity());
+                    chain_ranges.push((k, msg));
+                } else {
+                    if let Some(why) = index::normalize(k, &mut self.interner, &mut ax) {
+                        if matches!(attempt, AttemptProvenance::OriginalDefault)
+                            && !named_domain_candidate
+                        {
+                            named_domain_candidate = top_chain::shape(k, why).is_some();
+                        }
+                        partial.insert(k, why);
                     }
-                    partial.insert(k, why);
+                    self.interner.ranges.check()?;
                 }
-                self.interner.ranges.check()?;
+                chain_ranges_bytes = chain_ranges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(&AxiomKind, String)>())
+                    .saturating_add(chain_ranges_msg_bytes);
+                let live = self
+                    .interner
+                    .bytes()
+                    .checked_add(ax.rough_bytes())
+                    .and_then(|n| n.checked_add(chain_ranges_bytes))
+                    .ok_or(Error::Memory {
+                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                        used: usize::MAX,
+                    })?;
+                budget.refresh_base(live)?;
             }
+            let live = self
+                .interner
+                .bytes()
+                .checked_add(ax.bytes())
+                .and_then(|n| n.checked_add(chain_ranges_bytes))
+                .ok_or(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: usize::MAX,
+                })?;
+            budget.refresh_base(live)?;
+            drop(missing);
+            drop(scratch);
         }
         // what each axiom outside OWL 2 EL needs, counted once however often it occurs; a
         // chain whose superproperty has a range its last property lacks is Horn
@@ -2735,7 +2781,16 @@ impl Saturation {
         }
         ax.classes.extend(self.interner.met_classes());
         if let Some(b) = &self.interner.ranges.budget {
-            b.baseline(self.interner.bytes() + ax.bytes())?;
+            let live = self
+                .interner
+                .bytes()
+                .checked_add(ax.bytes())
+                .and_then(|n| n.checked_add(chain_ranges_bytes))
+                .ok_or(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: usize::MAX,
+                })?;
+            b.baseline(live)?;
         }
         if cfg!(debug_assertions)
             && let Some(run) = &self.interner.dt_run
@@ -2901,6 +2956,10 @@ impl Saturation {
                     self.reduced = true;
                     drop(all);
                     drop(red);
+                    // Rewritten axioms are no longer live; keep the earlier rewrite peak
+                    // and paid high-water mark intact while post-run scratch admits against
+                    // the live retained baseline.
+                    r.2.memory = r.2.memory.saturating_sub(red_bytes);
                     r.2.added = self.source_len.unwrap_or(axioms.len());
                     let charge = limits
                         .charge
@@ -2916,8 +2975,11 @@ impl Saturation {
                         check_stop: self.partial.is_none(),
                         scratch: 0,
                     };
+                    #[cfg(test)]
+                    admission_test::hit(admission_test::Point::PostRunStart);
                     match dl_reduce::Reduction::outside_el(axioms, &self.excluded, &mut scratch) {
                         Ok(outside_el) => {
+                            self.last_paid = paid;
                             r.2.outside_el = outside_el;
                             r.2.tier = r.2.outside_el.tier();
                             return Ok(r);
@@ -5309,13 +5371,26 @@ pub(super) fn vec_reserve<T>(
     }
     let old_cap = v.capacity();
     let new_cap = old_cap.saturating_mul(2).max(need).max(8);
-    let add_bytes = new_cap
-        .saturating_sub(old_cap)
+    let old_bytes = old_cap
         .checked_mul(std::mem::size_of::<T>())
         .ok_or_else(|| budget.overflow())?;
-    budget.grow(add_bytes)?;
+    let new_bytes = new_cap
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| budget.overflow())?;
+    budget.grow(new_bytes)?;
     v.reserve_exact(new_cap - v.len());
+    budget.release(old_bytes);
     Ok(())
+}
+
+fn hash_table_bytes(cap: usize, entry_bytes: usize) -> Option<usize> {
+    cap.checked_mul(entry_bytes)
+        .and_then(|b| b.checked_add(b / 7))
+}
+
+fn set_bytes<K>(s: &FxHashSet<K>) -> usize {
+    let entry_bytes = std::mem::size_of::<K>() + 1;
+    hash_table_bytes(s.capacity(), entry_bytes).unwrap_or(usize::MAX)
 }
 
 pub(super) fn map_admit<K: Eq + std::hash::Hash, V>(
@@ -5326,15 +5401,16 @@ pub(super) fn map_admit<K: Eq + std::hash::Hash, V>(
         return Ok(());
     }
     let old_cap = m.capacity();
-    let next_cap = old_cap.saturating_mul(2).max(14);
-    let add_slots = next_cap.saturating_sub(old_cap);
+    let next_cap = old_cap
+        .checked_mul(2)
+        .ok_or_else(|| budget.overflow())?
+        .max(14);
     let entry_bytes = std::mem::size_of::<(K, V)>() + 1;
-    let add_bytes = add_slots
-        .checked_mul(entry_bytes)
-        .and_then(|b| b.checked_add(b / 7))
-        .ok_or_else(|| budget.overflow())?;
-    budget.grow(add_bytes)?;
+    let old_bytes = hash_table_bytes(old_cap, entry_bytes).ok_or_else(|| budget.overflow())?;
+    let new_bytes = hash_table_bytes(next_cap, entry_bytes).ok_or_else(|| budget.overflow())?;
+    budget.grow(new_bytes)?;
     m.reserve(next_cap - m.len());
+    budget.release(old_bytes);
     Ok(())
 }
 
@@ -5346,15 +5422,73 @@ pub(super) fn set_admit<K: Eq + std::hash::Hash>(
         return Ok(());
     }
     let old_cap = s.capacity();
-    let next_cap = old_cap.saturating_mul(2).max(14);
-    let add_slots = next_cap.saturating_sub(old_cap);
+    let next_cap = old_cap
+        .checked_mul(2)
+        .ok_or_else(|| budget.overflow())?
+        .max(14);
     let entry_bytes = std::mem::size_of::<K>() + 1;
-    let add_bytes = add_slots
-        .checked_mul(entry_bytes)
-        .and_then(|b| b.checked_add(b / 7))
-        .ok_or_else(|| budget.overflow())?;
-    budget.grow(add_bytes)?;
+    let old_bytes = hash_table_bytes(old_cap, entry_bytes).ok_or_else(|| budget.overflow())?;
+    let new_bytes = hash_table_bytes(next_cap, entry_bytes).ok_or_else(|| budget.overflow())?;
+    budget.grow(new_bytes)?;
     s.reserve(next_cap - s.len());
+    budget.release(old_bytes);
+    Ok(())
+}
+
+/// In-place, zero-allocation heapsort on `(last, sup, idx)` entries that polls `budget`
+/// every [`RANGE_POLL_STEP`] sift iterations.
+fn sort_entries_polled<'a>(
+    entries: &mut [(&'a str, &'a str, usize)],
+    steps: &mut usize,
+    budget: &impl ScratchBudget,
+) -> Result<(), Error> {
+    let n = entries.len();
+    if n <= 1 {
+        return Ok(());
+    }
+    let cmp =
+        |a: &(&str, &str, usize), b: &(&str, &str, usize)| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1));
+    let sift_down = |entries: &mut [(&'a str, &'a str, usize)],
+                     mut root: usize,
+                     end: usize,
+                     steps: &mut usize|
+     -> Result<(), Error> {
+        loop {
+            let left = 2 * root + 1;
+            if left >= end {
+                break;
+            }
+            *steps += 1;
+            if (*steps).is_multiple_of(RANGE_POLL_STEP) {
+                budget.poll()?;
+            }
+            let mut swap = root;
+            if cmp(&entries[swap], &entries[left]) == std::cmp::Ordering::Less {
+                swap = left;
+            }
+            let right = left + 1;
+            if right < end && cmp(&entries[swap], &entries[right]) == std::cmp::Ordering::Less {
+                swap = right;
+            }
+            if swap == root {
+                break;
+            }
+            entries.swap(root, swap);
+            root = swap;
+        }
+        Ok(())
+    };
+    let mut start = n / 2;
+    while start > 0 {
+        start -= 1;
+        sift_down(entries, start, n, steps)?;
+    }
+    let mut end = n;
+    while end > 1 {
+        end -= 1;
+        entries.swap(0, end);
+        sift_down(entries, 0, end, steps)?;
+    }
     Ok(())
 }
 
@@ -5548,6 +5682,10 @@ pub(super) fn check_chain_ranges<'a>(
     let mut stack: Vec<&'a str> = Vec::new();
     let mut steps = 0usize;
     for &(last, sup, _) in &entries {
+        steps += 1;
+        if steps.is_multiple_of(RANGE_POLL_STEP) {
+            work.poll()?;
+        }
         for seed in [last, sup] {
             if !needed.contains(seed) {
                 set_admit(&mut needed, &mut work)?;
@@ -5594,12 +5732,18 @@ pub(super) fn check_chain_ranges<'a>(
     if direct.is_empty() {
         return Ok(out);
     }
+    let needed_bytes = set_bytes(&needed);
     drop(needed);
+    work.release(needed_bytes);
 
     // Group candidate chains by `(last, sup)` so each `last` computes its inherited
     // ranges once and each `(last, sup)` pair is checked once without materializing a
     // full property x range table.
-    entries.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+    #[cfg(test)]
+    admission_test::hit(admission_test::Point::OriginalRangeSort);
+    sort_entries_polled(&mut entries, &mut steps, &work)?;
+    #[cfg(test)]
+    admission_test::hit(admission_test::Point::OriginalRangeAfterSort);
     let mut last_supers: FxHashSet<&'a str> = FxHashSet::default();
     let mut have_ranges: FxHashSet<&'a ClassExpression> = FxHashSet::default();
     let mut sup_seen: FxHashSet<&'a str> = FxHashSet::default();
@@ -5608,10 +5752,18 @@ pub(super) fn check_chain_ranges<'a>(
     while pos < entries.len() {
         work.poll()?;
         let last = entries[pos].0;
+        #[cfg(test)]
+        admission_test::hit(admission_test::Point::OriginalRangeGroup);
         let mut last_end = pos + 1;
         while last_end < entries.len() && entries[last_end].0 == last {
+            steps += 1;
+            if steps.is_multiple_of(RANGE_POLL_STEP) {
+                work.poll()?;
+            }
             last_end += 1;
         }
+        #[cfg(test)]
+        admission_test::hit(admission_test::Point::OriginalRangeAfterGroup);
 
         last_supers.clear();
         have_ranges.clear();
@@ -5659,6 +5811,10 @@ pub(super) fn check_chain_ranges<'a>(
             let sup = entries[sub].1;
             let mut sub_end = sub + 1;
             while sub_end < last_end && entries[sub_end].1 == sup {
+                steps += 1;
+                if steps.is_multiple_of(RANGE_POLL_STEP) {
+                    work.poll()?;
+                }
                 sub_end += 1;
             }
 
@@ -5708,9 +5864,17 @@ pub(super) fn check_chain_ranges<'a>(
             }
 
             if let Some(c) = missing {
+                #[cfg(test)]
+                admission_test::hit(admission_test::Point::OriginalRangeFill);
                 for &(_, _, idx) in &entries[sub..sub_end] {
+                    steps += 1;
+                    if steps.is_multiple_of(RANGE_POLL_STEP) {
+                        work.poll()?;
+                    }
                     out[idx] = Some((c, sup, last));
                 }
+                #[cfg(test)]
+                admission_test::hit(admission_test::Point::OriginalRangeAfterFill);
             }
             sub = sub_end;
         }
@@ -8419,10 +8583,13 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let trigger = cancelled.clone();
         let check = cancelled.clone();
+        let hit_cancel_scan = Arc::new(AtomicBool::new(false));
+        let hit_cancel_scan_flag = hit_cancel_scan.clone();
         let mut sat = Saturation::new();
         let res = admission_test::with_hook(
             move |pt| {
                 if pt == admission_test::Point::OriginalRangeScan {
+                    hit_cancel_scan_flag.store(true, Ordering::Relaxed);
                     trigger.store(true, Ordering::Relaxed);
                 }
             },
@@ -8438,6 +8605,10 @@ mod tests {
             },
         );
         assert!(matches!(res, Err(Error::Cancelled)), "{res:?}");
+        assert!(
+            hit_cancel_scan.load(Ordering::Relaxed),
+            "expected cancellation to trigger at OriginalRangeScan"
+        );
         assert!(sat.reduced);
         if let Some(desc) = sat.describe(&c_cls) {
             for cls in desc
@@ -8463,10 +8634,13 @@ mod tests {
 
         // 2. Deadline expiring during the original range scan stops with Timeout.
         let mut sat_timeout = Saturation::new();
-        let deadline = Instant::now() + Duration::from_millis(60);
+        let hit_timeout_scan = Arc::new(AtomicBool::new(false));
+        let hit_timeout_scan_flag = hit_timeout_scan.clone();
+        let deadline = Instant::now() + Duration::from_millis(250);
         let res = admission_test::with_hook(
             move |pt| {
                 if pt == admission_test::Point::OriginalRangeScan {
+                    hit_timeout_scan_flag.store(true, Ordering::Relaxed);
                     while Instant::now() < deadline {
                         std::thread::sleep(Duration::from_millis(2));
                     }
@@ -8484,12 +8658,70 @@ mod tests {
             },
         );
         assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
+        assert!(
+            hit_timeout_scan.load(Ordering::Relaxed),
+            "expected deadline to trigger at OriginalRangeScan"
+        );
         assert!(sat_timeout.reduced);
         let after_rooted = sat_timeout.classify(&kinds, None, &rooted).unwrap();
         assert_eq!(after_rooted.taxonomy, baseline.taxonomy);
         assert_eq!(after_rooted.stats.outside_el, baseline.stats.outside_el);
         assert_eq!(after_rooted.stats.outside_el.horn, 1);
         assert_eq!(after_rooted.stats.outside_el.taken, 2);
+
+        // 3. Pool refusal specifically at an admission inside OriginalRangeScan.
+        let mut wide_ofn = String::from(
+            "Prefix(:=<http://ex.org/>)
+             Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+             Ontology(
+                 DisjointUnion(:C
+                     ObjectSomeValuesFrom(:r owl:Thing)
+                     ObjectSomeValuesFrom(:r ObjectMinCardinality(0 owl:topObjectProperty :X)))
+                 SubObjectPropertyOf(ObjectPropertyChain(:p :q) :s)
+                 SubObjectPropertyOf(:s :chain0)\n",
+        );
+        for i in 0..3999 {
+            wide_ofn.push_str(&format!("SubObjectPropertyOf(:chain{i} :chain{})\n", i + 1));
+        }
+        wide_ofn.push_str("SubObjectPropertyOf(:chain3999 owl:topObjectProperty)\n");
+        wide_ofn.push_str("ObjectPropertyRange(owl:topObjectProperty :T0)\n");
+        wide_ofn.push(')');
+        let wide_doc = crate::ofn_read::parse(&wide_ofn).unwrap();
+        let wide_kinds: Vec<&AxiomKind> = wide_doc.axioms.iter().map(|a| &a.kind).collect();
+        let in_scan = Arc::new(AtomicBool::new(false));
+        let in_scan_hook = in_scan.clone();
+        let in_scan_charge = in_scan.clone();
+        let refused_in_scan = Arc::new(AtomicBool::new(false));
+        let refused_in_scan_flag = refused_in_scan.clone();
+        let mut sat_scan_refuse = Saturation::new();
+        let res = admission_test::with_hook(
+            move |pt| {
+                if pt == admission_test::Point::OriginalRangeScan {
+                    in_scan_hook.store(true, Ordering::Relaxed);
+                }
+            },
+            || {
+                sat_scan_refuse.classify(
+                    &wide_kinds,
+                    None,
+                    &Limits {
+                        charge: Some(Arc::new(move |_| {
+                            if in_scan_charge.load(Ordering::Relaxed) {
+                                refused_in_scan_flag.store(true, Ordering::Relaxed);
+                                return false;
+                            }
+                            true
+                        })),
+                        ..rooted.clone()
+                    },
+                )
+            },
+        );
+        assert!(matches!(res, Err(Error::Memory { .. })), "{res:?}");
+        assert!(
+            in_scan.load(Ordering::Relaxed) && refused_in_scan.load(Ordering::Relaxed),
+            "expected pool refusal specifically inside OriginalRangeScan"
+        );
     }
 
     #[test]
@@ -8583,6 +8815,702 @@ mod tests {
         assert_eq!(expr, &ClassExpression::Class(Class::new("http://ex.org/A")));
         assert_eq!(sup, "http://ex.org/s");
         assert_eq!(last, "http://ex.org/q");
+    }
+
+    #[test]
+    fn map_and_set_admit_cover_resize_overlap() {
+        let est = |cap: usize, entry: usize| {
+            let b = cap * entry;
+            b + b / 7
+        };
+        let map_entry = std::mem::size_of::<(&str, usize)>() + 1;
+        let old_map = est(14, map_entry);
+        let new_map = est(28, map_entry);
+        let overlap_map = old_map + new_map;
+        let mid_map = new_map + old_map / 2;
+
+        // Cap admitting the replacement table alone must refuse the 14 -> 28 overlap.
+        let mut m: FxHashMap<&str, usize> = FxHashMap::default();
+        let limits = Limits {
+            max_memory: Some(mid_map),
+            ..Limits::default()
+        };
+        let mut peak = 0usize;
+        let mut paid = 0usize;
+        let mut scratch = PostRunScratch {
+            base: 0,
+            peak: &mut peak,
+            paid: &mut paid,
+            limits: &limits,
+            charge: None,
+            check_stop: true,
+            scratch: 0,
+        };
+        let keys: Vec<String> = (0..15).map(|i| format!("k{i}")).collect();
+        for (i, k) in keys.iter().take(14).enumerate() {
+            map_admit(&mut m, &mut scratch).unwrap();
+            m.insert(k.as_str(), i);
+        }
+        assert_eq!(m.capacity(), 14);
+        assert_eq!(scratch.scratch, old_map);
+        let refused = map_admit(&mut m, &mut scratch);
+        assert!(
+            matches!(refused, Err(Error::Memory { .. })),
+            "expected resize overlap refusal under cap={mid_map}, got {refused:?}"
+        );
+        assert_eq!(m.capacity(), 14);
+
+        // Cap covering old + replacement succeeds and releases the old table afterward.
+        let limits_ok = Limits {
+            max_memory: Some(overlap_map),
+            ..Limits::default()
+        };
+        let mut peak_ok = 0usize;
+        let mut paid_ok = 0usize;
+        let mut scratch_ok = PostRunScratch {
+            base: 0,
+            peak: &mut peak_ok,
+            paid: &mut paid_ok,
+            limits: &limits_ok,
+            charge: None,
+            check_stop: true,
+            scratch: 0,
+        };
+        let mut m2: FxHashMap<&str, usize> = FxHashMap::default();
+        for (i, k) in keys.iter().enumerate() {
+            map_admit(&mut m2, &mut scratch_ok).unwrap();
+            m2.insert(k.as_str(), i);
+        }
+        assert_eq!(m2.capacity(), 28);
+        assert_eq!(scratch_ok.scratch, new_map);
+        assert_eq!(peak_ok, overlap_map);
+
+        // Same 14 -> 28 overlap check for set_admit.
+        let set_entry = std::mem::size_of::<&str>() + 1;
+        let old_set = est(14, set_entry);
+        let new_set = est(28, set_entry);
+        let overlap_set = old_set + new_set;
+        let mid_set = new_set + old_set / 2;
+        let limits_set = Limits {
+            max_memory: Some(mid_set),
+            ..Limits::default()
+        };
+        let mut peak_s = 0usize;
+        let mut paid_s = 0usize;
+        let mut scratch_s = PostRunScratch {
+            base: 0,
+            peak: &mut peak_s,
+            paid: &mut paid_s,
+            limits: &limits_set,
+            charge: None,
+            check_stop: true,
+            scratch: 0,
+        };
+        let mut s: FxHashSet<&str> = FxHashSet::default();
+        for k in keys.iter().take(14) {
+            set_admit(&mut s, &mut scratch_s).unwrap();
+            s.insert(k.as_str());
+        }
+        assert_eq!(s.capacity(), 14);
+        assert!(matches!(
+            set_admit(&mut s, &mut scratch_s),
+            Err(Error::Memory { .. })
+        ));
+        let limits_set_ok = Limits {
+            max_memory: Some(overlap_set),
+            ..Limits::default()
+        };
+        let mut peak_s2 = 0usize;
+        let mut paid_s2 = 0usize;
+        let mut scratch_s2 = PostRunScratch {
+            base: 0,
+            peak: &mut peak_s2,
+            paid: &mut paid_s2,
+            limits: &limits_set_ok,
+            charge: None,
+            check_stop: true,
+            scratch: 0,
+        };
+        let mut s2: FxHashSet<&str> = FxHashSet::default();
+        for k in &keys {
+            set_admit(&mut s2, &mut scratch_s2).unwrap();
+            s2.insert(k.as_str());
+        }
+        assert_eq!(s2.capacity(), 28);
+        assert_eq!(scratch_s2.scratch, new_set);
+        assert_eq!(peak_s2, overlap_set);
+    }
+
+    #[test]
+    fn build_inner_refreshes_baseline_for_wide_final_axiom_parallel_merge_and_missing_overlap() {
+        // 1. Wide final serial axiom (EquivalentClasses of 2,000 named classes) followed by
+        //    chain range scan: the scan must see the post-normalization live baseline, not
+        //    the stale pre-final-axiom baseline.
+        let mut wide_classes = String::new();
+        for i in 0..2000 {
+            wide_classes.push_str(&format!(" :C{i}"));
+        }
+        let mut body_no_chain =
+            String::from("Prefix(:=<http://ex.org/>)\nOntology(\nObjectPropertyRange(:r :T)\n");
+        for i in 0..500 {
+            body_no_chain.push_str(&format!("SubObjectPropertyOf(:extra{i} :r)\n"));
+        }
+        body_no_chain.push_str(&format!("EquivalentClasses({wide_classes})\n)"));
+        let mut body_with_chain = String::from(
+            "Prefix(:=<http://ex.org/>)\nOntology(\n\
+             SubObjectPropertyOf(ObjectPropertyChain(:p :q) :s)\n\
+             SubObjectPropertyOf(:s :r)\n\
+             ObjectPropertyRange(:r :T)\n",
+        );
+        for i in 0..500 {
+            body_with_chain.push_str(&format!("SubObjectPropertyOf(:extra{i} :r)\n"));
+        }
+        body_with_chain.push_str(&format!("EquivalentClasses({wide_classes})\n)"));
+
+        let doc_no = crate::ofn_read::parse(&body_no_chain).unwrap();
+        let doc_with = crate::ofn_read::parse(&body_with_chain).unwrap();
+        let kinds_no: Vec<&AxiomKind> = doc_no.axioms.iter().map(|a| &a.kind).collect();
+        let kinds_with: Vec<&AxiomKind> = doc_with.axioms.iter().map(|a| &a.kind).collect();
+        let serial = Limits {
+            threads: 1,
+            ..Limits::default()
+        };
+        let (_, _, peak_no, _) = Saturation::new()
+            .build(
+                &kinds_no,
+                &[],
+                1,
+                0,
+                0,
+                &serial,
+                AttemptProvenance::OriginalDefault,
+            )
+            .unwrap();
+        let (_, _, peak_with, _) = Saturation::new()
+            .build(
+                &kinds_with,
+                &[],
+                1,
+                0,
+                0,
+                &serial,
+                AttemptProvenance::OriginalDefault,
+            )
+            .unwrap();
+        assert!(
+            peak_with > peak_no + 32 * 1024,
+            "scan did not coexist with wide final axiom baseline: with={peak_with} no={peak_no}"
+        );
+        let cap_wide = peak_no + (peak_with - peak_no) / 2;
+        let err_wide = Saturation::new()
+            .build(
+                &kinds_with,
+                &[],
+                1,
+                0,
+                0,
+                &Limits {
+                    max_memory: Some(cap_wide),
+                    ..serial.clone()
+                },
+                AttemptProvenance::OriginalDefault,
+            )
+            .err();
+        assert!(
+            matches!(err_wide, Some(Error::Memory { .. })),
+            "expected Memory refusal at wide-final-axiom + scan overlap cap={cap_wide}, got {err_wide:?}"
+        );
+
+        // 2. Populated missing-range vector must keep its reservation through consumption
+        //    while chain signatures and diagnostics are built.
+        let mut body_miss =
+            String::from("Prefix(:=<http://ex.org/>)\nOntology(\nObjectPropertyRange(:s :T)\n");
+        for i in 0..2000 {
+            body_miss.push_str(&format!(
+                "SubObjectPropertyOf(ObjectPropertyChain(:p{i} :q) :s)\n"
+            ));
+        }
+        body_miss.push(')');
+        let doc_miss = crate::ofn_read::parse(&body_miss).unwrap();
+        let kinds_miss: Vec<&AxiomKind> = doc_miss.axioms.iter().map(|a| &a.kind).collect();
+        let mut sat_miss = Saturation::new();
+        let (ax_miss, _, peak_miss, _) = sat_miss
+            .build(
+                &kinds_miss,
+                &[],
+                1,
+                0,
+                0,
+                &serial,
+                AttemptProvenance::OriginalDefault,
+            )
+            .unwrap();
+        let post_base = sat_miss.interner.bytes() + ax_miss.bytes();
+        let missing_vec_bytes = 2000 * std::mem::size_of::<Option<MissingRange<'_>>>();
+        assert!(
+            peak_miss >= post_base + missing_vec_bytes,
+            "build peak did not cover overlap of missing vector ({missing_vec_bytes}) with interned signatures and diagnostics (post_base={post_base}, peak={peak_miss})"
+        );
+        let cap_miss = post_base + missing_vec_bytes / 2;
+        let err_miss = Saturation::new()
+            .build(
+                &kinds_miss,
+                &[],
+                1,
+                0,
+                0,
+                &Limits {
+                    max_memory: Some(cap_miss),
+                    ..serial.clone()
+                },
+                AttemptProvenance::OriginalDefault,
+            )
+            .err();
+        assert!(
+            matches!(err_miss, Some(Error::Memory { .. })),
+            "expected Memory refusal at missing-vector consumption overlap cap={cap_miss}, got {err_miss:?}"
+        );
+
+        // 3. Parallel normalization must refresh live baseline after dropping chunk allowances.
+        let mut body_par = String::from(
+            "Prefix(:=<http://ex.org/>)\nOntology(\n\
+             SubObjectPropertyOf(ObjectPropertyChain(:p :q) :s)\n\
+             SubObjectPropertyOf(:s :r)\n\
+             ObjectPropertyRange(:r :T)\n",
+        );
+        for i in 0..(PARALLEL_AXIOMS + 128) {
+            body_par.push_str(&format!("SubClassOf(:A{i} :B{i})\n"));
+        }
+        body_par.push(')');
+        let doc_par = crate::ofn_read::parse(&body_par).unwrap();
+        let kinds_par: Vec<&AxiomKind> = doc_par.axioms.iter().map(|a| &a.kind).collect();
+        let parallel = Limits {
+            threads: 2,
+            ..Limits::default()
+        };
+        let mut sat_par = Saturation::new();
+        let (_, _, peak_par, _) = sat_par
+            .build(
+                &kinds_par,
+                &[],
+                2,
+                0,
+                0,
+                &parallel,
+                AttemptProvenance::OriginalDefault,
+            )
+            .unwrap();
+        let mut sat_par_ser = Saturation::new();
+        let (_, _, peak_ser, _) = sat_par_ser
+            .build(
+                &kinds_par,
+                &[],
+                1,
+                0,
+                0,
+                &serial,
+                AttemptProvenance::OriginalDefault,
+            )
+            .unwrap();
+        assert!(peak_par >= peak_ser);
+    }
+
+    #[test]
+    fn kept_rewritten_profile_check_is_allocation_free_and_polled() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Sol r3 fixture: kept Horn ontology extended with a huge ObjectIntersectionOf of
+        // ObjectMinCardinality(0 owl:topObjectProperty ObjectSomeValuesFrom(:p_i owl:Thing)).
+        const N_OPS: usize = 2500;
+        let mut body = String::from(
+            "Prefix(:=<http://ex.org/>)
+             Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+             Ontology(
+                 SubClassOf(:Z ObjectIntersectionOf(",
+        );
+        for i in 0..N_OPS {
+            body.push_str(&format!(
+                " ObjectMinCardinality(0 owl:topObjectProperty ObjectSomeValuesFrom(:p{i} owl:Thing))"
+            ));
+        }
+        body.push_str("))\n)");
+        let doc = crate::ofn_read::parse(&body).unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+
+        // Single huge valid EL axiom (2,500 conjuncts) must poll mid-expression.
+        let mut el_body = String::from(
+            "Prefix(:=<http://ex.org/>)\nOntology(\nSubClassOf(:W ObjectIntersectionOf(",
+        );
+        for i in 0..N_OPS {
+            el_body.push_str(&format!(" :C{i}"));
+        }
+        el_body.push_str("))\n)");
+        let el_doc = crate::ofn_read::parse(&el_body).unwrap();
+        let el_kinds: Vec<&AxiomKind> = el_doc.axioms.iter().map(|a| &a.kind).collect();
+
+        let el_polls = Arc::new(AtomicUsize::new(0));
+        let el_polls_c = el_polls.clone();
+        let limits_el = Limits {
+            cancelled: Some(Arc::new(move || {
+                el_polls_c.fetch_add(1, Ordering::Relaxed);
+                false
+            })),
+            ..Limits::default()
+        };
+        let mut peak = 0usize;
+        let mut paid = 0usize;
+        let mut scratch = PostRunScratch {
+            base: 0,
+            peak: &mut peak,
+            paid: &mut paid,
+            limits: &limits_el,
+            charge: None,
+            check_stop: true,
+            scratch: 0,
+        };
+        let out_el = dl_reduce::Reduction::outside_el(&el_kinds, &[], &mut scratch).unwrap();
+        assert_eq!(out_el, OutsideEl::default());
+        assert!(
+            el_polls.load(Ordering::Relaxed) >= 5,
+            "expected mid-expression polling during EL profile check, saw only {} polls",
+            el_polls.load(Ordering::Relaxed)
+        );
+
+        // On the wide ObjectMinCardinality(0 owl:topObjectProperty ...) axiom,
+        // outside_el must poll mid-expression during dl::shape and classify it as Horn.
+        let horn_polls = Arc::new(AtomicUsize::new(0));
+        let horn_polls_c = horn_polls.clone();
+        let limits_horn = Limits {
+            cancelled: Some(Arc::new(move || {
+                horn_polls_c.fetch_add(1, Ordering::Relaxed);
+                false
+            })),
+            ..Limits::default()
+        };
+        let mut peak2 = 0usize;
+        let mut paid2 = 0usize;
+        let mut scratch2 = PostRunScratch {
+            base: 0,
+            peak: &mut peak2,
+            paid: &mut paid2,
+            limits: &limits_horn,
+            charge: None,
+            check_stop: true,
+            scratch: 0,
+        };
+        let out_horn = dl_reduce::Reduction::outside_el(&kinds, &[], &mut scratch2).unwrap();
+        assert_eq!(out_horn.horn, 1);
+        assert_eq!(out_horn.disjunctive, 0);
+        assert_eq!(out_horn.taken, 1);
+        assert!(
+            horn_polls.load(Ordering::Relaxed) >= 6,
+            "expected mid-expression polling during shape check, saw only {} polls",
+            horn_polls.load(Ordering::Relaxed)
+        );
+
+        // End-to-end kept-Horn classification with the kept Horn fixture extended with
+        // the wide rewritten intersection succeeds on the reduced path.
+        let mut full_body = String::from(
+            "Prefix(:=<http://ex.org/>)
+             Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+             Ontology(
+                 DisjointUnion(:C
+                     ObjectSomeValuesFrom(:r owl:Thing)
+                     ObjectSomeValuesFrom(:r ObjectMinCardinality(0 owl:topObjectProperty :X)))
+                 SubClassOf(:Z ObjectIntersectionOf(",
+        );
+        for i in 0..N_OPS {
+            full_body.push_str(&format!(
+                " ObjectMinCardinality(0 owl:topObjectProperty ObjectSomeValuesFrom(:p{i} owl:Thing))"
+            ));
+        }
+        full_body.push_str("))\n)");
+        let full_doc = crate::ofn_read::parse(&full_body).unwrap();
+        let full_kinds: Vec<&AxiomKind> = full_doc.axioms.iter().map(|a| &a.kind).collect();
+        let rooted = Limits {
+            threads: 1,
+            rooted: true,
+            strict: true,
+            ..Limits::default()
+        };
+        let mut sat_full = Saturation::new();
+        let res = sat_full.classify(&full_kinds, None, &rooted).unwrap();
+        assert!(sat_full.reduced, "expected kept rewritten path");
+        assert_eq!(res.stats.tier, Tier::Disjunctive);
+        assert_eq!(res.stats.outside_el.disjunctive, 1);
+        assert_eq!(res.stats.outside_el.horn, 1);
+        assert_eq!(res.stats.outside_el.taken, 2);
+    }
+
+    #[test]
+    fn check_chain_ranges_polls_sort_group_and_fill_phases() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const N_CHAINS: usize = 3000;
+        let mut body =
+            String::from("Prefix(:=<http://ex.org/>)\nOntology(\nObjectPropertyRange(:s :T)\n");
+        for i in 0..N_CHAINS {
+            body.push_str(&format!(
+                "SubObjectPropertyOf(ObjectPropertyChain(:p{i} :q) :s)\n"
+            ));
+        }
+        body.push(')');
+        let doc = crate::ofn_read::parse(&body).unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let chains: Vec<&AxiomKind> = kinds[1..].to_vec();
+
+        // Cancel inside each phase and assert the phase stops before its end marker.
+        for (start_pt, end_pt, label) in [
+            (
+                admission_test::Point::OriginalRangeSort,
+                admission_test::Point::OriginalRangeAfterSort,
+                "sort",
+            ),
+            (
+                admission_test::Point::OriginalRangeGroup,
+                admission_test::Point::OriginalRangeAfterGroup,
+                "group",
+            ),
+            (
+                admission_test::Point::OriginalRangeFill,
+                admission_test::Point::OriginalRangeAfterFill,
+                "fill",
+            ),
+        ] {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let trigger = cancelled.clone();
+            let check = cancelled.clone();
+            let hit_start = Arc::new(AtomicBool::new(false));
+            let hit_start_c = hit_start.clone();
+            let hit_end = Arc::new(AtomicBool::new(false));
+            let hit_end_c = hit_end.clone();
+            let limits = Limits {
+                cancelled: Some(Arc::new(move || check.load(Ordering::Relaxed))),
+                ..Limits::default()
+            };
+            let mut peak = 0usize;
+            let mut paid = 0usize;
+            let mut scratch = PostRunScratch {
+                base: 0,
+                peak: &mut peak,
+                paid: &mut paid,
+                limits: &limits,
+                charge: None,
+                check_stop: true,
+                scratch: 0,
+            };
+            let res = admission_test::with_hook(
+                move |pt| {
+                    if pt == start_pt {
+                        hit_start_c.store(true, Ordering::Relaxed);
+                        trigger.store(true, Ordering::Relaxed);
+                    } else if pt == end_pt {
+                        hit_end_c.store(true, Ordering::Relaxed);
+                    }
+                },
+                || check_chain_ranges(&kinds, |_, _| false, &chains, false, &mut scratch),
+            );
+            assert!(
+                matches!(res, Err(Error::Cancelled)),
+                "{label}: expected Cancelled, got {res:?}"
+            );
+            assert!(hit_start.load(Ordering::Relaxed), "{label}: start not hit");
+            assert!(
+                !hit_end.load(Ordering::Relaxed),
+                "{label}: phase ran to completion without cooperative polling"
+            );
+        }
+
+        // Without cancellation, all 3,000 chains report the missing range.
+        let unlimited = Limits::default();
+        let mut peak = 0usize;
+        let mut paid = 0usize;
+        let mut scratch = PostRunScratch {
+            base: 0,
+            peak: &mut peak,
+            paid: &mut paid,
+            limits: &unlimited,
+            charge: None,
+            check_stop: true,
+            scratch: 0,
+        };
+        let out = check_chain_ranges(&kinds, |_, _| false, &chains, false, &mut scratch).unwrap();
+        assert_eq!(out.len(), N_CHAINS);
+        assert!(out.iter().all(|m| m.is_some()));
+    }
+
+    #[test]
+    fn post_run_scratch_excludes_dropped_rewrite_storage_and_requests_no_extra_pool_grant() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Construct a kept-rewrite ontology with large `red_bytes` (many rewritten
+        // universal-role range axioms) and a smaller post-run range scan so that
+        // `live_memory + scan_scratch <= rewrite_peak < live_memory + red_bytes + scan_scratch`.
+        let mut body = String::from(
+            "Prefix(:=<http://ex.org/>)
+             Prefix(owl:=<http://www.w3.org/2002/07/owl#>)
+             Ontology(
+                 DisjointUnion(:C
+                     ObjectSomeValuesFrom(:r owl:Thing)
+                     ObjectSomeValuesFrom(:r ObjectMinCardinality(0 owl:topObjectProperty :X)))
+                 SubObjectPropertyOf(ObjectPropertyChain(:p :q) :s)
+                 SubObjectPropertyOf(:s owl:topObjectProperty)\n",
+        );
+        for i in 0..1500 {
+            body.push_str(&format!(
+                "ObjectPropertyRange(owl:topObjectProperty :T{i})\n"
+            ));
+        }
+        for i in 0..400 {
+            body.push_str(&format!(
+                "SubObjectPropertyOf(:extra{i} owl:topObjectProperty)\n"
+            ));
+        }
+        body.push(')');
+        let doc = crate::ofn_read::parse(&body).unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let rooted = Limits {
+            threads: 1,
+            rooted: true,
+            strict: true,
+            ..Limits::default()
+        };
+
+        let granted = Arc::new(AtomicUsize::new(0));
+        let granted_charge = granted.clone();
+        let granted_at_scan = Arc::new(AtomicUsize::new(0));
+        let granted_at_scan_hook = granted_at_scan.clone();
+        let granted_for_hook = granted.clone();
+        let mut sat_full = Saturation::new();
+
+        let full = admission_test::with_hook(
+            move |pt| {
+                if pt == admission_test::Point::PostRunStart {
+                    granted_at_scan_hook
+                        .store(granted_for_hook.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+            },
+            || {
+                sat_full.classify(
+                    &kinds,
+                    None,
+                    &Limits {
+                        charge: Some(Arc::new(move |bytes| {
+                            granted_charge.fetch_add(bytes, Ordering::Relaxed);
+                            true
+                        })),
+                        ..rooted.clone()
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert!(sat_full.reduced, "expected kept rewritten path");
+        let before_scan = granted_at_scan.load(Ordering::Relaxed);
+        let total_granted = granted.load(Ordering::Relaxed);
+        assert!(before_scan > 0, "expected PostRunStart checkpoint to fire");
+        assert_eq!(
+            total_granted, before_scan,
+            "post-run scan requested extra pool grant ({total_granted} vs {before_scan}) for dropped rewrite storage"
+        );
+        assert_eq!(full.stats.peak_memory, before_scan);
+        assert!(
+            full.stats.memory < full.stats.peak_memory,
+            "retained memory ({}) should exclude dropped rewrite storage below rewrite peak ({})",
+            full.stats.memory,
+            full.stats.peak_memory
+        );
+
+        // A cap equal to the rewrite peak covers both the rewrite peak and live + scan,
+        // while sitting strictly below live + red_bytes + scan.
+        let capped = Saturation::new()
+            .classify(
+                &kinds,
+                None,
+                &Limits {
+                    max_memory: Some(before_scan),
+                    ..rooted
+                },
+            )
+            .unwrap();
+        assert_eq!(capped.stats.outside_el, full.stats.outside_el);
+        assert_eq!(capped.stats.peak_memory, before_scan);
+    }
+
+    #[test]
+    fn check_chain_ranges_releases_needed_set_before_range_walks() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Chain reaches 2,000 properties so `needed` grows large before `drop(needed)`.
+        let mut body = String::from(
+            "Prefix(:=<http://ex.org/>)\nOntology(\n\
+             SubObjectPropertyOf(ObjectPropertyChain(:p :q) :r0)\n",
+        );
+        for i in 0..1999 {
+            body.push_str(&format!("SubObjectPropertyOf(:r{i} :r{})\n", i + 1));
+        }
+        body.push_str("ObjectPropertyRange(:r1999 :T0)\n)");
+        let doc = crate::ofn_read::parse(&body).unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let chains = [kinds[0]];
+
+        struct RecordingScratch {
+            live: Arc<AtomicUsize>,
+            max_live: Arc<AtomicUsize>,
+        }
+        impl ScratchBudget for RecordingScratch {
+            fn poll(&self) -> Result<(), Error> {
+                Ok(())
+            }
+            fn grow(&mut self, more: usize) -> Result<(), Error> {
+                let next = self.live.fetch_add(more, Ordering::Relaxed) + more;
+                self.max_live.fetch_max(next, Ordering::Relaxed);
+                Ok(())
+            }
+            fn release(&mut self, less: usize) {
+                let prev = self.live.load(Ordering::Relaxed);
+                self.live
+                    .store(prev.saturating_sub(less), Ordering::Relaxed);
+            }
+            fn overflow(&self) -> Error {
+                Error::Memory {
+                    limit: usize::MAX,
+                    used: usize::MAX,
+                }
+            }
+        }
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let max_live = Arc::new(AtomicUsize::new(0));
+        let live_at_sort = Arc::new(AtomicUsize::new(0));
+        let max_at_sort = Arc::new(AtomicUsize::new(0));
+        let live_h = live.clone();
+        let max_h = max_live.clone();
+        let live_sort_h = live_at_sort.clone();
+        let max_sort_h = max_at_sort.clone();
+        let mut budget = RecordingScratch { live, max_live };
+
+        let out = admission_test::with_hook(
+            move |pt| {
+                if pt == admission_test::Point::OriginalRangeSort {
+                    live_sort_h.store(live_h.load(Ordering::Relaxed), Ordering::Relaxed);
+                    max_sort_h.store(max_h.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+            },
+            || check_chain_ranges(&kinds, |_, _| false, &chains, false, &mut budget),
+        )
+        .unwrap();
+        assert!(out[0].is_some());
+        let at_sort = live_at_sort.load(Ordering::Relaxed);
+        let before_sort_peak = max_at_sort.load(Ordering::Relaxed);
+        assert!(
+            before_sort_peak > at_sort + 32 * 1024,
+            "expected drop(needed) to release needed set bytes before range walks: peak_before_sort={before_sort_peak}, live_at_sort={at_sort}"
+        );
     }
 }
 
