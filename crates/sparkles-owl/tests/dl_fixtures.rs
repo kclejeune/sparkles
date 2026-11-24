@@ -19,10 +19,9 @@ const THING: &str = "http://www.w3.org/2002/07/owl#Thing";
 const NOTHING: &str = "http://www.w3.org/2002/07/owl#Nothing";
 
 /// The cases of the families `horn-shiq` and `horn-sroiq` that the classifier takes
-/// whole: all 50 of `horn-shiq` and the 35 of `horn-sroiq` without an at-least restriction
-/// above one, since the Horn rules with individuals leave such a restriction out beside
-/// individuals (roadmap item 867).
-const HORN_WHOLE: usize = 85;
+/// whole: all 50 of `horn-shiq` and all 50 of `horn-sroiq`, including the 15 cases with
+/// at-least restrictions above one beside individuals (roadmap item 867).
+const HORN_WHOLE: usize = 100;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603")

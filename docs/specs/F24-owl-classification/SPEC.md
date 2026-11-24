@@ -103,6 +103,21 @@ rules on ontologies with individuals, functional data properties and top propert
 [The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
 shared hierarchical budget remains in item 675.
 
+Item 867 enables at-least restrictions above one beside individuals in the Horn rules,
+using Kazakov's Lemma 2 unfolding into fresh, pairwise disjoint subclasses of the filler
+up to `MAX_AT_LEAST`. For Horn ontologies with individuals, nominals, at-most-one
+restrictions, keys, top properties and OWL 2 EL data axioms, the unfolding preserves
+satisfiability and all class subsumptions over the original signature by a direct-power
+argument over `I^κ`, where every instance of `≥n r.C` has at least `2^κ` distinct
+successors to colour with the fresh classes. When a non-Horn finite data range enters
+through the datatype checker, the Horn saturation stays sound because the checker emits
+only valid Horn implications and reports unresolved data covers as used in part. All 50
+`horn-sroiq` fixtures in the `dl603` suite now classify whole alongside the 50
+`horn-shiq` fixtures with exact HermiT 1.4.5.519 taxonomy parity, together with new hand
+fixtures covering satisfiable and unsatisfiable restrictions, nominals, functionality,
+at-most restrictions, inverses, subproperties, `DifferentIndividuals`, asymmetric roles,
+non-Horn data covers and incremental updates.
+
 Item 972 is the second phase of [the datatype checker](#the-datatype-checker). A data
 property whose component has a universal restriction, a cardinality, an enumeration of
 several values, a facet, a union, a complement, a datatype outside OWL 2 EL or a
@@ -1859,9 +1874,7 @@ disjunctive rules decline an ontology, the Horn rules take what they can of it, 
 individuals, and leave out and report the axioms that need case analysis and the axioms
 they left out before, which are at-least restrictions above 64, data restrictions outside
 OWL 2 EL, and axioms over property hierarchies that are not regular or whose automata
-pass the bound. A run with individuals also leaves out at-least restrictions above one,
-for the reason the normalization paragraph gives, which item 867 follows, and chains
-through the top property stay partial, as item 663 records.
+pass the bound. Chains through the top property stay partial, as item 663 records.
 
 **One saturation.** Kazakov's rules read a context as the set of instances of its
 conjunction, and every conclusion of a context holds of each of its instances. The EL
@@ -1881,17 +1894,40 @@ individuals in a positive position is not Horn and stays with the disjunctive ru
 normalization takes a class assertion `C(a)` as `{a} ⊑ C`, so that a Horn class
 expression in an assertion reaches the rules, and an object property assertion over an
 inverse property as the assertion over the property the other way round. The other
-assertions are EL axioms already. A run with individuals leaves out and reports an
-at-least restriction above one, where a run without them unfolds it as the paper's Lemma
-2 does into fresh, pairwise disjoint fillers. The lemma's argument expands a model of
-the ontology to one of the unfolding, and it colours each element's successors with the
-fresh fillers, which it can do because the paper's models are trees in which no two
-elements share a successor. A nominal is a shared successor, and the argument is not
-made here for models with them, though no Horn axiom bounds an element's successors to
-a finite set, so an expansion that adds fresh successors may exist. Leaving the
-restriction out is a sound weakening that the run reports, no file of the lane's gate
-has such a restriction beside individuals, and item 867 holds the argument or the
-rule that takes them. Lemma 2 stays for runs without individuals.
+assertions are EL axioms already. A run with individuals takes an at-least restriction
+above one, up to `MAX_AT_LEAST` over a simple role, by unfolding `≥n r.C` into `n`
+existential restrictions `∃r.B_1 ⊓ … ⊓ ∃r.B_n` with fresh, pairwise disjoint subclasses
+`B_i ⊑ C`, as Kazakov's Lemma 2 does without individuals. Every model of the unfolding
+is a model of the original ontology, because pairwise disjointness forces the `n`
+successors to be distinct. For the converse in the Horn fragment with individuals,
+take any model `I` of the original ontology and set `κ = max(ℵ_0, |Δ^I|)`. When `|Δ^I| = 1`
+no element satisfies `≥n r.C` for `n ≥ 2`, so interpreting every `B_i` as empty suffices.
+When `|Δ^I| ≥ 2`, form the direct power `I^κ` with domain `(Δ^I)^κ`, coordinatewise
+atomic classes and object roles, and each named or anonymous individual interpreted as
+its constant tuple `(a^I)_{α < κ}`. By structural induction, every negative-position Horn
+expression `G` satisfies `G^{I^κ} ⊆ (G^I)^κ` and every positive-position Horn expression
+`H` satisfies `(H^I)^κ ⊆ H^{I^κ}`, because positive nominals are singletons, positive
+at-most restrictions have bound at most one, and no positive disjunctions occur. Role
+inclusions, chains, inverses, reflexivity, irreflexivity, asymmetry, disjointness,
+universal roles, assertions, individual equalities and inequalities, and keys over named
+individuals all hold in `I^κ`. For OWL 2 EL data properties, each tuple receives every
+value shared across all coordinates together with one fresh value in the top atomic cell
+of the smallest EL datatype covering its coordinates whenever no single literal is shared,
+preserving `DataHasValue`, `DataSomeValuesFrom`, `DataPropertyRange`, `SubDataPropertyOf`,
+`FunctionalDataProperty` and keys on named individuals. For each occurrence of `≥n r.C`
+processed bottom-up, every tuple `x` in `((≥n r.C)^I)^κ` has at least `n^κ ≥ 2^κ` distinct
+`r`-successors in `(C^I)^κ ⊆ C^{I^κ}`, while `|Δ^{I^κ}| = |Δ^I|^κ = 2^κ`, so transfinite
+recursion assigns `n` distinct unassigned `r`-successors of each `x` to `B_1, …, B_n`
+without reusing any element. Unfolding therefore preserves consistency and all class
+subsumptions over the original signature in the Horn fragment with individuals. When an
+ontology also contains a non-Horn finite data range handled by the datatype checker, such
+as `DataOneOf` over three values alongside `≤1 r.(d = v)` restrictions, the unfolded
+ontology can be semantically stronger under full case analysis over data values. The Horn
+saturation still stays sound on such ontologies because the datatype checker emits only
+valid Horn implications `⋀ Γ ⊑ ψ` and never splits a data cover across `B_1, …, B_n`, so
+every derivation takes place inside the pure Horn ontology obtained by replacing the
+checker atoms with those emitted Horn implications, and any unresolved cover is reported
+as used in part.
 
 Three mechanisms of the EL rules of individuals have to reach the links and contexts of
 the Horn rules.
@@ -2217,8 +2253,7 @@ holds the judgements, the exclusions, the generator and the timings, which the
 discusses.
 
 **Out of scope.** Enumerations of several individuals in a positive position need case
-analysis and stay with the rooted run. At-least restrictions above one beside
-individuals are item 867, and chains through the top property stay in item 663. A cheaper
+analysis and stay with the rooted run. Chains through the top property stay in item 663. A cheaper
 witness criterion is not built. Item 1281 later took anonymous individuals, as
 [Anonymous individuals and top-property inclusions](#anonymous-individuals-and-top-property-inclusions)
 describes. Data cardinalities
