@@ -3,8 +3,9 @@
 
 use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, Store, Stored, XLit};
 use super::dl_rules::{
-    AdaptiveMeta, AdaptivePolicy, DlRun, WorkStopGuard, with_rooted_adaptive_bound,
-    with_rooted_adaptive_diag, with_rooted_adaptive_policy,
+    AdaptiveMeta, AdaptivePolicy, DlRun, WorkStopGuard, adaptive_alloc_count,
+    reset_adaptive_alloc_count, with_on_adaptive_latch, with_on_adaptive_sample,
+    with_rooted_adaptive_bound, with_rooted_adaptive_diag, with_rooted_adaptive_policy,
 };
 use super::index::{Axioms, Ex, Index, Interner};
 use super::numeric::tests::measure;
@@ -372,9 +373,66 @@ fn raw_queue_oracle_push_subsumed_refusal_dead_pop_and_underflow() {
         "dead pop on refusal must earn zero memory credit"
     );
 
+    // Explicit `kill_head` unit-subsumption kill leaves a dead resident entry in `queue`
+    // (0 push/pop change), and `peek_live` drains it to decrement `raw_queue`.
+    let mut unit_kill_store = Store::default();
+    let before_kill_q = run.raw_queue();
+    let before_kill_p = run.raw_pushed();
+    assert!(unit_kill_store.add_admitted(
+        Clause::new(vec![Lit::x(70)], vec![Lit::x(77), Lit::x(78)]),
+        &mut sink
+    ));
+    assert_eq!(run.raw_pushed(), before_kill_p + 1);
+    assert_eq!(run.raw_queue(), before_kill_q + 1);
+    assert_eq!(unit_kill_store.queue_len(), 1);
+    unit_kill_store.kill_head(Lit::x(77));
+    assert_eq!(
+        run.raw_queue(),
+        before_kill_q + 1,
+        "kill_head marks dead without popping the heap"
+    );
+    assert_eq!(unit_kill_store.queue_len(), 1);
+    assert_eq!(unit_kill_store.peek_live(&run), None);
+    assert_eq!(run.raw_queue(), before_kill_q);
+    assert_eq!(unit_kill_store.queue_len(), 0);
+
+    // Bottom context with a nonempty resident heap keeps its residue until teardown and
+    // skips root_work/work/push on subsequent derivations into the already-bottom state.
+    let mut bottom_st = State::default();
+    let lit_r0 = intern_lit(&run, XLit::Atom(2, RTerm::C(0)));
+    let lit_r1 = intern_lit(&run, XLit::Atom(3, RTerm::C(0)));
+    super::dl_root::derive(&ix, &mut bottom_st, (vec![], vec![lit_r0]), &mut sink);
+    super::dl_root::derive(&ix, &mut bottom_st, (vec![], vec![lit_r1]), &mut sink);
+    let q_with_residue = run.raw_queue();
+    let p_with_residue = run.raw_pushed();
+    let w_with_residue = run.work();
+    let rw_with_residue = run.root_work();
+    let dl_q = bottom_st
+        .extra
+        .as_ref()
+        .and_then(|x| x.dl.as_ref())
+        .map_or(0, |d| d.store.queue_len());
+    assert_eq!(dl_q, 2, "expected 2 resident queued clauses before bottom");
+    bottom_st.bottom = true;
+    let lit_r2 = intern_lit(&run, XLit::Atom(4, RTerm::C(0)));
+    super::dl_root::derive(&ix, &mut bottom_st, (vec![], vec![lit_r2]), &mut sink);
+    assert_eq!(run.work(), w_with_residue);
+    assert_eq!(run.root_work(), rw_with_residue);
+    assert_eq!(run.raw_pushed(), p_with_residue);
+    assert_eq!(run.raw_queue(), q_with_residue);
+    assert_eq!(
+        bottom_st
+            .extra
+            .as_ref()
+            .and_then(|x| x.dl.as_ref())
+            .map_or(0, |d| d.store.queue_len()),
+        2,
+        "bottom context must retain resident heap residue until teardown"
+    );
+
     // Loud underflow assertion (no silent repair).
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run.on_queue_pop(2);
+        run.on_queue_pop(q_with_residue + 1);
     }));
     assert!(res.is_err(), "raw_queue underflow must panic loudly");
 }
@@ -752,6 +810,37 @@ fn observe_only_diag_tracks_without_latching_stop() {
     assert_eq!(snaps2[0].winning_stop, WinningStop::SaturationFinished);
     assert_eq!(snaps2[0].stop_guard, WorkStopGuard::None);
     assert_eq!(snaps2[0].hypothetical_guard, WorkStopGuard::RootWork);
+
+    // Observe-only on an explicit fixed cap exceeding `policy.ceiling`: hypothetical
+    // `TotalLimit` latches without touching `stop_guard`, and saturation still finishes.
+    let low_ceiling_policy = AdaptivePolicy {
+        sample_shift: 4,
+        ratio_num: 3,
+        ratio_den: 10,
+        root_limit: 100_000,
+        warmup_work: 100_000,
+        queue_max: 100_000,
+        ceiling: 64,
+    };
+    let (out3, snaps3) = with_rooted_adaptive_policy(low_ceiling_policy, || {
+        with_rooted_adaptive_bound(false, || {
+            with_rooted_adaptive_diag(true, || {
+                let mut k = Classifier::of(&input);
+                let out = k.classify(&limits_explicit).expect("classify");
+                (out, last_adaptive_attempts())
+            })
+        })
+    });
+    assert!(!out3.stats.dl_rooted_over && !out3.stats.dl_over_budget);
+    assert_eq!(snaps3.len(), 1);
+    assert!(!snaps3[0].enforce);
+    assert_eq!(snaps3[0].policy_name, "explicit_fixed");
+    assert_eq!(snaps3[0].effective_cap, 100_000);
+    assert_eq!(snaps3[0].winning_stop, WinningStop::SaturationFinished);
+    assert_eq!(snaps3[0].stop_guard, WorkStopGuard::None);
+    assert_eq!(snaps3[0].hypothetical_guard, WorkStopGuard::TotalLimit);
+    assert!(snaps3[0].hypothetical_at > low_ceiling_policy.ceiling);
+    assert!(snaps3[0].final_work > snaps3[0].hypothetical_at);
 }
 
 /// 7. Critical Astra Catch #2 & Decision #4: `partial = true` + adaptive `Stop::Work`
@@ -807,76 +896,234 @@ fn partial_true_stop_capture_and_publication_order() {
     // Cooperative poll overshoot must be recorded cleanly.
     let _ = s.overshoot();
 
-    // (b) `partial = true` + memory refusal wins even after `stop_guard` has latched:
-    //     `admit_dl` checks memory before `check_held` checks `over_work()`, so a pool
-    //     refusal during saturation wins with `WinningStop::Memory`, returns a partial
-    //     answer (`!complete`, `Consistency::Unknown`, `!dl_rooted_over`), and preserves
-    //     `raw_queue == oracle_queue` before partial cleanup drops stores.
-    let admitted = Arc::new(AtomicUsize::new(0));
-    let admitted_ref = admitted.clone();
-    // Allow normalization & base setup, then refuse during root saturation growth.
+    // (b) Strict non-vacuous `partial = true` + memory refusal winning AFTER `stop_guard`
+    //     latched: refuse the very next positive saturation debit once `RootWork` latches,
+    //     so `admit_dl` publishes `STOP_MEMORY` before the next `check_held` poll sees
+    //     `over_work()`. Unconditionally verify both the pending guard and Memory winner.
+    let latched = Arc::new(AtomicBool::new(false));
+    let refused = Arc::new(AtomicBool::new(false));
+    let latched_hook = latched.clone();
+    let latched_charge = latched.clone();
+    let refused_charge = refused.clone();
     let limits_mem = Limits {
         threads: 1,
         rooted: true,
         dl_steps: true,
         partial: true,
-        charge: Some(Arc::new(move |bytes: usize| {
-            let prev = admitted_ref.load(Ordering::Relaxed);
-            if prev.saturating_add(bytes) > 160 << 10 {
+        charge: Some(Arc::new(move |_bytes: usize| {
+            if latched_charge.load(Ordering::SeqCst) && !refused_charge.swap(true, Ordering::SeqCst)
+            {
                 return false;
             }
-            admitted_ref.fetch_add(bytes, Ordering::Relaxed);
             true
         })),
         ..Limits::default()
     };
     let (res_mem, snaps_mem) = with_rooted_adaptive_policy(small_root_policy, || {
         with_rooted_adaptive_bound(true, || {
-            let mut k = Classifier::of(&input);
-            let r = k.classify(&limits_mem);
-            (r, last_adaptive_attempts())
+            with_on_adaptive_latch(
+                move |guard, _| {
+                    if guard == WorkStopGuard::RootWork {
+                        latched_hook.store(true, Ordering::SeqCst);
+                    }
+                },
+                || {
+                    let mut k = Classifier::of(&input);
+                    let r = k.classify(&limits_mem);
+                    (r, last_adaptive_attempts())
+                },
+            )
         })
     });
-    if !snaps_mem.is_empty() {
-        let sm = snaps_mem[0];
-        assert_eq!(sm.raw_queue, sm.oracle_queue);
-        if sm.winning_stop == WinningStop::Memory {
-            let out_mem = res_mem.expect("partial memory answer");
-            assert!(!out_mem.stats.dl_rooted_over);
-            assert!(!out_mem.complete);
-            assert_eq!(out_mem.consistency, Consistency::Unknown);
-        }
-    }
+    assert!(
+        latched.load(Ordering::SeqCst),
+        "RootWork guard must latch before memory refusal"
+    );
+    assert!(
+        refused.load(Ordering::SeqCst),
+        "pool debit must be refused after RootWork latched"
+    );
+    assert_eq!(snaps_mem.len(), 1);
+    let sm = snaps_mem[0];
+    assert_eq!(sm.stop_guard, WorkStopGuard::RootWork);
+    assert_eq!(sm.winning_stop, WinningStop::Memory);
+    assert_eq!(sm.raw_queue, sm.oracle_queue);
+    let out_mem = res_mem.expect("partial memory answer");
+    assert!(!out_mem.stats.dl_rooted_over && !out_mem.stats.dl_over_budget);
+    assert!(!out_mem.complete && !out_mem.complete_for_taken);
+    assert_eq!(out_mem.consistency, Consistency::Unknown);
 
-    // (c) Publication order: at a `check_held` poll where `over_work()` is ALREADY true
-    //     AND `cancelled` is ALREADY true, `Stop::Work` outranks `Stop::Cancelled`!
-    //     Verify with a cancel predicate that flips true only after root work > 16.
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls_ref = calls.clone();
+    // (b2) Neon Blocker #1 regression: `partial = true` + `entangled == true` + `Stop::Memory`
+    //      winning AFTER `stop_guard` latched. `:Witness ⊑ {:w}` is processed before `dl.root`
+    //      so `totals.merged == true` (making `entangled == true`); the individual-marking
+    //      loop must NOT abort the partial answer on the stale adaptive `stop_guard` or fall
+    //      back to Horn!
+    let mut ent_body = String::from(
+        "SubClassOf(:Witness ObjectOneOf(:w))\n\
+         SubClassOf(:Witness :Tag)\n\
+         SubClassOf(:Reaches ObjectSomeValuesFrom(:r :Witness))\n\
+         SubClassOf(:Seed ObjectUnionOf(:U0 :U1))\n\
+         SubClassOf(:U0 :Done)\n\
+         SubClassOf(:U1 :Done)\n",
+    );
+    for t in 0..20 {
+        ent_body.push_str(&format!("SubClassOf(owl:Thing :T{t})\n"));
+    }
+    for i in 0..80 {
+        ent_body.push_str(&format!("ClassAssertion(:Seed :i{i})\n"));
+    }
+    let ent_input = axioms(&ent_body);
+    let ent_kinds: Vec<&AxiomKind> = ent_input.iter().map(|a| &a.kind).collect();
+    let ent_latched = Arc::new(AtomicBool::new(false));
+    let ent_refused = Arc::new(AtomicBool::new(false));
+    let ent_latched_hook = ent_latched.clone();
+    let ent_latched_charge = ent_latched.clone();
+    let ent_refused_charge = ent_refused.clone();
+    let limits_ent_mem = Limits {
+        threads: 1,
+        rooted: true,
+        dl_steps: true,
+        partial: true,
+        charge: Some(Arc::new(move |_bytes: usize| {
+            if ent_latched_charge.load(Ordering::SeqCst)
+                && !ent_refused_charge.swap(true, Ordering::SeqCst)
+            {
+                return false;
+            }
+            true
+        })),
+        ..Limits::default()
+    };
+    let mut ent_sat = Saturation::new();
+    let (res_ent, snaps_ent) = with_rooted_adaptive_policy(small_root_policy, || {
+        with_rooted_adaptive_bound(true, || {
+            with_on_adaptive_latch(
+                move |guard, _| {
+                    if guard == WorkStopGuard::RootWork {
+                        ent_latched_hook.store(true, Ordering::SeqCst);
+                    }
+                },
+                || {
+                    let r = ent_sat.classify(&ent_kinds, None, &limits_ent_mem);
+                    (r, last_adaptive_attempts())
+                },
+            )
+        })
+    });
+    assert!(ent_latched.load(Ordering::SeqCst) && ent_refused.load(Ordering::SeqCst));
+    assert!(
+        ent_sat.entangled && ent_sat.dl_rooted,
+        "must exercise entangled rooted marking path"
+    );
+    assert_eq!(snaps_ent.len(), 1);
+    assert_eq!(snaps_ent[0].stop_guard, WorkStopGuard::RootWork);
+    assert_eq!(snaps_ent[0].winning_stop, WinningStop::Memory);
+    assert_eq!(snaps_ent[0].raw_queue, snaps_ent[0].oracle_queue);
+    let out_ent = res_ent.expect("partial entangled answer must not abort on stale stop_guard");
+    assert!(
+        !out_ent.stats.dl_rooted_over && !out_ent.stats.dl_over_budget,
+        "entangled partial answer must not discard partial result into Horn fallback: {:?}",
+        out_ent.stats
+    );
+    assert!(!out_ent.complete && !out_ent.complete_for_taken);
+    assert_eq!(out_ent.consistency, Consistency::Unknown);
+
+    // (c) Strict non-vacuous publication order: arm `cancelled = true` deterministically
+    //     immediately when `RootWork` latches (BEFORE the decisive `check_held` poll).
+    //     At that `check_held` poll both `over_work()` and `cancelled()` are true, so
+    //     `Stop::Work` MUST win on the rooted attempt; the subsequent unrooted fallback then
+    //     observes `cancelled() == true` and returns `Err(Error::Cancelled)`.
+    let cancel_armed = Arc::new(AtomicBool::new(false));
+    let cancel_hook = cancel_armed.clone();
+    let cancel_pred = cancel_armed.clone();
     let limits_cancel_race = Limits {
         threads: 1,
         rooted: true,
         dl_steps: true,
         partial: true,
-        cancelled: Some(Arc::new(move || {
-            // Let normalization polls pass; flip true once saturation starts checking.
-            calls_ref.fetch_add(1, Ordering::Relaxed) > 10_000
-        })),
+        cancelled: Some(Arc::new(move || cancel_pred.load(Ordering::SeqCst))),
         ..Limits::default()
     };
-    let (out_race, snaps_race) = with_rooted_adaptive_policy(small_root_policy, || {
+    let (res_race, snaps_race) = with_rooted_adaptive_policy(small_root_policy, || {
         with_rooted_adaptive_bound(true, || {
-            let mut k = Classifier::of(&input);
-            let r = k
-                .classify(&limits_cancel_race)
-                .expect("work stop beats cancel");
-            (r, last_adaptive_attempts())
+            with_on_adaptive_latch(
+                move |guard, _| {
+                    if guard == WorkStopGuard::RootWork {
+                        cancel_hook.store(true, Ordering::SeqCst);
+                    }
+                },
+                || {
+                    let mut k = Classifier::of(&input);
+                    let r = k.classify(&limits_cancel_race);
+                    (r, last_adaptive_attempts())
+                },
+            )
         })
     });
-    assert!(out_race.stats.dl_rooted_over);
+    assert!(
+        cancel_armed.load(Ordering::SeqCst),
+        "cancel predicate must be armed before the decisive check_held poll"
+    );
+    assert!(
+        matches!(res_race, Err(Error::Cancelled)),
+        "after Work wins on the rooted attempt, the unrooted retry must observe cancelled=true: {res_race:?}"
+    );
     assert_eq!(snaps_race.len(), 1);
-    assert_eq!(snaps_race[0].winning_stop, WinningStop::Work);
     assert_eq!(snaps_race[0].stop_guard, WorkStopGuard::RootWork);
+    assert_eq!(snaps_race[0].winning_stop, WinningStop::Work);
+    assert_eq!(snaps_race[0].raw_queue, snaps_race[0].oracle_queue);
+
+    // (d) Companion arm: earlier cancellation BEFORE any adaptive guard latches wins with
+    //     `WinningStop::Cancelled` and returns the partial answer (`!complete`,
+    //     `Consistency::Unknown`, `!dl_rooted_over`).
+    let high_root_policy = AdaptivePolicy {
+        sample_shift: 4,
+        ratio_num: 3,
+        ratio_den: 10,
+        root_limit: 100_000,
+        warmup_work: 1 << 20,
+        queue_max: 1 << 20,
+        ceiling: 1 << 20,
+    };
+    let early_cancel = Arc::new(AtomicBool::new(false));
+    let early_cancel_hook = early_cancel.clone();
+    let early_cancel_pred = early_cancel.clone();
+    let limits_early_cancel = Limits {
+        threads: 1,
+        rooted: true,
+        dl_steps: true,
+        partial: true,
+        cancelled: Some(Arc::new(move || early_cancel_pred.load(Ordering::SeqCst))),
+        ..Limits::default()
+    };
+    let (res_early, snaps_early) = with_rooted_adaptive_policy(high_root_policy, || {
+        with_rooted_adaptive_bound(true, || {
+            with_on_adaptive_sample(
+                move |_work, guard| {
+                    if guard == WorkStopGuard::None {
+                        early_cancel_hook.store(true, Ordering::SeqCst);
+                    }
+                },
+                || {
+                    let mut k = Classifier::of(&input);
+                    let r = k.classify(&limits_early_cancel);
+                    (r, last_adaptive_attempts())
+                },
+            )
+        })
+    });
+    assert!(
+        early_cancel.load(Ordering::SeqCst),
+        "early cancel must fire at a passing sample before any guard latches"
+    );
+    assert_eq!(snaps_early.len(), 1);
+    assert_eq!(snaps_early[0].stop_guard, WorkStopGuard::None);
+    assert_eq!(snaps_early[0].winning_stop, WinningStop::Cancelled);
+    assert_eq!(snaps_early[0].raw_queue, snaps_early[0].oracle_queue);
+    let out_early = res_early.expect("partial cancelled answer");
+    assert!(!out_early.stats.dl_rooted_over && !out_early.stats.dl_over_budget);
+    assert!(!out_early.complete && !out_early.complete_for_taken);
+    assert_eq!(out_early.consistency, Consistency::Unknown);
 }
 
 /// 8. Binding Decision #2: post-counting rooted retry (`counting: true, rooted: true`,
@@ -981,6 +1228,26 @@ fn post_counting_rooted_retry_finishes_and_falls_back() {
     assert_eq!(snaps_fb[0].winning_stop, WinningStop::Work);
     assert_eq!(snaps_fb[0].stop_guard, WorkStopGuard::RootWork);
     assert_eq!(snaps_fb[0].raw_queue, snaps_fb[0].oracle_queue);
+
+    // Compare Case B's fallback taxonomy, consistency, completeness, incomplete classes, and
+    // exclusions against the corresponding fixed-bound rooted fallback (switch OFF).
+    let fixed_fb_limits = Limits {
+        dl_work: Some(1),
+        ..limits
+    };
+    let (out_fixed_fb, excl_fixed_fb) = with_rooted_adaptive_bound(false, || {
+        with_rooted_adaptive_diag(false, || {
+            let mut k = Classifier::of(&input);
+            let out = k.classify(&fixed_fb_limits).expect("fixed fallback");
+            (out, k.excluded().to_vec())
+        })
+    });
+    assert!(out_fixed_fb.stats.dl_counting_over && out_fixed_fb.stats.dl_rooted_over);
+    assert_eq!(out_fb.taxonomy, out_fixed_fb.taxonomy);
+    assert_eq!(out_fb.consistency, out_fixed_fb.consistency);
+    assert_eq!(out_fb.complete, out_fixed_fb.complete);
+    assert_eq!(out_fb.incomplete, out_fixed_fb.incomplete);
+    assert_eq!(excl_fb, excl_fixed_fb);
 }
 
 /// 9. `t = 1` vs `t = 4` determinism, parallel classifier isolation, stale-state clearing,
@@ -1112,11 +1379,9 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
     };
     let ((out, snaps), sample) = with_rooted_adaptive_policy(init_root_policy, || {
         with_rooted_adaptive_bound(true, || {
-            measure(|| {
-                let mut k = Classifier::of(&input);
-                let out = k.classify(&limits).expect("fallback");
-                (out, last_adaptive_attempts())
-            })
+            let mut k = Classifier::of(&input);
+            let (out, sample) = measure(|| k.classify(&limits).expect("fallback"));
+            ((out, last_adaptive_attempts()), sample)
         })
     });
     assert!(out.stats.dl_rooted_over && out.stats.dl_over_budget);
@@ -1131,32 +1396,359 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
         sample.peak
     );
 
-    // (b) Tight caller `max_memory` under Option 2 ON stops cleanly with heap covered.
-    let cap = 2 << 20;
-    let tight = Limits {
+    // (b) Sol Blocker #1: pre-box `AdaptiveState` refusal at exact pre-box `base` boundary
+    //     (both without a pool and with a pool refusing the `size_of::<AdaptiveState>()`
+    //     increment), plus single-charge and mid-saturation counting-allocator coverage.
+    let baseline_limits = Limits {
         threads: 1,
         rooted: true,
         dl_steps: true,
-        max_memory: Some(cap),
         ..Limits::default()
     };
-    let (res_tight, sample_tight) = with_rooted_adaptive_bound(true, || {
-        measure(|| {
+    let pre_box_base = with_rooted_adaptive_bound(false, || {
+        with_rooted_adaptive_diag(false, || {
             let mut k = Classifier::of(&input);
-            k.classify(&tight)
+            let _ = k.classify(&baseline_limits).expect("baseline");
+            LAST_ALLOWANCE.get().0
         })
     });
-    if let Ok(out_tight) = res_tight {
-        assert!(
-            out_tight.stats.peak_memory >= sample_tight.peak,
-            "tight cap peak_memory ({}) undercounted measured peak heap ({})",
-            out_tight.stats.peak_memory,
-            sample_tight.peak
-        );
-    }
+    assert!(pre_box_base > 0);
+    let state_bytes = std::mem::size_of::<super::dl_rules::AdaptiveState>();
+
+    // (b1) Without a pool: `max_memory == Some(pre_box_base)` must refuse BEFORE allocating
+    //      `Box<AdaptiveState>` and BEFORE starting saturation workers.
+    let cap_at_base = Limits {
+        threads: 1,
+        rooted: true,
+        dl_steps: true,
+        max_memory: Some(pre_box_base),
+        ..Limits::default()
+    };
+    reset_adaptive_alloc_count();
+    let (res_base_cap, snaps_base_cap, allocs_base_cap) = with_rooted_adaptive_bound(true, || {
+        let mut k = Classifier::of(&input);
+        let r = k.classify(&cap_at_base);
+        (r, last_adaptive_attempts(), adaptive_alloc_count())
+    });
+    let _ = res_base_cap;
+    assert_eq!(
+        allocs_base_cap, 0,
+        "max_memory == pre_box_base must refuse before allocating Box<AdaptiveState>"
+    );
+    assert!(snaps_base_cap.is_empty());
+
+    // (b2) With a pool refusing any increment above `pre_box_base`: the `AdaptiveState`
+    //      overlap debit is cleanly rejected BEFORE `enable_adaptive` allocates.
+    let paid_b2 = Arc::new(AtomicUsize::new(0));
+    let rejected_b2 = Arc::new(AtomicBool::new(false));
+    let paid_b2_ref = paid_b2.clone();
+    let rejected_b2_ref = rejected_b2.clone();
+    let pool_at_base = Limits {
+        threads: 1,
+        rooted: true,
+        dl_steps: true,
+        charge: Some(Arc::new(move |bytes: usize| {
+            let cur = paid_b2_ref.load(Ordering::Relaxed);
+            if cur.saturating_add(bytes) > pre_box_base {
+                rejected_b2_ref.store(true, Ordering::SeqCst);
+                return false;
+            }
+            paid_b2_ref.fetch_add(bytes, Ordering::Relaxed);
+            true
+        })),
+        ..Limits::default()
+    };
+    reset_adaptive_alloc_count();
+    let (_res_pool_refuse, snaps_pool_refuse, allocs_pool_refuse) =
+        with_rooted_adaptive_bound(true, || {
+            let mut k = Classifier::of(&input);
+            let r = k.classify(&pool_at_base);
+            (r, last_adaptive_attempts(), adaptive_alloc_count())
+        });
     assert!(
-        sample_tight.peak <= cap + (256 << 10),
-        "tight cap measured peak ({}) overshot cap ({cap})",
+        rejected_b2.load(Ordering::SeqCst),
+        "pool capped at pre_box_base must reject the AdaptiveState increment"
+    );
+    assert_eq!(
+        allocs_pool_refuse, 0,
+        "pool refusal at pre_box_base must happen before allocating Box<AdaptiveState>"
+    );
+    assert!(snaps_pool_refuse.is_empty());
+
+    // (b3) When the pool allows `pre_box_base + state_bytes` (`pre_sat_exact`), `AdaptiveState`
+    //      is admitted once (`allocs == 1`), NOT double-charged on entry to `saturate_counted`,
+    //      and refusing the first mid-saturation growth debit stops cleanly with
+    //      `WinningStop::Memory` and full counting-allocator peak coverage!
+    let pre_sat_exact = pre_box_base + state_bytes;
+    let paid_b3 = Arc::new(AtomicUsize::new(0));
+    let rejected_b3 = Arc::new(AtomicBool::new(false));
+    let paid_b3_ref = paid_b3.clone();
+    let rejected_b3_ref = rejected_b3.clone();
+    let pool_tight_sat = Limits {
+        threads: 1,
+        rooted: true,
+        dl_steps: true,
+        partial: true,
+        charge: Some(Arc::new(move |bytes: usize| {
+            let cur = paid_b3_ref.load(Ordering::Relaxed);
+            // Allow exact `pre_sat_exact` (plus a bounded saturation prefix) to verify
+            // single-charge admission, refuse ONCE on mid-saturation growth to trigger
+            // `WinningStop::Memory`, then allow partial taxonomy construction to finish.
+            if cur.saturating_add(bytes) > pre_sat_exact + (64 << 10)
+                && !rejected_b3_ref.swap(true, Ordering::SeqCst)
+            {
+                return false;
+            }
+            paid_b3_ref.fetch_add(bytes, Ordering::Relaxed);
+            true
+        })),
+        ..Limits::default()
+    };
+    reset_adaptive_alloc_count();
+    let ((res_tight, snaps_tight, allocs_tight), sample_tight) =
+        with_rooted_adaptive_bound(true, || {
+            let mut k = Classifier::of(&input);
+            let (r, sample) = measure(|| k.classify(&pool_tight_sat));
+            (
+                (r, last_adaptive_attempts(), adaptive_alloc_count()),
+                sample,
+            )
+        });
+    assert_eq!(allocs_tight, 1, "AdaptiveState must be allocated once");
+    assert!(
+        rejected_b3.load(Ordering::SeqCst),
+        "tight saturation pool must cleanly reject a mid-saturation debit"
+    );
+    assert_eq!(snaps_tight.len(), 1);
+    assert_eq!(snaps_tight[0].winning_stop, WinningStop::Memory);
+    assert_eq!(snaps_tight[0].raw_queue, snaps_tight[0].oracle_queue);
+    let out_tight = res_tight.expect("partial memory stop");
+    assert!(!out_tight.complete && !out_tight.complete_for_taken);
+    assert_eq!(out_tight.consistency, Consistency::Unknown);
+    assert!(!out_tight.stats.dl_rooted_over && !out_tight.stats.dl_over_budget);
+    assert!(
+        out_tight.stats.peak_memory >= sample_tight.peak,
+        "tight cap peak_memory ({}) undercounted measured peak heap ({})",
+        out_tight.stats.peak_memory,
         sample_tight.peak
+    );
+
+    // (b4) Exact single-charge boundary check: a pool capped at EXACTLY `pre_sat_exact`
+    //      (`pre_box_base + state_bytes`, zero extra headroom) must admit `AdaptiveState`
+    //      without double-charging on `saturate_counted` entry, enter saturation, and then
+    //      reject the first saturation allocation debit cleanly (`allocs == 1`, `snaps == 1`,
+    //      `WinningStop::Memory`).
+    let paid_b4 = Arc::new(AtomicUsize::new(0));
+    let rejected_b4 = Arc::new(AtomicBool::new(false));
+    let paid_b4_ref = paid_b4.clone();
+    let rejected_b4_ref = rejected_b4.clone();
+    let pool_exact_presat = Limits {
+        threads: 1,
+        rooted: true,
+        dl_steps: true,
+        partial: true,
+        charge: Some(Arc::new(move |bytes: usize| {
+            let cur = paid_b4_ref.load(Ordering::Relaxed);
+            if cur.saturating_add(bytes) > pre_sat_exact {
+                rejected_b4_ref.store(true, Ordering::SeqCst);
+                return false;
+            }
+            paid_b4_ref.fetch_add(bytes, Ordering::Relaxed);
+            true
+        })),
+        ..Limits::default()
+    };
+    reset_adaptive_alloc_count();
+    let (res_exact, snaps_exact, allocs_exact) = with_rooted_adaptive_bound(true, || {
+        let mut k = Classifier::of(&input);
+        let r = k.classify(&pool_exact_presat);
+        (r, last_adaptive_attempts(), adaptive_alloc_count())
+    });
+    assert_eq!(
+        allocs_exact, 1,
+        "pool capped at exact pre_box_base + state_bytes must admit AdaptiveState once"
+    );
+    assert!(rejected_b4.load(Ordering::SeqCst));
+    assert_eq!(snaps_exact.len(), 1);
+    assert_eq!(snaps_exact[0].winning_stop, WinningStop::Memory);
+    assert_eq!(snaps_exact[0].raw_queue, snaps_exact[0].oracle_queue);
+    assert!(matches!(res_exact, Err(Error::Memory { .. })));
+}
+
+/// 11. Sol Blocker #2 & Neon Note #3: `ADAPTIVE-OUTCOME` reports the EXACT final public
+///     classification outcome (after `Classification::new`, exclusion `cover`, and `strict`),
+///     and stale snapshots/outcomes are cleared at top-level entry before `interchangeable()`
+///     can return early on cancellation or timeout.
+#[test]
+fn adaptive_outcome_matches_public_result_and_clears_on_early_error() {
+    let mut body = String::from(
+        "SubClassOf(:C ObjectMaxCardinality(12 :r owl:Thing))\n\
+         SubClassOf(:Seed ObjectUnionOf(:U0 :U1))\n\
+         SubClassOf(:U0 :Done)\n\
+         SubClassOf(:U1 :Done)\n",
+    );
+    for k in 0..13 {
+        body.push_str(&format!("SubClassOf(:C ObjectSomeValuesFrom(:r :B{k}))\n"));
+    }
+    for i in 0..20 {
+        body.push_str(&format!("ClassAssertion(:Seed :i{i})\n"));
+    }
+    let counting_input = axioms(&body);
+
+    // (a) `strict = true` after a counting exclusion returns `Err(Error::Incomplete)`:
+    //     `ADAPTIVE-OUTCOME` must report `Err { kind: "incomplete" }`, NOT `Ok`!
+    let strict_limits = Limits {
+        threads: 1,
+        counting: true,
+        rooted: true,
+        dl_steps: true,
+        strict: true,
+        ..Limits::default()
+    };
+    let (res_strict, outcome_strict, snaps_strict) = with_rooted_adaptive_bound(true, || {
+        with_rooted_adaptive_diag(true, || {
+            let mut k = Classifier::of(&counting_input);
+            let r = k.classify(&strict_limits);
+            (r, last_adaptive_outcome(), last_adaptive_attempts())
+        })
+    });
+    assert!(matches!(res_strict, Err(Error::Incomplete(_))));
+    assert_eq!(snaps_strict.len(), 1);
+    assert!(matches!(
+        outcome_strict,
+        Some(AdaptiveOutcome::Err {
+            run_id,
+            attempts: 1,
+            kind: "incomplete",
+        }) if run_id > 0
+    ));
+
+    // (b) `strict = false` on the same ontology runs `out.cover(...)`: `ADAPTIVE-OUTCOME`
+    //     must report the exact post-coverage `complete`, `consistency`, `incomplete`, and
+    //     `excluded` returned to the caller!
+    let cover_limits = Limits {
+        strict: false,
+        ..strict_limits
+    };
+    let (out_cov, excl_cov, outcome_cov) = with_rooted_adaptive_bound(true, || {
+        with_rooted_adaptive_diag(true, || {
+            let mut k = Classifier::of(&counting_input);
+            let out = k.classify(&cover_limits).expect("covered answer");
+            (out, k.excluded().to_vec(), last_adaptive_outcome())
+        })
+    });
+    assert!(!out_cov.complete);
+    assert!(!excl_cov.is_empty());
+    assert!(matches!(
+        outcome_cov,
+        Some(AdaptiveOutcome::Ok {
+            run_id,
+            attempts: 1,
+            consistency,
+            complete,
+            complete_for_taken,
+            dl_counting_over: true,
+            dl_rooted_over: false,
+            excluded,
+            incomplete,
+            ..
+        }) if run_id > 0
+            && consistency == out_cov.consistency
+            && complete == out_cov.complete
+            && complete_for_taken == out_cov.complete_for_taken
+            && excluded == excl_cov.len()
+            && incomplete == out_cov.incomplete.len()
+    ));
+
+    // (c) `partial = true` + `Stop::Memory`: `ADAPTIVE-OUTCOME` must report
+    //     `consistency == Consistency::Unknown`, `complete == false`, `incomplete > 0`.
+    let partial_input = rooted_disjunctive_ontology(60, 15);
+    let small_root_policy = AdaptivePolicy {
+        sample_shift: 4,
+        ratio_num: 3,
+        ratio_den: 10,
+        root_limit: 16,
+        warmup_work: 1 << 20,
+        queue_max: 1 << 20,
+        ceiling: 1 << 20,
+    };
+    let latched = Arc::new(AtomicBool::new(false));
+    let refused = Arc::new(AtomicBool::new(false));
+    let latched_h = latched.clone();
+    let latched_c = latched.clone();
+    let refused_c = refused.clone();
+    let partial_limits = Limits {
+        threads: 1,
+        rooted: true,
+        dl_steps: true,
+        partial: true,
+        charge: Some(Arc::new(move |_| {
+            if latched_c.load(Ordering::SeqCst) && !refused_c.swap(true, Ordering::SeqCst) {
+                return false;
+            }
+            true
+        })),
+        ..Limits::default()
+    };
+    let (out_part, outcome_part) = with_rooted_adaptive_policy(small_root_policy, || {
+        with_rooted_adaptive_bound(true, || {
+            with_rooted_adaptive_diag(true, || {
+                with_on_adaptive_latch(
+                    move |g, _| {
+                        if g == WorkStopGuard::RootWork {
+                            latched_h.store(true, Ordering::SeqCst);
+                        }
+                    },
+                    || {
+                        let mut k = Classifier::of(&partial_input);
+                        let out = k.classify(&partial_limits).expect("partial memory");
+                        (out, last_adaptive_outcome())
+                    },
+                )
+            })
+        })
+    });
+    assert_eq!(out_part.consistency, Consistency::Unknown);
+    assert!(!out_part.complete && !out_part.incomplete.is_empty());
+    assert!(matches!(
+        outcome_part,
+        Some(AdaptiveOutcome::Ok {
+            consistency: Consistency::Unknown,
+            complete: false,
+            complete_for_taken: false,
+            incomplete,
+            ..
+        }) if incomplete == out_part.incomplete.len()
+    ));
+
+    // (d) Early cancellation inside `interchangeable()` must clear stale snapshots and
+    //     outcome from the preceding classification instead of leaving them visible.
+    let mut k = Classifier::of(&partial_input);
+    let normal_limits = Limits {
+        threads: 1,
+        rooted: true,
+        dl_steps: true,
+        ..Limits::default()
+    };
+    with_rooted_adaptive_bound(true, || {
+        with_rooted_adaptive_diag(true, || {
+            let _ = k.classify(&normal_limits).expect("seed snapshots");
+            assert_eq!(last_adaptive_attempts().len(), 1);
+            assert!(last_adaptive_outcome().is_some());
+        })
+    });
+    let cancelled_immediately = Limits {
+        cancelled: Some(Arc::new(|| true)),
+        ..normal_limits
+    };
+    let early_err = k.classify(&cancelled_immediately);
+    assert!(matches!(early_err, Err(Error::Cancelled)));
+    assert!(
+        last_adaptive_attempts().is_empty(),
+        "early interchangeable() cancellation must clear prior adaptive snapshots"
+    );
+    assert!(
+        last_adaptive_outcome().is_none(),
+        "early interchangeable() cancellation must clear prior adaptive outcome"
     );
 }

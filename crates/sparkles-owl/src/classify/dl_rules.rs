@@ -668,11 +668,15 @@ pub(super) struct AdaptiveState {
     hypothetical_at: AtomicUsize,
     /// Number of `2^sample_shift` sample crossings observed.
     samples: AtomicUsize,
+    /// Set once a non-work stop has already won on a `partial = true` run so subsequent
+    /// individual-marking rounds cannot trip on a stale guard or emit post-saturation samples.
+    disarmed: std::sync::atomic::AtomicBool,
 }
 
 impl AdaptiveState {
     fn new(policy: AdaptivePolicy, enforce: bool, diag: bool, meta: AdaptiveMeta) -> Self {
         debug_assert!(policy.sample_shift < usize::BITS);
+        debug_assert!(policy.ceiling > 0);
         Self {
             policy,
             enforce,
@@ -687,6 +691,7 @@ impl AdaptiveState {
             hypothetical_guard: AtomicU8::new(WorkStopGuard::None as u8),
             hypothetical_at: AtomicUsize::new(0),
             samples: AtomicUsize::new(0),
+            disarmed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -709,6 +714,12 @@ impl AdaptiveState {
             .is_ok()
         {
             self.stop_requested_at.store(at_work, Ordering::Relaxed);
+            #[cfg(test)]
+            ON_ADAPTIVE_LATCH_TEST.with(|c| {
+                if let Some(f) = c.borrow().as_ref() {
+                    f(guard, at_work);
+                }
+            });
         }
     }
 
@@ -745,6 +756,11 @@ impl AdaptiveState {
 }
 
 #[cfg(test)]
+type AdaptiveLatchHook = std::sync::Arc<dyn Fn(WorkStopGuard, usize) + Send + Sync>;
+#[cfg(test)]
+type AdaptiveSampleHook = std::sync::Arc<dyn Fn(usize, WorkStopGuard) + Send + Sync>;
+
+#[cfg(test)]
 thread_local! {
     static ROOTED_ADAPTIVE_BOUND_TEST: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
@@ -752,6 +768,12 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static ROOTED_ADAPTIVE_POLICY_TEST: std::cell::Cell<Option<AdaptivePolicy>> =
         const { std::cell::Cell::new(None) };
+    static ON_ADAPTIVE_LATCH_TEST: std::cell::RefCell<Option<AdaptiveLatchHook>> =
+        const { std::cell::RefCell::new(None) };
+    static ON_ADAPTIVE_SAMPLE_TEST: std::cell::RefCell<Option<AdaptiveSampleHook>> =
+        const { std::cell::RefCell::new(None) };
+    static ADAPTIVE_ALLOC_COUNT_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Whether Option 2 (`rawQ`) adaptive rooted stopping is enabled
@@ -823,6 +845,48 @@ pub(super) fn with_rooted_adaptive_policy<R>(policy: AdaptivePolicy, f: impl FnO
     let prev = ROOTED_ADAPTIVE_POLICY_TEST.with(|c| c.replace(Some(policy)));
     let _reset = Reset(prev);
     f()
+}
+
+#[cfg(test)]
+pub(super) fn with_on_adaptive_latch<R>(
+    hook: impl Fn(WorkStopGuard, usize) + Send + Sync + 'static,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Reset(Option<AdaptiveLatchHook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ON_ADAPTIVE_LATCH_TEST.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = ON_ADAPTIVE_LATCH_TEST.with(|c| c.borrow_mut().replace(std::sync::Arc::new(hook)));
+    let _reset = Reset(prev);
+    f()
+}
+
+#[cfg(test)]
+pub(super) fn with_on_adaptive_sample<R>(
+    hook: impl Fn(usize, WorkStopGuard) + Send + Sync + 'static,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Reset(Option<AdaptiveSampleHook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ON_ADAPTIVE_SAMPLE_TEST.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = ON_ADAPTIVE_SAMPLE_TEST.with(|c| c.borrow_mut().replace(std::sync::Arc::new(hook)));
+    let _reset = Reset(prev);
+    f()
+}
+
+#[cfg(test)]
+pub(super) fn reset_adaptive_alloc_count() {
+    ADAPTIVE_ALLOC_COUNT_TEST.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn adaptive_alloc_count() -> usize {
+    ADAPTIVE_ALLOC_COUNT_TEST.with(|c| c.get())
 }
 
 /// What a saturation with Tier D shares: the table of the clauses that contexts send one
@@ -941,9 +1005,22 @@ impl DlRun {
         diag: bool,
         meta: AdaptiveMeta,
     ) {
+        #[cfg(test)]
+        ADAPTIVE_ALLOC_COUNT_TEST.with(|c| c.set(c.get() + 1));
         self.adaptive = Some(Box::new(AdaptiveState::new(policy, enforce, diag, meta)));
         if enforce {
             self.set_work_limit(policy.ceiling);
+        }
+    }
+    /// Disarms work-bound enforcement once a non-work stop has already won on a
+    /// `partial = true` run, keeping `AdaptiveState` allocated so `bytes()` accounting
+    /// remains accurate through individual marking and partial result construction.
+    pub(super) fn disarm_work_bound(&self) {
+        self.work_limit.store(0, Ordering::Relaxed);
+        self.width_limit.store(0, Ordering::Relaxed);
+        self.exhausted.store(false, Ordering::Relaxed);
+        if let Some(a) = self.adaptive.as_deref() {
+            a.disarmed.store(true, Ordering::Relaxed);
         }
     }
     #[inline]
@@ -1094,6 +1171,10 @@ impl DlRun {
         if n == 0 {
             return;
         }
+        if a.disarmed.load(Ordering::Relaxed) {
+            self.work.fetch_add(n, Ordering::Relaxed);
+            return;
+        }
         let old = self
             .work
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
@@ -1147,6 +1228,12 @@ impl DlRun {
         if guard != WorkStopGuard::None {
             a.latch_policy_guard(guard, work);
         }
+        #[cfg(test)]
+        ON_ADAPTIVE_SAMPLE_TEST.with(|c| {
+            if let Some(f) = c.borrow().as_ref() {
+                f(work, guard);
+            }
+        });
         if a.diag {
             let first = if a.enforce {
                 WorkStopGuard::from_u8(a.stop_guard.load(Ordering::Relaxed))
@@ -1192,13 +1279,16 @@ impl DlRun {
     /// Passes the bound on derived conclusions at once, recording `guard` when adaptive
     /// enforcement is active.
     fn exhaust_with(&self, guard: WorkStopGuard) {
-        if let Some(a) = self.adaptive.as_deref()
-            && a.enforce
-        {
-            let w = self
-                .carried
-                .saturating_add(self.work.load(Ordering::Relaxed));
-            a.latch_stop(guard, w);
+        if let Some(a) = self.adaptive.as_deref() {
+            if a.disarmed.load(Ordering::Relaxed) {
+                return;
+            }
+            if a.enforce {
+                let w = self
+                    .carried
+                    .saturating_add(self.work.load(Ordering::Relaxed));
+                a.latch_stop(guard, w);
+            }
         }
         self.exhausted.store(true, Ordering::Relaxed);
     }
@@ -1242,6 +1332,9 @@ impl DlRun {
         if let Some(a) = self.adaptive.as_deref()
             && a.enforce
         {
+            if a.disarmed.load(Ordering::Relaxed) {
+                return false;
+            }
             return self.over_work_adaptive(a);
         }
         let l = self.work_limit.load(Ordering::Relaxed);
