@@ -178,6 +178,15 @@ pub(super) fn view_leaf(p: &Planner<'_>, inner: &GraphPattern) -> Result<Node> {
 
 /// Read the view's rows into a table of `vars`.
 pub(super) fn run(ctx: &Ctx, spec: &ViewSpec, vars: &[VarId]) -> Result<Table> {
+    if ctx
+        .read_source
+        .as_ref()
+        .is_some_and(crate::store::BoundReadSource::is_txn)
+    {
+        return Err(Error::Unsupported(
+            "view providers are not supported on a scoped transaction view".into(),
+        ));
+    }
     let Some(source) = ctx.views.as_ref() else {
         return Err(crate::incr::error(
             "view-not-found",

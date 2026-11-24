@@ -6742,18 +6742,19 @@ impl WriteTxn<'_> {
         &'a self,
         preparation: &crate::access::Preparation,
     ) -> Result<PreparedTxnView<'a>> {
-        preparation.check()?;
+        let selection = preparation.selection_scope();
+        selection.check()?;
         let limit = crate::history::ReadLimit {
-            options: preparation,
-            memory: Some(preparation.selection_room()),
+            options: &selection,
+            memory: Some(selection.selection_room()),
             held: 0,
         };
         let delta_bytes = crate::store::history_limited::preparation_delta_bytes(&self.delta);
         let retained = delta_bytes
             .checked_add(self.base.generation.retained_bytes_limited(&limit)?)
             .and_then(|bytes| bytes.checked_add(crate::history::READ_METADATA_BYTES))
-            .ok_or_else(|| preparation.exhausted())?;
-        let held = preparation.reserve(retained)?;
+            .ok_or_else(|| selection.exhausted())?;
+        let held = selection.reserve(retained)?;
         let snap = if self.is_dirty() {
             Arc::new(self.view())
         } else {
@@ -6762,7 +6763,11 @@ impl WriteTxn<'_> {
         let txn = bound_read_source::PreparedTxn::new(snap, self.store, held);
         let all = crate::access::GraphAccess::all();
         let access = self.opts.graphs.as_deref().unwrap_or(&all);
-        let view = crate::access::triples::controlled::prepare_txn(txn, access, preparation)?;
+        let view = crate::access::triples::controlled::prepare_txn(
+            txn,
+            access,
+            &preparation.without_selection_scope(),
+        )?;
         Ok(PreparedTxnView::new(self.store, view))
     }
 

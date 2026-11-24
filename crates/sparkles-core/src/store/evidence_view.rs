@@ -46,6 +46,9 @@ struct BoundInner {
     original_data_binding: ConfigurationBinding,
     document: managed_history::Owned<managed_history::Generation>,
     _held: Reservation,
+    // Declared after `_held` and `document` so selection reservations release
+    // before the last `Preparation` handle drops.
+    preparation: Preparation,
 }
 
 impl std::fmt::Debug for BoundEvidenceView {
@@ -66,9 +69,19 @@ impl BoundEvidenceView {
         self.inner._held.bytes()
     }
 
-    /// The configured memory limit of the [`Preparation`] backing this evidence view.
+    /// The configured execution memory limit of the [`Preparation`] backing this evidence view.
     pub fn preparation_limit(&self) -> u64 {
-        self.inner._held.preparation().limit()
+        self.inner.preparation.limit()
+    }
+
+    /// The configured selection memory ceiling of the [`Preparation`] backing this evidence view.
+    pub fn selection_limit(&self) -> u64 {
+        self.inner.preparation.selection_limit()
+    }
+
+    /// Remaining local room in the execution allowance of the [`Preparation`] backing this view.
+    pub fn available_execution_bytes(&self) -> u64 {
+        self.inner.preparation.available_bytes()
     }
 
     /// Retain the genuine RDF/configuration source and its original admission.
@@ -78,7 +91,7 @@ impl BoundEvidenceView {
     }
 
     pub(super) fn query_input(&self) -> (&Arc<Snapshot>, &Preparation) {
-        (&self.inner.snapshot, self.inner._held.preparation())
+        (&self.inner.snapshot, &self.inner.preparation)
     }
 
     pub fn dataset_id(&self) -> uuid::Uuid {
@@ -268,7 +281,8 @@ impl Store {
         at: &At,
         preparation: &Preparation,
     ) -> Result<BoundEvidenceView> {
-        let pair = self.select_configuration_pair(store, at, preparation)?;
+        let selection = preparation.selection_scope();
+        let pair = self.select_configuration_pair(store, at, &selection)?;
         let configuration = pair.semantic.configuration().ok_or_else(|| {
             managed_history::unavailable("historical evidence configuration is explicitly unbound")
         })?;
@@ -286,7 +300,7 @@ impl Store {
                 self.owner_dataset_id(),
                 history,
                 configuration,
-                preparation,
+                &selection,
             )?
         } else {
             let published = installed.history_memory.as_ref().ok_or_else(|| {
@@ -297,9 +311,9 @@ impl Store {
                     "configuration memory root differs",
                 ));
             }
-            managed_history::resolve_memory(published, configuration, preparation)?
+            managed_history::resolve_memory(published, configuration, &selection)?
         };
-        preparation.check()?;
+        selection.check()?;
         Ok(BoundEvidenceView {
             inner: Arc::new(BoundInner {
                 family: Arc::downgrade(&self.family),
@@ -314,6 +328,7 @@ impl Store {
                 original_data_binding: pair.data,
                 document,
                 _held: pair.held,
+                preparation: preparation.without_selection_scope(),
             }),
         })
     }
@@ -324,6 +339,7 @@ impl Store {
         at: &At,
         preparation: &Preparation,
     ) -> Result<SelectedPair> {
+        let preparation = &preparation.selection_scope();
         preparation.check()?;
         if self.is_branch() || !Arc::ptr_eq(&self.family, &store.family) {
             return Err(Error::invalid(

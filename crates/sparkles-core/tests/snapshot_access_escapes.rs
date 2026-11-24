@@ -726,3 +726,356 @@ fn controlled_guard_callback_uses_scoped_guard_snapshot_on_selected_and_evidence
     }
     assert_eq!(grant.used(), 0);
 }
+
+#[test]
+fn prepared_txn_view_refuses_reasoning_and_view_providers_that_could_retain_snapshot() {
+    use sparkles_core::sparql::reasoning::{
+        Demand, DemandInfo, Derived, Materialization, ReasoningProvider, ReasoningSession, Report,
+        Rewritten, SessionRequest,
+    };
+    use sparkles_core::sparql::viewsvc::{ViewRead, ViewRows, ViewSource};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type ReadableFn = Arc<dyn Fn(sparkles_core::id::Id) -> bool + Send + Sync>;
+
+    struct CapturingReasoner {
+        calls: AtomicUsize,
+        snaps: Mutex<Vec<Arc<Snapshot>>>,
+        readables: Mutex<Vec<ReadableFn>>,
+    }
+
+    impl CapturingReasoner {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                snaps: Mutex::new(Vec::new()),
+                readables: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    struct DummySession;
+    impl ReasoningSession for DummySession {
+        fn intensional(
+            &self,
+            _: Option<&oxrdf::Term>,
+            _: Option<&oxrdf::Term>,
+            _: Option<&oxrdf::Term>,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+        fn prepare(&mut self, _: &[Demand], _: bool) -> Result<Vec<DemandInfo>> {
+            Ok(Vec::new())
+        }
+        fn derive(&mut self, _: Vec<(usize, Vec<u64>)>) -> Result<Derived> {
+            Ok(Derived::default())
+        }
+        fn report(&self) -> Report {
+            Report::default()
+        }
+    }
+
+    impl ReasoningProvider for CapturingReasoner {
+        fn label(&self) -> String {
+            "capturing".into()
+        }
+        fn auto(&self) -> bool {
+            true
+        }
+        fn reads_all(&self, req: &SessionRequest) -> Option<Materialization> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.snaps.lock().unwrap().push(req.snap.clone());
+            if let Some(r) = &req.readable {
+                self.readables.lock().unwrap().push(r.clone());
+            }
+            None
+        }
+        fn rewrite(
+            &self,
+            _: &spargebra::Query,
+            _: &[(String, oxrdf::Term)],
+            req: &SessionRequest,
+        ) -> Result<Option<Rewritten>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.snaps.lock().unwrap().push(req.snap.clone());
+            if let Some(r) = &req.readable {
+                self.readables.lock().unwrap().push(r.clone());
+            }
+            Ok(None)
+        }
+        fn start(&self, req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.snaps.lock().unwrap().push(req.snap);
+            if let Some(r) = req.readable {
+                self.readables.lock().unwrap().push(r);
+            }
+            Ok(Box::new(DummySession))
+        }
+    }
+
+    struct CapturingViewSource {
+        calls: AtomicUsize,
+        snaps: Mutex<Vec<Arc<Snapshot>>>,
+    }
+
+    impl std::fmt::Debug for CapturingViewSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CapturingViewSource")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ViewSource for CapturingViewSource {
+        fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(snap) = r.snap {
+                self.snaps.lock().unwrap().push(snap.clone());
+            }
+            Ok(ViewRows {
+                columns: vec!["x".into()],
+                rows: vec![],
+                commit: r.at,
+                evaluated_under: None,
+            })
+        }
+    }
+
+    let store = Store::in_memory(StoreOptions::default());
+    sparkles_core::sparql::update::update(
+        &store,
+        "INSERT DATA { <urn:s> <urn:p> 1 }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+
+    let policy = Arc::new(GraphAccess::graphs(
+        Graphs::All.guarded_by("urn:guarded:*", Decider(Arc::new(CommitGuard))),
+        Graphs::All,
+    ));
+    let mut txn = store.write_with(
+        sparkles_core::commit::CommitKind::Update,
+        sparkles_core::guard::WriteOptions {
+            graphs: Some(policy),
+            ..Default::default()
+        },
+    );
+    let s = txn
+        .intern(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+            "urn:uncommitted:s",
+        )))
+        .unwrap();
+    let p = txn
+        .intern(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+            "urn:uncommitted:p",
+        )))
+        .unwrap();
+    txn.insert([s, p, s, sparkles_core::id::Id::DEFAULT_GRAPH])
+        .unwrap();
+
+    let pool = QueryPool::new(64 << 20);
+    let grant = Arc::new(pool.empty_grant());
+    let reasoner = Arc::new(CapturingReasoner::new());
+    let views = Arc::new(CapturingViewSource {
+        calls: AtomicUsize::new(0),
+        snaps: Mutex::new(Vec::new()),
+    });
+    {
+        let prep = Preparation::with_grant(Control::none(), 16 << 20, grant.clone()).unwrap();
+        let baseline = grant.used();
+        let prepared = txn.prepare_read_view(&prep).unwrap();
+
+        let err = prepared
+            .query(
+                "SELECT ?s WHERE { ?s ?p ?o }",
+                &QueryOptions {
+                    grant: Some(grant.clone()),
+                    reasoning: Some(reasoner.clone()),
+                    ..Default::default()
+                },
+            )
+            .err()
+            .expect("scoped transaction query must refuse owning reasoning provider");
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Error::Unsupported for reasoning provider, got {err:?}"
+        );
+        assert_eq!(reasoner.calls.load(Ordering::Relaxed), 0);
+        assert!(reasoner.snaps.lock().unwrap().is_empty());
+        assert!(reasoner.readables.lock().unwrap().is_empty());
+
+        let err = prepared
+            .query(
+                "PREFIX view: <urn:x-sparkles:view#> SELECT ?x WHERE { SERVICE view:read { [] view:name \"v\" ; view:bind ?x } }",
+                &QueryOptions {
+                    grant: Some(grant.clone()),
+                    views: Some(views.clone()),
+                    ..Default::default()
+                },
+            )
+            .err()
+            .expect("scoped transaction query must refuse owning view provider");
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Error::Unsupported for view provider, got {err:?}"
+        );
+        assert_eq!(views.calls.load(Ordering::Relaxed), 0);
+        assert!(views.snaps.lock().unwrap().is_empty());
+
+        drop(prepared);
+        assert_eq!(grant.used(), baseline);
+    }
+    assert_eq!(grant.used(), 0);
+    txn.discard_terms().unwrap();
+    drop(txn);
+    assert!(store.snapshot().lookup_iri("urn:uncommitted:s").is_none());
+}
+
+#[test]
+fn evidence_selection_ceiling_is_distinct_from_execution_allowance() {
+    let store = Store::in_memory(StoreOptions::default());
+    let init_prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+    store
+        .activate_memory_configuration_history(&init_prep)
+        .unwrap();
+    drop(init_prep);
+
+    // Load enough quads + vocab strings that the retained evidence view uses
+    // substantial selection bytes (> 128 KiB).
+    let mut ttl = String::from("INSERT DATA {\n");
+    for i in 0..800 {
+        ttl.push_str(&format!(
+            "  <urn:item:{i}> <urn:payload> \"{:0>256}\" .\n",
+            i
+        ));
+    }
+    ttl.push('}');
+    sparkles_core::sparql::update::update(&store, &ttl, &QueryOptions::default()).unwrap();
+
+    // 1. A tight selection ceiling refuses oversized evidence selection even when
+    //    the execution allowance is huge (256 MiB or u64::MAX), both pooled and unpooled.
+    let big_pool = QueryPool::new(128 << 20);
+    for execution_limit in [256 << 20, u64::MAX] {
+        // Unpooled
+        let unpooled_prep = Preparation::new(Control::none(), execution_limit)
+            .unwrap()
+            .with_selection_limit(16 << 10)
+            .unwrap();
+        assert_eq!(unpooled_prep.limit(), execution_limit);
+        assert_eq!(unpooled_prep.selection_limit(), 16 << 10);
+        let res = store.evidence_view(&At::Head, &unpooled_prep);
+        assert!(
+            matches!(
+                res,
+                Err(Error::BudgetExceeded(ref b)) if b.limit <= (16 << 10)
+            ),
+            "unpooled selection must enforce its own 16 KiB ceiling even with execution_limit={execution_limit}, got {res:?}"
+        );
+
+        // Pooled
+        let grant = Arc::new(big_pool.empty_grant());
+        {
+            let pooled_prep =
+                Preparation::with_grant(Control::none(), execution_limit, grant.clone())
+                    .unwrap()
+                    .with_selection_limit(16 << 10)
+                    .unwrap();
+            let baseline = grant.used();
+            let res = store.evidence_view(&At::Head, &pooled_prep);
+            assert!(
+                matches!(
+                    res,
+                    Err(Error::BudgetExceeded(ref b)) if b.limit <= (16 << 10)
+                ),
+                "pooled selection must enforce its own 16 KiB ceiling even with execution_limit={execution_limit}, got {res:?}"
+            );
+            assert_eq!(grant.used(), baseline);
+            assert!(
+                grant.peak() <= sparkles_core::sparql::pool::GRANULE,
+                "refused selection must not reserve beyond one pool granule: peak={}",
+                grant.peak()
+            );
+        }
+        assert_eq!(grant.used(), 0);
+    }
+
+    // 2. With an unset query cap (u64::MAX) on a 128 MiB pool and an 8 MiB selection
+    //    ceiling, selection must not temporarily reserve the pool's entire capacity.
+    {
+        let grant = Arc::new(big_pool.empty_grant());
+        {
+            let prep = Preparation::with_grant(Control::none(), u64::MAX, grant.clone())
+                .unwrap()
+                .with_selection_limit(8 << 20)
+                .unwrap();
+            let view = store.evidence_view(&At::Head, &prep).unwrap();
+            assert_eq!(view.preparation_limit(), u64::MAX);
+            assert_eq!(view.selection_limit(), 8 << 20);
+            assert!(
+                grant.peak() <= 8 << 20,
+                "unbounded query selection must stay within 8 MiB selection ceiling: peak={}",
+                grant.peak()
+            );
+            drop(view);
+        }
+        assert_eq!(grant.used(), 0);
+    }
+    assert_eq!(big_pool.granted(), 0);
+
+    // 3. While a live evidence view retains selection bytes (> 1 MiB here, larger
+    //    than query_limit itself), the full configured execution allowance remains
+    //    usable for queries (and execution cannot steal unused selection slack).
+    let query_limit = 1 << 20;
+    let selection_limit = 16 << 20;
+    let grant = Arc::new(big_pool.empty_grant());
+    {
+        let prep = Preparation::with_grant(Control::none(), query_limit, grant.clone())
+            .unwrap()
+            .with_selection_limit(selection_limit)
+            .unwrap();
+        let baseline = grant.used();
+        let before_room = prep.available_bytes();
+        let view = store.evidence_view(&At::Head, &prep).unwrap();
+        let retained_selection = grant.used() - baseline;
+        assert!(
+            retained_selection > query_limit,
+            "expected retained selection ({retained_selection}) > query_limit ({query_limit})"
+        );
+        // Selection must not reduce execution headroom below the configured query cap.
+        assert_eq!(view.available_execution_bytes(), before_room);
+
+        // Allocate nearly the full query_limit from execution headroom while `view`
+        // stays live — impossible if selection had consumed the execution allowance.
+        let exec_hold = prep.reserve(query_limit - (64 << 10)).unwrap();
+        drop(exec_hold);
+
+        // Execution must still refuse exceeding `query_limit` even though `selection_limit`
+        // has > 14 MiB of unused slack.
+        assert!(matches!(
+            prep.reserve(query_limit),
+            Err(Error::BudgetExceeded(ref b)) if b.limit == query_limit
+        ));
+
+        // Running a real SPARQL query over `view.read_source()` with `max_memory_bytes`
+        // set to `query_limit` succeeds while `view` stays live.
+        let res = query_source(
+            view.read_source(),
+            &store,
+            "SELECT ?s ?o WHERE { ?s <urn:payload> ?o }",
+            &QueryOptions {
+                graphs: Some(Arc::new(GraphAccess::all())),
+                grant: Some(grant.clone()),
+                max_memory_bytes: Some(query_limit),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(res.len(), 800);
+        drop(res);
+        drop(view);
+        assert_eq!(grant.used(), baseline);
+    }
+    assert_eq!(grant.used(), 0);
+    drop(grant);
+    assert_eq!(big_pool.granted(), 0);
+}

@@ -2246,10 +2246,7 @@ impl Tools<'_> {
             deadline: Some(deadline),
             ..sparkles::task::Control::with_cancel(self.call.cancel.clone())
         };
-        let limit = self
-            .cfg()
-            .query_memory_bytes
-            .map_or(u64::MAX, |bytes| bytes.saturating_add(VIEW_BYTES));
+        let query_limit = self.cfg().query_memory_bytes.unwrap_or(u64::MAX);
         let grant = self.call.grant.clone().or_else(|| {
             ds.dataset
                 .query_options()
@@ -2257,9 +2254,10 @@ impl Tools<'_> {
                 .map(|pool| std::sync::Arc::new(pool.empty_grant()))
         });
         let preparation = match grant {
-            Some(grant) => sparkles::access::Preparation::with_grant(control, limit, grant),
-            None => sparkles::access::Preparation::new(control, limit),
+            Some(grant) => sparkles::access::Preparation::with_grant(control, query_limit, grant),
+            None => sparkles::access::Preparation::new(control, query_limit),
         }
+        .and_then(|prep| prep.with_selection_limit(VIEW_BYTES))
         .map_err(|e| ctx.engine(e))?;
         main.dataset
             .store()

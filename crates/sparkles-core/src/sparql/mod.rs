@@ -1665,6 +1665,16 @@ fn prepare_query_input_policy(
         ctx.deadline = opts.effective_deadline(started)?;
     }
     // a provider that rewrites the query (OWL 2 QL, spec F17 §7) plans the rewritten one
+    if opts.reasoning.is_some()
+        && ctx
+            .read_source
+            .as_ref()
+            .is_some_and(crate::store::BoundReadSource::is_txn)
+    {
+        return Err(Error::Unsupported(
+            "query-time reasoning is not supported on a scoped transaction view".into(),
+        ));
+    }
     let rewritten = match &opts.reasoning {
         Some(provider) => {
             reasoning::check_form(parsed)?;

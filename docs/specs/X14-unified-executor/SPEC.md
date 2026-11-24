@@ -548,9 +548,11 @@ through `BoundReadSource`, `BoundEvidenceView::prepare_view`, `Reads::from_prepa
 Store-instance validation and a weak identity of the original policy `Arc` inside the
 returned `PreparedView`. In the server, GraphRAG's `Evidence` replaces `snapshot`
 with `read_source` and `commit` using the server query pool and configured execution
-memory budget, and MCP memory recall runs evidence-backed reads and conflict checks
+memory budget with a distinct `Preparation::with_selection_limit` ceiling for evidence
+selection, and MCP memory recall runs evidence-backed reads and conflict checks
 through `BoundReadSource` and `Schema::constraints_for_evidence` under the call's grant
-or dataset pool instead of cloning the raw snapshot or opening live `HEAD`.
+or dataset pool with the same distinct selection ceiling instead of cloning the raw
+snapshot or opening live `HEAD`.
 
 `Snapshot::mask`, `Snapshot::counts` and `access::triples::apply` are now crate-private,
 with read-only non-escaping accessors `has_mask`, `mask_id`, `mask_key` and
@@ -565,7 +567,9 @@ readers validate both top-level and nested rules, accepting the matching view an
 refusing another commit, store, uncommitted view or masked derivative. `WriteTxn::graphs`
 is removed and `WriteTxn::prepare_read_view` reserves the transaction snapshot storage up
 front and returns a `PreparedTxnView` borrowed from the writer so neither the view nor
-its `ScopedQueryResult` can outlive `WriteTxn::discard_terms` or a dry-run rollback.
+its `ScopedQueryResult` can outlive `WriteTxn::discard_terms` or a dry-run rollback;
+`PreparedTxnView::query` also refuses owning snapshot callbacks (`QueryOptions::reasoning`
+and `QueryOptions::views`) so a provider cannot retain the transaction snapshot past drop.
 `QueryBatch::transient_term`, used only by the FFI cursor encoder, remains deferred to
 coordinate with items 1306 and 1308.
 

@@ -93,11 +93,27 @@ impl<'a> PreparedTxnView<'a> {
     /// Execute a SPARQL query against this scoped transaction view under `opts`.
     /// The returned [`ScopedQueryResult`] stays bound to this view's lifetime so the
     /// transaction snapshot cannot survive vocabulary rollback.
+    ///
+    /// Owning provider callbacks that receive an `Arc<Snapshot>`
+    /// ([`crate::sparql::QueryOptions::reasoning`] and
+    /// [`crate::sparql::QueryOptions::views`]) are refused with
+    /// [`Error::Unsupported`] so a callback cannot retain the transaction snapshot
+    /// past drop or rollback.
     pub fn query<'q>(
         &'q self,
         q: &str,
         opts: &crate::sparql::QueryOptions,
     ) -> Result<ScopedQueryResult<'q>> {
+        if opts.reasoning.is_some() {
+            return Err(Error::Unsupported(
+                "query-time reasoning is not supported on a scoped transaction view".into(),
+            ));
+        }
+        if opts.views.is_some() {
+            return Err(Error::Unsupported(
+                "view providers are not supported on a scoped transaction view".into(),
+            ));
+        }
         let result = crate::sparql::query_source(self.view.read_source(), self.store, q, opts)?;
         Ok(ScopedQueryResult {
             result,
@@ -229,8 +245,8 @@ impl ScopedQueryResult<'_> {
         Ok(())
     }
 
-    /// Decode SELECT rows into owned RDF terms that retain no reference to the
-    /// transaction snapshot or delta vocabulary.
+    /// Decode SELECT rows into application-owned vectors of RDF terms that retain
+    /// no reference to the transaction snapshot, delta vocabulary, or query credit.
     pub fn collect_rows(&self) -> Result<Vec<Vec<Option<oxrdf::Term>>>> {
         let rows = self.result.rows()?;
         Ok(rows.iter().map(|row| row.values().to_vec()).collect())
@@ -339,30 +355,31 @@ impl super::Store {
         preparation: &Preparation,
         inherited: bool,
     ) -> Result<PreparedView> {
-        preparation.check()?;
+        let selection = preparation.selection_scope();
+        selection.check()?;
         // The estimate below is not admission. This atomic reservation must
         // succeed before any cold metadata/decoder/source allocation. Another
         // grant can take the free granules first, so a refused estimate retries
         // once with the room the grant already covers.
         let (allowance, mut held) = {
-            let allowance = preparation.selection_room();
-            match preparation.reserve(allowance) {
+            let allowance = selection.selection_room();
+            match selection.reserve(allowance) {
                 Ok(held) => (allowance, held),
                 Err(Error::BudgetExceeded(_)) => {
-                    let covered = preparation.covered_room();
-                    (covered, preparation.reserve(covered)?)
+                    let covered = selection.covered_room();
+                    (covered, selection.reserve(covered)?)
                 }
                 Err(error) => return Err(error),
             }
         };
         let snapshot = if inherited {
             let (snapshot, resolved, _) =
-                self.snapshot_at_prepared(logical, at, preparation, allowance)?;
+                self.snapshot_at_prepared(logical, at, &selection, allowance)?;
             drop(resolved);
             snapshot
         } else {
             let (snapshot, resolved) =
-                logical.snapshot_at_inner(at, preparation, Some(allowance))?;
+                logical.snapshot_at_inner(at, &selection, Some(allowance))?;
             drop(resolved);
             snapshot
         };
@@ -372,7 +389,7 @@ impl super::Store {
             ));
         }
         let limit = ReadLimit {
-            options: preparation,
+            options: &selection,
             memory: Some(allowance),
             held: 0,
         };
@@ -380,9 +397,9 @@ impl super::Store {
             .retained_preparation_bytes()
             .checked_add(snapshot.generation.retained_bytes_limited(&limit)?)
             .and_then(|bytes| bytes.checked_add(crate::history::READ_METADATA_BYTES))
-            .ok_or_else(|| preparation.exhausted())?;
+            .ok_or_else(|| selection.exhausted())?;
         if retained > allowance {
-            return Err(preparation.exhausted());
+            return Err(selection.exhausted());
         }
         // Read temporaries are gone. Keep the actual selected snapshot and its
         // remaining credit coupled before any permission-mask construction.
@@ -396,7 +413,10 @@ impl super::Store {
             logical_branch: logical.branch_id(),
             _held: held,
         };
-        crate::access::triples::controlled::prepare_selected(selected, preparation)
+        crate::access::triples::controlled::prepare_selected(
+            selected,
+            &preparation.without_selection_scope(),
+        )
     }
 }
 
@@ -487,6 +507,10 @@ impl BoundReadSource {
         Self {
             source: Source::Prepared(view),
         }
+    }
+
+    pub(crate) fn is_txn(&self) -> bool {
+        matches!(&self.source, Source::Prepared(view) if view.is_txn())
     }
 }
 

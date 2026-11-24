@@ -1398,40 +1398,79 @@ async fn pooled_server_evidence_build_succeeds_and_returns_pool_credit() {
     assert!(outcome.communities > 0);
     assert_eq!(st.catalog.pool().unwrap().granted(), 0);
 
-    // Verify Evidence::admit preserves configured query_memory_bytes (> 64 MiB and
-    // unbounded None) rather than capping query execution at the 64 MiB selection floor.
-    let mut big_opts = ds.dataset.query_options();
-    big_opts.max_memory_bytes = Some(256 << 20);
-    let ev_big = Evidence::admit(
-        &ds,
-        Some("main"),
-        None,
-        Default::default(),
-        Limits::default(),
-        &big_opts,
-    )
-    .unwrap()
-    .unwrap();
-    assert!(
-        ev_big.preparation_limit() >= 256 << 20,
-        "expected >= 256 MiB, got {}",
-        ev_big.preparation_limit()
-    );
-    drop(ev_big);
-
-    let mut unbounded_opts = ds.dataset.query_options();
-    unbounded_opts.max_memory_bytes = None;
-    let ev_unbounded = Evidence::admit(
-        &ds,
-        Some("main"),
-        None,
-        Default::default(),
-        Limits::default(),
-        &unbounded_opts,
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(ev_unbounded.preparation_limit(), u64::MAX);
-    drop(ev_unbounded);
+    // Verify Evidence::admit keeps the 64 MiB selection ceiling distinct from the
+    // configured query_memory_bytes (> 64 MiB and unbounded None) without grabbing
+    // the entire pool during selection.
+    let big_pool = sparkles::sparql::pool::QueryPool::new(128 << 20);
+    {
+        let big_grant = Arc::new(big_pool.empty_grant());
+        let mut big_opts = ds.dataset.query_options();
+        big_opts.grant = Some(big_grant.clone());
+        big_opts.max_memory_bytes = Some(256 << 20);
+        let ev_big = Evidence::admit(
+            &ds,
+            Some("main"),
+            None,
+            Default::default(),
+            Limits::default(),
+            &big_opts,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            ev_big.preparation_limit(),
+            256 << 20,
+            "root execution limit must match configured query cap, not cap + VIEW_BYTES"
+        );
+        assert_eq!(ev_big.selection_limit(), 64 << 20);
+        assert!(
+            ev_big.available_execution_bytes() >= (256 << 20) - 4096,
+            "selection must not reduce usable execution headroom: available={}",
+            ev_big.available_execution_bytes()
+        );
+        assert!(
+            big_grant.peak() <= 64 << 20,
+            "selection temporary reservation exceeded 64 MiB ceiling: peak={}",
+            big_grant.peak()
+        );
+        let mut live_query_opts = big_opts.clone();
+        live_query_opts.graphs = Some(Arc::new(sparkles::access::GraphAccess::all()));
+        let live_res = sparkles::sparql::query_source(
+            ev_big.read_source(),
+            ds.dataset.store(),
+            "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1",
+            &live_query_opts,
+        )
+        .unwrap();
+        drop(live_res);
+        drop(ev_big);
+        assert_eq!(big_grant.used(), 0);
+    }
+    {
+        let unbounded_grant = Arc::new(big_pool.empty_grant());
+        let mut unbounded_opts = ds.dataset.query_options();
+        unbounded_opts.grant = Some(unbounded_grant.clone());
+        unbounded_opts.max_memory_bytes = None;
+        let ev_unbounded = Evidence::admit(
+            &ds,
+            Some("main"),
+            None,
+            Default::default(),
+            Limits::default(),
+            &unbounded_opts,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ev_unbounded.preparation_limit(), u64::MAX);
+        assert_eq!(ev_unbounded.selection_limit(), 64 << 20);
+        assert!(
+            unbounded_grant.peak() <= 64 << 20,
+            "unbounded query selection must not reserve the entire pool: peak={}",
+            unbounded_grant.peak()
+        );
+        drop(ev_unbounded);
+        assert_eq!(unbounded_grant.used(), 0);
+    }
+    assert_eq!(big_pool.granted(), 0);
     assert_eq!(st.catalog.pool().unwrap().granted(), 0);
 }

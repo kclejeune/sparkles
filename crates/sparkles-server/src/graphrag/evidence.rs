@@ -197,17 +197,17 @@ impl Evidence {
                     .pool
                     .map(|pool| Arc::new(pool.empty_grant()))
             });
-        // Preserve the configured query execution budget (including unbounded None)
-        // while keeping room for the retained evidence view's selection reservation.
-        let prep_bytes = query_opts
-            .max_memory_bytes
-            .map_or(u64::MAX, |bytes| bytes.saturating_add(VIEW_BYTES));
+        // Keep the evidence-selection ceiling (VIEW_BYTES) distinct from the
+        // configured query execution cap (including unbounded None) while
+        // charging both against the same pool grant.
+        let query_limit = query_opts.max_memory_bytes.unwrap_or(u64::MAX);
         let preparation = match grant {
             Some(grant) => {
-                sparkles::access::Preparation::with_grant(control.clone(), prep_bytes, grant)
+                sparkles::access::Preparation::with_grant(control.clone(), query_limit, grant)
             }
-            None => sparkles::access::Preparation::new(control.clone(), prep_bytes),
+            None => sparkles::access::Preparation::new(control.clone(), query_limit),
         }
+        .and_then(|prep| prep.with_selection_limit(VIEW_BYTES))
         .map_err(engine)?;
         let view = main
             .dataset
@@ -291,6 +291,16 @@ impl Evidence {
     #[cfg(test)]
     pub(crate) fn preparation_limit(&self) -> u64 {
         self.view.preparation_limit()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selection_limit(&self) -> u64 {
+        self.view.selection_limit()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_execution_bytes(&self) -> u64 {
+        self.view.available_execution_bytes()
     }
 
     /// The check a recheck repeats.

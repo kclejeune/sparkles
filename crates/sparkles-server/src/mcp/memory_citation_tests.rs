@@ -318,6 +318,110 @@ fn pooled_server_grantless_recall_with_review_policy_succeeds() {
     assert_eq!(st.catalog.pool().unwrap().granted(), 0);
 }
 
+#[test]
+fn pooled_server_recall_keeps_selection_ceiling_distinct_from_query_memory_cap() {
+    use sparkles::evidence::{ClaimKind, ConflictMode, Policy, Settings};
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(128 << 20),
+    )
+    .unwrap();
+    st.read_only = false;
+    let st = Arc::new(st);
+    let ds = st.attach("mem", DbType::Mem, None).unwrap();
+    let prep =
+        sparkles::access::Preparation::new(sparkles::task::Control::none(), 64 << 20).unwrap();
+    ds.dataset
+        .store()
+        .activate_memory_configuration_history(&prep)
+        .unwrap();
+    drop(prep);
+    let settings = Settings {
+        enabled: true,
+        source_records: vec!["urn:ev:sources".into()],
+        proposals: vec!["urn:ev:claims".into()],
+        decisions: vec!["urn:ev:decisions".into()],
+        supports: vec!["urn:ev:supports".into()],
+        projections: vec!["urn:ev:accepted".into()],
+        policies: [(
+            "main".into(),
+            Policy {
+                version: 1,
+                admitted_kinds: vec![ClaimKind::Reported],
+                required_scope: vec![],
+                conflicts: ConflictMode::AdmitLabelled,
+                boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+                decisions: "urn:ev:decisions".into(),
+                supports: "urn:ev:supports".into(),
+                output: "urn:ev:accepted".into(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    sparkles::evidence::configure(&ds.dataset, &settings, &sparkles::task::Control::none())
+        .unwrap();
+    load_trig(
+        &ds,
+        &format!(
+            "{PREFIXES}\n<urn:g:facts> {{ <urn:cite:entity> <urn:cite:predicate> \"hello\" . }}\n"
+        ),
+    );
+    let pool = st.catalog.pool().unwrap();
+    for query_memory_bytes in [Some(256 << 20), None] {
+        let cfg = McpConfig {
+            query_memory_bytes,
+            ..Default::default()
+        };
+        let server = McpServer::new(st.clone(), cfg);
+        let grant = Arc::new(pool.empty_grant());
+        let mut call = Call {
+            arrived: Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            request_id: "selection-ceiling".into(),
+            principal: Principal::local(),
+            headers: None,
+            held: None,
+            grant: Some(grant.clone()),
+            preparation: None,
+        };
+        let args = json!({
+            "dataset": "mem",
+            "seeds": ["urn:cite:entity"],
+            "hops": 0,
+            "format": "json",
+            "reviewPolicy": "main"
+        });
+        let outcome = server
+            .run_now("recall", args.as_object().unwrap().clone(), &mut call)
+            .unwrap();
+        let Outcome::Text(text) = outcome else {
+            panic!("recall JSON is a text block");
+        };
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            parsed.get("entities").is_some(),
+            "expected recall JSON for query_memory_bytes={query_memory_bytes:?}, got: {parsed}"
+        );
+        // Call preparation shares the same grant, so peak granted is bounded by
+        // the 64 MiB selection ceiling plus at most one 4 MiB pool granule, never
+        // the 128 MiB pool capacity.
+        assert!(
+            grant.peak() <= (64 << 20) + sparkles::sparql::pool::GRANULE,
+            "MCP evidence selection exceeded 64 MiB ceiling for query_memory_bytes={query_memory_bytes:?}: peak={}",
+            grant.peak()
+        );
+        drop(call);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+}
+
 #[cfg(feature = "shacl")]
 #[test]
 fn recall_conflicts_use_historical_reader_state_and_evidence_view() {
