@@ -584,6 +584,10 @@ pub struct DlRun {
     /// [`MREPAIR_NO_RETURN`] and [`MREPAIR_NO_REPLAY`] for the diagnostic's tests, and
     /// [`MREPAIR_CF`] for M-return's restriction to premises without ground body literals
     pub mrepair: u8,
+    /// whether item 1061 phase 1 unit-only provenance-tagged shared root facts and
+    /// constants-only successor replay deduplication are enabled (default off, behind
+    /// `SPARKLES_ROOTED_SHARED_FACTS=1`)
+    pub(super) shared_facts: bool,
     /// the repair's counts, for measurements: the notices of held triggers the root took,
     /// the markers it sent and the clauses it returned
     pub mcount: [AtomicUsize; 3],
@@ -623,8 +627,14 @@ impl DlRun {
         DlRun {
             eager,
             worked,
+            shared_facts: shared_facts_switch(),
             ..DlRun::default()
         }
+    }
+    #[cfg(test)]
+    pub(super) fn with_shared_facts(mut self, on: bool) -> DlRun {
+        self.shared_facts = on;
+        self
     }
     pub fn bytes(&self) -> usize {
         self.table.bytes() + self.lits.unadmitted_bytes() + self.stores.load(Ordering::Relaxed)
@@ -742,6 +752,10 @@ pub struct DlSt {
     pub empty_core: bool,
     /// in a rooted run, whether the context is taking a fact of the root, which it keeps
     pub taking_fact: bool,
+    /// in a rooted run, whether the clause currently being processed by [`process`] is an
+    /// exact empty-body unit delivered from the root (`Stored::fact == true`), cleared on
+    /// every exit from `process`
+    pub given_fact: bool,
     /// in a rooted run, the heads of the facts a hypothetical successor sent the root
     pub(super) promoted: FxHashSet<Box<[Lit]>>,
     /// the clauses over the predecessor that successors sent, by successor
@@ -1388,6 +1402,86 @@ pub fn late_unit_mode() -> u8 {
     })
 }
 
+/// Whether item 1061 phase 1 unit-only shared root facts and constants-only successor
+/// deduplication are enabled (`SPARKLES_ROOTED_SHARED_FACTS=1`). Off by default until
+/// measured on `ore_ont_14924`, `ore_ont_15803`, `dl1061` and merged `shoi-022`.
+pub fn shared_facts_switch() -> bool {
+    #[cfg(test)]
+    if let Some(on) = SHARED_FACTS_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SHARED_FACTS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHARED_FACTS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_shared_facts_override<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SHARED_FACTS_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = SHARED_FACTS_TEST.with(|c| c.replace(Some(on)));
+    let _reset = Reset(prev);
+    f()
+}
+
+/// Whether `st` (a non-root context) currently has at least one eligible ordinary edge
+/// reaching successor `v` (an existential restriction with `into_nominal(ix, e).is_none()`).
+pub(super) fn has_eligible_ordinary_edge(ix: &Index, dx: &DlIx, st: &State, v: Ex) -> bool {
+    if let Some(x) = dl(st)
+        && x.edges
+            .iter()
+            .any(|&(e, w)| w == v && into_nominal(ix, e).is_none())
+    {
+        return true;
+    }
+    if dx.of_hyp.contains_key(&v) {
+        return false;
+    }
+    dx.by_succ.get(&v).is_some_and(|es| {
+        es.iter()
+            .any(|&e| st.subs.contains(&e) && into_nominal(ix, e).is_none())
+    })
+}
+
+/// Whether `st` already had an eligible ordinary or rooted edge to successor `v` before the
+/// late edge transition `(e, v, kind)` occurred.
+fn had_prior_eligible_edge(ix: &Index, dx: &DlIx, st: &State, e: Ex, v: Ex, kind: &str) -> bool {
+    if kind == "unit-edge" {
+        return true;
+    }
+    if dl(st)
+        .and_then(|x| x.root.as_deref())
+        .is_some_and(|r| !r.edges_to(v).is_empty())
+    {
+        return true;
+    }
+    let exclude_edge = kind == "edge";
+    if let Some(x) = dl(st)
+        && x.edges
+            .iter()
+            .any(|&(f, w)| w == v && (!exclude_edge || f != e) && into_nominal(ix, f).is_none())
+    {
+        return true;
+    }
+    if dx.of_hyp.contains_key(&v) {
+        return false;
+    }
+    let exclude_sub = kind == "unit";
+    dx.by_succ.get(&v).is_some_and(|es| {
+        es.iter().any(|&f| {
+            (!exclude_sub || f != e) && st.subs.contains(&f) && into_nominal(ix, f).is_none()
+        })
+    })
+}
+
 /// Whether a run takes the rule of [`late_unit_mode`]: one that counts or has the root,
 /// in which Pred's conclusion can name the restriction's successor term.
 fn late_rules(dx: &DlIx) -> bool {
@@ -1437,8 +1531,18 @@ fn late<S: Sink>(
             false
         }
         _ => {
+            let share = dx.root.is_some() && out.dl().shared_facts;
+            let first_edge = share && !had_prior_eligible_edge(ix, dx, st, e, v, kind);
             for &cid in cids {
-                let c = out.dl().table.get(cid).clone();
+                let c = out.dl().table.get(cid);
+                if share && constants_only(ix, dx, &out.dl().lits, c) {
+                    if first_edge && !super::dl_root::is_marker(c) {
+                        found.rule = "predg";
+                        found.push((c.body().to_vec(), c.head().to_vec()));
+                    }
+                    continue;
+                }
+                let c = c.clone();
                 pred(ix, st, e, &c, None, found, &out.dl().lits);
             }
             true
@@ -2526,6 +2630,12 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
         return;
     }
     out.worked(1);
+    // Only an exact empty-body unit delivered from the root via `rpred_c` in this run
+    // acquires `Stored::fact = true`; a local strengthening or conditional clause does not.
+    let incoming_unit_fact = out.dl().shared_facts
+        && dl(st).is_some_and(|x| x.taking_fact)
+        && body.is_empty()
+        && head.len() == 1;
     let dx = dix(ix);
     // a test context's denied class leaves the head
     if let Some(x) = dl(st)
@@ -2725,7 +2835,10 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
         }
     }
     if let Some(x) = ds_admit(st, out) {
-        let _ = x.store.add_parts_admitted(body, head, out);
+        let unit_fact = incoming_unit_fact && body.is_empty() && head.len() == 1;
+        let _ = x
+            .store
+            .add_parts_admitted_with_fact(body, head, unit_fact, out);
     }
 }
 
@@ -3519,6 +3632,15 @@ fn is_ground(v: super::dl_clause::XLit) -> bool {
     v.is_ground()
 }
 
+/// Whether every literal of `c` (both body and head) is a plain ground literal over
+/// constants alone (no `x`, no `y`, no `f`), including the empty clause. Such a clause is
+/// invariant under both ordinary `Pred` and rooted `root_pred` substitutions.
+pub(super) fn constants_only(ix: &Index, dx: &DlIx, lits: &Lits, c: &Clause) -> bool {
+    let inv = |r: Role| dx.inv(ix, r);
+    let ok = |&l: &Lit| l.kind() == XL && is_ground(lits.view(l, inv));
+    c.body().iter().all(ok) && c.head().iter().all(ok)
+}
+
 /// Whether a clause of a rooted run goes to the predecessors: its body holds atoms over x,
 /// role atoms `s(y, x)` and ground literals, and every head literal is a predecessor
 /// trigger of the journal's Definition 4: an atom over y or a constant, a role atom between
@@ -3650,8 +3772,12 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
         return true;
     }
     let Some(r) = role_of(ix, e) else { return true };
+    let to_root = dix(ix).is_root(u) && out.dl().shared_facts;
     for k in 0..x.store.preds.len() {
         let i = x.store.preds[k];
+        if to_root && x.store.clauses[i as usize].fact {
+            continue;
+        }
         if let Some(cid) = pred_id(x, i, out)
             && (any || meets(ix, &x.store.clauses[i as usize].c, r))
         {
@@ -3725,18 +3851,26 @@ pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out:
     let mut found = Found::default();
     let root = dx.is_root(me);
     found.root = root;
-    if !root {
-        let mut es = Vec::new();
-        reaching(dx, st, v, &mut es);
-        for e in es {
-            if into_nominal(ix, e).is_some() {
-                continue;
-            }
-            pred(ix, st, e, &c, None, &mut found, &out.dl().lits);
+    if dx.root.is_some() && out.dl().shared_facts && constants_only(ix, dx, &out.dl().lits, &c) {
+        let has_edge = !pairs.is_empty() || (!root && has_eligible_ordinary_edge(ix, dx, st, v));
+        if has_edge && !super::dl_root::is_marker(&c) {
+            found.rule = "predg";
+            found.push((c.body().to_vec(), c.head().to_vec()));
         }
-    }
-    for (e, u) in pairs {
-        super::dl_root::root_pred(ix, st, e, u, &c, None, &mut found, &out.dl().lits);
+    } else {
+        if !root {
+            let mut es = Vec::new();
+            reaching(dx, st, v, &mut es);
+            for e in es {
+                if into_nominal(ix, e).is_some() {
+                    continue;
+                }
+                pred(ix, st, e, &c, None, &mut found, &out.dl().lits);
+            }
+        }
+        for (e, u) in pairs {
+            super::dl_root::root_pred(ix, st, e, u, &c, None, &mut found, &out.dl().lits);
+        }
     }
     if root {
         drain_with(ix, st, found, out, &RootDerive);
@@ -4000,6 +4134,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
             let delta = x.store.next_commit(ix, None, id, &max);
             max_guard.commit_dl(bound, delta);
         }
+        let mut given_fact = false;
         if rooted {
             super::dl_root::index_consts(ix, x, &max, id, &mut max_guard);
             if max_guard.stopped() {
@@ -4010,10 +4145,28 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
             x.empty_core = dx.of_hyp.contains_key(&me);
             let s = &mut x.store.clauses[id as usize];
             s.sel = selected(&max_guard.dl().lits, inv, &s.c);
+            given_fact = max_guard.dl().shared_facts
+                && s.fact
+                && s.c.body().is_empty()
+                && s.c.head().len() == 1;
+            x.given_fact = given_fact;
         }
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
+        if given_fact {
+            super::dl_root::register_max(ix, me, st, &max, &mut max_guard);
+            if max_guard.stopped() {
+                if let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) {
+                    x.given_fact = false;
+                    x.store.interrupted = true;
+                }
+                break;
+            }
+        }
         process(ix, me, st, id, &c, &max, &mut max_guard);
+        if let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) {
+            x.given_fact = false;
+        }
         // the units go to the EL rules first, and a stopped run leaves the rest queued,
         // as an activation of a run in steps does once it derived its share
         if max_guard.busy() || max_guard.stopped() || max_guard.pause() {
@@ -4064,8 +4217,13 @@ fn process<S: Sink>(
             return;
         };
         // a predecessor of a rooted run may reach the context over f_e(u) and finds the
-        // role premises itself, with every role over f_e(u)
+        // role premises itself, with every role over f_e(u). Ordinary Pred delivery and
+        // late replay are preserved for every non-root predecessor (gap G6); only the root
+        // itself has an independent witness that it already holds its own delivered unit.
         for &(u, e) in &x.dpreds {
+            if x.given_fact && dx.is_root(u) {
+                continue;
+            }
             if rooted || role_of(ix, e).is_some_and(|r| meets(ix, c, r)) {
                 out.send(u, Concl::PredC(me, cid));
             }

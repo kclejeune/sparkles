@@ -2124,3 +2124,45 @@ fn drain_single_conclusion_early_stop_and_panic_drop_products_before_release() {
         assert_eq!(live_charge.load(Ordering::Relaxed), 0);
     }
 }
+
+/// Phase 1 shared root facts (`SPARKLES_ROOTED_SHARED_FACTS=1`) must preserve exact
+/// counting-allocator peak memory coverage under both marker-repair settings.
+#[test]
+fn shared_facts_end_to_end_peak_memory_covers_counting_allocator_heap() {
+    let mut body = String::from(
+        "SubClassOf(:A ObjectUnionOf(:B :C))\n\
+         SubClassOf(:B ObjectSomeValuesFrom(:r :E))\n\
+         SubClassOf(:C ObjectSomeValuesFrom(:r :F))\n\
+         SubClassOf(:E ObjectUnionOf(:G :H))\n\
+         SubClassOf(:F ObjectUnionOf(:G :H))\n\
+         SubClassOf(ObjectSomeValuesFrom(:r :G) :Done)\n\
+         SubClassOf(ObjectSomeValuesFrom(:r :H) :Done)\n",
+    );
+    for t in 0..32 {
+        body.push_str(&format!("SubClassOf(owl:Thing :Top{t})\n"));
+    }
+    for i in 0..80 {
+        body.push_str(&format!("ClassAssertion(:A :u{i})\n"));
+    }
+    let rooted_input = axioms(&body);
+
+    for repair in [false, true] {
+        let (out, sample) = super::dl_rules::with_shared_facts_override(true, || {
+            let mut k = Classifier::of(&rooted_input);
+            let limits = Limits {
+                threads: 1,
+                rooted: true,
+                dl_steps: true,
+                rooted_marker_repair: repair,
+                ..Limits::default()
+            };
+            measure(|| k.classify(&limits).expect("rooted shared_facts classify"))
+        });
+        assert!(
+            out.stats.peak_memory >= sample.peak,
+            "shared_facts repair={repair}: peak_memory ({}) < measured peak ({})",
+            out.stats.peak_memory,
+            sample.peak
+        );
+    }
+}

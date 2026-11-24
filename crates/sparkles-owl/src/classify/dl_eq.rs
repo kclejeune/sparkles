@@ -190,17 +190,18 @@ impl Eqs<'_> {
         }
     }
 
-    /// Visits each premise whose maximal literal mentions `t`, with its literal and whether
-    /// its clause is selected: the stored clauses, and the units in place of a context
-    /// other than the root, without cloning the whole target list upfront.
-    fn for_each_target(&self, st: &State, t: RTerm, mut f: impl FnMut(&Side, XLit, bool)) {
+    /// Visits each premise whose maximal literal mentions `t`, with its literal, whether
+    /// its clause is selected, and whether it is a certified root unit: the stored clauses,
+    /// and the units in place of a context other than the root, without cloning the whole
+    /// target list upfront.
+    fn for_each_target(&self, st: &State, t: RTerm, mut f: impl FnMut(&Side, XLit, bool, bool)) {
         if !self.root {
             let u = unit();
             match t {
                 RTerm::X => {
                     for &a in &st.subs {
                         if a != TOP {
-                            f(&u, XLit::Atom(a, RTerm::X), false);
+                            f(&u, XLit::Atom(a, RTerm::X), false, false);
                         }
                     }
                 }
@@ -208,7 +209,7 @@ impl Eqs<'_> {
                     let mut us = Vec::new();
                     unit_lits(self, st, e, &mut us);
                     for l in us {
-                        f(&u, l, false);
+                        f(&u, l, false, false);
                     }
                 }
                 _ => {}
@@ -225,7 +226,7 @@ impl Eqs<'_> {
             }
             for &l in d.store.maxima(i) {
                 let c2 = side(&s.c, l);
-                f(&c2, self.view(l), s.sel);
+                f(&c2, self.view(l), s.sel, s.fact);
             }
         }
     }
@@ -252,7 +253,7 @@ impl Eqs<'_> {
                 if !Eqs::orients(s1, t1) {
                     continue;
                 }
-                self.for_each_target(st, s1, |c2, v2, sel2| {
+                self.for_each_target(st, s1, |c2, v2, sel2, fact2| {
                     if v2 == v && c2 == prem || !self.admits(s1, t1, v2, c2) {
                         return;
                     }
@@ -262,7 +263,7 @@ impl Eqs<'_> {
                     made.clear();
                     self.rewrites(v2, s1, t1, &mut made);
                     found.rule = shape("eq", s1, t1);
-                    self.push(found, prem, c2, &made, no_xy(v) && no_xy(v2));
+                    self.push(st, found, prem, c2, &made, no_xy(v) && no_xy(v2), fact2);
                 });
             }
         }
@@ -322,7 +323,15 @@ impl Eqs<'_> {
                         made.clear();
                         self.rewrites(v, s1, t1, &mut made);
                         found.rule = shape("eqinto", s1, t1);
-                        self.push(found, &c1, prem, &made, no_xy(self.view(e)) && no_xy(v));
+                        self.push(
+                            st,
+                            found,
+                            &c1,
+                            prem,
+                            &made,
+                            no_xy(self.view(e)) && no_xy(v),
+                            s.fact,
+                        );
                     }
                 }
             }
@@ -364,12 +373,30 @@ impl Eqs<'_> {
 
     /// The conclusions of rewriting `c2` with `c1`, one for each literal made: a false
     /// literal leaves the clause without it, and a true one makes no conclusion. The
-    /// restriction on ground inferences applies when `ground`.
-    fn push(&self, found: &mut Found, c1: &Side, c2: &Side, made: &[Made], ground: bool) {
+    /// restriction on ground inferences applies when `ground`, and unit-only root-fact
+    /// suppression applies when both premises are certified root units.
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &self,
+        st: &State,
+        found: &mut Found,
+        c1: &Side,
+        c2: &Side,
+        made: &[Made],
+        ground: bool,
+        fact: bool,
+    ) {
         let mut add = |c: Side| {
-            if !ground || !restricted(self.lits, self.inv(), &c) {
-                found.push(c);
+            if ground && restricted(self.lits, self.inv(), &c) {
+                return;
             }
+            if !self.root && super::dl_root::shared(self.ix, st, self.lits, fact, &c) {
+                if super::dl_rules::tracing() {
+                    super::dl_root::trace_shared(self.ix, st, self.lits, found.rule, &c);
+                }
+                return;
+            }
+            found.push(c);
         };
         for &m in made {
             match m {

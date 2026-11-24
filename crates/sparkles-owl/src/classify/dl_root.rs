@@ -820,6 +820,150 @@ fn partners_at<S: Sink>(ix: &Index, st: &State, out: &S, a: Ex, u: u32) -> Vec<S
     partners(st, atom(ix, out, a, u))
 }
 
+/// The premises of `a(u)` with each partner's root-unit provenance flag: the implicit unit
+/// for `owl:Thing` carries `true`, and stored clauses carry [`Stored::fact`].
+fn partners_at_with_fact<S: Sink>(
+    ix: &Index,
+    st: &State,
+    out: &S,
+    a: Ex,
+    u: u32,
+) -> Vec<(Side, bool)> {
+    if a == TOP {
+        return vec![(unit(), true)];
+    }
+    let Some(d) = dl(st) else {
+        return Vec::new();
+    };
+    let l = atom(ix, out, a, u);
+    d.store
+        .by_xl
+        .get(&l)
+        .into_iter()
+        .flatten()
+        .filter(|&&i| {
+            let s = &d.store.clauses[i as usize];
+            !s.dead && !s.sel
+        })
+        .map(|&i| {
+            let s = &d.store.clauses[i as usize];
+            (side(&s.c, l), s.fact)
+        })
+        .collect()
+}
+
+/// Whether `a(u)` has a certified empty-body root-unit premise in `st` (including implicit
+/// `owl:Thing`), without interning any new literal in `Lits`.
+fn has_fact_at<S: Sink>(ix: &Index, st: &State, out: &S, a: Ex, u: u32) -> bool {
+    if a == TOP {
+        return true;
+    }
+    let Some(d) = dl(st) else {
+        return false;
+    };
+    let inv = inv_of(ix, dix(ix));
+    let Some(l) = out.dl().lits.get(XLit::Atom(a, RTerm::C(u)), inv) else {
+        return false;
+    };
+    d.store.by_xl.get(&l).into_iter().flatten().any(|&i| {
+        let s = &d.store.clauses[i as usize];
+        !s.dead && !s.sel && s.fact
+    })
+}
+
+/// Whether `c` is a non-tautological empty-body normalized unit whose single head literal
+/// mentions only constants or successor terms of constants (`C` or `Fc`, explicitly
+/// excluding `X`, `Y` and `Fx`) and every such constant is registered with the root in
+/// `r.edged`. Zero heap allocation.
+fn routable_unit(ix: &Index, st: &State, lits: &super::dl_clause::Lits, c: &Side) -> bool {
+    if !c.0.is_empty() {
+        return false;
+    }
+    let Some(r) = dl(st).and_then(|x| x.root.as_deref()) else {
+        return false;
+    };
+    let dx = dix(ix);
+    let inv = inv_of(ix, dx);
+    let mut unit_lit: Option<Lit> = None;
+    for &l in &c.1 {
+        if l.kind() != XL {
+            return false;
+        }
+        match lits.view(l, inv) {
+            XLit::Atom(TOP, _) => return false,
+            XLit::Atom(BOTTOM, _) => continue,
+            _ => match unit_lit {
+                None => unit_lit = Some(l),
+                Some(prev) if prev == l => {}
+                Some(_) => return false,
+            },
+        }
+    }
+    let Some(l) = unit_lit else {
+        return false;
+    };
+    let (ts, n) = terms_of(lits.view(l, inv));
+    if n == 0 {
+        return false;
+    }
+    for &t in &ts[..n] {
+        match t {
+            RTerm::C(u) | RTerm::Fc(_, u) => {
+                if !r.edged.contains(&u) {
+                    return false;
+                }
+            }
+            RTerm::X | RTerm::Y | RTerm::Fx(_) => return false,
+        }
+    }
+    true
+}
+
+/// Whether a ground inference's conclusion `c` in a non-root context is already derived by
+/// the root and delivered as a root unit: both the processed premise (`given_fact`) and the
+/// partner (`partner_fact`) are certified root units, and `c` normalizes to an empty-body
+/// ground unit over constants this context registered for.
+pub(super) fn shared(
+    ix: &Index,
+    st: &State,
+    lits: &super::dl_clause::Lits,
+    partner_fact: bool,
+    c: &Side,
+) -> bool {
+    partner_fact && dl(st).is_some_and(|x| x.given_fact) && routable_unit(ix, st, lits, c)
+}
+
+/// Logs a D1-suppressed conclusion lazily when `DLTRACE` is enabled.
+pub(super) fn trace_shared(
+    ix: &Index,
+    st: &State,
+    lits: &super::dl_clause::Lits,
+    rule: &'static str,
+    c: &Side,
+) {
+    eprintln!(
+        "TR S {} {rule} {} -> {}",
+        super::dl_rules::tr_ctx(st, false),
+        super::dl_rules::tr(ix, lits, &c.0),
+        super::dl_rules::tr(ix, lits, &c.1),
+    );
+}
+
+/// Adds the conclusion `s` of a ground inference, unless the restriction on ground
+/// inferences or D1 unit-only root-fact suppression leaves it out.
+fn put_with_fact<S: Sink>(ix: &Index, st: &State, out: &S, found: &mut Found, fact: bool, s: Side) {
+    if restricted(&out.dl().lits, inv_of(ix, dix(ix)), &s) {
+        return;
+    }
+    if shared(ix, st, &out.dl().lits, fact, &s) {
+        if super::dl_rules::tracing() {
+            trace_shared(ix, st, &out.dl().lits, found.rule, &s);
+        }
+        return;
+    }
+    found.push(s);
+}
+
 /// Adds the conclusion `s` of a ground inference, unless the restriction on ground
 /// inferences leaves it out.
 fn put<S: Sink>(ix: &Index, out: &S, found: &mut Found, s: Side) {
@@ -853,8 +997,8 @@ fn hyper_at<S: Sink>(
     let h = ix.head(d);
     match h.node {
         Node::Conj(a, b) => {
-            put(ix, out, found, with(prem, at(a)));
-            put(ix, out, found, with(prem, at(b)));
+            put_with_fact(ix, st, out, found, true, with(prem, at(a)));
+            put_with_fact(ix, st, out, found, true, with(prem, at(b)));
         }
         Node::Exist(r, _) => {
             let f = match super::dl_rules::into_nominal(ix, d) {
@@ -863,14 +1007,14 @@ fn hyper_at<S: Sink>(
             };
             for l in [XLit::Role(r, RTerm::C(u), f), XLit::Atom(h.succ, f)] {
                 if let Made::Lit(l) = lit(ix, out, l) {
-                    put(ix, out, found, with(prem, l));
+                    put_with_fact(ix, st, out, found, true, with(prem, l));
                 }
             }
         }
         // N_v(x) → x ≈ v
         Node::Nominal(v) if v != u => {
             if let Made::Lit(l) = lit(ix, out, XLit::Eq(RTerm::C(v), RTerm::C(u))) {
-                put(ix, out, found, with(prem, l));
+                put_with_fact(ix, st, out, found, true, with(prem, l));
             }
         }
         _ => {}
@@ -880,17 +1024,17 @@ fn hyper_at<S: Sink>(
         for (i, &a) in es.iter().enumerate() {
             for &b in &es[i + 1..] {
                 if let Made::Lit(n) = lit(ix, out, XLit::Ne(RTerm::Fc(a, u), RTerm::Fc(b, u))) {
-                    put(ix, out, found, with(prem, n));
+                    put_with_fact(ix, st, out, found, true, with(prem, n));
                 }
             }
         }
     }
     for &t in ix.told_of(h) {
-        put(ix, out, found, with(prem, at(t)));
+        put_with_fact(ix, st, out, found, true, with(prem, at(t)));
     }
     for &(p, k) in ix.conj_of(h) {
-        for q in partners_at(ix, st, out, p, u) {
-            put(ix, out, found, with(&merge(prem, &q), at(k)));
+        for (q, fact) in partners_at_with_fact(ix, st, out, p, u) {
+            put_with_fact(ix, st, out, found, fact, with(&merge(prem, &q), at(k)));
         }
     }
     for &set in ix.disjoint_of(h) {
@@ -903,8 +1047,22 @@ fn hyper_at<S: Sink>(
         }
     }
     if let Some(ids) = dx.by_body.get(&d) {
+        let given = dl(st).is_some_and(|x| x.given_fact);
         for &cl in ids {
             let (body, head) = &dx.clauses[cl as usize];
+            // Unit-only specialization: every certified root unit (including implicit TOP)
+            // has the empty residual, which subsumes every alternative at its position.
+            // If every body position has such a witness, pruning leaves only `base`, which
+            // we suppress iff `base` itself passes D1, avoiding any mask allocation.
+            if given
+                && body
+                    .iter()
+                    .all(|&a| a == d || has_fact_at(ix, st, out, a, u))
+            {
+                let base: Side = (Vec::new(), head.iter().map(|&a| at(a)).collect());
+                put_with_fact(ix, st, out, found, true, base);
+                continue;
+            }
             let lists: Vec<Vec<Side>> = body
                 .iter()
                 .map(|&a| {
@@ -963,7 +1121,14 @@ fn hyper_roles<S: Sink>(
                     if dx.sub(ix, t, a)
                         && let Made::Lit(m) = lit(ix, out, XLit::Atom(b, f))
                     {
-                        put(ix, out, found, with(&merge(prem, &side(&s.c, l)), m));
+                        put_with_fact(
+                            ix,
+                            st,
+                            out,
+                            found,
+                            s.fact,
+                            with(&merge(prem, &side(&s.c, l)), m),
+                        );
                     }
                 }
             }
@@ -1011,23 +1176,30 @@ fn on_role<S: Sink>(
     if ground && sel {
         return;
     }
-    let add = |found: &mut Found, c: Side| {
-        if !ground || !restricted(&out.dl().lits, inv, &c) {
-            found.push(c);
+    let add = |found: &mut Found, fact: bool, c: Side| {
+        if ground && restricted(&out.dl().lits, inv, &c) {
+            return;
         }
+        if ground && shared(ix, st, &out.dl().lits, fact, &c) {
+            if super::dl_rules::tracing() {
+                trace_shared(ix, st, &out.dl().lits, found.rule, &c);
+            }
+            return;
+        }
+        found.push(c);
     };
     let mut ps = Vec::new();
-    let over = |b: Ex, q: &Side, ps: &mut Vec<(Role, Ex)>, found: &mut Found| {
+    let over = |b: Ex, q: &Side, fact: bool, ps: &mut Vec<(Role, Ex)>, found: &mut Found| {
         alls(ix, b, ps);
         for &(t, c) in ps.iter() {
             if dx.sub(ix, s, t)
                 && let Made::Lit(m) = lit(ix, out, XLit::Atom(c, f))
             {
-                add(found, with(&merge(prem, q), m));
+                add(found, fact, with(&merge(prem, q), m));
             }
         }
     };
-    over(TOP, &unit(), &mut ps, found);
+    over(TOP, &unit(), true, &mut ps, found);
     let Some(x) = dl(st) else { return };
     if let Some(r) = x.root.as_deref() {
         for &i in r.by_const.get(&u).into_iter().flatten() {
@@ -1039,7 +1211,7 @@ fn on_role<S: Sink>(
                 if let XLit::Atom(b, RTerm::C(w)) = out.dl().lits.view(l, inv)
                     && w == u
                 {
-                    over(b, &side(&c.c, l), &mut ps, found);
+                    over(b, &side(&c.c, l), c.fact, &mut ps, found);
                 }
             }
         }
@@ -1055,7 +1227,7 @@ fn on_role<S: Sink>(
                 for &l in x.store.maxima(i) {
                     for (w, t, g) in from(out.dl().lits.view(l, inv), inv) {
                         if w == u && g == f && dx.sub(ix, t, b) {
-                            add(found, merge(prem, &side(&c.c, l)));
+                            add(found, c.fact, merge(prem, &side(&c.c, l)));
                         }
                     }
                 }
@@ -1122,7 +1294,7 @@ fn derive_covered<S: Sink>(
 }
 
 /// Whether a clause is a marker `A → A`.
-fn is_marker(c: &Clause) -> bool {
+pub(super) fn is_marker(c: &Clause) -> bool {
     c.body().len() == 1 && c.body() == c.head()
 }
 
@@ -1648,6 +1820,38 @@ pub(super) fn register_body<S: Sink>(ix: &Index, me: Ex, st: &mut State, c: &Cla
     edge_to(root, me, st, us, out);
 }
 
+/// Registers `me` (other than the root) with the root for every constant appearing in
+/// `max` (inside `f_e(u)` included), without scratch allocation, so `r.edged` holds them
+/// before `Eqs::on_max` and `dl_root::on_max` check [`shared`].
+pub(super) fn register_max<S: Sink>(ix: &Index, me: Ex, st: &mut State, max: &[Lit], out: &mut S) {
+    let dx = dix(ix);
+    let Some(root) = dx.root else { return };
+    let inv = inv_of(ix, dx);
+    for &l in max {
+        if l.kind() != XL {
+            continue;
+        }
+        let (ts, n) = terms_of(out.dl().lits.view(l, inv));
+        for &t in &ts[..n] {
+            if let RTerm::C(u) | RTerm::Fc(_, u) = t {
+                let Some(x) = ds_admit(st, out) else { return };
+                let Some(r) = root_admit(x, out) else {
+                    x.store.interrupted = true;
+                    return;
+                };
+                match RootSt::ins_admit(&mut r.edged, u, out) {
+                    Some(true) => out.send(root, Concl::REdge(me, u)),
+                    Some(false) => {}
+                    None => {
+                        x.store.interrupted = true;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The context `me`, other than the root, registers with the root for the constants
 /// `us`, once each.
 fn edge_to<S: Sink>(root: Ex, me: Ex, st: &mut State, us: Vec<u32>, out: &mut S) {
@@ -1718,18 +1922,19 @@ fn succ_at<S: Sink>(
     if fresh {
         new_succ(st, w, out);
     }
+    let first_edge =
+        fresh && (dx.is_root(me) || !super::dl_rules::has_eligible_ordinary_edge(ix, dx, st, w));
     if let Some(cids) = dl(st).and_then(|x| x.pred_in.get(&w)) {
         for &cid in cids {
-            root_pred(
-                ix,
-                st,
-                e,
-                u,
-                out.dl().table.get(cid),
-                None,
-                found,
-                &out.dl().lits,
-            );
+            let c = out.dl().table.get(cid);
+            if out.dl().shared_facts && super::dl_rules::constants_only(ix, dx, &out.dl().lits, c) {
+                if first_edge && !is_marker(c) {
+                    found.rule = "predg";
+                    found.push((c.body().to_vec(), c.head().to_vec()));
+                }
+                continue;
+            }
+            root_pred(ix, st, e, u, c, None, found, &out.dl().lits);
         }
     }
     w
@@ -6810,5 +7015,671 @@ pub(super) mod tests {
         };
         assert!(has(XLit::Eq(RTerm::X, o)), "the seed is kept");
         assert!(has(XLit::Eq(RTerm::X, p)), "{:?}", d.clauses_of(z));
+    }
+
+    #[test]
+    fn stored_fact_adds_zero_padding_bytes() {
+        // Stored::fact: bool must fit inside existing struct padding (0 B growth vs 1291).
+        assert_eq!(
+            std::mem::size_of::<super::super::dl_clause::Stored>(),
+            64,
+            "Stored should stay 64 bytes with fact: bool in existing padding"
+        );
+    }
+
+    #[test]
+    fn exact_root_unit_provenance_and_duplicate_marking() {
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [a, b, g, z] = ["A", "B", "G", "Z"].map(|n| s.class(n));
+        let (ix, _) = probe_ix(s);
+        let inv = inv_of(&ix, dix(&ix));
+        let RTerm::C(u) = c(na, &ix) else {
+            unreachable!()
+        };
+
+        // 1. Switch OFF: even an exact root unit does not acquire `fact = true`.
+        {
+            let run = DlRun::new(false, Default::default()).with_shared_facts(false);
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let la = atom(&ix, &out, a, u);
+            let cid = run.table.push(Clause::new(Vec::new(), vec![la]));
+            let mut st = State {
+                init: true,
+                ..State::default()
+            };
+            assert!(rpred_c(&ix, &mut st, cid, &mut out));
+            let x = dl(&st).unwrap();
+            assert_eq!(x.store.clauses.len(), 1);
+            assert!(!x.store.clauses[0].fact);
+        }
+
+        // 2. Switch ON: exact root unit acquires `fact = true`; disjunctive root clause
+        //    and conditional unit do NOT; pre-existing live exact duplicate (both queued
+        //    and already processed) is marked `fact = true` in place with zero byte growth.
+        for already_processed in [false, true] {
+            let run = DlRun::new(false, Default::default()).with_shared_facts(true);
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let la = atom(&ix, &out, a, u);
+            let lb = atom(&ix, &out, b, u);
+            let lg = atom(&ix, &out, g, u);
+            let mut st = State {
+                init: true,
+                ..State::default()
+            };
+            // Seed a local copy of `→ A(u)` (`fact = false`) and a conditional `G(u) → B(u)`.
+            assert!(
+                ds(&mut st)
+                    .store
+                    .add_parts_admitted(vec![], vec![la], &mut out)
+            );
+            assert!(
+                ds(&mut st)
+                    .store
+                    .add_parts_admitted(vec![lg], vec![lb], &mut out)
+            );
+            assert!(!dl(&st).unwrap().store.clauses[0].fact);
+            assert!(!dl(&st).unwrap().store.clauses[1].fact);
+
+            if already_processed {
+                super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+                assert!(dl(&st).unwrap().store.clauses[0].done);
+            }
+
+            let store_bytes_before = dl(&st).unwrap().store.bytes();
+            let cid_unit = run.table.push(Clause::new(Vec::new(), vec![la]));
+            assert!(rpred_c(&ix, &mut st, cid_unit, &mut out));
+            assert_eq!(
+                dl(&st).unwrap().store.bytes(),
+                store_bytes_before,
+                "duplicate unit marking must allocate zero store bytes"
+            );
+            assert!(
+                dl(&st).unwrap().store.clauses[0].fact,
+                "live exact duplicate unit must be marked fact=true (processed={already_processed})"
+            );
+            assert!(
+                !dl(&st).unwrap().store.clauses[1].fact,
+                "conditional unit must never become fact=true"
+            );
+
+            // A disjunctive empty-body root clause `→ B(u) ∨ G(u)` stays `fact = false`.
+            let cid_disj = run.table.push(Clause::new(Vec::new(), vec![lb, lg]));
+            assert!(rpred_c(&ix, &mut st, cid_disj, &mut out));
+            let disj_clause = dl(&st)
+                .unwrap()
+                .store
+                .clauses
+                .iter()
+                .find(|cl| !cl.dead && cl.c.body().is_empty() && cl.c.head().len() == 2)
+                .expect("disjunctive root clause stored");
+            assert!(
+                !disj_clause.fact,
+                "disjunctive root fact must NOT acquire unit-only fact=true"
+            );
+            assert!(
+                dl(&st).unwrap().store.scan_bytes() == dl(&st).unwrap().store.bytes(),
+                "store owned_bytes must stay exact"
+            );
+            let _ = inv;
+        }
+    }
+
+    #[test]
+    fn a_fact_of_the_root_alone_gives_no_inference_in_another_context() {
+        // A ⊑ B: a certified root unit A(u) produces no local B(u) when shared_facts is ON,
+        // and DOES produce B(u) when shared_facts is OFF or when A(u) is a local clause.
+        for (shared_on, via_rpred, want_b) in [
+            (true, true, false),
+            (false, true, true),
+            (true, false, true),
+        ] {
+            let mut s = Sig::new();
+            let na = s.ind("a");
+            let [a, b, z] = ["A", "B", "Z"].map(|n| s.class(n));
+            s.sub(a, b);
+            let (ix, _) = probe_ix(s);
+            let run = DlRun::new(false, Default::default()).with_shared_facts(shared_on);
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let RTerm::C(u) = c(na, &ix) else {
+                unreachable!()
+            };
+            let la = atom(&ix, &out, a, u);
+            let lb = atom(&ix, &out, b, u);
+            let mut st = State {
+                init: true,
+                ..State::default()
+            };
+            if via_rpred {
+                let cid = run.table.push(Clause::new(Vec::new(), vec![la]));
+                rpred_c(&ix, &mut st, cid, &mut out);
+            } else {
+                ds(&mut st).store.add(Clause::new(Vec::new(), vec![la]));
+            }
+            super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+            assert!(!dl(&st).unwrap().given_fact, "given_fact cleared on exit");
+            let has_b = dl(&st)
+                .unwrap()
+                .store
+                .clauses
+                .iter()
+                .any(|cl| !cl.dead && cl.c.body().is_empty() && cl.c.head() == [lb]);
+            assert_eq!(
+                has_b, want_b,
+                "shared_on={shared_on}, via_rpred={via_rpred}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_root_units_suppress_unit_conclusions_but_keep_mixed_multihead_and_bottom() {
+        // Test:
+        // - A ⊓ B ⊑ C (conj_of) -> unit C(u) suppressed for root+root (both orders), kept for mixed.
+        // - by_body Horn `A ∧ B → H` -> unit H(u) suppressed for root+root, kept for mixed.
+        // - by_body Disj `A ∧ B → D1 ∨ D2` -> multihead ALWAYS kept locally (Astra #2).
+        // - A ⊓ E ⊑ ⊥ (disjoint_of) -> bottom ALWAYS kept locally (Astra #2).
+        for (a_root, b_root, swap_order) in [
+            (true, true, false),
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let mut s = Sig::new();
+            let na = s.ind("a");
+            let [a, b, cc, hh, d1, d2, z] =
+                ["A", "B", "C", "H", "D1", "D2", "Z"].map(|n| s.class(n));
+            let ab = s.it.conj(a, b);
+            s.sub(ab, cc);
+            s.dl.clauses.push((vec![a, b], vec![hh]));
+            s.dl.clauses.push((vec![a, b], vec![d1, d2]));
+            let (ix, _) = probe_ix(s);
+            let run = DlRun::new(false, Default::default()).with_shared_facts(true);
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let RTerm::C(u) = c(na, &ix) else {
+                unreachable!()
+            };
+            let la = atom(&ix, &out, a, u);
+            let lb = atom(&ix, &out, b, u);
+            let lc = atom(&ix, &out, cc, u);
+            let lh = atom(&ix, &out, hh, u);
+            let ld1 = atom(&ix, &out, d1, u);
+            let ld2 = atom(&ix, &out, d2, u);
+            let mut st = State {
+                init: true,
+                ..State::default()
+            };
+            let add_one = |st: &mut State, out: &mut Probe<'_>, lit: Lit, as_root: bool| {
+                if as_root {
+                    let cid = run.table.push(Clause::new(Vec::new(), vec![lit]));
+                    rpred_c(&ix, st, cid, out);
+                } else {
+                    ds(st).store.add(Clause::new(Vec::new(), vec![lit]));
+                }
+            };
+            if swap_order {
+                add_one(&mut st, &mut out, lb, b_root);
+                super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+                add_one(&mut st, &mut out, la, a_root);
+            } else {
+                add_one(&mut st, &mut out, la, a_root);
+                super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+                add_one(&mut st, &mut out, lb, b_root);
+            }
+            super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+            let has_unit = |l: Lit| {
+                dl(&st)
+                    .unwrap()
+                    .store
+                    .clauses
+                    .iter()
+                    .any(|cl| !cl.dead && cl.c.body().is_empty() && cl.c.head() == [l])
+            };
+            let has_disj = dl(&st).unwrap().store.clauses.iter().any(|cl| {
+                !cl.dead
+                    && cl.c.body().is_empty()
+                    && cl.c.head().len() == 2
+                    && cl.c.head().contains(&ld1)
+                    && cl.c.head().contains(&ld2)
+            });
+            let both_root = a_root && b_root;
+            assert_eq!(
+                has_unit(lc),
+                !both_root,
+                "conj_of C(u): a_root={a_root}, b_root={b_root}, swap={swap_order}"
+            );
+            assert_eq!(
+                has_unit(lh),
+                !both_root,
+                "by_body Horn H(u): a_root={a_root}, b_root={b_root}, swap={swap_order}"
+            );
+            assert!(
+                has_disj,
+                "by_body multihead D1(u) ∨ D2(u) must stay local: a_root={a_root}, b_root={b_root}"
+            );
+        }
+
+        // Disjoint root units keep bottom locally.
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [a, e, z] = ["A", "E", "Z"].map(|n| s.class(n));
+        s.ax.disjoint.push(vec![a, e]);
+        let (ix, _) = probe_ix(s);
+        let run = DlRun::new(false, Default::default()).with_shared_facts(true);
+        let mut out = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let RTerm::C(u) = c(na, &ix) else {
+            unreachable!()
+        };
+        let mut st = State {
+            init: true,
+            ..State::default()
+        };
+        for cl in [a, e] {
+            let cid = run
+                .table
+                .push(Clause::new(Vec::new(), vec![atom(&ix, &out, cl, u)]));
+            rpred_c(&ix, &mut st, cid, &mut out);
+        }
+        super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+        assert!(
+            out.mine.contains(&Concl::Sub(BOTTOM)),
+            "disjoint root units must still derive bottom locally"
+        );
+    }
+
+    #[test]
+    fn a_conclusion_with_an_unregistered_constant_stays_local() {
+        // Root unit N_v(u) (nominal v != u) derives `v ≈ u`. If the context is NOT
+        // registered for v, `v ≈ u` must stay local; if v IS registered, it is suppressed.
+        for pre_register_v in [false, true] {
+            let mut s = Sig::new();
+            let na = s.ind("a");
+            let nb = s.ind("b");
+            let z = s.class("Z");
+            let (ix, _) = probe_ix(s);
+            let run = DlRun::new(false, Default::default()).with_shared_facts(true);
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let RTerm::C(u) = c(na, &ix) else {
+                unreachable!()
+            };
+            let RTerm::C(v) = c(nb, &ix) else {
+                unreachable!()
+            };
+            let mut st = State {
+                init: true,
+                ..State::default()
+            };
+            if pre_register_v {
+                rst(&mut st, &out).edged.insert(v);
+            }
+            let nv_u = atom(&ix, &out, nb, u);
+            let cid = run.table.push(Clause::new(Vec::new(), vec![nv_u]));
+            rpred_c(&ix, &mut st, cid, &mut out);
+            super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+            let Made::Lit(eq_uv) = lit(&ix, &out, XLit::Eq(RTerm::C(u), RTerm::C(v))) else {
+                unreachable!()
+            };
+            let has_eq = dl(&st)
+                .unwrap()
+                .store
+                .clauses
+                .iter()
+                .any(|cl| !cl.dead && cl.c.body().is_empty() && cl.c.head() == [eq_uv]);
+            assert_eq!(has_eq, !pre_register_v, "pre_register_v={pre_register_v}");
+        }
+    }
+
+    #[test]
+    fn root_equality_rewrites_no_root_unit_but_rewrites_local_premise() {
+        // u ≈ v (u > v) and A(u): both root -> A(v) suppressed (both orders);
+        // mixed (one local) -> A(v) derived locally.
+        for (eq_root, a_root, eq_first) in [
+            (true, true, true),
+            (true, true, false),
+            (true, false, true),
+            (false, true, false),
+        ] {
+            let mut s = Sig::new();
+            let nv = s.ind("v");
+            let nu = s.ind("u");
+            let [a, z] = ["A", "Z"].map(|n| s.class(n));
+            let (ix, _) = probe_ix(s);
+            let run = DlRun::new(false, Default::default()).with_shared_facts(true);
+            let mut out = Probe {
+                run: &run,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let RTerm::C(u) = c(nu, &ix) else {
+                unreachable!()
+            };
+            let RTerm::C(v) = c(nv, &ix) else {
+                unreachable!()
+            };
+            assert!(u > v);
+            let Made::Lit(eq_uv) = lit(&ix, &out, XLit::Eq(RTerm::C(u), RTerm::C(v))) else {
+                unreachable!()
+            };
+            let au = atom(&ix, &out, a, u);
+            let av = atom(&ix, &out, a, v);
+            let mut st = State {
+                init: true,
+                ..State::default()
+            };
+            // Pre-register v when A(u) arrives first so `routable_unit` sees both u and v.
+            rst(&mut st, &out).edged.insert(v);
+            let push = |st: &mut State, out: &mut Probe<'_>, l: Lit, as_root: bool| {
+                if as_root {
+                    let cid = run.table.push(Clause::new(Vec::new(), vec![l]));
+                    rpred_c(&ix, st, cid, out);
+                } else {
+                    ds(st).store.add(Clause::new(Vec::new(), vec![l]));
+                }
+            };
+            if eq_first {
+                push(&mut st, &mut out, eq_uv, eq_root);
+                super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+                push(&mut st, &mut out, au, a_root);
+            } else {
+                push(&mut st, &mut out, au, a_root);
+                super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+                push(&mut st, &mut out, eq_uv, eq_root);
+            }
+            super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+            let has_av = dl(&st)
+                .unwrap()
+                .store
+                .clauses
+                .iter()
+                .any(|cl| !cl.dead && cl.c.body().is_empty() && cl.c.head() == [av]);
+            assert_eq!(
+                has_av,
+                !(eq_root && a_root),
+                "eq_root={eq_root}, a_root={a_root}, eq_first={eq_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn pred_to_non_root_predecessor_preserved_and_to_root_omitted_for_root_unit() {
+        // Gap G6: a certified root unit in a successor is STILL sent via PredC to a non-root
+        // predecessor (both live and late via dedge), and kept in `store.preds`; only sends
+        // back to the root itself (which already holds the unit) are omitted.
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let [a, p, z] = ["A", "P", "Z"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e = s.some_h(r, a);
+        let (ix, root) = probe_ix(s);
+        let run = DlRun::new(false, Default::default()).with_shared_facts(true);
+        let mut out = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let RTerm::C(u) = c(na, &ix) else {
+            unreachable!()
+        };
+        let la = atom(&ix, &out, a, u);
+        let mut st = State {
+            init: true,
+            ..State::default()
+        };
+        // Register both `root` and non-root predecessor `p` before processing the unit.
+        assert!(super::super::dl_rules::dedge(
+            &ix, z, &mut st, root, e, &mut out
+        ));
+        assert!(super::super::dl_rules::dedge(
+            &ix, z, &mut st, p, e, &mut out
+        ));
+        out.sent.clear();
+
+        let cid_in = run.table.push(Clause::new(Vec::new(), vec![la]));
+        rpred_c(&ix, &mut st, cid_in, &mut out);
+        super::super::dl_rules::flush(&ix, z, &mut st, &mut out, 100);
+
+        let sent_to_p = out
+            .sent
+            .iter()
+            .any(|&(to, c)| to == p && matches!(c, Concl::PredC(from, _) if from == z));
+        let sent_to_root = out
+            .sent
+            .iter()
+            .any(|&(to, c)| to == root && matches!(c, Concl::PredC(from, _) if from == z));
+        assert!(sent_to_p, "non-root predecessor must receive PredC for G6");
+        assert!(
+            !sent_to_root,
+            "root itself must not be re-sent its own root unit via PredC"
+        );
+        assert!(
+            !dl(&st).unwrap().store.preds.is_empty(),
+            "root unit must remain in store.preds for late non-root predecessors"
+        );
+
+        // A late non-root predecessor `a` receives it via dedge replay; root does not.
+        out.sent.clear();
+        assert!(super::super::dl_rules::dedge(
+            &ix, z, &mut st, a, e, &mut out
+        ));
+        assert!(
+            out.sent
+                .iter()
+                .any(|&(to, c)| to == a && matches!(c, Concl::PredC(from, _) if from == z)),
+            "late non-root predecessor must receive root unit from store.preds"
+        );
+    }
+
+    #[test]
+    fn constants_only_clauses_emit_once_and_honor_edge_eligibility_and_bottom() {
+        // D4: constants-only clauses emit at most once per successor across multiple rooted
+        // edges and ordinary/rooted transitions; markers are skipped; cache-before-edge
+        // replays on the first eligible edge; empty clause still delivers bottom.
+        let mut s = Sig::new();
+        let na = s.ind("a");
+        let nb = s.ind("b");
+        let [a, b, z] = ["A", "B", "Z"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e1 = s.some_h(r, a);
+        let e2 = s.some_h(r, a);
+        let (ix, _) = probe_ix(s);
+        let dx = dix(&ix);
+        let w = dx.hyp[&e1];
+        let run = DlRun::new(false, Default::default()).with_shared_facts(true);
+        let mut out = Probe {
+            run: &run,
+            sent: Vec::new(),
+            mine: Vec::new(),
+        };
+        let RTerm::C(ua) = c(na, &ix) else {
+            unreachable!()
+        };
+        let RTerm::C(ub) = c(nb, &ix) else {
+            unreachable!()
+        };
+        let la = atom(&ix, &out, a, ua);
+        let lb = atom(&ix, &out, b, ub);
+
+        // 1. Cache-before-edge: clause arrives with NO eligible edge -> cached, 0 work!
+        let mut st = State {
+            init: true,
+            ..State::default()
+        };
+        let cid_unit = run.table.push(Clause::new(Vec::new(), vec![lb]));
+        let cid_marker = run.table.push(Clause::new(vec![la], vec![la]));
+        assert!(super::super::dl_rules::pred_c(
+            &ix, z, &mut st, w, cid_unit, &mut out
+        ));
+        assert!(super::super::dl_rules::pred_c(
+            &ix, z, &mut st, w, cid_marker, &mut out
+        ));
+        assert_eq!(
+            run.work(),
+            0,
+            "no eligible edge yet: cached without deriving"
+        );
+
+        // 2. First rooted edge `(e1, ua)` to `w`: replays `cid_unit` ONCE, skips marker!
+        let mut found = Found::default();
+        succ_at(&ix, z, &mut st, e1, ua, &mut found, &mut out);
+        drain(&ix, &mut st, found, &mut out);
+        assert_eq!(
+            run.work(),
+            1,
+            "first eligible edge emits constants-only once and skips marker"
+        );
+
+        // 3. Second rooted edge `(e2, ub)` to the same `w`: emits 0 times!
+        let mut found = Found::default();
+        succ_at(&ix, z, &mut st, e2, ub, &mut found, &mut out);
+        drain(&ix, &mut st, found, &mut out);
+        assert_eq!(
+            run.work(),
+            1,
+            "second rooted edge must not re-emit constants-only clause"
+        );
+
+        // 4. New constants-only clause arriving over two edges: emits ONCE!
+        let cid_unit2 = run.table.push(Clause::new(Vec::new(), vec![la]));
+        assert!(super::super::dl_rules::pred_c(
+            &ix, z, &mut st, w, cid_unit2, &mut out
+        ));
+        assert_eq!(
+            run.work(),
+            2,
+            "pred_c over two edges emits constants-only once"
+        );
+
+        // 5. Empty clause `[] → []` still fires and delivers BOTTOM!
+        let cid_empty = run.empty();
+        assert!(super::super::dl_rules::pred_c(
+            &ix, z, &mut st, w, cid_empty, &mut out
+        ));
+        assert!(
+            out.mine.contains(&Concl::Sub(BOTTOM)),
+            "empty clause must still deliver bottom under D4"
+        );
+
+        // 6. Ordinary -> rooted transition and `into_nominal` exclusion:
+        //    an `into_nominal` existential is NOT an eligible ordinary edge (must not emit
+        //    constants-only clause); once a real ordinary edge exists to `w`, a subsequent
+        //    rooted edge `(e1, ua)` to the same `w` must NOT re-emit the constants-only clause.
+        {
+            let mut st2 = State {
+                init: true,
+                ..State::default()
+            };
+            let run2 = DlRun::new(false, Default::default()).with_shared_facts(true);
+            let mut out2 = Probe {
+                run: &run2,
+                sent: Vec::new(),
+                mine: Vec::new(),
+            };
+            let lb2 = atom(&ix, &out2, b, ub);
+            let cid = run2.table.push(Clause::new(Vec::new(), vec![lb2]));
+            // Register an eligible ordinary edge `(e1, w)` first.
+            ds(&mut st2).edges.push((e1, w));
+            assert!(super::super::dl_rules::pred_c(
+                &ix, z, &mut st2, w, cid, &mut out2
+            ));
+            assert_eq!(run2.work(), 1, "ordinary edge emits constants-only once");
+            // Now open a rooted edge `(e1, ua)` to the same `w`: must NOT emit again!
+            let mut found2 = Found::default();
+            succ_at(&ix, z, &mut st2, e1, ua, &mut found2, &mut out2);
+            drain(&ix, &mut st2, found2, &mut out2);
+            assert_eq!(
+                run2.work(),
+                1,
+                "rooted edge after existing ordinary edge must not re-emit constants-only clause"
+            );
+        }
+    }
+
+    #[test]
+    fn g6_private_marker_and_existential_unit_with_dl_steps_off_and_repair_on() {
+        // Astra §1 gate witness: predecessor Z holds private conditional marker over c,
+        // reaches child V which sees existential unit E(b) = (∃r.A)(b) first from root,
+        // and E's successor combines A(x) ∧ s(y, x) ∧ G(c) to entail Z ⊑ Ans.
+        use crate::ofn_read;
+        let ofn = r#"
+Prefix(:=<http://example.org/g6#>)
+Ontology(<http://example.org/g6>
+  SubClassOf(:Z ObjectSomeValuesFrom(:p :V))
+  SubClassOf(:Z ObjectSomeValuesFrom(:q ObjectOneOf(:c)))
+  SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:q) :Z) :G)
+  SubClassOf(:V ObjectSomeValuesFrom(:k ObjectOneOf(:b)))
+  SubClassOf(ObjectOneOf(:b) ObjectSomeValuesFrom(:r :A))
+  SubObjectPropertyOf(:r :s)
+  SubClassOf(ObjectIntersectionOf(:A ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectThing)) :Step1)
+  SubClassOf(:A ObjectSomeValuesFrom(:m ObjectOneOf(:c)))
+  SubClassOf(ObjectIntersectionOf(:A ObjectSomeValuesFrom(:m :G)) :Hit)
+  SubClassOf(ObjectSomeValuesFrom(:r :Hit) :BHit)
+  SubClassOf(ObjectSomeValuesFrom(:k :BHit) :VHit)
+  SubClassOf(ObjectSomeValuesFrom(:p :VHit) :Ans)
+)
+"#
+        .replace("ObjectThing", "owl:Thing");
+        let ax = ofn_read::parse(&ofn).unwrap().axioms;
+        let z = crate::model::Class::new("http://example.org/g6#Z");
+        let ans = crate::model::Class::new("http://example.org/g6#Ans");
+        for (threads, dl_steps, repair) in [
+            (1, true, false),
+            (4, false, false),
+            (1, true, true),
+            (4, false, true),
+        ] {
+            let limits = super::super::Limits {
+                threads,
+                rooted: true,
+                dl_steps,
+                rooted_marker_repair: repair,
+                ..super::super::Limits::default()
+            };
+            let off = super::super::dl_rules::with_shared_facts_override(false, || {
+                let mut k = super::super::Classifier::of(&ax);
+                k.classify(&limits).unwrap()
+            });
+            let on = super::super::dl_rules::with_shared_facts_override(true, || {
+                let mut k = super::super::Classifier::of(&ax);
+                k.classify(&limits).unwrap()
+            });
+            assert_eq!(off.consistency, on.consistency);
+            assert_eq!(off.complete, on.complete);
+            assert!(
+                off.taxonomy.is_subclass(&z, &ans),
+                "baseline must entail Z ⊑ Ans"
+            );
+            assert!(
+                on.taxonomy.is_subclass(&z, &ans),
+                "shared_facts must preserve Z ⊑ Ans (threads={threads}, steps={dl_steps}, repair={repair})"
+            );
+            assert_eq!(
+                on.stats.dl_marker_deficits,
+                [0, 0, 0],
+                "zero marker deficits with repair={repair}"
+            );
+        }
     }
 }

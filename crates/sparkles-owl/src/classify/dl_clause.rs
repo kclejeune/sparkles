@@ -561,6 +561,19 @@ pub fn admit_lit<S: Sink>(
     expect(dead_code, reason = "the rooted rules of item 603 phase 6 make it")
 )]
 impl Lits {
+    /// Looks up `l` without allocating or mutating the interner, returning `Some(lit)` when
+    /// it packs or is already interned.
+    pub fn get(&self, l: XLit, inv: impl Fn(Role) -> Option<Role> + Copy) -> Option<Lit> {
+        if let Some(m) = packed_xlit(l, inv) {
+            return match m {
+                Made::Lit(l) => Some(l),
+                Made::True | Made::False => None,
+            };
+        }
+        let l = l.canon(inv);
+        self.ids.lock().get(&l).copied().map(Lit::xl)
+    }
+
     /// The literal of `l`, packed when one of the six packed forms holds it and interned
     /// otherwise, or true or false for an equality or inequality of a term with itself.
     /// `inv` gives a role's inverse.
@@ -1287,6 +1300,9 @@ pub struct Stored {
     /// ground literal in its body and is selected: it takes part only in the local
     /// inferences, Join on that literal, Pred and Succ ([`super::dl_rules::selected`])
     pub sel: bool,
+    /// in a context other than the root of a rooted run, the clause is an exact empty-body
+    /// unit delivered from the root in this run (`RPred`)
+    pub fact: bool,
 }
 
 /// A context's clause store, with the indexes the rules read.
@@ -1509,7 +1525,7 @@ impl Store {
 
     /// Inserts an unsubsumed clause `c` with signature `sig`, marking backward-subsumed
     /// clauses dead, and returns the exact retained byte increase.
-    fn add_unchecked(&mut self, c: Clause, sig: u64) -> usize {
+    fn add_unchecked(&mut self, c: Clause, sig: u64, fact: bool) -> usize {
         // the clauses it subsumes have every literal of its head
         match c.head().first() {
             Some(l) => {
@@ -1565,6 +1581,7 @@ impl Store {
                 sent: None,
                 max: None,
                 sel: false,
+                fact,
             },
         );
         self.owned_bytes += delta;
@@ -1579,7 +1596,7 @@ impl Store {
         if self.subsumed(&c, sig) {
             return None;
         }
-        Some(self.add_unchecked(c, sig))
+        Some(self.add_unchecked(c, sig, false))
     }
 
     /// Pre-admits peak growth against `out`, then adds `c` if not subsumed and commits its
@@ -1599,7 +1616,7 @@ impl Store {
             self.interrupted = true;
             return false;
         }
-        let delta = self.add_unchecked(c, sig);
+        let delta = self.add_unchecked(c, sig, false);
         out.commit_dl(bound, delta);
         true
     }
@@ -1611,20 +1628,44 @@ impl Store {
     /// settled `covered_payload` (so the caller should disarm its guard).
     pub fn add_parts_admitted_covered<S: Sink>(
         &mut self,
+        body: Vec<Lit>,
+        head: Vec<Lit>,
+        covered_payload: usize,
+        out: &mut S,
+    ) -> (bool, bool) {
+        self.add_parts_admitted_covered_with_fact(body, head, covered_payload, false, out)
+    }
+
+    /// [`Store::add_parts_admitted_covered`], conferring exact root-unit provenance
+    /// (`Stored::fact = true`) when `is_fact` is set and the normalized clause is an exact
+    /// empty-body unit. When a live exact duplicate unit already exists in the store (even
+    /// if still queued), marks it `fact = true` in place with zero allocation.
+    fn add_parts_admitted_covered_with_fact<S: Sink>(
+        &mut self,
         mut body: Vec<Lit>,
         mut head: Vec<Lit>,
         covered_payload: usize,
+        is_fact: bool,
         out: &mut S,
     ) -> (bool, bool) {
         body.sort_unstable();
         body.dedup();
         head.sort_unstable();
         head.dedup();
+        let unit_fact = is_fact && body.is_empty() && head.len() == 1;
         let sig = body
             .iter()
             .chain(head.iter())
             .fold(0u64, |s, l| s | l.sig_bit());
         if self.subsumed_parts(&body, &head, sig) {
+            if unit_fact && let Some(ids) = self.by_last.get(&head[0]) {
+                for &i in ids {
+                    let s = &mut self.clauses[i as usize];
+                    if !s.dead && s.c.body().is_empty() && s.c.head() == head.as_slice() {
+                        s.fact = true;
+                    }
+                }
+            }
             return (true, false);
         }
         let Some((total_need, extra_need)) = (|| {
@@ -1653,7 +1694,7 @@ impl Store {
             return (false, false);
         }
         let c = Clause::from_sorted(body, head);
-        let delta = self.add_unchecked(c, sig);
+        let delta = self.add_unchecked(c, sig, unit_fact);
         let committed_bound = covered_payload + extra_need;
         debug_assert!(committed_bound >= total_need);
         out.commit_dl(committed_bound, delta);
@@ -1669,7 +1710,20 @@ impl Store {
         head: Vec<Lit>,
         out: &mut S,
     ) -> bool {
-        self.add_parts_admitted_covered(body, head, 0, out).0
+        self.add_parts_admitted_covered_with_fact(body, head, 0, false, out)
+            .0
+    }
+
+    /// [`Store::add_parts_admitted`], with exact root-unit provenance when `is_fact` is set.
+    pub fn add_parts_admitted_with_fact<S: Sink>(
+        &mut self,
+        body: Vec<Lit>,
+        head: Vec<Lit>,
+        is_fact: bool,
+        out: &mut S,
+    ) -> bool {
+        self.add_parts_admitted_covered_with_fact(body, head, 0, is_fact, out)
+            .0
     }
 
     /// Upper bound on peak allocation needed to index processed clause `id` with maximal
