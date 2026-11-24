@@ -1,323 +1,104 @@
-# Search and graph analysis capabilities
+# Search and graph analysis
 
-This page describes the available capabilities and their current limits. The
-[capability matrix](../FEATURES.md#capability-status) records delivery status within
-each stated scope.
+Sparkles runs BM25 full-text search, HNSW vector search, hybrid reciprocal rank fusion, typo-tolerant ontology entity search, weighted path finding, graph algorithms, and GeoSPARQL 1.1 spatial queries directly inside SPARQL or over dedicated HTTP endpoints. Every search and algorithm respects MVCC snapshots and caller access grants, so results join cleanly with ordinary graph patterns. The [capability matrix](../FEATURES.md#capability-status) records delivery status for each area.
+
+| Section | What it covers |
+|---|---|
+| [Search](#search) | Full-text BM25, ontology typeahead search, vector indexes, embeddings on write, path search, and graph algorithms. |
+| [GeoSPARQL](#geosparql) | WKT/GeoJSON/GML/KML literals, CRSs, topological and metric functions, R-tree indexes, spatial joins, and nearest-neighbour queries. |
+| [Configuration and usage](#configuration-and-usage) | Links to HTTP API endpoints and index settings. |
+| [Known gaps](#known-gaps) | Analyzer, quantization, path, Graphalytics, and CRS/geometry limits. |
 
 ## Search
 
-Full-text, vector, path and graph-algorithm search run inside SPARQL and join with the
-rest of a query. Entity search answers the typeahead of ontology browsers and editors.
+Full-text, vector, hybrid, path, and graph-algorithm operators execute inside SPARQL queries and join with surrounding patterns. Entity search powers fast typeahead for ontology browsers and editors.
 
 ### Full-text search
 
-* Full-text search supports a subset of Jena's `text:query`, ranked by BM25 through
-  Tantivy ([API.md](../API.md#full-text-search)). It needs the `text` cargo feature, which
-  the server enables.
-* Each quad is a document, kept current with each commit. A write stages its documents,
-  and the next search or a 1 s tick commits them. A bulk commit updates only the documents
-  it changes, and `POST /$/text/{ds}/rebuild` rebuilds the index while writes continue.
-* A search returns the top k within a graph. The query string can be a variable that the
-  rest of the group binds, and a join can pass a search the subjects it already has.
-* The index stems the literals of configured languages with Tantivy's Snowball stemmers
-  and stop words, and `lang:` searches use them, as with jena-text's multilingual support.
-  Analyzers that reproduce Lucene's for English, French, Spanish, Italian, Portuguese,
-  German, Dutch, Russian, Swedish and CJK text can be selected per language instead. With
-  them, 1,576 of 1,590 stemmed searches in nine languages find the same literals as
-  Fuseki, and the other 14 consist of stop words alone.
-* Those analyzers tokenize by the grammar of Lucene's `StandardTokenizer` over Unicode
-  12.1, emoji and South East Asian scripts included, and agree with Lucene on every code
-  point.
-* Japanese, Chinese and Korean text can be segmented into words with a dictionary
-  through the `ja-dict`, `zh-dict` and `ko-dict` analyzers. `ja-dict` and `ko-dict`
-  produce the tokens of Lucene's Kuromoji and Nori analyzers on every line of their
-  fixtures, and `zh-dict` segments by jieba's word frequencies. `sparkles text-dict`
-  downloads the pinned IPADIC, mecab-ko-dic and jieba sources with verified hashes and
-  compiles them.
-* An index can be enabled when a dataset is created. A missing or damaged index recovers
-  in the background at open while the RDF data stays usable, and text searches answer
-  `503` until recovery succeeds. Reconfiguring an index waits for old writers and
-  checkpoints before it reuses their paths.
-* A background checkpoint synchronizes only the segment files written since the last
-  one, from several threads, while documents continue to publish. Under steady writes it
-  repeats its unlocked pass over the newest files and takes the writer lock only for a
-  short last pass when those repetitions keep being raced.
+Full-text search implements a BM25 subset of Jena's `text:query` backed by Tantivy ([API.md](../API.md#full-text-search)); it requires the `text` cargo feature, which is enabled in standard server builds.
+
+* **Indexing and lazy commits.** Each quad is indexed as one document. Writes stage documents immediately and commit them on the next search or a 1-second timer so write bursts share Tantivy flushes, while each snapshot still sees exact committed results. Bulk commits update only changed documents, and `POST /$/text/{ds}/rebuild` rebuilds online while writes continue. Background checkpoints synchronize only new segment files across multiple threads and take the writer lock only for a short final pass if steady writes keep racing them.
+* **Querying and joins.** Searches return the top `k` hits within a graph. Query strings can come from bound SPARQL variables, and surrounding joins can push candidate subjects into the search.
+* **Language analyzers and CJK segmentation.** Configured languages use Tantivy's Snowball stemmers and stop-word lists by default, matching `lang:` queries. Optional per-language Lucene-compatible analyzers cover English, French, Spanish, Italian, Portuguese, German, Dutch, Russian, Swedish, and CJK using Lucene's Unicode 12.1 `StandardTokenizer` grammar; across 1,590 stemmed queries in nine languages, 1,576 match Fuseki exactly (the remaining 14 consist solely of stop words). Dictionary-based `ja-dict`, `zh-dict`, and `ko-dict` analyzers segment Japanese, Chinese, and Korean text (matching Lucene Kuromoji and Nori on fixtures and jieba for Chinese), with pinned dictionaries fetched and compiled via `sparkles text-dict`.
+* **Recovery.** Datasets can enable full-text indexing at creation. Missing or damaged indexes rebuild in the background on open while RDF queries keep working, returning `503` for text queries until recovery completes. Reconfiguring an index waits for active writers and checkpoints before reusing paths.
 
 ### Entity search
 
-* `GET /$/ontology/{ds}/search` searches the entities of an ontology or thesaurus for a
-  typeahead or a results page ([API.md](../API.md#ontology)), and Python's, Node.js's
-  and the JVM's ontology handles call the same search. An entity is an IRI that a graph
-  types as an OWL or RDFS class, property, individual or datatype, or as a SKOS concept,
-  concept scheme or collection. The search matches labels, synonyms in SKOS, SKOS-XL and
-  oboInOwl, short forms such as `oboInOwl:id`, `skos:notation`, prefixed names and local
-  names, and definitions in any language.
-* Texts are compared with case, diacritics and punctuation folded. A query finds labels
-  and synonyms that equal it, that start with it or whose words start with its words.
-  Misspelt words match within one edit from 3 characters and two from 6, and a word still
-  being typed within one edit from 4 characters and two from 8, with a transposition as
-  one edit. Levenshtein automata walk the sorted words and texts of the index and skip
-  every run of keys whose common prefix is already too far from the query.
-* Hits are ranked in tiers, with exact labels first, then label prefixes, synonyms and
-  short forms, the words of labels and synonyms, matches with edits and last the words
-  of definitions. Within a tier the ranking prefers fewer edits, entities that are not
-  deprecated and the caller's languages, and it breaks ties by length, text and IRI, so
-  the same request on the same commit gives the same page.
-* Each branch keeps its own index in memory. A branch's first search builds it from
-  the head, and a later search applies the commits made since, so a commit costs nothing
-  until the next search. A change too large to apply, a head that moved back or an
-  unavailable change record rebuilds the index, and a restarted server builds it again
-  at the first search. ChEBI lite's index holds 238,190 entities in about 233 MiB,
-  292 MiB resident, and is built in 1.3 s. That memory buys typeahead that answers
-  within 8.3 ms at the 99th percentile ([entity search
-  benchmark](../benchmarks/entity-search/README.md)).
-* A caller sees only the graphs and triples their grants allow. When the grants hide
-  some triples, each candidate's matched value is checked against the caller's view
-  before it is returned.
+`GET /$/ontology/{ds}/search` and the Python, Node.js, and JVM ontology handles provide typo-tolerant entity search over OWL/RDFS classes, properties, individuals, datatypes, and SKOS concepts, schemes, and collections ([API.md](../API.md#ontology)).
+
+* **Matching and fuzzy tolerance.** Search indexes labels, synonyms (SKOS, SKOS-XL, `oboInOwl`), short forms (`oboInOwl:id`, `skos:notation`, prefixed and local names), and definitions across all languages with case, diacritics, and punctuation folded. Queries match exact strings, prefixes, and word prefixes, tolerating 1 edit (including transpositions) from 3 characters and 2 edits from 6 (4 and 8 for partial words being typed) using Levenshtein automata that prune distant prefix runs.
+* **Deterministic ranking.** Hits rank in tiers: exact labels, label prefixes, synonyms and short forms, label/synonym words, fuzzy matches, and definition words. Ties break deterministically by fewer edits, non-deprecated status, caller language preference, length, text, and IRI.
+* **Per-branch memory index and access control.** Each branch builds its index lazily on first search and updates incrementally from subsequent commits (rebuilding only on large jumps, head rollbacks, missing change records, or restart). On ChEBI lite (238,190 entities), the index uses ~233 MiB (~292 MiB RSS), builds in 1.3 s, and answers typeahead queries within 8.3 ms at p99 ([entity search benchmark](../benchmarks/entity-search/README.md)). Results respect graph and triple grants by checking each matched value against the caller's view.
 
 ### Vector search and embeddings
 
-* Vectors are `spk:vector` literals or their compact base64 form `spk:vectorB64`, compared
-  with `spk:cosine`, `spk:dot` and `spk:euclidean`.
-* `spk:vectorSearch` returns the top k within the active graph. Its query can be a
-  literal, an entity, a variable bound by the rest of the group, or a text for an index
-  that embeds on write. It takes `ef:`, `exact:true`, `distinct:subject` and
-  `candidates:join`. `ORDER BY DESC(spk:cosine(?v, C)) LIMIT k` over one pattern runs as
-  an exact vector search.
-* Vector indexes pack one predicate's vectors and build an HNSW graph over them in the
-  background ([API.md](../API.md#vector-indexes)). They are managed through `vector.json`,
-  `/$/vector/{ds}/{name}` and `sparkles vector`. The graph is a file of the generation
-  that is mapped after a restart. New rows are inserted into it after each commit, and a
-  compaction carries it over, so neither waits for a full rebuild. Searches overlay
-  deleted and not-yet-inserted vectors exactly, past commits are searched exactly, and
-  `M`, `efConstruction` and `efSearch` are set per index.
-* An index can compute embeddings on write ([API.md](../API.md#embeddings-on-write)). It
-  names the literals to embed, by predicate, language, class or a SELECT query, and an
-  OpenAI-compatible endpoint such as OpenAI, Ollama or vLLM. A background worker embeds
-  new and changed text after each commit, removes the vectors of deleted text, and catches
-  up after restarts and bulk loads without resending unchanged text. Long texts can be
-  split into overlapping chunks, and requests can be rate-limited by count and by
-  estimated tokens. API keys come from operator-defined secrets, and Prometheus metrics
-  report requests, failures, the backlog and the lag.
-* The standard server includes the `embed-local` runtime and
-  runs BERT, XLM-RoBERTa, NomicBERT and Qwen3 sentence-embedding models itself with Candle
-  ([API.md](../API.md#model-providers), [F12](../specs/F12-local-embeddings.md)). Models run on
-  a small thread pool at a lower priority than queries, load at first use and unload when
-  idle. They come from a store of pinned, hash-verified snapshots that
-  `sparkles models pull` fills from the Hugging Face Hub or a Nix build provides.
-* `spk:hybridSearch` fuses a `text:query` ranking and a `spk:vectorSearch` ranking by
-  reciprocal rank fusion and returns the fused score and both ranks
-  ([API.md](../API.md#hybrid-text-and-vector-search)). The MCP memory tools fuse their
-  text and vector lists with the same library function, `sparkles::rank::fuse_rrf`, and
-  read full-text hits through the same `text:query` call as `GET /{ds}/text`.
+* **Literals and similarity functions.** Vectors are stored as `spk:vector` or compact base64 `spk:vectorB64` literals and compared with `spk:cosine`, `spk:dot`, and `spk:euclidean`.
+* **SPARQL search.** `spk:vectorSearch` returns the top `k` matches in the active graph from a vector literal, entity, bound variable, or query text (when the index embeds on write), supporting `ef:`, `exact:true`, `distinct:subject`, and `candidates:join`. Single-pattern `ORDER BY DESC(spk:cosine(?v, C)) LIMIT k` executes as an exact vector search.
+* **HNSW indexes.** Configured via `vector.json`, `/$/vector/{ds}/{name}`, or `sparkles vector`, each index packs one predicate's vectors and maintains an HNSW graph (`M`, `efConstruction`, `efSearch`) stored as a memory-mapped generation file ([API.md](../API.md#vector-indexes)). New vectors insert incrementally after commits and carry across compactions without full rebuilds; queries overlay pending/deleted vectors exactly, and historical commits run exact search.
+* **Embeddings on write.** Indexes can compute embeddings automatically for literals selected by predicate, language, class, or `SELECT` query through OpenAI-compatible endpoints (OpenAI, Ollama, vLLM) or the built-in `embed-local` Candle runtime supporting BERT, XLM-RoBERTa, NomicBERT, and Qwen3 models ([API.md](../API.md#embeddings-on-write), [F12](../specs/F12-local-embeddings.md)). Background workers embed changed text, drop vectors for deleted literals, split long text into overlapping chunks, enforce request and token rate limits, and catch up after restarts or bulk loads without re-sending unchanged text. Local models load lazily from hash-verified snapshots (`sparkles models pull` or Nix) on a low-priority pool and unload when idle; remote API keys come from operator secrets, and Prometheus metrics track requests, errors, backlog, and lag.
+* **Hybrid search.** `spk:hybridSearch` combines `text:query` and `spk:vectorSearch` using reciprocal rank fusion and returns fused scores alongside both ranks ([API.md](../API.md#hybrid-text-and-vector-search)). MCP memory tools reuse the same `sparkles::rank::fuse_rrf` helper and `text:query` execution path.
 
 ### Path search
 
-* `SERVICE path:search` returns paths as solutions, one row per edge or per path
-  ([API.md](../API.md#path-search), [U09](../specs/U09-path-finder.md#outcome)). It finds one
-  shortest path per pair, every shortest path, the k shortest paths with Yen's algorithm,
-  or every path up to a length.
-* Edges come from a set of predicates, each followed forward, backward or both ways, from
-  every triple, or from the solutions of a nested graph pattern. Each edge can be bound as
-  a triple term. Sources and targets are constants or variables bound by the rest of the
-  group.
-* Weights on RDF 1.2 reifiers switch the search to Dijkstra's algorithm. A single pair
-  runs from both ends, as a breadth-first search over the PSO and POS permutations
-  without weights and as Dijkstra's algorithm with them, for one shortest path, every
-  shortest path or the shortest cycles through a node. Yen's spur searches run from both
-  ends too. Ties between weighted paths are decided on the exact sums of their weights
-  while the weights lie within a factor of 2^28 of each other.
-* `path:excludePredicate` skips predicates such as `rdf:type`, and `path:maxDegree` keeps
-  paths from passing through hubs. Paths never use triples the caller cannot see.
+`SERVICE path:search` returns one shortest path per pair, all shortest paths, `k` shortest paths via Yen's algorithm, or all paths up to a maximum length, emitting one solution row per edge or per path ([API.md](../API.md#path-search), [U09](../specs/U09-path-finder.md#outcome)).
+
+* **Edge sources and bindings.** Edges come from selected predicates (forward, backward, or undirected), all triples, or a nested graph pattern, and each edge can bind as an RDF 1.2 triple term. Sources and targets may be constants or bound join variables.
+* **Bidirectional and weighted algorithms.** Unweighted single-pair searches run bidirectional BFS over PSO and POS; weights on RDF 1.2 reifiers switch to bidirectional Dijkstra for shortest paths, all shortest paths, shortest cycles, and Yen's spur searches. Ties between weighted paths compare exact sums while edge weights stay within a factor of 2²⁸.
+* **Pruning and visibility.** `path:excludePredicate` omits predicates such as `rdf:type`, `path:maxDegree` avoids traversing high-degree hubs, and all traversals exclude triples hidden from the caller.
 
 ### Graph algorithms
 
-* Graph algorithms run through `SERVICE algo:<name>`, `sparkles algo` and
-  `POST /$/algo/{ds}/run` ([API.md](../API.md#graph-algorithms),
-  [F14](../specs/F14-graph-algorithms.md#outcome)).
-  The MCP tool `graph_algorithm` and the Python and Node.js bindings expose them too.
-* The algorithms are PageRank and personalized PageRank, betweenness, weakly and strongly
-  connected components, label propagation, Louvain and Leiden with hierarchy levels, node
-  similarity, triangle counts and clustering, k-core, breadth-first search, single-source
-  shortest paths, and FastRP and node2vec embeddings.
-* They run on a compressed sparse row projection built from chosen predicates,
-  directions, node classes and reifier weights, or from a nested pattern. Results are
-  rows that join with the rest of the query, and the projection holds only what the
-  caller may read. Under `GRAPH ?g`, each graph's call uses only that graph's edges.
-* A named projection is kept in `algo.json`, and built projections are cached for
-  committed views.
-* Weights follow each algorithm's domain. PageRank requires finite non-negative weights
-  and treats nodes with no outgoing weight as dangling, and weights and sums must stay
-  finite in f32. Graphalytics clustering defaults to forward edges.
-* A run can write its results back in batched commits with a run record, as a
-  cancellable task, and embeddings can go to a vector index the same way. Write-back
-  replaces counters only within the destination graph.
-* All calls share a thread pool, and each has a memory budget that charges every
-  workspace before it grows. Long loops check cancellation and the deadline within a
-  bounded amount of work.
-* HTTP runs check the caller's Query or Update grants and rate limits before they read
-  the dataset. A read run waits for the query memory pool as a query does, and a
-  write-back run takes its grant when its task starts.
+Graph algorithms run via `SERVICE algo:<name>`, `sparkles algo`, `POST /$/algo/{ds}/run`, MCP `graph_algorithm`, and Python/Node.js bindings ([API.md](../API.md#graph-algorithms), [F14](../specs/F14-graph-algorithms.md#outcome)).
 
+* **Supported algorithms.** PageRank and personalized PageRank, betweenness centrality, weakly and strongly connected components, label propagation, Louvain and Leiden community detection (with hierarchy levels), node similarity, triangle counting and local clustering coefficient, k-core, breadth-first search, single-source shortest paths (SSSP), and FastRP and node2vec embeddings.
+* **Projections and visibility.** Algorithms execute over a compressed sparse row (CSR) projection built from selected predicates, directions, node classes, and reifier weights, or from a nested pattern. Named projections live in `algo.json` and cache per committed view. Under `GRAPH ?g`, each graph runs on its own edges, and projections include only caller-visible edges. PageRank requires finite non-negative weights (treating zero-out-weight nodes as dangling, finite in `f32`), and Graphalytics clustering defaults to forward edges.
+* **Write-back and resource controls.** Runs can write results or embeddings back in batched commits with a run record as a cancellable task (replacing counters only in the target graph). All runs share a thread pool, reserve workspace memory before growing, poll cancellation and deadlines in long loops, and enforce HTTP Query/Update grants, rate limits, and query memory-pool admission.
 
 ## GeoSPARQL
 
-GeoSPARQL 1.1 and Jena's spatial functions run over a spatial index that is exact for
-every snapshot. They need the `geo` cargo feature, which the server enables.
+GeoSPARQL 1.1 and Apache Jena spatial functions run over an exact per-dataset spatial index. Spatial support requires the `geo` cargo feature, enabled in standard server builds.
 
 ### Geometry literals and functions
 
-* Literals can be `geo:wktLiteral`, `geo:geoJSONLiteral`, `geo:gmlLiteral` and
-  `geo:kmlLiteral` ([API.md](../API.md#geosparql)). GML covers the Simple Features levels 0
-  and 1 of GML 3.2 with linear curves and surfaces, and KML is version 2.2. Z and M
-  layouts and EMPTY are supported, and parse errors give byte offsets. `asGML` and `asKML`
-  write GML and KML.
-* The built-in CRSs are CRS84, CRS84h, EPSG:4326 and EPSG:4979 with their latitude-first
-  axes, and Web Mercator, with OGC, QUDT and EPSG units. The 120 UTM zones use Krüger's
-  series. A `--geo-crs` file adds projected CRSs from proj4 definitions, and the server
-  resolves 4,916 projected EPSG codes from an EPSG-derived table. Definitions that need
-  grid files are refused, and queries warn when a CRS shifts its datum by approximate
-  Helmert parameters.
-* The functions cover the 24 topological relations and `relate` on DE-9IM, `convexHull`,
-  `envelope`, `boundary`, `centroid`, the four overlay operations, the accessors,
-  `boundingCircle`, `concaveHull`, `isSimple` and the six `geof:agg…` aggregates
-  ([API.md](../API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion)).
-* `distance` is geodesic on WGS 84 by default, haversine if a dataset asks for it, and
-  Euclidean for projected CRSs. `buffer` makes metric buffers through a local projection,
-  and `area`, `length` and `perimeter` are geodesic.
-* With `"wgs84": true` in `geo.json`, W3C Basic Geo `wgs84_pos:lat` and `long` pairs are
-  indexed as points.
+* **Serializations.** Supported datatypes are `geo:wktLiteral`, `geo:geoJSONLiteral`, `geo:gmlLiteral` (GML 3.2 Simple Features levels 0 and 1 with linear curves and surfaces), and `geo:kmlLiteral` (KML 2.2), including Z/M dimensions and `EMPTY` geometries with byte-offset parse errors ([API.md](../API.md#geosparql)). `asGML` and `asKML` serialize geometries to GML and KML.
+* **Coordinate reference systems.** Built-in CRSs include CRS84, CRS84h, EPSG:4326 and EPSG:4979 (latitude-first axes), Web Mercator, and all 120 UTM zones via Krüger's series, with OGC, QUDT, and EPSG units. `--geo-crs` loads additional projected CRSs from proj4 definitions, and the server resolves 4,916 projected EPSG codes from an EPSG-derived table. Definitions requiring grid files are refused, and approximate Helmert datum shifts emit plan warnings.
+* **Functions and aggregates.** Supports all 24 DE-9IM topological relations plus `relate`, `convexHull`, `envelope`, `boundary`, `centroid`, overlay operations, accessors, `boundingCircle`, `concaveHull`, `isSimple`, and all six `geof:agg…` aggregates ([API.md](../API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion)). `distance` computes WGS 84 geodesic distance by default (or spherical haversine when configured in `geo.json`, and Euclidean on projected CRSs), `buffer` creates metric buffers through a local projection, and `area`, `length`, and `perimeter` are geodesic. Enabling `"wgs84": true` in `geo.json` also indexes W3C Basic Geo `wgs84_pos:lat`/`long` pairs as points.
 
 ### Spatial index and queries
 
-* Each dataset can have a spatial index, configured by `geo.json`, `/$/geo/{ds}`,
-  `sparkles geo-index` or `serve --geo`. It is a packed Hilbert R-tree over a generation's
-  geometry literals plus an overlay of committed writes. It stays within the `--geo-mb`
-  memory budget and reports its status, rows, skipped literals and CRSs in
-  `sparkles_geo_*` metrics.
-* The index files in `gen-NNNN/geo/` are checksummed and read in place, so opening a
-  database parses no literals. Damaged or foreign files are rebuilt, and compactions and
-  bulk loads parse only new literals. The files are not part of backups or clones.
-* Jena's `spatial:` property functions `nearby`, `withinCircle`, `withinBox`,
-  `intersectBox`, the cardinal directions and their `…Geom` forms use the index, and so do
-  spatial FILTERs. Arguments can be variables that the rest of the group binds. Jena's 15
-  `spatialF:` filter functions and `spatial:equals` are supported.
-* A GeoSPARQL relation, `relate` or a distance bound between two parts of a group runs as
-  a spatial join instead of a cross product, and the index answers
-  `ORDER BY geof:metricDistance(?w, C) LIMIT k`
-  ([API.md](../API.md#spatial-joins-and-nearest-neighbours)). The nearest-neighbour
-  search also handles independent join components, continuing through candidate
-  batches that produce no rows after the joins and filters. It preserves local filter
-  scope and filters connected candidates before crossing independent inputs.
-  EXPLAIN shows `SpatialScan`, `SpatialPf`, `SpatialJoin` and `SpatialKnn`, and warns
-  when a query misses a join or
-  nearest-neighbour plan.
-* Query rewrite of the 24 topological properties, over asserted triples and those derived
-  through default geometries and serializations, is opt-in per dataset with
-  `queryRewrite` ([API.md](../API.md#query-rewrite-spatialequals-and-rdfs-entailment)).
-  `infer --vocab geosparql` adds RDFS entailment of the GeoSPARQL, Simple Features and GML
-  vocabularies and types each geometry from its serializations, and
-  `infer --geo-default-geometry` materializes default geometries.
-* `GET /{ds}/geo?bbox=…` returns the indexed geometries in a box as simplified CRS84
-  GeoJSON, and `POST /$/geo/convert` converts literals to CRS84 GeoJSON for maps.
-
-## Known gaps
-
-These limits name the roadmap items that address them. Current priorities and
-dependencies are recorded in the [central roadmap](../ROADMAP.md).
-
-### Search and graph algorithms
-
-* The entity search keeps its index in memory only, so the first search of each branch
-  after a start builds it. Roadmap item 657. It reads the head and refuses `at` and
-  `inferences`. Roadmap item 658. Words are split at spaces, punctuation, camel case and
-  digits, so a label in a script written without spaces matches only as a whole text or
-  its prefix. Roadmap item 659.
-* Full-text search uses Tantivy's Snowball stemmers by default, and the analyzers that
-  reproduce Lucene's are selected per language. Lucene's analyzers for other languages,
-  such as Greek and Arabic, have no counterpart. Roadmap item 251.
-* `zh-dict` segments Chinese by jieba's word frequencies, so its tokens differ from those
-  of Lucene's SmartChineseAnalyzer. Kuromoji's normal and extended modes and the user
-  dictionaries of Kuromoji and Nori have no counterpart. Where a run of more than 1,024
-  UTF-16 units of unknown characters reaches that limit inside a surrogate pair, `ja-dict`
-  and `ko-dict` cut it before the pair while Lucene cuts inside it, which can shift later
-  positions. Roadmap item 250.
-* Full-text documents have one field. Roadmap item 35.
-* Enabling or reconfiguring a full-text index builds it while writes wait. A write
-  transaction cannot search the full-text index after it changes data, because the index
-  covers committed data only. Roadmap item 23.
-* A vector index has no quantization, so its packed vectors take 4 bytes per dimension.
-  Roadmap item 34. Each pass that inserts new rows into a vector index's graph scans all
-  rows inserted since the last compaction. Roadmap item 82.
-* A weighted shortest search with `path:maxLength` lists paths in order of cost until one
-  is short enough, so a pair whose short paths are all dear runs until the visit limit.
-  The UI's path finder always sends a length limit and stops at a million visits. Roadmap
-  item 275.
-* A source with several bound targets runs one search from the source, with or without
-  weights, rather than a search from both ends for each pair. Roadmap item 491.
-* Yen's weighted spur searches that close a cycle through the source, in
-  `path:kShortest`, run Dijkstra's algorithm from one end. Roadmap item 492.
-* Weighted costs are double-double sums, which are exact only while a path's weights lie
-  within a factor of about 2^28 of each other. With weights further apart a sum can round,
-  so two equally cheap paths can rank apart and one of them is missed. Roadmap
-  item 493.
-* Graph algorithms match the Graphalytics reference outputs for BFS, WCC and PageRank on
-  the two small official example graphs, through `scripts/graphalytics-reference.py`.
-  There is no full Graphalytics driver, no run on the larger datasets, no reference check
-  of CDLP, LCC or SSSP, and no certification. Roadmap item 8.
-* The UI cannot complete `algo:` names, and openCypher procedures wait for the openCypher
-  frontend, which belongs to additional query languages. Roadmap item 20. Write-back
-  commits through the ordinary writer rather than a bulk writer. A write-back run has no
-  deadline unless the request or `--update-timeout` gives one. Thread admission has no
-  queue order, so a call that needs several threads can wait while one-thread calls take
-  the free slots. A background view-only run reports progress by phase only. Roadmap
-  item 8.
-* Betweenness requires finite, strictly positive edge weights, while SSSP accepts zero
-  weights and PageRank non-negative ones. This is an optional extension. Roadmap item 79.
-* Weighted betweenness refuses a distance addition that cannot keep a strict increase at
-  `f64` precision and refuses non-finite distances. Accepted distances and path counts are
-  approximate, including rounded path ties, and sampling checks only the selected source
-  searches. This is an optional extension. Roadmap item 80.
-
-
-### GeoSPARQL
-
-* EPSG codes come from a table of proj4 definitions rather than the EPSG database, and
-  the library includes the table only with its `geo-epsg` feature. Geographic CRSs on
-  datums other than WGS 84, grid-based datum shifts and curved GML segments are not
-  supported, and Helmert datum shifts are approximate. A planned change adds exact
-  Helmert shifts, other geographic datums, opt-in grid shifts from operator-supplied grid
-  files that still refuse when a needed grid is missing, and curved segments densified
-  within a stated tolerance. Roadmap item 24.
-* A nearest-neighbour search takes its query geometry as a constant and cannot bind it per
-  row, and QLever's `spatialSearch:` syntax, metric-property rewrites and polygon
-  approximations beyond the cell grid are missing. Roadmap item 24.
-* Sparkles does not support GML solids, 3D constructions or exact arithmetic on curves,
-  and geometry constructions return 2D results. Unions of crossing lines keep the covered
-  points but do not split the lines at each crossing, unlike Jena's JTS engine, and
-  Sparkles has no Jena-compatible mode. See [COMPARISON.md](../COMPARISON.md#geosparql)
-  for where results differ from Jena.
+* **Packed Hilbert R-tree.** Configured via `geo.json`, `/$/geo/{ds}`, `sparkles geo-index`, or `serve --geo`, the spatial index stores a packed Hilbert R-tree in checksummed `gen-NNNN/geo/` files plus an in-memory overlay of committed writes, bounded by `--geo-mb` and reported in `sparkles_geo_*` metrics. Files map directly on open without re-parsing literals, rebuild automatically if damaged, and parse only new literals across compactions and bulk loads; index files are excluded from backups and clones.
+* **Indexed functions, joins, and nearest neighbours.** Jena's `spatial:` property functions (`nearby`, `withinCircle`, `withinBox`, `intersectBox`, cardinal directions, and `…Geom` forms), 15 `spatialF:` filter functions, `spatial:equals`, and spatial `FILTER` expressions all use the index and accept join-bound variables. Spatial relations, `relate`, and distance bounds between graph patterns execute as spatial joins rather than cross products, and `ORDER BY geof:metricDistance(?w, C) LIMIT k` runs as an indexed nearest-neighbour search, continuing across empty candidate batches even when combined with independent join components ([API.md](../API.md#spatial-joins-and-nearest-neighbours)). `EXPLAIN` shows `SpatialScan`, `SpatialPf`, `SpatialJoin`, and `SpatialKnn` and warns when a query misses a spatial plan.
+* **Query rewrite, RDFS typing, and GeoJSON routes.** Opt-in `queryRewrite` rewrites the 24 topological properties over asserted and default-geometry triples ([API.md](../API.md#query-rewrite-spatialequals-and-rdfs-entailment)). `infer --vocab geosparql` derives GeoSPARQL/SF/GML class hierarchies and types geometries from their serialization literals, and `infer --geo-default-geometry` materializes default geometries. `GET /{ds}/geo?bbox=…` returns simplified CRS84 GeoJSON for map tiles, and `POST /$/geo/convert` converts geometry literals to CRS84 GeoJSON.
 
 ## Configuration and usage
 
-The following guides describe configuration and supported UI, command-line, HTTP
-or library workflows. Exact HTTP contracts remain in the API reference.
+| Topic | Reference |
+|---|---|
+| Full-text and ontology entity search | [Full-text search](../API.md#full-text-search), [Ontology](../API.md#ontology) |
+| Vector indexes, embeddings on write, and hybrid search | [Vector indexes](../API.md#vector-indexes), [Embeddings on write](../API.md#embeddings-on-write), [Model providers](../API.md#model-providers), [Hybrid search](../API.md#hybrid-text-and-vector-search) |
+| Path search and graph algorithms | [Path search](../API.md#path-search), [Graph algorithms](../API.md#graph-algorithms) |
+| GeoSPARQL functions, joins, and query rewrite | [GeoSPARQL](../API.md#geosparql), [Hulls and aggregates](../API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion), [Spatial joins and k-NN](../API.md#spatial-joins-and-nearest-neighbours), [Query rewrite](../API.md#query-rewrite-spatialequals-and-rdfs-entailment) |
 
-* Read [Full-text search](../API.md#full-text-search).
-* Read [Ontology](../API.md#ontology) for the entity search route.
-* Read [Vector indexes](../API.md#vector-indexes).
-* Read [Embeddings on write](../API.md#embeddings-on-write).
-* Read [Model providers](../API.md#model-providers).
-* Read [Hybrid text and vector search](../API.md#hybrid-text-and-vector-search).
-* Read [Path search](../API.md#path-search).
-* Read [Graph algorithms](../API.md#graph-algorithms).
-* Read [GeoSPARQL](../API.md#geosparql).
-* Read [Hulls, aggregates, Jena filter functions, UTM and conversion](../API.md#hulls-aggregates-jena-filter-functions-utm-and-conversion).
-* Read [Spatial joins and nearest neighbours](../API.md#spatial-joins-and-nearest-neighbours).
+## Known gaps
+
+Each limit below cites the [central roadmap](../ROADMAP.md) item tracking it.
+
+### Search and graph algorithms
+
+* **Entity search limits.** The entity index lives in memory only and builds lazily on the first search per branch after startup (roadmap [item 657](../ROADMAP.md)). It queries branch heads only, refusing `at` and `inferences` (roadmap [item 658](../ROADMAP.md)). Tokenization splits on spaces, punctuation, camel case, and digits, so unspaced scripts match only as whole texts or prefixes (roadmap [item 659](../ROADMAP.md)).
+* **Full-text limits.** Lucene-compatible analyzers do not cover languages outside the ten listed above, such as Greek or Arabic (roadmap [item 251](../ROADMAP.md)). `zh-dict` uses jieba rather than Lucene's SmartChineseAnalyzer, Kuromoji/Nori user dictionaries and Kuromoji normal/extended modes are absent, and 1,024-UTF-16-unit unknown runs split before rather than inside surrogate pairs (roadmap [item 250](../ROADMAP.md)). Documents have a single field (roadmap [item 35](../ROADMAP.md)). Enabling or reconfiguring an index blocks writes during the build, and uncommitted writes inside a transaction cannot be searched (roadmap [item 23](../ROADMAP.md)).
+* **Vector index limits.** Vector indexes lack quantization and store 4 bytes per dimension (roadmap [item 34](../ROADMAP.md)). Incremental HNSW insertion passes scan all rows inserted since the last compaction (roadmap [item 82](../ROADMAP.md)).
+* **Path search limits.** Weighted shortest searches with `path:maxLength` enumerate paths in cost order until one satisfies the length bound, hitting the visit cap (1 million in the UI) when short paths are expensive (roadmap [item 275](../ROADMAP.md)). A single source with multiple bound targets runs a unidirectional search instead of bidirectional pairs (roadmap [item 491](../ROADMAP.md)), and Yen's weighted spur searches closing cycles through the source run unidirectional Dijkstra (roadmap [item 492](../ROADMAP.md)). Double-double weight sums remain exact only within a ~2²⁸ weight ratio (roadmap [item 493](../ROADMAP.md)).
+* **Graph algorithm limits.** Graphalytics verification covers BFS, WCC, and PageRank on the two small official example graphs via `scripts/graphalytics-reference.py`, without a full driver, large-graph runs, CDLP/LCC/SSSP checks, or certification. The UI does not autocomplete `algo:` names, write-back uses the ordinary writer without a default deadline, thread admission has no queue ordering, and background view-only runs report phase-level progress only (roadmap [item 8](../ROADMAP.md)). openCypher procedures await the openCypher frontend (roadmap [item 20](../ROADMAP.md)). Weighted betweenness requires strictly positive weights (roadmap [item 79](../ROADMAP.md)) and refuses non-strict `f64` distance increments or non-finite values, with approximate path counts on rounded ties (roadmap [item 80](../ROADMAP.md)).
+
+### GeoSPARQL
+
+* **CRSs and curves.** Projected EPSG lookup uses a proj4 table (opt-in via the `geo-epsg` library feature) rather than the full EPSG database. Non-WGS 84 geographic datums, grid-based datum shifts, and curved GML segments are not supported, and Helmert shifts are approximate; exact Helmert shifts, additional datums, opt-in grid files, and densified curves are planned (roadmap [item 24](../ROADMAP.md)).
+* **Query forms.** Nearest-neighbour searches require a constant query geometry rather than a per-row binding, and QLever `spatialSearch:` syntax, metric-property rewrites, and polygon approximations beyond the cell grid are not implemented (roadmap [item 24](../ROADMAP.md)).
+* **Geometry boundaries.** GML solids, 3D constructions, and exact curve arithmetic are outside scope; constructions produce 2D results. Line unions do not split crossing lines at intersections, and Sparkles has no Jena-compatible behavior mode ([COMPARISON.md](../COMPARISON.md#geosparql)).
 
 ## Roadmap
 
-The remaining work described above refers to [item 8](../ROADMAP.md), [item 20](../ROADMAP.md), [item 23](../ROADMAP.md), [item 24](../ROADMAP.md), [item 34](../ROADMAP.md), [item 35](../ROADMAP.md), [item 79](../ROADMAP.md), [item 80](../ROADMAP.md), [item 82](../ROADMAP.md), [item 250](../ROADMAP.md), [item 251](../ROADMAP.md), [item 275](../ROADMAP.md), [item 491](../ROADMAP.md), [item 492](../ROADMAP.md), [item 493](../ROADMAP.md).
-The central roadmap owns priority and dependencies. Its
-[completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
-link partially complete specs to their remaining work and acceptance criteria.
+Core design specifications for this area are [F03](../specs/F03-full-text-search/SPEC.md), [F04](../specs/F04-vector-search.md), [F07](../specs/F07-path-search.md), [F12](../specs/F12-local-embeddings.md), [F14](../specs/F14-graph-algorithms.md), [G01](../specs/G01-geosparql/SPEC.md), and [U09](../specs/U09-path-finder.md). Entity search measurements live in [docs/benchmarks/entity-search/README.md](../benchmarks/entity-search/README.md).
+
+The central [roadmap](../ROADMAP.md) owns priorities and dependencies, and its [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs) cover items 8, 20, 23, 24, 34, 35, 79, 80, 82, 250, 251, 275, 491–493, and 657–659.
