@@ -1,7 +1,6 @@
 # X16: Storage consolidation
 
-> **Status:** in progress. The plan below is ordered and audited against the code, and
-> phase 2 has shipped.
+> **Status:** implemented in part (Phases 1–2). The plan below is ordered and audited against the code.
 >
 > **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479 and 830 to 833
 > hold the phases that are ready to start, and each is named in its phase. Items 484 and 832 are

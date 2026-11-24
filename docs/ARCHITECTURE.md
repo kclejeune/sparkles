@@ -1,16 +1,23 @@
 # Sparkles architecture
 
-Sparkles is an embeddable RDF database with a Rust storage and query engine, a
-Fuseki-compatible server, and language bindings. Its central choice is to preserve
-Jena's observable semantics and operational model while using QLever-style sorted
-indexes and columnar execution. Transactions, history, branches and derived indexes
-extend that foundation.
+Sparkles is a single-node, embeddable RDF database with a Rust storage and query engine, a
+Fuseki-compatible HTTP server, and Python, JVM and Node.js bindings. It pairs Apache
+Jena's observable semantics and operational model with QLever-style sorted indexes and
+columnar execution, adding durable commits, point-in-time history, branches and derived
+indexes on top.
 
-This document describes the current implementation and connects the architectural
-decisions across the [design specs](specs/README.md). Not every phase of every spec
-is implemented, and each spec's **Outcome** section says which parts are. [FEATURES](FEATURES.md) inventories behavior,
-[API](API.md) defines the HTTP surface, and [BENCHMARKS](BENCHMARKS.md)
-records performance evidence and reproduction instructions.
+This guide explains the current architecture and connects the design decisions across the
+[design specs](specs/README.md) (each spec's **Outcome** section records what shipped).
+See [FEATURES.md](FEATURES.md) for current capabilities, [API.md](API.md) for the HTTP
+contract, [internals/OPTIMIZATIONS.md](internals/OPTIMIZATIONS.md) for operator fast paths,
+and [BENCHMARKS.md](BENCHMARKS.md) for performance evidence.
+
+| Layer | Primary crates | Owns |
+|---|---|---|
+| Storage & query engine | `sparkles-core` | 64-bit term IDs, sorted vocabularies, 7 compressed permutations, MVCC deltas, WAL durability, access views, cost-based planner, eager/cursor executors and derived-index lifecycles |
+| Application facade & bindings | `sparkles`, `sparkles-py`, `sparkles-ffi`, `sparkles-node` | `Dataset` and `Catalog` handles, persisted dataset settings, write guards, admin handles and Python, JVM (Jena) and Node.js adapters |
+| Optional satellites | `sparkles-reasoner`, `sparkles-shacl`, `sparkles-shex`, `sparkles-owl`, `sparkles-graphql`, `sparkles-backup`, `sparkles-fmt` | Forward reasoning, SHACL/ShEx validation, OWL 2 axioms, GraphQL compilation, repository backups and syntax formatting/linting |
+| Server, CLI & tooling | `sparkles-server`, `sparkles-client`, `ui/` | HTTP/Fuseki endpoints, authentication, task queues, layered settings, MCP server, model orchestration, CLI tools and web UI |
 
 * [Compatibility, execution and reuse](#compatibility-execution-and-reuse)
 * [Library boundaries and entry points](#library-boundaries-and-entry-points)
@@ -24,9 +31,9 @@ records performance evidence and reproduction instructions.
 
 ## Compatibility, execution and reuse
 
-The phrase “Jena on QLever-style internals” describes a division of responsibilities.
-The Rust engine does not run Jena, Fuseki or QLever underneath it. The JVM binding
-does depend on Jena to expose its Java APIs and to support ARQ fallback.
+"Jena on QLever-style internals" describes a division of responsibilities, not a runtime
+dependency. The Rust engine does not embed Jena, Fuseki or QLever. Only the JVM binding
+depends on Apache Jena, to expose Jena's Java APIs and optional ARQ fallback.
 
 | Influence | What Sparkles takes from it | Where Sparkles makes its own choices |
 |---|---|---|
@@ -97,13 +104,12 @@ feature. `sparkles-client` and `js/client` instead talk to remote endpoints. The
 not embed another store. The formatter has a separate browser WASM build. The
 database engine itself has no WASM build.
 
-The library-first boundary is implemented, but the server is more than a thin
-transport wrapper. Its dataset object wraps the library's `Dataset` and
-dereferences a hidden `DatasetState` for the handlers that use it. Authentication, task
-queues, schedulers, layered operator settings, model providers and agent workflows
-remain process concerns. The parity map between HTTP and the library explicitly records these
-exceptions, and the bindings matrix includes intentional planned entries. A new
-HTTP endpoint therefore does not automatically imply a method in every binding.
+The library-first boundary keeps core invariants reusable, though the server adds process
+services beyond HTTP transport. Its dataset wrapper builds on the library's `Dataset` and
+exposes an internal `DatasetState` for server-only handlers. Authentication, task queues,
+schedulers, layered operator settings, model providers and agent workflows stay in the
+server process. The parity map between HTTP and the library records these intentional
+boundaries, so a new HTTP route does not automatically imply a method in every binding.
 
 Sources: [facade](../crates/sparkles/src/lib.rs),
 [Dataset](../crates/sparkles/src/dataset.rs), [Catalog](../crates/sparkles/src/catalog/mod.rs),
@@ -598,7 +604,7 @@ matter when building on it:
 | Execution | Automatic execution streams many plans, and the rest run eagerly. Sorts, groupings, DISTINCT and joins spill to disk by default on the server, and `--spill off` turns it off. Eager operators still hold their whole state and can exceed a budget. |
 | Query languages | Read-only GraphQL is implemented with limitations on nested query cost. Cypher remains [specified only](specs/F01-cypher.md). There is no implemented property-graph frontend. |
 | Reasoning and shapes | Materialization plus RDFS on read is implemented, without a general backward rule engine or ontology object API. Incremental reasoning has full-run fallbacks. ShEx 2.2 and SHACL 1.2 node expressions are implemented within the [compatibility boundaries](FEATURES.md#compatibility-boundaries). |
-| Agents and settings | Model clients are tested against mock endpoints, and there is no evaluation matrix against real models. C18 Phase 6 is not built. |
+| Agents and settings | Model clients are tested against mock endpoints, with no evaluation matrix against live models. End-to-end live-model evaluation remains open ([C18](specs/C18-natural-language-questions-and-ingest/README.md)). |
 | Packaging and scale | Bindings are implemented but unpublished to package registries. The engine has no browser WASM build. Published measurements reach 1.24 billion triples on one machine. They do not establish larger or distributed behavior. |
 
 Architecture is checked through several complementary contracts. W3C query and update

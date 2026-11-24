@@ -1,6 +1,8 @@
 # X13: Per-crate Nix builds
 
-This investigation is [roadmap item 92](../ROADMAP.md). It is deferred. The current
+> **Status:** specified (deferred investigation)
+
+This investigation is [roadmap item 92](../ROADMAP.md). It is deferred, and the current
 packaging continues to use Crane while the comparison remains incomplete.
 
 ## Problem
@@ -55,7 +57,7 @@ and any import from derivation.
 Publish the matched measurements and the remaining limitations, then recommend
 retaining Crane, migrating to per-crate builds, or making a smaller change. Any
 migration must preserve package interfaces and pass the existing build and test
-gates. No packaging migration is included in the CI streamline merge.
+gates. No packaging migration is included in the separate CI consolidation changes.
 
 ## Provenance
 
@@ -65,5 +67,5 @@ record is asserted here. The Outcome describes its current investigation scope.
 
 ## Outcome
 
-The CI streamline work landed separately. The per-crate comparison remains future
+The CI consolidation work landed separately. The per-crate comparison remains future
 work, and no controlled result establishes that Crane or crate2nix is faster here.

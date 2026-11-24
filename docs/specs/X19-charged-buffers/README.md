@@ -1,8 +1,10 @@
-# Charged buffers
+# X19: Charged buffers
+
+> **Status:** implemented in part
 
 This spec covers buffers whose memory charge is their allocation and one heap audit
-shared by every cursor operator. It is implemented in part, and
-[roadmap items 1192 and 1193](../../ROADMAP.md) hold the remaining work.
+shared by every cursor operator.
+[Roadmap items 1192 and 1193](../../ROADMAP.md) hold the remaining work.
 
 The `Charged` buffer type and the audit harness are in place, and the audit runs a
 fixture for each cursor operator. The operators whose readings are above the exact

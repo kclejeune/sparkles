@@ -1,6 +1,6 @@
 # C26: Durable jobs and delivery
 
-> **Status:** Phase 1 shipped for the `quads` kind.
+> **Status:** implemented in part (Phase 1 shipped for the `quads` kind)
 >
 > **Phases:** Phase 1 adds durable jobs, fenced worker leases, atomic publication and
 > checkpoints through the library and HTTP. Phase 2 adds the delivery outbox, recurring

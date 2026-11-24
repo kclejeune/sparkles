@@ -1,4 +1,6 @@
-# Resource catalog
+# C30: Resource catalog
+
+> **Status:** implemented in part (Phase 1)
 
 This spec covers a server-level catalog of versioned sources, vocabularies and datasets with a content-addressed source store, recipes and harvesters, load manifests, pinned imports, mirrors, IRI minting and licence records. Phase 1 is implemented, and
 [roadmap item 458](../../ROADMAP.md) holds the remaining phases.

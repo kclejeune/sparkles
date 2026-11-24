@@ -1,6 +1,6 @@
 # U04: Live query profiling
 
-> **Status:** partly implemented
+> **Status:** implemented in part (Phase 4)
 >
 > **Phases:** Phase 4 shipped on 2026-10-23, and Phases 1 to 3 are not built. Phase 1 is a
 > progress registry in the engine and server,

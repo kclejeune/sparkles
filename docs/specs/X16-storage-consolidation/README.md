@@ -1,8 +1,10 @@
-# Storage consolidation
+# X16: Storage consolidation
 
-This spec covers a first-release format cutoff, budgeted readers through one Control trait, a shared commit publish tail, one load plan, partitioned vocabularies with per-range generations, and the remaining replica, clone and format-policy work. It is planned, and
-[roadmap item 455](../../ROADMAP.md) holds the work. Items 479, 484 and 830 to 833 hold
-the phases that are ready to start.
+> **Status:** implemented in part (Phases 1–2)
+
+This spec covers a first-release format cutoff, budgeted readers through one Control trait, a shared commit publish tail, one load plan, partitioned vocabularies with per-range generations, and the remaining replica, clone and format-policy work. Phases 1 and 2 have shipped, and
+[roadmap item 455](../../ROADMAP.md) holds the remaining work. Items 479, 484 and 830 to 833 hold
+the initial phases.
 
 Read the [design](SPEC.md), its ordered [plan](SPEC.md#plan), its later
 [candidate phases](SPEC.md#candidate-phases), its [decisions](SPEC.md#decisions)

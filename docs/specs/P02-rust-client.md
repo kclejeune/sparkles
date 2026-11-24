@@ -49,7 +49,7 @@ cannot use. This spec adds `crates/sparkles-client`, a library that speaks the S
 5. **Authentication as the server accepts it.** The client sends HTTP Basic, API tokens,
    OIDC access tokens and the token saved by `sparkles auth login`
    ([C09](C09-dataset-access-control.md)).
-6. **Robust by default.** Requests are retried with backoff when the server says so, as
+6. **Retries and timeouts by default.** Requests are retried with backoff when the server says so, as
    `Retry-After` and the RateLimit fields of the rate limiter tell it to. A write is
    retried only when the server refused it before doing any work. Calls take a deadline
    and a cancellation token.

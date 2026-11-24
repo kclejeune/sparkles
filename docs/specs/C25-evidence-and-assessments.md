@@ -1,6 +1,6 @@
 # C25: Evidence, claims and assessments
 
-> **Status:** partially implemented
+> **Status:** implemented in part (Phase 1 resources and local Phase 2 preparation)
 >
 > **Phases:** Phase 1 supplies versioned vocabulary, shapes, source and claim fixtures,
 > compatibility views and competency queries. Phase 2 adds authenticated typed writes,

@@ -1,4 +1,6 @@
-# Agent platform controls
+# C33: Agent platform controls
+
+> **Status:** implemented in part
 
 This spec covers MCP tool profiles, shape templates, an approval queue for agent updates, data-change resources, composite tools, branch handoff, framework adapters, in-process memory APIs and A2A skills. The tool profiles are built, as its [Outcome](SPEC.md#outcome) describes, and
 [roadmap item 462](../../ROADMAP.md) holds the remaining work.

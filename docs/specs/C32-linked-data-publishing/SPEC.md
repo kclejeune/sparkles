@@ -1,6 +1,6 @@
 # C32: Linked-data publishing
 
-> **Status:** planned.
+> **Status:** specified.
 >
 > **Roadmap:** [item 461](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered

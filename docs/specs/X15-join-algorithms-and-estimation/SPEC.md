@@ -1,6 +1,6 @@
 # X15: Join algorithms and estimation
 
-> **Status:** planned.
+> **Status:** implemented in part (Phase 1 estimation).
 >
 > **Roadmap:** [item 454](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered

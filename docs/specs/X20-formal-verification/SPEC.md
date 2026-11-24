@@ -1,6 +1,6 @@
 # X20: Formal verification
 
-> **Status:** planned.
+> **Status:** specified.
 >
 > **Roadmap:** [item 1223](../../ROADMAP.md) holds this work. Each candidate phase below
 > gets its own numbered roadmap item when it is ready to start.

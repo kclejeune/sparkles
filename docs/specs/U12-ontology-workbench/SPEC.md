@@ -1,6 +1,6 @@
 # U12: Ontology workbench
 
-> **Status:** partially complete. The ontology editor, DL Query, thesaurus editor and visual SHACL editor
+> **Status:** implemented in part. The ontology editor, DL Query, thesaurus editor and visual SHACL editor
 > phases are built, and the editable schema diagram is planned.
 >
 > **Roadmap:** [item 457](../../ROADMAP.md) holds this work. Each candidate phase below gets

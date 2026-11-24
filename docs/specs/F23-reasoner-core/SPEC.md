@@ -1,6 +1,6 @@
 # F23: Reasoner core
 
-> **Status:** partially complete. The quick-fixes phase is built, and the
+> **Status:** implemented in part. The quick-fixes phase is built, and the
 > [Outcome](#outcome) records it.
 >
 > **Roadmap:** [item 456](../../ROADMAP.md) holds this work. Each candidate phase below gets

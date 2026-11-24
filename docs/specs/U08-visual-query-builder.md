@@ -1,6 +1,6 @@
 # U08: A two-way visual query builder
 
-> **Status:** partly implemented
+> **Status:** implemented in part (Phases 1–2)
 >
 > **Phases:** Phase 1 shipped on 2026-10-23, with the splice core of Phase 2. Phase 1
 > draws the pattern graph of any query, from the editor's text or from a query that ran.

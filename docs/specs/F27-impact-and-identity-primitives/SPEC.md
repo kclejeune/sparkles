@@ -1,6 +1,6 @@
 # F27: Impact and identity primitives
 
-> **Status:** planned.
+> **Status:** specified.
 >
 > **Roadmap:** [item 463](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered

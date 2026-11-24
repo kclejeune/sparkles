@@ -1,6 +1,6 @@
 # C29: Bounded preparation of read views
 
-> **Status:** partially implemented.
+> **Status:** implemented in part (Phases 1–2).
 >
 > **Phases:** Additive bounded history reads come first, followed by controlled
 > permission preparation and adoption by callers that require an operation limit.

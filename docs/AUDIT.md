@@ -1,32 +1,34 @@
 # Audit: Apache Jena, QLever and Oxigraph → Sparkles
 
-This audit covers these source snapshots: Apache Jena `6.3.0-SNAPSHOT` (b1dcba53b5,
-2026‑09‑28), QLever (b0c6d0cd, 2026‑09) and Oxigraph (e0f286b0, 2026‑09‑23). Each feature
-Sparkles added beyond these three projects has a design spec in
-[`specs/`](specs/README.md), which also records how it was implemented (§2b).
-
-This is the historical source and design audit. [ARCHITECTURE.md](ARCHITECTURE.md)
-describes the current implementation, [FEATURES.md](FEATURES.md#known-gaps) owns the
-current limits, and [COMPARISON.md](COMPARISON.md) explains compatibility differences.
+> **Historical design record.** This audit captures the September 2026 source snapshots that
+> guided Sparkles' initial architecture: Apache Jena `6.3.0-SNAPSHOT` (`b1dcba53b5`,
+> 2026-09-28), QLever (`b0c6d0cd`, 2026-09) and Oxigraph (`e0f286b0`, 2026-09-23). It is
+> kept as provenance for the original reuse and language decisions, not as a live feature
+> specification.
+>
+> For current behavior, see [ARCHITECTURE.md](ARCHITECTURE.md) (system design),
+> [FEATURES.md](FEATURES.md#known-gaps) (current capabilities and limits) and
+> [COMPARISON.md](COMPARISON.md) (compatibility differences). Features added beyond these
+> three projects have design specs in [`specs/`](specs/README.md) (§2b).
 
 ## 1. Apache Jena — functional inventory
 
 | Module | Java LOC (main/test) | Role | Sparkles status |
 |---|---|---|---|
-| jena-base | 19K / 8K | Utilities, and the persistent maps (PMap/PSet) for TIM | Replaced by the Rust standard library and `imbl` |
-| jena-iri3986, jena-langtag | 7K + 2K | RFC 3986 IRIs and BCP47 language tags | `oxiri`, `oxilangtag` |
-| jena-core | 141K / 84K | Node/Triple/Graph, the Model API, datatypes, the rule reasoners (forward RETE, backward LP), the ARP RDF/XML parser and the legacy OntModel | The term model comes from `oxrdf`. The reasoners became `sparkles-reasoner`. |
-| jena-arq | 309K / 82K | RIOT I/O and SPARQL (JavaCC parser → algebra → 21 optimizer passes → iterator engine), with functions, update and SERVICE | `sparkles::{io,sparql}` |
-| jena-db + jena-tdb2 | 25K + 19K | DBOE: copy-on-write MVCC B+trees, a journal, the node table (MD5 → NodeId), inline NodeIds, 3 triple and 6 quad indexes, loaders and compaction | `sparkles::store`, QLever-style instead of B+trees |
-| jena-fuseki2 | ~36K | The SPARQL server: query, update, GSP, upload, patch and shacl endpoints, and the `/$/` admin API (datasets, stats, compact, backup, tasks, metrics) | `sparkles-server` |
-| jena-ontapi | 35K | The OWL 2 object API, with DL, EL, QL and RL profiles and no DL reasoner | Out of scope (§5) |
-| jena-shacl / jena-shex | 23K / 18K | SHACL Core and SHACL-SPARQL; ShEx 2 | `sparkles-shacl` implements SHACL Core and SHACL-SPARQL and passes the W3C suites (98/98 and 20/20). `sparkles-shex` implements ShEx 2.1 with ShExC, ShExJ, ShExR and shape maps, and passes 99.9% of the shexTest validation tests. Either can validate writes ([C10](specs/C10-write-time-validation.md), [G02](specs/G02-shex/README.md)). |
-| jena-text | 7.5K | A Lucene text index | A `text:query` subset over string literals, on Tantivy with BM25. It does not use jena-text's Lucene format or assembler ([F03](specs/F03-full-text-search/README.md)). |
-| jena-geosparql | 23K | GeoSPARQL 1.0/1.1 on JTS and Apache SIS. It has the `geof:` and `spatialF:` functions, `spatial:` property functions over an STR-tree of feature envelopes, query rewrite, GML, KML, WKT and GeoJSON literals, and EPSG CRSs. | `sparkles::geo` (the `geo` cargo feature), built on the `geo`, `geo-index` and `geographiclib-rs` crates with its own WKT and GeoJSON readers. It has the `geof:` functions over WKT, GeoJSON, GML and KML, a packed R-tree per generation with an overlay of commits, the `spatial:` property functions, Jena's `spatialF:` filter functions, spatial joins, query rewrite, RDFS entailment of the GeoSPARQL vocabulary with geometry types from literals, and projected CRSs from proj4 definitions through `proj4rs`. It follows Jena where GeoSPARQL leaves room, and [COMPARISON.md](COMPARISON.md#geosparql) lists the divergences. The server resolves projected EPSG codes through an EPSG-derived proj4 table, and there are no datum-shift grids (§5). The design is in [G01](specs/G01-geosparql/README.md). |
-| jena-rdfpatch, rdfconnection, querybuilder, serviceenhancer, cmds | — | Patch logs, client APIs, builders and the CLI | The CLI became the `sparkles` binary. Sparkles writes RDF Patch for diffs and the change feed and applies it through Fuseki's `patch` operation, without patch logs ([F10](specs/F10-replication.md)). The remote side of `RDFConnection` became `sparkles-client` ([P02](specs/P02-rust-client.md)), and the query builder became `sparkles::querybuilder`. serviceenhancer's `loop`, `bulk` and `cache` options became SERVICE options of the engine ([G10](specs/G10-service-enhancer.md)). |
-| jena-tdb1, commonsrdf | — | Deprecated | Skipped |
+| jena-base | 19K / 8K | Utilities and persistent maps (PMap/PSet) for TIM | Replaced by the Rust standard library and `imbl`. |
+| jena-iri3986, jena-langtag | 7K + 2K | RFC 3986 IRIs and BCP47 language tags | Uses `oxiri` and `oxilangtag`, plus scheme and tag checks. |
+| jena-core | 141K / 84K | Node/Triple/Graph, Model API, datatypes, rule reasoners (forward RETE, backward LP), ARP RDF/XML parser and legacy OntModel | Term model from `oxrdf`; forward reasoners in `sparkles-reasoner`. |
+| jena-arq | 309K / 82K | RIOT I/O and SPARQL (JavaCC parser, algebra, 21 optimizer passes, iterator engine), functions, update and SERVICE | Implemented in `sparkles-core` (`io` and `sparql`) and re-exported by `sparkles`. |
+| jena-db + jena-tdb2 | 25K + 19K | DBOE copy-on-write MVCC B+trees, journal, MD5 node table, inline NodeIds, 3 triple and 6 quad indexes, loaders and compaction | Replaced by QLever-style sorted blocks and WAL in `sparkles-core`. |
+| jena-fuseki2 | ~36K | SPARQL server (query, update, GSP, upload, patch, shacl) and `/$/` admin API | Implemented in `sparkles-server`. |
+| jena-ontapi | 35K | OWL 2 object API with DL, EL, QL and RL profiles and no DL reasoner | Out of v1 scope (§5); a separate Rust OWL 2 axiom crate (`sparkles-owl`) was added later. |
+| jena-shacl / jena-shex | 23K / 18K | SHACL Core and SHACL-SPARQL; ShEx 2 | `sparkles-shacl` covers SHACL Core and SHACL-SPARQL (98/98 and 20/20 W3C). `sparkles-shex` covers ShEx with ShExC, ShExJ, ShExR and shape maps, and both support write-time guards ([C10](specs/C10-write-time-validation.md), [G02](specs/G02-shex/README.md)). |
+| jena-text | 7.5K | Lucene text index | `text:query` subset over string literals on Tantivy with BM25; does not use Lucene's index format or assembler ([F03](specs/F03-full-text-search/README.md)). |
+| jena-geosparql | 23K | GeoSPARQL 1.0/1.1 on JTS and Apache SIS (`geof:`, `spatialF:`, `spatial:` over STR-tree, query rewrite, WKT/GeoJSON/GML/KML, EPSG CRSs) | `sparkles-core` (`geo` feature) provides `geof:`, `spatial:`, `spatialF:`, a per-generation packed R-tree, spatial joins, query rewrite and EPSG-derived proj4 transforms without datum-shift grids ([G01](specs/G01-geosparql/README.md), [COMPARISON.md](COMPARISON.md#geosparql)). |
+| jena-rdfpatch, rdfconnection, querybuilder, serviceenhancer, cmds | — | Patch logs, client APIs, builders, SERVICE enhancer and CLI | Covered by `sparkles` CLI, RDF Patch diffs/feeds/apply ([F10](specs/F10-replication.md)), `sparkles-client` ([P02](specs/P02-rust-client.md)), `sparkles::querybuilder` and engine SERVICE options ([G10](specs/G10-service-enhancer.md)). |
+| jena-tdb1, commonsrdf | — | Deprecated | Skipped. |
 
-Sparkles preserves these Jena behaviours:
+Sparkles preserves these Jena behaviors from the audit baseline:
 
 * **Data model.** IRIs, blank nodes, literals with a language tag or datatype, RDF 1.2
   triple terms and base direction, triples and quads, and datasets with a default graph,
@@ -61,19 +63,19 @@ tests in `jena-arq/testing/ARQ`. The formatter's tests read the Turtle and TriG 
 
 | Area | Mechanism | Adopted in Sparkles |
 |---|---|---|
-| Ids | A 64-bit `ValueId`: a 4-bit datatype and a 60-bit payload. All zeros is UNDEF. Int, Double, Bool, Date and GeoPoint are inline. | ✅ Integer, decimal, double, boolean, dateTime and date are inline, but only in canonical lexical form, so term identity is exact, as in TDB2. |
-| Vocabulary | Ids are assigned in sort order, so range and prefix filters work on ids. FSST²-compressed, with a sparse sample in RAM. | ✅ Sorted, front-coded and memory-mapped, with prefix ranges on ids. |
-| Index build | Parallel parse → per-batch partial vocabularies → k-way merge → id remap → external sort per permutation | ✅ The same pipeline, on rayon. |
-| Permutations | 6 permutations (SPO, SOP, PSO, POS, OSP, OPS) plus a graph column. Blocks of ~31k rows with per-column zstd. The first and last triple of each block stay in RAM. | ✅ 6 permutations plus GSPO, in 32k-row blocks with per-column delta, varint and LZ4. Block metadata stays in RAM for block skipping. |
-| Updates | An immutable base plus DeltaTriples located per block, a snapshot per version, and a rebuild when the delta grows | ✅ Persistent (`imbl`) delta sets per permutation, a WAL, MVCC snapshots, and `compact` to rebuild. |
-| Planner | DP over connected components with interesting sort orders, and a greedy fallback past a budget. Filters are applied as soon as their variables are bound. The cost is row counts, and join estimates use multiplicities. | ✅ |
-| Execution | A column-major `IdTable`. Operators materialize their results, though some are lazy. A LocalVocab per result. | ✅ Column-major tables and a local vocabulary per query. |
-| Joins | Zipper merge join with UNDEF, galloping join for skewed sizes, MultiColumnJoin, OptionalJoin, Minus, and TransitivePath with a bound side | ✅ Merge, galloping and hash joins. Transitive paths use BFS from the bound side. |
-| GROUP BY | COUNT from metadata, sort-based grouping and special cases | ✅ COUNT fast paths and hash grouping. |
-| Cache | A concurrent LRU keyed by subtree and delta version, with pinning | ✅ An LRU keyed by the canonical plan and the snapshot version. |
-| Limits | A cancellation handle, a memory-limited allocator and timeouts | ✅ Cancellation, including on client disconnect, and timeouts. Per-query budgets cover estimated intermediate-result memory, response bytes and rows. They are estimates, not an allocator limit ([C01](specs/C01-observability-and-budgets.md)). |
-| Server | Streaming results, `qlever-json` with a runtime-information tree, and websockets for the live plan | ✅ `x-sparkles+json` with the executed plan tree (see API.md). |
-| Patterns / text / spatial | `ql:has-predicate` patterns, a text index and spatial joins | Full-text search uses BM25 through `text:query` (Tantivy), with no text/entity co-occurrence index. GeoSPARQL functions and a packed R-tree per dataset also drive spatial joins and nearest neighbours. The R-tree borrows ideas from QLever's geometry precomputation, not its code ([F03](specs/F03-full-text-search/README.md), [G01](specs/G01-geosparql/README.md)). Predicate patterns answer `ql:has-predicate` and subject counts per predicate ([X11](specs/X11-index-compression-and-predicate-patterns.md#outcome)). |
+| Ids | A 64-bit `ValueId`: a 4-bit datatype and a 60-bit payload. All zeros is UNDEF. Int, Double, Bool, Date and GeoPoint are inline. | Adopted. Integer, decimal, double, boolean, dateTime and date are inline only in canonical lexical form, preserving exact term identity as in TDB2. |
+| Vocabulary | Ids are assigned in sort order, so range and prefix filters work on ids. FSST²-compressed, with a sparse sample in RAM. | Adopted. Sorted, front-coded and memory-mapped, with prefix ranges on IDs and optional FSST suffixes. |
+| Index build | Parallel parse → per-batch partial vocabularies → k-way merge → id remap → external sort per permutation | Adopted on Rayon. |
+| Permutations | 6 permutations (SPO, SOP, PSO, POS, OSP, OPS) plus a graph column. Blocks of ~31k rows with per-column zstd. The first and last triple of each block stay in RAM. | Adopted. Six triple permutations plus GSPO, in 32k-row blocks with per-column delta, varint and LZ4; block metadata stays in RAM for skipping. |
+| Updates | An immutable base plus DeltaTriples located per block, a snapshot per version, and a rebuild when the delta grows | Adopted. Persistent (`imbl`) delta sets per permutation, checksummed WAL, MVCC snapshots and online compaction. |
+| Planner | DP over connected components with interesting sort orders, and a greedy fallback past a budget. Filters are applied as soon as their variables are bound. The cost is row counts, and join estimates use multiplicities. | Adopted. |
+| Execution | A column-major `IdTable`. Operators materialize their results, though some are lazy. A LocalVocab per result. | Adopted. Column-major tables, snapshot-owning cursors and a local vocabulary per query. |
+| Joins | Zipper merge join with UNDEF, galloping join for skewed sizes, MultiColumnJoin, OptionalJoin, Minus, and TransitivePath with a bound side | Adopted. Merge, galloping, hash and batched index joins; transitive paths use BFS from the bound side. |
+| GROUP BY | COUNT from metadata, sort-based grouping and special cases | Adopted. Metadata and run-based COUNT fast paths plus hash grouping. |
+| Cache | A concurrent LRU keyed by subtree and delta version, with pinning | Adopted. LRU keyed by canonical plan, snapshot version and access view. |
+| Limits | A cancellation handle, a memory-limited allocator and timeouts | Adopted in part. Cancellation (including client disconnect), timeouts and per-query estimates for intermediate memory, response bytes and rows, rather than an allocator limit ([C01](specs/C01-observability-and-budgets.md)). |
+| Server | Streaming results, `qlever-json` with a runtime-information tree, and websockets for the live plan | Adopted in part. `x-sparkles+json` carries the executed plan tree ([API.md](API.md)). |
+| Patterns / text / spatial | `ql:has-predicate` patterns, a text index and spatial joins | Adapted. Tantivy BM25 powers `text:query` without a co-occurrence index; a packed R-tree drives GeoSPARQL spatial joins and nearest neighbors ([F03](specs/F03-full-text-search/README.md), [G01](specs/G01-geosparql/README.md)); predicate patterns answer `ql:has-predicate` and subject counts ([X11](specs/X11-index-compression-and-predicate-patterns.md#outcome)). |
 
 ## 2a. Oxigraph — what Sparkles reuses
 
@@ -83,16 +85,16 @@ with iterators, in `spareval`. Sparkles uses the libraries and replaces the data
 
 | Oxigraph crate | Role | In Sparkles |
 |---|---|---|
-| `oxrdf` 0.3, `oxiri`, `oxilangtag` | The term model (IRIs, blank nodes, literals, RDF 1.2 triple terms), and IRI and language-tag validation | ✅ The term model, everywhere. Sparkles has its own ids and vocabulary. |
-| `oxttl`, `oxrdfxml`, `oxjsonld`, `oxrdfio` 0.2 | Parsers and serializers for Turtle, TriG, N-Triples, N-Quads, RDF/XML and JSON-LD | ✅ All RDF I/O. The bulk loader drives `oxttl`'s parallel chunked parsing. |
-| `sparesults` 0.3 | SPARQL result formats (JSON, XML, CSV, TSV) | ✅ Result parsing and serialization. Sparkles adds its own `x-sparkles+json`. |
-| `spargebra` 0.4.7 | The SPARQL 1.1/1.2 parser and algebra | ✅ Vendored, with fixes for the W3C tests it failed and for left-associative arithmetic (`vendor/spargebra/PATCHED.md`). |
-| `oxsdatatypes` 0.2 | The XSD value space (decimal, dateTime, durations) | ✅ Literal values and arithmetic. |
-| `sparopt`, `spareval` | The algebra optimizer and evaluator | ✗ Sparkles has its own DP planner and columnar executor. |
-| `oxigraph` (store) | RocksDB storage with 9 index orders and in-place updates | ✗ Sparkles uses QLever-style sorted blocks (§2). |
-| `spargeo` | GeoSPARQL functions on `geo` | ✗ Not used. `sparkles::geo` has its own literal parsing (EPSG:4326 axes, CRS IRIs, byte offsets), geodesic measures and spatial index. `spargeo` served as a reference for the `geo` crate family. |
+| `oxrdf` 0.3, `oxiri`, `oxilangtag` | Term model (IRIs, blank nodes, literals, RDF 1.2 triple terms) and IRI/language-tag validation | Reused throughout for terms; Sparkles keeps its own IDs and vocabulary. |
+| `oxttl`, `oxrdfxml`, `oxjsonld`, `oxrdfio` 0.2 | Parsers and serializers for Turtle, TriG, N-Triples, N-Quads, RDF/XML and JSON-LD | Reused for RDF I/O; the bulk loader drives `oxttl`'s parallel chunked parsing. |
+| `sparesults` 0.3 | SPARQL result formats (JSON, XML, CSV, TSV) | Reused for result parsing and serialization; Sparkles adds `x-sparkles+json`. |
+| `spargebra` 0.4.7 | SPARQL 1.1/1.2 parser and algebra | Vendored with W3C fixes and left-associative arithmetic ([`vendor/spargebra/PATCHED.md`](../vendor/spargebra/PATCHED.md)). |
+| `oxsdatatypes` 0.2 | XSD value space (decimal, dateTime, durations) | Reused for literal values and arithmetic. |
+| `sparopt`, `spareval` | Algebra optimizer and evaluator | Replaced by Sparkles' dynamic-programming planner and columnar executor. |
+| `oxigraph` (store) | RocksDB storage with 9 index orders and in-place updates | Replaced by QLever-style sorted blocks (§2). |
+| `spargeo` | GeoSPARQL functions on `geo` | Not used. `sparkles-core` parses geometries directly and implements geodesic measures and a spatial index. |
 
-Oxigraph is one of the engines in the benchmarks (`docs/BENCHMARKS.md`).
+Oxigraph is one of the engines compared in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## 2b. Features beyond the audited projects
 

@@ -1,6 +1,8 @@
-# Standalone desktop application
+# U13: Standalone desktop application
 
-U13 is specified and unimplemented. [Roadmap item 746](../../ROADMAP.md)
+> **Status:** specified
+
+[Roadmap item 746](../../ROADMAP.md)
 orders the work after the shared shell and the initial workbench features.
 
 The [design](SPEC.md) calls for a desktop application covering the existing web UI,

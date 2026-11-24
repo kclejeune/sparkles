@@ -1,6 +1,6 @@
 # U06: Rendering large graphs
 
-> **Status:** partly implemented
+> **Status:** implemented in part (Phases 1–2)
 >
 > **Phases:** Phases 1 and 2 shipped on 2026-10-23. Phase 1 is a WebGL graph view with
 > layout in a web worker, used for graph results above the current limits, and a

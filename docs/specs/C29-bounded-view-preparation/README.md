@@ -1,4 +1,6 @@
-# Bounded preparation of read views
+# C29: Bounded preparation of read views
+
+> **Status:** implemented in part (Phases 1–2)
 
 This design adds request-scoped limits while preparing historical snapshots and
 permission-filtered views. It preserves the selected state and the caller's exact

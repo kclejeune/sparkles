@@ -1,6 +1,6 @@
 # X06: Benchmark coverage and refresh
 
-> **Status:** partly shipped
+> **Status:** implemented in part (Phase 1 published)
 >
 > **Phases:** Phase 1 has shipped its tooling and part of its measurements. The result record,
 > the run manifest, `scripts/bench-record.py`, the `compare` subcommand and the BSBM

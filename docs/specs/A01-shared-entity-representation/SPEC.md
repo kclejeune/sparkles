@@ -16,7 +16,7 @@ preserves those descriptions while allowing a reviewed, reproducible current vie
 This application profile defines a small common entity model, typed relationships,
 identifier scopes, resolution inputs and evolution policies. Software, organization,
 place, event and aggregate-observation examples prove that the common contract works
-across domains. These examples are a bounded reference corpus, not comprehensive
+across domains. These examples are a bounded reference corpus, not an exhaustive
 ontologies, automatic entity matching or operational domain products.
 
 The profile uses ordinary RDF, SHACL and SPARQL. It reuses [C25](../C25-evidence-and-assessments.md)
@@ -32,7 +32,7 @@ last-writer-wins truth, or automatic `owl:sameAs`. F16 equality representatives,
 RDF datatype and an ontology object API are not prerequisites. Resource authoring and
 offline replay do not wait for unfinished managed runtimes.
 
-Full feed connectors, comprehensive corporate ownership, hardware applicability,
+Full feed connectors, exhaustive corporate ownership, hardware applicability,
 clinical records, operational public-health workflows, forecasts and new UI screens
 are outside this scope. Aggregate health examples make no clinical recommendation.
 A later operational health package requires separate domain and expert validation.

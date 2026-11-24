@@ -1,4 +1,6 @@
-# OWL classification
+# F24: OWL classification
+
+> **Status:** implemented in part (OWL 2 EL classifier)
 
 This spec covers an OWL 2 EL classifier and a bridge to external DL reasoners over the F21 axiom model, with inferred-axiom export, justifications for any entailed axiom and repair suggestions. Its OWL 2 EL classifier is delivered as roadmap item 580, and
 [roadmap item 457](../../ROADMAP.md) holds the other phases.

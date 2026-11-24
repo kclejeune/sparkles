@@ -1,6 +1,6 @@
 # X09: Group commit by default
 
-> **Status:** Phases 1, 2 and 3 built, with exceptions listed in the Outcome. Group
+> **Status:** implemented in part. Phases 1, 2 and 3 are built, with exceptions listed in the Outcome. Group
 > commit is on by default for persistent stores. Phase 4 is built and passes its crash
 > runs, so it also groups the commits of datasets with a full-text, spatial or embedding
 > index, and it meets its performance gates of section 17.9 on `forge`.

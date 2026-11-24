@@ -1,6 +1,6 @@
 # F25: Git sync and remotes
 
-> **Status:** planned.
+> **Status:** specified.
 >
 > **Roadmap:** [item 460](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered

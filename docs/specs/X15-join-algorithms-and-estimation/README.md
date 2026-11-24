@@ -1,4 +1,6 @@
-# Join algorithms and estimation
+# X15: Join algorithms and estimation
+
+> **Status:** implemented in part (Phase 1 estimation)
 
 This spec covers correlation-aware cardinality estimation, worst-case-optimal joins, scalable join enumeration, adaptive re-optimization, OPTIONAL reordering, a reachability index and factorized intermediate results. Its first phase, correlation-aware estimation from
 characteristic sets, is built, and the other phases are planned.

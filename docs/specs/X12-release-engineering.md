@@ -1,6 +1,6 @@
 # X12: Distribution and format compatibility
 
-> **Status:** partially implemented (Phase 3 and Phase 4a)
+> **Status:** implemented in part (Phase 3 and Phase 4a)
 >
 > **Phases:** Phase 3 shipped: the on-disk format policy with older-format fixtures,
 > in-place upgrades and `sparkles migrate`. Phase 1 is one release workflow for every

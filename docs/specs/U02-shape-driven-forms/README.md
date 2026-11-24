@@ -1,5 +1,7 @@
 # U02: Editing forms generated from SHACL shapes
 
+> **Status:** implemented in part
+
 Forms edit literal and IRI values, nested blank-node children, SHACL 1.2 lists and
 value-level `sh:or` and `sh:xone` alternatives, with previews, branch saves, conflict
 handling, DASH hints, new instances and entity search. Each save is one guarded commit.
