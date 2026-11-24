@@ -266,23 +266,30 @@ impl SwitchWriter {
             gate.wait();
         }
         let max_first = self.threshold.saturating_add(1);
-        let mut pending = Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK)));
-        let first = if pending.len() > max_first {
-            pending.split_to(max_first)
-        } else {
-            std::mem::take(&mut pending)
-        };
-        self.send_bytes(first)?;
+        let pending = std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK));
+        if pending.len() <= max_first {
+            self.send_bytes(Bytes::from(pending))?;
+            #[cfg(test)]
+            if let Some(gate) = self.queued_producer_gate.take() {
+                gate.wait();
+            }
+            return Ok(());
+        }
+        // Copy overflow slices into independently owned `Bytes` so neither `first` nor
+        // subsequent chunks retain the oversized `pending` backing allocation.
+        let mut offset = max_first;
+        self.send_bytes(Bytes::copy_from_slice(&pending[..max_first]))?;
         #[cfg(test)]
         if let Some(gate) = self.queued_producer_gate.take() {
             gate.wait();
         }
-        while pending.len() >= CHUNK {
-            let piece = pending.split_to(CHUNK);
+        while pending.len() - offset >= CHUNK {
+            let piece = Bytes::copy_from_slice(&pending[offset..offset + CHUNK]);
+            offset += CHUNK;
             self.send_bytes(piece)?;
         }
-        if !pending.is_empty() {
-            self.buf.extend_from_slice(&pending);
+        if offset < pending.len() {
+            self.buf.extend_from_slice(&pending[offset..]);
         }
         Ok(())
     }
@@ -2605,5 +2612,73 @@ mod timed_tests {
                 "post-switch chunk {idx} had {len} bytes > CHUNK ({CHUNK})"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_switch_initial_chunk_does_not_pin_oversized_backing_allocation() {
+        let control = StreamControl::new(Default::default(), None, Default::default(), None);
+        let threshold = 100usize;
+        let max_first = threshold + 1;
+        let total = threshold + CHUNK * 4 + 17;
+        let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let mut w = LimitedWriter::new(
+            SwitchWriter::new_in_place_cursor(threshold, control.clone()),
+            None,
+            None,
+        );
+        w.write_all(&payload).unwrap();
+        let (send, end) = oneshot::channel();
+        let Ok(Serialized::Timed { body, .. }) = finish_handoff_controlled(
+            w,
+            control,
+            timeouts(),
+            Instant::now(),
+            |switched, _w| switched,
+            move |e| {
+                let _ = send.send(e);
+            },
+        )
+        .await
+        else {
+            panic!("expected timed stream");
+        };
+        let mut stream = body.into_data_stream();
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.unwrap());
+        }
+        let report = ended(end).await;
+        assert!(report.error.is_none());
+        assert_eq!(report.bytes, total as u64);
+        assert!(chunks.len() >= 2);
+
+        // Keep all later chunks alive while checking that `first` owns an independent,
+        // bounded backing allocation rather than pinning the oversized `Vec<u8>`.
+        let first = chunks.remove(0);
+        assert_eq!(first.len(), max_first);
+        let first_mut = first.try_into_mut().expect(
+            "initial handoff chunk must own its backing allocation independently of later chunks",
+        );
+        assert!(
+            first_mut.capacity() <= max_first,
+            "initial handoff chunk retained oversized backing capacity {} (max_first={max_first})",
+            first_mut.capacity()
+        );
+
+        let mut reassembled = first_mut.to_vec();
+        for piece in chunks {
+            let len = piece.len();
+            let piece_mut = piece
+                .try_into_mut()
+                .expect("overflow handoff chunk must own its backing allocation independently");
+            assert!(
+                piece_mut.capacity() <= CHUNK,
+                "overflow chunk retained oversized backing capacity {} (CHUNK={CHUNK})",
+                piece_mut.capacity()
+            );
+            assert_eq!(piece_mut.len(), len);
+            reassembled.extend_from_slice(&piece_mut);
+        }
+        assert_eq!(reassembled, payload);
     }
 }
