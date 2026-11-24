@@ -2747,7 +2747,7 @@ fn ret_lists_with(
                 if !read(1) {
                     return None;
                 }
-                // partners_of with selected premises
+                // all live non-marker premises (including selected/gbody); M-return-cf filters below
                 let s = &d.store.clauses[i as usize];
                 if s.dead {
                     continue;
@@ -5317,12 +5317,19 @@ pub(super) mod tests {
         ds(&mut st)
             .store
             .add(Clause::new(vec![hyp, Lit::x(k)], vec![all_u]));
-        // A body-side Join target: B(u) -> Z(x), and an empty-body producer: -> B(u).
+        // A body-side Join target: B(u) -> Z(x), and two live, mutually incomparable
+        // producers of B(u): K(x) -> B(u) (gbody=false) and H(u) -> B(u) (gbody=true).
         ds(&mut st)
             .store
             .add(Clause::new(vec![gb], vec![Lit::x(z)]));
-        let prod_id = {
-            ds(&mut st).store.add(Clause::new(vec![], vec![gb]));
+        let prod_clean_id = {
+            ds(&mut st)
+                .store
+                .add(Clause::new(vec![Lit::x(k)], vec![gb]));
+            ds(&mut st).store.clauses.len() - 1
+        };
+        let prod_gbody_id = {
+            ds(&mut st).store.add(Clause::new(vec![hyp], vec![gb]));
             ds(&mut st).store.clauses.len() - 1
         };
 
@@ -5339,7 +5346,11 @@ pub(super) mod tests {
             s.sel = false;
             s.gbody = has_gbody;
         }
-        assert!(!ds(&mut st).store.clauses[prod_id].gbody);
+        let clauses = &dl(&st).unwrap().store.clauses;
+        let prod_clean = &clauses[prod_clean_id];
+        let prod_gbody = &clauses[prod_gbody_id];
+        assert!(prod_clean.done && !prod_clean.dead && !prod_clean.gbody && !prod_clean.sel);
+        assert!(prod_gbody.done && !prod_gbody.dead && prod_gbody.gbody && !prod_gbody.sel);
 
         // 1. Fc Pred with sel=false, gbody=true, include_selected=false STILL takes both
         //    partners: no fixed premise, first fixed, and second fixed.
@@ -5433,7 +5444,7 @@ pub(super) mod tests {
         );
 
         // 5. Join: gbody=true is blocked on head side (join_head & join_body) while still
-        //    discharged on body side against an empty-body (gbody=false) producer.
+        //    discharged on body side against a gbody=false producer.
         let head_gbody = Clause::new(vec![hyp, Lit::x(k)], vec![gb]);
         let mut found = Found::default();
         join_head(
@@ -5450,13 +5461,51 @@ pub(super) mod tests {
             found.one_sides().is_empty(),
             "join_head(gbody=true) must block gbody head premise"
         );
-        let body_gbody = Clause::new(vec![gb, Lit::x(k)], vec![Lit::x(z)]);
         let mut found = Found::default();
-        join_body(&ix, &st, &body_gbody, &mut found, lits);
+        join_head(
+            &ix,
+            &st,
+            &head_gbody,
+            gb,
+            &side(&head_gbody, gb),
+            &mut found,
+            lits,
+            false,
+        );
+        let mut want_head_body = vec![hyp, Lit::x(k)];
+        want_head_body.sort();
+        assert_eq!(
+            found.one_sides(),
+            &[(want_head_body, vec![Lit::x(z)])],
+            "join_head(gbody=false) must resolve head premise against body target"
+        );
+
+        let body_target = Clause::new(vec![gb], vec![Lit::x(z)]);
+        let mut found = Found::default();
+        join_body(&ix, &st, &body_target, &mut found, lits);
+        assert_eq!(
+            found.one_sides(),
+            &[(vec![Lit::x(k)], vec![Lit::x(z)])],
+            "join_body must resolve only against the live gbody=false producer, excluding the live gbody=true producer"
+        );
+        // Clearing gbody on the second live producer makes its distinct resolvent appear.
+        ds(&mut st).store.clauses[prod_gbody_id].gbody = false;
+        let mut found = Found::default();
+        join_body(&ix, &st, &body_target, &mut found, lits);
         assert_eq!(
             found.one_sides().len(),
-            1,
-            "join_body must resolve body-side gbody clause against empty-body producer only"
+            2,
+            "clearing gbody on stored head producer must admit its join_body resolvent"
+        );
+        assert!(
+            found
+                .one_sides()
+                .contains(&(vec![Lit::x(k)], vec![Lit::x(z)])),
+            "clean producer resolvent must remain present"
+        );
+        assert!(
+            found.one_sides().contains(&(vec![hyp], vec![Lit::x(z)])),
+            "previously gated producer resolvent must appear once gbody is cleared"
         );
     }
 
@@ -5749,30 +5798,33 @@ pub(super) mod tests {
     /// literals, and `Stored` keeps its layout size and `Store::owned_bytes == scan_bytes`.
     #[test]
     fn root_flags_stay_false_and_stored_owned_bytes_matches_scan() {
+        #[cfg(target_pointer_width = "64")]
         assert_eq!(
             std::mem::size_of::<super::super::dl_clause::Stored>(),
             64,
             "adding gbody: bool must fit inside Stored's existing alignment padding"
         );
         let mut sig = Sig::new();
-        let [a, b, z] = ["A", "B", "Z"].map(|n| sig.class(n));
+        let [a, b, h, z] = ["A", "B", "H", "Z"].map(|n| sig.class(n));
         let u = sig.ind("u");
         sig.sub(u, a);
-        sig.sub(a, b);
         sig.dl.clauses.push((vec![a], vec![b, z]));
         let done = saturate_seeded(sig, None, |ix, _| {
             let cu = c(u, ix);
             vec![
-                (vec![XLit::Atom(a, cu)], vec![XLit::Atom(b, cu)]),
-                (vec![], vec![XLit::Atom(a, cu)]),
+                // Unsubsumed ground-bodied clause that survives until dl_root::flush processes it.
+                (vec![XLit::Atom(h, cu)], vec![XLit::Atom(b, cu)]),
             ]
         });
         let st = done.ctx[done.root as usize].get().unwrap().st.lock();
         let store = &dl(&st).expect("root store").store;
         assert_eq!(store.bytes(), store.scan_bytes());
         assert!(
-            store.clauses.iter().any(|s| !s.c.body().is_empty()),
-            "root store must have processed a ground-bodied clause"
+            store
+                .clauses
+                .iter()
+                .any(|s| s.done && !s.dead && !s.c.body().is_empty()),
+            "root store must have processed a live ground-bodied clause"
         );
         assert!(
             store.clauses.iter().all(|s| !s.sel && !s.gbody),
@@ -5930,7 +5982,36 @@ pub(super) mod tests {
                     .clauses
                     .iter()
                     .all(|s| !s.c.head().is_empty()),
-                "M-return-cf must not derive ground-bodied denials from ineligible holders"
+                "M-return-cf must not derive ground-bodied denials from pre-existing ineligible holders"
+            );
+            // Late ineligible ground-bodied and Fc-bodied premises arrive AFTER `rret` has
+            // saved `cid` in `rets`: m_note's late fixed-premise filter must reject both.
+            assert!(m_note(
+                &ix,
+                root,
+                k,
+                &mut st,
+                ga,
+                &(vec![gh, Lit::x(k)], vec![]),
+                &mut out
+            ));
+            assert!(m_note(
+                &ix,
+                root,
+                k,
+                &mut st,
+                ga,
+                &(vec![gfc, Lit::x(k)], vec![]),
+                &mut out
+            ));
+            assert!(
+                dl(&st)
+                    .unwrap()
+                    .store
+                    .clauses
+                    .iter()
+                    .all(|s| !s.c.head().is_empty()),
+                "M-return-cf must not replay saved returns against late ineligible ground/Fc-bodied premises"
             );
             // Eligible x-only holder arrives later: m_late derives K(x) -> ⊥.
             let x_only: Side = (vec![Lit::x(k)], vec![]);

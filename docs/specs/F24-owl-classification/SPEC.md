@@ -251,7 +251,8 @@ fixtures are exact again, and two runs pass the bound that finished before, s2-g
 one thread and on four and a version of shoi-022 with its individuals merged on four
 threads, which are items 1227 and 1228. `SPARKLES_ROOTED_SELECT_GROUND=0`,
 `SPARKLES_ROOTED_SEL_PARTNERS_X=0` and `SPARKLES_ROOTED_JOIN_EXEMPT=0` turn each part off
-for measurement.
+for measurement, and reproducing the original uncut selection-off control after item 1250
+also sets `SPARKLES_ROOTED_GROUND_BODY_CUT=0`.
 
 Item 1229 records a loss of runs that count and of rooted runs. Pred takes each clause
 that a successor sends with the restrictions that reach the successor when it arrives, and
@@ -299,39 +300,75 @@ containment, and `Limits::rooted_decline` turns it off for measurement.
 a ground literal as a condition tells the root, which sends the literal as a marker to the
 contexts registered for its individuals that the root reaches, also to a context that
 registers or becomes reachable later. The root returns its clauses whose bodies hold such
-literals to the contexts that hold them, and each holder resolves a returned clause with
-its own premises for the body, again when a premise comes later. The sends and the returns
-count against the work bound. With the repair on and the check off, the two generated
-corpora built around the loss give 1,168 and 262 runs that differ from HermiT without the
-repair and none with it. Twelve fixtures built for particular orders of arrival fail
-without it and pass with it, although no fixture isolates a returned clause that the root
-subsumes later or a return followed by a late premise that it misses. No run that finishes
-on the other generated corpora, with or without counting and on one and four threads,
-differs from HermiT apart from g2-150. With the repair off, every corpus gives the same
-answers and the same counts of derived conclusions as before. With the diagnostic
-`SPARKLES_ROOTED_MARKER_DIAG=1`, a run reports in `Stats::dl_marker_deficits` the markers
-and returned products that its quiescent contexts still owe, and every finished run on the
-corpora owes none with the repair. The repair derives 1.02 to 1.13 times the conclusions
-on the larger generated corpora, up to 1.41 times on corpora of small files, up to 1.28
-times with counting and 1.4 to 1.65 times on the two built around the loss, which now
-derive the missing entailments, so a few runs near the bound pass it and give their
-default answer.
+literals to the contexts that hold them. Enabling `Limits::rooted_marker_repair` defaults
+to mode `129` (`MREPAIR_ON | MREPAIR_CF`), in which both return arrival paths exclude any
+holder premise whose body holds a literal mentioning neither `x` nor `y`, namely a constant
+literal or a constant-successor `f_e(u)` literal. On initial return arrival the holder
+records the returned clause under every literal of its body before filtering its candidate
+premises, and on late premise arrival the holder registers itself with the root before
+excluding an ineligible premise from replay. The sends and the returns count against the
+work bound. `SPARKLES_ROOTED_MARKER_REPAIR=1` selects the unfiltered return rule that
+resolves against all live non-marker holder premises on both arrival paths, `=0` turns the
+repair off, and an explicit environment value takes precedence over test overrides and
+`Limits::rooted_marker_repair`. With the diagnostic `SPARKLES_ROOTED_MARKER_DIAG=1`, a run
+reports in `Stats::dl_marker_deficits` the markers and returned products that its quiescent
+contexts still owe; when mode `129` is active, the second deficit measures only the
+eligible filtered return products, while mode `1` measures unfiltered products. In the
+initial unfiltered measurements (`SPARKLES_ROOTED_MARKER_REPAIR=1`) with the check off, the
+two generated corpora built around the loss give 1,168 and 262 runs that differ from HermiT
+without the repair and none with it. Twelve fixtures built for particular orders of arrival
+fail without it and pass with it, although no fixture isolates a returned clause that the
+root subsumes later or a return followed by a late premise that it misses. No run that
+finishes on the other generated corpora, with or without counting and on one and four
+threads, differs from HermiT apart from g2-150. With the repair off, every corpus gives the
+same answers and the same counts of derived conclusions as before, and every finished run
+on the corpora owes no deficit with the repair. Unfiltered repair derives 1.02 to 1.13
+times the conclusions on the larger generated corpora, up to 1.41 times on corpora of small
+files, up to 1.28 times with counting and 1.4 to 1.65 times on the two built around the
+loss, which now derive the missing entailments, so a few runs near the bound pass it and
+give their default answer.
 
-With the selection of ground body literals off, the setting of item 1220's measurements,
-the repair's returns derive more. On one purpose-built ontology they add 24% to the
-derived conclusions, and on the generated ontology g1-051_p0012 the run passes the work
-bound at 4 million conclusions and the memory budget of 1 GiB at 400 million, against
-455,967 conclusions without the repair. `SPARKLES_ROOTED_MARKER_REPAIR=129` resolves a
-returned clause only with premises whose body has no ground literal. It loses no answer on
-the corpora, takes the purpose-built ontology's cost from 24% to 10.5% and finishes ten
-runs that the repair alone takes past the bound, but g1-051_p0012 still passes the bound of 4
+In the original uncut selection-off control (`SPARKLES_ROOTED_SELECT_GROUND=0` and
+`SPARKLES_ROOTED_GROUND_BODY_CUT=0`, the setting of item 1220's earlier measurements),
+unfiltered returns (`SPARKLES_ROOTED_MARKER_REPAIR=1`) derive more. On one purpose-built
+ontology they add 24% to the derived conclusions, and on the generated ontology
+g1-051_p0012 the run passes the work bound at 4 million conclusions and the memory budget
+of 1 GiB at 400 million, against 455,967 conclusions without the repair. Filtering returns
+alone with `SPARKLES_ROOTED_MARKER_REPAIR=129` on that uncut control loses no answer on the
+corpora, takes the purpose-built ontology's cost from 24% to 10.5% and finishes ten runs
+that unfiltered repair takes past the bound, but g1-051_p0012 still passes the bound of 4
 million and finishes only at 63.2 million conclusions under a bound of 400 million. Its
-growth is in Pred over successor terms of constants and in Join, which item 1250
-follows, and g1-051_p0121 derives 1.42 million conclusions against 1.17 million with the
-repair alone. The repair's state costs 8 bytes per context with the repair off, which item
-1247 removes, and a synthetic family whose conditions nest two or more deep grows with the
-repair's sends, which is item 1251. The repair's completeness is not proved, and the check
-stays on by default.
+growth is in Pred over successor terms of constants and in Join, and g1-051_p0121 derives
+1.42 million conclusions against 1.17 million with unfiltered repair alone.
+
+Item 1250 decouples the non-root ground-body cut from full ground-body selection and makes
+mode `129` the default when `Limits::rooted_marker_repair` is enabled. Each stored clause
+in a non-root context carries `Stored::gbody` alongside `Stored::sel`, while root clauses
+keep both flags false. A non-root clause whose body holds a literal mentioning neither `x`
+nor `y` sets `Stored::gbody` whenever either full selection or the decoupled cut is active
+and sets `Stored::sel` only when full selection is active. `Stored::gbody` cuts non-local
+ground Hyper, role-universal inferences with constant or `f_e(u)` fillers, head-side Join,
+and purely constant or `f_e(u)` binary Eq and Factor even when
+`SPARKLES_ROOTED_SELECT_GROUND=0`. Mixed non-local Eq and Factor, including query-form
+`x ≈ u` equalities, remain gated by `Stored::sel`, and Hyper over `x` and `f_e(u)` Pred
+partners remain gated by `Stored::sel` and `SPARKLES_ROOTED_SEL_PARTNERS_X`.
+`SPARKLES_ROOTED_GROUND_BODY_CUT` is on by default and `=0` disables the decoupled cut;
+reproducing the original uncut selection-off control therefore sets
+`SPARKLES_ROOTED_SELECT_GROUND=0`, `SPARKLES_ROOTED_GROUND_BODY_CUT=0` and
+`SPARKLES_ROOTED_SEL_PARTNERS_X=0`, together with `SPARKLES_ROOTED_MARKER_REPAIR=1` for
+unfiltered returns. With the decoupled cut active under `SPARKLES_ROOTED_SELECT_GROUND=0`
+and `SPARKLES_ROOTED_SEL_PARTNERS_X=0`, the full 19-axiom `g1-051_p0012` finishes complete
+within the default 524,288 rooted work bound with zero marker deficits and matches HermiT
+1.4.5's taxonomy (`C1` unsatisfiable and `C0` equivalent to `owl:Thing`) across repair off,
+default filtered mode `129` and unfiltered mode `1`: on one thread cautious with default
+mode `129` it takes 251,217 derived conclusions, 32,307 stored clauses and 10.9 MB peak
+estimated memory, and on four threads eager it takes 336,298 derived conclusions, 41,450
+stored clauses and 12.6 MB peak estimated memory, against 232,622 conclusions (10.2 MB)
+with repair off and 262,033 conclusions (10.9 MB) with mode `1` on one thread cautious. The
+repair's state costs 8 bytes per context with the repair off, which item 1247 removes, and
+a synthetic family whose conditions nest two or more deep grows with the repair's sends,
+which is item 1251. The repair's completeness is not proved, and the check stays on by
+default.
 
 The repair keeps the resource contract of the rest of Tier D, and the contract is
 cooperative. A run charges each conclusion that it derives to the work bound, and several

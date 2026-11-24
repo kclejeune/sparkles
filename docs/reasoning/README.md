@@ -574,12 +574,18 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   measurements. `Limits::rooted_marker_repair`, which is off by default, repairs the
   delivery instead. A context that holds such a fact as a condition tells the root, which
   sends it to the contexts registered for its individual, and the root returns the clauses
-  it derives under the fact to the contexts that hold it. With the repair and without the
-  check, the generated ontologies and fixtures built around the loss give HermiT's answers
-  in every run that finishes, and the larger generated corpora derive 2 to 13% more
-  conclusions, so that a few of their runs pass the work bound. With the selection of
-  ground body literals turned off for measurement, the repair makes the generated ontology
-  g1-051_p0012 grow past every bound tried, and the work and memory bounds stop it. The
+  it derives under the fact to the contexts that hold it. Enabling the repair defaults to
+  filtered returns, mode `129`, in which both initial return arrival and late premise
+  replay exclude holder premises whose bodies hold a constant or constant-successor
+  literal, while `SPARKLES_ROOTED_MARKER_REPAIR=1` selects unfiltered returns and `=0`
+  turns the repair off. With the repair and without the check, the generated ontologies and
+  fixtures built around the loss give HermiT's answers in every run that finishes, and the
+  larger generated corpora derive 2 to 13% more conclusions, so that a few of their runs
+  pass the work bound. A decoupled non-root ground-body cut stays active even when full
+  ground-body selection is turned off with `SPARKLES_ROOTED_SELECT_GROUND=0`, keeping the
+  containment reproductions within the default work bound; reproducing the original uncut
+  selection-off control where `g1-051_p0012` exceeds the work and memory bounds also
+  requires `SPARKLES_ROOTED_GROUND_BODY_CUT=0` and `SPARKLES_ROOTED_MARKER_REPAIR=1`. The
   repair checks the run's bounds at the same cooperative checkpoints as the other rules,
   and some of its preparation reads premise lists between two checks without counting
   the reads, which item 1280 meters. Roadmap item 1231 turns the repair on by default and
