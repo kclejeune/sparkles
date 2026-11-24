@@ -22,7 +22,7 @@ applications can use Sparkles through Jena's existing `Model`, RIOT, `Txn`, and
 See the [Web UI highlights](#web-ui) below or browse every workflow in the
 [Web UI tour](docs/visualization/README.md#web-ui-tour).
 
-## Why Sparkles
+## Philosophy
 
 Jena and Fuseki define the protocols, formats, and operational model that RDF applications
 depend on, while QLever provides a columnar storage and execution design built for high
@@ -44,33 +44,51 @@ query throughput. Sparkles combines those two foundations inside an embeddable l
    [libraries and bindings](docs/integrations/README.md#libraries-and-bindings) for the
    surfaces each binding exposes.
 
-## Core capabilities
+## Highlights
 
 * **Querying and standards.** Sparkles passes the W3C SPARQL 1.0, 1.1 Query, 1.1 Update,
-  and 1.2 conformance suites, and supports RDF 1.2, Jena ARQ extensions, federated
-  `SERVICE`, incremental views, and GeoSPARQL 1.1. See the
-  [querying guide](docs/querying/README.md#sparql-queries-and-updates).
-* **Versioning and branches.** Every write creates a retained commit that supports
-  point-in-time queries, RDF Patch and graph diffs, named snapshots, and persistent or
-  memory branches with conflict-checked merges. See
+  and 1.2 conformance suites, supports RDF 1.2, Jena ARQ extensions, federated `SERVICE`,
+  automatic streaming with disk spill, and incremental views, and ships a SPARQL/RDF
+  formatter, linter, and language server. See the
+  [querying guide](docs/querying/README.md#sparql-queries-and-updates) and
+  [editor integration](docs/editors.md).
+* **Storage, versioning, and branches.** Sorted, compressed quad permutations pair with an
+  MVCC write-ahead log, durable group commit, and online compaction. Every write produces a
+  retained commit supporting point-in-time reads, RDF Patch and graph diffs, change feeds,
+  named snapshots, and conflict-checked branch merges. See
   [storage and history](docs/storage/README.md#versioning-and-history).
-* **Search and graph analytics.** BM25 full-text search (`text:query`), HNSW vector
-  indexes with embeddings computed on write, hybrid ranking, shortest-path search, and
-  graph algorithms run directly inside SPARQL. See the
+* **Search, spatial, and graph analytics.** BM25 full-text search (`text:query`), HNSW
+  vector indexes with embeddings computed on write, hybrid ranking, GeoSPARQL 1.1 spatial
+  indexes and joins, weighted shortest-path search, and graph algorithms (PageRank, Leiden
+  communities, centrality) run directly inside SPARQL. See the
   [search guide](docs/search/README.md#search).
-* **Reasoning and validation.** Incremental materialization and query-time derivation
-  cover RDFS, OWL 2 RL, and Jena rules alongside OWL 2 EL classification, SHACL Core,
-  SHACL-SPARQL, and ShEx 2.2 write-time guards. See
+* **Reasoning, ontologies, and validation.** Incremental materialization and query-time
+  derivation cover RDFS, OWL 2 RL, OWL 2 QL, Jena rules, Datalog, and SHACL-AF rules
+  alongside a concurrent OWL 2 EL/Horn/ALCHI classifier, an OWL 2 axiom API, SHACL 1.2 and
+  ShEx 2.2 write-time guards, and schema drafting. See
   [reasoning and validation](docs/reasoning/README.md#reasoning-validation-and-schema).
-* **AI and agent workflows.** Grant-checked MCP tools, cited question answering over
-  checked queries, provenance-tracked agent memory with branch review, and GraphRAG
-  Leiden community reports integrate directly with datasets. See
+* **AI, GraphRAG, and agent memory.** Grant-checked MCP tools, natural-language question
+  answering over verified SPARQL, provenance-tracked agent memory with branch review,
+  document ingestion (Markdown, HTML, PDF, and Office formats), and GraphRAG Leiden
+  community reports integrate directly with datasets. See
   [AI and agents](docs/ai/README.md#ai-and-agents).
-* **Server, security, and bindings.** The server exposes Fuseki-compatible endpoints and
-  the `/$/` admin API with dataset, graph, triple, and endpoint grants, query budgets,
-  rate limits, and Rust, Python, JVM, and Node.js bindings. See the
-  [server](docs/server/README.md#server-and-protocols) and
-  [bindings](docs/integrations/README.md#libraries-and-bindings) guides.
+* **Fuseki server, GraphQL, and access control.** The HTTP server implements Fuseki
+  protocols and the `/$/` admin API alongside read-only GraphQL, versioned stored queries,
+  a DCAT 3 resource catalog, Fuseki configuration import, dataset/graph/triple/endpoint
+  grants, rate limits, and query memory budgets. See the
+  [server guide](docs/server/README.md#server-and-protocols).
+* **Embeddable libraries and clients.** Rust, Python, JVM (Jena `DatasetGraph`), and
+  Node.js/TypeScript libraries embed the engine in process, paired with native Rust and
+  TypeScript HTTP clients. See
+  [libraries and bindings](docs/integrations/README.md#libraries-and-bindings).
+* **Web UI and workbench.** The embedded SvelteKit UI provides a SPARQL editor, visual
+  query builder, interactive graph/map/facet/embedding views, time-travel and merge tools,
+  SHACL-generated forms, and ontology, SKOS thesaurus, and SHACL shape editors. See the
+  [Web UI guide](docs/visualization/README.md#web-ui).
+* **Operations and backups.** Sparkles runs as a single binary packaged for Docker, NixOS,
+  and Kubernetes (Helm), with Prometheus metrics, OpenTelemetry tracing, shared memory
+  pools, and incremental, deduplicated, optionally encrypted filesystem or S3 backups. See
+  the [operations guide](docs/operations/README.md).
 
 See [docs/FEATURES.md](docs/FEATURES.md) for the complete capability matrix and
 [known gaps](docs/FEATURES.md#known-gaps), including compatibility differences from Jena.
@@ -108,21 +126,21 @@ running alone, result caches disabled, and answer checks qualifying the reported
 
 ## Web UI
 
-The server embeds a SvelteKit web UI at `/ui/`. The six views below highlight time travel,
-visual query editing, GraphRAG exploration, cited answers, shape-driven forms, and OWL
-classification.
+The server embeds a SvelteKit web UI at `/ui/`. The six views below highlight commit diff
+graphs, visual query editing, GraphRAG communities, GeoSPARQL maps, shape-driven forms, and
+OWL classification.
 
-| ![The query page with the time slider in compare mode, marking one team membership as added and one as removed between two commits](docs/images/time-slider.png) | ![The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows](docs/images/pattern.png) |
+| ![The diff graph of one commit, drawing a new employee, a new job title and a move to Los Angeles in green and the removed job title, home city and acquaintance as dashed red ghosts](docs/images/diff-graph.png) | ![The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows](docs/images/pattern.png) |
 |---|---|
-| Compare query results between two commits with the time slider. | Inspect and edit SPARQL graph patterns visually beside the query text. |
-| ![The Explore overview drawing seven GraphRAG communities of a freight network as circles sized by their members and coloured by report status, with the head office selected and its report, findings, sub-communities and members beside the picture](docs/images/explore-communities.png) | ![The Ask page with a thread's answer, its checked query, its rows and its sources, with the first cited row marked and the memory facts about it quoted](docs/images/ask-answer.png) |
-| Explore GraphRAG communities sized by members alongside their reports. | Answer plain-language questions with checked queries and cited rows. |
+| Inspect a commit's added and removed triples directly as a graph diff. | Inspect and edit SPARQL graph patterns visually beside the query text. |
+| ![The Explore overview drawing seven GraphRAG communities of a freight network as circles sized by their members and coloured by report status, with the head office selected and its report, findings, sub-communities and members beside the picture](docs/images/explore-communities.png) | ![The resource explorer showing a freight company's graph as a world map, with arcs from its head office in Dubai to its offices, partners and employees on six continents, coloured by predicate](docs/images/map-arcs.png) |
+| Explore GraphRAG communities sized by members alongside their reports. | Plot geographic entities and predicate relations as arcs on a world map. |
 | ![The resource explorer with a person's graph and an editing form generated from SHACL shapes in the side panel, showing an email that fails the shape's pattern under its field and a server check that reports an employer which is not a company](docs/images/forms.png) | ![The ontology editor with the asserted and inferred class trees side by side, the EL classifier placing Professor under Teacher, which is defined as a Person who teaches some Course](docs/images/ontology-inferred.png) |
 | Edit resources with SHACL-generated forms checked in the browser and on the server. | Compare asserted and EL-inferred OWL class hierarchies side by side. |
 
-See the full [Web UI tour](docs/visualization/README.md#web-ui-tour) for commit diff
-graphs, branch merges, agent memory, maps, facets, embedding projections, the ontology
-browser, and the thesaurus and SHACL shape editors.
+See the full [Web UI tour](docs/visualization/README.md#web-ui-tour) for the time slider,
+branch merges, cited plain-language answers, agent memory, facets, embedding projections,
+the ontology browser, and the thesaurus and SHACL shape editors.
 
 ## Getting started
 
