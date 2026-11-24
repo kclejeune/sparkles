@@ -23,8 +23,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 | **Embeddings & bindings** | [Embedding the library](#embedding-the-library) | [Rust library](#embedding-the-library), [Python](#python), [JVM (Apache Jena)](#jvm-apache-jena), [JavaScript & TypeScript](#javascript-and-typescript), [Rust HTTP client](#rust-client) |
 | **Deployment** | [Docker](#docker) | [Docker & Compose](#docker), [Kubernetes (Helm)](#kubernetes-helm), [NixOS](#deploying-on-nixos), [Home Manager](#home-manager) |
 
-<details>
-<summary>Full section index (all 37 sections)</summary>
+### Full section index
 
 **Running and operating the server**
 
@@ -98,8 +97,6 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Deploying on NixOS](#deploying-on-nixos)
   * [Model providers and credentials](#model-providers-and-credentials) · [Local embedding models on NixOS](#local-embedding-models-on-nixos) · [Declarative dataset settings](#declarative-dataset-settings) · [Shutdown](#shutdown)
 * [Home Manager](#home-manager)
-
-</details>
 
 ## Running the server
 

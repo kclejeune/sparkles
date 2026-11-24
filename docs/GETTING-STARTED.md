@@ -11,8 +11,7 @@ The [README quick start](../README.md#getting-started) builds `sparkles-server` 
 source, loads a Turtle file, and runs a query both locally and over HTTP. To include the
 embedded web UI at `/ui/`, build `ui/` with Node.js and pnpm before compiling the server.
 
-You can also deploy Sparkles with Docker or NixOS, or embed the engine directly from
-another language.
+Sparkles also deploys with Docker or NixOS, or embeds directly into another language.
 
 | Option | How to start | Guide |
 |---|---|---|

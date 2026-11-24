@@ -106,9 +106,6 @@ item 58, both after the format cutoff. The later encryption phases of item 65, s
 items 468 and 47, the remaining notification work in item 785, the per-crate Nix builds of item 92 and the
 replication refresh of item 280 follow the first release.
 
-<a id="wave-a-engine-quality"></a>
-<a id="wave-a2-engine-rewrites"></a>
-
 ### Wave A: engine quality and consolidation
 
 Wave A holds engine quality, competitive recovery and the remaining executor, join,
@@ -1252,8 +1249,6 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 1049 | **SvelteKit 3 for the web UI.** The UI stays on SvelteKit 2.70.4, so the advisories that only 3.0.0 and 3.1.1 fix stay open. They cover remote functions, prerendered cache headers and enhanced forms, none of which the static single-page UI uses. The migration moves the configuration into the Vite plugin, rewrites the `$lib` imports to `#lib` with file extensions, replaces `$app/paths` `base` and the shallow-routing and `goto` options, and moves to adapter-static 4. | [Web UI](visualization/README.md#web-ui) | M |
 | 1165 | **The logged status of a timed-out body that the client drops.** When a finite body's idle or transfer limit fires and the client drops the unread body before the timer has run the body's observation callback, the access log records status 499. When the callback runs first, it records the response's own status. The outcome is Timeout either way. Record the body end that the timer latched first, so that one cause gives one logged status. | [X05](specs/X05-streaming-query-execution.md#finite-http-body-limits) | S |
 
-<a id="tier-6-release-work"></a>
-
 ## Tier 6: later operational completion
 
 Release artifacts, recovery, startup, audit and the adopted encryption workflows advance
@@ -1540,8 +1535,8 @@ linked spec Outcome records how they landed.
 - **114.** Client time of large results, from eager serializers compiled with the engine and buffered. [Benchmarking](BENCHMARKING.md#release-build-settings), [Benchmarks](benchmarks/engine/RESULTS.md#the-cost-of-result-serialization)
 - **161.** Front coding on warm DBpedia after item 108, which forge measured at a geometric mean of 1.004. [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)
 - **180.** Plan pattern references only for a shown plan. [U04](specs/U04-live-query-profiling.md#phase-4-2026-10-23) Phase 4
-- **181.** Compiler provenance in the Namespace query screen. [Benchmarking](BENCHMARKING.md#namespace-query-screens)
-- **182.** `subquery-agg` after the U02 forms, U11 Phase 3 and item 94 merges, which forge measured unchanged. [Benchmarking](BENCHMARKING.md#namespace-query-screens)
+- **181.** Compiler provenance in the Namespace query screen. [Benchmarking](BENCHMARKING.md#query-screens)
+- **182.** `subquery-agg` after the U02 forms, U11 Phase 3 and item 94 merges, which forge measured unchanged. [Benchmarking](BENCHMARKING.md#query-screens)
 - **191.** Schema facts from derived instances under demand, including declarations, schema-term equality and preserved fresh witnesses. [F17](specs/F17-query-time-reasoning.md#instance-derived-schema-facts)
 - **242.** `two-hop-count` after the result buffer, which forge measured at 0.998 of the build before the buffer in 24 pinned rounds. [Benchmarks](benchmarks/engine/RESULTS.md#the-cost-of-result-serialization)
 

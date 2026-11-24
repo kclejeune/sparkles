@@ -2,9 +2,9 @@
 
 Sparkles is a Rust RDF database that pairs [Apache Jena](https://jena.apache.org/) and
 Fuseki protocols with [QLever](https://github.com/ad-freiburg/qlever)-style compressed
-columnar indexes and query execution. You can run it as a Fuseki-compatible HTTP server
-and CLI with an embedded web UI, or embed the engine directly from Rust, Python, Node.js,
-and the JVM. The JVM binding implements Jena's `DatasetGraph`, so Java and Kotlin
+columnar indexes and query execution. It runs as a Fuseki-compatible HTTP server and CLI
+with an embedded web UI, or embeds directly into Rust, Python, Node.js, and JVM
+applications. The JVM binding implements Jena's `DatasetGraph`, so Java and Kotlin
 applications can use Sparkles through Jena's existing `Model`, RIOT, `Txn`, and
 `QueryExecution` APIs.
 
@@ -36,12 +36,44 @@ query throughput. Sparkles combines those two foundations inside an embeddable l
 2. **Columnar storage with transactions and history.** Terms use 64-bit IDs with inline
    numbers and dates, indexes store sorted and compressed permutations, and a cost-based
    planner drives column-at-a-time execution. Sparkles adds MVCC transactions, durable
-   commits, online compaction, and a commit history you can read, diff, and branch.
+   commits, online compaction, and a commit history that supports point-in-time reads,
+   diffs, and branching.
 3. **Library first.** The core engine has no HTTP server dependency. The server, CLI, and
    Rust, Python, JVM, and Node.js bindings all share its public API and query semantics,
    using Oxigraph's crates for the term model, parsers, and SPARQL algebra. See
    [libraries and bindings](docs/integrations/README.md#libraries-and-bindings) for the
    surfaces each binding exposes.
+
+## Core capabilities
+
+* **Querying and standards.** Sparkles passes the W3C SPARQL 1.0, 1.1 Query, 1.1 Update,
+  and 1.2 conformance suites, and supports RDF 1.2, Jena ARQ extensions, federated
+  `SERVICE`, incremental views, and GeoSPARQL 1.1. See the
+  [querying guide](docs/querying/README.md#sparql-queries-and-updates).
+* **Versioning and branches.** Every write creates a retained commit that supports
+  point-in-time queries, RDF Patch and graph diffs, named snapshots, and persistent or
+  memory branches with conflict-checked merges. See
+  [storage and history](docs/storage/README.md#versioning-and-history).
+* **Search and graph analytics.** BM25 full-text search (`text:query`), HNSW vector
+  indexes with embeddings computed on write, hybrid ranking, shortest-path search, and
+  graph algorithms run directly inside SPARQL. See the
+  [search guide](docs/search/README.md#search).
+* **Reasoning and validation.** Incremental materialization and query-time derivation
+  cover RDFS, OWL 2 RL, and Jena rules alongside OWL 2 EL classification, SHACL Core,
+  SHACL-SPARQL, and ShEx 2.2 write-time guards. See
+  [reasoning and validation](docs/reasoning/README.md#reasoning-validation-and-schema).
+* **AI and agent workflows.** Grant-checked MCP tools, cited question answering over
+  checked queries, provenance-tracked agent memory with branch review, and GraphRAG
+  Leiden community reports integrate directly with datasets. See
+  [AI and agents](docs/ai/README.md#ai-and-agents).
+* **Server, security, and bindings.** The server exposes Fuseki-compatible endpoints and
+  the `/$/` admin API with dataset, graph, triple, and endpoint grants, query budgets,
+  rate limits, and Rust, Python, JVM, and Node.js bindings. See the
+  [server](docs/server/README.md#server-and-protocols) and
+  [bindings](docs/integrations/README.md#libraries-and-bindings) guides.
+
+See [docs/FEATURES.md](docs/FEATURES.md) for the complete capability matrix and
+[known gaps](docs/FEATURES.md#known-gaps), including compatibility differences from Jena.
 
 ## Performance
 
@@ -74,52 +106,19 @@ running alone, result caches disabled, and answer checks qualifying the reported
   [where Sparkles loses](docs/BENCHMARKS.md#where-sparkles-loses) and the
   [benchmark summary](docs/BENCHMARKS.md).
 
-## Core capabilities
-
-| Area | What Sparkles provides | Guide |
-|---|---|---|
-| Querying and standards | Passes W3C SPARQL 1.0, 1.1 Query, 1.1 Update, and 1.2 suites; supports RDF 1.2, Jena ARQ extensions, federated `SERVICE`, incremental views, and GeoSPARQL 1.1. | [Querying](docs/querying/README.md#sparql-queries-and-updates) |
-| Versioning and branches | Point-in-time queries on any retained commit, RDF Patch and graph diffs, named snapshots, and persistent or memory branches with conflict-checked merges. | [Storage and history](docs/storage/README.md#versioning-and-history) |
-| Search and graph analytics | BM25 full-text search (`text:query`), HNSW vector indexes with embeddings computed on write, hybrid ranking, shortest-path search, and graph algorithms inside SPARQL. | [Search](docs/search/README.md#search) |
-| Reasoning and validation | Incremental materialization and query-time derivation for RDFS, OWL 2 RL, and Jena rules, OWL 2 EL classification, plus SHACL Core, SHACL-SPARQL, and ShEx 2.2 write-time guards. | [Reasoning and validation](docs/reasoning/README.md#reasoning-validation-and-schema) |
-| AI and agent workflows | Grant-checked MCP tools, cited question answering over checked queries, provenance-tracked agent memory with branch review, and GraphRAG Leiden community reports. | [AI and agents](docs/ai/README.md#ai-and-agents) |
-| Server, security, and bindings | Fuseki-compatible endpoints and `/$/` admin API, dataset, graph, triple, and endpoint grants, query budgets and rate limits, and Rust, Python, JVM, and Node.js bindings. | [Server](docs/server/README.md#server-and-protocols), [Bindings](docs/integrations/README.md#libraries-and-bindings) |
-
-See [docs/FEATURES.md](docs/FEATURES.md) for the complete capability matrix and
-[known gaps](docs/FEATURES.md#known-gaps), including compatibility differences from Jena.
-
 ## Web UI
 
 The server embeds a SvelteKit web UI at `/ui/`. The six views below highlight time travel,
 visual query editing, GraphRAG exploration, cited answers, shape-driven forms, and OWL
 classification.
 
-<table>
-  <tr>
-    <td><img src="docs/images/time-slider.png" alt="The query page with the time slider in compare mode, marking one team membership as added and one as removed between two commits"></td>
-    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows"></td>
-  </tr>
-  <tr>
-    <td>Compare query results between two commits with the time slider.</td>
-    <td>Inspect and edit SPARQL graph patterns visually beside the query text.</td>
-  </tr>
-  <tr>
-    <td><img src="docs/images/explore-communities.png" alt="The Explore overview drawing seven GraphRAG communities of a freight network as circles sized by their members and coloured by report status, with the head office selected and its report, findings, sub-communities and members beside the picture"></td>
-    <td><img src="docs/images/ask-answer.png" alt="The Ask page with a thread's answer, its checked query, its rows and its sources, with the first cited row marked and the memory facts about it quoted"></td>
-  </tr>
-  <tr>
-    <td>Explore GraphRAG communities sized by members alongside their reports.</td>
-    <td>Answer plain-language questions with checked queries and cited rows.</td>
-  </tr>
-  <tr>
-    <td><img src="docs/images/forms.png" alt="The resource explorer with a person's graph and an editing form generated from SHACL shapes in the side panel, showing an email that fails the shape's pattern under its field and a server check that reports an employer which is not a company"></td>
-    <td><img src="docs/images/ontology-inferred.png" alt="The ontology editor with the asserted and inferred class trees side by side, the EL classifier placing Professor under Teacher, which is defined as a Person who teaches some Course"></td>
-  </tr>
-  <tr>
-    <td>Edit resources with SHACL-generated forms checked in the browser and on the server.</td>
-    <td>Compare asserted and EL-inferred OWL class hierarchies side by side.</td>
-  </tr>
-</table>
+| ![The query page with the time slider in compare mode, marking one team membership as added and one as removed between two commits](docs/images/time-slider.png) | ![The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows](docs/images/pattern.png) |
+|---|---|
+| Compare query results between two commits with the time slider. | Inspect and edit SPARQL graph patterns visually beside the query text. |
+| ![The Explore overview drawing seven GraphRAG communities of a freight network as circles sized by their members and coloured by report status, with the head office selected and its report, findings, sub-communities and members beside the picture](docs/images/explore-communities.png) | ![The Ask page with a thread's answer, its checked query, its rows and its sources, with the first cited row marked and the memory facts about it quoted](docs/images/ask-answer.png) |
+| Explore GraphRAG communities sized by members alongside their reports. | Answer plain-language questions with checked queries and cited rows. |
+| ![The resource explorer with a person's graph and an editing form generated from SHACL shapes in the side panel, showing an email that fails the shape's pattern under its field and a server check that reports an employer which is not a company](docs/images/forms.png) | ![The ontology editor with the asserted and inferred class trees side by side, the EL classifier placing Professor under Teacher, which is defined as a Person who teaches some Course](docs/images/ontology-inferred.png) |
+| Edit resources with SHACL-generated forms checked in the browser and on the server. | Compare asserted and EL-inferred OWL class hierarchies side by side. |
 
 See the full [Web UI tour](docs/visualization/README.md#web-ui-tour) for commit diff
 graphs, branch merges, agent memory, maps, facets, embedding projections, the ontology
@@ -128,7 +127,7 @@ browser, and the thesaurus and SHACL shape editors.
 ## Getting started
 
 Install the Rust toolchain listed in `rust-toolchain.toml`. Linux servers also need system
-CA certificates. If you want the embedded web UI, build it first with Node.js and pnpm.
+CA certificates. To include the embedded web UI, build it first with Node.js and pnpm.
 
 ```sh
 pnpm -C ui install && pnpm -C ui build  # optional web UI
@@ -167,7 +166,7 @@ still opening. While running, the server holds the database lock; query it over 
 stop it before running local `--loc` commands. When built, the web UI is served at
 <http://localhost:3030/ui/>. Run `sparkles help COMMAND` for subcommand options.
 
-You can also run the server with Nix or Docker.
+Nix and Docker provide alternative ways to run the server.
 
 ```sh
 nix run github:kclejeune/sparkles -- serve --data ./data

@@ -25,7 +25,7 @@ This index organizes the Sparkles documentation by task. Start with the
 
 ## Libraries and clients
 
-You can embed the engine in process from [Rust](USAGE.md#embedding-the-library),
+Applications can embed the engine in process from [Rust](USAGE.md#embedding-the-library),
 [Python](USAGE.md#python), [Java and Kotlin through Jena](USAGE.md#jvm-apache-jena), or
 [Node.js](USAGE.md#javascript-and-typescript), or connect over HTTP with the
 [Rust client](USAGE.md#rust-client). The

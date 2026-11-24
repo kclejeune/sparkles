@@ -15,264 +15,95 @@ authoring, SHACL shape editing, and administration.
 
 ### Querying, visual patterns, and profiling
 
-<table>
-  <tr>
-    <td><img src="../images/graph.png" alt="A CONSTRUCT query's results drawn as a graph of people, who they know and where they work, with one person's neighborhood highlighted"></td>
-    <td><img src="../images/query.png" alt="The query editor with a SPARQL query and its results"></td>
-  </tr>
-  <tr>
-    <td>CONSTRUCT results rendered as an interactive graph with neighborhood highlighting.</td>
-    <td>The SPARQL query editor with syntax completion, formatting, and table results.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows"></td>
-    <td><img src="../images/pattern-edit.png" alt="The Pattern pane adding an edge from ?person, with the predicate picker listing the predicates that instances of ex:Person use, with their counts"></td>
-  </tr>
-  <tr>
-    <td>The Pattern pane renders a SPARQL query's graph pattern beside its text.</td>
-    <td>Schema-fed pickers let you build and edit query edges directly on the canvas.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/plan-pattern.png" alt="The Pattern tab of a query that ran with Plan on pattern, each edge labelled with its estimated and actual rows, ex:memberOf marked as a misestimate, numbered join badges on the variables and the plan tree beside it"></td>
-    <td><img src="../images/query-paths.png" alt="A query's graph of 37 freight flights between cities, with the Paths panel beside it listing the three shortest routes from Vancouver to Auckland by distance, each with its cost summed from the ex:km values on the reifiers of its flights, and the routes drawn over the result with each edge numbered by the paths that use it"></td>
-  </tr>
-  <tr>
-    <td>Plan on pattern overlays estimated and actual row counts and highlights misestimates.</td>
-    <td>Weighted shortest paths computed from edge reifiers drawn over a query result graph.</td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center"><img width="50%" src="../images/query-facets.png" alt="The query page's Facets tab counting the values of ?person in every solution, with a brush on the years people joined and the editor above holding the triple and FILTER that Apply to query added"></td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">Brushing a result facet writes the corresponding triple pattern and FILTER into the query.</td>
-  </tr>
-</table>
+| ![A CONSTRUCT query's results drawn as a graph of people, who they know and where they work, with one person's neighborhood highlighted](../images/graph.png) | ![The query editor with a SPARQL query and its results](../images/query.png) |
+|---|---|
+| CONSTRUCT results rendered as an interactive graph with neighborhood highlighting. | The SPARQL query editor with syntax completion, formatting, and table results. |
+| ![The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows](../images/pattern.png) | ![The Pattern pane adding an edge from ?person, with the predicate picker listing the predicates that instances of ex:Person use, with their counts](../images/pattern-edit.png) |
+| The Pattern pane renders a SPARQL query's graph pattern beside its text. | Schema-fed pickers build and edit query edges directly on the canvas. |
+| ![The Pattern tab of a query that ran with Plan on pattern, each edge labelled with its estimated and actual rows, ex:memberOf marked as a misestimate, numbered join badges on the variables and the plan tree beside it](../images/plan-pattern.png) | ![A query's graph of 37 freight flights between cities, with the Paths panel beside it listing the three shortest routes from Vancouver to Auckland by distance, each with its cost summed from the ex:km values on the reifiers of its flights, and the routes drawn over the result with each edge numbered by the paths that use it](../images/query-paths.png) |
+| Plan on pattern overlays estimated and actual row counts and highlights misestimates. | Weighted shortest paths computed from edge reifiers drawn over a query result graph. |
+
+![The query page's Facets tab counting the values of ?person in every solution, with a brush on the years people joined and the editor above holding the triple and FILTER that Apply to query added](../images/query-facets.png)
+
+*Brushing a result facet writes the corresponding triple pattern and FILTER into the query.*
 
 ### Time travel, commit diffs, and branches
 
-<table>
-  <tr>
-    <td><img src="../images/time-slider.png" alt="The query page with the time slider in compare mode, marking one team membership as added and one as removed between two commits"></td>
-    <td><img src="../images/time-slider-graph.png" alt="The resource explorer with the time slider in compare mode, drawing a new edge in green and a removed one as a dashed ghost"></td>
-  </tr>
-  <tr>
-    <td>The time slider compares query results between two retained commits.</td>
-    <td>Compare mode highlights added edges in green and removed edges as dashed ghosts in Explore.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/diff-graph.png" alt="The diff graph of one commit, drawing a new employee, a new job title and a move to Los Angeles in green and the removed job title, home city and acquaintance as dashed red ghosts"></td>
-    <td><img src="../images/diff-lapse.png" alt="A time-lapse over four commits with ghosts kept, showing the changes of each commit added in green and removed ones as dashed ghosts, with a running total of changes since the start"></td>
-  </tr>
-  <tr>
-    <td>A commit diff drawn as a graph of additions and removals.</td>
-    <td>A time-lapse steps through commits one diff at a time with running totals.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/branches.png" alt="A dataset page listing its branches above a commit history graph that includes a merge"></td>
-    <td><img src="../images/merge.png" alt="The merge page previewing a merge of one branch into main, with two conflicts and a choice of which side to take for each"></td>
-  </tr>
-  <tr>
-    <td>Dataset branches displayed above their commit history graph.</td>
-    <td>Branch merge previews let you resolve per-triple conflicts before committing.</td>
-  </tr>
-</table>
+| ![The query page with the time slider in compare mode, marking one team membership as added and one as removed between two commits](../images/time-slider.png) | ![The resource explorer with the time slider in compare mode, drawing a new edge in green and a removed one as a dashed ghost](../images/time-slider-graph.png) |
+|---|---|
+| The time slider compares query results between two retained commits. | Compare mode highlights added edges in green and removed edges as dashed ghosts in Explore. |
+| ![The diff graph of one commit, drawing a new employee, a new job title and a move to Los Angeles in green and the removed job title, home city and acquaintance as dashed red ghosts](../images/diff-graph.png) | ![A time-lapse over four commits with ghosts kept, showing the changes of each commit added in green and removed ones as dashed ghosts, with a running total of changes since the start](../images/diff-lapse.png) |
+| A commit diff drawn as a graph of additions and removals. | A time-lapse steps through commits one diff at a time with running totals. |
+| ![A dataset page listing its branches above a commit history graph that includes a merge](../images/branches.png) | ![The merge page previewing a merge of one branch into main, with two conflicts and a choice of which side to take for each](../images/merge.png) |
+| Dataset branches displayed above their commit history graph. | Branch merge previews resolve per-triple conflicts before committing. |
 
 ### Graph exploration, lenses, maps, and embeddings
 
-<table>
-  <tr>
-    <td><img src="../images/explore.png" alt="The resource explorer showing one resource as a graph, with its properties and the resources that refer to it"></td>
-    <td><img src="../images/explore-lenses.png" alt="The resource explorer with lenses on, sizing nodes by their degree in the dataset, colouring them by class, badging the nodes with inferred edges and drawing those edges dashed, with the legend beside the graph"></td>
-  </tr>
-  <tr>
-    <td>The resource explorer inspects a node's properties, incoming links, and local graph.</td>
-    <td>Canvas lenses size nodes by degree, colour by class, and draw inferred edges dashed.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/explore-algo-lenses.png" alt="The resource explorer with algorithm lenses, sizing nodes by PageRank over the drawn graph and colouring them by Leiden communities, with the legend giving the score ranges and each community's size"></td>
-    <td><img src="../images/explore-facets.png" alt="The resource explorer with the Facets panel beside a person's graph, brushing an age range on a histogram and one employer on a bar list, so that the other facets count the 41 people under both brushes and the drawn people outside them are dimmed"></td>
-  </tr>
-  <tr>
-    <td>Algorithm lenses size nodes by PageRank and colour them by Leiden community.</td>
-    <td>Brushing facet histograms and bar lists filters the explored graph interactively.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/path-finder.png" alt="The resource explorer with the Paths panel open, listing the three shortest foaf:knows paths from Freya Lindqvist to Lukáš Novák, which pass through ten different people, and drawing them over her neighbourhood with each edge numbered by the paths that use it"></td>
-    <td><img src="../images/validation-overlay.png" alt="The resource explorer with validation badges on three people, the validation lens's legend grouping the nodes by their worst severity, and a results panel previewing an update that adds a missing name"></td>
-  </tr>
-  <tr>
-    <td>The Paths panel finds and overlays the k shortest paths between two entities.</td>
-    <td>The validation lens badges SHACL results on the graph and previews a suggested fix.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/explore-why.png" alt="The resource explorer with the Why panel beside the graph, explaining that Alice is a Person by rdfs9 from her inferred Employee type, itself derived by rdfs9 from her asserted Manager type and the subclass of Manager, and the subclass of Employee, with every premise highlighted on the canvas after Show on graph"></td>
-    <td><img src="../images/explore-why-stale.png" alt="The Why panel on a dataset whose inferences are two commits stale, with the note that the tree shows the inferences as computed at commit 2, and the second of two derivations, Alice as an Employee by rdfs3 from the range of reportsTo"></td>
-  </tr>
-  <tr>
-    <td>The Why panel shows an inferred edge's derivation tree and highlights its premises on the graph.</td>
-    <td>Stale inferences carry an explicit commit notice alongside alternate derivations.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/map.png" alt="GeoSPARQL query results drawn on a map beside a list of the places"></td>
-    <td><img src="../images/map-arcs.png" alt="The resource explorer showing a freight company's graph as a world map, with arcs from its head office in Dubai to its offices, partners and employees on six continents, coloured by predicate"></td>
-  </tr>
-  <tr>
-    <td>GeoSPARQL query results plotted on a bundled MapLibre basemap.</td>
-    <td>Located graph relations rendered as predicate-coloured great-circle arcs in Explore.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/result-arcs.png" alt="A query result drawn as labelled great-circle arcs for 37 freight routes between cities on six continents, beside the list of rows"></td>
-    <td><img src="../images/embedding-map.png" alt="The embedding map of 6,000 freight shipments projected from 64-dimensional vectors to two dimensions and coloured by cargo class, with the legend counting each class and a lasso around one cluster whose 1,171 shipments form the shared selection, ready for Use in query or Open as graph"></td>
-  </tr>
-  <tr>
-    <td>Query result rows drawn as labelled great-circle arcs between places.</td>
-    <td>The embedding map projects vector indexes to 2D with lasso selection into SPARQL or Explore.</td>
-  </tr>
-</table>
+| ![The resource explorer showing one resource as a graph, with its properties and the resources that refer to it](../images/explore.png) | ![The resource explorer with lenses on, sizing nodes by their degree in the dataset, colouring them by class, badging the nodes with inferred edges and drawing those edges dashed, with the legend beside the graph](../images/explore-lenses.png) |
+|---|---|
+| The resource explorer inspects a node's properties, incoming links, and local graph. | Canvas lenses size nodes by degree, colour by class, and draw inferred edges dashed. |
+| ![The resource explorer with algorithm lenses, sizing nodes by PageRank over the drawn graph and colouring them by Leiden communities, with the legend giving the score ranges and each community's size](../images/explore-algo-lenses.png) | ![The resource explorer with the Facets panel beside a person's graph, brushing an age range on a histogram and one employer on a bar list, so that the other facets count the 41 people under both brushes and the drawn people outside them are dimmed](../images/explore-facets.png) |
+| Algorithm lenses size nodes by PageRank and colour them by Leiden community. | Brushing facet histograms and bar lists filters the explored graph interactively. |
+| ![The resource explorer with the Paths panel open, listing the three shortest foaf:knows paths from Freya Lindqvist to Lukáš Novák, which pass through ten different people, and drawing them over her neighbourhood with each edge numbered by the paths that use it](../images/path-finder.png) | ![The resource explorer with validation badges on three people, the validation lens's legend grouping the nodes by their worst severity, and a results panel previewing an update that adds a missing name](../images/validation-overlay.png) |
+| The Paths panel finds and overlays the k shortest paths between two entities. | The validation lens badges SHACL results on the graph and previews a suggested fix. |
+| ![The resource explorer with the Why panel beside the graph, explaining that Alice is a Person by rdfs9 from her inferred Employee type, itself derived by rdfs9 from her asserted Manager type and the subclass of Manager, and the subclass of Employee, with every premise highlighted on the canvas after Show on graph](../images/explore-why.png) | ![The Why panel on a dataset whose inferences are two commits stale, with the note that the tree shows the inferences as computed at commit 2, and the second of two derivations, Alice as an Employee by rdfs3 from the range of reportsTo](../images/explore-why-stale.png) |
+| The Why panel shows an inferred edge's derivation tree and highlights its premises on the graph. | Stale inferences carry an explicit commit notice alongside alternate derivations. |
+| ![GeoSPARQL query results drawn on a map beside a list of the places](../images/map.png) | ![The resource explorer showing a freight company's graph as a world map, with arcs from its head office in Dubai to its offices, partners and employees on six continents, coloured by predicate](../images/map-arcs.png) |
+| GeoSPARQL query results plotted on a bundled MapLibre basemap. | Located graph relations rendered as predicate-coloured great-circle arcs in Explore. |
+| ![A query result drawn as labelled great-circle arcs for 37 freight routes between cities on six continents, beside the list of rows](../images/result-arcs.png) | ![The embedding map of 6,000 freight shipments projected from 64-dimensional vectors to two dimensions and coloured by cargo class, with the legend counting each class and a lasso around one cluster whose 1,171 shipments form the shared selection, ready for Use in query or Open as graph](../images/embedding-map.png) |
+| Query result rows drawn as labelled great-circle arcs between places. | The embedding map projects vector indexes to 2D with lasso selection into SPARQL or Explore. |
 
 ### AI, GraphRAG, and agent memory
 
-<table>
-  <tr>
-    <td><img src="../images/ask-answer.png" alt="The Ask page with a thread's answer, its checked query, its rows and its sources, with the first cited row marked and the memory facts about it quoted"></td>
-    <td><img src="../images/ask-steps.png" alt="The Ask drawer docked beside the Query page while it works, showing Summarizing after the query results have arrived, with Stop beside the field"></td>
-  </tr>
-  <tr>
-    <td>The Ask page answers plain-language questions with checked SPARQL queries and cited rows.</td>
-    <td>The docked Ask drawer streams progress through query generation, execution, and summarization.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/handoff.png" alt="A query handed over by an agent, open in the query editor with its question, assumptions, the terms it uses and a clean check"></td>
-    <td><img src="../images/explore-communities.png" alt="The Explore overview drawing seven GraphRAG communities of a freight network as circles sized by their members and coloured by report status, with the head office selected and its report, findings, sub-communities and members beside the picture"></td>
-  </tr>
-  <tr>
-    <td>Agent-authored queries open for review with their question, assumptions, and term checks.</td>
-    <td>Explore maps GraphRAG communities by member count and report status beside each report.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/communities-map.png" alt="A dataset's Communities tab drawing the GraphRAG hierarchy of a freight network as a treemap, with a box for each community sized by its members and tinted by its report's status, and the report of the Gulf head office selected"></td>
-    <td><img src="../images/memory.png" alt="The Memory page with its counts of facts, agents, sources and branches over a search for the payments team, whose results are cards of facts that each show a review status, a confidence, the agent, the source and the quote, with a conflict between two dates marked on its card"></td>
-  </tr>
-  <tr>
-    <td>The Communities tab renders the GraphRAG hierarchy as a treemap tinted by report status.</td>
-    <td>The Memory page tracks agent-recorded facts with provenance, review status, and conflicts.</td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center"><img width="50%" src="../images/memory-facts.png" alt="The resource explorer's Memory tab for Ana Lima, with a card for each predicate showing the values agents recorded with their review status, confidence, agent, source and quote, and under them a timeline whose entry pairs the superseded team res:platform, struck through, with the res:payments that replaced it"></td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">A resource's Memory tab pairs each fact's provenance with a timeline of superseded values.</td>
-  </tr>
-</table>
+| ![The Ask page with a thread's answer, its checked query, its rows and its sources, with the first cited row marked and the memory facts about it quoted](../images/ask-answer.png) | ![The Ask drawer docked beside the Query page while it works, showing Summarizing after the query results have arrived, with Stop beside the field](../images/ask-steps.png) |
+|---|---|
+| The Ask page answers plain-language questions with checked SPARQL queries and cited rows. | The docked Ask drawer streams progress through query generation, execution, and summarization. |
+| ![A query handed over by an agent, open in the query editor with its question, assumptions, the terms it uses and a clean check](../images/handoff.png) | ![The Explore overview drawing seven GraphRAG communities of a freight network as circles sized by their members and coloured by report status, with the head office selected and its report, findings, sub-communities and members beside the picture](../images/explore-communities.png) |
+| Agent-authored queries open for review with their question, assumptions, and term checks. | Explore maps GraphRAG communities by member count and report status beside each report. |
+| ![A dataset's Communities tab drawing the GraphRAG hierarchy of a freight network as a treemap, with a box for each community sized by its members and tinted by its report's status, and the report of the Gulf head office selected](../images/communities-map.png) | ![The Memory page with its counts of facts, agents, sources and branches over a search for the payments team, whose results are cards of facts that each show a review status, a confidence, the agent, the source and the quote, with a conflict between two dates marked on its card](../images/memory.png) |
+| The Communities tab renders the GraphRAG hierarchy as a treemap tinted by report status. | The Memory page tracks agent-recorded facts with provenance, review status, and conflicts. |
+
+![The resource explorer's Memory tab for Ana Lima, with a card for each predicate showing the values agents recorded with their review status, confidence, agent, source and quote, and under them a timeline whose entry pairs the superseded team res:platform, struck through, with the res:payments that replaced it](../images/memory-facts.png)
+
+*A resource's Memory tab pairs each fact's provenance with a timeline of superseded values.*
 
 ### Ontology authoring, browsing, and SKOS thesauri
 
-<table>
-  <tr>
-    <td><img src="../images/ontology-editor.png" alt="The ontology editor with the class tree of a university ontology and the frame of Professor, listing its labels in French and English, its superclasses Employee and teaches some Course, its instance and an axiom on its range, each with an add field"></td>
-    <td><img src="../images/ontology-inferred.png" alt="The ontology editor with the asserted and inferred class trees side by side, the EL classifier placing Professor under Teacher, which is defined as a Person who teaches some Course"></td>
-  </tr>
-  <tr>
-    <td>The ontology editor pairs class and property trees with an entity's Manchester-syntax frame.</td>
-    <td>Asserted and EL-inferred class hierarchies appear side by side in the ontology editor.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/ontology-dl-query.png" alt="The DL Query tab of the ontology editor answering Person and (teaches some Course), labelled as answered completely by the OWL 2 EL classifier, with Teacher as its equivalent class, Person and Agent above it, Professor below it and Ada Lovelace as its instance, beside the frame of Professor"></td>
-    <td><img src="../images/ontology-preview.png" alt="The preview of an ontology edit that creates the class teaching assistant, listing the declaration, label and subclass axioms it adds, the three triples it writes and the commit message"></td>
-  </tr>
-  <tr>
-    <td>DL Query evaluates Manchester class expressions and labels the reasoning tier that answered.</td>
-    <td>Every ontology edit previews its exact axiom and triple changes before committing.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/browse-landing.png" alt="The landing page of a cell organelle ontology in the ontology browser, with its title, version and description, a search across the content that lists the classes matching mitoch, the top classes with their definitions and child counts, and the counts of classes and properties"></td>
-    <td><img src="../images/browse-term.png" alt="The ontology browser's page of mitochondrion, with a line of counts under its title, one text that leads with its property as a chip, disclosures for its other texts, sections with headings of one size, and a rail of cards with its metadata and hierarchy"></td>
-  </tr>
-  <tr>
-    <td>An ontology landing page in Browse with full-width search, top classes, and entity counts.</td>
-    <td>Each entity page in Browse combines definitions, linked axioms, metadata, and hierarchy.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/browse-edit.png" alt="The ontology browser's page of mitochondrion in edit mode, with a bar naming the branch and holding undo, redo, start session, the ontology editor link and done, the definition as a text field with its language and its sources as chips, and edit and remove buttons on each synonym and annotation with an add row below them"></td>
-    <td><img src="../images/browse-edit-preview.png" alt="The preview of a definition edit in the ontology browser's edit mode, listing the definition it removes and the one it adds, each with its one source annotation, the dry run's six triples removed and six added, and a button that commits it"></td>
-  </tr>
-  <tr>
-    <td>In-place edit mode on a Browse term page supports session branches, undo, and redo.</td>
-    <td>Browser edits preview dry-run triple diffs before writing a commit.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/thesaurus-editor.png" alt="The thesaurus editor with the concept tree of an animals scheme, where Whales and Penguins appear under both Mammals and Marine animals marked 2 broader, and the label table of Whales with its English and French preferred labels and an English alternative label, each with buttons that edit it, remove it or turn it into a SKOS-XL label"></td>
-    <td><img src="../images/thesaurus-move.png" alt="The preview of a drag in the thesaurus editor that moves Bats under Flying animals, removing the broader and narrower triples that linked it to Mammals and adding the two that link it to Flying animals, above the commit message"></td>
-  </tr>
-  <tr>
-    <td>The thesaurus editor manages polyhierarchical SKOS trees and multilingual or SKOS-XL labels.</td>
-    <td>Dragging a concept to a new broader term previews both hierarchy directions as one commit.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/thesaurus-checks.png" alt="The checks of the thesaurus editor, listing the concept Owls as breaking S13 because one label is both preferred and alternative, with a button that enforces the SKOS rules on writes"></td>
-    <td><img src="../images/watches.png" alt="The Watches page with a subtree watch on Professor opened, listing the commits that put a class below it and labelled it"></td>
-  </tr>
-  <tr>
-    <td>Built-in SHACL shapes verify SKOS Reference integrity conditions and can guard writes.</td>
-    <td>Entity and subtree watches list the commits that modified watched terms.</td>
-  </tr>
-</table>
+| ![The ontology editor with the class tree of a university ontology and the frame of Professor, listing its labels in French and English, its superclasses Employee and teaches some Course, its instance and an axiom on its range, each with an add field](../images/ontology-editor.png) | ![The ontology editor with the asserted and inferred class trees side by side, the EL classifier placing Professor under Teacher, which is defined as a Person who teaches some Course](../images/ontology-inferred.png) |
+|---|---|
+| The ontology editor pairs class and property trees with an entity's Manchester-syntax frame. | Asserted and EL-inferred class hierarchies appear side by side in the ontology editor. |
+| ![The DL Query tab of the ontology editor answering Person and (teaches some Course), labelled as answered completely by the OWL 2 EL classifier, with Teacher as its equivalent class, Person and Agent above it, Professor below it and Ada Lovelace as its instance, beside the frame of Professor](../images/ontology-dl-query.png) | ![The preview of an ontology edit that creates the class teaching assistant, listing the declaration, label and subclass axioms it adds, the three triples it writes and the commit message](../images/ontology-preview.png) |
+| DL Query evaluates Manchester class expressions and labels the reasoning tier that answered. | Every ontology edit previews its exact axiom and triple changes before committing. |
+| ![The landing page of a cell organelle ontology in the ontology browser, with its title, version and description, a search across the content that lists the classes matching mitoch, the top classes with their definitions and child counts, and the counts of classes and properties](../images/browse-landing.png) | ![The ontology browser's page of mitochondrion, with a line of counts under its title, one text that leads with its property as a chip, disclosures for its other texts, sections with headings of one size, and a rail of cards with its metadata and hierarchy](../images/browse-term.png) |
+| An ontology landing page in Browse with full-width search, top classes, and entity counts. | Each entity page in Browse combines definitions, linked axioms, metadata, and hierarchy. |
+| ![The ontology browser's page of mitochondrion in edit mode, with a bar naming the branch and holding undo, redo, start session, the ontology editor link and done, the definition as a text field with its language and its sources as chips, and edit and remove buttons on each synonym and annotation with an add row below them](../images/browse-edit.png) | ![The preview of a definition edit in the ontology browser's edit mode, listing the definition it removes and the one it adds, each with its one source annotation, the dry run's six triples removed and six added, and a button that commits it](../images/browse-edit-preview.png) |
+| In-place edit mode on a Browse term page supports session branches, undo, and redo. | Browser edits preview dry-run triple diffs before writing a commit. |
+| ![The thesaurus editor with the concept tree of an animals scheme, where Whales and Penguins appear under both Mammals and Marine animals marked 2 broader, and the label table of Whales with its English and French preferred labels and an English alternative label, each with buttons that edit it, remove it or turn it into a SKOS-XL label](../images/thesaurus-editor.png) | ![The preview of a drag in the thesaurus editor that moves Bats under Flying animals, removing the broader and narrower triples that linked it to Mammals and adding the two that link it to Flying animals, above the commit message](../images/thesaurus-move.png) |
+| The thesaurus editor manages polyhierarchical SKOS trees and multilingual or SKOS-XL labels. | Dragging a concept to a new broader term previews both hierarchy directions as one commit. |
+| ![The checks of the thesaurus editor, listing the concept Owls as breaking S13 because one label is both preferred and alternative, with a button that enforces the SKOS rules on writes](../images/thesaurus-checks.png) | ![The Watches page with a subtree watch on Professor opened, listing the commits that put a class below it and labelled it](../images/watches.png) |
+| Built-in SHACL shapes verify SKOS Reference integrity conditions and can guard writes. | Entity and subtree watches list the commits that modified watched terms. |
 
 ### SHACL shapes, editing forms, and schema
 
-<table>
-  <tr>
-    <td><img src="../images/shape-editor.png" alt="The SHACL shape editor with a tree of a Person node shape and its Email, Employer and Name property shapes, and the form of the Employer shape with a sequence path of worksFor and organization, its targets and its name"></td>
-    <td><img src="../images/shape-editor-preview.png" alt="The preview of a shape edit that raises the minimum count of the Name property shape from 1 to 2, with the RDF patch pinned to the source commit, the one triple it removes and the one it adds, and a button that commits it"></td>
-  </tr>
-  <tr>
-    <td>The SHACL shape editor displays shapes in a tree and edits targets, paths, and constraints in forms.</td>
-    <td>Every shape edit previews an exact RDF patch pinned to the source commit before saving.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/forms.png" alt="The resource explorer with a person's graph and an editing form generated from SHACL shapes in the side panel, showing an email that fails the shape's pattern under its field and a server check that reports an employer which is not a company"></td>
-    <td><img src="../images/forms-branch.png" alt="An editing form on its own page after a save while main is protected, with a banner saying it edits the session branch edits.anonymous.20261024 with one commit and a Review and merge button, and an age below the shape's minimum marked under its field"></td>
-  </tr>
-  <tr>
-    <td>SHACL-generated forms validate values in the browser and against the server.</td>
-    <td>When main is protected, form saves commit to a session branch with a link to review and merge.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/forms-nested.png" alt="The editing form of a SKOS concept with its SKOS-XL labels as nested forms, the stored label edited to All animals and a new French label added from the label shape's template, with the previewed commit listing the triples it adds and removes"></td>
-    <td><img src="../images/forms-list.png" alt="The editing form of a SKOS collection, with its member chosen as a Concept among the alternatives of sh:or and its ordered member list after fish moved up, each member with buttons that move or remove it"></td>
-  </tr>
-  <tr>
-    <td>Nested blank-node children edit and commit atomically with their parent form.</td>
-    <td>Forms include ordered list editors and selectors for sh:or and sh:xone alternatives.</td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center"><img width="50%" src="../images/schema.png" alt="The schema browser with a class hierarchy, instance counts and the properties of the selected class"></td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">The schema browser combines observed class counts and properties with declared constraints.</td>
-  </tr>
-</table>
+| ![The SHACL shape editor with a tree of a Person node shape and its Email, Employer and Name property shapes, and the form of the Employer shape with a sequence path of worksFor and organization, its targets and its name](../images/shape-editor.png) | ![The preview of a shape edit that raises the minimum count of the Name property shape from 1 to 2, with the RDF patch pinned to the source commit, the one triple it removes and the one it adds, and a button that commits it](../images/shape-editor-preview.png) |
+|---|---|
+| The SHACL shape editor displays shapes in a tree and edits targets, paths, and constraints in forms. | Every shape edit previews an exact RDF patch pinned to the source commit before saving. |
+| ![The resource explorer with a person's graph and an editing form generated from SHACL shapes in the side panel, showing an email that fails the shape's pattern under its field and a server check that reports an employer which is not a company](../images/forms.png) | ![An editing form on its own page after a save while main is protected, with a banner saying it edits the session branch edits.anonymous.20261024 with one commit and a Review and merge button, and an age below the shape's minimum marked under its field](../images/forms-branch.png) |
+| SHACL-generated forms validate values in the browser and against the server. | When main is protected, form saves commit to a session branch with a link to review and merge. |
+| ![The editing form of a SKOS concept with its SKOS-XL labels as nested forms, the stored label edited to All animals and a new French label added from the label shape's template, with the previewed commit listing the triples it adds and removes](../images/forms-nested.png) | ![The editing form of a SKOS collection, with its member chosen as a Concept among the alternatives of sh:or and its ordered member list after fish moved up, each member with buttons that move or remove it](../images/forms-list.png) |
+| Nested blank-node children edit and commit atomically with their parent form. | Forms include ordered list editors and selectors for sh:or and sh:xone alternatives. |
+
+![The schema browser with a class hierarchy, instance counts and the properties of the selected class](../images/schema.png)
+
+*The schema browser combines observed class counts and properties with declared constraints.*
 
 ### Navigation, administration, and mobile layout
 
-<table>
-  <tr>
-    <td><img src="../images/palette.png" alt="The command palette on the Query page with nothing typed, listing the page's commands with their shortcuts and the pages of the shell"></td>
-    <td><img src="../images/shell-phone.png" alt="The web UI on a phone, with the drawer open over a dataset page, holding the dataset switcher, the pages, the connection status and the theme"></td>
-  </tr>
-  <tr>
-    <td>Ctrl+K opens the command palette for page commands, entities, datasets, and saved queries.</td>
-    <td>On narrow viewports, navigation moves into a drawer and search expands across the top bar.</td>
-  </tr>
-  <tr>
-    <td><img src="../images/models-settings.png" alt="The model configuration form on the server page, with a provider's allowed models as a list of three with buttons to move and remove each, and its per-model options as two open cards with typed fields for context tokens, output tokens, temperature, structured output, request timeout and prices, the empty fields showing the values they inherit"></td>
-    <td><img src="../images/models-settings-errors.png" alt="The model configuration form with a new model's card marked 2 errors, saying under its fields that context tokens must be a whole number and that the temperature is at most 2, above the role lists shown as rows of provider and model"></td>
-  </tr>
-  <tr>
-    <td>The server Models page edits provider allowlists and per-model options in typed forms.</td>
-    <td>Client and server validation errors appear directly beside the offending configuration fields.</td>
-  </tr>
-</table>
+| ![The command palette on the Query page with nothing typed, listing the page's commands with their shortcuts and the pages of the shell](../images/palette.png) | ![The web UI on a phone, with the drawer open over a dataset page, holding the dataset switcher, the pages, the connection status and the theme](../images/shell-phone.png) |
+|---|---|
+| Ctrl+K opens the command palette for page commands, entities, datasets, and saved queries. | On narrow viewports, navigation moves into a drawer and search expands across the top bar. |
+| ![The model configuration form on the server page, with a provider's allowed models as a list of three with buttons to move and remove each, and its per-model options as two open cards with typed fields for context tokens, output tokens, temperature, structured output, request timeout and prices, the empty fields showing the values they inherit](../images/models-settings.png) | ![The model configuration form with a new model's card marked 2 errors, saying under its fields that context tokens must be a whole number and that the temperature is at most 2, above the role lists shown as rows of provider and model](../images/models-settings-errors.png) |
+| The server Models page edits provider allowlists and per-model options in typed forms. | Client and server validation errors appear directly beside the offending configuration fields. |
 
 ## Web UI
 
@@ -518,8 +349,6 @@ IRIs using the dataset's prefix map plus conventional prefixes such as `rdf`, `o
   The Models form is generated from the OpenAPI `ModelsSettings` schema with typed bounds,
   reorderable model allowlists, per-model option cards, role lists, inline validation, and
   a synchronized JSON editor under **Advanced**.
-
-<a id="nested-form-read-models"></a>
 
 ### Nested forms, lists and alternatives
 

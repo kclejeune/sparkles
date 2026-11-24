@@ -1301,8 +1301,6 @@ stays `SPIN_LOOP=user` until an Intel host run shows that the other loop keeps t
 verdicts, and runs under different loops are never compared. `env.txt` and `verdict.md`
 name the loop.
 
-<a id="namespace-query-screens"></a>
-
 ### Query screens
 
 `bench:remote` runs `scripts/bench-remote.sh`, which hands its arguments to
@@ -1421,8 +1419,6 @@ quick look at changes of about 10% or more. It cannot
 confirm a change of a few percent, and [Choosing a host](#choosing-a-host) says where to
 measure those. Queries under 0.1 ms vary widely between server processes and say little
 on their own.
-
-<a id="namespace-write-screens"></a>
 
 ### Write screens
 

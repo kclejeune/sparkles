@@ -108,7 +108,7 @@ SHACL and ShEx guards validate the post-commit state of every write before publi
 
 * **Modes and fail-closed safety.** `reject` refuses invalid writes with HTTP `422`, `warn` commits and reports findings, and grandfather mode blocks only newly introduced violations. `--no-validate` bypasses guards on local CLI writes and marks the commit `unvalidated`. If a configured guard fails to load, writes are refused rather than accepted unvalidated.
 * **Incremental checking and schema digests.** Guards track head validation counts in `validation-status.json`, skipping unrelated writes and validating only affected focus nodes or ShEx typings—including anchored SHACL-SPARQL constraints, `sh:targetWhere`, `rdfs:subClassOf` edits, and recursive ShEx schemas—falling back to full validation when shapes change, computed predicates cannot localize, or impact is large. ShEx schemas copied into the dataset verify their digest before install or reuse (legacy configs without digests run a full locked validation on open until re-saved). Metrics and timings appear in `sparkles_validation_*`, access logs, and `sparkles stats`.
-* **Nested editing forms.** Shape-driven editing forms edit nested blank-node children, SHACL 1.2 lists, and `sh:or`/`sh:xone` alternatives in one guarded commit ([nested forms](../visualization/README.md#nested-form-read-models)).
+* **Nested editing forms.** Shape-driven editing forms edit nested blank-node children, SHACL 1.2 lists, and `sh:or`/`sh:xone` alternatives in one guarded commit ([nested forms](../visualization/README.md#nested-forms-lists-and-alternatives)).
 
 ### Gate suite validation
 

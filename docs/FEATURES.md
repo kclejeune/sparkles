@@ -23,17 +23,6 @@ phases, and the [design specs](specs/README.md) explain their contracts and deci
 
 ## Feature categories
 
-<a id="standards-conformance"></a>
-<a id="sparql-queries-and-updates"></a>
-<a id="query-and-update-language"></a>
-<a id="jena-arq-extensions"></a>
-<a id="federated-queries"></a>
-<a id="planning-and-execution"></a>
-<a id="explaining-queries"></a>
-<a id="incremental-views-and-live-queries"></a>
-<a id="command-line"></a>
-<a id="formatter-and-editor-support"></a>
-
 ### Querying
 
 Use [SPARQL Query and Update](querying/README.md#sparql-queries-and-updates),
@@ -43,19 +32,6 @@ the [command line](querying/README.md#command-line) and
 [formatting and editor support](querying/README.md#formatter-and-editor-support).
 How MIN, MAX, AVG and GROUP_CONCAT treat errors is a setting with Jena's answers as its
 default, described under [aggregate errors](querying/README.md#aggregate-errors).
-
-<a id="storage-and-indexes"></a>
-<a id="indexes-and-vocabulary"></a>
-<a id="cold-reads"></a>
-<a id="loading-data"></a>
-<a id="transactions-and-durability"></a>
-<a id="compaction-clones-and-integrity"></a>
-<a id="versioning-and-history"></a>
-<a id="commits"></a>
-<a id="time-travel"></a>
-<a id="diffs-change-feed-and-history-queries"></a>
-<a id="branches-and-merges"></a>
-<a id="rdf-patch"></a>
 
 ### Storage and history
 
@@ -67,27 +43,12 @@ triple terms in HTTP history and diff filters. Rust branch administration refuse
 conflict when the calling thread already holds a needed write transaction, leaving that
 transaction usable.
 
-<a id="search"></a>
-<a id="full-text-search"></a>
-<a id="vector-search-and-embeddings"></a>
-<a id="path-search"></a>
-<a id="graph-algorithms"></a>
-<a id="geosparql"></a>
-<a id="geometry-literals-and-functions"></a>
-<a id="spatial-index-and-queries"></a>
-
 ### Search and graph analysis
 
 Combine [full-text, vector and hybrid search](search/README.md#search) with SPARQL
 patterns, path search and graph algorithms. [GeoSPARQL](search/README.md#geosparql)
 adds geometry functions, spatial indexes, joins and nearest-neighbour ordering within
 the documented geometry and query limits.
-
-<a id="reasoning"></a>
-<a id="shacl"></a>
-<a id="shex"></a>
-<a id="write-time-validation"></a>
-<a id="schema-discovery-and-drafted-shapes"></a>
 
 ### Reasoning, validation and schema
 
@@ -101,24 +62,12 @@ Validate data with [SHACL](reasoning/README.md#shacl),
 from existing data. ShEx write guards verify copied schemas before installation or reuse,
 and legacy configurations without a copy digest validate the head in full at install.
 
-<a id="server-and-protocols"></a>
-<a id="sparql-protocol-and-fuseki-compatibility"></a>
-<a id="graphql"></a>
-<a id="stored-queries"></a>
-<a id="access-control-and-security"></a>
-
 ### Server and security
 
 Serve [SPARQL and Graph Store protocols](server/README.md#server-and-protocols),
 GraphQL and stored queries, with supported Fuseki administration and configuration.
 [Access controls](server/README.md#access-control-and-security) cover datasets,
 graphs and triples, with OIDC and API-token authentication.
-
-<a id="mcp-server"></a>
-<a id="questions-in-plain-language"></a>
-<a id="agent-memory"></a>
-<a id="document-ingestion"></a>
-<a id="community-reports-graphrag"></a>
 
 ### AI and agents
 
@@ -137,13 +86,6 @@ questions in an [Ask thread](ai/README.md#the-ask-thread) at `/ui/ask`
 ([screenshot](images/ask-answer.png)) or as a `Shift+A` drawer beside any page
 ([screenshot](images/ask-drawer.png)), with folded queries, rows, sources, follow-ups
 and saved thread history.
-
-<a id="web-ui"></a>
-<a id="query-page"></a>
-<a id="explore"></a>
-<a id="maps"></a>
-<a id="history-and-time-travel"></a>
-<a id="datasets-validation-and-editing"></a>
 
 ### Visualization and editing
 
@@ -164,26 +106,16 @@ each entity a dedicated page with linked Manchester prose and inline edit mode, 
 [thesaurus editor](visualization/README.md#thesaurus-editor) manages SKOS and SKOS-XL
 hierarchies against SKOS integrity rules, the
 [visual SHACL shape editor](visualization/README.md#visual-shacl-shape-editor) authors
-shapes in trees and forms, and [SHACL-driven forms](visualization/README.md#nested-form-read-models)
+shapes in trees and forms, and [SHACL-driven forms](visualization/README.md#nested-forms-lists-and-alternatives)
 edit nested blank nodes, ordered lists and value alternatives in one previewed commit.
 See the [visualization guide](visualization/README.md#web-ui) for screenshots and
 walkthroughs of each view.
-
-<a id="libraries-and-bindings"></a>
 
 ### Libraries and integrations
 
 Embed the same engine through [Rust, Python, JVM and Node.js APIs](integrations/README.md#libraries-and-bindings),
 or connect through the Rust HTTP client. The guide describes Jena integration and the
 administration, callback and platform coverage that differs between bindings.
-
-<a id="operations"></a>
-<a id="deployment"></a>
-<a id="settings-and-notifications"></a>
-<a id="memory-and-resource-limits"></a>
-<a id="observability"></a>
-<a id="backups"></a>
-<a id="upgrades-and-on-disk-formats"></a>
 
 ### Deployment and operations
 
@@ -320,13 +252,13 @@ and links each item to its design spec.
 
 | Area | Remaining scope |
 |---|---|
-| <a id="storage-and-execution"></a>[Storage and execution](storage/README.md#storage-and-execution) | Compaction controls, larger-scale measurements and storage configuration remain. |
-| <a id="versioning-and-history-1"></a>[Versioning and history](storage/README.md#versioning-and-history-1) | Historical search and further branch administration remain. |
-| <a id="sparql-and-formats"></a>[SPARQL and formats](querying/README.md#sparql-and-formats) | Additional query surfaces, execution coverage, formats and editor support remain. |
-| <a id="search-and-graph-algorithms"></a>[Search and graph algorithms](search/README.md#search-and-graph-algorithms) | Multi-field search, quantization and further algorithm surfaces remain. |
-| <a id="geosparql-1"></a>[GeoSPARQL](search/README.md#geosparql-1) | Item 24 adds per-row nearest-neighbour joins, spatial syntax, polygon approximations and further CRS support. |
-| <a id="reasoning-and-validation"></a>[Reasoning and validation](reasoning/README.md#reasoning-and-validation) | A separate derived layer, canonical equality, per-pattern `auto` selection, complete OWL 2 DL classification, MCP and CLI ontology entity and inferred reads, and remaining validation and form work remain. |
-| <a id="server-access-control-and-operations"></a>[Server, access control and operations](server/README.md#server-access-control-and-operations) | Further Fuseki integration, derived visibility and operational controls remain. |
-| <a id="ai-and-agents-1"></a>[AI and agents](ai/README.md#ai-and-agents-1) | Ask accuracy, contextual linking, ingestion formats and configurable reports remain. |
-| <a id="web-ui-1"></a>[Web UI](visualization/README.md#web-ui-1) | Live profiling, additional query-builder blocks and larger graph rendering remain. |
-| <a id="bindings-and-packaging"></a>[Bindings and packaging](integrations/README.md#bindings-and-packaging) | Callback completion, administration parity and additional release platforms remain. |
+| [Storage and execution](storage/README.md#storage-and-execution) | Compaction controls, larger-scale measurements and storage configuration remain. |
+| [Versioning and history](storage/README.md#versioning-and-history-1) | Historical search and further branch administration remain. |
+| [SPARQL and formats](querying/README.md#sparql-and-formats) | Additional query surfaces, execution coverage, formats and editor support remain. |
+| [Search and graph algorithms](search/README.md#search-and-graph-algorithms) | Multi-field search, quantization and further algorithm surfaces remain. |
+| [GeoSPARQL](search/README.md#geosparql-1) | Item 24 adds per-row nearest-neighbour joins, spatial syntax, polygon approximations and further CRS support. |
+| [Reasoning and validation](reasoning/README.md#reasoning-and-validation) | A separate derived layer, canonical equality, per-pattern `auto` selection, complete OWL 2 DL classification, MCP and CLI ontology entity and inferred reads, and remaining validation and form work remain. |
+| [Server, access control and operations](server/README.md#server-access-control-and-operations) | Further Fuseki integration, derived visibility and operational controls remain. |
+| [AI and agents](ai/README.md#ai-and-agents-1) | Ask accuracy, contextual linking, ingestion formats and configurable reports remain. |
+| [Web UI](visualization/README.md#web-ui-1) | Live profiling, additional query-builder blocks and larger graph rendering remain. |
+| [Bindings and packaging](integrations/README.md#bindings-and-packaging) | Callback completion, administration parity and additional release platforms remain. |
