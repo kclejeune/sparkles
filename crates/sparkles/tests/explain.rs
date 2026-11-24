@@ -813,6 +813,115 @@ fn materialized_fast_miss_refuses_oversized_key_before_allocating() {
 
 #[cfg(feature = "reasoning")]
 #[test]
+fn materialized_fast_miss_admits_fsst_lookup_scratch() {
+    use sparkles::reasoning::{
+        ReasonRequest,
+        reasoner::{GraphRef, Inputs, Profile},
+    };
+    use sparkles_core::{
+        builder::{BuildOptions, VocabCodec},
+        store::StoreOptions,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open_with(
+        dir.path().join("db"),
+        StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Fsst),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Fill one literal block so the subject and predicate probes use a different block.
+    let long = "z".repeat(65_536);
+    let mut data = format!(r#"@prefix ex: <http://ex.org/> . ex:hr {{ ex:s ex:p "a", "{long}""#);
+    for i in 2..sparkles_core::vocab::FC_BLOCK {
+        data.push_str(&format!(r#", "~filler{i}""#));
+    }
+    data.push_str(" . }");
+    ds.load_str(&data, RdfFormat::TriG).unwrap();
+    ds.store().compact().unwrap();
+    let snap = ds.store().snapshot();
+    assert!(snap.generation.vocab.is_fsst());
+    assert_eq!(
+        snap.generation.vocab.find(&sparkles_core::id::term_key(
+            &oxrdf::Literal::new_simple_literal(long).into()
+        )),
+        Ok(1)
+    );
+    ds.reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::Rules(
+                "@prefix ex: <http://ex.org/> . [derive: (?x ex:p ?y) -> (?x ex:q ?y)]".into(),
+            ),
+            inputs: Inputs {
+                data_graphs: vec![GraphRef::Named(HR.into())],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+
+    let mut req = ExplainRequest::new([
+        ex("s"),
+        ex("q"),
+        oxrdf::Literal::new_simple_literal("b").into(),
+    ]);
+    req.source = Some(ExplainSource::Materialized);
+    assert!(matches!(
+        ds.reasoning().explain(&req).unwrap().explained,
+        Explained::NotFound
+    ));
+
+    req.max_memory = Some(8192);
+    let (result, alloc) = caller_allocations::measure(|| ds.reasoning().explain(&req));
+    assert!(
+        alloc.largest < 8192,
+        "short probe allocated an oversized FSST suffix (peak={}, largest={})",
+        alloc.peak,
+        alloc.largest
+    );
+    let error = result.map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&error, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "{error:?}"
+    );
+    let peak = std::cell::Cell::new(0);
+    let miss = snap
+        .lookup_term_controlled(
+            &req.triple[2],
+            &mut |bytes| {
+                peak.set(peak.get().max(bytes));
+                Ok(())
+            },
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert!(miss.is_none());
+    // The 3-byte probe and previous 3-byte scratch coexist with the larger scratch.
+    assert_eq!(peak.get(), 3 + 3 + 65_536 + 2);
+    let stopped = snap.lookup_term_controlled(
+        &req.triple[2],
+        &mut |bytes| {
+            peak.set(bytes);
+            Ok(())
+        },
+        &mut || {
+            if peak.get() > 8192 {
+                Err(sparkles::Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(matches!(stopped, Err(sparkles::Error::Cancelled)));
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
 fn demand_session_refuses_before_allocating_terms_table() {
     use sparkles::reasoning::{
         ReasonRequest,

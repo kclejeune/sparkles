@@ -1484,6 +1484,33 @@ impl Vocab {
         Ok(result)
     }
 
+    /// Read a key while its owner accounts for old and new scratch during growth,
+    /// then only the settled allocation. The callback runs while the scratch is live.
+    pub fn get_with_controlled_capacity<T, E: From<crate::error::Error>>(
+        &self,
+        id: u64,
+        mut grow: impl FnMut(usize, usize) -> Result<(), E>,
+        mut settled: impl FnMut(usize) -> Result<(), E>,
+        mut read: impl FnMut(&[u8]) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        if id >= self.len {
+            return Ok(None);
+        }
+        let mut result = None;
+        self.scan_block_capacity_controlled(
+            id as usize / FC_BLOCK,
+            1 << (id as usize % FC_BLOCK),
+            &mut grow,
+            &mut settled,
+            &mut |_| Ok(()),
+            |_, key| {
+                result = Some(read(key)?);
+                Ok(false)
+            },
+        )?;
+        Ok(result)
+    }
+
     /// Reconstruct one key into admitted storage that the callback may retain.
     /// Growth covers both physical buffers; settlement follows old-buffer retirement.
     /// The callback's owner must keep that admission until its final allocation drops.
@@ -1535,15 +1562,15 @@ impl Vocab {
         )
     }
 
-    fn scan_block_capacity_controlled(
+    fn scan_block_capacity_controlled<E: From<crate::error::Error>>(
         &self,
         b: usize,
         wanted: u32,
-        grow: &mut impl FnMut(usize, usize) -> crate::error::Result<()>,
-        settled: &mut impl FnMut(usize) -> crate::error::Result<()>,
-        checkpoint: &mut impl FnMut(&'static str) -> crate::error::Result<()>,
-        mut each: impl FnMut(usize, &mut Vec<u8>) -> crate::error::Result<bool>,
-    ) -> crate::error::Result<()> {
+        grow: &mut impl FnMut(usize, usize) -> Result<(), E>,
+        settled: &mut impl FnMut(usize) -> Result<(), E>,
+        checkpoint: &mut impl FnMut(&'static str) -> Result<(), E>,
+        mut each: impl FnMut(usize, &mut Vec<u8>) -> Result<bool, E>,
+    ) -> Result<(), E> {
         let _timer = ioacct::timer(Phase::VocabRead);
         let data = self.data.as_slice();
         let mut position = self.block_offset(b);
@@ -1611,7 +1638,8 @@ impl Vocab {
                     if key.capacity() != total {
                         return Err(crate::error::Error::invalid(
                             "unsupported vocabulary scratch capacity",
-                        ));
+                        )
+                        .into());
                     }
                     settled(key.capacity())?;
                 }
@@ -1638,6 +1666,15 @@ impl Vocab {
         &self,
         key: &[u8],
         mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+        checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
+    ) -> crate::error::Result<std::result::Result<u64, u64>> {
+        self.find_with_controlled_growth(key, |_, new| reserve(new), checkpoint)
+    }
+
+    pub(crate) fn find_with_controlled_growth(
+        &self,
+        key: &[u8],
+        mut grow: impl FnMut(usize, usize) -> crate::error::Result<()>,
         mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
     ) -> crate::error::Result<std::result::Result<u64, u64>> {
         let (mut lo, mut hi) = (0usize, self.num_blocks());
@@ -1658,10 +1695,11 @@ impl Vocab {
         // The scanner owns the mutable checkpoint; comparisons borrow the same
         // callback through a RefCell only for the duration of each nonnested call.
         let check = std::cell::RefCell::new(&mut checkpoint);
-        self.scan_block_controlled(
+        self.scan_block_capacity_controlled(
             b,
             ALL_KEYS,
-            &mut reserve,
+            &mut grow,
+            &mut |_| Ok(()),
             &mut |phase| check.borrow_mut()(phase),
             |at, actual| {
                 Ok(

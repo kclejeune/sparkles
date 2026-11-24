@@ -2943,7 +2943,7 @@ impl Ctx {
                     .local
                     .read()
                     .get(id.payload())
-                    .map(|key| output_key_bytes(self, key, 0))
+                    .map(|key| output_key_bytes(self, key))
                     .transpose()?;
                 match bytes {
                     None => None,
@@ -2961,7 +2961,7 @@ impl Ctx {
                     .with(|vocab| {
                         vocab
                             .get(id.payload())
-                            .map(|key| output_key_bytes(self, key, 0))
+                            .map(|key| output_key_bytes(self, key))
                     })
                     .transpose()?;
                 match bytes {
@@ -3037,7 +3037,7 @@ impl Ctx {
                     .local
                     .read()
                     .get(id.payload())
-                    .map(|key| output_key_bytes(self, key, 0))
+                    .map(|key| output_key_bytes(self, key))
                     .transpose()?;
                 if let Some(bytes) = bytes {
                     row.add(bytes)?;
@@ -3054,7 +3054,7 @@ impl Ctx {
                     .with(|vocab| {
                         vocab
                             .get(id.payload())
-                            .map(|key| output_key_bytes(self, key, 0))
+                            .map(|key| output_key_bytes(self, key))
                     })
                     .transpose()?;
                 if let Some(bytes) = bytes {
@@ -3181,7 +3181,7 @@ impl Ctx {
         }
         let decode = || {
             self.check()?;
-            storage.add(output_key_bytes(self, key, 0)?)?;
+            storage.add(output_key_bytes(self, key)?)?;
             #[cfg(test)]
             {
                 use crate::algo::memory::probe;
@@ -3903,7 +3903,7 @@ fn output_key_term(ctx: &Ctx, key: &[u8], row: &RowCredit<'_>) -> Result<Term> {
         )?;
         return Ok(text.into_term());
     }
-    row.add(output_key_bytes(ctx, key, 0)?)?;
+    row.add(output_key_bytes(ctx, key)?)?;
     Ok(copied_output_key(key))
 }
 
@@ -3919,97 +3919,8 @@ fn copied_output_key(key: &[u8]) -> Term {
     }
 }
 
-fn output_key_bytes(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
-    if depth == 0 && key.first() == Some(&b'(') {
-        return super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || {
-            output_key_bytes_inner(ctx, key, depth)
-        });
-    }
-    output_key_bytes_inner(ctx, key, depth)
-}
-fn output_key_bytes_inner(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
-    let overflow = || ctx.memory_exceeded(u64::MAX);
-    let malformed = || Error::Corrupt("invalid vocabulary triple-term key".into());
-    if depth > crate::nesting::MAX_TRIPLE_TERMS {
-        return Err(malformed());
-    }
-    if key.first() != Some(&b'(') {
-        // UTF-8 text is copied into String. The fixed allowance covers
-        // a datatype/language string, blank-node formatting and string construction.
-        // A damaged key's lossy UTF-8 route can expand each byte to three bytes.
-        let bytes = (key.len() as u64).checked_mul(3).ok_or_else(overflow)?;
-        // Literal separators and blank-node binary IDs are not UTF-8 text.
-        let mut overlap = 64u64;
-        let valid = match key.first() {
-            Some(b'"') => {
-                let sep = key
-                    .iter()
-                    .rposition(|&b| b == id::KEY_SEP)
-                    .unwrap_or(key.len());
-                let suffix = key.get(sep + 1..).unwrap_or(&[]);
-                if suffix.first() == Some(&b'@') {
-                    // lang_literal borrows a temporary decoded tag while oxrdf
-                    // copies that tag into its final owned String.
-                    let tag = &suffix[1..];
-                    let copies = if std::str::from_utf8(tag).is_ok() {
-                        1
-                    } else {
-                        3
-                    };
-                    overlap = overlap
-                        .checked_add(
-                            (tag.len() as u64)
-                                .checked_mul(copies)
-                                .ok_or_else(overflow)?,
-                        )
-                        .ok_or_else(overflow)?;
-                }
-                std::str::from_utf8(&key[1..sep]).is_ok() && std::str::from_utf8(suffix).is_ok()
-            }
-            Some(b'_') => true,
-            _ => std::str::from_utf8(key).is_ok(),
-        };
-        return (if valid { key.len() as u64 } else { bytes })
-            .checked_add(overlap)
-            .ok_or_else(overflow);
-    }
-    let mut bytes =
-        (3 * std::mem::size_of::<Term>()) as u64 + std::mem::size_of::<oxrdf::Triple>() as u64;
-    let mut pos = 1usize;
-    for _ in 0..3 {
-        // Only existing three-component headers are walked, without allocation.
-        // Invalid lengths are corruption; they are not relabeled budget failures.
-        let mut len = 0u64;
-        let mut shift = 0;
-        loop {
-            let next = *key.get(pos).ok_or_else(malformed)?;
-            pos += 1;
-            if shift == 63 && next > 1 {
-                return Err(malformed());
-            }
-            len |= u64::from(next & 127)
-                .checked_shl(shift)
-                .ok_or_else(malformed)?;
-            if next & 128 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err(malformed());
-            }
-        }
-        let len = usize::try_from(len).map_err(|_| malformed())?;
-        let end = pos.checked_add(len).ok_or_else(malformed)?;
-        let part = key.get(pos..end).ok_or_else(malformed)?;
-        bytes = bytes
-            .checked_add(output_key_bytes(ctx, part, depth + 1)?)
-            .ok_or_else(overflow)?;
-        pos = end;
-    }
-    if pos != key.len() {
-        return Err(malformed());
-    }
-    Ok(bytes)
+fn output_key_bytes(ctx: &Ctx, key: &[u8]) -> Result<u64> {
+    id::key_decode_bytes_with(key, || ctx.memory_exceeded(u64::MAX))
 }
 
 /// Estimated bytes of `rows` rows of `width` ids (a row of a zero-width table still
@@ -4749,7 +4660,7 @@ mod charge_tests {
             assert_eq!(term, id::key_to_term(key), "{key:?}");
             assert_eq!(
                 row.used.get(),
-                output_key_bytes(&ctx, key, 0).unwrap(),
+                output_key_bytes(&ctx, key).unwrap(),
                 "{key:?}"
             );
         }

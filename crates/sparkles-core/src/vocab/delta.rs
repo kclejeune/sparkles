@@ -807,6 +807,18 @@ impl DeltaVocab {
         Ok(result)
     }
 
+    /// Find a key visible to the snapshot with interruptible lock acquisition and search.
+    pub(crate) fn find_prepared(
+        &self,
+        key: &[u8],
+        limit: u64,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<Option<u64>> {
+        let check = std::cell::RefCell::new(&mut check);
+        let guard = crate::task::read_lock(&self.inner, || check.borrow_mut()())?;
+        guard.find_prepared(key, limit, |_| check.borrow_mut()())
+    }
+
     pub(crate) fn with_prepared<R>(
         &self,
         preparation: &crate::access::Preparation,

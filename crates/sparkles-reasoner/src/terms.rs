@@ -139,6 +139,20 @@ fn tail_key(rel: u64, cols: &[u64]) -> Option<Vec<u8>> {
     Some(key)
 }
 
+fn rule_bnode_label_len(key: &[u8]) -> usize {
+    8 + 2 * (key.len() - 3)
+}
+
+fn rule_bnode_term(key: &[u8]) -> Term {
+    use std::fmt::Write;
+    let mut label = String::with_capacity(rule_bnode_label_len(key));
+    label.push_str("spkrule_");
+    for byte in &key[3..] {
+        write!(label, "{byte:02x}").expect("String write");
+    }
+    Term::BlankNode(BlankNode::new_unchecked(label))
+}
+
 /// Term context shared by all evaluation threads.
 pub(crate) struct Terms {
     pub snap: Arc<Snapshot>,
@@ -710,64 +724,66 @@ impl Terms {
                 LocalTerm::BNode => {
                     Term::BlankNode(BlankNode::new_unchecked(format!("r{:x}", i.payload())))
                 }
-                LocalTerm::RuleBNode(key) => {
-                    use std::fmt::Write;
-                    let mut label = String::with_capacity(8 + 2 * (key.len() - 3));
-                    label.push_str("spkrule_");
-                    for byte in &key[3..] {
-                        write!(label, "{byte:02x}").expect("String write");
-                    }
-                    Term::BlankNode(BlankNode::new_unchecked(label))
-                }
+                LocalTerm::RuleBNode(key) => rule_bnode_term(&key),
                 LocalTerm::Tail(_) => return None,
             });
         }
         self.snap.term(i)
     }
 
-    /// Decode `raw` only after admitting its reconstruction scratch and encoded key length
-    /// against `budget` (transient admission; callers that retain the decoded [`Term`]
-    /// charge its retained heap separately).
+    /// Decode under the proof budget, keeping the value's credit with the result.
     pub(crate) fn term_admitted(
         &self,
         raw: u64,
         budget: &Arc<Budget>,
-    ) -> Result<Option<Term>, BudgetFailure> {
+    ) -> anyhow::Result<(Option<Term>, Held)> {
         let id = Id(raw);
-        let decode = |key: &[u8]| -> Result<Term, BudgetFailure> {
-            let _temporary = Held::try_new_exact(budget, key.len())?;
+        let slot = std::mem::size_of::<Term>();
+        let mut retained = Held::new(budget);
+        let mut decode = |key: &[u8]| -> anyhow::Result<Term> {
+            let bytes = usize::try_from(id::key_decode_bytes(key)?).unwrap_or(usize::MAX);
+            retained.try_grow(bytes.saturating_add(slot))?;
             Ok(id::key_to_term(key))
         };
-        match id.tag() {
+        let term = match id.tag() {
             Tag::Local => match self.table.get(id.payload()) {
-                Some(LocalTerm::Key(key)) => decode(key).map(Some),
+                Some(LocalTerm::Key(key)) => Some(decode(key)?),
                 Some(LocalTerm::RuleBNode(key)) => {
-                    let bytes =
-                        8usize.saturating_add(key.len().saturating_sub(3).saturating_mul(2));
-                    let _temporary = Held::try_new_exact(budget, bytes)?;
-                    Ok(self.term(raw))
+                    retained.try_grow(rule_bnode_label_len(key).saturating_add(slot))?;
+                    Some(rule_bnode_term(key))
                 }
-                _ => Ok(self.term(raw)),
+                Some(LocalTerm::BNode) => {
+                    retained.try_grow(32 + slot)?;
+                    self.term(raw)
+                }
+                _ => None,
             },
             Tag::Vocab => {
-                let mut reconstruction = Held::new(budget);
-                self.snap
-                    .generation
-                    .vocab
-                    .get_with_checked(
-                        id.payload(),
-                        |capacity| reconstruction.try_set(capacity),
-                        decode,
-                    )?
-                    .transpose()
+                let scratch = std::cell::RefCell::new(Held::new(budget));
+                self.snap.generation.vocab.get_with_controlled_capacity(
+                    id.payload(),
+                    |old, new| -> anyhow::Result<()> {
+                        Ok(scratch.borrow_mut().try_set(old.saturating_add(new))?)
+                    },
+                    |capacity| Ok(scratch.borrow_mut().try_set(capacity)?),
+                    decode,
+                )?
             }
             Tag::Delta => self
                 .snap
                 .generation
                 .dvocab
-                .with(|vocab| vocab.get(id.payload()).map(decode).transpose()),
-            _ => Ok(self.term(raw)),
-        }
+                .with(|vocab| vocab.get(id.payload()).map(&mut decode).transpose())?,
+            Tag::Undef | Tag::Special => None,
+            _ => {
+                retained.try_grow(256)?;
+                self.term(raw)
+            }
+        };
+        let live = term.as_ref().map_or(0, sparkles_core::explain::term_bytes);
+        debug_assert!(live <= retained.bytes());
+        retained.shrink(retained.bytes().saturating_sub(live));
+        Ok((term, retained))
     }
 
     /// Decode a summary term only after reserving reconstruction and RDF heap space.

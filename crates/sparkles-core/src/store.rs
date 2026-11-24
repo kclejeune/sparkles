@@ -753,7 +753,7 @@ impl Snapshot {
     }
 
     /// Id of a term if it exists in this snapshot, checking live controls and admitting
-    /// the exact encoded vocabulary-key length before allocating its lookup buffer.
+    /// the probe and coexisting vocabulary reconstruction buffers before allocating.
     pub fn lookup_term_controlled(
         &self,
         t: &Term,
@@ -779,7 +779,24 @@ impl Snapshot {
                 }
                 id::write_term_ref_key(t.as_ref(), &mut key);
                 debug_assert_eq!(key.len(), len);
-                Ok(self.lookup_key(&key))
+                check()?;
+                let found = match self.generation.vocab.find_with_controlled_growth(
+                    &key,
+                    |old, new| {
+                        let bytes = key.capacity().saturating_add(old).saturating_add(new);
+                        admit(bytes)
+                    },
+                    |_| check(),
+                )? {
+                    Ok(i) => Some(Id::vocab(i)),
+                    Err(_) => self
+                        .generation
+                        .dvocab
+                        .find_prepared(&key, self.dvocab_len, &mut *check)?
+                        .map(Id::delta),
+                };
+                check()?;
+                Ok(found)
             }
         }
     }

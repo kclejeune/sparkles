@@ -615,37 +615,60 @@ fn term_bytes(t: &Term) -> usize {
     sparkles_core::explain::term_bytes(t)
 }
 
-/// A term written for a builtin call: N-Triples, or `_` for a wildcard.
-fn call_arg(t: Option<Term>) -> String {
-    t.map_or_else(|| "_".to_string(), |t| t.to_string())
+pub(crate) struct CallBytes(pub usize);
+impl std::fmt::Write for CallBytes {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 = self.0.checked_add(s.len()).ok_or(std::fmt::Error)?;
+        Ok(())
+    }
+}
+
+pub(crate) fn write_call(
+    out: &mut impl std::fmt::Write,
+    prefix: &str,
+    name: &str,
+    args: &[Option<Term>],
+    sep: &str,
+) -> std::fmt::Result {
+    write!(out, "{prefix}{name}(")?;
+    for (i, arg) in args.iter().enumerate() {
+        if i != 0 {
+            out.write_str(sep)?;
+        }
+        match arg {
+            Some(term) => write!(out, "{term}")?,
+            None => out.write_str("_")?,
+        }
+    }
+    out.write_str(")")
 }
 
 /// Builds the answer's trees, numbering facts once across them.
 struct Builder<'s, 'a> {
     s: &'s Search<'a>,
-    /// charged with the answer's nodes and decoded terms, which it holds until it returns
-    budget: &'s Arc<Budget>,
+    /// Own the output's credit until it is transferred to the returned proof.
+    memory: Held,
     max_depth: u32,
     ids: FxHashMap<u32, u32>,
     next: u32,
 }
 
 impl Builder<'_, '_> {
-    fn term(&self, id: u64) -> anyhow::Result<Term> {
-        self.s
-            .terms
-            .term_admitted(id, self.budget)
-            .map_err(|e| match e {
-                crate::budget::BudgetFailure::Local(m) => anyhow::Error::from(
-                    m.with_context(" while building an explanation".to_string()),
-                ),
-                e => anyhow::Error::from(e),
-            })?
-            .ok_or_else(|| anyhow::anyhow!("term {id} of a derivation is unknown"))
+    fn charge(&mut self, bytes: usize) -> Result<(), BudgetFailure> {
+        self.memory
+            .try_grow(bytes)
+            .map_err(|e| e.with_context(" while building an explanation".to_string()))
+    }
+
+    fn term(&mut self, id: u64) -> anyhow::Result<Term> {
+        let (term, held) = self.s.terms.term_admitted(id, self.memory.budget())?;
+        let term = term.ok_or_else(|| anyhow::anyhow!("term {id} of a derivation is unknown"))?;
+        self.memory.absorb(held);
+        Ok(term)
     }
 
     /// The relation fact `f`, when it is one.
-    fn relation(&self, f: u32) -> anyhow::Result<Option<RelationAtom>> {
+    fn relation(&mut self, f: u32) -> anyhow::Result<Option<RelationAtom>> {
         let t = self.s.facts[f as usize];
         let Some(r) = crate::ir::lower::rel_of(t[1]) else {
             return Ok(None);
@@ -671,22 +694,18 @@ impl Builder<'_, '_> {
                 cols.extend(tail);
             }
         }
+        self.charge(rel.name.len())?;
         let args = cols
             .into_iter()
             .map(|x| self.term(x))
             .collect::<anyhow::Result<Vec<Term>>>()?;
-        let atom = RelationAtom {
+        Ok(Some(RelationAtom {
             name: rel.name.to_string(),
             args,
-        };
-        let bytes = atom.name.len() + atom.args.iter().map(term_bytes).sum::<usize>();
-        self.budget
-            .try_charge(bytes)
-            .map_err(|e| e.with_context(" while building an explanation".to_string()))?;
-        Ok(Some(atom))
+        }))
     }
 
-    fn triple(&self, f: u32) -> anyhow::Result<[Term; 3]> {
+    fn triple(&mut self, f: u32) -> anyhow::Result<[Term; 3]> {
         let t = self.s.facts[f as usize];
         if let Some(r) = crate::ir::lower::rel_of(t[1]) {
             // a relation node's triple names its relation, and is no fact
@@ -704,23 +723,16 @@ impl Builder<'_, '_> {
                 }
                 .iri(),
             );
-            self.budget
-                .try_charge(std::mem::size_of::<Derivation>() + 3 * term_bytes(&iri))
-                .map_err(|e| e.with_context(" while building an explanation".to_string()))?;
+            self.charge(std::mem::size_of::<Derivation>() + 3 * term_bytes(&iri))?;
             return Ok([iri.clone(), iri.clone(), iri]);
         }
-        let triple = [self.term(t[0])?, self.term(t[1])?, self.term(t[2])?];
-        // the node and its decoded terms, which a large literal can make large
-        let bytes =
-            std::mem::size_of::<Derivation>() + triple.iter().map(term_bytes).sum::<usize>();
-        self.budget
-            .try_charge(bytes)
-            .map_err(|e| e.with_context(" while building an explanation".to_string()))?;
-        Ok(triple)
+        self.charge(std::mem::size_of::<Derivation>())?;
+        Ok([self.term(t[0])?, self.term(t[1])?, self.term(t[2])?])
     }
 
-    fn graph(&self, g: Id) -> anyhow::Result<String> {
+    fn graph(&mut self, g: Id) -> anyhow::Result<String> {
         if g == Id::DEFAULT_GRAPH {
+            self.charge("default".len())?;
             return Ok("default".to_string());
         }
         match self.term(g.0)? {
@@ -755,7 +767,7 @@ impl Builder<'_, '_> {
 
     /// The bindings of instance `inst` by variable name, and its builtins as calls.
     #[allow(clippy::type_complexity)]
-    fn bindings(&self, inst: u32) -> anyhow::Result<(Vec<(String, Term)>, Vec<String>)> {
+    fn bindings(&mut self, inst: u32) -> anyhow::Result<(Vec<(String, Term)>, Vec<String>)> {
         let s = self.s;
         let i = &s.insts[inst as usize];
         if i.rule == GEO_RULE {
@@ -767,7 +779,6 @@ impl Builder<'_, '_> {
         };
         let vals = &s.binds[i.binds as usize..i.binds as usize + rule.nvars];
         let mut bindings = Vec::new();
-        let mut bytes = 0usize;
         for (v, &x) in vals.iter().enumerate() {
             if x == 0 {
                 continue;
@@ -777,60 +788,77 @@ impl Builder<'_, '_> {
             if name.is_empty() {
                 continue;
             }
-            let t = self.term(x)?;
-            bytes += name.len() + term_bytes(&t);
-            bindings.push((name, t));
+            self.charge(name.len())?;
+            bindings.push((name, self.term(x)?));
         }
         let mut builtins = Vec::new();
         for (j, b) in rule.builtins.iter().enumerate() {
             use crate::builtins::BuiltinKind as B;
-            let arg = |a: &Slot| match *a {
-                Slot::Const(c) => call_arg(s.terms.term(c)),
-                Slot::Var(v) if vals[v] != 0 => call_arg(s.terms.term(vals[v])),
-                _ => call_arg(None),
-            };
             let call = match b.kind {
                 // the lowering of a relation atom, which the node shows as its premise
                 B::RelTail | B::RelTuple => continue,
-                B::RelAbsent => self.negated(&b.args, &arg),
+                B::RelAbsent => self.negated(&b.args, vals)?,
                 _ => {
-                    let args: Vec<String> = b.args.iter().map(arg).collect();
                     let name = info.builtins.get(j).map_or("builtin", String::as_str);
-                    format!("{name}({})", args.join(", "))
+                    self.builtin_call("", name, &[&b.args], ", ", vals)?
                 }
             };
-            bytes += call.len();
             builtins.push(call);
         }
-        self.budget
-            .try_charge(bytes)
-            .map_err(|e| e.with_context(" while building an explanation".to_string()))?;
         Ok((bindings, builtins))
     }
 
     /// A negated atom (item 839) as a call: `not name(args)` for a relation, whose lowered
     /// arguments are the first column, the key and the other columns, and `not (s p o)`
     /// for a triple.
-    fn negated(&self, args: &[Slot], arg: &dyn Fn(&Slot) -> String) -> String {
+    fn negated(&mut self, args: &[Slot], vals: &[u64]) -> anyhow::Result<String> {
         let key = match args.get(1) {
             Some(Slot::Const(k)) => crate::ir::lower::rel_of(*k),
             _ => None,
         };
         let rel = key.and_then(|r| self.s.rs.relations.and_then(|rs| rs.get(r)));
         let Some(rel) = rel else {
-            let a: Vec<String> = args.iter().map(arg).collect();
-            return format!("not ({})", a.join(" "));
+            return self.builtin_call("not ", "", &[args], " ", vals);
         };
-        let cols: Vec<String> = match rel.arity {
-            0 => Vec::new(),
-            1 => vec![arg(&args[0])],
-            2 => vec![arg(&args[0]), arg(&args[2])],
-            _ => std::iter::once(&args[0])
-                .chain(&args[2..])
-                .map(arg)
-                .collect(),
+        let cols: &[&[Slot]] = match rel.arity {
+            0 => &[],
+            1 => &[&args[..1]],
+            2 => &[&args[..1], &args[2..3]],
+            _ => &[&args[..1], &args[2..]],
         };
-        format!("not {}({})", rel.name, cols.join(", "))
+        self.builtin_call("not ", &rel.name, cols, ", ", vals)
+    }
+
+    fn builtin_call(
+        &mut self,
+        prefix: &str,
+        name: &str,
+        groups: &[&[Slot]],
+        sep: &str,
+        vals: &[u64],
+    ) -> anyhow::Result<String> {
+        let count = groups.iter().map(|group| group.len()).sum::<usize>();
+        let mut temporary = Held::try_new_exact(
+            self.memory.budget(),
+            count * std::mem::size_of::<Option<Term>>(),
+        )?;
+        let mut args = Vec::with_capacity(count);
+        for arg in groups.iter().flat_map(|group| group.iter()) {
+            let id = match *arg {
+                Slot::Const(c) => c,
+                Slot::Var(v) => vals[v],
+                Slot::Any => 0,
+            };
+            let (term, held) = self.s.terms.term_admitted(id, self.memory.budget())?;
+            temporary.absorb(held);
+            args.push(term);
+        }
+        let mut bytes = CallBytes(0);
+        write_call(&mut bytes, prefix, name, &args, sep)?;
+        self.charge(bytes.0 + std::mem::size_of::<String>())?;
+        let mut call = String::with_capacity(bytes.0);
+        write_call(&mut call, prefix, name, &args, sep)?;
+        Ok(call)
     }
 
     fn generalized(&self, f: u32) -> bool {
@@ -838,7 +866,7 @@ impl Builder<'_, '_> {
         !crate::ir::lower::is_key(t[1]) && !self.s.terms.valid(t)
     }
 
-    fn leaf_node(&self, f: u32, id: u32, shared: bool, l: Leaf) -> anyhow::Result<Derivation> {
+    fn leaf_node(&mut self, f: u32, id: u32, shared: bool, l: Leaf) -> anyhow::Result<Derivation> {
         let triple = self.triple(f)?;
         let mut d = Derivation::asserted(triple, None);
         d.id = id;
@@ -1470,12 +1498,13 @@ fn search(
         if let Some(reason) = short {
             let mut b = Builder {
                 s: &s,
-                budget,
+                memory: Held::new(budget),
                 max_depth: opts.max_depth.min(MAX_DEPTH_LIMIT),
                 ids: FxHashMap::default(),
                 next: 0,
             };
             let tree = b.partial(r, 0, &mut Vec::new())?;
+            b.memory.into_bytes();
             return Ok(Explained::Partial {
                 tree: Box::new(tree),
                 reason,
@@ -1491,7 +1520,7 @@ fn search(
     s.via = via;
     let mut b = Builder {
         s: &s,
-        budget,
+        memory: Held::new(budget),
         max_depth: opts.max_depth.min(MAX_DEPTH_LIMIT),
         ids: FxHashMap::default(),
         next: 0,
@@ -1506,6 +1535,7 @@ fn search(
         trees.push(b.node(r, 0, Some(i))?);
     }
     let more = tops.len() + usize::from(s.leaf[r as usize].is_some()) > trees.len();
+    b.memory.into_bytes();
     Ok(Explained::Found { trees, more })
 }
 
@@ -1736,6 +1766,122 @@ mod partial_tests {
     }
 
     #[test]
+    fn proof_triple_admits_the_second_literal_while_the_first_is_live() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let mut tx = store.write();
+        let literal = tx
+            .intern(&oxrdf::Literal::new_simple_literal("z".repeat(65_536)).into())
+            .unwrap();
+        let predicate = tx
+            .intern(&oxrdf::NamedNode::new_unchecked("urn:p").into())
+            .unwrap();
+        tx.insert([predicate, predicate, literal, Id::DEFAULT_GRAPH])
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(literal.tag(), Tag::Delta);
+        let snap = store.snapshot();
+        let terms = Terms::new(snap.clone());
+        let rs = RuleSet {
+            rules: &[],
+            infos: &[],
+            sources: &[],
+            geo: None,
+            relations: None,
+        };
+        let mut graph = Graph::with_capacity(0);
+        let plans = Plans::new(&mut graph, &[]).unwrap();
+        const LIMIT: usize = 96 * 1024;
+        let budget = Budget::new(Some(LIMIT));
+        let search = Search {
+            snap: &snap,
+            g: &graph,
+            terms: &terms,
+            rs: &rs,
+            plans: &plans,
+            inputs: &[],
+            extra: &FxHashSet::default(),
+            budget: &budget,
+            opts: &ExplainOptions::default(),
+            rounds: &[],
+            abort: AtomicBool::new(false),
+            facts: vec![[literal.0, predicate.0, literal.0]],
+            index: FxHashMap::default(),
+            leaf: Vec::new(),
+            by_head: Vec::new(),
+            insts: Vec::new(),
+            premises: Vec::new(),
+            binds: Vec::new(),
+            visited: 0,
+            depth: Vec::new(),
+            via: Vec::new(),
+            kept: 0,
+            full_schedule: None,
+            _full_schedule_allocation: None,
+        };
+        let mut builder = Builder {
+            s: &search,
+            memory: Held::new(&budget),
+            max_depth: 1,
+            ids: FxHashMap::default(),
+            next: 0,
+        };
+        let (result, peak) = crate::alloc_probe::peak_of(|| builder.triple(0));
+        assert!(
+            peak <= LIMIT,
+            "proof allocated both 64 KiB literals before refusing (peak={peak})"
+        );
+        assert!(BudgetFailure::from_anyhow(&result.unwrap_err()).is_some());
+        drop(builder);
+        assert_eq!(budget.used(), 0);
+
+        let mut builder = Builder {
+            s: &search,
+            memory: Held::new(&budget),
+            max_depth: 1,
+            ids: FxHashMap::default(),
+            next: 0,
+        };
+        let (result, peak) = crate::alloc_probe::peak_of(|| {
+            builder.builtin_call("", "print", &[&[Slot::Const(literal.0)]], ", ", &[])
+        });
+        assert!(
+            peak <= LIMIT,
+            "builtin allocated both the 64 KiB term and call before refusing (peak={peak})"
+        );
+        assert!(BudgetFailure::from_anyhow(&result.unwrap_err()).is_some());
+    }
+
+    #[test]
+    fn proof_decode_admits_nested_triple_allocations() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let mut term: Term = oxrdf::NamedNode::new_unchecked("urn:o").into();
+        let subject = oxrdf::NamedNode::new_unchecked("urn:s");
+        let predicate = oxrdf::NamedNode::new_unchecked("urn:p");
+        for _ in 0..16 {
+            term = Term::Triple(Box::new(oxrdf::Triple::new(
+                subject.clone(),
+                predicate.clone(),
+                term,
+            )));
+        }
+        let key = sparkles_core::id::term_key(&term);
+        let limit = key.len() * 2;
+        let terms = Terms::new(store.snapshot());
+        let id = terms.id_for(&term).unwrap();
+        let budget = Budget::new(Some(limit));
+        let (result, peak) = crate::alloc_probe::peak_of(|| terms.term_admitted(id, &budget));
+        assert!(
+            peak <= limit,
+            "decoded a nested triple over budget (peak={peak})"
+        );
+        assert!(BudgetFailure::from_anyhow(&result.unwrap_err()).is_some());
+        assert_eq!(budget.used(), 0);
+        let (decoded, held) = terms.term_admitted(id, &Budget::unlimited()).unwrap();
+        assert_eq!(decoded.as_ref(), Some(&term));
+        assert_eq!(held.bytes(), term_bytes(&term));
+    }
+
+    #[test]
     fn partial_tree_after_expansion_has_depth_entries_for_new_premises() {
         let store = sparkles_core::store::Store::in_memory(Default::default());
         let snap = store.snapshot();
@@ -1810,7 +1956,7 @@ mod partial_tests {
             .expect("unlimited rule instance");
         let mut builder = Builder {
             s: &search,
-            budget: &budget,
+            memory: Held::new(&budget),
             max_depth: 32,
             ids: FxHashMap::default(),
             next: 0,

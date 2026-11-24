@@ -23,7 +23,10 @@
 use crate::builtins::BuiltinKind;
 use crate::demand::{head_slots, intensional};
 use crate::engine::{CHead, CRule, Eval, Mode, Slot};
-use crate::explain::{DemandInput, ExplainOptions, demand_session, search_session, session_error};
+use crate::explain::{
+    CallBytes, DemandInput, ExplainOptions, demand_session, search_session, session_error,
+    write_call,
+};
 use crate::facts::Memo;
 use crate::graph::{Graph, Triple};
 use crate::query::Session;
@@ -168,33 +171,6 @@ struct Unfold<'a> {
     work: crate::budget::Held,
 }
 
-struct CallBytes(usize);
-impl std::fmt::Write for CallBytes {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.0 = self.0.checked_add(s.len()).ok_or(std::fmt::Error)?;
-        Ok(())
-    }
-}
-
-fn write_call(
-    out: &mut impl std::fmt::Write,
-    name: &str,
-    args: &[Option<Term>],
-    sep: &str,
-) -> std::fmt::Result {
-    write!(out, "{name}(")?;
-    for (i, arg) in args.iter().enumerate() {
-        if i != 0 {
-            out.write_str(sep)?;
-        }
-        match arg {
-            Some(term) => write!(out, "{term}")?,
-            None => out.write_str("_")?,
-        }
-    }
-    out.write_str(")")
-}
-
 /// Measure before rendering, and retain one charged string without joined copies.
 fn blocker_call(
     terms: &Terms,
@@ -224,10 +200,10 @@ fn blocker_call_sep(
         decoded.push(term);
     }
     let mut bytes = CallBytes(0);
-    write_call(&mut bytes, name, &decoded, sep)?;
+    write_call(&mut bytes, "", name, &decoded, sep)?;
     retained.try_grow(bytes.0 + 2 * std::mem::size_of::<(String, Option<Triple>)>())?;
     let mut call = String::with_capacity(bytes.0);
-    write_call(&mut call, name, &decoded, sep)?;
+    write_call(&mut call, "", name, &decoded, sep)?;
     Ok(call)
 }
 

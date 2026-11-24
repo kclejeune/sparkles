@@ -665,6 +665,113 @@ impl<'a> TextKey<'a> {
     }
 }
 
+/// Size the peak heap required to decode a vocabulary key, including component
+/// storage for triple terms and temporary text used by the decoder.
+pub fn key_decode_bytes(key: &[u8]) -> crate::error::Result<u64> {
+    key_decode_bytes_with(key, || {
+        crate::error::Error::invalid("term decode allocation size overflows")
+    })
+}
+
+pub(crate) fn key_decode_bytes_with(
+    key: &[u8],
+    overflow: impl Fn() -> crate::error::Error,
+) -> crate::error::Result<u64> {
+    if key.first() == Some(&b'(') {
+        return crate::sparql::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || {
+            key_decode_bytes_inner(key, 0, &overflow)
+        });
+    }
+    key_decode_bytes_inner(key, 0, &overflow)
+}
+
+fn key_decode_bytes_inner(
+    key: &[u8],
+    depth: usize,
+    overflow: &impl Fn() -> crate::error::Error,
+) -> crate::error::Result<u64> {
+    use crate::error::Error;
+
+    let malformed = || Error::Corrupt("invalid vocabulary triple-term key".into());
+    if depth > crate::nesting::MAX_TRIPLE_TERMS {
+        return Err(malformed());
+    }
+    if key.first() != Some(&b'(') {
+        // UTF-8 text is copied into String. The fixed allowance covers
+        // a datatype/language string, blank-node formatting and string construction.
+        // A damaged key's lossy UTF-8 route can expand each byte to three bytes.
+        let bytes = (key.len() as u64).checked_mul(3).ok_or_else(overflow)?;
+        // Literal separators and blank-node binary IDs are not UTF-8 text.
+        let mut overlap = 64u64;
+        let valid = match key.first() {
+            Some(b'"') => {
+                let sep = key.iter().rposition(|&b| b == KEY_SEP).unwrap_or(key.len());
+                let suffix = key.get(sep + 1..).unwrap_or(&[]);
+                if suffix.first() == Some(&b'@') {
+                    // lang_literal borrows a temporary decoded tag while oxrdf
+                    // copies that tag into its final owned String.
+                    let tag = &suffix[1..];
+                    let copies = if std::str::from_utf8(tag).is_ok() {
+                        1
+                    } else {
+                        3
+                    };
+                    overlap = overlap
+                        .checked_add(
+                            (tag.len() as u64)
+                                .checked_mul(copies)
+                                .ok_or_else(overflow)?,
+                        )
+                        .ok_or_else(overflow)?;
+                }
+                std::str::from_utf8(&key[1..sep]).is_ok() && std::str::from_utf8(suffix).is_ok()
+            }
+            Some(b'_') => true,
+            _ => std::str::from_utf8(key).is_ok(),
+        };
+        return (if valid { key.len() as u64 } else { bytes })
+            .checked_add(overlap)
+            .ok_or_else(overflow);
+    }
+    let mut bytes =
+        (3 * std::mem::size_of::<Term>()) as u64 + std::mem::size_of::<oxrdf::Triple>() as u64;
+    let mut pos = 1usize;
+    for _ in 0..3 {
+        // Only existing three-component headers are walked, without allocation.
+        // Invalid lengths are corruption; they are not relabeled budget failures.
+        let mut len = 0u64;
+        let mut shift = 0;
+        loop {
+            let next = *key.get(pos).ok_or_else(malformed)?;
+            pos += 1;
+            if shift == 63 && next > 1 {
+                return Err(malformed());
+            }
+            len |= u64::from(next & 127)
+                .checked_shl(shift)
+                .ok_or_else(malformed)?;
+            if next & 128 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 64 {
+                return Err(malformed());
+            }
+        }
+        let len = usize::try_from(len).map_err(|_| malformed())?;
+        let end = pos.checked_add(len).ok_or_else(malformed)?;
+        let part = key.get(pos..end).ok_or_else(malformed)?;
+        bytes = bytes
+            .checked_add(key_decode_bytes_inner(part, depth + 1, overflow)?)
+            .ok_or_else(overflow)?;
+        pos = end;
+    }
+    if pos != key.len() {
+        return Err(malformed());
+    }
+    Ok(bytes)
+}
+
 /// Parse a vocabulary key back into a term.
 pub fn key_to_term(key: &[u8]) -> Term {
     match key.first() {
