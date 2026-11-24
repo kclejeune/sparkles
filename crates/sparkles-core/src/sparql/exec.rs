@@ -10294,6 +10294,7 @@ mod string_order_tests {
             "\"5\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_string(),
             "\"ab\"@en".to_string(),
             "<urn:iri>".to_string(),
+            "\"a\"^^<urn:datatype>".to_string(),
             format!("\"{long}\""),
         ];
         for (k, v) in extra.iter().enumerate() {
@@ -10333,6 +10334,16 @@ mod string_order_tests {
                 .unwrap(),
         );
         ids.push(
+            snap.lookup_term(
+                &oxrdf::Literal::new_typed_literal(
+                    "a",
+                    oxrdf::NamedNode::new("urn:datatype").unwrap(),
+                )
+                .into(),
+            )
+            .unwrap(),
+        );
+        ids.push(
             snap.lookup_term(&oxrdf::Literal::new_simple_literal(long).into())
                 .unwrap(),
         );
@@ -10358,6 +10369,8 @@ mod string_order_tests {
             }
         }
         t.push_row(&[local, ids[1]]);
+        t.push_row(&[Id::UNDEF, ids[1]]);
+        t.push_row(&[ids[1], Id::UNDEF]);
         (t, x, y)
     }
 
@@ -10391,6 +10404,62 @@ mod string_order_tests {
             }
             assert_eq!(masks[0], masks[1], "{op:?}");
         }
+    }
+
+    #[test]
+    fn floor_masks_match_direct_comparison_at_low_reuse() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let (s, ids) = word_store(2 * rows);
+        for cursor in [false, true] {
+            for distinct_pairs in [rows - rows / 8, rows] {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 64 << 20;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let mut t = Table::new(vec![x, y]);
+                for i in 0..rows {
+                    let pair = i % distinct_pairs;
+                    t.push_row(&ids[2 * pair..2 * pair + 2]);
+                }
+                let e = cmp(x, y, CmpOp::Lt);
+                let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .expect("the floors apply");
+                let direct = evaluate_mask(&ctx, &t, &[e], None).unwrap();
+                assert_eq!(
+                    mask, direct,
+                    "cursor {cursor}, {distinct_pairs} distinct pairs"
+                );
+                assert!(ctx.check().is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_floor_mask_polls_cancellation_after_decoding_starts() {
+        use super::super::expr::CmpOp;
+        let (s, ids) = store("long");
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.mem_limit = 64 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let (t, x, y) = product(&ctx, &ids);
+        let e = cmp(x, y, CmpOp::Lt);
+        let cancel = ctx.cancel.clone();
+        crate::algo::set_projection_observer(Some(std::sync::Arc::new(move |event| {
+            if let crate::algo::ProjectionEvent::Materialized(
+                "checked-vocab-scratch-allocated",
+                _,
+            ) = event
+            {
+                cancel.store(true, AtomicOrdering::Relaxed);
+            }
+        })));
+        let result = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+        crate::algo::set_projection_observer(None);
+        assert!(matches!(result, Err(Error::Cancelled)));
     }
 
     /// The floor of every word is the first id whose key starts with its lexical form, in
@@ -10997,6 +11066,55 @@ mod string_order_tests {
                 assert!(ctx.check().is_ok(), "{len} cursor {cursor}");
             }
         }
+    }
+
+    #[test]
+    fn a_short_floor_after_an_unrelated_long_key_fits_the_cursor_budget() {
+        use super::super::expr::CmpOp;
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            format!(
+                "<urn:s:0> <urn:p> \"a{}\" .\n<urn:s:1> <urn:p> \"b\" .\n<urn:s:2> <urn:p> \"c\" .\n",
+                "é".repeat(8192)
+            )
+            .into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let id = |word| {
+            snap.lookup_term(&oxrdf::Literal::new_simple_literal(word).into())
+                .unwrap()
+        };
+        let (b, c) = (id("b"), id("c"));
+        assert!(!(b.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+        let mut ctx = Ctx::new(snap);
+        ctx.mem_limit = 64 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let (x, y) = (ctx.var("x"), ctx.var("y"));
+        let mut t = Table::new(vec![x, y]);
+        for _ in 0..STRING_ORDER_ROWS {
+            t.push_row(&[b, c]);
+        }
+        // On one worker this admits short keys while refusing the long predecessor.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let _held = ctx
+            .charge(ctx.mem_limit - ctx.live_bytes() - (8 << 10))
+            .unwrap();
+        pool.install(|| {
+            let e = cmp(x, y, CmpOp::Lt);
+            let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("the floors apply");
+            let direct = evaluate_mask(&ctx, &t, &[e], None).unwrap();
+            assert_eq!(mask, direct);
+            assert!(mask.iter().all(|&keep| keep));
+            assert!(ctx.check().is_ok());
+        });
     }
 
     /// The strings of the growth tests: `n` distinct words, each the object of one subject.

@@ -229,9 +229,9 @@ impl ValueCache {
 /// (see [`FloorCache::cap`]).
 const FLOOR_CACHE_BYTES: u64 = 64 << 20;
 
-/// The most reconstruction a cursor's walk of a key and the key before it admits (see
-/// [`Ctx::with_vocab_key_prev`]).
-const PAIR_WALK_BYTES: usize = 4096;
+/// The most reconstruction a cursor's floor lookup admits on its first attempt (see
+/// [`Ctx::with_vocab_key_prefix`]).
+const FLOOR_WALK_BYTES: usize = 4096;
 
 /// The slots of the floor table a query starts with, 512 KiB of words.
 const FLOOR_TABLE_FIRST: usize = 1 << 16;
@@ -3421,7 +3421,7 @@ impl Ctx {
     /// is below `b`'s floor, since the keys between `b`'s floor and `b` all start with
     /// `b`'s lexical form.
     ///
-    /// Both keys it reads and the search for the floor decode inside the envelope
+    /// Key reconstruction and the search for the floor use the decoding envelope
     /// ([`Ctx::reserve_decode`]), so a cursor reserves them on the ledger. A refusal
     /// records a failure, which the next check reports, and gives `None`.
     pub(super) fn string_floor(&self, id: Id) -> Option<u64> {
@@ -3433,16 +3433,15 @@ impl Ctx {
         if p >= v.first_triple() {
             return None;
         }
-        self.with_vocab_key_prev(p, |prev, key| {
+        self.with_vocab_key_prefix(p, |shared, key| {
             if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
                 return None;
             }
             let prefix = &key[..key.len() - 1];
-            // Most strings extend none, which the key before them shows by not starting
-            // with them. That key comes from the same walk of the block, or is read on its
-            // own when it starts a block or is long.
-            let extended = match prev {
-                Some(k) => k.starts_with(prefix),
+            // Within a block, the stored common prefix tells whether the preceding
+            // key extends this simple literal. Across blocks, compare the keys.
+            let extended = match shared {
+                Some(len) => len >= prefix.len(),
                 None if p == 0 => false,
                 None => self.with_vocab_key(p - 1, |k| k.starts_with(prefix))?,
             };
@@ -3454,58 +3453,44 @@ impl Ctx {
         .flatten()
     }
 
-    /// `f(prev, key)` of the key of base vocabulary id `id` and, when the same walk of
-    /// its block gives it, the key before it
-    /// ([`crate::vocab::Vocab::get_with_prev`]), with both reconstructions and decodings
-    /// inside the envelope. A refusal records a failure and gives `None`.
-    ///
-    /// A cursor's walk admits at most [`PAIR_WALK_BYTES`] of reconstruction, and only what
-    /// the envelope grants. A longer key on the way, or one the envelope refuses, such as
-    /// a long string before a short language-tagged one that needs no floor, sends the
-    /// read to [`Ctx::with_vocab_key`] of `id` alone with `prev` `None`, so the key before
-    /// is reserved only when the caller reads it. An eager walk cannot be refused, so it
-    /// reads both keys in one walk whatever their length.
-    fn with_vocab_key_prev<T>(
+    /// Read a vocabulary key and, within its block, its common prefix length with
+    /// the preceding key. A cursor uses the decoding envelope for the walk. If the
+    /// walk exceeds its scratch cap or the envelope refuses it, read the key alone.
+    /// That read records any memory refusal, and the caller reads the preceding
+    /// key only if needed.
+    fn with_vocab_key_prefix<T>(
         &self,
         id: u64,
-        f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
+        f: impl FnOnce(Option<usize>, &[u8]) -> T,
     ) -> Option<T> {
-        let mut f = Some(f);
-        let mut decode = |prev: Option<&[u8]>, key: &[u8]| {
-            let longest = prev.map_or(0, <[u8]>::len).max(key.len());
-            if !self.reserve_decode(longest) {
-                return None;
-            }
-            f.take().map(|f| f(prev, key))
-        };
+        let vocab = &self.snap.generation.vocab;
         if !self.envelope_refuses() {
-            return self
-                .snap
-                .generation
-                .vocab
-                .get_with_prev(id, &mut decode)
+            let mut f = Some(f);
+            return vocab
+                .get_with_shared_prefix(id, |shared, key| {
+                    if !self.reserve_decode(key.len()) {
+                        return None;
+                    }
+                    f.take().map(|f| f(shared, key))
+                })
                 .flatten();
         }
-        // The walk is a shortcut, so a key on the way that is long or that the envelope
-        // refuses records nothing. The key alone is read instead, which records a refusal
-        // of its own reconstruction, and its caller reads the key before when it needs it.
-        let walked = self.snap.generation.vocab.get_with_prev_checked(
+        let mut f = Some(f);
+        let walked = vocab.get_with_shared_prefix_checked(
             id,
             |need| {
-                if need > PAIR_WALK_BYTES {
+                if need > FLOOR_WALK_BYTES {
                     return Err(());
                 }
                 self.reserve_decode_checked(need).map_err(|_| ())
             },
-            &mut decode,
+            |shared, key| f.take().map(|f| f(shared, key)),
         );
         match walked {
             Ok(found) => found.flatten(),
-            Err(()) => {
-                let mut f = f.take();
-                self.with_vocab_key(id, |key| f.take().map(|f| f(None, key)))
-                    .flatten()
-            }
+            Err(()) => self
+                .with_vocab_key(id, |key| f.take().map(|f| f(None, key)))
+                .flatten(),
         }
     }
 

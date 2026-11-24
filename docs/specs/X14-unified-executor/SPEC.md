@@ -257,10 +257,9 @@ the floors it evicted that had been read again reaches a thirty-second of its sl
 inputs whose strings rarely repeat keep it. Each table is charged to the query before it is allocated, inside
 the spill threshold, and the cache holds at most 64 MiB or a sixteenth of the query's
 memory budget. This memory buys the speed below, and a table that the budget refuses
-leaves the floors the cache lacks to be computed each time. A cursor reads a key and the key before it in one walk of their block when
-that walk admits at most 4 KiB and the envelope grants it, and otherwise reads the key
-alone. A cursor batch spreads its floor comparison over the pool as the generic filter
-does. The bounded-reads test counts every read of the mode, seven in all.
+leaves the floors the cache lacks to be computed each time. A cursor batch spreads its
+floor comparison over the pool as the generic filter does. The bounded-reads test
+counts every read of the mode, seven in all.
 
 Forge measured 3a8b7adb, the build with the shared table, against c0948014, the build
 before item 1069, with 1.05M triples in five A,B,B,A rounds of ten requests per cell, and
@@ -291,10 +290,13 @@ shuffled order the first 4,096 rows of `str-pair-names` repeat as few values as
 names query's 2x. A profile of the per-worker maps put most of the floors' time in
 `Ctx::with_vocab_key_prev` and `Vocab::get_with_prev_checked`, which read the key and its
 predecessor. The shared table has not been profiled, so that read is the suspected cause
-of its cost, and item 1088 recovers the streaming cost. Its first candidate admits and allocates
-the checked walk's key buffer before the walk instead of growing it from empty and reads the
-predecessor without the copy that `PrevKey::keep` makes, keeping the checked envelope and
-its fallback.
+of its cost. Item 1088's implementation admits the checked walk's initial scratch before
+reconstruction. Both vocabulary codecs store the exact common prefix length between
+adjacent keys in a block. If that length covers the current key's lexical prefix, the
+preceding key extends it. The floor lookup uses that length directly. At a block boundary
+it reads the preceding key when needed. The cursor retains the 4 KiB cap and retries
+an oversized or refused walk as a single-key read under the decoding envelope. The
+shared table still serves every eligible mask. The timing comparison is pending.
 
 Queries that the floors do not reach also became slower in every round, and item 1089
 holds these costs. The 37-query screens compared 174de1f8, before the shared table, with
@@ -932,11 +934,12 @@ row of the table before it starts, which is more than the 12 bytes and one value
 decoded row that the separate large-input pre-decode admitted. Under a budget with little room left,
 a large column can therefore fall back to its rows where it was decoded before, which
 costs time but no correctness. The comparison of two string columns through cached
-lexicographic floors serves eager tables and cursor batches of at least 4,096 rows. A floor reads its
-string's key, the key before it and, for a string that other strings extend, the search
-for the first of them inside the decoding envelope, and a refused read fails the
-comparison with the refusal it recorded. The floors last the query in a charged cache,
-which the batches of a cursor share.
+lexicographic floors serves eager tables and cursor batches of at least 4,096 rows. A floor
+uses the string's key and its shared prefix length within the block. When that length is
+unavailable, it reads the preceding key. If the preceding key extends the string, the
+lookup searches for the first extension. These reads use the decoding envelope, and a
+refused required read fails the comparison with the refusal it recorded. The floors last
+the query in a charged cache, which the batches of a cursor share.
 
 A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
 reads of the accounting mode outside tests and fails above its bound. A read is a call of

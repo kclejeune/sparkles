@@ -38,46 +38,6 @@ const FSST_ROOM: usize = 64;
 /// Every key of a front-coded block, as a mask of [`Vocab::decode_block`].
 const ALL_KEYS: u32 = (1 << FC_BLOCK) - 1;
 
-/// The longest key before another that [`Vocab::get_with_prev`] copies to the stack.
-pub(crate) const PREV_KEY_BYTES: usize = 96;
-
-/// The keys [`Vocab::get_with_prev`] decodes from a block: the `want`-th and the one
-/// before it, when that one is in the block.
-#[inline(always)]
-fn prev_mask(want: usize) -> u32 {
-    if want == 0 { 1 } else { 3 << (want - 1) }
-}
-
-/// A copy of the key before another, when it fits in [`PREV_KEY_BYTES`].
-struct PrevKey {
-    bytes: [u8; PREV_KEY_BYTES],
-    len: Option<usize>,
-}
-
-impl Default for PrevKey {
-    fn default() -> Self {
-        Self {
-            bytes: [0; PREV_KEY_BYTES],
-            len: None,
-        }
-    }
-}
-
-impl PrevKey {
-    #[inline(always)]
-    fn keep(&mut self, key: &[u8]) {
-        self.len = (key.len() <= PREV_KEY_BYTES).then(|| {
-            self.bytes[..key.len()].copy_from_slice(key);
-            key.len()
-        });
-    }
-
-    #[inline(always)]
-    fn get(&self) -> Option<&[u8]> {
-        self.len.map(|n| &self.bytes[..n])
-    }
-}
-
 /// How many bytes of key `i` of a front-coded block a decode of the keys in `wanted`
 /// (a bit per key) needs, given the entry after it: all of a wanted key
 /// (`usize::MAX`), and of another key the bytes that the next key takes from it, its
@@ -952,8 +912,9 @@ impl Vocab {
         b: usize,
         wanted: u32,
         key: &mut Vec<u8>,
-        f: impl FnMut(usize, &[u8]) -> bool,
+        mut f: impl FnMut(usize, &[u8]) -> bool,
     ) {
+        let f = |i, _, key: &[u8]| f(i, key);
         if self.fsst.is_some() {
             self.decode_block_as::<P, true>(b, wanted, key, f)
         } else {
@@ -970,7 +931,7 @@ impl Vocab {
         b: usize,
         wanted: u32,
         key: &mut Vec<u8>,
-        mut f: impl FnMut(usize, &[u8]) -> bool,
+        mut f: impl FnMut(usize, usize, &[u8]) -> bool,
     ) {
         key.clear();
         let data = self.data.as_slice();
@@ -992,7 +953,7 @@ impl Vocab {
                 let e = self.entry::<F>(data, &mut pos, i == 0);
                 key.truncate(e.shared);
                 self.push_suffix::<F>(data, e, (start + i) as u64, usize::MAX, key, false);
-                if wanted >> i & 1 == 1 && !f(i, key) {
+                if wanted >> i & 1 == 1 && !f(i, e.shared, key) {
                     return;
                 }
             }
@@ -1003,7 +964,7 @@ impl Vocab {
             let next = (i < last).then(|| self.entry::<F>(data, &mut pos, false));
             let need = lookahead(wanted, i, next);
             self.step::<F>(data, cur, (start + i) as u64, need, key, false);
-            if wanted >> i & 1 == 1 && !f(i, key) {
+            if wanted >> i & 1 == 1 && !f(i, cur.shared, key) {
                 return;
             }
             if let Some(e) = next {
@@ -1093,7 +1054,18 @@ impl Vocab {
 
     /// Decode a key while its block scratch is borrowed, avoiding an intermediate
     /// owned key when the caller immediately converts it to another owned value.
-    pub(crate) fn get_with<T>(&self, id: u64, f: impl FnMut(&[u8]) -> T) -> Option<T> {
+    pub(crate) fn get_with<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
+        self.get_with_shared_prefix(id, |_, key| f(key))
+    }
+
+    /// Decode a key with the length of its common prefix with the preceding key.
+    /// Both vocabulary codecs store that length for keys after the first in a block.
+    /// For the first key of a block, the prefix length is unknown.
+    pub(crate) fn get_with_shared_prefix<T>(
+        &self,
+        id: u64,
+        f: impl FnMut(Option<usize>, &[u8]) -> T,
+    ) -> Option<T> {
         if id >= self.len {
             return None;
         }
@@ -1107,57 +1079,35 @@ impl Vocab {
         }
     }
 
-    /// `f(prev, key)` of the key of `id` and the key of `id - 1`, decoded in one walk of
-    /// `id`'s front-coded block. `prev` is `None` when `id` is the first key of its block
-    /// or the key before it is longer than [`PREV_KEY_BYTES`], and the caller reads that
-    /// key on its own. The key before is copied to the stack before the walk overwrites
-    /// it, which costs less than a second walk of the block.
-    pub(crate) fn get_with_prev<T>(
-        &self,
-        id: u64,
-        f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
-    ) -> Option<T> {
-        if id >= self.len {
-            return None;
-        }
-        if ioacct::profiling() {
-            let _t = ioacct::timer(Phase::VocabRead);
-            self.get_with_prev_at::<true, T>(id, f)
-        } else {
-            self.get_with_prev_at::<false, T>(id, f)
-        }
-    }
-
     #[inline(always)]
-    fn get_with_prev_at<const P: bool, T>(
+    fn get_with_at<const P: bool, T>(
         &self,
         id: u64,
-        f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
+        mut f: impl FnMut(Option<usize>, &[u8]) -> T,
     ) -> Option<T> {
         let b = (id as usize) / FC_BLOCK;
         let want = (id as usize) % FC_BLOCK;
-        let mut prev = PrevKey::default();
-        let mut f = Some(f);
         let mut out = None;
         let mut key = Vec::with_capacity(self.scratch_capacity());
-        self.decode_block::<P>(b, prev_mask(want), &mut key, |i, k| {
-            if i < want {
-                prev.keep(k);
-                return true;
-            }
-            out = f.take().map(|f| f(prev.get(), k));
+        let read = |_, shared, key: &[u8]| {
+            out = Some(f((want != 0).then_some(shared), key));
             false
-        });
+        };
+        if self.fsst.is_some() {
+            self.decode_block_as::<P, true>(b, 1 << want, &mut key, read);
+        } else {
+            self.decode_block_as::<P, false>(b, 1 << want, &mut key, read);
+        }
         out
     }
 
-    /// [`Vocab::get_with_prev`] with every growth of the reconstruction buffer admitted
-    /// by `reserve` first, as [`Vocab::get_with_checked`] admits it.
-    pub(crate) fn get_with_prev_checked<T, E>(
+    /// [`Vocab::get_with_shared_prefix`] with scratch admitted before the walk and
+    /// every subsequent growth admitted before allocation.
+    pub(crate) fn get_with_shared_prefix_checked<T, E>(
         &self,
         id: u64,
         mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
-        f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
+        f: impl FnOnce(Option<usize>, &[u8]) -> T,
     ) -> std::result::Result<Option<T>, E> {
         if id >= self.len {
             return Ok(None);
@@ -1165,39 +1115,22 @@ impl Vocab {
         let _t = ioacct::timer(Phase::VocabRead);
         let b = (id as usize) / FC_BLOCK;
         let want = (id as usize) % FC_BLOCK;
-        let mut prev = PrevKey::default();
-        let mut f = Some(f);
-        let mut out = None;
-        let mut each = |at: u64, k: &[u8]| {
-            if (at as usize) % FC_BLOCK < want {
-                prev.keep(k);
-            } else {
-                out = f.take().map(|f| f(prev.get(), k));
-            }
-            Ok(())
-        };
-        let mut key = Vec::new();
-        let mask = prev_mask(want);
-        if self.fsst.is_some() {
-            self.checked_block::<true, false, E>(b, mask, &mut key, &mut reserve, &mut each)?;
+        let capacity = self.scratch_capacity();
+        reserve(capacity)?;
+        let mut key = Vec::with_capacity(capacity);
+        #[cfg(any(test, feature = "failpoints"))]
+        crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
+            "checked-vocab-scratch-allocated",
+            key.capacity(),
+        ));
+        let mut ignore = |_, _: &[u8]| Ok(());
+        let mask = 1 << want;
+        let shared = if self.fsst.is_some() {
+            self.checked_block::<true, false, E>(b, mask, &mut key, &mut reserve, &mut ignore)?
         } else {
-            self.checked_block::<false, false, E>(b, mask, &mut key, &mut reserve, &mut each)?;
-        }
-        Ok(out)
-    }
-
-    #[inline(always)]
-    fn get_with_at<const P: bool, T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
-        let b = (id as usize) / FC_BLOCK;
-        let want = (id as usize) % FC_BLOCK;
-        let mut out = None;
-        // Single-key callers own this fresh buffer throughout their scan.
-        let mut key = Vec::with_capacity(self.scratch_capacity());
-        self.decode_block::<P>(b, 1 << want, &mut key, |_, k| {
-            out = Some(f(k));
-            false
-        });
-        out
+            self.checked_block::<false, false, E>(b, mask, &mut key, &mut reserve, &mut ignore)?
+        };
+        Ok(Some(f((want != 0).then_some(shared), &key)))
     }
 
     /// Decode many ids (sorted ascending, deduplicated), touching each front-coded
@@ -1323,7 +1256,8 @@ impl Vocab {
     }
 
     /// The checked reconstruction of the keys of block `b` whose bits are set in the
-    /// nonempty `mask`, which holds only keys of the block.
+    /// nonempty `mask`, which holds only keys of the block. Returns the last key's
+    /// common prefix length with its predecessor within the block.
     #[inline(always)]
     fn checked_block<const F: bool, const ROOM: bool, E>(
         &self,
@@ -1332,7 +1266,7 @@ impl Vocab {
         key: &mut Vec<u8>,
         reserve: &mut impl FnMut(usize) -> std::result::Result<(), E>,
         f: &mut impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
-    ) -> std::result::Result<(), E> {
+    ) -> std::result::Result<usize, E> {
         let data = self.data.as_slice();
         let last = 31 - mask.leading_zeros() as usize;
         let mut pos = self.block_offset(b);
@@ -1377,7 +1311,7 @@ impl Vocab {
                     e = n;
                 }
             }
-            return Ok(());
+            return Ok(e.shared);
         }
         for at in 0..=last {
             let id = (b * FC_BLOCK + at) as u64;
@@ -1419,7 +1353,7 @@ impl Vocab {
                 e = n;
             }
         }
-        Ok(())
+        Ok(e.shared)
     }
 
     /// Decode one key after `reserve` admits reconstruction capacity, including
@@ -4695,14 +4629,11 @@ mod tests {
         }
     }
 
-    /// Every key read with the key before it gives both keys, in both codecs and on both
-    /// paths, and gives no key before it only at a block's first key or past
-    /// [`PREV_KEY_BYTES`].
     #[test]
-    fn a_key_read_with_the_one_before_it_gives_both() {
-        let mut keys: Vec<Vec<u8>> = Vec::new();
+    fn shared_prefix_matches_the_preceding_key_in_both_codecs() {
+        let mut keys = Vec::new();
         for i in 0..300u32 {
-            let long = "y".repeat(if i % 11 == 0 {
+            let long = "é".repeat(if i % 11 == 0 {
                 120
             } else {
                 (i % 5 * 7) as usize
@@ -4717,25 +4648,64 @@ mod tests {
             write_codec(dir.path(), &keys, fsst);
             let v = Vocab::open(dir.path()).unwrap();
             assert_eq!(v.is_fsst(), fsst);
-            let mut skipped = 0;
-            for id in 0..keys.len() as u64 {
-                let expect = |prev: Option<&[u8]>, key: &[u8]| {
-                    assert_eq!(key, keys[id as usize], "fsst {fsst} id {id}");
-                    let i = id as usize;
-                    let alone = i.is_multiple_of(FC_BLOCK) || keys[i - 1].len() > PREV_KEY_BYTES;
-                    match prev {
-                        Some(prev) => assert_eq!(prev, keys[i - 1], "fsst {fsst} id {id}"),
-                        None => assert!(alone, "fsst {fsst} id {id}"),
-                    }
-                    usize::from(prev.is_none() && !i.is_multiple_of(FC_BLOCK))
+            for (i, expected) in keys.iter().enumerate() {
+                let shared = (!i.is_multiple_of(FC_BLOCK)).then(|| {
+                    keys[i - 1]
+                        .iter()
+                        .zip(expected)
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                });
+                let check = |prefix: Option<usize>, key: &[u8]| {
+                    assert_eq!(key, expected, "fsst {fsst} id {i}");
+                    assert_eq!(prefix, shared, "fsst {fsst} id {i}");
                 };
-                skipped += v.get_with_prev(id, expect).unwrap();
-                v.get_with_prev_checked::<_, ()>(id, |_| Ok(()), expect)
-                    .unwrap()
-                    .unwrap();
+                assert_eq!(v.get_with_shared_prefix(i as u64, check), Some(()));
+                assert_eq!(
+                    v.get_with_shared_prefix_checked(i as u64, |_| Ok::<_, ()>(()), check),
+                    Ok(Some(()))
+                );
             }
-            assert!(skipped > 0, "a long key before another is read on its own");
-            assert!(v.get_with_prev(keys.len() as u64, |_, _| ()).is_none());
+        }
+    }
+
+    #[test]
+    fn checked_shared_prefix_lookup_admits_scratch_without_reading_a_long_suffix() {
+        let keys = [
+            format!("<aa{}>", "é".repeat(4096)).into_bytes(),
+            b"<ab>".to_vec(),
+        ];
+        for fsst in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_codec(dir.path(), &keys, fsst);
+            let v = Vocab::open(dir.path()).unwrap();
+            let cap = v.scratch_capacity();
+            let mut admissions = Vec::new();
+            let result = v.get_with_shared_prefix_checked(
+                1,
+                |need| {
+                    admissions.push(need);
+                    if need <= cap { Ok(()) } else { Err(need) }
+                },
+                |shared, key| {
+                    assert_eq!(key, keys[1]);
+                    assert_eq!(shared, Some(2));
+                },
+            );
+            assert_eq!(result, Ok(Some(())));
+            assert_eq!(admissions, [cap]);
+            assert_eq!(
+                v.get_with_shared_prefix_checked(1, Err, |_, _| panic!("initial scratch refused")),
+                Err(cap)
+            );
+            assert_eq!(
+                v.get_with_shared_prefix_checked(
+                    0,
+                    |need| if need <= cap { Ok(()) } else { Err(need) },
+                    |_, _| panic!("scratch growth refused"),
+                ),
+                Err(keys[0].len())
+            );
         }
     }
 
