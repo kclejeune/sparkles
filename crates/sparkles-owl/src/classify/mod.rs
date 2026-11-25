@@ -6970,11 +6970,44 @@ impl Saturation {
         let ix = Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(halt)?;
         self.interner.dt_run = None;
         self.interner.end_run();
-        let mut excluded: Vec<Excluded> = Vec::new();
+        let outside = outside.iter().filter(|(i, _)| !taken.contains(axioms[*i]));
+        let (entries, report_bytes) =
+            outside
+                .clone()
+                .map(|(i, (rule, message))| (axioms[*i], rule.len().saturating_add(message.len())))
+                .chain(chain_ranges.iter().filter(|(k, _)| !taken.contains(k)).map(
+                    |(k, message)| {
+                        (
+                            *k,
+                            CHAIN_RANGE_RULE.len().saturating_add(message.capacity()),
+                        )
+                    },
+                ))
+                .chain(partial.keys().map(|&k| (k, 0)))
+                .fold((0, 0usize), |(entries, bytes), (k, diagnostic)| {
+                    (
+                        entries + 1,
+                        bytes
+                            .saturating_add(std::mem::size_of::<Excluded>())
+                            .saturating_add(dl_reduce::axiom_retained_heap_bytes(k))
+                            .saturating_add(diagnostic),
+                    )
+                });
+        if entries != 0 {
+            // The old report is in the build floor until the replacement is ready.
+            // Admit every entry before cloning, including duplicates removed below.
+            let budget = self.interner.ranges.budget.as_ref().expect("build budget");
+            budget.baseline(
+                self.interner
+                    .bytes()
+                    .saturating_add(self.merge_extra_bytes())
+                    .saturating_add(ax.bytes())
+                    .saturating_add(ix.bytes())
+                    .saturating_add(report_bytes),
+            )?;
+        }
+        let mut excluded = Vec::with_capacity(entries);
         for (i, (rule, message)) in outside {
-            if taken.contains(axioms[*i]) {
-                continue;
-            }
             excluded.push(Excluded {
                 axiom: axioms[*i].clone(),
                 gap: Gap::Outside {
@@ -7001,7 +7034,7 @@ impl Saturation {
                 gap: Gap::Partial(why),
             });
         }
-        excluded.sort();
+        excluded.sort_unstable();
         excluded.dedup();
         self.excluded = excluded;
         outside_el.taken = taken.len();
@@ -7161,6 +7194,7 @@ impl Saturation {
                             charge: Self::charge_drawing_on(limits, admitted),
                             ..limits.clone()
                         };
+                        let prior_report = self.excluded.as_ptr();
                         let r = self.run_once(
                             &all,
                             None,
@@ -7192,9 +7226,13 @@ impl Saturation {
                                 return Ok(r);
                             }
                             Err(e) => {
-                                // the report of a run that stopped still names the original
-                                // axioms
-                                red.restore(axioms, &mut self.excluded);
+                                // A refused build leaves the previous report in place.
+                                // The replacement has its own buffer while the old one
+                                // is live. After saturation the checker may grow that
+                                // buffer, and the completed index identifies that case.
+                                if self.index.is_some() || self.excluded.as_ptr() != prior_report {
+                                    red.restore(axioms, &mut self.excluded);
+                                }
                                 self.reduced = true;
                                 return Err(e);
                             }
@@ -9137,6 +9175,7 @@ impl Saturation {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<Ex>())
             + world_bytes
+            + excluded_copy_bytes(&self.excluded)
     }
 
     fn admit_retained(

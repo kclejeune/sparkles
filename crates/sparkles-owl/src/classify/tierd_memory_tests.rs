@@ -9215,6 +9215,135 @@ fn split_round4_declined_forked_plan_leaves_empty_interner() {
 }
 
 #[test]
+fn split_round5_replacement_exclusions_are_admitted_before_cloning() {
+    const IRI_BYTES: usize = 512 * 1024;
+    let old = axioms(&format!(
+        "IrreflexiveObjectProperty(:old_{})",
+        "o".repeat(IRI_BYTES)
+    ));
+    let new = axioms(&format!(
+        "IrreflexiveObjectProperty(:new_{})",
+        "n".repeat(IRI_BYTES)
+    ));
+    let old_refs = [&old[0].kind];
+    let new_refs = [&new[0].kind];
+    let limits = Limits {
+        el_only: true,
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    let old_peak = sat
+        .saturate(&old_refs, None, &limits)
+        .unwrap()
+        .stats
+        .peak_memory;
+    let new_peak = Saturation::new()
+        .saturate(&new_refs, None, &limits)
+        .unwrap()
+        .stats
+        .peak_memory;
+    let cap = old_peak.max(new_peak) + IRI_BYTES / 8;
+    assert!(cap < 2 * IRI_BYTES, "the cap must exclude two reports");
+    let bounded = Limits {
+        max_memory: Some(cap),
+        ..limits
+    };
+    Saturation::new()
+        .saturate(&old_refs, None, &bounded)
+        .unwrap();
+    let mut fresh = Saturation::new();
+    let (one_report, admitted) = measure(|| fresh.saturate(&new_refs, None, &bounded));
+    one_report.unwrap();
+
+    // A restarted build drops the old index and contexts but keeps the public report.
+    sat.reset_empty();
+    let (result, sample) = measure(|| sat.saturate(&new_refs, None, &bounded));
+    assert!(
+        matches!(result, Err(Error::Memory { limit, used }) if limit == cap && used > cap),
+        "replacement should exceed the cap, got {result:?}"
+    );
+    assert!(
+        sample.requested_alloc_bytes + IRI_BYTES <= admitted.requested_alloc_bytes,
+        "refused build allocated {} bytes versus {} with one report",
+        sample.requested_alloc_bytes,
+        admitted.requested_alloc_bytes
+    );
+    assert_eq!(sat.excluded().len(), 1);
+    assert!(sat.excluded()[0].axiom == *old_refs[0]);
+}
+
+#[test]
+fn split_round5_retained_exclusions_reduce_taxonomy_headroom() {
+    let input = axioms(&format!(
+        "SubClassOf(:D ObjectUnionOf(:E :F))
+         SubClassOf(:X ObjectOneOf(:b))
+         ClassAssertion(:X :a)
+         IrreflexiveObjectProperty(:irref_{})
+         ClassAssertion(:P :b)
+         SubClassOf(:A ObjectOneOf(:a))",
+        "m".repeat(512 * 1024)
+    ));
+    let refs: Vec<_> = input.iter().map(|a| &a.kind).collect();
+    let mut sat = Saturation::new();
+    let limits = Limits {
+        threads: 1,
+        rooted: true,
+        rooted_merge: true,
+        rooted_eq_split: true,
+        ..Limits::default()
+    };
+    let retained_at_exit = Arc::new(AtomicUsize::new(0));
+    let observed = retained_at_exit.clone();
+    let out = admission_test::with_attempt(
+        None,
+        false,
+        move |event| {
+            if let admission_test::Attempt::Retained { bytes, pending, .. } = event {
+                assert_eq!(pending, 0);
+                observed.store(bytes, Ordering::Relaxed);
+            }
+        },
+        || sat.classify(&refs, None, &limits).unwrap(),
+    );
+    assert!(out.stats.dl_rooted_restarts >= 1 && sat.index.is_some());
+    assert_eq!(sat.excluded().len(), 1);
+    let report_bytes = excluded_copy_bytes(&sat.excluded);
+    assert!(report_bytes > 512 * 1024);
+    let retained = sat.retained_bytes(0, 0, 0);
+    let report = std::mem::take(&mut sat.excluded);
+    let without_report = sat.retained_bytes(0, 0, 0);
+    sat.excluded = report;
+
+    let peak = std::cell::Cell::new(0);
+    let build = |budget: &dyn Fn(usize) -> bool| {
+        taxonomy::build(&sat, out.consistent, 1, false, &|| false, budget)
+    };
+    build(&|bytes| {
+        peak.set(peak.get().max(bytes));
+        true
+    })
+    .unwrap();
+    let cap = without_report + report_bytes.max(peak.get());
+    let paid = std::cell::Cell::new(retained);
+    let bounded = build(&Saturation::taxonomy_budget(
+        retained,
+        &paid,
+        Some(cap),
+        None,
+    ));
+    assert!(
+        matches!(bounded, Err(taxonomy::Halt::Memory(bytes)) if retained + bytes > cap),
+        "taxonomy should refuse the overlap with the exclusion report"
+    );
+    assert_eq!(retained, without_report + report_bytes);
+    assert_eq!(
+        out.stats.memory,
+        retained_at_exit.load(Ordering::Relaxed) + out.stats.taxonomy_memory
+    );
+}
+
+#[test]
 fn split_round4_ledger_covers_a_watermark_raising_fork() {
     use super::admission_test::{LedgerChargeSource, MergePhase, SplitAllocSite, with_merge_probe};
 
