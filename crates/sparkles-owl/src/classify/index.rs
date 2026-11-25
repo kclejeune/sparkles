@@ -2717,6 +2717,11 @@ impl Index {
         Some(changed)
     }
 
+    /// The bytes of the `Vec<bool>` returned by [`Index::changed`] for this `old` index.
+    pub fn changed_bytes(&self) -> usize {
+        self.heads.len()
+    }
+
     /// The bytes that [`Index::changed`] allocates for the comparison with `old`,
     /// roughly: a mark for each expression, the members of the disjointness sets of
     /// both indexes with their lists, their entries in the table that numbers them and

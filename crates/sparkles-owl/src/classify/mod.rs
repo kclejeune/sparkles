@@ -3877,6 +3877,10 @@ impl Saturation {
                 Ok(())
             };
             let ix_bytes = self.index_bytes_poll(&ix, &mut tick)?;
+            #[cfg(test)]
+            if reuse {
+                admission_test::hit(admission_test::Point::RebaseAccountAxiomsStart);
+            }
             let ax_bytes = ax.bytes_poll(&mut tick)?;
             #[cfg(test)]
             if reuse {
@@ -4042,19 +4046,26 @@ impl Saturation {
             let d = dynamic
                 .as_ref()
                 .expect("the contexts above the index's of a run that keeps them");
-            // the comparison holds both indexes beside the kept contexts and their
-            // clause table, with its marks and the set and the queue of the
-            // invalidation, which count against the budget as the kept state does; a
-            // run that passes it starts again in full (`run_with`)
-            let inv_scratch = (self.ctx.len() + d.len()) * 16;
-            let live_without_old = rebuilt_ix_bytes
+            // The comparison holds both indexes beside the kept contexts and their
+            // clause table; once `old` drops, invalidation holds `changed` (during the
+            // initial scan) plus `affected` and the slot-capped `queue`, including any
+            // growth overlap. Pre-admit the peak of both phases; a run that passes it
+            // starts again in full (`run_with`).
+            let slots = self.ctx.len() + d.len();
+            let inv_closure_peak = invalidation_scratch_peak(slots);
+            let live_base = rebuilt_ix_bytes
                 + held_bytes
                 + rebuilt_ax_bytes
                 + self.context_bytes()
                 + d.retained_bytes()
-                + dl_run.as_ref().map_or(0, |d| d.bytes())
-                + inv_scratch;
-            let held = live_without_old + old_ix_bytes + ix.changed_scratch(&old);
+                + dl_run.as_ref().map_or(0, |d| d.bytes());
+            let inv_peak = live_base
+                .saturating_add(old.changed_bytes())
+                .saturating_add(inv_closure_peak);
+            let held = live_base
+                .saturating_add(old_ix_bytes)
+                .saturating_add(ix.changed_scratch(&old))
+                .max(inv_peak);
             let more = held.saturating_sub(normalized_peak);
             if limits.max_memory.is_some_and(|m| held > m)
                 || limits
@@ -4089,7 +4100,7 @@ impl Saturation {
                 d,
                 renumbered,
                 limits,
-                live_without_old,
+                live_base,
                 &mut normalized_peak,
             )?;
             poll(limits)?;
@@ -5462,12 +5473,14 @@ impl Saturation {
         dynamic: &saturate::Dynamic,
         renumbered: bool,
         limits: &Limits,
-        live_without_old: usize,
+        live_base: usize,
         normalized_peak: &mut usize,
     ) -> Result<usize, Error> {
         let base = dynamic.base();
         let count = dynamic.len() as Ex;
         let ctx = &self.ctx;
+        let slots = ctx.len() + count as usize;
+        let closure_peak = invalidation_scratch_peak(slots);
         let ctx_of = |e: Ex| -> Option<&saturate::Ctx> {
             if e < base {
                 ctx.get(e as usize).and_then(|c| c.get()).map(|c| &**c)
@@ -5526,13 +5539,13 @@ impl Saturation {
                 hit = true;
             }
             if hit && affected.insert(e) {
-                queue.push(e);
+                push_capped(&mut queue, e, slots);
             }
         }
         #[cfg(test)]
         admission_test::hit(admission_test::Point::InvalidateInitialEnd);
         // `changed` is never read past the initial scan; free it before the BFS and any
-        // `renumbered` disjoint-map growth check so `live_without_old` stays exact.
+        // `renumbered` disjoint-map growth check so only `affected` and `queue` stay live.
         drop(changed);
         // every context with a link into an affected context is affected, as is every
         // context that registered with one as its predecessor, which took its clauses
@@ -5551,7 +5564,7 @@ impl Saturation {
                 }
                 for &s in &srcs.list {
                     if affected.insert(s) {
-                        queue.push(s);
+                        push_capped(&mut queue, s, slots);
                     }
                     tick(1)?;
                 }
@@ -5567,7 +5580,7 @@ impl Saturation {
                 }
                 for &(u, _) in &d.dpreds {
                     if affected.insert(u) {
-                        queue.push(u);
+                        push_capped(&mut queue, u, slots);
                     }
                     tick(1)?;
                 }
@@ -5582,11 +5595,37 @@ impl Saturation {
                 && let Some(x) = dl_rules::tested_class_poll(dynamic.core(e), &mut tick)?
                 && affected.insert(x)
             {
-                queue.push(x);
+                push_capped(&mut queue, x, slots);
             }
         }
         #[cfg(test)]
         admission_test::hit(admission_test::Point::InvalidateClosureEnd);
+        let affected_bytes =
+            dl_clause::hash_table_bytes(affected.capacity(), std::mem::size_of::<Ex>());
+        let queue_bytes = queue.capacity().saturating_mul(std::mem::size_of::<Ex>());
+        debug_assert!(
+            affected.len() <= slots && queue.capacity() <= slots,
+            "invalidation scratch exceeded slot count {slots}: affected={}, queue_cap={}",
+            affected.len(),
+            queue.capacity()
+        );
+        debug_assert!(
+            affected_bytes.saturating_add(queue_bytes) <= closure_peak,
+            "invalidation scratch ({affected_bytes} + {queue_bytes}) exceeded bound {closure_peak}"
+        );
+        #[cfg(test)]
+        admission_test::hit(admission_test::Point::InvalidateScratch {
+            slots,
+            affected_len: affected.len(),
+            affected_bytes,
+            queue_cap: queue.capacity(),
+            queue_bytes,
+            bound: closure_peak,
+            live_base,
+        });
+        // Release `queue` before any `renumbered` disjoint-map growth check so only
+        // `affected` stays live alongside `live_base`.
+        drop(queue);
         if renumbered {
             let mut maps = 0usize;
             for e in all.clone() {
@@ -5601,6 +5640,7 @@ impl Saturation {
                 }
             }
             if maps > 0 {
+                let live_without_old = live_base.saturating_add(affected_bytes);
                 let used = live_without_old.saturating_add(maps);
                 let more = used.saturating_sub(*normalized_peak);
                 #[cfg(test)]
@@ -5998,6 +6038,43 @@ impl Scratch<'_> {
         v.push(e);
         Ok(())
     }
+}
+
+/// Upper bound on peak live scratch bytes held by `affected: FxHashSet<Ex>` and the
+/// slot-capped `queue: Vec<Ex>` during [`Saturation::invalidate_changed`], including
+/// single-collection resize overlap (they never reallocate simultaneously).
+fn invalidation_scratch_peak(slots: usize) -> usize {
+    if slots == 0 {
+        return 0;
+    }
+    let ex = std::mem::size_of::<Ex>();
+    let affected_live = dl_clause::hash_table_bytes(slots, ex);
+    let affected_peak = dl_clause::hash_table_grow_bound(0, 0, slots, ex).unwrap_or(usize::MAX);
+    let queue_live = slots.saturating_mul(ex);
+    let queue_peak = if slots <= 4 {
+        queue_live
+    } else {
+        let prev = 1usize << (usize::BITS - 1 - (slots - 1).leading_zeros());
+        prev.saturating_add(slots).saturating_mul(ex)
+    };
+    affected_peak
+        .saturating_add(queue_live)
+        .max(affected_live.saturating_add(queue_peak))
+}
+
+/// Pushes `e` onto `queue`, doubling capacity on growth up to `max_len` so the backing
+/// buffer never overshoots the total number of context slots.
+#[inline]
+fn push_capped(queue: &mut Vec<Ex>, e: Ex, max_len: usize) {
+    if queue.len() == queue.capacity() {
+        let next = queue
+            .capacity()
+            .saturating_mul(2)
+            .max(4)
+            .min(max_len.max(queue.len().saturating_add(1)));
+        queue.reserve_exact(next - queue.len());
+    }
+    queue.push(e);
 }
 
 /// A set of expressions or contexts by id, one bit each, which the invalidation reads
@@ -9750,6 +9827,179 @@ mod tests {
         );
     }
 
+    /// Dense invalidation seeding above a queue capacity boundary (Item 753 Phase 1):
+    /// 1. `invalidation_scratch_peak` bounds both steady-state and single-collection resize
+    ///    overlap of `affected: FxHashSet<Ex>` and slot-capped `queue: Vec<Ex>` across
+    ///    power-of-two and 7/8 load-factor boundaries.
+    /// 2. With >8192 seeded contexts out of <16384 total slots and a renumbered disjointness
+    ///    edit, `queue` stays capped at `slots` (never doubling to 16384), `affected + queue`
+    ///    stays within the pre-admitted scratch bound, and `queue` is released before
+    ///    `DisjointGrowthAdmit` so only `affected` remains live alongside `live_base`.
+    #[test]
+    fn invalidate_changed_dense_seeds_stay_within_scratch_bound_and_release_queue() {
+        let ex = std::mem::size_of::<Ex>();
+        for slots in [
+            0usize, 1, 3, 4, 5, 7, 8, 15, 16, 7_168, 7_169, 8_192, 8_193, 8_200, 14_336, 14_337,
+            16_384, 16_385,
+        ] {
+            let bound = invalidation_scratch_peak(slots);
+            let mut affected: FxHashSet<Ex> = FxHashSet::default();
+            let mut queue: Vec<Ex> = Vec::new();
+            let mut peak = 0usize;
+            for i in 0..slots as Ex {
+                let old_a = dl_clause::hash_table_bytes(affected.capacity(), ex);
+                let q_cur = queue.capacity() * ex;
+                affected.insert(i);
+                let new_a = dl_clause::hash_table_bytes(affected.capacity(), ex);
+                let a_step = if new_a != old_a { old_a + new_a } else { new_a };
+                peak = peak.max(a_step + q_cur);
+
+                let old_q = queue.capacity() * ex;
+                push_capped(&mut queue, i, slots);
+                let new_q = queue.capacity() * ex;
+                let q_step = if new_q != old_q { old_q + new_q } else { new_q };
+                peak = peak.max(new_a + q_step);
+            }
+            assert_eq!(queue.capacity(), slots, "slots={slots}");
+            assert!(
+                peak <= bound,
+                "slots={slots}: resize peak {peak} exceeded bound {bound}"
+            );
+            let live = dl_clause::hash_table_bytes(affected.capacity(), ex) + queue.capacity() * ex;
+            assert!(
+                live <= bound,
+                "slots={slots}: live scratch {live} exceeded bound {bound}"
+            );
+        }
+
+        let eager = Limits {
+            threads: 1,
+            expansion: Expansion::Eager,
+            ..Limits::default()
+        };
+        let parse = |body: &str| {
+            crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
+                .unwrap()
+                .axioms
+        };
+
+        // >8192 seeded classes (:S0..:S8199 -> :Seed) plus a small kept disjoint cluster
+        // (:Keep0..:Keep3 -> :Hub -> :DA{j} disjoint :DB{j}) so `slots` sits just above 8192
+        // (well below 16384), `affected.len() >= 8200`, and a renumbered disjoint edit triggers
+        // `DisjointGrowthAdmit` right after closure.
+        let mut body = String::from(
+            "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\nSubClassOf(:Q :R)\n",
+        );
+        for i in 0..8_200usize {
+            body.push_str(&format!("SubClassOf(:S{i} :Seed)\n"));
+        }
+        for j in 0..32usize {
+            body.push_str(&format!(
+                "SubClassOf(:Hub :DA{j})\nDisjointClasses(:DA{j} :DB{j})\n"
+            ));
+        }
+        for k in 0..4usize {
+            body.push_str(&format!("SubClassOf(:Keep{k} :Hub)\n"));
+        }
+        let base = parse(&body);
+        let edit = parse("SubClassOf(:Seed :Target)\nDisjointClasses(:DZ0 :DZ1)\n");
+
+        let mut k = Classifier::of(&base);
+        let first = k.classify(&eager).unwrap();
+        assert_eq!(first.stats.tier, Tier::Disjunctive);
+        // Shrink `:Keep{k}` disjointness maps to 1 entry so `reindex_disjoint` must grow them
+        // and reach `DisjointGrowthAdmit`.
+        for idx in 0..4usize {
+            let iri = format!("http://ex.org/Keep{idx}");
+            let id = k
+                .sat
+                .interner
+                .get(&Node::Class(
+                    k.sat
+                        .interner
+                        .classes
+                        .iter()
+                        .position(|c| c.as_str() == iri)
+                        .unwrap() as u32,
+                ))
+                .unwrap();
+            let ctx = k.sat.ctx[id as usize].get().unwrap();
+            let mut st = ctx.st.lock();
+            let (&first_key, &first_val) = st.disj.iter().next().unwrap();
+            st.disj = FxHashMap::default();
+            st.disj.insert(first_key, first_val);
+            assert!(st.disj.capacity() < 32);
+        }
+        k.add(&edit);
+
+        let scratch_obs = Arc::new(parking_lot::Mutex::new(
+            None::<(usize, usize, usize, usize, usize, usize, usize)>,
+        ));
+        let admit_obs = Arc::new(parking_lot::Mutex::new(None::<(usize, usize, usize)>));
+        let so = scratch_obs.clone();
+        let ao = admit_obs.clone();
+        let out = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::InvalidateScratch {
+                    slots,
+                    affected_len,
+                    affected_bytes,
+                    queue_cap,
+                    queue_bytes,
+                    bound,
+                    live_base,
+                } => {
+                    *so.lock() = Some((
+                        slots,
+                        affected_len,
+                        affected_bytes,
+                        queue_cap,
+                        queue_bytes,
+                        bound,
+                        live_base,
+                    ));
+                }
+                admission_test::Point::DisjointGrowthAdmit { live, growth, paid } => {
+                    *ao.lock() = Some((live, growth, paid));
+                }
+                _ => {}
+            },
+            || k.classify(&eager).unwrap(),
+        );
+        assert!(out.stats.incremental);
+        assert!(out.stats.cleared >= 8_200);
+
+        let (slots, affected_len, affected_bytes, queue_cap, queue_bytes, bound, live_base) =
+            scratch_obs
+                .lock()
+                .expect("InvalidateScratch was not observed");
+        assert!(
+            affected_len > 8_192 && slots < 16_384,
+            "expected >8192 seeds in <16384 slots, got affected_len={affected_len}, slots={slots}"
+        );
+        assert!(
+            queue_cap <= slots && queue_cap < 16_384,
+            "queue overshot slot bound: queue_cap={queue_cap}, slots={slots}"
+        );
+        assert!(
+            affected_bytes + queue_bytes <= bound,
+            "live invalidation scratch ({affected_bytes} + {queue_bytes}) exceeded bound {bound}"
+        );
+
+        let (admit_live, admit_growth, _) = admit_obs
+            .lock()
+            .expect("DisjointGrowthAdmit was not observed");
+        assert!(admit_growth > 0);
+        // `queue` is dropped before `DisjointGrowthAdmit`, so live memory equals `live_base`
+        // plus `affected`'s exact backing table with zero retained queue bytes.
+        assert_eq!(admit_live, live_base + affected_bytes);
+
+        let mut held = base;
+        held.extend(edit);
+        let want = Classifier::of(&held).classify(&eager).unwrap();
+        assert_eq!(out.taxonomy, want.taxonomy);
+    }
+
     /// Cooperative polling inside `invalidate_changed` for large dynamic cores and large
     /// disjointness membership rebuilds (Item 753 Phase 1): both a >4096-element core scan
     /// and a >4096-membership `reindex_disjoint_poll` inside the final pass cancel mid-walk
@@ -10459,9 +10709,13 @@ mod tests {
     }
 
     /// Polled rebuilt index and normalized-axiom accounting (Item 753 Phase 1):
-    /// `index_bytes_poll` and `Axioms::bytes_poll` match `index_bytes`/`Axioms::bytes` exactly,
-    /// stop cooperatively inside `RebaseAccountStart..RebaseAccountEnd` on >4096 Tier D clauses
-    /// before `RebaseScratchStart`/`RebaseAdmit`/`RebaseShift`, and recover cleanly.
+    /// 1. Direct unit checks prove `Saturation::index_bytes_poll` and `Axioms::bytes_poll`
+    ///    match `index_bytes`/`Axioms::bytes` exactly and stop at `POLL_INVALIDATE` on >4096
+    ///    Tier D clauses.
+    /// 2. End-to-end checks isolate cancellation strictly inside rebuilt index accounting
+    ///    (`RebaseAccountStart..RebaseAccountAxiomsStart`) and strictly inside normalized-axiom
+    ///    accounting (`RebaseAccountAxiomsStart..RebaseAccountEnd`), both before
+    ///    `RebaseScratchStart`/`RebaseAdmit`/`RebaseShift`, with clean fresh recovery.
     #[test]
     fn rebase_pre_account_polls_and_matches_bytes() {
         let eager = Limits {
@@ -10483,30 +10737,54 @@ mod tests {
         .unwrap()
         .axioms;
 
-        let mut k = Classifier::of(&base);
-        let first = k.classify(&eager).unwrap();
-        assert_eq!(first.stats.tier, Tier::Disjunctive);
-        let ix_ref = k.sat.index.as_ref().expect("classified index");
-        let exact = k.sat.index_bytes(ix_ref);
-        let mut noop_ticks = 0usize;
-        let polled = k
-            .sat
-            .index_bytes_poll(ix_ref, &mut |w| {
-                noop_ticks += w;
+        // Direct unit check on both `Saturation::index_bytes_poll` and `Axioms::bytes_poll`.
+        let axiom_kinds: Vec<&AxiomKind> = base.iter().map(|a| &a.kind).collect();
+        let outside: Vec<(usize, (String, String))> = axiom_kinds
+            .iter()
+            .enumerate()
+            .filter_map(|(i, k)| {
+                let b = el_break(k)?;
+                Some((i, (b.rule.to_string(), b.message)))
+            })
+            .collect();
+        let mut probe_sat = Saturation::default();
+        let (ax_probe, ix_probe, _, _, _) = probe_sat
+            .build(
+                &axiom_kinds,
+                &outside,
+                1,
+                0,
+                0,
+                &eager,
+                AttemptProvenance::Ineligible,
+            )
+            .unwrap();
+        assert!(
+            ax_probe
+                .dl
+                .as_ref()
+                .is_some_and(|d| d.clauses.len() >= 4200),
+            "expected >= 4200 normalized DL clauses"
+        );
+
+        let exact_ix = probe_sat.index_bytes(&ix_probe);
+        let mut ix_noop_ticks = 0usize;
+        let polled_ix = probe_sat
+            .index_bytes_poll(&ix_probe, &mut |w| {
+                ix_noop_ticks += w;
                 Ok::<(), Error>(())
             })
             .unwrap();
-        assert_eq!(polled, exact);
+        assert_eq!(polled_ix, exact_ix);
         assert!(
-            noop_ticks > POLL_INVALIDATE,
-            "expected > {POLL_INVALIDATE} accounting ticks, got {noop_ticks}"
+            ix_noop_ticks > POLL_INVALIDATE,
+            "expected > {POLL_INVALIDATE} index accounting ticks, got {ix_noop_ticks}"
         );
-        let mut stop_ticks = 0usize;
-        let err = k
-            .sat
-            .index_bytes_poll(ix_ref, &mut |w| {
-                stop_ticks += w;
-                if stop_ticks >= POLL_INVALIDATE {
+        let mut ix_stop_ticks = 0usize;
+        let err = probe_sat
+            .index_bytes_poll(&ix_probe, &mut |w| {
+                ix_stop_ticks += w;
+                if ix_stop_ticks >= POLL_INVALIDATE {
                     Err(Error::Cancelled)
                 } else {
                     Ok(())
@@ -10514,74 +10792,141 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, Error::Cancelled));
-        assert_eq!(stop_ticks, POLL_INVALIDATE);
+        assert_eq!(ix_stop_ticks, POLL_INVALIDATE);
 
-        k.add(&edit);
-        let in_account = Arc::new(AtomicBool::new(false));
-        let saw_start = Arc::new(AtomicBool::new(false));
-        let saw_end = Arc::new(AtomicBool::new(false));
-        let saw_scratch = Arc::new(AtomicBool::new(false));
-        let saw_admit = Arc::new(AtomicBool::new(false));
-        let saw_shift = Arc::new(AtomicBool::new(false));
-        let account_polls = Arc::new(AtomicUsize::new(0));
-        let ia_hook = in_account.clone();
-        let ia_poll = in_account.clone();
-        let ss = saw_start.clone();
-        let se = saw_end.clone();
-        let sscr = saw_scratch.clone();
-        let sadm = saw_admit.clone();
-        let ssh = saw_shift.clone();
-        let ap = account_polls.clone();
-        let err = admission_test::with_hook(
-            move |pt| match pt {
-                admission_test::Point::RebaseAccountStart => {
-                    ss.store(true, Ordering::SeqCst);
-                    ia_hook.store(true, Ordering::SeqCst);
-                }
-                admission_test::Point::RebaseAccountEnd => {
-                    ia_hook.store(false, Ordering::SeqCst);
-                    se.store(true, Ordering::SeqCst);
-                }
-                admission_test::Point::RebaseScratchStart => sscr.store(true, Ordering::SeqCst),
-                admission_test::Point::RebaseAdmit { .. } => sadm.store(true, Ordering::SeqCst),
-                admission_test::Point::RebaseShift => ssh.store(true, Ordering::SeqCst),
-                _ => {}
-            },
-            || {
-                k.classify(&Limits {
-                    cancelled: Some(Arc::new(move || {
-                        if ia_poll.load(Ordering::SeqCst) {
-                            ap.fetch_add(1, Ordering::SeqCst);
-                            true
-                        } else {
-                            false
-                        }
-                    })),
-                    ..eager.clone()
-                })
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::Cancelled), "{err:?}");
-        assert!(saw_start.load(Ordering::SeqCst));
+        let exact_ax = ax_probe.bytes();
+        let mut ax_noop_ticks = 0usize;
+        let polled_ax = ax_probe
+            .bytes_poll(&mut |w| {
+                ax_noop_ticks += w;
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+        assert_eq!(polled_ax, exact_ax);
         assert!(
-            account_polls.load(Ordering::SeqCst) > 0,
-            "no cooperative poll ran inside rebuilt index/axiom accounting"
+            ax_noop_ticks > POLL_INVALIDATE,
+            "expected > {POLL_INVALIDATE} axiom accounting ticks, got {ax_noop_ticks}"
         );
-        assert!(
-            !saw_end.load(Ordering::SeqCst),
-            "RebaseAccountEnd ran despite cancellation inside accounting"
-        );
-        assert!(!saw_scratch.load(Ordering::SeqCst));
-        assert!(!saw_admit.load(Ordering::SeqCst));
-        assert!(!saw_shift.load(Ordering::SeqCst));
+        let mut ax_stop_ticks = 0usize;
+        let err = ax_probe
+            .bytes_poll(&mut |w| {
+                ax_stop_ticks += w;
+                if ax_stop_ticks >= POLL_INVALIDATE {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::Cancelled));
+        assert_eq!(ax_stop_ticks, POLL_INVALIDATE);
 
         let mut held = base.clone();
-        held.extend(edit);
+        held.extend(edit.clone());
         let want = Classifier::of(&held).classify(&eager).unwrap();
-        let recovered = k.classify(&eager).unwrap();
-        assert!(!recovered.stats.incremental);
-        assert_eq!(recovered.taxonomy, want.taxonomy);
+
+        let assert_account_window_cancels =
+            |arm_at: admission_test::Point, stop_before: admission_test::Point, label: &str| {
+                let mut k = Classifier::of(&base);
+                let first = k.classify(&eager).unwrap();
+                assert_eq!(first.stats.tier, Tier::Disjunctive);
+                k.add(&edit);
+
+                let armed = Arc::new(AtomicBool::new(false));
+                let saw_arm = Arc::new(AtomicBool::new(false));
+                let saw_stop_before = Arc::new(AtomicBool::new(false));
+                let saw_end = Arc::new(AtomicBool::new(false));
+                let saw_scratch = Arc::new(AtomicBool::new(false));
+                let saw_admit = Arc::new(AtomicBool::new(false));
+                let saw_shift = Arc::new(AtomicBool::new(false));
+                let account_polls = Arc::new(AtomicUsize::new(0));
+                let ar_hook = armed.clone();
+                let ar_poll = armed.clone();
+                let sa = saw_arm.clone();
+                let sb = saw_stop_before.clone();
+                let se = saw_end.clone();
+                let sscr = saw_scratch.clone();
+                let sadm = saw_admit.clone();
+                let ssh = saw_shift.clone();
+                let ap = account_polls.clone();
+                let err = admission_test::with_hook(
+                    move |pt| {
+                        if pt == arm_at {
+                            sa.store(true, Ordering::SeqCst);
+                            ar_hook.store(true, Ordering::SeqCst);
+                        } else if pt == stop_before {
+                            ar_hook.store(false, Ordering::SeqCst);
+                            sb.store(true, Ordering::SeqCst);
+                        }
+                        match pt {
+                            admission_test::Point::RebaseAccountEnd => {
+                                ar_hook.store(false, Ordering::SeqCst);
+                                se.store(true, Ordering::SeqCst);
+                            }
+                            admission_test::Point::RebaseScratchStart => {
+                                sscr.store(true, Ordering::SeqCst);
+                            }
+                            admission_test::Point::RebaseAdmit { .. } => {
+                                sadm.store(true, Ordering::SeqCst);
+                            }
+                            admission_test::Point::RebaseShift => ssh.store(true, Ordering::SeqCst),
+                            _ => {}
+                        }
+                    },
+                    || {
+                        k.classify(&Limits {
+                            cancelled: Some(Arc::new(move || {
+                                if ar_poll.load(Ordering::SeqCst) {
+                                    ap.fetch_add(1, Ordering::SeqCst);
+                                    true
+                                } else {
+                                    false
+                                }
+                            })),
+                            ..eager.clone()
+                        })
+                    },
+                )
+                .unwrap_err();
+                assert!(matches!(err, Error::Cancelled), "{label}: {err:?}");
+                assert!(
+                    saw_arm.load(Ordering::SeqCst),
+                    "{label}: {arm_at:?} was not reached"
+                );
+                assert!(
+                    account_polls.load(Ordering::SeqCst) > 0,
+                    "{label}: no cooperative poll ran between {arm_at:?} and {stop_before:?}"
+                );
+                assert!(
+                    !saw_stop_before.load(Ordering::SeqCst),
+                    "{label}: reached {stop_before:?} without stopping on cancellation"
+                );
+                assert!(
+                    !saw_end.load(Ordering::SeqCst),
+                    "{label}: RebaseAccountEnd ran despite cancellation"
+                );
+                assert!(!saw_scratch.load(Ordering::SeqCst));
+                assert!(!saw_admit.load(Ordering::SeqCst));
+                assert!(!saw_shift.load(Ordering::SeqCst));
+
+                let recovered = k.classify(&eager).unwrap();
+                assert!(!recovered.stats.incremental);
+                assert_eq!(recovered.taxonomy, want.taxonomy);
+            };
+
+        // End-to-end 1: cancellation inside rebuilt index accounting stops before axiom accounting.
+        assert_account_window_cancels(
+            admission_test::Point::RebaseAccountStart,
+            admission_test::Point::RebaseAccountAxiomsStart,
+            "rebuilt index accounting",
+        );
+        // End-to-end 2: cancellation armed strictly at normalized-axiom accounting stops before
+        // `RebaseAccountEnd` (fails if `ax.bytes_poll` is replaced with `ax.bytes()`).
+        assert_account_window_cancels(
+            admission_test::Point::RebaseAccountAxiomsStart,
+            admission_test::Point::RebaseAccountEnd,
+            "normalized-axiom accounting",
+        );
     }
 
     /// Phase-verified deadline timeouts under `Expansion::Eager` (Item 753 Phase 1): using a

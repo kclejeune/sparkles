@@ -41,6 +41,7 @@ pub(super) enum Point {
     TopChainWorldMessage,
     BeforePanicWake,
     RebaseAccountStart,
+    RebaseAccountAxiomsStart,
     RebaseAccountEnd,
     RebaseScratchStart,
     RebaseAdmit {
@@ -57,6 +58,15 @@ pub(super) enum Point {
     InvalidateLargeCoreEnd,
     InvalidateClosureStart,
     InvalidateClosureEnd,
+    InvalidateScratch {
+        slots: usize,
+        affected_len: usize,
+        affected_bytes: usize,
+        queue_cap: usize,
+        queue_bytes: usize,
+        bound: usize,
+        live_base: usize,
+    },
     InvalidateBackListStart,
     InvalidateBackListEnd,
     InvalidateDlPredsStart,
