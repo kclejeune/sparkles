@@ -54,22 +54,42 @@ impl DatasetSpec {
         access: &crate::access::GraphAccess,
         term: &dyn Fn(Id) -> Option<Term>,
     ) -> Result<()> {
+        self.restrict_checked(snap, access, &|id| Ok(term(id)))
+    }
+
+    /// Checked variant of [`DatasetSpec::restrict`] that propagates decoding and request
+    /// control failures instead of treating a refused graph IRI as absent.
+    pub fn restrict_checked(
+        &mut self,
+        snap: &Snapshot,
+        access: &crate::access::GraphAccess,
+        term: &dyn Fn(Id) -> Result<Option<Term>>,
+    ) -> Result<()> {
         if access.reads_all() {
             return Ok(());
         }
         let (visible, every) = access.visible_named_all(snap)?;
-        let allowed = |g: &Id| {
+        let allowed = |g: &Id| -> Result<bool> {
             if *g == Id::DEFAULT_GRAPH {
-                access.read.default_graph()
+                Ok(access.read.default_graph())
             } else if visible.binary_search(g).is_ok() {
-                true
+                Ok(true)
             } else {
                 // a graph without quads (or a query-local term): by its name
                 match g.tag() {
-                    id::Tag::BNode | id::Tag::Undef | id::Tag::Special => false,
-                    _ => access.readable(term(*g).as_ref()),
+                    id::Tag::BNode | id::Tag::Undef | id::Tag::Special => Ok(false),
+                    _ => Ok(access.readable(term(*g)?.as_ref())),
                 }
             }
+        };
+        let filter_graphs = |graphs: Vec<Id>| -> Result<Vec<Id>> {
+            let mut kept = Vec::with_capacity(graphs.len());
+            for g in graphs {
+                if allowed(&g)? {
+                    kept.push(g);
+                }
+            }
+            Ok(kept)
         };
         let union = || visible.to_vec();
         self.default = match self.default.take() {
@@ -80,7 +100,7 @@ impl DatasetSpec {
             // the store's default graph, as before (which keeps its fast paths)
             None if access.read.default_graph() => None,
             None => Some(Vec::new()),
-            Some(l) => Some(l.into_iter().filter(allowed).collect()),
+            Some(l) => Some(filter_graphs(l)?),
         };
         if self.default.is_some() {
             self.union_default = false;
@@ -88,7 +108,7 @@ impl DatasetSpec {
         self.named = match self.named.take() {
             None if every => None,
             None => Some(union()),
-            Some(l) => Some(l.into_iter().filter(allowed).collect()),
+            Some(l) => Some(filter_graphs(l)?),
         };
         Ok(())
     }

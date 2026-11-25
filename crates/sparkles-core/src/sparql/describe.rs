@@ -792,6 +792,30 @@ impl<'a> Describer<'a> {
         Ok(())
     }
 
+    fn decode_triple_checked(
+        &self,
+        s: Id,
+        p: Id,
+        o: Id,
+        credit: &crate::sparql::ctx::Charge<'_>,
+    ) -> Result<Option<Triple>> {
+        let Some(s) = self.ctx.term_checked_into(s, credit)? else {
+            return Ok(None);
+        };
+        let s = match s {
+            Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+            Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+            _ => return Ok(None),
+        };
+        let Some(Term::NamedNode(p)) = self.ctx.term_checked_into(p, credit)? else {
+            return Ok(None);
+        };
+        let Some(o) = self.ctx.term_checked_into(o, credit)? else {
+            return Ok(None);
+        };
+        Ok(Some(Triple::new(s, p, o)))
+    }
+
     /// Add a triple to the result, unless it is there already.
     fn emit(&mut self, s: Id, p: Id, o: Id, src: Source) -> Result<()> {
         if self.opts.labels {
@@ -817,14 +841,14 @@ impl<'a> Describer<'a> {
             self.truncated = true;
             return Ok(());
         }
-        let bytes = [s, p, o].iter().try_fold(512u64, |bytes, id| {
-            Ok::<_, Error>(bytes.saturating_add(self.ctx.decoded_bytes(*id)?.saturating_mul(4)))
-        })?;
-        self.reserve(bytes)?;
-        self.transient = self.transient.saturating_add(bytes);
-        if let Some(q) = self.ctx.snap.quad_to_terms(&[s, p, o, Id::DEFAULT_GRAPH]) {
-            self.out.push(Triple::new(q.subject, q.predicate, q.object));
+        let decode = self.ctx.charge(0)?;
+        if let Some(triple) = self.decode_triple_checked(s, p, o, &decode)? {
+            let bytes = super::graph_triple_bytes(&triple);
+            self.reserve(bytes)?;
+            self.transient = self.transient.saturating_add(bytes);
+            self.out.push(triple);
         }
+        drop(decode);
         Ok(())
     }
 
@@ -832,16 +856,17 @@ impl<'a> Describer<'a> {
     /// and RDF 1.1's `?r rdf:subject s ; rdf:predicate p ; rdf:object o`.
     fn reifiers_of(&mut self, s: Id, p: Id, o: Id, src: Source) -> Result<Vec<Id>> {
         if !self.reifiers.contains_key(&(s, p, o)) {
-            let bytes = [s, p, o].iter().try_fold(1024u64, |bytes, id| {
-                Ok::<_, Error>(bytes.saturating_add(self.ctx.decoded_bytes(*id)?.saturating_mul(8)))
-            })?;
-            let _decode_charge = DescriptionCharge::new(self.ctx, bytes)?;
             let mut found: Vec<(Id, u64)> = Vec::new();
-            if let Some(reifies) = self.reifies
-                && let Some(q) = self.ctx.snap.quad_to_terms(&[s, p, o, Id::DEFAULT_GRAPH])
-            {
-                let tt = Term::Triple(Box::new(Triple::new(q.subject, q.predicate, q.object)));
-                if let Some(tt) = self.ctx.snap.lookup_term(&tt) {
+            if let Some(reifies) = self.reifies {
+                let decode = self.ctx.charge(0)?;
+                let tt_id = if let Some(triple) = self.decode_triple_checked(s, p, o, &decode)? {
+                    let tt = Term::Triple(Box::new(triple));
+                    self.ctx.snap.lookup_term(&tt)
+                } else {
+                    None
+                };
+                drop(decode);
+                if let Some(tt) = tt_id {
                     for [r, _, _, g] in self.quads(Perm::Pos, &[reifies.0, tt.0])? {
                         self.reserve(128)?;
                         found.push((r, g.0));

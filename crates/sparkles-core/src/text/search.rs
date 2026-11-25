@@ -131,6 +131,7 @@ pub fn search_in(
             .index()
             .tokenizer_for_field(field)
             .map_err(text_err)?;
+        let done_charge = ctx.charge(0)?;
         let mut done: FxHashMap<Id, Id> = Default::default();
         for (i, id) in t.cols[c].iter_mut().enumerate() {
             if i % 4096 == 4095 {
@@ -140,10 +141,12 @@ pub fn search_in(
                 *id = h;
                 continue;
             }
-            let h = match snap.term(*id) {
+            let decode = ctx.charge(0)?;
+            let h = match ctx.term_checked_into(*id, &decode)? {
                 Some(oxrdf::Term::Literal(l)) => {
                     match super::highlight::highlight(l.value(), opts, &matchers, &mut analyzer) {
                         Some(text) => {
+                            decode.add(text.len() as u64 + 64)?;
                             let lit = match l.language() {
                                 Some(lang) => {
                                     oxrdf::Literal::new_language_tagged_literal_unchecked(
@@ -152,16 +155,24 @@ pub fn search_in(
                                 }
                                 None => oxrdf::Literal::new_typed_literal(text, l.datatype()),
                             };
-                            ctx.intern_term(&oxrdf::Term::Literal(lit))
+                            let interned = ctx.intern_term(&oxrdf::Term::Literal(lit));
+                            drop(l);
+                            drop(decode);
+                            ctx.check()?;
+                            interned
                         }
                         None => *id,
                     }
                 }
                 _ => *id,
             };
+            done_charge.add(32)?;
             done.insert(*id, h);
             *id = h;
         }
+        ctx.check()?;
+        drop(done);
+        drop(done_charge);
     }
     Ok(t)
 }

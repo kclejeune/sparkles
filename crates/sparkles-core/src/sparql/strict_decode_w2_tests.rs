@@ -570,3 +570,280 @@ fn expr_registered_and_triple_terms_hold_combined_credit() {
     })();
     assert_memory_budget_error(c_err, "registered 3-arg 6 KiB scalar (cursor)");
 }
+
+// =========================================================================
+// T4: exec::unpack, exec::assign (LET), exec::unfold (UNFOLD)
+// =========================================================================
+
+#[test]
+fn exec_unpack_assign_unfold_propagate_decode_refusal() {
+    let big = "u".repeat(16 * 1024);
+    let big2 = "v".repeat(16 * 1024);
+    let cdt_big = format!("[\"{}\", 1]", "z".repeat(16 * 1024));
+    let ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         @prefix cdt: <http://w3id.org/awslabs/neptune/SPARQL-CDTs/> .\n\
+         ex:r_big rdf:reifies <<( ex:s ex:p \"{big}\" )>> .\n\
+         ex:r_small rdf:reifies <<( ex:s ex:p \"ok\" )>> .\n\
+         ex:a_big ex:x \"{big}\" ; ex:y \"{big2}\" .\n\
+         ex:a_small ex:x \"a\" ; ex:y \"b\" .\n\
+         ex:u_big ex:list \"{}\"^^cdt:List .\n\
+         ex:u_small ex:list \"[1, 2]\"^^cdt:List .\n",
+        cdt_big.replace('"', "\\\"")
+    );
+    let store = store_with_turtle(&ttl, true);
+    let budget = 48 * 1024;
+
+    // 1. unpack (reified triple decomposition)
+    let unpack_ctrl = "PREFIX ex: <http://example.org/> \
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+        SELECT ?o WHERE { ex:r_small rdf:reifies ?t . <<( ex:s ex:p ?o )>> }";
+    let _ = unpack_ctrl; // also test explicit reifier unpack via ?t bound to triple term
+    let unpack_ctrl = "PREFIX ex: <http://example.org/> \
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+        SELECT ?o WHERE { ex:r_small rdf:reifies <<( ?s ?p ?o )>> }";
+    let unpack_tgt = "PREFIX ex: <http://example.org/> \
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+        SELECT ?o WHERE { ex:r_big rdf:reifies <<( ?s ?p ?o )>> }";
+    run_select_both_modes(&store, unpack_ctrl, budget, "unpack", true);
+    run_select_both_modes(&store, unpack_tgt, budget, "unpack", false);
+
+    // 2. assign (LET on already-bound variable with two differing literals)
+    let assign_ctrl = "PREFIX ex: <http://example.org/> \
+        SELECT ?x WHERE { ex:a_small ex:x ?x ; ex:y ?y . LET (?x := ?y) }";
+    let assign_tgt = "PREFIX ex: <http://example.org/> \
+        SELECT ?x WHERE { ex:a_big ex:x ?x ; ex:y ?y . LET (?x := ?y) }";
+    run_select_both_modes(&store, assign_ctrl, budget, "assign LET", true);
+    run_select_both_modes(&store, assign_tgt, budget, "assign LET", false);
+
+    // 3. unfold (UNFOLD over oversized cdt:List literal)
+    let unfold_ctrl = "PREFIX ex: <http://example.org/> \
+        SELECT ?e ?pos WHERE { ex:u_small ex:list ?l . UNFOLD(?l AS ?e, ?pos) }";
+    let unfold_tgt = "PREFIX ex: <http://example.org/> \
+        SELECT ?e ?pos WHERE { ex:u_big ex:list ?l . UNFOLD(?l AS ?e, ?pos) }";
+    run_select_both_modes(&store, unfold_ctrl, budget, "unfold", true);
+    run_select_both_modes(&store, unfold_tgt, budget, "unfold", false);
+}
+
+// =========================================================================
+// T5: TopK ordered, prefilter, offer_rows, key_rows_charged
+// =========================================================================
+
+#[test]
+fn exec_topk_ordered_and_heap_propagate_decode_refusal() {
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..20 {
+        let big = format!("val_{i:02}_{}", "k".repeat(16 * 1024));
+        ttl.push_str(&format!(
+            "ex:big_{i} ex:k {i} ; ex:v \"{big}\" .\n\
+             ex:small_{i} ex:k {i} ; ex:v \"short_{i:02}\" .\n"
+        ));
+    }
+    let store = store_with_turtle(&ttl, true);
+    let budget = 64 * 1024;
+
+    // 1. Single-key ORDER BY ?v LIMIT 2 (hits OrderedTopK / offer_rows / key_rows_charged)
+    let q_ctrl = "PREFIX ex: <http://example.org/> \
+        SELECT ?s ?v WHERE { ?s ex:v ?v . FILTER(STRSTARTS(STR(?s), \"http://example.org/small_\")) } \
+        ORDER BY ?v LIMIT 2";
+    let q_tgt = "PREFIX ex: <http://example.org/> \
+        SELECT ?s ?v WHERE { ?s ex:v ?v . FILTER(STRSTARTS(STR(?s), \"http://example.org/big_\")) } \
+        ORDER BY ?v LIMIT 2";
+    run_select_both_modes(&store, q_ctrl, budget, "topk single-key", true);
+    run_select_both_modes(&store, q_tgt, budget, "topk single-key", false);
+
+    // 2. Multi-key ORDER BY ?k ?v LIMIT 2 (hits HeapKey::Var secondary key decode in offer_rows)
+    let q2_ctrl = "PREFIX ex: <http://example.org/> \
+        SELECT ?s ?k ?v WHERE { ?s ex:k ?k ; ex:v ?v . FILTER(STRSTARTS(STR(?s), \"http://example.org/small_\")) } \
+        ORDER BY ?k ?v LIMIT 2";
+    let q2_tgt = "PREFIX ex: <http://example.org/> \
+        SELECT ?s ?k ?v WHERE { ?s ex:k ?k ; ex:v ?v . FILTER(STRSTARTS(STR(?s), \"http://example.org/big_\")) } \
+        ORDER BY ?k ?v LIMIT 2";
+    run_select_both_modes(&store, q2_ctrl, budget, "topk multi-key HeapKey::Var", true);
+    run_select_both_modes(&store, q2_tgt, budget, "topk multi-key HeapKey::Var", false);
+
+    // 3. Multi-key ORDER BY ?k LCASE(?v) LIMIT 2 (hits HeapKey::Expr secondary key decode)
+    let q3_ctrl = "PREFIX ex: <http://example.org/> \
+        SELECT ?s ?k WHERE { ?s ex:k ?k ; ex:v ?v . FILTER(STRSTARTS(STR(?s), \"http://example.org/small_\")) } \
+        ORDER BY ?k LCASE(?v) LIMIT 2";
+    let q3_tgt = "PREFIX ex: <http://example.org/> \
+        SELECT ?s ?k WHERE { ?s ex:k ?k ; ex:v ?v . FILTER(STRSTARTS(STR(?s), \"http://example.org/big_\")) } \
+        ORDER BY ?k LCASE(?v) LIMIT 2";
+    run_select_both_modes(
+        &store,
+        q3_ctrl,
+        budget,
+        "topk multi-key HeapKey::Expr",
+        true,
+    );
+    run_select_both_modes(
+        &store,
+        q3_tgt,
+        budget,
+        "topk multi-key HeapKey::Expr",
+        false,
+    );
+}
+
+// =========================================================================
+// T8: SERVICE, DESCRIBE, restrict_ctx, entity_vector / vector_search
+// =========================================================================
+
+#[test]
+fn service_describe_restrict_and_vector_strict_decode() {
+    use crate::access::{GraphAccess, GraphRule, Graphs};
+    use oxrdf::NamedNode;
+
+    // 1. SERVICE endpoint decode refusal must return BudgetKind::Memory, NOT Error::Service
+    let long_url = format!("http://example.org/endpoint/{}", "e".repeat(16 * 1024));
+    let store_svc = store_with_turtle(
+        &format!("<{long_url}> <http://example.org/p> \"v\" .\n"),
+        true,
+    );
+    let svc_q = format!("SELECT ?x WHERE {{ SERVICE <{long_url}> {{ ?x ?y ?z }} }}");
+    let svc_opts = QueryOptions {
+        allow_service: true,
+        no_cache: true,
+        max_memory_bytes: Some(32 * 1024),
+        ..QueryOptions::default()
+    };
+    assert_memory_budget_error(
+        super::query(store_svc.snapshot(), &svc_q, &svc_opts),
+        "SERVICE endpoint decode refusal must not become Error::Service",
+    );
+
+    // 2. SERVICE cache key allocation must refuse BEFORE allocating key String
+    let cache_store = Store::in_memory(StoreOptions {
+        service_cache_bytes: 1 << 20,
+        ..StoreOptions::default()
+    });
+    let cache_q = "SELECT ?x WHERE { SERVICE <cache:http://example.org/remote> { ?x ?y ?z } }";
+    let scope: Arc<str> = Arc::from("s".repeat(32 * 1024));
+    let cache_opts = QueryOptions {
+        allow_service: true,
+        no_cache: false,
+        service_scope: Some(scope),
+        max_memory_bytes: Some(16 * 1024),
+        ..QueryOptions::default()
+    };
+    let mut cache_res = None;
+    let largest = crate::test_alloc::record_largest(|| {
+        cache_res = Some(super::query(cache_store.snapshot(), cache_q, &cache_opts));
+    });
+    assert_memory_budget_error(
+        cache_res.unwrap(),
+        "SERVICE cache key try_key refuses past budget",
+    );
+    assert!(
+        largest < 24 * 1024,
+        "SERVICE cache key must refuse before allocating oversized key String (largest={largest})"
+    );
+
+    // 3. DESCRIBE decodes via term_checked_into and propagates memory budget refusal
+    let big_lit = "d".repeat(16 * 1024);
+    let desc_ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         ex:big ex:p \"{big_lit}\" .\n\
+         ex:small ex:p \"ok\" .\n"
+    );
+    let store_desc = store_with_turtle(&desc_ttl, true);
+    let desc_opts = QueryOptions {
+        max_memory_bytes: Some(40 * 1024),
+        no_cache: true,
+        ..QueryOptions::default()
+    };
+    super::query(
+        store_desc.snapshot(),
+        "PREFIX ex: <http://example.org/> DESCRIBE ex:small",
+        &desc_opts,
+    )
+    .expect("DESCRIBE control passes");
+    assert_memory_budget_error(
+        super::query(
+            store_desc.snapshot(),
+            "PREFIX ex: <http://example.org/> DESCRIBE ex:big",
+            &desc_opts,
+        ),
+        "DESCRIBE oversized literal refuses with Memory BudgetExceeded",
+    );
+
+    // 4. restrict_ctx propagates memory refusal instead of hiding graph silently
+    let big_g = format!("http://example.org/graph/{}", "g".repeat(16 * 1024));
+    let small_g = "http://example.org/graph/small";
+    let store_g = Store::in_memory(StoreOptions::default());
+    store_g
+        .load(&[Source::from_bytes(
+            b"<http://example.org/s> <http://example.org/p> \"seed\" .\n".to_vec(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    store_g.compact().unwrap();
+    let access = Arc::new(GraphAccess {
+        read: Graphs::Only(GraphRule {
+            default_graph: true,
+            ..Default::default()
+        }),
+        write: Graphs::All,
+        triples: None,
+    });
+    // Control: short graph IRI fits under 16 KiB headroom
+    let mut ctx_ok = Ctx::new(store_g.snapshot());
+    ctx_ok.mem_limit = MIB;
+    let small_gid = ctx_ok.intern_term(&Term::NamedNode(NamedNode::new_unchecked(small_g)));
+    ctx_ok.dataset.named = Some(vec![small_gid]);
+    ctx_ok.mem_limit = ctx_ok.live_bytes() + 16 * 1024;
+    super::restrict_ctx(&mut ctx_ok, Some(&access)).expect("restrict_ctx control passes");
+
+    // Target: 16 KiB graph IRI refuses under 16 KiB headroom
+    let mut ctx_bad = Ctx::new(store_g.snapshot());
+    ctx_bad.mem_limit = MIB;
+    let big_gid = ctx_bad.intern_term(&Term::NamedNode(NamedNode::new_unchecked(&big_g)));
+    ctx_bad.dataset.named = Some(vec![big_gid]);
+    ctx_bad.mem_limit = ctx_bad.live_bytes() + 16 * 1024;
+    assert_memory_budget_error(
+        super::restrict_ctx(&mut ctx_bad, Some(&access)),
+        "restrict_ctx propagates memory error on oversized graph IRI",
+    );
+
+    // 5. vector_search variable query literal refuses instead of falling back to entity_vector
+    let vec_lit = "x".repeat(16 * 1024);
+    let vec_ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix spk: <urn:x-sparkles:> .\n\
+         ex:q_big ex:q \"{vec_lit}\" .\n\
+         ex:q_small ex:q \"[1.0, 0.0]\"^^spk:vector .\n\
+         ex:doc ex:emb \"[1.0, 0.0]\"^^spk:vector .\n"
+    );
+    let store_vec = store_with_turtle(&vec_ttl, true);
+    let vec_ctrl = "PREFIX ex: <http://example.org/> PREFIX spk: <urn:x-sparkles:> \
+        SELECT ?s ?score WHERE { ex:q_small ex:q ?q . (?s ?score) spk:vectorSearch (ex:emb ?q 5) }";
+    let vec_tgt = "PREFIX ex: <http://example.org/> PREFIX spk: <urn:x-sparkles:> \
+        SELECT ?s ?score WHERE { ex:q_big ex:q ?q . (?s ?score) spk:vectorSearch (ex:emb ?q 5) }";
+    let ctrl_res = super::query(
+        store_vec.snapshot(),
+        vec_ctrl,
+        &QueryOptions {
+            max_memory_bytes: Some(48 * 1024),
+            no_cache: true,
+            ..QueryOptions::default()
+        },
+    )
+    .expect("vector_search control passes");
+    assert_eq!(ctrl_res.len(), 1, "vector_search control must match ex:doc");
+    run_select_both_modes(
+        &store_vec,
+        vec_ctrl,
+        48 * 1024,
+        "vector_search var query",
+        true,
+    );
+    run_select_both_modes(
+        &store_vec,
+        vec_tgt,
+        48 * 1024,
+        "vector_search var query",
+        false,
+    );
+}
