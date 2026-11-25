@@ -4,7 +4,9 @@
 //! random sequences of edits over generated ontologies and the fixtures.
 
 use proptest::prelude::*;
-use sparkles_owl::classify::{Classification, Classifier, Excluded, Limits};
+use sparkles_owl::classify::{
+    Classification, Classifier, Consistency, Excluded, Expansion, Limits,
+};
 use sparkles_owl::model::*;
 use sparkles_owl::ofn_read;
 
@@ -31,8 +33,20 @@ fn limits(threads: usize) -> Limits {
 }
 
 /// What two classifications must share: every subsumption between classes, the
-/// unsatisfiable classes, the consistency and the completeness.
-fn answer(o: &Classification) -> (Vec<(String, String)>, Vec<String>, bool, bool) {
+/// unsatisfiable classes, the legacy and full consistency status, overall and taken
+/// completeness, and the incomplete class list.
+#[allow(clippy::type_complexity)]
+fn answer(
+    o: &Classification,
+) -> (
+    Vec<(String, String)>,
+    Vec<String>,
+    bool,
+    Consistency,
+    bool,
+    bool,
+    Vec<String>,
+) {
     let t = &o.taxonomy;
     let cs: Vec<Class> = t.classes().cloned().collect();
     let mut pairs = Vec::new();
@@ -46,7 +60,20 @@ fn answer(o: &Classification) -> (Vec<(String, String)>, Vec<String>, bool, bool
     pairs.sort();
     let mut unsat: Vec<String> = t.unsatisfiable().map(|c| c.as_str().to_string()).collect();
     unsat.sort();
-    (pairs, unsat, o.consistent, o.complete)
+    let incomplete: Vec<String> = o
+        .incomplete
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect();
+    (
+        pairs,
+        unsat,
+        o.consistent,
+        o.consistency,
+        o.complete,
+        o.complete_for_taken,
+        incomplete,
+    )
 }
 
 /// Classifies the kept classifier and one that starts again over `held`, and checks
@@ -1434,5 +1461,679 @@ fn a_property_that_gains_its_first_link_gets_its_transitions_back() {
             remove(&mut k, &mut held, "SubClassOf(:M :K)");
             same_as_fresh(&mut k, &held, threads, "after the leaf left");
         }
+    }
+}
+
+fn eager_limits(threads: usize) -> Limits {
+    Limits {
+        threads,
+        expansion: Expansion::Eager,
+        ..Limits::default()
+    }
+}
+
+fn same_as_fresh_with(
+    k: &mut Classifier,
+    held: &[Axiom],
+    lim: &Limits,
+    at: &str,
+) -> Classification {
+    let out = k.classify(lim).unwrap();
+    let mut fresh = Classifier::of(held);
+    let want = fresh.classify(lim).unwrap();
+    assert_eq!(answer(&out), answer(&want), "the answers differ {at}");
+    assert_eq!(out.taxonomy, want.taxonomy, "the taxonomies differ {at}");
+    assert_eq!(
+        k.excluded(),
+        fresh.excluded(),
+        "the axioms left out differ {at}"
+    );
+    out
+}
+
+fn started_eager(base: &str, threads: usize) -> (Classifier, Vec<Axiom>) {
+    let held = axioms(base);
+    let lim = eager_limits(threads);
+    let mut k = Classifier::of(&held);
+    let out = same_as_fresh_with(&mut k, &held, &lim, "at the start (eager)");
+    assert!(!out.stats.incremental);
+    assert!(k.excluded().is_empty(), "{:?}", k.excluded());
+    (k, held)
+}
+
+#[test]
+fn eager_unsat_conjunction_does_not_spuriously_clear_first_member() {
+    // `:A` is interned before `:B`, so the eager conjunction context for `∃r.A ⊓ ∀r.B` has
+    // core `[A, B]` (no `NEG` bit) and derives `bottom` via `B ⊑ C` and `Disjoint(A, C)`.
+    // Removing `B ⊑ C` changes only `B`, clearing `B`, `[A, B]`, and `U`, while keeping `A`
+    // and the 8 classes below `A`. Before fixing `tested_class`, `[A, B]` was mistaken for
+    // a test of `A`, spuriously clearing `A` and all 8 subclasses too.
+    let base = "SubClassOf(:A0 :A)
+         SubClassOf(:A1 :A)
+         SubClassOf(:A2 :A)
+         SubClassOf(:A3 :A)
+         SubClassOf(:A4 :A)
+         SubClassOf(:A5 :A)
+         SubClassOf(:A6 :A)
+         SubClassOf(:A7 :A)
+         SubClassOf(:U ObjectSomeValuesFrom(:r :A))
+         SubClassOf(:U ObjectAllValuesFrom(:r :B))
+         SubClassOf(:B :C)
+         DisjointClasses(:A :C)
+         SubClassOf(:W ObjectUnionOf(:P :Q))
+         SubClassOf(:P :R)
+         SubClassOf(:Q :R)";
+    for threads in [1, 4] {
+        let lim = eager_limits(threads);
+        let (mut k, mut held) = started_eager(base, threads);
+        let out = k.classify(&lim).unwrap();
+        assert_eq!(out.stats.tier, sparkles_owl::classify::Tier::Disjunctive);
+        assert!(out.taxonomy.is_unsatisfiable(&c("U")));
+        assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+
+        remove(&mut k, &mut held, "SubClassOf(:B :C)");
+        let out = same_as_fresh_with(
+            &mut k,
+            &held,
+            &lim,
+            &format!("after B ⊑ C left on {threads} threads"),
+        );
+        assert!(out.stats.incremental, "eager run started again");
+        assert!(!out.taxonomy.is_unsatisfiable(&c("U")));
+        // At most B, [A, B], and U (and any existential/conjunction expression context for U)
+        // are cleared; A and A0..A7 (9 contexts) must remain intact.
+        assert!(
+            out.stats.cleared <= 4,
+            "spurious invalidation of A's subtree: cleared {} contexts",
+            out.stats.cleared
+        );
+
+        add(&mut k, &mut held, "SubClassOf(:B :C)");
+        let out = same_as_fresh_with(
+            &mut k,
+            &held,
+            &lim,
+            &format!("after B ⊑ C returned on {threads} threads"),
+        );
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_unsatisfiable(&c("U")));
+    }
+}
+
+#[test]
+fn eager_change_keeps_unreachable_contexts_and_tracks_held_tests() {
+    for threads in [1, 4, 8] {
+        let lim = eager_limits(threads);
+        let (mut k, mut held) = started_eager(UNIONS, threads);
+        let out = k.classify(&lim).unwrap();
+        assert_eq!(out.stats.tier, sparkles_owl::classify::Tier::Disjunctive);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert!(out.taxonomy.is_subclass(&c("F"), &c("G")));
+
+        // An unrelated leaf keeps every existing context.
+        add(&mut k, &mut held, "SubClassOf(:M :K)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after leaf joined (eager)");
+        assert!(out.stats.incremental, "eager run started again");
+        assert_eq!(out.stats.cleared, 0);
+        assert!(out.taxonomy.is_subclass(&c("M"), &c("L")));
+
+        // A told subsumer of K clears only K and M.
+        add(&mut k, &mut held, "SubClassOf(:K :D)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after K got subsumer (eager)");
+        assert!(out.stats.incremental);
+        assert_eq!(out.stats.cleared, 2);
+        assert!(out.taxonomy.is_subclass(&c("M"), &c("D")));
+
+        // A held test loses its support and regains it.
+        remove(&mut k, &mut held, "SubClassOf(:C :D)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after case lost support (eager)");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert!(!out.taxonomy.is_subclass(&c("E"), &c("D")));
+        assert!(!out.taxonomy.is_subclass(&c("F"), &c("G")));
+        add(&mut k, &mut held, "SubClassOf(:C :D)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after case regained support (eager)");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("E"), &c("D")));
+        assert!(out.taxonomy.is_subclass(&c("F"), &c("G")));
+
+        // Complement on the left creates a universal clause affecting all contexts.
+        add(&mut k, &mut held, "SubClassOf(ObjectComplementOf(:B) :D)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after left complement (eager)");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("K"), &c("D")));
+        remove(&mut k, &mut held, "SubClassOf(ObjectComplementOf(:B) :D)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after left complement left (eager)");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    }
+}
+
+#[test]
+fn eager_conjunction_and_shared_successor_incremental_parity() {
+    // Exercises eager conjunction successors `[B, C]` and `[B, C2]`, a conditional
+    // existential restriction, and two distinct roles (`:r` and `:s`) in `:S` targeting the
+    // same eager conjunction context `[B, C]`.
+    let base = "SubClassOf(:A ObjectUnionOf(:X ObjectSomeValuesFrom(:r :B)))
+         SubClassOf(:A ObjectAllValuesFrom(:r :C))
+         SubClassOf(ObjectIntersectionOf(:B :C) owl:Nothing)
+         SubClassOf(:X :Y)
+         SubClassOf(:S ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:S ObjectAllValuesFrom(:r :C))
+         SubClassOf(:S ObjectSomeValuesFrom(:s :B))
+         SubClassOf(:S ObjectAllValuesFrom(:s :C))
+         SubClassOf(:Z ObjectSomeValuesFrom(:r :B))
+         SubClassOf(:Z ObjectAllValuesFrom(:r :C2))
+         SubClassOf(ObjectIntersectionOf(:B :C2) :W)
+         SubClassOf(ObjectSomeValuesFrom(:r :W) :V)
+         SubClassOf(:K :L)";
+    for threads in [1, 4, 8] {
+        let lim = eager_limits(threads);
+        let (mut k, mut held) = started_eager(base, threads);
+        let out = k.classify(&lim).unwrap();
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("Y")));
+        assert!(out.taxonomy.is_unsatisfiable(&c("S")));
+        assert!(out.taxonomy.is_subclass(&c("Z"), &c("V")));
+
+        // Re-saturating A and S against kept eager conjunction successors replays clauses.
+        add(&mut k, &mut held, "SubClassOf(:A :N) SubClassOf(:S :N2)");
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after A and S got subsumers");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("Y")));
+        assert!(out.taxonomy.is_unsatisfiable(&c("S")));
+
+        // Removing the clash clears `[B, C]` and both predecessors A and S, keeping Z and K.
+        remove(
+            &mut k,
+            &mut held,
+            "SubClassOf(ObjectIntersectionOf(:B :C) owl:Nothing)",
+        );
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after clash left (eager)");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("Y")));
+        assert!(!out.taxonomy.is_unsatisfiable(&c("S")));
+        assert!(out.taxonomy.is_subclass(&c("Z"), &c("V")));
+
+        // Adding new expressions shifts dynamic eager conjunction context IDs cleanly.
+        add(
+            &mut k,
+            &mut held,
+            "SubClassOf(:K ObjectSomeValuesFrom(:r :Fresh1))
+             SubClassOf(:Fresh1 :Fresh2)
+             SubClassOf(ObjectIntersectionOf(:B :C) owl:Nothing)",
+        );
+        let out = same_as_fresh_with(&mut k, &held, &lim, "after shift and clash return");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("Y")));
+        assert!(out.taxonomy.is_unsatisfiable(&c("S")));
+        assert!(out.taxonomy.is_subclass(&c("Z"), &c("V")));
+    }
+}
+
+#[test]
+fn eager_switch_rooted_and_counting_stay_on_full_rebuild() {
+    // Switching between Cautious and Eager on the same Classifier must restart fresh.
+    let (mut k, mut held) = started_eager(UNIONS, 1);
+    add(&mut k, &mut held, "SubClassOf(:M :K)");
+    let out = same_as_fresh_with(&mut k, &held, &limits(1), "switching eager -> cautious");
+    assert!(!out.stats.incremental);
+    add(&mut k, &mut held, "SubClassOf(:M2 :K)");
+    let out = same_as_fresh_with(
+        &mut k,
+        &held,
+        &eager_limits(1),
+        "switching cautious -> eager",
+    );
+    assert!(!out.stats.incremental);
+    add(&mut k, &mut held, "SubClassOf(:M3 :K)");
+    let out = same_as_fresh_with(&mut k, &held, &eager_limits(1), "staying in eager");
+    assert!(out.stats.incremental);
+
+    // Counting runs under Expansion::Eager must stay on full rebuild.
+    let counting_eager = Limits {
+        counting: true,
+        expansion: Expansion::Eager,
+        ..Limits::default()
+    };
+    let mut held_c = axioms(&format!(
+        "{UNIONS}\nSubClassOf(:A ObjectMaxCardinality(2 :r :B))"
+    ));
+    let mut kc = Classifier::of(&held_c);
+    kc.classify(&counting_eager).unwrap();
+    add(&mut kc, &mut held_c, "SubClassOf(:M :K)");
+    let out = same_as_fresh_with(&mut kc, &held_c, &counting_eager, "counting eager");
+    assert!(!out.stats.incremental);
+
+    // Rooted runs under Expansion::Eager must stay on full rebuild.
+    let rooted_eager = Limits {
+        rooted: true,
+        expansion: Expansion::Eager,
+        ..Limits::default()
+    };
+    let mut held_r = axioms(&format!("{UNIONS}\nClassAssertion(:A :ind)"));
+    let mut kr = Classifier::of(&held_r);
+    kr.classify(&rooted_eager).unwrap();
+    add(&mut kr, &mut held_r, "SubClassOf(:M :K)");
+    let out = same_as_fresh_with(&mut kr, &held_r, &rooted_eager, "rooted eager");
+    assert!(!out.stats.incremental);
+
+    // Post-counting fallback under Expansion::Eager (`dl_counting_over == true`, where
+    // `no_counting` ran Tier D without the counting axioms) must not retain kept contexts.
+    let post_counting_eager = Limits {
+        threads: 1,
+        counting: true,
+        dl_work: Some(1),
+        expansion: Expansion::Eager,
+        ..Limits::default()
+    };
+    let mut held_pc = axioms(&format!(
+        "{UNIONS}\nSubClassOf(:A ObjectMaxCardinality(2 :r :B))"
+    ));
+    let mut kpc = Classifier::of(&held_pc);
+    let first_pc = kpc.classify(&post_counting_eager).unwrap();
+    assert!(
+        first_pc.stats.dl_counting_over,
+        "counting eager run with dl_work=1 did not take post-counting fallback"
+    );
+    add(&mut kpc, &mut held_pc, "SubClassOf(:M :K)");
+    let out = same_as_fresh_with(
+        &mut kpc,
+        &held_pc,
+        &eager_limits(1),
+        "after post-counting eager fallback",
+    );
+    assert!(
+        !out.stats.incremental,
+        "post-counting fallback retained eager contexts"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Random sequences of additions and removals under `Expansion::Eager` on 1, 4, and 8
+    /// threads: every kept run produces byte-for-byte identical taxonomies and consistency
+    /// verdicts to a fresh run.
+    #[test]
+    fn eager_edits_of_a_disjunctive_ontology_answer_as_a_fresh_run(
+        base in prop::collection::vec(gen_axiom(), 4..24),
+        edits in prop::collection::vec(
+            (prop::collection::vec(gen_axiom(), 0..3), prop::collection::vec(any::<u8>(), 0..3)),
+            1..8,
+        ),
+        threads in prop::sample::select(vec![1usize, 4, 8]),
+    ) {
+        let lim = eager_limits(threads);
+        let text = |g: &Gen| disjunctive_axiom(g.0, g.1, g.2, g.3, g.4);
+        let mut held: Vec<Axiom> = Vec::new();
+        for g in &base {
+            for a in axioms(&text(g)) {
+                if !held.iter().any(|h| h.kind == a.kind) {
+                    held.push(a);
+                }
+            }
+        }
+        let mut k = Classifier::of(&held);
+        same_as_fresh_with(&mut k, &held, &lim, "at the start (eager)");
+        for (step, (added, removed)) in edits.iter().enumerate() {
+            for &i in removed {
+                if !held.is_empty() {
+                    let gone = held.remove(i as usize % held.len());
+                    k.remove([&gone]);
+                }
+            }
+            for g in added {
+                for a in axioms(&text(g)) {
+                    if !held.iter().any(|h| h.kind == a.kind) {
+                        k.add([&a]);
+                        held.push(a);
+                    }
+                }
+            }
+            same_as_fresh_with(&mut k, &held, &lim, &format!("after eager edit {step}"));
+        }
+    }
+}
+
+#[test]
+fn eager_seeded_edits_keep_contexts_often_enough_to_test_them() {
+    use sparkles_owl::classify::Tier;
+    let mut seed = 0xE46E_5A32_D192_ED03u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let (mut steps, mut disjunctive, mut incremental, mut cleared_some, mut cleared_none) =
+        (0usize, 0, 0, 0, 0);
+    let (mut kept_a_class, mut tests_held) = (0usize, 0);
+    for round in 0..240usize {
+        let threads = [1usize, 4, 8][round % 3];
+        let lim = eager_limits(threads);
+        let gen_axioms = |n: usize, next: &mut dyn FnMut() -> u64| -> Vec<Axiom> {
+            let mut out = Vec::new();
+            for _ in 0..n {
+                let x = next();
+                let text = disjunctive_axiom(
+                    x as u8,
+                    (x >> 8) as u8,
+                    (x >> 16) as u8,
+                    (x >> 24) as u8,
+                    (x >> 32) as u8,
+                );
+                out.extend(axioms(&text));
+            }
+            out
+        };
+        let mut held: Vec<Axiom> = Vec::new();
+        for a in gen_axioms(8 + (next() % 16) as usize, &mut next) {
+            if !held.iter().any(|h| h.kind == a.kind) {
+                held.push(a);
+            }
+        }
+        let mut k = Classifier::of(&held);
+        let first = same_as_fresh_with(&mut k, &held, &lim, "at the start (eager)");
+        let mut classes_before = first.taxonomy.classes().count();
+        for step in 0..6 {
+            for _ in 0..next() % 3 {
+                if !held.is_empty() {
+                    let gone = held.remove(next() as usize % held.len());
+                    k.remove([&gone]);
+                }
+            }
+            for a in gen_axioms((next() % 3) as usize, &mut next) {
+                if !held.iter().any(|h| h.kind == a.kind) {
+                    k.add([&a]);
+                    held.push(a);
+                }
+            }
+            let at = format!("in eager round {round} after edit {step}");
+            let out = same_as_fresh_with(&mut k, &held, &lim, &at);
+            steps += 1;
+            if out.stats.tier == Tier::Disjunctive && out.stats.outside_el.taken > 0 {
+                disjunctive += 1;
+                if out.stats.incremental {
+                    incremental += 1;
+                    cleared_some += usize::from(out.stats.cleared > 0);
+                    cleared_none += usize::from(out.stats.cleared == 0);
+                    kept_a_class +=
+                        usize::from(out.stats.cleared > 0 && out.stats.cleared < classes_before);
+                    tests_held += usize::from(out.stats.dl_tests_held > 0);
+                }
+            }
+            classes_before = out.taxonomy.classes().count();
+        }
+    }
+    eprintln!(
+        "TALLY eager steps={steps} disjunctive={disjunctive} incremental={incremental} \
+         cleared_some={cleared_some} cleared_none={cleared_none} kept_a_class={kept_a_class} \
+         tests_held={tests_held}"
+    );
+    assert!(incremental >= 650, "{incremental} eager incremental steps");
+    assert!(
+        cleared_some >= 550,
+        "{cleared_some} eager steps cleared a context"
+    );
+    assert!(
+        cleared_none >= 80,
+        "{cleared_none} eager steps cleared none"
+    );
+    assert!(
+        kept_a_class >= 100,
+        "{kept_a_class} eager steps kept a class beside cleared ones"
+    );
+    assert!(
+        tests_held >= 100,
+        "{tests_held} eager steps with a test that held"
+    );
+}
+
+#[test]
+fn eager_edits_of_the_dl603_fixtures_answer_as_a_fresh_run() {
+    let tally = edits_of_files(&fixture_files("dl603"), 2, &eager_limits);
+    eprintln!("TALLY eager dl603 {tally:?}");
+    assert!(tally.files >= 600, "{tally:?}");
+    assert!(tally.incremental >= 650, "{tally:?}");
+    assert!(tally.disjunctive >= 475, "{tally:?}");
+    assert!(tally.kept_a_class >= 400, "{tally:?}");
+}
+
+#[test]
+fn eager_edits_of_the_dl897_fixtures_answer_as_a_fresh_run() {
+    let tally = edits_of_files(&fixture_files("dl897"), 3, &eager_limits);
+    eprintln!("TALLY eager dl897 {tally:?}");
+    assert!(tally.files >= 25, "{tally:?}");
+    assert!(tally.disjunctive >= 140, "{tally:?}");
+    assert!(tally.kept_a_class >= 125, "{tally:?}");
+}
+
+#[test]
+fn eager_kept_run_memory_budget_charge_cancellation_and_partial() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 1. Tight `max_memory` budget on a kept eager run falls back to fresh and recovers.
+    let pad: String = (0..64)
+        .map(|i| format!("SubClassOf(:Pad{i} :L)\n"))
+        .collect();
+    let padded = format!(
+        "{UNIONS}\nSubClassOf(:A ObjectSomeValuesFrom(:r :B))\n\
+         SubClassOf(:A ObjectAllValuesFrom(:r :C))\n{pad}"
+    );
+    let mut held = axioms(&padded);
+    held.extend(axioms("SubClassOf(:M :K)"));
+    let fresh = |limit: usize| {
+        let mut k = Classifier::of(&held);
+        let out = k
+            .classify(&Limits {
+                max_memory: Some(limit),
+                ..eager_limits(1)
+            })
+            .ok()?;
+        k.excluded().is_empty().then_some(out)
+    };
+    let (mut low, mut high) = (0usize, 1usize << 30);
+    assert!(fresh(high).is_some());
+    while high - low > 64 {
+        let mid = low + (high - low) / 2;
+        if fresh(mid).is_some() {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    let want = fresh(high).unwrap();
+    let mut restarted = 0;
+    for more in [0usize, 64, 256, 1024, 4096] {
+        let (mut k, _) = started_eager(&padded, 1);
+        k.add(&axioms("SubClassOf(:M :K)"));
+        let out = k
+            .classify(&Limits {
+                max_memory: Some(high + more),
+                ..eager_limits(1)
+            })
+            .unwrap();
+        assert_eq!(answer(&out), answer(&want));
+        assert_eq!(out.taxonomy, want.taxonomy);
+        assert_eq!(k.excluded(), Vec::new());
+        restarted += usize::from(!out.stats.incremental);
+        // The run after the fresh retry keeps eager contexts again.
+        k.add(&axioms("SubClassOf(:M2 :K)"));
+        let out = k.classify(&eager_limits(1)).unwrap();
+        assert!(out.stats.incremental);
+    }
+    assert!(
+        restarted > 0,
+        "no eager kept run passed the budget of a fresh one"
+    );
+
+    // 2. Pool-credit `charge` refusal on an eager kept run retries fresh drawing on
+    // already-admitted credit without double-charging past `cap`.
+    let mut saw_refusal_retry = false;
+    for more in [0usize, 64, 256, 1024] {
+        let charged = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let cap = high + more;
+        let (mut k, _) = started_eager(&padded, 1);
+        k.add(&axioms("SubClassOf(:M :K)"));
+        let c_ref = charged.clone();
+        let r_ref = refused.clone();
+        let out = k
+            .classify(&Limits {
+                charge: Some(Arc::new(move |bytes| {
+                    let prev = c_ref.fetch_add(bytes, Ordering::Relaxed);
+                    if prev + bytes > cap {
+                        c_ref.fetch_sub(bytes, Ordering::Relaxed);
+                        r_ref.fetch_add(1, Ordering::Relaxed);
+                        false
+                    } else {
+                        true
+                    }
+                })),
+                ..eager_limits(1)
+            })
+            .unwrap();
+        assert_eq!(answer(&out), answer(&want));
+        assert_eq!(out.taxonomy, want.taxonomy);
+        assert!(k.excluded().is_empty(), "{:?}", k.excluded());
+        assert!(charged.load(Ordering::Relaxed) <= cap);
+        if refused.load(Ordering::Relaxed) > 0 {
+            assert!(
+                !out.stats.incremental,
+                "charge refusal did not trigger a fresh retry"
+            );
+            saw_refusal_retry = true;
+        }
+    }
+    assert!(
+        saw_refusal_retry,
+        "charge callback never refused a kept eager run to exercise drawing_on fresh retry"
+    );
+
+    // 3. Cancellation and mid-incremental deadline recovery under Expansion::Eager on 1 and 4 threads.
+    for threads in [1usize, 4] {
+        let lim = eager_limits(threads);
+        let mut stopped = 0;
+        for polls in 0..40usize {
+            let (mut k, mut held) = started_eager(UNIONS, threads);
+            add(&mut k, &mut held, "SubClassOf(:A :N) SubClassOf(:N :K)");
+            let seen = Arc::new(AtomicUsize::new(0));
+            let s = seen.clone();
+            let cancelled = Limits {
+                cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= polls)),
+                ..lim.clone()
+            };
+            if k.classify(&cancelled).is_err() {
+                stopped += 1;
+            }
+            let out = same_as_fresh_with(
+                &mut k,
+                &held,
+                &lim,
+                &format!("eager after stop at poll {polls} on {threads} threads"),
+            );
+            assert!(out.taxonomy.is_subclass(&c("A"), &c("L")));
+        }
+        assert!(
+            stopped > 0,
+            "no eager run was cancelled on {threads} threads"
+        );
+
+        // Public-API deadline timeout and clean fresh recovery on 1 and 4 threads.
+        // Phase-isolated mid-invalidation and mid-saturation deadline stops with a
+        // controlled clock live in `classify::tests::eager_kept_phase_deadline_stops_and_recovers`.
+        let (mut k, mut held) = started_eager(&padded, threads);
+        add(&mut k, &mut held, "SubClassOf(:A :N) SubClassOf(:N :N2)");
+        let late = Limits {
+            deadline: Some(std::time::Instant::now()),
+            ..lim.clone()
+        };
+        let err = k.classify(&late).unwrap_err();
+        assert!(
+            matches!(err, sparkles_owl::classify::Error::Timeout),
+            "expected Timeout on {threads} threads, got {err:?}"
+        );
+        let out = same_as_fresh_with(
+            &mut k,
+            &held,
+            &lim,
+            &format!("eager after deadline on {threads} threads"),
+        );
+        assert!(!out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("N2")));
+    }
+
+    // 4. `Limits::partial = true` stop mid-incremental under Expansion::Eager remains sound
+    // (complete classes match fresh, incomplete classes report only entailed positive
+    // subsumptions, non-Unknown consistency matches fresh), stays unretained (`dirty = true`),
+    // and the next complete run starts fresh, on both 1 and 4 threads.
+    for threads in [1usize, 4] {
+        let lim = eager_limits(threads);
+        let mut saw_partial = false;
+        for polls in 1..80usize {
+            let (mut k, mut held) = started_eager(&padded, threads);
+            add(
+                &mut k,
+                &mut held,
+                "SubClassOf(:N1 ObjectUnionOf(:N2 :N3)) SubClassOf(:N2 :D) SubClassOf(:N3 :D)",
+            );
+            let seen = Arc::new(AtomicUsize::new(0));
+            let s = seen.clone();
+            let partial_lim = Limits {
+                partial: true,
+                cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= polls)),
+                ..lim.clone()
+            };
+            if let Ok(part) = k.classify(&partial_lim)
+                && !part.complete_for_taken
+            {
+                saw_partial = true;
+                assert!(part.stats.incremental);
+                let mut fresh = Classifier::of(&held);
+                let want = fresh.classify(&lim).unwrap();
+                if part.consistency != Consistency::Unknown {
+                    assert_eq!(part.consistency, want.consistency);
+                }
+                let incomplete: std::collections::HashSet<&Class> =
+                    part.incomplete.iter().collect();
+                for cls in part.taxonomy.classes() {
+                    if !incomplete.contains(cls) {
+                        for sup in want.taxonomy.classes() {
+                            assert_eq!(
+                                part.taxonomy.is_subclass(cls, sup),
+                                want.taxonomy.is_subclass(cls, sup),
+                                "partial eager answer disagreed on complete class {} ({threads}t)",
+                                cls.as_str()
+                            );
+                        }
+                    } else {
+                        for sup in part.taxonomy.classes() {
+                            if part.taxonomy.is_subclass(cls, sup) {
+                                assert!(
+                                    want.taxonomy.is_subclass(cls, sup),
+                                    "partial eager answer reported unsound subsumption {} ⊑ {} for incomplete class ({threads}t)",
+                                    cls.as_str(),
+                                    sup.as_str()
+                                );
+                            }
+                        }
+                    }
+                }
+                // Partial runs are not retained (`dirty = true`), so the next run starts fresh.
+                let next = same_as_fresh_with(
+                    &mut k,
+                    &held,
+                    &lim,
+                    &format!("after eager partial on {threads} threads"),
+                );
+                assert!(!next.stats.incremental, "partial eager state was retained");
+                break;
+            }
+        }
+        assert!(
+            saw_partial,
+            "no incremental eager run stopped partially on {threads} threads"
+        );
     }
 }

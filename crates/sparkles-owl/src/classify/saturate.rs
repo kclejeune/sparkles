@@ -180,16 +180,65 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
         }
     }
 
-    /// Replaces each member by `f` of it, which must keep distinct members distinct.
-    pub fn map(&mut self, f: impl Fn(T) -> T) {
+    /// Retains members matching `keep`, polling `tick` across the scan and compaction.
+    pub fn retain_poll(
+        &mut self,
+        keep: impl Fn(&T) -> bool,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
+        let mut first_drop = None;
+        for (i, x) in self.list.iter().enumerate() {
+            tick(1)?;
+            if !keep(x) {
+                first_drop = Some(i);
+                break;
+            }
+        }
+        let Some(start) = first_drop else {
+            return Ok(());
+        };
+        if let Some(set) = &mut self.set {
+            set.remove(&self.list[start]);
+        }
+        let mut write = start;
+        for read in (start + 1)..self.list.len() {
+            tick(1)?;
+            let x = self.list[read];
+            if keep(&x) {
+                self.list[write] = x;
+                write += 1;
+            } else if let Some(set) = &mut self.set {
+                set.remove(&x);
+            }
+        }
+        self.list.truncate(write);
+        Ok(())
+    }
+
+    /// Replaces each member by `f` of it, which must keep distinct members distinct,
+    /// dropping any old hash set before allocating the replacement from `self.list` so peak
+    /// memory never overlaps two tables, and polling `tick` across both passes.
+    pub fn map_poll(
+        &mut self,
+        f: impl Fn(T) -> T,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
         for x in &mut self.list {
             *x = f(*x);
+            tick(1)?;
         }
-        if let Some(set) = &mut self.set {
-            let mapped: FxHashSet<T> = set.iter().map(|&x| f(x)).collect();
+        if let Some(set) = self.set.take() {
+            drop(set);
+            let mut mapped: FxHashSet<T> =
+                FxHashSet::with_capacity_and_hasher(self.list.len(), Default::default());
+            for &x in &self.list {
+                mapped.insert(x);
+                tick(1)?;
+            }
             debug_assert_eq!(mapped.len(), self.list.len());
-            *set = mapped;
+            self.set = Some(mapped);
         }
+        Ok(())
     }
 
     pub fn bytes(&self) -> usize {
@@ -505,9 +554,33 @@ impl State {
         }
     }
 
-    /// Removes the backward links whose source is in `gone`.
-    pub fn drop_links_from(&mut self, gone: &FxHashSet<Ex>) {
-        self.drop_links_where(|e| gone.contains(&e));
+    /// Removes the backward links whose source is in `gone`, polling `tick` across roles
+    /// and source lists.
+    pub fn drop_links_from_poll(
+        &mut self,
+        gone: &FxHashSet<Ex>,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
+        let mut emptied = false;
+        for (_, srcs) in &mut self.back {
+            tick(1)?;
+            srcs.retain_poll(|&e| !gone.contains(&e), tick)?;
+            emptied |= srcs.list.is_empty();
+        }
+        if emptied {
+            let mut write = 0;
+            for read in 0..self.back.len() {
+                tick(1)?;
+                if !self.back[read].1.list.is_empty() {
+                    if write != read {
+                        self.back.swap(write, read);
+                    }
+                    write += 1;
+                }
+            }
+            self.back.truncate(write);
+        }
+        Ok(())
     }
 
     /// Removes the backward links whose source `gone` answers true for.
@@ -526,25 +599,38 @@ impl State {
 
     /// Removes what the state keeps of the contexts in `gone` as its predecessors,
     /// which a run that clears them does before they register again (roadmap item
-    /// 753): their backward links and what the Horn rules were told of them.
-    pub fn drop_predecessors(&mut self, gone: &FxHashSet<Ex>) {
-        self.drop_links_from(gone);
+    /// 753): their backward links, what the Horn rules were told of them, and DL
+    /// predecessor registrations, polling `tick` across every list.
+    pub fn drop_predecessors_poll(
+        &mut self,
+        gone: &FxHashSet<Ex>,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
+        self.drop_links_from_poll(gone, tick)?;
         if let Some(x) = self.extra.as_mut() {
             let h = &mut x.horn;
-            if h.pred_in.list.iter().any(|(m, _)| gone.contains(m)) {
-                h.pred_in.retain(|(m, _)| !gone.contains(m));
-            }
-            if h.told.list.iter().any(|(m, _)| gone.contains(m)) {
-                h.told.retain(|(m, _)| !gone.contains(m));
-            }
+            h.pred_in.retain_poll(|(m, _)| !gone.contains(m), tick)?;
+            h.told.retain_poll(|(m, _)| !gone.contains(m), tick)?;
             for set in [&mut h.real_preds, &mut h.same, &mut h.told_singular] {
-                if set.list.iter().any(|m| gone.contains(m)) {
-                    set.retain(|m| !gone.contains(m));
-                }
+                set.retain_poll(|m| !gone.contains(m), tick)?;
             }
             if let Some(d) = x.dl.as_deref_mut() {
-                d.drop_predecessors(gone);
+                d.drop_predecessors_poll(gone, tick)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Peak temporary scratch bytes needed by [`State::shift_contexts`] for this state when
+    /// shifting dynamic context ids from `from` upward, polling `tick` across table scans.
+    pub fn shift_scratch(
+        &self,
+        from: Ex,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<usize, super::Error> {
+        match self.extra.as_ref().and_then(|x| x.dl.as_deref()) {
+            Some(d) => d.shift_scratch(from, tick),
+            None => Ok(0),
         }
     }
 
@@ -552,45 +638,64 @@ impl State {
     /// ids of the contexts that a saturation creates above the index's, when the index
     /// of the next run has `delta` more expressions (roadmap item 753). The subsumers,
     /// the fillers and the roles are expressions and roles of the index and stay.
-    pub fn shift_contexts(&mut self, from: Ex, delta: Ex) {
+    pub fn shift_contexts(
+        &mut self,
+        from: Ex,
+        delta: Ex,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
+        fn any_poll<T>(
+            list: &[T],
+            pred: impl Fn(&T) -> bool,
+            tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+        ) -> Result<bool, super::Error> {
+            for x in list {
+                tick(1)?;
+                if pred(x) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         let up = |e: Ex| if e >= from { e + delta } else { e };
         for (_, srcs) in &mut self.back {
-            if srcs.list.iter().any(|&e| e >= from) {
-                srcs.map(up);
+            if any_poll(&srcs.list, |&e| e >= from, tick)? {
+                srcs.map_poll(up, tick)?;
             }
         }
-        if self.fwd.list.iter().any(|&(_, f)| f >= from) {
-            self.fwd.map(|(r, f)| (r, up(f)));
+        if any_poll(&self.fwd.list, |&(_, f)| f >= from, tick)? {
+            self.fwd.map_poll(|(r, f)| (r, up(f)), tick)?;
         }
         if let Some(x) = self.extra.as_mut() {
             debug_assert!(x.noms.is_empty() && x.links.is_empty());
             if let Some(d) = x.dl.as_deref_mut() {
-                d.shift_contexts(from, delta);
+                d.shift_contexts(from, delta, tick)?;
             }
-            if x.members.list.iter().any(|&e| e >= from) {
-                x.members.map(up);
+            if any_poll(&x.members.list, |&e| e >= from, tick)? {
+                x.members.map_poll(up, tick)?;
             }
             let h = &mut x.horn;
             debug_assert!(h.pending.is_empty() && h.merges.is_empty());
             h.forget_dominance();
-            if h.succ.list.iter().any(|&(_, n)| n >= from) {
-                h.succ.map(|(r, n)| (r, up(n)));
+            if any_poll(&h.succ.list, |&(_, n)| n >= from, tick)? {
+                h.succ.map_poll(|(r, n)| (r, up(n)), tick)?;
             }
-            if h.succ_in.list.iter().any(|&(n, _)| n >= from) {
-                h.succ_in.map(|(n, b)| (up(n), b));
+            if any_poll(&h.succ_in.list, |&(n, _)| n >= from, tick)? {
+                h.succ_in.map_poll(|(n, b)| (up(n), b), tick)?;
             }
-            if h.pred_in.list.iter().any(|&(m, _)| m >= from) {
-                h.pred_in.map(|(m, b)| (up(m), b));
+            if any_poll(&h.pred_in.list, |&(m, _)| m >= from, tick)? {
+                h.pred_in.map_poll(|(m, b)| (up(m), b), tick)?;
             }
-            if h.told.list.iter().any(|&(m, n)| m >= from || n >= from) {
-                h.told.map(|(m, n)| (up(m), up(n)));
+            if any_poll(&h.told.list, |&(m, n)| m >= from || n >= from, tick)? {
+                h.told.map_poll(|(m, n)| (up(m), up(n)), tick)?;
             }
             for set in [&mut h.real_preds, &mut h.same, &mut h.told_singular] {
-                if set.list.iter().any(|&e| e >= from) {
-                    set.map(up);
+                if any_poll(&set.list, |&e| e >= from, tick)? {
+                    set.map_poll(up, tick)?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Recomputes the members of the disjointness sets among the subsumers, whose
@@ -599,41 +704,86 @@ impl State {
     /// subsumer that gave it, whose memberships the saturation never recorded. The map
     /// grows only past [`State::disjoint_growth`], which the caller admits first.
     pub fn reindex_disjoint(&mut self, ix: &Index) {
+        let mut noop = |_| Ok(());
+        self.reindex_disjoint_poll(ix, &mut noop)
+            .expect("noop poll never fails");
+    }
+
+    /// Like [`State::reindex_disjoint`], polling `tick` across subsumers and disjointness
+    /// memberships so large maps remain cooperatively interruptible.
+    pub fn reindex_disjoint_poll(
+        &mut self,
+        ix: &Index,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
         self.disj.clear();
         if self.bottom {
-            return;
+            return Ok(());
         }
-        let n = self.disjoint_members(ix);
+        let n = self.disjoint_members_poll(ix, tick)?;
         if n > self.disj.capacity() {
             // drop the old table before the new one is allocated
             self.disj = FxHashMap::default();
             self.disj.reserve(n);
         }
         for &d in &self.subs {
-            for &s in ix.disjoint(d) {
+            tick(1)?;
+            let members = ix.disjoint(d);
+            #[cfg(test)]
+            if members.len() > super::POLL_INVALIDATE {
+                super::admission_test::hit(super::admission_test::Point::DisjointMembersStart);
+            }
+            for &s in members {
+                tick(1)?;
                 self.disj.entry(s).or_insert(d);
             }
+            #[cfg(test)]
+            if members.len() > super::POLL_INVALIDATE {
+                super::admission_test::hit(super::admission_test::Point::DisjointMembersEnd);
+            }
         }
+        Ok(())
     }
 
     /// The memberships of the subsumers in the index's disjointness sets, a bound on the
-    /// entries of the map that [`State::reindex_disjoint`] builds.
-    fn disjoint_members(&self, ix: &Index) -> usize {
-        self.subs.iter().map(|&d| ix.disjoint(d).len()).sum()
+    /// entries of the map that [`State::reindex_disjoint`] builds, polling `tick` per
+    /// subsumer.
+    fn disjoint_members_poll(
+        &self,
+        ix: &Index,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<usize, super::Error> {
+        let mut total = 0usize;
+        for &d in &self.subs {
+            tick(1)?;
+            total = total.saturating_add(ix.disjoint(d).len());
+        }
+        Ok(total)
     }
 
     /// The bytes of the table that [`State::reindex_disjoint`] allocates over `ix`, none
     /// when the map it has holds the memberships. A table reserved for `n` entries has
     /// at most `2n + 8` of capacity.
     pub fn disjoint_growth(&self, ix: &Index) -> usize {
+        let mut noop = |_| Ok(());
+        self.disjoint_growth_poll(ix, &mut noop)
+            .expect("noop poll never fails")
+    }
+
+    /// Like [`State::disjoint_growth`], polling `tick` across the subsumer scan.
+    pub fn disjoint_growth_poll(
+        &self,
+        ix: &Index,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<usize, super::Error> {
         if self.bottom {
-            return 0;
+            return Ok(0);
         }
-        let n = self.disjoint_members(ix);
+        let n = self.disjoint_members_poll(ix, tick)?;
         if n <= self.disj.capacity() {
-            0
+            Ok(0)
         } else {
-            table_bytes(2 * n + 8, 8)
+            Ok(table_bytes(2 * n + 8, 8))
         }
     }
 
@@ -2517,18 +2667,25 @@ impl Dynamic {
     /// Moves the table's contexts to the ids from `base` upward, when the index of the
     /// next run has more expressions (roadmap item 753). The caller shifts the ids that
     /// the kept states name ([`State::shift_contexts`]).
-    pub fn rebase(&mut self, base: Ex) {
+    pub fn rebase(
+        &mut self,
+        base: Ex,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
         debug_assert!(base >= self.base);
         let delta = base - self.base;
         if delta == 0 {
-            return;
+            return Ok(());
         }
         self.base = base;
         for shard in self.shards.iter_mut() {
+            tick(1)?;
             for e in shard.get_mut().values_mut() {
                 *e += delta;
+                tick(1)?;
             }
         }
+        Ok(())
     }
 
     /// Whether the id is one of the table's contexts.
@@ -3444,7 +3601,7 @@ impl<'a> Run<'a> {
             self.halt(STOP_WORK);
             return false;
         }
-        if b.deadline.is_some_and(|d| Instant::now() >= d) {
+        if b.deadline.is_some_and(super::deadline_passed) {
             self.halt(STOP_TIMEOUT);
             return false;
         }

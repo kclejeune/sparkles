@@ -41,7 +41,7 @@ use super::dl_clause::{
     hash_table_bytes, map_vec_bytes, map_vec_push, map_vec_push_bound, next_hash_table_bytes,
     next_vec_cap, set_insert_bound, set_insert_delta, vec_grow_bound, vec_push_delta,
 };
-use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
+use super::index::{BOTTOM, Ex, Index, Node, POLL_CHANGED, Role, TOP};
 use super::saturate::{Concl, Guard, Sink, State, flatten, table_bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
@@ -329,34 +329,45 @@ impl DlIx {
             && self.witnesses.is_empty()
     }
 
+    /// Upper bound on peak scratch bytes that [`DlIx::changed`] allocates for the
+    /// comparison with `old`: both pre-sized clause-key hash sets and their sorted head
+    /// copies.
+    pub fn changed_scratch<E>(
+        &self,
+        old: &DlIx,
+        poll: &impl Fn() -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let keys = |d: &DlIx| -> Result<usize, E> {
+            let mut bytes = super::dl_clause::hash_table_bytes(
+                d.clauses.len(),
+                std::mem::size_of::<(&[Ex], Vec<Ex>)>(),
+            );
+            for clauses in d.clauses.chunks(POLL_CHANGED) {
+                poll()?;
+                for (_, head) in clauses {
+                    bytes = bytes.saturating_add(std::mem::size_of_val(&**head));
+                }
+            }
+            Ok(bytes)
+        };
+        Ok(keys(old)?.saturating_add(keys(self)?))
+    }
+
     /// Marks in `changed`, which covers the expressions of `old`, each expression that
     /// keys other rules here than in `old`: one in the body of a clause that only one of
     /// the two has, one with another hypothetical successor or successor core, and one
     /// that the order of atoms ranks differently.
-    /// The bytes that [`DlIx::changed`] allocates for the comparison with `old`,
-    /// roughly: a key for each clause of both, with a copy of its head.
-    pub fn changed_scratch(&self, old: &DlIx) -> usize {
-        let keys = |d: &DlIx| {
-            d.clauses
-                .iter()
-                .map(|(_, h)| 56 + h.len() * 4)
-                .sum::<usize>()
-        };
-        keys(old) + keys(self)
-    }
-
     pub fn changed(&self, old: &DlIx, changed: &mut [bool]) {
         type Key<'a> = (&'a [Ex], Vec<Ex>);
         fn keys(d: &DlIx) -> FxHashSet<Key<'_>> {
-            d.clauses
-                .iter()
-                .map(|(b, h)| {
-                    let mut h = h.to_vec();
-                    h.sort_unstable();
-                    h.dedup();
-                    (&**b, h)
-                })
-                .collect()
+            let mut set = FxHashSet::with_capacity_and_hasher(d.clauses.len(), Default::default());
+            for (b, h) in &d.clauses {
+                let mut h = h.to_vec();
+                h.sort_unstable();
+                h.dedup();
+                set.insert((&**b, h));
+            }
+            set
         }
         let (a, b) = (keys(old), keys(self));
         for (body, _) in a.symmetric_difference(&b) {
@@ -433,34 +444,9 @@ impl DlIx {
         !self.counting || self.carry.get(t as usize).copied().unwrap_or(false)
     }
 
-    pub fn bytes(&self) -> usize {
-        self.clauses
-            .iter()
-            .map(|(b, h)| 40 + (b.len() + h.len()) * 4)
-            .sum::<usize>()
-            + self
-                .by_body
-                .values()
-                .map(|v| 48 + v.capacity() * 4)
-                .sum::<usize>()
-            + self
-                .sets
-                .iter()
-                .map(|s| 24 + s.capacity() * 4)
-                .sum::<usize>()
-            + table_bytes(self.hyp.capacity(), 8) * 2
-            + self.cores.values().map(|c| 24 + c.len() * 4).sum::<usize>()
-            + self
-                .by_succ
-                .values()
-                .map(|v| 32 + v.capacity() * 4)
-                .sum::<usize>()
+    pub fn bytes_poll<E>(&self, tick: &mut impl FnMut(usize) -> Result<(), E>) -> Result<usize, E> {
+        let mut total = table_bytes(self.hyp.capacity(), 8) * 2
             + self.reach.len()
-            + self
-                .below
-                .iter()
-                .map(|v| 24 + v.capacity() * 4)
-                .sum::<usize>()
             + self.quals.capacity() * 8
             + table_bytes(self.quals_of.capacity(), 32)
             + table_bytes(self.atmost.capacity(), 12)
@@ -481,17 +467,47 @@ impl DlIx {
             + self.carry.capacity()
             + self.consts.capacity() * 8
             + table_bytes(self.ne_of.capacity(), 32)
-            + self.ne_of.values().map(|v| v.capacity() * 4).sum::<usize>()
             + table_bytes(self.blockers.capacity(), 24)
-            + self.blockers.values().map(|v| v.len() * 4).sum::<usize>()
             + table_bytes(self.skip_weaken.capacity(), 24)
-            + self
-                .skip_weaken
-                .values()
-                .map(|v| v.len() * 4)
-                .sum::<usize>()
             + table_bytes(self.witnesses.capacity(), 8)
-            + self.least.capacity()
+            + self.least.capacity();
+        for (b, h) in &self.clauses {
+            tick(1)?;
+            total += 40 + (b.len() + h.len()) * 4;
+        }
+        for v in self.by_body.values() {
+            tick(1)?;
+            total += 48 + v.capacity() * 4;
+        }
+        for s in &self.sets {
+            tick(1)?;
+            total += 24 + s.capacity() * 4;
+        }
+        for c in self.cores.values() {
+            tick(1)?;
+            total += 24 + c.len() * 4;
+        }
+        for v in self.by_succ.values() {
+            tick(1)?;
+            total += 32 + v.capacity() * 4;
+        }
+        for v in &self.below {
+            tick(1)?;
+            total += 24 + v.capacity() * 4;
+        }
+        for v in self.ne_of.values() {
+            tick(1)?;
+            total += v.capacity() * 4;
+        }
+        for v in self.blockers.values() {
+            tick(1)?;
+            total += v.len() * 4;
+        }
+        for v in self.skip_weaken.values() {
+            tick(1)?;
+            total += v.len() * 4;
+        }
+        Ok(total)
     }
 
     pub fn logical_bytes(&self) -> usize {
@@ -1125,6 +1141,9 @@ impl DlRun {
         *self.merge.get_mut() = false;
         self.merge_skip = None;
         *self.merged.get_mut() = None;
+        for c in &mut self.mcount {
+            *c.get_mut() = 0;
+        }
         self.adaptive = None;
     }
     /// Enables Option 2 (`rawQ`) adaptive tracking for this attempt. When `enforce` is
@@ -1644,73 +1663,251 @@ impl DlSt {
         }
     }
 
-    /// Whether a marker or a stored clause of the context, dead or not, names an
-    /// expression that `changed` marks, or one it does not cover (roadmap item 753).
-    /// Every rule reads the index by the atoms and the successor terms of its premises,
-    /// and a premise is a unit of the context, a marker or a clause its store took, so a
-    /// context that names no marked expression here or among its units made no inference
-    /// that the changed rules give or take. A clause the store subsumed on arrival was a
-    /// premise of none. The equalities and the interned literals of runs that count or
-    /// have a root are not read, and count as marked.
+    /// Test wrapper around [`DlSt::names_changed_poll`] with a no-op poll callback.
+    #[cfg(test)]
     pub fn names_changed(&self, changed: &[bool]) -> bool {
+        let mut noop = |_| Ok(());
+        self.names_changed_poll(changed, &mut noop)
+            .expect("noop poll never fails")
+    }
+
+    /// Whether a marker, a denied test class, a registered existential restriction, or a
+    /// stored clause of the context, dead or not, names an expression that `changed` marks,
+    /// or one it does not cover (roadmap item 753), polling `tick` across markers, edges,
+    /// and stored clauses. Every rule reads the index by the atoms and the successor terms
+    /// of its premises, and a premise is a unit of the context, a marker or a clause its
+    /// store took, so a context that names no marked expression here or among its units made
+    /// no inference that the changed rules give or take. A clause the store subsumed on
+    /// arrival was a premise of none. The equalities and the interned literals of runs that
+    /// count or have a root are not read, and count as marked.
+    pub(super) fn names_changed_poll(
+        &self,
+        changed: &[bool],
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<bool, super::Error> {
         let hit = |e: Ex| changed.get(e as usize).copied().unwrap_or(true);
-        self.hyps.iter().any(|&a| hit(a))
-            || self.store.clauses.iter().any(|s| {
-                s.c.body().iter().chain(s.c.head()).any(|l| match l.kind() {
+        for &a in &self.hyps {
+            tick(1)?;
+            if hit(a) {
+                return Ok(true);
+            }
+        }
+        for &a in &self.neg {
+            tick(1)?;
+            if hit(a) {
+                return Ok(true);
+            }
+        }
+        for &(e, _) in &self.edges {
+            tick(1)?;
+            if hit(e) {
+                return Ok(true);
+            }
+        }
+        for s in &self.store.clauses {
+            tick(1)?;
+            for l in s.c.body().iter().chain(s.c.head()) {
+                tick(1)?;
+                let matched = match l.kind() {
                     X | Y => hit(l.atom()),
                     F => hit(l.fun()) || hit(l.atom()),
                     RL => hit(l.fun()),
                     RY => false,
                     _ => true,
-                })
-            })
+                };
+                if matched {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Removes the contexts in `gone` from the predecessors that registered, which
-    /// register again when a run saturates them again (roadmap item 753).
-    pub fn drop_predecessors(&mut self, gone: &FxHashSet<Ex>) {
-        self.dpreds.retain(|(u, _)| !gone.contains(u));
+    /// register again when a run saturates them again (roadmap item 753), polling `tick`
+    /// across the predecessor list.
+    pub fn drop_predecessors_poll(
+        &mut self,
+        gone: &FxHashSet<Ex>,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
+        let mut write = 0;
+        for read in 0..self.dpreds.len() {
+            tick(1)?;
+            let item = self.dpreds[read];
+            if !gone.contains(&item.0) {
+                self.dpreds[write] = item;
+                write += 1;
+            }
+        }
+        self.dpreds.truncate(write);
+        Ok(())
+    }
+
+    /// Peak temporary scratch bytes needed by [`DlSt::shift_contexts`] when shifting dynamic
+    /// context ids from `from` upward. Each hash table is rebuilt sequentially with
+    /// `with_capacity_and_hasher(old.len(), ..)` and drops its old table before the next
+    /// table starts, so the peak overlap is the maximum single rebuilt table.
+    pub fn shift_scratch(
+        &self,
+        from: Ex,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<usize, super::Error> {
+        let mut peak = 0usize;
+        let mut has_pred_in = false;
+        for &v in self.pred_in.keys() {
+            tick(1)?;
+            if v >= from {
+                has_pred_in = true;
+                break;
+            }
+        }
+        if has_pred_in {
+            peak = peak.max(hash_table_bytes(
+                self.pred_in.len(),
+                std::mem::size_of::<(Ex, Vec<u32>)>(),
+            ));
+        }
+        let mut has_pred_seen = false;
+        for &(v, _) in &self.pred_seen {
+            tick(1)?;
+            if v >= from {
+                has_pred_seen = true;
+                break;
+            }
+        }
+        if has_pred_seen {
+            peak = peak.max(hash_table_bytes(
+                self.pred_seen.len(),
+                std::mem::size_of::<(Ex, u32)>(),
+            ));
+        }
+        let mut has_sent = false;
+        for &(v, _) in &self.sent {
+            tick(1)?;
+            if v >= from {
+                has_sent = true;
+                break;
+            }
+        }
+        if has_sent {
+            peak = peak.max(hash_table_bytes(
+                self.sent.len(),
+                std::mem::size_of::<(Ex, Ex)>(),
+            ));
+        }
+        if let Some(r) = self.root.as_deref() {
+            let mut has_pending = false;
+            for &v in r.pred_pending.keys() {
+                tick(1)?;
+                if v >= from {
+                    has_pending = true;
+                    break;
+                }
+            }
+            if has_pending {
+                peak = peak.max(hash_table_bytes(
+                    r.pred_pending.len(),
+                    std::mem::size_of::<(Ex, Vec<u32>)>(),
+                ));
+            }
+        }
+        Ok(peak)
     }
 
     /// Adds `delta` to every context id from `from` upward that the state names, as
     /// [`State::shift_contexts`] does for the rest of the state.
-    pub fn shift_contexts(&mut self, from: Ex, delta: Ex) {
+    pub fn shift_contexts(
+        &mut self,
+        from: Ex,
+        delta: Ex,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
         let up = |e: Ex| if e >= from { e + delta } else { e };
         for (u, _) in &mut self.dpreds {
             *u = up(*u);
+            tick(1)?;
         }
         for (_, v) in &mut self.edges {
             *v = up(*v);
+            tick(1)?;
         }
         debug_assert!(
             self.edges
                 .windows(2)
                 .all(|w| (w[0].1, w[0].0) < (w[1].1, w[1].0))
         );
-        if self.pred_in.keys().any(|&v| v >= from) {
-            self.pred_in = std::mem::take(&mut self.pred_in)
-                .into_iter()
-                .map(|(v, c)| (up(v), c))
-                .collect();
-            self.pred_seen = std::mem::take(&mut self.pred_seen)
-                .into_iter()
-                .map(|(v, c)| (up(v), c))
-                .collect();
+        let mut has_pred_in = false;
+        for &v in self.pred_in.keys() {
+            tick(1)?;
+            if v >= from {
+                has_pred_in = true;
+                break;
+            }
         }
-        if self.sent.iter().any(|&(v, _)| v >= from) {
-            self.sent = std::mem::take(&mut self.sent)
-                .into_iter()
-                .map(|(v, a)| (up(v), a))
-                .collect();
+        if has_pred_in {
+            let old = std::mem::take(&mut self.pred_in);
+            let mut next = FxHashMap::with_capacity_and_hasher(old.len(), Default::default());
+            for (v, c) in old {
+                next.insert(up(v), c);
+                tick(1)?;
+            }
+            self.pred_in = next;
         }
-        if let Some(r) = self.root.as_deref_mut()
-            && r.pred_pending.keys().any(|&v| v >= from)
-        {
-            r.pred_pending = std::mem::take(&mut r.pred_pending)
-                .into_iter()
-                .map(|(v, c)| (up(v), c))
-                .collect();
+        let mut has_pred_seen = false;
+        for &(v, _) in &self.pred_seen {
+            tick(1)?;
+            if v >= from {
+                has_pred_seen = true;
+                break;
+            }
         }
+        if has_pred_seen {
+            let old = std::mem::take(&mut self.pred_seen);
+            let mut next = FxHashSet::with_capacity_and_hasher(old.len(), Default::default());
+            for (v, c) in old {
+                next.insert((up(v), c));
+                tick(1)?;
+            }
+            self.pred_seen = next;
+        }
+        let mut has_sent = false;
+        for &(v, _) in &self.sent {
+            tick(1)?;
+            if v >= from {
+                has_sent = true;
+                break;
+            }
+        }
+        if has_sent {
+            let old = std::mem::take(&mut self.sent);
+            let mut next = FxHashSet::with_capacity_and_hasher(old.len(), Default::default());
+            for (v, a) in old {
+                next.insert((up(v), a));
+                tick(1)?;
+            }
+            self.sent = next;
+        }
+        if let Some(r) = self.root.as_deref_mut() {
+            let mut has_pending = false;
+            for &v in r.pred_pending.keys() {
+                tick(1)?;
+                if v >= from {
+                    has_pending = true;
+                    break;
+                }
+            }
+            if has_pending {
+                let old = std::mem::take(&mut r.pred_pending);
+                let mut next = FxHashMap::with_capacity_and_hasher(old.len(), Default::default());
+                for (v, c) in old {
+                    next.insert(up(v), c);
+                    tick(1)?;
+                }
+                r.pred_pending = next;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1732,9 +1929,58 @@ pub fn has_test(d: &super::saturate::Dynamic, x: Ex, bs: &[Ex]) -> bool {
     d.find(&core).is_some()
 }
 
-/// The class that a test context with the core `core` tests.
+/// The class that a test context with the core `core` tests, or `None` when `core` has no
+/// denied class (such as an eager conjunction context whose core holds only positive
+/// expressions), polling `tick` across the core entries.
+pub(super) fn tested_class_poll(
+    core: &[Ex],
+    tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+) -> Result<Option<Ex>, super::Error> {
+    let mut has_neg = false;
+    let mut first_pos = None;
+    for &m in core {
+        tick(1)?;
+        if m & NEG != 0 {
+            has_neg = true;
+        } else if first_pos.is_none() {
+            first_pos = Some(m);
+        }
+        if has_neg && first_pos.is_some() {
+            return Ok(first_pos);
+        }
+    }
+    Ok(if has_neg { first_pos } else { None })
+}
+
+/// Test wrapper around [`tested_class_poll`] with a no-op poll callback.
+#[cfg(test)]
 pub fn tested_class(core: &[Ex]) -> Option<Ex> {
-    core.iter().copied().find(|&m| m & NEG == 0)
+    let mut noop = |_| Ok(());
+    tested_class_poll(core, &mut noop).expect("noop poll never fails")
+}
+
+/// Whether any expression named by a dynamic context's `core` (positive or denied) is
+/// marked in `changed`, or lies outside `changed` (roadmap item 753), polling `tick`
+/// across the core entries.
+pub(super) fn core_changed_poll(
+    core: &[Ex],
+    changed: &[bool],
+    tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+) -> Result<bool, super::Error> {
+    for &m in core {
+        tick(1)?;
+        if changed.get((m & !NEG) as usize).copied().unwrap_or(true) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Test wrapper around [`core_changed_poll`] with a no-op poll callback.
+#[cfg(test)]
+pub(super) fn core_changed(core: &[Ex], changed: &[bool]) -> bool {
+    let mut noop = |_| Ok(());
+    core_changed_poll(core, changed, &mut noop).expect("noop poll never fails")
 }
 
 /// Starts a test context: its core, `owl:Thing` and the class it denies.
@@ -3831,6 +4077,8 @@ fn drain_with_covered<S: Sink, D: Deriver>(
         // a product past the run's limit on choices ends the run as its bound does, before
         // the product spends its work (roadmap item 1011)
         if held_guard.dl().too_wide(&lists) {
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::DlWidthStop);
             held_guard.dl().exhaust_with(WorkStopGuard::WidthExhausted);
             mark_interrupted(st);
             return;
@@ -8394,5 +8642,65 @@ mod tests {
             dx.carries(q_inv),
             "lazy-only predecessor merge must carry qualified inverse (s_QualB)⁻"
         );
+    }
+
+    #[test]
+    fn tested_class_ignores_eager_conjunction_cores_without_neg_bits() {
+        // Test contexts carry the tested class alongside one or more denied (`NEG`) classes.
+        assert_eq!(tested_class(&[5, 9 | NEG]), Some(5));
+        assert_eq!(tested_class(&[5, 7 | NEG, 9 | NEG]), Some(5));
+        // Eager conjunction contexts carry only positive expressions (no `NEG` bit) and
+        // must never be misidentified as a test of their first member.
+        assert_eq!(tested_class(&[2, 5]), None);
+        assert_eq!(tested_class(&[2, 5, 8]), None);
+        assert_eq!(tested_class(&[]), None);
+        assert_eq!(tested_class(&[9 | NEG]), None);
+    }
+
+    #[test]
+    fn core_changed_checks_positive_and_denied_members() {
+        let mut changed = vec![false; 12];
+        assert!(!core_changed(&[2, 5], &changed));
+        assert!(!core_changed(&[5, 9 | NEG], &changed));
+
+        // Marking a denied class in a test core invalidates the test context.
+        changed[9] = true;
+        assert!(core_changed(&[5, 9 | NEG], &changed));
+        assert!(!core_changed(&[2, 5], &changed));
+
+        // Marking a positive member in an eager conjunction core invalidates it.
+        changed[9] = false;
+        changed[5] = true;
+        assert!(core_changed(&[2, 5], &changed));
+        assert!(core_changed(&[5, 9 | NEG], &changed));
+
+        // Any expression outside `changed` is conservatively treated as changed.
+        changed[5] = false;
+        assert!(core_changed(&[2, 20], &changed));
+        assert!(core_changed(&[2, 20 | NEG], &changed));
+    }
+
+    #[test]
+    fn names_changed_checks_neg_and_edge_restrictions_only() {
+        let mut st = State::default();
+        let x = ds(&mut st);
+        x.neg.push(4);
+        // Edge `(e = 3, v = 100)` targets a dynamic context id `100` past `changed.len()`.
+        // `names_changed` must check the restriction `e = 3` and NOT treat target `v = 100`
+        // as an out-of-range changed expression.
+        x.insert_edge(3, 100);
+
+        let mut changed = vec![false; 10];
+        assert!(!x.names_changed(&changed));
+
+        changed[4] = true;
+        assert!(x.names_changed(&changed));
+
+        changed[4] = false;
+        changed[3] = true;
+        assert!(x.names_changed(&changed));
+
+        changed[3] = false;
+        assert!(!x.names_changed(&changed));
     }
 }

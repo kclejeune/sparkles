@@ -1,8 +1,9 @@
 use parking_lot::Mutex;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Point {
@@ -80,6 +81,65 @@ pub(super) enum Point {
     OriginalRangeFill,
     OriginalRangeAfterFill,
     BeforePanicWake,
+    RebaseAccountStart,
+    RebaseAccountAxiomsStart,
+    RebaseAccountEnd,
+    RebaseScratchStart,
+    RebaseAdmit {
+        live: usize,
+        scratch: usize,
+        paid: usize,
+    },
+    RebaseShift,
+    RebaseDynamicStart,
+    RebaseDynamicEnd,
+    CompareScratchHeadChunk(usize),
+    CompareAdmit {
+        live_base: usize,
+        old_ix_bytes: usize,
+        changed_scratch: usize,
+        inv_peak: usize,
+        held: usize,
+    },
+    InvalidateInitialStart,
+    InvalidateInitialEnd,
+    InvalidateLargeCoreStart,
+    InvalidateLargeCoreEnd,
+    InvalidateClosureStart,
+    InvalidateClosureEnd,
+    InvalidateScratch {
+        slots: usize,
+        affected_len: usize,
+        affected_bytes: usize,
+        queue_cap: usize,
+        queue_bytes: usize,
+        queue_ptr: usize,
+        bound: usize,
+        live_base: usize,
+    },
+    InvalidateBackListStart,
+    InvalidateBackListEnd,
+    InvalidateDlPredsStart,
+    InvalidateDlPredsEnd,
+    DisjointGrowthAdmit {
+        live: usize,
+        growth: usize,
+        paid: usize,
+    },
+    DisjointReindex,
+    DisjointReindexEnd,
+    DisjointMembersStart,
+    DisjointMembersEnd,
+    InvalidateFinalStart,
+    InvalidateFinalEnd,
+    KeptSaturationStart,
+    KeptSaturationEnd {
+        stopped_by_timeout: bool,
+    },
+    DlWidthStop,
+    KeptRetry {
+        dl_worked: bool,
+    },
     Idle,
 }
 
@@ -121,6 +181,57 @@ pub(super) fn hit(point: Point) {
 }
 
 pub(super) const WAIT: Duration = Duration::from_secs(10);
+
+static NEXT_DEADLINE_NS: AtomicU64 = AtomicU64::new(1);
+static EXPIRED_DEADLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static EXPIRED_DEADLINES: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+
+/// Controlled deadline for deterministic tests: starts 1 hour in the future with a unique
+/// `Instant` so scheduling delays never cause premature expiry and concurrent tests never
+/// interfere, and becomes immediately expired across all worker threads once [`Self::expire`]
+/// is called.
+pub(super) struct TestDeadline {
+    deadline: Instant,
+    expired: AtomicBool,
+}
+
+impl TestDeadline {
+    pub(super) fn future() -> Self {
+        let offset = NEXT_DEADLINE_NS.fetch_add(1, Ordering::Relaxed);
+        Self {
+            deadline: Instant::now() + Duration::from_secs(3600) + Duration::from_nanos(offset),
+            expired: AtomicBool::new(false),
+        }
+    }
+
+    pub(super) fn instant(&self) -> Instant {
+        self.deadline
+    }
+
+    pub(super) fn expire(&self) {
+        if !self.expired.swap(true, Ordering::SeqCst) {
+            EXPIRED_DEADLINES.lock().push(self.deadline);
+            EXPIRED_DEADLINE_COUNT.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for TestDeadline {
+    fn drop(&mut self) {
+        if self.expired.load(Ordering::SeqCst) {
+            let mut list = EXPIRED_DEADLINES.lock();
+            if let Some(pos) = list.iter().position(|&d| d == self.deadline) {
+                list.swap_remove(pos);
+                EXPIRED_DEADLINE_COUNT.fetch_sub(1, Ordering::Release);
+            }
+        }
+    }
+}
+
+pub(super) fn is_deadline_expired(deadline: Instant) -> bool {
+    EXPIRED_DEADLINE_COUNT.load(Ordering::Acquire) > 0
+        && EXPIRED_DEADLINES.lock().contains(&deadline)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Attempt {
