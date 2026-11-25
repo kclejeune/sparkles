@@ -38,6 +38,27 @@ pub(super) struct Hist {
     from: u64,
     to: u64,
     pub(super) rows: HistRows,
+    bytes: u64,
+}
+
+/// Replay diffs kept for resumed live queries and past-commit reads.
+///
+/// Stored behind a leaf [`Mutex`] so [`super::super::budget::ViewBudget`] can evict
+/// oldest diffs first whenever active circuit state or pass work hits a memory cap,
+/// without ever acquiring `Cell::state` or `Runtime::reg`.
+#[derive(Default)]
+pub(super) struct HistoryBuf {
+    pub(super) entries: VecDeque<Hist>,
+    pub(super) rows: usize,
+    pub(super) bytes: u64,
+}
+
+pub(super) fn hist_bytes(rows: &[(Vec<Option<Term>>, i64)]) -> u64 {
+    (std::mem::size_of::<Hist>() + std::mem::size_of_val(rows)) as u64
+        + rows
+            .iter()
+            .map(|(row, _)| crate::incr::circuit::decoded_row_bytes(row))
+            .sum::<u64>()
 }
 
 pub(super) struct Sub {
@@ -48,25 +69,92 @@ pub(super) struct Sub {
 }
 
 /// A circuit's state, shared by its views and live queries.
+///
+/// `circuit` is declared last so `history` (whose bytes are accounted on `circuit`'s
+/// budget) drops strictly before `circuit`'s credit returns to the pool.
 pub(crate) struct Slot {
-    pub(super) circuit: Circuit,
     pub(super) query: Arc<Query>,
     pub(super) query_text_bytes: usize,
     /// why the access makes the whole query be evaluated again, when it does
     pub(super) whole: Option<String>,
     pub(super) vars: Arc<[String]>,
-    pub(super) history: VecDeque<Hist>,
-    pub(super) history_rows: usize,
+    pub(super) history: Arc<Mutex<HistoryBuf>>,
     pub(super) subs: Vec<Sub>,
-    /// the views attached to the circuit
-    pub(super) views: usize,
+    /// each attached view's local `memoryBytes` ceiling, by view name
+    pub(super) view_limits: FxHashMap<String, u64>,
     /// set by a switch of the inference until the evaluation that follows it: the change
     /// that evaluation publishes leads from one mode to the other, and diffs from before
     /// it must not rewind a view across the switch
     pub(super) rebased: bool,
+    pub(super) circuit: Circuit,
 }
 
 impl Slot {
+    /// Leaf reclaim hook for `ViewBudget`: drops oldest replay diffs when active state
+    /// needs headroom under the local cap or parent pool. Captures a `Weak` reference so
+    /// `Slot::history` remains the sole strong owner and drops strictly before
+    /// `Slot::circuit`'s credit returns to the pool.
+    pub(super) fn history_reclaim_hook(
+        history: &Arc<Mutex<HistoryBuf>>,
+    ) -> crate::incr::budget::ReclaimHook {
+        let hist = Arc::downgrade(history);
+        Arc::new(move |needed: u64| {
+            let Some(hist) = hist.upgrade() else {
+                return 0;
+            };
+            let mut h = hist.lock();
+            let mut freed = 0u64;
+            while freed < needed {
+                let Some(old) = h.entries.pop_front() else {
+                    break;
+                };
+                h.rows = h.rows.saturating_sub(old.rows.len());
+                h.bytes = h.bytes.saturating_sub(old.bytes);
+                freed = freed.saturating_add(old.bytes);
+                drop(old);
+            }
+            if h.entries.is_empty() {
+                h.entries = VecDeque::new();
+                h.rows = 0;
+                h.bytes = 0;
+            }
+            freed
+        })
+    }
+
+    pub(super) fn views_count(&self) -> usize {
+        self.view_limits.len()
+    }
+
+    /// Prune dropped or explicitly closed live subscribers and recompute the effective
+    /// local limit when any subscriber left.
+    pub(super) fn prune_dead_subs(&mut self) {
+        let before = self.subs.len();
+        self.subs
+            .retain(|s| s.shared.upgrade().is_some_and(|sh| !sh.is_closed()));
+        if self.subs.len() != before {
+            self.recompute_local_limit();
+        }
+    }
+
+    /// Recompute the shared circuit's local byte limit from its currently attached views
+    /// and live subscribers so detaching a larger consumer lowers the ceiling.
+    pub(super) fn recompute_local_limit(&mut self) {
+        let max_view = self.view_limits.values().copied().max();
+        let max_sub = self
+            .subs
+            .iter()
+            .filter(|s| s.shared.upgrade().is_some_and(|sh| !sh.is_closed()))
+            .map(|s| s.budget)
+            .max();
+        let effective = match (max_view, max_sub) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(limit) = effective {
+            self.circuit.set_local_limit(Some(limit));
+        }
+    }
     /// Why the whole query is evaluated again: protections that depend on the data, or
     /// the dataset's inference.
     pub(super) fn whole_reason(&self, inference: Option<&Inference>) -> Option<String> {
@@ -103,85 +191,160 @@ impl Slot {
         u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
     }
 
-    /// The rows of a snapshot. An ordered window's rows come in order with their
-    /// positions.
-    pub(super) fn live_rows(&self, rows: Vec<(Vec<Option<Term>>, i64)>) -> Vec<LiveRow> {
-        let ordered = self.circuit.ordered();
-        let mut at = 0u64;
-        rows.into_iter()
-            .map(|(terms, w)| {
-                let count = w.unsigned_abs();
-                let position = ordered.then_some(at);
-                at += count;
-                LiveRow {
-                    terms,
-                    count,
-                    position,
-                }
-            })
-            .collect()
-    }
-
-    /// The diff of an ordered window's latest pass, `None` when the pass left the
-    /// window alone.
-    pub(super) fn moves_event(&self, from: u64, to: u64) -> Option<LiveEvent> {
-        let (removed, added) = self.circuit.moves()?;
-        if removed.is_empty() && added.is_empty() {
-            return None;
-        }
-        let rows = |v: Vec<(u64, Vec<Option<Term>>, u64)>| -> Arc<[LiveRow]> {
-            v.into_iter()
-                .map(|(position, terms, count)| LiveRow {
-                    terms,
-                    count,
-                    position: Some(position),
-                })
-                .collect()
+    /// The diff of an ordered window's latest pass, decoded incrementally under a
+    /// `ScratchLease`. Returns `Ok(None)` when the pass left the window alone.
+    pub(super) fn moves_event_budgeted(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<Option<(LiveEvent, crate::incr::budget::ScratchLease)>> {
+        let Some((removed, added, lease)) = self.circuit.moves_live_budgeted()? else {
+            return Ok(None);
         };
-        Some(LiveEvent::Diff {
-            commit: to,
-            from,
-            removed: rows(removed),
-            added: rows(added),
-        })
-    }
-
-    pub(super) fn event(&self, reset: bool) -> LiveEvent {
-        let ask = self.circuit.kind == Kind::Ask;
-        LiveEvent::Snapshot {
-            commit: self.circuit.applied,
-            vars: self.vars.clone(),
-            rows: if ask {
-                Arc::from(Vec::new())
-            } else {
-                self.live_rows(self.circuit.rows()).into()
+        Ok(Some((
+            LiveEvent::Diff {
+                commit: to,
+                from,
+                removed,
+                added,
             },
-            value: ask.then(|| self.circuit.result.total() > 0),
-            reset,
-        }
+            lease,
+        )))
     }
 
-    /// The whole result as a `reset` event for the subscriber of `shared`, whose next
-    /// diff then starts from the circuit's commit.
-    pub(crate) fn resync(&mut self, shared: &Arc<Shared>) -> LiveEvent {
-        let applied = self.circuit.applied;
-        for s in &mut self.subs {
-            if std::ptr::eq(s.shared.as_ptr(), Arc::as_ptr(shared)) {
-                s.last = applied;
+    /// Build a snapshot event incrementally under a `ScratchLease`, covering its decoded
+    /// rows before returning.
+    pub(super) fn event_budgeted(
+        &self,
+        reset: bool,
+    ) -> Result<(LiveEvent, crate::incr::budget::ScratchLease)> {
+        let ask = self.circuit.kind == Kind::Ask;
+        if ask {
+            return Ok((
+                LiveEvent::Snapshot {
+                    commit: self.circuit.applied,
+                    vars: self.vars.clone(),
+                    rows: Arc::from(Vec::new()),
+                    value: Some(self.circuit.result.total() > 0),
+                    reset,
+                },
+                self.circuit.scratch_lease(),
+            ));
+        }
+        let (rows, lease) = self.circuit.live_rows_budgeted()?;
+        Ok((
+            LiveEvent::Snapshot {
+                commit: self.circuit.applied,
+                vars: self.vars.clone(),
+                rows,
+                value: None,
+                reset,
+            },
+            lease,
+        ))
+    }
+
+    /// Build an unordered diff event from compact `c` incrementally under a `ScratchLease`.
+    pub(super) fn diff_event_budgeted(
+        &self,
+        from: u64,
+        to: u64,
+        c: &Changes,
+    ) -> Result<Option<(LiveEvent, crate::incr::budget::ScratchLease)>> {
+        let Some((removed, added, lease)) = self.circuit.diff_live_budgeted(c)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            LiveEvent::Diff {
+                commit: to,
+                from,
+                removed,
+                added,
+            },
+            lease,
+        )))
+    }
+
+    /// End all active live subscribers on this slot with an error event and lower
+    /// `local_limit` accordingly without failing co-located named views.
+    pub(super) fn fail_live_subs(&mut self, e: &Error, deferred: &mut DeferredDrops) {
+        let (code, message) = super::round::failure(e);
+        for s in self.subs.drain(..) {
+            if let Some(sh) = s.shared.upgrade() {
+                deferred.queued.extend(sh.push_leased(
+                    LiveEvent::Error {
+                        code: code.clone(),
+                        message: message.clone(),
+                    },
+                    None,
+                ));
             }
         }
-        self.event(true)
+        self.recompute_local_limit();
+    }
+
+    pub(super) fn detach_event_lease(
+        &self,
+        lease: &mut crate::incr::budget::ScratchLease,
+    ) -> Option<Arc<crate::incr::live::QueuedLease>> {
+        crate::incr::live::QueuedLease::new(lease.bytes(), self.circuit.detach_scratch_lease(lease))
+    }
+
+    /// The whole result as a `reset` event for the subscriber of `shared`, built under
+    /// budget admission. Returns the event and retired credit to release after unlocking.
+    pub(crate) fn resync_budgeted(
+        &mut self,
+        shared: &Arc<Shared>,
+    ) -> (crate::incr::live::QueuedEvent, Vec<MemoryLease>) {
+        let applied = self.circuit.applied;
+        let event = self.event_budgeted(true).and_then(|(event, lease)| {
+            if lease.bytes() <= shared.byte_limit() {
+                Ok((event, lease))
+            } else {
+                Err(Error::BudgetExceeded(crate::error::Budget {
+                    kind: crate::error::BudgetKind::Memory,
+                    limit: shared.byte_limit(),
+                    requested: lease.bytes(),
+                }))
+            }
+        });
+        match event {
+            Ok((ev, mut lease)) => {
+                for s in &mut self.subs {
+                    if std::ptr::eq(s.shared.as_ptr(), Arc::as_ptr(shared)) {
+                        s.last = applied;
+                    }
+                }
+                let detached = self.detach_event_lease(&mut lease);
+                let retired = self.circuit.drain_retired();
+                (crate::incr::live::QueuedEvent::new(ev, detached), retired)
+            }
+            Err(e) => {
+                self.subs
+                    .retain(|s| !std::ptr::eq(s.shared.as_ptr(), Arc::as_ptr(shared)));
+                self.recompute_local_limit();
+                let retired = self.circuit.drain_retired();
+                let (code, message) = super::round::failure(&e);
+                (
+                    crate::incr::live::QueuedEvent::new(LiveEvent::Error { code, message }, None),
+                    retired,
+                )
+            }
+        }
     }
 
     /// Evaluate the query at `snap` from scratch. This is the first build, or a rebuild
-    /// whose change from the old result is returned for the live queries.
+    /// whose change from the old result is returned with its scratch lease for the live
+    /// queries.
     pub(super) fn evaluate(
         &mut self,
         snap: Arc<crate::store::Snapshot>,
         control: &Control,
-    ) -> Result<Option<Changes>> {
+    ) -> Result<Option<(Changes, crate::incr::budget::ScratchLease)>> {
         if self.circuit.snap.is_some() {
-            self.circuit.reset(&DeltaSet::at(snap), control).map(Some)
+            self.circuit
+                .reset_charged(&DeltaSet::at(snap), control)
+                .map(Some)
         } else {
             self.circuit.build(snap, control).map(|()| None)
         }
@@ -189,16 +352,21 @@ impl Slot {
 
     /// Forget the diffs kept for resumed live queries and reads at past commits.
     pub(super) fn clear_history(&mut self) {
-        self.history.clear();
-        self.history_rows = 0;
+        {
+            let mut h = self.history.lock();
+            h.entries = VecDeque::new();
+            h.rows = 0;
+            h.bytes = 0;
+        }
+        self.circuit.set_external_best_effort(0);
     }
 
     pub(super) fn alive(&mut self) -> bool {
-        self.subs.retain(|s| s.shared.strong_count() > 0);
-        if self.subs.is_empty() && self.views == 0 {
+        self.prune_dead_subs();
+        if self.subs.is_empty() && self.view_limits.is_empty() {
             self.clear_history();
         }
-        !self.subs.is_empty() || self.views > 0
+        !self.subs.is_empty() || !self.view_limits.is_empty()
     }
 
     pub(super) fn remember(
@@ -208,52 +376,208 @@ impl Slot {
         rows: Arc<[(Vec<Option<Term>>, i64)]>,
         max: usize,
     ) {
+        let mut empty = crate::incr::budget::ScratchLease::default();
+        self.remember_charged(from, to, rows, max, &mut empty);
+    }
+
+    /// Store `rows` in replay history while atomically handing off any pre-admitted
+    /// scratch `lease` into `external_bytes`, avoiding any uncharged gap or 2× peak.
+    pub(super) fn remember_charged(
+        &mut self,
+        from: u64,
+        to: u64,
+        rows: Arc<[(Vec<Option<Term>>, i64)]>,
+        max: usize,
+        lease: &mut crate::incr::budget::ScratchLease,
+    ) {
         let max = if self.subs.is_empty() {
-            if self.views == 0 {
+            if self.view_limits.is_empty() {
                 return;
             }
             VIEW_HISTORY_COMMITS
         } else {
             max
         };
-        if rows.is_empty()
-            && let Some(last) = self.history.back_mut()
-            && last.rows.is_empty()
-            && last.to == from
-        {
-            last.to = to;
-            return;
+        if rows.is_empty() {
+            let mut h = self.history.lock();
+            if let Some(last) = h.entries.back_mut()
+                && last.rows.is_empty()
+                && last.to == from
+            {
+                last.to = to;
+                return;
+            }
         }
-        self.history_rows += rows.len();
-        self.history.push_back(Hist { from, to, rows });
-        while self.history.len() > max.max(1) || self.history_rows > HISTORY_ROWS {
-            match self.history.pop_front() {
-                Some(h) => self.history_rows -= h.rows.len(),
-                None => break,
+        let bytes = hist_bytes(&rows);
+        let new_rows = rows.len();
+        {
+            let mut h = self.history.lock();
+            while h.entries.len() >= max.max(1) || h.rows.saturating_add(new_rows) > HISTORY_ROWS {
+                match h.entries.pop_front() {
+                    Some(old) => {
+                        h.rows = h.rows.saturating_sub(old.rows.len());
+                        h.bytes = h.bytes.saturating_sub(old.bytes);
+                    }
+                    None => break,
+                }
+            }
+        }
+        // Pre-admit the incoming diff before storing it in history, evicting oldest
+        // entries first when memory is tight so replay history never escapes the pool
+        // or breaks an otherwise healthy view.
+        loop {
+            let cur_bytes = self.history.lock().bytes;
+            let next_bytes = cur_bytes.saturating_add(bytes);
+            if self
+                .circuit
+                .commit_external_from_scratch(next_bytes, lease)
+                .is_ok()
+            {
+                let mut h = self.history.lock();
+                h.rows = h.rows.saturating_add(new_rows);
+                h.bytes = h.bytes.saturating_add(bytes);
+                h.entries.push_back(Hist {
+                    from,
+                    to,
+                    rows,
+                    bytes,
+                });
+                return;
+            }
+            let popped = {
+                let mut h = self.history.lock();
+                let popped = h.entries.pop_front();
+                if let Some(ref old) = popped {
+                    h.rows = h.rows.saturating_sub(old.rows.len());
+                    h.bytes = h.bytes.saturating_sub(old.bytes);
+                }
+                if h.entries.is_empty() {
+                    h.entries = VecDeque::new();
+                    h.rows = 0;
+                    h.bytes = 0;
+                }
+                popped
+            };
+            if popped.is_none() {
+                drop(rows);
+                self.circuit.set_external_best_effort(0);
+                return;
             }
         }
     }
 
-    /// The history spans from `after` to the circuit's commit, if they still connect.
-    pub(super) fn history_spans_since(&self, after: u64) -> Option<impl Iterator<Item = &Hist>> {
-        let start = self.history.iter().position(|h| {
-            h.from == after || (h.rows.is_empty() && h.from <= after && after < h.to)
-        })?;
-        let spans = self.history.iter().skip(start);
-        let mut at = after;
-        for h in spans.clone() {
-            if h.from > at {
-                return None;
+    /// Collect the non-empty history diff slices from `after` to the circuit's commit,
+    /// admitting the output vector outside the history lock and polling `check`.
+    pub(super) fn history_rows_since(
+        &self,
+        after: u64,
+        check: &dyn Fn() -> Result<()>,
+        admit: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Option<Vec<HistRows>>> {
+        let count = {
+            let h = self.history.lock();
+            let Some(start) = h.entries.iter().position(|entry| {
+                entry.from == after
+                    || (entry.rows.is_empty() && entry.from <= after && after < entry.to)
+            }) else {
+                return Ok(None);
+            };
+            let mut at = after;
+            let mut count = 0usize;
+            for entry in h.entries.iter().skip(start) {
+                if entry.from > at {
+                    return Ok(None);
+                }
+                if !entry.rows.is_empty() {
+                    count += 1;
+                }
+                at = entry.to;
             }
-            at = h.to;
+            if at != self.circuit.applied {
+                return Ok(None);
+            }
+            count
+        };
+        admit((count * std::mem::size_of::<HistRows>()) as u64)?;
+        let h = self.history.lock();
+        let Some(start) = h.entries.iter().position(|entry| {
+            entry.from == after
+                || (entry.rows.is_empty() && entry.from <= after && after < entry.to)
+        }) else {
+            return Ok(None);
+        };
+        let mut at = after;
+        let mut parts = Vec::with_capacity(count);
+        for (i, entry) in h.entries.iter().skip(start).enumerate() {
+            if i.is_multiple_of(256) {
+                check()?;
+            }
+            if entry.from > at {
+                return Ok(None);
+            }
+            if !entry.rows.is_empty() {
+                parts.push(entry.rows.clone());
+            }
+            at = entry.to;
         }
-        (at == self.circuit.applied).then_some(spans)
+        Ok((at == self.circuit.applied).then_some(parts))
+    }
+
+    /// Admit the history copies and netting buffers before materializing a resumed diff.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn history_since_budgeted(
+        &self,
+        after: u64,
+    ) -> Option<(
+        Vec<(Vec<Option<Term>>, i64)>,
+        crate::incr::budget::ScratchLease,
+    )> {
+        let mut lease = self.circuit.scratch_lease();
+        let (bytes, rows) = {
+            let history = self.history.lock();
+            let start = history.entries.iter().position(|entry| {
+                entry.from == after
+                    || (entry.rows.is_empty() && entry.from <= after && after < entry.to)
+            })?;
+            history
+                .entries
+                .iter()
+                .skip(start)
+                .fold((0u64, 0usize), |(bytes, rows), h| {
+                    (
+                        bytes.saturating_add(h.bytes),
+                        rows.saturating_add(h.rows.len()),
+                    )
+                })
+        };
+        // Netting keeps a map of row keys, a copy of each distinct row in its input
+        // order, and an output vector. Admission may evict history, so history_since
+        // checks continuity again after the reservation.
+        lease
+            .try_reserve(bytes.saturating_mul(2).saturating_add(rows as u64 * 96))
+            .ok()?;
+        let change = self.history_since(after)?;
+        Some((change, lease))
     }
 
     /// The net change from commit `after` to the circuit's commit from the history.
     pub(super) fn history_since(&self, after: u64) -> Option<Vec<(Vec<Option<Term>>, i64)>> {
-        let spans = self.history_spans_since(after)?;
-        Some(net(spans.flat_map(|h| h.rows.iter().cloned())))
+        let h = self.history.lock();
+        let start = h.entries.iter().position(|entry| {
+            entry.from == after
+                || (entry.rows.is_empty() && entry.from <= after && after < entry.to)
+        })?;
+        let mut at = after;
+        let mut parts = Vec::new();
+        for entry in h.entries.iter().skip(start) {
+            if entry.from > at {
+                return None;
+            }
+            parts.push(&entry.rows);
+            at = entry.to;
+        }
+        (at == self.circuit.applied)
+            .then(|| net(parts.into_iter().flat_map(|rows| rows.iter().cloned())))
     }
 }
 
@@ -292,14 +616,16 @@ pub(crate) struct Cell {
 }
 
 impl Cell {
-    /// Detach one view from the circuit, which leaves the views still attached.
-    pub(super) fn release_view(&self) -> usize {
+    /// Detach view `name` from the circuit and recompute its effective local limit,
+    /// returning the number of views still attached.
+    pub(super) fn release_view(&self, name: &str) -> usize {
         let mut st = self.state.lock();
-        st.views = st.views.saturating_sub(1);
-        if st.views == 0 {
+        st.view_limits.remove(name);
+        st.recompute_local_limit();
+        if st.view_limits.is_empty() {
             st.circuit.set_version_pool(None);
         }
-        st.views
+        st.view_limits.len()
     }
 }
 
@@ -341,5 +667,81 @@ pub(super) fn diff_event(
         from,
         removed: removed.into(),
         added: added.into(),
+    }
+}
+
+#[cfg(test)]
+mod drop_order_tests {
+    use super::*;
+    use crate::sparql::parse_query;
+    use crate::store::StoreOptions;
+    use sparkles_budget::MemoryDomain;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Proves using the real `Slot` and `Slot::history_reclaim_hook` that dropping a
+    /// populated `Slot` destroys `HistoryBuf` strictly before `Slot::circuit`'s credit
+    /// returns to the parent.
+    #[test]
+    fn real_slot_drop_frees_history_buf_before_parent_release() {
+        let store = Store::in_memory(StoreOptions::default());
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:a> <urn:p> \"seed\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+
+        let history = Arc::new(Mutex::new(HistoryBuf::default()));
+        let weak_hist = Arc::downgrade(&history);
+        let saw_dead = Arc::new(AtomicBool::new(false));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let saw_dead_cb = saw_dead.clone();
+        let releases_cb = releases.clone();
+        let weak_cb = weak_hist.clone();
+        let parent = MemoryDomain::unpooled().parent(
+            |_| Ok(()),
+            move |bytes| {
+                if bytes > 0 {
+                    releases_cb.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        weak_cb.strong_count(),
+                        0,
+                        "Slot::history must be dropped before Slot::circuit returns parent credit"
+                    );
+                    saw_dead_cb.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+
+        let q = parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
+        let mut circuit = Circuit::new(compile(&q, None).unwrap(), None);
+        circuit.set_pool(None, Some(parent));
+        circuit.set_reclaim_external(Some(Slot::history_reclaim_hook(&history)));
+        circuit.build(store.snapshot(), &Control::none()).unwrap();
+        let vars: Arc<[String]> = circuit.columns().into();
+        let mut view_limits = FxHashMap::default();
+        view_limits.insert("v".to_string(), 1 << 20);
+        let mut slot = Slot {
+            query: q,
+            whole: None,
+            vars,
+            history,
+            subs: Vec::new(),
+            view_limits,
+            rebased: false,
+            circuit,
+        };
+        let rows: Arc<[(Vec<Option<Term>>, i64)]> = Arc::from(vec![(
+            vec![
+                Some(Term::NamedNode(oxrdf::NamedNode::new_unchecked("urn:a"))),
+                Some(Term::Literal(oxrdf::Literal::new_simple_literal("v"))),
+            ],
+            1,
+        )]);
+        slot.remember(0, 1, rows, VIEW_HISTORY_COMMITS);
+        assert_eq!(weak_hist.strong_count(), 1);
+        drop(slot);
+        assert!(releases.load(Ordering::SeqCst) >= 1);
+        assert!(saw_dead.load(Ordering::SeqCst));
     }
 }

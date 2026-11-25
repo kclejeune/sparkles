@@ -22,6 +22,8 @@ impl Runtime {
         let budget = o
             .max_memory_bytes
             .unwrap_or(self.opts.read().live_memory_bytes);
+        let shared = Arc::new(Shared::new(budget));
+        let mut deferred_reg = DeferredDrops::default();
         let cell = {
             let mut reg = self.reg.lock();
             if self.is_closed() {
@@ -30,52 +32,96 @@ impl Runtime {
                     "the dataset is closing",
                 ));
             }
-            self.sync_inference(&mut reg, host.as_ref());
-            let (cell, _) = self.cell_for(&mut reg, q, query, access, Some(budget))?;
-            cell.pending.fetch_add(1, Ordering::AcqRel);
-            cell
+            self.sync_inference(&mut reg, host.as_ref(), &mut deferred_reg);
+            let res = self.cell_for(&mut reg, q, query, access, Some(budget));
+            if let Ok((cell, _)) = &res {
+                cell.pending.fetch_add(1, Ordering::AcqRel);
+                if reg.live.len() == reg.live.capacity() {
+                    reg.live.retain(|entry| entry.queue.strong_count() > 0);
+                }
+                reg.live.push(LiveRegistration {
+                    cell: Arc::downgrade(cell),
+                    queue: Arc::downgrade(&shared),
+                });
+            }
+            res
         };
+        drop(deferred_reg);
+        let (cell, _) = cell?;
         let joining = Joining(&cell);
         self.ensure_subscription(store);
-        let shared = Arc::new(Shared::default());
-        {
-            let mut st = cell.state.lock();
-            let status = cell.info.lock().status.clone();
-            if status != Status::Ready
-                && let Err(e) = self.evaluate_for_live(store, &cell, &mut st)
-            {
-                drop(st);
-                drop(joining);
-                self.gc();
-                return Err(e);
+        // Declared outside `cell.state.lock()` so any temporary circuit built by `resume`
+        // and any retired leases drop strictly after the state lock releases (even on
+        // panic unwind), with circuits freeing payloads strictly before retired leases.
+        let mut deferred_state = DeferredDrops::default();
+        let subscribe_res: Result<()> = {
+            struct LimitGuard<'a>(parking_lot::MutexGuard<'a, Slot>);
+            impl Drop for LimitGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.recompute_local_limit();
+                }
             }
-            if st.circuit.bytes() > budget {
-                let bytes = st.circuit.bytes();
-                drop(st);
-                drop(joining);
-                self.gc();
-                return Err(crate::incr::error(
-                    "over-budget",
-                    format!(
-                        "the live query's state of {bytes} bytes passes its budget of {budget} bytes"
-                    ),
-                ));
-            }
-            let first = match o.after {
-                None => Some(st.event(false)),
-                Some(after) => self.resume(store, &st, after),
-            };
-            // queued before a pass can see the subscriber, so that no later diff
-            // overtakes it
-            if let Some(e) = first {
-                shared.push(e);
-            }
-            let last = st.circuit.applied;
-            st.subs.push(Sub {
-                shared: Arc::downgrade(&shared),
-                budget,
-                last,
-            });
+            let mut guard = LimitGuard(cell.state.lock());
+            let st = &mut *guard.0;
+            // Provisionally allow the joining subscriber's budget while building or
+            // constructing its initial event; `LimitGuard` restores the exact
+            // active-consumer ceiling on exit or unwind.
+            let result = (|| {
+                if self.is_closed() {
+                    return Err(crate::incr::error(
+                        "views-unavailable",
+                        "the dataset is closing",
+                    ));
+                }
+                let next_limit = st
+                    .circuit
+                    .local_limit()
+                    .map_or(budget, |cur| cur.max(budget));
+                st.circuit.set_local_limit(Some(next_limit));
+                let status = cell.info.lock().status.clone();
+                if status != Status::Ready
+                    && let Err(e) = self.evaluate_for_live(store, &cell, st, &mut deferred_state)
+                {
+                    return Err(e);
+                }
+                if st.circuit.bytes() > budget {
+                    let bytes = st.circuit.bytes();
+                    return Err(crate::incr::error(
+                        "over-budget",
+                        format!(
+                            "the live query's state of {bytes} bytes passes its budget of {budget} bytes"
+                        ),
+                    ));
+                }
+                let first = match o.after {
+                    None => Some(st.event_budgeted(false)?),
+                    Some(after) => self.resume(store, st, after, &mut deferred_state.circuits)?,
+                };
+                // queued before a pass can see the subscriber, so that no later diff
+                // overtakes it
+                if let Some((e, mut lease)) = first {
+                    let shared_lease = st.detach_event_lease(&mut lease);
+                    deferred_state
+                        .queued
+                        .extend(shared.push_leased(e, shared_lease));
+                }
+                let last = st.circuit.applied;
+                st.subs.push(Sub {
+                    shared: Arc::downgrade(&shared),
+                    budget,
+                    last,
+                });
+                st.recompute_local_limit();
+                Ok(())
+            })();
+            deferred_state.retired.extend(st.circuit.drain_retired());
+            result
+        };
+        drop(deferred_state);
+        if let Err(e) = subscribe_res {
+            drop(joining);
+            self.gc();
+            return Err(e);
         }
         drop(joining);
         let (kind, vars) = {
@@ -128,23 +174,50 @@ impl Runtime {
 
     /// Evaluate the circuit a live query joins when it is not ready, and send its
     /// other subscribers the new result as a `reset`.
-    fn evaluate_for_live(&self, store: &Store, cell: &Cell, st: &mut Slot) -> Result<()> {
+    fn evaluate_for_live(
+        &self,
+        store: &Store,
+        cell: &Cell,
+        st: &mut Slot,
+        deferred: &mut DeferredDrops,
+    ) -> Result<()> {
         let snap = store.snapshot();
+        let had_snap = st.circuit.snap.is_some();
         let t0 = Instant::now();
-        st.evaluate(snap, &self.control())?;
+        if let Err(e) = st.evaluate(snap, &self.control()) {
+            if !had_snap {
+                st.circuit.clear_state();
+            }
+            return Err(e);
+        }
         cell.info.lock().status = Status::Ready;
         self.note_pass(cell, st, t0.elapsed(), false);
         if std::mem::take(&mut st.rebased) {
             st.clear_history();
         }
-        self.live_budgets(st);
-        // other subscribers see the new result as a reset
-        let applied = st.circuit.applied;
-        let reset = st.event(true);
-        for s in &mut st.subs {
-            if let Some(sh) = s.shared.upgrade() {
-                s.last = applied;
-                sh.push(reset.clone());
+        self.live_budgets(st, deferred);
+        st.prune_dead_subs();
+        if !st.subs.is_empty() {
+            // other subscribers see the new result as a reset
+            let applied = st.circuit.applied;
+            match st.event_budgeted(true) {
+                Ok((reset, mut lease)) => {
+                    let shared_lease = st.detach_event_lease(&mut lease);
+                    for s in &mut st.subs {
+                        if let Some(sh) = s.shared.upgrade() {
+                            s.last = applied;
+                            deferred
+                                .queued
+                                .extend(sh.push_leased(reset.clone(), shared_lease.clone()));
+                        }
+                    }
+                    deferred
+                        .queued
+                        .push(crate::incr::live::QueuedEvent::new(reset, shared_lease));
+                }
+                Err(e) => {
+                    st.fail_live_subs(&e, deferred);
+                }
             }
         }
         Ok(())
@@ -152,58 +225,287 @@ impl Runtime {
 
     /// The first event of a live query resumed after commit `after`: the change from
     /// it from the circuit's history, or by evaluating the query before the changes
-    /// since, or a `reset` (spec F13 §2.3).
-    pub(super) fn resume(&self, store: &Store, st: &Slot, after: u64) -> Option<LiveEvent> {
+    /// since, or a `reset` (spec F13 §2.3). Any temporary circuit built is pushed into
+    /// `temp_circuits` so the caller drops it outside `cell.state.lock()`.
+    pub(super) fn resume(
+        &self,
+        store: &Store,
+        st: &Slot,
+        after: u64,
+        temp_circuits: &mut Vec<Circuit>,
+    ) -> Result<Option<(LiveEvent, crate::incr::budget::ScratchLease)>> {
         let applied = st.circuit.applied;
         let switched = self.switched.load(Ordering::Acquire);
         if switched > 0 && after <= switched {
-            return Some(st.event(true));
+            return st.event_budgeted(true).map(Some);
         }
         // an ordered window keeps no positions for past commits, and a circuit built
         // again since the subscriber's event may order ties otherwise, even at its commit
         if st.circuit.ordered() {
-            return Some(st.event(true));
+            return st.event_budgeted(true).map(Some);
         }
         if after == applied {
-            return None;
+            return Ok(None);
         }
         if after > applied {
-            return Some(st.event(true));
+            return st.event_budgeted(true).map(Some);
         }
         let ask = st.circuit.kind == Kind::Ask;
-        let change = st.history_since(after).or_else(|| {
+        let change = st.history_since_budgeted(after).or_else(|| {
             let d = DeltaSet::read(store, after, &Control::none());
             if !d.complete || d.snapshot.commit != applied {
                 return None;
             }
             let old = d.old().ok()?;
             let mut c = st.fresh(st.circuit.inference.clone()).ok()?;
+            c.set_pool(self.pool.clone(), self.circuit_parent());
+            // Keep the temporary circuit outside the cell lock's drop scope.
+            temp_circuits.push(c);
+            let c = temp_circuits.last_mut().expect("pushed above");
             c.build(old, &self.control()).ok()?;
+            let mut lease = st.circuit.scratch_lease();
             if ask {
                 let delta = st.circuit.result.total() - c.result.total();
-                return Some(vec![(Vec::new(), delta)]);
+                return Some((vec![(Vec::new(), delta)], lease));
             }
-            let now = st.circuit.rows();
-            let before = c.rows();
-            Some(net(now
+            let now = st.circuit.rows_charged().ok()?;
+            let before = c.rows_charged().ok()?;
+            let terms = now
+                .0
+                .iter()
+                .chain(&before.0)
+                .map(|(row, _)| crate::incr::circuit::decoded_row_bytes(row))
+                .sum::<u64>();
+            lease
+                .try_reserve(terms + (now.0.len() + before.0.len()) as u64 * 96)
+                .ok()?;
+            let change = net(now
+                .0
                 .into_iter()
-                .chain(before.into_iter().map(|(r, w)| (r, -w)))))
+                .chain(before.0.into_iter().map(|(row, w)| (row, -w))));
+            drop(before.1);
+            drop(now.1);
+            Some((change, lease))
         });
-        let Some(change) = change else {
-            return Some(st.event(true));
+        let Some((change, mut lease)) = change else {
+            return st.event_budgeted(true).map(Some);
         };
         if ask {
             let delta: i64 = change.iter().map(|x| x.1).sum();
             let now = st.circuit.result.total();
             if (now - delta > 0) == (now > 0) {
-                return None;
+                return Ok(None);
             }
-            return Some(LiveEvent::Value {
-                commit: applied,
-                from: after,
-                value: now > 0,
-            });
+            return Ok(Some((
+                LiveEvent::Value {
+                    commit: applied,
+                    from: after,
+                    value: now > 0,
+                },
+                st.circuit.scratch_lease(),
+            )));
         }
-        Some(diff_event(after, applied, change.into_iter()))
+        if change.len() > crate::incr::live::QUEUE_ROWS {
+            drop(change);
+            drop(lease);
+            return st.event_budgeted(true).map(Some);
+        }
+        let row_slot = std::mem::size_of::<LiveRow>() as u64;
+        let rows = change.len() as u64;
+        let terms = change
+            .iter()
+            .map(|(row, _)| crate::incr::circuit::decoded_row_bytes(row))
+            .sum::<u64>();
+        // diff_event temporarily owns both its vectors and the final Arc slices.
+        if lease
+            .try_set(terms + change.capacity() as u64 * 32 + (3 * rows + 8) * row_slot)
+            .is_err()
+        {
+            drop(change);
+            drop(lease);
+            return st.event_budgeted(true).map(Some);
+        }
+        let event = diff_event(after, applied, change.into_iter());
+        lease.try_set(terms + rows * row_slot)?;
+        Ok(Some((event, lease)))
+    }
+}
+
+#[cfg(test)]
+mod resume_unwind_tests {
+    use super::*;
+    use crate::store::StoreOptions;
+
+    /// Proves that a charged fallback circuit pushed into caller-owned `DeferredDrops`
+    /// before building/unwinding releases its `QueryPool` credit strictly AFTER
+    /// `cell.state.lock()` unwinds, so a synchronous waker that re-acquires
+    /// `cell.state.lock()` never deadlocks.
+    #[test]
+    fn resume_unwind_drops_charged_circuit_after_cell_state_lock_releases() {
+        let store = Store::in_memory(StoreOptions::default());
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:a> <urn:p> \"1\" . <urn:b> <urn:p> \"2\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        let pool = QueryPool::new(16 << 20);
+        let rt = Runtime::open_with_pool(
+            None,
+            store.dataset_id(),
+            RuntimeOptions::default(),
+            Some(pool.clone()),
+        );
+        rt.set_host(Arc::new(OpenHost));
+        let _live = rt
+            .live(
+                &store,
+                "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+                None,
+                &LiveOptions::default(),
+            )
+            .unwrap();
+        let cell = rt.reg.lock().cells.values().next().unwrap().clone();
+        let baseline = pool.granted();
+        assert!(baseline > 0);
+
+        // Fill pool so free room is exact 4 MiB before building the fallback circuit;
+        // once `c.build` charges `c`, entering a 4 MiB waiter queues it, and dropping `c`
+        // during unwind frees exact 4 MiB and wakes the waiter synchronously.
+        let filler = pool
+            .work_parent()
+            .reserve(pool.capacity() - (4 << 20) - baseline)
+            .unwrap();
+        let woke = Arc::new(AtomicUsize::new(0));
+        let woke_cb = woke.clone();
+        let cell_cb = cell.clone();
+        let waiter_slot = Mutex::new(None);
+
+        let snap = store.snapshot();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut deferred_state = DeferredDrops::default();
+            let st = cell.state.lock();
+            let mut c = st.fresh(st.circuit.inference.clone()).unwrap();
+            c.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+            // Same ordering as `Runtime::resume`: push into `deferred_state` BEFORE build.
+            deferred_state.circuits.push(c);
+            let c = deferred_state.circuits.last_mut().unwrap();
+            c.build(snap, &Control::none()).unwrap();
+            *waiter_slot.lock() = Some(pool.enter(
+                4 << 20,
+                Some(Arc::new(move || {
+                    // Would deadlock immediately if the fallback circuit dropped while
+                    // `cell.state.lock()` was still held during unwind.
+                    let _st = cell_cb.state.lock();
+                    woke_cb.fetch_add(1, Ordering::SeqCst);
+                })),
+            ));
+            panic!("simulated panic after charging fallback circuit inside cell.state.lock()");
+        }));
+        assert!(res.is_err());
+        assert!(
+            woke.load(Ordering::SeqCst) >= 1,
+            "waker must have acquired cell.state.lock() cleanly after unwind"
+        );
+        drop(waiter_slot);
+        drop(filler);
+        drop(_live);
+        rt.close(&store);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    /// Exercises the actual `Runtime::live(..., after: Some(_))` -> `Runtime::resume`
+    /// fallback circuit path with an active `QueryPool` waker that re-acquires
+    /// `cell.state.lock()`, proving the temporary resume circuit drops strictly outside
+    /// `cell.state.lock()`.
+    #[test]
+    fn actual_runtime_resume_drops_fallback_circuit_outside_cell_state_lock() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut init = String::from("INSERT DATA { ");
+        for i in 0..200 {
+            init.push_str(&format!("<urn:r:{i}> <urn:p> \"{}\". ", "v".repeat(128)));
+        }
+        init.push('}');
+        crate::sparql::update::update(&store, &init, &crate::sparql::QueryOptions::default())
+            .unwrap();
+        let c1 = store.snapshot().commit;
+
+        let pool = QueryPool::new(16 << 20);
+        let rt = Runtime::open_with_pool(
+            None,
+            store.dataset_id(),
+            RuntimeOptions {
+                history_commits: 1,
+                ..RuntimeOptions::default()
+            },
+            Some(pool.clone()),
+        );
+        rt.set_host(Arc::new(OpenHost));
+        let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+        let live1 = rt.live(&store, q, None, &LiveOptions::default()).unwrap();
+
+        // Advance past `c1` and clear history so resuming after `c1` takes the fallback
+        // circuit path inside `Runtime::resume`.
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:r:extra> <urn:p> \"extra\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        rt.round(&store);
+        let cell = rt.reg.lock().cells.values().next().unwrap().clone();
+        {
+            let mut st = cell.state.lock();
+            st.clear_history();
+            let retired = st.circuit.drain_retired();
+            drop(st);
+            drop(retired);
+        }
+
+        let baseline = pool.granted();
+        assert!(baseline > 0);
+        // Leave room for the fallback circuit. The resumed event stays leased
+        // while queued, so leave a margin between free room and the waiting grant.
+        let filler = pool
+            .work_parent()
+            .reserve(pool.capacity() - (5 << 20) - baseline)
+            .unwrap();
+        let woke = Arc::new(AtomicUsize::new(0));
+        let woke_cb = woke.clone();
+        let cell_cb = cell.clone();
+        let waiter = pool.enter(
+            4 << 20,
+            Some(Arc::new(move || {
+                // Would deadlock if `Runtime::resume` dropped the fallback circuit under
+                // `cell.state.lock()`.
+                let _st = cell_cb.state.lock();
+                woke_cb.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+
+        let live2 = rt
+            .live(
+                &store,
+                q,
+                None,
+                &LiveOptions {
+                    after: Some(c1),
+                    ..LiveOptions::default()
+                },
+            )
+            .unwrap();
+        // The resumed subscriber received the diff for `<urn:r:extra>`, and the fallback
+        // circuit dropped cleanly outside `cell.state.lock()` waking our waiter.
+        assert!(
+            woke.load(Ordering::SeqCst) >= 1,
+            "waker must acquire cell.state.lock() cleanly when Runtime::resume drops fallback circuit"
+        );
+        assert!(matches!(live2.try_next(), Some(LiveEvent::Diff { .. })));
+        drop(waiter);
+        drop(filler);
+        drop(live2);
+        drop(live1);
+        rt.close(&store);
+        assert_eq!(pool.granted(), 0);
     }
 }

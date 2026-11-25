@@ -146,6 +146,9 @@ impl Runtime {
                 caller: r.caller,
                 deadline: r.deadline,
                 aggregate_errors: r.aggregate_errors,
+                memory_parent: r.memory_parent,
+                memory_pool: r.memory_pool,
+                max_memory_bytes: r.max_memory_bytes,
             },
         };
         let control = Control {
@@ -186,6 +189,7 @@ impl Runtime {
                     rows,
                     commit: rewound.commit,
                     evaluated_under: None,
+                    lease: None,
                 })
             }
             OpenedView::Rebuild(rebuild) => {
@@ -199,6 +203,12 @@ impl Runtime {
                 c.inference = rebuild.inference.clone();
                 c.aggregate_errors = Some(rebuild.aggregate_errors);
                 c.max_memory_bytes = rebuild.max_memory_bytes;
+                let (pool, parent) = self.resolve_fallback_budget(r)?;
+                c.set_pool(pool, parent);
+                if let Some(limit) = r.max_memory_bytes {
+                    let effective = c.max_memory_bytes.map_or(limit, |m| m.min(limit));
+                    c.set_local_limit(Some(effective));
+                }
                 let control = Control {
                     deadline: rebuild.deadline,
                     ..Control::none()
@@ -211,11 +221,13 @@ impl Runtime {
                     },
                 );
                 c.build(snap, &control)?;
+                let (rows, lease) = c.rows_budgeted()?;
                 Ok(ViewRows {
                     columns: rebuild.columns.to_vec(),
-                    rows: c.rows(),
+                    rows,
                     commit: rebuild.commit,
                     evaluated_under: rebuild.evaluated_under,
+                    lease,
                 })
             }
         }
@@ -356,26 +368,7 @@ impl Runtime {
         admit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<OpenedView> {
         let r = &open.read;
-        let parts = if let Some(spans) = st.history_spans_since(r.at) {
-            let count = spans.filter(|h| !h.rows.is_empty()).count();
-            admit((count * std::mem::size_of::<HistRows>()) as u64)?;
-            let mut parts = Vec::with_capacity(count);
-            for (i, h) in st
-                .history_spans_since(r.at)
-                .expect("same history")
-                .enumerate()
-            {
-                if i.is_multiple_of(256) {
-                    check()?;
-                }
-                if !h.rows.is_empty() {
-                    parts.push(h.rows.clone());
-                }
-            }
-            Some(parts)
-        } else {
-            None
-        };
+        let parts = st.history_rows_since(r.at, check, admit)?;
         if let Some(parts) = parts {
             let version = st.circuit.version.clone().ok_or_else(|| {
                 crate::incr::error(
@@ -408,6 +401,55 @@ impl Runtime {
             return Err(ahead());
         };
         self.prepare_rebuild(&st, open, snap, held, None, admit)
+    }
+
+    /// Resolve a coherent `(pool, parent)` pair for fallback evaluation (`read_back` /
+    /// `evaluate_under`) so `parent.domain()` always matches `pool`, unpooled callers
+    /// never bypass `self.pool`, and `Ctx::memory_parent()` is invoked lazily.
+    fn resolve_fallback_budget(
+        &self,
+        r: &ViewRead<'_>,
+    ) -> Result<(Option<Arc<QueryPool>>, Option<ParentHandle>)> {
+        let unpooled_id = sparkles_budget::MemoryDomain::unpooled().id();
+        if let Some(rp) = r.memory_pool {
+            if let Some(get_parent) = r.memory_parent {
+                let parent = get_parent()?;
+                if parent.domain() != rp.domain() {
+                    return Err(Error::invalid(
+                        "view read memory_parent domain does not match memory_pool",
+                    ));
+                }
+                return Ok((Some(rp.clone()), Some(parent)));
+            }
+            return Ok((Some(rp.clone()), Some(rp.work_parent())));
+        }
+        if let Some(sp) = &self.pool {
+            if let Some(get_parent) = r.memory_parent {
+                let parent = get_parent()?;
+                if parent.domain() == sp.domain() {
+                    return Ok((Some(sp.clone()), Some(parent)));
+                }
+                if parent.domain() == unpooled_id {
+                    // An unpooled query reading a pooled dataset's view must still charge
+                    // the dataset's QueryPool during fallback evaluation.
+                    return Ok((Some(sp.clone()), Some(sp.work_parent())));
+                }
+                return Err(Error::invalid(
+                    "view read memory_parent belongs to another QueryPool without matching memory_pool",
+                ));
+            }
+            return Ok((Some(sp.clone()), Some(sp.work_parent())));
+        }
+        if let Some(get_parent) = r.memory_parent {
+            let parent = get_parent()?;
+            if parent.domain() != unpooled_id {
+                return Err(Error::invalid(
+                    "pooled view read memory_parent requires its matching memory_pool",
+                ));
+            }
+            return Ok((None, Some(parent)));
+        }
+        Ok((None, None))
     }
 
     /// Open a view evaluated under the reader's `AggregateErrors` reading `m`, which
@@ -571,6 +613,9 @@ mod tests {
                     caller: None,
                     deadline: None,
                     aggregate_errors: None,
+                    memory_parent: None,
+                    memory_pool: None,
+                    max_memory_bytes: None,
                 },
             };
             let announced = std::cell::Cell::new(false);

@@ -12,7 +12,7 @@
 //! and the dataset's prefixes ([`Host`]). Until a host is set, views are not attached,
 //! so a view never reads with access its principal does not have.
 
-use super::circuit::{Advance, Circuit, DeltaSet};
+use super::circuit::{Circuit, DeltaSet};
 use super::compile::{Kind, compile};
 use super::inference::Inference;
 use super::live::{Count, LiveEvent, LiveOptions, LiveQuery, LiveRow, Shared};
@@ -22,6 +22,7 @@ use super::views::{self, ViewDef, ViewInfo, ViewState};
 use super::zset::Changes;
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
+use crate::sparql::pool::QueryPool;
 use crate::sparql::viewsvc::{
     OpenedView, RewoundView, ViewOpen, ViewRead, ViewRebuild, ViewRows, ViewSource, ViewVersion,
     row_retained_bytes,
@@ -34,6 +35,7 @@ use parking_lot::{Condvar, Mutex, ReentrantMutex, RwLock};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use spargebra::Query;
+use sparkles_budget::{MemoryLease, ParentHandle};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::ManuallyDrop;
@@ -78,6 +80,19 @@ pub(crate) fn checkpoint_fingerprint_for_compiler(compiler: &str, q: &Query, tex
 use stats::Counters;
 pub use stats::{RuntimeStats, ViewStat};
 pub use worker::WorkerPause;
+
+/// Payloads and retired leases collected while holding runtime/cell locks.
+///
+/// Rust drops struct fields in declaration order, guaranteeing that all circuit and
+/// cell allocations are freed strictly before any detached [`MemoryLease`] returns
+/// credit to the parent pool on normal return, early `?`, and panic unwind.
+#[derive(Default)]
+pub(super) struct DeferredDrops {
+    pub(super) circuits: Vec<Circuit>,
+    pub(super) cells: Vec<Arc<Cell>>,
+    pub(super) queued: Vec<super::live::QueuedEvent>,
+    pub(super) retired: Vec<MemoryLease>,
+}
 
 /// The branch whose state Phase 1 keeps.
 const BRANCH: &str = "main";
@@ -180,6 +195,7 @@ pub struct Runtime {
     opts: RwLock<RuntimeOptions>,
     root: Option<PathBuf>,
     dataset: uuid::Uuid,
+    pool: Option<Arc<QueryPool>>,
     host: RwLock<Option<Arc<dyn Host>>>,
     reg: Mutex<Registry>,
     /// The definitions as backups and clones capture them, replaced while `reg` is
@@ -224,12 +240,25 @@ impl Runtime {
     /// A runtime for the dataset at `root` (`None`: in memory, without checkpoints)
     /// with the definitions found there. Views are attached once a host is set.
     pub fn open(root: Option<PathBuf>, dataset: uuid::Uuid, opts: RuntimeOptions) -> Arc<Runtime> {
+        Self::open_with_pool(root, dataset, opts, None)
+    }
+
+    /// [`open`](Self::open) wired to a shared [`QueryPool`], so every view, live query
+    /// and internal circuit reserves its state, history/tally and nested SPARQL work
+    /// from the pool.
+    pub fn open_with_pool(
+        root: Option<PathBuf>,
+        dataset: uuid::Uuid,
+        opts: RuntimeOptions,
+        pool: Option<Arc<QueryPool>>,
+    ) -> Arc<Runtime> {
         let reg = Registry::load(root.as_deref());
         let defs = RwLock::new(reg.defs());
         Arc::new(Runtime {
             opts: RwLock::new(opts),
             root,
             dataset,
+            pool,
             host: RwLock::new(None),
             reg: Mutex::new(reg),
             defs,
@@ -250,6 +279,10 @@ impl Runtime {
             seen: AtomicU64::new(0),
             switched: AtomicU64::new(0),
         })
+    }
+
+    pub(super) fn circuit_parent(&self) -> Option<ParentHandle> {
+        self.pool.as_ref().map(QueryPool::work_parent)
     }
 
     pub fn options(&self) -> RuntimeOptions {
@@ -331,7 +364,7 @@ impl Runtime {
 
     fn ensure_subscription(&self, store: &Store) {
         let mut s = self.subscription.lock();
-        if s.is_none() {
+        if s.is_none() && !self.is_closed() {
             *s = Some(store.subscribe_deltas());
         }
     }

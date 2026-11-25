@@ -356,6 +356,23 @@ pub(crate) fn record_unadmitted_events(
     preparation: &Preparation,
     f: impl FnOnce(),
 ) -> ([Maximum; STAGES], usize) {
+    record_growth(preparation.test_used_counter(), f)
+}
+
+/// The peak co-resident bytes allocated by `f` on this thread.
+pub(crate) fn record_peak(f: impl FnOnce()) -> u64 {
+    let counter = std::sync::atomic::AtomicU64::new(0);
+    let (max, _) = record_growth(&counter, || {
+        let _stage = Stage::enter(0);
+        f();
+    });
+    max[0].excess as u64
+}
+
+fn record_growth(
+    counter: &std::sync::atomic::AtomicU64,
+    f: impl FnOnce(),
+) -> ([Maximum; STAGES], usize) {
     let layout = std::alloc::Layout::new::<Observation>();
     struct Reset(*mut Observation, std::alloc::Layout);
     impl Drop for Reset {
@@ -375,7 +392,7 @@ pub(crate) fn record_unadmitted_events(
     assert!(!observation.is_null());
     let reset = Reset(observation, layout);
     // SAFETY: valid and not yet shared.
-    unsafe { (*observation).counter = preparation.test_used_counter() as *const _ as usize };
+    unsafe { (*observation).counter = counter as *const _ as usize };
     OBSERVATION.with(|cell| cell.set(observation));
     f();
     let (max, peak, failed, depth) = with(|o| (o.max, o.peak, o.failed, o.depth)).unwrap();
@@ -695,14 +712,18 @@ struct AllocationObserver;
 // returned pointers. A selected test-thread watch retains its actual Preparation until
 // cleared. The hooks read atomics and update Copy TLS and the observation, which lives
 // in System memory: no allocation, callback, borrow, panic or reentry.
+fn observe_largest(size: usize) {
+    let _ = LARGEST.try_with(|cell| {
+        let (on, largest) = cell.get();
+        if on {
+            cell.set((on, largest.max(size)));
+        }
+    });
+}
+
 unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let _ = LARGEST.try_with(|cell| {
-            let (on, largest) = cell.get();
-            if on {
-                cell.set((on, largest.max(layout.size())));
-            }
-        });
+        observe_largest(layout.size());
         let _ = PEAK_LIVE.try_with(|cell| {
             let (on, live, peak) = cell.get();
             if on {
@@ -759,6 +780,7 @@ unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
         });
         // Watched staging byte vectors are complete and never grow after arm. A
         // reallocation to the selected size acquires storage of that size.
+        observe_largest(size);
         admitted(size);
         let new = unsafe { std::alloc::System.realloc(pointer, layout, size) };
         reallocated(pointer, new, size);

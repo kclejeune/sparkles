@@ -84,7 +84,8 @@ impl Template {
     fn apply(&mut self, p: &mut Pass, c: Changes) -> Result<Changes> {
         let mut out = Changes::new();
         let blanks = self.has_blanks();
-        for (row, w) in c {
+        let mut tracked = self.bytes();
+        for (i, (row, w)) in c.into_iter().enumerate() {
             p.tick()?;
             if !blanks {
                 self.emit(p, &row, &[], None, w, &mut out);
@@ -98,6 +99,9 @@ impl Template {
             // the occurrences added or removed, the newest removed first
             let before = self.counts.get(&row);
             self.counts.add(row.clone(), w);
+            if i % 1024 == 1023 {
+                p.sync_op_state(&mut tracked, self.bytes())?;
+            }
             let (range, sign) = if w > 0 {
                 (before..before + w, 1)
             } else {
@@ -109,6 +113,7 @@ impl Template {
                 self.emit(p, &row, &keys, k, sign, &mut out);
             }
         }
+        p.sync_op_state(&mut tracked, self.bytes())?;
         Ok(out)
     }
 
@@ -216,6 +221,10 @@ impl Template {
         self.counts.bytes(self.inner.schema.len())
     }
 
+    pub fn clear(&mut self) {
+        self.counts = ZSet::new();
+    }
+
     pub fn save(&self, w: &mut Writer) -> Result<()> {
         w.zset(&self.counts)
     }
@@ -227,13 +236,21 @@ impl Template {
 
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
         self.counts = ZSet::new();
+        let mark = p.output_lease_mark();
         let c = self.inner.init(p)?;
-        self.apply(p, c)
+        let leases = p.take_output_leases_since(mark);
+        let out = self.apply(p, c)?;
+        drop(leases);
+        Ok(out)
     }
 
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
+        let mark = p.output_lease_mark();
         let c = self.inner.delta(p)?;
-        self.apply(p, c)
+        let leases = p.take_output_leases_since(mark);
+        let out = self.apply(p, c)?;
+        drop(leases);
+        Ok(out)
     }
 }
 

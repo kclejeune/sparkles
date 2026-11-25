@@ -355,8 +355,16 @@ id tuples, stored in columnar chunks of the kind `sparql::table::Table` already 
 The state of every view counts against its `memoryBytes` and against a server-wide pool
 of `--views-memory`, which [X08](X08-disk-spill-and-server-memory.md)'s server-wide memory pool provides. A view whose state
 passes its budget is `suspended` with `over-budget`, and its reads fail with
-`503 view-suspended` until a rebuild with a larger budget. A live query whose state
-passes the per-query budget fails with an `error` event naming the budget.
+`503 view-suspended` until a rebuild with a larger budget.
+
+A live query's per-query budget bounds its circuit and the decoded events queued for
+that subscriber. A budget refusal during the initial build or snapshot decoding fails
+the subscription request with `over-budget`. A subscriber joining a shared circuit
+can open a stream even if the decoded snapshot exceeds its queue limit. The queue
+overflows, and the first read requests a fresh `reset`. Queue overflow during
+delivery follows the same rule. If a later circuit update or diff cannot be admitted,
+or the reset exceeds its budget, the subscription ends with `over-budget`. Unread
+decoded rows hold server pool credit until delivery, overflow, or close.
 
 ### 3.6 Internal circuits
 

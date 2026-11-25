@@ -400,7 +400,12 @@ impl Dataset {
             StoreHandle::Own(s) => s.root().map(Path::to_path_buf),
             StoreHandle::Branch(_) => None,
         };
-        let views = crate::incr::Runtime::open(views_root, store.dataset_id(), opts.views.clone());
+        let views = crate::incr::Runtime::open_with_pool(
+            views_root,
+            store.dataset_id(),
+            opts.views.clone(),
+            opts.pool.clone(),
+        );
         // backups and clones capture the views' definitions from the runtime, at the
         // same writer-lock boundary as the data
         if let StoreHandle::Own(s) = &store {

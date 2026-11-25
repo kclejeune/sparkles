@@ -41,6 +41,10 @@ impl QueryPool {
         self.domain.id()
     }
 
+    pub(crate) fn memory_domain(&self) -> &MemoryDomain {
+        &self.domain
+    }
+
     pub fn domain_stats(&self) -> DomainStats {
         DomainStats {
             work_capacity: self.capacity,

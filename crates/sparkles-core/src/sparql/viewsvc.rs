@@ -39,6 +39,10 @@ pub fn is_read(name: &NamedNodePattern) -> bool {
     matches!(name, NamedNodePattern::NamedNode(n) if n.as_str() == READ)
 }
 
+/// Lazy supplier for a reading query's upstream memory parent, invoked only when
+/// fallback evaluation (`read_back` / `evaluate_under`) actually runs.
+pub type MemoryParentFn<'a> = &'a dyn Fn() -> Result<sparkles_budget::ParentHandle>;
+
 /// A read of a view.
 pub struct ViewRead<'a> {
     pub name: &'a str,
@@ -55,6 +59,14 @@ pub struct ViewRead<'a> {
     /// reading than the view's, the view's query is evaluated at the reader's snapshot
     /// and the view's state is neither read nor changed.
     pub aggregate_errors: Option<super::AggregateErrors>,
+    /// lazy upstream memory parent for fallback evaluation (`read_back` /
+    /// `evaluate_under`), binding any temporary circuit to the reading query's budget
+    /// and pool without promoting `Ctx` on the common ready-cache hit path
+    pub memory_parent: Option<MemoryParentFn<'a>>,
+    /// query pool backing `memory_parent`, when the reading query runs under a pool
+    pub memory_pool: Option<&'a Arc<super::pool::QueryPool>>,
+    /// local memory ceiling for fallback evaluation (`None`: inherit the view's limit)
+    pub max_memory_bytes: Option<u64>,
 }
 
 /// The rows of a view.
@@ -68,6 +80,9 @@ pub struct ViewRows {
     /// the reader's and not the view's, so that the rows come from the view's query
     /// and not its state
     pub evaluated_under: Option<super::AggregateErrors>,
+    /// optional reservation covering `rows` from fallback evaluation (`read_back` /
+    /// `evaluate_under`), declared last so `rows` drops strictly before credit returns
+    pub lease: Option<sparkles_budget::MemoryLease>,
 }
 
 /// A single charge shared by every version that uses the same allocation.
@@ -186,6 +201,7 @@ impl ViewVersion {
             rows,
             commit: self.commit,
             evaluated_under: self.evaluated_under,
+            lease: None,
         }
     }
 
@@ -853,6 +869,9 @@ pub(super) fn run(ctx: &Ctx, spec: &ViewSpec, vars: &[VarId]) -> Result<Table> {
             format!("no view {:?}: views are not available here", spec.name),
         ));
     };
+    let get_parent = || ctx.memory_parent();
+    let memory_pool = ctx.grant().map(|g| g.pool());
+    let max_memory_bytes = (ctx.mem_limit != u64::MAX).then_some(ctx.mem_limit);
     let rows = source.read_view(&ViewRead {
         name: &spec.name,
         at: ctx.snap.commit,
@@ -861,6 +880,9 @@ pub(super) fn run(ctx: &Ctx, spec: &ViewSpec, vars: &[VarId]) -> Result<Table> {
         caller: ctx.graphs.as_ref(),
         deadline: ctx.current_deadline(),
         aggregate_errors: Some(ctx.aggregate_errors),
+        memory_parent: Some(&get_parent),
+        memory_pool,
+        max_memory_bytes,
     })?;
     if let Some(m) = rows.evaluated_under {
         ctx.warn(evaluated(&spec.name, m));

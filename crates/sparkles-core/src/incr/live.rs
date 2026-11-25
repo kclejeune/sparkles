@@ -10,6 +10,7 @@
 use super::compile::Kind;
 use oxrdf::Term;
 use parking_lot::{Condvar, Mutex, MutexGuard};
+use sparkles_budget::MemoryLease;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -220,7 +221,7 @@ pub struct LiveOptions {
     /// it to the circuit's commit when the runtime can compute it, and a `reset`
     /// otherwise
     pub after: Option<u64>,
-    /// the budget of the circuit's state (the runtime's default when `None`)
+    /// the budget of the circuit and the decoded event queue (the runtime's default when `None`)
     pub max_memory_bytes: Option<u64>,
     /// the principal the per-principal limit counts against
     pub principal: Option<String>,
@@ -228,40 +229,125 @@ pub struct LiveOptions {
 
 /// The most rows a subscription's queue holds before its events are replaced by a
 /// `reset` taken when the subscriber reads again.
-const QUEUE_ROWS: usize = if cfg!(test) { 1_000 } else { 1_000_000 };
+pub(crate) const QUEUE_ROWS: usize = if cfg!(test) { 1_000 } else { 1_000_000 };
+
+/// The charge shared by all queues receiving the same event.
+pub(crate) struct QueuedLease {
+    bytes: u64,
+    _parent: Option<MemoryLease>,
+}
+
+impl QueuedLease {
+    pub(crate) fn new(bytes: u64, parent: Option<MemoryLease>) -> Option<Arc<Self>> {
+        (bytes > 0).then(|| {
+            Arc::new(Self {
+                bytes,
+                _parent: parent,
+            })
+        })
+    }
+}
+
+/// One queued live event paired with the detached pool lease covering its decoded rows.
+///
+/// `event` is declared before `lease` so `Arc<[LiveRow]>` payloads drop strictly before
+/// parent credit returns to the pool.
+pub(crate) struct QueuedEvent {
+    pub(crate) event: LiveEvent,
+    lease: Option<Arc<QueuedLease>>,
+}
+
+impl QueuedEvent {
+    pub(crate) fn new(event: LiveEvent, lease: Option<Arc<QueuedLease>>) -> Self {
+        Self { event, lease }
+    }
+}
 
 #[derive(Default)]
 struct Queue {
-    events: VecDeque<LiveEvent>,
+    events: VecDeque<QueuedEvent>,
     rows: usize,
+    bytes: u64,
     /// the queue overflowed: the next read takes a fresh `reset`
     overflow: bool,
     closed: bool,
 }
 
 /// What a pass and a subscriber share.
-#[derive(Default)]
 pub(crate) struct Shared {
+    byte_limit: u64,
     queue: Mutex<Queue>,
     cv: Condvar,
     notify: tokio::sync::Notify,
 }
 
 impl Shared {
-    pub(crate) fn push(&self, e: LiveEvent) {
+    pub(crate) fn new(byte_limit: u64) -> Self {
+        Self {
+            byte_limit,
+            queue: Mutex::default(),
+            cv: Condvar::new(),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn byte_limit(&self) -> u64 {
+        self.byte_limit
+    }
+
+    /// Whether this subscriber is open, not already overflowed, and has room for `rows`
+    /// more queued rows without overflowing `QUEUE_ROWS`.
+    pub(crate) fn can_accept_rows(&self, rows: usize) -> bool {
+        let q = self.queue.lock();
+        !q.closed && !q.overflow && q.rows.saturating_add(rows) <= QUEUE_ROWS
+    }
+
+    /// Mark an open, non-overflowed subscriber as overflowed without materializing a
+    /// new event, returning any displaced queued events to drop outside locks.
+    pub(crate) fn mark_overflow(&self) -> Vec<QueuedEvent> {
+        let mut q = self.queue.lock();
+        if q.closed || q.overflow {
+            return Vec::new();
+        }
+        let displaced: Vec<QueuedEvent> = q.events.drain(..).collect();
+        q.rows = 0;
+        q.bytes = 0;
+        q.overflow = true;
+        drop(q);
+        self.cv.notify_all();
+        self.notify.notify_one();
+        displaced
+    }
+
+    pub(crate) fn push_leased(
+        &self,
+        e: LiveEvent,
+        lease: Option<Arc<QueuedLease>>,
+    ) -> Vec<QueuedEvent> {
         let mut q = self.queue.lock();
         if q.closed {
-            return;
+            return vec![QueuedEvent::new(e, lease)];
         }
+        let mut displaced = Vec::new();
         let end = matches!(e, LiveEvent::Error { .. });
         if !q.overflow || end {
-            q.rows += e.rows();
-            q.events.push_back(e);
-            if q.rows > QUEUE_ROWS && !end {
-                q.events.clear();
+            let next_rows = q.rows.saturating_add(e.rows());
+            let next_bytes = q
+                .bytes
+                .saturating_add(lease.as_ref().map_or(0, |l| l.bytes));
+            if (next_rows > QUEUE_ROWS || next_bytes > self.byte_limit) && !end {
+                displaced.extend(q.events.drain(..));
+                displaced.push(QueuedEvent::new(e, lease));
                 q.rows = 0;
+                q.bytes = 0;
                 q.overflow = true;
+            } else {
+                q.rows = next_rows;
+                q.bytes = next_bytes;
+                q.events.push_back(QueuedEvent::new(e, lease));
             }
+        } else {
+            displaced.push(QueuedEvent::new(e, lease));
         }
         if end {
             q.closed = true;
@@ -269,11 +355,33 @@ impl Shared {
         drop(q);
         self.cv.notify_all();
         self.notify.notify_one();
+        displaced
     }
 
-    pub(crate) fn close(&self) {
-        self.queue.lock().closed = true;
+    /// End the stream and take its data events. A terminal error can still be read
+    /// after runtime shutdown, and it carries no event lease.
+    pub(crate) fn close(&self, keep_error: bool) -> VecDeque<QueuedEvent> {
+        let mut q = self.queue.lock();
+        q.closed = true;
+        let mut drained = std::mem::take(&mut q.events);
+        q.rows = 0;
+        q.bytes = 0;
+        q.overflow = false;
+        if keep_error
+            && drained
+                .back()
+                .is_some_and(|e| matches!(e.event, LiveEvent::Error { .. }))
+        {
+            q.events.push_back(drained.pop_back().unwrap());
+            q.rows = 1;
+        }
+        drop(q);
         self.wake_all();
+        drained
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.queue.lock().closed
     }
 
     /// Wake every waiting reader, blocking or asynchronous, and the next one to wait.
@@ -338,28 +446,51 @@ impl LiveQuery {
         &self.vars
     }
 
-    fn take(&self, q: &mut MutexGuard<'_, Queue>) -> Option<LiveEvent> {
+    fn take(&self, q: &mut MutexGuard<'_, Queue>) -> Option<QueuedEvent> {
         if q.overflow {
             // passes hold the circuit's lock while they queue events, so the queue's
             // lock is let go and taken again after the circuit's
             let e = MutexGuard::unlocked(q, || {
-                let mut slot = self.slot.state.lock();
-                let mut q = self.shared.queue.lock();
-                if !q.overflow {
-                    return None;
-                }
-                q.overflow = false;
-                q.rows = 0;
-                // the reset covers the data events, but not an error that ends the stream
-                q.events.retain(|e| matches!(e, LiveEvent::Error { .. }));
-                Some(slot.resync(&self.shared))
+                let mut displaced = Vec::new();
+                let (out, retired) = {
+                    let mut slot = self.slot.state.lock();
+                    let mut q = self.shared.queue.lock();
+                    if !q.overflow {
+                        (None, Vec::new())
+                    } else {
+                        q.overflow = false;
+                        q.rows = 0;
+                        q.bytes = 0;
+                        // the reset covers the data events, but not an error that ends the stream
+                        let mut kept = VecDeque::new();
+                        for ev in q.events.drain(..) {
+                            if matches!(ev.event, LiveEvent::Error { .. }) {
+                                kept.push_back(ev);
+                            } else {
+                                displaced.push(ev);
+                            }
+                        }
+                        q.events = kept;
+                        let (event, retired) = slot.resync_budgeted(&self.shared);
+                        if matches!(event.event, LiveEvent::Error { .. }) {
+                            q.closed = true;
+                        }
+                        (Some(event), retired)
+                    }
+                };
+                drop(displaced);
+                drop(retired);
+                out
             });
             if e.is_some() {
                 return e;
             }
         }
         let e = q.events.pop_front()?;
-        q.rows = q.rows.saturating_sub(e.rows());
+        q.rows = q.rows.saturating_sub(e.event.rows());
+        q.bytes = q
+            .bytes
+            .saturating_sub(e.lease.as_ref().map_or(0, |l| l.bytes));
         Some(e)
     }
 
@@ -379,7 +510,8 @@ impl LiveQuery {
         let mut q = self.shared.queue.lock();
         loop {
             if let Some(e) = self.take(&mut q) {
-                return Some(e);
+                drop(q);
+                return Some(e.event);
             }
             if q.closed {
                 return None;
@@ -388,7 +520,9 @@ impl LiveQuery {
                 None => self.shared.cv.wait(&mut q),
                 Some(t) => {
                     if self.shared.cv.wait_until(&mut q, t).timed_out() {
-                        return self.take(&mut q);
+                        let out = self.take(&mut q);
+                        drop(q);
+                        return out.map(|e| e.event);
                     }
                 }
             }
@@ -398,7 +532,9 @@ impl LiveQuery {
     /// The next event if one is waiting.
     pub fn try_next(&self) -> Option<LiveEvent> {
         let mut q = self.shared.queue.lock();
-        self.take(&mut q)
+        let out = self.take(&mut q);
+        drop(q);
+        out.map(|e| e.event)
     }
 
     /// The next event, awaiting it. `None` once the subscription has ended.
@@ -410,7 +546,8 @@ impl LiveQuery {
             {
                 let mut q = self.shared.queue.lock();
                 if let Some(e) = self.take(&mut q) {
-                    return Some(e);
+                    drop(q);
+                    return Some(e.event);
                 }
                 if q.closed {
                     return None;
@@ -423,13 +560,7 @@ impl LiveQuery {
     /// End the subscription and wake every thread waiting for its next event.
     /// Events still queued are dropped.
     pub fn close(&self) {
-        let mut q = self.shared.queue.lock();
-        q.closed = true;
-        q.events.clear();
-        q.rows = 0;
-        q.overflow = false;
-        drop(q);
-        self.shared.wake_all();
+        drop(self.shared.close(false));
     }
 
     /// Whether the subscription has ended and its queue is empty.
@@ -441,6 +572,6 @@ impl LiveQuery {
 
 impl Drop for LiveQuery {
     fn drop(&mut self) {
-        self.shared.close();
+        self.close();
     }
 }

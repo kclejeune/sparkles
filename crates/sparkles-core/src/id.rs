@@ -792,7 +792,9 @@ pub fn key_to_term(key: &[u8]) -> Term {
             let suffix = key.get(sep + 1..).unwrap_or(&[]);
             match suffix.first() {
                 None => Term::Literal(Literal::new_simple_literal(lex)),
-                Some(b'@') => Term::Literal(lang_literal(lex, &utf8(&suffix[1..]))),
+                Some(b'@') => {
+                    Term::Literal(lang_literal(lex, &String::from_utf8_lossy(&suffix[1..])))
+                }
                 Some(_) => Term::Literal(Literal::new_typed_literal(
                     lex,
                     NamedNode::new_unchecked(utf8(&suffix[1..])),

@@ -363,6 +363,56 @@ impl Why {
         }
     }
 
+    /// Apply a signed change, reporting effective support deltas when requested.
+    /// Sort the input in place and move new witnesses into the retained state.
+    fn absorb(&mut self, d: &mut Why, max: usize, mut record: impl FnMut(&Witness, i64)) -> i64 {
+        let before = self.unknown;
+        self.unknown += d.unknown;
+        // Apply removals first to free room for additions.
+        for (x, c) in d.supports.iter().filter(|(_, c)| *c < 0) {
+            let want = -c;
+            let mut rest = want;
+            if let Some(i) = self.find(x) {
+                let removed = self.supports[i].1.min(want);
+                self.supports[i].1 -= removed;
+                if self.supports[i].1 == 0 {
+                    self.supports.swap_remove(i);
+                }
+                record(x, -removed);
+                rest -= removed;
+            }
+            self.unknown -= rest;
+        }
+        d.supports.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (x, c) in d.supports.drain(..).filter(|(_, c)| *c > 0) {
+            if let Some(i) = self.find(&x) {
+                self.supports[i].1 += c;
+                record(&x, c);
+            } else if self.supports.len() < max {
+                record(&x, c);
+                self.supports.push((x, c));
+            } else {
+                let largest = self
+                    .supports
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.0.cmp(&b.1.0))
+                    .map(|(i, _)| i);
+                match largest {
+                    Some(i) if x < self.supports[i].0 => {
+                        let (old, count) = std::mem::replace(&mut self.supports[i], (x, c));
+                        self.unknown += count;
+                        record(&old, -count);
+                        record(&self.supports[i].0, c);
+                    }
+                    _ => self.unknown += c,
+                }
+            }
+        }
+        debug_assert!(self.unknown >= 0, "a state's unknown count went below zero");
+        self.unknown - before
+    }
+
     fn add_all(&mut self, o: &Why) {
         self.unknown += o.unknown;
         if self.supports.len() + o.supports.len() > 32 {
@@ -376,6 +426,22 @@ impl Why {
         } else {
             for (x, c) in &o.supports {
                 self.add(x, *c);
+            }
+        }
+    }
+
+    fn sub_all(&mut self, o: &Why) {
+        self.unknown -= o.unknown;
+        if self.supports.len() + o.supports.len() > 32 {
+            let mut m: FxHashMap<Witness, i64> =
+                std::mem::take(&mut self.supports).into_iter().collect();
+            for (x, c) in &o.supports {
+                *m.entry(x.clone()).or_insert(0) -= c;
+            }
+            self.supports = m.into_iter().filter(|(_, c)| *c != 0).collect();
+        } else {
+            for (x, c) in &o.supports {
+                self.add(x, -*c);
             }
         }
     }
@@ -603,10 +669,30 @@ impl Ann {
         }
     }
 
+    /// Subtract `o` from `self` in place without cloning `o`.
+    fn sub_assign(&mut self, o: &Ann) {
+        match (self, o) {
+            (Ann::Count(a), Ann::Count(b)) => *a -= b,
+            (Ann::Lineage(a), Ann::Lineage(b)) => {
+                a.n -= b.n;
+                a.unknown -= b.unknown;
+                for (k, c) in &b.atoms {
+                    let e = a.atoms.entry(*k).or_insert(0);
+                    *e -= c;
+                    if *e == 0 {
+                        a.atoms.remove(k);
+                    }
+                }
+            }
+            (Ann::Why(a), Ann::Why(b)) => a.sub_all(b),
+            (a, b) => debug_assert!(false, "annotations of two semirings: {a:?} {b:?}"),
+        }
+    }
+
     /// `self − o`.
     pub fn sub(&self, o: &Ann) -> Ann {
         let mut d = self.clone();
-        d.add_assign(&o.clone().scaled(-1));
+        d.sub_assign(o);
         d
     }
 
@@ -669,69 +755,60 @@ impl Ann {
     /// the state does not keep is taken from the unknown count (the rules of the module
     /// documentation).
     pub fn absorb(&mut self, d: Ann, max: usize) -> Ann {
-        let (Ann::Why(s), Ann::Why(d)) = (&mut *self, &d) else {
-            self.add_assign(&d);
-            return d;
-        };
-        let mut e = Why {
-            unknown: d.unknown,
-            supports: Vec::new(),
-        };
-        s.unknown += d.unknown;
-        // removals first, so that they free room for the additions
-        for (x, c) in d.supports.iter().filter(|(_, c)| *c < 0) {
-            let want = -c;
-            let mut rest = want;
-            if let Some(i) = s.find(x) {
-                let m = s.supports[i].1.min(want);
-                s.supports[i].1 -= m;
-                if s.supports[i].1 == 0 {
-                    s.supports.swap_remove(i);
-                }
-                e.add(x, -m);
-                rest -= m;
+        match (self, d) {
+            (Ann::Why(s), Ann::Why(mut d)) => {
+                let mut effective = Why::default();
+                effective.unknown = s.absorb(&mut d, max, |w, count| effective.add(w, count));
+                Ann::Why(Box::new(effective))
             }
-            if rest > 0 {
-                s.unknown -= rest;
-                e.unknown -= rest;
+            (a, d) => {
+                a.add_assign(&d);
+                d
             }
         }
-        let mut adds: Vec<&(Witness, i64)> = d.supports.iter().filter(|(_, c)| *c > 0).collect();
-        adds.sort_by(|a, b| a.0.cmp(&b.0));
-        for (x, c) in adds {
-            if let Some(i) = s.find(x) {
-                s.supports[i].1 += c;
-                e.add(x, *c);
-                continue;
+    }
+
+    fn absorb_state(&mut self, d: Ann, max: usize) {
+        match (self, d) {
+            (Ann::Why(s), Ann::Why(mut d)) => {
+                s.absorb(&mut d, max, |_, _| {});
             }
-            if s.supports.len() < max {
-                s.supports.push((x.clone(), *c));
-                e.add(x, *c);
-                continue;
-            }
-            let largest = s
-                .supports
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.0.cmp(&b.1.0))
-                .map(|(i, _)| i);
-            match largest {
-                Some(l) if *x < s.supports[l].0 => {
-                    let (y, cy) = s.supports.swap_remove(l);
-                    s.unknown += cy;
-                    e.unknown += cy;
-                    e.add(&y, -cy);
-                    s.supports.push((x.clone(), *c));
-                    e.add(x, *c);
+            (a, d) => a.add_assign(&d),
+        }
+    }
+
+    /// Bound the effective change before absorption, including displaced witnesses.
+    pub(super) fn effective_bytes(&self, old: Option<&Ann>, max: usize) -> u64 {
+        let Ann::Why(d) = self else {
+            return self.bytes();
+        };
+        let mut displaced_bytes = 0;
+        let mut displaced_count = 0;
+        if let Some(Ann::Why(old)) = old {
+            let adds = d.supports.iter().filter(|(_, c)| *c > 0);
+            let additions = adds.clone().count();
+            if old.supports.len().saturating_add(additions) > max
+                && let Some((first, _)) = adds.min_by(|a, b| a.0.cmp(&b.0))
+            {
+                let mut largest = 0;
+                for (w, _) in &old.supports {
+                    if w > first {
+                        displaced_count += 1;
+                        displaced_bytes += w.bytes();
+                        largest = largest.max(w.bytes());
+                    }
                 }
-                _ => {
-                    s.unknown += c;
-                    e.unknown += c;
-                }
+                displaced_count = displaced_count.min(additions);
+                displaced_bytes = displaced_bytes.min(displaced_count as u64 * largest);
             }
         }
-        debug_assert!(s.unknown >= 0, "a state's unknown count went below zero");
-        Ann::Why(Box::new(e))
+        let count = d.supports.len() + displaced_count;
+        // The effective support vector grows geometrically. Include its unused slots.
+        let spare = if count == 0 { 0 } else { count.max(4) };
+        self.bytes()
+            + displaced_bytes
+            + (displaced_count as u64) * 8
+            + (spare * std::mem::size_of::<(Witness, i64)>()) as u64
     }
 
     /// The annotation as a reader sees it, with at most `max` witnesses.
@@ -780,6 +857,14 @@ impl Ann {
         }
     }
 
+    pub(super) fn zero_bytes(mode: Provenance) -> u64 {
+        match mode {
+            Provenance::None | Provenance::Count => 8,
+            Provenance::Lineage => 48,
+            Provenance::Why { .. } => 40,
+        }
+    }
+
     /// The approximate memory of the annotation.
     pub fn bytes(&self) -> u64 {
         match self {
@@ -787,6 +872,15 @@ impl Ann {
             Ann::Lineage(l) => 48 + l.atoms.len() as u64 * 40,
             Ann::Why(w) => 40 + w.supports.iter().map(|(x, _)| x.bytes() + 8).sum::<u64>(),
         }
+    }
+
+    /// The effective annotation's charge includes unused WHY support slots.
+    pub(super) fn bytes_with_spare_supports(&self) -> u64 {
+        let spare = match self {
+            Ann::Why(w) => w.supports.capacity() - w.supports.len(),
+            _ => 0,
+        };
+        self.bytes() + (spare * std::mem::size_of::<(Witness, i64)>()) as u64
     }
 
     pub fn save(&self, w: &mut Writer) {
@@ -849,6 +943,7 @@ impl Ann {
         };
         Ok(match m {
             Provenance::Lineage => {
+                r.charge_state(48)?;
                 let mut l = Lineage {
                     n: r.i64()?,
                     unknown: r.i64()?,
@@ -856,24 +951,37 @@ impl Ann {
                 };
                 for _ in 0..bounded(r.u64()?)? {
                     let a = atom(r)?;
-                    l.atoms.insert(a, r.i64()?);
+                    let c = r.i64()?;
+                    r.charge_state(40)?;
+                    l.atoms.insert(a, c);
                 }
                 Ann::Lineage(Box::new(l))
             }
             Provenance::Why { .. } => {
+                r.charge_state(40)?;
                 let mut x = Why {
                     unknown: r.i64()?,
                     supports: Vec::new(),
                 };
+                let atom_sz = std::mem::size_of::<Atom>() as u64;
                 for _ in 0..bounded(r.u64()?)? {
                     let n = bounded(r.u64()?)?;
-                    let atoms = (0..n).map(|_| atom(r)).collect::<Result<Vec<_>>>()?;
+                    r.charge_state(24)?;
+                    let mut atoms = Vec::new();
+                    for _ in 0..n {
+                        let a = atom(r)?;
+                        r.charge_state(atom_sz)?;
+                        atoms.push(a);
+                    }
                     let c = r.i64()?;
                     x.supports.push((Witness::new(atoms), c));
                 }
                 Ann::Why(Box::new(x))
             }
-            _ => Ann::Count(r.i64()?),
+            _ => {
+                r.charge_state(8)?;
+                Ann::Count(r.i64()?)
+            }
         })
     }
 }
@@ -894,7 +1002,10 @@ pub fn load_map(r: &mut Reader, mode: Provenance) -> Result<AnnMap> {
     let mut m = AnnMap::default();
     for _ in 0..n {
         let row = r.row()?;
-        m.insert(row, Ann::load(r, mode)?);
+        let width = row.len();
+        r.charge_state(super::zset::row_bytes(width))?;
+        let a = Ann::load(r, mode)?;
+        m.insert(row, a);
     }
     Ok(m)
 }
@@ -907,26 +1018,39 @@ pub fn map_bytes(m: &AnnMap, width: usize) -> u64 {
 /// Add change `d` to row `row`'s annotation in `m`, dropping it when it becomes zero,
 /// and return the effective change.
 pub fn absorb_row(m: &mut AnnMap, row: &Row, d: Ann, mode: Provenance) -> Ann {
-    let max = mode.max_witnesses();
+    update_row(m, row, mode, |a| a.absorb(d, mode.max_witnesses()))
+}
+
+/// Add a change to a retained annotation without creating an effective change.
+pub(super) fn absorb_row_state(m: &mut AnnMap, row: &Row, d: Ann, mode: Provenance) {
+    update_row(m, row, mode, |a| a.absorb_state(d, mode.max_witnesses()));
+}
+
+fn update_row<T>(
+    m: &mut AnnMap,
+    row: &Row,
+    mode: Provenance,
+    update: impl FnOnce(&mut Ann) -> T,
+) -> T {
     match m.map.get_mut(row) {
         Some(a) => {
             let before = a.bytes();
-            let e = a.absorb(d, max);
+            let result = update(a);
             if a.is_zero() {
                 m.map.remove(row);
                 m.bytes -= before;
             } else {
                 m.bytes = m.bytes - before + a.bytes();
             }
-            e
+            result
         }
         None => {
             let mut a = Ann::zero(mode);
-            let e = a.absorb(d, max);
+            let result = update(&mut a);
             if !a.is_zero() {
                 m.insert(row.clone(), a);
             }
-            e
+            result
         }
     }
 }
@@ -1003,7 +1127,7 @@ impl FactCache {
     }
 
     pub fn clear(&mut self) {
-        self.map.clear();
+        self.map = FxHashMap::default();
     }
 
     pub fn bytes(&self) -> u64 {

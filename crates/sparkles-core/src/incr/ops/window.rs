@@ -66,14 +66,29 @@ fn count_down(hook: &'static std::thread::LocalKey<Hook>) {
     });
 }
 
+/// One contiguous run of identical rows entering or leaving a window: `(position, row, count)`.
+type MoveRun = (u64, Row, u64);
+
 /// Rows of the window that entered or left it in a pass, each with the position of its
 /// first copy (0 is the first row the query returns) and the number of copies, which
 /// stand at consecutive positions. Removed rows carry their position before the pass and
 /// added rows their position after it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moves {
-    pub removed: Vec<(u64, Row, u64)>,
-    pub added: Vec<(u64, Row, u64)>,
+    pub removed: Vec<MoveRun>,
+    pub added: Vec<MoveRun>,
+}
+
+impl Moves {
+    pub(crate) fn bytes(&self, width: usize) -> u64 {
+        let slot = std::mem::size_of::<(u64, Row, u64)>() as u64;
+        let row_sz = (width as u64) * 8;
+        (self.removed.capacity() as u64 + self.added.capacity() as u64)
+            .saturating_mul(slot)
+            .saturating_add(
+                (self.removed.len() as u64 + self.added.len() as u64).saturating_mul(row_sz),
+            )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -176,27 +191,47 @@ impl Window {
         self.serial
     }
 
-    /// Compute the keys of rows loaded from a checkpoint. The rows stay stale until
-    /// every key is computed.
+    /// Compute the keys of rows loaded from a checkpoint in place without allocating an
+    /// outer vector of key vectors. On cancellation or budget refusal, clears any
+    /// partially populated keys so the rows stay cleanly stale.
     fn refresh(&mut self, p: &mut Pass) -> Result<()> {
         if !self.stale {
             return Ok(());
         }
         p.control.check()?;
-        let mut used = self.bytes();
-        let mut keys = Vec::with_capacity(self.kept.len());
-        for e in &self.kept {
-            p.tick()?;
-            let k = self.key_of(p, &e.row);
-            // `bytes` counts each row's key slots already, so only the strings are new
+        let base_state = self.bytes();
+        let mut used = base_state;
+        let len = self.kept.len();
+        for i in 0..len {
+            if let Err(e) = p.tick() {
+                for e in &mut self.kept[..i] {
+                    e.keys = Vec::new();
+                }
+                p.clear_window_scratch();
+                return Err(e);
+            }
+            let k = self.key_of(p, &self.kept[i].row);
+            // `bytes` counts each row's `SortKey` slots already, and populating `e.keys`
+            // in place allocates no outer vector, so only key heap payloads are new.
             used = used.saturating_add(k.iter().map(SortKey::payload_bytes).sum::<u64>());
-            charge(p, used)?;
-            keys.push(k);
+            if let Err(e) = charge(p, used, base_state) {
+                drop(k);
+                for e in &mut self.kept[..i] {
+                    e.keys = Vec::new();
+                }
+                p.clear_window_scratch();
+                return Err(e);
+            }
+            self.kept[i].keys = k;
         }
-        p.control.check()?;
-        for (e, k) in self.kept.iter_mut().zip(keys) {
-            e.keys = k;
+        if let Err(e) = p.control.check() {
+            for e in &mut self.kept {
+                e.keys = Vec::new();
+            }
+            p.clear_window_scratch();
+            return Err(e);
         }
+        p.commit_window_state(self.bytes(), base_state)?;
         self.partial = self
             .kept
             .iter()
@@ -211,16 +246,15 @@ impl Window {
         p.control.check()?;
         let width = self.inner.schema.len();
         let slot = std::mem::size_of::<(Row, i64, Vec<SortKey>)>() as u64;
-        let mut used = self
-            .bytes()
-            .saturating_add((c.len() as u64).saturating_mul(slot));
-        charge(p, used)?;
+        let base_state = self.bytes();
+        let mut used = base_state.saturating_add((c.len() as u64).saturating_mul(slot));
+        charge(p, used, base_state)?;
         let mut out = Vec::with_capacity(c.len());
         for (r, w) in c {
             p.tick()?;
             let k = self.key_of(p, &r);
             used = used.saturating_add(heap_bytes(&k, width));
-            charge(p, used)?;
+            charge(p, used, base_state)?;
             out.push((r, w, k));
         }
         p.control.check()?;
@@ -241,38 +275,55 @@ impl Window {
 
     /// The window as segments of the kept rows.
     fn segments(&self) -> Vec<Segment> {
-        let big = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
-        let (start, end) = (
-            big(self.offset),
-            big(self.offset).saturating_add(big(self.limit)),
-        );
-        let mut out = Vec::new();
-        let mut at: i64 = 0;
-        for e in &self.kept {
-            if at >= end {
-                break;
-            }
-            let next = at + e.w;
-            let (a, b) = (at.max(start), next.min(end));
-            if a < b {
-                out.push(Segment {
-                    serial: e.serial,
-                    lo: a - at,
-                    hi: b - at,
-                    pos: (a - start) as u64,
-                    row: e.row.clone(),
-                });
-            }
-            at = next;
-        }
-        out
+        self.segment_slices()
+            .map(|(e, lo, hi, pos)| Segment {
+                serial: e.serial,
+                lo,
+                hi,
+                pos,
+                row: e.row.clone(),
+            })
+            .collect()
     }
 
-    /// The rows of the window in order, each with its copies.
+    fn segment_slices(&self) -> impl Iterator<Item = (&Entry, i64, i64, u64)> {
+        let big = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+        let start = big(self.offset);
+        let end = start.saturating_add(big(self.limit));
+        self.kept
+            .iter()
+            .scan(0i64, move |at, e| {
+                if *at >= end {
+                    return None;
+                }
+                let lo = (*at).max(start);
+                let hi = (*at + e.w).min(end);
+                let slice = (lo < hi).then(|| (e, lo - *at, hi - *at, (lo - start) as u64));
+                *at += e.w;
+                Some(slice)
+            })
+            .flatten()
+    }
+
     /// The slots of the kept rows' vector, for tests of its memory.
     #[cfg(test)]
     pub fn slots(&self) -> usize {
         self.kept.capacity()
+    }
+
+    /// Visit the rows of the window in order with their multiplicity (`(&Row, i64)`)
+    /// without allocating an intermediate `Vec<Segment>`.
+    pub(crate) fn for_each_row<E>(
+        &self,
+        mut f: impl FnMut(&Row, i64) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.segment_slices()
+            .try_for_each(|(e, lo, hi, _)| f(&e.row, hi - lo))
+    }
+
+    /// The number of runs in the current window.
+    pub(crate) fn row_count(&self) -> usize {
+        self.segment_slices().count()
     }
 
     pub fn rows(&self) -> Vec<(Row, i64)> {
@@ -283,8 +334,17 @@ impl Window {
     }
 
     /// The copies of `old` that are not in `new`, as runs with their positions.
-    fn leaving(old: &[Segment], new: &FxHashMap<u64, (i64, i64)>) -> Vec<(u64, Row, u64)> {
+    fn leaving(
+        old: &[Segment],
+        new: &FxHashMap<u64, (i64, i64)>,
+        width: usize,
+        base_bytes: u64,
+        lease: &mut super::super::budget::ScratchLease,
+    ) -> Result<(Vec<MoveRun>, u64)> {
         let mut out = Vec::new();
+        let slot = std::mem::size_of::<(u64, Row, u64)>() as u64;
+        let row_sz = (width as u64) * 8;
+        let mut out_bytes = 0u64;
         for s in old {
             // the copies of [lo, hi) outside the entry's copies in the other window
             let parts = match new.get(&s.serial) {
@@ -293,33 +353,106 @@ impl Window {
             };
             for (a, b) in parts {
                 if a < b {
+                    let next_cap = sparkles_budget::sizes::vec_grown(
+                        out.capacity(),
+                        out.len(),
+                        1,
+                        slot as usize,
+                    );
+                    out_bytes = (next_cap as u64)
+                        .saturating_mul(slot)
+                        .saturating_add((out.len() as u64 + 1).saturating_mul(row_sz));
+                    let need = base_bytes.saturating_add(out_bytes);
+                    if need > lease.bytes() {
+                        lease.try_set(need)?;
+                    }
                     out.push((s.pos + (a - s.lo) as u64, s.row.clone(), (b - a) as u64));
                 }
             }
         }
-        out
+        Ok((out, out_bytes))
     }
 
     /// The change of the window from `old` to the current rows, and its moves.
-    fn diff(&mut self, old: Vec<Segment>) -> Changes {
+    fn diff(
+        &mut self,
+        p: &mut Pass,
+        old_lease: super::super::budget::ScratchLease,
+        old: Vec<Segment>,
+    ) -> Result<Changes> {
+        let width = self.inner.schema.len();
+        let mut diff_lease = p.scratch_lease();
+        let new_est = (self.kept.len().min(self.limit) as u64)
+            .saturating_mul(std::mem::size_of::<Segment>() as u64 + row_bytes(width));
+        diff_lease.try_reserve(new_est)?;
         let new = self.segments();
+        let idx_entry = std::mem::size_of::<(u64, (i64, i64))>();
+        let oi_bytes = sparkles_budget::sizes::table_bytes(
+            sparkles_budget::sizes::table_capacity(old.len()),
+            idx_entry,
+        ) as u64;
+        let ni_bytes = sparkles_budget::sizes::table_bytes(
+            sparkles_budget::sizes::table_capacity(new.len()),
+            idx_entry,
+        ) as u64;
+        let base_bytes = new_est.saturating_add(oi_bytes).saturating_add(ni_bytes);
+        if base_bytes > diff_lease.bytes() {
+            diff_lease.try_set(base_bytes)?;
+        }
         let idx = |v: &[Segment]| -> FxHashMap<u64, (i64, i64)> {
             v.iter().map(|s| (s.serial, (s.lo, s.hi))).collect()
         };
         let (oi, ni) = (idx(&old), idx(&new));
-        let removed = Self::leaving(&old, &ni);
-        let added = Self::leaving(&new, &oi);
+        let (removed, rem_bytes) = Self::leaving(&old, &ni, width, base_bytes, &mut diff_lease)?;
+        let (added, add_bytes) = Self::leaving(
+            &new,
+            &oi,
+            width,
+            base_bytes.saturating_add(rem_bytes),
+            &mut diff_lease,
+        )?;
+        drop(oi);
+        drop(ni);
+        drop(new);
+        drop(old);
+        drop(old_lease);
+        // Release scratch for the dropped index maps and `new` segments while keeping
+        // `removed` and `added` covered.
+        let moves_scratch = rem_bytes.saturating_add(add_bytes);
+        if diff_lease.bytes() > moves_scratch {
+            diff_lease.release(diff_lease.bytes() - moves_scratch);
+        }
+        let mut out_lease = p.scratch_lease();
         let mut out = Changes::new();
         for (_, r, n) in &removed {
+            p.preadmit_changes_push(&out, width, &mut out_lease)?;
             out.push((r.clone(), -(*n as i64)));
         }
         for (_, r, n) in &added {
+            p.preadmit_changes_push(&out, width, &mut out_lease)?;
             out.push((r.clone(), *n as i64));
         }
         if self.positions {
-            self.moves = Some(Moves { removed, added });
+            let moves = Moves { removed, added };
+            let moves_bytes = moves.bytes(width);
+            let moved = p.move_scratch_to_pass(&mut diff_lease, moves_bytes);
+            if moves_bytes > moved {
+                p.reserve_pass(moves_bytes - moved)?;
+            }
+            self.moves = Some(moves);
+        } else {
+            drop(removed);
+            drop(added);
         }
-        consolidate(out)
+        drop(diff_lease);
+        let out = super::super::circuit::consolidate_budgeted(
+            out,
+            width,
+            p.budget_handle(),
+            &mut out_lease,
+        )?;
+        p.push_output_lease(out_lease);
+        Ok(out)
     }
 
     /// Drop copies from the end until the kept rows fit the cap.
@@ -364,6 +497,19 @@ impl Window {
         let mut top: TopK<(Row, i64, Option<usize>)> = TopK::new(cap, self.asc.clone());
         let mut partial = false;
         let mut total = 0i64;
+        // the window's rows stay allocated until the new ones replace them
+        let per = std::mem::size_of::<(&[crate::id::Id], usize)>() as u64 + 16;
+        let base_state = self.bytes();
+        let keep_len = if keep { self.kept.len() } else { 0 };
+        let est_index_cap = sparkles_budget::sizes::table_capacity(keep_len) as u64;
+        let est_index_bytes = est_index_cap.saturating_mul(per);
+        let counts_bytes = (keep_len as u64).saturating_mul(std::mem::size_of::<i64>() as u64);
+        let base = base_state
+            .saturating_add(est_index_bytes)
+            .saturating_add(counts_bytes);
+        if keep_len > 0 {
+            charge(p, base, base_state)?;
+        }
         // a refill tracks each kept row's copies in the input, and nothing else
         let index: FxHashMap<&[crate::id::Id], usize> = if keep {
             self.kept
@@ -374,12 +520,10 @@ impl Window {
         } else {
             FxHashMap::default()
         };
-        let mut counts = vec![0i64; if keep { self.kept.len() } else { 0 }];
-        // the window's rows stay allocated until the new ones replace them
-        let per = std::mem::size_of::<(&[crate::id::Id], usize)>() as u64 + 16;
-        let base = self
-            .bytes()
-            .saturating_add((index.capacity() as u64).saturating_mul(per));
+        let mut counts = vec![0i64; keep_len];
+        let base = base_state
+            .saturating_add((index.capacity() as u64).saturating_mul(per))
+            .saturating_add(counts_bytes);
         let slot = std::mem::size_of::<HeapEntry>() as u64;
         let mut payloads = 0u64;
         for (r, w) in rows {
@@ -394,14 +538,24 @@ impl Window {
             if let Some(i) = at {
                 counts[i] = counts[i].saturating_add(w);
             }
-            payloads = payloads.saturating_add(heap_bytes(&keys, width));
+            let entry_bytes = heap_bytes(&keys, width);
+            let next_kept = top.kept().saturating_add(1).min(cap);
+            let next_slots = if next_kept == 0 {
+                0
+            } else {
+                (next_kept.next_power_of_two() as u64).saturating_mul(slot)
+            };
+            charge(
+                p,
+                base.saturating_add(payloads)
+                    .saturating_add(entry_bytes)
+                    .saturating_add(next_slots),
+                base_state,
+            )?;
+            payloads = payloads.saturating_add(entry_bytes);
             if let Some(out) = top.offer(keys, (r, w, at)) {
                 payloads = payloads.saturating_sub(heap_bytes(&out.keys, width));
             }
-            // the heap is the operator's state to be, charged as it grows; a vector
-            // doubles, so its slots are charged at the next power of two
-            let slots = (top.kept().next_power_of_two() as u64).saturating_mul(slot);
-            charge(p, base.saturating_add(payloads).saturating_add(slots))?;
         }
         drop(index);
         #[cfg(test)]
@@ -418,6 +572,7 @@ impl Window {
             base.saturating_add(payloads)
                 .saturating_add(slots)
                 .saturating_add(sorting),
+            base_state,
         )?;
         p.control.check()?;
         let sorted = top.into_sorted();
@@ -438,11 +593,16 @@ impl Window {
         self.total = total;
         self.partial = partial;
         self.trim();
+        p.commit_window_state(self.bytes(), base_state)?;
         Ok(())
     }
 
     /// The heap's rows in order as the kept rows, each with all its copies.
     fn place(&mut self, p: &mut Pass, sorted: Vec<HeapEntry>) -> Result<()> {
+        let mut place_lease = p.scratch_lease();
+        place_lease.try_reserve(
+            (sorted.len() as u64).saturating_mul(std::mem::size_of::<Entry>() as u64),
+        )?;
         let mut kept = Vec::with_capacity(sorted.len());
         let mut held = 0i64;
         for e in sorted {
@@ -461,6 +621,7 @@ impl Window {
         p.control.check()?;
         self.kept = kept;
         self.held = held;
+        drop(place_lease);
         Ok(())
     }
 
@@ -469,7 +630,11 @@ impl Window {
     /// copies in the heap join its entry, and the heap's other rows take their places
     /// after the kept rows they tie with.
     fn reconcile(&mut self, p: &mut Pass, sorted: Vec<HeapEntry>, counts: &[i64]) -> Result<()> {
+        let mut rec_lease = p.scratch_lease();
+        let extra_bytes = (counts.len() as u64).saturating_mul(std::mem::size_of::<i64>() as u64);
+        rec_lease.try_reserve(extra_bytes)?;
         let mut extra = vec![0i64; counts.len()];
+        let fresh_slot = std::mem::size_of::<(Row, i64, Vec<SortKey>)>() as u64;
         let mut fresh = Vec::new();
         for e in sorted {
             p.tick()?;
@@ -479,9 +644,25 @@ impl Window {
                     let retained = counts[i].min(self.kept[i].w);
                     extra[i] = extra[i].saturating_add(full - retained);
                 }
-                None => fresh.push((row, full, e.keys)),
+                None => {
+                    let next_cap = sparkles_budget::sizes::vec_grown(
+                        fresh.capacity(),
+                        fresh.len(),
+                        1,
+                        fresh_slot as usize,
+                    );
+                    let need =
+                        extra_bytes.saturating_add((next_cap as u64).saturating_mul(fresh_slot));
+                    if need > rec_lease.bytes() {
+                        rec_lease.try_set(need)?;
+                    }
+                    fresh.push((row, full, e.keys));
+                }
             }
         }
+        let kept_bytes = (self.kept.len().saturating_add(fresh.len()) as u64)
+            .saturating_mul(std::mem::size_of::<Entry>() as u64);
+        rec_lease.try_reserve(kept_bytes)?;
         let old = std::mem::take(&mut self.kept);
         self.held = 0;
         let mut kept = Vec::with_capacity(old.len().saturating_add(fresh.len()));
@@ -526,6 +707,8 @@ impl Window {
         p.control.check()?;
         self.kept = kept;
         self.held = held;
+        drop(extra);
+        drop(rec_lease);
         Ok(())
     }
 
@@ -552,23 +735,45 @@ impl Window {
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
         self.moves = None;
         self.stale = false;
+        let mark = p.output_lease_mark();
         let rows = self.inner_init(p)?;
+        let rows_leases = p.take_output_leases_since(mark);
         self.fill(p, rows, false)?;
-        Ok(self.rows())
+        drop(rows_leases);
+        let width = self.inner.schema.len();
+        let mut out_lease = p.scratch_lease();
+        let mut out = Changes::new();
+        self.for_each_row(|row, w| -> Result<()> {
+            p.preadmit_changes_push(&out, width, &mut out_lease)?;
+            out.push((row.clone(), w));
+            Ok(())
+        })?;
+        p.push_output_lease(out_lease);
+        Ok(out)
     }
 
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
         self.moves = None;
+        let mark = p.output_lease_mark();
         let c = self.inner_delta(p)?;
+        let c_leases = p.take_output_leases_since(mark);
         if c.is_empty() {
+            drop(c_leases);
             if self.positions {
                 self.moves = Some(Moves::default());
             }
             return Ok(Vec::new());
         }
         self.refresh(p)?;
+        let base_state = self.bytes();
+        let mut old_lease = p.scratch_lease();
+        let width = self.inner.schema.len();
+        let seg_est = (self.kept.len().min(self.limit) as u64)
+            .saturating_mul(std::mem::size_of::<Segment>() as u64 + row_bytes(width));
+        old_lease.try_reserve(seg_est)?;
         let old = self.segments();
         let keyed = self.keyed(p, c)?;
+        drop(c_leases);
         let partial = self.partial
             || keyed
                 .iter()
@@ -576,10 +781,18 @@ impl Window {
         if partial {
             // no sorted vector without a total order: the input's rows again
             drop(keyed);
+            p.clear_window_scratch();
+            let rmark = p.output_lease_mark();
             let rows = self.inner_init(p)?;
+            let r_leases = p.take_output_leases_since(rmark);
             self.fill(p, rows, false)?;
-            return Ok(self.diff(old));
+            drop(r_leases);
+            return self.diff(p, old_lease, old);
         }
+        // Pre-admit the split remove/add vectors before partitioning `keyed`.
+        let split_slot = std::mem::size_of::<(Row, i64, Vec<SortKey>)>() as u64;
+        let mut split_lease = p.scratch_lease();
+        split_lease.try_reserve((keyed.len() as u64).saturating_mul(split_slot))?;
         // removals first, so that an insert sees the kept rows without them
         let (rem, add): (Vec<_>, Vec<_>) = keyed.into_iter().partition(|(_, w, _)| *w < 0);
         for (r, w, k) in rem {
@@ -632,13 +845,18 @@ impl Window {
             }
         }
         self.trim();
+        drop(split_lease);
+        p.commit_window_state(self.bytes(), base_state)?;
         if self.held < self.need() && self.total > self.held {
             // the reserve ran out: the input's own operators give its rows again
             self.refills += 1;
+            let rmark = p.output_lease_mark();
             let rows = self.inner_init(p)?;
+            let r_leases = p.take_output_leases_since(rmark);
             self.fill(p, rows, true)?;
+            drop(r_leases);
         }
-        Ok(self.diff(old))
+        self.diff(p, old_lease, old)
     }
 
     /// [`init`](Self::init) with annotations. The window's rows carry unknown
@@ -702,15 +920,30 @@ impl Window {
     }
 
     pub fn bytes(&self) -> u64 {
-        // the vector's slots, whether used or not, then each row's ids and keys
+        // the vector's slots, whether used or not, then each row's ids and keys,
+        // plus any retained ordered-window movement lists.
         let slots = self.kept.capacity() as u64 * std::mem::size_of::<Entry>() as u64;
         let per = self.per_row() - std::mem::size_of::<Entry>() as u64;
+        let moves = self
+            .moves
+            .as_ref()
+            .map_or(0, |m| m.bytes(self.inner.schema.len()));
         slots
             + self
                 .kept
                 .iter()
                 .map(|e| per + e.keys.iter().map(SortKey::payload_bytes).sum::<u64>())
                 .sum::<u64>()
+            + moves
+    }
+
+    pub fn clear(&mut self) {
+        self.kept = Vec::new();
+        self.held = 0;
+        self.total = 0;
+        self.stale = false;
+        self.partial = false;
+        self.moves = None;
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {
@@ -729,6 +962,7 @@ impl Window {
         let width = self.inner.schema.len();
         let mut kept = Vec::new();
         let mut held = 0i64;
+        let per = self.per_row();
         for _ in 0..n {
             let row = r.row()?;
             let w = r.i64()?;
@@ -740,6 +974,7 @@ impl Window {
             held = held.checked_add(w).ok_or_else(|| {
                 crate::error::Error::Corrupt("a view's window holds too many rows".into())
             })?;
+            r.charge_state(per)?;
             self.serial += 1;
             kept.push(Entry {
                 row,
@@ -785,16 +1020,9 @@ fn key_bytes(keys: &[SortKey]) -> u64 {
     (std::mem::size_of_val(keys) as u64).saturating_add(strings)
 }
 
-/// Fail with a memory budget error when `used` passes the pass's budget.
-fn charge(p: &Pass, used: u64) -> Result<()> {
-    match p.max_memory_bytes {
-        Some(max) if used > max => Err(crate::error::Error::BudgetExceeded(crate::error::Budget {
-            kind: crate::error::BudgetKind::Memory,
-            limit: max,
-            requested: used,
-        })),
-        _ => Ok(()),
-    }
+/// Fail with a memory budget error when `used` passes the pass's budget or parent pool.
+fn charge(p: &mut Pass, used: u64, base_state: u64) -> Result<()> {
+    p.charge_window(used, base_state)
 }
 
 fn strip(c: AChanges) -> Changes {

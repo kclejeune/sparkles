@@ -837,6 +837,7 @@ fn prepared_txn_view_refuses_reasoning_and_view_providers_that_could_retain_snap
                 rows: vec![],
                 commit: r.at,
                 evaluated_under: None,
+                lease: None,
             })
         }
     }

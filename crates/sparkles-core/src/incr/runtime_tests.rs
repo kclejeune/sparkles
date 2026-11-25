@@ -85,6 +85,9 @@ fn read(
         caller,
         deadline: None,
         aggregate_errors: None,
+        memory_parent: None,
+        memory_pool: None,
+        max_memory_bytes: None,
     })?;
     Ok(rows_of(&r.rows))
 }
@@ -1155,6 +1158,9 @@ fn a_view_reads_at_the_query_commit() {
             caller: None,
             deadline: None,
             aggregate_errors: None,
+            memory_parent: None,
+            memory_pool: None,
+            max_memory_bytes: None,
         })
         .map(|r| (r.commit, rows_of(&r.rows)))
     };
@@ -1184,6 +1190,9 @@ fn a_view_reads_at_the_query_commit() {
         caller: None,
         deadline: None,
         aggregate_errors: None,
+        memory_parent: None,
+        memory_pool: None,
+        max_memory_bytes: None,
     }) else {
         panic!("a read past the history without the snapshot");
     };
@@ -1551,6 +1560,9 @@ fn a_read_back_after_a_switch_uses_the_new_mode() {
             caller: None,
             deadline: None,
             aggregate_errors: None,
+            memory_parent: None,
+            memory_pool: None,
+            max_memory_bytes: None,
         })
         .unwrap();
     assert_eq!(rows_of(&r.rows), ["a", "b"]);
@@ -1718,6 +1730,9 @@ fn a_view_read_back_keeps_its_default_graph() {
             caller: None,
             deadline: None,
             aggregate_errors: None,
+            memory_parent: None,
+            memory_pool: None,
+            max_memory_bytes: None,
         })
         .map(|r| rows_of(&r.rows));
     assert_eq!(r.ok(), Some(vec!["a".to_string()]));

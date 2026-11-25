@@ -317,6 +317,9 @@ impl View {
             * (std::mem::size_of::<Option<usize>>() + std::mem::size_of::<Id>()))
             as u64;
         let mut charge = OwnedCharge::new(ctx, scratch)?;
+        let get_parent = || ctx.memory_parent();
+        let memory_pool = ctx.grant().map(|g| g.pool());
+        let max_memory_bytes = (ctx.mem_limit != u64::MAX).then_some(ctx.mem_limit);
         let open = ViewOpen {
             read: ViewRead {
                 name: &spec.name,
@@ -326,6 +329,9 @@ impl View {
                 caller: ctx.graphs.as_ref(),
                 deadline: ctx.current_deadline(),
                 aggregate_errors: Some(ctx.aggregate_errors),
+                memory_parent: Some(&get_parent),
+                memory_pool,
+                max_memory_bytes,
             },
         };
         let opened = source.open_view(&open, &|| ctx.check(), &mut |bytes| {
