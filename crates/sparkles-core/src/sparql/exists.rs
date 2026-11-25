@@ -189,29 +189,37 @@ struct CachedPlan {
 }
 
 struct CachedAdmit {
-    result: std::result::Result<AdmitMeta, String>,
+    result: std::result::Result<Arc<AdmitMeta>, Arc<str>>,
     bytes: u64,
     charge: Option<RetainedCharge>,
 }
 
-#[derive(Clone)]
 struct AdmitMeta {
     keys: Vec<VarId>,
     risky: Vec<VarId>,
 }
 
-fn admit_bytes(result: &std::result::Result<AdmitMeta, String>) -> u64 {
-    match result {
-        Ok(meta) => (meta
-            .keys
-            .capacity()
-            .saturating_mul(std::mem::size_of::<VarId>()))
+fn admit_meta_bytes(meta: &AdmitMeta) -> u64 {
+    std::mem::size_of::<AdmitMeta>()
+        .saturating_add(2 * std::mem::size_of::<usize>())
+        .saturating_add(
+            meta.keys
+                .capacity()
+                .saturating_mul(std::mem::size_of::<VarId>()),
+        )
         .saturating_add(
             meta.risky
                 .capacity()
                 .saturating_mul(std::mem::size_of::<VarId>()),
-        ) as u64,
-        Err(reason) => reason.capacity() as u64,
+        ) as u64
+}
+
+fn admit_bytes(result: &std::result::Result<Arc<AdmitMeta>, Arc<str>>) -> u64 {
+    match result {
+        Ok(meta) => admit_meta_bytes(meta),
+        Err(reason) => reason
+            .len()
+            .saturating_add(2 * std::mem::size_of::<usize>()) as u64,
     }
 }
 
@@ -240,6 +248,10 @@ impl PlanCache {
     pub(super) fn set_strict(&self, value: bool) {
         self.strict
             .store(if value { 2 } else { 1 }, Ordering::Release);
+    }
+
+    pub(super) fn cached_plan(&self) -> Option<Arc<Node>> {
+        self.plan.lock().as_ref().map(|cached| cached.node.clone())
     }
 
     pub(super) fn release_plan(&self) {
@@ -301,11 +313,9 @@ enum State {
 }
 
 struct Plan {
-    /// variables of the pattern an outer row may bind and the key set holds (sorted)
-    keys: Vec<VarId>,
-    /// variables an outer row must leave unbound for a probe
-    risky: Vec<VarId>,
+    meta: Arc<AdmitMeta>,
     node: Arc<Node>,
+    _charge: Option<RetainedCharge>,
 }
 
 struct Build {
@@ -662,8 +672,8 @@ pub(super) fn keyed_plan(
         return Ok(None);
     }
     let meta = match admit_meta(ctx, spec, admission, true) {
-        Ok(Ok(meta)) => meta,
-        Ok(Err(_)) | Err(Error::BudgetExceeded(_)) => return Ok(None),
+        Ok((Ok(meta), _)) => meta,
+        Ok((Err(_), _)) | Err(Error::BudgetExceeded(_)) => return Ok(None),
         Err(e @ (Error::Cancelled | Error::Timeout | Error::Io(_) | Error::Corrupt(_))) => {
             return Err(e);
         }
@@ -1072,6 +1082,11 @@ impl Decor {
         tracing::debug!(target: "sparkles::sparql::exists", "EXISTS evaluated per row: {reason}");
         *self.reason.lock() = Some(reason.to_string());
     }
+
+    #[cfg(test)]
+    pub(super) fn is_planned(&self) -> bool {
+        matches!(*self.state.lock(), State::Planned(_))
+    }
 }
 
 /// The key set of `spec`, built now if the outer table `t` makes it worthwhile.
@@ -1095,8 +1110,8 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
     let State::Planned(plan) = &*st else {
         unreachable!("planned above")
     };
-    let keys = slots(spec, t, &plan.keys);
-    let risky = slots(spec, t, &plan.risky);
+    let keys = slots(spec, t, &plan.meta.keys);
+    let risky = slots(spec, t, &plan.meta.risky);
     if keys.iter().all(|s| s.unbound()) {
         decor.note("the outer solutions bind none of its variables");
         return Ok(None);
@@ -1116,7 +1131,7 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
     // A cursor keeps the keys of its earlier batches, charged as retained state.
     let mut local: FxHashSet<Vec<Id>> = FxHashSet::default();
     let mut cumulative = ctx.streams().then(|| decor.seen.lock());
-    let entry = plan.keys.len() as u64 * 8 + 128;
+    let entry = plan.meta.keys.len() as u64 * 8 + 128;
     if let Some(seen) = cumulative.as_deref_mut() {
         let room = need.saturating_sub(seen.keys.len()).min(t.len()) as u64;
         let bytes = (seen.keys.len() as u64 + room) * entry + 1024;
@@ -1166,7 +1181,7 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
     if let Some(mut seen) = cumulative.take() {
         *seen = Seen::default();
     }
-    if (ctx.rows_within_budget(plan.keys.len()) as f64) < plan.node.est {
+    if (ctx.rows_within_budget(plan.meta.keys.len()) as f64) < plan.node.est {
         decor.note("its estimated solutions exceed the memory budget");
         *st = State::Rejected;
         spec.plan_cache.release_plan();
@@ -1174,9 +1189,26 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
     }
     // the keys are the variables these rows can bind (the rows of this filter all have
     // the same columns); a row binding another one is evaluated per row
+    let copy_bytes = plan
+        .meta
+        .risky
+        .len()
+        .saturating_add(plan.meta.keys.len())
+        .saturating_mul(std::mem::size_of::<VarId>()) as u64;
+    let copy_charge = match ctx.charge(copy_bytes) {
+        Ok(charge) => charge,
+        Err(Error::BudgetExceeded(_)) => {
+            decor.note("its key set does not fit in the memory budget");
+            *st = State::Rejected;
+            spec.plan_cache.release_plan();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     let mut keyed = Vec::new();
-    let mut risky = plan.risky.clone();
-    for (&v, s) in plan.keys.iter().zip(&keys) {
+    let mut risky = Vec::with_capacity(plan.meta.risky.len() + plan.meta.keys.len());
+    risky.extend_from_slice(&plan.meta.risky);
+    for (&v, s) in plan.meta.keys.iter().zip(&keys) {
         if s.unbound() {
             risky.push(v);
         } else {
@@ -1188,6 +1220,7 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
         Some(owner) => build_streaming(&owner, &node, keyed, risky),
         None => build(ctx, &node, keyed, risky),
     };
+    drop(copy_charge);
     match built {
         Ok(b) => {
             let b = Arc::new(b);
@@ -1234,9 +1267,15 @@ fn build(ctx: &Ctx, node: &Node, keys: Vec<VarId>, risky: Vec<VarId>) -> Result<
         return Err(Error::invalid("a key variable is unbound in a solution"));
     }
     let width = cols.len();
+    let meta_bytes = keys
+        .capacity()
+        .saturating_add(risky.capacity())
+        .saturating_mul(std::mem::size_of::<VarId>()) as u64;
     // The hash table may reserve almost twice its cardinality, and multi-column
     // keys allocate individually. Reserve their construction before allocating.
-    let charge = ctx.retained_charge(t.len() as u64 * (width as u64 * 8 + 128) + 1024)?;
+    let charge = ctx.retained_charge(
+        meta_bytes.saturating_add(t.len() as u64 * (width as u64 * 8 + 128) + 1024),
+    )?;
     let full = if width == 1 {
         KeySet::One(cols[0].iter().copied().collect())
     } else {
@@ -1281,15 +1320,20 @@ fn build_streaming(
     } else {
         width as u64 * 8 + 80
     };
-    let mut charge = ctx.retained_charge(1024)?;
+    let meta_bytes = keys
+        .capacity()
+        .saturating_add(risky.capacity())
+        .saturating_mul(std::mem::size_of::<VarId>()) as u64;
+    let base = meta_bytes.saturating_add(1024);
+    let mut charge = ctx.retained_charge(base)?;
     let mut one: FxHashSet<Id> = FxHashSet::default();
     let mut many: FxHashSet<Box<[Id]>> = FxHashSet::default();
     // Size the set for the pattern's estimated solutions when a quarter of the
     // remaining budget covers them, so that it does not rehash as it fills. Growing
     // from empty spent a fifth of a NOT EXISTS query in rehashing.
     let expected = node.est.clamp(0.0, u32::MAX as f64) as usize;
-    let mut floor = 1024;
-    let presized = expected as u64 * entry + 1024;
+    let mut floor = base;
+    let presized = (expected as u64).saturating_mul(entry).saturating_add(base);
     if let Some(retained) = charge.as_mut()
         && expected > 0
         && presized < ctx.memory_remaining() / 4
@@ -1319,7 +1363,12 @@ fn build_streaming(
             let held = one.len() + many.len();
             // Reserve for every row of the batch being new before the set grows.
             if let Some(charge) = charge.as_mut() {
-                charge.resize(((held + t.len()) as u64 * entry + 1024).max(floor))?;
+                charge.resize(
+                    ((held + t.len()) as u64)
+                        .saturating_mul(entry)
+                        .saturating_add(base)
+                        .max(floor),
+                )?;
             }
             if width == 1 {
                 one.extend(cols[0].iter().copied());
@@ -1330,7 +1379,12 @@ fn build_streaming(
             }
             solutions += t.len();
             if let Some(charge) = charge.as_mut() {
-                charge.resize(((one.len() + many.len()) as u64 * entry + 1024).max(floor))?;
+                charge.resize(
+                    ((one.len() + many.len()) as u64)
+                        .saturating_mul(entry)
+                        .saturating_add(base)
+                        .max(floor),
+                )?;
             }
             Ok(())
         })
@@ -1354,15 +1408,20 @@ fn build_streaming(
 
 /// Structural admission of `spec`: classify its key and risky variables once per
 /// `ExistsSpec` without mutating `Decor::reason` or `Decor::state`. When `cache` is
-/// true, retains the result charged to `ctx` (or `admission` before attachment); when
-/// `cache` is false (`admit` in `prepare`), consumes any previously cached entry and
-/// drops its charge immediately.
+/// true, retains the `Arc`-shared result charged to `ctx` (or `admission` before
+/// attachment) so lookups share the buffers with zero copies; when `cache` is false
+/// (`admit` in `prepare`), consumes any previously cached entry and transfers its
+/// retained charge to the caller (`State::Planned`).
+#[allow(clippy::type_complexity)]
 fn admit_meta(
     ctx: &Ctx,
     spec: &ExistsSpec,
     admission: Option<&Charge<'_>>,
     cache: bool,
-) -> Result<std::result::Result<AdmitMeta, String>> {
+) -> Result<(
+    std::result::Result<Arc<AdmitMeta>, Arc<str>>,
+    Option<RetainedCharge>,
+)> {
     ctx.check()?;
     {
         let mut guard = spec.plan_cache.admit.lock();
@@ -1371,13 +1430,13 @@ fn admit_meta(
                 if cached.charge.is_none() && ctx.shared().is_some() {
                     cached.charge = ctx.retained_charge(cached.bytes)?;
                 }
-                return Ok(cached.result.clone());
+                return Ok((cached.result.clone(), None));
             }
         } else if let Some(cached) = guard.take() {
-            return Ok(cached.result);
+            return Ok((cached.result, cached.charge));
         }
     }
-    let computed = (|| -> std::result::Result<AdmitMeta, String> {
+    let computed = (|| -> std::result::Result<Arc<AdmitMeta>, Arc<str>> {
         // Evaluating a key set can reach a callback under an untaken expression arm.
         if ctx
             .extensions
@@ -1390,7 +1449,7 @@ fn admit_meta(
             return Err("its active graph is a variable".into());
         }
         let mut risky = FxHashSet::default();
-        let cert = certain(ctx, spec.pattern(), &mut risky)?;
+        let cert = certain(ctx, spec.pattern(), &mut risky).map_err(Arc::<str>::from)?;
         let keys: Vec<VarId> = spec
             .vars
             .iter()
@@ -1398,10 +1457,7 @@ fn admit_meta(
             .filter(|v| !risky.contains(v))
             .collect();
         if let Some(v) = keys.iter().find(|v| !cert.contains(v)) {
-            return Err(format!(
-                "?{} is not bound by every solution",
-                ctx.var_name(*v)
-            ));
+            return Err(format!("?{} is not bound by every solution", ctx.var_name(*v)).into());
         }
         if keys.is_empty() {
             return Err("it has no variable to correlate on".into());
@@ -1414,10 +1470,10 @@ fn admit_meta(
             .filter(|v| spec.vars.contains(v))
             .collect();
         risky.sort_unstable();
-        Ok(AdmitMeta { keys, risky })
+        Ok(Arc::new(AdmitMeta { keys, risky }))
     })();
     if !cache {
-        return Ok(computed);
+        return Ok((computed, None));
     }
     let bytes = admit_bytes(&computed);
     let mut guard = spec.plan_cache.admit.lock();
@@ -1425,7 +1481,7 @@ fn admit_meta(
         if existing.charge.is_none() && ctx.shared().is_some() {
             existing.charge = ctx.retained_charge(existing.bytes)?;
         }
-        return Ok(existing.result.clone());
+        return Ok((existing.result.clone(), None));
     }
     let charge = if ctx.shared().is_some() {
         ctx.retained_charge(bytes)?
@@ -1434,21 +1490,21 @@ fn admit_meta(
         None
     } else {
         // Unattached context without an admission guard: do not retain uncharged backing.
-        return Ok(computed);
+        return Ok((computed, None));
     };
     *guard = Some(CachedAdmit {
         result: computed.clone(),
         bytes,
         charge,
     });
-    Ok(computed)
+    Ok((computed, None))
 }
 
 /// Check the pattern against the admitted algebra and reuse its unsubstituted plan.
 fn admit(ctx: &Ctx, spec: &ExistsSpec) -> Result<std::result::Result<Plan, String>> {
-    let meta = match admit_meta(ctx, spec, None, false) {
-        Ok(Ok(meta)) => meta,
-        Ok(Err(reason)) => return Ok(Err(reason)),
+    let (meta, mut charge) = match admit_meta(ctx, spec, None, false) {
+        Ok((Ok(meta), charge)) => (meta, charge),
+        Ok((Err(reason), _)) => return Ok(Err(reason.to_string())),
         Err(e @ (Error::Timeout | Error::Cancelled | Error::Io(_) | Error::Corrupt(_))) => {
             return Err(e);
         }
@@ -1457,6 +1513,18 @@ fn admit(ctx: &Ctx, spec: &ExistsSpec) -> Result<std::result::Result<Plan, Strin
         }
         Err(e) => return Ok(Err(format!("admitting it failed ({e})"))),
     };
+    if charge.is_none() && ctx.shared().is_some() {
+        match ctx.retained_charge(admit_meta_bytes(&meta)) {
+            Ok(retained) => charge = retained,
+            Err(e @ (Error::Timeout | Error::Cancelled | Error::Io(_) | Error::Corrupt(_))) => {
+                return Err(e);
+            }
+            Err(Error::BudgetExceeded(budget)) => {
+                return Ok(Err(Error::BudgetExceeded(budget).to_string()));
+            }
+            Err(e) => return Ok(Err(format!("admitting it failed ({e})"))),
+        }
+    }
     let node = match unsubstituted_plan(ctx, spec) {
         Ok(node) => node,
         Err(e @ (Error::Timeout | Error::Cancelled | Error::Io(_) | Error::Corrupt(_))) => {
@@ -1471,9 +1539,9 @@ fn admit(ctx: &Ctx, spec: &ExistsSpec) -> Result<std::result::Result<Plan, Strin
         return Ok(Err(format!("its plan does not bind ?{}", ctx.var_name(*v))));
     }
     Ok(Ok(Plan {
-        keys: meta.keys,
-        risky: meta.risky,
+        meta,
         node,
+        _charge: charge,
     }))
 }
 

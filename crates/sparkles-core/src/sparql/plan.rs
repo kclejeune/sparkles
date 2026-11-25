@@ -1141,14 +1141,14 @@ impl<'a> Planner<'a> {
                 self.plan_charge,
             )?))
         };
-        super::expr::compile_expression(
-            ctx,
-            subst,
-            &exists,
-            &|_| Ok(()),
-            &|name| Ok(ctx.var(name)),
-            e,
-        )
+        let admit = |expr: &Expression| -> Result<()> {
+            if let Some(held) = self.plan_charge {
+                ctx.check()?;
+                held.add(super::checked_layout::expression_compile_bytes(expr))?;
+            }
+            Ok(())
+        };
+        super::expr::compile_expression(ctx, subst, &exists, &admit, &|name| Ok(ctx.var(name)), e)
     }
 
     fn compile_in_branch(&self, e: &Expression, graph: &ActiveGraph) -> Result<Expr> {
@@ -1925,12 +1925,20 @@ impl<'a> Planner<'a> {
                                             );
                                             if grown > cap {
                                                 let slot = std::mem::size_of::<(&GroundTerm, Id)>();
-                                                let need = sparkles_budget::sizes::table_bytes(
+                                                let old_bytes = if cap == 0 {
+                                                    0
+                                                } else {
+                                                    sparkles_budget::sizes::table_bytes(cap, slot)
+                                                        as u64
+                                                };
+                                                let new_bytes = sparkles_budget::sizes::table_bytes(
                                                     grown, slot,
                                                 )
                                                     as u64;
-                                                if charge.resize(need).is_ok() {
+                                                let peak = old_bytes.saturating_add(new_bytes);
+                                                if charge.resize(peak).is_ok() {
                                                     seen.insert(term, id);
+                                                    let _ = charge.resize(new_bytes);
                                                 } else {
                                                     seen_full = true;
                                                 }
@@ -1951,6 +1959,7 @@ impl<'a> Planner<'a> {
                 }
                 drop(seen);
                 drop(seen_charge);
+                self.ctx.check()?;
                 // substituted variables (initial bindings, filter equalities): keep only
                 // compatible rows and fill their UNDEF cells with the bound value, so the
                 // table agrees with the substitution the rest of the plan assumes

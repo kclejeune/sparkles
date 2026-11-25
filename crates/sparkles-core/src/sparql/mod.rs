@@ -1778,7 +1778,7 @@ fn prepare_query_input_policy(
     let plan_depth = depth::check_plan(node.depth())?;
     ioacct::mark("planned");
     exec::prefetch_scans(&ctx, &node);
-    let (streamed, mut admission_lease) = if let Some(automatic) = automatic
+    let (streamed, admission_lease) = if let Some(automatic) = automatic
         && bound.is_empty()
     {
         cursor::auto_streaming_lease(&ctx, &node, kind, automatic)?
@@ -1786,17 +1786,12 @@ fn prepare_query_input_policy(
         (false, None)
     };
     if streamed {
-        let mutable = Arc::get_mut(&mut ctx)
-            .ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
-        mutable.enable_cursor_accounting()?;
-    }
-    // Retained charges release through the shared context in both accounting modes.
-    // An eager context is attached once the automatic choice no longer needs it alone,
-    // so its planning keeps what it retains uncharged, as before.
-    ctx.attach_owner();
-    if streamed {
-        exists::charge_cached_plans(&ctx, &node, admission_lease.as_mut())?;
-        drop(admission_lease);
+        finalize_auto_streaming(&mut ctx, &node, admission_lease)?;
+    } else {
+        // Retained charges release through the shared context in both accounting modes.
+        // An eager context is attached once the automatic choice no longer needs it alone,
+        // so its planning keeps what it retains uncharged, as before.
+        ctx.attach_owner();
     }
     ctx.check()?;
     Ok(PreparedQuery {
@@ -1807,6 +1802,41 @@ fn prepare_query_input_policy(
         kind,
         plan_depth,
     })
+}
+
+/// Complete the automatic-streaming transition after `auto_streaming_lease`: switch
+/// `ctx` into cursor accounting, attach its owner, and transfer `admission_lease` into
+/// `RetainedCharge`s on cached `EXISTS` plans and metadata.
+///
+/// Clears speculative caches before `admission_lease` drops on any error or unwind so a
+/// concurrent query cannot claim the released pool bytes while cached plans are still live.
+pub(super) fn finalize_auto_streaming(
+    ctx: &mut Arc<Ctx>,
+    node: &plan::Node,
+    mut admission_lease: Option<query_memory::QueryMemoryLease>,
+) -> Result<()> {
+    struct ClearOnDrop<'a> {
+        node: &'a plan::Node,
+        keep: bool,
+    }
+    impl Drop for ClearOnDrop<'_> {
+        fn drop(&mut self) {
+            if !self.keep {
+                exists::clear_cached_plans(self.node);
+            }
+        }
+    }
+    // Declared after `admission_lease` so on error or unwind, speculative caches drop
+    // before `admission_lease` releases its pool bytes.
+    let mut clear_guard = ClearOnDrop { node, keep: false };
+    let mutable =
+        Arc::get_mut(ctx).ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
+    mutable.enable_cursor_accounting()?;
+    ctx.attach_owner();
+    exists::charge_cached_plans(ctx, node, admission_lease.as_mut())?;
+    clear_guard.keep = true;
+    drop(admission_lease);
+    Ok(())
 }
 
 fn execute_parsed(

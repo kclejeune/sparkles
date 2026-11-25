@@ -2540,6 +2540,13 @@ pub(super) fn compile_expression<T>(
     admit(e)?;
     let compile = |e: &Expression| compile_expression(ctx, subst, exists, admit, variable, e);
     let bx = |e: &Expression| compile(e).map(Box::new);
+    let compile_list = |items: &[Expression]| -> std::result::Result<Vec<Expr>, T> {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(compile(item)?);
+        }
+        Ok(out)
+    };
     Ok(match e {
         E::NamedNode(n) => Expr::Const(ctx.intern_term(&Term::NamedNode(n.clone()))),
         E::Literal(l) => {
@@ -2566,12 +2573,7 @@ pub(super) fn compile_expression<T>(
         E::GreaterOrEqual(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Ge),
         E::Less(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Lt),
         E::LessOrEqual(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Le),
-        E::In(a, l) => Expr::In(
-            bx(a)?,
-            l.iter()
-                .map(&compile)
-                .collect::<std::result::Result<_, T>>()?,
-        ),
+        E::In(a, l) => Expr::In(bx(a)?, compile_list(l)?),
         E::Add(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Add),
         E::Subtract(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Sub),
         E::Multiply(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Mul),
@@ -2589,16 +2591,9 @@ pub(super) fn compile_expression<T>(
             }
         }
         E::If(a, c, d) => Expr::If(bx(a)?, bx(c)?, bx(d)?),
-        E::Coalesce(l) => Expr::Coalesce(
-            l.iter()
-                .map(&compile)
-                .collect::<std::result::Result<_, T>>()?,
-        ),
+        E::Coalesce(l) => Expr::Coalesce(compile_list(l)?),
         E::FunctionCall(f, args) => {
-            let args: Vec<Expr> = args
-                .iter()
-                .map(&compile)
-                .collect::<std::result::Result<_, T>>()?;
+            let args = compile_list(args)?;
             let f = match f {
                 Function::Custom(n) if is_cast(n.as_str()) => Func::Cast(n.clone()),
                 Function::Custom(n) => {
