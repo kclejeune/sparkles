@@ -83,7 +83,7 @@ fn reserve_cdt_key(key: &[u8], next: &mut u64, ordinals: &mut u64) -> Result<()>
     }
     let lex = std::str::from_utf8(raw_lex)
         .map_err(|_| Error::Corrupt("invalid UTF-8 in vocabulary composite literal key".into()))?;
-    crate::sparql::cdt::scan_bnode_ids(lex, |id| reserve(id, next, ordinals))
+    crate::sparql::cdt::scan_bnode_ids(lex, dt, |id| reserve(id, next, ordinals))
 }
 
 /// Reserve every stored blank node named inside `key` (RDF 1.2 triple terms and

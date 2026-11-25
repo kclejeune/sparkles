@@ -193,7 +193,7 @@ fn copies_stop_on_cancellation_and_refuse_an_insufficient_memory_grant() {
 
 #[test]
 fn retained_dry_run_nested_blank_ids_are_reserved_before_new_allocations() {
-    for case in ["triple", "cdt-list", "cdt-map"] {
+    for case in ["triple", "cdt-list", "cdt-map", "cdt-quoted-plus-unicode"] {
         let source = Store::in_memory(Default::default());
         let options = WriteOptions {
             dry_run: Some(DryRun {
@@ -219,6 +219,19 @@ fn retained_dry_run_nested_blank_ids_are_reserved_before_new_allocations() {
                 format!("{{ \"k\" : _:{} }}", blank.as_str()),
                 NamedNode::new(sparkles_core::sparql::cdt::MAP).unwrap(),
             )),
+            "cdt-quoted-plus-unicode" => {
+                let suffix = blank
+                    .as_str()
+                    .strip_prefix('b')
+                    .expect("stored blank node label starts with 'b'");
+                Term::Literal(Literal::new_typed_literal(
+                    format!(
+                        "[\"[_:\\u+062{suffix}]\"^^<{}>]",
+                        sparkles_core::sparql::cdt::LIST
+                    ),
+                    NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+                ))
+            }
             _ => unreachable!(),
         };
         let subject = transaction
@@ -315,9 +328,11 @@ fn compacted_base_vocab_copy_accounts_for_live_scratch_and_entry_overhead() {
 
     // Compacted CDT literal containing a blank node must scan without allocating
     // a decoded Term or parsed CDT AST while live vocab scratch is held.
+    // Leave the source allocator at 0 so the no-reuse assertion directly verifies
+    // CDT reservation rather than inherited source counter advancement.
     let cdt_source = Store::in_memory(Default::default());
     let mut tx = cdt_source.write();
-    let node = tx.new_bnode();
+    let node = Id::bnode(0);
     let cdt_lex = format!("[\"{payload}\", _:{}]", bnode_label(node.payload()));
     let cdt_object = Term::Literal(Literal::new_typed_literal(
         cdt_lex.clone(),
@@ -399,11 +414,18 @@ fn compacted_base_vocab_copy_accounts_for_live_scratch_and_entry_overhead() {
         "compacted CDT blank node must be reserved under tight memory cap"
     );
     drop(cdt_write);
+    let mut cdt_src_check = cdt_source.write();
+    assert_eq!(
+        cdt_src_check.new_bnode(),
+        node,
+        "source allocator counter must still be at the unallocated target label"
+    );
+    drop(cdt_src_check);
 
     // Same tight-cap check for an escaped quoted nested CDT literal holding a 64 KiB string.
     let quoted_source = Store::in_memory(Default::default());
     let mut qtx = quoted_source.write();
-    let qnode = qtx.new_bnode();
+    let qnode = Id::bnode(0);
     let quoted_lex = format!(
         "[\"[\\\"{payload}\\\", _:{}]\"^^<{}>]",
         bnode_label(qnode.payload()),
@@ -457,6 +479,112 @@ fn compacted_base_vocab_copy_accounts_for_live_scratch_and_entry_overhead() {
         qwrite.new_bnode(),
         qnode,
         "blank node inside escaped quoted nested CDT must be reserved under tight cap"
+    );
+    drop(qwrite);
+    let mut qsrc_check = quoted_source.write();
+    assert_eq!(
+        qsrc_check.new_bnode(),
+        qnode,
+        "source allocator counter must still be at the unallocated quoted target label"
+    );
+}
+
+#[test]
+fn ill_typed_cdt_literals_copy_without_exhausting_or_advancing_blank_allocator() {
+    let cases = [
+        (
+            "trailing-comma-max-bnode",
+            "[_:b7ffffffffff,]",
+            sparkles_core::sparql::cdt::LIST,
+        ),
+        (
+            "trailing-comma-b0",
+            "[_:b0,]",
+            sparkles_core::sparql::cdt::LIST,
+        ),
+        (
+            "duplicate-map-key",
+            r#"{"a": _:b7ffffffffff, "a": 1}"#,
+            sparkles_core::sparql::cdt::MAP,
+        ),
+        (
+            "canonical-duplicate-map-key",
+            r#"{1: _:b7ffffffffff, "1"^^<http://www.w3.org/2001/XMLSchema#integer>: 2}"#,
+            sparkles_core::sparql::cdt::MAP,
+        ),
+        (
+            "bnode-map-key",
+            "{_:b7ffffffffff : 1}",
+            sparkles_core::sparql::cdt::MAP,
+        ),
+        (
+            "map-syntax-in-list-datatype",
+            r#"{"k": _:b7ffffffffff}"#,
+            sparkles_core::sparql::cdt::LIST,
+        ),
+    ];
+    for (name, lex, dt) in cases {
+        let source = Store::in_memory(Default::default());
+        let mut tx = source.write();
+        let subject = tx
+            .intern(&Term::NamedNode(NamedNode::new("urn:s").unwrap()))
+            .unwrap();
+        let predicate = tx
+            .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+            .unwrap();
+        let object = tx
+            .intern(&Term::Literal(Literal::new_typed_literal(
+                lex,
+                NamedNode::new(dt).unwrap(),
+            )))
+            .unwrap();
+        tx.insert([subject, predicate, object, Id::DEFAULT_GRAPH])
+            .unwrap();
+        tx.commit().unwrap();
+        let snap = source.snapshot();
+        let copied = source
+            .copy_view_to_memory(&snap, Default::default(), &Default::default(), |_| Ok(true))
+            .unwrap_or_else(|e| panic!("case {name}: ill-typed CDT copy must succeed, got: {e}"));
+        assert_eq!(state(&snap), state(&copied.snapshot()), "case {name}");
+        let mut write = copied.write();
+        assert_eq!(
+            write.new_bnode(),
+            Id::bnode(0),
+            "case {name}: ill-typed CDT literal must not advance destination allocator"
+        );
+    }
+
+    // Valid outer list containing both a real blank node and an ill-typed quoted nested CDT
+    // must copy cleanly, reserve the valid blank node, and ignore the ill-typed inner literal.
+    let source = Store::in_memory(Default::default());
+    let mut tx = source.write();
+    let subject = tx
+        .intern(&Term::NamedNode(NamedNode::new("urn:s").unwrap()))
+        .unwrap();
+    let predicate = tx
+        .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+        .unwrap();
+    let mixed = Term::Literal(Literal::new_typed_literal(
+        format!(
+            "[_:b0, \"[_:b7ffffffffff,]\"^^<{}>]",
+            sparkles_core::sparql::cdt::LIST
+        ),
+        NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+    ));
+    let object = tx.intern(&mixed).unwrap();
+    tx.insert([subject, predicate, object, Id::DEFAULT_GRAPH])
+        .unwrap();
+    tx.commit().unwrap();
+    let snap = source.snapshot();
+    let copied = source
+        .copy_view_to_memory(&snap, Default::default(), &Default::default(), |_| Ok(true))
+        .unwrap();
+    assert_eq!(state(&snap), state(&copied.snapshot()));
+    let mut write = copied.write();
+    assert_ne!(
+        write.new_bnode(),
+        Id::bnode(0),
+        "valid blank node beside ill-typed quoted nested CDT must still be reserved"
     );
 }
 
