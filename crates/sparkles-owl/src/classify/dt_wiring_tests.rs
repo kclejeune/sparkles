@@ -2076,3 +2076,96 @@ fn dt_index_absent_ranges_prices_default_without_allocating() {
     assert!(granted.load(Ordering::Relaxed) <= cap);
     assert_eq!(Ranges::new_calls(), 0);
 }
+
+#[test]
+fn dtix_align_preserves_uncounted_and_renumbers_untouched_components() {
+    // Component :u triggers UNCOUNTED (cardinality on a continuous/uncounted datatype:
+    // xsd:decimal with >= 2 values and <= 1 on overlapping facet, or rdf:langString),
+    // while component :e is edited and a new component :z is introduced to renumber IDs.
+    let base = "SubClassOf(:U DataMinCardinality(2 :u xsd:decimal))
+        SubClassOf(:U DataMaxCardinality(2 :u DataComplementOf(DataOneOf(\"0.0\"^^xsd:decimal))))
+        SubClassOf(:U DataSomeValuesFrom(:u DatatypeRestriction(xsd:decimal xsd:minInclusive \"0.0\"^^xsd:decimal xsd:maxInclusive \"1.0\"^^xsd:decimal)))
+        SubClassOf(:E DataAllValuesFrom(:e xsd:integer))
+        SubClassOf(:E DataSomeValuesFrom(:e xsd:integer))
+        SubClassOf(:K :L)";
+    let ax1 = axioms(base);
+    let refs1: Vec<&AxiomKind> = ax1.iter().collect();
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    let first = sat.classify(&refs1, None, &limits).unwrap();
+    assert!(!first.stats.incremental);
+    let old_dt = sat.index.as_ref().unwrap().dt.as_ref().unwrap();
+    let old_u_comp = old_dt
+        .comps
+        .component(&DataProperty::new("urn:dt:u"))
+        .expect("component :u");
+    let u_ex = sat
+        .interner
+        .get(&index::Node::Class(
+            sat.interner
+                .classes
+                .iter()
+                .position(|c| c.as_str() == "urn:dt:U")
+                .unwrap() as u32,
+        ))
+        .unwrap();
+    let old_last = sat.ctx[u_ex as usize]
+        .get()
+        .unwrap()
+        .st
+        .lock()
+        .extra
+        .as_ref()
+        .unwrap()
+        .dt
+        .iter()
+        .find(|s| s.comp == old_u_comp)
+        .unwrap()
+        .last;
+
+    // Add a new component :z ahead of :u (changing axiom order / component numbering)
+    // and edit :e; :u must stay aligned, kept, and preserve `last`.
+    let added = axioms(
+        "SubClassOf(:Z DataAllValuesFrom(:z xsd:string))
+         SubClassOf(:E DataSomeValuesFrom(:e xsd:int))",
+    );
+    let mut ax2 = added.clone();
+    ax2.extend(ax1.iter().cloned());
+    let refs2: Vec<&AxiomKind> = ax2.iter().collect();
+    let add_refs: Vec<&AxiomKind> = added.iter().collect();
+    let second = sat
+        .classify(
+            &refs2,
+            Some(Changes {
+                added: &add_refs,
+                removed: &[],
+            }),
+            &limits,
+        )
+        .unwrap();
+    assert!(second.stats.incremental);
+    let new_dt = sat.index.as_ref().unwrap().dt.as_ref().unwrap();
+    let new_u_comp = new_dt
+        .comps
+        .component(&DataProperty::new("urn:dt:u"))
+        .expect("component :u after edit");
+    let kept_u = sat.ctx[u_ex as usize].get().unwrap().st.lock();
+    let new_dt_st = kept_u
+        .extra
+        .as_ref()
+        .unwrap()
+        .dt
+        .iter()
+        .find(|s| s.comp == new_u_comp)
+        .expect("kept context :U must be remapped to new component id");
+    assert_eq!(new_dt_st.last, old_last);
+    drop(kept_u);
+
+    let mut fresh = Saturation::new();
+    let want = fresh.classify(&refs2, None, &limits).unwrap();
+    assert_eq!(second.taxonomy, want.taxonomy);
+    assert_eq!(sat.excluded(), fresh.excluded());
+}
