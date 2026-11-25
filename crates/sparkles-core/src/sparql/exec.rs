@@ -122,20 +122,6 @@ pub(super) fn map_batch<T: Send>(
     par: bool,
     f: impl Fn(usize) -> T + Sync + Send,
 ) -> Result<Vec<T>> {
-    map_batch_with(ctx, n, par, || (), |_, i| f(i))
-}
-
-/// [`map_batch`] with a state for each thread that maps rows, made by `init`: one for the
-/// calling thread and one for each parallel task, as [`rayon`]'s `map_init` gives, such as
-/// a map of the query's floor cache in [`string_order_mask`].
-pub(super) fn map_batch_with<S, T: Send>(
-    ctx: &Ctx,
-    n: usize,
-    par: bool,
-    init: impl Fn() -> S + Sync + Send,
-    f: impl Fn(&mut S, usize) -> T + Sync + Send,
-) -> Result<Vec<T>> {
-    let mut state = init();
     let sample = n.min(BATCH_SAMPLE_ROWS);
     let rest = n - sample;
     let mut out = Vec::with_capacity(n);
@@ -144,7 +130,7 @@ pub(super) fn map_batch_with<S, T: Send>(
     // rows of an aggregate's BIND, would pay a clock read for nothing.
     let may_split = par && batch_may_split(n) && rayon::current_num_threads() > 1;
     let t0 = may_split.then(Instant::now);
-    out.extend((0..sample).map(|i| f(&mut state, i)));
+    out.extend((0..sample).map(&f));
     if let Some(t0) = t0
         && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
     {
@@ -161,11 +147,9 @@ pub(super) fn map_batch_with<S, T: Send>(
             // an indexed collect writes each piece's slot in place
             let pieces: Vec<Result<Vec<T>>> = starts
                 .into_par_iter()
-                .map_init(&init, |state, start| {
+                .map(|start| {
                     ctx.check()?;
-                    Ok((start..(start + BATCH_PAR_PIECE).min(n))
-                        .map(|i| f(state, i))
-                        .collect())
+                    Ok((start..(start + BATCH_PAR_PIECE).min(n)).map(&f).collect())
                 })
                 .collect();
             for piece in pieces {
@@ -178,10 +162,57 @@ pub(super) fn map_batch_with<S, T: Send>(
     while start < n {
         ctx.check()?;
         let end = (start + 1024).min(n);
-        out.extend((start..end).map(|i| f(&mut state, i)));
+        out.extend((start..end).map(&f));
         start = end;
     }
     Ok(out)
+}
+
+/// [`map_batch_with`] writing directly into an already-allocated output slice `out` for
+/// rows `base..base + out.len()`, avoiding intermediate piece vectors and copies.
+fn fill_batch_with<S, T: Send>(
+    ctx: &Ctx,
+    out: &mut [T],
+    base: usize,
+    init: impl Fn() -> S + Sync + Send,
+    f: impl Fn(&mut S, usize) -> T + Sync + Send,
+) -> Result<()> {
+    let n = out.len();
+    let mut state = init();
+    let sample = n.min(BATCH_SAMPLE_ROWS);
+    let rest = n - sample;
+    ctx.check()?;
+    let may_split = batch_may_split(n) && rayon::current_num_threads() > 1;
+    let t0 = may_split.then(Instant::now);
+    for (offset, slot) in out[..sample].iter_mut().enumerate() {
+        *slot = f(&mut state, base + offset);
+    }
+    if let Some(t0) = t0
+        && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
+    {
+        drop(state);
+        return out[sample..]
+            .par_chunks_mut(BATCH_PAR_PIECE)
+            .enumerate()
+            .try_for_each_init(&init, |state, (chunk_idx, chunk)| -> Result<()> {
+                ctx.check()?;
+                let start = base + sample + chunk_idx * BATCH_PAR_PIECE;
+                for (offset, slot) in chunk.iter_mut().enumerate() {
+                    *slot = f(state, start + offset);
+                }
+                Ok(())
+            });
+    }
+    let mut start = sample;
+    while start < n {
+        ctx.check()?;
+        let end = (start + 1024).min(n);
+        for (offset, slot) in out[start..end].iter_mut().enumerate() {
+            *slot = f(&mut state, base + start + offset);
+        }
+        start = end;
+    }
+    Ok(())
 }
 
 /// Executed operator tree with runtime information (QLever `RuntimeInformation`).
@@ -6138,20 +6169,30 @@ fn stratum_bounds(k: usize, n: usize, s: usize) -> (usize, usize) {
     (lo, hi)
 }
 
-/// Estimate the initial slot count of the shared floor table from a stack-allocated
-/// stratified sample of `(xs, ys)`.
+struct FloorEstimate {
+    slots: usize,
+    /// Whether the sampled rows repeat enough strings for the floor table to pay off
+    /// over direct key comparison on this mask.
+    worth_caching: bool,
+}
+
+/// Estimate the initial slot count and repetition payoff of the shared floor table from a
+/// stack-allocated stratified sample of `(xs, ys)`.
 ///
 /// Inputs whose strings are few or never repeat stay compact so small queries avoid
 /// over-allocating. Inputs with one non-repeating column and one small repeating column
 /// (such as a unique person name compared against a handful of cities) size a compact table
 /// wide enough that non-repeating writes do not trigger spurious growth. Large inputs with
 /// many repeating strings pre-size directly to avoid growth migrations and recomputations.
-fn estimate_floor_slots(xs: &[Id], ys: &[Id]) -> usize {
-    use super::ctx::{FLOOR_TABLE_FEWEST, FLOOR_TABLE_FIRST};
+fn estimate_floor_slots(xs: &[Id], ys: &[Id]) -> FloorEstimate {
+    use super::ctx::{FLOOR_BYPASS_HIT_DENOM, FLOOR_TABLE_FEWEST, FLOOR_TABLE_FIRST};
     let n = xs.len().min(ys.len());
     let s = FLOOR_ESTIMATE_SAMPLE.min(n);
     if s == 0 {
-        return FLOOR_TABLE_FEWEST;
+        return FloorEstimate {
+            slots: FLOOR_TABLE_FEWEST,
+            worth_caching: false,
+        };
     }
     let mut bx = [0u64; FLOOR_ESTIMATE_SAMPLE];
     let mut by = [0u64; FLOOR_ESTIMATE_SAMPLE];
@@ -6185,7 +6226,10 @@ fn estimate_floor_slots(xs: &[Id], ys: &[Id]) -> usize {
             .unwrap_or(max_pow2)
     };
     if !rep_x && !rep_y && cross == 0 {
-        return FLOOR_TABLE_FEWEST;
+        return FloorEstimate {
+            slots: FLOOR_TABLE_FEWEST,
+            worth_caching: false,
+        };
     }
     if cross == 0 && (rep_x ^ rep_y) {
         let r = if rep_x { est_x } else { est_y };
@@ -6199,7 +6243,13 @@ fn estimate_floor_slots(xs: &[Id], ys: &[Id]) -> usize {
         )
         .unwrap_or(usize::MAX)
         .saturating_mul(2);
-        return round_slots(r.saturating_mul(4).max(guard.min(FLOOR_TABLE_FIRST)));
+        let expected_hits = (n as u128).saturating_sub(r as u128);
+        let worth_caching = expected_hits.saturating_mul(FLOOR_BYPASS_HIT_DENOM as u128)
+            >= (n as u128).saturating_mul(2);
+        return FloorEstimate {
+            slots: round_slots(r.saturating_mul(4).max(guard.min(FLOOR_TABLE_FIRST))),
+            worth_caching,
+        };
     }
     let u = if f1_all < d_all {
         d_all.saturating_add(f1_all.saturating_mul(f1_all.saturating_sub(1)) / (2 * (f2_all + 1)))
@@ -6227,7 +6277,13 @@ fn estimate_floor_slots(xs: &[Id], ys: &[Id]) -> usize {
     let target = repeating
         .saturating_mul(4)
         .max(distinct.saturating_mul(5).min(FLOOR_TABLE_FIRST));
-    round_slots(target)
+    let expected_hits = (cells as u128).saturating_sub(distinct as u128);
+    let worth_caching =
+        expected_hits.saturating_mul(FLOOR_BYPASS_HIT_DENOM as u128) >= cells as u128;
+    FloorEstimate {
+        slots: round_slots(target),
+        worth_caching,
+    }
 }
 
 struct InitialFloorSample {
@@ -6246,15 +6302,16 @@ fn probe_initial_floor_sample(
     sample: usize,
     order: impl Fn(Id, Id, u64, u64) -> bool,
 ) -> Result<Option<InitialFloorSample>> {
+    let mut scratch = super::ctx::FloorScratch::default();
     // Check row 0 before touching the 256-slot stack table so immediately-ineligible masks
     // pay no stack initialization cost.
-    let Some(fa0) = ctx.string_floor(xs[0]) else {
+    let Some(fa0) = ctx.string_floor_in(xs[0], &mut scratch) else {
         ctx.check_memory_failure()?;
         return Ok(None);
     };
     let y0_new = ys[0] != xs[0];
     let fb0 = if y0_new {
-        let Some(fb0) = ctx.string_floor(ys[0]) else {
+        let Some(fb0) = ctx.string_floor_in(ys[0], &mut scratch) else {
             ctx.check_memory_failure()?;
             return Ok(None);
         };
@@ -6279,7 +6336,7 @@ fn probe_initial_floor_sample(
     if y0_new {
         insert_known(&mut seen, ys[0], fb0);
     }
-    let lookup_or_compute =
+    let mut lookup_or_compute =
         |seen: &mut [(u64, u64); SEEN_SLOTS], id: Id| -> Result<Option<(u64, bool)>> {
             if !ctx.may_be_base_literal(id) {
                 return Ok(None);
@@ -6291,7 +6348,7 @@ fn probe_initial_floor_sample(
                     return Ok(Some((v, false)));
                 }
                 if k == Id::UNDEF.0 {
-                    let Some(floor) = ctx.string_floor(id) else {
+                    let Some(floor) = ctx.string_floor_in(id, &mut scratch) else {
                         ctx.check_memory_failure()?;
                         return Ok(None);
                     };
@@ -6325,11 +6382,14 @@ fn probe_initial_floor_sample(
 /// are stored simple literals. Their order is read from their base-vocabulary ids and
 /// each string's floor ([`Ctx::string_floor`]), which the query's floor cache keeps for
 /// each distinct id across tables and the batches of a cursor (see
-/// [`super::ctx::FloorCache`]), so neither column is decoded. A row with another kind of
-/// value is evaluated as the generic filter would. `None` when the table is small or its
-/// first rows hold other values, so that the generic filter decodes the columns instead.
-/// The floors decode inside the envelope, and a refused floor fails the mask with the
-/// refusal it recorded.
+/// [`super::ctx::FloorCache`]), so neither column is decoded. When the floor table's hit
+/// rate stays low, a mask bypasses the table and compares the two vocabulary keys
+/// directly with worker-local reusable scratch buffers, probing periodically so inputs
+/// that repeat across later batches re-enable floors. A row with another kind of value is
+/// evaluated as the generic filter would. `None` when the table is small or its first
+/// rows hold other values, so that the generic filter decodes the columns instead. The
+/// floors and direct comparisons decode inside the envelope, and a refused decode fails
+/// the mask with the refusal it recorded.
 fn string_order_mask(
     ctx: &Ctx,
     t: &Table,
@@ -6337,6 +6397,7 @@ fn string_order_mask(
     op: super::expr::CmpOp,
     expr: &Expr,
 ) -> Result<Option<Vec<bool>>> {
+    use super::ctx::{FloorMaskPlan, FloorScratch};
     use super::expr::CmpOp;
     let n = t.len();
     let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
@@ -6350,35 +6411,41 @@ fn string_order_mask(
         return Ok(None);
     }
     let sample = n.min(STRING_ORDER_SAMPLE);
+    let cmp_op = |ord: Ordering| match op {
+        CmpOp::Lt => ord == Ordering::Less,
+        CmpOp::Le => ord != Ordering::Greater,
+        CmpOp::Gt => ord == Ordering::Greater,
+        CmpOp::Ge => ord != Ordering::Less,
+    };
     let order = |a: Id, b: Id, fa: u64, fb: u64| -> bool {
         let (pa, pb) = (a.payload(), b.payload());
-        let order = match pa.cmp(&pb) {
+        let ord = match pa.cmp(&pb) {
             Ordering::Equal => Ordering::Equal,
             Ordering::Less if pa < fb => Ordering::Less,
             Ordering::Less => Ordering::Greater,
             Ordering::Greater if pb < fa => Ordering::Greater,
             Ordering::Greater => Ordering::Less,
         };
-        match op {
-            CmpOp::Lt => order == Ordering::Less,
-            CmpOp::Le => order != Ordering::Greater,
-            CmpOp::Gt => order == Ordering::Greater,
-            CmpOp::Ge => order != Ordering::Less,
-        }
+        cmp_op(ord)
     };
-    // The sample's rows keep the order their floors give, so that no row's floors are
-    // looked up twice, which would mark them as read again without a repeat and grow the
-    // cache for strings that do not recur.
-    let sample_keep = if ctx.floor_cache_needs_init() {
+    let first_triple = ctx.first_triple();
+    // The sample's rows keep the order their floors or direct comparisons give, so that
+    // no row is looked up twice, which would mark floors as read again without a repeat
+    // and grow the cache for strings that do not recur.
+    let (sample_keep, plan) = if ctx.floor_cache_needs_init() {
         let Some(probed) = probe_initial_floor_sample(ctx, xs, ys, sample, order)? else {
             return Ok(None);
         };
-        let mut floors = ctx.floor_map_for(estimate_floor_slots(xs, ys));
-        for (i, &(fa, fb, a_new, b_new)) in probed.rows[..sample].iter().enumerate() {
-            floors.record_floor(xs[i], fa, a_new);
-            floors.record_floor(ys[i], fb, b_new);
+        let est = estimate_floor_slots(xs, ys);
+        let plan = ctx.init_floor_cache(est.slots, est.worth_caching);
+        if let FloorMaskPlan::Floors(ref table) = plan {
+            let mut floors = ctx.floor_map_borrowed(table.as_deref(), first_triple);
+            for (i, &(fa, fb, a_new, b_new)) in probed.rows[..sample].iter().enumerate() {
+                floors.record_floor(xs[i], fa, a_new);
+                floors.record_floor(ys[i], fb, b_new);
+            }
         }
-        probed.keep
+        (probed.keep, plan)
     } else {
         if !ctx.may_be_base_literal(ys[0]) {
             // Check `xs[0]` first so a refused floor decode still reports its failure,
@@ -6387,33 +6454,45 @@ fn string_order_mask(
             ctx.check_memory_failure()?;
             return Ok(None);
         }
-        ctx.grow_floor_cache();
+        let plan = ctx.begin_floor_mask();
         let mut sample_keep = [false; STRING_ORDER_SAMPLE];
-        let strings = {
-            let mut floors = ctx.floor_map();
-            (0..sample).all(|i| {
-                let (a, b) = (xs[i], ys[i]);
-                // the second floor is read only when the first is a string's, as the generic
-                // comparison reads the second value only when the first has one
-                let Some(fa) = floors.floor(a) else {
-                    return false;
-                };
-                let Some(fb) = floors.floor(b) else {
-                    return false;
-                };
-                sample_keep[i] = order(a, b, fa, fb);
-                true
-            })
+        let strings = match &plan {
+            FloorMaskPlan::Floors(table) => {
+                let mut floors = ctx.floor_map_borrowed(table.as_deref(), first_triple);
+                (0..sample).all(|i| {
+                    let (a, b) = (xs[i], ys[i]);
+                    // the second floor is read only when the first is a string's, as the generic
+                    // comparison reads the second value only when the first has one
+                    let Some(fa) = floors.floor(a) else {
+                        return false;
+                    };
+                    let Some(fb) = floors.floor(b) else {
+                        return false;
+                    };
+                    sample_keep[i] = order(a, b, fa, fb);
+                    true
+                })
+            }
+            FloorMaskPlan::Direct => {
+                let mut scratch = FloorScratch::default();
+                (0..sample).all(|i| {
+                    let Some(ord) = ctx.simple_literal_cmp_in(xs[i], ys[i], &mut scratch) else {
+                        return false;
+                    };
+                    sample_keep[i] = cmp_op(ord);
+                    true
+                })
+            }
         };
         if !strings {
-            // a refused floor is not another kind of value
+            // a refused decode is not another kind of value
             ctx.check_memory_failure()?;
             return Ok(None);
         }
-        sample_keep
+        (sample_keep, plan)
     };
-    let mut keep = Vec::with_capacity(n);
-    keep.extend_from_slice(&sample_keep[..sample]);
+    let mut keep = vec![false; n];
+    keep[..sample].copy_from_slice(&sample_keep[..sample]);
     let threads = rayon::current_num_threads().max(1);
     let map = t.var_map(ctx.nvars());
     let generic = |i: usize| {
@@ -6433,53 +6512,120 @@ fn string_order_mask(
         };
         order(a, b, fa, fb)
     };
-    let test = |floors: &mut super::ctx::FloorMap<'_>, i: usize| -> Result<bool> {
-        if i.is_multiple_of(1024) {
-            ctx.check()?;
+    let direct_of = |scratch: &mut FloorScratch, i: usize| -> bool {
+        match ctx.simple_literal_cmp_in(xs[i], ys[i], scratch) {
+            Some(ord) => cmp_op(ord),
+            None => generic(i),
         }
-        Ok(order_of(floors, i))
+    };
+    let fill_direct = |out: &mut [bool], lo: usize| -> Result<()> {
+        if threads > 1 {
+            let chunk_len = out.len().div_ceil(threads).max(1);
+            out.par_chunks_mut(chunk_len).enumerate().try_for_each_init(
+                FloorScratch::default,
+                |scratch, (chunk_idx, chunk)| {
+                    let start = lo + chunk_idx * chunk_len;
+                    for (offset, slot) in chunk.iter_mut().enumerate() {
+                        let i = start + offset;
+                        if i.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        *slot = direct_of(scratch, i);
+                    }
+                    Ok(())
+                },
+            )
+        } else {
+            let mut scratch = FloorScratch::default();
+            for (offset, slot) in out.iter_mut().enumerate() {
+                let i = lo + offset;
+                if i.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                *slot = direct_of(&mut scratch, i);
+            }
+            Ok(())
+        }
     };
     if n <= PAR_THRESHOLD && threads > 1 {
         // A table of at most `PAR_THRESHOLD` rows, such as a cursor's batch, spreads over
         // the pool as the generic filter's batch does, so that a cursor's comparison is
         // not left on one thread where the generic filter would use them all. The batch
-        // checks the deadline itself and collects the rows' booleans.
-        let rest = map_batch_with(
-            ctx,
-            n - sample,
-            true,
-            || ctx.floor_map(),
-            |floors, i| order_of(floors, sample + i),
-        )?;
-        keep.extend_from_slice(&rest);
-    } else {
-        // A larger table is compared in parts of `PAR_THRESHOLD` rows and then of the
-        // rows before them, so that the floor cache can grow after the first parts as it
-        // does between a cursor's batches.
-        let mut lo = sample;
-        while lo < n {
-            if lo > sample {
-                ctx.grow_floor_cache();
+        // checks the deadline itself and writes directly into `keep`.
+        match plan {
+            FloorMaskPlan::Floors(table) => {
+                let table_ref = table.as_deref();
+                fill_batch_with(
+                    ctx,
+                    &mut keep[sample..],
+                    sample,
+                    || ctx.floor_map_borrowed(table_ref, first_triple),
+                    order_of,
+                )?;
             }
-            let hi = n.min(lo + lo.max(PAR_THRESHOLD));
-            if threads > 1 {
-                let part = (lo..hi)
-                    .into_par_iter()
-                    .with_min_len((hi - lo).div_ceil(threads))
-                    .map_init(|| ctx.floor_map(), |floors, i| test(floors, i))
-                    .collect::<Result<Vec<bool>>>()?;
-                keep.extend_from_slice(&part);
-            } else {
-                let mut floors = ctx.floor_map();
-                for i in lo..hi {
-                    keep.push(test(&mut floors, i)?);
+            FloorMaskPlan::Direct => {
+                fill_batch_with(
+                    ctx,
+                    &mut keep[sample..],
+                    sample,
+                    FloorScratch::default,
+                    direct_of,
+                )?;
+            }
+        }
+    } else {
+        match plan {
+            FloorMaskPlan::Direct => {
+                fill_direct(&mut keep[sample..], sample)?;
+            }
+            FloorMaskPlan::Floors(mut table) => {
+                // A larger table is compared in parts of `PAR_THRESHOLD` rows and then of
+                // the rows before them, so that the floor cache can grow after the first
+                // parts as it does between a cursor's batches without aborting a pre-sized
+                // table during its cold initial part.
+                let mut lo = sample;
+                while lo < n {
+                    if lo > sample {
+                        table = ctx.grow_floor_table_snapshot();
+                    }
+                    let hi = n.min(lo + lo.max(PAR_THRESHOLD));
+                    let table_ref = table.as_deref();
+                    if threads > 1 {
+                        let chunk_len = (hi - lo).div_ceil(threads).max(1);
+                        keep[lo..hi]
+                            .par_chunks_mut(chunk_len)
+                            .enumerate()
+                            .try_for_each_init(
+                                || ctx.floor_map_borrowed(table_ref, first_triple),
+                                |floors, (chunk_idx, chunk)| -> Result<()> {
+                                    let start = lo + chunk_idx * chunk_len;
+                                    for (offset, slot) in chunk.iter_mut().enumerate() {
+                                        let i = start + offset;
+                                        if i.is_multiple_of(1024) {
+                                            ctx.check()?;
+                                        }
+                                        *slot = order_of(floors, i);
+                                    }
+                                    Ok(())
+                                },
+                            )?;
+                    } else {
+                        let mut floors = ctx.floor_map_borrowed(table_ref, first_triple);
+                        for (offset, slot) in keep[lo..hi].iter_mut().enumerate() {
+                            let i = lo + offset;
+                            if i.is_multiple_of(1024) {
+                                ctx.check()?;
+                            }
+                            *slot = order_of(&mut floors, i);
+                        }
+                    }
+                    lo = hi;
                 }
             }
-            lo = hi;
         }
     }
     debug_assert_eq!(keep.len(), n);
-    // A refused floor took its row to the generic test, so the mask must not stand.
+    // A refused decode took its row to the generic test, so the mask must not stand.
     ctx.check_memory_failure()?;
     #[cfg(test)]
     STRING_ORDER_MASKS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -13172,7 +13318,7 @@ mod string_order_tests {
             .vocab
             .first_triple()
             .next_power_of_two() as usize;
-        assert!(estimate_floor_slots(&ref_t.cols[0], &ref_t.cols[1]) >= full_slots);
+        assert!(estimate_floor_slots(&ref_t.cols[0], &ref_t.cols[1]).slots >= full_slots);
 
         for cursor in [false, true] {
             // (a) Small cache cap clamps initial table before allocation.
@@ -13343,7 +13489,9 @@ mod string_order_tests {
             for i in 0..(3 * lang_n) {
                 lang_t.push_row(&[lang_ids[i % lang_n], lang_ids[(i * 13 + 7) % lang_n]]);
             }
-            assert!(estimate_floor_slots(&lang_t.cols[0], &lang_t.cols[1]) >= FLOOR_TABLE_FIRST);
+            assert!(
+                estimate_floor_slots(&lang_t.cols[0], &lang_t.cols[1]).slots >= FLOOR_TABLE_FIRST
+            );
             let out = string_order_mask(&ctx, &lang_t, (x, y), CmpOp::Lt, &e).unwrap();
             assert!(out.is_none(), "lang-tagged mask must fall back");
             assert!(ctx.floor_cache_needs_init(), "cursor {cursor}");
@@ -13559,5 +13707,303 @@ mod string_order_tests {
         assert_eq!(large_lo, large_n - large_n / s - 1);
         assert_eq!(large_hi, large_n);
         assert!(large_hi > large_lo);
+    }
+
+    /// A low-reuse stream (all distinct string pairs) defers floor table allocation on its
+    /// initial masks, compares keys directly, probes on every 4th mask without growing the
+    /// table, and matches `evaluate_mask` across modes and thread counts.
+    #[test]
+    fn low_reuse_stream_defers_table_bypasses_and_probes_without_growing() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let masks = 7;
+        let (s, ids) = word_store(masks * 2 * rows);
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for cursor in [false, true] {
+                    let mut ctx = Ctx::new(s.snapshot());
+                    ctx.mem_limit = 256 << 20;
+                    if cursor {
+                        ctx.enable_cursor_accounting().unwrap();
+                    }
+                    let (x, y) = (ctx.var("x"), ctx.var("y"));
+                    let e = cmp(x, y, CmpOp::Lt);
+                    for (idx, part) in ids.chunks(2 * rows).enumerate() {
+                        let mut t = Table::new(vec![x, y]);
+                        for pair in part.chunks(2) {
+                            t.push_row(pair);
+                        }
+                        let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                            .unwrap()
+                            .expect("string_order_mask handles low-reuse pairs");
+                        let generic =
+                            evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                        assert_eq!(
+                            mask, generic,
+                            "threads {threads} cursor {cursor} mask {idx}"
+                        );
+                        if idx < 3 {
+                            assert_eq!(
+                                ctx.floor_cache().slots(),
+                                0,
+                                "threads {threads} cursor {cursor} mask {idx}: table stays deferred"
+                            );
+                            assert_eq!(ctx.floor_cache().used(), 0);
+                            assert_eq!(ctx.floor_cache().bypassed(), idx + 1);
+                        } else if idx == 3 {
+                            assert!(
+                                ctx.floor_cache().slots() > 0,
+                                "threads {threads} cursor {cursor}: probe mask installs table"
+                            );
+                            assert_eq!(ctx.floor_cache().bypassed(), 3);
+                        }
+                    }
+                    let slots_after_probe = ctx.floor_cache().slots();
+                    assert_eq!(
+                        ctx.floor_cache().bypassed(),
+                        6,
+                        "threads {threads} cursor {cursor}: 6 of 7 low-reuse masks bypassed"
+                    );
+                    assert_eq!(ctx.floor_cache().slots(), slots_after_probe);
+                    assert!(ctx.check().is_ok(), "threads {threads} cursor {cursor}");
+                }
+            });
+        }
+    }
+
+    /// A shuffled stream whose first batch repeats too few strings to cache initially starts
+    /// in bypass mode, populates the table on periodic probe masks, and re-enables floors
+    /// once cross-batch reuse rises above the hit-rate threshold.
+    #[test]
+    fn shuffled_repeating_stream_reenables_floors_after_probing() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let distinct = 32_000usize;
+        let (s, ids) = word_store(distinct);
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.mem_limit = 256 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let (x, y) = (ctx.var("x"), ctx.var("y"));
+        let e = cmp(x, y, CmpOp::Lt);
+
+        // Deterministic pseudo-random shuffle over 32,000 distinct strings.
+        let mut state: u64 = 0x517c_c1b7_2722_0a95;
+        let mut next_id = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ids[((state >> 32) as usize) % distinct]
+        };
+
+        let mut bypassed_by_batch = Vec::new();
+        for batch in 0..16 {
+            let mut t = Table::new(vec![x, y]);
+            for _ in 0..rows {
+                t.push_row(&[next_id(), next_id()]);
+            }
+            let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("the mask applies");
+            if batch < 2 || batch == 15 {
+                let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                assert_eq!(mask, generic, "batch {batch}");
+            }
+            bypassed_by_batch.push(ctx.floor_cache().bypassed());
+        }
+        assert!(
+            bypassed_by_batch[0] == 1,
+            "first low-repeat batch starts bypassed: {bypassed_by_batch:?}"
+        );
+        assert!(
+            ctx.floor_cache().slots() > 0,
+            "probe installed the floor table"
+        );
+        // Once cross-batch hits exceed 1/8, bypass stops growing for the trailing batches.
+        let tail_start = bypassed_by_batch[11];
+        assert_eq!(
+            bypassed_by_batch[15], tail_start,
+            "floors stayed enabled once cross-batch reuse rose: {bypassed_by_batch:?}"
+        );
+        assert!(ctx.check().is_ok());
+    }
+
+    /// On the bypassed direct-compare path in cursor mode, a budget-exceeding literal after
+    /// the sample fails with `BudgetExceeded(Memory)` and cancellation returns `Cancelled`.
+    #[test]
+    fn bypassed_direct_mask_enforces_strict_memory_refusal_and_cancellation() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let long = format!("z{}", "y".repeat(1 << 19));
+        let mut nt = String::new();
+        for i in 0..(2 * rows) {
+            nt.push_str(&format!("<urn:s:{i}> <urn:p> \"w{i:06}\" .\n"));
+        }
+        nt.push_str(&format!("<urn:s:long> <urn:p> \"{long}\" .\n"));
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let ids: Vec<Id> = (0..(2 * rows))
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(format!("w{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        let long_id = snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal(&long).into())
+            .unwrap();
+        drop(snap);
+
+        // (a) Strict memory refusal after the initial sample on a bypassed mask.
+        {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 4 << 20;
+            ctx.enable_cursor_accounting().unwrap();
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let mut t = Table::new(vec![x, y]);
+            for i in 0..rows {
+                let b = if i == STRING_ORDER_SAMPLE + 50 {
+                    long_id
+                } else {
+                    ids[2 * i + 1]
+                };
+                t.push_row(&[ids[2 * i], b]);
+            }
+            let e = cmp(x, y, CmpOp::Lt);
+            let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+            assert!(
+                matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                "expected memory refusal on bypassed mask, got {outcome:?}"
+            );
+            assert_eq!(ctx.floor_cache().bypassed(), 1);
+            assert!(ctx.check().is_err());
+        }
+
+        // (b) Cancellation after decoding scratch allocation on a bypassed mask.
+        {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            ctx.enable_cursor_accounting().unwrap();
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let mut t = Table::new(vec![x, y]);
+            for i in 0..rows {
+                t.push_row(&[ids[2 * i], ids[2 * i + 1]]);
+            }
+            let e = cmp(x, y, CmpOp::Lt);
+            let cancel = ctx.cancel.clone();
+            crate::algo::set_projection_observer(Some(std::sync::Arc::new(move |event| {
+                if let crate::algo::ProjectionEvent::Materialized(
+                    "checked-vocab-scratch-allocated",
+                    _,
+                ) = event
+                {
+                    cancel.store(true, AtomicOrdering::Relaxed);
+                }
+            })));
+            let result = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+            crate::algo::set_projection_observer(None);
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            assert_eq!(ctx.floor_cache().bypassed(), 1);
+        }
+    }
+
+    /// A bypassed direct-compare mask falls back to the generic row evaluator whenever a
+    /// row after the sample holds a non-simple-literal term, matching `evaluate_mask`.
+    #[test]
+    fn bypassed_direct_mask_falls_back_to_generic_on_mixed_rows() {
+        use super::super::expr::CmpOp;
+        let rows = STRING_ORDER_ROWS;
+        let mut nt = String::new();
+        for i in 0..(2 * rows) {
+            nt.push_str(&format!("<urn:s:{i}> <urn:p> \"w{i:06}\" .\n"));
+        }
+        nt.push_str("<urn:s:lang> <urn:p> \"w000100\"@en .\n");
+        nt.push_str("<urn:s:typed> <urn:p> \"w000101\"^^<urn:dt> .\n");
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let ids: Vec<Id> = (0..(2 * rows))
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Literal::new_simple_literal(format!("w{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        let lang = snap
+            .lookup_term(
+                &oxrdf::Literal::new_language_tagged_literal("w000100", "en")
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap();
+        let typed = snap
+            .lookup_term(
+                &oxrdf::Literal::new_typed_literal(
+                    "w000101",
+                    oxrdf::NamedNode::new_unchecked("urn:dt"),
+                )
+                .into(),
+            )
+            .unwrap();
+        let iri = snap
+            .lookup_term(&oxrdf::NamedNode::new_unchecked("urn:s:0").into())
+            .unwrap();
+        drop(snap);
+
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for cursor in [false, true] {
+                    for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+                        let mut ctx = Ctx::new(s.snapshot());
+                        ctx.mem_limit = 64 << 20;
+                        if cursor {
+                            ctx.enable_cursor_accounting().unwrap();
+                        }
+                        let local = ctx.intern_value(&Value::Str("w000200".into()));
+                        let (x, y) = (ctx.var("x"), ctx.var("y"));
+                        let mut t = Table::new(vec![x, y]);
+                        for i in 0..rows {
+                            let pair = match i {
+                                100 => [lang, ids[2 * i + 1]],
+                                101 => [ids[2 * i], lang],
+                                102 => [typed, ids[2 * i + 1]],
+                                103 => [iri, ids[2 * i + 1]],
+                                104 => [local, ids[2 * i + 1]],
+                                105 => [Id::UNDEF, ids[2 * i + 1]],
+                                106 => [ids[2 * i], Id::UNDEF],
+                                107 => [ids[2 * i], ids[2 * i]],
+                                _ => [ids[2 * i], ids[2 * i + 1]],
+                            };
+                            t.push_row(&pair);
+                        }
+                        let e = cmp(x, y, op);
+                        let mask = string_order_mask(&ctx, &t, (x, y), op, &e)
+                            .unwrap()
+                            .expect("the mask applies");
+                        let generic =
+                            evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                        assert_eq!(mask, generic, "threads {threads} cursor {cursor} {op:?}");
+                        assert_eq!(ctx.floor_cache().bypassed(), 1);
+                        assert!(ctx.check().is_ok());
+                    }
+                }
+            });
+        }
     }
 }
