@@ -637,8 +637,8 @@ impl FloorMap<'_> {
     }
 
     /// Record a floor already computed by [`Ctx::string_floor`] for a base-vocabulary simple
-    /// literal `id`. Preserves read-bit, eviction and test `computed` accounting identically
-    /// to [`FloorMap::floor`] without recomputing the floor.
+    /// literal `id`. Preserves lookup, hit, read-bit, eviction and test `computed` accounting
+    /// identically to [`FloorMap::floor`] without recomputing the floor.
     #[inline]
     pub(super) fn record_floor(&mut self, id: Id, floor: u64, computed: bool) {
         let p = id.payload();
@@ -652,9 +652,11 @@ impl FloorMap<'_> {
         let Some(cur) = self.cur.as_ref().map(FloorTableRef::as_ref) else {
             return;
         };
+        self.lookups += 1;
         let slot = cur.slot(p);
         let word = slot.load(Ordering::Relaxed);
         if cur.decode(p, word).is_some() {
+            self.hits += 1;
             if word & 1 == 0 {
                 slot.store(word | 1, Ordering::Relaxed);
             }
@@ -3890,11 +3892,27 @@ impl Ctx {
         self.begin_floor_mask_locked(&mut tables)
     }
 
-    /// Inspect the current floor mode and table without advancing growth or bypass state,
-    /// so a subsequent mask can validate its sample before mutating [`FloorCache`].
+    /// Preview the floor mode and table that [`Ctx::begin_floor_mask`] will choose for the
+    /// next mask, including pending `Floors -> Direct` and `Direct -> Probe` transitions,
+    /// without mutating [`FloorCache`] state.
     pub(super) fn peek_floor_plan(&self) -> FloorMaskPlan {
         let tables = self.floors.tables.lock();
-        if tables.bypass {
+        if !tables.bypass {
+            if let Some(cur) = &tables.cur
+                && !self.can_grow_floor_table(&tables)
+            {
+                let lookups = cur.lookups.load(Ordering::Relaxed);
+                let hits = cur.hits.load(Ordering::Relaxed);
+                if lookups >= FLOOR_BYPASS_MIN_LOOKUPS {
+                    let low_hit = hits.saturating_mul(FLOOR_BYPASS_HIT_DENOM) < lookups;
+                    if low_hit && tables.warmup_lookups <= lookups {
+                        return FloorMaskPlan::Direct;
+                    }
+                }
+            }
+            return FloorMaskPlan::Floors(tables.cur.clone());
+        }
+        if tables.bypass_streak + 1 < FLOOR_BYPASS_PROBE_INTERVAL {
             FloorMaskPlan::Direct
         } else {
             FloorMaskPlan::Floors(tables.cur.clone())
@@ -3974,6 +3992,55 @@ impl Ctx {
         let _ = self.maybe_grow_floor_table(&mut tables);
     }
 
+    fn clamped_floor_slots(&self, requested: usize, cap: u64) -> Option<usize> {
+        let first_triple = self.snap.generation.vocab.first_triple();
+        let max_pow2 = 1usize << (usize::BITS - 1);
+        let slots = requested
+            .max(1)
+            .checked_next_power_of_two()
+            .unwrap_or(max_pow2);
+        let most = usize::try_from(first_triple)
+            .unwrap_or(usize::MAX)
+            .checked_next_power_of_two()
+            .unwrap_or(max_pow2);
+        let room =
+            usize::try_from(cap.saturating_sub(FloorTable::OVERHEAD) / 8).unwrap_or(usize::MAX);
+        // the largest power of two of words that fits the cap with the table's overhead
+        let room = if room == 0 { 0 } else { 1 << room.ilog2() };
+        let wanted = slots.min(most);
+        if room < wanted && room < FLOOR_TABLE_FEWEST {
+            return None;
+        }
+        Some(wanted.min(room))
+    }
+
+    fn can_grow_floor_table(&self, tables: &FloorTables) -> bool {
+        let Some(cur) = &tables.cur else {
+            return false;
+        };
+        if tables.full || cur.evicted.load(Ordering::Relaxed) < cur.len() / FLOOR_TABLE_EVICTIONS {
+            return false;
+        }
+        let cap = FloorCache::cap(self.mem_limit);
+        let Some(slots) =
+            self.clamped_floor_slots(cur.len().saturating_mul(FLOOR_TABLE_GROWTH), cap)
+        else {
+            return false;
+        };
+        if slots <= cur.len() {
+            return false;
+        }
+        let cache = &self.floors;
+        let step = self.reservation_step();
+        let base_used = cache.used.load(Ordering::Acquire);
+        let reserved = cache.charge.reserved();
+        let bytes = FloorTable::bytes(slots);
+        let used = base_used.saturating_add(bytes);
+        let ahead = used.next_multiple_of(step).min(cap).max(used);
+        let delta = ahead.saturating_sub(reserved);
+        used <= cap && (delta == 0 || delta <= self.memory_room() / 2)
+    }
+
     fn maybe_grow_floor_table(&self, tables: &mut FloorTables) -> bool {
         let Some(cur) = &tables.cur else {
             return false;
@@ -4001,22 +4068,10 @@ impl Ctx {
         let cache = &self.floors;
         let first_triple = self.snap.generation.vocab.first_triple();
         let cap = FloorCache::cap(self.mem_limit);
-        let max_pow2 = 1usize << (usize::BITS - 1);
-        let slots = slots.max(1).checked_next_power_of_two().unwrap_or(max_pow2);
-        let most = usize::try_from(first_triple)
-            .unwrap_or(usize::MAX)
-            .checked_next_power_of_two()
-            .unwrap_or(max_pow2);
-        let room =
-            usize::try_from(cap.saturating_sub(FloorTable::OVERHEAD) / 8).unwrap_or(usize::MAX);
-        // the largest power of two of words that fits the cap with the table's overhead
-        let room = if room == 0 { 0 } else { 1 << room.ilog2() };
-        let wanted = slots.min(most);
-        if room < wanted && room < FLOOR_TABLE_FEWEST {
+        let Some(mut slots) = self.clamped_floor_slots(slots, cap) else {
             tables.full = true;
             return;
-        }
-        let mut slots = wanted.min(room);
+        };
         let step = self.reservation_step();
         let base_used = cache.used.load(Ordering::Acquire);
         let reserved = cache.charge.reserved();
@@ -5880,16 +5935,26 @@ mod charge_tests {
     fn cursor_fsst_lookup_succeeds_when_optional_room_is_refused() {
         use oxrdf::Literal;
 
-        let pad = "alpha_beta_gamma_delta_".repeat(6);
-        let literals: Vec<oxrdf::Term> = (0..160u32)
-            .map(|i| Literal::new_simple_literal(format!("m{i:04}-{pad}tail")).into())
+        let mid_pad = "alpha_beta_gamma_delta_".repeat(5);
+        let long_pad = "alpha_beta_gamma_delta_".repeat(8);
+        let mut literals: Vec<oxrdf::Term> = (0..160u32)
+            .map(|i| {
+                Literal::new_simple_literal(format!("m-{mid_pad}delta_tail_{i:04}_alpha_beta"))
+                    .into()
+            })
             .collect();
+        for i in 0..32u32 {
+            literals.push(
+                Literal::new_simple_literal(format!("z-{long_pad}delta_tail_{i:02}_alpha_beta"))
+                    .into(),
+            );
+        }
         let store = store_with_floor_literals(&literals, VocabCodec::Fsst);
         let snap = store.snapshot();
         assert!(snap.generation.vocab.is_fsst());
 
-        // Pick a verified FSST-coded simple literal whose full vocab key fits in 192 bytes
-        // while `key.len() + 64` exceeds 192 bytes.
+        // Pick a verified FSST-coded simple literal with at most 8 suffix codes (`fast_room`)
+        // whose full vocab key fits in 192 bytes while `key.len() + 64` exceeds 192 bytes.
         let (target_term, target_id) = literals
             .iter()
             .find_map(|term| {
@@ -5899,14 +5964,41 @@ mod charge_tests {
                 (key.len() > 128
                     && key.len() <= 192
                     && !(p as usize).is_multiple_of(crate::vocab::FC_BLOCK)
-                    && snap.generation.vocab.is_entry_coded(p))
+                    && snap
+                        .generation
+                        .vocab
+                        .entry_coded_len(p)
+                        .is_some_and(|codes| codes <= 8))
                 .then(|| (term.clone(), id))
             })
-            .expect("fixture must contain a verified FSST-coded simple literal in (128, 192]");
+            .expect(
+                "fixture must contain a verified FSST-coded simple literal in (128, 192] with <= 8 codes",
+            );
 
-        // Outside Rayon, `Ctx::decode_workers() == 1`, so 192 bytes needs
-        // `(192 * 8 + 1024) = 2560` bytes while optional 64-byte FSST headroom exceeds it.
-        let room_for_192 = (192u64 * 8 + 1024) * Ctx::decode_workers();
+        // Pick a verified FSST-coded simple literal longer than 192 bytes with at most 8 codes.
+        let (grown_id, grown_len) = literals
+            .iter()
+            .find_map(|term| {
+                let id = snap.lookup_term(term).unwrap();
+                let p = id.payload();
+                let key = snap.generation.vocab.get(p).unwrap();
+                (key.len() > 192
+                    && !(p as usize).is_multiple_of(crate::vocab::FC_BLOCK)
+                    && snap
+                        .generation
+                        .vocab
+                        .entry_coded_len(p)
+                        .is_some_and(|codes| codes <= 8))
+                .then_some((id, key.len()))
+            })
+            .expect(
+                "fixture must contain a verified FSST-coded simple literal > 192 bytes with <= 8 codes",
+            );
+
+        // Outside Rayon, `Ctx::decode_workers() == 1`, so `n` bytes needs
+        // `(n * 8 + 1024)` bytes while optional 64-byte FSST headroom exceeds it.
+        let room_for = |bytes: usize| (bytes as u64 * 8 + 1024) * Ctx::decode_workers();
+        let room_for_192 = room_for(192);
         // (a) `string_floor_in` via `with_vocab_key_prefix_in`
         {
             let mut ctx = Ctx::new(snap.clone());
@@ -5925,7 +6017,7 @@ mod charge_tests {
             );
             drop(held);
         }
-        // (b) `simple_literal_cmp_in` via `with_vocab_key_in`
+        // (b) `simple_literal_cmp_in` via `with_vocab_key_in` (`total <= 192`, `fast_room` refused)
         {
             let mut ctx = Ctx::new(snap.clone());
             ctx.mem_limit = MIB;
@@ -5935,7 +6027,7 @@ mod charge_tests {
             assert_eq!(
                 ctx.simple_literal_cmp_in(target_id, target_id, &mut scratch),
                 Some(std::cmp::Ordering::Equal),
-                "simple_literal_cmp_in must succeed when 192-byte scratch fits"
+                "simple_literal_cmp_in must succeed when 192-byte scratch fits and fast_room is refused"
             );
             assert!(
                 ctx.check().is_ok(),
@@ -5957,6 +6049,27 @@ mod charge_tests {
             assert!(
                 ctx.check().is_ok(),
                 "scalar term lookup must not record a memory failure"
+            );
+            drop(held);
+        }
+        // (d) `simple_literal_cmp_in` via `with_vocab_key_in` (`total > 192`, `fast_room` refused,
+        // fallback grows to required `grown_len`)
+        {
+            let mut ctx = Ctx::new(snap.clone());
+            ctx.mem_limit = MIB;
+            ctx.enable_cursor_accounting().unwrap();
+            let held = ctx
+                .charge(MIB - ctx.live_bytes() - room_for(grown_len))
+                .unwrap();
+            let mut scratch = FloorScratch::default();
+            assert_eq!(
+                ctx.simple_literal_cmp_in(grown_id, grown_id, &mut scratch),
+                Some(std::cmp::Ordering::Equal),
+                "simple_literal_cmp_in must grow to required length after fast_room refusal"
+            );
+            assert!(
+                ctx.check().is_ok(),
+                "simple_literal_cmp_in must not record a memory failure after optional headroom fallback"
             );
             drop(held);
         }

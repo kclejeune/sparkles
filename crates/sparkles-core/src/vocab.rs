@@ -1134,11 +1134,12 @@ impl Vocab {
         out
     }
 
-    /// Whether entry `id` is stored with an FSST-coded suffix (for regression tests).
+    /// If entry `id` is stored with an FSST-coded suffix, return its encoded code count
+    /// (for regression tests verifying `fast_room` eligibility).
     #[cfg(test)]
-    pub(crate) fn is_entry_coded(&self, id: u64) -> bool {
+    pub(crate) fn entry_coded_len(&self, id: u64) -> Option<usize> {
         if id >= self.len || self.fsst.is_none() {
-            return false;
+            return None;
         }
         let b = (id as usize) / FC_BLOCK;
         let want = (id as usize) % FC_BLOCK;
@@ -1148,7 +1149,7 @@ impl Vocab {
         for _ in 1..=want {
             e = self.entry::<true>(data, &mut pos, false);
         }
-        e.coded
+        e.coded.then_some(e.len)
     }
 
     /// [`Vocab::get_with_shared_prefix`] with scratch admitted before the walk and
@@ -5043,13 +5044,13 @@ mod tests {
     #[test]
     fn checked_fsst_lookup_succeeds_when_optional_room_is_refused() {
         let mut keys = Vec::new();
-        let mid_pad = "alpha_beta_gamma_delta_".repeat(6);
-        let long_pad = "alpha_beta_gamma_delta_".repeat(9);
+        let mid_pad = "alpha_beta_gamma_delta_".repeat(5);
+        let long_pad = "alpha_beta_gamma_delta_".repeat(8);
         for i in 0..160u32 {
-            keys.push(format!("\"m{i:04}-{mid_pad}tail\"\x7f").into_bytes());
+            keys.push(format!("\"m-{mid_pad}delta_tail_{i:04}_alpha_beta\"\x7f").into_bytes());
         }
         for i in 0..32u32 {
-            keys.push(format!("\"z-{long_pad}suffix_{i:02}\"\x7f").into_bytes());
+            keys.push(format!("\"z-{long_pad}delta_tail_{i:02}_alpha_beta\"\x7f").into_bytes());
         }
         keys.sort();
         keys.dedup();
@@ -5061,15 +5062,21 @@ mod tests {
         let cap = v.scratch_capacity();
         assert_eq!(cap, 192);
 
-        // (a) A verified FSST-coded entry whose key fits in `cap` (192) while `len + FSST_ROOM`
-        // exceeds `cap`: refusing admissions above `cap` must still succeed.
+        // (a) A verified FSST-coded entry with at most 8 codes (`fast_room`) whose key fits
+        // in `cap` (192) while `len + FSST_ROOM` exceeds `cap`: refusing the preferred
+        // headroom reservation must fall back to the already-admitted buffer.
         let fit_id = (0..keys.len())
             .find(|&i| {
                 let len = keys[i].len();
-                len > cap - FSST_ROOM && len <= cap && v.is_entry_coded(i as u64)
+                len > cap - FSST_ROOM
+                    && len <= cap
+                    && !i.is_multiple_of(FC_BLOCK)
+                    && v.entry_coded_len(i as u64).is_some_and(|codes| codes <= 8)
             })
-            .expect("fixture must contain a verified FSST-coded entry in (cap - FSST_ROOM, cap]")
-            as u64;
+            .expect(
+                "fixture must contain a verified FSST-coded entry in (cap - FSST_ROOM, cap] with <= 8 codes",
+            ) as u64;
+        let fit_len = keys[fit_id as usize].len();
         let expected_shared = (!(fit_id as usize).is_multiple_of(FC_BLOCK)).then(|| {
             keys[fit_id as usize - 1]
                 .iter()
@@ -5077,13 +5084,20 @@ mod tests {
                 .take_while(|(a, b)| a == b)
                 .count()
         });
-        let admit_cap = |need: usize| if need <= cap { Ok(()) } else { Err(need) };
 
         let mut shared_buf = Vec::new();
+        let mut shared_refused = Vec::new();
         let got_shared = v.get_with_shared_prefix_checked_in(
             fit_id,
             &mut shared_buf,
-            admit_cap,
+            |need| {
+                if need <= cap {
+                    Ok(())
+                } else {
+                    shared_refused.push(need);
+                    Err(need)
+                }
+            },
             |shared, key| (shared, key.to_vec()),
         );
         assert_eq!(
@@ -5091,46 +5105,140 @@ mod tests {
             Ok(Some((expected_shared, keys[fit_id as usize].clone()))),
             "reused checked shared-prefix walk must succeed within admitted required capacity"
         );
+        assert!(
+            shared_refused.is_empty(),
+            "ROOM = false shared-prefix walk must not request optional headroom: {shared_refused:?}"
+        );
 
         let mut reused_buf = Vec::new();
-        let got_reused =
-            v.get_with_checked_in(fit_id, &mut reused_buf, admit_cap, |key| key.to_vec());
+        let mut fit_refused = Vec::new();
+        let got_reused = v.get_with_checked_in(
+            fit_id,
+            &mut reused_buf,
+            |need| {
+                if need <= cap {
+                    Ok(())
+                } else {
+                    fit_refused.push(need);
+                    Err(need)
+                }
+            },
+            |key| key.to_vec(),
+        );
         assert_eq!(
             got_reused,
             Ok(Some(keys[fit_id as usize].clone())),
             "reused checked walk must succeed within admitted required capacity"
         );
+        assert!(
+            fit_refused.contains(&(fit_len + FSST_ROOM)),
+            "fast_room must attempt and observe refusal of preferred headroom {}: {fit_refused:?}",
+            fit_len + FSST_ROOM
+        );
+        assert_eq!(
+            reused_buf.capacity(),
+            cap,
+            "falling back when total <= cap must keep the already-admitted buffer"
+        );
 
-        let got_fresh = v.get_with_checked(fit_id, admit_cap, |key| key.to_vec());
+        let mut fresh_refused = Vec::new();
+        let got_fresh = v.get_with_checked(
+            fit_id,
+            |need| {
+                if need <= cap {
+                    Ok(())
+                } else {
+                    fresh_refused.push(need);
+                    Err(need)
+                }
+            },
+            |key| key.to_vec(),
+        );
         assert_eq!(
             got_fresh,
             Ok(Some(keys[fit_id as usize].clone())),
             "fresh checked walk must succeed within admitted required capacity"
         );
+        assert!(
+            fresh_refused.is_empty(),
+            "ROOM = false fresh walk must not request optional headroom: {fresh_refused:?}"
+        );
 
-        // (b) A verified FSST-coded entry longer than `cap`: admitting exact key length while
-        // refusing `len + FSST_ROOM` must still succeed.
+        // (b) A verified FSST-coded entry longer than `cap` with at most 8 codes (`fast_room`):
+        // refusing `len + FSST_ROOM` must fall back to admitting `len` and growing the buffer.
         let grown_id = (0..keys.len())
-            .find(|&i| keys[i].len() > cap && v.is_entry_coded(i as u64))
-            .expect("fixture must contain a verified FSST-coded entry longer than cap")
-            as u64;
+            .find(|&i| {
+                keys[i].len() > cap
+                    && !i.is_multiple_of(FC_BLOCK)
+                    && v.entry_coded_len(i as u64).is_some_and(|codes| codes <= 8)
+            })
+            .expect(
+                "fixture must contain a verified FSST-coded entry longer than cap with <= 8 codes",
+            ) as u64;
         let need_len = keys[grown_id as usize].len();
-        let admit_exact = |need: usize| if need <= need_len { Ok(()) } else { Err(need) };
 
         let mut grown_shared = Vec::new();
+        let mut grown_shared_admitted = Vec::new();
+        let mut grown_shared_refused = Vec::new();
         assert_eq!(
             v.get_with_shared_prefix_checked_in(
                 grown_id,
                 &mut grown_shared,
-                admit_exact,
+                |need| {
+                    if need <= need_len {
+                        grown_shared_admitted.push(need);
+                        Ok(())
+                    } else {
+                        grown_shared_refused.push(need);
+                        Err(need)
+                    }
+                },
                 |_, k| k.to_vec()
             ),
             Ok(Some(keys[grown_id as usize].clone()))
         );
+        assert!(
+            grown_shared_refused.contains(&(need_len + FSST_ROOM)),
+            "fast_room growth must attempt and observe refusal of preferred headroom {}: {grown_shared_refused:?}",
+            need_len + FSST_ROOM
+        );
+        assert!(
+            grown_shared_admitted.contains(&need_len),
+            "after preferred headroom refusal, shared-prefix walk must fall back to required size {need_len}: {grown_shared_admitted:?}"
+        );
+
         let mut grown_reused = Vec::new();
+        let mut grown_admitted = Vec::new();
+        let mut grown_refused = Vec::new();
         assert_eq!(
-            v.get_with_checked_in(grown_id, &mut grown_reused, admit_exact, |k| k.to_vec()),
+            v.get_with_checked_in(
+                grown_id,
+                &mut grown_reused,
+                |need| {
+                    if need <= need_len {
+                        grown_admitted.push(need);
+                        Ok(())
+                    } else {
+                        grown_refused.push(need);
+                        Err(need)
+                    }
+                },
+                |k| k.to_vec()
+            ),
             Ok(Some(keys[grown_id as usize].clone()))
+        );
+        assert!(
+            grown_refused.contains(&(need_len + FSST_ROOM)),
+            "fast_room must attempt and observe refusal of preferred headroom {}: {grown_refused:?}",
+            need_len + FSST_ROOM
+        );
+        assert!(
+            grown_admitted.contains(&need_len),
+            "after preferred headroom refusal, walk must fall back to admitting required size {need_len}: {grown_admitted:?}"
+        );
+        assert!(
+            grown_reused.capacity() >= need_len,
+            "buffer must grow to at least required length {need_len}"
         );
     }
 

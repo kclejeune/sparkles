@@ -6464,6 +6464,9 @@ fn string_order_mask(
                 has_floors = true;
                 let table_ref = table.as_deref();
                 let mut scratch = FloorScratch::default();
+                const SEEN_SLOTS: usize = 256;
+                const _: () = assert!(SEEN_SLOTS >= 2 * STRING_ORDER_SAMPLE);
+                let mut seen: Option<[(u64, u64); SEEN_SLOTS]> = None;
                 let mut lookup = |id: Id| -> Option<(u64, bool)> {
                     if !ctx.may_be_base_literal(id) {
                         return None;
@@ -6473,8 +6476,26 @@ fn string_order_mask(
                     {
                         return cached.map(|floor| (floor, false));
                     }
-                    ctx.string_floor_in(id, &mut scratch)
-                        .map(|floor| (floor, true))
+                    if let Some(seen_table) = seen.as_mut() {
+                        let mut slot = (id.payload() as usize) & (SEEN_SLOTS - 1);
+                        loop {
+                            let (k, v) = seen_table[slot];
+                            if k == id.0 {
+                                return Some((v, false));
+                            }
+                            if k == Id::UNDEF.0 {
+                                let floor = ctx.string_floor_in(id, &mut scratch)?;
+                                seen_table[slot] = (id.0, floor);
+                                return Some((floor, true));
+                            }
+                            slot = (slot + 1) & (SEEN_SLOTS - 1);
+                        }
+                    }
+                    let floor = ctx.string_floor_in(id, &mut scratch)?;
+                    let mut seen_table = [(Id::UNDEF.0, 0u64); SEEN_SLOTS];
+                    seen_table[(id.payload() as usize) & (SEEN_SLOTS - 1)] = (id.0, floor);
+                    seen = Some(seen_table);
+                    Some((floor, true))
                 };
                 (0..sample).all(|i| {
                     let (a, b) = (xs[i], ys[i]);
@@ -14342,5 +14363,233 @@ mod string_order_tests {
             assert_eq!(ctx.floor_cache().slots(), 0);
         }
         assert!(ctx.check().is_ok());
+    }
+
+    /// A cursor mask entering bypass on a pending `Floors -> Direct` transition must validate
+    /// its sample via direct key comparison so an uncached block-start literal does not
+    /// trigger an unnecessary floor predecessor decode under a tight cursor budget.
+    #[test]
+    fn floors_to_direct_transition_skips_predecessor_decode_under_cursor_budget() {
+        use super::super::expr::CmpOp;
+        use crate::builder::{BuildOptions, VocabCodec};
+        use oxrdf::Literal;
+
+        let mut nt = String::new();
+        // IDs 0..=14: 15 short simple literals sorting before "m".
+        let mut a_terms = Vec::with_capacity(15);
+        for i in 0..15usize {
+            let term: oxrdf::Term = Literal::new_simple_literal(format!("a{i:02}")).into();
+            nt.push_str(&format!("<urn:s> <urn:p> {term} .\n"));
+            a_terms.push(term);
+        }
+        // ID 15: a 1 MiB extension of "m" (`"mxxx...\xFF"` sorts immediately before `"m\xFF"`).
+        let huge_term: oxrdf::Term =
+            Literal::new_simple_literal(format!("m{}", "x".repeat(1 << 20))).into();
+        nt.push_str(&format!("<urn:s> <urn:p> {huge_term} .\n"));
+        // ID 16: short simple literal "m" at block start (`16 % FC_BLOCK == 0`).
+        let m_term: oxrdf::Term = Literal::new_simple_literal("m").into();
+        nt.push_str(&format!("<urn:s> <urn:p> {m_term} .\n"));
+        // Cheap distinct simple literals sorting after "m" to drive a low-hit Floors batch.
+        let distinct_count = 2 * STRING_ORDER_ROWS;
+        for i in 0..distinct_count {
+            nt.push_str(&format!("<urn:s> <urn:p> \"z{i:06}\" .\n"));
+        }
+
+        let s = Store::in_memory(StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Front),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.generation.vocab_codec(), VocabCodec::Front);
+        let a_ids: Vec<Id> = a_terms
+            .iter()
+            .map(|t| snap.lookup_term(t).unwrap())
+            .collect();
+        let huge_id = snap.lookup_term(&huge_term).unwrap();
+        let m_id = snap.lookup_term(&m_term).unwrap();
+        assert_eq!(huge_id.payload(), 15);
+        assert_eq!(m_id.payload(), 16);
+        assert!((m_id.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+        let z_ids: Vec<Id> = (0..distinct_count)
+            .map(|i| {
+                snap.lookup_term(&Literal::new_simple_literal(format!("z{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        drop(snap);
+
+        // Sanity check: computing `m`'s floor under a 4 MiB cursor budget fails because
+        // decoding its 1 MiB predecessor at ID 15 exceeds the decoding envelope.
+        {
+            let mut probe_ctx = Ctx::new(s.snapshot());
+            probe_ctx.mem_limit = 4 << 20;
+            probe_ctx.enable_cursor_accounting().unwrap();
+            assert_eq!(probe_ctx.string_floor(m_id), None);
+            assert!(
+                matches!(
+                    probe_ctx.check(),
+                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                ),
+                "computing m's floor must fail when decoding ID 15 under 4 MiB cursor budget"
+            );
+        }
+
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.mem_limit = 4 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let (x, y) = (ctx.var("x"), ctx.var("y"));
+        let e = cmp(x, y, CmpOp::Gt);
+
+        // Batch 1: establish a compact floor table on `Floors` with a repeating batch.
+        let mut warm = Table::new(vec![x, y]);
+        for i in 0..STRING_ORDER_ROWS {
+            warm.push_row(&[a_ids[i % a_ids.len()], a_ids[(i + 5) % a_ids.len()]]);
+        }
+        string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+            .unwrap()
+            .expect("warm mask applies");
+        assert!(ctx.floor_cache().slots() > 0);
+        assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+        // Batch 2: distinct cheap literals drive misses past `FLOOR_BYPASS_MIN_LOOKUPS` with
+        // at most 15 read-again evictions (below the growth threshold), queuing `Floors -> Direct`.
+        let mut low_hit = Table::new(vec![x, y]);
+        for i in 0..STRING_ORDER_ROWS {
+            low_hit.push_row(&[z_ids[2 * i], z_ids[2 * i + 1]]);
+        }
+        string_order_mask(&ctx, &low_hit, (x, y), CmpOp::Gt, &e)
+            .unwrap()
+            .expect("low-hit mask applies");
+        assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+        // Batch 3: comparing uncached block-start ID 16 ("m") with short literal `a00` must
+        // preview the pending bypass, validate via `simple_literal_cmp_in`, and succeed.
+        let mut transition = Table::new(vec![x, y]);
+        for i in 0..STRING_ORDER_ROWS {
+            let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+            transition.push_row(&[m_id, rhs]);
+        }
+        let mask = string_order_mask(&ctx, &transition, (x, y), CmpOp::Gt, &e)
+            .unwrap()
+            .expect("transition mask applies on Direct");
+        let generic = evaluate_mask(&ctx, &transition, std::slice::from_ref(&e), None).unwrap();
+        assert_eq!(mask, generic);
+        assert_eq!(
+            ctx.floor_cache().bypassed(),
+            1,
+            "transition mask must enter Direct bypass"
+        );
+        assert!(ctx.check().is_ok());
+    }
+
+    /// A subsequent `Floors` mask must count its validated 64-row sample's lookups and hits
+    /// toward floor hit-rate feedback so boundary decisions do not drop the sampled rows.
+    #[test]
+    fn later_mask_sample_counts_toward_floor_hit_rate_feedback() {
+        use super::super::expr::CmpOp;
+        let (s, ids) = word_store(2_500);
+        let non_base_a = Id::from_i64(1).unwrap();
+        let non_base_b = Id::from_i64(2).unwrap();
+
+        // (a) Sample lookups count toward `FLOOR_BYPASS_MIN_LOOKUPS` (2,048):
+        // 64 sampled rows (128 lookups) + 960 tail rows (1,920 lookups) = 2,048 distinct
+        // base-literal lookups, followed by non-base rows. Without sample accounting only
+        // 1,920 lookups would be recorded and the next mask would stay on Floors.
+        {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Lt);
+
+            let mut warm = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                warm.push_row(&[ids[i % 16], ids[(i + 5) % 16]]);
+            }
+            string_order_mask(&ctx, &warm, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("warm mask applies");
+            assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+            let mut boundary = Table::new(vec![x, y]);
+            for i in 0..1_024usize {
+                boundary.push_row(&[ids[16 + 2 * i], ids[16 + 2 * i + 1]]);
+            }
+            for _ in 1_024..STRING_ORDER_ROWS {
+                boundary.push_row(&[non_base_a, non_base_b]);
+            }
+            let mask = string_order_mask(&ctx, &boundary, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("boundary mask applies");
+            let generic = evaluate_mask(&ctx, &boundary, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic);
+            assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+            string_order_mask(&ctx, &warm, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("next mask applies");
+            assert_eq!(
+                ctx.floor_cache().bypassed(),
+                1,
+                "64 sampled rows + 960 tail rows must reach 2,048 lookups and trigger bypass"
+            );
+            assert!(ctx.check().is_ok());
+        }
+
+        // (b) Sample hits count toward the 1/8 hit-rate threshold:
+        // 64 cached sampled rows (128 hits / 128 lookups) + 72 cached tail rows (144 hits) +
+        // 952 distinct uncached tail rows (1,904 misses) = 272 hits / 2,176 lookups (12.5%).
+        // Without sample hits, 144 / 2,048 (7.0%) would wrongly trigger bypass.
+        {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Lt);
+
+            let mut warm = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                warm.push_row(&[ids[i % 16], ids[(i + 5) % 16]]);
+            }
+            string_order_mask(&ctx, &warm, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("warm mask applies");
+            assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+            let mut boundary = Table::new(vec![x, y]);
+            // 64 sampled rows + 72 tail rows hitting the 16 cached ids.
+            for i in 0..(STRING_ORDER_SAMPLE + 72) {
+                boundary.push_row(&[ids[i % 16], ids[(i + 3) % 16]]);
+            }
+            // 952 distinct uncached tail rows (1,904 misses).
+            for i in 0..952usize {
+                boundary.push_row(&[ids[16 + 2 * i], ids[16 + 2 * i + 1]]);
+            }
+            for _ in (STRING_ORDER_SAMPLE + 1_024)..STRING_ORDER_ROWS {
+                boundary.push_row(&[non_base_a, non_base_b]);
+            }
+            let mask = string_order_mask(&ctx, &boundary, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("boundary mask applies");
+            let generic = evaluate_mask(&ctx, &boundary, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic);
+
+            string_order_mask(&ctx, &warm, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("next mask applies");
+            assert_eq!(
+                ctx.floor_cache().bypassed(),
+                0,
+                "sample hits must keep 272 / 2,176 (12.5%) at or above the cutoff on Floors"
+            );
+            assert!(ctx.check().is_ok());
+        }
     }
 }
