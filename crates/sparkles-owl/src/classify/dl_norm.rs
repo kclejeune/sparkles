@@ -128,6 +128,49 @@ impl DlAx {
 /// Why an axiom stays left out.
 type Why = &'static str;
 
+/// Whether `dl_norm::normalize` can accept `ax` (ignoring counting/rooted flags, nesting
+/// depth, and role regularity): `ax` is an axiom kind Tier D handles and every
+/// subexpression that [`Norm::pos`] and [`Norm::neg`] visit avoids self restrictions and
+/// `Data*` restrictions.
+///
+/// In particular, `ObjectMinCardinality(0, ..)` short-circuits to `TOP` in both positive
+/// and negative positions without inspecting its filler, so a data restriction nested only
+/// beneath a zero minimum does not prevent Tier D from taking the axiom.
+pub fn may_accept(ax: &AxiomKind) -> bool {
+    use AxiomKind as K;
+    use ClassExpression as C;
+    fn expr_ok(c: &C) -> bool {
+        match c {
+            C::Class(_) | C::ObjectMinCardinality(0, ..) => true,
+            C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs.iter().all(expr_ok),
+            C::ObjectComplementOf(f)
+            | C::ObjectSomeValuesFrom(_, f)
+            | C::ObjectAllValuesFrom(_, f) => expr_ok(f),
+            C::ObjectMinCardinality(_, _, f)
+            | C::ObjectMaxCardinality(_, _, f)
+            | C::ObjectExactCardinality(_, _, f) => f.as_deref().is_none_or(expr_ok),
+            C::ObjectOneOf(_) | C::ObjectHasValue(..) => true,
+            C::ObjectHasSelf(_)
+            | C::DataSomeValuesFrom(..)
+            | C::DataAllValuesFrom(..)
+            | C::DataHasValue(..)
+            | C::DataMinCardinality(..)
+            | C::DataMaxCardinality(..)
+            | C::DataExactCardinality(..) => false,
+        }
+    }
+    match ax {
+        K::SubClassOf(a, b) => expr_ok(a) && expr_ok(b),
+        K::EquivalentClasses(cs) => cs.iter().all(expr_ok),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => cs.iter().all(expr_ok),
+        K::ObjectPropertyDomain(_, c) | K::ObjectPropertyRange(_, c) | K::ClassAssertion(c, _) => {
+            expr_ok(c)
+        }
+        K::ObjectPropertyAssertion(..) | K::NegativeObjectPropertyAssertion(..) => true,
+        _ => false,
+    }
+}
+
 /// Whether the EL part of a run lets Tier D take the axioms outside OWL 2 EL: no top or
 /// bottom properties, data properties, self restrictions or reflexive roles, whose rules
 /// this phase does not have, and no individuals or nominals unless `rooted` lets the run

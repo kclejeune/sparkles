@@ -2559,7 +2559,14 @@ impl Index {
     /// ([`DlIx::keyed_by_expressions`](super::dl_rules::DlIx)).
     /// Roles that `old` lacks may be new here, since a kept context holds no link by
     /// them.
+    #[allow(dead_code)]
     pub fn same_tables(&self, old: &Index) -> bool {
+        self.same_tables_with_stop(old, &|| false).unwrap_or(false)
+    }
+
+    /// Cooperative polling variant of [`Index::same_tables`]; returns `None` when `stop`
+    /// signals cancellation or deadline expiry.
+    pub fn same_tables_with_stop(&self, old: &Index, stop: &dyn Fn() -> bool) -> Option<bool> {
         let (a, b) = (&old.roles, &self.roles);
         let n = a.sup.len();
         let prefix = |x: &[bool], y: &[bool]| y.len() >= x.len() && y[..x.len()] == *x;
@@ -2589,44 +2596,46 @@ impl Index {
             && b.functional[..a.functional.len()] == a.functional[..];
         let dt_same = match (&old.dt, &self.dt) {
             (None, None) => true,
-            (Some(a_dt), Some(b_dt)) => b_dt.modes_compatible(a_dt, n),
+            (Some(a_dt), Some(b_dt)) => b_dt.modes_compatible_with_stop(a_dt, n, stop)?,
             _ => false,
         };
-        b.sup.len() >= n
-            && b.sup[..n] == a.sup[..]
-            && comp_within(&a.comp, &b.comp)
-            && comp_within(&b.comp, &a.comp)
-            && prefix(&a.right, &b.right)
-            && prefix(&a.left, &b.left)
-            && a.reflexive == b.reflexive
-            && b.range.len() >= a.range.len()
-            && b.range[..a.range.len()] == a.range[..]
-            && data_ranges_same
-            && functional_same
-            && super::saturate::plain(old) == super::saturate::plain(self)
-            && prefix(&a.empty, &b.empty)
-            && prefix(&a.linear, &b.linear)
-            && b.inv.len() >= a.inv.len()
-            && b.inv[..a.inv.len()] == a.inv[..]
-            && a.clash == b.clash
-            && sorted(&old.selfs) == sorted(&self.selfs)
-            && dt_same
-            && old.universal.is_empty()
-            && self.universal.is_empty()
-            && old.keys.is_empty()
-            && self.keys.is_empty()
-            && old.nominals.is_empty()
-            && self.nominals.is_empty()
-            && !old.nominal_selfs
-            && !self.nominal_selfs
-            && old.tops == self.tops
-            && self.tops[1].is_none()
-            && old.horn.as_ref().map(|h| h.dominate) == self.horn.as_ref().map(|h| h.dominate)
-            && match (&old.dl, &self.dl) {
-                (None, None) => true,
-                (Some(a), Some(b)) => a.keyed_by_expressions() && b.keyed_by_expressions(),
-                _ => false,
-            }
+        Some(
+            b.sup.len() >= n
+                && b.sup[..n] == a.sup[..]
+                && comp_within(&a.comp, &b.comp)
+                && comp_within(&b.comp, &a.comp)
+                && prefix(&a.right, &b.right)
+                && prefix(&a.left, &b.left)
+                && a.reflexive == b.reflexive
+                && b.range.len() >= a.range.len()
+                && b.range[..a.range.len()] == a.range[..]
+                && data_ranges_same
+                && functional_same
+                && super::saturate::plain(old) == super::saturate::plain(self)
+                && prefix(&a.empty, &b.empty)
+                && prefix(&a.linear, &b.linear)
+                && b.inv.len() >= a.inv.len()
+                && b.inv[..a.inv.len()] == a.inv[..]
+                && a.clash == b.clash
+                && sorted(&old.selfs) == sorted(&self.selfs)
+                && dt_same
+                && old.universal.is_empty()
+                && self.universal.is_empty()
+                && old.keys.is_empty()
+                && self.keys.is_empty()
+                && old.nominals.is_empty()
+                && self.nominals.is_empty()
+                && !old.nominal_selfs
+                && !self.nominal_selfs
+                && old.tops == self.tops
+                && self.tops[1].is_none()
+                && old.horn.as_ref().map(|h| h.dominate) == self.horn.as_ref().map(|h| h.dominate)
+                && match (&old.dl, &self.dl) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.keyed_by_expressions() && b.keyed_by_expressions(),
+                    _ => false,
+                },
+        )
     }
 
     /// For each expression of `old`, whether a context that holds it reads other rules
@@ -2703,17 +2712,25 @@ impl Index {
         let mut changed_neg_roles: FxHashSet<Role> = FxHashSet::default();
         if !old.neg_data.is_empty() || !self.neg_data.is_empty() {
             let old_roles = old.roles.sup.len();
-            let mut neg_a: Vec<(&DataVal, Ex)> = Vec::new();
-            let mut neg_b: Vec<(&DataVal, Ex)> = Vec::new();
-            let mut seen_roles: FxHashSet<Role> = FxHashSet::default();
+            let old_neg_max = old.neg_data.values().map(Vec::len).max().unwrap_or(0);
+            let new_neg_max = self.neg_data.values().map(Vec::len).max().unwrap_or(0);
+            let mut neg_a: Vec<(&DataVal, Ex)> = Vec::with_capacity(old_neg_max);
+            let mut neg_b: Vec<(&DataVal, Ex)> = Vec::with_capacity(new_neg_max);
+            let mut seen_roles: FxHashSet<Role> = FxHashSet::with_capacity_and_hasher(
+                (old.neg_data.len() + self.neg_data.len()).min(old_roles),
+                Default::default(),
+            );
             let mut ticks = 0usize;
             for &r in old.neg_data.keys().chain(self.neg_data.keys()) {
                 if (r as usize) >= old_roles || !seen_roles.insert(r) {
                     continue;
                 }
                 ticks += 1;
-                if ticks.is_multiple_of(POLL_CHANGED) && stop() {
-                    return None;
+                if ticks >= POLL_CHANGED {
+                    ticks = 0;
+                    if stop() {
+                        return None;
+                    }
                 }
                 neg_a.clear();
                 if let Some(v) = old.neg_data.get(&r) {
@@ -2790,22 +2807,35 @@ impl Index {
                     && sets(old, a, &old_sets) != sets(self, b, &new_sets);
         }
         if let (Some(old_dt), Some(new_dt), Some(align)) = (&old.dt, &self.dt, dt_align) {
+            let mut ticks = 0usize;
             for e in 0..n {
-                if e % POLL_CHANGED == 0 && stop() {
-                    return None;
+                ticks += 1;
+                if ticks >= POLL_CHANGED {
+                    ticks = 0;
+                    if stop() {
+                        return None;
+                    }
                 }
                 if let Node::DtFire(t) = old.heads[e].node {
                     let refire_same = match (old_dt.refire_of(t), new_dt.refire_of(t)) {
                         (None, None) => true,
                         (Some(old_cs), Some(new_cs)) if old_cs.len() == new_cs.len() => {
-                            old_cs.iter().all(|&oc| {
-                                align
-                                    .comp_map
-                                    .get(oc as usize)
-                                    .copied()
-                                    .flatten()
-                                    .is_some_and(|nc| new_cs.contains(&nc))
-                            })
+                            let mut same = true;
+                            for &oc in old_cs {
+                                ticks += 1;
+                                if ticks >= POLL_CHANGED {
+                                    ticks = 0;
+                                    if stop() {
+                                        return None;
+                                    }
+                                }
+                                let mapped = align.comp_map.get(oc as usize).copied().flatten();
+                                if !mapped.is_some_and(|nc| new_cs.binary_search(&nc).is_ok()) {
+                                    same = false;
+                                    break;
+                                }
+                            }
+                            same
                         }
                         _ => false,
                     };
@@ -2842,8 +2872,14 @@ impl Index {
             .map(Vec::len)
             .max()
             .unwrap_or(0);
-        let neg_scratch = neg_roles
-            .saturating_mul(32)
+        let neg_tables = if neg_roles > 0 {
+            super::dtcheck::range::map_buckets_for(neg_roles)
+                .saturating_mul((std::mem::size_of::<Role>() + 1) * 2)
+                .saturating_add(64)
+        } else {
+            0
+        };
+        let neg_scratch = neg_tables
             .saturating_add(neg_max.saturating_mul(std::mem::size_of::<(&DataVal, Ex)>() * 2));
         let dt_scratch = match (&old.dt, &self.dt) {
             (Some(a), Some(b)) => b.align_scratch(a),
@@ -3367,14 +3403,23 @@ fn dt_index(
                 v.into_boxed_slice()
             })
             .filter(|ts| {
-                ts.iter()
-                    .all(|&t| t == TOP || refire.get(&t).is_some_and(|cs| cs.contains(&comp)))
+                ts.iter().all(|&t| {
+                    t == TOP
+                        || refire
+                            .get(&t)
+                            .is_some_and(|cs| cs.binary_search(&comp).is_ok())
+                })
             });
         debug_assert!(
             key.at_least,
             "a body atom of the Horn tier is an at-least atom"
         );
         body[comp as usize].push(Body { e, told });
+    }
+    // Canonicalize body order by expression id so reordering unchanged axioms does not
+    // alter `DtIx::align` or cache keys.
+    for v in &mut body {
+        v.sort_unstable_by_key(|b| b.e);
     }
     let mut disjoint: Vec<(Role, Role)> = Vec::with_capacity(exact_disjoint);
     for &(a, b) in &ax.dt_disjoint {
@@ -3433,17 +3478,21 @@ fn dt_fires(
             by.entry(a).or_default().push(c);
         }
     }
-    let mut refire: FxHashMap<Ex, Vec<u32>> = FxHashMap::default();
+    let mut items: Vec<(u32, Ex)> = Vec::new();
     for &e in &b.dt_body {
         if b.dt_other.contains(&e) {
             continue;
         }
-        let Some(comp) = dt_comp(it, run, e) else {
-            continue;
-        };
+        if let Some(comp) = dt_comp(it, run, e) {
+            items.push((comp, e));
+        }
+    }
+    items.sort_unstable_by_key(|&(comp, _)| comp);
+    let mut refire: FxHashMap<Ex, Vec<u32>> = FxHashMap::default();
+    for (comp, e) in items {
         for &t in by.get(&e).map_or(&[][..], |v| v.as_slice()) {
             let cs = refire.entry(t).or_default();
-            if !cs.contains(&comp) {
+            if cs.last() != Some(&comp) {
                 cs.push(comp);
             }
         }

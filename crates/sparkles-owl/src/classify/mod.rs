@@ -1444,8 +1444,8 @@ struct Kept {
     /// whether the run had axioms outside OWL 2 EL, taken or left out, whose tier the
     /// run decided over the interner as it was then
     outside: bool,
-    /// whether one of them needs case analysis over non-data constructors (axioms that
-    /// Tier D could take if data, self restrictions or top/bottom properties leave)
+    /// whether one of them needs case analysis and [`dl_norm::may_accept`] says Tier D
+    /// could accept it if blocking data, self restrictions or top/bottom properties leave
     disjunctive: bool,
     /// the interner's expressions and the contexts above the index's after the last
     /// run that started again, which bound what the runs since may keep
@@ -1463,6 +1463,17 @@ const KEPT_SLACK: usize = 4096;
 /// Contexts or edges visited between cooperative deadline/cancellation polls in
 /// incremental invalidation, shifting, and orphan pruning.
 const POLL_INVALIDATE: usize = 4096;
+
+/// Pushes `e` onto `queue`, growing geometrically via `reserve_exact` without exceeding
+/// `cap_limit` elements so worklist capacity never outgrows pre-admitted scratch.
+fn push_bounded(queue: &mut Vec<Ex>, e: Ex, cap_limit: usize) {
+    if queue.len() == queue.capacity() {
+        let remaining = cap_limit.saturating_sub(queue.len());
+        let grow = queue.capacity().max(8).min(remaining).max(1);
+        queue.reserve_exact(grow);
+    }
+    queue.push(e);
+}
 
 impl Default for Saturation {
     fn default() -> Saturation {
@@ -3751,7 +3762,7 @@ impl Saturation {
             self.disjoint = Vec::new();
             self.dynamic = None;
             self.dl_run = None;
-            self.last_roots.clear();
+            self.last_roots = Vec::new();
         }
         // a run that keeps the contexts of a run with the Horn rules, Tier D, datatype
         // checker components, or data-bearing EL edits compares the two indexes, so the
@@ -3783,7 +3794,7 @@ impl Saturation {
                     !c.added.iter().chain(c.removed).any(|k| {
                         dtcheck::comp::Comps::may_trigger(&[*k], &|| false).unwrap_or(false)
                     }),
-                    "must_restart already forces a full run for any edit naming a data property or datatype"
+                    "el_index_diff routes data-bearing EL edits through index comparison rather than the premise fast path"
                 );
                 let mut scratch = Axioms::default();
                 for &k in c.added.iter().chain(c.removed) {
@@ -3825,9 +3836,9 @@ impl Saturation {
                 normalized_peak,
             }));
         }
-        let non_data_disjunctive = outside.iter().any(|&(i, _)| {
+        let tier_d_disjunctive = outside.iter().any(|&(i, _)| {
             let k = axioms[i];
-            !dl::shape(k).horn && !mentions_data(k)
+            !dl::shape(k).horn && dl_norm::may_accept(k)
         });
         drop(outside);
         // the disjointness sets by their numbers in this index, beside those of the
@@ -3887,18 +3898,33 @@ impl Saturation {
         }
         let reuse = match &old_ix {
             Some(old) => {
-                if !ix.same_tables(old) {
-                    return Ok(ControlFlow::Break(LateRestart::Incompatible {
-                        normalized_peak,
-                    }));
+                let stopped = std::cell::RefCell::new(None);
+                let stop_tbl = || {
+                    let r = poll(limits);
+                    let stop = r.is_err();
+                    if let Err(e) = r {
+                        *stopped.borrow_mut() = Some(e);
+                    }
+                    stop
+                };
+                match ix.same_tables_with_stop(old, &stop_tbl) {
+                    Some(true) => true,
+                    Some(false) => {
+                        return Ok(ControlFlow::Break(LateRestart::Incompatible {
+                            normalized_peak,
+                        }));
+                    }
+                    None => {
+                        return Err(stopped.into_inner().unwrap_or(Error::Cancelled));
+                    }
                 }
-                true
             }
             None => false,
         };
         if !reuse {
             self.dynamic = None;
             self.dl_run = None;
+            self.last_roots = Vec::new();
         }
         let premises = if (horn || disj) && !reuse {
             self.ctx = Vec::new();
@@ -4085,21 +4111,25 @@ impl Saturation {
             let Some(changed) = changed else {
                 return Err(stopped.into_inner().unwrap_or(Error::Cancelled));
             };
+            let last_roots = std::mem::take(&mut self.last_roots);
             stats.cleared = self.invalidate_changed(
                 &changed,
                 &ix,
                 dynamic.as_ref(),
                 dt_align.as_ref(),
+                &last_roots,
                 &roots,
                 renumbered,
                 limits,
                 held,
                 &mut normalized_peak,
             )?;
+            drop(last_roots);
             drop(old);
             poll(limits)?;
         }
         stats.index = start.elapsed();
+        debug_assert_eq!(self.last_roots.capacity(), 0);
         // the index, the caller's copy of the axioms, the normalized axioms and the roots,
         // and the contexts kept from the last run
         let base = self.index_bytes(&ix)
@@ -4871,7 +4901,7 @@ impl Saturation {
             tier,
             key,
             outside: stats.outside_el.horn + stats.outside_el.disjunctive > 0,
-            disjunctive: non_data_disjunctive,
+            disjunctive: tier_d_disjunctive,
             nodes: kept.map_or(self.interner.len(), |k| k.nodes),
             dynamic: kept.map_or(dynamic.as_ref().map_or(0, |d| d.len()), |k| k.dynamic),
             table: kept.map_or(dl_run.as_ref().map_or(0, |d| d.table.len()), |k| k.table),
@@ -5410,7 +5440,7 @@ impl Saturation {
         let disj_in_play = k.disjunctive
             || outside
                 .iter()
-                .any(|a| !dl::shape(a).horn && !mentions_data(a));
+                .any(|a| !dl::shape(a).horn && dl_norm::may_accept(a));
         if disj_in_play && (self.stale_tier || changed().any(|a| logical(a) && !tier_neutral(a))) {
             return true;
         }
@@ -5449,6 +5479,7 @@ impl Saturation {
         ix: &Index,
         dynamic: Option<&saturate::Dynamic>,
         dt_align: Option<&dt_sat::DtAlign>,
+        last_roots: &[Ex],
         new_roots: &[Ex],
         renumbered: bool,
         limits: &Limits,
@@ -5470,44 +5501,63 @@ impl Saturation {
         let mut affected = Marks::new(total_slots);
         let mut queue: Vec<Ex> = Vec::new();
         let mut ticks = 0usize;
-        for e in all.clone() {
+        let mut tick = || -> Result<(), Error> {
             ticks += 1;
-            if ticks.is_multiple_of(POLL_INVALIDATE) {
+            if ticks >= POLL_INVALIDATE {
+                ticks = 0;
                 poll(limits)?;
             }
+            Ok(())
+        };
+        for e in all.clone() {
+            tick()?;
             let Some(c) = get_ctx(e) else { continue };
             let st = c.st.lock();
-            if st.init
-                && (st
-                    .subs
-                    .iter()
-                    .any(|&s| changed.get(s as usize).copied().unwrap_or(true))
-                    || dl_rules::dl(&st).is_some_and(|d| d.names_changed(changed))
-                    || dt_align.is_some_and(|align| {
-                        st.extra.as_ref().is_some_and(|x| {
-                            x.dt.iter().any(|s| {
-                                align
-                                    .changed_comps
-                                    .get(s.comp as usize)
-                                    .copied()
-                                    .unwrap_or(true)
-                            })
-                        })
-                    }))
-                && affected.insert(e)
+            if !st.init {
+                continue;
+            }
+            let mut hit = false;
+            for &s in &st.subs {
+                tick()?;
+                if changed.get(s as usize).copied().unwrap_or(true) {
+                    hit = true;
+                    break;
+                }
+            }
+            if !hit && dl_rules::dl(&st).is_some_and(|d| d.names_changed(changed)) {
+                hit = true;
+            }
+            if !hit
+                && let Some(align) = dt_align
+                && let Some(x) = st.extra.as_ref()
             {
-                queue.push(e);
+                for s in &x.dt {
+                    tick()?;
+                    if align
+                        .changed_comps
+                        .get(s.comp as usize)
+                        .copied()
+                        .unwrap_or(true)
+                    {
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            if hit && affected.insert(e) {
+                push_bounded(&mut queue, e, total_slots);
             }
         }
         // Clear dead roots that disappeared between runs so stale roots never pollute
         // `dt_sat::collect` or downstream scans.
-        for &r in &self.last_roots {
+        for &r in last_roots {
+            tick()?;
             if (r as usize) < total_slots
                 && new_roots.binary_search(&r).is_err()
                 && get_ctx(r).is_some_and(|c| c.st.lock().init)
                 && affected.insert(r)
             {
-                queue.push(r);
+                push_bounded(&mut queue, r, total_slots);
             }
         }
         // every context with a link into an affected context is affected, as is every
@@ -5515,24 +5565,23 @@ impl Saturation {
         // over the predecessor, and the class whose subsumer a test that held gave
         let tests = ix.dl.is_some();
         while let Some(e) = queue.pop() {
-            ticks += 1;
-            if ticks.is_multiple_of(POLL_INVALIDATE) {
-                poll(limits)?;
-            }
+            tick()?;
             let Some(c) = get_ctx(e) else { continue };
             let st = c.st.lock();
             let mut add = |s: Ex| {
                 if (s as usize) < total_slots && affected.insert(s) {
-                    queue.push(s);
+                    push_bounded(&mut queue, s, total_slots);
                 }
             };
             for (_, srcs) in &st.back {
                 for &s in &srcs.list {
+                    tick()?;
                     add(s);
                 }
             }
             if let Some(d) = dl_rules::dl(&st) {
                 for &(u, _) in &d.dpreds {
+                    tick()?;
                     add(u);
                 }
             }
@@ -5549,10 +5598,7 @@ impl Saturation {
         if renumbered {
             let mut maps = 0usize;
             for e in all.clone() {
-                ticks += 1;
-                if ticks.is_multiple_of(POLL_INVALIDATE) {
-                    poll(limits)?;
-                }
+                tick()?;
                 if affected.has(e) {
                     continue;
                 }
@@ -5581,10 +5627,7 @@ impl Saturation {
         }
         let mut cleared = 0;
         for e in all {
-            ticks += 1;
-            if ticks.is_multiple_of(POLL_INVALIDATE) {
-                poll(limits)?;
-            }
+            tick()?;
             let Some(c) = get_ctx(e) else { continue };
             if affected.has(e) {
                 if c.st.lock().init {
@@ -5648,24 +5691,31 @@ impl Saturation {
             }
         };
         let mut reachable = Marks::new(total_slots);
-        let mut queue: Vec<Ex> = Vec::with_capacity(roots.len().min(total_slots));
+        let mut queue: Vec<Ex> = Vec::with_capacity(total_slots);
+        let mut ticks = 0usize;
+        let mut tick = || -> Result<(), Error> {
+            ticks += 1;
+            if ticks >= POLL_INVALIDATE {
+                ticks = 0;
+                poll(limits)?;
+            }
+            Ok(())
+        };
         for &r in roots {
+            tick()?;
             if (r as usize) < total_slots && reachable.insert(r) {
                 queue.push(r);
             }
         }
-        let mut ticks = 0usize;
         while let Some(e) = queue.pop() {
-            ticks += 1;
-            if ticks.is_multiple_of(POLL_INVALIDATE) {
-                poll(limits)?;
-            }
+            tick()?;
             let Some(c) = get_ctx(e) else { continue };
             let st = c.st.lock();
             if !st.init {
                 continue;
             }
             for &d in &st.subs {
+                tick()?;
                 if matches!(ix.head(d).node, Node::Exist(..)) {
                     let succ = ix.head(d).succ;
                     if (succ as usize) < total_slots && reachable.insert(succ) {
@@ -5674,12 +5724,14 @@ impl Saturation {
                 }
             }
             for &(_, f) in &st.fwd.list {
+                tick()?;
                 if (f as usize) < total_slots && reachable.insert(f) {
                     queue.push(f);
                 }
             }
             if let Some(x) = &st.extra {
                 for &(_, n) in &x.horn.succ.list {
+                    tick()?;
                     if (n as usize) < total_slots && reachable.insert(n) {
                         queue.push(n);
                     }
@@ -5689,10 +5741,7 @@ impl Saturation {
         let all = (0..self.ctx.len() as Ex).chain((0..count).map(|i| base + i));
         let mut pruned = false;
         for e in all.clone() {
-            ticks += 1;
-            if ticks.is_multiple_of(POLL_INVALIDATE) {
-                poll(limits)?;
-            }
+            tick()?;
             if !reachable.has(e)
                 && let Some(c) = get_ctx(e)
                 && c.st.lock().init
@@ -5703,10 +5752,7 @@ impl Saturation {
         }
         if pruned {
             for e in all {
-                ticks += 1;
-                if ticks.is_multiple_of(POLL_INVALIDATE) {
-                    poll(limits)?;
-                }
+                tick()?;
                 if reachable.has(e)
                     && let Some(c) = get_ctx(e)
                 {

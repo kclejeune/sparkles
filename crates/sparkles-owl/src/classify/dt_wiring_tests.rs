@@ -2079,12 +2079,10 @@ fn dt_index_absent_ranges_prices_default_without_allocating() {
 
 #[test]
 fn dtix_align_preserves_uncounted_and_renumbers_untouched_components() {
-    // Component :u triggers UNCOUNTED (cardinality on a continuous/uncounted datatype:
-    // xsd:decimal with >= 2 values and <= 1 on overlapping facet, or rdf:langString),
-    // while component :e is edited and a new component :z is introduced to renumber IDs.
-    let base = "SubClassOf(:U DataMinCardinality(2 :u xsd:decimal))
-        SubClassOf(:U DataMaxCardinality(2 :u DataComplementOf(DataOneOf(\"0.0\"^^xsd:decimal))))
-        SubClassOf(:U DataSomeValuesFrom(:u DatatypeRestriction(xsd:decimal xsd:minInclusive \"0.0\"^^xsd:decimal xsd:maxInclusive \"1.0\"^^xsd:decimal)))
+    // Component :u triggers UNCOUNTED (a finite but uncounted cell: xsd:token of length 2
+    // with a 4e9 minimum cardinality, matching dtcheck::tests), while component :e is
+    // edited and a new component :z is introduced ahead of :u to force component renumbering.
+    let base = "SubClassOf(:U DataMinCardinality(4000000000 :u DatatypeRestriction(xsd:token xsd:length \"2\"^^xsd:integer)))
         SubClassOf(:E DataAllValuesFrom(:e xsd:integer))
         SubClassOf(:E DataSomeValuesFrom(:e xsd:integer))
         SubClassOf(:K :L)";
@@ -2097,6 +2095,10 @@ fn dtix_align_preserves_uncounted_and_renumbers_untouched_components() {
     let mut sat = Saturation::new();
     let first = sat.classify(&refs1, None, &limits).unwrap();
     assert!(!first.stats.incremental);
+    assert!(
+        !sat.excluded().is_empty(),
+        "initial run must report UNCOUNTED in excluded"
+    );
     let old_dt = sat.index.as_ref().unwrap().dt.as_ref().unwrap();
     let old_u_comp = old_dt
         .comps
@@ -2125,9 +2127,14 @@ fn dtix_align_preserves_uncounted_and_renumbers_untouched_components() {
         .find(|s| s.comp == old_u_comp)
         .unwrap()
         .last;
+    assert_eq!(
+        old_last,
+        dt_sat::UNCOUNTED,
+        "fixture must genuinely produce dt_sat::UNCOUNTED"
+    );
 
-    // Add a new component :z ahead of :u (changing axiom order / component numbering)
-    // and edit :e; :u must stay aligned, kept, and preserve `last`.
+    // Add a new component :z ahead of :u (shifting :u's component id) and edit :e;
+    // :u must stay aligned, kept without re-evaluation, renumbered, and preserve UNCOUNTED.
     let added = axioms(
         "SubClassOf(:Z DataAllValuesFrom(:z xsd:string))
          SubClassOf(:E DataSomeValuesFrom(:e xsd:int))",
@@ -2152,7 +2159,17 @@ fn dtix_align_preserves_uncounted_and_renumbers_untouched_components() {
         .comps
         .component(&DataProperty::new("urn:dt:u"))
         .expect("component :u after edit");
+    assert_ne!(
+        old_u_comp, new_u_comp,
+        "component :u must actually be renumbered by inserting :z ahead of it"
+    );
+    assert_eq!(
+        new_dt.cache_entries_for(new_u_comp),
+        0,
+        "kept component :u must not be cleared and re-evaluated"
+    );
     let kept_u = sat.ctx[u_ex as usize].get().unwrap().st.lock();
+    assert!(kept_u.init, "context :U must remain initialized");
     let new_dt_st = kept_u
         .extra
         .as_ref()
@@ -2161,11 +2178,375 @@ fn dtix_align_preserves_uncounted_and_renumbers_untouched_components() {
         .iter()
         .find(|s| s.comp == new_u_comp)
         .expect("kept context :U must be remapped to new component id");
-    assert_eq!(new_dt_st.last, old_last);
+    assert_eq!(new_dt_st.last, dt_sat::UNCOUNTED);
     drop(kept_u);
+    assert!(!sat.excluded().is_empty());
 
     let mut fresh = Saturation::new();
     let want = fresh.classify(&refs2, None, &limits).unwrap();
     assert_eq!(second.taxonomy, want.taxonomy);
     assert_eq!(sat.excluded(), fresh.excluded());
+}
+
+#[test]
+fn dtix_align_preserves_bound_and_renumbers_untouched_components() {
+    // Component :b0..:b12 has 13 linked data properties (> Bounds::default().props == 12),
+    // triggering dt_sat::BOUND on :B while component :e is edited and :z shifts IDs.
+    let mut chain = String::new();
+    for i in 0..12 {
+        chain.push_str(&format!("SubDataPropertyOf(:b{i} :b{})\n", i + 1));
+    }
+    let base = format!(
+        "{chain}
+         SubClassOf(:B DataAllValuesFrom(:b0 xsd:integer))
+         SubClassOf(:B DataSomeValuesFrom(:b0 xsd:integer))
+         SubClassOf(:E DataAllValuesFrom(:e xsd:integer))
+         SubClassOf(:E DataSomeValuesFrom(:e xsd:integer))
+         SubClassOf(:K :L)"
+    );
+    let ax1 = axioms(&base);
+    let refs1: Vec<&AxiomKind> = ax1.iter().collect();
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    let first = sat.classify(&refs1, None, &limits).unwrap();
+    assert!(!first.stats.incremental);
+    assert!(
+        !sat.excluded().is_empty(),
+        "initial run must report BOUND in excluded"
+    );
+    let old_dt = sat.index.as_ref().unwrap().dt.as_ref().unwrap();
+    let old_b_comp = old_dt
+        .comps
+        .component(&DataProperty::new("urn:dt:b0"))
+        .expect("component :b0");
+    let b_ex = sat
+        .interner
+        .get(&index::Node::Class(
+            sat.interner
+                .classes
+                .iter()
+                .position(|c| c.as_str() == "urn:dt:B")
+                .unwrap() as u32,
+        ))
+        .unwrap();
+    let old_last = sat.ctx[b_ex as usize]
+        .get()
+        .unwrap()
+        .st
+        .lock()
+        .extra
+        .as_ref()
+        .unwrap()
+        .dt
+        .iter()
+        .find(|s| s.comp == old_b_comp)
+        .unwrap()
+        .last;
+    assert_eq!(
+        old_last,
+        dt_sat::BOUND,
+        "13-property component must trigger dt_sat::BOUND"
+    );
+
+    let added = axioms(
+        "SubClassOf(:Z DataAllValuesFrom(:z xsd:string))
+         SubClassOf(:E DataSomeValuesFrom(:e xsd:int))",
+    );
+    let mut ax2 = added.clone();
+    ax2.extend(ax1.iter().cloned());
+    let refs2: Vec<&AxiomKind> = ax2.iter().collect();
+    let add_refs: Vec<&AxiomKind> = added.iter().collect();
+    let second = sat
+        .classify(
+            &refs2,
+            Some(Changes {
+                added: &add_refs,
+                removed: &[],
+            }),
+            &limits,
+        )
+        .unwrap();
+    assert!(second.stats.incremental);
+    let new_dt = sat.index.as_ref().unwrap().dt.as_ref().unwrap();
+    let new_b_comp = new_dt
+        .comps
+        .component(&DataProperty::new("urn:dt:b0"))
+        .expect("component :b0 after edit");
+    assert_ne!(old_b_comp, new_b_comp);
+    assert_eq!(
+        new_dt.cache_entries_for(new_b_comp),
+        0,
+        "kept BOUND component must not be cleared and re-evaluated"
+    );
+    let kept_b = sat.ctx[b_ex as usize].get().unwrap().st.lock();
+    assert!(kept_b.init);
+    let new_dt_st = kept_b
+        .extra
+        .as_ref()
+        .unwrap()
+        .dt
+        .iter()
+        .find(|s| s.comp == new_b_comp)
+        .expect("kept context :B must be remapped to new component id");
+    assert_eq!(new_dt_st.last, dt_sat::BOUND);
+    drop(kept_b);
+    assert!(!sat.excluded().is_empty());
+
+    let mut fresh = Saturation::new();
+    let want = fresh.classify(&refs2, None, &limits).unwrap();
+    assert_eq!(second.taxonomy, want.taxonomy);
+    assert_eq!(sat.excluded(), fresh.excluded());
+}
+
+#[test]
+fn dtix_align_ignores_reordered_unchanged_body_axioms() {
+    let u_body1 = axioms("SubClassOf(DataSomeValuesFrom(:u xsd:integer) :B1)");
+    let u_body2 = axioms("SubClassOf(DataSomeValuesFrom(:u xsd:string) :B2)");
+    let rest = axioms(
+        "SubClassOf(:U DataSomeValuesFrom(:u DataUnionOf(xsd:integer xsd:string)))
+         SubClassOf(:E DataAllValuesFrom(:e xsd:integer))
+         SubClassOf(:E DataSomeValuesFrom(:e xsd:integer))",
+    );
+    let mut ax1 = Vec::new();
+    ax1.extend(u_body1.iter().cloned());
+    ax1.extend(u_body2.iter().cloned());
+    ax1.extend(rest.iter().cloned());
+    let refs1: Vec<&AxiomKind> = ax1.iter().collect();
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    let first = sat.classify(&refs1, None, &limits).unwrap();
+    assert!(!first.stats.incremental);
+
+    // Reverse the two unchanged body axioms of :u while editing unrelated component :e.
+    let added = axioms("SubClassOf(:E DataSomeValuesFrom(:e xsd:int))");
+    let mut ax2 = Vec::new();
+    ax2.extend(u_body2.iter().cloned());
+    ax2.extend(u_body1.iter().cloned());
+    ax2.extend(rest.iter().cloned());
+    ax2.extend(added.iter().cloned());
+    let refs2: Vec<&AxiomKind> = ax2.iter().collect();
+    let add_refs: Vec<&AxiomKind> = added.iter().collect();
+    let second = sat
+        .classify(
+            &refs2,
+            Some(Changes {
+                added: &add_refs,
+                removed: &[],
+            }),
+            &limits,
+        )
+        .unwrap();
+    assert!(second.stats.incremental);
+    let new_dt = sat.index.as_ref().unwrap().dt.as_ref().unwrap();
+    let new_u_comp = new_dt
+        .comps
+        .component(&DataProperty::new("urn:dt:u"))
+        .expect("component :u");
+    assert_eq!(
+        new_dt.cache_entries_for(new_u_comp),
+        0,
+        "reordering unchanged body axioms of :u must not invalidate component :u"
+    );
+
+    let mut fresh = Saturation::new();
+    let want = fresh.classify(&refs2, None, &limits).unwrap();
+    assert_eq!(second.taxonomy, want.taxonomy);
+    assert_eq!(sat.excluded(), fresh.excluded());
+}
+
+#[test]
+fn push_bounded_never_exceeds_cap_limit() {
+    for cap_limit in [1usize, 7, 8, 9, 4096, 4097, 4100, 8193] {
+        let mut q = Vec::new();
+        for i in 0..cap_limit as index::Ex {
+            push_bounded(&mut q, i, cap_limit);
+            assert!(
+                q.capacity() <= cap_limit,
+                "cap {} exceeded cap_limit {cap_limit} at len {}",
+                q.capacity(),
+                q.len()
+            );
+        }
+        assert_eq!(q.len(), cap_limit);
+    }
+}
+
+#[test]
+fn high_fanout_refire_and_modes_compatible_poll_within_bound() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 4,200 independent checker properties all telling the same class :Shared creates a
+    // single DtFire(:Shared) head with 4,200 refire components (> POLL_CHANGED = 4096)
+    // and 4,200 checker roles (> POLL_ALIGN = 4096).
+    let n = 4200usize;
+    let mut doc = String::with_capacity(n * 110);
+    for i in 0..n {
+        doc.push_str(&format!(
+            "SubClassOf(:A{i} DataAllValuesFrom(:p{i} xsd:integer))\n\
+             SubClassOf(DataSomeValuesFrom(:p{i} xsd:integer) :Shared)\n"
+        ));
+    }
+    let ax1 = axioms(&doc);
+    let refs1: Vec<&AxiomKind> = ax1.iter().collect();
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    let first = sat.classify(&refs1, None, &limits).unwrap();
+    assert!(!first.stats.incremental);
+
+    let old_ix = sat.index.as_ref().unwrap();
+    let old_dt = old_ix.dt.as_ref().unwrap();
+    let shared_ex = sat
+        .interner
+        .get(&index::Node::Class(
+            sat.interner
+                .classes
+                .iter()
+                .position(|c| c.as_str() == "urn:dt:Shared")
+                .unwrap() as u32,
+        ))
+        .unwrap();
+    assert_eq!(
+        old_dt.refire_of(shared_ex).map(<[u32]>::len),
+        Some(n),
+        "expected a single high-fanout DtFire target with {n} components"
+    );
+
+    // 1. modes_compatible_with_stop must poll within POLL_ALIGN roles and stop cleanly.
+    let polls = AtomicUsize::new(0);
+    let res = old_dt.modes_compatible_with_stop(old_dt, old_ix.roles.sup.len(), &|| {
+        polls.fetch_add(1, Ordering::Relaxed) >= 1
+    });
+    assert_eq!(
+        res, None,
+        "modes_compatible_with_stop must stop on cooperative poll"
+    );
+    assert!(polls.load(Ordering::Relaxed) >= 2);
+
+    // 2. changed_with_dt must compare the 4,200-component DtFire in near-linear time
+    //    and poll inside the refire scan.
+    let aligned = match old_dt.align(old_dt, old_ix.roles.sup.len(), &|| false) {
+        dt_sat::DtAlignOutcome::Aligned(a) => a,
+        _ => panic!("self-alignment must succeed"),
+    };
+    let total_polls = AtomicUsize::new(0);
+    let changed = old_ix.changed_with_dt(old_ix, Some(&aligned), &|| {
+        total_polls.fetch_add(1, Ordering::Relaxed);
+        false
+    });
+    assert!(changed.is_some());
+    let seen = total_polls.load(Ordering::Relaxed);
+    assert!(
+        seen >= 2,
+        "expected multiple polls across expressions and refire scan, got {seen}"
+    );
+    // Cancelling on the last poll observed must abort changed_with_dt cleanly.
+    let cancel_at = seen - 1;
+    let cpolls = AtomicUsize::new(0);
+    let stopped = old_ix.changed_with_dt(old_ix, Some(&aligned), &|| {
+        cpolls.fetch_add(1, Ordering::Relaxed) >= cancel_at
+    });
+    assert!(
+        stopped.is_none(),
+        "changed_with_dt must stop on late cooperative poll"
+    );
+}
+
+#[test]
+fn high_fanout_invalidation_and_orphan_prune_poll_within_bound() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 4,200 sources all link into a single hub :Hub via :r so :Hub's `st.back` holds
+    // > POLL_INVALIDATE (4096) incoming edges, and a checker property :d exercises
+    // both `invalidate_changed` and `orphan_prune`.
+    let n = 4200usize;
+    let mut doc = String::with_capacity(n * 64 + 256);
+    doc.push_str(
+        "SubClassOf(:Hub DataAllValuesFrom(:d xsd:integer))\n\
+         SubClassOf(:Hub DataSomeValuesFrom(:d xsd:integer))\n",
+    );
+    for i in 0..n {
+        doc.push_str(&format!(
+            "SubClassOf(:S{i} ObjectSomeValuesFrom(:r :Hub))\n"
+        ));
+    }
+    let ax1 = axioms(&doc);
+    let refs1: Vec<&AxiomKind> = ax1.iter().collect();
+    let base_limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    let first = sat.classify(&refs1, None, &base_limits).unwrap();
+    assert!(!first.stats.incremental);
+
+    let added = axioms("SubClassOf(:Hub DataSomeValuesFrom(:d xsd:int))");
+    let mut ax2 = ax1.clone();
+    ax2.extend(added.iter().cloned());
+    let refs2: Vec<&AxiomKind> = ax2.iter().collect();
+    let add_refs: Vec<&AxiomKind> = added.iter().collect();
+
+    // First run without cancellation while counting total polls across the incremental edit.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let p = polls.clone();
+    let counting = Limits {
+        cancelled: Some(Arc::new(move || {
+            p.fetch_add(1, Ordering::Relaxed);
+            false
+        })),
+        ..base_limits.clone()
+    };
+    let second = sat
+        .classify(
+            &refs2,
+            Some(Changes {
+                added: &add_refs,
+                removed: &[],
+            }),
+            &counting,
+        )
+        .unwrap();
+    assert!(second.stats.incremental);
+    assert!(
+        polls.load(Ordering::Relaxed) >= 4,
+        "expected multiple polls across high-fanout invalidation and orphan_prune, got {}",
+        polls.load(Ordering::Relaxed)
+    );
+
+    // Re-run on a fresh kept state and cancel near the end of invalidation/orphan_prune,
+    // then verify clean recovery on the next run.
+    let mut sat2 = Saturation::new();
+    sat2.classify(&refs1, None, &base_limits).unwrap();
+    let stop_at = polls.load(Ordering::Relaxed) / 2;
+    let seen = Arc::new(AtomicUsize::new(0));
+    let s = seen.clone();
+    let cancelled = Limits {
+        cancelled: Some(Arc::new(move || {
+            s.fetch_add(1, Ordering::Relaxed) >= stop_at
+        })),
+        ..base_limits.clone()
+    };
+    let err = sat2.classify(
+        &refs2,
+        Some(Changes {
+            added: &add_refs,
+            removed: &[],
+        }),
+        &cancelled,
+    );
+    assert!(
+        err.is_err(),
+        "expected cancellation stop on high-fanout edit"
+    );
+    let recovered = sat2.classify(&refs2, None, &base_limits).unwrap();
+    assert_eq!(recovered.taxonomy, second.taxonomy);
 }

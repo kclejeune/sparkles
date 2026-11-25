@@ -1486,7 +1486,7 @@ fn el_data_lattice_additions_deletions_and_functional_groups_stay_incremental() 
         SubClassOf(:K :L)
         SubClassOf(:P DataSomeValuesFrom(:u xsd:string))
         SubClassOf(DataSomeValuesFrom(:u xsd:string) :Q)";
-    for threads in [1, 4] {
+    for threads in [1, 4, 8] {
         let (mut k, mut held) = data_started(base, threads);
         let init = same_as_fresh(&mut k, &held, threads, "initial functional EL data");
         assert!(init.taxonomy.is_subclass(&c("P"), &c("Q")));
@@ -1556,7 +1556,7 @@ fn horn_with_el_data_and_functional_groups_stays_incremental_and_falls_back_on_r
         SubClassOf(:C DataHasValue(:df \"10\"^^xsd:integer))
         SubClassOf(DataSomeValuesFrom(:df xsd:decimal) :Num)
         SubClassOf(:K :L)";
-    for threads in [1, 4] {
+    for threads in [1, 4, 8] {
         let (mut k, mut held) = data_started(base, threads);
         data_add(&mut k, &mut held, "SubClassOf(:M :K)");
         let out = same_as_fresh(
@@ -1653,6 +1653,90 @@ fn removing_data_axiom_later_allows_tier_d_to_take_added_disjunction() {
 }
 
 #[test]
+fn deleting_data_axiom_with_mixed_zero_min_disjunction_restarts_into_tier_d() {
+    // Tier D short-circuits ObjectMinCardinality(0, ..) to TOP without inspecting its
+    // filler, so a disjunctive axiom containing data only beneath a zero minimum is
+    // accepted by Tier D once the blocking EL data axiom is removed.
+    let horn_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        SubClassOf(:P ObjectAllValuesFrom(:r :Q))
+        SubClassOf(:A ObjectIntersectionOf(
+            ObjectUnionOf(:B :C)
+            ObjectMinCardinality(0 :r DataSomeValuesFrom(:z xsd:integer))))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(horn_base, 1);
+    assert!(
+        !k.classify(&limits(1))
+            .unwrap()
+            .taxonomy
+            .is_subclass(&c("A"), &c("G"))
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed zero-min disjunction (Horn)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // Same transition when the initial run had no Horn axiom (KeptTier::El).
+    let el_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        SubClassOf(:A ObjectIntersectionOf(
+            ObjectUnionOf(:B :C)
+            ObjectMinCardinality(0 :r DataSomeValuesFrom(:z xsd:integer))))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(el_base, 1);
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed zero-min disjunction (EL)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // And when the mixed zero-min disjunction is added only after an earlier data deletion.
+    let (mut k, mut held) = data_started(
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+         SubClassOf(:B :G)
+         SubClassOf(:C :G)",
+        1,
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after deleting data axiom");
+    assert!(out.stats.incremental);
+    data_add(
+        &mut k,
+        &mut held,
+        "SubClassOf(:A ObjectIntersectionOf(
+            ObjectUnionOf(:B :C)
+            ObjectMinCardinality(0 :r DataSomeValuesFrom(:z xsd:integer))))",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after adding mixed zero-min disjunction");
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    assert!(k.excluded().is_empty());
+}
+
+#[test]
 fn dtix_multi_component_edits_preserve_untouched_components_across_renumbering() {
     // Component 1 (:d): facet + cover; Component 2 (:e1, :e2): disjoint/cardinality;
     // Component 3 (:g): unrelated EL data property.
@@ -1667,7 +1751,7 @@ fn dtix_multi_component_edits_preserve_untouched_components_across_renumbering()
         SubClassOf(:G DataSomeValuesFrom(:g xsd:string))
         SubClassOf(DataSomeValuesFrom(:g xsd:string) :GOut)
         SubClassOf(:K :L)";
-    for threads in [1, 4] {
+    for threads in [1, 4, 8] {
         let (mut k, mut held) = data_started(base, threads);
         let init = same_as_fresh(&mut k, &held, threads, "initial multi-component DtIx");
         assert!(init.taxonomy.is_subclass(&c("KeepD"), &c("NonNeg")));
@@ -1753,7 +1837,7 @@ fn dtix_orphan_and_cyclic_cover_cleanup_and_reconnection() {
         SubClassOf(DataSomeValuesFrom(:e xsd:integer) :E1)
         SubClassOf(DataSomeValuesFrom(:e xsd:string) :E2)
         SubClassOf(:KeepE DataSomeValuesFrom(:e xsd:int))";
-    for threads in [1, 4] {
+    for threads in [1, 4, 8] {
         let (mut k, mut held) = data_started(base, threads);
         assert!(!k.excluded().is_empty());
 
@@ -1804,7 +1888,7 @@ fn dtix_orphan_and_cyclic_cover_cleanup_and_reconnection() {
 
 #[test]
 fn el_lattice_to_and_from_dtix_checker_transitions_fall_back_safely() {
-    for threads in [1, 4] {
+    for threads in [1, 4, 8] {
         // 1. Whole ontology transitions: None -> Some -> None
         let (mut k, mut held) = data_started(
             "SubClassOf(:A DataSomeValuesFrom(:d xsd:integer))
@@ -2116,7 +2200,7 @@ fn random_horn_el_data_and_dtix_edit_sequences_match_fresh() {
     let mut total_steps = 0usize;
     let mut incremental_steps = 0usize;
     let mut kept_some = 0usize;
-    for threads in [1, 4] {
+    for threads in [1, 4, 8] {
         for seed in 1..=12u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (threads as u64));
             let mut held = data_axioms(

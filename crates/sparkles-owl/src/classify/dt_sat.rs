@@ -142,6 +142,12 @@ impl DtIx {
         self.cache.lock().clear();
     }
 
+    /// Number of cached evaluations currently stored for checker component `comp`.
+    #[cfg(test)]
+    pub(super) fn cache_entries_for(&self, comp: u32) -> usize {
+        self.cache.lock().keys().filter(|k| k.0 == comp).count()
+    }
+
     /// The bytes the tables hold, the cache and the ranges with them. The saturation
     /// charges the growth of the cache and the ranges as it makes it, and the estimates
     /// that read this, the base before the saturation and the retained state after it,
@@ -298,32 +304,59 @@ impl DtIx {
 
     /// Zero-allocation compatibility check: whether checker bounds match and no existing
     /// data property switched between the EL data lattice and the datatype checker.
+    #[allow(dead_code)]
     pub fn modes_compatible(&self, old: &DtIx, old_roles_len: usize) -> bool {
+        self.modes_compatible_with_stop(old, old_roles_len, &|| false)
+            .unwrap_or(false)
+    }
+
+    /// Cooperative polling variant of [`DtIx::modes_compatible`]; returns `None` when
+    /// `stop` signals cancellation or deadline expiry.
+    pub fn modes_compatible_with_stop(
+        &self,
+        old: &DtIx,
+        old_roles_len: usize,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<bool> {
         if (self.bounds.props, self.bounds.types, self.bounds.nodes)
             != (old.bounds.props, old.bounds.types, old.bounds.nodes)
         {
-            return false;
+            return Some(false);
         }
+        let mut ticks = 0usize;
+        let mut poll = || -> bool {
+            ticks += 1;
+            if ticks >= POLL_ALIGN {
+                ticks = 0;
+                stop()
+            } else {
+                false
+            }
+        };
         // Any role already interned in `old` that is now a checker role must already have
         // been a checker role in `old`; otherwise it switched from EL lattice (or was
         // previously removed and re-entered as a checker role).
-        if self
-            .roles
-            .keys()
-            .any(|&r| (r as usize) < old_roles_len && !old.roles.contains_key(&r))
-        {
-            return false;
+        for &r in self.roles.keys() {
+            if poll() {
+                return None;
+            }
+            if (r as usize) < old_roles_len && !old.roles.contains_key(&r) {
+                return Some(false);
+            }
         }
         // Any data property present in both runs' component maps must keep the same
         // EL-lattice vs checker assignment.
         for (d, old_c) in old.comps.iter() {
+            if poll() {
+                return None;
+            }
             if let Some(new_c) = self.comps.component(d)
                 && old.comps.is_checker(old_c) != self.comps.is_checker(new_c)
             {
-                return false;
+                return Some(false);
             }
         }
-        true
+        Some(true)
     }
 
     /// Upper-bound scratch bytes allocated by [`DtIx::align`] and `refire` comparison.
@@ -343,7 +376,7 @@ impl DtIx {
             .saturating_mul(std::mem::size_of::<Vec<(Role, Role)>>())
             .saturating_add(
                 (old.disjoint.len() + self.disjoint.len())
-                    .saturating_mul(std::mem::size_of::<(Role, Role)>() * 4),
+                    .saturating_mul(std::mem::size_of::<(Role, Role)>() * 8),
             );
         let out = old_comps.saturating_mul(std::mem::size_of::<Option<u32>>() + 1);
         let max_ranges = old
@@ -373,20 +406,29 @@ impl DtIx {
         old_roles_len: usize,
         stop: &dyn Fn() -> bool,
     ) -> DtAlignOutcome {
-        if !self.modes_compatible(old, old_roles_len) {
-            return DtAlignOutcome::Incompatible;
+        match self.modes_compatible_with_stop(old, old_roles_len, stop) {
+            Some(true) => {}
+            Some(false) => return DtAlignOutcome::Incompatible,
+            None => return DtAlignOutcome::Stopped,
         }
         let mut ticks = 0usize;
         let mut poll = || -> bool {
             ticks += 1;
-            ticks.is_multiple_of(POLL_ALIGN) && stop()
+            if ticks >= POLL_ALIGN {
+                ticks = 0;
+                stop()
+            } else {
+                false
+            }
         };
 
+        let mut max_ranges = 0usize;
         let mut old_groups: Vec<Vec<Role>> = vec![Vec::new(); old.body.len()];
         for (&r, ri) in &old.roles {
             if poll() {
                 return DtAlignOutcome::Stopped;
             }
+            max_ranges = max_ranges.max(ri.ranges.len());
             old_groups[ri.comp as usize].push(r);
         }
         for g in &mut old_groups {
@@ -401,6 +443,7 @@ impl DtIx {
             if poll() {
                 return DtAlignOutcome::Stopped;
             }
+            max_ranges = max_ranges.max(ri.ranges.len());
             new_groups[ri.comp as usize].push(r);
         }
         for g in &mut new_groups {
@@ -413,6 +456,9 @@ impl DtIx {
         let mut new_by_roles: FxHashMap<&[Role], u32> =
             FxHashMap::with_capacity_and_hasher(self.body.len(), Default::default());
         for (c, g) in new_groups.iter().enumerate() {
+            if poll() {
+                return DtAlignOutcome::Stopped;
+            }
             if !g.is_empty() {
                 new_by_roles.insert(g.as_slice(), c as u32);
             }
@@ -467,16 +513,27 @@ impl DtIx {
             }
             let old_body = &old.body[old_c];
             let new_body = &self.body[new_c as usize];
-            if old_body.len() != new_body.len()
-                || !old_body
-                    .iter()
-                    .zip(new_body)
-                    .all(|(a, b)| a.e == b.e && a.told == b.told)
-            {
+            if old_body.len() != new_body.len() {
+                continue;
+            }
+            let mut body_same = true;
+            for (a, b) in old_body.iter().zip(new_body) {
+                if poll() {
+                    return DtAlignOutcome::Stopped;
+                }
+                if a.e != b.e || a.told != b.told {
+                    body_same = false;
+                    break;
+                }
+            }
+            if !body_same {
                 continue;
             }
             let mut roles_same = true;
             for &r in roles {
+                if poll() {
+                    return DtAlignOutcome::Stopped;
+                }
                 let old_ri = &old.roles[&r];
                 let new_ri = &self.roles[&r];
                 if old_ri.functional != new_ri.functional || old_ri.supers != new_ri.supers {
@@ -484,6 +541,10 @@ impl DtIx {
                     break;
                 }
                 if old_ri.ranges != new_ri.ranges {
+                    if ra.capacity() == 0 && max_ranges > 0 {
+                        ra.reserve_exact(max_ranges);
+                        rb.reserve_exact(max_ranges);
+                    }
                     ra.clear();
                     ra.extend_from_slice(&old_ri.ranges);
                     ra.sort_unstable();
