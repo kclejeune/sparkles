@@ -947,6 +947,87 @@ fn bare_nesting_past_131072_and_wide_map_copy_respect_bounds_and_cancellation() 
 }
 
 #[test]
+fn deep_and_oscillating_maps_copy_without_false_storage_full() {
+    let copy_and_check = |lex: String, dt: &str, expect_reserve_b0: bool| {
+        let source = Store::in_memory(Default::default());
+        let mut tx = source.write();
+        let s = tx
+            .intern(&Term::NamedNode(NamedNode::new("urn:s").unwrap()))
+            .unwrap();
+        let p = tx
+            .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+            .unwrap();
+        let o = tx
+            .intern(&Term::Literal(Literal::new_typed_literal(
+                lex,
+                NamedNode::new(dt).unwrap(),
+            )))
+            .unwrap();
+        tx.insert([s, p, o, Id::DEFAULT_GRAPH]).unwrap();
+        tx.commit().unwrap();
+        let snap = source.snapshot();
+        let copied = source
+            .copy_view_to_memory(
+                &snap,
+                StoreOptions {
+                    max_memory_bytes: None,
+                    ..Default::default()
+                },
+                &Default::default(),
+                |_| Ok(true),
+            )
+            .unwrap();
+        assert_eq!(state(&snap), state(&copied.snapshot()));
+        let mut write = copied.write();
+        if expect_reserve_b0 {
+            assert_ne!(write.new_bnode(), Id::bnode(0));
+        } else {
+            assert_eq!(write.new_bnode(), Id::bnode(0));
+        }
+    };
+
+    // 1. 1,025 copies of a 257-deep 2-key map chain stored in one cdt:List.
+    let chain = format!("{}_:b0{}", "{\"a\":".repeat(257), ",\"b\":0}".repeat(257));
+    let list_lex = format!("[{}]", vec![chain; 1_025].join(","));
+    copy_and_check(list_lex, sparkles_core::sparql::cdt::LIST, true);
+
+    // 2. Oscillating 128<->257 deep map (valid and ill-typed trailing-comma variants).
+    let inner_129 = format!("{}0{}", "{0:".repeat(129), "}".repeat(129));
+    let mut osc_valid = format!("{}{{", "{0:".repeat(127));
+    for j in 0..726 {
+        use std::fmt::Write;
+        if j > 0 {
+            osc_valid.push(',');
+        }
+        let _ = write!(&mut osc_valid, "{j}:{inner_129}");
+    }
+    let mut osc_ill = osc_valid.clone();
+    osc_valid.push_str(",999:_:b0");
+    osc_valid.push_str(&"}".repeat(128));
+    osc_ill.push_str(",999:_:b0,");
+    osc_ill.push_str(&"}".repeat(128));
+    copy_and_check(osc_valid, sparkles_core::sparql::cdt::MAP, true);
+    copy_and_check(osc_ill, sparkles_core::sparql::cdt::MAP, false);
+
+    // 3. ~1 MiB WideTable-outer oscillating 128<->257 deep map.
+    let mut wide_osc = format!("{}{{", "{0:".repeat(127));
+    for j in 0..513 {
+        use std::fmt::Write;
+        if j > 0 {
+            wide_osc.push(',');
+        }
+        let _ = write!(&mut wide_osc, "{j}:0");
+    }
+    for j in 513..2_513 {
+        use std::fmt::Write;
+        let _ = write!(&mut wide_osc, ",{j}:{inner_129}");
+    }
+    wide_osc.push_str(",9999:_:b0");
+    wide_osc.push_str(&"}".repeat(128));
+    copy_and_check(wide_osc, sparkles_core::sparql::cdt::MAP, true);
+}
+
+#[test]
 fn an_unrelated_dataset_view_is_refused() {
     let first = Store::in_memory(Default::default());
     let second = Store::in_memory(Default::default());

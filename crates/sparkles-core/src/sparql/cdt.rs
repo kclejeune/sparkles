@@ -587,24 +587,28 @@ fn literal(lex: &str, dt: &str) -> Term {
 /// and scanned iteratively with a fixed sliding-window stack bitset and zero heap.
 const MAX_QUOTED_CDT_DEPTH: usize = 64;
 
-/// Sliding window of bare `[` / `{` container kinds tracked in `validate_cdt`'s
-/// fixed stack-allocated bitset (8 KiB on the stack, 0 heap). Nesting beyond
-/// the window slides by half a window on push and refills on pop, so bare
-/// nesting has no artificial depth ceiling.
+/// Inline stack bitset of bare `[` / `{` container kinds tracked in
+/// `validate_cdt` (8 KiB on the stack, 0 heap). Nesting beyond the inline
+/// window spills into a memory-preflighted heap bit vector for O(1) push/pop
+/// without rescans, falling back to a bounded sliding window only when a tight
+/// memory cap refuses the spill.
 const CONTAINER_WINDOW_BITS: usize = 1024 * 64;
 const CONTAINER_WINDOW_WORDS: usize = CONTAINER_WINDOW_BITS / 64;
 const CONTAINER_WINDOW_HALF_WORDS: usize = CONTAINER_WINDOW_WORDS / 2;
 const CONTAINER_WINDOW_HALF_BITS: usize = CONTAINER_WINDOW_HALF_WORDS * 64;
 
-/// Sliding window of open map frames and fixed stack pool for O(1) zero-heap
-/// duplicate-key checks on ordinary maps. Wider maps promote to a memory-
-/// preflighted open-addressing hash table, or fall back to a bounded zero-heap
-/// batched scan when a tight memory cap refuses the table.
+/// Inline stack frames and fixed key pool for O(1) zero-heap duplicate-key
+/// checks on ordinary maps. Deeper map nesting spills frames into a memory-
+/// preflighted heap vector; wider maps promote to a memory-preflighted
+/// open-addressing hash table sized proportionally to their key count. When a
+/// tight memory cap refuses heap spills, validation falls back to bounded
+/// zero-heap sliding windows and batched scans capped linearly in input length.
 const INLINE_MAP_FRAMES: usize = 256;
 const INLINE_MAP_FRAMES_HALF: usize = INLINE_MAP_FRAMES / 2;
 const INLINE_MAP_KEY_POOL: usize = 512;
 const INLINE_MAP_KEY_BUCKETS: usize = 1024;
-const MAX_ZERO_HEAP_MAP_RESCAN_VISITS: usize = 262_144;
+const ZERO_HEAP_FALLBACK_STEP_FACTOR: u64 = 8;
+const MIN_ZERO_HEAP_FALLBACK_STEPS: u64 = 262_144;
 
 /// The 26 RFC 5646 grandfathered tags accepted by `oxilangtag` 0.1.6
 /// (maximum length 11 bytes: `"cel-gaulish"`).
@@ -927,7 +931,10 @@ struct CdtStream<'a> {
     pos: usize,
     depth: usize,
     ends: [usize; MAX_QUOTED_CDT_DEPTH],
-    steps: u32,
+    steps: u64,
+    fallback_steps: u64,
+    fallback_limit: u64,
+    in_fallback: bool,
 }
 
 impl<'a> CdtStream<'a> {
@@ -938,7 +945,19 @@ impl<'a> CdtStream<'a> {
             depth: 0,
             ends: [0; MAX_QUOTED_CDT_DEPTH],
             steps: 0,
+            fallback_steps: 0,
+            fallback_limit: u64::MAX,
+            in_fallback: false,
         }
+    }
+
+    #[inline]
+    fn reset_fallback_budget(&mut self, level_len: usize) {
+        self.fallback_steps = 0;
+        self.fallback_limit = (level_len as u64)
+            .saturating_mul(ZERO_HEAP_FALLBACK_STEP_FACTOR)
+            .max(MIN_ZERO_HEAP_FALLBACK_STEPS);
+        self.in_fallback = false;
     }
 
     #[inline]
@@ -949,6 +968,14 @@ impl<'a> CdtStream<'a> {
         self.steps = self.steps.wrapping_add(1);
         if self.steps & 1023 == 0 {
             check()?;
+        }
+        if self.in_fallback {
+            self.fallback_steps = self.fallback_steps.saturating_add(1);
+            if self.fallback_steps > self.fallback_limit {
+                return Err(crate::error::Error::StorageFull(
+                    "composite literal validation exceeds memory budget".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1548,15 +1575,23 @@ impl PoolEntry {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MapKeyMode {
-    /// All keys seen so far in this map are indexed in `key_pool`/`key_buckets`.
+    /// Zero keys seen so far in this map; holds zero slots in `key_pool`.
+    Empty,
+    /// Exactly one key seen so far, stored inline in the frame (zero slots in
+    /// `key_pool` and zero heap allocation even when `key_pool` is full).
+    Single { start: usize, tag: u32 },
+    /// Two or more keys seen so far, all indexed in `key_pool`/`key_buckets`.
     Inline,
-    /// All keys seen so far in this map are indexed in the matching top
+    /// All keys seen so far in this map are indexed in the matching
     /// `overflow_tables` entry. This map holds zero slots in `key_pool`.
     WideTable,
-    /// Keys before `batch_start` (or all keys so far when `None`) are pairwise
-    /// distinct; keys from `batch_start` onward are buffered in `key_pool` and
-    /// checked against earlier entries when the batch flushes or the map closes.
-    BatchedFallback { batch_start: Option<usize> },
+    /// Tight-cap fallback where all earlier keys are already verified pairwise
+    /// distinct and no keys are currently buffered in `key_pool`.
+    BatchedFallbackEmpty,
+    /// Tight-cap fallback where keys before `batch_start` are pairwise distinct
+    /// and keys from `batch_start` onward are buffered in `key_pool` to be
+    /// checked against earlier entries when the batch flushes or closes.
+    BatchedFallback { batch_start: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -1573,9 +1608,277 @@ impl MapFrame {
         start: 0,
         key_base: 0,
         key_count: 0,
-        mode: MapKeyMode::Inline,
+        mode: MapKeyMode::Empty,
         mem_refused: false,
     };
+}
+
+/// Compact 16-byte representation of [`MapFrame`] for literals under 4 GiB,
+/// allowing paged overflow frames to grow in fixed 2 KiB increments without
+/// doubling spikes.
+#[derive(Clone, Copy)]
+struct CompactMapFrame {
+    start: u32,
+    extra: u32,
+    tag: u32,
+    meta: u32,
+}
+
+impl CompactMapFrame {
+    const EMPTY: Self = Self {
+        start: 0,
+        extra: 0,
+        tag: 0,
+        meta: 0,
+    };
+
+    #[inline]
+    fn from_frame(f: MapFrame) -> Self {
+        debug_assert!(f.key_base <= INLINE_MAP_KEY_POOL as u16);
+        debug_assert!(f.key_count <= INLINE_MAP_KEY_POOL as u16);
+        let (mode_bits, extra, tag) = match f.mode {
+            MapKeyMode::Empty => (0u32, 0u32, 0u32),
+            MapKeyMode::Single { start, tag } => (1u32, start as u32, tag),
+            MapKeyMode::Inline => (2u32, 0u32, 0u32),
+            MapKeyMode::WideTable => (3u32, 0u32, 0u32),
+            MapKeyMode::BatchedFallbackEmpty => (4u32, 0u32, 0u32),
+            MapKeyMode::BatchedFallback { batch_start } => (5u32, batch_start as u32, 0u32),
+        };
+        let meta = u32::from(f.key_base)
+            | (u32::from(f.key_count) << 10)
+            | (mode_bits << 20)
+            | (u32::from(f.mem_refused) << 23);
+        Self {
+            start: f.start as u32,
+            extra,
+            tag,
+            meta,
+        }
+    }
+
+    #[inline]
+    fn into_frame(self) -> MapFrame {
+        let key_base = (self.meta & 0x3ff) as u16;
+        let key_count = ((self.meta >> 10) & 0x3ff) as u16;
+        let mode = match (self.meta >> 20) & 0x7 {
+            0 => MapKeyMode::Empty,
+            1 => MapKeyMode::Single {
+                start: self.extra as usize,
+                tag: self.tag,
+            },
+            2 => MapKeyMode::Inline,
+            3 => MapKeyMode::WideTable,
+            4 => MapKeyMode::BatchedFallbackEmpty,
+            _ => MapKeyMode::BatchedFallback {
+                batch_start: self.extra as usize,
+            },
+        };
+        let mem_refused = ((self.meta >> 23) & 1) != 0;
+        MapFrame {
+            start: self.start as usize,
+            key_base,
+            key_count,
+            mode,
+            mem_refused,
+        }
+    }
+}
+
+const OVERFLOW_BITS_PAGE_WORDS: usize = 128;
+const OVERFLOW_MAP_PAGE_SMALL: usize = 128;
+const OVERFLOW_MAP_PAGE_LARGE: usize = 64;
+
+// Pages are boxed individually so growing the page directory reallocates only
+// 8-byte pointers instead of doubling the full 2 KiB page buffers.
+#[allow(clippy::vec_box)]
+enum OverflowMapPages {
+    Empty,
+    Small {
+        pages: Vec<Box<[CompactMapFrame; OVERFLOW_MAP_PAGE_SMALL]>>,
+        vec_bytes: u64,
+        len: usize,
+    },
+    Large {
+        pages: Vec<Box<[MapFrame; OVERFLOW_MAP_PAGE_LARGE]>>,
+        vec_bytes: u64,
+        len: usize,
+    },
+}
+
+impl OverflowMapPages {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Small { len, .. } | Self::Large { len, .. } => *len,
+        }
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> MapFrame {
+        match self {
+            Self::Empty => unreachable!("overflow map pages empty"),
+            Self::Small { pages, .. } => {
+                pages[idx / OVERFLOW_MAP_PAGE_SMALL][idx % OVERFLOW_MAP_PAGE_SMALL].into_frame()
+            }
+            Self::Large { pages, .. } => {
+                pages[idx / OVERFLOW_MAP_PAGE_LARGE][idx % OVERFLOW_MAP_PAGE_LARGE]
+            }
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, idx: usize, frame: MapFrame) {
+        match self {
+            Self::Empty => unreachable!("overflow map pages empty"),
+            Self::Small { pages, .. } => {
+                pages[idx / OVERFLOW_MAP_PAGE_SMALL][idx % OVERFLOW_MAP_PAGE_SMALL] =
+                    CompactMapFrame::from_frame(frame);
+            }
+            Self::Large { pages, .. } => {
+                pages[idx / OVERFLOW_MAP_PAGE_LARGE][idx % OVERFLOW_MAP_PAGE_LARGE] = frame;
+            }
+        }
+    }
+
+    #[inline]
+    fn pop(&mut self) {
+        match self {
+            Self::Empty => debug_assert!(false, "pop on empty overflow map pages"),
+            Self::Small { len, .. } | Self::Large { len, .. } => {
+                debug_assert!(*len > 0);
+                *len -= 1;
+            }
+        }
+    }
+
+    fn try_push(
+        &mut self,
+        frame: MapFrame,
+        large: bool,
+        active_heap: &mut u64,
+        total_bytes: &mut u64,
+        allow_mem: &mut dyn FnMut(u64) -> bool,
+    ) -> bool {
+        if matches!(self, Self::Empty) {
+            *self = if large {
+                Self::Large {
+                    pages: Vec::new(),
+                    vec_bytes: 0,
+                    len: 0,
+                }
+            } else {
+                Self::Small {
+                    pages: Vec::new(),
+                    vec_bytes: 0,
+                    len: 0,
+                }
+            };
+        }
+        match self {
+            Self::Empty => unreachable!(),
+            Self::Small {
+                pages,
+                vec_bytes,
+                len,
+            } => {
+                let page_idx = *len / OVERFLOW_MAP_PAGE_SMALL;
+                if page_idx == pages.len() {
+                    let page_bytes =
+                        std::mem::size_of::<[CompactMapFrame; OVERFLOW_MAP_PAGE_SMALL]>() as u64;
+                    let elem =
+                        std::mem::size_of::<Box<[CompactMapFrame; OVERFLOW_MAP_PAGE_SMALL]>>()
+                            as u64;
+                    if pages.len() == pages.capacity() {
+                        let old_cap = pages.capacity();
+                        let Some(new_cap) = (if old_cap == 0 {
+                            Some(8)
+                        } else {
+                            old_cap.checked_mul(2)
+                        }) else {
+                            return false;
+                        };
+                        let Some(new_vec_bytes) = (new_cap as u64).checked_mul(elem) else {
+                            return false;
+                        };
+                        if !allow_mem(
+                            active_heap
+                                .saturating_add(new_vec_bytes)
+                                .saturating_add(page_bytes),
+                        ) {
+                            return false;
+                        }
+                        pages.reserve_exact(new_cap - pages.len());
+                        *active_heap = active_heap
+                            .saturating_sub(*vec_bytes)
+                            .saturating_add(new_vec_bytes);
+                        *total_bytes = total_bytes
+                            .saturating_sub(*vec_bytes)
+                            .saturating_add(new_vec_bytes);
+                        *vec_bytes = new_vec_bytes;
+                    } else if !allow_mem(active_heap.saturating_add(page_bytes)) {
+                        return false;
+                    }
+                    pages.push(Box::new([CompactMapFrame::EMPTY; OVERFLOW_MAP_PAGE_SMALL]));
+                    *active_heap = active_heap.saturating_add(page_bytes);
+                    *total_bytes = total_bytes.saturating_add(page_bytes);
+                }
+                pages[page_idx][*len % OVERFLOW_MAP_PAGE_SMALL] =
+                    CompactMapFrame::from_frame(frame);
+                *len += 1;
+                true
+            }
+            Self::Large {
+                pages,
+                vec_bytes,
+                len,
+            } => {
+                let page_idx = *len / OVERFLOW_MAP_PAGE_LARGE;
+                if page_idx == pages.len() {
+                    let page_bytes =
+                        std::mem::size_of::<[MapFrame; OVERFLOW_MAP_PAGE_LARGE]>() as u64;
+                    let elem =
+                        std::mem::size_of::<Box<[MapFrame; OVERFLOW_MAP_PAGE_LARGE]>>() as u64;
+                    if pages.len() == pages.capacity() {
+                        let old_cap = pages.capacity();
+                        let Some(new_cap) = (if old_cap == 0 {
+                            Some(8)
+                        } else {
+                            old_cap.checked_mul(2)
+                        }) else {
+                            return false;
+                        };
+                        let Some(new_vec_bytes) = (new_cap as u64).checked_mul(elem) else {
+                            return false;
+                        };
+                        if !allow_mem(
+                            active_heap
+                                .saturating_add(new_vec_bytes)
+                                .saturating_add(page_bytes),
+                        ) {
+                            return false;
+                        }
+                        pages.reserve_exact(new_cap - pages.len());
+                        *active_heap = active_heap
+                            .saturating_sub(*vec_bytes)
+                            .saturating_add(new_vec_bytes);
+                        *total_bytes = total_bytes
+                            .saturating_sub(*vec_bytes)
+                            .saturating_add(new_vec_bytes);
+                        *vec_bytes = new_vec_bytes;
+                    } else if !allow_mem(active_heap.saturating_add(page_bytes)) {
+                        return false;
+                    }
+                    pages.push(Box::new([MapFrame::EMPTY; OVERFLOW_MAP_PAGE_LARGE]));
+                    *active_heap = active_heap.saturating_add(page_bytes);
+                    *total_bytes = total_bytes.saturating_add(page_bytes);
+                }
+                pages[page_idx][*len % OVERFLOW_MAP_PAGE_LARGE] = frame;
+                *len += 1;
+                true
+            }
+        }
+    }
 }
 
 enum WideSlots {
@@ -1589,6 +1892,8 @@ struct WideKeySet {
 }
 
 impl WideKeySet {
+    const MIN_CAPACITY: usize = 4;
+
     fn bytes_for(cap: usize, large: bool) -> u64 {
         let elem = if large {
             std::mem::size_of::<(u64, usize)>()
@@ -1604,7 +1909,7 @@ impl WideKeySet {
         active_heap: &mut u64,
         allow_mem: &mut dyn FnMut(u64) -> bool,
     ) -> Option<Self> {
-        let cap = cap.next_power_of_two().max(1024);
+        let cap = cap.checked_next_power_of_two()?.max(Self::MIN_CAPACITY);
         let bytes = Self::bytes_for(cap, large);
         if !allow_mem(active_heap.saturating_add(bytes)) {
             return None;
@@ -1697,27 +2002,31 @@ impl WideKeySet {
 
     fn grow_preflighted(
         &mut self,
+        stream: &mut CdtStream<'_>,
         active_heap: &mut u64,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
         allow_mem: &mut dyn FnMut(u64) -> bool,
-    ) -> bool {
+    ) -> crate::error::Result<bool> {
         let old_cap = self.capacity();
         let Some(new_cap) = old_cap.checked_mul(2) else {
-            return false;
+            return Ok(false);
         };
         let old_bytes = self.bytes();
         let new_bytes = Self::bytes_for(new_cap, self.is_large());
         // Account for old and new buffers live simultaneously during rehash.
         if !allow_mem(active_heap.saturating_add(new_bytes)) {
-            return false;
+            return Ok(false);
         }
         let new_mask = new_cap - 1;
         match &mut self.slots {
             WideSlots::Small(old) => {
                 let mut next = vec![(0u32, 0u32); new_cap];
                 for &(tag, pos1) in old.iter() {
+                    stream.tick(check)?;
                     if pos1 != 0 {
                         let mut idx = (tag as usize) & new_mask;
                         while next[idx].1 != 0 {
+                            stream.tick(check)?;
                             idx = (idx + 1) & new_mask;
                         }
                         next[idx] = (tag, pos1);
@@ -1728,9 +2037,11 @@ impl WideKeySet {
             WideSlots::Large(old) => {
                 let mut next = vec![(0u64, 0usize); new_cap];
                 for &(hash, pos1) in old.iter() {
+                    stream.tick(check)?;
                     if pos1 != 0 {
                         let mut idx = (mix_tag(hash) as usize) & new_mask;
                         while next[idx].1 != 0 {
+                            stream.tick(check)?;
                             idx = (idx + 1) & new_mask;
                         }
                         next[idx] = (hash, pos1);
@@ -1742,15 +2053,24 @@ impl WideKeySet {
         *active_heap = active_heap
             .saturating_sub(old_bytes)
             .saturating_add(new_bytes);
-        true
+        Ok(true)
     }
 
-    fn insert_unique(&mut self, hash: u64, tag: u32, pos: usize) {
+    fn insert_unique(
+        &mut self,
+        stream: &mut CdtStream<'_>,
+        hash: u64,
+        tag: u32,
+        pos: usize,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        stream.tick(check)?;
         match &mut self.slots {
             WideSlots::Small(slots) => {
                 let mask = slots.len() - 1;
                 let mut idx = (tag as usize) & mask;
                 while slots[idx].1 != 0 {
+                    stream.tick(check)?;
                     idx = (idx + 1) & mask;
                 }
                 slots[idx] = (tag, (pos as u32) + 1);
@@ -1759,12 +2079,14 @@ impl WideKeySet {
                 let mask = slots.len() - 1;
                 let mut idx = (tag as usize) & mask;
                 while slots[idx].1 != 0 {
+                    stream.tick(check)?;
                     idx = (idx + 1) & mask;
                 }
                 slots[idx] = (hash, pos + 1);
             }
         }
         self.len += 1;
+        Ok(())
     }
 }
 
@@ -1773,13 +2095,6 @@ struct MapKeyEntry {
     start: usize,
     hash: u64,
     tag: u32,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FallbackScan {
-    NoDuplicate,
-    Duplicate,
-    BudgetExceeded,
 }
 
 fn skip_map_entry_value(
@@ -1819,49 +2134,58 @@ fn skip_map_entry_value(
     Ok(true)
 }
 
+/// Returns `Ok(true)` if no duplicate was found before `cur.start`, `Ok(false)`
+/// on duplicate, or `Err(StorageFull | Cancelled)` if bounded fallback or
+/// cancellation triggers.
 fn scan_single_against_prior(
     stream: &mut CdtStream<'_>,
     map_start: usize,
     cur_key: KeyKind,
     cur: MapKeyEntry,
-    fallback_visits: &mut usize,
     check: &mut dyn FnMut() -> crate::error::Result<()>,
-) -> crate::error::Result<FallbackScan> {
+) -> crate::error::Result<bool> {
     let saved = stream.pos;
+    let prev_fallback = std::mem::replace(&mut stream.in_fallback, true);
     stream.pos = map_start;
     let res = (|| {
         loop {
             stream.skip_ws(check)?;
             if stream.pos >= cur.start {
-                return Ok(FallbackScan::NoDuplicate);
+                return Ok(true);
             }
             stream.tick(check)?;
-            *fallback_visits = fallback_visits.saturating_add(1);
-            if *fallback_visits > MAX_ZERO_HEAP_MAP_RESCAN_VISITS {
-                return Ok(FallbackScan::BudgetExceeded);
-            }
             let Some(prev_key) = stream.eat_map_key(false, check)? else {
-                return Ok(FallbackScan::NoDuplicate);
+                return Ok(true);
             };
             if hash_map_key(stream, prev_key, check)? == cur.hash
                 && map_keys_equal(stream, prev_key, cur_key, check)?
             {
-                return Ok(FallbackScan::Duplicate);
+                return Ok(false);
             }
             if !skip_map_entry_value(stream, check)? {
-                return Ok(FallbackScan::NoDuplicate);
+                return Ok(true);
             }
         }
     })();
+    stream.in_fallback = prev_fallback;
     stream.pos = saved;
     res
 }
 
 struct ContainerStack {
     bits: [u64; CONTAINER_WINDOW_WORDS],
+    // Pages are boxed individually so growing the page directory reallocates
+    // only 8-byte pointers instead of doubling the full 1 KiB bit pages.
+    #[allow(clippy::vec_box)]
+    overflow_bits_pages: Vec<Box<[u64; OVERFLOW_BITS_PAGE_WORDS]>>,
+    overflow_bits_vec_bytes: u64,
+    overflow_bits_bytes: u64,
+    overflow_bits_len: usize,
     bits_base: usize,
     depth: usize,
     map_frames: [MapFrame; INLINE_MAP_FRAMES],
+    overflow_map_frames: OverflowMapPages,
+    overflow_map_frames_bytes: u64,
     map_frame_base: usize,
     map_depth: usize,
     key_pool: [PoolEntry; INLINE_MAP_KEY_POOL],
@@ -1870,16 +2194,21 @@ struct ContainerStack {
     overflow_tables: Vec<(usize, WideKeySet)>,
     overflow_tables_vec_bytes: u64,
     active_heap_bytes: u64,
-    fallback_visits: usize,
 }
 
 impl ContainerStack {
     fn new() -> Self {
         Self {
             bits: [0; CONTAINER_WINDOW_WORDS],
+            overflow_bits_pages: Vec::new(),
+            overflow_bits_vec_bytes: 0,
+            overflow_bits_bytes: 0,
+            overflow_bits_len: 0,
             bits_base: 0,
             depth: 0,
             map_frames: [MapFrame::EMPTY; INLINE_MAP_FRAMES],
+            overflow_map_frames: OverflowMapPages::Empty,
+            overflow_map_frames_bytes: 0,
             map_frame_base: 0,
             map_depth: 0,
             key_pool: [PoolEntry::EMPTY; INLINE_MAP_KEY_POOL],
@@ -1888,7 +2217,6 @@ impl ContainerStack {
             overflow_tables: Vec::new(),
             overflow_tables_vec_bytes: 0,
             active_heap_bytes: 0,
-            fallback_visits: 0,
         }
     }
 
@@ -1898,13 +2226,172 @@ impl ContainerStack {
     }
 
     #[inline]
-    fn top_is_map(&self) -> bool {
-        let rel = (self.depth - 1) - self.bits_base;
-        (self.bits[rel / 64] >> (rel % 64)) & 1 != 0
+    fn overflow_bit_word(&self, word_idx: usize) -> u64 {
+        self.overflow_bits_pages[word_idx / OVERFLOW_BITS_PAGE_WORDS]
+            [word_idx % OVERFLOW_BITS_PAGE_WORDS]
     }
 
-    fn push_bit(&mut self, is_map: bool) {
-        if self.depth == self.bits_base + CONTAINER_WINDOW_BITS {
+    #[inline]
+    fn overflow_bit_word_mut(&mut self, word_idx: usize) -> &mut u64 {
+        &mut self.overflow_bits_pages[word_idx / OVERFLOW_BITS_PAGE_WORDS]
+            [word_idx % OVERFLOW_BITS_PAGE_WORDS]
+    }
+
+    #[inline]
+    fn top_is_map(&self) -> bool {
+        let d = self.depth - 1;
+        if self.bits_base == 0 {
+            if d < CONTAINER_WINDOW_BITS {
+                (self.bits[d / 64] >> (d % 64)) & 1 != 0
+            } else {
+                let r = d - CONTAINER_WINDOW_BITS;
+                (self.overflow_bit_word(r / 64) >> (r % 64)) & 1 != 0
+            }
+        } else {
+            let rel = d - self.bits_base;
+            (self.bits[rel / 64] >> (rel % 64)) & 1 != 0
+        }
+    }
+
+    #[inline]
+    fn top_map_frame(&self) -> MapFrame {
+        let idx = self.map_depth - 1;
+        if self.map_frame_base == 0 {
+            if idx < INLINE_MAP_FRAMES {
+                self.map_frames[idx]
+            } else {
+                self.overflow_map_frames.get(idx - INLINE_MAP_FRAMES)
+            }
+        } else {
+            self.map_frames[idx - self.map_frame_base]
+        }
+    }
+
+    #[inline]
+    fn set_top_map_frame(&mut self, frame: MapFrame) {
+        let idx = self.map_depth - 1;
+        if self.map_frame_base == 0 {
+            if idx < INLINE_MAP_FRAMES {
+                self.map_frames[idx] = frame;
+            } else {
+                self.overflow_map_frames.set(idx - INLINE_MAP_FRAMES, frame);
+            }
+        } else {
+            self.map_frames[idx - self.map_frame_base] = frame;
+        }
+    }
+
+    #[inline]
+    fn update_top_map_frame(&mut self, f: impl FnOnce(&mut MapFrame)) {
+        let mut frame = self.top_map_frame();
+        f(&mut frame);
+        self.set_top_map_frame(frame);
+    }
+
+    fn shift_bits_from_spill(&mut self) {
+        let ov_len = self.overflow_bits_len;
+        debug_assert_eq!(self.depth, CONTAINER_WINDOW_BITS + ov_len * 64);
+        if ov_len >= CONTAINER_WINDOW_HALF_WORDS {
+            let start = ov_len - CONTAINER_WINDOW_HALF_WORDS;
+            for i in 0..CONTAINER_WINDOW_HALF_WORDS {
+                self.bits[i] = self.overflow_bit_word(start + i);
+            }
+        } else {
+            let from_bits = CONTAINER_WINDOW_HALF_WORDS - ov_len;
+            let bits_start = CONTAINER_WINDOW_WORDS - from_bits;
+            self.bits.copy_within(bits_start..CONTAINER_WINDOW_WORDS, 0);
+            for i in 0..ov_len {
+                self.bits[from_bits + i] = self.overflow_bit_word(i);
+            }
+        }
+        self.bits[CONTAINER_WINDOW_HALF_WORDS..].fill(0);
+        self.bits_base = self.depth - CONTAINER_WINDOW_HALF_BITS;
+        self.active_heap_bytes = self
+            .active_heap_bytes
+            .saturating_sub(self.overflow_bits_bytes);
+        self.overflow_bits_pages = Vec::new();
+        self.overflow_bits_vec_bytes = 0;
+        self.overflow_bits_bytes = 0;
+        self.overflow_bits_len = 0;
+    }
+
+    fn try_grow_overflow_bits(&mut self, allow_mem: &mut dyn FnMut(u64) -> bool) -> bool {
+        let page_idx = self.overflow_bits_len / OVERFLOW_BITS_PAGE_WORDS;
+        if page_idx < self.overflow_bits_pages.len() {
+            return true;
+        }
+        let page_bytes = std::mem::size_of::<[u64; OVERFLOW_BITS_PAGE_WORDS]>() as u64;
+        let elem = std::mem::size_of::<Box<[u64; OVERFLOW_BITS_PAGE_WORDS]>>() as u64;
+        if self.overflow_bits_pages.len() == self.overflow_bits_pages.capacity() {
+            let old_cap = self.overflow_bits_pages.capacity();
+            let Some(new_cap) = (if old_cap == 0 {
+                Some(8)
+            } else {
+                old_cap.checked_mul(2)
+            }) else {
+                return false;
+            };
+            let Some(new_vec_bytes) = (new_cap as u64).checked_mul(elem) else {
+                return false;
+            };
+            if !allow_mem(
+                self.active_heap_bytes
+                    .saturating_add(new_vec_bytes)
+                    .saturating_add(page_bytes),
+            ) {
+                return false;
+            }
+            self.overflow_bits_pages
+                .reserve_exact(new_cap - self.overflow_bits_pages.len());
+            self.active_heap_bytes = self
+                .active_heap_bytes
+                .saturating_sub(self.overflow_bits_vec_bytes)
+                .saturating_add(new_vec_bytes);
+            self.overflow_bits_bytes = self
+                .overflow_bits_bytes
+                .saturating_sub(self.overflow_bits_vec_bytes)
+                .saturating_add(new_vec_bytes);
+            self.overflow_bits_vec_bytes = new_vec_bytes;
+        } else if !allow_mem(self.active_heap_bytes.saturating_add(page_bytes)) {
+            return false;
+        }
+        self.overflow_bits_pages
+            .push(Box::new([0u64; OVERFLOW_BITS_PAGE_WORDS]));
+        self.active_heap_bytes = self.active_heap_bytes.saturating_add(page_bytes);
+        self.overflow_bits_bytes = self.overflow_bits_bytes.saturating_add(page_bytes);
+        true
+    }
+
+    fn push_bit(&mut self, is_map: bool, allow_mem: &mut dyn FnMut(u64) -> bool) {
+        if self.bits_base == 0 {
+            if self.depth < CONTAINER_WINDOW_BITS {
+                let d = self.depth;
+                if is_map {
+                    self.bits[d / 64] |= 1u64 << (d % 64);
+                } else {
+                    self.bits[d / 64] &= !(1u64 << (d % 64));
+                }
+                self.depth += 1;
+                return;
+            }
+            let r = self.depth - CONTAINER_WINDOW_BITS;
+            let word_idx = r / 64;
+            if word_idx < self.overflow_bits_len || self.try_grow_overflow_bits(allow_mem) {
+                if word_idx == self.overflow_bits_len {
+                    *self.overflow_bit_word_mut(word_idx) = 0;
+                    self.overflow_bits_len += 1;
+                }
+                let word = self.overflow_bit_word_mut(word_idx);
+                if is_map {
+                    *word |= 1u64 << (r % 64);
+                } else {
+                    *word &= !(1u64 << (r % 64));
+                }
+                self.depth += 1;
+                return;
+            }
+            self.shift_bits_from_spill();
+        } else if self.depth == self.bits_base + CONTAINER_WINDOW_BITS {
             self.bits.copy_within(CONTAINER_WINDOW_HALF_WORDS.., 0);
             self.bits[CONTAINER_WINDOW_HALF_WORDS..].fill(0);
             self.bits_base += CONTAINER_WINDOW_HALF_BITS;
@@ -1918,8 +2405,8 @@ impl ContainerStack {
         self.depth += 1;
     }
 
-    fn push_list(&mut self) {
-        self.push_bit(false);
+    fn push_list(&mut self, allow_mem: &mut dyn FnMut(u64) -> bool) {
+        self.push_bit(false, allow_mem);
     }
 
     fn push_pool_entry(&mut self, tag: u32, start: usize) {
@@ -1985,13 +2472,17 @@ impl ContainerStack {
             return allow_mem(self.active_heap_bytes.saturating_add(extra_bytes));
         }
         let old_cap = self.overflow_tables.capacity();
-        let new_cap = if old_cap == 0 {
-            4
+        let Some(new_cap) = (if old_cap == 0 {
+            Some(4)
         } else {
-            old_cap.saturating_mul(2)
+            old_cap.checked_mul(2)
+        }) else {
+            return false;
         };
         let elem = std::mem::size_of::<(usize, WideKeySet)>() as u64;
-        let new_bytes = (new_cap as u64).saturating_mul(elem);
+        let Some(new_bytes) = (new_cap as u64).checked_mul(elem) else {
+            return false;
+        };
         if !allow_mem(
             self.active_heap_bytes
                 .saturating_add(new_bytes)
@@ -2009,6 +2500,9 @@ impl ContainerStack {
         true
     }
 
+    /// Returns `Ok(true)` if no duplicate was found between `[map_start, batch_start)`
+    /// and the buffered batch in `key_pool[frame_key_base..]`, `Ok(false)` on duplicate,
+    /// or `Err(StorageFull | Cancelled)` on budget or cancellation.
     fn scan_batch_against_prior(
         &mut self,
         stream: &mut CdtStream<'_>,
@@ -2016,27 +2510,25 @@ impl ContainerStack {
         batch_start: usize,
         frame_key_base: usize,
         check: &mut dyn FnMut() -> crate::error::Result<()>,
-    ) -> crate::error::Result<FallbackScan> {
+    ) -> crate::error::Result<bool> {
         let saved = stream.pos;
+        let prev_fallback = std::mem::replace(&mut stream.in_fallback, true);
         stream.pos = map_start;
         let res = (|| {
             loop {
                 stream.skip_ws(check)?;
                 if stream.pos >= batch_start {
-                    return Ok(FallbackScan::NoDuplicate);
+                    return Ok(true);
                 }
                 stream.tick(check)?;
-                self.fallback_visits = self.fallback_visits.saturating_add(1);
-                if self.fallback_visits > MAX_ZERO_HEAP_MAP_RESCAN_VISITS {
-                    return Ok(FallbackScan::BudgetExceeded);
-                }
                 let Some(prev_key) = stream.eat_map_key(false, check)? else {
-                    return Ok(FallbackScan::NoDuplicate);
+                    return Ok(true);
                 };
                 let prev_hash = hash_map_key(stream, prev_key, check)?;
                 let prev_tag = mix_tag(prev_hash);
                 let mut cur = self.key_buckets[(prev_tag as usize) & (INLINE_MAP_KEY_BUCKETS - 1)];
                 while cur != 0 {
+                    stream.tick(check)?;
                     let idx = (cur - 1) as usize;
                     if idx < frame_key_base {
                         break;
@@ -2050,18 +2542,100 @@ impl ContainerStack {
                         if let Some(batch_key) = batch_key?
                             && map_keys_equal(stream, prev_key, batch_key, check)?
                         {
-                            return Ok(FallbackScan::Duplicate);
+                            return Ok(false);
                         }
                     }
                     cur = entry.next;
                 }
                 if !skip_map_entry_value(stream, check)? {
-                    return Ok(FallbackScan::NoDuplicate);
+                    return Ok(true);
                 }
             }
         })();
+        stream.in_fallback = prev_fallback;
         stream.pos = saved;
         res
+    }
+
+    fn flush_and_clear_pool_frame(
+        &mut self,
+        frame: MapFrame,
+        stream: &mut CdtStream<'_>,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<bool> {
+        match frame.mode {
+            MapKeyMode::BatchedFallback { batch_start } => {
+                if !self.scan_batch_against_prior(
+                    stream,
+                    frame.start,
+                    batch_start,
+                    frame.key_base as usize,
+                    check,
+                )? {
+                    return Ok(false);
+                }
+                self.pop_pool_to(frame.key_base as usize);
+            }
+            MapKeyMode::Inline => {
+                self.pop_pool_to(frame.key_base as usize);
+            }
+            MapKeyMode::Empty
+            | MapKeyMode::Single { .. }
+            | MapKeyMode::WideTable
+            | MapKeyMode::BatchedFallbackEmpty => {}
+        }
+        Ok(true)
+    }
+
+    fn shift_map_frames_from_spill(
+        &mut self,
+        stream: &mut CdtStream<'_>,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<bool> {
+        let ov_len = self.overflow_map_frames.len();
+        debug_assert_eq!(self.map_depth, INLINE_MAP_FRAMES + ov_len);
+        for d in (0..self.map_depth).rev() {
+            let frame = if d < INLINE_MAP_FRAMES {
+                self.map_frames[d]
+            } else {
+                self.overflow_map_frames.get(d - INLINE_MAP_FRAMES)
+            };
+            if !self.flush_and_clear_pool_frame(frame, stream, check)? {
+                return Ok(false);
+            }
+        }
+        debug_assert_eq!(self.key_pool_len, 0);
+        if ov_len >= INLINE_MAP_FRAMES_HALF {
+            let start = ov_len - INLINE_MAP_FRAMES_HALF;
+            for i in 0..INLINE_MAP_FRAMES_HALF {
+                self.map_frames[i] = self.overflow_map_frames.get(start + i);
+            }
+        } else {
+            let from_inline = INLINE_MAP_FRAMES_HALF - ov_len;
+            let inline_start = INLINE_MAP_FRAMES - from_inline;
+            self.map_frames
+                .copy_within(inline_start..INLINE_MAP_FRAMES, 0);
+            for i in 0..ov_len {
+                self.map_frames[from_inline + i] = self.overflow_map_frames.get(i);
+            }
+        }
+        for frame in &mut self.map_frames[..INLINE_MAP_FRAMES_HALF] {
+            frame.key_base = 0;
+            frame.key_count = 0;
+            if matches!(
+                frame.mode,
+                MapKeyMode::Inline | MapKeyMode::BatchedFallback { .. }
+            ) {
+                frame.mode = MapKeyMode::BatchedFallbackEmpty;
+            }
+        }
+        self.active_heap_bytes = self
+            .active_heap_bytes
+            .saturating_sub(self.overflow_map_frames_bytes);
+        self.overflow_map_frames = OverflowMapPages::Empty;
+        self.overflow_map_frames_bytes = 0;
+        self.map_frame_base = self.map_depth - INLINE_MAP_FRAMES_HALF;
+        Ok(true)
     }
 
     fn shift_map_frames(
@@ -2073,36 +2647,20 @@ impl ContainerStack {
         // so the LIFO key_buckets chains stay exact while clearing key_pool.
         for i in (0..INLINE_MAP_FRAMES).rev() {
             let frame = self.map_frames[i];
-            if let MapKeyMode::BatchedFallback {
-                batch_start: Some(b_start),
-            } = frame.mode
-            {
-                match self.scan_batch_against_prior(
-                    stream,
-                    frame.start,
-                    b_start,
-                    frame.key_base as usize,
-                    check,
-                )? {
-                    FallbackScan::NoDuplicate => {}
-                    FallbackScan::Duplicate => return Ok(false),
-                    FallbackScan::BudgetExceeded => {
-                        return Err(crate::error::Error::StorageFull(
-                            "composite literal duplicate-key validation exceeds memory budget"
-                                .into(),
-                        ));
-                    }
-                }
+            if !self.flush_and_clear_pool_frame(frame, stream, check)? {
+                return Ok(false);
             }
-            self.pop_pool_to(frame.key_base as usize);
         }
         debug_assert_eq!(self.key_pool_len, 0);
         self.map_frames.copy_within(INLINE_MAP_FRAMES_HALF.., 0);
         for frame in &mut self.map_frames[..INLINE_MAP_FRAMES_HALF] {
             frame.key_base = 0;
             frame.key_count = 0;
-            if frame.mode != MapKeyMode::WideTable {
-                frame.mode = MapKeyMode::BatchedFallback { batch_start: None };
+            if matches!(
+                frame.mode,
+                MapKeyMode::Inline | MapKeyMode::BatchedFallback { .. }
+            ) {
+                frame.mode = MapKeyMode::BatchedFallbackEmpty;
             }
         }
         self.map_frame_base += INLINE_MAP_FRAMES_HALF;
@@ -2114,20 +2672,45 @@ impl ContainerStack {
         start: usize,
         stream: &mut CdtStream<'_>,
         check: &mut dyn FnMut() -> crate::error::Result<()>,
+        allow_mem: &mut dyn FnMut(u64) -> bool,
     ) -> crate::error::Result<bool> {
-        self.push_bit(true);
-        if self.map_depth == self.map_frame_base + INLINE_MAP_FRAMES
+        self.push_bit(true, allow_mem);
+        let new_frame = MapFrame {
+            start,
+            key_base: self.key_pool_len as u16,
+            key_count: 0,
+            mode: MapKeyMode::Empty,
+            mem_refused: false,
+        };
+        if self.map_frame_base == 0 {
+            if self.map_depth < INLINE_MAP_FRAMES {
+                self.map_frames[self.map_depth] = new_frame;
+                self.map_depth += 1;
+                return Ok(true);
+            }
+            let large = stream.s.len() >= u32::MAX as usize;
+            if self.overflow_map_frames.try_push(
+                new_frame,
+                large,
+                &mut self.active_heap_bytes,
+                &mut self.overflow_map_frames_bytes,
+                allow_mem,
+            ) {
+                self.map_depth += 1;
+                return Ok(true);
+            }
+            if !self.shift_map_frames_from_spill(stream, check)? {
+                return Ok(false);
+            }
+        } else if self.map_depth == self.map_frame_base + INLINE_MAP_FRAMES
             && !self.shift_map_frames(stream, check)?
         {
             return Ok(false);
         }
         let rel = self.map_depth - self.map_frame_base;
         self.map_frames[rel] = MapFrame {
-            start,
             key_base: self.key_pool_len as u16,
-            key_count: 0,
-            mode: MapKeyMode::Inline,
-            mem_refused: false,
+            ..new_frame
         };
         self.map_depth += 1;
         Ok(true)
@@ -2144,6 +2727,7 @@ impl ContainerStack {
         let window_end = new_base + CONTAINER_WINDOW_BITS;
         self.bits.fill(0);
         let saved = stream.pos;
+        let prev_fallback = std::mem::replace(&mut stream.in_fallback, true);
         stream.pos = level_start;
         let res: crate::error::Result<()> = (|| {
             let mut d = 0usize;
@@ -2184,6 +2768,7 @@ impl ContainerStack {
             }
             Ok(())
         })();
+        stream.in_fallback = prev_fallback;
         stream.pos = saved;
         res?;
         self.bits_base = new_base;
@@ -2197,9 +2782,11 @@ impl ContainerStack {
         up_to: usize,
         check: &mut dyn FnMut() -> crate::error::Result<()>,
     ) -> crate::error::Result<()> {
+        debug_assert_eq!(self.key_pool_len, 0);
         let new_base = self.map_frame_base.saturating_sub(INLINE_MAP_FRAMES_HALF);
         let window_end = new_base + INLINE_MAP_FRAMES;
         let saved = stream.pos;
+        let prev_fallback = std::mem::replace(&mut stream.in_fallback, true);
         stream.pos = level_start;
         let res: crate::error::Result<()> = (|| {
             let mut m = 0usize;
@@ -2223,7 +2810,7 @@ impl ContainerStack {
                                 mode: if has_table {
                                     MapKeyMode::WideTable
                                 } else {
-                                    MapKeyMode::BatchedFallback { batch_start: None }
+                                    MapKeyMode::BatchedFallbackEmpty
                                 },
                                 mem_refused: false,
                             };
@@ -2247,6 +2834,7 @@ impl ContainerStack {
             }
             Ok(())
         })();
+        stream.in_fallback = prev_fallback;
         stream.pos = saved;
         res?;
         self.map_frame_base = new_base;
@@ -2261,7 +2849,7 @@ impl ContainerStack {
     ) -> crate::error::Result<()> {
         debug_assert!(!self.top_is_map());
         self.depth -= 1;
-        if self.depth > 0 && self.depth - 1 < self.bits_base {
+        if self.bits_base > 0 && self.depth > 0 && self.depth - 1 < self.bits_base {
             self.refill_bits(stream, level_start, stream.pos, check)?;
         }
         Ok(())
@@ -2274,9 +2862,9 @@ impl ContainerStack {
         check: &mut dyn FnMut() -> crate::error::Result<()>,
     ) -> crate::error::Result<bool> {
         debug_assert!(self.top_is_map());
-        let frame_idx = (self.map_depth - 1) - self.map_frame_base;
-        let frame = self.map_frames[frame_idx];
+        let frame = self.top_map_frame();
         match frame.mode {
+            MapKeyMode::Empty | MapKeyMode::Single { .. } | MapKeyMode::BatchedFallbackEmpty => {}
             MapKeyMode::Inline => {
                 self.pop_pool_to(frame.key_base as usize);
             }
@@ -2288,54 +2876,98 @@ impl ContainerStack {
                 debug_assert_eq!(d, self.map_depth);
                 self.active_heap_bytes = self.active_heap_bytes.saturating_sub(table.bytes());
                 drop(table);
-                self.pop_pool_to(frame.key_base as usize);
             }
             MapKeyMode::BatchedFallback { batch_start } => {
-                if let Some(b_start) = batch_start {
-                    match self.scan_batch_against_prior(
-                        stream,
-                        frame.start,
-                        b_start,
-                        frame.key_base as usize,
-                        check,
-                    )? {
-                        FallbackScan::NoDuplicate => {}
-                        FallbackScan::Duplicate => return Ok(false),
-                        FallbackScan::BudgetExceeded => {
-                            return Err(crate::error::Error::StorageFull(
-                                "composite literal duplicate-key validation exceeds memory budget"
-                                    .into(),
-                            ));
-                        }
-                    }
+                if !self.scan_batch_against_prior(
+                    stream,
+                    frame.start,
+                    batch_start,
+                    frame.key_base as usize,
+                    check,
+                )? {
+                    return Ok(false);
                 }
                 self.pop_pool_to(frame.key_base as usize);
             }
         }
+        if self.map_frame_base == 0 && self.map_depth > INLINE_MAP_FRAMES {
+            self.overflow_map_frames.pop();
+        }
         self.depth -= 1;
         self.map_depth -= 1;
-        if self.depth > 0 && self.depth - 1 < self.bits_base {
+        if self.bits_base > 0 && self.depth > 0 && self.depth - 1 < self.bits_base {
             self.refill_bits(stream, level_start, stream.pos, check)?;
         }
-        if self.map_depth > 0 && self.map_depth - 1 < self.map_frame_base {
+        if self.map_frame_base > 0 && self.map_depth > 0 && self.map_depth - 1 < self.map_frame_base
+        {
             self.refill_map_frames(stream, level_start, stream.pos, check)?;
         }
         Ok(true)
     }
 
-    fn try_promote_inline_to_wide(
+    fn try_promote_single_to_wide(
         &mut self,
-        frame_idx: usize,
+        first_start: usize,
+        first_tag: u32,
         stream: &mut CdtStream<'_>,
         cur: MapKeyEntry,
         check: &mut dyn FnMut() -> crate::error::Result<()>,
         allow_mem: &mut dyn FnMut(u64) -> bool,
     ) -> crate::error::Result<bool> {
-        let frame = self.map_frames[frame_idx];
+        let large = stream.s.len() >= u32::MAX as usize;
+        let init_cap = WideKeySet::MIN_CAPACITY;
+        let init_bytes = WideKeySet::bytes_for(init_cap, large);
+        if !self.ensure_overflow_tables_slot_with_extra(init_bytes, allow_mem) {
+            return Ok(false);
+        }
+        let Some(mut table) =
+            WideKeySet::new_preflighted(init_cap, large, &mut self.active_heap_bytes, allow_mem)
+        else {
+            return Ok(false);
+        };
+        let insert_res = (|| -> crate::error::Result<()> {
+            let first_hash = if large {
+                let saved = stream.pos;
+                stream.pos = first_start;
+                let prev_key = stream.eat_map_key(false, check);
+                stream.pos = saved;
+                if let Some(prev_key) = prev_key? {
+                    hash_map_key(stream, prev_key, check)?
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            table.insert_unique(stream, first_hash, first_tag, first_start, check)?;
+            table.insert_unique(stream, cur.hash, cur.tag, cur.start, check)?;
+            Ok(())
+        })();
+        if let Err(e) = insert_res {
+            self.active_heap_bytes = self.active_heap_bytes.saturating_sub(table.bytes());
+            drop(table);
+            return Err(e);
+        }
+        self.overflow_tables.push((self.map_depth, table));
+        self.update_top_map_frame(|frame| {
+            frame.mode = MapKeyMode::WideTable;
+            frame.key_count = 0;
+        });
+        Ok(true)
+    }
+
+    fn try_promote_inline_to_wide(
+        &mut self,
+        stream: &mut CdtStream<'_>,
+        cur: MapKeyEntry,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+        allow_mem: &mut dyn FnMut(u64) -> bool,
+    ) -> crate::error::Result<bool> {
+        let frame = self.top_map_frame();
         let large = stream.s.len() >= u32::MAX as usize;
         let init_cap = ((frame.key_count as usize + 1) * 4 / 3 + 1)
             .next_power_of_two()
-            .max(1024);
+            .max(WideKeySet::MIN_CAPACITY);
         let init_bytes = WideKeySet::bytes_for(init_cap, large);
         if !self.ensure_overflow_tables_slot_with_extra(init_bytes, allow_mem) {
             return Ok(false);
@@ -2347,28 +2979,38 @@ impl ContainerStack {
         };
         let start_i = frame.key_base as usize;
         let end_i = start_i + frame.key_count as usize;
-        for idx in start_i..end_i {
-            let entry = self.key_pool[idx];
-            let hash = if large {
-                let saved = stream.pos;
-                stream.pos = entry.start;
-                let prev_key = stream.eat_map_key(false, check);
-                stream.pos = saved;
-                if let Some(prev_key) = prev_key? {
-                    hash_map_key(stream, prev_key, check)?
+        let insert_res = (|| -> crate::error::Result<()> {
+            for idx in start_i..end_i {
+                let entry = self.key_pool[idx];
+                let hash = if large {
+                    let saved = stream.pos;
+                    stream.pos = entry.start;
+                    let prev_key = stream.eat_map_key(false, check);
+                    stream.pos = saved;
+                    if let Some(prev_key) = prev_key? {
+                        hash_map_key(stream, prev_key, check)?
+                    } else {
+                        0
+                    }
                 } else {
                     0
-                }
-            } else {
-                0
-            };
-            table.insert_unique(hash, entry.tag, entry.start);
+                };
+                table.insert_unique(stream, hash, entry.tag, entry.start, check)?;
+            }
+            table.insert_unique(stream, cur.hash, cur.tag, cur.start, check)?;
+            Ok(())
+        })();
+        if let Err(e) = insert_res {
+            self.active_heap_bytes = self.active_heap_bytes.saturating_sub(table.bytes());
+            drop(table);
+            return Err(e);
         }
-        table.insert_unique(cur.hash, cur.tag, cur.start);
         self.pop_pool_to(start_i);
         self.overflow_tables.push((self.map_depth, table));
-        self.map_frames[frame_idx].mode = MapKeyMode::WideTable;
-        self.map_frames[frame_idx].key_count = 0;
+        self.update_top_map_frame(|frame| {
+            frame.mode = MapKeyMode::WideTable;
+            frame.key_count = 0;
+        });
         Ok(true)
     }
 
@@ -2378,18 +3020,17 @@ impl ContainerStack {
     /// was found, and `Ok(None)` if `allow_mem` refused the table.
     fn try_promote_batched_to_wide(
         &mut self,
-        frame_idx: usize,
         stream: &mut CdtStream<'_>,
         prior_end: usize,
         cur: MapKeyEntry,
         check: &mut dyn FnMut() -> crate::error::Result<()>,
         allow_mem: &mut dyn FnMut(u64) -> bool,
     ) -> crate::error::Result<Option<bool>> {
-        let frame = self.map_frames[frame_idx];
+        let frame = self.top_map_frame();
         let large = stream.s.len() >= u32::MAX as usize;
         let init_cap = ((frame.key_count as usize + 1) * 4 / 3 + 1)
             .next_power_of_two()
-            .max(1024);
+            .max(WideKeySet::MIN_CAPACITY);
         let init_bytes = WideKeySet::bytes_for(init_cap, large);
         if !self.ensure_overflow_tables_slot_with_extra(init_bytes, allow_mem) {
             return Ok(None);
@@ -2401,28 +3042,29 @@ impl ContainerStack {
         };
         let start_i = frame.key_base as usize;
         let end_i = start_i + frame.key_count as usize;
-        for idx in start_i..end_i {
-            let entry = self.key_pool[idx];
-            let hash = if large {
-                let saved = stream.pos;
-                stream.pos = entry.start;
-                let prev_key = stream.eat_map_key(false, check);
-                stream.pos = saved;
-                if let Some(prev_key) = prev_key? {
-                    hash_map_key(stream, prev_key, check)?
+        let saved = stream.pos;
+        let prev_fallback = std::mem::replace(&mut stream.in_fallback, true);
+        let scan_res: crate::error::Result<Option<bool>> = (|| {
+            for idx in start_i..end_i {
+                let entry = self.key_pool[idx];
+                let hash = if large {
+                    let saved_inner = stream.pos;
+                    stream.pos = entry.start;
+                    let prev_key = stream.eat_map_key(false, check);
+                    stream.pos = saved_inner;
+                    if let Some(prev_key) = prev_key? {
+                        hash_map_key(stream, prev_key, check)?
+                    } else {
+                        0
+                    }
                 } else {
                     0
-                }
-            } else {
-                0
-            };
-            table.insert_unique(hash, entry.tag, entry.start);
-        }
-        table.insert_unique(cur.hash, cur.tag, cur.start);
+                };
+                table.insert_unique(stream, hash, entry.tag, entry.start, check)?;
+            }
+            table.insert_unique(stream, cur.hash, cur.tag, cur.start, check)?;
 
-        let saved = stream.pos;
-        stream.pos = frame.start;
-        let scan_res: crate::error::Result<Option<bool>> = (|| {
+            stream.pos = frame.start;
             loop {
                 stream.skip_ws(check)?;
                 if stream.pos >= prior_end {
@@ -2439,23 +3081,31 @@ impl ContainerStack {
                     return Ok(Some(false));
                 }
                 if table.needs_grow()
-                    && !table.grow_preflighted(&mut self.active_heap_bytes, allow_mem)
+                    && !table.grow_preflighted(
+                        stream,
+                        &mut self.active_heap_bytes,
+                        check,
+                        allow_mem,
+                    )?
                 {
                     return Ok(None);
                 }
-                table.insert_unique(prev_hash, prev_tag, prev_start);
+                table.insert_unique(stream, prev_hash, prev_tag, prev_start, check)?;
                 if !skip_map_entry_value(stream, check)? {
                     return Ok(Some(true));
                 }
             }
         })();
+        stream.in_fallback = prev_fallback;
         stream.pos = saved;
         match scan_res {
             Ok(Some(true)) => {
                 self.pop_pool_to(start_i);
                 self.overflow_tables.push((self.map_depth, table));
-                self.map_frames[frame_idx].mode = MapKeyMode::WideTable;
-                self.map_frames[frame_idx].key_count = 0;
+                self.update_top_map_frame(|frame| {
+                    frame.mode = MapKeyMode::WideTable;
+                    frame.key_count = 0;
+                });
                 Ok(Some(true))
             }
             Ok(Some(false)) => {
@@ -2492,27 +3142,84 @@ impl ContainerStack {
             hash: cur_hash,
             tag: mix_tag(cur_hash),
         };
-        let frame_idx = (self.map_depth - 1) - self.map_frame_base;
-        let frame = self.map_frames[frame_idx];
+        let frame = self.top_map_frame();
         match frame.mode {
+            MapKeyMode::Empty => {
+                self.update_top_map_frame(|frame| {
+                    frame.mode = MapKeyMode::Single {
+                        start: cur.start,
+                        tag: cur.tag,
+                    };
+                });
+                Ok(true)
+            }
+            MapKeyMode::Single {
+                start: first_start,
+                tag: first_tag,
+            } => {
+                if first_tag == cur.tag {
+                    let saved = stream.pos;
+                    stream.pos = first_start;
+                    let prev_key = stream.eat_map_key(false, check);
+                    stream.pos = saved;
+                    if let Some(prev_key) = prev_key?
+                        && map_keys_equal(stream, prev_key, key, check)?
+                    {
+                        return Ok(false);
+                    }
+                }
+                if self.key_pool_len + 2 <= INLINE_MAP_KEY_POOL {
+                    let base = self.key_pool_len as u16;
+                    self.push_pool_entry(first_tag, first_start);
+                    self.push_pool_entry(cur.tag, cur.start);
+                    self.update_top_map_frame(|frame| {
+                        frame.key_base = base;
+                        frame.key_count = 2;
+                        frame.mode = MapKeyMode::Inline;
+                    });
+                    return Ok(true);
+                }
+                if self.try_promote_single_to_wide(
+                    first_start,
+                    first_tag,
+                    stream,
+                    cur,
+                    check,
+                    allow_mem,
+                )? {
+                    return Ok(true);
+                }
+                // Tight memory cap refused WideTable; both keys are already
+                // verified distinct.
+                let base = self.key_pool_len as u16;
+                self.update_top_map_frame(|frame| {
+                    frame.key_base = base;
+                    frame.key_count = 0;
+                    frame.mem_refused = true;
+                    frame.mode = MapKeyMode::BatchedFallbackEmpty;
+                });
+                Ok(true)
+            }
             MapKeyMode::Inline => {
                 if self.pool_contains(stream, frame.key_base as usize, key, cur.tag, check)? {
                     return Ok(false);
                 }
                 if self.key_pool_len < INLINE_MAP_KEY_POOL {
                     self.push_pool_entry(cur.tag, cur.start);
-                    self.map_frames[frame_idx].key_count += 1;
+                    self.update_top_map_frame(|frame| frame.key_count += 1);
                     return Ok(true);
                 }
-                if self.try_promote_inline_to_wide(frame_idx, stream, cur, check, allow_mem)? {
+                if self.try_promote_inline_to_wide(stream, cur, check, allow_mem)? {
                     return Ok(true);
                 }
                 // Tight memory cap refused WideTable; all prior keys in key_pool
                 // were already checked against each other and against cur_key.
                 self.pop_pool_to(frame.key_base as usize);
-                self.map_frames[frame_idx].key_count = 0;
-                self.map_frames[frame_idx].mem_refused = true;
-                self.map_frames[frame_idx].mode = MapKeyMode::BatchedFallback { batch_start: None };
+                self.update_top_map_frame(|frame| {
+                    frame.key_count = 0;
+                    frame.mem_refused = true;
+                    frame.mode = MapKeyMode::BatchedFallbackEmpty;
+                });
                 Ok(true)
             }
             MapKeyMode::WideTable => {
@@ -2525,8 +3232,13 @@ impl ContainerStack {
                     return Ok(false);
                 }
                 if table.needs_grow() {
-                    if table.grow_preflighted(&mut self.active_heap_bytes, allow_mem) {
-                        table.insert_unique(cur.hash, cur.tag, cur.start);
+                    if table.grow_preflighted(
+                        stream,
+                        &mut self.active_heap_bytes,
+                        check,
+                        allow_mem,
+                    )? {
+                        table.insert_unique(stream, cur.hash, cur.tag, cur.start, check)?;
                     } else {
                         // Tight memory cap refused doubling; drop table and continue
                         // in bounded zero-heap batched fallback. All keys up to and
@@ -2534,18 +3246,24 @@ impl ContainerStack {
                         let (_, old) = self.overflow_tables.pop().expect("wide table exists");
                         self.active_heap_bytes = self.active_heap_bytes.saturating_sub(old.bytes());
                         drop(old);
-                        self.map_frames[frame_idx].key_base = self.key_pool_len as u16;
-                        self.map_frames[frame_idx].key_count = 0;
-                        self.map_frames[frame_idx].mem_refused = true;
-                        self.map_frames[frame_idx].mode =
-                            MapKeyMode::BatchedFallback { batch_start: None };
+                        let base = self.key_pool_len as u16;
+                        self.update_top_map_frame(|frame| {
+                            frame.key_base = base;
+                            frame.key_count = 0;
+                            frame.mem_refused = true;
+                            frame.mode = MapKeyMode::BatchedFallbackEmpty;
+                        });
                     }
                 } else {
-                    table.insert_unique(cur.hash, cur.tag, cur.start);
+                    table.insert_unique(stream, cur.hash, cur.tag, cur.start, check)?;
                 }
                 Ok(true)
             }
-            MapKeyMode::BatchedFallback { batch_start } => {
+            MapKeyMode::BatchedFallbackEmpty | MapKeyMode::BatchedFallback { .. } => {
+                let batch_start = match frame.mode {
+                    MapKeyMode::BatchedFallback { batch_start } => Some(batch_start),
+                    _ => None,
+                };
                 if batch_start.is_some()
                     && self.pool_contains(stream, frame.key_base as usize, key, cur.tag, check)?
                 {
@@ -2553,68 +3271,52 @@ impl ContainerStack {
                 }
                 if self.key_pool_len < INLINE_MAP_KEY_POOL {
                     if batch_start.is_none() {
-                        self.map_frames[frame_idx].mode = MapKeyMode::BatchedFallback {
-                            batch_start: Some(cur.start),
-                        };
+                        let base = self.key_pool_len as u16;
+                        self.update_top_map_frame(|frame| {
+                            frame.key_base = base;
+                            frame.mode = MapKeyMode::BatchedFallback {
+                                batch_start: cur.start,
+                            };
+                        });
                     }
                     self.push_pool_entry(cur.tag, cur.start);
-                    self.map_frames[frame_idx].key_count += 1;
+                    self.update_top_map_frame(|frame| frame.key_count += 1);
                     return Ok(true);
                 }
                 // Key pool is full. If this frame entered BatchedFallback due to
                 // map_frames shifting (not a memory refusal), try promoting to WideTable.
                 let prior_end = batch_start.unwrap_or(cur.start);
                 if !frame.mem_refused {
-                    match self.try_promote_batched_to_wide(
-                        frame_idx, stream, prior_end, cur, check, allow_mem,
-                    )? {
+                    match self
+                        .try_promote_batched_to_wide(stream, prior_end, cur, check, allow_mem)?
+                    {
                         Some(ok) => return Ok(ok),
                         None => {
-                            self.map_frames[frame_idx].mem_refused = true;
+                            self.update_top_map_frame(|frame| frame.mem_refused = true);
                         }
                     }
                 }
                 if let Some(b_start) = batch_start {
-                    match self.scan_batch_against_prior(
+                    if !self.scan_batch_against_prior(
                         stream,
                         frame.start,
                         b_start,
                         frame.key_base as usize,
                         check,
                     )? {
-                        FallbackScan::NoDuplicate => {}
-                        FallbackScan::Duplicate => return Ok(false),
-                        FallbackScan::BudgetExceeded => {
-                            return Err(crate::error::Error::StorageFull(
-                                "composite literal duplicate-key validation exceeds memory budget"
-                                    .into(),
-                            ));
-                        }
+                        return Ok(false);
                     }
                     self.pop_pool_to(frame.key_base as usize);
-                    self.map_frames[frame_idx].key_count = 0;
-                    self.map_frames[frame_idx].mode = MapKeyMode::BatchedFallback {
-                        batch_start: Some(cur.start),
-                    };
                     self.push_pool_entry(cur.tag, cur.start);
-                    self.map_frames[frame_idx].key_count = 1;
+                    self.update_top_map_frame(|frame| {
+                        frame.mode = MapKeyMode::BatchedFallback {
+                            batch_start: cur.start,
+                        };
+                        frame.key_count = 1;
+                    });
                     Ok(true)
                 } else {
-                    match scan_single_against_prior(
-                        stream,
-                        frame.start,
-                        key,
-                        cur,
-                        &mut self.fallback_visits,
-                        check,
-                    )? {
-                        FallbackScan::NoDuplicate => Ok(true),
-                        FallbackScan::Duplicate => Ok(false),
-                        FallbackScan::BudgetExceeded => Err(crate::error::Error::StorageFull(
-                            "composite literal duplicate-key validation exceeds memory budget"
-                                .into(),
-                        )),
-                    }
+                    scan_single_against_prior(stream, frame.start, key, cur, check)
                 }
             }
         }
@@ -2624,9 +3326,12 @@ impl ContainerStack {
 /// Validate a single CDT lexical level (matching `parse_list` / `parse_map`,
 /// including all bare nested lists/maps and map duplicate-key checks, without
 /// descending into quoted nested CDT literals) iteratively in O(1) stack.
-/// Uses zero heap for all lists, language tags, and maps up to 512 keys; wider
-/// maps promote to a memory-preflighted hash table (or a bounded zero-heap
-/// batched fallback when memory is tight) and check cancellation throughout.
+/// Uses zero heap for language tags, bare nesting up to 65,536 containers,
+/// map nesting up to 256 levels, single-key maps at any pool occupancy, and
+/// nested multi-key maps whose concurrent active keys fit in the 512-key stack
+/// pool. Deeper containers and additional keys spill to memory-preflighted
+/// proportional heap buffers (or bounded zero-heap fallback when memory is
+/// tight) and check cancellation throughout.
 fn validate_cdt(
     stream: &mut CdtStream<'_>,
     is_map: bool,
@@ -2643,6 +3348,7 @@ fn validate_cdt(
     }
 
     let level_start = stream.pos;
+    stream.reset_fallback_budget(stream.limit().saturating_sub(level_start));
     stream.skip_ws(check)?;
     let mut stack = ContainerStack::new();
     let mut expect = if is_map {
@@ -2652,7 +3358,7 @@ fn validate_cdt(
         if stack.depth >= stream.limit().saturating_sub(stream.pos) {
             return Ok(false);
         }
-        if !stack.push_map(stream.pos, stream, check)? {
+        if !stack.push_map(stream.pos, stream, check, allow_mem)? {
             return Ok(false);
         }
         Expect::MapStartOrEnd
@@ -2663,7 +3369,7 @@ fn validate_cdt(
         if stack.depth >= stream.limit().saturating_sub(stream.pos) {
             return Ok(false);
         }
-        stack.push_list();
+        stack.push_list(allow_mem);
         Expect::ListStartOrEnd
     };
 
@@ -2685,7 +3391,7 @@ fn validate_cdt(
                     if stack.depth >= stream.limit().saturating_sub(stream.pos) {
                         return Ok(false);
                     }
-                    stack.push_list();
+                    stack.push_list(allow_mem);
                     expect = Expect::ListStartOrEnd;
                 }
                 Some('{') => {
@@ -2693,7 +3399,7 @@ fn validate_cdt(
                     if stack.depth >= stream.limit().saturating_sub(stream.pos) {
                         return Ok(false);
                     }
-                    if !stack.push_map(stream.pos, stream, check)? {
+                    if !stack.push_map(stream.pos, stream, check, allow_mem)? {
                         return Ok(false);
                     }
                     expect = Expect::MapStartOrEnd;
@@ -2759,11 +3465,15 @@ fn validate_cdt(
 /// parsed elements or replacement strings, calling `visit` for every stored
 /// blank-node id referenced as a CDT blank node (including inside arbitrarily
 /// nested bare lists/maps and quoted nested `cdt:List` / `cdt:Map` literals).
-/// Uses zero heap for lists, language tags, and maps up to 512 keys; wider maps
-/// preflight temporary duplicate-key indexes through `allow_mem` and drop them
-/// before returning. `check` is polled periodically for cancellation/deadlines.
-/// Ill-typed CDT literals (or ill-typed quoted nested CDT literals) are skipped
-/// cleanly without calling `visit`, matching `relabel_lexical`.
+/// Uses zero heap for language tags, bare nesting up to 65,536 containers,
+/// map nesting up to 256 levels, single-key maps at any pool occupancy, and
+/// nested multi-key maps whose concurrent active keys fit in the 512-key stack
+/// pool; deeper containers or additional keys preflight proportional temporary
+/// heap buffers through `allow_mem` (falling back to bounded zero-heap scans
+/// under tight caps) and drop them before returning. `check` is polled
+/// periodically for cancellation/deadlines. Ill-typed CDT literals (or
+/// ill-typed quoted nested CDT literals) are skipped cleanly without calling
+/// `visit`, matching `relabel_lexical`.
 pub(crate) fn scan_bnode_ids(
     lex: &str,
     dt: &str,
@@ -3912,12 +4622,13 @@ mod tests {
         let handle = std::thread::Builder::new()
             .stack_size(2 * 1024 * 1024)
             .spawn(|| {
-                let depth = 131_073;
-                let valid = format!("{}_:b0{}", "[".repeat(depth), "]".repeat(depth));
+                // Within the inline stack windows (<= 65,536 bare containers and <= 256 maps),
+                // validation performs zero heap allocations even when allow_mem permits heap.
+                let inline_list = format!("{}_:b0{}", "[".repeat(65_536), "]".repeat(65_536));
                 let mut seen = None;
-                let largest = crate::test_alloc::record_largest(|| {
+                let inline_largest = crate::test_alloc::record_largest(|| {
                     scan_bnode_ids(
-                        &valid,
+                        &inline_list,
                         LIST,
                         || Ok(()),
                         |_| true,
@@ -3930,8 +4641,47 @@ mod tests {
                 });
                 assert_eq!(seen, Some(0));
                 assert_eq!(
-                    largest, 0,
-                    "131_073-deep bare list validation must perform zero heap allocations"
+                    inline_largest, 0,
+                    "65_536-deep bare list validation must perform zero heap allocations"
+                );
+
+                // Past 131,072 bare nesting: validates cleanly with allow_mem = true (spilling
+                // preflighted overflow_bits for O(1) push/pop) AND with allow_mem = false in
+                // zero heap via the bounded sliding-window fallback.
+                let depth = 131_073;
+                let valid = format!("{}_:b0{}", "[".repeat(depth), "]".repeat(depth));
+                let mut seen_spill = None;
+                scan_bnode_ids(
+                    &valid,
+                    LIST,
+                    || Ok(()),
+                    |_| true,
+                    |id| {
+                        seen_spill = Some(id.payload());
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(seen_spill, Some(0));
+
+                let mut seen_tight = None;
+                let tight_largest = crate::test_alloc::record_largest(|| {
+                    scan_bnode_ids(
+                        &valid,
+                        LIST,
+                        || Ok(()),
+                        |_| false,
+                        |id| {
+                            seen_tight = Some(id.payload());
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                });
+                assert_eq!(seen_tight, Some(0));
+                assert_eq!(
+                    tight_largest, 0,
+                    "131_073-deep monotonic bare list must validate with zero heap when heap is refused"
                 );
 
                 // Trailing comma at depth 131,073 must skip cleanly as ill-typed rather than error.
@@ -3951,7 +4701,8 @@ mod tests {
                 assert!(!ill_seen);
 
                 // Mixed list/map nesting crossing both CONTAINER_WINDOW_BITS (65,536) and
-                // INLINE_MAP_FRAMES (256) exercises upward slide and downward refill.
+                // INLINE_MAP_FRAMES (256) validates cleanly both with heap spilling and with
+                // zero-heap sliding-window fallback.
                 let outer_lists = 66_000;
                 let inner_maps = 300;
                 let mut mixed = String::new();
@@ -3969,24 +4720,549 @@ mod tests {
                     mixed.push(']');
                 }
                 let mut mixed_seen = None;
+                scan_bnode_ids(
+                    &mixed,
+                    LIST,
+                    || Ok(()),
+                    |_| true,
+                    |id| {
+                        mixed_seen = Some(id.payload());
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(mixed_seen, Some(9));
+
+                let mut mixed_tight_seen = None;
                 let mixed_largest = crate::test_alloc::record_largest(|| {
                     scan_bnode_ids(
                         &mixed,
                         LIST,
                         || Ok(()),
-                        |_| true,
+                        |_| false,
                         |id| {
-                            mixed_seen = Some(id.payload());
+                            mixed_tight_seen = Some(id.payload());
                             Ok(())
                         },
                     )
                     .unwrap();
                 });
-                assert_eq!(mixed_seen, Some(9));
+                assert_eq!(mixed_tight_seen, Some(9));
                 assert_eq!(mixed_largest, 0);
             })
             .unwrap();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn deep_and_oscillating_maps_and_lists_validate_linearly_without_false_storage_full() {
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                // 1. 1,025 copies of a 257-deep 2-key map chain in one cdt:List must succeed
+                //    linearly with allow_mem = true (never hitting a false StorageFull).
+                let chain = format!("{}_:b0{}", "{\"a\":".repeat(257), ",\"b\":0}".repeat(257));
+                let list_lex = format!("[{}]", vec![chain; 1_025].join(","));
+                let mut list_ticks = 0usize;
+                let mut list_visits = 0usize;
+                scan_bnode_ids(
+                    &list_lex,
+                    LIST,
+                    || {
+                        list_ticks += 1;
+                        Ok(())
+                    },
+                    |_| true,
+                    |id| {
+                        assert_eq!(id.payload(), 0);
+                        list_visits += 1;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(list_visits, 1_025);
+                assert!(
+                    list_ticks * 1024 <= list_lex.len() * 16,
+                    "1,025x257-deep list took superlinear work: {} steps for {} bytes",
+                    list_ticks * 1024,
+                    list_lex.len()
+                );
+
+                // 2. Oscillating 128<->257 deep map (726 oscillating entries): valid must visit
+                //    b0 and ill-typed trailing-comma variant must skip cleanly without StorageFull.
+                let inner_129 = format!("{}0{}", "{0:".repeat(129), "}".repeat(129));
+                let mut osc_valid = format!("{}{{", "{0:".repeat(127));
+                for j in 0..726 {
+                    use std::fmt::Write;
+                    if j > 0 {
+                        osc_valid.push(',');
+                    }
+                    let _ = write!(&mut osc_valid, "{j}:{inner_129}");
+                }
+                let mut osc_ill = osc_valid.clone();
+                osc_valid.push_str(",999:_:b0");
+                osc_valid.push_str(&"}".repeat(128));
+                osc_ill.push_str(",999:_:b0,");
+                osc_ill.push_str(&"}".repeat(128));
+
+                let mut osc_ticks = 0usize;
+                let mut osc_seen = None;
+                scan_bnode_ids(
+                    &osc_valid,
+                    MAP,
+                    || {
+                        osc_ticks += 1;
+                        Ok(())
+                    },
+                    |_| true,
+                    |id| {
+                        osc_seen = Some(id.payload());
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(osc_seen, Some(0));
+                assert!(
+                    osc_ticks * 1024 <= osc_valid.len() * 16,
+                    "oscillating 128<->257 map took superlinear work: {} steps for {} bytes",
+                    osc_ticks * 1024,
+                    osc_valid.len()
+                );
+
+                let mut osc_ill_seen = false;
+                scan_bnode_ids(
+                    &osc_ill,
+                    MAP,
+                    || Ok(()),
+                    |_| true,
+                    |_| {
+                        osc_ill_seen = true;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert!(!osc_ill_seen);
+
+                // 3. 32,768-deep chain of 2-key maps (every ancestor gets a later key on unwind):
+                //    linear pass under allow_mem = true; linearly bounded StorageFull under tight cap.
+                let deep2 = format!(
+                    "{}_:b0{}",
+                    "{\"a\":".repeat(32_768),
+                    ",\"b\":0}".repeat(32_768)
+                );
+                let mut deep2_ticks = 0usize;
+                let mut deep2_seen = None;
+                scan_bnode_ids(
+                    &deep2,
+                    MAP,
+                    || {
+                        deep2_ticks += 1;
+                        Ok(())
+                    },
+                    |_| true,
+                    |id| {
+                        deep2_seen = Some(id.payload());
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(deep2_seen, Some(0));
+                assert!(
+                    deep2_ticks * 1024 <= deep2.len() * 16,
+                    "32,768-deep 2-key map took superlinear work: {} steps for {} bytes",
+                    deep2_ticks * 1024,
+                    deep2.len()
+                );
+
+                // Duplicate at the outermost ancestor of the 32,768-deep chain must be caught.
+                let deep2_dup = format!(
+                    "{}_:b0{},\"a\":0}}",
+                    "{\"a\":".repeat(32_768),
+                    ",\"b\":0}".repeat(32_767)
+                );
+                let mut deep2_dup_seen = false;
+                scan_bnode_ids(
+                    &deep2_dup,
+                    MAP,
+                    || Ok(()),
+                    |_| true,
+                    |_| {
+                        deep2_dup_seen = true;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert!(!deep2_dup_seen);
+
+                let mut deep2_tight_ticks = 0usize;
+                let deep2_tight = scan_bnode_ids(
+                    &deep2,
+                    MAP,
+                    || {
+                        deep2_tight_ticks += 1;
+                        Ok(())
+                    },
+                    |_| false,
+                    |_| Ok(()),
+                );
+                assert!(matches!(
+                    deep2_tight,
+                    Err(crate::error::Error::StorageFull(_))
+                ));
+                assert!(
+                    deep2_tight_ticks * 1024 <= deep2.len() * 16 + 300_000,
+                    "tight-cap 32,768-deep map exceeded linear work bound: {} steps for {} bytes",
+                    deep2_tight_ticks * 1024,
+                    deep2.len()
+                );
+
+                // 4. 2,000-deep chain of 3-key maps (fills key_pool and spills overflow frames +
+                //    proportional 4-slot tables) must also stay strictly linear.
+                let deep3 = format!(
+                    "{}_:b3{}",
+                    "{\"a\":1,\"b\":".repeat(2_000),
+                    ",\"c\":2}".repeat(2_000)
+                );
+                let mut deep3_ticks = 0usize;
+                let mut deep3_seen = None;
+                scan_bnode_ids(
+                    &deep3,
+                    MAP,
+                    || {
+                        deep3_ticks += 1;
+                        Ok(())
+                    },
+                    |_| true,
+                    |id| {
+                        deep3_seen = Some(id.payload());
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(deep3_seen, Some(3));
+                assert!(
+                    deep3_ticks * 1024 <= deep3.len() * 16,
+                    "2,000-deep 3-key map took superlinear work: {} steps for {} bytes",
+                    deep3_ticks * 1024,
+                    deep3.len()
+                );
+
+                // 5. ~1 MiB WideTable-outer oscillating 128<->257 deep map (513 scalar keys +
+                //    2,000 oscillating 129-deep map entries) must run in a single linear pass.
+                let mut wide_osc = format!("{}{{", "{0:".repeat(127));
+                for j in 0..513 {
+                    use std::fmt::Write;
+                    if j > 0 {
+                        wide_osc.push(',');
+                    }
+                    let _ = write!(&mut wide_osc, "{j}:0");
+                }
+                for j in 513..2_513 {
+                    use std::fmt::Write;
+                    let _ = write!(&mut wide_osc, ",{j}:{inner_129}");
+                }
+                wide_osc.push_str(",9999:_:b5");
+                wide_osc.push_str(&"}".repeat(128));
+
+                let mut wide_osc_ticks = 0usize;
+                let mut wide_osc_seen = None;
+                scan_bnode_ids(
+                    &wide_osc,
+                    MAP,
+                    || {
+                        wide_osc_ticks += 1;
+                        Ok(())
+                    },
+                    |_| true,
+                    |id| {
+                        wide_osc_seen = Some(id.payload());
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(wide_osc_seen, Some(5));
+                assert!(
+                    wide_osc_ticks * 1024 <= wide_osc.len() * 16,
+                    "WideTable oscillating deep map took superlinear work: {} steps for {} bytes",
+                    wide_osc_ticks * 1024,
+                    wide_osc.len()
+                );
+
+                let mut wide_osc_tight_ticks = 0usize;
+                let wide_osc_tight = scan_bnode_ids(
+                    &wide_osc,
+                    MAP,
+                    || {
+                        wide_osc_tight_ticks += 1;
+                        Ok(())
+                    },
+                    |_| false,
+                    |_| Ok(()),
+                );
+                assert!(matches!(
+                    wide_osc_tight,
+                    Err(crate::error::Error::StorageFull(_))
+                ));
+                assert!(
+                    wide_osc_tight_ticks * 1024 <= wide_osc.len() * 16 + 300_000,
+                    "tight-cap WideTable oscillating map exceeded linear work bound: {} steps",
+                    wide_osc_tight_ticks * 1024
+                );
+
+                // 6. Bare lists oscillating 32,768<->65,537 must stay linear under allow_mem = true
+                //    and refuse linearly under allow_mem = false (no quadratic refill_bits).
+                let spike = format!("{}0{}", "[".repeat(32_769), "]".repeat(32_769));
+                let mut list_osc = "[".repeat(32_768);
+                for i in 0..24 {
+                    if i > 0 {
+                        list_osc.push(',');
+                    }
+                    list_osc.push_str(&spike);
+                }
+                list_osc.push_str(",_:b6");
+                list_osc.push_str(&"]".repeat(32_768));
+
+                let mut list_osc_ticks = 0usize;
+                let mut list_osc_seen = None;
+                scan_bnode_ids(
+                    &list_osc,
+                    LIST,
+                    || {
+                        list_osc_ticks += 1;
+                        Ok(())
+                    },
+                    |_| true,
+                    |id| {
+                        list_osc_seen = Some(id.payload());
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(list_osc_seen, Some(6));
+                assert!(
+                    list_osc_ticks * 1024 <= list_osc.len() * 16,
+                    "oscillating deep bare list took superlinear work: {} steps for {} bytes",
+                    list_osc_ticks * 1024,
+                    list_osc.len()
+                );
+
+                let mut list_osc_tight_ticks = 0usize;
+                let list_osc_tight = scan_bnode_ids(
+                    &list_osc,
+                    LIST,
+                    || {
+                        list_osc_tight_ticks += 1;
+                        Ok(())
+                    },
+                    |_| false,
+                    |_| Ok(()),
+                );
+                assert!(matches!(
+                    list_osc_tight,
+                    Err(crate::error::Error::StorageFull(_))
+                ));
+                assert!(
+                    list_osc_tight_ticks * 1024 <= list_osc.len() * 16 + 300_000,
+                    "tight-cap oscillating deep list exceeded linear work bound: {} steps",
+                    list_osc_tight_ticks * 1024
+                );
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn wide_key_set_polls_cancellation_during_rehash_and_insertion() {
+        // Direct rehash cancellation test: growing a 4,096-slot table polls `check`
+        // inside the rehash loop and leaves `active_heap` intact on cancellation.
+        let mut stream = CdtStream::new("");
+        let mut active = 0u64;
+        let mut table =
+            WideKeySet::new_preflighted(4_096, false, &mut active, &mut |_| true).unwrap();
+        let before_bytes = active;
+        for i in 0..3_072usize {
+            let tag = mix_tag(i as u64);
+            table
+                .insert_unique(&mut stream, i as u64, tag, i, &mut || Ok(()))
+                .unwrap();
+        }
+        let mut rehash_checks = 0usize;
+        let err = table.grow_preflighted(
+            &mut stream,
+            &mut active,
+            &mut || {
+                rehash_checks += 1;
+                Err(crate::error::Error::Cancelled)
+            },
+            &mut |_| true,
+        );
+        assert!(matches!(err, Err(crate::error::Error::Cancelled)));
+        assert_eq!(rehash_checks, 1);
+        assert_eq!(
+            active, before_bytes,
+            "cancelled rehash must not mutate active_heap"
+        );
+        assert_eq!(table.capacity(), 4_096);
+
+        // Direct insertion probe-chain cancellation test: colliding probes poll `check`.
+        let mut probe_stream = CdtStream::new("");
+        let mut probe_active = 0u64;
+        let mut probe_table =
+            WideKeySet::new_preflighted(4_096, false, &mut probe_active, &mut |_| true).unwrap();
+        for i in 0..1_500usize {
+            probe_table
+                .insert_unique(&mut probe_stream, 0, 42, i, &mut || Ok(()))
+                .unwrap();
+        }
+        let mut insert_checks = 0usize;
+        let probe_err = probe_table.insert_unique(&mut probe_stream, 0, 42, 1_500, &mut || {
+            insert_checks += 1;
+            Err(crate::error::Error::Cancelled)
+        });
+        assert!(matches!(probe_err, Err(crate::error::Error::Cancelled)));
+        assert_eq!(insert_checks, 1);
+
+        // End-to-end scan cancellation triggered right when grow_preflighted preflights
+        // the 4,096 -> 8,192 table doubling (64 KiB + 32 KiB = 96 KiB peak).
+        let mut wide = String::with_capacity(5_000 * 14);
+        wide.push('{');
+        for i in 0..5_000 {
+            if i > 0 {
+                wide.push(',');
+            }
+            use std::fmt::Write;
+            let _ = write!(&mut wide, "\"k{i:05}\":{i}");
+        }
+        wide.push_str(",\"last\":_:b0}");
+        let cancel_now = std::cell::Cell::new(false);
+        let mut checks_after_grow = 0usize;
+        let mut allow_calls_after_trigger = 0usize;
+        let res = scan_bnode_ids(
+            &wide,
+            MAP,
+            || {
+                if cancel_now.get() {
+                    checks_after_grow += 1;
+                    Err(crate::error::Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            |bytes| {
+                if cancel_now.get() {
+                    allow_calls_after_trigger += 1;
+                } else if bytes >= 65_536 {
+                    cancel_now.set(true);
+                }
+                true
+            },
+            |_| Ok(()),
+        );
+        assert!(matches!(res, Err(crate::error::Error::Cancelled)));
+        assert!(cancel_now.get());
+        assert_eq!(checks_after_grow, 1);
+        assert_eq!(allow_calls_after_trigger, 0);
+    }
+
+    #[test]
+    fn narrow_maps_under_full_ancestor_pool_avoid_wide_table_allocation() {
+        // Fill all 512 slots of the shared inline key pool in the outer map.
+        let mut prefix = String::from("{");
+        for i in 0..511 {
+            use std::fmt::Write;
+            if i > 0 {
+                prefix.push(',');
+            }
+            let _ = write!(&mut prefix, "\"o{i}\":{i}");
+        }
+        prefix.push_str(",\"o511\":");
+
+        // 1. A single-key inner map at the 512th outer entry must allocate ZERO heap.
+        let one_key = format!("{prefix}{{\"inner\":_:b1}}}}");
+        let mut seen_one = None;
+        let one_largest = crate::test_alloc::record_largest(|| {
+            scan_bnode_ids(
+                &one_key,
+                MAP,
+                || Ok(()),
+                |_| true,
+                |id| {
+                    seen_one = Some(id.payload());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        assert_eq!(seen_one, Some(1));
+        assert_eq!(
+            one_largest, 0,
+            "one-key map under a full 512-key ancestor pool must allocate zero heap"
+        );
+
+        // 2. A 200-deep chain of one-key maps at that position must also allocate ZERO heap.
+        let chain_one = format!(
+            "{prefix}{}_:b2{}}}",
+            "{\"inner\":".repeat(200),
+            "}".repeat(200)
+        );
+        let mut seen_chain = None;
+        let chain_largest = crate::test_alloc::record_largest(|| {
+            scan_bnode_ids(
+                &chain_one,
+                MAP,
+                || Ok(()),
+                |_| true,
+                |id| {
+                    seen_chain = Some(id.payload());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        assert_eq!(seen_chain, Some(2));
+        assert_eq!(
+            chain_largest, 0,
+            "chain of one-key maps under a full 512-key ancestor pool must allocate zero heap"
+        );
+
+        // 3. A two-key inner map under a full ancestor pool spills proportionally
+        //    (4-slot table = 32 B + 4-entry directory), never an 8 KiB 1,024-slot table.
+        let two_key = format!("{prefix}{{\"x\":1,\"y\":_:b3}}}}");
+        let mut seen_two = None;
+        let two_largest = crate::test_alloc::record_largest(|| {
+            scan_bnode_ids(
+                &two_key,
+                MAP,
+                || Ok(()),
+                |_| true,
+                |id| {
+                    seen_two = Some(id.payload());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        assert_eq!(seen_two, Some(3));
+        assert!(
+            two_largest <= 512,
+            "two-key map spill must be proportional to its key count, got {two_largest} bytes"
+        );
+
+        // Duplicate detection in the spilled two-key inner map must still reject cleanly.
+        let two_key_dup = format!("{prefix}{{\"x\":1,\"x\":_:b3}}}}");
+        let mut dup_seen = false;
+        scan_bnode_ids(
+            &two_key_dup,
+            MAP,
+            || Ok(()),
+            |_| true,
+            |_| {
+                dup_seen = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!dup_seen);
     }
 
     #[test]
