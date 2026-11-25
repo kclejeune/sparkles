@@ -190,7 +190,7 @@ impl ChangeLog {
     /// the queued commits, so the log covers the state the caller reads.
     pub(crate) fn range(&self, q: &HistoryQuery, upto: u64) -> Result<(u64, u64, u64)> {
         let upto = self.prepare(q, upto, None)?;
-        let (from, to) = self.bounds(q, upto, &|| q.check())?;
+        let (from, to) = self.bounds(q, upto, &|| q.check(), None)?;
         Ok((from, to, upto))
     }
 
@@ -235,12 +235,13 @@ impl ChangeLog {
         q: &HistoryQuery,
         upto: u64,
         mut check: &dyn Fn() -> Result<()>,
+        budget: Option<&super::changelog::MemoryBudget>,
     ) -> Result<(u64, u64)> {
         let from = match &q.from {
             None => 1,
             Some(HistoryBound::Commit(n)) => (*n).max(1),
             Some(HistoryBound::Time(ms)) => self
-                .commit_at_time_checked(ms.saturating_sub(1), &mut check)?
+                .commit_at_time_checked(ms.saturating_sub(1), &mut check, budget)?
                 .map_or(1, |c| c + 1),
             Some(HistoryBound::At(a)) => {
                 return Err(Error::Invalid(format!(
@@ -252,7 +253,7 @@ impl ChangeLog {
             None => upto,
             Some(HistoryBound::Commit(n)) => (*n).min(upto),
             Some(HistoryBound::Time(ms)) => self
-                .commit_at_time_checked(*ms, &mut check)?
+                .commit_at_time_checked(*ms, &mut check, budget)?
                 .unwrap_or(0)
                 .min(upto),
             Some(HistoryBound::At(a)) => {
@@ -278,6 +279,7 @@ impl ChangeLog {
         max_bytes: Option<u64>,
     ) -> Result<HistoryResult> {
         let bounded = no_wait || max_bytes.is_some();
+        let budget = max_bytes.map(super::changelog::MemoryBudget::new);
         let (from, to, upto) = if no_wait {
             q.check()?;
             if !self.is_enabled() {
@@ -287,12 +289,12 @@ impl ChangeLog {
             let upto = self
                 .read_only_through()
                 .map_or(upto, |through| upto.min(through));
-            let (from, to) = self.bounds(q, upto, &|| q.check())?;
+            let (from, to) = self.bounds(q, upto, &|| q.check(), budget.as_ref())?;
             (from, to, upto)
         } else if max_bytes.is_some() {
             let check_fn = || q.check();
             let upto = self.prepare(q, upto, Some(&check_fn))?;
-            let (from, to) = self.bounds(q, upto, &check_fn)?;
+            let (from, to) = self.bounds(q, upto, &check_fn, budget.as_ref())?;
             (from, to, upto)
         } else {
             self.range(q, upto)?
@@ -301,7 +303,6 @@ impl ChangeLog {
         let access = q.access.as_ref().filter(|a| !a.reads_everything());
         let mut readable: FxHashMap<Arc<[u8]>, bool> = FxHashMap::default();
         let mut changes: Vec<HistoryChange> = Vec::new();
-        let budget = max_bytes.map(super::changelog::MemoryBudget::new);
         let mut memo_guard = budget.as_ref().map(super::changelog::MemoryBudget::guard);
         let mut page_guard = budget.as_ref().map(super::changelog::MemoryBudget::guard);
         let mut memo_content_bytes = 0u64;

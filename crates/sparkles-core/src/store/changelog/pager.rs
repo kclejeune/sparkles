@@ -120,7 +120,7 @@ impl ChangeLog {
         if let Some(check) = check {
             check()?;
         }
-        let (from, to) = self.bounds(&q, upto, check.unwrap_or(&query_check))?;
+        let (from, to) = self.bounds(&q, upto, check.unwrap_or(&query_check), None)?;
         after_range()?;
         #[cfg(test)]
         open_tests::observe(open_tests::Event::ResolvedBounds);

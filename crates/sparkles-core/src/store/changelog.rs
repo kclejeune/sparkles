@@ -2457,6 +2457,7 @@ impl ChangeLog {
         &self,
         ms: i64,
         check: &mut dyn FnMut() -> Result<()>,
+        budget: Option<&MemoryBudget>,
     ) -> Result<Option<u64>> {
         if let Some(reader) = &self.readonly {
             return reader.commit_at_time(ms, check);
@@ -2468,7 +2469,12 @@ impl ChangeLog {
             check()?;
             #[cfg(test)]
             open_tests::observe(open_tests::Event::TimestampIndex);
-            let (ix, _) = self.index_with(&mut inner, i, Some(check), None)?;
+            // Keep the decoded index guard bound before `ix` so `ix` always drops before
+            // its budget charge is released on every exit path.
+            let (_ix_guard, ix) = {
+                let (ix, guard) = self.index_with(&mut inner, i, Some(check), budget)?;
+                (guard, ix)
+            };
             let n = ix.recs.partition_point(|r| r.ts <= ms);
             // a gap tells no time of its own
             for (idx, r) in ix.recs[..n].iter().rev().enumerate() {
@@ -2484,7 +2490,10 @@ impl ChangeLog {
             }
             #[cfg(test)]
             open_tests::observe(open_tests::Event::TimestampIndexed);
-            if n < ix.recs.len() {
+            let done = n < ix.recs.len();
+            drop(ix);
+            drop(_ix_guard);
+            if done {
                 break;
             }
         }
@@ -4902,6 +4911,186 @@ mod settings_format_tests {
     }
 
     #[test]
+    fn time_bound_cold_sidecar_memory_budget() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::fmt::Write as _;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 768 << 10,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts).unwrap();
+        store.change_log().unwrap().set_background(false);
+
+        let mut triples = String::new();
+        for i in 0..6_000 {
+            writeln!(&mut triples, "<urn:pad{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c1 = store.head_commit().seq;
+
+        let payload = "x".repeat(160 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:coldhit> <urn:p> \"{payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c2_commit = store.head_commit();
+        let c2 = c2_commit.seq;
+        let c2_ts = c2_commit.timestamp_ms;
+
+        let seal_payload = "s".repeat(512 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:seal> <urn:p> \"{seal_payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+
+        let log = store.change_log().unwrap().clone();
+        let (seg0_idx_path, seg0_idx_len) = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs[0].sealed, "segment 0 must be sealed");
+            assert!(
+                inner.segs[0].first <= c1 && inner.segs[0].last >= c2,
+                "c1={c1} and c2={c2} must share sealed segment 0 ({}..={})",
+                inner.segs[0].first,
+                inner.segs[0].last
+            );
+            inner.cache.clear();
+            let path = inner.segs[0].idx_path().unwrap();
+            let len = path.metadata().unwrap().len();
+            (path, len)
+        };
+        let raw_bytes = std::fs::read(&seg0_idx_path).unwrap();
+        let seg0_decoded_bytes = {
+            let (_, _, ix) = SegIndex::decode(&raw_bytes, log.dataset_id).unwrap();
+            arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                + (ix.recs.len() as u64) * (std::mem::size_of::<RecEntry>() as u64)
+                + (ix.postings.len() as u64) * (std::mem::size_of::<(u64, u32)>() as u64)
+        };
+
+        let q_missing = HistoryQuery {
+            subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+            from: Some(HistoryBound::Time(c2_ts)),
+            to: Some(HistoryBound::Time(c2_ts)),
+            ..Default::default()
+        };
+        let q_hit = HistoryQuery {
+            subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:coldhit"))],
+            from: Some(HistoryBound::Time(c2_ts)),
+            to: Some(HistoryBound::Time(c2_ts)),
+            ..Default::default()
+        };
+
+        // 1. Cap smaller than the cold sidecar refuses before reading raw chunks and leaves cache empty.
+        let tiny_limit = seg0_idx_len / 2;
+        log.inner.lock().cache.clear();
+        let stats = Rc::new(Cell::new((0usize, 0usize)));
+        let witness = stats.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            let (mut chunks, mut decodes) = witness.get();
+            match event {
+                open_tests::Event::IndexReadChunk => chunks += 1,
+                open_tests::Event::IndexRecords => decodes += 1,
+                _ => {}
+            }
+            witness.set((chunks, decodes));
+        });
+        let res = store.published_history_changes(&q_missing, tiny_limit);
+        drop(observer);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected cold sidecar refusal under tiny time-bound cap, got {res:?}"
+        );
+        assert_eq!(
+            stats.get(),
+            (0, 0),
+            "sidecar larger than cap must fail before reading chunks or decoding"
+        );
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "refused time-bound lookup must leave shared cache empty"
+        );
+
+        // 2. Cap fitting raw sidecar length but not raw + decoded refuses before decoding and leaves cache empty.
+        let len_only_limit = seg0_idx_len + 16_384;
+        assert!(seg0_idx_len + seg0_decoded_bytes > len_only_limit);
+        log.inner.lock().cache.clear();
+        let stats = Rc::new(Cell::new((0usize, 0usize)));
+        let witness = stats.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            let (mut chunks, mut decodes) = witness.get();
+            match event {
+                open_tests::Event::IndexReadChunk => chunks += 1,
+                open_tests::Event::IndexRecords => decodes += 1,
+                _ => {}
+            }
+            witness.set((chunks, decodes));
+        });
+        let res = store.published_history_changes(&q_missing, len_only_limit);
+        drop(observer);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected raw + decoded refusal under time-bound cap, got {res:?}"
+        );
+        let (chunks, decodes) = stats.get();
+        assert!(chunks > 0, "file length fit cap so raw read should proceed");
+        assert_eq!(
+            decodes, 0,
+            "decoded index must be refused before allocating entries"
+        );
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "refused time-bound decode must leave shared cache empty"
+        );
+
+        // 3. Cap fitting cold index succeeds for missing subject while leaving shared cache empty.
+        let limit = (seg0_idx_len + seg0_decoded_bytes).max(360 << 10) + (24 << 10);
+        assert!(
+            seg0_decoded_bytes + (320 << 10) > limit,
+            "decoded index ({seg0_decoded_bytes}) + record peak (~320 KiB) must exceed limit ({limit})"
+        );
+        log.inner.lock().cache.clear();
+        let ok = store.published_history_changes(&q_missing, limit).unwrap();
+        assert!(ok.changes.is_empty());
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "budgeted time-bound lookup and scan must leave shared cache empty"
+        );
+
+        // 4. Cold index + matching record overlap is still refused under time bounds because
+        //    timestamp resolution did not populate the shared cache.
+        log.inner.lock().cache.clear();
+        let res = store.published_history_changes(&q_hit, limit);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected cold index + record overlap refusal under time bounds, got {res:?}"
+        );
+        assert!(
+            log.inner.lock().cache.is_empty(),
+            "failed time-bound overlap scan must leave shared cache empty"
+        );
+
+        // 5. Once warmed by an unbounded scan, the same time-bound query fits `limit`.
+        store.history_changes(&q_missing).unwrap();
+        assert!(!log.inner.lock().cache.is_empty());
+        let ok = store.published_history_changes(&q_hit, limit).unwrap();
+        assert_eq!(ok.changes.len(), 1);
+    }
+
+    #[test]
     fn hole_normalization_polls_and_checks_before_return() {
         let store = Store::in_memory(StoreOptions {
             change_log_segment_bytes: 64 << 20,
@@ -5084,10 +5273,28 @@ mod settings_format_tests {
             }
         }
 
-        // 3. Descending cooperative reverse polls mid-normalization at CHECK_STRIDE.
-        //    Polls: 1..8 up to role0, 9=finish entry, 10=reverse_holes_checked@CHECK_STRIDE.
-        let mut desc_polls = 0usize;
-        let res = log.scan(
+        // 3. End-to-end scan poll accounting distinguishes reverse stride and final pre-return checks.
+        //    Ascending polls: 1..8 up to role0, 9=finish entry, 10=finish final.
+        //    Descending polls: 1..8 up to role0, 9=finish entry, 10=reverse@CHECK_STRIDE, 11=finish final.
+        let mut asc_total_polls = 0usize;
+        log.scan(
+            1,
+            head,
+            &filter,
+            false,
+            true,
+            true,
+            Some(&MemoryBudget::new(1 << 20)),
+            &mut || {
+                asc_total_polls += 1;
+                Ok(())
+            },
+            None,
+            &mut |_, _, _| Ok(true),
+        )
+        .unwrap();
+        let mut desc_total_polls = 0usize;
+        log.scan(
             1,
             head,
             &filter,
@@ -5096,20 +5303,179 @@ mod settings_format_tests {
             true,
             Some(&MemoryBudget::new(1 << 20)),
             &mut || {
-                desc_polls += 1;
-                if desc_polls >= 10 {
+                desc_total_polls += 1;
+                Ok(())
+            },
+            None,
+            &mut |_, _, _| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(asc_total_polls, 10);
+        assert_eq!(desc_total_polls, 11);
+
+        // Letting entry and reverse stride checks pass still cancels on the final pre-return check.
+        for (descending, stop_at) in [
+            (false, asc_total_polls),
+            (true, desc_total_polls - 1),
+            (true, desc_total_polls),
+        ] {
+            let mut polls = 0usize;
+            let res = log.scan(
+                1,
+                head,
+                &filter,
+                descending,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || {
+                    polls += 1;
+                    if polls >= stop_at {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                },
+                None,
+                &mut |_, _, _| Ok(true),
+            );
+            assert!(
+                matches!(res, Err(Error::Cancelled)),
+                "descending={descending} stop_at={stop_at}: {res:?}"
+            );
+            assert_eq!(polls, stop_at);
+        }
+
+        // 4. Directly exercise `reverse_holes_checked` with >1 stride of work (2 stride polls)
+        //    and ordered `HoleCollector::finish` entry, mid-reverse, and final pre-return checks.
+        let rev_len = 2 * (2 * CHECK_STRIDE + 50);
+        let desc_holes: Vec<Unrecorded> = (0..rev_len as u64)
+            .rev()
+            .map(|idx| Unrecorded {
+                from: idx * 2 + 1,
+                to: idx * 2 + 1,
+                reason: UnrecordedReason::Bulk,
+            })
+            .collect();
+        let asc_holes: Vec<Unrecorded> = desc_holes.iter().copied().rev().collect();
+
+        let mut rev_ok = desc_holes.clone();
+        let mut rev_polls = 0usize;
+        reverse_holes_checked(&mut rev_ok, true, &mut || {
+            rev_polls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rev_ok, asc_holes);
+        assert_eq!(
+            rev_polls, 2,
+            "expected two reverse stride polls for {rev_len} holes"
+        );
+
+        for (stop_poll, checked_idx) in [(1usize, CHECK_STRIDE), (2usize, 2 * CHECK_STRIDE)] {
+            let mut partial = desc_holes.clone();
+            let mut polls = 0usize;
+            let err = reverse_holes_checked(&mut partial, true, &mut || {
+                polls += 1;
+                if polls >= stop_poll {
                     Err(Error::Cancelled)
                 } else {
                     Ok(())
                 }
-            },
-            None,
-            &mut |_, _, _| Ok(true),
-        );
-        assert!(matches!(res, Err(Error::Cancelled)), "{res:?}");
-        assert_eq!(desc_polls, 10);
+            });
+            assert!(matches!(err, Err(Error::Cancelled)), "{err:?}");
+            assert_eq!(polls, stop_poll);
+            assert_eq!(
+                partial[checked_idx - 1],
+                asc_holes[checked_idx - 1],
+                "swaps before poll {stop_poll} must have run"
+            );
+            assert_eq!(
+                partial[checked_idx], desc_holes[checked_idx],
+                "cancellation at poll {stop_poll} must stop before swap {checked_idx}"
+            );
+        }
 
-        // 4. Unordered HoleCollector fallback normalizes identically and polls cooperatively.
+        let mut desc_collector = HoleCollector::new(None, true);
+        for &h in &desc_holes {
+            desc_collector.push(h).unwrap();
+        }
+        assert!(desc_collector.ordered);
+        let mut desc_finish_polls = 0usize;
+        let desc_got = desc_collector
+            .finish(true, &mut || {
+                desc_finish_polls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(desc_got, asc_holes);
+        assert_eq!(
+            desc_finish_polls,
+            1 + rev_polls + 1,
+            "ordered descending finish must poll entry + reverse strides + final"
+        );
+
+        for stop_at in [1usize, 2, 3, desc_finish_polls] {
+            let mut c = HoleCollector::new(None, true);
+            for &h in &desc_holes {
+                c.push(h).unwrap();
+            }
+            let mut polls = 0usize;
+            let err = c.finish(true, &mut || {
+                polls += 1;
+                if polls >= stop_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(err, Err(Error::Cancelled)),
+                "descending finish stop_at={stop_at}: {err:?}"
+            );
+            assert_eq!(polls, stop_at);
+        }
+
+        let mut asc_collector = HoleCollector::new(None, false);
+        for &h in &asc_holes {
+            asc_collector.push(h).unwrap();
+        }
+        assert!(asc_collector.ordered);
+        let mut asc_finish_polls = 0usize;
+        let asc_got = asc_collector
+            .finish(true, &mut || {
+                asc_finish_polls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(asc_got, asc_holes);
+        assert_eq!(
+            asc_finish_polls, 2,
+            "ordered ascending finish must poll entry and final pre-return checks"
+        );
+        for stop_at in [1usize, 2] {
+            let mut c = HoleCollector::new(None, false);
+            for &h in &asc_holes {
+                c.push(h).unwrap();
+            }
+            let mut polls = 0usize;
+            let err = c.finish(true, &mut || {
+                polls += 1;
+                if polls >= stop_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(err, Err(Error::Cancelled)),
+                "ascending finish stop_at={stop_at}: {err:?}"
+            );
+            assert_eq!(polls, stop_at);
+        }
+
+        // 5. Directly exercise `sort_holes_checked` and `dedup_holes_checked` with >1 stride of work,
+        //    and verify unordered `HoleCollector::finish` polls entry + sort + dedup + final.
         let mut raw = Vec::new();
         for i in (0..2_500u64).rev() {
             raw.push(Unrecorded {
@@ -5125,8 +5491,10 @@ mod settings_format_tests {
                 });
             }
         }
-        let mut expected = raw.clone();
-        expected.sort_unstable_by_key(|h| (h.from, h.reason as u8, h.to));
+        assert_eq!(raw.len(), 3_000);
+        let mut expected_sorted = raw.clone();
+        expected_sorted.sort_unstable_by_key(|h| (h.from, h.reason as u8, h.to));
+        let mut expected = expected_sorted.clone();
         expected.dedup_by(|b, a| {
             if a.reason == b.reason && b.from <= a.to + 1 {
                 a.to = a.to.max(b.to);
@@ -5135,6 +5503,65 @@ mod settings_format_tests {
                 false
             }
         });
+
+        let mut sorted = raw.clone();
+        let mut sort_polls = 0usize;
+        sort_holes_checked(&mut sorted, true, &mut || {
+            sort_polls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sorted, expected_sorted);
+        assert!(
+            sort_polls > 1,
+            "expected >1 heapsort stride poll, got {sort_polls}"
+        );
+        let mut sort_cancel_buf = raw.clone();
+        let mut sort_cancel_polls = 0usize;
+        let sort_err = sort_holes_checked(&mut sort_cancel_buf, true, &mut || {
+            sort_cancel_polls += 1;
+            if sort_cancel_polls >= 2 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(sort_err, Err(Error::Cancelled)), "{sort_err:?}");
+        assert_eq!(sort_cancel_polls, 2);
+
+        let mut deduped = expected_sorted.clone();
+        let mut dedup_polls = 0usize;
+        dedup_holes_checked(&mut deduped, true, &mut || {
+            dedup_polls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(deduped, expected);
+        assert_eq!(
+            dedup_polls,
+            2,
+            "expected two dedup stride polls for {} sorted holes",
+            expected_sorted.len()
+        );
+        for stop_poll in [1usize, 2] {
+            let mut partial = expected_sorted.clone();
+            let mut polls = 0usize;
+            let err = dedup_holes_checked(&mut partial, true, &mut || {
+                polls += 1;
+                if polls >= stop_poll {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(err, Err(Error::Cancelled)), "{err:?}");
+            assert_eq!(polls, stop_poll);
+            assert_eq!(
+                partial.len(),
+                expected_sorted.len(),
+                "mid-dedup cancellation at poll {stop_poll} must stop before truncate"
+            );
+        }
 
         let mut collector = HoleCollector::new(None, false);
         for &h in &raw {
@@ -5149,25 +5576,37 @@ mod settings_format_tests {
             })
             .unwrap();
         assert_eq!(got, expected);
-        assert!(
-            norm_polls > 3,
-            "expected cooperative stride polls during unordered sort/dedup, got {norm_polls}"
+        assert_eq!(
+            norm_polls,
+            1 + sort_polls + dedup_polls + 1,
+            "unordered finish must poll entry + sort strides + dedup strides + final"
         );
 
-        let mut cancel_collector = HoleCollector::new(None, false);
-        for &h in &raw {
-            cancel_collector.push(h).unwrap();
-        }
-        let mut cancel_polls = 0usize;
-        let cancelled = cancel_collector.finish(true, &mut || {
-            cancel_polls += 1;
-            if cancel_polls >= 3 {
-                Err(Error::Cancelled)
-            } else {
-                Ok(())
+        for stop_at in [
+            1usize,
+            1 + 2,
+            1 + sort_polls + 1,
+            1 + sort_polls + dedup_polls,
+            norm_polls,
+        ] {
+            let mut cancel_collector = HoleCollector::new(None, false);
+            for &h in &raw {
+                cancel_collector.push(h).unwrap();
             }
-        });
-        assert!(matches!(cancelled, Err(Error::Cancelled)), "{cancelled:?}");
-        assert_eq!(cancel_polls, 3);
+            let mut cancel_polls = 0usize;
+            let cancelled = cancel_collector.finish(true, &mut || {
+                cancel_polls += 1;
+                if cancel_polls >= stop_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(cancelled, Err(Error::Cancelled)),
+                "unordered finish stop_at={stop_at}: {cancelled:?}"
+            );
+            assert_eq!(cancel_polls, stop_at);
+        }
     }
 }

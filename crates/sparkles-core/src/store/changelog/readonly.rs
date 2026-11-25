@@ -456,7 +456,9 @@ mod tests {
             ] {
                 assert_eq!(
                     reader.commit_at_time(ms, &mut || Ok(())).unwrap(),
-                    normal.commit_at_time_checked(ms, &mut || Ok(())).unwrap(),
+                    normal
+                        .commit_at_time_checked(ms, &mut || Ok(()), None)
+                        .unwrap(),
                     "time through={through} instant={ms}"
                 );
             }

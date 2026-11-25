@@ -384,12 +384,12 @@ fn writable_timestamp_index_keeps_typed_corruption_and_caches_valid_indexes() {
     let mut damaged = pristine.clone();
     *damaged.last_mut().unwrap() ^= 1;
     std::fs::write(&fixture.first_index, &damaged).unwrap();
-    let result = log.commit_at_time_checked(i64::MAX, &mut || Ok(()));
+    let result = log.commit_at_time_checked(i64::MAX, &mut || Ok(()), None);
     assert!(matches!(result, Err(Error::Corrupt(_))), "{result:?}");
     assert!(log.inner.lock().cache.is_empty());
     std::fs::write(&fixture.first_index, &pristine).unwrap();
     assert_eq!(
-        log.commit_at_time_checked(i64::MAX, &mut || Ok(()))
+        log.commit_at_time_checked(i64::MAX, &mut || Ok(()), None)
             .unwrap(),
         Some(fixture.store.head_commit().seq)
     );
@@ -424,13 +424,17 @@ fn assert_index_stop(phase: Event, stop_at: usize) {
         }
         witness.set((triggers, later));
     });
-    let result = log.commit_at_time_checked(i64::MAX, &mut || {
-        if flag.load(Ordering::Relaxed) {
-            Err(Error::Cancelled)
-        } else {
-            Ok(())
-        }
-    });
+    let result = log.commit_at_time_checked(
+        i64::MAX,
+        &mut || {
+            if flag.load(Ordering::Relaxed) {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        },
+        None,
+    );
     drop(observer);
     assert_eq!(
         progress.get(),
@@ -489,7 +493,7 @@ fn writable_timestamp_gap_walk_stops_at_the_next_stride() {
         }
     }
     assert_eq!(
-        log.commit_at_time_checked(i64::MAX, &mut || Ok(()))
+        log.commit_at_time_checked(i64::MAX, &mut || Ok(()), None)
             .unwrap(),
         Some(first)
     );
@@ -505,8 +509,11 @@ fn writable_timestamp_gap_walk_stops_at_the_next_stride() {
             }
         }
     });
-    let result =
-        log.commit_at_time_checked(i64::MAX, &mut || Control::with_cancel(flag.clone()).check());
+    let result = log.commit_at_time_checked(
+        i64::MAX,
+        &mut || Control::with_cancel(flag.clone()).check(),
+        None,
+    );
     drop(observer);
     assert_eq!(
         count.get(),
@@ -531,7 +538,7 @@ fn writable_timestamp_checks_after_the_last_segment() {
         }
     });
     let control = Control::with_cancel(flag.clone());
-    let result = log.commit_at_time_checked(i64::MAX, &mut || control.check());
+    let result = log.commit_at_time_checked(i64::MAX, &mut || control.check(), None);
     drop(observer);
     assert!(flag.load(Ordering::Relaxed), "the last index was processed");
     assert!(
@@ -898,7 +905,7 @@ fn checked_open_preserves_writable_and_cold_selector_rows_and_order() {
     let cold_view = cold.view(policy.clone(), &prep);
     let log = cold_view.snapshot().change_log.as_ref().unwrap();
     assert_eq!(
-        log.commit_at_time_checked(i64::MAX, &mut || Ok(()))
+        log.commit_at_time_checked(i64::MAX, &mut || Ok(()), None)
             .unwrap(),
         Some(cold.later.seq),
         "the time lookup sees the captured head beyond the row ceiling"
