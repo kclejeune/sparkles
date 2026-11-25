@@ -1680,6 +1680,40 @@ impl Store {
         set.table.lock().branches.iter().map(|b| b.id).collect()
     }
 
+    /// Enumerate the listed branch IDs under reconciliation's lock-wait policy.
+    #[doc(hidden)]
+    pub fn reconciliation_branch_ids(
+        &self,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<Vec<uuid::Uuid>> {
+        let SetRef::Owner(set) = &self.branching.set else {
+            return Ok(Vec::new());
+        };
+        let table = controlled_lock(&set.table, options)?;
+        let mut ids = Vec::with_capacity(table.branches.len());
+        for branch in &table.branches {
+            options.check()?;
+            ids.push(branch.id);
+        }
+        Ok(ids)
+    }
+
+    /// Read a listed branch or a reachable retired upstream for reconciliation. A
+    /// no-wait scan uses only resident stores because reopening can do lengthy I/O.
+    #[doc(hidden)]
+    pub fn reconciliation_branch_store(
+        &self,
+        id: uuid::Uuid,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<Option<Arc<Store>>> {
+        options.check()?;
+        if !options.no_wait {
+            return self.upstream_store(id).map(|store| store.shared());
+        }
+        let set = self.owned_set()?;
+        Ok(controlled_lock(&set.stores, options)?.get(&id).cloned())
+    }
+
     /// Check that the listed branch identities still match a previous enumeration.
     /// Returns false if the branch table is busy, so this can be used under a source
     /// hold's publication lock without waiting for another dataset's branch table.
@@ -3382,7 +3416,7 @@ mod source_tests {
 }
 
 /// Take `mutex` under the cancellation, deadline and no-wait choice of `options`.
-fn controlled_lock<'a, T>(
+pub(super) fn controlled_lock<'a, T>(
     mutex: &'a parking_lot::Mutex<T>,
     options: &crate::guard::WriteOptions,
 ) -> Result<parking_lot::MutexGuard<'a, T>> {

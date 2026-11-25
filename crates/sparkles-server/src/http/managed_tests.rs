@@ -1261,26 +1261,7 @@ async fn cross_dataset_claims_proposal_holds_referenced_dataset_over_http() {
     inv.dataset
         .update("DELETE DATA { GRAPH <urn:inv> { <urn:host> <urn:runs> <urn:release> } }")
         .unwrap();
-    let digest =
-        sparkles::evidence::Sha256Digest::of_bytes(b"note", &sparkles::task::Control::none())
-            .unwrap()
-            .to_string();
-    let body = json!({
-        "revisions": [{"key": "rev", "source": "urn:src", "sourceKey": "s1",
-                       "content": {"digest": digest}}],
-        "references": [{"key": "ref", "occurrenceKey": "r1", "storedFact": {
-            "datasetId": inv.store.dataset_id(),
-            "branchId": inv.store.dataset_id(),
-            "commit": fact_commit,
-            "graph": "urn:inv",
-            "triple": "<urn:host> <urn:runs> <urn:release>",
-        }}],
-        "claims": [{"key": "c", "occurrenceKey": "c1", "revision": {"key": "rev"},
-                    "proposition": "<urn:host> <urn:runs> <urn:release>",
-                    "kind": "reported", "polarity": "positive", "author": "urn:a"}],
-        "links": [{"key": "l", "occurrenceKey": "l1", "target": {"key": "c"},
-                   "evidence": {"key": "ref"}, "relation": "supports", "author": "urn:a"}],
-    });
+    let body = foreign_claims_body(inv.store.dataset_id(), fact_commit);
     use crate::auth::{Access, Endpoint, Grants, Kind, Level, Principal, Restricted, Scheme};
     let principal = Principal::new(
         Kind::User,
@@ -1401,4 +1382,109 @@ async fn cross_dataset_claims_proposal_holds_referenced_dataset_over_http() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{gone}");
     assert_eq!(gone["code"], "evidence-unavailable");
+}
+
+fn foreign_claims_body(dataset_id: uuid::Uuid, fact_commit: u64) -> serde_json::Value {
+    let digest =
+        sparkles::evidence::Sha256Digest::of_bytes(b"note", &sparkles::task::Control::none())
+            .unwrap()
+            .to_string();
+    json!({
+        "revisions": [{"key": "rev", "source": "urn:src", "sourceKey": "s1",
+                       "content": {"digest": digest}}],
+        "references": [{"key": "ref", "occurrenceKey": "r1", "storedFact": {
+            "datasetId": dataset_id,
+            "branchId": dataset_id,
+            "commit": fact_commit,
+            "graph": "urn:inv",
+            "triple": "<urn:host> <urn:runs> <urn:release>",
+        }}],
+        "claims": [{"key": "c", "occurrenceKey": "c1", "revision": {"key": "rev"},
+                    "proposition": "<urn:host> <urn:runs> <urn:release>",
+                    "kind": "reported", "polarity": "positive", "author": "urn:a"}],
+        "links": [{"key": "l", "occurrenceKey": "l1", "target": {"key": "c"},
+                   "evidence": {"key": "ref"}, "relation": "supports", "author": "urn:a"}],
+    })
+}
+
+#[test]
+fn cross_dataset_proposal_rejects_a_source_renamed_before_acquisition() {
+    memory_source_rename_refuses("evidence-sources-resolved", 0);
+}
+
+#[test]
+fn cross_dataset_proposal_rejects_a_source_renamed_before_publication() {
+    memory_source_rename_refuses("evidence-held", 1);
+}
+
+fn memory_source_rename_refuses(point: &'static str, expected_holds: usize) {
+    use crate::auth::{Access, Grants, Kind, Level, Principal, Scheme};
+    use sparkles::task::Control;
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    let ev = state.create("ev", DbType::Memory).unwrap();
+    let inv = state.create("inv", DbType::Memory).unwrap();
+    sparkles::evidence::configure(
+        &ev.dataset,
+        &sparkles::evidence::Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".into()],
+            proposals: vec!["urn:ev:claims".into()],
+            ..Default::default()
+        },
+        &Control::none(),
+    )
+    .unwrap();
+    inv.dataset
+        .update("INSERT DATA { GRAPH <urn:inv> { <urn:host> <urn:runs> <urn:release> } }")
+        .unwrap();
+    let body = foreign_claims_body(inv.store.dataset_id(), inv.store.head_commit().seq);
+    let principal = Principal::new(
+        Kind::User,
+        "proposer",
+        Scheme::Basic,
+        Access::of(Grants {
+            datasets: vec![
+                ("ev".into(), Level::Write),
+                ("inv".into(), Level::Admin),
+                ("renamed".into(), Level::Read),
+            ],
+            ..Default::default()
+        }),
+    );
+    assert!(principal.admin_everywhere("inv"));
+    assert!(!principal.admin_everywhere("renamed"));
+    let catalog = state.catalog.clone();
+    ev.store.set_failpoint(
+        point,
+        Some(Arc::new(move |_| {
+            catalog.rename("inv", "renamed").unwrap();
+        })),
+    );
+    let origin_head = ev.store.head_commit().seq;
+    let refused = crate::evidence::execute(
+        "propose",
+        state.clone(),
+        "ev".into(),
+        principal,
+        body.to_string().into(),
+        crate::evidence::Execution {
+            branch: sparkles::branch::MAIN.into(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deadline: None,
+            grant: None,
+        },
+    );
+    ev.store.set_failpoint(point, None);
+    let refused = refused.expect_err("the authorized source name changed");
+    assert_eq!(refused.into_parts().0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(ev.store.head_commit().seq, origin_head);
+    let renamed = state.catalog.get("renamed").unwrap();
+    assert!(std::ptr::eq(inv.dataset.store(), renamed.store()));
+    assert_eq!(
+        sparkles::evidence::holds(&renamed).unwrap().len(),
+        expected_holds
+    );
 }

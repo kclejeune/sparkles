@@ -249,8 +249,27 @@ pub(crate) struct CatalogIdentities(
 
 impl CatalogIdentities {
     pub(crate) fn matches(&self, dataset: &Dataset) -> bool {
-        Catalog::unique_entry(&self.0, dataset.dataset_id())
-            .is_some_and(|entry| std::ptr::eq(dataset.store(), entry.dataset.store()))
+        Catalog::unique_entry(&self.0, dataset.dataset_id()).is_some_and(|entry| {
+            dataset.name() == entry.dataset.name()
+                && std::ptr::eq(dataset.store(), entry.dataset.store())
+        })
+    }
+}
+
+/// Keeps open and closed registrations stable through a hold's durable release.
+pub(crate) struct ReconcileCatalogIdentities<'a> {
+    open: CatalogIdentities,
+    closed: parking_lot::MutexGuard<'a, BTreeMap<String, Detached>>,
+    _management: parking_lot::MutexGuard<'a, ()>,
+}
+
+impl ReconcileCatalogIdentities<'_> {
+    pub(crate) fn matches(&self, dataset: &Dataset) -> bool {
+        self.open.matches(dataset)
+            && self
+                .closed
+                .values()
+                .all(|entry| entry.id.is_some_and(|id| id != dataset.dataset_id()))
     }
 }
 
@@ -680,12 +699,7 @@ impl Catalog {
             .map(|e| e.dataset.clone())
     }
 
-    /// Look up an identity that names exactly one open dataset in this catalog.
-    pub(crate) fn unique_by_id(&self, id: Uuid) -> Option<Dataset> {
-        Self::unique_entry(&self.inner.entries.read(), id).map(|entry| entry.dataset.clone())
-    }
-
-    /// Pin the exact registered handles until the caller finishes publication.
+    /// Pin the exact registered names and handles through acquisition or publication.
     /// A busy registry is retryable, unlike an absent or ambiguous identity.
     pub(crate) fn pin_dataset_identities<'a>(
         &self,
@@ -713,6 +727,27 @@ impl Catalog {
             .into_iter()
             .all(|ds| entries.matches(ds))
             .then_some(entries))
+    }
+
+    /// The open registry alone cannot prove uniqueness while a registered dataset
+    /// is closed or a management operation is changing its registration.
+    pub(crate) fn try_pin_reconciliation(
+        &self,
+        target: &Dataset,
+        control: &crate::task::Control,
+    ) -> Result<Option<ReconcileCatalogIdentities<'_>>> {
+        control.check()?;
+        let management = self.try_pin_management().ok_or(Error::WriterBusy)?;
+        let Some(open) = self.pin_dataset_identities([target], control, true)? else {
+            return Ok(None);
+        };
+        let closed = self.inner.detached.try_lock().ok_or(Error::WriterBusy)?;
+        let pin = ReconcileCatalogIdentities {
+            open,
+            closed,
+            _management: management,
+        };
+        Ok(pin.matches(target).then_some(pin))
     }
 
     fn unique_entry(entries: &BTreeMap<String, Entry>, id: Uuid) -> Option<&Entry> {
@@ -1144,11 +1179,10 @@ impl Catalog {
             entry.dataset.close_for_disposal(|| drop(map.take()))
         };
         drop(paused);
-        // As in delete, only an unwinding committed close keeps this record.
-        self.inner.detached.lock().remove(from);
         let reasoning = match closed {
             Ok(reasoning) => reasoning,
             Err(refused) => {
+                self.inner.detached.lock().remove(from);
                 let dataset = refused.dataset;
                 map.as_mut()
                     .expect("refusal retains entries exclusion")
@@ -1184,16 +1218,18 @@ impl Catalog {
             rename::fail_point(rename::FAIL_AFTER_MOVE)?;
             // Publish the reopened store only once the registry names it.
             let ds = self.open_existing_dataset(to, Some(id))?;
-            self.inner.detached.lock().insert(
-                to.into(),
-                Detached {
-                    id: Some(id),
-                    reasoning: ds.reasoning_record(),
-                },
-            );
-            let saved = self.save_locked();
-            self.inner.detached.lock().remove(to);
-            saved?;
+            {
+                let mut detached = self.inner.detached.lock();
+                detached.remove(from);
+                detached.insert(
+                    to.into(),
+                    Detached {
+                        id: Some(id),
+                        reasoning: ds.reasoning_record(),
+                    },
+                );
+            }
+            self.save_locked()?;
             self.inner.entries.write().insert(
                 to.into(),
                 Entry {
@@ -1202,6 +1238,7 @@ impl Catalog {
                     attached: false,
                 },
             );
+            self.inner.detached.lock().remove(to);
             Ok(())
         });
         if let Err(e) = result {
@@ -1237,6 +1274,9 @@ impl Catalog {
             rename::fail_point(rename::FAIL_ROLLBACK_REOPEN)?;
             self.reattach_locked(&name, Some(id))
         })();
+        let mut detached = self.inner.detached.lock();
+        detached.remove(from);
+        detached.remove(to);
         match reopened {
             Ok(()) => err,
             Err(again) => {
@@ -1244,7 +1284,7 @@ impl Catalog {
                     Some(r) => (r.name, r.reasoning),
                     None => (from.to_string(), reasoning),
                 };
-                self.inner.detached.lock().insert(
+                detached.insert(
                     name.clone(),
                     Detached {
                         id: Some(id),

@@ -128,6 +128,12 @@ impl Catalog {
             _mark: Marked::push(self, Mark::Holding),
         })
     }
+    /// Exclude a management transition while reconciling a hold. The reader takes
+    /// no management actions and runs no deferred callbacks when it drops the pin.
+    pub(super) fn try_pin_management(&self) -> Option<MutexGuard<'_, ()>> {
+        self.inner.manage.lock.try_lock()
+    }
+
     /// Refuse, without taking the lock, a management call that [`manage`](Self::manage)
     /// would refuse. Entry points that change files or other state before they take the
     /// lock call it first, so a refusal leaves everything as it was. The answer cannot

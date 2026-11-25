@@ -14,7 +14,7 @@ impl Store {
     #[doc(hidden)]
     pub fn published_history_ranges(
         &self,
-        options: &HistoryOptions,
+        options: &crate::access::Preparation,
         max_memory_bytes: u64,
     ) -> Result<Vec<(u64, u64)>> {
         let limit = ReadLimit {
@@ -45,7 +45,7 @@ impl Store {
     pub fn snapshot_at_published(
         &self,
         seq: u64,
-        options: &HistoryOptions,
+        options: &crate::access::Preparation,
         max_memory_bytes: u64,
     ) -> Result<Arc<Snapshot>> {
         let capacity = self

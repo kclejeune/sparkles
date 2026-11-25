@@ -66,7 +66,7 @@ mod lock;
 mod lock_tests;
 mod managed;
 pub(crate) mod managed_history;
-pub use holds::{Acquired, HoldPublication};
+pub use holds::{Acquired, HoldPublication, PublishedWriter};
 pub use managed::ManagedSnapshot;
 #[cfg(test)]
 mod control_tests;
@@ -4165,6 +4165,13 @@ impl Store {
         *self.clock.lock() = Some(clock);
     }
 
+    /// Inject a vocabulary sync error after writing the terms (tests).
+    #[cfg(any(test, feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn fail_next_vocab_sync(&self) {
+        self.snapshot().generation.dvocab.fail_next_sync();
+    }
+
     // ------------------------------------------------------------ full-text ------
 
     /// Open the full-text index if `text.json` enables it (rebuilding it if needed).
@@ -7458,6 +7465,11 @@ impl WriteTxn<'_> {
             }
             self.store.failpoint("merge-recorded");
         }
+        let control_enabled = self.store.control_enabled();
+        let evidence_commit = self
+            .managed
+            .as_ref()
+            .is_some_and(|cap| cap.owner() == crate::managed::OwnerKind::Evidence);
         let w = &mut **self.guard;
         if let Some(wal) = w.wal.as_mut() {
             // the record says no earlier commit may be missing from disk, so a fence
@@ -7479,12 +7491,13 @@ impl WriteTxn<'_> {
                 next_bnode,
                 wal::Seal::of(&c, 0, 0),
             )?;
-            // In a store with a control keyspace the writer stays poisoned from here
-            // until the snapshot and the control state are published, so that an error
-            // or an unwind in between leaves no writer whose head differs from what
-            // readers see (spec C26 §7.1).
-            if self.store.control_enabled() {
+            // Recovery can find a sealed WAL commit that has not published in this
+            // process. A control commit must publish its control state as well, and
+            // evidence reconciliation must retain the holds of an uncertain receipt.
+            if control_enabled || evidence_commit {
                 w.poisoned = true;
+            }
+            if control_enabled {
                 self.store.failpoint("control-commit-armed");
             }
             // once the first byte is written, a failure leaves the WAL in an unknown
@@ -7553,6 +7566,10 @@ impl WriteTxn<'_> {
             if control.is_some() {
                 self.store.failpoint("control-commit-synced");
             }
+            #[cfg(any(test, feature = "failpoints"))]
+            if evidence_commit {
+                self.store.failpoint("evidence-wal-synced");
+            }
             // the bytes the file grew by: the records past its end and any zeros after,
             // which the quota does not count
             // and the bytes the vocabulary file grew by
@@ -7616,8 +7633,10 @@ impl WriteTxn<'_> {
         if let Some((_, state)) = control {
             self.store.control.store(Some(Arc::new(state)));
         }
-        if self.store.control_enabled() && self.guard.wal.is_some() {
-            self.store.failpoint("control-commit-published");
+        if self.guard.wal.is_some() && (control_enabled || evidence_commit) {
+            if control_enabled {
+                self.store.failpoint("control-commit-published");
+            }
             self.guard.poisoned = false;
         }
         Ok(Receipt {

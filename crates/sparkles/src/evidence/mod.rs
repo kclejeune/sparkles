@@ -395,9 +395,10 @@ pub fn release_hold(dataset: &Dataset, id: uuid::Uuid) -> Result<bool> {
         .is_empty())
 }
 
-/// Release the evidence holds acquired at least `grace_ms` milliseconds ago that `keep`
-/// does not keep, such as holds whose referencing commit never published. Returns the
-/// released ids.
+/// Release local evidence holds acquired at least `grace_ms` milliseconds ago that
+/// `keep` does not keep. Foreign holds stay in place and are never passed to the
+/// callback. Use [`reconcile_operation_holds_in`] to verify and release foreign holds.
+/// Returns the released ids.
 pub fn reconcile_holds(
     dataset: &Dataset,
     grace_ms: i64,

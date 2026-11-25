@@ -918,16 +918,17 @@ A proposal runs in this order.
    read access with the L4 resolver, so a reference the caller cannot read answers as a
    missing one.
 5. The server checks the caller's authority to change holds on every referenced
-   dataset outside the proposing dataset. Each dataset that serves a referenced
-   stored fact acquires a hold under the operation UUID before step 6 starts.
+   dataset outside the proposing dataset. The registered names and identities stay
+   pinned through this check and hold acquisition. Each dataset that serves a
+   referenced stored fact acquires a hold under the operation UUID before step 6 starts.
    Persistent datasets make each hold durable before acquiring the next.
 6. Under the branch writer, `ifHead` is checked as `409 head-changed`, the key is checked
    again, every record identity is checked, the commit is stamped and the record and
    operation quads are built. An existing identity in the same graph whose authenticated
    record has an equal digest is reported as `existing` and not written again, and any
    other existing identity is `409 immutable-record-conflict`. A publish hook then runs
-   on the committing thread inside the commit. It pins the exact registered handles
-   for a cross-dataset proposal and takes the referenced datasets' hold publication
+   on the committing thread inside the commit. It pins the same registered names
+   and handles for a cross-dataset proposal and takes the referenced datasets' hold publication
    locks in ascending dataset UUID order. It verifies each hold and refuses if its
    last file replacement is uncertain. It then enters the host's authority fence.
    The thread keeps the guards until the commit has published or been refused.
@@ -944,15 +945,22 @@ hold set per source as digests in `ev:sourceHoldSets`. A receipt from an earlier
 keeps the hold when it describes the operation but lacks that field. The first pass
 opens the origin's stores and checks that retained origin history cannot supply a
 foreign receipt to a historical fork. The second pass rechecks current heads under
-the target's exclusive publication lock. It pins the verified catalog identities and
-listed branches through the durable release. Busy or changed membership keeps the
-hold. The second pass waits for no origin writer. Publication renews each hold, so a
-reconciliation that selected the hold earlier leaves it in place.
+the target's exclusive publication lock. It excludes catalog management and pins
+the verified open and closed registrations and listed branches through the durable
+release. An unresolved registration keeps a foreign hold when it could name the
+target or the origin. It also tries to pin each relevant
+persistent writer while it confirms that the published head includes every commit
+that could recover at reopen. An uncertain writer or busy or changed membership
+keeps the hold. Publication renews each hold, so a reconciliation that selected the
+hold earlier leaves it in place.
 
 Each published proposal checks its own dataset and the datasets it held with an
-hour's grace. The outcome of this housekeeping does not affect its commit.
-`reconcile_operation_holds` is the local-only Rust wrapper. Use
-`reconcile_operation_holds_in` with the catalog to check foreign holds.
+hour's grace. The checks share the request's cancellation and remaining time, capped
+at one second across all datasets. This path uses available branch stores and skips
+cold opens and change-log flushes. Any hold whose check cannot finish stays for later
+reconciliation. The outcome of this housekeeping does not affect the commit.
+`reconcile_operation_holds` and the legacy `reconcile_holds` callback are local-only.
+Use `reconcile_operation_holds_in` with the catalog to check foreign holds.
 
 The server's authority fence binds the commit to the caller's credential.
 `AuthorityRegistry::begin_hold` takes a shared guard on the authority generation, and
@@ -2316,7 +2324,8 @@ Item 550 extends proposal holds to every catalog dataset that serves a reference
 stored fact. Each dataset must be uniquely registered by UUID in the same catalog.
 All must be persistent or all must be in memory. HTTP, MCP and ingestion callers need
 `admin` on every branch and graph of each foreign source in addition to their read
-grants. The publication hook preserves the verified dataset identities and every
+grants. Acquisition pins the names under which the caller is authorized. The
+publication hook revalidates the verified names and identities and preserves every
 source hold through publication. Replay returns the hold in the original receipt,
 including a null hold for older proposals that referenced only foreign facts.
 
@@ -2326,11 +2335,14 @@ A foreign hold records the proposing dataset's UUID as `forDatasetId` in
 include the originating dataset for foreign holds.
 
 A hold stays while either dataset is unavailable or ambiguously registered.
+A pending or refused registration with an unknown UUID prevents automatic release
+until the catalog can establish the hold's origin.
 Deleting the origin leaves the foreign hold for an administrator to release until
 item 1315 adds durable cleanup. Automatic reconciliation currently runs after
 proposals publish on the target or acquire holds there. Item 1316 tracks scheduled
 cleanup and an index for large historical scans. A foreign hold also stays if its
-origin history cannot be checked within the scan bounds.
+origin can recover an unpublished receipt or its history cannot be checked within
+the scan bounds.
 
 Tests cover catalog ambiguity, copied store handles, mixed persistence, foreign
 authority, both hold file versions, retention, crash recovery, a race between

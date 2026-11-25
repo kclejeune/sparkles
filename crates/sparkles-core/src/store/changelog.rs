@@ -1933,6 +1933,7 @@ impl ChangeLog {
         filter: &LogFilter,
         descending: bool,
         holes_after_stop: bool,
+        no_wait: bool,
         check: &mut dyn FnMut() -> Result<()>,
         mut paged: Option<&mut PageHooks<'_, '_>>,
         visit: &mut Visit<'_>,
@@ -1940,7 +1941,11 @@ impl ChangeLog {
         if let Some(reader) = &self.readonly {
             return reader.scan(from, to, filter, descending, check, visit);
         }
-        let mut inner = self.inner.lock();
+        let mut inner = if no_wait {
+            self.inner.try_lock().ok_or(Error::WriterBusy)?
+        } else {
+            self.inner.lock()
+        };
         let mut holes: Vec<Unrecorded> = Vec::new();
         if from > to {
             return Ok(holes);
@@ -1977,7 +1982,7 @@ impl ChangeLog {
         };
         let mut stop = false;
         'segs: for i in order {
-            if paged.is_some() {
+            if no_wait || paged.is_some() {
                 check()?;
             }
             let (sf, sl) = (inner.segs[i].first, inner.segs[i].last);
@@ -2078,7 +2083,7 @@ impl ChangeLog {
                 if let Record::Changes(c, changes) = &record {
                     let is_paged = paged.is_some();
                     for (idx, (add, k)) in changes.iter().enumerate() {
-                        if is_paged && idx.is_multiple_of(CHECK_STRIDE) {
+                        if (no_wait || is_paged) && idx.is_multiple_of(CHECK_STRIDE) {
                             check()?;
                         }
                         #[cfg(test)]
@@ -2973,6 +2978,7 @@ mod settings_format_tests {
             &reject_all,
             false,
             false,
+            false,
             &mut || Ok(()),
             Some(&mut PageHooks {
                 admit: &mut admit,
@@ -2995,6 +3001,7 @@ mod settings_format_tests {
             1,
             1,
             &reject_all,
+            false,
             false,
             false,
             &mut || {

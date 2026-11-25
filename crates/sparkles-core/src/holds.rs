@@ -20,8 +20,8 @@
 //! branch that made the commit: a commit at or below a branch's starting point belongs
 //! to its upstream, whose history the hold keeps. `forDatasetId`, present when it differs
 //! from `datasetId`, names the dataset whose operation acquired this hold so
-//! cross-dataset reconciliation can verify it there; when no hold names another dataset,
-//! `holds.json` is written as format 1. Together the holds name at most
+//! cross-dataset reconciliation can verify it there. A file with a foreign hold uses
+//! format 2. A file with only local holds uses format 1. Together the holds name at most
 //! [`MAX_COMMITS`] commits. A dataset with `holds.json` needs dataset reader 7
 //! ([`READER`]), so a build that ignores the file refuses to open the dataset instead of
 //! trimming held history.

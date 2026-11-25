@@ -413,6 +413,7 @@ impl HistoryPages {
                 &self.filter,
                 q.descending,
                 false,
+                false,
                 &mut storage_check,
                 Some(&mut PageHooks {
                     admit: &mut admit_record,

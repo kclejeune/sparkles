@@ -99,6 +99,10 @@ impl State {
     fn busy(&self) -> bool {
         self.syncing.is_some() || self.publishing.is_some()
     }
+
+    fn idle(&self) -> bool {
+        !self.busy() && self.queue.is_empty() && !self.failed
+    }
 }
 
 #[derive(Default)]
@@ -131,8 +135,12 @@ impl Coordinator {
     /// No fence runs and nothing is queued, so a commit made now would be the only one
     /// in its group.
     pub fn idle(&self) -> bool {
-        let s = self.state.lock();
-        !s.busy() && s.queue.is_empty() && !s.failed
+        self.state.lock().idle()
+    }
+
+    /// Check for a healthy idle queue without waiting for a fence.
+    pub(super) fn try_idle(&self) -> bool {
+        self.state.try_lock().is_some_and(|state| state.idle())
     }
 
     /// Wait, without leading a fence, until no commit is in flight: no fence runs, and

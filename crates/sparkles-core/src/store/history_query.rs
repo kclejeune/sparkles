@@ -267,7 +267,24 @@ impl ChangeLog {
     /// Run a history query against the commits up to `upto` (the state the caller
     /// reads). Bounds given as [`HistoryBound::At`] must already be resolved.
     pub fn query(&self, q: &HistoryQuery, upto: u64) -> Result<HistoryResult> {
-        let (from, to, upto) = self.range(q, upto)?;
+        self.query_with(q, upto, false)
+    }
+
+    fn query_with(&self, q: &HistoryQuery, upto: u64, no_wait: bool) -> Result<HistoryResult> {
+        let (from, to, upto) = if no_wait {
+            q.check()?;
+            if !self.is_enabled() {
+                return Err(Error::HistoryUnsupported("the change log is off".into()));
+            }
+            check_history_access(q.access.as_ref())?;
+            let upto = self
+                .read_only_through()
+                .map_or(upto, |through| upto.min(through));
+            let (from, to) = self.bounds(q, upto, &|| q.check())?;
+            (from, to, upto)
+        } else {
+            self.range(q, upto)?
+        };
         let filter = q.filter();
         let access = q.access.as_ref().filter(|a| !a.reads_everything());
         let mut readable: FxHashMap<Arc<[u8]>, bool> = FxHashMap::default();
@@ -276,7 +293,7 @@ impl ChangeLog {
         let mut n = 0u64;
         let mut check = || {
             n += 1;
-            if self.read_only_through().is_some() {
+            if no_wait || self.read_only_through().is_some() {
                 return q.check();
             }
             if n & 0xFF != 0 {
@@ -304,6 +321,7 @@ impl ChangeLog {
             &filter,
             q.descending,
             true,
+            no_wait,
             &mut check,
             None,
             &mut |c, add, k: &QuadKey| {
@@ -378,6 +396,25 @@ impl Store {
             ));
         };
         log.query(q, self.snapshot().commit)
+    }
+
+    /// Read commit bounds through the published head without flushing queued records
+    /// or waiting for the log lock. Unflushed records are reported as gaps.
+    #[doc(hidden)]
+    pub fn try_published_history_changes(&self, q: &HistoryQuery) -> Result<HistoryResult> {
+        if q.from
+            .iter()
+            .chain(&q.to)
+            .any(|bound| !matches!(bound, HistoryBound::Commit(_)))
+        {
+            return Err(Error::invalid("this history scan requires commit bounds"));
+        }
+        let Some(log) = &self.changelog else {
+            return Err(Error::HistoryUnsupported(
+                "this store has no change log".into(),
+            ));
+        };
+        log.query_with(q, self.snapshot().commit, true)
     }
 
     /// The commit a selector names, without asking that its state be readable.

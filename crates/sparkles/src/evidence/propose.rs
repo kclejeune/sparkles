@@ -20,18 +20,17 @@
 //!    and right before publication the caller's authority and every hold are checked
 //!    in ascending dataset-UUID order.
 //!
-//! A failure after step 5 leaves the holds without an operation that records them. They
-//! are orphans that [`reconcile_operation_holds_in`] (and [`reconcile_operation_holds`]
-//! for local holds) releases once their grace period has passed, which every published
-//! proposal runs on its own dataset and on each other dataset it held, and a retry with
-//! the same idempotency key acquires the same holds again.
+//! A failure after step 5 can leave holds in place. Reconciliation can release a hold
+//! after its grace period once the operation is absent from its origin and cannot
+//! recover at reopen. Each published proposal runs a bounded reconciliation on its
+//! own dataset and on each dataset it held. A retry can reacquire the same holds.
 
 use super::resolve::{Reference, Resolution};
 use crate::access::GraphAccess;
 use crate::branch::CommitRef;
-use crate::catalog::CatalogIdentities;
+use crate::catalog::ReconcileCatalogIdentities;
 use crate::managed::{ManagedError, ManagedErrorKind, OwnerKind};
-use crate::store::{HistoryBound, HistoryQuery, ListedBranches, Store};
+use crate::store::{HistoryBound, HistoryQuery, ListedBranches, PublishedWriter, Store};
 use crate::task::Control;
 use crate::{Catalog, Dataset, Error, Result};
 use oxrdf::{NamedNode, Term};
@@ -45,6 +44,7 @@ use sparkles_core::evidence::{
 };
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub use sparkles_core::evidence::write::{HeldCommit, operation_id, operation_iri};
@@ -63,8 +63,9 @@ pub trait AuthorityFence: Send + Sync {
     fn enter(&self) -> Result<Box<dyn std::any::Any>>;
 
     /// Check authority to change the foreign datasets' source holds. The returned
-    /// guard stays alive through acquisition. Trusted Rust callers can use the
-    /// default when they control every dataset in the proposal.
+    /// guard stays alive through acquisition. The supplied names are pinned in the
+    /// catalog during the check, so this callback must not take the catalog lock.
+    /// Trusted Rust callers can use the default when they control every dataset.
     fn enter_source_holds(&self, _targets: &[&Dataset]) -> Result<Box<dyn std::any::Any>> {
         Ok(Box::new(()))
     }
@@ -497,7 +498,7 @@ fn references(
 fn catalog_identity_changed() -> Error {
     managed(
         ManagedErrorKind::EvidenceUnavailable,
-        "cross-dataset holds require unambiguous datasets in the proposal catalog",
+        "cross-dataset holds require unchanged, unambiguous dataset registrations in the proposal catalog",
     )
 }
 
@@ -682,12 +683,13 @@ pub fn propose(
             },
         )?;
     }
+    main.store().failpoint("evidence-sources-resolved");
     let foreign: Vec<&Dataset> = resolved_datasets.values().collect();
-    let publication_catalog = if foreign.is_empty() {
-        None
+    let (publication_catalog, source_identities) = if foreign.is_empty() {
+        (None, None)
     } else {
         let catalog = catalog.ok_or_else(catalog_identity_changed)?;
-        catalog
+        let identities = catalog
             .pin_dataset_identities(
                 std::iter::once(main).chain(foreign.iter().copied()),
                 control,
@@ -703,7 +705,7 @@ pub fn propose(
                 "cross-dataset holds require all sources and the proposal dataset to have the same persistence",
             ));
         }
-        Some(catalog.clone())
+        (Some(catalog.clone()), Some(identities))
     };
     let source_authority = match &options.authority {
         Some(authority) if !foreign.is_empty() => Some(authority.enter_source_holds(&foreign)?),
@@ -743,6 +745,7 @@ pub fn propose(
         }
     }
     drop(source_authority);
+    drop(source_identities);
     if hold.is_some() && !options.dry_run {
         main.store().failpoint("evidence-held");
     }
@@ -892,23 +895,34 @@ pub fn propose(
         Err(e) => Err(e),
         Ok(receipt) => {
             main.store().failpoint("evidence-committed");
-            // Orphaned holds of earlier operations past their grace period are released
-            // after a publication, on this dataset and on any other dataset this
-            // operation held. This housekeeping never fails the proposal.
-            if let Err(e) =
-                reconcile_operation_holds_in(catalog, main, crate::holds::DEFAULT_GRACE_MS)
-            {
-                tracing::warn!(target: "sparkles::evidence", "orphaned evidence holds were not reconciled: {e}");
-            }
-            for (target_ds, _, for_dataset) in &held_targets {
-                if for_dataset.is_some()
-                    && let Err(e) = reconcile_operation_holds_in(
-                        catalog,
-                        target_ds,
-                        crate::holds::DEFAULT_GRACE_MS,
-                    )
-                {
-                    tracing::warn!(target: "sparkles::evidence", "orphaned cross-dataset evidence holds were not reconciled: {e}");
+            // All targets share the remaining request time, even after publication.
+            let sweep_end = Instant::now() + Duration::from_secs(1);
+            let cleanup = Control {
+                deadline: Some(control.deadline.map_or(sweep_end, |d| d.min(sweep_end))),
+                cancel: control.cancel.clone(),
+                ..Control::default()
+            };
+            let targets = std::iter::once(main).chain(
+                held_targets
+                    .iter()
+                    .filter_map(|(ds, _, origin)| origin.is_some().then_some(ds)),
+            );
+            for target in targets {
+                if cleanup.check().is_err() {
+                    break;
+                }
+                match reconcile_operation_holds_controlled(
+                    catalog,
+                    target,
+                    crate::holds::DEFAULT_GRACE_MS,
+                    &cleanup,
+                    true,
+                ) {
+                    Ok(_) | Err(Error::WriterBusy) => {}
+                    Err(Error::Timeout | Error::Cancelled) => break,
+                    Err(e) => {
+                        tracing::warn!(target: "sparkles::evidence", "orphaned evidence holds were not reconciled: {e}")
+                    }
                 }
             }
             Ok(Proposed {
@@ -950,56 +964,65 @@ pub fn operation_recorded(main: &Dataset, id: Uuid, control: &Control) -> Result
 /// The stores to scan in both passes of reconciliation, and the branch identities
 /// whose membership must still match when the operation is found absent.
 struct OperationStores {
-    datasets: Vec<Dataset>,
+    origin: Dataset,
+    listed: Vec<Arc<Store>>,
     branches: Vec<Uuid>,
     upstreams: Vec<Arc<Store>>,
 }
 
 impl OperationStores {
-    fn open(main: &Dataset, include_upstreams: bool) -> Result<Option<Self>> {
-        let branches = main.store().listed_branch_ids();
-        let mut datasets = vec![main.clone()];
+    fn open(
+        origin: Dataset,
+        include_upstreams: bool,
+        options: &crate::guard::WriteOptions,
+    ) -> Result<Option<Self>> {
+        let main = origin.store();
+        let branches = match main.reconciliation_branch_ids(options) {
+            Err(Error::WriterBusy) => return Ok(None),
+            result => result?,
+        };
+        let mut listed = Vec::with_capacity(branches.len());
         for &id in &branches {
-            let name = main.store().listed_branch_name(id, &Default::default())?;
-            match name.map(|n| main.branch(&n)) {
-                Some(Ok(ds)) if ds.store().branch_id() == id => datasets.push(ds),
-                _ => return Ok(None),
-            }
+            let Ok(Some(store)) = main.reconciliation_branch_store(id, options) else {
+                return Ok(None);
+            };
+            listed.push(store);
         }
-        if !include_upstreams {
-            return Ok(Some(Self {
-                datasets,
-                branches,
-                upstreams: Vec::new(),
-            }));
-        }
-        let mut found: HashSet<_> = branches
-            .iter()
-            .copied()
-            .chain([main.dataset_id()])
-            .collect();
-        let mut pending: Vec<_> = datasets
-            .iter()
-            .filter_map(|ds| ds.store().branch_from())
-            .collect();
         let mut upstreams = Vec::new();
-        while let Some(from) = pending.pop() {
-            if found.insert(from.branch_id) {
-                let Ok(upstream) = main.store().upstream_store(from.branch_id) else {
-                    return Ok(None);
-                };
-                let Some(upstream) = upstream.shared() else {
-                    return Ok(None);
-                };
-                pending.extend(upstream.branch_from());
-                upstreams.push(upstream);
+        if include_upstreams {
+            let mut found: HashSet<_> = branches
+                .iter()
+                .copied()
+                .chain([origin.dataset_id()])
+                .collect();
+            let mut pending: Vec<_> = listed.iter().filter_map(|s| s.branch_from()).collect();
+            while let Some(from) = pending.pop() {
+                options.check()?;
+                if found.insert(from.branch_id) {
+                    let Ok(Some(store)) = main.reconciliation_branch_store(from.branch_id, options)
+                    else {
+                        return Ok(None);
+                    };
+                    pending.extend(store.branch_from());
+                    upstreams.push(store);
+                }
             }
         }
         Ok(Some(Self {
-            datasets,
+            origin,
+            listed,
             branches,
             upstreams,
         }))
+    }
+
+    fn current_stores(&self) -> impl Iterator<Item = &Store> {
+        std::iter::once(self.origin.store()).chain(self.listed.iter().map(Arc::as_ref))
+    }
+
+    fn all_stores(&self) -> impl Iterator<Item = &Store> {
+        self.current_stores()
+            .chain(self.upstreams.iter().map(Arc::as_ref))
     }
 
     fn current_holds(
@@ -1009,8 +1032,9 @@ impl OperationStores {
         target: Uuid,
         commits: &[CommitRef],
     ) -> Result<bool> {
-        for ds in &self.datasets {
-            let head = ds.store().snapshot();
+        for store in self.current_stores() {
+            preparation.check()?;
+            let head = store.snapshot();
             if Reads::new(preparation, &head).describes_hold(op, target, commits)? {
                 return Ok(true);
             }
@@ -1022,30 +1046,32 @@ impl OperationStores {
     /// disappeared from the current graphs. Limit background work conservatively.
     fn historical_holds(
         &self,
-        preparation: &crate::access::Preparation,
         op: &NamedNode,
         target: Uuid,
         commits: &[CommitRef],
+        control: &Control,
+        no_wait: bool,
     ) -> Result<bool> {
-        let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
-        let history_options = crate::history::HistoryOptions {
+        let deadline = control
+            .deadline
+            .or_else(|| Some(Instant::now() + Duration::from_secs(1)));
+        let scan_control = Control {
             deadline,
-            ..Default::default()
+            ..control.clone()
         };
+        let preparation =
+            crate::access::Preparation::new(scan_control, READS_BYTES)?.with_no_wait(no_wait);
         let mut remaining = 256;
         let mut query = HistoryQuery {
             subjects: vec![op.clone().into()],
             predicates: write::operation_hold_predicates().into(),
             deadline,
+            cancel: Some(control.cancel.flag()),
             ..Default::default()
         };
-        for store in self
-            .datasets
-            .iter()
-            .map(Dataset::store)
-            .chain(self.upstreams.iter().map(Arc::as_ref))
-        {
-            let Ok(ranges) = store.published_history_ranges(&history_options, READS_BYTES) else {
+        for store in self.all_stores() {
+            control.check()?;
+            let Ok(ranges) = store.published_history_ranges(&preparation, READS_BYTES) else {
                 return Ok(true);
             };
             for (first, last) in ranges {
@@ -1058,7 +1084,14 @@ impl OperationStores {
                 query.to = Some(HistoryBound::Commit(last));
                 query.limit = remaining;
                 let changes = (first < last)
-                    .then(|| store.published_history_changes(&query).ok())
+                    .then(|| {
+                        if no_wait {
+                            store.try_published_history_changes(&query)
+                        } else {
+                            store.published_history_changes(&query)
+                        }
+                        .ok()
+                    })
                     .flatten()
                     .filter(|result| {
                         !result.truncated && result.unrecorded.is_empty() && result.to == last
@@ -1078,9 +1111,11 @@ impl OperationStores {
                 };
                 for seq in states.by_ref().take(remaining) {
                     remaining -= 1;
-                    match store.snapshot_at_published(seq, &history_options, READS_BYTES) {
+                    match store.snapshot_at_published(seq, &preparation, READS_BYTES) {
                         Ok(snap) => {
-                            if Reads::new(preparation, &snap).describes_hold(op, target, commits)? {
+                            if Reads::new(&preparation, &snap)
+                                .describes_hold(op, target, commits)?
+                            {
                                 return Ok(true);
                             }
                         }
@@ -1098,10 +1133,22 @@ impl OperationStores {
     }
 }
 
+fn keep_if_inconclusive(result: Result<bool>, no_wait: bool) -> Result<bool> {
+    match result {
+        Err(error) if no_wait && !matches!(error, Error::Cancelled | Error::Timeout) => Ok(true),
+        result => result,
+    }
+}
+
 #[derive(Default)]
-struct ReconcileGuards {
-    catalog: Option<CatalogIdentities>,
-    branches: HashMap<Uuid, ListedBranches>,
+struct ReconcileGuards<'a> {
+    catalog: Option<ReconcileCatalogIdentities<'a>>,
+    origins: HashMap<Uuid, OriginGuards>,
+}
+
+struct OriginGuards {
+    _branches: ListedBranches,
+    _writers: Vec<PublishedWriter>,
 }
 
 /// Release the local evidence holds of `main` acquired at least `grace_ms` milliseconds
@@ -1115,93 +1162,147 @@ pub fn reconcile_operation_holds(main: &Dataset, grace_ms: i64) -> Result<Vec<Uu
 
 /// Release evidence holds of `main` acquired at least `grace_ms` milliseconds ago
 /// whose operation is absent from its originating dataset. A foreign hold is kept
-/// while either dataset cannot be identified unambiguously in `catalog`. The grace
+/// while either dataset cannot be identified unambiguously among open and closed
+/// registrations in `catalog`. The grace
 /// period must exceed the longest request deadline. Returns the released ids.
 ///
 /// The first pass reads the listed branches and checks retained history for foreign
 /// holds, so a historical fork cannot revive a foreign dependency whose hold was
 /// released. An inconclusive historical scan keeps the hold. The second pass pins
-/// catalog identities and origin branch membership without waiting and rechecks the
-/// current heads. Every publication renews its hold, so a release selected before
-/// that publication leaves the hold in place.
+/// catalog identities, origin branch membership and persistent writers without
+/// waiting. It checks current heads and keeps holds while an origin commit can
+/// recover beyond the published head. Every publication renews its hold, so a
+/// release selected before that publication leaves the hold in place.
 pub fn reconcile_operation_holds_in(
     catalog: Option<&Catalog>,
     main: &Dataset,
     grace_ms: i64,
 ) -> Result<Vec<Uuid>> {
-    let control = Control::none();
+    reconcile_operation_holds_controlled(catalog, main, grace_ms, &Control::none(), false)
+}
+
+fn reconcile_operation_holds_controlled(
+    catalog: Option<&Catalog>,
+    main: &Dataset,
+    grace_ms: i64,
+    control: &Control,
+    no_wait: bool,
+) -> Result<Vec<Uuid>> {
+    let options = crate::guard::WriteOptions {
+        deadline: control.deadline,
+        cancel: Some(control.cancel.flag()),
+        no_wait,
+        ..Default::default()
+    };
     let mut origins = HashMap::new();
-    main.store().reconcile_holds_checked::<ReconcileGuards>(
-        OwnerKind::Evidence,
-        grace_ms,
-        |info, confirmation| {
-            let hold = &info.hold;
-            let origin_id = info.for_dataset.unwrap_or_else(|| main.dataset_id());
-            let stores = match origins.entry(origin_id) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let origin = if info.for_dataset.is_none() {
-                        Some(main.clone())
-                    } else {
-                        catalog.and_then(|cat| cat.unique_by_id(origin_id))
-                    };
-                    let stores = match origin {
-                        Some(origin) => OperationStores::open(&origin, info.for_dataset.is_some())?,
-                        None => None,
-                    };
-                    main.store().failpoint("evidence-reconcile-origin-opened");
-                    entry.insert(stores)
-                }
-            };
-            let Some(stores) = stores else {
-                return Ok(true);
-            };
-            let origin = &stores.datasets[0];
-            let op = operation_iri(hold.id);
-            let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
-            if let Some(guards) = confirmation {
-                if info.for_dataset.is_some() {
-                    if guards.catalog.is_none() {
-                        guards.catalog = catalog.and_then(|cat| {
-                            cat.pin_dataset_identities([main], &control, true)
-                                .ok()
-                                .flatten()
+    main.store()
+        .reconcile_holds_checked_with::<ReconcileGuards<'_>>(
+            OwnerKind::Evidence,
+            grace_ms,
+            &options,
+            |info, confirmation| {
+                let hold = &info.hold;
+                let origin_id = info.for_dataset.unwrap_or_else(|| main.dataset_id());
+                let stores = match origins.entry(origin_id) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let origin = if info.for_dataset.is_none() {
+                            Some(main.clone())
+                        } else {
+                            match catalog {
+                                Some(cat) => match cat.try_get_by_id(origin_id, &options) {
+                                    Err(Error::WriterBusy) => None,
+                                    result => result?,
+                                },
+                                None => None,
+                            }
+                        };
+                        let stores = match origin {
+                            Some(origin) => {
+                                OperationStores::open(origin, info.for_dataset.is_some(), &options)?
+                            }
+                            None => None,
+                        };
+                        main.store().failpoint("evidence-reconcile-origin-opened");
+                        entry.insert(stores)
+                    }
+                };
+                control.check()?;
+                let Some(stores) = stores else {
+                    return Ok(true);
+                };
+                let origin = &stores.origin;
+                let op = operation_iri(hold.id);
+                let read_without_waiting = no_wait || confirmation.is_some();
+                let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?
+                    .with_no_wait(read_without_waiting);
+                let current_holds = || {
+                    keep_if_inconclusive(
+                        stores.current_holds(&preparation, &op, main.dataset_id(), &hold.commits),
+                        read_without_waiting,
+                    )
+                };
+                if let Some(guards) = confirmation {
+                    if info.for_dataset.is_some() {
+                        if guards.catalog.is_none() {
+                            guards.catalog = catalog.and_then(|cat| {
+                                cat.try_pin_reconciliation(main, control).ok().flatten()
+                            });
+                        }
+                        if !guards
+                            .catalog
+                            .as_ref()
+                            .is_some_and(|pin| pin.matches(origin))
+                        {
+                            return Ok(true);
+                        }
+                    }
+                    if let Entry::Vacant(slot) = guards.origins.entry(origin_id) {
+                        let Some(branches) = origin.store().pin_listed_branch_ids(&stores.branches)
+                        else {
+                            return Ok(true);
+                        };
+                        // A failed sync may leave a sealed commit beyond a published head.
+                        // No writer wait is permitted while confirming under a hold lock.
+                        let mut writers = Vec::new();
+                        if origin.store().is_persistent() {
+                            for store in stores.all_stores() {
+                                control.check()?;
+                                let Some(writer) = store.try_pin_published_writer() else {
+                                    return Ok(true);
+                                };
+                                writers.push(writer);
+                            }
+                        }
+                        slot.insert(OriginGuards {
+                            _branches: branches,
+                            _writers: writers,
                         });
                     }
-                    if !guards
-                        .catalog
-                        .as_ref()
-                        .is_some_and(|pin| pin.matches(origin))
-                    {
-                        return Ok(true);
-                    }
+                    return current_holds();
                 }
-                if let Entry::Vacant(slot) = guards.branches.entry(origin_id) {
-                    let Some(pin) = origin.store().pin_listed_branch_ids(&stores.branches) else {
-                        return Ok(true);
-                    };
-                    slot.insert(pin);
-                }
-                return stores.current_holds(&preparation, &op, main.dataset_id(), &hold.commits);
-            }
-            if stores.current_holds(&preparation, &op, main.dataset_id(), &hold.commits)? {
-                return Ok(true);
-            }
-            if info.for_dataset.is_some() {
-                if !catalog.is_some_and(|cat| {
-                    cat.pin_dataset_identities([main, origin], &control, true)
-                        .is_ok_and(|pin| pin.is_some())
-                }) {
+                if current_holds()? {
                     return Ok(true);
                 }
-                return stores.historical_holds(
-                    &preparation,
-                    &op,
-                    main.dataset_id(),
-                    &hold.commits,
-                );
-            }
-            Ok(false)
-        },
-    )
+                if info.for_dataset.is_some() {
+                    if !catalog.is_some_and(|cat| {
+                        cat.try_pin_reconciliation(main, control)
+                            .is_ok_and(|pin| pin.is_some_and(|pin| pin.matches(origin)))
+                    }) {
+                        return Ok(true);
+                    }
+                    return keep_if_inconclusive(
+                        stores.historical_holds(
+                            &op,
+                            main.dataset_id(),
+                            &hold.commits,
+                            control,
+                            no_wait,
+                        ),
+                        no_wait,
+                    );
+                }
+                Ok(false)
+            },
+        )
 }

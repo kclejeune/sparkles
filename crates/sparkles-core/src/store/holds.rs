@@ -28,6 +28,7 @@
 use super::Store;
 use crate::branch::CommitRef;
 use crate::error::{Error, Result};
+use crate::guard::WriteOptions;
 use crate::holds::{self, HeldIndex, HoldsState, Record, SourceHold, SourceHoldInfo};
 use crate::managed::OwnerKind;
 use std::collections::BTreeMap;
@@ -47,6 +48,12 @@ pub struct Acquired {
 pub struct HoldPublication(
     #[allow(dead_code)] parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, ()>,
 );
+
+/// Keeps a store's published head free of uncertain durable writes during hold release.
+#[doc(hidden)]
+pub struct PublishedWriter {
+    _writer: parking_lot::ArcMutexGuard<parking_lot::RawMutex, super::WriterState>,
+}
 
 /// Puts the protection back to what `holds.json` records when an acquisition fails.
 struct Unpublished<'a> {
@@ -351,10 +358,22 @@ impl Store {
         self.release_where(|r| r.hold.owner == owner && ids.contains(&r.hold.id))
     }
 
-    /// Release the holds of `owner` last acquired at least `grace_ms` milliseconds ago that
-    /// `keep` does not keep, as after an operation that acquired them never published
-    /// the commit that refers to them. `keep` is asked outside every lock, and a hold
-    /// acquired again in the meantime, even with the same commits, is not released.
+    /// Pin a writer whose snapshot includes every commit that could survive reopening.
+    /// A busy or poisoned writer, or a pending group commit, is inconclusive.
+    /// The caller can try this while holding the target's publication lock.
+    #[doc(hidden)]
+    pub fn try_pin_published_writer(&self) -> Option<PublishedWriter> {
+        let writer = self.writer.try_lock_arc()?;
+        (!writer.poisoned
+            && writer.head.seq == self.snapshot().commit
+            && self.group.as_ref().is_none_or(|g| g.try_idle()))
+        .then_some(PublishedWriter { _writer: writer })
+    }
+
+    /// Release local holds of `owner` last acquired at least `grace_ms` milliseconds ago
+    /// that `keep` does not keep. Foreign holds require the origin-aware
+    /// [`Store::reconcile_holds_checked`] callback and are kept here. The callback runs
+    /// outside the holds state lock. A hold acquired again in the meantime stays.
     /// Returns the released ids.
     pub fn reconcile_holds(
         &self,
@@ -362,7 +381,12 @@ impl Store {
         grace_ms: i64,
         keep: &mut dyn FnMut(&SourceHold) -> Result<bool>,
     ) -> Result<Vec<uuid::Uuid>> {
-        self.reconcile_holds_checked::<()>(owner, grace_ms, |hold, _| keep(&hold.hold))
+        self.reconcile_holds_checked::<()>(owner, grace_ms, |info, _| {
+            if info.for_dataset.is_some() {
+                return Ok(true);
+            }
+            keep(&info.hold)
+        })
     }
 
     /// Reconcile with separate preparation and confirmation passes. The confirmation
@@ -373,20 +397,41 @@ impl Store {
         &self,
         owner: OwnerKind,
         grace_ms: i64,
+        keep: impl FnMut(&SourceHoldInfo, Option<&mut G>) -> Result<bool>,
+    ) -> Result<Vec<uuid::Uuid>> {
+        self.reconcile_holds_checked_with(owner, grace_ms, &WriteOptions::default(), keep)
+    }
+
+    /// Run reconciliation under the caller's deadline, cancellation and lock-wait policy.
+    #[doc(hidden)]
+    pub fn reconcile_holds_checked_with<G: Default>(
+        &self,
+        owner: OwnerKind,
+        grace_ms: i64,
+        options: &WriteOptions,
         mut keep: impl FnMut(&SourceHoldInfo, Option<&mut G>) -> Result<bool>,
     ) -> Result<Vec<uuid::Uuid>> {
         self.holds_main()?;
+        options.check()?;
         let cutoff = self.now_ms().saturating_sub(grace_ms.max(0));
-        let candidates: Vec<(SourceHoldInfo, u64)> = match &*self.family.holds.state.lock() {
-            HoldsState::Ready(r) => r
-                .values()
-                .filter(|r| r.hold.owner == owner && r.acquired_ms <= cutoff)
-                .map(|r| (Self::hold_info(r), r.touch))
-                .collect(),
-            HoldsState::Unavailable(reason) => return Err(holds::unavailable(reason)),
+        let candidates = {
+            let state = super::branching::controlled_lock(&self.family.holds.state, options)?;
+            let records = match &*state {
+                HoldsState::Ready(records) => records,
+                HoldsState::Unavailable(reason) => return Err(holds::unavailable(reason)),
+            };
+            let mut candidates = Vec::new();
+            for r in records.values() {
+                options.check()?;
+                if r.hold.owner == owner && r.acquired_ms <= cutoff {
+                    candidates.push((Self::hold_info(r), r.touch));
+                }
+            }
+            candidates
         };
         let mut orphans: Vec<(SourceHoldInfo, u64)> = Vec::new();
         for (h, touch) in candidates {
+            options.check()?;
             if !keep(&h, None)? {
                 orphans.push((h, touch));
             }
@@ -394,28 +439,35 @@ impl Store {
         if orphans.is_empty() {
             return Ok(Vec::new());
         }
-        let _family = self.shared_family(&Default::default())?;
+        let _family = self.shared_family(options)?;
         // No commit is publishing a reference to a hold from here on, so asking again
         // sees every publication that passed its check before this point, and a later
         // one finds its hold gone and is refused.
-        let publishing = self.family.holds.publishing.write();
-        let mut confirmed: Vec<(uuid::Uuid, u64)> = Vec::new();
+        let publishing = if options.no_wait {
+            let Some(publishing) = self.family.holds.publishing.try_write() else {
+                return Ok(Vec::new());
+            };
+            publishing
+        } else {
+            self.family.holds.publishing.write()
+        };
+        let mut confirmed = BTreeMap::new();
         let mut guards = G::default();
         for (h, touch) in &orphans {
+            options.check()?;
             if !keep(h, Some(&mut guards))? {
-                confirmed.push((h.hold.id, *touch));
+                confirmed.insert(h.hold.id, *touch);
             }
         }
         self.failpoint("holds-reconcile-confirmed");
+        options.check()?;
         // A validation guard may pin the target's own branch table. Acquisitions
         // take the holds state before that table, so never wait for state here.
         let Some(state) = self.family.holds.state.try_lock() else {
             return Ok(Vec::new());
         };
-        self.release_locked(publishing, state, guards, |r| {
-            confirmed
-                .iter()
-                .any(|(id, touch)| r.hold.id == *id && r.touch == *touch)
+        self.release_locked(publishing, state, guards, options, |r| {
+            confirmed.get(&r.hold.id) == Some(&r.touch)
         })
     }
 
@@ -424,7 +476,7 @@ impl Store {
         self.failpoint("holds-release-waiting");
         let publishing = self.family.holds.publishing.write();
         let state = self.family.holds.state.lock();
-        self.release_locked(publishing, state, (), which)
+        self.release_locked(publishing, state, (), &WriteOptions::default(), which)
     }
 
     /// [`Store::release_where`] under the exclusive publication lock `publishing`,
@@ -434,6 +486,7 @@ impl Store {
         publishing: parking_lot::RwLockWriteGuard<'_, ()>,
         mut state: parking_lot::MutexGuard<'_, HoldsState>,
         guards: impl Sized,
+        options: &WriteOptions,
         which: impl Fn(&Record) -> bool,
     ) -> Result<Vec<uuid::Uuid>> {
         let records = match &*state {
@@ -450,13 +503,16 @@ impl Store {
         for id in &ids {
             next.remove(id);
         }
+        options.check()?;
         self.persist_holds(&next)?;
         drop(guards);
         self.failpoint("holds-release-published");
         self.install_holds(&mut state, next, &touched);
         drop(state);
         drop(publishing);
-        self.collect_members(&touched);
+        if !options.no_wait {
+            self.collect_members(&touched);
+        }
         Ok(ids)
     }
 

@@ -1031,7 +1031,7 @@ mod crashes {
     }
 
     #[test]
-    fn a_reconciliation_takes_no_writer_while_it_holds_off_publications() {
+    fn a_reconciliation_does_not_wait_for_a_busy_writer() {
         let dir = tempfile::tempdir().unwrap();
         let ds = crash_at(dir.path(), "evidence-held", &options());
         ds.create_branch("dev", &Default::default()).unwrap();
@@ -1048,9 +1048,13 @@ mod crashes {
                 .recv_timeout(std::time::Duration::from_secs(20))
                 .expect("the reconciliation finished while the writer was held")
                 .unwrap();
-            assert_eq!(released, 1);
+            assert_eq!(released, 0, "the busy writer leaves the hold unconfirmed");
             drop(t);
         });
+        assert_eq!(
+            evidence::reconcile_operation_holds(&ds, 0).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -1871,9 +1875,13 @@ fn foreign_release_waits_for_publication_and_reconcile_does_not_block_on_writer(
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect("cross-dataset reconciliation finished while a's writer was held")
             .unwrap();
-        assert_eq!(released, vec![orphan]);
+        assert!(released.is_empty(), "the busy origin cannot be confirmed");
         drop(t);
     });
+    assert_eq!(
+        evidence::reconcile_operation_holds_in(Some(&cat), &b, 0).unwrap(),
+        [orphan]
+    );
 }
 
 fn copy_dataset(source: &std::path::Path, destination: &std::path::Path) {
@@ -2015,18 +2023,21 @@ fn mixed_persistence_refuses_before_any_hold_or_receipt() {
             let head = origin.store().head_commit().seq;
             let mut opts = options();
             opts.idempotency_key = Some("mixed".into());
-            assert_eq!(
-                code(evidence::propose(
-                    Some(&catalog),
-                    origin,
-                    origin,
-                    &input,
-                    &opts,
-                    &mut |_, _| all(),
-                    &Control::none(),
-                )),
-                "evidence-unavailable"
-            );
+            for dry_run in [false, true] {
+                opts.dry_run = dry_run;
+                assert_eq!(
+                    code(evidence::propose(
+                        Some(&catalog),
+                        origin,
+                        origin,
+                        &input,
+                        &opts,
+                        &mut |_, _| all(),
+                        &Control::none(),
+                    )),
+                    "evidence-unavailable"
+                );
+            }
             assert_eq!(origin.store().head_commit().seq, head);
             assert!(evidence::holds(target).unwrap().is_empty());
         }
@@ -2431,4 +2442,311 @@ fn reconciliation_keeps_a_hold_while_a_memory_fork_has_an_unlisted_base() {
         .set_failpoint("memory-ordinal-reserved", None);
     assert!(evidence::operation_recorded(&origin, id, &Control::none()).unwrap());
     assert_eq!(evidence::holds(&target).unwrap()[0].id, id);
+}
+
+#[test]
+fn reconciliation_keeps_the_hold_of_a_recoverable_origin_branch_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options();
+    opts.idempotency_key = Some("failed-origin-sync".into());
+    let id;
+    {
+        let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+        let origin = catalog.create("origin", &Default::default()).unwrap();
+        let target = catalog.create("target", &Default::default()).unwrap();
+        configured(&origin);
+        configured(&target);
+        origin.create_branch("work", &Default::default()).unwrap();
+        let work = origin.branch("work").unwrap();
+        let fact = with_fact(&target);
+        id = evidence::operation_id(origin.dataset_id(), &opts.principal, "failed-origin-sync");
+        let head = work.store().head_commit().seq;
+        work.store().fail_next_vocab_sync();
+        let error = evidence::propose(
+            Some(&catalog),
+            &origin,
+            &work,
+            &batch_for_fact(&target, target.dataset_id(), fact),
+            &opts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, sparkles::Error::Io(_)), "{error:?}");
+        assert_eq!(work.store().head_commit().seq, head);
+        assert!(
+            evidence::holds(&target)
+                .unwrap()
+                .iter()
+                .any(|hold| hold.id == id)
+        );
+        assert!(!evidence::operation_recorded(&origin, id, &Control::none()).unwrap());
+
+        let future =
+            target.store().head_commit().timestamp_ms + 2 * sparkles::holds::DEFAULT_GRACE_MS;
+        target.store().set_clock(Arc::new(move || future));
+        assert!(
+            evidence::propose(
+                Some(&catalog),
+                &target,
+                &target,
+                &batch(&target, fact),
+                &options(),
+                &mut |_, _| all(),
+                &Control::none(),
+            )
+            .unwrap()
+            .committed
+        );
+        assert!(
+            evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            evidence::holds(&target)
+                .unwrap()
+                .iter()
+                .any(|hold| hold.id == id)
+        );
+    }
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let origin = catalog.get("origin").unwrap();
+    let target = catalog.get("target").unwrap();
+    assert!(evidence::operation_recorded(&origin, id, &Control::none()).unwrap());
+    assert!(
+        evidence::holds(&target)
+            .unwrap()
+            .iter()
+            .any(|hold| hold.id == id)
+    );
+    assert!(
+        evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn legacy_reconciliation_callbacks_only_see_local_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let origin = catalog.create("origin", &Default::default()).unwrap();
+    let target = catalog.create("target", &Default::default()).unwrap();
+    configured(&origin);
+    let fact = with_fact(&target);
+    let foreign = evidence::propose(
+        Some(&catalog),
+        &origin,
+        &origin,
+        &batch_for_fact(&target, target.dataset_id(), fact),
+        &options(),
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap()
+    .hold
+    .unwrap();
+    let local = uuid::Uuid::new_v4();
+    evidence::acquire_hold(
+        &target,
+        local,
+        &[evidence::CommitRef {
+            branch_id: target.dataset_id(),
+            seq: fact,
+        }],
+    )
+    .unwrap();
+
+    let released = evidence::reconcile_holds(&target, 0, &mut |hold| {
+        assert_eq!(hold.id, local);
+        evidence::operation_recorded(&target, hold.id, &Control::none())
+    })
+    .unwrap();
+    assert_eq!(released, [local]);
+    assert_eq!(evidence::holds(&target).unwrap()[0].id, foreign);
+}
+
+#[test]
+fn post_commit_reconciliation_shares_request_cancellation_across_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let origin = catalog.create("origin", &Default::default()).unwrap();
+    let target = catalog.create("target", &Default::default()).unwrap();
+    configured(&origin);
+    let origin_fact = with_fact(&origin);
+    let target_fact = with_fact(&target);
+    let local = uuid::Uuid::new_v4();
+    let foreign = uuid::Uuid::new_v4();
+    evidence::acquire_hold(
+        &origin,
+        local,
+        &[evidence::CommitRef {
+            branch_id: origin.dataset_id(),
+            seq: origin_fact,
+        }],
+    )
+    .unwrap();
+    evidence::acquire_hold_for(
+        &target,
+        foreign,
+        &[evidence::CommitRef {
+            branch_id: target.dataset_id(),
+            seq: target_fact,
+        }],
+        Some(origin.dataset_id()),
+    )
+    .unwrap();
+    for ds in [&origin, &target] {
+        let future = ds.store().head_commit().timestamp_ms + 2 * sparkles::holds::DEFAULT_GRACE_MS;
+        ds.store().set_clock(Arc::new(move || future));
+    }
+
+    let control = Control::none();
+    let cancel = control.cancel.clone();
+    origin.store().set_failpoint(
+        "evidence-reconcile-origin-opened",
+        Some(Arc::new(move |_| cancel.cancel())),
+    );
+    let proposed = evidence::propose(
+        Some(&catalog),
+        &origin,
+        &origin,
+        &batch_for_fact(&target, target.dataset_id(), target_fact),
+        &options(),
+        &mut |_, _| all(),
+        &control,
+    )
+    .unwrap();
+    origin
+        .store()
+        .set_failpoint("evidence-reconcile-origin-opened", None);
+    assert!(proposed.committed);
+    assert!(matches!(control.check(), Err(sparkles::Error::Cancelled)));
+    assert_eq!(
+        evidence::holds(&origin)
+            .unwrap()
+            .iter()
+            .map(|hold| hold.id)
+            .collect::<Vec<_>>(),
+        [local]
+    );
+    let held = evidence::holds(&target).unwrap();
+    assert_eq!(held.len(), 2);
+    assert!(held.iter().any(|hold| hold.id == foreign));
+    assert!(held.iter().any(|hold| Some(hold.id) == proposed.hold));
+}
+
+#[test]
+fn reconciliation_keeps_holds_when_the_original_registration_is_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let copied_root = dir.path().join("copy");
+    let (origin_id, hold_id);
+    {
+        let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+        let origin = catalog.create("origin", &Default::default()).unwrap();
+        let target = catalog.create("target", &Default::default()).unwrap();
+        configured(&origin);
+        copy_dataset(origin.store().root().unwrap(), &copied_root);
+        origin_id = origin.dataset_id();
+        let fact = with_fact(&target);
+        hold_id = evidence::propose(
+            Some(&catalog),
+            &origin,
+            &origin,
+            &batch_for_fact(&target, target.dataset_id(), fact),
+            &options(),
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap()
+        .hold
+        .unwrap();
+    }
+
+    let (catalog, _) = sparkles::Catalog::open_deferred(dir.path(), Default::default()).unwrap();
+    assert!(catalog.is_opening("origin"));
+    catalog.open_registered("target").unwrap();
+    let target = catalog.get("target").unwrap();
+    let copy = catalog
+        .attach("copy", sparkles::catalog::Attach::Directory(copied_root))
+        .unwrap();
+    assert_eq!(copy.dataset_id(), origin_id);
+    assert!(!evidence::operation_recorded(&copy, hold_id, &Control::none()).unwrap());
+    let released = evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0).unwrap();
+
+    catalog.open_registered("origin").unwrap();
+    let origin = catalog.get("origin").unwrap();
+    assert_eq!(origin.dataset_id(), origin_id);
+    assert!(evidence::operation_recorded(&origin, hold_id, &Control::none()).unwrap());
+    assert!(
+        released.is_empty(),
+        "released a hold owned by a pending origin"
+    );
+    assert_eq!(evidence::holds(&target).unwrap()[0].id, hold_id);
+}
+
+#[test]
+fn reconciliation_keeps_a_synced_receipt_after_unwind_and_process_exit() {
+    const CHILD_ROOT: &str = "SPARKLES_EVIDENCE_WAL_UNWIND_ROOT";
+    const KEY: &str = "synced-wal-unwind";
+    let mut opts = options();
+    opts.idempotency_key = Some(KEY.into());
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let catalog = sparkles::Catalog::open(root, Default::default()).unwrap();
+        let origin = catalog.create("origin", &Default::default()).unwrap();
+        let target = catalog.create("target", &Default::default()).unwrap();
+        configured(&origin);
+        let fact = with_fact(&target);
+        let head = origin.store().head_commit().seq;
+        origin.store().set_failpoint(
+            "evidence-wal-synced",
+            Some(Arc::new(|_| panic!("unwind after WAL sync"))),
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            evidence::propose(
+                Some(&catalog),
+                &origin,
+                &origin,
+                &batch_for_fact(&target, target.dataset_id(), fact),
+                &opts,
+                &mut |_, _| all(),
+                &Control::none(),
+            )
+        }));
+        assert!(result.is_err(), "expected to unwind at the sync boundary");
+        assert_eq!(origin.store().head_commit().seq, head);
+        assert_eq!(evidence::holds(&target).unwrap().len(), 1);
+        evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0).unwrap();
+        // A process exit leaves the WAL intact. Orderly Store drop can trim its suffix.
+        std::process::exit(0);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "reconciliation_keeps_a_synced_receipt_after_unwind_and_process_exit",
+            "--nocapture",
+        ])
+        .env(CHILD_ROOT, dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let origin = catalog.get("origin").unwrap();
+    let target = catalog.get("target").unwrap();
+    let id = evidence::operation_id(origin.dataset_id(), &opts.principal, KEY);
+    assert!(evidence::operation_recorded(&origin, id, &Control::none()).unwrap());
+    assert!(
+        evidence::holds(&target)
+            .unwrap()
+            .iter()
+            .any(|hold| hold.id == id)
+    );
 }

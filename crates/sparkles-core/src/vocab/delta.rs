@@ -318,7 +318,7 @@ pub(crate) struct DeltaFile {
     sync_gate: Arc<Mutex<()>>,
     #[cfg(test)]
     sync_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "failpoints"))]
     fail_next_sync: bool,
 }
 
@@ -389,7 +389,7 @@ impl DeltaFile {
             f.write_pending(upto)?;
             (f.file.try_clone()?, f.end)
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "failpoints"))]
         Self::test_hook(file)?;
         // The exact descriptor keeps this generation alive. Later appenders can
         // proceed; syncing extra suffix bytes never publishes that suffix.
@@ -465,12 +465,10 @@ impl DeltaFile {
                     debug_assert_eq!(f.end, at, "the vocabulary moved during a direct write");
                     f.end += chunk.len() as u64;
                     f.written += n;
-                    #[cfg(test)]
-                    {
-                        if std::mem::take(&mut f.fail_next_sync) {
-                            f.failed = true;
-                            return Err(std::io::Error::other("injected sync failure").into());
-                        }
+                    #[cfg(any(test, feature = "failpoints"))]
+                    if std::mem::take(&mut f.fail_next_sync) {
+                        f.failed = true;
+                        return Err(std::io::Error::other("injected sync failure").into());
                     }
                     f.durable = f.end;
                     return Ok(());
@@ -487,12 +485,14 @@ impl DeltaFile {
         Self::sync_gated(file, upto)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "failpoints"))]
     fn test_hook(file: &Arc<Mutex<Self>>) -> Result<()> {
-        let (hook, failed) = {
-            let mut f = file.lock();
-            (f.sync_hook.clone(), std::mem::take(&mut f.fail_next_sync))
-        };
+        let mut f = file.lock();
+        #[cfg(test)]
+        let hook = f.sync_hook.clone();
+        let failed = std::mem::take(&mut f.fail_next_sync);
+        drop(f);
+        #[cfg(test)]
         if let Some(hook) = hook {
             hook();
         }
@@ -705,7 +705,7 @@ impl DeltaVocab {
                 sync_gate: Default::default(),
                 #[cfg(test)]
                 sync_hook: None,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "failpoints"))]
                 fail_next_sync: false,
             }))),
         })
@@ -1039,7 +1039,7 @@ impl DeltaVocab {
 
     /// Make the next [`sync`](Self::sync) with new entries fail after writing them to
     /// the file, as a failed `fdatasync` would.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "failpoints"))]
     pub(crate) fn fail_next_sync(&self) {
         if let Some(f) = &self.file {
             f.lock().fail_next_sync = true;

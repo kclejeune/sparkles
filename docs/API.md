@@ -13635,19 +13635,24 @@ deleted, error}`, and holds nothing.
 | `409 idempotency-conflict` | The key was used with a different payload. |
 | `409 immutable-record-conflict` | A record identity already holds other content, or content that is not an authenticated record. |
 | `409 hold-conflict` | An earlier attempt of the operation holds other commits. |
+| `409 holds-limit` | A referenced dataset cannot hold more commits. |
 | `409 unsupported-profile` | The profile is not enabled, or a written graph is detached. |
 | `422` | A reference does not verify, or the catalog identity or persistence check failed. A passage of an existing rendition and a structured value outside a retained JSON revision of the batch are `incomplete-evidence`. |
-| `409 holds-limit` | A referenced dataset cannot hold more commits. |
 | `503 holds-unavailable` | A referenced dataset could not confirm a durable hold. |
 | `503 authority-changed` | The caller's credential was revoked, expired or the access policy changed before the commit published. |
 
-A refusal publishes no proposal records. A failure between acquisition and
-publication can leave orphaned holds. After a successful proposal, the server checks
-holds in the proposing dataset and each dataset the proposal held. Reconciliation
-can release a hold after an hour if the originating dataset has no receipt that
-accounts for it and no retained foreign receipt could be inherited by a fork.
-Legacy receipts keep their holds. Ambiguous identities and inconclusive checks
-keep holds for later reconciliation or an administrator's explicit release.
+A refusal before publication leaves the proposal records unwritten. A storage
+failure during publication can leave a proposal that recovers when the origin
+reopens. Either outcome can leave its source holds in place.
+After a successful proposal, the server checks holds in the proposing dataset and
+each dataset the proposal held. The checks share up to one second of the request's
+remaining time. A durable hold release that has started runs to completion.
+Reconciliation can release a hold after an hour
+when the originating dataset has no receipt that accounts for it and no retained
+foreign receipt could be inherited by a fork. Legacy receipts keep their holds.
+Ambiguous identities, unresolved registrations, busy or uncertain origin writers
+and incomplete checks keep holds for later reconciliation or an administrator's
+explicit release.
 A retry with the same key can reacquire the same holds. A release waits for a
 commit that is publishing a reference to the hold. Publication answers
 `409 hold-conflict` if a required hold was already released.
