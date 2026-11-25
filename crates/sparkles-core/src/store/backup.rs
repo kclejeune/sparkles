@@ -3818,14 +3818,7 @@ mod tests {
         use std::io::{Read, Seek, SeekFrom};
         let root = temporary.path().join("source");
         drop(history_store(&root));
-        let store = Store::open(
-            &root,
-            StoreOptions {
-                group_commit_idle_direct: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let store = Store::open(&root, StoreOptions::default()).unwrap();
         assert!(store.groups_commits());
         update(
             &store,

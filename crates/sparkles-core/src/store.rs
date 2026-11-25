@@ -1572,17 +1572,13 @@ pub struct StoreOptions {
     pub wal_direct_writes: bool,
     /// Group commit: concurrent commits of a persistent store share one synchronization,
     /// and each is acknowledged once the prefix that holds it is durable. On by default,
-    /// and ignored for in-memory stores. Writes the group does not admit (merges, forced
-    /// and bulk commits, and commits while a full-text index recovers or rebuilds or a
-    /// spatial index builds or has failed) drain it and take the ordinary path. Datasets
+    /// and ignored for in-memory stores. Every persistent WAL commit goes through the
+    /// coordinator's fence; when this is off, or for writes the group does not admit
+    /// (merges, forced, control and bulk commits, and commits while a full-text index
+    /// recovers or rebuilds or a spatial index builds or has failed), the commit drains
+    /// prior grouped work and leads a solo fence of one under the writer lock. Datasets
     /// with a full-text, spatial or embedding index otherwise group their commits.
     pub group_commit: bool,
-    /// With group commit on, a commit that is the only writer (nothing queued, no fence
-    /// running, no transaction waiting for the writer lock) takes the ordinary path with
-    /// its write-through writes, which need no cache flush. On by default. Only tests turn
-    /// it off, to send every admitted commit through the group.
-    #[doc(hidden)]
-    pub group_commit_idle_direct: bool,
     /// Record each commit's net changes in the change log ([`ChangeLog`]), which history
     /// queries read and which outlives compactions. A dataset's `changelog.json` can
     /// turn it off or on.
@@ -1654,7 +1650,6 @@ impl Default for StoreOptions {
             wal_prealloc_bytes: DEFAULT_WAL_PREALLOC_BYTES,
             wal_direct_writes: true,
             group_commit: true,
-            group_commit_idle_direct: true,
             change_log: true,
             change_log_max_bytes: DEFAULT_CHANGE_LOG_MAX_BYTES,
             change_log_segment_bytes: 16 << 20,
@@ -1666,7 +1661,7 @@ impl Default for StoreOptions {
 }
 
 struct WriterState {
-    wal: Option<BufWriter<File>>,
+    wal: Option<Arc<File>>,
     /// bytes of complete transactions in the current generation's WAL, those of grouped
     /// commits still queued for their fence included
     wal_len: u64,
@@ -1679,8 +1674,6 @@ struct WriterState {
     head: CommitInfo,
     /// a WAL or generation write failed after a commit started: refuse further writes
     poisoned: bool,
-    /// Reused only for commits introducing persisted vocabulary entries.
-    vocab_sync: crate::vocab::LazySync,
     /// Private speculative state: readers and receipts only see the synced prefix.
     staged: Option<Arc<Snapshot>>,
     /// the store is being dropped: a backup lease released later must not collect
@@ -1703,9 +1696,8 @@ impl WriterState {
         if !self.poisoned
             && io.end == len
             && io.alloc > len
-            && let Some(wal) = self.wal.as_mut()
-            && wal.flush().is_ok()
-            && wal.get_ref().set_len(len).is_ok()
+            && let Some(wal) = self.wal.as_ref()
+            && wal.set_len(len).is_ok()
         {
             io.alloc = len;
             self.tail.release(&io);
@@ -1765,7 +1757,7 @@ struct SwitchFailed {
 /// The log of a generation that `CURRENT` now names, which the writer moves onto (see
 /// [`Store::adopt_generation_log`]).
 struct NextLog {
-    wal: BufWriter<File>,
+    wal: Arc<File>,
     tail: Arc<wal::Tail>,
     len: u64,
     index: wal::WalIndex,
@@ -2194,7 +2186,6 @@ impl Store {
                 next_bnode,
                 head: root,
                 poisoned: false,
-                vocab_sync: Default::default(),
                 staged: None,
                 closed: false,
                 tap: None,
@@ -2714,9 +2705,7 @@ impl Store {
         }
         let store = Store {
             root: Some(root.to_path_buf()),
-            group: opts
-                .group_commit
-                .then(|| Arc::new(group::Coordinator::default())),
+            group: Some(Arc::new(group::Coordinator::default())),
             commit_stats: Default::default(),
             current: Arc::new(ArcSwap::from_pointee(
                 SnapshotBuilder::of_generation(
@@ -2740,13 +2729,12 @@ impl Store {
                 .build(),
             )),
             writer: Arc::new(Mutex::new(WriterState {
-                wal: Some(BufWriter::new(wal)),
+                wal: Some(Arc::new(wal)),
                 wal_len,
                 tail: wal::Tail::new(wal_len, wal_len),
                 next_bnode,
                 head,
                 poisoned: false,
-                vocab_sync: Default::default(),
                 staged: None,
                 closed: false,
                 tap: None,
@@ -4278,6 +4266,18 @@ impl Store {
         Ok(())
     }
 
+    /// Whether a solo commit must maintain the full-text index directly at publication
+    /// instead of staging documents before the fence (during recovery at open or an
+    /// online rebuild).
+    #[cfg(feature = "text")]
+    pub(super) fn text_needs_direct_maintain(&self) -> bool {
+        self.text_recovery
+            .load()
+            .as_ref()
+            .is_some_and(|job| job.pending())
+            || self.text.load().as_ref().is_some_and(|t| t.rebuilding())
+    }
+
     /// Apply a WAL commit's changes to the full-text index and give `snap` its view.
     fn maintain_text(&self, snap: &mut Snapshot, log: &[(u8, [Id; 4])]) {
         #[cfg(feature = "text")]
@@ -4982,7 +4982,7 @@ impl Store {
     /// Whether this store groups commits
     /// ([`StoreOptions::group_commit`] on a persistent store).
     pub fn groups_commits(&self) -> bool {
-        self.group.is_some()
+        self.opts.group_commit && self.root.is_some()
     }
 
     /// The error of a write that may have started from the speculative head of a group
@@ -5086,10 +5086,10 @@ impl Store {
         w: &WriterState,
     ) -> std::result::Result<(), Option<Fallback>> {
         use Fallback::*;
-        if self.group.is_none() || w.wal.is_none() || o.dry_run.is_some() {
+        if !self.opts.group_commit || w.wal.is_none() || o.dry_run.is_some() {
             return Err(None);
         }
-        let first = if w.poisoned {
+        let first = if w.poisoned || self.group.as_ref().is_some_and(|g| g.failed()) {
             Some(Poisoned)
         } else if !(kind == CommitKind::Transaction || Self::speculative_kind(kind)) {
             Some(Kind)
@@ -5928,7 +5928,7 @@ impl Store {
                 w,
                 &gen_,
                 NextLog {
-                    wal: BufWriter::new(wal),
+                    wal: Arc::new(wal),
                     // the new log holds its header record
                     tail: wal::Tail::new(wal_size, wal::HEADER_BYTES),
                     len: wal::HEADER_BYTES,
@@ -7246,10 +7246,9 @@ impl WriteTxn<'_> {
         // cannot acknowledge or capture a speculative predecessor.
         if !grouped || (self.net_ins == 0 && self.net_del == 0) {
             self.store.drain_group(&mut self.guard, Some(&self.opts))?;
-        } else if self.opts.no_wait {
-            // A grouped commit is acknowledged only after a fence, which a write that will
-            // not wait must not wait for. It is refused before the guard runs, and nothing
-            // has reached the WAL.
+        } else if self.opts.no_wait && self.store.group.as_ref().is_some_and(|g| !g.idle()) {
+            // A write that will not wait must not park behind another commit's fence.
+            // On an idle coordinator it seals and leads its own group of one directly.
             return Err(Error::WriterBusy);
         }
         // a commit with a merge record (a merge, or a commit a merge replays) passes
@@ -7298,8 +7297,15 @@ impl WriteTxn<'_> {
                     self.opts.check_publish()?;
                     return self.publish_control_only();
                 }
-                // no net change: no commit, nothing to validate
-                return self.publish_log(None, sync);
+                // no net change: no commit, nothing to validate or publish
+                let head = self.guard.head;
+                return Ok(Receipt {
+                    dataset_id: self.store.owner_dataset_id(),
+                    committed: false,
+                    commit: head,
+                    validation: None,
+                    annotation: self.store.annotation(head.seq).unwrap_or_default(),
+                });
             }
             let head = self.guard.head.seq;
             let validation = self.store.run_guard(
@@ -7320,10 +7326,10 @@ impl WriteTxn<'_> {
             };
             // the last check, after the validation, right before publication
             self.opts.check_publish()?;
-            if grouped {
-                return self.publish_grouped(validation);
+            if self.guard.wal.is_none() {
+                return self.publish_memory(validation);
             }
-            return self.publish_log(validation, sync);
+            return self.publish_grouped(validation, grouped, sync);
         }
         // Build the new generation from this transaction's view (base + uncommitted delta)
         // plus the bulk quads; switching CURRENT is the atomic commit point, so the
@@ -7381,62 +7387,31 @@ impl WriteTxn<'_> {
         if let Some(why) = why {
             self.store.commit_stats.fell_back(why);
         }
-        // a no-op is counted, but still drains and is answered by the ordinary path
+        // a no-op is counted, but still drains and returns without writing to the log
         if why.is_some() {
             return why == Some(Fallback::Noop);
         }
-        // Idle fast path: the only writer, with no fence running, commits as the ordinary
-        // writer does, with write-through writes that need no cache flush. A commit that
-        // finds another writer waiting for the lock groups instead.
-        let alone = self.store.opts.group_commit_idle_direct
-            && self.store.writers_waiting() == 0
-            && self.store.group.as_ref().is_some_and(|g| g.idle());
-        !alone
+        true
     }
 
-    fn publish_log(
+    /// Publish a commit of an in-memory store, which has no write-ahead log (X16 Phase 6).
+    fn publish_memory(
         &mut self,
         validation: Option<Arc<crate::guard::ValidationSummary>>,
-        sync: &mut Option<(SyncPath, std::time::Duration)>,
     ) -> Result<Receipt> {
         let gen_ = &self.base.generation;
-        let head = self.guard.head;
-        if self.net_ins == 0 && self.net_del == 0 && !self.force {
-            // nothing changed (or every change was undone): no commit, nothing published
-            return Ok(Receipt {
-                dataset_id: self.store.owner_dataset_id(),
-                committed: false,
-                commit: head,
-                validation: None,
-                annotation: self.store.annotation(head.seq).unwrap_or_default(),
-            });
-        }
         let message = match &self.opts.message {
             Some(m) => crate::annotations::validate_message(m)?,
             None => None,
         };
-        // nothing is written when the disk (or an in-memory store's limit, or a
-        // persistent one's quota) has no room
         self.check_storage()?;
-        // A commit that added terms syncs them together with its WAL records (see
-        // `commit_direct` and `sync_commit_reused`); without a WAL they are synced here.
-        if self.guard.wal.is_none() {
-            gen_.dvocab.sync()?;
-        }
+        gen_.dvocab.sync()?;
         let c = self.next_commit(validation.as_deref());
-        // the control frame the commit carries, which names it (spec C26 §7.1)
         let control = self.control_frame(c.seq, c.timestamp_ms)?;
-        let control_bytes = match &control {
-            Some((frame, _)) => frame.encode()?,
-            None => Vec::new(),
-        };
-        // the message and digest are durable before the commit is (see `annotations`)
         let annotation = self
             .store
             .annotate(&c, message, || Some(self.change_lines()))?;
         let next_bnode = self.guard.next_bnode;
-        let prealloc = self.wal_prealloc();
-        // a merge's record is durable before its commit (open drops one above the head)
         if let Some(m) = self.merge.as_mut() {
             m.seq = c.seq;
             let rec = *m;
@@ -7446,120 +7421,6 @@ impl WriteTxn<'_> {
             }
             self.store.failpoint("merge-recorded");
         }
-        let w = &mut **self.guard;
-        if let Some(wal) = w.wal.as_mut() {
-            // the record says no earlier commit may be missing from disk, so a fence
-            // that is still running would make that untrue
-            debug_assert!(
-                self.store
-                    .group
-                    .as_ref()
-                    .is_none_or(|g| g.idle() || g.failed())
-                    && w.head.seq == self.store.current.load().commit,
-                "an ordinary commit while group commit has commits in flight"
-            );
-            // The records carry no `WAL_FLAG_ANNOTATED`: the annotation above is durable
-            // before them, so replay never has to tell a torn one from a missing one.
-            let data = wal::encode_txn_with_control(
-                &self.log,
-                &control_bytes,
-                self.configuration,
-                next_bnode,
-                wal::Seal::of(&c, 0, 0),
-            )?;
-            // In a store with a control keyspace the writer stays poisoned from here
-            // until the snapshot and the control state are published, so that an error
-            // or an unwind in between leaves no writer whose head differs from what
-            // readers see (spec C26 §7.1).
-            if self.store.control_enabled() {
-                w.poisoned = true;
-                self.store.failpoint("control-commit-armed");
-            }
-            // once the first byte is written, a failure leaves the WAL in an unknown
-            // state: refuse further writes, so a seq can never be written twice
-            let tail = w.tail.clone();
-            let mut io = tail.lock();
-            debug_assert_eq!(io.end, w.wal_len, "an ordinary commit after unwritten ones");
-            let alloc_before = io.alloc;
-            let vocab_before = gen_.dvocab.allocated();
-            let direct_on = self.store.opts.wal_direct_writes;
-            let path = gen_
-                .dir
-                .as_deref()
-                .filter(|_| direct_on)
-                .map(|d| d.join("wal.log"));
-            gen_.dvocab.set_prealloc(prealloc);
-            let written = wal.flush().map_err(Error::from).and_then(|_| {
-                if wal::DirectLog::fits(w.wal_len, data.len(), io.alloc)
-                    && let Some(direct) = io.direct.handle(path.as_deref(), wal.get_ref())
-                {
-                    let t = std::time::Instant::now();
-                    // A test's branch-selection control, not a physical EINVAL fault,
-                    // refuses before this helper performs any mutation.
-                    let direct_written = !ordinary_sync_probe::skip_direct(self.store)
-                        && commit_direct(
-                            direct,
-                            w.wal_len,
-                            &data,
-                            &gen_.dvocab,
-                            &mut w.vocab_sync,
-                            u64::MAX,
-                        )?;
-                    if direct_written {
-                        *sync = Some((SyncPath::Direct, t.elapsed()));
-                        ordinary_sync_probe::captured(self.store);
-                        return Ok(());
-                    }
-                    // the file system refused direct I/O: write this commit and the
-                    // later ones the buffered way
-                    io.direct = wal::Direct::Off;
-                }
-                // The terms are written before the records, so that a reader of the
-                // WAL (`sparkles check`, a linked branch opening) finds every term
-                // the records name. The sync covers both.
-                if gen_.dvocab.needs_sync() {
-                    gen_.dvocab.flush()?;
-                }
-                wal::write_commit(wal.get_ref(), w.wal_len, &mut io.alloc, &data, prealloc)?;
-                let t = std::time::Instant::now();
-                let synced =
-                    sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync, u64::MAX);
-                *sync = Some((SyncPath::Buffered, t.elapsed()));
-                ordinary_sync_probe::captured(self.store);
-                synced
-            });
-            tail.release(&io);
-            if let Err(e) = written {
-                // The records may have reached the file, and the commit may then come back
-                // at the next open. Its annotation and merge record stay, so a recovered
-                // commit keeps its message, its change digest and its merge parent. The
-                // writer takes no more commits, and the next open drops both records if the
-                // commit did not survive, because they lie above the recovered head.
-                w.poisoned = true;
-                return Err(e);
-            }
-            if control.is_some() {
-                self.store.failpoint("control-commit-synced");
-            }
-            // the bytes the file grew by: the records past its end and any zeros after,
-            // which the quota does not count
-            // and the bytes the vocabulary file grew by
-            self.store.quota.add(io.alloc - alloc_before);
-            self.store
-                .quota
-                .add(gen_.dvocab.allocated().saturating_sub(vocab_before));
-            w.wal_len += data.len() as u64;
-            io.end = w.wal_len;
-            self.store.quota.set_preallocated(io.alloc - io.end);
-            drop(io);
-            self.store
-                .quota
-                .set_vocab_preallocated(gen_.dvocab.preallocated());
-        }
-        // the commit's records end where the log ends now, when it has a log
-        let log_end = w.wal.is_some().then_some(w.wal_len);
-        // The tap takes the commit under the writer lock, as the group path does before
-        // it enqueues, so a compaction that is building carries it over.
         if let Some(tap) = self.guard.tap.as_mut() {
             if tap.active.load(Ordering::Acquire) {
                 tap.commits.push(compaction::TapCommit {
@@ -7596,17 +7457,13 @@ impl WriteTxn<'_> {
             info: c,
             snapshot: snap,
             configuration: self.configuration,
-            log_end,
+            log_end: None,
             changes: Some(&self.log),
             change,
             validated: validation.is_some(),
         }));
         if let Some((_, state)) = control {
             self.store.control.store(Some(Arc::new(state)));
-        }
-        if self.store.control_enabled() && self.guard.wal.is_some() {
-            self.store.failpoint("control-commit-published");
-            self.guard.poisoned = false;
         }
         Ok(Receipt {
             dataset_id: self.store.owner_dataset_id(),
@@ -8060,6 +7917,9 @@ impl Drop for Store {
         // process (or a restore's swap) may own next
         {
             let mut w = self.guarded_writer();
+            if self.group.as_ref().is_some_and(|g| g.failed()) {
+                w.poisoned = true;
+            }
             // a guard keeps what it knows of the head for the next open
             if !w.poisoned
                 && !std::thread::panicking()
@@ -8080,7 +7940,9 @@ impl Drop for Store {
             w.closed = true;
             // Backup leases may retain WriterState after the store closes.
             // Shut down the owned worker now, rather than with that last lease.
-            w.vocab_sync = Default::default();
+            if let Some(g) = &self.group {
+                *g.vocab.lock() = Default::default();
+            }
             w.trim_wal();
             if !w.poisoned {
                 self.snapshot().generation.dvocab.trim();
@@ -9127,8 +8989,9 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
     fn vocabulary_worker_is_lazy_reused_and_generation_safe() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), Default::default()).unwrap();
+        let vocab_thread = |s: &Store| s.group.as_ref().unwrap().vocab.lock().thread_id();
         store.load(&[src()]).unwrap();
-        assert!(store.guarded_writer().vocab_sync.thread_id().is_none());
+        assert!(vocab_thread(&store).is_none());
         let commit = |s: &str, o: &str| {
             let mut t = store.write();
             let q = t
@@ -9144,35 +9007,44 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
             .unwrap();
         t.insert(q).unwrap();
         t.commit().unwrap();
-        assert!(store.guarded_writer().vocab_sync.thread_id().is_none());
+        assert!(vocab_thread(&store).is_none());
         commit("fresh1", "fresh-object1");
-        let id = store.guarded_writer().vocab_sync.thread_id().unwrap();
+        let id = vocab_thread(&store).unwrap();
         commit("fresh2", "fresh-object2");
-        assert_eq!(store.guarded_writer().vocab_sync.thread_id(), Some(id));
+        assert_eq!(vocab_thread(&store), Some(id));
         store.compact().unwrap();
         commit("fresh3", "fresh-object3");
-        assert_eq!(store.guarded_writer().vocab_sync.thread_id(), Some(id));
+        assert_eq!(vocab_thread(&store), Some(id));
         let head = store.snapshot().commit;
         let len = store.snapshot().len();
         drop(store);
         let reopened = Store::open(dir.path(), Default::default()).unwrap();
         assert_eq!(reopened.snapshot().commit, head);
         assert_eq!(reopened.snapshot().len(), len);
-        assert!(reopened.guarded_writer().vocab_sync.thread_id().is_none());
+        assert!(vocab_thread(&reopened).is_none());
     }
 
     #[test]
     fn vocabulary_worker_spawn_failure_keeps_commits_durable() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), Default::default()).unwrap();
-        store.guarded_writer().vocab_sync.fail_spawn = true;
+        store.group.as_ref().unwrap().vocab.lock().fail_spawn = true;
         let mut txn = store.write();
         let q = txn
             .encode_quad(&quad("s", "p", "o"), &mut Default::default())
             .unwrap();
         txn.insert(q).unwrap();
         let receipt = txn.commit().unwrap();
-        assert!(store.guarded_writer().vocab_sync.thread_id().is_none());
+        assert!(
+            store
+                .group
+                .as_ref()
+                .unwrap()
+                .vocab
+                .lock()
+                .thread_id()
+                .is_none()
+        );
         drop(store);
         let store = Store::open(dir.path(), Default::default()).unwrap();
         assert_eq!(store.snapshot().commit, receipt.commit.seq);
@@ -10125,7 +9997,7 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
 
 // Private diagnostic probes are scoped to one Store and one calling thread. No timed
 // release build contains the observer, fault selection, or post-capture panic point:
-// outside tests the three points of `publish_log` call the empty functions below.
+// outside tests the three points of a solo fence in `write_prefix` call the empty functions below.
 #[cfg(not(test))]
 mod ordinary_sync_probe {
     use super::{Store, SyncPath};
@@ -10198,7 +10070,7 @@ mod ordinary_sync_probe {
     }
 
     pub(super) fn captured(store: &Store) {
-        // The observer itself never panics. Inject only inside publish_log, after
+        // The observer itself never panics. Inject only inside a solo fence's `write_prefix`, after
         // the original sample publication (R) or sample capture (S).
         if with_probe(store, |p| p.panic_after_capture.replace(false)) {
             panic!("private diagnostic panic after ordinary sync sample");
@@ -10257,7 +10129,7 @@ mod ordinary_sync_tests {
         let before = std::fs::read(&wal_path).unwrap();
         let mut state = wal::Direct::Untried;
         let writer = store.writer.lock();
-        let descriptor = writer.wal.as_ref().unwrap().get_ref();
+        let descriptor = writer.wal.as_ref().unwrap();
         assert!(state.handle(Some(&missing), descriptor).is_none());
         assert!(matches!(state, wal::Direct::Off));
         writer.tail.lock().direct = state;
@@ -10342,6 +10214,7 @@ mod ordinary_sync_tests {
                 let store = Store::open(
                     dir.path(),
                     StoreOptions {
+                        group_commit: false,
                         wal_direct_writes: direct,
                         ..Default::default()
                     },
@@ -10377,13 +10250,18 @@ mod ordinary_sync_tests {
                 assert!(store.writer.try_lock().is_some());
                 if !panic {
                     assert_eq!(store.snapshot().commit, head + 1);
+                } else {
+                    assert!(matches!(
+                        insert(&store, "after-panic"),
+                        Err(Error::Poisoned)
+                    ));
                 }
                 drop(store);
                 let reopened = Store::open(dir.path(), Default::default()).unwrap();
-                // An injected panic has no acknowledged receipt. Orderly close
-                // trims that unpublished suffix using the unchanged head.
-                assert_eq!(reopened.snapshot().commit, head + u64::from(!panic));
-                assert_eq!(reopened.snapshot().len(), len + u64::from(!panic));
+                // The panic occurred after the commit was already durable on disk,
+                // so the poisoned store did not trim the log and reopen recovers it.
+                assert_eq!(reopened.snapshot().commit, head + 1);
+                assert_eq!(reopened.snapshot().len(), len + 1);
             }
         }
     }
@@ -10395,6 +10273,7 @@ mod ordinary_sync_tests {
             let store = Store::open(
                 dir.path(),
                 StoreOptions {
+                    group_commit: false,
                     wal_direct_writes: direct,
                     ..Default::default()
                 },
@@ -10436,7 +10315,14 @@ mod ordinary_sync_tests {
         }
         for unavailable in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let store = Store::open(dir.path(), Default::default()).unwrap();
+            let store = Store::open(
+                dir.path(),
+                StoreOptions {
+                    group_commit: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             let calibrated = calibrate(&store, unavailable);
             let before = counts(&store);
             let head = store.snapshot().commit;
@@ -10471,7 +10357,14 @@ mod ordinary_sync_tests {
     #[test]
     fn ordinary_sync_excludes_noop_dry_bulk_memory_and_group_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), Default::default()).unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                group_commit: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         insert(&store, "warm").unwrap();
         let before = counts(&store);
         let probe = Rc::new(ordinary_sync_probe::Probe::default());
@@ -10513,7 +10406,6 @@ mod ordinary_sync_tests {
             let opts = StoreOptions {
                 group_commit: group,
                 bulk_threshold: if bulk { 0 } else { 250_000 },
-                group_commit_idle_direct: false,
                 ..Default::default()
             };
             let store = if memory {
@@ -10570,6 +10462,7 @@ mod ordinary_sync_tests {
             let store = Store::open(
                 &db,
                 StoreOptions {
+                    group_commit: false,
                     wal_direct_writes: direct,
                     ..Default::default()
                 },
@@ -10679,13 +10572,12 @@ mod ordinary_sync_tests {
     }
 
     #[test]
-    fn ordinary_sync_group_enabled_idle_fallback_remains_ordinary() {
+    fn group_enabled_idle_writer_uses_a_group_of_one_fence() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(
             dir.path(),
             StoreOptions {
                 group_commit: true,
-                group_commit_idle_direct: true,
                 wal_direct_writes: false,
                 ..Default::default()
             },
@@ -10695,8 +10587,9 @@ mod ordinary_sync_tests {
         let scope = ordinary_sync_probe::install(&store, &probe);
         let receipt = insert(&store, "idle").unwrap();
         drop(scope);
-        assert_eq!(counts(&store), [0, 1, 0]);
-        assert_observed(&probe, SyncPath::Buffered);
+        assert_eq!(counts(&store), [0, 0, 1]);
+        assert_eq!(store.commit_metrics().size.count(), 1);
+        assert_eq!(probe.publications.get(), 0);
         assert!(receipt.committed);
         drop(store);
         let reopened = Store::open(dir.path(), Default::default()).unwrap();

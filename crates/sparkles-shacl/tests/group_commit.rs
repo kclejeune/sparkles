@@ -31,7 +31,6 @@ const P: &str = "PREFIX ex: <http://ex.org/> ";
 fn options() -> StoreOptions {
     StoreOptions {
         group_commit: true,
-        group_commit_idle_direct: false,
         ..Default::default()
     }
 }

@@ -1554,7 +1554,6 @@ mod pending_tests {
             dir.path(),
             StoreOptions {
                 group_commit: grouped,
-                group_commit_idle_direct: false,
                 ..Default::default()
             },
         )

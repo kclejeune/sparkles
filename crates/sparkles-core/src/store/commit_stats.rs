@@ -239,6 +239,6 @@ impl Store {
 
     /// Whether commits of this store may share a synchronization.
     pub fn group_commit_enabled(&self) -> bool {
-        self.group.is_some() && self.root.is_some()
+        self.opts.group_commit && self.root.is_some()
     }
 }

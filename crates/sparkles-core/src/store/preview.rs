@@ -269,7 +269,7 @@ impl WriteTxn<'_> {
         storage
     }
 
-    /// The preview of a commit through the WAL, made where `publish_log` would write it.
+    /// The preview of a commit through the WAL, made where `publish_grouped` would write it.
     pub(super) fn preview_log(&mut self, dr: &DryRun) -> Result<Preview> {
         self.preview_log_inner(dr, None)
     }

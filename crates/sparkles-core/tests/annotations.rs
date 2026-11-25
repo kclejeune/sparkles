@@ -151,7 +151,9 @@ fn annotations_of_commits_that_did_not_survive_are_dropped() {
         let r = upd_with(&s, "INSERT DATA { <urn:c> <urn:p> 3 }", Default::default()).unwrap();
         assert_eq!((r.commit.seq, r.annotation.message.clone()), (2, None));
     }
-    // a torn tail of the side-file is cut off at the next open
+    // a torn tail of the side-file is cut off at the next open, and because every WAL
+    // commit carries `WAL_FLAG_ANNOTATED` (X16 Phase 6), commit 3 is treated as a torn
+    // tail as well so the next commit takes seq 3
     let s = Store::open(&root, StoreOptions::default()).unwrap();
     upd_with(
         &s,
@@ -169,17 +171,20 @@ fn annotations_of_commits_that_did_not_survive_are_dropped() {
         .set_len(len - 1)
         .unwrap();
     let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.head_commit().seq, 2);
     assert_eq!(message(&s, 1).as_deref(), Some("one"));
     assert_eq!(message(&s, 3), None);
-    upd_with(
+    let r = upd_with(
         &s,
         "INSERT DATA { <urn:e> <urn:p> 5 }",
         with_message("four"),
     )
     .unwrap();
+    assert_eq!(r.commit.seq, 3);
     drop(s);
     let all = annotations::read(&root).unwrap();
-    assert_eq!(all.keys().copied().collect::<Vec<_>>(), [1, 4]);
+    assert_eq!(all.keys().copied().collect::<Vec<_>>(), [1, 3]);
+    assert_eq!(all[&3].message.as_deref(), Some("four"));
 }
 
 #[test]
