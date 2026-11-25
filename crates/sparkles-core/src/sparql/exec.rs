@@ -6599,66 +6599,124 @@ fn key_rows_retained(
 ) -> Result<Vec<Option<Value>>> {
     with_key_evaluator(ctx, t, e, dec, |eval| {
         let step = ctx.reservation_step();
-        let mut values = Vec::with_capacity(t.len());
-        // Workers keep a paid part of the retained charge. The only additional
-        // slots are the collector's pieces, with one transient key on each worker.
-        const PIECE_ROWS: usize = 4096;
-        let pieces = t.len().div_ceil(PIECE_ROWS);
-        let scratch = (t.len() * std::mem::size_of::<Option<Value>>()) as u64
-            + pieces.min(rayon::current_num_threads()) as u64
-                * super::bignum::AGG_SUM_PAYLOAD_BYTES;
-        if t.len() > PAR_THRESHOLD
-            && e.parallel()
-            && let Ok(_scratch) = ctx.charge(scratch)
-        {
-            let part_owner = charge.as_ref();
-            let parts = (0..pieces)
-                .into_par_iter()
-                .map(|piece| {
-                    let start = piece * PIECE_ROWS;
-                    let end = (start + PIECE_ROWS).min(t.len());
-                    let part = part_owner.map(|owner| owner.part(ctx));
-                    let mut payload = 0u64;
-                    let mut keys = Vec::with_capacity(end - start);
-                    for i in start..end {
-                        if i.is_multiple_of(MAP_POLL_ROWS) {
-                            ctx.check()?;
-                        }
-                        let value = eval(i)?;
-                        payload = payload.saturating_add(key_payload(&value));
-                        if let Some(part) = &part
-                            && payload > part.bytes()
-                            && part.resize(payload.saturating_add(step)).is_err()
-                        {
-                            part.resize(payload)?;
-                        }
-                        keys.push(value);
-                    }
-                    if let Some(part) = &part {
-                        part.resize(payload)?;
-                    }
-                    Ok((keys, payload, part))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for (keys, payload, part) in parts {
-                if let (Some(charge), Some(part)) = (charge.as_mut(), part) {
-                    charge.absorb(part);
-                }
-                *bytes = bytes.saturating_add(payload);
-                values.extend(keys);
-            }
-        } else {
-            for i in 0..t.len() {
+        let eval_retained =
+            |i: usize, charge: &mut Option<super::ctx::RetainedCharge>, bytes: &mut u64| {
                 if i.is_multiple_of(MAP_POLL_ROWS) {
                     ctx.check()?;
                 }
                 let value = eval(i)?;
                 *bytes = bytes.saturating_add(key_payload(&value));
-                if let Some(charge) = &mut *charge {
+                if let Some(charge) = charge {
                     charge.cover(*bytes, step)?;
                 }
-                values.push(value);
+                Ok::<_, Error>(value)
+            };
+        // Fill the final slots directly. Bound the number of pieces so each can
+        // keep one transient result if its retained charge runs out of room.
+        const TRANSIENT: u64 = super::bignum::AGG_SUM_PAYLOAD_BYTES;
+        const PIECE_BYTES: u64 = 128;
+        let piece_rows = if t.len() > PAR_THRESHOLD && e.parallel() {
+            t.len()
+                .div_ceil(rayon::current_num_threads())
+                .max(PAR_MIN_LEN)
+        } else {
+            t.len().max(1)
+        };
+        let pieces = t.len().div_ceil(piece_rows) as u64;
+        let piece_bytes = pieces * PIECE_BYTES;
+        let reserve_scratch = || {
+            let bytes = piece_bytes + pieces * TRANSIENT;
+            let Some(owner) = charge.as_ref() else {
+                return ctx.charge(bytes);
+            };
+            let scratch = owner.part(ctx);
+            scratch.add(bytes)?;
+            Ok(scratch)
+        };
+        if pieces > 1
+            && let Ok(scratch) = reserve_scratch()
+        {
+            let mut values = vec![None; t.len()];
+            let part_owner = charge.as_ref();
+            let mut parts: Vec<_> = values
+                .par_chunks_mut(piece_rows)
+                .enumerate()
+                .map(|(piece, slots)| {
+                    let start = piece * piece_rows;
+                    let part = part_owner.map(|owner| owner.part(ctx));
+                    let mut payload = 0u64;
+                    let progress = (|| {
+                        for (offset, slot) in slots.iter_mut().enumerate() {
+                            if offset.is_multiple_of(MAP_POLL_ROWS) {
+                                ctx.check()?;
+                            }
+                            let value = eval(start + offset)?;
+                            let key_bytes = key_payload(&value);
+                            let needed = payload.saturating_add(key_bytes);
+                            if let Some(part) = &part
+                                && needed > part.bytes()
+                                && part.resize(needed.saturating_add(step)).is_err()
+                            {
+                                match part.resize(needed) {
+                                    Ok(()) => {}
+                                    Err(Error::BudgetExceeded(_)) if key_bytes <= TRANSIENT => {
+                                        *slot = value;
+                                        return Ok((offset + 1, key_bytes));
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            payload = needed;
+                            *slot = value;
+                        }
+                        Ok((slots.len(), 0))
+                    })();
+                    if let Some(part) = &part {
+                        part.resize(payload).expect("shrinking a piece's charge");
+                    }
+                    (progress, payload, part)
+                })
+                .collect();
+            for (_, payload, part) in &mut parts {
+                if let (Some(charge), Some(part)) = (charge.as_mut(), part.take()) {
+                    charge.absorb(part);
+                }
+                *bytes = bytes.saturating_add(*payload);
             }
+            // The workers returned their slack. Keep only the actual payload of
+            // their paused keys and the piece metadata, then finish any suffixes
+            // serially without evaluating a row twice.
+            if let Some(failed) = parts.iter().position(|(progress, _, _)| progress.is_err()) {
+                return Err(parts.swap_remove(failed).0.unwrap_err());
+            }
+            let pending: u64 = parts
+                .iter()
+                .filter_map(|(progress, _, _)| progress.as_ref().ok().map(|&(_, pending)| pending))
+                .sum();
+            if pending > 0 {
+                let kept = piece_bytes + pending;
+                scratch.resize(kept)?;
+                charge.as_mut().expect("retained pieces").absorb(scratch);
+                *bytes = bytes.saturating_add(kept);
+                for (piece, ((progress, _, _), slots)) in parts
+                    .into_iter()
+                    .zip(values.chunks_mut(piece_rows))
+                    .enumerate()
+                {
+                    let (done, _) = progress?;
+                    let start = piece * piece_rows;
+                    for (offset, slot) in slots.iter_mut().enumerate().skip(done) {
+                        *slot = eval_retained(start + offset, charge, bytes)?;
+                    }
+                }
+                *bytes -= piece_bytes;
+                charge.as_mut().expect("retained pieces").resize(*bytes)?;
+            }
+            return Ok(values);
+        }
+        let mut values = Vec::with_capacity(t.len());
+        for i in 0..t.len() {
+            values.push(eval_retained(i, charge, bytes)?);
         }
         Ok(values)
     })
@@ -11686,4 +11744,81 @@ fn cursor_large_sparse_and_uncached_sort_keys_admit_payload_incrementally() {
         );
         assert_eq!(ctx.live_bytes(), 0);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_full_sort_fits_without_a_second_key_column() {
+    use super::expr::ArithOp;
+
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.opt.expr_cache = false;
+    let var = ctx.var("v");
+    let rows = 2 * PAR_THRESHOLD;
+    let mut table = Table::new(vec![var]);
+    for i in (1..=rows as i64).rev() {
+        table.push_row(&[Id::from_i64(i).unwrap()]);
+    }
+    let factor = Value::from_typed(&"9".repeat(1700), oxrdf::vocab::xsd::INTEGER.as_str());
+    let expr = Expr::Arith(
+        Box::new(Expr::Var(var)),
+        Box::new(Expr::Lit(Id::UNDEF, factor)),
+        ArithOp::Mul,
+    );
+    let payload = with_key_evaluator(&ctx, &table, &expr, None, |eval| {
+        (0..rows).try_fold(0, |bytes, i| Ok(bytes + key_payload(&eval(i)?)))
+    })
+    .unwrap();
+    let slots = (rows * size_of::<Option<Value>>()) as u64;
+    assert!(payload > slots);
+    let sort = rows as u64 * 24 + 2 * table.mem_bytes() + 128 + 1024;
+    let evaluator = ctx.nvars() as u64 * 16 + 128;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    // The complete sort has room for only half the old scratch column's slots.
+    ctx.mem_limit = sort + slots + 128 + evaluator + payload + slots / 2;
+    let ctx = ctx.into_shared();
+    let sorted = pool
+        .install(|| {
+            order_by_rows(
+                &ctx,
+                table.clone(),
+                &[(expr.clone(), true)],
+                None,
+                &mut ExprReport::default(),
+            )
+        })
+        .unwrap();
+    assert!(
+        sorted.cols[0]
+            .iter()
+            .map(|id| id.as_i64())
+            .eq(1..=rows as i64)
+    );
+    assert_eq!(ctx.live_bytes(), 0);
+
+    // The column alone has room for the keys and piece metadata. The workers
+    // must hand off when the transient allowance occupies the remaining room.
+    let mut tight = Ctx::new(store.snapshot());
+    assert_eq!(tight.var("v"), var);
+    tight.mem_limit = slots + 128 + evaluator + payload + 4 * 128;
+    let tight = tight.into_shared();
+    let keys = pool
+        .install(|| key_column_charged(&tight, &table, &expr, None))
+        .unwrap();
+    with_key_evaluator(&ctx, &table, &expr, None, |eval| {
+        for i in 0..rows {
+            assert_eq!(
+                order_cmp(keys.get(i).as_ref(), eval(i)?.as_ref()),
+                Ordering::Equal
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+    drop(keys);
+    assert_eq!(tight.live_bytes(), 0);
 }

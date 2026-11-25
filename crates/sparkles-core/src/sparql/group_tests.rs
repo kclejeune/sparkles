@@ -498,6 +498,18 @@ fn spill_group_distinct_avg_replays_arguments_once_in_order() {
     let datatype = oxrdf::vocab::xsd::INTEGER.as_str();
     let positive = ctx.intern_value(&Value::from_typed(&digits, datatype));
     let negative = ctx.intern_value(&Value::from_typed(&format!("-{digits}"), datatype));
+    let mut single = Table::new(table.vars.clone());
+    single.push_row(&[int(&ctx, 0), positive]);
+    assert_eq!(spill.written_bytes(), 0);
+    // The first write opens the deferred argument stream. Since only one existing
+    // group received an argument in that call, the positive value for it was deferred.
+    let replayed = (0..511)
+        .find(|&group| {
+            single.cols[0][0] = int(&ctx, group);
+            grouping.add(&ctx, &single, &mut report).unwrap();
+            spill.written_bytes() > 0
+        })
+        .expect("a wide positive argument was deferred");
     table.cols[1].fill(positive);
     grouping.add(&ctx, &table, &mut report).unwrap();
     // A repeated wide value crossed the spill boundary for some groups. DISTINCT
@@ -509,10 +521,16 @@ fn spill_group_distinct_avg_replays_arguments_once_in_order() {
     grouping.add(&ctx, &error, &mut report).unwrap();
     table.cols[1].fill(negative);
     grouping.add(&ctx, &table, &mut report).unwrap();
+    // Promoting to float before cancellation would convert a wide operand to
+    // infinity. The correct replay cancels the integers before seeing this zero.
+    single.cols[1][0] = ctx.intern_value(&Value::Float(0.0f32.into()));
+    grouping.add(&ctx, &single, &mut report).unwrap();
     grouping.end_input().unwrap();
     assert!(grouping.spilled > 0);
     let expected_avg = ctx.intern_value(&Value::Decimal(oxsdatatypes::Decimal::from(2)));
     let expected_sum = int(&ctx, 6);
+    let float_avg = ctx.intern_value(&Value::Float(1.5f32.into()));
+    let float_sum = ctx.intern_value(&Value::Float(6.0f32.into()));
     let mut groups = 0;
     while let Some(output) = grouping.output(&ctx, &[key, avg, sum], 83).unwrap() {
         for row in 0..output.len() {
@@ -520,10 +538,16 @@ fn spill_group_distinct_avg_replays_arguments_once_in_order() {
             assert_eq!(slot, groups);
             let expected = if slot == 511 {
                 (Id::UNDEF, Id::UNDEF)
+            } else if slot == replayed {
+                (float_avg, float_sum)
             } else {
                 (expected_avg, expected_sum)
             };
-            assert_eq!((output.cols[1][row], output.cols[2][row]), expected);
+            assert_eq!(
+                (output.cols[1][row], output.cols[2][row]),
+                expected,
+                "group {slot}"
+            );
             groups += 1;
         }
     }
