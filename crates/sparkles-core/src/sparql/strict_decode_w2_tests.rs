@@ -168,29 +168,40 @@ fn eager_decode_bypass_closed_across_vocab_delta_local() {
         largest_floor < 32 * 1024,
         "string_floor must not allocate 64 KiB key before admission (largest={largest_floor})"
     );
+}
 
-    // 3. query_regex::replace in eager mode: choose headroom (48 KiB) that admits the
+#[test]
+fn regex_replace_refuses_final_output_reservation() {
+    // Choose headroom (48 KiB) that admits the
     //    1 KiB base + 2*16 KiB growth loop (~33 KiB) so refusal happens specifically at
     //    the final output-lifetime `reserve_decode_checked(output.capacity())` (~129 KiB),
     //    paired with a control replacement whose final decode reservation fits.
-    let mut ctx_re = Ctx::new(store.snapshot());
-    ctx_re.mem_limit = 256 * 1024;
-    let re = ctx_re.regex("a", "").unwrap().unwrap();
-    let _held_re = hold_all_but(&ctx_re, 48 * 1024);
+    let store = Store::in_memory(StoreOptions::default());
     let src = "a".repeat(2048);
-    let ctrl_re = re.replace(&ctx_re, &src, "b");
+    let regex_ctx = || {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 256 * 1024;
+        ctx
+    };
+    let control = regex_ctx();
+    let re = control.regex("a", "").unwrap().unwrap();
+    let _held = hold_all_but(&control, 48 * 1024);
     assert_eq!(
-        ctrl_re
+        re.replace(&control, &src, "b")
             .expect("regex control fits growth loop and final reserve_decode_checked")
             .len(),
         2048
     );
-    let res = re.replace(&ctx_re, &src, "bbbbbbbb");
-    assert_memory_budget_error(
-        res,
-        "eager query_regex::replace final reserve_decode_checked",
-    );
-    drop(_held_re);
+    let target = regex_ctx();
+    let re = target.regex("a", "").unwrap().unwrap();
+    let _held = hold_all_but(&target, 48 * 1024);
+    let Err(Error::BudgetExceeded(b)) = re.replace(&target, &src, "bbbbbbbb") else {
+        panic!("regex output must refuse at its final decode reservation");
+    };
+    assert_eq!(b.kind, BudgetKind::Memory);
+    // 1 KiB scratch, twice the 16 KiB output for growth, then the final decode
+    // envelope of 8 * 16 KiB + 1 KiB. The growth stage fits by itself.
+    assert_eq!(b.requested, b.limit - 48 * 1024 + 162 * 1024);
 }
 
 #[test]
@@ -1321,7 +1332,7 @@ fn geo_execution_operators_and_spatialf_strict_decode() {
 }
 
 // =========================================================================
-// T10: Large ORDER BY / top-k payload pre-admission & OrderedTopK lexical_check (Sol #2, Neon #5)
+// T10: Large ORDER BY / top-k payload pre-admission (Sol #2)
 // =========================================================================
 
 #[test]
@@ -1389,45 +1400,6 @@ fn large_order_by_and_topk_admit_payloads_before_retaining() {
         "large top-k heap secondary key",
         false,
     );
-
-    // 3. OrderedTopK + lexical_check on compacted base-vocab strings with prefix relations
-    //    and an oversized string that must refuse inside lexical_check / ordered_topk.
-    let mut lex_ttl = String::from("@prefix ex: <http://example.org/> .\n");
-    let long_s = format!("aa{}", "x".repeat(32 * 1024));
-    lex_ttl.push_str(&format!(
-        "ex:p0 ex:s \"a\" .\n\
-         ex:p1 ex:s \"aa\" .\n\
-         ex:p2 ex:s \"{long_s}\" .\n"
-    ));
-    for i in 0..40 {
-        lex_ttl.push_str(&format!("ex:q{i} ex:s \"z{i:03}\" .\n"));
-    }
-    let lex_store = store_with_turtle(&lex_ttl, true);
-    let lex_q = "PREFIX ex: <http://example.org/> \
-        SELECT ?x ?s WHERE { ?x ex:s ?s } ORDER BY ?s LIMIT 3";
-    let ok_lex = super::query(
-        lex_store.snapshot(),
-        lex_q,
-        &QueryOptions {
-            max_memory_bytes: Some(MIB),
-            no_cache: true,
-            ..QueryOptions::default()
-        },
-    )
-    .expect("OrderedTopK lexical control");
-    assert_eq!(ok_lex.len(), 3);
-    assert_memory_budget_error(
-        super::query(
-            lex_store.snapshot(),
-            lex_q,
-            &QueryOptions {
-                max_memory_bytes: Some(24 * 1024),
-                no_cache: true,
-                ..QueryOptions::default()
-            },
-        ),
-        "OrderedTopK lexical_check refuses oversized vocab key",
-    );
 }
 
 // =========================================================================
@@ -1478,6 +1450,23 @@ fn declined_filter_sample_releases_decode_state_and_propagates_controls() {
     ctx.check()
         .expect("exact evaluation succeeds after declined sample");
 
+    let mut cursor = Ctx::new(snap.clone());
+    cursor.mem_limit = 48 * 1024;
+    cursor.enable_cursor_accounting().unwrap();
+    let hold = cursor.charge(4096).unwrap();
+    let baseline = cursor.live_bytes();
+    let result: Result<Option<()>> = cursor.with_sampling_trial(|trial| {
+        let decode = trial.charge(0)?;
+        assert!(trial.value_checked_into(med_id, &decode)?.is_some());
+        assert!(cursor.live_bytes() >= baseline + med.len() as u64);
+        trial.value_checked_into(big_id, &decode)?;
+        Ok(Some(()))
+    });
+    assert!(matches!(result, Ok(None)));
+    assert_eq!(cursor.live_bytes(), baseline);
+    cursor.check().unwrap();
+    drop(hold);
+
     // Pre-existing refusal on ctx is preserved and propagated (not cleared).
     let mut ctx_latched = Ctx::new(snap.clone());
     ctx_latched.mem_limit = 48 * 1024;
@@ -1503,6 +1492,46 @@ fn declined_filter_sample_releases_decode_state_and_propagates_controls() {
         ctx_to.with_sampling_trial(|_| Ok(Some(1usize))),
         Err(Error::Timeout)
     ));
+}
+
+#[test]
+fn filter_trial_admits_setup_before_copying() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    const SETUP: usize = 128 * 1024;
+    ctx.dataset.default = Some(vec![Id::DEFAULT_GRAPH; SETUP / 8]);
+    ctx.dataset.named = Some(vec![Id::vocab(1); SETUP / 8]);
+    ctx.base_iri = Some(oxiri::Iri::parse(format!("urn:base:{}", "x".repeat(SETUP))).unwrap());
+    let v = ctx.var(&"v".repeat(SETUP));
+    let local = ctx.intern_term(&Term::Literal(Literal::new_simple_literal("local")));
+    ctx.mem_limit = ctx.live_bytes() + MIB;
+    ctx.enable_cursor_accounting().unwrap();
+    let hold = hold_all_but(&ctx, 16 * 1024);
+    let baseline = ctx.live_bytes();
+    let mut result = None;
+    let peak = crate::test_alloc::record_peak_live(|| {
+        result = Some(ctx.with_sampling_trial(|_| Ok(Some(()))));
+    });
+    assert!(peak < SETUP, "trial allocated {peak} bytes before refusing");
+    assert!(matches!(result.unwrap(), Ok(None)));
+    assert_eq!(ctx.live_bytes(), baseline);
+    ctx.check().unwrap();
+    drop(hold);
+
+    let baseline = ctx.live_bytes();
+    let result = ctx
+        .with_sampling_trial(|trial| {
+            assert!(ctx.live_bytes() >= baseline + 4 * SETUP as u64);
+            assert_eq!(trial.dataset.default, ctx.dataset.default);
+            assert_eq!(trial.dataset.named, ctx.dataset.named);
+            assert_eq!(trial.base_iri, ctx.base_iri);
+            assert_eq!(trial.var_name(v), ctx.var_name(v));
+            assert!(trial.term_checked(local)?.is_some());
+            Ok(Some(()))
+        })
+        .unwrap();
+    assert_eq!(result, Some(()));
+    assert_eq!(ctx.live_bytes(), baseline);
 }
 
 // =========================================================================

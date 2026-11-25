@@ -549,6 +549,44 @@ fn dim_tag(word: &str) -> Option<Layout> {
 // ---------------------------------------------------------------------------------------
 // GeoJSON
 
+/// Additional space for the JSON value tree and its overlap with geometry construction.
+/// The caller separately covers the lexical copy, JSON strings and string scratch.
+pub(super) fn geojson_structure_bytes(lex: &str) -> u64 {
+    let value = std::mem::size_of::<serde_json::Value>() as u64;
+    let geometry = std::mem::size_of::<Geometry<f64>>() as u64;
+    let mut bytes = 0u64;
+    let mut in_string = false;
+    let mut escaped = false;
+    for b in lex.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        let extra = match b {
+            b'"' => {
+                in_string = true;
+                0
+            }
+            // A nonempty value vector starts with four slots. Each additional
+            // element can add up to three slots at a growth peak (old plus new).
+            b'[' => 4 * value + geometry,
+            b',' => 3 * value + 2 * geometry,
+            // A member may open a singleton map. Allow a whole serde_json B-tree
+            // node (key and value slots, child pointers and node metadata).
+            b':' => 1024,
+            _ => 0,
+        };
+        bytes = bytes.saturating_add(extra);
+    }
+    bytes
+}
+
 fn parse_geojson(lex: &str, max_vertices: u32) -> Result<Geom, GeomError> {
     let crs = CrsRef::Known(CRS84);
     let text = lex.trim();

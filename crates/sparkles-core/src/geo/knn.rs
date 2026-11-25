@@ -204,7 +204,13 @@ pub(crate) fn spatial_knn_materialized<'ctx>(
     let mut taken: FxHashSet<Id> = FxHashSet::default();
     if spec.errors {
         let rows;
-        (rows, taken) = rows_without_distance(ctx, spec, subj)?;
+        (rows, taken) = rows_without_distance(
+            ctx,
+            spec,
+            subj,
+            #[cfg(test)]
+            |_| {},
+        )?;
         error_rows = rows.len();
         for chunk in rows.chunks(ERROR_BATCH) {
             errors += run.run(chunk)?.iter().filter(|k| k.is_none()).count();
@@ -280,6 +286,7 @@ fn rows_without_distance(
     ctx: &Ctx,
     spec: &SpatialKnnSpec,
     subj: Option<Id>,
+    #[cfg(test)] observe: impl Fn(&Geom),
 ) -> Result<(Vec<[Id; 3]>, FxHashSet<Id>)> {
     let snap = &*ctx.snap;
     let base = snap.geo.as_deref().and_then(|v| v.base.clone());
@@ -338,12 +345,16 @@ fn rows_without_distance(
                     Some(slot) => slot,
                     None => classify_controlled(ctx, o, &cfg, false, &parse_charge)?,
                 };
-                let geom = match slot {
+                let geom = match &slot {
                     Slot::Geom(e) => e.geom(snap).ok(),
                     s if s.rechecked() => rechecked.entry(o.0)?.and_then(|e| e.geom(snap).ok()),
                     _ => None,
                 };
-                let bad = geom.is_none_or(|g| !test.measurable(&g));
+                let bad = geom.is_none_or(|g| {
+                    #[cfg(test)]
+                    observe(&g);
+                    !test.measurable(&g)
+                });
                 drop(parse_charge);
                 bad
             };
@@ -415,4 +426,80 @@ impl Measurable<'_> {
             geographic || in_crs(g, &self.q.crs).is_ok()
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn fallback_knn_keeps_geometry_credit_during_measurement() {
+    use crate::index::Perm;
+    use crate::io::{RdfFormat, Source};
+    use crate::sparql::expr::Expr;
+    use crate::sparql::plan::{GraphFilter, ScanSpec};
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{NamedNode, Term};
+
+    let store = Store::in_memory(StoreOptions::default());
+    let line = format!(
+        "<http://www.opengis.net/def/crs/EPSG/0/3857> LINESTRING({}1 1)",
+        "0 0,".repeat(255)
+    );
+    let data = format!(
+        "<urn:feature> <urn:geometry> \"{line}\"^^<{}> .",
+        super::WKT_LITERAL
+    );
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let ctx = Ctx::new(store.snapshot());
+    assert!(
+        ctx.snap
+            .geo
+            .as_ref()
+            .and_then(|v| v.base.as_ref())
+            .is_none()
+    );
+    let pred = ctx
+        .snap
+        .lookup_term(&Term::NamedNode(NamedNode::new_unchecked("urn:geometry")))
+        .unwrap();
+    let order = Perm::Pos.order();
+    let col = |c| order.iter().position(|&x| x == c).unwrap();
+    let spec = SpatialKnnSpec {
+        scan: ScanSpec {
+            perm: Perm::Pos,
+            prefix: vec![pred.0],
+            cols: vec![(col(O), 0), (col(S), 1)],
+            eqs: Vec::new(),
+            graph: GraphFilter::Default,
+            graph_col: col(G),
+            dedup: false,
+            src: None,
+        },
+        pred,
+        geom_var: 0,
+        subj_var: Some(1),
+        graph_var: None,
+        q: std::sync::Arc::new(super::parse("POINT(0 0)", super::WKT_LITERAL).unwrap()),
+        k: 1,
+        metres_per_unit: 1.0,
+        errors: true,
+        placeholder: Vec::new(),
+        key: 0,
+        order: Expr::Var(0),
+        w_first: false,
+    };
+    let observations = std::cell::Cell::new(0);
+    let (rows, skipped) = rows_without_distance(&ctx, &spec, None, |g| {
+        assert_eq!(g.vertices, 256);
+        assert!(ctx.live_bytes_for_tests() >= g.mem_size() as u64);
+        observations.set(observations.get() + 1);
+    })
+    .unwrap();
+    assert_eq!(observations.get(), 1);
+    assert!(rows.is_empty() && skipped.is_empty());
+    assert_eq!(ctx.live_bytes_for_tests(), 0);
 }

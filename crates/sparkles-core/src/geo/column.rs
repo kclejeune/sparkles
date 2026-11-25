@@ -291,6 +291,10 @@ pub(crate) fn classify_controlled(
     let Some(lex) = lex else {
         return Ok(Slot::Other);
     };
+    if dt == GEOJSON_LITERAL {
+        parse_charge.add(super::parse::geojson_structure_bytes(&lex))?;
+        ctx.check()?;
+    }
     let mut slot = parse_slot(&lex, dt, cfg, recheck);
     drop(lex);
     ctx.check()?;
@@ -885,6 +889,67 @@ mod tests {
         k.push(b'^');
         k.extend_from_slice(dt.as_bytes());
         k
+    }
+
+    #[test]
+    fn compact_geojson_refuses_before_allocating_the_value_tree() {
+        use crate::error::{BudgetKind, Error};
+        use crate::sparql::ctx::Ctx;
+        use crate::store::{Store, StoreOptions};
+        use oxrdf::{Literal, NamedNode, Term};
+
+        let positions = 8192;
+        let lex = format!(
+            r#"{{"type":"LineString","coordinates":[{}[1,1]]}}"#,
+            "[0,0],".repeat(positions - 1)
+        );
+        let term = Term::Literal(Literal::new_typed_literal(
+            &lex,
+            NamedNode::new_unchecked(GEOJSON_LITERAL),
+        ));
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        let id = ctx.intern_term(&term);
+        let baseline = ctx.live_bytes_for_tests();
+        // The old lexical allowance and retained coordinate array both fit here.
+        // Three JSON value slots per position already exceed the remaining budget.
+        ctx.mem_limit = baseline + 256 * 1024;
+        let mut result = None;
+        let peak = crate::test_alloc::record_peak_live(|| {
+            let charge = ctx.charge(0).unwrap();
+            result = Some(classify_controlled(
+                &ctx,
+                id,
+                &GeoConfig::default(),
+                true,
+                &charge,
+            ));
+        });
+        assert!(
+            peak < 2 * lex.len(),
+            "parser allocated {peak} bytes before refusing"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+        ));
+        assert_eq!(ctx.live_bytes_for_tests(), baseline);
+
+        let control = Ctx::new(store.snapshot());
+        let id = control.intern_term(&term);
+        let baseline = control.live_bytes_for_tests();
+        let charge = control.charge(0).unwrap();
+        let slot = classify_controlled(&control, id, &GeoConfig::default(), true, &charge).unwrap();
+        let Slot::Geom(entry) = slot else {
+            panic!("compact GeoJSON control must parse");
+        };
+        assert_eq!(
+            entry.geom(&control.snap).unwrap().vertices,
+            positions as u32
+        );
+        assert!(control.live_bytes_for_tests() >= baseline + entry.bytes());
+        drop(entry);
+        assert_eq!(control.live_bytes_for_tests(), baseline);
     }
 
     #[test]

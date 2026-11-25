@@ -1450,6 +1450,82 @@ pub fn empty(map: bool) -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn map_and_key_decode_charges_overlap() {
+        use crate::store::{Store, StoreOptions};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        let key = "k".repeat(4096);
+        let map = Term::Literal(Literal::new_typed_literal(
+            format!(r#"{{"{key}" : 1}}"#),
+            NamedNode::new_unchecked(MAP),
+        ));
+        let key = Term::Literal(Literal::new_simple_literal(key));
+        let ids = [ctx.intern_term(&map), ctx.intern_term(&key)];
+        let args = ids.map(Expr::Const);
+        let table = super::super::table::Table::new(Vec::new());
+        let row = Row {
+            table: &table,
+            i: 0,
+            map: &[],
+            dec: None,
+            exists: None,
+        };
+
+        assert!(
+            matches!(call("containsKey", &args, &row, &ctx), Ok(Val::Id(id)) if id == crate::id::Id::from_bool(true))
+        );
+        ctx.mem_limit = ctx.live_bytes() + 48 * 1024;
+        for (id, expected) in ids.into_iter().zip([map, key]) {
+            let credit = ctx.charge(0).unwrap();
+            assert_eq!(ctx.term_checked_into(id, &credit).unwrap(), Some(expected));
+        }
+        assert!(call("containsKey", &args, &row, &ctx).is_err());
+        assert!(
+            matches!(ctx.check(), Err(crate::Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory)
+        );
+    }
+
+    #[test]
+    fn list_constructor_refuses_serialized_result_after_input_decode() {
+        use crate::store::{Store, StoreOptions};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let term = Term::Literal(Literal::new_simple_literal("\"".repeat(4096)));
+        let table = super::super::table::Table::new(Vec::new());
+        let row = Row {
+            table: &table,
+            i: 0,
+            map: &[],
+            dec: None,
+            exists: None,
+        };
+        let control = Ctx::new(store.snapshot());
+        let id = control.intern_term(&term);
+        let Ok(Val::V(Value::Other { lex, .. })) = call("List", &[Expr::Const(id)], &row, &control)
+        else {
+            panic!("control constructor must serialize its argument");
+        };
+        let output_bytes = 8 * lex.len() as u64 + 1024;
+        let mut target = Ctx::new(store.snapshot());
+        let id = target.intern_term(&term);
+        let baseline = target.live_bytes();
+        target.mem_limit = baseline + 80 * 1024;
+        let input_bytes = {
+            let credit = target.charge(0).unwrap();
+            assert_eq!(target.term_checked_into(id, &credit).unwrap(), Some(term));
+            credit.bytes()
+        };
+        assert!(output_bytes < target.mem_limit - baseline);
+        assert!(call("List", &[Expr::Const(id)], &row, &target).is_err());
+        assert!(matches!(
+            target.check(),
+            Err(crate::Error::BudgetExceeded(b))
+                if b.kind == crate::BudgetKind::Memory && b.requested == baseline + input_bytes + output_bytes
+        ));
+    }
+
     fn lst(s: &str) -> Vec<Elem> {
         parse_list(s).unwrap_or_else(|| panic!("{s}"))
     }

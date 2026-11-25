@@ -720,6 +720,68 @@ mod head_reload_tests {
     use crate::store::{Store, StoreOptions};
 
     #[test]
+    fn raw_head_refuses_wide_frame_before_allocating() {
+        const ROWS: usize = 1024;
+        const WIDTH: usize = 24;
+        let dir = tempfile::tempdir().unwrap();
+        let spill = Spill::open(&SpillOptions {
+            dir: dir.path().to_path_buf(),
+            max_bytes: 64 << 20,
+            query_bytes: 64 << 20,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let qspill = Arc::new(spill.query(None));
+        let mut writer = qspill.create(SpillKind::SortRun, WIDTH).unwrap();
+        writer.set_frame_rows(ROWS);
+        let ids: Vec<Id> = (0..ROWS as u64)
+            .map(|i| Id::vocab(i.wrapping_mul(0x9e37_79b9) & 0xffff_ffff))
+            .collect();
+        writer.write(&[ids.as_slice(); WIDTH], ROWS).unwrap();
+        let run = Arc::new(writer.finish().unwrap());
+        let mut head = Head {
+            reader: run.reader().unwrap(),
+            columns: Vec::new(),
+            keys: Vec::new(),
+            at: 0,
+            len: 0,
+            _charge: None,
+        };
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut target = Ctx::new(store.snapshot());
+        target.mem_limit = 512 * 1024;
+        target.enable_cursor_accounting().unwrap();
+        let target = target.into_shared();
+        let hold = target.charge(target.mem_limit - 4096).unwrap();
+        let baseline = target.live_bytes();
+        let keys = Keys::Raw(vec![0]);
+        let mut result = None;
+        let peak = crate::test_alloc::record_peak_live(|| {
+            result = Some(head.load(&target, &keys));
+        });
+        assert!(matches!(
+            result.unwrap(),
+            Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+        ));
+        assert_eq!(head.reader.buffer_capacity(), 0);
+        assert_eq!(target.live_bytes(), baseline);
+        assert!(
+            peak < ROWS * 8,
+            "frame allocated {peak} bytes before refusal"
+        );
+        drop(hold);
+        assert!(head.load(&target, &keys).unwrap(), "same frame fits");
+        assert_eq!(head.len, ROWS);
+        assert_eq!(head.columns.len(), WIDTH);
+        assert_eq!(head.columns[0], ids);
+        assert!(head.reader.buffer_capacity() > 0);
+        assert!(!head.load(&target, &keys).unwrap());
+        assert_eq!(target.live_bytes(), 0);
+    }
+
+    #[test]
     fn head_load_retains_reader_credit_across_reloads_refuses_before_decode_and_releases_at_eof() {
         let dir = tempfile::tempdir().unwrap();
         let spill = Spill::open(&SpillOptions {

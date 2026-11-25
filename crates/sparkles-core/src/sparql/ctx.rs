@@ -2115,20 +2115,51 @@ impl Ctx {
         trial.deadline_pause = self.deadline_pause.clone();
         trial.cancel = self.cancel.clone();
         trial.cancellation = self.cancellation.clone();
-        trial.dataset = self.dataset.clone();
         trial.graphs = self.graphs.clone();
-        trial.base_iri = self.base_iri.clone();
         if let Some(now) = self.now.get() {
             let _ = trial.now.set(*now);
         }
         trial.opt = self.opt;
         trial.aggregate_errors = self.aggregate_errors;
-        *trial.var_names.write() = self.var_names.read().clone();
-        let local_metadata = self.local.read().len().saturating_mul(64);
-        if !trial.retain_bytes(local_metadata) {
-            trial.check()?;
+        let graph_bytes = [&self.dataset.default, &self.dataset.named]
+            .into_iter()
+            .flatten()
+            .fold(0u64, |bytes, graphs| {
+                bytes.saturating_add(
+                    (graphs.len() as u64).saturating_mul(std::mem::size_of::<Id>() as u64),
+                )
+            });
+        let base_bytes = self
+            .base_iri
+            .as_ref()
+            .map_or(0, |iri| iri.as_str().len() as u64);
+        let fixed_bytes = graph_bytes.saturating_add(base_bytes);
+        let mut admitted = 0;
+        loop {
+            let names = self.var_names.read();
+            let local = self.local.read();
+            let name_bytes = names.iter().fold(0u64, |bytes, name| {
+                bytes.saturating_add(name.len() as u64 + std::mem::size_of::<String>() as u64)
+            });
+            let bytes = fixed_bytes
+                .saturating_add(name_bytes)
+                .saturating_add(local.len().saturating_mul(64));
+            if bytes <= admitted {
+                *trial.var_names.get_mut() = names.clone();
+                *trial.local.get_mut() = local.clone();
+                break;
+            }
+            // Admission may wake a pool entrant. Keep both vocabulary and
+            // variable-name locks free, then recheck the size before copying.
+            drop(local);
+            drop(names);
+            if !trial.retain_bytes(bytes - admitted) {
+                trial.check()?;
+            }
+            admitted = bytes;
         }
-        *trial.local.write() = self.local.read().clone();
+        trial.dataset = self.dataset.clone();
+        trial.base_iri = self.base_iri.clone();
         trial
             .next_bnode
             .store(self.next_bnode.load(Ordering::Relaxed), Ordering::Relaxed);

@@ -1591,7 +1591,10 @@ the same memory budget and live request controls across expression combinators, 
 loops, executor operators, ORDER BY and top-k heaps, external sort frame reloads,
 streaming and eager group accumulators, DESCRIBE, SERVICE, text highlighting, dataset
 restriction, incremental passes, SHACL embedded query results and GeoSPARQL execution.
-Optional FILTER selectivity sampling runs on a disposable trial context so a declined
-estimate releases its decode, cache and local-term state before execution starts. Triple
-keys validate their framing and nesting depth before recursive decoding, and vocabulary
-read locks are released before memory admission or geometry parsing.
+Optional FILTER selectivity sampling skips impure expressions and uses a disposable
+trial on a snapshot cache miss. The trial admits copies of query setup before cloning
+them and releases its decode, cache and local-term state before execution starts.
+Triple keys validate their framing and nesting depth before recursive decoding, and
+vocabulary read locks are released before memory admission or geometry parsing.
+GeoJSON fallback and recheck paths admit the JSON value tree before parsing. The
+nearest-neighbour fallback keeps parsed entry credit through distance measurement.

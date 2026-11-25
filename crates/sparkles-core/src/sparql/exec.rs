@@ -3483,6 +3483,92 @@ fn lexical_check(
     })
 }
 
+#[cfg(test)]
+#[test]
+fn ordered_lexical_check_refuses_oversized_probe_after_candidate_decode() {
+    use crate::io::{RdfFormat, Source};
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{Literal, NamedNode, Term};
+
+    let store = Store::in_memory(StoreOptions::default());
+    let oversized = format!("ab{}", "x".repeat(32 * 1024));
+    let data = format!("<urn:s> <urn:p> \"a\", \"abc\", \"{oversized}\" .");
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    store.compact().unwrap();
+    let snap = store.snapshot();
+    let literal = |s| {
+        snap.lookup_term(&Term::Literal(Literal::new_simple_literal(s)))
+            .unwrap()
+    };
+    let candidate = literal("a");
+    let short = literal("abc");
+    let long = literal(oversized.as_str());
+    let pred = snap
+        .lookup_term(&Term::NamedNode(NamedNode::new_unchecked("urn:p")))
+        .unwrap();
+    let scan = super::plan::ScanSpec {
+        perm: crate::index::Perm::Pos,
+        prefix: vec![pred.0],
+        cols: vec![(1, 0)],
+        eqs: Vec::new(),
+        graph: super::plan::GraphFilter::Default,
+        graph_col: 3,
+        dedup: false,
+        src: None,
+    };
+    let spec = OrderedTopK {
+        fallback: Box::new(Node::empty(vec![0])),
+        scan,
+        var: 0,
+        asc: true,
+        k: 1,
+        pieces: Vec::new(),
+        filter: Vec::new(),
+        range_filter: Vec::new(),
+        tie_order: vec![0],
+    };
+    let run = |last: Id| TopKRun {
+        lo: last.0 + 1,
+        hi: candidate.0,
+        exact: true,
+        best_high: false,
+        kept: Table::new(vec![0]),
+        want: 1,
+        done: false,
+        lexical: true,
+        extra: Vec::new(),
+        hold: false,
+    };
+
+    let control = Ctx::new(snap.clone());
+    let kth = control.value(candidate).expect("short candidate decodes");
+    assert!(matches!(
+        lexical_check(&control, &spec, &run(short), Some(&kth)).unwrap(),
+        Lexical::Read(ids) if ids == [candidate.0]
+    ));
+    assert!(matches!(
+        lexical_check(&control, &spec, &run(long), Some(&kth)).unwrap(),
+        Lexical::Read(ids) if ids == [candidate.0]
+    ));
+
+    let mut target = Ctx::new(snap);
+    target.mem_limit = 24 * 1024;
+    let kth = target
+        .value(candidate)
+        .expect("candidate fits tight budget");
+    target.check().unwrap();
+    assert!(matches!(
+        lexical_check(&target, &spec, &run(long), Some(&kth)),
+        Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+    ));
+}
+
 /// Rows of an [`OrderedTopK`] scan whose order-column ids lie in `[lo, hi]`, in key order,
 /// with the filters applied; also returns how many rows were scanned.
 fn topk_read(
