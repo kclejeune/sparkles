@@ -766,8 +766,11 @@ impl Norm<'_, '_> {
         Ok(match c {
             C::Class(c) => self.it.class(c),
             C::ObjectIntersectionOf(cs) => {
-                if self.order && has_guarded_card(cs) {
-                    return self.neg_inter_order(cs, d);
+                if self.order
+                    && has_guarded_card(cs)
+                    && let Some(res) = self.neg_inter_order(cs, d)
+                {
+                    return res;
                 }
                 // `D ⊓ ¬F ⊑ y` is the clause `D → y ⊔ F`, with a body, where the complement
                 // alone would give a clause of every context; so are `∀r.F` and `≤n r.F`,
@@ -1058,7 +1061,9 @@ impl Norm<'_, '_> {
     /// `⊓lhs ⊑ ⊔rhs`.
     fn sub(&mut self, lhs: Vec<ClassExpression>, rhs: Vec<ClassExpression>) -> Result<(), Why> {
         if self.order {
-            let _ = self.sub_order(lhs, rhs, 0, false)?;
+            let _ = self
+                .sub_order(lhs, rhs, 0, false)
+                .expect("non-neg sub_order always returns Some")?;
             return Ok(());
         }
         use ClassExpression as C;
@@ -1128,12 +1133,14 @@ impl Norm<'_, '_> {
     }
 
     /// Negative intersection under `order` when any conjunct is an exact cardinality or a
-    /// minimum cardinality `>= 2` (item 896, R4).
+    /// minimum cardinality `>= 2` (item 896, R4). Returns `None` when guarded flattening
+    /// exceeds its work cap without violating the nesting limit, so `neg()` can fall back
+    /// to its wide, shallow negative-intersection path without mutating state.
     fn neg_inter_order(
         &mut self,
         cs: &std::collections::BTreeSet<ClassExpression>,
         depth: usize,
-    ) -> Result<Ex, Why> {
+    ) -> Option<Result<Ex, Why>> {
         self.sub_order(cs.iter().cloned().collect(), Vec::new(), depth, true)
     }
 
@@ -1141,91 +1148,165 @@ impl Norm<'_, '_> {
     /// under `order` (item 896, R4).
     ///
     /// Splits `=n r.F` (`n >= 1`) into `≥n r.F` on the LHS (shadowed for `n = 1`, guarded
-    /// lazy DL-clause for `n >= 2`) and `≥(n+1) r.F` in the guarded head, and keeps
-    /// `≥n r.F` (`n >= 2`) as a guarded lazy DL-clause instead of creating an at-most
-    /// holder `M_{≤n-1}`.
+    /// lazy DL-clause for `n >= 2`) and `≥(n+1) r.F` in the guarded head, after validating
+    /// the premise role and qualifier and preserving the bottom-filler vacuity shortcut.
+    /// Keeps `≥n r.F` (`n >= 2`) as a guarded lazy DL-clause instead of creating an at-most
+    /// holder `M_{≤n-1}`. Tracks per-node nesting depth during flattening.
     fn sub_order(
         &mut self,
         lhs: Vec<ClassExpression>,
         rhs: Vec<ClassExpression>,
         depth: usize,
         as_neg: bool,
-    ) -> Result<Ex, Why> {
+    ) -> Option<Result<Ex, Why>> {
         use ClassExpression as C;
         if depth > 256 {
-            return Err("class expressions nested too deeply");
+            return Some(Err("class expressions nested too deeply"));
         }
-        let mut left: Vec<ClassExpression> = Vec::new();
-        let mut mins_l: Vec<(u32, ObjectPropertyExpression, Option<Box<ClassExpression>>)> =
-            Vec::new();
-        let mut right: Vec<(ClassExpression, bool)> = Vec::new();
-        let mut todo_l = lhs;
-        let mut todo_r: Vec<(ClassExpression, bool)> =
-            rhs.into_iter().map(|c| (c, false)).collect();
+        let mut left: Vec<(ClassExpression, usize)> = Vec::new();
+        let mut mins_l: Vec<(
+            u32,
+            ObjectPropertyExpression,
+            Option<Box<ClassExpression>>,
+            usize,
+        )> = Vec::new();
+        let mut exacts_l: Vec<(
+            u32,
+            ObjectPropertyExpression,
+            Option<Box<ClassExpression>>,
+            usize,
+        )> = Vec::new();
+        let mut right: Vec<(ClassExpression, bool, usize)> = Vec::new();
+        let mut todo_l: Vec<(ClassExpression, usize)> =
+            lhs.into_iter().map(|c| (c, depth)).collect();
+        let mut todo_r: Vec<(ClassExpression, bool, usize)> =
+            rhs.into_iter().map(|c| (c, false, depth)).collect();
         let mut steps = 0usize;
         while !todo_l.is_empty() || !todo_r.is_empty() {
             steps += 1;
             if steps > 4096 {
-                return Err("class expressions nested too deeply");
+                return if as_neg {
+                    None
+                } else {
+                    Some(Err("class expressions nested too deeply"))
+                };
             }
-            if let Some(c) = todo_l.pop() {
+            if let Some((c, cd)) = todo_l.pop() {
+                if cd > 256 {
+                    return Some(Err("class expressions nested too deeply"));
+                }
+                let nd = cd + 1;
                 match c {
-                    C::ObjectIntersectionOf(cs) => todo_l.extend(cs),
+                    C::ObjectIntersectionOf(cs) => {
+                        todo_l.extend(cs.into_iter().map(|x| (x, nd)));
+                    }
                     C::ObjectExactCardinality(0, p, f) => {
-                        todo_r.push((C::ObjectMinCardinality(1, p, f), false));
+                        todo_r.push((C::ObjectMinCardinality(1, p, f), false, nd));
                     }
                     C::ObjectExactCardinality(n, p, f) => {
-                        let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
-                        todo_l.push(C::ObjectMinCardinality(n, p.clone(), f.clone()));
-                        todo_r.push((C::ObjectMinCardinality(n1, p, f), true));
+                        exacts_l.push((n, p, f, nd));
                     }
                     C::ObjectMinCardinality(0, ..) => {}
                     C::ObjectMinCardinality(n, p, f) if n >= 2 => {
-                        mins_l.push((n, p, f));
+                        mins_l.push((n, p, f, nd));
                     }
                     C::ObjectMaxCardinality(n, p, f) => {
-                        let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
-                        todo_r.push((C::ObjectMinCardinality(n1, p, f), n >= 1));
+                        let Some(n1) = n.checked_add(1) else {
+                            return Some(Err("a cardinality too large"));
+                        };
+                        todo_r.push((C::ObjectMinCardinality(n1, p, f), n >= 1, nd));
+                    }
+                    C::ObjectComplementOf(f) => {
+                        todo_r.push((*f, false, nd));
                     }
                     c if self.dual(&c).is_some() => {
                         let dual = self.dual(&c).expect("a dual");
-                        todo_r.push((dual, false));
+                        todo_r.push((dual, false, cd));
                     }
                     C::Class(ref k) if k.as_str() == vocab::OWL_THING => {}
-                    c => left.push(c),
+                    c => left.push((c, cd)),
                 }
                 continue;
             }
-            if let Some((c, is_low)) = todo_r.pop() {
+            if let Some((c, is_low, cd)) = todo_r.pop() {
+                if cd > 256 {
+                    return Some(Err("class expressions nested too deeply"));
+                }
+                let nd = cd + 1;
                 match c {
                     C::ObjectUnionOf(cs) => {
-                        todo_r.extend(cs.into_iter().map(|x| (x, false)));
+                        todo_r.extend(cs.into_iter().map(|x| (x, false, nd)));
                     }
-                    C::ObjectComplementOf(f) => todo_l.push(*f),
+                    C::ObjectComplementOf(f) => todo_l.push((*f, nd)),
                     C::Class(ref k) if k.as_str() == vocab::OWL_NOTHING => {}
-                    c => right.push((c, is_low)),
+                    c => right.push((c, is_low, cd)),
                 }
             }
         }
+        Some(self.finish_sub_order(left, mins_l, exacts_l, right, as_neg))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn finish_sub_order(
+        &mut self,
+        left: Vec<(ClassExpression, usize)>,
+        mins_l: Vec<(
+            u32,
+            ObjectPropertyExpression,
+            Option<Box<ClassExpression>>,
+            usize,
+        )>,
+        exacts_l: Vec<(
+            u32,
+            ObjectPropertyExpression,
+            Option<Box<ClassExpression>>,
+            usize,
+        )>,
+        right: Vec<(ClassExpression, bool, usize)>,
+        as_neg: bool,
+    ) -> Result<Ex, Why> {
+        use ClassExpression as C;
         // Normalize every subexpression before tautology short-circuits so unsupported
         // roles, fillers, cardinalities, or depth limits reject the axiom consistently.
         let mut body = left
             .iter()
-            .map(|c| self.neg(c, depth))
+            .map(|(c, cd)| self.neg(c, *cd))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut norm_mins: Vec<(u32, Role, Ex)> = Vec::with_capacity(mins_l.len());
-        for (n, p, f) in &mins_l {
+        let mut norm_mins: Vec<(u32, Role, Ex)> = Vec::with_capacity(mins_l.len() + exacts_l.len());
+        for (n, p, f, cd) in &mins_l {
             let r = self.role(p)?;
-            let b = self.qualifier(f.as_deref(), depth)?;
+            let b = self.qualifier(f.as_deref(), *cd)?;
             norm_mins.push((*n, r, b));
         }
-        let mut head = Vec::with_capacity(right.len());
-        for (c, is_low) in &right {
-            let h = self.pos(c, depth)?;
+        let mut head = Vec::with_capacity(right.len() + exacts_l.len());
+        for (c, is_low, cd) in &right {
+            let h = self.pos(c, *cd)?;
             if *is_low && self.counting && h != TOP && h != BOTTOM {
                 self.out.low.push(h);
             }
             head.push(h);
+        }
+        for (n, p, f, cd) in &exacts_l {
+            let r = self.role(p)?;
+            let b = match f.as_deref() {
+                Some(f) if *n == 1 => self.neg(f, *cd)?,
+                _ => self.qualifier(f.as_deref(), *cd)?,
+            };
+            if b == BOTTOM {
+                body.push(BOTTOM);
+                continue;
+            }
+            let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
+            let h = self.pos(&C::ObjectMinCardinality(n1, p.clone(), f.clone()), *cd)?;
+            if self.counting && h != TOP && h != BOTTOM {
+                self.out.low.push(h);
+            }
+            head.push(h);
+            if *n == 1 {
+                body.push(self.it.node(Node::Exist(r, b)));
+            } else {
+                norm_mins.push((*n, r, b));
+            }
         }
         if head.contains(&TOP)
             || body.contains(&BOTTOM)
@@ -3702,5 +3783,154 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(taken, vec![true, true, false]);
+    }
+
+    #[test]
+    fn r4_vacuous_exact_cardinality_and_oversized_alternative_parity() {
+        let nothing = Some(Box::new(ClassExpression::Class(Class::nothing())));
+        let sat = Some(Box::new(c("A")));
+        let count_trigger = AxiomKind::SubClassOf(
+            c("Z"),
+            ClassExpression::ObjectMaxCardinality(1, self::role("u"), None),
+        );
+        let vacuous_64 = AxiomKind::SubClassOf(
+            ClassExpression::ObjectExactCardinality(64, self::role("r"), nothing.clone()),
+            c("H"),
+        );
+        let vacuous_max = AxiomKind::SubClassOf(
+            ClassExpression::ObjectExactCardinality(u32::MAX, self::role("r"), nothing.clone()),
+            c("H"),
+        );
+        let oversized_64 = AxiomKind::SubClassOf(
+            ClassExpression::ObjectExactCardinality(64, self::role("r"), sat.clone()),
+            c("H"),
+        );
+        let oversized_max = AxiomKind::SubClassOf(
+            ClassExpression::ObjectExactCardinality(u32::MAX, self::role("r"), sat.clone()),
+            c("H"),
+        );
+        let vacuous_bad_rhs = AxiomKind::SubClassOf(
+            ClassExpression::ObjectExactCardinality(64, self::role("r"), nothing.clone()),
+            ClassExpression::ObjectMinCardinality(65, self::role("s"), sat.clone()),
+        );
+        let vacuous_neg_inter = AxiomKind::DisjointClasses(
+            [
+                ClassExpression::ObjectIntersectionOf(
+                    [
+                        c("G"),
+                        ClassExpression::ObjectExactCardinality(
+                            64,
+                            self::role("r"),
+                            nothing.clone(),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                c("Peer"),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let oversized_neg_inter = AxiomKind::DisjointClasses(
+            [
+                ClassExpression::ObjectIntersectionOf(
+                    [
+                        c("G"),
+                        ClassExpression::ObjectExactCardinality(64, self::role("r"), sat),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                c("Peer"),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let u = union();
+        let all = [
+            &u,
+            &count_trigger,
+            &vacuous_64,
+            &vacuous_max,
+            &oversized_64,
+            &oversized_max,
+            &vacuous_bad_rhs,
+            &vacuous_neg_inter,
+            &oversized_neg_inter,
+        ];
+        for order in [false, true] {
+            let mut it = Interner::new();
+            let mut ax = Axioms::default();
+            let allowed = Allowed {
+                counting: true,
+                rooted: false,
+                order,
+                ..Allowed::default()
+            };
+            let (taken, _) = normalize(&all, &mut it, &mut ax, None, &|| false, allowed)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                taken,
+                vec![true, true, true, true, false, false, false, true, false],
+                "order={order} must match base vacuity and oversized-alternative rejection"
+            );
+        }
+    }
+
+    #[test]
+    fn r4_negative_intersection_tracks_depth_and_preserves_wide_shallow_empty() {
+        let count_trigger = AxiomKind::SubClassOf(
+            c("Z"),
+            ClassExpression::ObjectMaxCardinality(1, self::role("u"), None),
+        );
+        // 270 nested intersections with ≥2 r.F at the bottom (~540 nodes, below 4,096 steps,
+        // above the 256 nesting depth cap).
+        let mut deep =
+            ClassExpression::ObjectMinCardinality(2, self::role("r"), Some(Box::new(c("F"))));
+        for i in 0..270 {
+            deep = ClassExpression::ObjectIntersectionOf(
+                [c(&format!("L{i}")), deep].into_iter().collect(),
+            );
+        }
+        let deep_disj = AxiomKind::DisjointClasses([deep, c("Peer")].into_iter().collect());
+
+        // Wide, shallow negative intersection (> 4,096 conjuncts) containing ≥2 r.F, both
+        // repeated in DisjointClasses (taking `empty()`) and paired with a peer (taking `neg()`).
+        let mut wide_set = std::collections::BTreeSet::new();
+        wide_set.insert(ClassExpression::ObjectMinCardinality(
+            2,
+            self::role("r"),
+            Some(Box::new(c("F"))),
+        ));
+        for i in 0..4200 {
+            wide_set.insert(c(&format!("W{i:04}")));
+        }
+        let wide = ClassExpression::ObjectIntersectionOf(wide_set);
+        let wide_empty =
+            AxiomKind::DisjointClasses([wide.clone(), wide.clone()].into_iter().collect());
+        let wide_disj = AxiomKind::DisjointClasses([wide, c("Peer")].into_iter().collect());
+
+        let u = union();
+        let all = [&u, &count_trigger, &deep_disj, &wide_empty, &wide_disj];
+        for order in [false, true] {
+            let mut it = Interner::new();
+            let mut ax = Axioms::default();
+            let allowed = Allowed {
+                counting: true,
+                rooted: false,
+                order,
+                ..Allowed::default()
+            };
+            let (taken, _) = normalize(&all, &mut it, &mut ax, None, &|| false, allowed)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                taken,
+                vec![true, true, false, true, true],
+                "order={order} must reject >256-deep negative intersection and accept wide shallow ones"
+            );
+        }
     }
 }

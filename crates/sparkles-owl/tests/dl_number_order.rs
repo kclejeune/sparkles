@@ -1020,8 +1020,9 @@ fn r4_chemical_group_guarded_exact_cardinality_pattern() {
 
 /// Astra R4 condition: an ontology where ONLY a lazy equality (no positive at-most
 /// restriction anywhere in the ontology!) can merge a successor with the predecessor `y`,
-/// and that merge exposes another inverse role `s⁻` triggering a subsumption (`DlIx::carried`
-/// inverse-carry fixed point over lazy roles).
+/// and that merge sends `s⁻(y, x)` over `Pred` to `Root`, where `Root ⊑ ∀s⁻.Hit` and
+/// `Hit ⊑ ∀r⁻.RootSawSInv` strictly require the `s⁻` carry bit from `DlIx::carried`'s
+/// inverse-carry fixed point over lazy roles.
 #[test]
 fn r4_lazy_only_predecessor_merge_exposes_inverse_role() {
     check_strategies(
@@ -1033,14 +1034,18 @@ fn r4_lazy_only_predecessor_merge_exposes_inverse_role() {
              SubClassOf(:Mid :Guard)
              SubClassOf(ObjectIntersectionOf(:Guard
                ObjectMinCardinality(2 ObjectInverseOf(:r) owl:Thing)) owl:Nothing)
-             SubClassOf(:Mid ObjectAllValuesFrom(:s :ViaS))
+             SubClassOf(:Root ObjectAllValuesFrom(ObjectInverseOf(:s) :Hit))
+             SubClassOf(:Hit ObjectAllValuesFrom(ObjectInverseOf(:r) :RootSawSInv))
              {UNION}"
         ),
-        &[("Root", "Extra"), ("Root", "ViaS")],
+        &[("Root", "Extra"), ("Root", "RootSawSInv")],
         &[
             ("Root", "Nothing"),
             ("Mid", "Nothing"),
             ("Extra", "Nothing"),
+            ("Hit", "Nothing"),
+            ("Root", "Hit"),
+            ("Mid", "RootSawSInv"),
         ],
     );
 }
@@ -1095,6 +1100,7 @@ fn r4_astra_edge_cases_arrival_orders_fillers_and_compound_heads() {
                ObjectAllValuesFrom(:r :Other)))
              SubClassOf(ObjectIntersectionOf(:BotGuard ObjectExactCardinality(2 :r owl:Nothing))
                :NeverHit)
+             SubClassOf(ObjectExactCardinality(64 :r owl:Nothing) :NeverHit64)
              DisjointClasses(ObjectIntersectionOf(:NestGuard ObjectExactCardinality(2 :r :F1))
                :NestPeer)
              SubClassOf(:NestHit ObjectIntersectionOf(:NestGuard :NestPeer

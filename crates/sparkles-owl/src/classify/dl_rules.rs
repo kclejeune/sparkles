@@ -2195,6 +2195,44 @@ fn blocked(dx: &DlIx, st: &State, d: Ex) -> bool {
         .is_some_and(|hs| hs.iter().any(|h| st.subs.contains(h)))
 }
 
+/// Outcome of [`blocked_clause`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockerScan {
+    /// A unit, body, or live stored clause blocks witness expansion.
+    Blocked,
+    /// No blocker was found and the run may continue.
+    Clear,
+    /// The run's bounds (`Sink::go_on`) stopped the scan before completion.
+    Aborted,
+}
+
+/// Charges clause-blocker scan reads in [`WORK_READS`] chunks with remainder carry and
+/// polls [`Sink::go_on`] whenever work is charged so cancellation, deadlines, memory
+/// limits, and stepped-mode local work bounds all halt long scans promptly.
+struct BlockerMeter<'a, 'g, S: Sink> {
+    rem: usize,
+    out: &'a mut Guard<'g, S>,
+    aborted: bool,
+}
+
+impl<S: Sink> BlockerMeter<'_, '_, S> {
+    #[inline]
+    fn tick(&mut self, reads: usize) -> bool {
+        self.rem = self.rem.saturating_add(reads);
+        if self.rem < WORK_READS {
+            return true;
+        }
+        let work = self.rem / WORK_READS;
+        self.rem %= WORK_READS;
+        self.out.worked(work);
+        if !self.out.go_on() {
+            self.aborted = true;
+            return false;
+        }
+        true
+    }
+}
+
 /// Whether clause `c` with maximal `X` literal `d` (a minimum name with witness `w`)
 /// is blocked from expanding `w`: by a unit blocker, a body blocker (`G₁(x) ∈ Γ`), or
 /// a live stored clause subsuming the weakened conclusion (item 896, R1a).
@@ -2205,21 +2243,47 @@ fn blocked_clause<S: Sink>(
     d: Ex,
     w: Ex,
     out: &mut Guard<'_, S>,
-) -> bool {
+) -> BlockerScan {
     let Some(bs) = dx.blockers.get(&d) else {
-        return false;
+        return BlockerScan::Clear;
     };
-    if bs.iter().any(|h| st.subs.contains(h)) {
-        return true;
+    let rem = dl(st).map_or(0, |x| x.blocker_reads as usize);
+    let mut meter = BlockerMeter {
+        rem,
+        out,
+        aborted: false,
+    };
+    let save = |st: &mut State, rem: usize| {
+        if let Some(x) = st.extra.as_mut().and_then(|e| e.dl.as_deref_mut()) {
+            x.blocker_reads = rem as u8;
+        }
+    };
+    for &h in bs {
+        if !meter.tick(1) {
+            save(st, meter.rem);
+            return BlockerScan::Aborted;
+        }
+        if st.subs.contains(&h) {
+            save(st, meter.rem);
+            return BlockerScan::Blocked;
+        }
     }
     let body = c.body();
-    if bs.iter().any(|&h| body.binary_search(&Lit::x(h)).is_ok()) {
-        return true;
+    if !body.is_empty() {
+        for &h in bs {
+            if !meter.tick(1) {
+                save(st, meter.rem);
+                return BlockerScan::Aborted;
+            }
+            if body.binary_search(&Lit::x(h)).is_ok() {
+                save(st, meter.rem);
+                return BlockerScan::Blocked;
+            }
+        }
     }
     let Some(x) = st.extra.as_mut().and_then(|e| e.dl.as_deref_mut()) else {
-        return false;
+        return BlockerScan::Clear;
     };
-    let mut rem = x.blocker_reads as usize;
     let mut reads = 0usize;
     let hit = x.store.has_clause_blocker(
         body,
@@ -2230,23 +2294,21 @@ fn blocked_clause<S: Sink>(
         WORK_READS,
         &mut reads,
         |r| {
-            let total = rem + *r;
-            let work = total / WORK_READS;
-            rem = total % WORK_READS;
-            *r = 0;
-            if work > 0 {
-                out.worked(work);
-            }
-            !out.stopped()
+            let n = std::mem::take(r);
+            meter.tick(n)
         },
     );
-    let total = rem + reads;
-    let work = total / WORK_READS;
-    x.blocker_reads = (total % WORK_READS) as u8;
-    if work > 0 {
-        out.worked(work);
+    if !meter.aborted && reads > 0 {
+        meter.tick(reads);
     }
-    hit
+    x.blocker_reads = meter.rem as u8;
+    if meter.aborted {
+        BlockerScan::Aborted
+    } else if hit {
+        BlockerScan::Blocked
+    } else {
+        BlockerScan::Clear
+    }
 }
 
 /// What a run that counts or has the root does when an existential restriction reaches a
@@ -6992,11 +7054,17 @@ fn process<S: Sink>(
                     _ => {}
                 }
                 found.rule = "told";
-                let skip = dx
-                    .witnesses
-                    .get(&d)
-                    .copied()
-                    .filter(|&w| blocked_clause(dx, st, c, d, w, &mut found_guard));
+                let skip = match dx.witnesses.get(&d).copied() {
+                    Some(w) => match blocked_clause(dx, st, c, d, w, &mut found_guard) {
+                        BlockerScan::Blocked => Some(w),
+                        BlockerScan::Clear => None,
+                        BlockerScan::Aborted => {
+                            mark_interrupted(st);
+                            return;
+                        }
+                    },
+                    None => None,
+                };
                 if found_guard.stopped() {
                     mark_interrupted(st);
                     return;
@@ -7982,5 +8050,299 @@ mod tests {
             true
         }));
         assert_eq!(visited, vec![2, 15]);
+    }
+
+    #[test]
+    fn blocked_clause_carries_remainder_and_polls_go_on_on_actual_saturation_sink() {
+        use super::super::dl_norm::DlAx;
+        use super::super::index::{Axioms, Interner};
+        use super::super::saturate::{Bounds, Contexts, Ctx, Stop, saturate_counted};
+        use crate::model::Class;
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut it = Interner::new();
+        let p = it.class(&Class::new("http://ex.org/P"));
+        let q = it.class(&Class::new("http://ex.org/Q"));
+        let r = it.class(&Class::new("http://ex.org/R"));
+        let w2 = it.class(&Class::new("http://ex.org/W2"));
+        let g1 = it.class(&Class::new("http://ex.org/G1"));
+        let g2 = it.class(&Class::new("http://ex.org/G2"));
+        assert!(g2 > q && g2 > g1, "G2 must be maximal in P -> Q v G2");
+
+        let mut dl = DlAx {
+            counting: true,
+            order: true,
+            ..DlAx::default()
+        };
+        dl.least.push((g1, None));
+        dl.least.push((g2, Some(w2)));
+        dl.blockers.insert(g2, vec![g1]);
+
+        let mut ax = Axioms::default();
+        ax.subs.push((g2, w2));
+        ax.dl = Some(Box::new(dl));
+        let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+        let dx = dix(&ix);
+
+        // 1. Remainder carry across consecutive small calls + go_on() poll with stopped() == false.
+        {
+            let mut st = State::default();
+            let x = ds(&mut st);
+            x.store.add(Clause::new(
+                vec![Lit::x(p)],
+                vec![Lit::x(q), Lit::x(r), Lit::x(g1)],
+            ));
+            x.store.clauses.last_mut().unwrap().dead = true;
+            let c = Clause::new(vec![Lit::x(p)], vec![Lit::x(q), Lit::x(g2)]);
+            let mut sink = Charges {
+                limit: Some(0),
+                ..Charges::default()
+            };
+            // First call: 1 unit + 1 body + (1 body + 2 head + 1 blocker + 1 probe + 1 entry) = 8 < 16.
+            {
+                let mut guard = Guard::new(&mut sink);
+                assert_eq!(
+                    blocked_clause(dx, &mut st, &c, g2, w2, &mut guard),
+                    BlockerScan::Clear
+                );
+            }
+            assert_eq!(sink.work, 0);
+            assert_eq!(super::dl(&st).unwrap().blocker_reads, 8);
+            // Second call: 8 + 8 = 16 -> charges 1 work unit, polls go_on() which sees 1 > 0 -> Aborted
+            // even though Charges::stopped() stays false.
+            {
+                let mut guard = Guard::new(&mut sink);
+                assert!(!guard.stopped());
+                assert_eq!(
+                    blocked_clause(dx, &mut st, &c, g2, w2, &mut guard),
+                    BlockerScan::Aborted
+                );
+            }
+            assert_eq!(sink.work, 1);
+            assert_eq!(super::dl(&st).unwrap().blocker_reads, 0);
+        }
+
+        // Helper building a pre-populated single-context saturation with 4,000 dead G1 clauses
+        // and one live queued `P -> Q v G2` clause, then running `saturate_counted` (actual `Out`).
+        let run_real_sink = |steps: bool,
+                             work_limit: Option<usize>,
+                             cancel_after_polls: Option<usize>| {
+            let ctx: Contexts = (0..it.nodes.len()).map(|_| OnceLock::new()).collect();
+            let c0 = Box::new(Ctx::default());
+            {
+                let mut st = c0.st.lock();
+                st.init = true;
+                st.subs.insert(p);
+                let x = ds(&mut st);
+                for _ in 0..4_000 {
+                    // Add directly via dead-marked distinct-body clauses so every entry sits in by_lit[G1].
+                    let cl = Clause::new(vec![Lit::x(p)], vec![Lit::x(q), Lit::x(r), Lit::x(g1)]);
+                    let id = x.store.clauses.len() as u32;
+                    let sig = cl.sig();
+                    x.store.add(cl);
+                    if let Some(last) = x.store.clauses.last_mut() {
+                        last.dead = true;
+                    }
+                    // Ensure dead clauses keep growing `by_lit[G1]` even if identical.
+                    let _ = (id, sig);
+                }
+                // `Store::add` inserts whenever existing duplicates are dead; confirm 4,000 entries.
+                assert!(
+                    x.store.clauses.len() >= 4_000,
+                    "expected >= 4000 dead clauses in by_lit[G1], got {}",
+                    x.store.clauses.len()
+                );
+                let live = Clause::new(vec![Lit::x(p)], vec![Lit::x(q), Lit::x(g2)]);
+                assert!(x.store.add(live).is_some());
+            }
+            c0.started.store(true, Ordering::Release);
+            c0.todo.lock().push(Concl::Sub(p));
+            assert!(ctx[p as usize].set(c0).is_ok());
+
+            let dl_run = DlRun::default();
+            if let Some(lim) = work_limit {
+                dl_run.set_work_limit(lim);
+            }
+            let polls = AtomicUsize::new(0);
+            let cancel_fn = || {
+                let n = polls.fetch_add(1, Ordering::Relaxed) + 1;
+                cancel_after_polls.is_some_and(|after| n >= after)
+            };
+            let bounds = Bounds {
+                threads: 1,
+                deadline: None,
+                max_memory: None,
+                cancelled: cancel_after_polls.map(|_| &cancel_fn as &(dyn Fn() -> bool + Sync)),
+                charge: None,
+                base_memory: 0,
+                base_queued: 1,
+                peak_memory: 0,
+                paid_memory: 0,
+                dynamic: None,
+                dl: Some(&dl_run),
+                partial: true,
+                steps,
+            };
+            let (_totals, stop) = saturate_counted(&ix, &ctx, &[], &[p], &[], &bounds);
+            let st = ctx[p as usize].get().unwrap().st.lock();
+            let x = super::dl(&st).unwrap();
+            let interrupted = x.store.interrupted;
+            let emitted_w2 = x
+                .store
+                .clauses
+                .iter()
+                .any(|s| !s.dead && s.c.head().contains(&Lit::x(w2)));
+            (stop, dl_run.work(), interrupted, emitted_w2)
+        };
+
+        // 2a. Non-stepped cancellation stops the blocker scan promptly via Out::go_on().
+        let (stop, work, interrupted, emitted_w2) = run_real_sink(false, None, Some(2));
+        assert_eq!(stop, Some(Stop::Cancelled));
+        assert!(
+            work < 50,
+            "cancellation should abort long scan early, work={work}"
+        );
+        assert!(interrupted, "aborted scan must mark store interrupted");
+        assert!(!emitted_w2, "aborted scan must not emit witness W2");
+
+        // 2b. Non-stepped work limit stops the blocker scan promptly via Out::go_on().
+        let (stop, work, interrupted, emitted_w2) = run_real_sink(false, Some(4), None);
+        assert!(matches!(stop, Some(Stop::Work { .. })), "got {stop:?}");
+        assert!(
+            work <= 10,
+            "work limit 4 should abort scan promptly, work={work}"
+        );
+        assert!(interrupted, "aborted scan must mark store interrupted");
+        assert!(!emitted_w2, "aborted scan must not emit witness W2");
+
+        // 2c. Stepped work limit stops via Out::go_on()'s local `dl().past(self.work)` before
+        //     a global stop is published and propagates BlockerScan::Aborted to process().
+        let (stop, work, interrupted, emitted_w2) = run_real_sink(true, Some(4), None);
+        assert!(matches!(stop, Some(Stop::Work { .. })), "got {stop:?}");
+        assert!(
+            work <= 10,
+            "stepped work limit 4 should abort scan promptly, work={work}"
+        );
+        assert!(
+            interrupted,
+            "stepped aborted scan must mark store interrupted"
+        );
+        assert!(!emitted_w2, "stepped aborted scan must not emit witness W2");
+    }
+
+    #[test]
+    fn dlix_carried_propagates_unqualified_and_qualified_inverses_for_lazy_only() {
+        use super::super::dl_norm::{Allowed, normalize};
+        use super::super::index::{Axioms, Interner, RoleName};
+        use crate::model::{
+            AxiomKind, Class, ClassExpression, ObjectProperty, ObjectPropertyExpression,
+            SubObjectPropertyExpression,
+        };
+
+        let cl = |s: &str| ClassExpression::Class(Class::new(format!("http://ex.org/{s}")));
+        let op = |s: &str| {
+            ObjectPropertyExpression::Property(ObjectProperty::new(format!("http://ex.org/{s}")))
+        };
+        let inv_op = |s: &str| {
+            ObjectPropertyExpression::InverseOf(ObjectProperty::new(format!("http://ex.org/{s}")))
+        };
+        let axs = [
+            AxiomKind::SubObjectPropertyOf(
+                SubObjectPropertyExpression::Expression(op("p")),
+                inv_op("r"),
+            ),
+            AxiomKind::SubObjectPropertyOf(
+                SubObjectPropertyExpression::Expression(op("p")),
+                op("s"),
+            ),
+            AxiomKind::SubClassOf(
+                cl("Root"),
+                ClassExpression::ObjectSomeValuesFrom(op("r"), Box::new(cl("Mid"))),
+            ),
+            AxiomKind::SubClassOf(
+                cl("Mid"),
+                ClassExpression::ObjectSomeValuesFrom(op("p"), Box::new(cl("Extra"))),
+            ),
+            AxiomKind::SubClassOf(cl("Mid"), cl("Guard")),
+            // Lazy-only cardinality counting r⁻ (which has carried inverse r):
+            AxiomKind::SubClassOf(
+                ClassExpression::ObjectIntersectionOf(
+                    [
+                        cl("Guard"),
+                        ClassExpression::ObjectMinCardinality(2, inv_op("r"), None),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ClassExpression::Class(Class::nothing()),
+            ),
+            // Qualified lazy cardinality over s.QualB so s_QualB is registered in dx.quals:
+            AxiomKind::SubClassOf(
+                ClassExpression::ObjectIntersectionOf(
+                    [
+                        cl("Guard"),
+                        ClassExpression::ObjectMinCardinality(
+                            2,
+                            op("s"),
+                            Some(Box::new(cl("QualB"))),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                cl("Out"),
+            ),
+            // Trigger Tier D without any positive ObjectMaxCardinality:
+            AxiomKind::SubClassOf(
+                cl("U0"),
+                ClassExpression::ObjectUnionOf([cl("U1"), cl("U2")].into_iter().collect()),
+            ),
+        ];
+        let refs: Vec<&AxiomKind> = axs.iter().collect();
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let allowed = Allowed {
+            counting: true,
+            rooted: false,
+            order: true,
+            ..Allowed::default()
+        };
+        let (taken, dl) = normalize(&refs, &mut it, &mut ax, None, &|| false, allowed)
+            .unwrap()
+            .unwrap();
+        assert!(taken.iter().all(|&t| t), "all axioms should be taken");
+        assert!(
+            dl.atmost.is_empty(),
+            "fixture must have no positive at-most"
+        );
+        assert!(
+            !dl.lazy.is_empty(),
+            "fixture must have guarded lazy clauses"
+        );
+        ax.dl = Some(Box::new(dl));
+        let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+        let dx = dix(&ix);
+        assert!(dx.atmosts.is_empty());
+        assert!(!dx.lazy.is_empty());
+
+        let s_role = it.role(RoleName::Object(ObjectProperty::new("http://ex.org/s")));
+        let s_inv = it.role(RoleName::Inverse(ObjectProperty::new("http://ex.org/s")));
+        let qual_b = it.class(&Class::new("http://ex.org/QualB"));
+        let q_idx = dx
+            .quals
+            .iter()
+            .position(|&(r, b)| r == s_role && b == qual_b)
+            .expect("qualified role s_QualB must be registered");
+        let q_inv = dx.base + 2 * (q_idx as Role) + 1;
+
+        assert!(
+            dx.carries(s_inv),
+            "lazy-only predecessor merge must carry unqualified inverse s⁻"
+        );
+        assert!(
+            dx.carries(q_inv),
+            "lazy-only predecessor merge must carry qualified inverse (s_QualB)⁻"
+        );
     }
 }
