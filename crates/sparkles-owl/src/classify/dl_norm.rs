@@ -1214,7 +1214,7 @@ impl Norm<'_, '_> {
                         let Some(n1) = n.checked_add(1) else {
                             return Some(Err("a cardinality too large"));
                         };
-                        todo_r.push((C::ObjectMinCardinality(n1, p, f), n >= 1, nd));
+                        todo_r.push((C::ObjectMinCardinality(n1, p, f), n >= 1, cd));
                     }
                     C::ObjectComplementOf(f) => {
                         todo_r.push((*f, false, nd));
@@ -3930,6 +3930,76 @@ mod tests {
                 taken,
                 vec![true, true, false, true, true],
                 "order={order} must reject >256-deep negative intersection and accept wide shallow ones"
+            );
+        }
+    }
+
+    #[test]
+    fn r4_negative_intersection_preserves_valid_depth_256_cardinality_operands() {
+        let count_trigger = AxiomKind::SubClassOf(
+            c("Z"),
+            ClassExpression::ObjectMaxCardinality(1, self::role("u"), None),
+        );
+        let wrap = |mut expr: ClassExpression, levels: usize, prefix: &str| {
+            for i in 0..levels {
+                expr = ClassExpression::ObjectIntersectionOf(
+                    [c(&format!("{prefix}{i}")), expr].into_iter().collect(),
+                );
+            }
+            AxiomKind::DisjointClasses([expr, c("Peer")].into_iter().collect())
+        };
+        let unqual_inner = ClassExpression::ObjectIntersectionOf(
+            [
+                c("G"),
+                ClassExpression::ObjectMinCardinality(2, self::role("r"), None),
+                ClassExpression::ObjectMaxCardinality(1, self::role("s"), None),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        // 255 outer binary intersections + 1 inner intersection place the leaves at depth 256.
+        let unqual_256 = wrap(unqual_inner.clone(), 255, "U");
+        let unqual_257 = wrap(unqual_inner, 256, "V");
+
+        let qual_inner = ClassExpression::ObjectIntersectionOf(
+            [
+                c("G"),
+                ClassExpression::ObjectMinCardinality(2, self::role("r"), None),
+                ClassExpression::ObjectMaxCardinality(1, self::role("s"), Some(Box::new(c("A")))),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        // 254 wrappers place `≤1 s.A` at depth 255 and its filler `A` at depth 256; 255 wrappers
+        // push `A` to depth 257.
+        let qual_255 = wrap(qual_inner.clone(), 254, "Q");
+        let qual_256 = wrap(qual_inner, 255, "R");
+
+        let u = union();
+        let all = [
+            &u,
+            &count_trigger,
+            &unqual_256,
+            &unqual_257,
+            &qual_255,
+            &qual_256,
+        ];
+        for order in [false, true] {
+            let mut it = Interner::new();
+            let mut ax = Axioms::default();
+            let allowed = Allowed {
+                counting: true,
+                rooted: false,
+                order,
+                ..Allowed::default()
+            };
+            let (taken, _) = normalize(&all, &mut it, &mut ax, None, &|| false, allowed)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                taken,
+                vec![true, true, true, false, true, false],
+                "order={order} must match base depth-256 cardinality boundary handling"
             );
         }
     }
