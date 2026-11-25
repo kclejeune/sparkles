@@ -1632,7 +1632,7 @@ fn prepare_query(
     parsed: &Query,
     opts: &QueryOptions,
     cursor_started: Option<Instant>,
-    automatic: Option<&CursorOptions>,
+    automatic: Option<(&CursorOptions, &str)>,
 ) -> Result<PreparedQuery> {
     prepare_query_input(snap, parsed, opts, cursor_started, automatic, None)
 }
@@ -1642,7 +1642,7 @@ fn prepare_query_input(
     parsed: &Query,
     opts: &QueryOptions,
     cursor_started: Option<Instant>,
-    automatic: Option<&CursorOptions>,
+    automatic: Option<(&CursorOptions, &str)>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<PreparedQuery> {
     prepare_query_input_policy(
@@ -1671,7 +1671,7 @@ fn prepare_query_input_policy(
     parsed: &Query,
     opts: &QueryOptions,
     cursor_started: Option<Instant>,
-    automatic: Option<&CursorOptions>,
+    automatic: Option<(&CursorOptions, &str)>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
     parent: Option<sparkles_budget::ParentHandle>,
@@ -1778,10 +1778,10 @@ fn prepare_query_input_policy(
     let plan_depth = depth::check_plan(node.depth())?;
     ioacct::mark("planned");
     exec::prefetch_scans(&ctx, &node);
-    let (streamed, admission_lease) = if let Some(automatic) = automatic
+    let (streamed, admission_lease) = if let Some((automatic, query)) = automatic
         && bound.is_empty()
     {
-        cursor::auto_streaming_lease(&ctx, &node, kind, automatic)?
+        cursor::auto_streaming_lease(&ctx, &node, Some(&pattern), query, kind, automatic)?
     } else {
         (false, None)
     };

@@ -1117,27 +1117,12 @@ impl<'a> Planner<'a> {
         let ctx = self.ctx;
         let subst = &self.subst;
         let exists = |p: &GraphPattern| -> Result<Arc<ExistsSpec>> {
-            let mut names = Vec::new();
-            collect_pattern_vars(p, &mut names);
-            let mut deduped: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
-            deduped.sort_unstable();
-            deduped.dedup();
-            let mut vars = Vec::with_capacity(deduped.len());
-            vars.extend_from_slice(&deduped);
-            let bound_len = vars.iter().filter(|v| subst.contains_key(v)).count();
-            let mut bound = Vec::with_capacity(bound_len);
-            for &v in &vars {
-                if let Some(&id) = subst.get(&v) {
-                    bound.push((v, id));
-                }
-            }
-            Ok(Arc::new(ExistsSpec::new_ordinary_charged_with_admission(
+            Ok(Arc::new(ExistsSpec::compile_ordinary_with_admission(
                 ctx,
                 p,
                 self.view_patterns,
                 graph.clone(),
-                vars,
-                bound,
+                subst,
                 self.plan_charge,
             )?))
         };
@@ -1290,6 +1275,16 @@ impl<'a> Planner<'a> {
             measure(&mut layout)?;
             let bytes = layout.bytes();
             credit.grow_by(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn admit_plan_expressions(&self, exprs: &[Expr]) -> Result<()> {
+        if let Some(held) = self.plan_charge
+            && !exprs.is_empty()
+        {
+            self.ctx.check()?;
+            held.add(super::checked_layout::expressions_copy_bytes(exprs))?;
         }
         Ok(())
     }
@@ -1694,9 +1689,18 @@ impl<'a> Planner<'a> {
                 let mut branches = self.planning_vec()?;
                 flatten_union(gp, &mut branches)?;
                 let mut children = self.planning_vec()?;
-                for branch in branches {
-                    self.admit_payload(|layout| layout.expressions(&filters))?;
-                    let child = self.plan(branch, g, filters.clone())?;
+                let mut filters = filters;
+                let checked = self.branch_payload.borrow().is_some();
+                let mut iter = branches.into_iter().peekable();
+                while let Some(branch) = iter.next() {
+                    let branch_filters = if !checked && iter.peek().is_none() {
+                        std::mem::take(&mut filters)
+                    } else {
+                        self.admit_payload(|layout| layout.expressions(&filters))?;
+                        self.admit_plan_expressions(&filters)?;
+                        filters.clone()
+                    };
+                    let child = self.plan(branch, g, branch_filters)?;
                     if !child.is_empty() {
                         children.push(child)?;
                     }
@@ -4866,22 +4870,50 @@ impl<'a> Planner<'a> {
                 let opts = items.into_iter().next().unwrap();
                 if preparation.is_some() {
                     self.choose_checked_scan(opts, filters)?
+                } else if opts.len() == 1 {
+                    let o = opts.into_iter().next().unwrap();
+                    self.place_filters(o, filters)?
                 } else {
+                    struct Candidate<'a> {
+                        node: Node,
+                        rest: Vec<Expr>,
+                        _copy: Option<super::ctx::Charge<'a>>,
+                    }
                     // the first of the cheapest, as `min_by` takes it
-                    let mut best: Option<(Node, Vec<Expr>)> = None;
-                    for o in opts {
-                        let mut f = filters.clone();
+                    let mut best: Option<Candidate<'_>> = None;
+                    let mut iter = opts.into_iter().peekable();
+                    while let Some(o) = iter.next() {
+                        self.ctx.check()?;
+                        let (mut f, copy) = if iter.peek().is_none() {
+                            (std::mem::take(filters), None)
+                        } else {
+                            let copy = if let Some(held) = self.plan_charge
+                                && !filters.is_empty()
+                            {
+                                let part = held.part();
+                                part.add(super::checked_layout::expressions_copy_bytes(filters))?;
+                                Some(part)
+                            } else {
+                                None
+                            };
+                            (filters.clone(), copy)
+                        };
                         let n = self.place_filters(o, &mut f)?;
+                        let candidate = Candidate {
+                            node: n,
+                            rest: f,
+                            _copy: copy,
+                        };
                         if best
                             .as_ref()
-                            .is_none_or(|(b, _)| n.cost.total_cmp(&b.cost).is_lt())
+                            .is_none_or(|b| candidate.node.cost.total_cmp(&b.node.cost).is_lt())
                         {
-                            best = Some((n, f));
+                            best = Some(candidate);
                         }
                     }
-                    let (best, rest) = best.unwrap();
+                    let Candidate { node, rest, _copy } = best.unwrap();
                     *filters = rest;
-                    best
+                    node
                 }
             } else {
                 #[cfg(test)]
@@ -6456,7 +6488,7 @@ fn keyed_left_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &C
 /// estimated as a join on one variable whose result the rest of the condition filters.
 fn keyed_inner_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &Ctx) -> Node {
     let joined = join_est_from(l.est, r.est, l.d(a).max(r.d(b)));
-    let conjuncts = expr.clone().conjuncts().len().max(1);
+    let conjuncts = expr.conjunct_count().max(1);
     let est = (joined * FILTER_SELECTIVITY.powi(conjuncts as i32 - 1)).max(1.0);
     let mut vars = l.vars.clone();
     vars.extend(r.vars.iter().filter(|v| !l.vars.contains(v)));
@@ -8551,14 +8583,33 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
 }
 
 fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
-    gp.on_in_scope_variable(|v| out(v.as_str()));
+    let _ = try_visit_pattern_vars(gp, &mut |name| {
+        out(name);
+        Ok::<(), std::convert::Infallible>(())
+    });
+}
+
+pub(super) fn try_visit_pattern_vars<E>(
+    gp: &GraphPattern,
+    out: &mut impl FnMut(&str) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
+    let mut status = Ok(());
+    gp.on_in_scope_variable(|v| {
+        if status.is_ok() {
+            status = out(v.as_str());
+        }
+    });
+    status?;
     // variables used only in filters also matter for substitution
-    fn walk(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
+    fn walk<E>(
+        gp: &GraphPattern,
+        out: &mut impl FnMut(&str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         use GraphPattern as GP;
         match gp {
             GP::Filter { expr, inner } => {
-                visit_expr_vars(expr, out);
-                walk(inner, out);
+                try_visit_expr_vars(expr, out)?;
+                walk(inner, out)
             }
             GP::LeftJoin {
                 left,
@@ -8566,10 +8617,10 @@ fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
                 expression,
             } => {
                 if let Some(e) = expression {
-                    visit_expr_vars(e, out);
+                    try_visit_expr_vars(e, out)?;
                 }
-                walk(left, out);
-                walk(right, out);
+                walk(left, out)?;
+                walk(right, out)
             }
             GP::Join { left, right }
             | GP::Lateral { left, right }
@@ -8577,8 +8628,8 @@ fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
             | GP::Minus { left, right }
             | GP::SemiJoin { left, right }
             | GP::AntiJoin { left, right } => {
-                walk(left, out);
-                walk(right, out);
+                walk(left, out)?;
+                walk(right, out)
             }
             GP::Extend {
                 inner, expression, ..
@@ -8589,25 +8640,24 @@ fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
             | GP::Unfold {
                 inner, expression, ..
             } => {
-                visit_expr_vars(expression, out);
-                walk(inner, out);
+                try_visit_expr_vars(expression, out)?;
+                walk(inner, out)
             }
             GP::Graph { inner, .. }
             | GP::Distinct { inner }
             | GP::Reduced { inner }
             | GP::Slice { inner, .. }
             | GP::OrderBy { inner, .. } => walk(inner, out),
-            _ => {}
+            _ => Ok(()),
         }
     }
-    walk(gp, out);
+    walk(gp, out)
 }
 
-pub(super) fn expr_vars(e: &Expression, out: &mut Vec<String>) {
-    visit_expr_vars(e, &mut |name| out.push(name.to_string()));
-}
-
-fn visit_expr_vars(e: &Expression, out: &mut impl FnMut(&str)) {
+pub(super) fn try_visit_expr_vars<E>(
+    e: &Expression,
+    out: &mut impl FnMut(&str) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
     use Expression as E;
     match e {
         E::Variable(v) | E::Bound(v) => out(v.as_str()),
@@ -8623,22 +8673,30 @@ fn visit_expr_vars(e: &Expression, out: &mut impl FnMut(&str)) {
         | E::Subtract(a, b)
         | E::Multiply(a, b)
         | E::Divide(a, b) => {
-            visit_expr_vars(a, out);
-            visit_expr_vars(b, out);
+            try_visit_expr_vars(a, out)?;
+            try_visit_expr_vars(b, out)
         }
-        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => visit_expr_vars(a, out),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => try_visit_expr_vars(a, out),
         E::In(a, l) => {
-            visit_expr_vars(a, out);
-            l.iter().for_each(|x| visit_expr_vars(x, out));
+            try_visit_expr_vars(a, out)?;
+            for x in l {
+                try_visit_expr_vars(x, out)?;
+            }
+            Ok(())
         }
         E::If(a, b, c) => {
-            visit_expr_vars(a, out);
-            visit_expr_vars(b, out);
-            visit_expr_vars(c, out);
+            try_visit_expr_vars(a, out)?;
+            try_visit_expr_vars(b, out)?;
+            try_visit_expr_vars(c, out)
         }
-        E::Coalesce(l) | E::FunctionCall(_, l) => l.iter().for_each(|x| visit_expr_vars(x, out)),
-        E::Exists(p) => visit_pattern_vars(p, out),
-        _ => {}
+        E::Coalesce(l) | E::FunctionCall(_, l) => {
+            for x in l {
+                try_visit_expr_vars(x, out)?;
+            }
+            Ok(())
+        }
+        E::Exists(p) => try_visit_pattern_vars(p, out),
+        _ => Ok(()),
     }
 }
 

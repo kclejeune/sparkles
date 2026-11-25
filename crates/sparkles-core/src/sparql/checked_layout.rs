@@ -788,6 +788,18 @@ pub(super) fn node_retained_bytes(node: &Node) -> u64 {
     layout.bytes()
 }
 
+/// Owned heap bytes of a cloned `Vec<Expr>` (its slot array plus every boxed child,
+/// argument vector, and custom function IRI), excluding `Arc`-shared `ExistsSpec` and
+/// `Value` backing.
+pub(super) fn expressions_copy_bytes(exprs: &[Expr]) -> u64 {
+    let mut layout = Layout::unchecked(false);
+    let _ = layout.slice(exprs);
+    for expr in exprs {
+        let _ = layout.expr(expr);
+    }
+    layout.bytes()
+}
+
 /// Heap bytes owned by `Arc`-backed [`super::value::Value`] variants inside `Expr::Lit`.
 pub(super) fn value_heap_bytes(value: &super::value::Value) -> u64 {
     use super::value::Value;

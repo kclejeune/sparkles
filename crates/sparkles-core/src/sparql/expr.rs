@@ -158,6 +158,7 @@ impl ExistsSpec {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn new_ordinary_charged_with_admission(
         ctx: &Ctx,
         pattern: &GraphPattern,
@@ -196,6 +197,166 @@ impl ExistsSpec {
             && let Some(held) = admission
         {
             held.add(spec_bytes)?;
+        }
+        let calls_service = super::cursor::calls_service(&owned.syntax);
+        Ok(Self::from_pattern(
+            ExistsPattern::Ordinary(owned),
+            calls_service,
+            graph,
+            vars,
+            bound,
+            projected,
+            spec_charge.map_or(BackingCredit::None, BackingCredit::Retained),
+        ))
+    }
+
+    /// Compile an ordinary `EXISTS` spec from `pattern` and `subst`, reserving the
+    /// syntax clone, deduplicated variable scratch, and spec vectors before allocating.
+    pub(super) fn compile_ordinary_with_admission(
+        ctx: &Ctx,
+        pattern: &GraphPattern,
+        view_patterns: Option<&super::viewsvc::ViewPatterns>,
+        graph: super::plan::ActiveGraph,
+        subst: &FxHashMap<VarId, Id>,
+        admission: Option<&super::ctx::Charge<'_>>,
+    ) -> Result<ExistsSpec> {
+        ctx.check()?;
+        let pattern_bytes = Self::ordinary_pattern_bytes(pattern);
+        let pattern_charge = ctx.retained_charge(pattern_bytes)?;
+        let pattern_admission = if pattern_charge.is_none()
+            && let Some(held) = admission
+        {
+            let part = held.part();
+            part.add(pattern_bytes)?;
+            Some(part)
+        } else {
+            None
+        };
+        let scratch = match admission {
+            Some(held) => Some(held.part()),
+            None if ctx.shared().is_some() => Some(ctx.charge(0)?),
+            None => None,
+        };
+        let mut seen: rustc_hash::FxHashSet<VarId> = rustc_hash::FxHashSet::default();
+        let mut steps = 0usize;
+        let mut charged_cap = 0usize;
+        super::plan::try_visit_pattern_vars(pattern, &mut |name| -> Result<()> {
+            steps += 1;
+            if steps.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let id = ctx.var(name);
+            if !seen.contains(&id) {
+                if let Some(scratch) = &scratch
+                    && seen.len() >= charged_cap
+                {
+                    let next_cap = charged_cap.max(4).saturating_mul(2);
+                    scratch.resize((next_cap as u64).saturating_mul(12))?;
+                    charged_cap = next_cap;
+                }
+                seen.insert(id);
+            }
+            Ok(())
+        })?;
+        let vars_len = seen.len();
+        let bound_len = seen.iter().filter(|v| subst.contains_key(v)).count();
+        let spec_bytes = Self::spec_bytes(vars_len, bound_len);
+        let spec_charge = ctx.retained_charge(spec_bytes)?;
+        let spec_admission = if spec_charge.is_none()
+            && let Some(held) = admission
+        {
+            let part = held.part();
+            part.add(spec_bytes)?;
+            Some(part)
+        } else {
+            None
+        };
+        let mut vars = Vec::with_capacity(vars_len);
+        vars.extend(seen);
+        vars.sort_unstable();
+        let mut bound = Vec::with_capacity(bound_len);
+        for &v in &vars {
+            if let Some(&id) = subst.get(&v) {
+                bound.push((v, id));
+            }
+        }
+        drop(scratch);
+        let actual_spec_bytes = Self::spec_bytes(vars.capacity(), bound.capacity());
+        if actual_spec_bytes > spec_bytes {
+            if let Some(mut charge) = spec_charge {
+                charge.resize(actual_spec_bytes)?;
+                // Re-bind below after moving out of the Option.
+                return Self::finish_ordinary_compiled(
+                    ctx,
+                    pattern,
+                    view_patterns,
+                    graph,
+                    vars,
+                    bound,
+                    admission,
+                    pattern_bytes,
+                    pattern_charge,
+                    pattern_admission,
+                    Some(charge),
+                    spec_admission,
+                );
+            } else if let Some(part) = spec_admission.as_ref() {
+                part.resize(actual_spec_bytes)?;
+            }
+        }
+        Self::finish_ordinary_compiled(
+            ctx,
+            pattern,
+            view_patterns,
+            graph,
+            vars,
+            bound,
+            admission,
+            pattern_bytes,
+            pattern_charge,
+            pattern_admission,
+            spec_charge,
+            spec_admission,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_ordinary_compiled(
+        ctx: &Ctx,
+        pattern: &GraphPattern,
+        view_patterns: Option<&super::viewsvc::ViewPatterns>,
+        graph: super::plan::ActiveGraph,
+        vars: Vec<VarId>,
+        bound: Vec<(VarId, Id)>,
+        admission: Option<&super::ctx::Charge<'_>>,
+        pattern_bytes: u64,
+        pattern_charge: Option<super::ctx::RetainedCharge>,
+        mut pattern_admission: Option<super::ctx::Charge<'_>>,
+        spec_charge: Option<super::ctx::RetainedCharge>,
+        mut spec_admission: Option<super::ctx::Charge<'_>>,
+    ) -> Result<ExistsSpec> {
+        let owned = Arc::new(OrdinaryPattern {
+            syntax: pattern.clone(),
+            bytes: pattern_bytes,
+            _charge: pattern_charge,
+        });
+        let projected = match view_patterns {
+            Some(vp) => vp
+                .project_retained(pattern, &owned.syntax, ctx, admission)?
+                .map(|(projected, bytes, charge)| {
+                    Arc::new(RetainedViewPatterns::from_retained(
+                        projected, bytes, charge,
+                    ))
+                }),
+            None => None,
+        };
+        if let Some(held) = admission {
+            if pattern_admission.is_some() {
+                held.adopt_charge(&mut pattern_admission)?;
+            }
+            if spec_admission.is_some() {
+                held.adopt_charge(&mut spec_admission)?;
+            }
         }
         let calls_service = super::cursor::calls_service(&owned.syntax);
         Ok(Self::from_pattern(
