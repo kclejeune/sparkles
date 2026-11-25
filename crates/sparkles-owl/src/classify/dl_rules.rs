@@ -311,30 +311,36 @@ impl DlIx {
     /// keys other rules here than in `old`: one in the body of a clause that only one of
     /// the two has, one with another hypothetical successor or successor core, and one
     /// that the order of atoms ranks differently.
-    /// The bytes that [`DlIx::changed`] allocates for the comparison with `old`,
-    /// roughly: a key for each clause of both, with a copy of its head.
+    /// Upper bound on peak scratch bytes that [`DlIx::changed`] allocates for the
+    /// comparison with `old`: both pre-sized clause-key hash sets and their sorted head
+    /// copies.
     pub fn changed_scratch(&self, old: &DlIx) -> usize {
         let keys = |d: &DlIx| {
-            d.clauses
+            let table = super::dl_clause::hash_table_bytes(
+                d.clauses.len(),
+                std::mem::size_of::<(&[Ex], Vec<Ex>)>(),
+            );
+            let heads: usize = d
+                .clauses
                 .iter()
-                .map(|(_, h)| 56 + h.len() * 4)
-                .sum::<usize>()
+                .map(|(_, h)| h.len().saturating_mul(std::mem::size_of::<Ex>()))
+                .sum();
+            table.saturating_add(heads)
         };
-        keys(old) + keys(self)
+        keys(old).saturating_add(keys(self))
     }
 
     pub fn changed(&self, old: &DlIx, changed: &mut [bool]) {
         type Key<'a> = (&'a [Ex], Vec<Ex>);
         fn keys(d: &DlIx) -> FxHashSet<Key<'_>> {
-            d.clauses
-                .iter()
-                .map(|(b, h)| {
-                    let mut h = h.to_vec();
-                    h.sort_unstable();
-                    h.dedup();
-                    (&**b, h)
-                })
-                .collect()
+            let mut set = FxHashSet::with_capacity_and_hasher(d.clauses.len(), Default::default());
+            for (b, h) in &d.clauses {
+                let mut h = h.to_vec();
+                h.sort_unstable();
+                h.dedup();
+                set.insert((&**b, h));
+            }
+            set
         }
         let (a, b) = (keys(old), keys(self));
         for (body, _) in a.symmetric_difference(&b) {

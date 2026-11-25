@@ -4062,10 +4062,19 @@ impl Saturation {
             let inv_peak = live_base
                 .saturating_add(old.changed_bytes())
                 .saturating_add(inv_closure_peak);
+            let changed_scratch = ix.changed_scratch(&old);
             let held = live_base
                 .saturating_add(old_ix_bytes)
-                .saturating_add(ix.changed_scratch(&old))
+                .saturating_add(changed_scratch)
                 .max(inv_peak);
+            #[cfg(test)]
+            admission_test::hit(admission_test::Point::CompareAdmit {
+                live_base,
+                old_ix_bytes,
+                changed_scratch,
+                inv_peak,
+                held,
+            });
             let more = held.saturating_sub(normalized_peak);
             if limits.max_memory.is_some_and(|m| held > m)
                 || limits
@@ -5498,134 +5507,137 @@ impl Saturation {
             Ok(())
         };
         let all = (0..ctx.len() as Ex).chain((0..count).map(|i| base + i));
-        let mut affected: FxHashSet<Ex> = FxHashSet::default();
-        let mut queue: Vec<Ex> = Vec::new();
-        #[cfg(test)]
-        admission_test::hit(admission_test::Point::InvalidateInitialStart);
-        for e in all.clone() {
-            tick(1)?;
-            let Some(c) = ctx_of(e) else { continue };
-            let st = c.st.lock();
-            if !st.init {
-                continue;
-            }
-            let mut hit = false;
-            for &s in &st.subs {
+        // Scope `changed` and `queue` to the invalidation closure so only `affected` stays
+        // live during any `renumbered` disjoint-map growth scan and admission check.
+        let (affected, affected_bytes) = {
+            let mut affected: FxHashSet<Ex> = FxHashSet::default();
+            let mut queue: Vec<Ex> = Vec::new();
+            #[cfg(test)]
+            admission_test::hit(admission_test::Point::InvalidateInitialStart);
+            for e in all.clone() {
                 tick(1)?;
-                if changed.get(s as usize).copied().unwrap_or(true) {
-                    hit = true;
-                    break;
+                let Some(c) = ctx_of(e) else { continue };
+                let st = c.st.lock();
+                if !st.init {
+                    continue;
                 }
-            }
-            if !hit && e >= base {
-                let core = dynamic.core(e);
-                #[cfg(test)]
-                if core.len() > POLL_INVALIDATE {
-                    admission_test::hit(admission_test::Point::InvalidateLargeCoreStart);
-                }
-                let core_hit = dl_rules::core_changed_poll(core, &changed, &mut tick)?;
-                #[cfg(test)]
-                if core.len() > POLL_INVALIDATE {
-                    admission_test::hit(admission_test::Point::InvalidateLargeCoreEnd);
-                }
-                if core_hit {
-                    hit = true;
-                }
-            }
-            if !hit
-                && let Some(d) = dl_rules::dl(&st)
-                && d.names_changed_poll(&changed, &mut tick)?
-            {
-                hit = true;
-            }
-            if hit && affected.insert(e) {
-                push_capped(&mut queue, e, slots);
-            }
-        }
-        #[cfg(test)]
-        admission_test::hit(admission_test::Point::InvalidateInitialEnd);
-        // `changed` is never read past the initial scan; free it before the BFS and any
-        // `renumbered` disjoint-map growth check so only `affected` and `queue` stay live.
-        drop(changed);
-        // every context with a link into an affected context is affected, as is every
-        // context that registered with one as its predecessor, which took its clauses
-        // over the predecessor, and the class whose subsumer a test that held gave
-        let tests = ix.dl.is_some();
-        #[cfg(test)]
-        admission_test::hit(admission_test::Point::InvalidateClosureStart);
-        while let Some(e) = queue.pop() {
-            tick(1)?;
-            let Some(c) = ctx_of(e) else { continue };
-            let st = c.st.lock();
-            for (_, srcs) in &st.back {
-                #[cfg(test)]
-                if srcs.list.len() > POLL_INVALIDATE {
-                    admission_test::hit(admission_test::Point::InvalidateBackListStart);
-                }
-                for &s in &srcs.list {
-                    if affected.insert(s) {
-                        push_capped(&mut queue, s, slots);
-                    }
+                let mut hit = false;
+                for &s in &st.subs {
                     tick(1)?;
-                }
-                #[cfg(test)]
-                if srcs.list.len() > POLL_INVALIDATE {
-                    admission_test::hit(admission_test::Point::InvalidateBackListEnd);
-                }
-            }
-            if let Some(d) = dl_rules::dl(&st) {
-                #[cfg(test)]
-                if d.dpreds.len() > POLL_INVALIDATE {
-                    admission_test::hit(admission_test::Point::InvalidateDlPredsStart);
-                }
-                for &(u, _) in &d.dpreds {
-                    if affected.insert(u) {
-                        push_capped(&mut queue, u, slots);
+                    if changed.get(s as usize).copied().unwrap_or(true) {
+                        hit = true;
+                        break;
                     }
-                    tick(1)?;
                 }
-                #[cfg(test)]
-                if d.dpreds.len() > POLL_INVALIDATE {
-                    admission_test::hit(admission_test::Point::InvalidateDlPredsEnd);
+                if !hit && e >= base {
+                    let core = dynamic.core(e);
+                    #[cfg(test)]
+                    if core.len() > POLL_INVALIDATE {
+                        admission_test::hit(admission_test::Point::InvalidateLargeCoreStart);
+                    }
+                    let core_hit = dl_rules::core_changed_poll(core, &changed, &mut tick)?;
+                    #[cfg(test)]
+                    if core.len() > POLL_INVALIDATE {
+                        admission_test::hit(admission_test::Point::InvalidateLargeCoreEnd);
+                    }
+                    if core_hit {
+                        hit = true;
+                    }
+                }
+                if !hit
+                    && let Some(d) = dl_rules::dl(&st)
+                    && d.names_changed_poll(&changed, &mut tick)?
+                {
+                    hit = true;
+                }
+                if hit && affected.insert(e) {
+                    push_capped(&mut queue, e, slots);
                 }
             }
-            if tests
-                && e >= base
-                && st.bottom
-                && let Some(x) = dl_rules::tested_class_poll(dynamic.core(e), &mut tick)?
-                && affected.insert(x)
-            {
-                push_capped(&mut queue, x, slots);
+            #[cfg(test)]
+            admission_test::hit(admission_test::Point::InvalidateInitialEnd);
+            // `changed` is never read past the initial scan; free it before the BFS and any
+            // `renumbered` disjoint-map growth check so only `affected` and `queue` stay live.
+            drop(changed);
+            // every context with a link into an affected context is affected, as is every
+            // context that registered with one as its predecessor, which took its clauses
+            // over the predecessor, and the class whose subsumer a test that held gave
+            let tests = ix.dl.is_some();
+            #[cfg(test)]
+            admission_test::hit(admission_test::Point::InvalidateClosureStart);
+            while let Some(e) = queue.pop() {
+                tick(1)?;
+                let Some(c) = ctx_of(e) else { continue };
+                let st = c.st.lock();
+                for (_, srcs) in &st.back {
+                    #[cfg(test)]
+                    if srcs.list.len() > POLL_INVALIDATE {
+                        admission_test::hit(admission_test::Point::InvalidateBackListStart);
+                    }
+                    for &s in &srcs.list {
+                        if affected.insert(s) {
+                            push_capped(&mut queue, s, slots);
+                        }
+                        tick(1)?;
+                    }
+                    #[cfg(test)]
+                    if srcs.list.len() > POLL_INVALIDATE {
+                        admission_test::hit(admission_test::Point::InvalidateBackListEnd);
+                    }
+                }
+                if let Some(d) = dl_rules::dl(&st) {
+                    #[cfg(test)]
+                    if d.dpreds.len() > POLL_INVALIDATE {
+                        admission_test::hit(admission_test::Point::InvalidateDlPredsStart);
+                    }
+                    for &(u, _) in &d.dpreds {
+                        if affected.insert(u) {
+                            push_capped(&mut queue, u, slots);
+                        }
+                        tick(1)?;
+                    }
+                    #[cfg(test)]
+                    if d.dpreds.len() > POLL_INVALIDATE {
+                        admission_test::hit(admission_test::Point::InvalidateDlPredsEnd);
+                    }
+                }
+                if tests
+                    && e >= base
+                    && st.bottom
+                    && let Some(x) = dl_rules::tested_class_poll(dynamic.core(e), &mut tick)?
+                    && affected.insert(x)
+                {
+                    push_capped(&mut queue, x, slots);
+                }
             }
-        }
-        #[cfg(test)]
-        admission_test::hit(admission_test::Point::InvalidateClosureEnd);
-        let affected_bytes =
-            dl_clause::hash_table_bytes(affected.capacity(), std::mem::size_of::<Ex>());
-        let queue_bytes = queue.capacity().saturating_mul(std::mem::size_of::<Ex>());
-        debug_assert!(
-            affected.len() <= slots && queue.capacity() <= slots,
-            "invalidation scratch exceeded slot count {slots}: affected={}, queue_cap={}",
-            affected.len(),
-            queue.capacity()
-        );
-        debug_assert!(
-            affected_bytes.saturating_add(queue_bytes) <= closure_peak,
-            "invalidation scratch ({affected_bytes} + {queue_bytes}) exceeded bound {closure_peak}"
-        );
-        #[cfg(test)]
-        admission_test::hit(admission_test::Point::InvalidateScratch {
-            slots,
-            affected_len: affected.len(),
-            affected_bytes,
-            queue_cap: queue.capacity(),
-            queue_bytes,
-            bound: closure_peak,
-            live_base,
-        });
-        // Release `queue` before any `renumbered` disjoint-map growth check so only
-        // `affected` stays live alongside `live_base`.
-        drop(queue);
+            #[cfg(test)]
+            admission_test::hit(admission_test::Point::InvalidateClosureEnd);
+            let affected_bytes =
+                dl_clause::hash_table_bytes(affected.capacity(), std::mem::size_of::<Ex>());
+            let queue_bytes = queue.capacity().saturating_mul(std::mem::size_of::<Ex>());
+            debug_assert!(
+                affected.len() <= slots && queue.capacity() <= slots,
+                "invalidation scratch exceeded slot count {slots}: affected={}, queue_cap={}",
+                affected.len(),
+                queue.capacity()
+            );
+            debug_assert!(
+                affected_bytes.saturating_add(queue_bytes) <= closure_peak,
+                "invalidation scratch ({affected_bytes} + {queue_bytes}) exceeded bound {closure_peak}"
+            );
+            #[cfg(test)]
+            admission_test::hit(admission_test::Point::InvalidateScratch {
+                slots,
+                affected_len: affected.len(),
+                affected_bytes,
+                queue_cap: queue.capacity(),
+                queue_bytes,
+                queue_ptr: queue.as_ptr().addr(),
+                bound: closure_peak,
+                live_base,
+            });
+            (affected, affected_bytes)
+        };
         if renumbered {
             let mut maps = 0usize;
             for e in all.clone() {
@@ -9932,12 +9944,23 @@ mod tests {
         }
         k.add(&edit);
 
+        struct WatchReset;
+        impl Drop for WatchReset {
+            fn drop(&mut self) {
+                let _ = numeric::tests::take_watched_deallocations();
+            }
+        }
+        let _watch_reset = WatchReset;
         let scratch_obs = Arc::new(parking_lot::Mutex::new(
             None::<(usize, usize, usize, usize, usize, usize, usize)>,
         ));
-        let admit_obs = Arc::new(parking_lot::Mutex::new(None::<(usize, usize, usize)>));
+        let admit_obs = Arc::new(parking_lot::Mutex::new(
+            None::<(usize, usize, usize, Option<usize>)>,
+        ));
+        let queue_deallocs_before_drop = Arc::new(parking_lot::Mutex::new(None::<Option<usize>>));
         let so = scratch_obs.clone();
         let ao = admit_obs.clone();
+        let qd = queue_deallocs_before_drop.clone();
         let out = admission_test::with_hook(
             move |pt| match pt {
                 admission_test::Point::InvalidateScratch {
@@ -9946,9 +9969,16 @@ mod tests {
                     affected_bytes,
                     queue_cap,
                     queue_bytes,
+                    queue_ptr,
                     bound,
                     live_base,
                 } => {
+                    assert!(queue_cap > 0);
+                    numeric::tests::watch_deallocation(
+                        queue_ptr,
+                        std::alloc::Layout::array::<Ex>(queue_cap).unwrap(),
+                    );
+                    *qd.lock() = Some(numeric::tests::watched_deallocations());
                     *so.lock() = Some((
                         slots,
                         affected_len,
@@ -9960,7 +9990,8 @@ mod tests {
                     ));
                 }
                 admission_test::Point::DisjointGrowthAdmit { live, growth, paid } => {
-                    *ao.lock() = Some((live, growth, paid));
+                    let deallocs = numeric::tests::watched_deallocations();
+                    *ao.lock() = Some((live, growth, paid, deallocs));
                 }
                 _ => {}
             },
@@ -9968,6 +9999,11 @@ mod tests {
         );
         assert!(out.stats.incremental);
         assert!(out.stats.cleared >= 8_200);
+        assert_eq!(
+            *queue_deallocs_before_drop.lock(),
+            Some(Some(0)),
+            "queue buffer was unexpectedly freed before closure ended"
+        );
 
         let (slots, affected_len, affected_bytes, queue_cap, queue_bytes, bound, live_base) =
             scratch_obs
@@ -9986,18 +10022,463 @@ mod tests {
             "live invalidation scratch ({affected_bytes} + {queue_bytes}) exceeded bound {bound}"
         );
 
-        let (admit_live, admit_growth, _) = admit_obs
+        let (admit_live, admit_growth, _, queue_deallocs_at_admit) = admit_obs
             .lock()
             .expect("DisjointGrowthAdmit was not observed");
         assert!(admit_growth > 0);
-        // `queue` is dropped before `DisjointGrowthAdmit`, so live memory equals `live_base`
-        // plus `affected`'s exact backing table with zero retained queue bytes.
+        // `queue` is physically deallocated before `DisjointGrowthAdmit`, so its backing
+        // buffer must already have been freed and live memory equals `live_base + affected_bytes`.
+        assert_eq!(
+            queue_deallocs_at_admit,
+            Some(1),
+            "queue backing buffer was still live at DisjointGrowthAdmit"
+        );
         assert_eq!(admit_live, live_base + affected_bytes);
 
         let mut held = base;
         held.extend(edit);
         let want = Classifier::of(&held).classify(&eager).unwrap();
         assert_eq!(out.taxonomy, want.taxonomy);
+    }
+
+    /// Equal-length differing index lists (`told_of`, `conj_of`, `exist_of`, and disjointness
+    /// sets) must stay within `Index::changed_scratch` and the Tier D `Expansion::Eager`
+    /// comparison admission reservation (Item 753 Phase 1, Sol r5 P2).
+    #[test]
+    fn tier_d_eager_equal_length_index_lists_stay_within_comparison_reservation() {
+        let eager = Limits {
+            threads: 1,
+            expansion: Expansion::Eager,
+            ..Limits::default()
+        };
+        let parse = |body: &str| {
+            crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
+                .unwrap()
+                .axioms
+        };
+        let dl_seed = "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\nSubClassOf(:Q :R)\n";
+
+        // Build two consecutive indexes on the same `Interner` and verify actual peak heap
+        // bytes during `Index::changed` never exceed `ix.changed_scratch(&old)`.
+        let assert_changed_within_scratch = |label: &str, base: &[Axiom], updated: &[Axiom]| {
+            let mut sat = Saturation::default();
+            let build_ix = |sat: &mut Saturation, axioms: &[Axiom]| {
+                let kinds: Vec<&AxiomKind> = axioms.iter().map(|a| &a.kind).collect();
+                let outside: Vec<(usize, (String, String))> = kinds
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, k)| {
+                        let b = el_break(k)?;
+                        Some((i, (b.rule.to_string(), b.message)))
+                    })
+                    .collect();
+                let (_, ix, _, _, _) = sat
+                    .build(
+                        &kinds,
+                        &outside,
+                        1,
+                        0,
+                        0,
+                        &eager,
+                        AttemptProvenance::Ineligible,
+                    )
+                    .unwrap();
+                ix
+            };
+            let old_ix = build_ix(&mut sat, base);
+            let new_ix = build_ix(&mut sat, updated);
+            assert!(
+                new_ix.same_tables(&old_ix),
+                "{label}: fixture must remain eligible for index comparison"
+            );
+            let estimate = new_ix.changed_scratch(&old_ix);
+            let (changed, sample) = numeric::tests::measure(|| new_ix.changed(&old_ix, &|| false));
+            let changed = changed.expect("uncancelled comparison must return marks");
+            assert!(
+                changed.iter().any(|&c| c),
+                "{label}: replacement must mark at least one expression changed"
+            );
+            assert!(
+                sample.peak <= estimate,
+                "{label}: Index::changed peak heap ({}) exceeded changed_scratch ({estimate})",
+                sample.peak
+            );
+            (sat, old_ix, new_ix, estimate, sample.peak)
+        };
+
+        // 1. Equal-length told superclasses (Sol r5 exact example: 256 distinct told
+        // superclasses on `:A`, replacing `:T255` with already-declared `:T256`).
+        let mut told_base_body = String::from(dl_seed);
+        told_base_body.push_str("Declaration(Class(:T256))\n");
+        for i in 0..256usize {
+            told_base_body.push_str(&format!("SubClassOf(:A :T{i})\n"));
+        }
+        let told_base = parse(&told_base_body);
+        let told_rm = parse("SubClassOf(:A :T255)\n");
+        let told_add = parse("SubClassOf(:A :T256)\n");
+        let mut told_updated: Vec<Axiom> = told_base
+            .iter()
+            .filter(|&a| a != &told_rm[0])
+            .cloned()
+            .collect();
+        told_updated.extend(told_add.iter().cloned());
+        let (sat_told, old_told, new_told, _, _) =
+            assert_changed_within_scratch("told_of 256", &told_base, &told_updated);
+        let a_told_ex = sat_told
+            .interner
+            .get(&Node::Class(
+                sat_told
+                    .interner
+                    .classes
+                    .iter()
+                    .position(|c| c.as_str() == "http://ex.org/A")
+                    .unwrap() as u32,
+            ))
+            .unwrap();
+        assert_eq!(old_told.told_of(old_told.head(a_told_ex)).len(), 256);
+        assert_eq!(new_told.told_of(new_told.head(a_told_ex)).len(), 256);
+        assert_ne!(
+            old_told.told_of(old_told.head(a_told_ex)),
+            new_told.told_of(new_told.head(a_told_ex))
+        );
+
+        // 2. Equal-length conjunction lists (256 distinct binary conjunctions on `:A`,
+        // replacing the 256th partner `:C255` with already-declared `:C256`).
+        let mut conj_base_body = String::from(dl_seed);
+        conj_base_body.push_str("Declaration(Class(:C256))\n");
+        for i in 0..256usize {
+            conj_base_body.push_str(&format!(
+                "SubClassOf(ObjectIntersectionOf(:A :C{i}) :Out)\n"
+            ));
+        }
+        let conj_base = parse(&conj_base_body);
+        let conj_rm = parse("SubClassOf(ObjectIntersectionOf(:A :C255) :Out)\n");
+        let conj_add = parse("SubClassOf(ObjectIntersectionOf(:A :C256) :Out)\n");
+        let mut conj_updated: Vec<Axiom> = conj_base
+            .iter()
+            .filter(|&a| a != &conj_rm[0])
+            .cloned()
+            .collect();
+        conj_updated.extend(conj_add.iter().cloned());
+        let (sat_conj, old_conj, new_conj, _, _) =
+            assert_changed_within_scratch("conj_of 256", &conj_base, &conj_updated);
+        let a_conj_ex = sat_conj
+            .interner
+            .get(&Node::Class(
+                sat_conj
+                    .interner
+                    .classes
+                    .iter()
+                    .position(|c| c.as_str() == "http://ex.org/A")
+                    .unwrap() as u32,
+            ))
+            .unwrap();
+        assert_eq!(old_conj.conj_of(old_conj.head(a_conj_ex)).len(), 256);
+        assert_eq!(new_conj.conj_of(new_conj.head(a_conj_ex)).len(), 256);
+        assert_ne!(
+            old_conj.conj_of(old_conj.head(a_conj_ex)),
+            new_conj.conj_of(new_conj.head(a_conj_ex))
+        );
+
+        // 3. Equal-length existential filler lists (256 distinct negative existentials on `:A`,
+        // replacing `:r255` with already-declared `:r256`).
+        let mut exist_base_body = String::from(dl_seed);
+        exist_base_body.push_str("SubObjectPropertyOf(:r256 :r256)\n");
+        for i in 0..256usize {
+            exist_base_body.push_str(&format!(
+                "SubClassOf(ObjectSomeValuesFrom(:r{i} :A) :Out)\n"
+            ));
+        }
+        let exist_base = parse(&exist_base_body);
+        let exist_rm = parse("SubClassOf(ObjectSomeValuesFrom(:r255 :A) :Out)\n");
+        let exist_add = parse("SubClassOf(ObjectSomeValuesFrom(:r256 :A) :Out)\n");
+        let mut exist_updated: Vec<Axiom> = exist_base
+            .iter()
+            .filter(|&a| a != &exist_rm[0])
+            .cloned()
+            .collect();
+        exist_updated.extend(exist_add.iter().cloned());
+        let (sat_exist, old_exist, new_exist, _, _) =
+            assert_changed_within_scratch("exist_of 256", &exist_base, &exist_updated);
+        let a_exist_ex = sat_exist
+            .interner
+            .get(&Node::Class(
+                sat_exist
+                    .interner
+                    .classes
+                    .iter()
+                    .position(|c| c.as_str() == "http://ex.org/A")
+                    .unwrap() as u32,
+            ))
+            .unwrap();
+        assert_eq!(old_exist.exist_of(old_exist.head(a_exist_ex)).len(), 256);
+        assert_eq!(new_exist.exist_of(new_exist.head(a_exist_ex)).len(), 256);
+        assert_ne!(
+            old_exist.exist_of(old_exist.head(a_exist_ex)),
+            new_exist.exist_of(new_exist.head(a_exist_ex))
+        );
+
+        // 4. Disjointness sets (small 1-set case and 32-set equal-length replacement).
+        for n_disj in [1usize, 32] {
+            let mut disj_base_body = String::from(dl_seed);
+            disj_base_body.push_str("Declaration(Class(:ExtraD))\n");
+            for i in 0..n_disj {
+                disj_base_body.push_str(&format!("DisjointClasses(:A :D{i})\n"));
+            }
+            let disj_base = parse(&disj_base_body);
+            let disj_rm = parse(&format!("DisjointClasses(:A :D{})\n", n_disj - 1));
+            let disj_add = parse("DisjointClasses(:A :ExtraD)\n");
+            let mut disj_updated: Vec<Axiom> = disj_base
+                .iter()
+                .filter(|&a| a != &disj_rm[0])
+                .cloned()
+                .collect();
+            disj_updated.extend(disj_add.iter().cloned());
+            assert_changed_within_scratch(&format!("disjoint {n_disj}"), &disj_base, &disj_updated);
+        }
+
+        // 5. End-to-end Tier D `Expansion::Eager` comparison admission boundary on equal-length
+        // `told_of`, `conj_of`, and `exist_of` replacements:
+        // include an unrelated 81-role transitive hierarchy (:p0 ⊑ ... ⊑ :p80, transitive :p80)
+        // so `old_ix_bytes` (~400 KiB of role-composition tables, untouched by the edit)
+        // dominates both the post-drop invalidation peak and fresh saturation/taxonomy scratch
+        // (`want.stats.peak_memory < held`), then verify `held - 1` refuses right at
+        // `CompareAdmit` (never reaching `InvalidateInitialStart`) and falls back cleanly to a
+        // complete Tier D fresh run under both `max_memory` and pool `charge`, while exact
+        // `held` admits incremental reuse.
+        let mut weight = String::from("TransitiveObjectProperty(:p80)\n");
+        for r in 0..80usize {
+            weight.push_str(&format!("SubObjectPropertyOf(:p{r} :p{})\n", r + 1));
+        }
+        let with_weight = |body: &str| parse(&format!("{weight}{body}"));
+        let told_e2e_base = with_weight(&told_base_body);
+        let mut told_e2e_updated: Vec<Axiom> = told_e2e_base
+            .iter()
+            .filter(|&a| a != &told_rm[0])
+            .cloned()
+            .collect();
+        told_e2e_updated.extend(told_add.iter().cloned());
+        let conj_e2e_base = with_weight(&conj_base_body);
+        let mut conj_e2e_updated: Vec<Axiom> = conj_e2e_base
+            .iter()
+            .filter(|&a| a != &conj_rm[0])
+            .cloned()
+            .collect();
+        conj_e2e_updated.extend(conj_add.iter().cloned());
+        let exist_e2e_base = with_weight(&exist_base_body);
+        let mut exist_e2e_updated: Vec<Axiom> = exist_e2e_base
+            .iter()
+            .filter(|&a| a != &exist_rm[0])
+            .cloned()
+            .collect();
+        exist_e2e_updated.extend(exist_add.iter().cloned());
+
+        for (label, base, rm, add, updated) in [
+            (
+                "told_of 256",
+                &told_e2e_base,
+                &told_rm,
+                &told_add,
+                &told_e2e_updated,
+            ),
+            (
+                "conj_of 256",
+                &conj_e2e_base,
+                &conj_rm,
+                &conj_add,
+                &conj_e2e_updated,
+            ),
+            (
+                "exist_of 256",
+                &exist_e2e_base,
+                &exist_rm,
+                &exist_add,
+                &exist_e2e_updated,
+            ),
+        ] {
+            let want = Classifier::of(updated).classify(&eager).unwrap();
+            assert_eq!(want.stats.tier, Tier::Disjunctive);
+
+            let make_edited = || {
+                let mut k = Classifier::of(base);
+                let first = k.classify(&eager).unwrap();
+                assert_eq!(first.stats.tier, Tier::Disjunctive);
+                k.remove(rm);
+                k.add(add);
+                k
+            };
+
+            let cmp_obs = Arc::new(parking_lot::Mutex::new(
+                None::<(usize, usize, usize, usize, usize)>,
+            ));
+            let co = cmp_obs.clone();
+            let mut k_probe = make_edited();
+            let probe = admission_test::with_hook(
+                move |pt| {
+                    if let admission_test::Point::CompareAdmit {
+                        live_base,
+                        old_ix_bytes,
+                        changed_scratch,
+                        inv_peak,
+                        held,
+                    } = pt
+                    {
+                        *co.lock() =
+                            Some((live_base, old_ix_bytes, changed_scratch, inv_peak, held));
+                    }
+                },
+                || k_probe.classify(&eager).unwrap(),
+            );
+            assert!(
+                probe.stats.incremental,
+                "{label}: probe must run incrementally"
+            );
+            assert_eq!(probe.taxonomy, want.taxonomy);
+
+            let (live_base, old_ix_bytes, changed_scratch, inv_peak, held) =
+                cmp_obs.lock().expect("CompareAdmit was not observed");
+            let cmp_arm = live_base + old_ix_bytes + changed_scratch;
+            assert!(
+                cmp_arm > inv_peak,
+                "{label}: expected comparison arm ({cmp_arm}) to exceed post-drop invalidation peak ({inv_peak})"
+            );
+            assert_eq!(held, cmp_arm);
+            assert!(
+                want.stats.peak_memory < held,
+                "{label}: expected fresh peak ({}) < comparison reservation ({held})",
+                want.stats.peak_memory
+            );
+
+            // Refusal at `held - 1` under `max_memory` stops at `CompareAdmit` (before
+            // `InvalidateInitialStart`) and falls back cleanly to a fresh Tier D run.
+            let mut k_refuse_mem = make_edited();
+            let saw_cmp = Arc::new(AtomicBool::new(false));
+            let saw_inv = Arc::new(AtomicBool::new(false));
+            let sc = saw_cmp.clone();
+            let si = saw_inv.clone();
+            let out_refuse_mem = admission_test::with_hook(
+                move |pt| match pt {
+                    admission_test::Point::CompareAdmit { .. } => {
+                        sc.store(true, Ordering::SeqCst);
+                    }
+                    admission_test::Point::InvalidateInitialStart => {
+                        si.store(true, Ordering::SeqCst);
+                    }
+                    _ => {}
+                },
+                || {
+                    k_refuse_mem
+                        .classify(&Limits {
+                            max_memory: Some(held - 1),
+                            ..eager.clone()
+                        })
+                        .unwrap()
+                },
+            );
+            assert!(
+                saw_cmp.load(Ordering::SeqCst),
+                "{label}: CompareAdmit was not reached under max_memory=held-1"
+            );
+            assert!(
+                !saw_inv.load(Ordering::SeqCst),
+                "{label}: InvalidateInitialStart ran despite refusal at CompareAdmit"
+            );
+            assert!(
+                !out_refuse_mem.stats.incremental,
+                "{label}: max_memory=held-1 must refuse incremental comparison"
+            );
+            assert_eq!(out_refuse_mem.stats.tier, Tier::Disjunctive);
+            assert_eq!(out_refuse_mem.taxonomy, want.taxonomy);
+
+            // Refusal at `held - 1` under pool `charge` stops at `CompareAdmit` and falls
+            // back cleanly to a fresh Tier D run.
+            let mut k_refuse_pool = make_edited();
+            let saw_cmp = Arc::new(AtomicBool::new(false));
+            let saw_inv = Arc::new(AtomicBool::new(false));
+            let charged = Arc::new(AtomicUsize::new(0));
+            let refused = Arc::new(AtomicUsize::new(0));
+            let sc = saw_cmp.clone();
+            let si = saw_inv.clone();
+            let ch = charged.clone();
+            let rf = refused.clone();
+            let out_refuse_pool = admission_test::with_hook(
+                move |pt| match pt {
+                    admission_test::Point::CompareAdmit { .. } => {
+                        sc.store(true, Ordering::SeqCst);
+                    }
+                    admission_test::Point::InvalidateInitialStart => {
+                        si.store(true, Ordering::SeqCst);
+                    }
+                    _ => {}
+                },
+                || {
+                    k_refuse_pool
+                        .classify(&Limits {
+                            charge: Some(Arc::new(move |bytes| {
+                                let prev = ch.fetch_add(bytes, Ordering::SeqCst);
+                                if prev + bytes > held - 1 {
+                                    ch.fetch_sub(bytes, Ordering::SeqCst);
+                                    rf.fetch_add(1, Ordering::SeqCst);
+                                    false
+                                } else {
+                                    true
+                                }
+                            })),
+                            ..eager.clone()
+                        })
+                        .unwrap()
+                },
+            );
+            assert!(saw_cmp.load(Ordering::SeqCst));
+            assert!(!saw_inv.load(Ordering::SeqCst));
+            assert!(
+                !out_refuse_pool.stats.incremental,
+                "{label}: pool cap=held-1 must refuse incremental comparison"
+            );
+            assert!(refused.load(Ordering::SeqCst) > 0);
+            assert_eq!(out_refuse_pool.stats.tier, Tier::Disjunctive);
+            assert_eq!(out_refuse_pool.taxonomy, want.taxonomy);
+
+            // Admission at exact `held` under `max_memory` succeeds incrementally.
+            let mut k_admit_mem = make_edited();
+            let out_admit_mem = k_admit_mem
+                .classify(&Limits {
+                    max_memory: Some(held),
+                    ..eager.clone()
+                })
+                .unwrap();
+            assert!(
+                out_admit_mem.stats.incremental,
+                "{label}: max_memory=held must admit incremental comparison"
+            );
+            assert_eq!(out_admit_mem.stats.tier, Tier::Disjunctive);
+            assert_eq!(out_admit_mem.taxonomy, want.taxonomy);
+
+            // Admission at exact `held` under pool `charge` succeeds incrementally.
+            let mut k_admit_pool = make_edited();
+            let charged_ok = Arc::new(AtomicUsize::new(0));
+            let ch_ok = charged_ok.clone();
+            let out_admit_pool = k_admit_pool
+                .classify(&Limits {
+                    charge: Some(Arc::new(move |bytes| {
+                        let prev = ch_ok.fetch_add(bytes, Ordering::SeqCst);
+                        if prev + bytes > held {
+                            ch_ok.fetch_sub(bytes, Ordering::SeqCst);
+                            false
+                        } else {
+                            true
+                        }
+                    })),
+                    ..eager.clone()
+                })
+                .unwrap();
+            assert!(
+                out_admit_pool.stats.incremental,
+                "{label}: pool cap=held must admit incremental comparison"
+            );
+            assert_eq!(out_admit_pool.stats.tier, Tier::Disjunctive);
+            assert_eq!(out_admit_pool.taxonomy, want.taxonomy);
+        }
     }
 
     /// Cooperative polling inside `invalidate_changed` for large dynamic cores and large

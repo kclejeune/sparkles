@@ -2492,6 +2492,24 @@ fn group<T: Copy>(
     out
 }
 
+/// Like [`group`], sorting each key's slice in place so [`Index::changed`] can compare
+/// per-head rule lists without allocating temporary copies.
+fn group_sorted<T: Copy + Ord>(
+    pairs: &[(Ex, T)],
+    span: impl Fn(&mut Head) -> &mut Span,
+    heads: &mut [Head],
+) -> Vec<T> {
+    let mut out = group(pairs, &span, heads);
+    for h in heads.iter_mut() {
+        let s = *span(h);
+        if s.len > 1 {
+            let start = s.start as usize;
+            out[start..start + s.len as usize].sort_unstable();
+        }
+    }
+    out
+}
+
 impl Index {
     #[inline]
     pub fn head(&self, e: Ex) -> &Head {
@@ -2634,50 +2652,65 @@ impl Index {
     pub fn changed(&self, old: &Index, stop: &dyn Fn() -> bool) -> Option<Vec<bool>> {
         let n = old.heads.len();
         debug_assert!(self.heads.len() >= n);
-        // the disjointness sets of each index by their members, which name them in both
-        let members = |ix: &Index| -> Vec<Vec<Ex>> {
-            let mut sets: Vec<Vec<Ex>> = Vec::new();
-            for (e, h) in ix.heads.iter().enumerate() {
-                for &s in ix.disjoint_of(h) {
-                    if sets.len() <= s as usize {
-                        sets.resize(s as usize + 1, Vec::new());
-                    }
-                    sets[s as usize].push(e as Ex);
+        // Scope the disjointness numbering table so it drops before `changed` is allocated.
+        let (old_sets, new_sets) = if old.disjoint.is_empty() && self.disjoint.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let set_count = |ix: &Index| {
+                ix.disjoint
+                    .iter()
+                    .copied()
+                    .max()
+                    .map_or(0, |m| m as usize + 1)
+            };
+            let old_n = set_count(old);
+            let new_n = set_count(self);
+            debug_assert!(old_n <= old.disjoint.len() && new_n <= self.disjoint.len());
+            // The disjointness sets of each index by their members, pre-sized to avoid
+            // amortized doubling during the comparison.
+            let members = |ix: &Index, n_sets: usize| -> Vec<Vec<Ex>> {
+                if n_sets == 0 {
+                    return Vec::new();
                 }
-            }
-            sets
-        };
-        // each set has one number in both indexes, so that an expression's sets compare
-        // without their members
-        let mut numbers: FxHashMap<Vec<Ex>, u32> = FxHashMap::default();
-        let mut numbered = |sets: Vec<Vec<Ex>>| -> Vec<u32> {
-            sets.into_iter()
-                .map(|members| {
+                let mut counts = vec![0u32; n_sets];
+                for &s in &ix.disjoint {
+                    counts[s as usize] += 1;
+                }
+                let mut sets: Vec<Vec<Ex>> = counts
+                    .into_iter()
+                    .map(|c| Vec::with_capacity(c as usize))
+                    .collect();
+                for (e, h) in ix.heads.iter().enumerate() {
+                    for &s in ix.disjoint_of(h) {
+                        sets[s as usize].push(e as Ex);
+                    }
+                }
+                sets
+            };
+            // Each set has one number in both indexes, so that an expression's sets compare
+            // without their members.
+            let mut numbers: FxHashMap<Vec<Ex>, u32> = FxHashMap::with_capacity_and_hasher(
+                old_n.saturating_add(new_n),
+                Default::default(),
+            );
+            let mut numbered = |sets: Vec<Vec<Ex>>| -> Vec<u32> {
+                let mut out = Vec::with_capacity(sets.len());
+                for members in sets {
                     let next = numbers.len() as u32;
-                    *numbers.entry(members).or_insert(next)
-                })
-                .collect()
+                    out.push(*numbers.entry(members).or_insert(next));
+                }
+                out
+            };
+            let old_sets = numbered(members(old, old_n));
+            let new_sets = numbered(members(self, new_n));
+            (old_sets, new_sets)
         };
-        let old_sets = numbered(members(old));
-        let new_sets = numbered(members(self));
         let flag = |ix: &Index, e: usize| -> u8 {
             ix.horn
                 .as_ref()
                 .and_then(|h| h.flags.get(e).copied())
                 .unwrap_or(0)
         };
-        fn same<T: Copy + Ord>(a: &[T], b: &[T]) -> bool {
-            if a.len() != b.len() {
-                return false;
-            }
-            if a == b {
-                return true;
-            }
-            let (mut a, mut b) = (a.to_vec(), b.to_vec());
-            a.sort_unstable();
-            b.sort_unstable();
-            a == b
-        }
         let mut changed = vec![false; n];
         for (e, changed) in changed.iter_mut().enumerate() {
             if e % POLL_CHANGED == 0 && stop() {
@@ -2685,6 +2718,9 @@ impl Index {
             }
             let (a, b) = (&old.heads[e], &self.heads[e]);
             debug_assert_eq!(a.node, b.node);
+            debug_assert!(old.told_of(a).is_sorted() && self.told_of(b).is_sorted());
+            debug_assert!(old.conj_of(a).is_sorted() && self.conj_of(b).is_sorted());
+            debug_assert!(old.exist_of(a).is_sorted() && self.exist_of(b).is_sorted());
             let sets = |ix: &Index, h: &Head, sets: &[u32]| -> Vec<u32> {
                 let mut v: Vec<u32> = ix
                     .disjoint_of(h)
@@ -2702,12 +2738,14 @@ impl Index {
                 || a.succ != b.succ
                 || filler
                 || flag(old, e) != flag(self, e)
-                || !same(old.told_of(a), self.told_of(b))
-                || !same(old.conj_of(a), self.conj_of(b))
-                || !same(old.exist_of(a), self.exist_of(b))
-                || (a.disj.len != 0 || b.disj.len != 0)
-                    && sets(old, a, &old_sets) != sets(self, b, &new_sets);
+                || old.told_of(a) != self.told_of(b)
+                || old.conj_of(a) != self.conj_of(b)
+                || old.exist_of(a) != self.exist_of(b)
+                || a.disj.len != b.disj.len
+                || (a.disj.len != 0 && sets(old, a, &old_sets) != sets(self, b, &new_sets));
         }
+        drop(old_sets);
+        drop(new_sets);
         if stop() {
             return None;
         }
@@ -2722,18 +2760,37 @@ impl Index {
         self.heads.len()
     }
 
-    /// The bytes that [`Index::changed`] allocates for the comparison with `old`,
-    /// roughly: a mark for each expression, the members of the disjointness sets of
-    /// both indexes with their lists, their entries in the table that numbers them and
-    /// their numbers, which for sets of two members is 48 bytes a member, and the keys
-    /// of the clauses of Tier D.
+    /// Upper bound on peak scratch bytes that [`Index::changed`] allocates for the
+    /// comparison with `old`: disjointness set numbering (dropped before `changed`), the
+    /// `changed` mark vector with per-head disjointness comparison (dropped before Tier D),
+    /// and the `changed` mark vector with Tier D's clause-key sets. Per-head `told`, `conj`
+    /// and `exist` slices are pre-sorted in [`Index::build`] and compared without allocation.
     pub fn changed_scratch(&self, old: &Index) -> usize {
-        old.heads.len()
-            + (old.disjoint.len() + self.disjoint.len()) * 48
-            + match (&old.dl, &self.dl) {
-                (Some(a), Some(b)) => b.changed_scratch(a),
-                _ => 0,
-            }
+        let d_old = old.disjoint.len();
+        let d_new = self.disjoint.len();
+        let d = d_old.saturating_add(d_new);
+        let disj_phase = if d == 0 {
+            0
+        } else {
+            super::dl_clause::hash_table_bytes(d, std::mem::size_of::<(Vec<Ex>, u32)>())
+                .saturating_add(
+                    d.saturating_mul(std::mem::size_of::<Ex>() + std::mem::size_of::<u32>()),
+                )
+                .saturating_add(
+                    d_old
+                        .max(d_new)
+                        .saturating_mul(std::mem::size_of::<Vec<Ex>>()),
+                )
+        };
+        let scan_phase = old
+            .heads
+            .len()
+            .saturating_add(d.saturating_mul(2 * std::mem::size_of::<u32>()));
+        let dl_phase = old.heads.len().saturating_add(match (&old.dl, &self.dl) {
+            (Some(a), Some(b)) => b.changed_scratch(a),
+            _ => 0,
+        });
+        disj_phase.max(scan_phase).max(dl_phase)
     }
 
     /// The bytes the index takes, roughly, the role table included.
@@ -3031,8 +3088,8 @@ impl Index {
         told.sort_unstable();
         told.dedup();
         ix.told = group(&told, |h| &mut h.told, &mut ix.heads);
-        ix.conj = group(&b.conj, |h| &mut h.conj, &mut ix.heads);
-        ix.exist = group(&b.exist, |h| &mut h.exist, &mut ix.heads);
+        ix.conj = group_sorted(&b.conj, |h| &mut h.conj, &mut ix.heads);
+        ix.exist = group_sorted(&b.exist, |h| &mut h.exist, &mut ix.heads);
         ix.disjoint = group(&disj, |h| &mut h.disj, &mut ix.heads);
         ix.nominal_selfs = !b.selfs.is_empty() && !it.individuals.is_empty();
         ix.selfs = std::mem::take(&mut b.selfs);
