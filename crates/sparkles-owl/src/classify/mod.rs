@@ -2626,9 +2626,13 @@ impl Saturation {
             let missing =
                 check_chain_ranges(axioms, |i, _| is_outside[i], &chains, true, &mut scratch)?;
             #[cfg(test)]
-            admission_test::hit(admission_test::Point::BuildMissingConsumeStart {
-                peak: budget.peak(),
-            });
+            {
+                let (_, s) = budget.retained_storage();
+                admission_test::hit(admission_test::Point::BuildMissingConsumeStart {
+                    peak: budget.peak(),
+                    scratch: s,
+                });
+            }
             let mut chain_ranges_msg_bytes = 0usize;
             for (i, (&k, miss)) in chains.iter().zip(missing.iter()).enumerate() {
                 if i.is_multiple_of(RANGE_POLL_STEP) {
@@ -2713,6 +2717,7 @@ impl Saturation {
                     chain_ranges.push((k, msg));
                 } else {
                     let old_role_subs_cap = ax.role_subs.capacity();
+                    let old_chains_cap = ax.chains.capacity();
                     let old_chains_len = ax.chains.len();
                     if let Some(why) = index::normalize(k, &mut self.interner, &mut ax) {
                         if matches!(attempt, AttemptProvenance::OriginalDefault)
@@ -2728,8 +2733,16 @@ impl Saturation {
                         ax_bytes =
                             ax_bytes.saturating_add((new_role_subs_cap - old_role_subs_cap) * 8);
                     }
+                    let new_chains_cap = ax.chains.capacity();
+                    if new_chains_cap > old_chains_cap {
+                        ax_bytes = ax_bytes.saturating_add(
+                            (new_chains_cap - old_chains_cap)
+                                * std::mem::size_of::<(Vec<index::Role>, index::Role)>(),
+                        );
+                    }
                     for (c, _) in &ax.chains[old_chains_len..] {
-                        ax_bytes = ax_bytes.saturating_add(32 + c.capacity() * 4);
+                        ax_bytes = ax_bytes
+                            .saturating_add(c.capacity() * std::mem::size_of::<index::Role>());
                     }
                 }
                 chain_ranges_bytes =
@@ -9313,7 +9326,7 @@ mod tests {
         let consume_end_peak_h = consume_end_peak.clone();
         let (ax_miss, _, peak_miss, _) = admission_test::with_hook(
             move |pt| match pt {
-                admission_test::Point::BuildMissingConsumeStart { peak } => {
+                admission_test::Point::BuildMissingConsumeStart { peak, .. } => {
                     consume_start_peak_h.store(peak, Ordering::Relaxed);
                 }
                 admission_test::Point::BuildMissingConsumeEnd { peak } => {
@@ -10317,6 +10330,155 @@ mod tests {
             sample_wide_no.peak
         );
 
+        // 1c. Accepted two-role chains before a long missing-range diagnostic: 1,025 accepted
+        //     chains grow `ax.chains` to 2,048 outer slots, leaving 1,023 spare slots
+        //     (32,736 bytes on 64-bit). Pre-allocation admission must charge `ax.chains` by
+        //     capacity so a cap above the occupied-only estimate still refuses BEFORE
+        //     allocating the 96 KiB diagnostic string.
+        const ACCEPTED_CHAINS: usize = 1025;
+        let chains_diag_iri = format!("http://ex.org/{}", "d".repeat(96 * 1024));
+        let mut accepted_body = String::from(
+            "Prefix(:=<http://ex.org/>)\nOntology(\n\
+             SubObjectPropertyOf(:a :b)\n\
+             SubObjectPropertyOf(:b :c)\n",
+        );
+        accepted_body.push_str(&format!("ObjectPropertyRange(:s <{chains_diag_iri}>)\n"));
+        for _ in 0..ACCEPTED_CHAINS {
+            accepted_body.push_str("SubObjectPropertyOf(ObjectPropertyChain(:a :b) :c)\n");
+        }
+        let doc_accepted_no = crate::ofn_read::parse(&format!("{accepted_body})")).unwrap();
+        let doc_accepted_with = crate::ofn_read::parse(&format!(
+            "{accepted_body}SubObjectPropertyOf(ObjectPropertyChain(:a :b) :s)\n)"
+        ))
+        .unwrap();
+        let kinds_accepted_no: Vec<&AxiomKind> =
+            doc_accepted_no.axioms.iter().map(|a| &a.kind).collect();
+        let kinds_accepted_with: Vec<&AxiomKind> =
+            doc_accepted_with.axioms.iter().map(|a| &a.kind).collect();
+        let ((ax_accepted_no, _, _, _), sample_accepted_no) = a1_probe_alloc::measure(|| {
+            Saturation::new()
+                .build(
+                    &kinds_accepted_no,
+                    &[],
+                    1,
+                    0,
+                    0,
+                    &serial,
+                    AttemptProvenance::OriginalDefault,
+                )
+                .unwrap()
+        });
+        assert_eq!(ax_accepted_no.chains.len(), ACCEPTED_CHAINS);
+        let chain_cap = ax_accepted_no.chains.capacity();
+        assert!(
+            chain_cap > ACCEPTED_CHAINS,
+            "expected spare outer capacity after {ACCEPTED_CHAINS} accepted chains, got cap={chain_cap}"
+        );
+        let acc_scan_base = Arc::new(AtomicUsize::new(0));
+        let acc_scan_base_h = acc_scan_base.clone();
+        let acc_consume_peak = Arc::new(AtomicUsize::new(0));
+        let acc_consume_peak_h = acc_consume_peak.clone();
+        let acc_consume_scratch = Arc::new(AtomicUsize::new(0));
+        let acc_consume_scratch_h = acc_consume_scratch.clone();
+        let (_, _, acc_peak_with, _) = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::BuildRangeScanStart { base, .. } => {
+                    acc_scan_base_h.store(base, Ordering::Relaxed);
+                }
+                admission_test::Point::BuildMissingConsumeStart { peak, scratch } => {
+                    acc_consume_peak_h.store(peak, Ordering::Relaxed);
+                    acc_consume_scratch_h.store(scratch, Ordering::Relaxed);
+                }
+                _ => {}
+            },
+            || {
+                Saturation::new()
+                    .build(
+                        &kinds_accepted_with,
+                        &[],
+                        1,
+                        0,
+                        0,
+                        &serial,
+                        AttemptProvenance::OriginalDefault,
+                    )
+                    .unwrap()
+            },
+        );
+        let slot_bytes = std::mem::size_of::<(Vec<index::Role>, index::Role)>();
+        let inner_role_bytes = ACCEPTED_CHAINS * 2 * std::mem::size_of::<index::Role>();
+        let occupied_only_chain_bytes = ACCEPTED_CHAINS * slot_bytes + inner_role_bytes;
+        let full_chain_bytes = chain_cap * slot_bytes + inner_role_bytes;
+        let spare_chain_bytes = full_chain_bytes - occupied_only_chain_bytes;
+        // Place the cap midway through the spare-slot delta above the occupied-only
+        // estimate + diagnostic size: an occupied-only `ax_bytes` would admit and allocate
+        // the diagnostic, while capacity-based accounting refuses before allocation.
+        let acc_base = acc_scan_base.load(Ordering::Relaxed);
+        let acc_scratch = acc_consume_scratch.load(Ordering::Relaxed);
+        let acc_diag_cap = acc_base
+            + acc_scratch
+            + occupied_only_chain_bytes
+            + chains_diag_iri.len()
+            + spare_chain_bytes / 2;
+        assert!(
+            acc_diag_cap > acc_consume_peak.load(Ordering::Relaxed),
+            "cap ({acc_diag_cap}) must exceed scan peak ({}) so refusal happens in diagnostic admission",
+            acc_consume_peak.load(Ordering::Relaxed)
+        );
+        assert!(
+            acc_diag_cap > acc_base + acc_scratch + full_chain_bytes,
+            "cap ({acc_diag_cap}) must admit all {ACCEPTED_CHAINS} accepted chains before the diagnostic"
+        );
+        assert!(acc_diag_cap < acc_peak_with);
+        let acc_reached_consume = Arc::new(AtomicBool::new(false));
+        let acc_reached_consume_h = acc_reached_consume.clone();
+        let acc_allocated_diag = Arc::new(AtomicBool::new(false));
+        let acc_allocated_diag_h = acc_allocated_diag.clone();
+        let (acc_err, sample_accepted_refused) = a1_probe_alloc::measure(|| {
+            admission_test::with_hook(
+                move |pt| match pt {
+                    admission_test::Point::BuildMissingConsumeStart { .. } => {
+                        acc_reached_consume_h.store(true, Ordering::Relaxed);
+                    }
+                    admission_test::Point::BuildDiagnosticAllocated => {
+                        acc_allocated_diag_h.store(true, Ordering::Relaxed);
+                    }
+                    _ => {}
+                },
+                || {
+                    Saturation::new()
+                        .build(
+                            &kinds_accepted_with,
+                            &[],
+                            1,
+                            0,
+                            0,
+                            &Limits {
+                                max_memory: Some(acc_diag_cap),
+                                ..serial.clone()
+                            },
+                            AttemptProvenance::OriginalDefault,
+                        )
+                        .err()
+                },
+            )
+        });
+        assert!(
+            matches!(acc_err, Some(Error::Memory { .. })),
+            "expected Memory refusal with {ACCEPTED_CHAINS} accepted chains + 96 KiB diagnostic, got {acc_err:?}"
+        );
+        assert!(acc_reached_consume.load(Ordering::Relaxed));
+        assert!(
+            !acc_allocated_diag.load(Ordering::Relaxed),
+            "diagnostic string was allocated past cap because spare ax.chains slots were dropped"
+        );
+        assert!(
+            sample_accepted_refused.peak < sample_accepted_no.peak + 48 * 1024,
+            "accepted-chains refusal peak={} exceeded no-diagnostic peak={}",
+            sample_accepted_refused.peak,
+            sample_accepted_no.peak
+        );
+
         // 2. Live `chains` vector capacity must be included in the scan baseline AND released
         //    from `budget` immediately after `drop(chains)` before dl_norm/horn run.
         let mut body_chains =
@@ -10459,16 +10621,21 @@ mod tests {
             full_res.unwrap();
             assert!(full_len > 128 * 1024, "{label}: unexpected len {full_len}");
             assert!(
-                full_polls >= 120,
+                full_polls >= 240,
                 "{label}: expected chunked polling during prefix validation and write, saw {full_polls}"
             );
             // Cancel early inside `is_local_name_polled` (well before half the IRI).
-            let (cancel_res, _, cancel_polls) = run_count(Some(3));
+            let (cancel_res, cancel_len, cancel_polls) = run_count(Some(3));
             assert!(
                 matches!(cancel_res, Err(Error::Cancelled)),
                 "{label}: expected Cancelled, got {cancel_res:?}"
             );
             assert_eq!(cancel_polls, 3, "{label}: did not stop on poll 3");
+            assert_eq!(
+                cancel_len,
+                "the range ".len(),
+                "{label}: cancellation must fire inside is_local_name_polled before writing either the prefixed name or bracketed fallback"
+            );
         }
 
         // 2. Cancellation raised right when the pool grants the diagnostic allocation

@@ -45,6 +45,7 @@ pub(super) enum Point {
     },
     BuildMissingConsumeStart {
         peak: usize,
+        scratch: usize,
     },
     BuildDiagnosticAllocated,
     BuildMissingConsumeEnd {
