@@ -3892,23 +3892,31 @@ impl Ctx {
         self.begin_floor_mask_locked(&mut tables)
     }
 
-    /// Preview the floor mode and table that [`Ctx::begin_floor_mask`] will choose for the
-    /// next mask, including pending `Floors -> Direct` and `Direct -> Probe` transitions,
-    /// without mutating [`FloorCache`] state.
+    /// Whether the current floor table has enough low-hit lookups past its warmup budget
+    /// to enter direct bypass if table growth does not happen first.
+    fn low_hit_bypass_pending(tables: &FloorTables, cur: &FloorTable) -> bool {
+        let lookups = cur.lookups.load(Ordering::Relaxed);
+        if lookups < FLOOR_BYPASS_MIN_LOOKUPS {
+            return false;
+        }
+        let hits = cur.hits.load(Ordering::Relaxed);
+        let low_hit = hits.saturating_mul(FLOOR_BYPASS_HIT_DENOM) < lookups;
+        low_hit && tables.warmup_lookups <= lookups
+    }
+
+    /// Preview the floor mode and table used to validate the next mask's sample without
+    /// mutating [`FloorCache`] state. Whenever a low-hit bypass can take effect, including
+    /// when table growth is also pending and could still be declined after sample decoding
+    /// enlarges the decode envelope, this selects [`FloorMaskPlan::Direct`] so sample
+    /// validation compares keys directly and never triggers a speculative floor-only
+    /// predecessor decode before [`Ctx::begin_floor_mask`] commits the mode.
     pub(super) fn peek_floor_plan(&self) -> FloorMaskPlan {
         let tables = self.floors.tables.lock();
         if !tables.bypass {
             if let Some(cur) = &tables.cur
-                && !self.can_grow_floor_table(&tables)
+                && Self::low_hit_bypass_pending(&tables, cur)
             {
-                let lookups = cur.lookups.load(Ordering::Relaxed);
-                let hits = cur.hits.load(Ordering::Relaxed);
-                if lookups >= FLOOR_BYPASS_MIN_LOOKUPS {
-                    let low_hit = hits.saturating_mul(FLOOR_BYPASS_HIT_DENOM) < lookups;
-                    if low_hit && tables.warmup_lookups <= lookups {
-                        return FloorMaskPlan::Direct;
-                    }
-                }
+                return FloorMaskPlan::Direct;
             }
             return FloorMaskPlan::Floors(tables.cur.clone());
         }
@@ -4012,33 +4020,6 @@ impl Ctx {
             return None;
         }
         Some(wanted.min(room))
-    }
-
-    fn can_grow_floor_table(&self, tables: &FloorTables) -> bool {
-        let Some(cur) = &tables.cur else {
-            return false;
-        };
-        if tables.full || cur.evicted.load(Ordering::Relaxed) < cur.len() / FLOOR_TABLE_EVICTIONS {
-            return false;
-        }
-        let cap = FloorCache::cap(self.mem_limit);
-        let Some(slots) =
-            self.clamped_floor_slots(cur.len().saturating_mul(FLOOR_TABLE_GROWTH), cap)
-        else {
-            return false;
-        };
-        if slots <= cur.len() {
-            return false;
-        }
-        let cache = &self.floors;
-        let step = self.reservation_step();
-        let base_used = cache.used.load(Ordering::Acquire);
-        let reserved = cache.charge.reserved();
-        let bytes = FloorTable::bytes(slots);
-        let used = base_used.saturating_add(bytes);
-        let ahead = used.next_multiple_of(step).min(cap).max(used);
-        let delta = ahead.saturating_sub(reserved);
-        used <= cap && (delta == 0 || delta <= self.memory_room() / 2)
     }
 
     fn maybe_grow_floor_table(&self, tables: &mut FloorTables) -> bool {

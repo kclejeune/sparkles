@@ -6433,7 +6433,7 @@ fn string_order_mask(
     // The sample's rows keep the order their floors or direct comparisons give, so that
     // no row is looked up twice, which would mark floors as read again without a repeat
     // and grow the cache for strings that do not recur.
-    let (sample_keep, plan) = if ctx.floor_cache_needs_init() {
+    let (sample_keep, plan, start) = if ctx.floor_cache_needs_init() {
         let Some(probed) = probe_initial_floor_sample(ctx, xs, ys, sample, order)? else {
             return Ok(None);
         };
@@ -6446,7 +6446,7 @@ fn string_order_mask(
                 floors.record_floor(ys[i], fb, b_new);
             }
         }
-        (probed.keep, plan)
+        (probed.keep, plan, sample)
     } else {
         if !ctx.may_be_base_literal(ys[0]) {
             // Check `xs[0]` first so a refused floor decode still reports its failure,
@@ -6529,17 +6529,29 @@ fn string_order_mask(
             return Ok(None);
         }
         let plan = ctx.begin_floor_mask();
-        if has_floors && let FloorMaskPlan::Floors(ref table) = plan {
-            let mut floors = ctx.floor_map_borrowed(table.as_deref(), first_triple);
-            for (i, &(fa, fb, a_new, b_new)) in sample_rows[..sample].iter().enumerate() {
-                floors.record_floor(xs[i], fa, a_new);
-                floors.record_floor(ys[i], fb, b_new);
+        let start = if has_floors {
+            if let FloorMaskPlan::Floors(ref table) = plan {
+                let mut floors = ctx.floor_map_borrowed(table.as_deref(), first_triple);
+                for (i, &(fa, fb, a_new, b_new)) in sample_rows[..sample].iter().enumerate() {
+                    floors.record_floor(xs[i], fa, a_new);
+                    floors.record_floor(ys[i], fb, b_new);
+                }
             }
-        }
-        (sample_keep, plan)
+            sample
+        } else if matches!(plan, FloorMaskPlan::Floors(_)) {
+            // The sample validated directly because low-hit bypass was pending, while
+            // `begin_floor_mask` grew the table and committed `Floors`. Run the committed
+            // floor pass from row 0 so the sampled rows are cached and counted once.
+            0
+        } else {
+            sample
+        };
+        (sample_keep, plan, start)
     };
     let mut keep = vec![false; n];
-    keep[..sample].copy_from_slice(&sample_keep[..sample]);
+    if start > 0 {
+        keep[..start].copy_from_slice(&sample_keep[..start]);
+    }
     let threads = rayon::current_num_threads().max(1);
     let map = t.var_map(ctx.nvars());
     let generic = |i: usize| {
@@ -6606,8 +6618,8 @@ fn string_order_mask(
                 let table_ref = table.as_deref();
                 fill_batch_with(
                     ctx,
-                    &mut keep[sample..],
-                    sample,
+                    &mut keep[start..],
+                    start,
                     || ctx.floor_map_borrowed(table_ref, first_triple),
                     order_of,
                 )?;
@@ -6615,8 +6627,8 @@ fn string_order_mask(
             FloorMaskPlan::Direct => {
                 fill_batch_with(
                     ctx,
-                    &mut keep[sample..],
-                    sample,
+                    &mut keep[start..],
+                    start,
                     FloorScratch::default,
                     direct_of,
                 )?;
@@ -6628,9 +6640,9 @@ fn string_order_mask(
         // can grow, bypass low-hit-rate parts, and probe periodically between parts as it
         // does between a cursor's batches.
         let mut plan = plan;
-        let mut lo = sample;
+        let mut lo = start;
         while lo < n {
-            if lo > sample {
+            if lo > start {
                 plan = ctx.begin_floor_mask();
             }
             let hi = n.min(lo + lo.max(PAR_THRESHOLD));
@@ -14591,5 +14603,254 @@ mod string_order_tests {
             );
             assert!(ctx.check().is_ok());
         }
+    }
+
+    /// When both floor-table growth (1,024 -> 8,192 slots) and low-hit bypass are pending,
+    /// sample decoding can enlarge the cursor decode envelope and shrink remaining room
+    /// below the half-room growth threshold. Sample validation must compare keys directly
+    /// so a later sampled block-start literal with an oversized predecessor does not poison
+    /// a mask that commits `Direct`, while still growing and counting the sample when room
+    /// stays above the threshold.
+    #[test]
+    fn pending_growth_and_bypass_sample_crossing_half_room_switches_to_direct() {
+        use super::super::ctx::FLOOR_TABLE_FEWEST;
+        use super::super::expr::CmpOp;
+        use crate::builder::{BuildOptions, VocabCodec};
+        use oxrdf::Literal;
+
+        let mut nt = String::new();
+        // IDs 0..=14: 15 short simple literals sorting before "m".
+        let mut a_terms = Vec::with_capacity(15);
+        for i in 0..15usize {
+            let term: oxrdf::Term = Literal::new_simple_literal(format!("a{i:02}")).into();
+            nt.push_str(&format!("<urn:s> <urn:p> {term} .\n"));
+            a_terms.push(term);
+        }
+        // ID 15: a 1 MiB extension of "m" (`"mxxx...\xFF"` sorts immediately before `"m\xFF"`).
+        let huge_term: oxrdf::Term =
+            Literal::new_simple_literal(format!("m{}", "x".repeat(1 << 20))).into();
+        nt.push_str(&format!("<urn:s> <urn:p> {huge_term} .\n"));
+        // ID 16: short simple literal "m" at block start (`16 % FC_BLOCK == 0`).
+        let m_term: oxrdf::Term = Literal::new_simple_literal("m").into();
+        nt.push_str(&format!("<urn:s> <urn:p> {m_term} .\n"));
+        // 64 short simple literals sorting after "m" so Batch 1 marks >= 64 read-again slots
+        // in the 1,024-slot table (well above the 1,024 / 32 = 32 eviction threshold).
+        let mut n_terms = Vec::with_capacity(64);
+        for i in 0..64usize {
+            let term: oxrdf::Term = Literal::new_simple_literal(format!("n{i:02}")).into();
+            nt.push_str(&format!("<urn:s> <urn:p> {term} .\n"));
+            n_terms.push(term);
+        }
+        // An uncached 1 KiB simple literal with no extension.
+        let medium_term: oxrdf::Term =
+            Literal::new_simple_literal(format!("y{}", "q".repeat(1023))).into();
+        nt.push_str(&format!("<urn:s> <urn:p> {medium_term} .\n"));
+        // Cheap distinct simple literals sorting after "y..." to drive low-hit evictions.
+        let distinct_count = 3 * STRING_ORDER_ROWS;
+        for i in 0..distinct_count {
+            nt.push_str(&format!("<urn:s> <urn:p> \"z{i:06}\" .\n"));
+        }
+
+        let s = Store::in_memory(StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Front),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.generation.vocab_codec(), VocabCodec::Front);
+        let a_ids: Vec<Id> = a_terms
+            .iter()
+            .map(|t| snap.lookup_term(t).unwrap())
+            .collect();
+        let huge_id = snap.lookup_term(&huge_term).unwrap();
+        let m_id = snap.lookup_term(&m_term).unwrap();
+        let n_ids: Vec<Id> = n_terms
+            .iter()
+            .map(|t| snap.lookup_term(t).unwrap())
+            .collect();
+        let medium_id = snap.lookup_term(&medium_term).unwrap();
+        assert_eq!(huge_id.payload(), 15);
+        assert_eq!(m_id.payload(), 16);
+        assert!((m_id.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+        let z_ids: Vec<Id> = (0..distinct_count)
+            .map(|i| {
+                snap.lookup_term(&Literal::new_simple_literal(format!("z{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        drop(snap);
+
+        // Sanity check: computing `m`'s floor under a 4 MiB cursor budget fails because
+        // decoding its 1 MiB predecessor at ID 15 exceeds the decoding envelope.
+        {
+            let mut probe_ctx = Ctx::new(s.snapshot());
+            probe_ctx.mem_limit = 4 << 20;
+            probe_ctx.enable_cursor_accounting().unwrap();
+            assert_eq!(probe_ctx.string_floor(m_id), None);
+            assert!(
+                matches!(
+                    probe_ctx.check(),
+                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                ),
+                "computing m's floor must fail when decoding ID 15 under 4 MiB cursor budget"
+            );
+        }
+
+        // Run in a single-thread pool so `decode_workers()` stays deterministic across hosts
+        // and the 1 KiB sample literal always enlarges the decode envelope past the 128 KiB
+        // (2 * 64 KiB step) growth threshold.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            // (a) Sample decoding enlarges the decode envelope across the half-room threshold,
+            // so table growth (1,024 -> 8,192) is declined and the mask must commit `Direct`
+            // without decoding `m`'s 1 MiB predecessor.
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 4 << 20;
+                ctx.enable_cursor_accounting().unwrap();
+                ctx.floor_cache().set_first_slots(FLOOR_TABLE_FEWEST);
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let e = cmp(x, y, CmpOp::Gt);
+
+                // Batch 1: install a 1,024-slot table and mark 64 distinct slots as read-again.
+                let mut warm = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    warm.push_row(&[n_ids[i % n_ids.len()], n_ids[(i + 7) % n_ids.len()]]);
+                }
+                string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("warm mask applies");
+                assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+                assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+                // Batch 2: 2 * STRING_ORDER_ROWS distinct cheap literals wrap the 1,024-slot
+                // table multiple times, evicting all 64 read-again slots (>= 32 growth threshold)
+                // while producing 0% hits across 8,192 lookups (>= 2,048 bypass threshold).
+                let mut low_hit = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    low_hit.push_row(&[z_ids[2 * i], z_ids[2 * i + 1]]);
+                }
+                string_order_mask(&ctx, &low_hit, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("low-hit mask applies");
+                assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+                assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+                // Leave 132 KiB of room: next reservation step for 8,192 slots is 64 KiB,
+                // which initially fits `room / 2` (66 KiB).
+                let initial_room = 132 << 10;
+                let _hold = ctx.charge(ctx.memory_room() - initial_room).unwrap();
+                assert_eq!(ctx.memory_room(), initial_room);
+
+                // Batch 3: row 0 decodes the uncached 1 KiB literal, shrinking remaining room
+                // below 128 KiB; subsequent sampled pairs compare `m_id` (1 MiB predecessor).
+                let mut transition = Table::new(vec![x, y]);
+                transition.push_row(&[medium_id, a_ids[0]]);
+                for i in 1..STRING_ORDER_ROWS {
+                    let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+                    transition.push_row(&[m_id, rhs]);
+                }
+                let mask = string_order_mask(&ctx, &transition, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("transition mask applies on Direct");
+                let generic =
+                    evaluate_mask(&ctx, &transition, std::slice::from_ref(&e), None).unwrap();
+                assert_eq!(mask, generic);
+                assert!(
+                    ctx.memory_room() < (128 << 10),
+                    "sample decode must shrink room below 2 * 64 KiB step: room={}",
+                    ctx.memory_room()
+                );
+                assert_eq!(
+                    ctx.floor_cache().slots(),
+                    FLOOR_TABLE_FEWEST,
+                    "growth to 8,192 slots must be declined once room drops below 128 KiB"
+                );
+                assert_eq!(
+                    ctx.floor_cache().bypassed(),
+                    1,
+                    "mask must transition cleanly to Direct without sticky memory failure"
+                );
+                assert!(ctx.check().is_ok());
+            }
+
+            // (b) When room stays above the half-room threshold, growth (1,024 -> 8,192) still
+            // commits `Floors` and the 64 sampled rows count toward the grown table's feedback.
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 4 << 20;
+                ctx.enable_cursor_accounting().unwrap();
+                ctx.floor_cache().set_first_slots(FLOOR_TABLE_FEWEST);
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let e = cmp(x, y, CmpOp::Gt);
+
+                let mut warm = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    warm.push_row(&[n_ids[i % n_ids.len()], n_ids[(i + 7) % n_ids.len()]]);
+                }
+                string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("warm mask applies");
+
+                let mut low_hit = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    low_hit.push_row(&[z_ids[2 * i], z_ids[2 * i + 1]]);
+                }
+                string_order_mask(&ctx, &low_hit, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("low-hit mask applies");
+
+                // Hold 132 KiB of room; cheap short literals do not enlarge the envelope, so
+                // `begin_floor_mask` grows to 8,192 slots. Put 1,024 distinct base-literal rows
+                // (64 sampled + 960 tail = 2,048 lookups) followed by non-base rows so bypass on
+                // the next mask proves the 64 sampled rows were counted on the grown table.
+                let initial_room = 132 << 10;
+                let _hold = ctx.charge(ctx.memory_room() - initial_room).unwrap();
+                let non_base_a = Id::from_i64(1).unwrap();
+                let non_base_b = Id::from_i64(2).unwrap();
+                let mut grown = Table::new(vec![x, y]);
+                for i in 0..1_024usize {
+                    let base = 2 * STRING_ORDER_ROWS + 2 * i;
+                    grown.push_row(&[z_ids[base], z_ids[base + 1]]);
+                }
+                for _ in 1_024..STRING_ORDER_ROWS {
+                    grown.push_row(&[non_base_a, non_base_b]);
+                }
+                let mask = string_order_mask(&ctx, &grown, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("grown mask applies on Floors");
+                let generic = evaluate_mask(&ctx, &grown, std::slice::from_ref(&e), None).unwrap();
+                assert_eq!(mask, generic);
+                assert_eq!(
+                    ctx.floor_cache().slots(),
+                    FLOOR_TABLE_FEWEST * 8,
+                    "table must grow to 8,192 slots when room stays sufficient"
+                );
+                assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+                // The next mask must enter Direct, proving all 64 sampled rows counted toward
+                // the 2,048-lookup threshold on the newly grown 8,192-slot table.
+                string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("next mask applies");
+                assert_eq!(
+                    ctx.floor_cache().bypassed(),
+                    1,
+                    "64 sampled rows + 960 tail rows on grown table must reach 2,048 lookups"
+                );
+                assert!(ctx.check().is_ok());
+            }
+        });
     }
 }
