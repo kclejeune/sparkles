@@ -3565,12 +3565,11 @@ impl Ctx {
                     TermKind::Literal
                 }
             }
-            Tag::Delta if id.payload() < self.snap.dvocab_len => self
+            Tag::Delta => self
                 .snap
                 .generation
                 .dvocab
                 .with(|d| d.get(id.payload()).map_or(TermKind::None, key_kind)),
-            Tag::Delta => TermKind::None,
             Tag::Local => self
                 .local
                 .read()

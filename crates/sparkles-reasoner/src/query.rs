@@ -76,7 +76,11 @@ struct Shared {
 
 /// A rule program of the IR over a session's terms.
 pub(crate) type ProgramSource = Arc<
-    dyn Fn(&Terms, &mut WorkingWarnings) -> anyhow::Result<crate::engine::frontend::ProgramInfo>
+    dyn Fn(
+            &Terms,
+            &mut WorkingWarnings,
+            &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<crate::engine::frontend::ProgramInfo>
         + Send
         + Sync,
 >;
@@ -105,9 +109,13 @@ impl QueryReasoner {
         crate::parser::check_program_includes(&rules)?;
         let program: Option<ProgramSource> = crate::parser::uses_program(&rules).then(|| {
             let parsed = Arc::new(rules.clone());
-            let source: ProgramSource = Arc::new(move |t: &Terms, w: &mut WorkingWarnings| {
-                crate::engine::frontend::compile(&parsed, t, w, true)
-            });
+            let source: ProgramSource = Arc::new(
+                move |t: &Terms,
+                      w: &mut WorkingWarnings,
+                      check: &mut dyn FnMut() -> anyhow::Result<()>| {
+                    crate::engine::frontend::compile_controlled(&parsed, t, w, true, check)
+                },
+            );
             source
         });
         Ok(QueryReasoner {
@@ -614,6 +622,22 @@ enum Compiled {
     },
 }
 
+fn session_check(
+    stop: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
+) -> impl FnMut() -> anyhow::Result<()> + '_ {
+    move || stop().map_err(anyhow::Error::new)
+}
+
+fn session_compile_error(e: anyhow::Error, what: &str) -> Error {
+    if let Some(m) = BudgetFailure::from_anyhow(&e) {
+        return memory_error(m, what);
+    }
+    match e.downcast::<Error>() {
+        Ok(core) => core,
+        Err(e) => component(RULES_CODE, format!("{e:#}")),
+    }
+}
+
 /// The lowered rules of the program that `source` makes over `terms`, in stratum order.
 /// Demand stages every negation in a stage of its own below its rule (see
 /// [`demand::transform`]), so the strata's boundaries are not kept.
@@ -622,12 +646,13 @@ fn program_rules(
     terms: &Terms,
     budget: &Arc<Budget>,
     warnings: &mut WorkingWarnings,
+    stop: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
 ) -> Result<Compiled> {
-    let failed = |e: anyhow::Error| match BudgetFailure::from_anyhow(&e) {
-        Some(m) => memory_error(m, "the rule program"),
-        None => component(RULES_CODE, format!("{e:#}")),
-    };
-    let program = Box::new(source(terms, warnings).map_err(failed)?);
+    let mut check = session_check(stop);
+    let program = Box::new(
+        source(terms, warnings, &mut check)
+            .map_err(|e| session_compile_error(e, "the rule program"))?,
+    );
     let mut lowered = program.program.lower(budget).map_err(|e| match e {
         crate::ir::lower::LowerError::Memory(m) => memory_error(m, "the rule program"),
         e => component(RULES_CODE, e.to_string()),
@@ -784,16 +809,22 @@ impl Session {
         let t0 = std::time::Instant::now();
         let snap = req.snap;
         let budget = Budget::new(req.max_memory.map(|m| m.min(usize::MAX as u64) as usize));
-        let terms =
-            Terms::new_in(snap.clone(), &budget).map_err(|e| memory_error(e, "the rules"))?;
+        let terms = Terms::new_in_controlled(snap.clone(), &budget, session_check(&req.stop))
+            .map_err(|e| session_compile_error(e, "the rules"))?;
         let mut warnings = WorkingWarnings::try_clone_from(&shared.warnings, &budget)
             .map_err(|e| memory_error(e, "the rule warnings"))?;
         let compiled = match &shared.program {
             None => Compiled::Profile(
-                engine::compile_info(&shared.rules, &terms, &mut warnings, true)
-                    .map_err(|e| memory_error(e, "the compiled rules"))?,
+                engine::compile_info_controlled(
+                    &shared.rules,
+                    &terms,
+                    &mut warnings,
+                    true,
+                    &mut session_check(&req.stop),
+                )
+                .map_err(|e| session_compile_error(e, "the compiled rules"))?,
             ),
-            Some(source) => program_rules(source, &terms, &budget, &mut warnings)?,
+            Some(source) => program_rules(source, &terms, &budget, &mut warnings, &req.stop)?,
         };
         let closures = (!shared.closures).then_some(false);
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
@@ -904,8 +935,8 @@ impl Session {
 
     fn id_of(&self, t: &Term) -> Result<u64> {
         self.terms
-            .try_id_for(t)
-            .map_err(|e| memory_error(e, "pattern constants"))
+            .try_id_for_controlled(t, session_check(&self.stop))
+            .map_err(|e| session_compile_error(e, "pattern constants"))
     }
 
     /// The table cache's key of demand `d` with `seeds` (sorted), when it may be cached.
@@ -1252,8 +1283,8 @@ impl Session {
         for (old, key) in keys {
             let new = self
                 .terms
-                .try_id_for_key(key)
-                .map_err(|e| memory_error(e, "the equality stages"))?;
+                .try_id_for_key_controlled(key, session_check(&self.stop))
+                .map_err(|e| session_compile_error(e, "the equality stages"))?;
             map.insert(*old, new);
         }
         Ok((map, held))
@@ -1278,7 +1309,8 @@ impl Session {
     ) -> Result<usize> {
         // the bytes the session's rules hold charged while they live
         let mut w = WorkingWarnings::new(budget);
-        program_rules(source, terms, budget, &mut w).map(|_compiled| budget.used())
+        let stop: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(|| Ok(()));
+        program_rules(source, terms, budget, &mut w, &stop).map(|_compiled| budget.used())
     }
 
     fn equality_table(&self) -> Option<(Table, Held)> {
@@ -2043,8 +2075,8 @@ impl Session {
         for (old, key) in &t.keys {
             let new = self
                 .terms
-                .try_id_for_key(key)
-                .map_err(|e| memory_error(e, "a cached table"))?;
+                .try_id_for_key_controlled(key, session_check(&self.stop))
+                .map_err(|e| session_compile_error(e, "a cached table"))?;
             map.insert(*old, new);
         }
         Ok(t.facts()
@@ -2113,8 +2145,8 @@ impl Session {
         for (old, key) in &t.keys {
             let new = self
                 .terms
-                .try_id_for_key(key)
-                .map_err(|e| memory_error(e, "a cached table"))?;
+                .try_id_for_key_controlled(key, session_check(&self.stop))
+                .map_err(|e| session_compile_error(e, "a cached table"))?;
             map.insert(*old, new);
             if Id(new).tag() == Tag::Local && self.locals_sent.insert(new) {
                 out.locals.push((new, OutTerm::Key(key.clone())));

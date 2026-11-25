@@ -616,6 +616,22 @@ fn geo_ids(terms: &Terms) -> Result<(u64, u64), budget::BudgetFailure> {
     Ok((iri("hasGeometry")?, iri("hasDefaultGeometry")?))
 }
 
+/// Controlled [`geo_ids`], admitting vocabulary lookup scratch and polling live controls.
+pub(crate) fn geo_ids_controlled(
+    terms: &Terms,
+    mut check: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<(u64, u64)> {
+    let has = terms.try_id_for_controlled(
+        &Term::NamedNode(NamedNode::new_unchecked(format!("{GEO}hasGeometry"))),
+        &mut check,
+    )?;
+    let default = terms.try_id_for_controlled(
+        &Term::NamedNode(NamedNode::new_unchecked(format!("{GEO}hasDefaultGeometry"))),
+        &mut check,
+    )?;
+    Ok((has, default))
+}
+
 /// Room in `held` for one more key of a table of capacity `cap` with `len` keys of
 /// `elem` bytes (with their values): the table it grows to is charged while the old one
 /// is still charged.
@@ -681,7 +697,7 @@ fn default_geometries_controlled(
     mut check: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<(Vec<[u64; 3]>, Held)> {
     check()?;
-    let (has, default) = geo_ids(terms)?;
+    let (has, default) = geo_ids_controlled(terms, &mut check)?;
     let mut held = Held::new(budget);
     let mut refused = None;
     let mut stopped = None;

@@ -1085,13 +1085,19 @@ fn why_not_inner(
     if session.graph().is_some_and(|g| g.contains(&root)) {
         return Ok(WhyNot::Entailed);
     }
-    let rdf_type = terms.id_for(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()))?;
-    let same_as = terms.id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(
-        "http://www.w3.org/2002/07/owl#sameAs",
-    )))?;
+    let rdf_type = terms.try_id_for_controlled(
+        &Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()),
+        || check_controls(&opts.explain),
+    )?;
+    let same_as = terms.try_id_for_controlled(
+        &Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+            "http://www.w3.org/2002/07/owl#sameAs",
+        )),
+        || check_controls(&opts.explain),
+    )?;
     let geo = session
         .geo_default()
-        .then(|| crate::geo_ids(session.terms()))
+        .then(|| crate::geo_ids_controlled(session.terms(), || check_controls(&opts.explain)))
         .transpose()?;
     let mut u = Unfold {
         geo,
@@ -1286,7 +1292,7 @@ fn add_hypothesis(
     if !session.geo_default() {
         return session.add_facts(facts.to_vec()).map_err(session_error);
     }
-    let (has, default) = crate::geo_ids(session.terms())?;
+    let (has, default) = crate::geo_ids_controlled(session.terms(), || check_controls(opts))?;
     let base = session
         .graph()
         .and_then(Graph::base_arc)

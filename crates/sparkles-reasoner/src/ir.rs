@@ -351,6 +351,21 @@ impl Vocab {
             rdf_rest: terms.rdf_rest,
         }
     }
+
+    pub(crate) fn try_of_controlled(
+        terms: &Terms,
+        check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Vocab> {
+        let rdf_type = terms.try_id_for_controlled(
+            &oxrdf::Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()),
+            check,
+        )?;
+        Ok(Vocab {
+            rdf_type: Some(rdf_type),
+            rdf_first: terms.rdf_first,
+            rdf_rest: terms.rdf_rest,
+        })
+    }
 }
 
 /// A variable of a rule, by its name when the frontend gave one.

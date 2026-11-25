@@ -4,8 +4,8 @@
 
 use super::Slot;
 use super::{
-    BuiltinOut, CompileFailure, FlatRule, compile_builtin, compile_credit, compile_one,
-    compiler_label, flatten, unsupported,
+    BuiltinOut, CompileFailure, ConstantMode, FlatRule, compile_builtin, compile_credit,
+    compile_one, compiler_label, flatten, rule_slot, unsupported,
 };
 use crate::budget::{Budget, BudgetFailure, Held, WorkingWarnings};
 use crate::builtins::HeadAction;
@@ -52,36 +52,75 @@ pub(crate) fn compile(
     warnings: &mut WorkingWarnings,
     backward: bool,
 ) -> anyhow::Result<ProgramInfo> {
+    compile_with(rules, terms, warnings, backward, ConstantMode::Uncontrolled)
+}
+
+/// [`compile`], admitting vocabulary reconstruction scratch on constant lookups
+/// against the term table's budget and polling live controls.
+pub(crate) fn compile_controlled(
+    rules: &[Rule],
+    terms: &Terms,
+    warnings: &mut WorkingWarnings,
+    backward: bool,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<ProgramInfo> {
+    compile_with(
+        rules,
+        terms,
+        warnings,
+        backward,
+        ConstantMode::Controlled(check),
+    )
+}
+
+fn compile_with(
+    rules: &[Rule],
+    terms: &Terms,
+    warnings: &mut WorkingWarnings,
+    backward: bool,
+    mut mode: ConstantMode<'_>,
+) -> anyhow::Result<ProgramInfo> {
+    mode.poll_anyhow()?;
     crate::parser::check_program_includes(rules)?;
     let budget = terms.budget();
-    let (bytes, emitted) = compile_credit::prewalk(rules, backward)?;
-    let mut working = Held::try_new_exact(&budget, bytes)?;
+    let (bytes, emitted) =
+        compile_credit::prewalk(rules, backward).map_err(|e| mode.fail_memory_anyhow(e))?;
+    let mut working =
+        Held::try_new_exact(&budget, bytes).map_err(|e| mode.fail_memory_anyhow(e))?;
     let mut flat = Vec::with_capacity(emitted);
     for (parsed, r) in rules.iter().enumerate() {
+        mode.poll_anyhow()?;
         if r.direction == Direction::Backward && !backward {
-            warnings.push_fmt(format_args!(
-                "rule '{}' (line {}): backward rules ('<-') are not supported by forward materialization; skipped",
-                compiler_label(r)?,
-                r.line
-            ))?;
+            let label = compiler_label(r).map_err(|e| mode.fail_memory_anyhow(e))?;
+            warnings
+                .push_fmt(format_args!(
+                    "rule '{label}' (line {}): backward rules ('<-') are not supported by forward materialization; skipped",
+                    r.line
+                ))
+                .map_err(|e| mode.fail_memory_anyhow(e))?;
             continue;
         }
         if r.body.iter().any(|c| matches!(c, Clause::Rule(_))) {
-            warnings.push_fmt(format_args!(
-                "rule '{}': nested rule in a body; skipped",
-                compiler_label(r)?
-            ))?;
+            let label = compiler_label(r).map_err(|e| mode.fail_memory_anyhow(e))?;
+            warnings
+                .push_fmt(format_args!(
+                    "rule '{label}': nested rule in a body; skipped"
+                ))
+                .map_err(|e| mode.fail_memory_anyhow(e))?;
             continue;
         }
-        flatten(r, &[], compiler_label(r)?, (r.line, parsed), &mut flat);
+        let label = compiler_label(r).map_err(|e| mode.fail_memory_anyhow(e))?;
+        flatten(r, &[], label, (r.line, parsed), &mut flat);
     }
     // the IR rules are larger than the compiled rules the prewalk counts: each literal or
     // head holds an atom with its arguments, each rule its names, and the catalog the
     // relations' names, all charged before any of them is made
     let mut ir_bytes = 0usize;
     for f in &flat {
-        let body = compile_credit::Shape::clauses(f.body.iter().copied())?;
-        let head = compile_credit::Shape::clauses(f.head.iter().copied())?;
+        let body = compile_credit::Shape::clauses(f.body.iter().copied())
+            .map_err(|e| mode.fail_memory_anyhow(e))?;
+        let head = compile_credit::Shape::clauses(f.head.iter().copied())
+            .map_err(|e| mode.fail_memory_anyhow(e))?;
         let clauses = body.clauses.saturating_add(head.clauses);
         ir_bytes =
             ir_bytes
@@ -113,7 +152,9 @@ pub(crate) fn compile(
             ir_bytes = ir_bytes.saturating_add(2 * a.name.len() + 64);
         }
     }
-    working.try_grow(ir_bytes)?;
+    working
+        .try_grow(ir_bytes)
+        .map_err(|e| mode.fail_memory_anyhow(e))?;
     // the relations, in the order the rules first name them, with the parser's arities
     let mut relations = Relations::default();
     let mut ids: FxHashMap<&str, ir::RelId> = FxHashMap::default();
@@ -140,15 +181,16 @@ pub(crate) fn compile(
     let mut includes: Vec<Option<Box<str>>> = Vec::with_capacity(flat.len());
     let mut occurrence = 0usize;
     for f in &flat {
+        mode.poll_anyhow()?;
         let ir_rule = f
             .body
             .iter()
             .chain(&f.head)
             .any(|c| matches!(c, Clause::Relation(_) | Clause::Not(_)));
         let compiled = if ir_rule {
-            compile_ir_one(f, terms, warnings, &budget, &ids)
+            compile_ir_one(f, terms, warnings, &budget, &ids, &mut mode)
         } else {
-            compile_one(f, terms, warnings, &budget).map(|r| {
+            compile_one(f, terms, warnings, &budget, &mut mode).map(|r| {
                 r.map(|(c, info)| {
                     let mut rule = ir::Rule::from_crule(&c);
                     rule.vars = info.vars;
@@ -162,7 +204,9 @@ pub(crate) fn compile(
                     if let Literal::Builtin(b) = l {
                         b.origin = Some(occurrence);
                         occurrence = occurrence.checked_add(1).ok_or_else(|| {
-                            BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow)
+                            mode.fail_memory_anyhow(BudgetFailure::parent(
+                                sparkles_budget::ParentRefused::Overflow,
+                            ))
                         })?;
                     }
                 }
@@ -175,23 +219,30 @@ pub(crate) fn compile(
                 let pushed = warnings.push_fmt(format_args!("rule '{}': {msg}; skipped", f.name));
                 drop(msg);
                 drop(held);
-                pushed?
+                pushed.map_err(|e| mode.fail_memory_anyhow(e))?
             }
-            Err(CompileFailure::Memory(error)) => return Err(error.into()),
+            Err(CompileFailure::Memory(error)) => return Err(mode.fail_memory_anyhow(error)),
+            Err(CompileFailure::Control(error)) => return Err(error),
         }
     }
     drop(flat);
     drop(working);
     let mut held = Held::new(&budget);
-    held.try_grow(lines.capacity() * size_of::<(usize, usize)>())?;
+    held.try_grow(lines.capacity() * size_of::<(usize, usize)>())
+        .map_err(|e| mode.fail_memory_anyhow(e))?;
     working = held;
-    let mut program =
-        ir::Program::new(relations, out, &ir::Vocab::of(terms), &budget).map_err(|e| match e {
-            ir::ProgramError::Memory(m) => anyhow::Error::from(m),
-            e => anyhow::anyhow!("{e}"),
-        })?;
+    let vocab = match &mut mode {
+        ConstantMode::Uncontrolled => ir::Vocab::of(terms),
+        ConstantMode::Controlled(check) => ir::Vocab::try_of_controlled(terms, check)?,
+    };
+    let mut program = ir::Program::new(relations, out, &vocab, &budget).map_err(|e| match e {
+        ir::ProgramError::Memory(m) => mode.fail_memory_anyhow(m),
+        e => anyhow::anyhow!("{e}"),
+    })?;
     if includes.iter().any(Option::is_some) {
-        program.set_includes(includes)?;
+        program
+            .set_includes(includes)
+            .map_err(|e| mode.fail_memory_anyhow(e))?;
     }
     Ok(ProgramInfo {
         program,
@@ -209,6 +260,7 @@ fn compile_ir_one<'a>(
     warnings: &mut WorkingWarnings,
     budget: &Arc<Budget>,
     ids: &FxHashMap<&str, ir::RelId>,
+    mode: &mut ConstantMode<'_>,
 ) -> Result<Option<ir::Rule>, CompileFailure> {
     let body_shape = compile_credit::Shape::clauses(f.body.iter().copied())?;
     let head_shape = compile_credit::Shape::clauses(f.head.iter().copied())?;
@@ -218,36 +270,21 @@ fn compile_ir_one<'a>(
         let n = vars.len();
         *vars.entry(v).or_insert(n)
     };
-    let slot =
-        |n: &'a Node, var: &mut dyn FnMut(&'a str) -> usize| -> Result<Slot, CompileFailure> {
-            Ok(match n {
-                Node::Var(v) => Slot::Var(var(v)),
-                Node::Const(t) => Slot::Const(terms.id_for_rule(t)?),
-                Node::Any => Slot::Any,
-                Node::Functor(name, _) => {
-                    return Err(unsupported(
-                        budget,
-                        format_args!(
-                            "functor term '{name}(…)' is not supported by forward materialization"
-                        ),
-                    ));
-                }
-            })
-        };
     // the atom of a triple or relation clause
     let atom = |c: &'a Clause,
-                var: &mut dyn FnMut(&'a str) -> usize|
+                var: &mut dyn FnMut(&'a str) -> usize,
+                mode: &mut ConstantMode<'_>|
      -> Result<Option<IAtom>, CompileFailure> {
         Ok(Some(match c {
             Clause::Triple(t) => IAtom::triple(
-                slot(&t.subject, var)?,
-                slot(&t.predicate, var)?,
-                slot(&t.object, var)?,
+                rule_slot(&t.subject, var, terms, budget, mode)?,
+                rule_slot(&t.predicate, var, terms, budget, mode)?,
+                rule_slot(&t.object, var, terms, budget, mode)?,
             ),
             Clause::Relation(a) => {
                 let mut args: SmallVec<[Slot; 4]> = SmallVec::with_capacity(a.args.len());
                 for n in &a.args {
-                    args.push(slot(n, var)?);
+                    args.push(rule_slot(n, var, terms, budget, mode)?);
                 }
                 IAtom {
                     pred: ir::Pred::Rel(ids[a.name.as_str()]),
@@ -277,12 +314,12 @@ fn compile_ir_one<'a>(
     for &c in &f.body {
         match c {
             Clause::Triple(_) | Clause::Relation(_) => {
-                let a = atom(c, &mut var)?.expect("an atom");
+                let a = atom(c, &mut var, mode)?.expect("an atom");
                 bound.extend(names_of(c));
                 body.push(Literal::Pos(a));
             }
             Clause::Not(inner) => {
-                let Some(a) = atom(inner, &mut var)? else {
+                let Some(a) = atom(inner, &mut var, mode)? else {
                     return Err(unsupported(
                         budget,
                         format_args!("'not' applies to a triple pattern or a relation atom"),
@@ -291,7 +328,7 @@ fn compile_ir_one<'a>(
                 body.push(Literal::Neg(a));
             }
             Clause::Builtin(b) => {
-                let mut slot_of = |n: &'a Node| slot(n, &mut var);
+                let mut slot_of = |n: &'a Node| rule_slot(n, &mut var, terms, budget, mode);
                 match compile_builtin(b, &mut bound, &mut slot_of, budget)? {
                     BuiltinOut::Call(call) => body.push(Literal::Builtin(IBuiltin::of(&call))),
                     BuiltinOut::Holds => {}
@@ -305,7 +342,7 @@ fn compile_ir_one<'a>(
     for &c in &f.head {
         match c {
             Clause::Triple(_) | Clause::Relation(_) => {
-                let a = atom(c, &mut var)?.expect("an atom");
+                let a = atom(c, &mut var, mode)?.expect("an atom");
                 if a.args.contains(&Slot::Any) {
                     return Err(unsupported(budget, format_args!("wildcard in a head atom")));
                 }
@@ -315,7 +352,7 @@ fn compile_ir_one<'a>(
                 Some(Ok(action)) => {
                     let mut args = SmallVec::with_capacity(b.args.len());
                     for argument in &b.args {
-                        args.push(slot(argument, &mut var)?);
+                        args.push(rule_slot(argument, &mut var, terms, budget, mode)?);
                     }
                     if args.len() != 3 {
                         return Err(unsupported(

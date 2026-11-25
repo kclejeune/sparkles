@@ -192,7 +192,7 @@ pub(crate) fn compile(
     terms: &Terms,
     warnings: &mut WorkingWarnings,
 ) -> Result<CompiledRules, BudgetFailure> {
-    compile_with(rules, terms, warnings, false).map(CompiledInfo::into_rules)
+    compile_info(rules, terms, warnings, false).map(CompiledInfo::into_rules)
 }
 
 /// [`compile`], with backward rules too when `backward` is set (for query-time
@@ -204,7 +204,35 @@ pub(crate) fn compile_info(
     warnings: &mut WorkingWarnings,
     backward: bool,
 ) -> Result<CompiledInfo, BudgetFailure> {
-    compile_with(rules, terms, warnings, backward)
+    match compile_with(rules, terms, warnings, backward, ConstantMode::Uncontrolled) {
+        Ok(compiled) => Ok(compiled),
+        Err(CompileError::Memory(error)) => Err(error),
+        Err(CompileError::Control(_)) => {
+            unreachable!("uncontrolled compilation has no control callback")
+        }
+    }
+}
+
+/// [`compile_info`], admitting vocabulary reconstruction scratch on constant lookups
+/// against the term table's budget and polling live controls.
+pub(crate) fn compile_info_controlled(
+    rules: &[Rule],
+    terms: &Terms,
+    warnings: &mut WorkingWarnings,
+    backward: bool,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<CompiledInfo> {
+    match compile_with(
+        rules,
+        terms,
+        warnings,
+        backward,
+        ConstantMode::Controlled(check),
+    ) {
+        Ok(compiled) => Ok(compiled),
+        Err(CompileError::Memory(error)) => Err(error.into()),
+        Err(CompileError::Control(error)) => Err(error),
+    }
 }
 
 fn compiler_message(args: std::fmt::Arguments<'_>) -> Result<String, BudgetFailure> {
@@ -221,50 +249,138 @@ fn compiler_label(rule: &Rule) -> Result<String, BudgetFailure> {
     }
 }
 
+enum CompileError {
+    Memory(BudgetFailure),
+    Control(anyhow::Error),
+}
+
+enum ConstantMode<'a> {
+    Uncontrolled,
+    Controlled(&'a mut dyn FnMut() -> anyhow::Result<()>),
+}
+
+impl ConstantMode<'_> {
+    fn poll(&mut self) -> Result<(), CompileError> {
+        if let Self::Controlled(check) = self {
+            check().map_err(CompileError::Control)?;
+        }
+        Ok(())
+    }
+
+    fn fail_memory(&mut self, error: BudgetFailure) -> CompileError {
+        if let Err(control) = self.poll() {
+            return control;
+        }
+        CompileError::Memory(error)
+    }
+
+    fn poll_anyhow(&mut self) -> anyhow::Result<()> {
+        if let Self::Controlled(check) = self {
+            check()?;
+        }
+        Ok(())
+    }
+
+    fn fail_memory_anyhow(&mut self, error: BudgetFailure) -> anyhow::Error {
+        if let Err(control) = self.poll_anyhow() {
+            return control;
+        }
+        error.into()
+    }
+
+    fn lookup_rule(&mut self, terms: &Terms, term: &Term) -> Result<u64, CompileFailure> {
+        match self {
+            Self::Uncontrolled => terms.id_for_rule(term).map_err(CompileFailure::Memory),
+            Self::Controlled(check) => {
+                terms
+                    .try_id_for_rule_controlled(term, check)
+                    .map_err(|error| match BudgetFailure::from_anyhow(&error) {
+                        Some(memory) => CompileFailure::Memory(memory),
+                        None => CompileFailure::Control(error),
+                    })
+            }
+        }
+    }
+}
+
+fn rule_slot<'a>(
+    n: &'a Node,
+    var: &mut dyn FnMut(&'a str) -> usize,
+    terms: &Terms,
+    budget: &Arc<Budget>,
+    mode: &mut ConstantMode<'_>,
+) -> Result<Slot, CompileFailure> {
+    Ok(match n {
+        Node::Var(v) => Slot::Var(var(v)),
+        Node::Const(t) => Slot::Const(mode.lookup_rule(terms, t)?),
+        Node::Any => Slot::Any,
+        Node::Functor(name, _) => {
+            return Err(unsupported(
+                budget,
+                format_args!(
+                    "functor term '{name}(…)' is not supported by forward materialization"
+                ),
+            ));
+        }
+    })
+}
+
 fn compile_with(
     rules: &[Rule],
     terms: &Terms,
     warnings: &mut WorkingWarnings,
     backward: bool,
-) -> Result<CompiledInfo, BudgetFailure> {
+    mut mode: ConstantMode<'_>,
+) -> Result<CompiledInfo, CompileError> {
     // a rule text with relations or `not` is a rule program, which every path compiles
     // through `frontend::compile`; here its rules would be skipped
     debug_assert!(
         !crate::parser::uses_program(rules),
         "a rule program compiled as Jena rules"
     );
+    mode.poll()?;
     let budget = terms.budget();
-    let (bytes, emitted) = compile_credit::prewalk(rules, backward)?;
-    let mut working = Held::try_new_exact(&budget, bytes)?;
+    let (bytes, emitted) =
+        compile_credit::prewalk(rules, backward).map_err(|e| mode.fail_memory(e))?;
+    let mut working = Held::try_new_exact(&budget, bytes).map_err(|e| mode.fail_memory(e))?;
     let mut flat = Vec::with_capacity(emitted);
     for (parsed, r) in rules.iter().enumerate() {
+        mode.poll()?;
         if r.direction == Direction::Backward && !backward {
-            warnings.push_fmt(format_args!(
-                "rule '{}' (line {}): backward rules ('<-') are not supported by forward materialization; skipped",
-                compiler_label(r)?,
-                r.line
-            ))?;
+            let label = compiler_label(r).map_err(|e| mode.fail_memory(e))?;
+            warnings
+                .push_fmt(format_args!(
+                    "rule '{label}' (line {}): backward rules ('<-') are not supported by forward materialization; skipped",
+                    r.line
+                ))
+                .map_err(|e| mode.fail_memory(e))?;
             continue;
         }
         if r.body.iter().any(|c| matches!(c, Clause::Rule(_))) {
-            warnings.push_fmt(format_args!(
-                "rule '{}': nested rule in a body; skipped",
-                compiler_label(r)?
-            ))?;
+            let label = compiler_label(r).map_err(|e| mode.fail_memory(e))?;
+            warnings
+                .push_fmt(format_args!(
+                    "rule '{label}': nested rule in a body; skipped"
+                ))
+                .map_err(|e| mode.fail_memory(e))?;
             continue;
         }
-        flatten(r, &[], compiler_label(r)?, (r.line, parsed), &mut flat);
+        let label = compiler_label(r).map_err(|e| mode.fail_memory(e))?;
+        flatten(r, &[], label, (r.line, parsed), &mut flat);
     }
     let mut out = Vec::with_capacity(emitted);
     let mut infos = Vec::with_capacity(emitted);
     let mut occurrence = 0usize;
     for f in &flat {
-        match compile_one(f, terms, warnings, &budget) {
+        mode.poll()?;
+        match compile_one(f, terms, warnings, &budget, &mut mode) {
             Ok(Some((mut c, info))) => {
                 for call in &mut c.builtins {
                     call.origin = occurrence;
                     occurrence = occurrence.checked_add(1).ok_or_else(|| {
-                        BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow)
+                        mode.fail_memory(BudgetFailure::parent(
+                            sparkles_budget::ParentRefused::Overflow,
+                        ))
                     })?;
                 }
                 out.push(c);
@@ -275,34 +391,55 @@ fn compile_with(
                 let pushed = warnings.push_fmt(format_args!("rule '{}': {msg}; skipped", f.name));
                 drop(msg);
                 drop(held);
-                pushed?
+                pushed.map_err(|e| mode.fail_memory(e))?
             }
-            Err(CompileFailure::Memory(error)) => return Err(error),
+            Err(CompileFailure::Memory(error)) => return Err(mode.fail_memory(error)),
+            Err(CompileFailure::Control(error)) => return Err(CompileError::Control(error)),
         }
     }
     let mut rule_bytes = out
         .capacity()
         .checked_mul(size_of::<CRule>())
-        .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        .ok_or_else(|| {
+            mode.fail_memory(BudgetFailure::parent(
+                sparkles_budget::ParentRefused::Overflow,
+            ))
+        })?;
     let mut info_bytes = infos
         .capacity()
         .checked_mul(size_of::<RuleInfo>())
-        .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+        .ok_or_else(|| {
+            mode.fail_memory(BudgetFailure::parent(
+                sparkles_budget::ParentRefused::Overflow,
+            ))
+        })?;
     for rule in &out {
         rule_bytes = rule_bytes
-            .checked_add(compile_credit::rule_bytes(rule)?)
-            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+            .checked_add(compile_credit::rule_bytes(rule).map_err(|e| mode.fail_memory(e))?)
+            .ok_or_else(|| {
+                mode.fail_memory(BudgetFailure::parent(
+                    sparkles_budget::ParentRefused::Overflow,
+                ))
+            })?;
     }
     for info in &infos {
         info_bytes = info_bytes
-            .checked_add(compile_credit::info_bytes(info)?)
-            .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+            .checked_add(compile_credit::info_bytes(info).map_err(|e| mode.fail_memory(e))?)
+            .ok_or_else(|| {
+                mode.fail_memory(BudgetFailure::parent(
+                    sparkles_budget::ParentRefused::Overflow,
+                ))
+            })?;
     }
-    let retained = rule_bytes
-        .checked_add(info_bytes)
-        .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+    let retained = rule_bytes.checked_add(info_bytes).ok_or_else(|| {
+        mode.fail_memory(BudgetFailure::parent(
+            sparkles_budget::ParentRefused::Overflow,
+        ))
+    })?;
     if retained > working.bytes() {
-        working.try_grow(retained - working.bytes())?;
+        working
+            .try_grow(retained - working.bytes())
+            .map_err(|e| mode.fail_memory(e))?;
     }
     let rules = CompiledRules {
         rules: out,
@@ -323,6 +460,7 @@ enum CompileFailure {
     /// its first error, so its message is charged only on that path.
     Unsupported(String, Held),
     Memory(BudgetFailure),
+    Control(anyhow::Error),
 }
 /// The skip message for a rule, charged to `budget` before it is formatted.
 fn unsupported(budget: &Arc<Budget>, args: std::fmt::Arguments<'_>) -> CompileFailure {
@@ -350,6 +488,7 @@ fn compile_one<'a>(
     terms: &Terms,
     warnings: &mut WorkingWarnings,
     budget: &Arc<Budget>,
+    mode: &mut ConstantMode<'_>,
 ) -> Result<Option<(CRule, RuleInfo)>, CompileFailure> {
     let body_shape = compile_credit::Shape::clauses(f.body.iter().copied())?;
     let head_shape = compile_credit::Shape::clauses(f.head.iter().copied())?;
@@ -360,22 +499,6 @@ fn compile_one<'a>(
         let n = vars.len();
         *vars.entry(v).or_insert(n)
     };
-    let slot =
-        |n: &'a Node, var: &mut dyn FnMut(&'a str) -> usize| -> Result<Slot, CompileFailure> {
-            Ok(match n {
-                Node::Var(v) => Slot::Var(var(v)),
-                Node::Const(t) => Slot::Const(terms.id_for_rule(t)?),
-                Node::Any => Slot::Any,
-                Node::Functor(name, _) => {
-                    return Err(unsupported(
-                        budget,
-                        format_args!(
-                            "functor term '{name}(…)' is not supported by forward materialization"
-                        ),
-                    ));
-                }
-            })
-        };
     let mut atoms = Vec::with_capacity(body_shape.atoms);
     let mut builtins = Vec::with_capacity(body_shape.builtins);
     // variables bound at the current textual position (Jena evaluates bodies left to right)
@@ -384,9 +507,9 @@ fn compile_one<'a>(
         match c {
             Clause::Triple(t) => {
                 let a = Atom {
-                    s: slot(&t.subject, &mut var)?,
-                    p: slot(&t.predicate, &mut var)?,
-                    o: slot(&t.object, &mut var)?,
+                    s: rule_slot(&t.subject, &mut var, terms, budget, mode)?,
+                    p: rule_slot(&t.predicate, &mut var, terms, budget, mode)?,
+                    o: rule_slot(&t.object, &mut var, terms, budget, mode)?,
                 };
                 for n in [&t.subject, &t.predicate, &t.object] {
                     if let Node::Var(v) = n {
@@ -396,7 +519,7 @@ fn compile_one<'a>(
                 atoms.push(a);
             }
             Clause::Builtin(b) => {
-                let mut slot_of = |n: &'a Node| slot(n, &mut var);
+                let mut slot_of = |n: &'a Node| rule_slot(n, &mut var, terms, budget, mode);
                 match compile_builtin(b, &mut bound, &mut slot_of, budget)? {
                     BuiltinOut::Call(call) => {
                         builtins.push(call);
@@ -419,9 +542,9 @@ fn compile_one<'a>(
     for &c in &f.head {
         match c {
             Clause::Triple(t) => {
-                let s = slot(&t.subject, &mut var)?;
-                let p = slot(&t.predicate, &mut var)?;
-                let o = slot(&t.object, &mut var)?;
+                let s = rule_slot(&t.subject, &mut var, terms, budget, mode)?;
+                let p = rule_slot(&t.predicate, &mut var, terms, budget, mode)?;
+                let o = rule_slot(&t.object, &mut var, terms, budget, mode)?;
                 if [s, p, o].contains(&Slot::Any) {
                     return Err(unsupported(
                         budget,
@@ -434,7 +557,7 @@ fn compile_one<'a>(
                 Some(Ok(action)) => {
                     let mut args = Vec::with_capacity(b.args.len());
                     for argument in &b.args {
-                        args.push(slot(argument, &mut var)?);
+                        args.push(rule_slot(argument, &mut var, terms, budget, mode)?);
                     }
                     if args.len() != 3 {
                         return Err(unsupported(

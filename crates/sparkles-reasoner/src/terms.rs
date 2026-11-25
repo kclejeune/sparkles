@@ -252,6 +252,84 @@ impl Terms {
         Ok(t)
     }
 
+    /// Construct in the receiving budget before allocating the segment index or
+    /// initial RDF/NOW keys, admitting vocabulary lookup scratch and polling live controls.
+    pub(crate) fn new_in_controlled(
+        snap: Arc<Snapshot>,
+        budget: &Arc<Budget>,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Terms> {
+        check()?;
+        let fixed = 40 * size_of::<OnceLock<Box<[OnceLock<LocalTerm>]>>>();
+        let fixed_credit = match Held::try_new_exact(budget, fixed) {
+            Ok(held) => held,
+            Err(err) => {
+                check()?;
+                return Err(err.into());
+            }
+        };
+        let lit_range = snap.generation.vocab.prefix_range(b"\"");
+        let mut t = Terms {
+            snap,
+            analysis: None,
+            analysis_round: AtomicUsize::new(0),
+            lit_range,
+            locals: RwLock::new(Locals::default()),
+            table: LocalTable::new(),
+            regex_cache: Mutex::new(RegexCache::default()),
+            credit: TermCredit {
+                budget: RwLock::new(budget.clone()),
+                charged: AtomicUsize::new(fixed),
+            },
+            rdf_first: 0,
+            rdf_rest: 0,
+            rdf_nil: 0,
+            now: 0,
+        };
+        let _ = fixed_credit.into_bytes();
+        let mut rdf = [0; 3];
+        for (i, suffix) in ["first", "rest", "nil"].iter().enumerate() {
+            check()?;
+            let bytes = crate::parser::RDF_NS
+                .len()
+                .checked_add(suffix.len())
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|n| n.checked_add(size_of::<Term>()))
+                .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+            let temporary = match Held::try_new_exact(budget, bytes) {
+                Ok(held) => held,
+                Err(err) => {
+                    check()?;
+                    return Err(err.into());
+                }
+            };
+            let term = Term::NamedNode(NamedNode::new_unchecked(format!(
+                "{}{suffix}",
+                crate::parser::RDF_NS
+            )));
+            rdf[i] = t.try_id_for_controlled(&term, &mut check)?;
+            drop(term);
+            drop(temporary);
+        }
+        [t.rdf_first, t.rdf_rest, t.rdf_nil] = rdf;
+        check()?;
+        let temporary = match Held::try_new_exact(budget, 256) {
+            Ok(held) => held,
+            Err(err) => {
+                check()?;
+                return Err(err.into());
+            }
+        };
+        let now = Term::Literal(Literal::new_typed_literal(
+            oxsdatatypes::DateTime::now().to_string(),
+            oxrdf::vocab::xsd::DATE_TIME,
+        ));
+        t.now = t.try_id_for_controlled(&now, &mut check)?;
+        drop(now);
+        drop(temporary);
+        Ok(t)
+    }
+
     pub fn set_analysis(
         &mut self,
         context: Arc<crate::analysis::AnalysisContext>,
@@ -556,6 +634,27 @@ impl Terms {
             Term::BlankNode(node) => self.rule_bnode(node, false),
             _ => self.id_for(term),
         }
+    }
+
+    /// Strict [`id_for_rule`](Self::id_for_rule) that admits vocabulary reconstruction
+    /// scratch against the term table's budget and polls live controls, while preserving
+    /// rule blank-node handling without interpreting encoded response labels.
+    pub(crate) fn try_id_for_rule_controlled(
+        &self,
+        term: &Term,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<u64> {
+        if let Term::BlankNode(node) = term {
+            check()?;
+            return match self.rule_bnode(node, true) {
+                Ok(id) => Ok(id),
+                Err(err) => {
+                    check()?;
+                    Err(err.into())
+                }
+            };
+        }
+        self.try_id_for_controlled(term, check)
     }
 
     fn rule_bnode(&self, node: &BlankNode, strict: bool) -> Result<u64, BudgetFailure> {

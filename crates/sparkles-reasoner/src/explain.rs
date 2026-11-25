@@ -1050,16 +1050,17 @@ fn materialized(
     let base = Arc::new(Base::new(snap.clone(), &graphs)?);
     let mut g = Graph::with_base(base);
     g.set_budget(&budget)?;
-    let terms = Terms::new_in(snap.clone(), &budget)?;
+    let terms = Terms::new_in_controlled(snap.clone(), &budget, || check_controls(opts))?;
     let mut warnings = WorkingWarnings::new(&budget);
     let parsed = crate::profile_rules(input.profile, input.extras)?;
     let sources = crate::rule_sources(input.profile, input.extras)?;
     if crate::parser::uses_program(&parsed) {
         drop(g);
         drop(terms);
-        let source = |t: &Terms, w: &mut WorkingWarnings| {
-            crate::engine::frontend::compile(&parsed, t, w, false)
-        };
+        let source =
+            |t: &Terms, w: &mut WorkingWarnings, check: &mut dyn FnMut() -> anyhow::Result<()>| {
+                crate::engine::frontend::compile_controlled(&parsed, t, w, false, check)
+            };
         // the generalized facts are not part of the dataset's graphs, so a derivation
         // through one is not found, as for Jena rules
         return program_search(
@@ -1074,7 +1075,10 @@ fn materialized(
             opts,
         );
     }
-    let compiled = engine::compile_info(&parsed, &terms, &mut warnings, false)?;
+    let compiled =
+        engine::compile_info_controlled(&parsed, &terms, &mut warnings, false, &mut || {
+            check_controls(opts)
+        })?;
     let (rules, infos) = (compiled.rules(), compiled.infos());
     let rs = RuleSet {
         rules,
@@ -1083,7 +1087,7 @@ fn materialized(
         geo: input
             .extras
             .geo_default_geometry
-            .then(|| crate::geo_ids(&terms))
+            .then(|| crate::geo_ids_controlled(&terms, || check_controls(opts)))
             .transpose()?,
         relations: None,
     };
@@ -1131,16 +1135,18 @@ pub(crate) fn explain_program(
     triple: &[Term; 3],
     opts: &ExplainOptions,
 ) -> anyhow::Result<Explained> {
-    let source = |t: &Terms, _: &mut WorkingWarnings| {
-        let p = crate::ir::Program::new(
-            program.relations.clone(),
-            program.rules.clone(),
-            &crate::ir::Vocab::of(t),
-            &t.budget(),
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(crate::engine::frontend::ProgramInfo::bare(p, &t.budget()))
-    };
+    let source =
+        |t: &Terms, _: &mut WorkingWarnings, check: &mut dyn FnMut() -> anyhow::Result<()>| {
+            let vocab = crate::ir::Vocab::try_of_controlled(t, check)?;
+            let p = crate::ir::Program::new(
+                program.relations.clone(),
+                program.rules.clone(),
+                &vocab,
+                &t.budget(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(crate::engine::frontend::ProgramInfo::bare(p, &t.budget()))
+        };
     let sources = vec!["rules".to_string()];
     budget_errors(program_search(
         snap,
@@ -1156,7 +1162,11 @@ pub(crate) fn explain_program(
 }
 
 /// What a program explanation compiles over its own terms.
-type ExplainSource<'a> = dyn Fn(&Terms, &mut WorkingWarnings) -> anyhow::Result<crate::engine::frontend::ProgramInfo>
+type ExplainSource<'a> = dyn Fn(
+        &Terms,
+        &mut WorkingWarnings,
+        &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<crate::engine::frontend::ProgramInfo>
     + 'a;
 
 /// The lowered rules of every stratum of `program`, in stratum order, with the infos of
@@ -1251,7 +1261,7 @@ fn program_search(
     let base = Arc::new(Base::new(snap.clone(), &graphs)?);
     let mut g = Graph::with_base(base);
     g.set_budget(&budget)?;
-    let terms = Terms::new_in(snap.clone(), &budget)?;
+    let terms = Terms::new_in_controlled(snap.clone(), &budget, || check_controls(opts))?;
     // the generalized facts, saved as term keys, in this explanation's terms; the credit
     // also holds the metadata of the rules below while the search runs
     let mut held = Held::new(&budget);
@@ -1268,9 +1278,9 @@ fn program_search(
     // the program is compiled over this explanation's terms, which hold the local terms
     // its constants need
     let mut warnings = WorkingWarnings::new(&budget);
-    let info = source(&terms, &mut warnings)?;
+    let info = source(&terms, &mut warnings, &mut || check_controls(opts))?;
     let program = &info.program;
-    let vocab = crate::ir::Vocab::of(&terms);
+    let vocab = crate::ir::Vocab::try_of_controlled(&terms, || check_controls(opts))?;
     let part = program
         .relation_part(&vocab, &budget)
         .map_err(|e| match e {
@@ -1313,7 +1323,9 @@ fn program_search(
         rules: &rules,
         infos: &infos,
         sources,
-        geo: geo.then(|| crate::geo_ids(&terms)).transpose()?,
+        geo: geo
+            .then(|| crate::geo_ids_controlled(&terms, || check_controls(opts)))
+            .transpose()?,
         relations: Some(&program.relations),
     };
     let mut root = [0u64; 3];
@@ -1648,7 +1660,10 @@ pub(crate) fn search_session(
         rules: p.rules,
         infos: p.infos,
         sources: p.sources,
-        geo: p.geo_default.then(|| crate::geo_ids(p.terms)).transpose()?,
+        geo: p
+            .geo_default
+            .then(|| crate::geo_ids_controlled(p.terms, || check_controls(opts)))
+            .transpose()?,
         relations: p.relations,
     };
     search(
@@ -1994,10 +2009,12 @@ mod partial_tests {
             Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
         };
         let lit = |s: &str| Term::Literal(oxrdf::Literal::new_simple_literal(s));
+        // Use "0fresh" (sorts before uncompressed entry 0 "a") so compiling the rule
+        // itself does not scan entry 1; only the tested root lookups do.
         let profile = Profile::Rules(
             "@prefix ex: <http://ex.org/> . \
              [derive: (?x ex:p ?y) -> (?x ex:q ?y)] \
-             [fresh: (?x ex:p \"a\") -> (?x ex:derived \"fresh\")]"
+             [fresh: (?x ex:p \"a\") -> (?x ex:derived \"0fresh\")]"
                 .into(),
         );
         let extras = Extras::default();
@@ -2133,7 +2150,7 @@ mod partial_tests {
         // Local-interning behavior on misses is preserved when budget allows.
         let found = explain_demand(
             &demand_input,
-            &[ex("s"), ex("derived"), lit("fresh")],
+            &[ex("s"), ex("derived"), lit("0fresh")],
             &ExplainOptions::default(),
         )
         .unwrap();
@@ -2207,6 +2224,426 @@ mod partial_tests {
                 .downcast_ref::<sparkles_core::Error>()
                 .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
         );
+    }
+
+    #[test]
+    fn explanation_rule_constant_lookup_admits_fsst_scratch_and_polls_controls() {
+        use sparkles_core::{
+            builder::{BuildOptions, VocabCodec},
+            io::{RdfFormat, Source},
+            store::{Store, StoreOptions},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            &dir.path().join("db"),
+            StoreOptions {
+                build: BuildOptions {
+                    vocab_codec: Some(VocabCodec::Fsst),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let long = "z".repeat(65_536);
+        let mut data = format!(r#"@prefix ex: <http://ex.org/> . ex:s ex:p "a", "{long}""#);
+        for i in 2..sparkles_core::vocab::FC_BLOCK {
+            data.push_str(&format!(r#", "~filler{i}""#));
+        }
+        data.push_str(" .");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.is_fsst());
+
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let lit = |s: &str| Term::Literal(oxrdf::Literal::new_simple_literal(s));
+        let extras = Extras::default();
+
+        // Baseline rules use "a" (uncompressed entry 0) and "0fresh" (sorts before entry 0),
+        // so baseline compilation never scans entry 1; target rules use "b", whose
+        // three-byte literal probe shares the tag with "a" and reaches the 64 KiB entry 1.
+        let jena_a = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [derive: (?x ex:p ?y) -> (?x ex:q ?y)] \
+             [fresh: (?x ex:p \"a\") -> (?x ex:derived \"0fresh\")]"
+                .into(),
+        );
+        let jena_b = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [derive: (?x ex:p ?y) -> (?x ex:q ?y)] \
+             [fresh: (?x ex:p \"b\") -> (?x ex:derived \"0fresh\")]"
+                .into(),
+        );
+        let prog_a = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [rel: (?x ex:p \"a\") -> r(?x)] \
+             [out: r(?x) -> (?x ex:q \"a\")]"
+                .into(),
+        );
+        let prog_b = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [rel: (?x ex:p \"b\") -> r(?x)] \
+             [out: r(?x) -> (?x ex:q \"b\")]"
+                .into(),
+        );
+
+        let setup_budget = Budget::unlimited();
+        let base = Arc::new(Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap());
+        let mut g = Graph::with_base(base);
+        g.set_budget(&setup_budget).unwrap();
+        let setup_terms = Terms::new_in(snap.clone(), &setup_budget).unwrap();
+        let mut warnings = WorkingWarnings::new(&setup_budget);
+        let parsed_a = crate::profile_rules(&jena_a, &extras).unwrap();
+        let _compiled_a =
+            engine::compile_info(&parsed_a, &setup_terms, &mut warnings, false).unwrap();
+        let mat_limit = setup_budget.used() + 8192;
+
+        let mat_a_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &jena_a,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let mat_b_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &jena_b,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let (_, mat_baseline) = crate::alloc_probe::peak_of(|| {
+            explain(
+                &mat_a_input,
+                &[ex("s"), ex("p"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let mat_opts = ExplainOptions {
+            max_memory: Some(mat_limit),
+            ..Default::default()
+        };
+        for root_obj in [lit("b"), lit("a")] {
+            let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+                explain(
+                    &mat_b_input,
+                    &[ex("s"), ex("p"), root_obj.clone()],
+                    &mat_opts,
+                )
+            });
+            assert!(
+                peak < mat_baseline + 16_384 && largest < 65_536,
+                "materialized rule constant \"b\" with root {root_obj} allocated 64 KiB FSST suffix (peak={peak}, baseline={mat_baseline}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some()
+            );
+        }
+
+        // Program rules (uses_program == true) in materialized program_search.
+        let prog_a_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &prog_a,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let prog_b_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &prog_b,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let (_, prog_baseline) = crate::alloc_probe::peak_of(|| {
+            explain(
+                &prog_a_input,
+                &[ex("s"), ex("p"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let prog_opts = ExplainOptions {
+            max_memory: Some(mat_limit + 4096),
+            ..Default::default()
+        };
+        for root_obj in [lit("b"), lit("a")] {
+            let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+                explain(
+                    &prog_b_input,
+                    &[ex("s"), ex("p"), root_obj.clone()],
+                    &prog_opts,
+                )
+            });
+            assert!(
+                peak < prog_baseline + 16_384 && largest < 65_536,
+                "program rule constant \"b\" with root {root_obj} allocated 64 KiB FSST suffix (peak={peak}, baseline={prog_baseline}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some()
+            );
+        }
+
+        // Demand and why-not sessions compile rules in Session::new before root lookup.
+        let reasoner_a =
+            QueryReasoner::new(jena_a.clone(), &extras, crate::Inputs::default()).unwrap();
+        let demand_a_input = DemandInput {
+            reasoner: &reasoner_a,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let probe_session =
+            demand_session(&demand_a_input, &ExplainOptions::default(), true).unwrap();
+        let demand_limit = probe_session.budget().used() + 8192;
+        drop(probe_session);
+        let (_, demand_baseline) = crate::alloc_probe::peak_of(|| {
+            explain_demand(
+                &demand_a_input,
+                &[ex("s"), ex("absent"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let reasoner_b =
+            QueryReasoner::new(jena_b.clone(), &extras, crate::Inputs::default()).unwrap();
+        let demand_b_input = DemandInput {
+            reasoner: &reasoner_b,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let demand_opts = ExplainOptions {
+            max_memory: Some(demand_limit),
+            ..Default::default()
+        };
+        for root_obj in [lit("b"), lit("a")] {
+            let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+                explain_demand(
+                    &demand_b_input,
+                    &[ex("s"), ex("q"), root_obj.clone()],
+                    &demand_opts,
+                )
+            });
+            assert!(
+                peak < demand_baseline + 16_384 && largest < 65_536,
+                "demand rule constant \"b\" with root {root_obj} allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some()
+            );
+        }
+
+        let whynot_opts = crate::whynot::WhyNotOptions {
+            explain: demand_opts.clone(),
+            ..Default::default()
+        };
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            crate::whynot::why_not(&demand_b_input, &[ex("s"), ex("q"), lit("b")], &whynot_opts)
+        });
+        assert!(
+            peak < demand_baseline + 16_384 && largest < 65_536,
+            "why-not rule constant \"b\" allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline}, largest={largest})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+
+        // Demand program rules (uses_program == true) in Session::new -> program_rules.
+        let reasoner_prog_a =
+            QueryReasoner::new(prog_a, &extras, crate::Inputs::default()).unwrap();
+        let demand_prog_a = DemandInput {
+            reasoner: &reasoner_prog_a,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let probe_prog = demand_session(&demand_prog_a, &ExplainOptions::default(), true).unwrap();
+        let demand_prog_limit = probe_prog.budget().used() + 8192;
+        drop(probe_prog);
+        let (_, demand_prog_baseline) = crate::alloc_probe::peak_of(|| {
+            explain_demand(
+                &demand_prog_a,
+                &[ex("s"), ex("absent"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let reasoner_prog_b =
+            QueryReasoner::new(prog_b.clone(), &extras, crate::Inputs::default()).unwrap();
+        let demand_prog_b = DemandInput {
+            reasoner: &reasoner_prog_b,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let demand_prog_opts = ExplainOptions {
+            max_memory: Some(demand_prog_limit),
+            ..Default::default()
+        };
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            explain_demand(
+                &demand_prog_b,
+                &[ex("s"), ex("q"), lit("b")],
+                &demand_prog_opts,
+            )
+        });
+        assert!(
+            peak < demand_prog_baseline + 16_384 && largest < 65_536,
+            "demand program constant \"b\" allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_prog_baseline}, largest={largest})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+
+        // Cancellation and expired deadline stop before rule/program compilation allocates
+        // the 64 KiB FSST suffix.
+        let cancel_opts = ExplainOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        };
+        let expired_opts = ExplainOptions {
+            deadline: Some(Instant::now() - std::time::Duration::from_secs(1)),
+            ..Default::default()
+        };
+        for (label, input, baseline) in [
+            ("materialized", &mat_b_input, mat_baseline),
+            ("program", &prog_b_input, prog_baseline),
+        ] {
+            let (res, peak) = crate::alloc_probe::peak_of(|| {
+                explain(input, &[ex("s"), ex("p"), lit("a")], &cancel_opts)
+            });
+            assert!(
+                peak < baseline + 16_384,
+                "{label} cancel allocated 64 KiB FSST suffix (peak={peak}, baseline={baseline})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<sparkles_core::Error>()
+                    .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+            );
+
+            let (res, peak) = crate::alloc_probe::peak_of(|| {
+                explain(input, &[ex("s"), ex("p"), lit("a")], &expired_opts)
+            });
+            assert!(
+                peak < baseline + 16_384,
+                "{label} expired deadline allocated 64 KiB FSST suffix (peak={peak}, baseline={baseline})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some()
+            );
+        }
+
+        // Mid-scan cancellation stops inside controlled Jena and program compilation
+        // before allocating the 64 KiB FSST suffix.
+        let parsed_b = crate::profile_rules(&jena_b, &extras).unwrap();
+        let parsed_prog_b = crate::profile_rules(&prog_b, &extras).unwrap();
+        let mid_budget = Budget::unlimited();
+        let mid_terms = Terms::new_in(snap.clone(), &mid_budget).unwrap();
+        let mut mid_warnings = WorkingWarnings::new(&mid_budget);
+        let polls = Cell::new(0usize);
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            engine::compile_info_controlled(
+                &parsed_b,
+                &mid_terms,
+                &mut mid_warnings,
+                false,
+                &mut || {
+                    let n = polls.get() + 1;
+                    polls.set(n);
+                    if n >= 16 {
+                        Err(anyhow::Error::new(sparkles_core::Error::Cancelled))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        });
+        assert!(
+            peak <= 16_384,
+            "mid-compile Jena cancellation allocated 64 KiB FSST suffix (peak={peak})"
+        );
+        assert!(
+            res.err()
+                .expect("mid-compile cancellation")
+                .downcast_ref::<sparkles_core::Error>()
+                .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+        );
+        let polls = Cell::new(0usize);
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            crate::engine::frontend::compile_controlled(
+                &parsed_prog_b,
+                &mid_terms,
+                &mut mid_warnings,
+                false,
+                &mut || {
+                    let n = polls.get() + 1;
+                    polls.set(n);
+                    if n >= 16 {
+                        Err(anyhow::Error::new(sparkles_core::Error::Cancelled))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        });
+        assert!(
+            peak <= 16_384,
+            "mid-compile program cancellation allocated 64 KiB FSST suffix (peak={peak})"
+        );
+        assert!(
+            res.err()
+                .expect("mid-compile program cancellation")
+                .downcast_ref::<sparkles_core::Error>()
+                .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+        );
+
+        // Controlled compilation preserves rule blank-node handling without interpreting
+        // encoded response labels such as `spkrule_62` (hex for "b").
+        let bnode_terms = Terms::new_in(snap.clone(), &Budget::unlimited()).unwrap();
+        let plain_bnode = bnode_terms
+            .try_id_for_rule_controlled(
+                &Term::BlankNode(oxrdf::BlankNode::new_unchecked("b")),
+                || Ok(()),
+            )
+            .unwrap();
+        let encoded_like_bnode = bnode_terms
+            .try_id_for_rule_controlled(
+                &Term::BlankNode(oxrdf::BlankNode::new_unchecked("spkrule_62")),
+                || Ok(()),
+            )
+            .unwrap();
+        assert!(bnode_terms.is_rule_bnode(plain_bnode));
+        assert!(bnode_terms.is_rule_bnode(encoded_like_bnode));
+        assert_ne!(plain_bnode, encoded_like_bnode);
+        // By contrast, general response-side lookup decodes `spkrule_62` back to `_:b`.
+        let decoded_bnode = bnode_terms
+            .try_id_for_controlled(
+                &Term::BlankNode(oxrdf::BlankNode::new_unchecked("spkrule_62")),
+                || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(decoded_bnode, plain_bnode);
     }
 
     #[test]
