@@ -1,19 +1,19 @@
-//! Incremental view grouping over the shared [`Accumulator`] trait: per group, positive
-//! change rows fold through [`Accumulator::add_batch`] and negative change rows retract
-//! through [`Accumulator::retract`] with signed weights, and each changed group's old
+//! Incremental view grouping over the shared `Accumulator` trait: per group, positive
+//! change rows fold through `Accumulator::add_batch` and negative change rows retract
+//! through `Accumulator::retract` with signed weights, and each changed group's old
 //! output row is retracted and its new one emitted.
 //!
-//! Integer and decimal sums are kept exactly in [`RetractableSum`], so removing a value
-//! is exact. Float and double values are kept as value counts, and a changed group sums
-//! them again. `DISTINCT` aggregates wrap their inner accumulator in
-//! [`RetractableDistinct`], and `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE` run through the
-//! ordered-multiset [`Ordered`] accumulator. All aggregate error readings share the same
-//! finalizers as one-off SPARQL grouping.
+//! Integer and decimal sums are kept exactly in `acc::RetractableSum`, so removing a
+//! value is exact. Float and double values are kept as value counts, and a changed group
+//! sums them again. `DISTINCT` aggregates wrap their inner accumulator in
+//! `acc::RetractableDistinct`, and `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE` run
+//! through the ordered-multiset `acc::Ordered` accumulator. All aggregate error
+//! readings share the same finalizers as one-off SPARQL grouping.
 
 use super::super::pass::Pass;
 use super::super::persist::{Reader, Writer};
 use super::super::prov::{self, AChanges, Ann, AnnMap, Provenance};
-use super::super::zset::{Changes, Row, consolidate, row_bytes};
+use super::super::zset::{Changes, Row, consolidate};
 use super::Node;
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -177,11 +177,39 @@ impl Group {
     }
 
     fn clear_state(&mut self) {
-        self.index.clear();
-        self.slots.clear();
+        self.index = FxHashMap::default();
+        self.slots = Vec::new();
         for acc in &mut self.accs {
             acc.clear();
         }
+    }
+
+    fn shrink_unused(&mut self) {
+        const SHRINK_MIN_CAP: usize = 64;
+        if self.slots.is_empty() {
+            self.slots = Vec::new();
+            self.index = FxHashMap::default();
+            for acc in &mut self.accs {
+                acc.clear();
+            }
+            return;
+        }
+        if self.slots.capacity() >= SHRINK_MIN_CAP && self.slots.len() * 4 <= self.slots.capacity()
+        {
+            self.slots.shrink_to(self.slots.len() * 2);
+        }
+        if self.index.capacity() >= SHRINK_MIN_CAP && self.index.len() * 4 <= self.index.capacity()
+        {
+            self.index.shrink_to(self.index.len() * 2);
+        }
+        for acc in &mut self.accs {
+            acc.shrink_unused();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backing_capacities(&self) -> (usize, usize) {
+        (self.slots.capacity(), self.index.capacity())
     }
 
     fn push_group(&mut self, key: Row) -> u32 {
@@ -304,7 +332,7 @@ impl Group {
     pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
         self.clear_state();
         if let Some(m) = self.gann.as_mut() {
-            m.clear();
+            *m = AnnMap::default();
         }
         let c = prov::consolidate(self.inner.init_a(p)?);
         let mut out = self.apply_a(p, c)?;
@@ -369,6 +397,7 @@ impl Group {
             for acc in accs.iter_mut() {
                 out.push(acc.read(ctx, slot)?);
             }
+            ctx.check()?;
             Ok(out)
         })
     }
@@ -401,6 +430,9 @@ impl Group {
         let mut neg_slots: Vec<u32> = Vec::new();
         let mut neg_weights: Vec<i64> = Vec::new();
         for (i, (r, w)) in c.iter().enumerate() {
+            if i.is_multiple_of(1024) {
+                p.control.check()?;
+            }
             let w = *w;
             if w == 0 {
                 continue;
@@ -440,6 +472,7 @@ impl Group {
         let index = &mut self.index;
         let slots = &mut self.slots;
         let implicit = self.implicit;
+        let mut removed_any = false;
         p.with_agg_ctx(|ctx| {
             // Fold positive weights first, then retract negative weights, so intermediate
             // multiplicities stay non-negative and SAMPLE stays stable on replacements.
@@ -488,7 +521,10 @@ impl Group {
                     }
                 }
             }
-            for key in touched {
+            for (ti, key) in touched.into_iter().enumerate() {
+                if ti.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
                 let slot = *index.get(&key).expect("touched group exists") as usize;
                 let row_count = slots[slot].rows;
                 let new = if row_count > 0 || implicit {
@@ -497,6 +533,7 @@ impl Group {
                     for acc in accs.iter_mut() {
                         row.push(acc.read(ctx, slot)?);
                     }
+                    ctx.check()?;
                     Some(row.into_boxed_slice())
                 } else {
                     None
@@ -510,6 +547,7 @@ impl Group {
                     }
                 }
                 if row_count <= 0 && !implicit {
+                    removed_any = true;
                     let removed = slots.swap_remove(slot);
                     index.remove(&removed.key);
                     for acc in accs.iter_mut() {
@@ -525,6 +563,9 @@ impl Group {
             }
             Ok(())
         })?;
+        if removed_any {
+            self.shrink_unused();
+        }
         Ok(out)
     }
 
@@ -550,10 +591,16 @@ impl Group {
     }
 
     pub fn bytes(&self) -> u64 {
-        let width = self.keys.len() + self.aggs.len();
-        let groups_bytes = self.slots.len() as u64 * row_bytes(width) * 2;
+        let key_row_bytes = self.keys.len() as u64 * 8;
+        let out_row_bytes = (self.keys.len() + self.aggs.len()) as u64 * 8;
+        let live_rows = self.slots.len() as u64 * (key_row_bytes * 2 + out_row_bytes);
+        let slots_buf = self.slots.capacity() as u64 * std::mem::size_of::<GroupMeta>() as u64;
+        let index_buf =
+            self.index.capacity() as u64 * (std::mem::size_of::<(Row, u32)>() as u64 + 8);
         let accs_bytes: u64 = self.accs.iter().map(|a| a.retained_bytes()).sum();
-        groups_bytes
+        live_rows
+            + slots_buf
+            + index_buf
             + accs_bytes
             + self
                 .gann

@@ -14,7 +14,6 @@
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::incr::persist::{Reader, Writer};
-use crate::incr::zset::row_bytes;
 use crate::sparql::ctx::Ctx;
 use crate::sparql::exec::AggState;
 use crate::sparql::expr::Expr;
@@ -110,6 +109,32 @@ impl Batch<'_> {
     #[inline]
     fn retract_weight(&self, row: usize) -> u64 {
         self.weights.map_or(1, |w| w[row].unsigned_abs())
+    }
+
+    /// Whether every row's retraction weight fits in `0..=i64::MAX` (rejects `i64::MIN`,
+    /// whose magnitude `2^63` overflows signed `i64` arithmetic).
+    #[inline]
+    fn retract_weights_fit_i64(&self, rows: usize) -> bool {
+        self.weights
+            .is_none_or(|w| w[..rows].iter().all(|&v| v != i64::MIN))
+    }
+}
+
+const SHRINK_MIN_CAP: usize = 64;
+
+fn shrink_vec<T>(v: &mut Vec<T>) {
+    if v.is_empty() {
+        *v = Vec::new();
+    } else if v.capacity() >= SHRINK_MIN_CAP && v.len() * 4 <= v.capacity() {
+        v.shrink_to(v.len() * 2);
+    }
+}
+
+fn shrink_map<K: Eq + std::hash::Hash, V>(m: &mut FxHashMap<K, V>) {
+    if m.is_empty() {
+        *m = FxHashMap::default();
+    } else if m.capacity() >= SHRINK_MIN_CAP && m.len() * 4 <= m.capacity() {
+        m.shrink_to(m.len() * 2);
     }
 }
 
@@ -217,7 +242,12 @@ pub(crate) trait Accumulator: Send {
     /// Remove group `group` by swapping in the last group, keeping slots dense.
     fn swap_remove(&mut self, _group: usize) {}
 
-    /// Approximate bytes retained across all live groups, for view memory budgeting.
+    /// Release excess backing capacity after group deletions so view memory budgets stay
+    /// accurate without reallocating on every individual removal.
+    fn shrink_unused(&mut self) {}
+
+    /// Approximate bytes retained across all live groups and backing allocations, for
+    /// view memory budgeting.
     fn retained_bytes(&self) -> u64 {
         0
     }
@@ -363,6 +393,7 @@ impl Accumulator for Running {
                 }
                 (AggregateFunction::Count, Arg::Unbound) => {}
                 _ => {
+                    let best = self.track && self.is_best();
                     for (row, &slot) in slots.iter().enumerate() {
                         if row.is_multiple_of(1024) {
                             ctx.check()?;
@@ -371,7 +402,16 @@ impl Accumulator for Running {
                         if w == 0 {
                             continue;
                         }
-                        self.states[slot as usize].add_weighted(ctx, agg, batch.value(row), w);
+                        let id = batch.value(row);
+                        if best && let Some(id) = id {
+                            let decoded = ctx.decoded_bytes(id)?;
+                            let held = &mut self.payload[slot as usize];
+                            if decoded > *held {
+                                self.growth += decoded - *held;
+                                *held = decoded;
+                            }
+                        }
+                        self.states[slot as usize].add_weighted(ctx, agg, id, w)?;
                     }
                 }
             }
@@ -481,8 +521,8 @@ impl Accumulator for Running {
     }
 
     fn clear(&mut self) {
-        self.states.clear();
-        self.payload.clear();
+        self.states = Vec::new();
+        self.payload = Vec::new();
         self.growth = 0;
     }
 
@@ -491,14 +531,20 @@ impl Accumulator for Running {
         if self.is_best() {
             self.payload.swap_remove(group);
         }
+        if self.states.is_empty() {
+            self.states = Vec::new();
+            self.payload = Vec::new();
+        }
+    }
+
+    fn shrink_unused(&mut self) {
+        shrink_vec(&mut self.states);
+        shrink_vec(&mut self.payload);
     }
 
     fn retained_bytes(&self) -> u64 {
-        if matches!(self.agg.func, AggregateFunction::Count) {
-            self.states.len() as u64 * 8
-        } else {
-            self.states.len() as u64 * size_of::<AggState>() as u64
-        }
+        self.states.capacity() as u64 * size_of::<AggState>() as u64
+            + self.payload.capacity() as u64 * size_of::<u64>() as u64
     }
 
     fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
@@ -580,6 +626,22 @@ impl Wide {
         let sign = if v < 0 { u128::MAX } else { 0 };
         (self.hi == sign).then_some(v)
     }
+
+    /// Approximate value as `f64`, for promoting an exact subtotal that overflows
+    /// `xsd:decimal` when the group also holds float or double terms.
+    fn to_f64(&self) -> f64 {
+        let neg = (self.hi as i128) < 0;
+        let (hi, lo) = if neg {
+            let (lo, carry) = (!self.lo).overflowing_add(1);
+            ((!self.hi).wrapping_add(u128::from(carry)), lo)
+        } else {
+            (self.hi, self.lo)
+        };
+        // 2^128 is exact in IEEE 754 binary64.
+        const TWO_POW_128: f64 = 340_282_366_920_938_463_463_374_607_431_768_211_456.0;
+        let mag = (hi as f64) * TWO_POW_128 + (lo as f64);
+        if neg { -mag } else { mag }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -614,6 +676,7 @@ impl SumState {
                 *n += w;
                 if *n == 0 {
                     self.decs.remove(&k);
+                    shrink_map(&mut self.decs);
                 }
             }
             Some(Value::Float(f)) => {
@@ -622,6 +685,7 @@ impl SumState {
                 *n += w;
                 if *n == 0 {
                     self.floats.remove(&b);
+                    shrink_map(&mut self.floats);
                 }
             }
             Some(Value::Double(d)) => {
@@ -630,6 +694,7 @@ impl SumState {
                 *n += w;
                 if *n == 0 {
                     self.doubles.remove(&b);
+                    shrink_map(&mut self.doubles);
                 }
             }
             _ => self.errs += w,
@@ -643,17 +708,33 @@ impl SumState {
         let mut acc = if !self.decs.is_empty() {
             // Summed exactly in 256 bits so values that cancel out do not overflow on
             // the way; the integers join the decimals as a one-off evaluation promotes
-            // them.
+            // them. When floats or doubles are present and the exact subtotal overflows
+            // xsd:decimal, promote the 256-bit subtotal directly into the target
+            // floating-point type so the result stays finite and order-independent.
             let mut acc = Wide::default();
             for (k, n) in &self.decs {
                 acc.add_product(*k, *n);
             }
             acc.add_product(self.int, 1_000_000_000_000_000_000);
-            Value::Decimal(Decimal::from_be_bytes(acc.to_i128()?.to_be_bytes()))
+            if let Some(raw) = acc.to_i128() {
+                Value::Decimal(Decimal::from_be_bytes(raw.to_be_bytes()))
+            } else if !self.doubles.is_empty() {
+                Value::Double(Double::from(acc.to_f64() / 1e18))
+            } else if !self.floats.is_empty() {
+                Value::Float(Float::from((acc.to_f64() / 1e18) as f32))
+            } else {
+                return None;
+            }
         } else if !self.floats.is_empty() || !self.doubles.is_empty() {
-            // Promote an i64-overflowing integer sum through exact_sum just as
-            // AggState::Sum does before adding floats or doubles.
-            exact_sum(self.int)?
+            // Promote an i64-overflowing integer sum through exact_sum when it fits a
+            // decimal, and otherwise directly into the target floating-point type.
+            if let Some(v) = exact_sum(self.int) {
+                v
+            } else if !self.doubles.is_empty() {
+                Value::Double(Double::from(self.int as f64))
+            } else {
+                Value::Float(Float::from(self.int as f32))
+            }
         } else {
             Value::Integer(i64::try_from(self.int).ok()?.into())
         };
@@ -678,8 +759,9 @@ impl SumState {
         Some(acc)
     }
 
-    fn bytes(&self) -> u64 {
-        96 + (self.floats.len() + self.doubles.len()) as u64 * 24 + self.decs.len() as u64 * 40
+    fn map_bytes(&self) -> u64 {
+        (self.floats.capacity() + self.doubles.capacity()) as u64 * 24
+            + self.decs.capacity() as u64 * 40
     }
 
     fn save(&self, w: &mut Writer) {
@@ -810,20 +892,31 @@ impl Accumulator for RetractableSum {
     }
 
     fn retract(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
+        if !batch.retract_weights_fit_i64(slots.len()) {
+            return Ok(false);
+        }
         self.fold(ctx, batch, slots, true)?;
         Ok(true)
     }
 
     fn clear(&mut self) {
-        self.groups.clear();
+        self.groups = Vec::new();
     }
 
     fn swap_remove(&mut self, group: usize) {
         self.groups.swap_remove(group);
+        if self.groups.is_empty() {
+            self.groups = Vec::new();
+        }
+    }
+
+    fn shrink_unused(&mut self) {
+        shrink_vec(&mut self.groups);
     }
 
     fn retained_bytes(&self) -> u64 {
-        self.groups.iter().map(SumState::bytes).sum()
+        self.groups.capacity() as u64 * size_of::<SumState>() as u64
+            + self.groups.iter().map(SumState::map_bytes).sum::<u64>()
     }
 
     fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
@@ -895,6 +988,7 @@ impl Multiset {
                 self.vals[i].1 += w;
                 if self.vals[i].1 == 0 {
                     self.vals.remove(i);
+                    shrink_vec(&mut self.vals);
                 }
             }
             Err(i) => self.vals.insert(i, (v, w)),
@@ -1067,23 +1161,35 @@ impl Accumulator for Ordered {
     }
 
     fn retract(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
+        if !batch.retract_weights_fit_i64(slots.len()) {
+            return Ok(false);
+        }
         self.fold(ctx, batch, slots, true)?;
         Ok(true)
     }
 
     fn clear(&mut self) {
-        self.groups.clear();
+        self.groups = Vec::new();
     }
 
     fn swap_remove(&mut self, group: usize) {
         self.groups.swap_remove(group);
+        if self.groups.is_empty() {
+            self.groups = Vec::new();
+        }
+    }
+
+    fn shrink_unused(&mut self) {
+        shrink_vec(&mut self.groups);
     }
 
     fn retained_bytes(&self) -> u64 {
-        self.groups
-            .iter()
-            .map(|m| 40 + m.vals.len() as u64 * 16)
-            .sum()
+        self.groups.capacity() as u64 * size_of::<Multiset>() as u64
+            + self
+                .groups
+                .iter()
+                .map(|m| m.vals.capacity() as u64 * size_of::<(Id, i64)>() as u64)
+                .sum::<u64>()
     }
 
     fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
@@ -1203,6 +1309,7 @@ impl Accumulator for RetractableDistinct {
                     let after = *e;
                     if after == 0 {
                         m.remove(&key);
+                        shrink_map(m);
                     }
                     if before <= 0 && after > 0 {
                         keep_slots.push(slot);
@@ -1223,6 +1330,7 @@ impl Accumulator for RetractableDistinct {
                         let after = *e;
                         if after == 0 {
                             m.remove(&id);
+                            shrink_map(m);
                         }
                         if before <= 0 && after > 0 {
                             keep_slots.push(slot);
@@ -1266,6 +1374,9 @@ impl Accumulator for RetractableDistinct {
     }
 
     fn retract(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
+        if !batch.retract_weights_fit_i64(slots.len()) {
+            return Ok(false);
+        }
         let mut drop_slots: Vec<u32> = Vec::new();
         let mut drop_vals: Vec<Id> = Vec::new();
         let mut drop_weights: Vec<i64> = Vec::new();
@@ -1291,6 +1402,7 @@ impl Accumulator for RetractableDistinct {
                     let after = *e;
                     if after == 0 {
                         m.remove(&key);
+                        shrink_map(m);
                     }
                     if before > 0 && after <= 0 {
                         drop_slots.push(slot);
@@ -1310,6 +1422,7 @@ impl Accumulator for RetractableDistinct {
                         let after = *e;
                         if after == 0 {
                             m.remove(&id);
+                            shrink_map(m);
                         }
                         if before > 0 && after <= 0 {
                             drop_slots.push(slot);
@@ -1339,25 +1452,37 @@ impl Accumulator for RetractableDistinct {
     }
 
     fn clear(&mut self) {
-        self.groups.clear();
+        self.groups = Vec::new();
         self.inner.clear();
     }
 
     fn swap_remove(&mut self, group: usize) {
         self.groups.swap_remove(group);
+        if self.groups.is_empty() {
+            self.groups = Vec::new();
+        }
         self.inner.swap_remove(group);
     }
 
+    fn shrink_unused(&mut self) {
+        shrink_vec(&mut self.groups);
+        self.inner.shrink_unused();
+    }
+
     fn retained_bytes(&self) -> u64 {
+        let outer = self.groups.capacity() as u64 * size_of::<DistinctGroup>() as u64;
         let own: u64 = self
             .groups
             .iter()
             .map(|g| match g {
-                DistinctGroup::Rows(m) => m.len() as u64 * row_bytes(self.row_width),
-                DistinctGroup::Values(m) => m.len() as u64 * 24 + 96,
+                DistinctGroup::Rows(m) => {
+                    m.len() as u64 * (self.row_width as u64 * 8)
+                        + m.capacity() as u64 * (size_of::<(Box<[Id]>, i64)>() as u64 + 16)
+                }
+                DistinctGroup::Values(m) => m.capacity() as u64 * 24,
             })
             .sum();
-        own + self.inner.retained_bytes()
+        outer + own + self.inner.retained_bytes()
     }
 
     fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {

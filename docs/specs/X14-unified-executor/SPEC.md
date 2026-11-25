@@ -1166,10 +1166,15 @@ negative weights with `retract`, and reading live groups without destroying thei
 `SAMPLE` and `GROUP_CONCAT` use `Ordered` over an ordered multiset, and `DISTINCT`
 aggregates wrap their inner accumulator in `RetractableDistinct`. All one-off and view
 accumulators share `finish_sum_avg`, `finish_best` and `finish_concat` so every reading of
-`aggregate-errors`, empty groups and numeric promotions agrees across both paths. Deleted
-non-implicit groups release their slot and state with `swap_remove`, and `Group::save`
-writes a versioned state header alongside the bumped incremental compiler version
-`f13-phase2-5` so unknown versions and earlier checkpoints are refused cleanly.
+`aggregate-errors`, empty groups and numeric promotions agrees across both paths.
+`RetractableSum` sums integers and decimals in 256-bit exact arithmetic and promotes an
+overflowing exact subtotal to float or double when the group holds float or double terms,
+keeping its result independent of row order where a one-off left-fold can overflow earlier
+if overflowing decimals precede a float or double. Deleted non-implicit groups release
+their slot and state with `swap_remove`, reclaim oversized or emptied backing buffers and
+account for allocated buffer capacity in view memory budgeting, and `Group::save` writes a
+versioned state header alongside the bumped incremental compiler version `f13-phase2-5` so
+unknown versions and earlier checkpoints are refused cleanly.
 
 The operator finds each row's group through a hash table on the keys, in order of first
 appearance. When every aggregate keeps running state, rows arrive in any batches, and a

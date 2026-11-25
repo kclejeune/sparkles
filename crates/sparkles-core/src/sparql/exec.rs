@@ -7602,15 +7602,47 @@ impl AggState {
     }
 
     /// Add `weight` copies of one row; `id` is the aggregated column's value (`None` for COUNT(*)).
-    pub(super) fn add_weighted(&mut self, ctx: &Ctx, agg: &Agg, id: Option<Id>, weight: u64) {
+    pub(super) fn add_weighted(
+        &mut self,
+        ctx: &Ctx,
+        agg: &Agg,
+        id: Option<Id>,
+        weight: u64,
+    ) -> Result<()> {
         if weight == 0 {
-            return;
+            return Ok(());
         }
         match self {
             AggState::Count(n) => {
                 if id.is_none_or(|id| !id.is_undef()) {
                     *n += weight;
                 }
+            }
+            AggState::Best(_, _, errs) => {
+                if id.is_none_or(|id| id.is_undef()) {
+                    *errs += weight;
+                } else {
+                    self.add(ctx, agg, id);
+                }
+            }
+            AggState::Sample(_) => {
+                self.add(ctx, agg, id);
+            }
+            AggState::Sum {
+                ok: false,
+                rows,
+                errs,
+                ..
+            } => {
+                *rows += weight;
+                if id.is_none_or(|id| id.is_undef()) {
+                    *errs += weight;
+                }
+            }
+            AggState::Sum { ok, rows, errs, .. } if id.is_none_or(|id| id.is_undef()) => {
+                *rows += weight;
+                *errs += weight;
+                *ok = false;
             }
             AggState::Sum {
                 int,
@@ -7625,18 +7657,46 @@ impl AggState {
                 {
                     *int = s;
                     *rows += weight;
-                    return;
+                    return Ok(());
                 }
-                for _ in 0..weight {
+                for i in 0..weight {
+                    if i.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
                     self.add(ctx, agg, Some(id));
+                    if let AggState::Sum {
+                        ok: false, rows, ..
+                    } = self
+                    {
+                        *rows += weight - 1 - i;
+                        break;
+                    }
                 }
             }
             _ => {
-                for _ in 0..weight {
+                for i in 0..weight {
+                    if i.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
                     self.add(ctx, agg, id);
+                    if let AggState::Sum {
+                        ok: false,
+                        rows,
+                        errs,
+                        ..
+                    } = self
+                    {
+                        let rem = weight - 1 - i;
+                        *rows += rem;
+                        if id.is_none_or(|id| id.is_undef()) {
+                            *errs += rem;
+                        }
+                        break;
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     /// Take back `weight` copies of one row that [`AggState::add`] counted, for a state

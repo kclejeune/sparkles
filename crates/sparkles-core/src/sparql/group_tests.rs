@@ -389,3 +389,230 @@ fn weighted_add_and_signed_retract_across_retractable_accumulators() {
     assert!(ctx.term(got_ret).is_some());
     assert_eq!(ctx.term(got_ret), ctx.term(got_run));
 }
+
+#[test]
+fn retractable_sum_decimal_overflow_with_float_or_double() {
+    let ctx = ctx();
+    let big_dec = ctx.intern_value(&Value::Decimal("100000000000000000000.0".parse().unwrap()));
+    let zero_d = ctx.intern_value(&Value::Double(0.0f64.into()));
+    let zero_f = ctx.intern_value(&Value::Float(0.0f32.into()));
+    let max_i = ctx.intern_value(&Value::Integer(i64::MAX.into()));
+    let table = Table::new(vec![0]);
+
+    for func in [AggregateFunction::Sum, AggregateFunction::Avg] {
+        let a = agg(func.clone(), true, false);
+        let mut running = Running::new(&a, false);
+        let mut ret = retractable(&a, 1).unwrap();
+        running.init(1);
+        ret.init(1);
+
+        // 0.0e0 followed by two 1e20 decimals: subtotal 2e20 exceeds xsd:decimal,
+        // but enters double arithmetic and stays finite in both Running and RetractableSum.
+        let vals = [zero_d, big_dec, big_dec];
+        let slots = [0u32, 0, 0];
+        fold(&ctx, &mut running, &vals, &slots);
+        fold(&ctx, &mut *ret, &vals, &slots);
+        let got_run = running.finish(&ctx, 0).unwrap();
+        let got_ret = ret.read(&ctx, 0).unwrap();
+        assert!(!got_ret.is_undef(), "{func:?} should stay finite");
+        assert_eq!(ctx.term(got_ret), ctx.term(got_run), "{func:?}");
+
+        // Retracting 0.0e0 leaves pure overflowing decimals -> UNDEF.
+        let retract_d = Batch {
+            table: &table,
+            arg: Arg::Column(&[zero_d]),
+            rows: None,
+            weights: Some(&[-1]),
+            base: 0,
+        };
+        assert!(ret.retract(&ctx, &retract_d, &[0]).unwrap());
+        assert!(ret.read(&ctx, 0).unwrap().is_undef(), "{func:?} overflows");
+
+        // Retracting one 1e20 recovers to exact decimal 1e20.
+        let retract_dec = Batch {
+            table: &table,
+            arg: Arg::Column(&[big_dec]),
+            rows: None,
+            weights: Some(&[-1]),
+            base: 0,
+        };
+        assert!(ret.retract(&ctx, &retract_dec, &[0]).unwrap());
+        let recovered = ret.read(&ctx, 0).unwrap();
+        assert_eq!(ctx.term(recovered), ctx.term(big_dec), "{func:?} recovers");
+
+        // Float promotion on overflowing decimal subtotal.
+        let mut run_f = Running::new(&a, false);
+        let mut ret_f = retractable(&a, 1).unwrap();
+        run_f.init(1);
+        ret_f.init(1);
+        let fvals = [zero_f, big_dec, big_dec];
+        fold(&ctx, &mut run_f, &fvals, &slots);
+        fold(&ctx, &mut *ret_f, &fvals, &slots);
+        assert_eq!(
+            ctx.term(ret_f.read(&ctx, 0).unwrap()),
+            ctx.term(run_f.finish(&ctx, 0).unwrap()),
+            "{func:?} float"
+        );
+
+        // Integer subtotal overflowing both i64 and xsd:decimal (20 * i64::MAX > 1.7e20)
+        // stays finite when a double is present and turns UNDEF when retracted.
+        let mut ret_i = retractable(&a, 1).unwrap();
+        ret_i.init(1);
+        let add_i = Batch {
+            table: &table,
+            arg: Arg::Column(&[max_i, zero_d]),
+            rows: None,
+            weights: Some(&[20, 1]),
+            base: 0,
+        };
+        ret_i.add_batch(&ctx, &add_i, &[0, 0]).unwrap();
+        let got_i = ret_i.read(&ctx, 0).unwrap();
+        assert!(
+            matches!(ctx.value(got_i), Some(Value::Double(d)) if f64::from(d).is_finite()),
+            "{func:?} large int + double: {:?}",
+            ctx.value(got_i)
+        );
+        assert!(ret_i.retract(&ctx, &retract_d, &[0]).unwrap());
+        assert!(ret_i.read(&ctx, 0).unwrap().is_undef());
+    }
+}
+
+#[test]
+fn retract_rejects_i64_min_without_mutating_state() {
+    let ctx = ctx();
+    let v5 = int(&ctx, 5);
+    let mut table = Table::new(vec![0]);
+    table.push_row(&[v5]);
+
+    let cases = [
+        agg(AggregateFunction::Sum, true, false),
+        agg(AggregateFunction::Avg, true, false),
+        agg(AggregateFunction::Min, true, false),
+        agg(
+            AggregateFunction::GroupConcat {
+                separator: Some(",".into()),
+            },
+            true,
+            false,
+        ),
+        agg(AggregateFunction::Count, true, true),
+        agg(AggregateFunction::Count, false, true),
+    ];
+
+    for a in cases {
+        let mut acc = retractable(&a, 1).unwrap();
+        acc.init(1);
+        let arg = if a.expr.is_some() {
+            Arg::Column(&[v5])
+        } else {
+            Arg::Star
+        };
+        let add = Batch {
+            table: &table,
+            arg,
+            rows: None,
+            weights: Some(&[3]),
+            base: 0,
+        };
+        acc.add_batch(&ctx, &add, &[0]).unwrap();
+        let before = acc.read(&ctx, 0).unwrap();
+
+        let bad = Batch {
+            table: &table,
+            arg,
+            rows: None,
+            weights: Some(&[i64::MIN]),
+            base: 0,
+        };
+        assert!(!acc.retract(&ctx, &bad, &[0]).unwrap(), "{:?}", a.func);
+        assert_eq!(acc.read(&ctx, 0).unwrap(), before, "{:?}", a.func);
+    }
+
+    // Running COUNT handles i64::MIN without overflowing.
+    let mut count = retractable(&agg(AggregateFunction::Count, true, false), 1).unwrap();
+    count.init(1);
+    let add = Batch {
+        table: &table,
+        arg: Arg::Column(&[v5]),
+        rows: None,
+        weights: Some(&[3]),
+        base: 0,
+    };
+    count.add_batch(&ctx, &add, &[0]).unwrap();
+    let bad = Batch {
+        table: &table,
+        arg: Arg::Column(&[v5]),
+        rows: None,
+        weights: Some(&[i64::MIN]),
+        base: 0,
+    };
+    assert!(count.retract(&ctx, &bad, &[0]).unwrap());
+    assert_eq!(count.read(&ctx, 0).unwrap(), int(&ctx, 0));
+}
+
+#[test]
+fn running_weighted_tracks_best_payload_and_polls_cancellation() {
+    let ctx = ctx();
+    let big_str = ctx.intern_value(&Value::Str("a".repeat(2048).into()));
+    let dec = ctx.intern_value(&Value::Decimal("1.5".parse().unwrap()));
+    let table = Table::new(vec![0]);
+
+    // Weighted MIN with track = true accounts for decoded best payload and runs in O(1).
+    let mut min_acc = Running::new(&agg(AggregateFunction::Min, true, false), true);
+    min_acc.init(1);
+    let batch = Batch {
+        table: &table,
+        arg: Arg::Column(&[big_str]),
+        rows: None,
+        weights: Some(&[1_000_000]),
+        base: 0,
+    };
+    min_acc.add_batch(&ctx, &batch, &[0]).unwrap();
+    assert!(min_acc.take_growth() >= 2048);
+    assert_eq!(min_acc.read(&ctx, 0).unwrap(), big_str);
+
+    // Weighted SAMPLE completes in O(1).
+    let mut sample_acc = Running::new(&agg(AggregateFunction::Sample, true, false), false);
+    sample_acc.init(1);
+    sample_acc.add_batch(&ctx, &batch, &[0]).unwrap();
+    assert_eq!(sample_acc.read(&ctx, 0).unwrap(), big_str);
+
+    // Weighted SUM polls cancellation inside its fallback loop.
+    ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut sum_acc = Running::new(&agg(AggregateFunction::Sum, true, false), false);
+    sum_acc.init(1);
+    let sum_batch = Batch {
+        table: &table,
+        arg: Arg::Column(&[dec]),
+        rows: None,
+        weights: Some(&[1_000_000]),
+        base: 0,
+    };
+    let err = sum_acc.add_batch(&ctx, &sum_batch, &[0]).unwrap_err();
+    assert!(matches!(err, crate::Error::Cancelled), "got {err:?}");
+}
+
+#[test]
+fn retractable_retained_bytes_charges_capacity_and_reclaims_on_drain() {
+    let count_agg = agg(AggregateFunction::Count, false, false);
+    let mut acc = retractable(&count_agg, 1).unwrap();
+    acc.init(512);
+    let peak = acc.retained_bytes();
+    assert!(
+        peak >= 512 * std::mem::size_of::<super::exec::AggState>() as u64,
+        "COUNT retained_bytes {peak} must charge full AggState capacity"
+    );
+    for _ in 0..450 {
+        acc.swap_remove(0);
+    }
+    acc.shrink_unused();
+    let shrunk = acc.retained_bytes();
+    assert!(
+        shrunk < peak / 2,
+        "expected shrunk retained_bytes ({shrunk}) < half of peak ({peak})"
+    );
+    for _ in 0..62 {
+        acc.swap_remove(0);
+    }
+    assert_eq!(acc.retained_bytes(), 0);
+}

@@ -132,6 +132,10 @@ impl Terms {
         self.keys.get(index).map(|k| k.bytes.as_ref())
     }
 
+    pub(crate) fn find_local_key(&self, key: &[u8]) -> Option<u64> {
+        self.index.get(key).copied()
+    }
+
     pub(crate) fn push_local_key(&mut self, key: Vec<u8>) -> Id {
         self.local(key)
     }

@@ -958,6 +958,69 @@ pub struct PlanWarning {
     pub message: String,
 }
 
+/// Query-local vocabulary backing: either an owned [`AppendVocab`] for ordinary queries
+/// or an incremental circuit's [`Terms`](crate::incr::terms::Terms) borrowed for the
+/// duration of an accumulator call without copying historical keys.
+enum LocalVocab {
+    Owned(AppendVocab),
+    Circuit(crate::incr::terms::Terms),
+}
+
+impl Default for LocalVocab {
+    fn default() -> Self {
+        Self::Owned(AppendVocab::default())
+    }
+}
+
+impl LocalVocab {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Owned(v) => v.len(),
+            Self::Circuit(t) => t.key_count() as u64,
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<&[u8]> {
+        match self {
+            Self::Owned(v) => v.get(id),
+            Self::Circuit(t) => t.key_bytes(id as usize),
+        }
+    }
+
+    fn find(&self, key: &[u8]) -> Option<u64> {
+        match self {
+            Self::Owned(v) => v.find(key),
+            Self::Circuit(t) => t.find_local_key(key),
+        }
+    }
+
+    fn insert(&mut self, key: &[u8]) -> (u64, bool) {
+        match self {
+            Self::Owned(v) => v.insert(key),
+            Self::Circuit(t) => {
+                let before = t.key_count();
+                let id = t.push_local_key(key.to_vec());
+                (id.payload(), t.key_count() > before)
+            }
+        }
+    }
+
+    fn clone_owned(&self) -> AppendVocab {
+        match self {
+            Self::Owned(v) => v.clone(),
+            Self::Circuit(t) => {
+                let mut v = AppendVocab::default();
+                for i in 0..t.key_count() {
+                    if let Some(k) = t.key_bytes(i) {
+                        v.insert(k);
+                    }
+                }
+                v
+            }
+        }
+    }
+}
+
 pub struct Ctx {
     pub extensions: Option<Arc<super::extensions::ExtensionRegistry>>,
     /// what query-time reasoning derived for this query (see [`super::reasoning`])
@@ -969,7 +1032,7 @@ pub struct Ctx {
     /// overlay, charged to the query until the context drops.
     pub(super) reasoning_memory: Vec<QueryMemoryLease>,
     pub snap: Arc<Snapshot>,
-    local: RwLock<AppendVocab>,
+    local: RwLock<LocalVocab>,
     values: ValueCache,
     floors: FloorCache,
     next_bnode: AtomicU64,
@@ -1565,7 +1628,7 @@ impl Ctx {
             source_setup: None,
             #[cfg(test)]
             chunk_hook: parking_lot::Mutex::new(None),
-            local: RwLock::new(AppendVocab::default()),
+            local: RwLock::new(LocalVocab::default()),
             values: Default::default(),
             floors: Default::default(),
             next_bnode: AtomicU64::new(0),
@@ -2831,11 +2894,11 @@ impl Ctx {
     /// Take the local terms and minted blank nodes of `other`, so that this context reads
     /// the ids `other` gave them (a query that reads a view with derived facts).
     pub(crate) fn share_local(&self, other: &Ctx) {
-        let local = other.local.read().clone();
+        let local = other.local.read().clone_owned();
         // The copy is this context's own, so it is charged here, and a refusal fails the
         // next check.
         self.retain_bytes(local.bytes() as u64);
-        *self.local.write() = local;
+        *self.local.write() = LocalVocab::Owned(local);
         self.next_bnode
             .store(other.next_bnode.load(Ordering::Relaxed), Ordering::Relaxed);
     }
@@ -3774,15 +3837,28 @@ impl Ctx {
         self.local.read().len()
     }
 
-    /// Append a key directly into the query-local vocabulary, returning its local index.
-    /// Used by incremental view passes to keep `Ctx` and `incr::terms::Terms` indices aligned.
-    pub(crate) fn push_local_key(&self, key: &[u8]) -> u64 {
-        self.local.write().insert(key).0
+    /// Back this context's query-local vocabulary directly with an incremental circuit's
+    /// [`Terms`](crate::incr::terms::Terms) so `Tag::Local` ids resolve and intern on
+    /// demand without copying historical keys.
+    pub(crate) fn swap_circuit_terms(
+        &self,
+        terms: crate::incr::terms::Terms,
+    ) -> crate::incr::terms::Terms {
+        let mut guard = self.local.write();
+        match std::mem::replace(&mut *guard, LocalVocab::Circuit(terms)) {
+            LocalVocab::Circuit(prev) => prev,
+            LocalVocab::Owned(_) => crate::incr::terms::Terms::default(),
+        }
     }
 
-    /// Copy the vocabulary key of a query-local id.
-    pub(crate) fn local_key(&self, id: u64) -> Option<Vec<u8>> {
-        self.local.read().get(id).map(|k| k.to_vec())
+    /// Take back the [`Terms`](crate::incr::terms::Terms) previously attached with
+    /// [`Ctx::swap_circuit_terms`], restoring an empty owned vocabulary.
+    pub(crate) fn take_circuit_terms(&self) -> crate::incr::terms::Terms {
+        let mut guard = self.local.write();
+        match std::mem::take(&mut *guard) {
+            LocalVocab::Circuit(terms) => terms,
+            LocalVocab::Owned(_) => crate::incr::terms::Terms::default(),
+        }
     }
 }
 
