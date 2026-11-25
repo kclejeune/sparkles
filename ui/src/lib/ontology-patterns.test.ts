@@ -1,16 +1,18 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   applyPatterns,
+  buildPatternSpec,
   dryRunPatterns,
   formatPrefixLines,
   parsePrefixLines,
   parsePreviewHeaders,
   PATTERN_PRESETS,
+  patternInputSignature,
   previewPatterns,
 } from './ontology-patterns';
 
 describe('ontology-patterns helpers', () => {
-  it('parses CSV and TSV headers including BOM and quoted columns', () => {
+  it('parses CSV and TSV headers including BOM, leading blanks, quoted multiline and duplicate columns', () => {
     expect(parsePreviewHeaders('\uFEFFID,"Display, Label",Parent\n1,2,3')).toEqual([
       'ID',
       'Display, Label',
@@ -21,7 +23,80 @@ describe('ontology-patterns helpers', () => {
       'Label',
       'Parent',
     ]);
+    // Leading blank lines before TSV header
+    expect(parsePreviewHeaders('\n  \nID\tLabel\tParent\nex:A\tA\towl:Thing', 'auto')).toEqual([
+      'ID',
+      'Label',
+      'Parent',
+    ]);
+    // Quoted header cell with embedded newline
+    expect(parsePreviewHeaders('ID,"Display\nLabel",Parent\nex:A,Heart,ex:Organ')).toEqual([
+      'ID',
+      'Display\nLabel',
+      'Parent',
+    ]);
+    // Duplicate header names preserved in order (chips are keyed by index)
+    expect(parsePreviewHeaders('ID,Note,Note\nex:A,a,b')).toEqual(['ID', 'Note', 'Note']);
     expect(parsePreviewHeaders('\n   \n')).toEqual([]);
+  });
+
+  it('preserves requiredColumns and split in buildPatternSpec and detects input/imports changes', () => {
+    const spec = buildPatternSpec({
+      mode: 'pattern',
+      baseIri: 'http://ex.org/',
+      prefixes: { ex: 'http://ex.org/' },
+      headerTemplateRow: false,
+      robotColumns: [],
+      rules: [
+        {
+          name: 'parts',
+          template: '${cls|iri} SubClassOf ex:partOf some ${parts|iri}',
+          syntax: 'manchester',
+          skipIfEmpty: true,
+          requiredColumns: ['cls', ' '],
+          split: { parts: '|', unused: '' },
+          annotations: [{ property: 'dcterms:source', value: '${src}' }],
+        },
+      ],
+      declarations: [{ column: 'cls', kind: 'Class', split: '' }],
+    });
+    expect(spec.mode).toBe('pattern');
+    if (spec.mode === 'pattern') {
+      expect(spec.rules?.[0].requiredColumns).toEqual(['cls']);
+      expect(spec.rules?.[0].split).toEqual({ parts: '|' });
+      expect(spec.rules?.[0].annotations).toHaveLength(1);
+    }
+
+    const baseArgs = {
+      target: 'bio',
+      sel: { graph: null, imports: true },
+      mode: 'robot' as const,
+      format: 'csv' as const,
+      tableData: 'ID,Label\nID,LABEL\nex:A,A\n',
+      baseIri: '',
+      prefixText: 'ex=http://ex.org/',
+      headerTemplateRow: true,
+      robotColumns: [],
+      rules: [],
+      declarations: [],
+      declareEntities: true,
+    };
+    const sig1 = patternInputSignature(baseArgs);
+    const sigImports = patternInputSignature({
+      ...baseArgs,
+      sel: { graph: null, imports: false },
+    });
+    const sigData = patternInputSignature({
+      ...baseArgs,
+      tableData: 'ID,Label\nID,LABEL\nex:B,B\n',
+    });
+    const sigDeclare = patternInputSignature({
+      ...baseArgs,
+      declareEntities: false,
+    });
+    expect(sigImports).not.toBe(sig1);
+    expect(sigData).not.toBe(sig1);
+    expect(sigDeclare).not.toBe(sig1);
   });
 
   it('parses and formats prefix binding lines', () => {
@@ -171,7 +246,9 @@ describe('ontology-patterns HTTP client', () => {
       etag: 'W/"bio:5:owl"',
     });
     expect(dry.commit?.inserted).toBe(3);
-    expect(fetchMock.mock.calls[0][0]).toBe('/$/ontology/bio/patterns/apply?dryRun=true');
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/$/ontology/bio/patterns/apply?dryRun=true&changes=50',
+    );
 
     const applied = await applyPatterns('bio', { graph: null, imports: true }, req, {
       etag: 'W/"bio:5:owl"',

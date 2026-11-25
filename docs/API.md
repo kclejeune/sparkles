@@ -2662,28 +2662,39 @@ head, and if the map cannot be written after the commit, the `500` answer
 
 `POST /$/ontology/{ds}/patterns/preview` evaluates CSV or TSV spreadsheet rows against a
 declarative template or pattern specification without modifying the dataset, requiring
-dataset read access on the `query` endpoint. The request body carries `table` (`{"data",
-"format"?: "auto" | "csv" | "tsv"}`), `spec` (`{"mode": "robot" | "pattern", "baseIri"?,
-"prefixes"?, ...}`), and optional `graph`, `imports`, `mode`, `declare`, `target`, and
-`limit` (1 to 2,000, default 200). In `robot` mode, `headerTemplateRow` reads ROBOT
-column directives (`ID`, `LABEL`, `LABEL@lang`, `TYPE`, `SC`, `EC`, `DC`, `SP`, `C`, `I`,
-`A`, `AL`, `AT`, `AI`, `SPLIT=<sep>`, and axiom annotations `>A`, `>AL`, `>AT`, `>AI`)
-from row 2 or from explicit `columns` entries. In `pattern` mode, `rules` define
-parameterized Manchester or functional-style axiom templates with `${col}` placeholders
-and optional filters (`iri`, `slug`, `str`, `lang(...)`, `type(...)`), optional
-`declarations`, per-column `split` delimiters, and axiom `annotations`. Inputs are bounded
-at 2 MiB, 5,000 data rows, 128 columns, 50,000 generated axioms, 1,000 diagnostics, and
-256 combinations per rule per row. The answer reports row counts, generated axioms with
-their `new` or `existing` status, auto-declarations, estimated RDF triples, and per-row
-diagnostics, together with the ontology's entity tag.
+dataset read access on the `query` endpoint. The JSON body takes `table` with `data` and
+an optional `format` of `auto`, `csv`, or `tsv`, `spec` with `mode` set to `robot` or
+`pattern`, optional `baseIri` and `prefixes`, and optional `graph`, `imports`, `mode`,
+`declare`, `target`, and `limit` from 1 to 2,000 with a default of 200.
 
-`POST /$/ontology/{ds}/patterns/apply` evaluates the same table and specification and
-commits all generated axioms in one atomic ontology edit, requiring dataset write access
-on the `update` endpoint. It honors read-only mode, protected branches, graph write
-grants, `If-Match`, `receipt=true`, `message`, and `dryRun=true` preview parity. With
-`onError: "abort"` (the default), any row diagnostic error refuses the commit with `422`
-(`pattern-errors`) and writes nothing. With `onError: "skip"`, valid axioms are committed
-and diagnostics are returned alongside the edit outcome under `pattern`.
+In `robot` mode, `headerTemplateRow` reads ROBOT column directives from row 2, and
+explicit `columns` entries either override individual columns in row 2 or define the full
+mapping when `headerTemplateRow` is false. Supported directives are `ID`, `LABEL`,
+`LABEL@lang`, `TYPE`, `SC`, `EC`, `DC`, `SP`, `C`, `I`, `TI`, `A`, `AL`, `AT`, `AI`,
+`SPLIT=<sep>`, and axiom annotations `>A`, `>AL`, `>AT`, and `>AI`. Multiple `EC`
+expressions on one row combine into a single `EquivalentClasses` intersection axiom, and
+`TI` adds class assertions to the row's named individual. In `pattern` mode, `rules`
+define parameterized Manchester or functional-style axiom templates with `${col}`
+placeholders and optional `iri`, `slug`, `str`, `lang(...)`, and `type(...)` filters,
+alongside optional `declarations`, per-column `split` delimiters, and axiom `annotations`.
+Inputs are bounded at 2 MiB, 5,000 data rows, 128 columns, 50,000 unique generated
+axioms, 100,000 evaluation attempts, 250,000 projected triples, 1,000 recorded
+diagnostics, and 256 split values or rule combinations per row. The answer reports row
+counts, generated axioms with their `new` or `existing` status against both terminology
+and stored assertions, auto-declarations, estimated RDF triples, and per-row diagnostics,
+together with the ontology's entity tag and commit headers.
+
+`POST /$/ontology/{ds}/patterns/apply` evaluates the table and specification under the
+writer lock against the head snapshot and commits all generated axioms in one atomic
+ontology edit, requiring dataset write access on the `update` endpoint. It enforces
+read-only mode, protected branches, target graph write grants, `If-Match` preconditions
+including import-target digest parity for ontology entity tags, `receipt=true`, `message`,
+and `dryRun=true` preview parity before reporting pattern diagnostics. With `onError` set
+to `abort` (the default), any error refuses the commit with `422` (`pattern-errors`) and
+writes nothing. With `onError` set to `skip`, erroneous rows are discarded atomically,
+valid rows are committed, and diagnostics are returned alongside the edit outcome under
+`pattern`. Request-wide budget failures and structural specification errors refuse the
+commit under either error policy.
 
 ## Per-dataset SPARQL protocol (Fuseki compatible)
 

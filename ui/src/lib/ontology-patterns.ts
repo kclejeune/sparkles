@@ -270,62 +270,75 @@ export const PATTERN_PRESETS: readonly PatternPreset[] = [
 ];
 
 /**
- * Extract the header column names from the first non-empty line of a CSV/TSV string for
- * UI column pickers and placeholder chips.
+ * Extract the header column names from the first non-blank logical RFC 4180 record of a
+ * CSV/TSV string (handling leading blank lines and quoted multiline header cells) for UI
+ * column pickers and placeholder chips.
  */
 export function parsePreviewHeaders(data: string, format: TableFormat = 'auto'): string[] {
   const text = data.replace(/^\uFEFF/, '');
-  const lines = text.split(/\r?\n/);
-  const first = lines.find((l) => l.trim().length > 0);
-  if (!first) return [];
-  const sep =
-    format === 'tsv'
-      ? '\t'
-      : format === 'csv'
-        ? ','
-        : countOutsideQuotes(first, '\t') > countOutsideQuotes(first, ',')
-          ? '\t'
-          : ',';
-
-  const cols: string[] = [];
-  let cur = '';
-  let inQuotes = false;
-  for (let i = 0; i < first.length; i++) {
-    const ch = first[i];
-    if (ch === '"') {
-      if (inQuotes && first[i + 1] === '"') {
-        cur += '"';
-        i++;
-      } else {
+  let pos = 0;
+  while (pos < text.length) {
+    const start = pos;
+    let inQuotes = false;
+    let tabs = 0;
+    let commas = 0;
+    let hasContent = false;
+    let recordEnd = text.length;
+    while (pos < text.length) {
+      const ch = text[pos];
+      if (ch === '"') {
+        if (inQuotes && text[pos + 1] === '"') {
+          hasContent = true;
+          pos += 2;
+          continue;
+        }
         inQuotes = !inQuotes;
-      }
-    } else if (ch === sep && !inQuotes) {
-      cols.push(cur.trim());
-      cur = '';
-    } else {
-      cur += ch;
-    }
-  }
-  cols.push(cur.trim());
-  return cols.filter((c) => c.length > 0);
-}
-
-function countOutsideQuotes(line: string, target: string): number {
-  let inQuotes = false;
-  let count = 0;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        i++;
+        pos++;
+      } else if (!inQuotes && ch === '\r') {
+        recordEnd = pos;
+        pos += text[pos + 1] === '\n' ? 2 : 1;
+        break;
+      } else if (!inQuotes && ch === '\n') {
+        recordEnd = pos;
+        pos++;
+        break;
+      } else if (!inQuotes && ch === '\t') {
+        tabs++;
+        pos++;
+      } else if (!inQuotes && ch === ',') {
+        commas++;
+        pos++;
       } else {
-        inQuotes = !inQuotes;
+        if (ch.trim().length > 0) hasContent = true;
+        pos++;
       }
-    } else if (!inQuotes && ch === target) {
-      count++;
     }
+    if (!hasContent) continue;
+    const record = text.slice(start, recordEnd);
+    const sep = format === 'tsv' ? '\t' : format === 'csv' ? ',' : tabs > commas ? '\t' : ',';
+    const cols: string[] = [];
+    let cur = '';
+    let quoted = false;
+    for (let i = 0; i < record.length; i++) {
+      const ch = record[i];
+      if (ch === '"') {
+        if (quoted && record[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          quoted = !quoted;
+        }
+      } else if (ch === sep && !quoted) {
+        cols.push(cur.trim());
+        cur = '';
+      } else {
+        cur += ch;
+      }
+    }
+    cols.push(cur.trim());
+    return cols.filter((c) => c.length > 0);
   }
-  return count;
+  return [];
 }
 
 /** Parse multiline `prefix=namespace` (or `prefix: namespace`) text into a prefix map. */
@@ -369,6 +382,98 @@ export function formatPrefixLines(prefixes: Record<string, string> | undefined):
     .join('\n');
 }
 
+export type PatternAuthoringState = {
+  mode: PatternMode;
+  baseIri: string;
+  prefixes: Record<string, string>;
+  headerTemplateRow: boolean;
+  robotColumns: RobotColumnDirective[];
+  rules: PatternRuleSpec[];
+  declarations: PatternDeclarationSpec[];
+};
+
+/** Build a normalized `PatternSpec` payload while preserving optional rule fields. */
+export function buildPatternSpec(state: PatternAuthoringState): PatternSpec {
+  const base = state.baseIri.trim() || null;
+  if (state.mode === 'robot') {
+    const cols = state.robotColumns
+      .filter((c) => c.column.trim() && c.directive.trim())
+      .map((c) => ({
+        column: c.column.trim(),
+        directive: c.directive.trim(),
+        ...(c.split?.trim() ? { split: c.split.trim() } : {}),
+      }));
+    return {
+      mode: 'robot',
+      baseIri: base,
+      prefixes: state.prefixes,
+      headerTemplateRow: state.headerTemplateRow,
+      ...(cols.length > 0 ? { columns: cols } : {}),
+    };
+  }
+  return {
+    mode: 'pattern',
+    baseIri: base,
+    prefixes: state.prefixes,
+    rules: state.rules
+      .filter((r) => r.template.trim().length > 0)
+      .map((r) => {
+        const reqCols = (r.requiredColumns ?? []).map((c) => c.trim()).filter(Boolean);
+        const splitEntries = Object.entries(r.split ?? {}).filter(
+          ([k, v]) => k.trim().length > 0 && v.length > 0,
+        );
+        return {
+          ...(r.name?.trim() ? { name: r.name.trim() } : {}),
+          template: r.template.trim(),
+          syntax: r.syntax ?? 'manchester',
+          skipIfEmpty: r.skipIfEmpty ?? true,
+          ...(reqCols.length > 0 ? { requiredColumns: reqCols } : {}),
+          ...(splitEntries.length > 0 ? { split: Object.fromEntries(splitEntries) } : {}),
+          ...(r.annotations?.length ? { annotations: r.annotations } : {}),
+        };
+      }),
+    declarations: state.declarations
+      .filter((d) => d.column.trim().length > 0)
+      .map((d) => ({
+        column: d.column.trim(),
+        kind: d.kind,
+        ...(d.split?.trim() ? { split: d.split.trim() } : {}),
+      })),
+  };
+}
+
+/** Stable signature of every input that affects preview output. */
+export function patternInputSignature(args: {
+  target: string;
+  sel: Selection;
+  mode: PatternMode;
+  format: TableFormat;
+  tableData: string;
+  baseIri: string;
+  prefixText: string;
+  headerTemplateRow: boolean;
+  robotColumns: RobotColumnDirective[];
+  rules: PatternRuleSpec[];
+  declarations: PatternDeclarationSpec[];
+  declareEntities: boolean;
+}): string {
+  return JSON.stringify({
+    target: args.target,
+    graph: args.sel.graph,
+    imports: args.sel.imports,
+    mode: args.mode,
+    format: args.format,
+    tableData: args.tableData,
+    baseIri: args.baseIri,
+    prefixText: args.prefixText,
+    headerTemplateRow: args.headerTemplateRow,
+    robotColumns: args.robotColumns,
+    rules: args.rules,
+    declarations: args.declarations,
+    declareEntities: args.declareEntities,
+  });
+}
+
 function buildBody(
   sel: Selection,
   req: PatternPreviewRequest | PatternApplyRequest,
@@ -400,24 +505,28 @@ export async function previewPatterns(
   return { ...data, etag: res.headers.get('etag') };
 }
 
-/** `POST /$/ontology/{ds}/patterns/apply?dryRun=true`: server dry-run triple diff parity. */
+/** `POST /$/ontology/{ds}/patterns/apply?dryRun=true&changes=50`: server dry-run triple diff parity. */
 export async function dryRunPatterns(
   target: string,
   sel: Selection,
   req: PatternApplyRequest,
-  opts: { etag?: string | null; signal?: AbortSignal } = {},
+  opts: { etag?: string | null; changes?: number; signal?: AbortSignal } = {},
 ): Promise<WritePreview> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json',
   };
   if (opts.etag) headers['If-Match'] = opts.etag;
-  const res = await request(`/$/ontology/${enc(target)}/patterns/apply?dryRun=true`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(buildBody(sel, req)),
-    signal: opts.signal,
-  });
+  const changes = opts.changes ?? 50;
+  const res = await request(
+    `/$/ontology/${enc(target)}/patterns/apply?dryRun=true&changes=${changes}`,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(buildBody(sel, req)),
+      signal: opts.signal,
+    },
+  );
   return (await res.json()) as WritePreview;
 }
 

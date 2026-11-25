@@ -10,16 +10,19 @@
   import type { EntityKind, Selection } from '$lib/ontology';
   import {
     applyPatterns,
+    buildPatternSpec,
     dryRunPatterns,
     formatPrefixLines,
     parsePrefixLines,
     parsePreviewHeaders,
     PATTERN_PRESETS,
+    patternInputSignature,
     previewPatterns,
     type PatternDeclarationSpec,
     type PatternMode,
     type PatternOnError,
     type PatternPreset,
+    type PatternPreviewRequest,
     type PatternPreviewResponse,
     type PatternRuleSpec,
     type PatternSpec,
@@ -81,9 +84,17 @@
   let commitMessage = $state(PATTERN_PRESETS[0].commitMessage);
   let fileName = $state<string | null>(null);
 
+  const MAX_UPLOAD_BYTES = 2 * 1024 * 1024;
+
   // --- preview & apply state --------------------------------------------------------------
   let preview = $state<PatternPreviewResponse | null>(null);
   let dryPreview = $state<WritePreview | null>(null);
+  let previewSignature = $state<string | null>(null);
+  let previewPinned = $state<{
+    target: string;
+    sel: Selection;
+    req: PatternPreviewRequest;
+  } | null>(null);
   let statusFilter = $state<'all' | 'new' | 'existing'>('all');
   let searchFilter = $state('');
   let busy = $state<'preview' | 'dry' | 'apply' | null>(null);
@@ -95,6 +106,47 @@
 
   const headers = $derived(parsePreviewHeaders(tableData, format));
   const parsedPrefixes = $derived(parsePrefixLines(prefixText));
+  const inputSignature = $derived(
+    patternInputSignature({
+      target,
+      sel,
+      mode,
+      format,
+      tableData,
+      baseIri,
+      prefixText,
+      headerTemplateRow,
+      robotColumns,
+      rules,
+      declarations,
+      declareEntities,
+    }),
+  );
+
+  let lastInputSignature: string | null = null;
+  $effect(() => {
+    const sig = inputSignature;
+    if (lastInputSignature !== null && lastInputSignature !== sig) {
+      run.claim('preview');
+      run.claim('apply');
+      busy = null;
+      preview = null;
+      dryPreview = null;
+      previewSignature = null;
+      previewPinned = null;
+    }
+    lastInputSignature = sig;
+  });
+
+  let lastOnError: PatternOnError | null = null;
+  $effect(() => {
+    const policy = onError;
+    if (lastOnError !== null && lastOnError !== policy) {
+      dryPreview = null;
+    }
+    lastOnError = policy;
+  });
+
   const filteredAxioms = $derived.by(() => {
     if (!preview) return [];
     const needle = searchFilter.trim().toLowerCase();
@@ -124,12 +176,16 @@
     } else {
       rules = (preset.spec.rules ?? []).map((r) => ({
         ...r,
+        requiredColumns: r.requiredColumns ? [...r.requiredColumns] : undefined,
+        split: r.split ? { ...r.split } : undefined,
         annotations: r.annotations ? r.annotations.map((a) => ({ ...a })) : undefined,
       }));
       declarations = (preset.spec.declarations ?? []).map((d) => ({ ...d }));
     }
     preview = null;
     dryPreview = null;
+    previewSignature = null;
+    previewPinned = null;
     error = null;
     notice = null;
   }
@@ -139,56 +195,40 @@
       error = new Error(parsedPrefixes.error);
       return null;
     }
-    const base = baseIri.trim() || null;
-    if (mode === 'robot') {
-      const cols = robotColumns
-        .filter((c) => c.column.trim() && c.directive.trim())
-        .map((c) => ({
-          column: c.column.trim(),
-          directive: c.directive.trim(),
-          ...(c.split?.trim() ? { split: c.split.trim() } : {}),
-        }));
-      return {
-        mode: 'robot',
-        baseIri: base,
-        prefixes: parsedPrefixes.prefixes,
-        headerTemplateRow: cols.length === 0 ? headerTemplateRow : headerTemplateRow,
-        ...(cols.length > 0 ? { columns: cols } : {}),
-      };
-    }
-    return {
-      mode: 'pattern',
-      baseIri: base,
+    return buildPatternSpec({
+      mode,
+      baseIri,
       prefixes: parsedPrefixes.prefixes,
-      rules: rules
-        .filter((r) => r.template.trim().length > 0)
-        .map((r) => ({
-          ...(r.name?.trim() ? { name: r.name.trim() } : {}),
-          template: r.template.trim(),
-          syntax: r.syntax ?? 'manchester',
-          skipIfEmpty: r.skipIfEmpty ?? true,
-          ...(r.annotations?.length ? { annotations: r.annotations } : {}),
-        })),
-      declarations: declarations
-        .filter((d) => d.column.trim().length > 0)
-        .map((d) => ({
-          column: d.column.trim(),
-          kind: d.kind,
-          ...(d.split?.trim() ? { split: d.split.trim() } : {}),
-        })),
-    };
+      headerTemplateRow,
+      robotColumns,
+      rules,
+      declarations,
+    });
   }
 
   async function onFileUpload(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
     if (!file) return;
-    fileName = file.name;
-    if (file.name.toLowerCase().endsWith('.tsv')) format = 'tsv';
-    else if (file.name.toLowerCase().endsWith('.csv')) format = 'csv';
-    tableData = await file.text();
-    preview = null;
-    dryPreview = null;
+    try {
+      if (file.size > MAX_UPLOAD_BYTES) {
+        error = new Error(
+          `File "${file.name}" is ${fmtInt(file.size)} bytes, exceeding the 2 MiB spreadsheet limit.`,
+        );
+        return;
+      }
+      error = null;
+      fileName = file.name;
+      if (file.name.toLowerCase().endsWith('.tsv')) format = 'tsv';
+      else if (file.name.toLowerCase().endsWith('.csv')) format = 'csv';
+      tableData = await file.text();
+      preview = null;
+      dryPreview = null;
+      previewSignature = null;
+      previewPinned = null;
+    } finally {
+      input.value = '';
+    }
   }
 
   function addRobotColumn(col = '') {
@@ -239,27 +279,46 @@
     declarations = declarations.filter((_, i) => i !== idx);
   }
 
+  function handlePreconditionError(e: unknown): boolean {
+    if (e instanceof api.ApiError && e.status === 412) {
+      preview = null;
+      dryPreview = null;
+      previewSignature = null;
+      previewPinned = null;
+      error = new Error(
+        'The ontology or its import map changed since your preview. Run Preview axioms again to review against the latest commit.',
+      );
+      return true;
+    }
+    return false;
+  }
+
   async function runPreview() {
     const spec = buildSpec();
     if (!spec) return;
+    const snapTarget = target;
+    const snapSel: Selection = { graph: sel.graph, imports: sel.imports };
+    const snapSig = inputSignature;
+    const req: PatternPreviewRequest = {
+      table: { data: tableData, format },
+      spec,
+      declare: declareEntities,
+      limit: 500,
+    };
     const current = run.claim('preview');
     busy = 'preview';
     error = null;
     notice = null;
     dryPreview = null;
     try {
-      const res = await previewPatterns(
-        target,
-        sel,
-        {
-          table: { data: tableData, format },
-          spec,
-          declare: declareEntities,
-          limit: 500,
-        },
-        { signal: run.signal('preview') },
-      );
-      if (current()) preview = res;
+      const res = await previewPatterns(snapTarget, snapSel, req, {
+        signal: run.signal('preview'),
+      });
+      if (current() && inputSignature === snapSig) {
+        preview = res;
+        previewSignature = snapSig;
+        previewPinned = { target: snapTarget, sel: snapSel, req };
+      }
     } catch (e) {
       if (current() && !isAbort(e)) error = e;
     } finally {
@@ -268,52 +327,54 @@
   }
 
   async function runDryRun() {
-    const spec = buildSpec();
-    if (!spec) return;
+    if (!preview || !previewPinned || previewSignature !== inputSignature) return;
+    const pinned = previewPinned;
+    const pinnedEtag = preview.etag ?? etag;
     const current = run.claim('apply');
     busy = 'dry';
     error = null;
     notice = null;
     try {
       const res = await dryRunPatterns(
-        target,
-        sel,
+        pinned.target,
+        pinned.sel,
         {
-          table: { data: tableData, format },
-          spec,
-          declare: declareEntities,
+          table: pinned.req.table,
+          spec: pinned.req.spec,
+          declare: pinned.req.declare,
           message: commitMessage.trim() || 'Generate axioms from pattern',
           onError,
         },
-        { etag: preview?.etag ?? etag, signal: run.signal('apply') },
+        { etag: pinnedEtag, changes: 50, signal: run.signal('apply') },
       );
       if (current()) dryPreview = res;
     } catch (e) {
-      if (current() && !isAbort(e)) error = e;
+      if (current() && !isAbort(e) && !handlePreconditionError(e)) error = e;
     } finally {
       if (current()) busy = null;
     }
   }
 
   async function commitApply() {
-    const spec = buildSpec();
-    if (!spec) return;
+    if (!preview || !previewPinned || previewSignature !== inputSignature) return;
+    const pinned = previewPinned;
+    const pinnedEtag = preview.etag ?? etag;
     const current = run.claim('apply');
     busy = 'apply';
     error = null;
     notice = null;
     try {
       const res = await applyPatterns(
-        target,
-        sel,
+        pinned.target,
+        pinned.sel,
         {
-          table: { data: tableData, format },
-          spec,
-          declare: declareEntities,
+          table: pinned.req.table,
+          spec: pinned.req.spec,
+          declare: pinned.req.declare,
           message: commitMessage.trim() || 'Generate axioms from pattern',
           onError,
         },
-        { etag: preview?.etag ?? etag, signal: run.signal('apply') },
+        { etag: pinnedEtag, signal: run.signal('apply') },
       );
       if (!current()) return;
       dryPreview = null;
@@ -322,10 +383,12 @@
         : `No new axioms to commit (${fmtInt(res.present)} already present).`;
       const seq = res.receipt?.commit?.seq ?? null;
       oncommitted?.(seq);
-      // Refresh preview against the new head so status badges update cleanly.
+      // Clear preview against the old head so the user previews again if re-applying.
       preview = null;
+      previewSignature = null;
+      previewPinned = null;
     } catch (e) {
-      if (current() && !isAbort(e)) error = e;
+      if (current() && !isAbort(e) && !handlePreconditionError(e)) error = e;
     } finally {
       if (current()) busy = null;
     }
@@ -334,8 +397,11 @@
   const canApply = $derived(
     !readonly &&
       busy == null &&
+      preview != null &&
+      previewPinned != null &&
+      previewSignature === inputSignature &&
       tableData.trim().length > 0 &&
-      (preview == null || preview.valid || onError === 'skip'),
+      (preview.valid || onError === 'skip'),
   );
 </script>
 
@@ -393,7 +459,7 @@
       {#if headers.length > 0}
         <div class="chips" aria-label="Detected columns">
           <span class="small faint">Columns:</span>
-          {#each headers as h (h)}
+          {#each headers as h, i (`${i}:${h}`)}
             <button
               type="button"
               class="chip mono"
@@ -739,6 +805,8 @@
               total={dryPreview.changes.total}
               ds={target}
             />
+          {:else if (dryPreview.commit?.inserted ?? 0) > 0 || (dryPreview.commit?.deleted ?? 0) > 0}
+            <p class="small faint">Triple sample not included in dry-run response.</p>
           {:else}
             <p class="small faint">No triple changes would be written.</p>
           {/if}

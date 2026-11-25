@@ -550,12 +550,12 @@ frame/usage/history/discussion segmented control on the entity panel.
   ontology bulk edits are tracked in roadmap item 770.
 * **Patterns.** The **Patterns** tab generates OWL 2 axioms from uploaded or pasted CSV
   and TSV spreadsheets through ROBOT-template column directives (`ID`, `LABEL`, `TYPE`,
-  `SC`, `EC`, `DC`, `C`, `I`, `A`, `SPLIT`, and axiom annotations) or DOSDP and Cellfie
-  style parameterized Manchester and functional-style axiom rules (`${col}` placeholders
-  and filters). Starter presets, live preview of new and existing axioms, per-row
-  validation diagnostics, dry-run triple diffs, and single-commit apply with `If-Match`
-  preconditions are built in, bounded to 2 MiB, 5,000 data rows, and 50,000 generated
-  axioms. Readers and protected branches can preview without committing.
+  `SC`, `EC`, `DC`, `SP`, `C`, `I`, `TI`, `A`, `SPLIT`, and axiom annotations) or DOSDP
+  and Cellfie style parameterized Manchester and functional-style axiom rules (`${col}`
+  placeholders and filters). Starter presets, live preview of new and existing axioms,
+  per-row validation diagnostics, dry-run triple diffs, and single-commit apply with
+  `If-Match` preconditions are built in, bounded to 2 MiB, 5,000 data rows, and 50,000
+  unique generated axioms. Readers and protected branches can preview without committing.
 * **Imports.** The **Imports** tab draws the `owl:imports` closure tree, marks cycles and
   unreadable targets, and manages the dataset-wide import map
   ([screenshot](../images/ontology-imports.png)). Imports resolve in order through the
