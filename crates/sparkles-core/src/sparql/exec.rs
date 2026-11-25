@@ -5901,6 +5901,16 @@ fn col_distinct_estimate(
     (chao.min(run_est).min(n).max(d), true)
 }
 
+/// Inclusive-exclusive row range `[lo, hi)` for stratum `k` of `s` across `n` rows.
+#[inline]
+fn stratum_bounds(k: usize, n: usize, s: usize) -> (usize, usize) {
+    let n128 = n as u128;
+    let s128 = s as u128;
+    let lo = ((k as u128) * n128 / s128) as usize;
+    let hi = (((k + 1) as u128) * n128 / s128) as usize;
+    (lo, hi)
+}
+
 /// Estimate the initial slot count of the shared floor table from a stack-allocated
 /// stratified sample of `(xs, ys)`.
 ///
@@ -5919,11 +5929,8 @@ fn estimate_floor_slots(xs: &[Id], ys: &[Id]) -> usize {
     let mut bx = [0u64; FLOOR_ESTIMATE_SAMPLE];
     let mut by = [0u64; FLOOR_ESTIMATE_SAMPLE];
     let (mut adj_x, mut adj_y) = (0usize, 0usize);
-    let n128 = n as u128;
-    let s128 = s as u128;
     for k in 0..s {
-        let lo = ((k as u128) * n128 / s128) as usize;
-        let hi = (((k + 1) as u128) * n128 / s128) as usize;
+        let (lo, hi) = stratum_bounds(k, n, s);
         let r = (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11;
         let i = lo + (r % (hi - lo) as u64) as usize;
         let (x, y) = (xs[i], ys[i]);
@@ -12201,31 +12208,27 @@ mod string_order_tests {
         }
     }
 
-    /// `col_distinct_estimate` computes `run_est` without `usize` multiplication overflow.
+    /// `col_distinct_estimate` and `stratum_bounds` compute large-`n` products without `usize`
+    /// overflow.
     #[test]
     fn col_distinct_estimate_handles_large_n_without_overflow() {
+        let s = FLOOR_ESTIMATE_SAMPLE;
         let large_n = usize::MAX / 2;
-        let (est, has_repeats) = col_distinct_estimate(
-            large_n,
-            FLOOR_ESTIMATE_SAMPLE,
-            100,
-            10,
-            5,
-            FLOOR_ESTIMATE_SAMPLE / 2,
-        );
+        let (est, has_repeats) = col_distinct_estimate(large_n, s, s, s, 0, s / 2);
         assert!(has_repeats);
-        assert!(est >= 100 && est <= large_n);
+        assert_eq!(est, large_n / 2);
 
-        let n = 1usize << 22;
-        let (est_run, has_repeats) = col_distinct_estimate(
-            n,
-            FLOOR_ESTIMATE_SAMPLE,
-            FLOOR_ESTIMATE_SAMPLE,
-            FLOOR_ESTIMATE_SAMPLE,
-            0,
-            FLOOR_ESTIMATE_SAMPLE / 2,
-        );
-        assert!(has_repeats);
-        assert_eq!(est_run, n / 2);
+        // Last of 1,024 strata at n = 1 << 22: (k + 1) * n = 2^32 overflows 32-bit usize.
+        let n_32bit_overflow = 1usize << 22;
+        let (lo, hi) = stratum_bounds(s - 1, n_32bit_overflow, s);
+        assert_eq!(lo, n_32bit_overflow - n_32bit_overflow / s);
+        assert_eq!(hi, n_32bit_overflow);
+        assert!(hi > lo);
+
+        // Same boundary check at usize::MAX / 2 overflows both 32-bit and 64-bit usize products.
+        let (large_lo, large_hi) = stratum_bounds(s - 1, large_n, s);
+        assert_eq!(large_lo, large_n - large_n / s - 1);
+        assert_eq!(large_hi, large_n);
+        assert!(large_hi > large_lo);
     }
 }
