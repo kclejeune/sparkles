@@ -6878,3 +6878,415 @@ fn has_key_rewritten_to_named_class_reuses_name_without_fresh_equivalence() {
         red2.axioms
     );
 }
+
+/// Design v12 §4.3.5 / r7 #3: strict duplicate-bypass hashbrown admission for `covered`
+/// in `taxonomy::build_from_rows`, flat many-rep & wide-parent counting-allocator peak
+/// coverage, and large moving-reallocation overlap refusal in `close_rows_admitted`.
+#[test]
+fn split_taxonomy_hashbrown_duplicate_bypass_wide_peak_and_moving_realloc() {
+    use super::dl_clause::{hash_table_bytes, next_hash_table_bytes};
+    use super::taxonomy::{MAX_CLASS_COUNT, build_from_rows, close_rows_admitted};
+    use rustc_hash::FxHashSet;
+    use std::sync::atomic::{AtomicIsize, AtomicUsize};
+
+    // Arithmetic boundary for NOTHING sentinel.
+    assert_eq!(MAX_CLASS_COUNT, u32::MAX as usize - 2);
+
+    // 1. Calling-thread counting-allocator check of the exact duplicate-bypass rule on
+    //    `FxHashSet<u32>`:
+    //    (a) initial 4-bucket table needs 36 B -> 20 B headroom refuses before alloc;
+    //    (b) full 3-key table with 0 growth headroom followed by repeated duplicate keys
+    //        -> unchanged capacity, 0 allocator events, 0 credit requests!
+    //    (c) distinct 4th key requests exact replacement table before alloc;
+    //    (d) drop releases exact observed `hash_table_bytes`.
+    let need0 = next_hash_table_bytes(0, std::mem::size_of::<u32>()).unwrap();
+    assert!(
+        need0 > 20,
+        "initial 4-bucket table needs > 20 B (got {need0})"
+    );
+    let mut covered: FxHashSet<u32> = FxHashSet::default();
+    let mut held = 0usize;
+    let mut credit_reqs = 0usize;
+    let try_insert = |set: &mut FxHashSet<u32>,
+                      k: u32,
+                      cap: usize,
+                      held: &mut usize,
+                      reqs: &mut usize|
+     -> bool {
+        if set.contains(&k) {
+            return true;
+        }
+        if set.len() == set.capacity() {
+            let Some(need) = next_hash_table_bytes(set.capacity(), std::mem::size_of::<u32>())
+            else {
+                return false;
+            };
+            *reqs += 1;
+            if *held + need > cap {
+                return false;
+            }
+            let old_live = hash_table_bytes(set.capacity(), std::mem::size_of::<u32>());
+            *held += need;
+            set.insert(k);
+            let new_live = hash_table_bytes(set.capacity(), std::mem::size_of::<u32>());
+            *held = held.saturating_sub((old_live + need).saturating_sub(new_live));
+        } else {
+            set.insert(k);
+        }
+        true
+    };
+
+    // (a) 20 B cap refuses before initial 36 B table allocation.
+    let (ok0, s0) = measure(|| try_insert(&mut covered, 1, 20, &mut held, &mut credit_reqs));
+    assert!(!ok0);
+    assert_eq!(s0.events, 0, "refused initial table must allocate 0 bytes");
+    assert_eq!(held, 0);
+
+    // Fill 3 keys into the initial 4-bucket table (capacity == 3).
+    assert!(try_insert(
+        &mut covered,
+        1,
+        need0,
+        &mut held,
+        &mut credit_reqs
+    ));
+    assert!(try_insert(
+        &mut covered,
+        2,
+        need0,
+        &mut held,
+        &mut credit_reqs
+    ));
+    assert!(try_insert(
+        &mut covered,
+        3,
+        need0,
+        &mut held,
+        &mut credit_reqs
+    ));
+    assert_eq!(covered.len(), 3);
+    assert_eq!(covered.capacity(), 3);
+    let cap_at_3 = covered.capacity();
+    let reqs_before_dups = credit_reqs;
+    let held_at_3 = held;
+    assert_eq!(
+        held_at_3,
+        hash_table_bytes(cap_at_3, std::mem::size_of::<u32>())
+    );
+
+    // (b) Zero growth headroom + repeated duplicate inserts: 0 allocs, 0 credit requests!
+    let (_, s_dups) = measure(|| {
+        for _ in 0..32 {
+            assert!(try_insert(
+                &mut covered,
+                1,
+                held_at_3,
+                &mut held,
+                &mut credit_reqs
+            ));
+            assert!(try_insert(
+                &mut covered,
+                2,
+                held_at_3,
+                &mut held,
+                &mut credit_reqs
+            ));
+            assert!(try_insert(
+                &mut covered,
+                3,
+                held_at_3,
+                &mut held,
+                &mut credit_reqs
+            ));
+        }
+    });
+    assert_eq!(covered.capacity(), cap_at_3);
+    assert_eq!(
+        s_dups.events, 0,
+        "duplicate keys in full set must cause 0 allocator events"
+    );
+    assert_eq!(
+        credit_reqs, reqs_before_dups,
+        "duplicate keys must make 0 credit requests"
+    );
+
+    // (c) Distinct 4th key refuses under 0 headroom (0 allocs), succeeds with exact replacement!
+    let (ok4_ref, s4_ref) =
+        measure(|| try_insert(&mut covered, 4, held_at_3, &mut held, &mut credit_reqs));
+    assert!(!ok4_ref);
+    assert_eq!(s4_ref.events, 0);
+    let need4 = next_hash_table_bytes(cap_at_3, std::mem::size_of::<u32>()).unwrap();
+    assert!(try_insert(
+        &mut covered,
+        4,
+        held_at_3 + need4,
+        &mut held,
+        &mut credit_reqs
+    ));
+    let final_live = hash_table_bytes(covered.capacity(), std::mem::size_of::<u32>());
+    assert_eq!(held, final_live);
+    drop(covered);
+    held -= final_live;
+    assert_eq!(held, 0);
+
+    // 2. Large moving-reallocation overlap test in `close_rows_admitted`:
+    //    Build a 2-node chain `0 -> 1`, where row 1 has 512 unique subsumers and row 0
+    //    has 512 disjoint subsumers. Merging row 1 into row 0 requires `new_cap >= 1024`
+    //    (4096 B) while `old_cap` (2048 B) is still live (simultaneous >= 6144 B).
+    let n = 1026usize;
+    let mut rows: Vec<(bool, Vec<u32>)> = (0..n).map(|i| (false, vec![i as u32])).collect();
+    let mut r1: Vec<u32> = (2..514).map(|x| x as u32).collect();
+    r1.push(1);
+    r1.sort_unstable();
+    rows[1] = (false, r1);
+    let mut r0: Vec<u32> = (514..1026).map(|x| x as u32).collect();
+    r0.push(0);
+    r0.push(1);
+    r0.sort_unstable();
+    rows[0] = (false, r0);
+
+    // First measure unrestricted peak of `close_rows_admitted`.
+    let live_u = AtomicIsize::new(0);
+    let peak_u = AtomicUsize::new(0);
+    let mut rows_u = rows.clone();
+    let (res_u, sample_u) = measure(|| {
+        close_rows_admitted(&mut rows_u, &[], &|| false, &|d| {
+            let now = (live_u.fetch_add(d, Ordering::Relaxed) + d).max(0) as usize;
+            peak_u.fetch_max(now, Ordering::Relaxed);
+            Ok(())
+        })
+    });
+    assert!(res_u.is_ok());
+    assert!(
+        peak_u.load(Ordering::Relaxed) >= sample_u.peak,
+        "close_rows_admitted admitted peak ({}) must cover measured peak ({})",
+        peak_u.load(Ordering::Relaxed),
+        sample_u.peak
+    );
+
+    // Tight cap strictly below `peak_u` (allowing Tarjan + initial scratch, refusing
+    // moving-realloc overlap): must return Halt::Memory cleanly without overshoot.
+    let tight = peak_u.load(Ordering::Relaxed) - 1024;
+    let live_t = AtomicIsize::new(0);
+    let mut rows_t = rows;
+    let res_t = close_rows_admitted(&mut rows_t, &[], &|| false, &|d| {
+        let cur = live_t.load(Ordering::Relaxed);
+        let next = cur + d;
+        if d > 0 && next as usize > tight {
+            return Err(next as usize);
+        }
+        live_t.store(next, Ordering::Relaxed);
+        Ok(())
+    });
+    assert!(
+        matches!(res_t, Err(super::taxonomy::Halt::Memory(_))),
+        "tight cap below moving-realloc overlap must refuse cleanly"
+    );
+    assert_eq!(
+        live_t.load(Ordering::Relaxed),
+        0,
+        "refusal must release all Tarjan scratch"
+    );
+
+    // 3. Flat many-representative (`max_sub = 1`) AND wide-parent (`direct.len() > 16`)
+    //    `build_from_rows` calling-thread counting-allocator peak coverage + 2-thread run.
+    let build_and_check = |classes: &[Class], subs: &[(bool, Vec<u32>)], threads: usize| {
+        let live = AtomicIsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let (res, sample) = measure(|| {
+            build_from_rows(classes, subs, &[], threads, &|| false, &|d| {
+                let now = (live.fetch_add(d, Ordering::Relaxed) + d).max(0) as usize;
+                peak.fetch_max(now, Ordering::Relaxed);
+                Ok(())
+            })
+        });
+        let (tax, owned) = res.expect("build_from_rows must succeed");
+        if threads == 1 {
+            assert!(
+                peak.load(Ordering::Relaxed) >= sample.peak,
+                "build_from_rows 1t admitted peak ({}) < measured peak ({})",
+                peak.load(Ordering::Relaxed),
+                sample.peak
+            );
+        }
+        assert_eq!(live.load(Ordering::Relaxed) as usize, owned);
+        assert_eq!(tax.nodes().len(), classes.len() + 2);
+    };
+
+    // Flat 128 classes (`max_sub = 1`).
+    let flat_cls: Vec<Class> = (0..128)
+        .map(|i| Class::new(format!("urn:flat:C{i:03}")))
+        .collect();
+    let flat_subs: Vec<(bool, Vec<u32>)> = (0..128).map(|i| (false, vec![i as u32])).collect();
+    build_and_check(&flat_cls, &flat_subs, 1);
+    build_and_check(&flat_cls, &flat_subs, 2);
+
+    // Wide-parent hierarchy: bottom class `C0` has 40 incomparable direct parents `C1..C40`
+    // (`> GREEDY_MAX = 16`), forcing `covered` wide-row compaction + duplicate ancestors!
+    let wide_n = 48usize;
+    let wide_cls: Vec<Class> = (0..wide_n)
+        .map(|i| Class::new(format!("urn:wide:C{i:03}")))
+        .collect();
+    let mut wide_subs: Vec<(bool, Vec<u32>)> =
+        (0..wide_n).map(|i| (false, vec![i as u32])).collect();
+    // C1..C40 each subsume shared ancestors C41..C47 so `covered` sees many duplicates!
+    for row in wide_subs.iter_mut().take(41).skip(1) {
+        for anc in 41..wide_n {
+            row.1.push(anc as u32);
+        }
+    }
+    wide_subs[0].1 = (0..wide_n as u32).collect();
+    build_and_check(&wide_cls, &wide_subs, 1);
+    build_and_check(&wide_cls, &wide_subs, 2);
+}
+
+/// Design v12 §4.3.5 + §4.3.4: single-ledger counting-allocator coverage on `shoi-042`
+/// multi-leaf split, index-free `retained_bytes` (zero panic with `index == None`),
+/// follow-up recovery after memory refusal, between-rounds `test_admitted` with `partial`
+/// false/true, and single-call incremental dynamic-fold exact total (`140`, not `150`).
+#[test]
+fn split_single_ledger_retained_bytes_between_rounds_and_dynamic_fold() {
+    use super::dl_rules::test_admitted;
+    use super::saturate::Dynamic;
+
+    // 1. Multi-leaf split on shoi-042: verify index-free `retained_bytes` never panics,
+    //    admitted peak covers single-threaded counting-allocator heap, and follow-up call
+    //    recovers cleanly after a tight memory refusal.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
+    let doc = crate::ofn_read::parse(&std::fs::read_to_string(dir.join("shoi-042.ofn")).unwrap())
+        .unwrap();
+    let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+    let lim_split = Limits {
+        threads: 1,
+        rooted: true,
+        rooted_merge: true,
+        rooted_eq_split: true,
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    let (out, sample) = measure(|| sat.classify(&refs, None, &lim_split).unwrap());
+    assert!(out.complete);
+    assert!(out.stats.dl_rooted_splits >= 1);
+    assert!(out.stats.dl_rooted_leaves >= 2);
+    assert!(
+        sat.index.is_none() && sat.split_answer.is_some(),
+        "forked run must retain SplitAnswer without index"
+    );
+    let ret = sat.retained_bytes(0, 0, 0);
+    assert!(
+        ret > 0,
+        "index-free retained_bytes must succeed without panicking"
+    );
+    assert!(
+        out.stats.peak_memory >= sample.peak,
+        "split peak_memory ({}) must cover measured heap peak ({})",
+        out.stats.peak_memory,
+        sample.peak
+    );
+
+    // Tight cap mid-split -> Tier D declines cleanly to Horn fallback (`dl_over_budget`),
+    // clearing stale `split_answer`, and preserving `peak_memory`.
+    let mid_lim = Limits {
+        max_memory: Some(out.stats.peak_memory / 2),
+        ..lim_split.clone()
+    };
+    let fb = sat.classify(&refs, None, &mid_lim).unwrap();
+    assert!(!fb.complete && fb.stats.dl_over_budget);
+    assert!(sat.split_answer.is_none());
+
+    // Ultra-tight cap below Horn too -> returns `Err(Error::Memory)`, invalidates prior
+    // `split_answer` (`describe == None`), and a follow-up unrestricted call recovers.
+    let _ = sat.classify(&refs, None, &lim_split).unwrap();
+    assert!(sat.split_answer.is_some());
+    let tiny_lim = Limits {
+        max_memory: Some(1024),
+        ..lim_split.clone()
+    };
+    let err = sat.classify(&refs, None, &tiny_lim).unwrap_err();
+    assert!(matches!(err, Error::Memory { .. }), "got {err:?}");
+    assert!(sat.split_answer.is_none());
+    assert!(
+        sat.describe(&Class::new("http://example.org/d#C0"))
+            .is_none()
+    );
+    let recovered = sat.classify(&refs, None, &lim_split).unwrap();
+    assert_eq!(recovered.taxonomy, out.taxonomy);
+
+    // 2. Between-rounds `test_admitted` at a `Dynamic` segment boundary:
+    //    refuses without allocating segment or publishing ID.
+    let mut d = Dynamic::new(100);
+    for i in 0..1024u32 {
+        let _ = d.intern(&[i, i + 5000]);
+    }
+    d.sync_unadmitted_on_begin_run();
+    let len_before = d.len();
+    struct CapDynBudget {
+        live: usize,
+        cap: usize,
+        overflowed: bool,
+    }
+    impl super::saturate::DynamicBudget for CapDynBudget {
+        fn admit(&mut self, bytes: usize) -> bool {
+            let Some(next) = self.live.checked_add(bytes) else {
+                self.overflowed = true;
+                return false;
+            };
+            if next > self.cap {
+                return false;
+            }
+            self.live = next;
+            true
+        }
+        fn credit(&mut self, bytes: usize) {
+            self.live = self.live.saturating_sub(bytes);
+        }
+        fn on_overflow(&mut self) {
+            self.overflowed = true;
+        }
+    }
+    let mut b_ref = CapDynBudget {
+        live: 100,
+        cap: 200,
+        overflowed: false,
+    };
+    let (r_ref, s_ref) = measure(|| test_admitted(&d, 1, &[2, 3], &mut b_ref));
+    assert_eq!(r_ref, None);
+    assert_eq!(
+        s_ref.events, 0,
+        "refused test_admitted at segment boundary must allocate 0 B"
+    );
+    assert_eq!(d.len(), len_before);
+    assert_eq!(b_ref.live, 100);
+
+    // 3. Single-call incremental dynamic-fold lifetime check (design §4.3.4 / r10 #1):
+    //    base=100, pre-existing dynamic payload=30 rebased on begin_run, round 1 admits
+    //    new bytes -> unadmitted_bytes stays equal to pre_bytes, final fold adds ONLY
+    //    `unadmitted_bytes` to `totals.memory` -> exact `100 + d.bytes()` (no double count!).
+    let mut d_inc = Dynamic::new(100);
+    let _ = d_inc.intern(&[1, 2]);
+    let pre_bytes = d_inc.bytes();
+    assert!(pre_bytes > 0);
+    d_inc.sync_unadmitted_on_begin_run();
+    assert_eq!(d_inc.unadmitted_bytes(), pre_bytes);
+    let mut b_ok = CapDynBudget {
+        live: 100 + pre_bytes,
+        cap: 100 + pre_bytes + 4096,
+        overflowed: false,
+    };
+    let id_new = test_admitted(&d_inc, 3, &[4], &mut b_ok).expect("new test in existing segment");
+    assert!(id_new >= 100);
+    let added = d_inc.bytes() - pre_bytes;
+    assert!(added > 0);
+    assert_eq!(
+        d_inc.unadmitted_bytes(),
+        pre_bytes,
+        "admitted insertion must NOT increase unadmitted_bytes"
+    );
+    let totals_mem_after_r1 = 100 + added;
+    let final_fold = totals_mem_after_r1 + d_inc.unadmitted_bytes();
+    assert_eq!(
+        final_fold,
+        100 + d_inc.bytes(),
+        "final dynamic fold must equal base + full dynamic bytes exactly once (no double count)"
+    );
+}

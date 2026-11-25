@@ -575,7 +575,10 @@ fn extend<S: Sink>(
             return true;
         }
         None if core.len() == 1 => core[0],
-        None => out.intern(&core),
+        None => match out.conjunction(&core) {
+            Some(m) => m,
+            None => return false,
+        },
     };
     out.me(Concl::Succ(r, m));
     true
@@ -897,7 +900,10 @@ fn merge_all<S: Sink>(
             a
         }
         None if u.len() == 1 => u[0],
-        None => out.intern(&u),
+        None => match out.conjunction(&u) {
+            Some(m) => m,
+            None => return false,
+        },
     };
     // the individual can be the context itself, whose conclusions wait in the
     // activation's own list, so the caller applies them before it ends

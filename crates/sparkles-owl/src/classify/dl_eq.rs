@@ -533,7 +533,7 @@ impl Eqs<'_> {
             let h_len =
                 prem.1.iter().filter(|&&m| m != o).count() + 1 + usize::from(ne_lit.is_some());
             let Some(bytes) = side_exact_bytes(prem.0.len(), h_len) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             if !found.push_admitted(
@@ -609,7 +609,7 @@ impl Eqs<'_> {
                 continue;
             }
             let Some(bytes) = side_parts_bytes(prem, part_body, part_head, without, add) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             if !found.push_admitted(

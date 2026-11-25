@@ -518,7 +518,7 @@ fn lit_admitted_loop<S: Sink>(
                 return Some(made);
             }
             Err(None) => {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return None;
             }
             Err(Some(need)) => {
@@ -1254,6 +1254,8 @@ pub struct Table {
     next: AtomicU32,
     segs: Segs<Clause>,
     bytes: AtomicUsize,
+    unadmitted_bytes: AtomicUsize,
+    append_lock: parking_lot::Mutex<()>,
 }
 
 impl Table {
@@ -1261,10 +1263,15 @@ impl Table {
         self.segs.slot(id, &self.bytes)
     }
 
+    #[cfg(test)]
     pub fn push(&self, c: Clause) -> u32 {
+        let _w = self.append_lock.lock();
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.bytes.fetch_add(c.bytes(), Ordering::Relaxed);
-        let _ = self.slot(id).set(c);
+        let (slot, grown) = self.segs.slot_with_delta(id);
+        let used = c.bytes() + grown;
+        self.bytes.fetch_add(used, Ordering::Relaxed);
+        self.unadmitted_bytes.fetch_add(used, Ordering::Relaxed);
+        let _ = slot.set(c);
         id
     }
 
@@ -1276,11 +1283,107 @@ impl Table {
         self.bytes.load(Ordering::Relaxed)
     }
 
+    pub(super) fn unadmitted_bytes(&self) -> usize {
+        self.unadmitted_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn sync_unadmitted_on_begin_run(&mut self) {
+        *self.unadmitted_bytes.get_mut() = *self.bytes.get_mut();
+    }
+
     /// The clauses the table holds.
     pub fn len(&self) -> usize {
         self.next.load(Ordering::Relaxed) as usize
     }
 }
+
+/// Unwind-safe credit holder for slot-bound [`Table`] appends, refunding any unused
+/// reservation strictly outside [`Table::append_lock`].
+struct TableAdmittedCredit<'a, S: Sink> {
+    out: &'a mut S,
+    held: usize,
+}
+
+impl<S: Sink> Drop for TableAdmittedCredit<'_, S> {
+    fn drop(&mut self) {
+        if self.held > 0 {
+            let back = std::mem::take(&mut self.held);
+            self.out.credit_dl(back);
+        }
+    }
+}
+
+/// Appends a clause to `out.dl().table` with slot-bound pre-admission and deferred
+/// construction: `make` is invoked only after credit covering `clause_bytes` and any new
+/// segment for the exact next ID is confirmed under `Table::append_lock`.
+///
+/// Admitted bytes live in `Run::memory` (not `Table::unadmitted_bytes`) so they are never
+/// double-counted, and any panic or refusal during top-up admission cleanly refunds all
+/// prior grants strictly outside `Table::append_lock`.
+pub(super) fn push_clause_admitted<S: Sink>(
+    out: &mut S,
+    clause_bytes: usize,
+    make: impl FnOnce() -> Clause,
+) -> Option<u32> {
+    let mut credit = TableAdmittedCredit { out, held: 0 };
+    let mut make = Some(make);
+    loop {
+        if credit.out.stopped() {
+            return None;
+        }
+        enum Step {
+            Done(u32),
+            Need(usize),
+            Overflow,
+        }
+        let step = {
+            let table = &credit.out.dl().table;
+            let _w = table.append_lock.lock();
+            let id = table.next.load(Ordering::Relaxed);
+            let seg_bytes = table.segs.next_seg_bytes(id);
+            match clause_bytes.checked_add(seg_bytes) {
+                None => Step::Overflow,
+                Some(total) if total <= credit.held => {
+                    let c = make.take().expect("clause constructor")();
+                    let actual_id = table.next.fetch_add(1, Ordering::Relaxed);
+                    debug_assert_eq!(actual_id, id);
+                    let (slot, grown) = table.segs.slot_with_delta(actual_id);
+                    debug_assert_eq!(grown, seg_bytes);
+                    let actual_used = c.bytes() + grown;
+                    debug_assert!(
+                        actual_used <= credit.held,
+                        "clause_bytes bound {clause_bytes} < actual {}",
+                        c.bytes()
+                    );
+                    table.bytes.fetch_add(actual_used, Ordering::Relaxed);
+                    let _ = slot.set(c);
+                    credit.held -= actual_used;
+                    Step::Done(actual_id)
+                }
+                Some(total) => Step::Need(total - credit.held),
+            }
+        };
+        match step {
+            Step::Done(id) => return Some(id),
+            Step::Overflow => {
+                if credit.held > 0 {
+                    let back = std::mem::take(&mut credit.held);
+                    credit.out.credit_dl(back);
+                }
+                credit.out.speculative_overflow();
+                return None;
+            }
+            Step::Need(needed) => {
+                if !credit.out.admit_dl(needed) {
+                    return None;
+                }
+                credit.held += needed;
+            }
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<Stored>() <= 64);
 
 /// A clause of a context's store.
 #[derive(Clone)]
@@ -1608,7 +1711,7 @@ impl Store {
             return true;
         }
         let Some(bound) = self.add_growth_bound(&c) else {
-            out.data_overflow();
+            out.speculative_overflow();
             self.interrupted = true;
             return false;
         };
@@ -1681,7 +1784,7 @@ impl Store {
             let extra = total.saturating_sub(covered_payload);
             Some((total, extra))
         })() else {
-            out.data_overflow();
+            out.speculative_overflow();
             self.interrupted = true;
             return (false, false);
         };
@@ -2064,12 +2167,12 @@ impl Store {
         let Some((views_bytes, max_peak_add)) =
             self.next_scratch_bound(id, rooted.is_some(), max, max_cap_before)
         else {
-            out.data_overflow();
+            out.speculative_overflow();
             self.interrupted = true;
             return None;
         };
         let Some(scratch) = views_bytes.checked_add(max_peak_add) else {
-            out.data_overflow();
+            out.speculative_overflow();
             self.interrupted = true;
             return None;
         };
@@ -2079,7 +2182,7 @@ impl Store {
             return None;
         }
         let Some(bound) = self.next_prepare_id(ix, rooted, id, max) else {
-            scratch_guard.data_overflow();
+            scratch_guard.speculative_overflow();
             self.interrupted = true;
             return None;
         };
@@ -2098,7 +2201,7 @@ impl Store {
     /// Appends `id` to `self.preds`, pre-admitting vector growth against `out`.
     pub fn push_pred_admitted<S: Sink>(&mut self, id: u32, out: &mut S) -> bool {
         let Some(bound) = vec_grow_bound(&self.preds) else {
-            out.data_overflow();
+            out.speculative_overflow();
             self.interrupted = true;
             return false;
         };

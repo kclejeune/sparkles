@@ -321,6 +321,71 @@ impl Race {
         };
         assert_eq!(&*self.requests.lock(), want);
     }
+
+    /// Serialized admission race fixture (for `Run::admission: Mutex<MemLedger>`):
+    /// drives `first` (64 B) and `second` (128 B) in the chosen order so the second waiter
+    /// contends on `admission` while the first is inside `charge`, then verifies their
+    /// separate serialized outcomes.
+    pub(super) fn run_serial(
+        &self,
+        first: impl FnOnce() -> bool + Send,
+        second: impl FnOnce() -> bool + Send,
+        smaller_first: bool,
+    ) {
+        let (resume, paused) = mpsc::channel();
+        let (initial, next, first_res, second_res) = thread::scope(|scope| {
+            let a = self.send.clone();
+            let first = scope.spawn(move || {
+                let out = a.clone();
+                set_hook(move |point| match point {
+                    Point::BeforeDebit if !smaller_first => {
+                        a.send(Event::Observed).unwrap();
+                        paused.recv_timeout(WAIT).unwrap();
+                    }
+                    Point::Contended => a.send(Event::Contended).unwrap(),
+                    _ => {}
+                });
+                let ok = first();
+                out.send(Event::Returned(ok)).unwrap();
+                ok
+            });
+            let first_evt = self.events.recv_timeout(WAIT).unwrap();
+            let b = self.send.clone();
+            let second = scope.spawn(move || {
+                let out = b.clone();
+                set_hook(move |point| {
+                    if point == Point::Contended {
+                        b.send(Event::Contended).unwrap();
+                    }
+                });
+                let ok = second();
+                out.send(Event::Returned(ok)).unwrap();
+                ok
+            });
+            let initial = if smaller_first {
+                first_evt
+            } else {
+                assert_eq!(first_evt, Event::Observed);
+                let second_charge = self.events.recv_timeout(WAIT).unwrap();
+                let _ = resume.send(());
+                second_charge
+            };
+            let next = self.events.recv_timeout(WAIT).unwrap();
+            let _ = self.release.send(());
+            (initial, next, first.join(), second.join())
+        });
+        assert_eq!(initial, Event::Charge(if smaller_first { 64 } else { 128 }));
+        assert_eq!(next, Event::Contended);
+        assert_eq!(first_res.unwrap(), self.accept);
+        assert_eq!(second_res.unwrap(), self.accept);
+        let want: &[usize] = match (smaller_first, self.accept) {
+            (true, true) => &[64, 128],
+            (true, false) => &[64],
+            (false, true) => &[128, 64],
+            (false, false) => &[128],
+        };
+        assert_eq!(&*self.requests.lock(), want);
+    }
 }
 
 /// Outcome of a `dl_reduce::plan_budgeted` call observed by [`with_merge_probe`].

@@ -201,7 +201,7 @@ impl RootSt {
             return Some(false);
         }
         let Some(bound) = set_insert_bound(set, &v) else {
-            out.data_overflow();
+            out.speculative_overflow();
             return None;
         };
         if bound > 0 && !out.admit_dl(bound) {
@@ -225,7 +225,7 @@ impl RootSt {
             return true;
         }
         let Some(bound) = map_vec_push_bound(map, &k) else {
-            out.data_overflow();
+            out.speculative_overflow();
             return false;
         };
         if bound > 0 && !out.admit_dl(bound) {
@@ -424,7 +424,7 @@ pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
                     continue;
                 }
                 let Some(head_bytes) = head.len().checked_mul(std::mem::size_of::<Lit>()) else {
-                    out.data_overflow();
+                    out.speculative_overflow();
                     ds(st).store.interrupted = true;
                     return;
                 };
@@ -510,7 +510,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
         let Some((views_bytes, max_realloc)) =
             x.store.next_scratch_bound(id, true, &max, max.capacity())
         else {
-            max_guard.data_overflow();
+            max_guard.speculative_overflow();
             x.store.interrupted = true;
             break;
         };
@@ -519,7 +519,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
             .checked_add(max_realloc)
             .and_then(|b| b.checked_add(views_bytes))
         else {
-            max_guard.data_overflow();
+            max_guard.speculative_overflow();
             x.store.interrupted = true;
             break;
         };
@@ -539,7 +539,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
         };
         max_guard.release_to(max.capacity() * std::mem::size_of::<Lit>());
         let Some(bound) = bound else {
-            max_guard.data_overflow();
+            max_guard.speculative_overflow();
             x.store.interrupted = true;
             break;
         };
@@ -570,13 +570,61 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
             }
             break;
         }
+        let split_mode = max_guard.dl().split_mode();
+        if split_mode != super::dl_rules::SplitMode::Disabled {
+            let mut scan = Scan(0);
+            let cand = disj_const_eq(
+                &x.store.clauses[id as usize].c,
+                id as usize,
+                max_guard.dl(),
+                inv,
+                &mut scan,
+                &mut |_reads| max_guard.go_on(),
+            );
+            scan.end(&mut max_guard);
+            if max_guard.stopped() {
+                x.store.interrupted = true;
+                break;
+            }
+            if let Some(cand) = cand {
+                // ALWAYS POPULATE `best` + atomic hints for both pure and mixed clauses,
+                // regardless of current work count.
+                max_guard.dl().record_split_cand(cand);
+                if cand.prio == 2
+                    && (split_mode == super::dl_rules::SplitMode::EagerPureThenProbe
+                        || max_guard.dl().split_probe() == 0)
+                {
+                    let won = {
+                        let mut slot = max_guard.dl().split_slot.lock();
+                        if slot.winner.is_none() {
+                            slot.winner = Some(cand);
+                            let won = max_guard.publish_split_stop();
+                            if !won {
+                                slot.winner = None;
+                            }
+                            won
+                        } else {
+                            false
+                        }
+                    };
+                    if won {
+                        max_guard.wake_split_stop();
+                        break;
+                    }
+                    if max_guard.stopped() {
+                        x.store.interrupted = true;
+                        break;
+                    }
+                }
+            }
+        }
         let c_bytes = {
             let c = &x.store.clauses[id as usize].c;
             (c.body().len() + c.head().len()) * std::mem::size_of::<Lit>()
         };
         let Some(live_need) = (max.capacity() * std::mem::size_of::<Lit>()).checked_add(c_bytes)
         else {
-            max_guard.data_overflow();
+            max_guard.speculative_overflow();
             x.store.interrupted = true;
             break;
         };
@@ -652,7 +700,7 @@ fn harvest_and_halt_merge<S: Sink>(
         return false;
     }
     let Some(bytes) = count.checked_mul(std::mem::size_of::<(u32, u32)>()) else {
-        out.data_overflow();
+        out.speculative_overflow();
         return false;
     };
     let mut pair_guard = DlGuard::new(out);
@@ -680,7 +728,7 @@ fn harvest_and_halt_merge<S: Sink>(
         .capacity()
         .checked_mul(std::mem::size_of::<(u32, u32)>())
     else {
-        pair_guard.data_overflow();
+        pair_guard.speculative_overflow();
         return false;
     };
     if kept > pair_guard.bytes() && !pair_guard.admit_add(kept - pair_guard.bytes()) {
@@ -692,6 +740,120 @@ fn harvest_and_halt_merge<S: Sink>(
     pair_guard.dl().set_merged(pairs, kept);
     pair_guard.commit(kept);
     true
+}
+
+/// Literals scanned between cooperative polls in [`disj_const_eq`].
+const HEAD_POLL_EVERY: usize = 1024;
+
+/// Inspects a live empty-body root clause with `head().len() >= 2` for an eligible
+/// undecided disjunctive constant equality (`XLit::Eq(RTerm::C(a), RTerm::C(b))`).
+///
+/// Scans every literal in `c.head()`, metering reads under `scan` and polling `poll()`
+/// every [`HEAD_POLL_EVERY`] literals. Returns `None` when stopped, ineligible, or when
+/// every constant-equality disjunct is already decided in `dl.branch_neq`.
+pub(crate) fn disj_const_eq(
+    c: &Clause,
+    slot_id: usize,
+    dl: &super::dl_rules::DlRun,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    scan: &mut Scan,
+    poll: &mut impl FnMut(&mut usize) -> bool,
+) -> Option<super::dl_rules::SplitCand> {
+    if !c.body().is_empty() || c.head().len() < 2 {
+        return None;
+    }
+    let clause_id = u32::try_from(slot_id).ok()?;
+    let head = c.head();
+    let const_rank = &dl.const_rank;
+    let branch_neq = &dl.branch_neq;
+    let mut all_pos_const_eq = true;
+    let mut best_pair: Option<(u32, u32, u32, u32)> = None; // (rank_lo, rank_hi, u_id, v_id)
+    for (idx, &lit) in head.iter().enumerate() {
+        scan.0 = scan.0.saturating_add(1);
+        if idx > 0 && idx % HEAD_POLL_EVERY == 0 && !poll(&mut scan.0) {
+            return None;
+        }
+        match dl.lits.view(lit, inv) {
+            XLit::Eq(RTerm::C(a), RTerm::C(b)) => {
+                if a == b {
+                    continue;
+                }
+                let ra = const_rank.get(a as usize).copied().unwrap_or(u32::MAX);
+                let rb = const_rank.get(b as usize).copied().unwrap_or(u32::MAX);
+                if ra == u32::MAX || rb == u32::MAX || ra == rb {
+                    continue;
+                }
+                let pair_id = (a.min(b), a.max(b));
+                if branch_neq.binary_search(&pair_id).is_ok() {
+                    continue;
+                }
+                let cand_pair = if ra < rb {
+                    (ra, rb, a, b)
+                } else {
+                    (rb, ra, b, a)
+                };
+                if best_pair.is_none_or(|cur| (cand_pair.0, cand_pair.1) < (cur.0, cur.1)) {
+                    best_pair = Some(cand_pair);
+                }
+            }
+            _ => {
+                all_pos_const_eq = false;
+            }
+        }
+    }
+    let (rank_lo, rank_hi, u_id, v_id) = best_pair?;
+    Some(super::dl_rules::SplitCand {
+        epoch: dl.split_epoch(),
+        prio: if all_pos_const_eq { 2 } else { 1 },
+        head_len: u32::try_from(head.len()).unwrap_or(u32::MAX),
+        rank_lo,
+        rank_hi,
+        u_id,
+        v_id,
+        clause_id,
+    })
+}
+
+/// Metered, cooperatively polled rescan of the root clause store under `root_st` when
+/// `SplitSlot::best` was killed by subsumption or was empty at probe time.
+pub(super) fn rescan_split_cand(
+    ix: &Index,
+    x: &DlSt,
+    dl: &super::dl_rules::DlRun,
+    poll: &mut impl FnMut() -> bool,
+) -> Option<super::dl_rules::SplitCand> {
+    let inv = inv_of(ix, dix(ix));
+    let mut best: Option<super::dl_rules::SplitCand> = None;
+    let mut scan = Scan(0);
+    let mut charge_reads = |reads: &mut usize| -> bool {
+        let work = *reads / WORK_READS;
+        if work > 0 {
+            dl.count(work);
+            *reads %= WORK_READS;
+        }
+        poll()
+    };
+    for (slot_id, s) in x.store.clauses.iter().enumerate() {
+        scan.0 = scan.0.saturating_add(1);
+        if scan.0 >= M_SCAN && !charge_reads(&mut scan.0) {
+            return None;
+        }
+        if s.dead {
+            continue;
+        }
+        if let Some(cand) = disj_const_eq(&s.c, slot_id, dl, inv, &mut scan, &mut charge_reads)
+            && best.is_none_or(|cur| cand.cmp_key() < cur.cmp_key())
+        {
+            best = Some(cand);
+        }
+        if scan.0 >= M_SCAN && !charge_reads(&mut scan.0) {
+            return None;
+        }
+    }
+    if scan.0 > 0 && !charge_reads(&mut scan.0) {
+        return None;
+    }
+    best
 }
 
 /// Lists the processed clause `id` of a context by the constants of its maximal literals
@@ -759,12 +921,12 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
             return;
         }
         let Some(prem_bytes) = super::dl_rules::side_bytes(c, l) else {
-            found_guard.data_overflow();
+            found_guard.speculative_overflow();
             mark_interrupted(st);
             return;
         };
         let Some(prem_need) = found.held_bytes().checked_add(prem_bytes) else {
-            found_guard.data_overflow();
+            found_guard.speculative_overflow();
             mark_interrupted(st);
             return;
         };
@@ -905,7 +1067,7 @@ fn univ_to_const<S: Sink>(
                 };
                 if let Made::Lit(m) = made {
                     let Some(bytes) = side_parts_bytes(prem, pb, ph, without, Some(m)) else {
-                        out.data_overflow();
+                        out.speculative_overflow();
                         return false;
                     };
                     if !found.push_admitted(
@@ -992,7 +1154,7 @@ pub(super) fn univ_from_x<S: Sink>(
                         let Some(bytes) =
                             side_parts_bytes(prem, c.c.body(), c.c.head(), Some(l), Some(m))
                         else {
-                            out.data_overflow();
+                            out.speculative_overflow();
                             return false;
                         };
                         if !found.push_admitted(
@@ -1337,7 +1499,7 @@ pub(super) fn push_partners_admitted<S: Sink>(
         side_bytes = bytes;
     });
     if overflow {
-        out.data_overflow();
+        out.speculative_overflow();
         mark_interrupted(st);
         return false;
     }
@@ -1492,7 +1654,7 @@ fn put_with_fact_parts_admitted<S: Sink>(
         return true;
     }
     let Some(bytes) = side_parts_bytes(prem, pb, ph, without, add) else {
-        out.data_overflow();
+        out.speculative_overflow();
         return false;
     };
     found.push_admitted(bytes, || merge_parts(prem, pb, ph, without, add), out)
@@ -1716,7 +1878,7 @@ fn hyper_at<S: Sink>(
                     }
                 } else {
                     let Some(side_bytes) = side_exact_bytes(0, head.len()) else {
-                        out.data_overflow();
+                        out.speculative_overflow();
                         mark_interrupted(st);
                         return false;
                     };
@@ -1750,7 +1912,7 @@ fn hyper_at<S: Sink>(
             }
             let Some(mut lists_bytes) = body.len().checked_mul(std::mem::size_of::<Vec<Side>>())
             else {
-                out.data_overflow();
+                out.speculative_overflow();
                 mark_interrupted(st);
                 return false;
             };
@@ -1805,7 +1967,7 @@ fn hyper_at<S: Sink>(
                 lists_bytes = pos_bytes;
             }
             if overflow {
-                out.data_overflow();
+                out.speculative_overflow();
                 mark_interrupted(st);
                 return false;
             }
@@ -1813,12 +1975,12 @@ fn hyper_at<S: Sink>(
                 continue;
             }
             let Some(base_bytes) = side_exact_bytes(0, head.len()) else {
-                out.data_overflow();
+                out.speculative_overflow();
                 mark_interrupted(st);
                 return false;
             };
             let Some(prod_bytes) = lists_bytes.checked_add(base_bytes) else {
-                out.data_overflow();
+                out.speculative_overflow();
                 mark_interrupted(st);
                 return false;
             };
@@ -1826,7 +1988,7 @@ fn hyper_at<S: Sink>(
                 0
             } else {
                 let Some(ps) = max_list_len.checked_mul(PRUNE_SCRATCH_ELEM) else {
-                    out.data_overflow();
+                    out.speculative_overflow();
                     mark_interrupted(st);
                     return false;
                 };
@@ -2197,7 +2359,7 @@ pub(super) fn join_head<S: Sink>(
         let extra_b = s.c.body().iter().filter(|&&m| m != l).count();
         let Some(bytes) = side_exact_bytes(prem.0.len() + extra_b, prem.1.len() + s.c.head().len())
         else {
-            out.data_overflow();
+            out.speculative_overflow();
             return false;
         };
         if !found.push_admitted(
@@ -2261,7 +2423,7 @@ pub(super) fn join_body<S: Sink>(
                 let Some(bytes) =
                     side_exact_bytes(s.c.body().len() + rest_b_len, s_h_len + rest_h_len)
                 else {
-                    out.data_overflow();
+                    out.speculative_overflow();
                     return false;
                 };
                 if !found.push_admitted(
@@ -2424,7 +2586,7 @@ fn register<S: Sink>(st: &mut State, v: Ex, mut us: Vec<u32>, out: &mut S) -> bo
             }
             Some(b)
         })() else {
-            out.data_overflow();
+            out.speculative_overflow();
             x.store.interrupted = true;
             return false;
         };
@@ -2447,7 +2609,10 @@ fn register<S: Sink>(st: &mut State, v: Ex, mut us: Vec<u32>, out: &mut S) -> bo
     }
     // an unsatisfiable root sends the empty clause to every context registered with it
     if bottom {
-        let id = out.dl().empty();
+        let Some(id) = super::dl_rules::DlRun::empty_admitted(out) else {
+            x.store.interrupted = true;
+            return false;
+        };
         out.send(v, Concl::RPred(id));
         return true;
     }
@@ -2534,7 +2699,9 @@ pub(super) fn bottom<S: Sink>(st: &State, out: &mut S) {
     let mut to: Vec<Ex> = r.edge_set.iter().map(|&(v, _)| v).collect();
     to.sort_unstable();
     to.dedup();
-    let id = out.dl().empty();
+    let Some(id) = super::dl_rules::DlRun::empty_admitted(out) else {
+        return;
+    };
     for v in to {
         out.send(v, Concl::RPred(id));
     }
@@ -2636,7 +2803,7 @@ fn ground_out<S: Sink>(ix: &Index, st: &mut State, l: Lit, out: &mut S) {
     let Some(bound) = set_insert_bound(&r.ground_set, &l)
         .and_then(|a| vec_grow_bound(&r.ground).and_then(|b| a.checked_add(b)))
     else {
-        out.data_overflow();
+        out.speculative_overflow();
         x.store.interrupted = true;
         return;
     };
@@ -2817,7 +2984,7 @@ fn succ_at<S: Sink>(
     let Some(bound) = set_insert_bound(&r.succ_set, &(e, u))
         .and_then(|a| map_vec_push_bound(&r.by_succ, &w).and_then(|b| a.checked_add(b)))
     else {
-        out.data_overflow();
+        out.speculative_overflow();
         x.store.interrupted = true;
         return w;
     };
@@ -2853,7 +3020,7 @@ fn succ_at<S: Sink>(
                     side_exact_bytes(c.body().len(), c.head().len())
                 };
                 let Some(bytes) = bytes else {
-                    out.data_overflow();
+                    out.speculative_overflow();
                     failed = true;
                     break;
                 };
@@ -3084,7 +3251,7 @@ fn root_pred_of_admitted<S: Sink>(
 
     let Some(base_bytes) = side_exact_bytes(ground_len, head_len) else {
         if let Some(g) = guard.as_deref_mut() {
-            g.data_overflow();
+            g.speculative_overflow();
         }
         return false;
     };
@@ -3141,7 +3308,7 @@ fn root_pred_of_admitted<S: Sink>(
             let (lits, c) = resolve_pred_clause(guard, lits_fallback, clause);
             let Some(mut lists_bytes) = need_len.checked_mul(size_of::<Vec<Side>>()) else {
                 if let Some(g) = guard.as_deref_mut() {
-                    g.data_overflow();
+                    g.speculative_overflow();
                 }
                 return false;
             };
@@ -3206,7 +3373,7 @@ fn root_pred_of_admitted<S: Sink>(
             });
             if overflow {
                 if let Some(g) = guard.as_deref_mut() {
-                    g.data_overflow();
+                    g.speculative_overflow();
                 }
                 return false;
             }
@@ -3215,7 +3382,7 @@ fn root_pred_of_admitted<S: Sink>(
             } else {
                 let Some(prod_bytes) = lists_bytes.checked_add(base_bytes) else {
                     if let Some(g) = guard.as_deref_mut() {
-                        g.data_overflow();
+                        g.speculative_overflow();
                     }
                     return false;
                 };
@@ -3224,7 +3391,7 @@ fn root_pred_of_admitted<S: Sink>(
                 } else {
                     let Some(ps) = max_list_len.checked_mul(PRUNE_SCRATCH_ELEM) else {
                         if let Some(g) = guard.as_deref_mut() {
-                            g.data_overflow();
+                            g.speculative_overflow();
                         }
                         return false;
                     };
@@ -3485,7 +3652,7 @@ fn m_flush<S: Sink>(ix: &Index, st: &mut State, batch: &mut Found, out: &mut S) 
         .checked_add(slack)
         .filter(|&n| n <= isize::MAX as usize)
     else {
-        out.data_overflow();
+        out.speculative_overflow();
         ds(st).store.interrupted = true;
         return false;
     };
@@ -3620,7 +3787,7 @@ fn m_stopped<S: Sink>(st: &mut State, out: &S) -> bool {
 /// A scan of the repair whose reads mostly send nothing: it counts them, charges a
 /// conclusion for each [`WORK_READS`] of them and checks the run's bounds after every
 /// [`M_SCAN`] of them.
-struct Scan(usize);
+pub(crate) struct Scan(usize);
 
 impl Scan {
     /// Counts `n` reads, false when a check of the bounds stopped the scan.
@@ -3702,16 +3869,19 @@ fn m_fwd<S: Sink>(r: &mut RootSt, d: Ex, l: Lit, out: &mut S) -> bool {
 
 /// The table id of the root's processed clause `i`, which a returned clause keeps whether
 /// or not it was subsumed since, since it holds in every model either way.
-fn ret_id<S: Sink>(x: &mut DlSt, i: u32, out: &mut S) -> u32 {
-    let s = &mut x.store.clauses[i as usize];
-    match s.sent {
-        Some(id) => id,
-        None => {
-            let id = out.dl().table.push(s.c.clone());
-            s.sent = Some(id);
-            id
-        }
+fn ret_id<S: Sink>(x: &mut DlSt, i: u32, out: &mut S) -> Option<u32> {
+    if let Some(id) = x.store.clauses[i as usize].sent {
+        return Some(id);
     }
+    let clause_bytes = x.store.clauses[i as usize].c.bytes();
+    let Some(id) = super::dl_clause::push_clause_admitted(out, clause_bytes, || {
+        x.store.clauses[i as usize].c.clone()
+    }) else {
+        x.store.interrupted = true;
+        return None;
+    };
+    x.store.clauses[i as usize].sent = Some(id);
+    Some(id)
 }
 
 /// The root takes M-send's notice that the context `h` holds the ground literal `xid`:
@@ -3753,7 +3923,7 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
         }
         Some(b)
     })() else {
-        out.data_overflow();
+        out.speculative_overflow();
         x.store.interrupted = true;
         return false;
     };
@@ -3871,7 +4041,9 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
         if !m_poll(k, st, &mut guard) {
             break;
         }
-        let cid = ret_id(ds(st), i, &mut guard);
+        let Some(cid) = ret_id(ds(st), i, &mut guard) else {
+            break;
+        };
         guard.send(h, Concl::RRet(cid));
         guard.worked(1);
         guard.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4006,7 +4178,7 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
         return;
     }
     let Some(gbody_bound) = map_vec_push_keys_bound(&r.mr().gbody, c.body()) else {
-        out.data_overflow();
+        out.speculative_overflow();
         x.store.interrupted = true;
         return;
     };
@@ -4059,7 +4231,9 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
         hs.clear();
     }
     if !hs.is_empty() {
-        let cid = ret_id(x, id, &mut guard);
+        let Some(cid) = ret_id(x, id, &mut guard) else {
+            return;
+        };
         for (k, h) in hs.into_iter().enumerate() {
             if !m_poll(k, st, &mut guard) {
                 break;
@@ -4104,7 +4278,7 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
         }
         Some(b)
     })() else {
-        out.data_overflow();
+        out.speculative_overflow();
         x.store.interrupted = true;
         return false;
     };
@@ -4131,7 +4305,7 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
     // refusal marks the store interrupted before enumeration.
     let slack = found.fold_slack();
     if slack > isize::MAX as usize {
-        out.data_overflow();
+        out.speculative_overflow();
         ds(st).store.interrupted = true;
         return true;
     }
@@ -5219,7 +5393,11 @@ pub(super) mod tests {
         fn stopped(&self) -> bool {
             self.stop.get()
         }
-        fn data_overflow(&mut self) {
+        fn speculative_overflow(&mut self) {
+            self.overflow = true;
+            self.stop.set(true);
+        }
+        fn retained_overflow(&mut self) {
             self.overflow = true;
             self.stop.set(true);
         }
@@ -10102,5 +10280,303 @@ Ontology(<http://example.org/g6>
         assert_eq!(kept, want_bytes);
         assert_eq!(pairs.capacity(), 2);
         assert_eq!(pairs, vec![(0, 1), (2, 3)]);
+    }
+
+    #[test]
+    fn disj_const_eq_eligibility_tiebreak_reversed_decided_provenance_and_rescan() {
+        use super::super::dl_rules::{SplitCand, SplitMode};
+
+        let mut run = DlRun::new(false, Default::default());
+        // Rank map: c0 -> rank 1, c1 -> rank 0 (reversed order vs raw u32!),
+        // c2 -> rank 2, c3 -> u32::MAX (ineligible: e.g. anonymous or active hub),
+        // c4 -> rank 3 (simulates input `urn:sparkles:internal:hub` when not active hub).
+        run.configure_split(
+            SplitMode::ProbeOnly,
+            16_384,
+            1,
+            vec![1, 0, 2, u32::MAX, 3].into_boxed_slice(),
+            vec![(1, 2)].into_boxed_slice(), // epoch-local IDs (1, 2) are ALREADY decided !=
+        );
+        let mk = |xl: XLit| match run.lits.lit(xl, |_| None) {
+            Made::Lit(l) => l,
+            other => panic!("expected literal for {xl:?}, got {other:?}"),
+        };
+        let inv = |_: Role| None;
+
+        // Reversed spelling `c0 ≈ c1` (ranks 1 and 0) normalizes to `(lo=0, hi=1)` (raw c1, c0).
+        let eq01 = mk(XLit::Eq(RTerm::C(0), RTerm::C(1)));
+        let eq12 = mk(XLit::Eq(RTerm::C(1), RTerm::C(2))); // already decided in branch_neq!
+        let eq03 = mk(XLit::Eq(RTerm::C(0), RTerm::C(3))); // c3 ineligible (u32::MAX)!
+        let eq24 = mk(XLit::Eq(RTerm::C(2), RTerm::C(4))); // c4 eligible (rank 3)
+        let atom = mk(XLit::Atom(7, RTerm::C(0)));
+
+        // 1. Unit clause (len < 2) or conditional clause (non-empty body) -> None.
+        let mut scan = Scan(0);
+        let polls = std::cell::Cell::new(0usize);
+        let mut poll = |_: &mut usize| {
+            polls.set(polls.get() + 1);
+            true
+        };
+        assert_eq!(
+            disj_const_eq(
+                &Clause::new(Vec::new(), vec![eq01]),
+                0,
+                &run,
+                inv,
+                &mut scan,
+                &mut poll
+            ),
+            None
+        );
+        assert_eq!(
+            disj_const_eq(
+                &Clause::new(vec![atom], vec![eq01, eq24]),
+                1,
+                &run,
+                inv,
+                &mut scan,
+                &mut poll
+            ),
+            None
+        );
+
+        // 2. All-decided / ineligible disjuncts -> None.
+        assert_eq!(
+            disj_const_eq(
+                &Clause::new(Vec::new(), vec![eq12, eq03]),
+                2,
+                &run,
+                inv,
+                &mut scan,
+                &mut poll
+            ),
+            None
+        );
+
+        // 3. Pure equality disjunction skipping decided `eq12` -> prio 2, picks (rank 0, rank 1).
+        let c_pure = Clause::new(Vec::new(), vec![eq12, eq24, eq01]);
+        let got_pure =
+            disj_const_eq(&c_pure, 10, &run, inv, &mut scan, &mut poll).expect("pure candidate");
+        assert_eq!(
+            got_pure,
+            SplitCand {
+                epoch: 1,
+                prio: 2,
+                head_len: 3,
+                rank_lo: 0,
+                rank_hi: 1,
+                u_id: 1,
+                v_id: 0,
+                clause_id: 10,
+            }
+        );
+
+        // 4. Mixed disjunction (with atom + eq24) -> prio 1 (strictly lower priority than pure).
+        let c_mixed = Clause::new(Vec::new(), vec![atom, eq24]);
+        let got_mixed =
+            disj_const_eq(&c_mixed, 11, &run, inv, &mut scan, &mut poll).expect("mixed candidate");
+        assert_eq!(got_mixed.prio, 1);
+        assert_eq!((got_mixed.rank_lo, got_mixed.rank_hi), (2, 3));
+
+        // 5. Tie-break: higher prio wins; atomic hints update monotonically.
+        run.record_split_cand(got_mixed);
+        assert!(
+            run.has_split_cand
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(
+            run.best_split_prio
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        run.record_split_cand(got_pure);
+        assert_eq!(
+            run.best_split_prio
+                .load(std::sync::atomic::Ordering::Acquire),
+            2
+        );
+
+        // 6. Long head (> HEAD_POLL_EVERY=1024) meters reads and polls cooperatively.
+        let mut long_head = Vec::with_capacity(1100);
+        for i in 0..1099u32 {
+            long_head.push(mk(XLit::Atom(200 + i, RTerm::C(0))));
+        }
+        long_head.push(eq01);
+        let c_long = Clause::new(Vec::new(), long_head);
+        let polls_before = polls.get();
+        let scan_before = scan.0;
+        let got_long = disj_const_eq(&c_long, 20, &run, inv, &mut scan, &mut poll)
+            .expect("long head candidate");
+        assert_eq!(got_long.prio, 1);
+        assert!(
+            polls.get() > polls_before,
+            "long head must poll every HEAD_POLL_EVERY"
+        );
+        assert!(
+            scan.0 >= scan_before + 1100,
+            "long head must meter every literal"
+        );
+
+        // 7. Full-width `u32` constant IDs around 2^31 (no i32 sign truncation).
+        let big_u = (1u32 << 31) + 5;
+        let big_v = (1u32 << 31) + 9;
+        let eq_big = mk(XLit::Eq(RTerm::C(big_u), RTerm::C(big_v)));
+        assert_eq!(
+            disj_const_eq(
+                &Clause::new(Vec::new(), vec![eq_big, atom]),
+                21,
+                &run,
+                inv,
+                &mut scan,
+                &mut poll
+            ),
+            None
+        );
+
+        // 8. Stale-candidate rescan refreshes BOTH atomic hints (`has_split_cand` and
+        //    `best_split_prio`) across a long store with dead slots.
+        let mut sig = Sig::new();
+        sig.ind("a");
+        let (ix, _) = probe_ix(sig);
+        let mut x = DlSt::default();
+        let id_pure = x.store.clauses.len();
+        let _ = x.store.add(c_pure);
+        let id_mixed = x.store.clauses.len();
+        let _ = x.store.add(c_mixed);
+        for i in 0..1100u32 {
+            let b = mk(XLit::Atom(5000 + i, RTerm::C(0)));
+            let _ = x.store.add(Clause::new(vec![b], vec![atom]));
+        }
+        x.store.clauses[id_pure].dead = true;
+        let mut rescan_polls = 0usize;
+        let rescanned = rescan_split_cand(&ix, &x, &run, &mut || {
+            rescan_polls += 1;
+            true
+        })
+        .expect("mixed clause still live");
+        assert_eq!(rescanned.clause_id as usize, id_mixed);
+        assert_eq!(rescanned.prio, 1);
+        assert!(rescan_polls >= 1, "long store rescan must poll");
+        {
+            let mut slot = run.split_slot.lock();
+            run.refresh_split_best_locked(&mut slot, Some(rescanned));
+        }
+        assert!(
+            run.has_split_cand
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(
+            run.best_split_prio
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+
+        x.store.clauses[id_mixed].dead = true;
+        let empty = rescan_split_cand(&ix, &x, &run, &mut || true);
+        assert!(empty.is_none());
+        {
+            let mut slot = run.split_slot.lock();
+            run.refresh_split_best_locked(&mut slot, empty);
+        }
+        assert!(
+            !run.has_split_cand
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(
+            run.best_split_prio
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+
+    /// Barrier interleaving race test (design §4.3.2): Worker A validates candidate X
+    /// under `root_st`, commits `winner` + `STOP_SPLIT`, and releases `root_st`; a
+    /// concurrent root mutator then acquires `root_st`, kills X, and Worker B rescans and
+    /// clears `best`. Immutable `winner` guarantees `take_winning_split` still returns X!
+    #[test]
+    fn barrier_race_immutable_winner_survives_subsumption_and_rescan_clear() {
+        use super::super::dl_rules::{SplitCand, SplitMode};
+        use std::sync::{Arc, Barrier};
+
+        let mut sig = Sig::new();
+        sig.ind("a");
+        let (ix, _) = probe_ix(sig);
+        let mut run_raw = DlRun::new(false, Default::default());
+        run_raw.configure_split(
+            SplitMode::ProbeOnly,
+            16_384,
+            7,
+            vec![0, 1].into_boxed_slice(),
+            Vec::new().into_boxed_slice(),
+        );
+        let run = Arc::new(run_raw);
+        let cand = SplitCand {
+            epoch: 7,
+            prio: 2,
+            head_len: 2,
+            rank_lo: 0,
+            rank_hi: 1,
+            u_id: 0,
+            v_id: 1,
+            clause_id: 0,
+        };
+        run.record_split_cand(cand);
+
+        let root_st = Arc::new(parking_lot::Mutex::new(DlSt::default()));
+        let mk = |xl: XLit| match run.lits.lit(xl, |_| None) {
+            Made::Lit(l) => l,
+            other => panic!("expected literal for {xl:?}, got {other:?}"),
+        };
+        let eq01 = mk(XLit::Eq(RTerm::C(0), RTerm::C(1)));
+        let atom = mk(XLit::Atom(10, RTerm::C(0)));
+        {
+            let mut st = root_st.lock();
+            let _ = st.store.add(Clause::new(Vec::new(), vec![eq01, atom]));
+        }
+
+        let after_publish = Arc::new(Barrier::new(2));
+        let run_a = run.clone();
+        let st_a = root_st.clone();
+        let bar_a = after_publish.clone();
+
+        let worker_a = std::thread::spawn(move || {
+            let committed = {
+                let st = st_a.lock();
+                let mut slot = run_a.split_slot.lock();
+                let live = slot.best.filter(|c| {
+                    st.store
+                        .clauses
+                        .get(c.clause_id as usize)
+                        .is_some_and(|s| !s.dead)
+                });
+                if let Some(c) = live {
+                    slot.winner = Some(c);
+                    true
+                } else {
+                    false
+                }
+            };
+            bar_a.wait();
+            committed
+        });
+
+        after_publish.wait();
+        {
+            let mut st = root_st.lock();
+            st.store.clauses[0].dead = true;
+            let rescanned = rescan_split_cand(&ix, &st, &run, &mut || true);
+            assert!(rescanned.is_none());
+            let mut slot = run.split_slot.lock();
+            run.refresh_split_best_locked(&mut slot, rescanned);
+            assert!(slot.best.is_none());
+            assert_eq!(slot.winner, Some(cand));
+        }
+
+        assert!(worker_a.join().unwrap());
+        assert_eq!(
+            run.take_winning_split(),
+            Some(cand),
+            "immutable winner must never be clobbered by post-publication subsumption/rescan"
+        );
     }
 }

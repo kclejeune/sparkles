@@ -222,6 +222,16 @@ thread_local! {
     static LAST_ROOTED_WORK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ROOTED_MERGE_TEST: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
+    static ROOTED_EQ_SPLIT_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static ROOTED_EQ_SPLIT_PROBE_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static ROOTED_EQ_SPLIT_CHILD_EAGER_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static ROOTED_EQ_SPLIT_MAX_DEPTH_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static ROOTED_EQ_SPLIT_MAX_LEAVES_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
     static ROOTED_MERGE_HUB_TEST: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
     static ROOTED_MERGE_ROOT_FIRST_TEST: std::cell::Cell<Option<bool>> =
@@ -280,6 +290,125 @@ fn merge_root_first() -> bool {
 fn merge_trace() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_MERGE_TRACE").is_some_and(|v| v == "1"))
+}
+
+/// Whether item 1075 rooted disjunctive constant-equality splitting is enabled by default
+/// (`SPARKLES_ROOTED_EQ_SPLIT=1`), off by default.
+fn rooted_eq_split_switch() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ROOTED_EQ_SPLIT_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_EQ_SPLIT").is_some_and(|v| v == "1"))
+}
+
+const DEFAULT_SPLIT_PROBE: usize = 16_384;
+const DEFAULT_SPLIT_MAX_DEPTH: usize = 8;
+const DEFAULT_SPLIT_MAX_LEAVES: usize = 32;
+
+fn split_probe_threshold() -> usize {
+    #[cfg(test)]
+    if let Some(v) = ROOTED_EQ_SPLIT_PROBE_TEST.with(|c| c.get()) {
+        return v;
+    }
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("SPARKLES_ROOTED_EQ_SPLIT_PROBE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SPLIT_PROBE)
+    })
+}
+
+fn split_child_eager() -> bool {
+    #[cfg(test)]
+    if let Some(v) = ROOTED_EQ_SPLIT_CHILD_EAGER_TEST.with(|c| c.get()) {
+        return v;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("SPARKLES_ROOTED_EQ_SPLIT_CHILD_EAGER").is_none_or(|v| v != "0")
+    })
+}
+
+fn split_max_depth() -> usize {
+    #[cfg(test)]
+    if let Some(v) = ROOTED_EQ_SPLIT_MAX_DEPTH_TEST.with(|c| c.get()) {
+        return v;
+    }
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("SPARKLES_ROOTED_EQ_SPLIT_MAX_DEPTH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SPLIT_MAX_DEPTH)
+    })
+}
+
+fn split_max_leaves() -> usize {
+    #[cfg(test)]
+    if let Some(v) = ROOTED_EQ_SPLIT_MAX_LEAVES_TEST.with(|c| c.get()) {
+        return v;
+    }
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("SPARKLES_ROOTED_EQ_SPLIT_MAX_LEAVES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SPLIT_MAX_LEAVES)
+    })
+}
+
+fn split_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_EQ_SPLIT_TRACE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn with_rooted_eq_split<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ROOTED_EQ_SPLIT_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = ROOTED_EQ_SPLIT_TEST.with(|c| c.replace(Some(on)));
+    let _reset = Reset(prev);
+    f()
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn with_split_knobs<R>(
+    probe: Option<usize>,
+    child_eager: Option<bool>,
+    max_depth: Option<usize>,
+    max_leaves: Option<usize>,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Reset {
+        p: Option<usize>,
+        e: Option<bool>,
+        d: Option<usize>,
+        l: Option<usize>,
+    }
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ROOTED_EQ_SPLIT_PROBE_TEST.with(|c| c.set(self.p));
+            ROOTED_EQ_SPLIT_CHILD_EAGER_TEST.with(|c| c.set(self.e));
+            ROOTED_EQ_SPLIT_MAX_DEPTH_TEST.with(|c| c.set(self.d));
+            ROOTED_EQ_SPLIT_MAX_LEAVES_TEST.with(|c| c.set(self.l));
+        }
+    }
+    let _reset = Reset {
+        p: ROOTED_EQ_SPLIT_PROBE_TEST.with(|c| c.replace(probe)),
+        e: ROOTED_EQ_SPLIT_CHILD_EAGER_TEST.with(|c| c.replace(child_eager)),
+        d: ROOTED_EQ_SPLIT_MAX_DEPTH_TEST.with(|c| c.replace(max_depth)),
+        l: ROOTED_EQ_SPLIT_MAX_LEAVES_TEST.with(|c| c.replace(max_leaves)),
+    };
+    f()
 }
 
 #[cfg(test)]
@@ -508,6 +637,11 @@ pub struct Limits {
     /// (default off; `SPARKLES_ROOTED_MERGE=1` turns it on).
     #[doc(hidden)]
     pub rooted_merge: bool,
+    /// whether item 1075 demand-driven binary equality case splitting on disjunctive
+    /// constant equalities in rooted runs is enabled (default off;
+    /// `SPARKLES_ROOTED_EQ_SPLIT=1` turns it on).
+    #[doc(hidden)]
+    pub rooted_eq_split: bool,
     /// whether a run that counts without the root orders its number restrictions by
     /// entailment (F24, "The order between number restrictions"), which is on by default
     /// and changes nothing without [`counting`](Limits::counting). `≥m r.F` entails
@@ -583,6 +717,7 @@ impl Default for Limits {
             rooted_decline: true,
             rooted_marker_repair: false,
             rooted_merge: rooted_merge_switch(),
+            rooted_eq_split: rooted_eq_split_switch(),
             number_order: true,
             dl_steps: true,
             dl_automata: None,
@@ -718,6 +853,13 @@ pub struct Stats {
     /// number of non-representative individuals mapped away in the answering run
     #[doc(hidden)]
     pub dl_rooted_merged: usize,
+    /// number of binary equality splits executed in the answering rooted attempt
+    #[doc(hidden)]
+    pub dl_rooted_splits: usize,
+    /// number of terminal leaves (consistent + inconsistent) evaluated in the answering
+    /// rooted split tree (0 when no fork occurred)
+    #[doc(hidden)]
+    pub dl_rooted_leaves: usize,
     /// Tier D with counting passed its bound on derived conclusions, so the run
     /// classified again without counting and left the axioms that need it out
     pub dl_counting_over: bool,
@@ -1298,6 +1440,17 @@ pub struct Saturation {
     merge_stop: Option<MergeStop>,
     /// set for the remainder of a call when `collect_same` declines on memory refusal
     merge_disabled: bool,
+    /// retained self-contained answer published by a completed item 1075 split tree
+    pub(super) split_answer: Option<Box<SplitAnswer>>,
+    /// winning split-stop payload returned from `run_once` to `run_splitting`
+    split_stop: Option<SplitStop>,
+    /// active item 1075 branch configuration during a `run_splitting` branch evaluation
+    split_cfg: Option<SplitBranchCfg>,
+    /// expressions of `ax.individuals` retained from a completed forked leaf for
+    /// complete nominal consistency validation in `export_leaf`
+    leaf_individuals: Vec<Ex>,
+    /// set when a forked branch loses rooted eligibility (or reduction declines)
+    split_ineligible: bool,
 }
 
 /// Payload transferred from a winning `Stop::Merge` out of `run_once` into `run_merging`.
@@ -1310,9 +1463,159 @@ struct MergeStop {
     active_hub: Option<NamedIndividual>,
 }
 
+/// Payload transferred from a winning `Stop::Split` out of `run_once` into `run_splitting`.
+struct SplitStop {
+    u: NamedIndividual,
+    v: NamedIndividual,
+    spent: usize,
+    bound: usize,
+    peak: usize,
+    prio: u8,
+}
+
+/// Per-branch configuration passed from `run_splitting` into `run` / `run_once`.
+struct SplitBranchCfg {
+    mode: dl_rules::SplitMode,
+    probe: usize,
+    epoch: u32,
+    forked: bool,
+    orig_individuals: std::sync::Arc<[NamedIndividual]>,
+    neq: Vec<(NamedIndividual, NamedIndividual)>,
+}
+
+/// Self-contained classification & `describe` answer published by a completed item 1075
+/// split tree (`0`, `1`, or `>= 2` consistent leaves).
+pub(super) struct SplitAnswer {
+    pub(super) consistent: bool,
+    pub(super) taxonomy: Taxonomy,
+    /// Sorted, deduplicated genuine original named individuals (never anonymous witnesses
+    /// or reduction-generated hubs).
+    pub(super) individuals: Vec<NamedIndividual>,
+    /// Per taxonomy node index, sorted deduplicated indices into `individuals` that are
+    /// instances of that node's classes in every consistent leaf. `TOP_NODE` and
+    /// `BOTTOM_NODE` stay empty and are served directly by `describe`.
+    pub(super) node_insts: Vec<Vec<u32>>,
+}
+
+impl SplitAnswer {
+    pub(super) fn owned_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<SplitAnswer>()
+            .saturating_add(taxonomy::taxonomy_owned_bytes(&self.taxonomy))
+            .saturating_add(
+                self.individuals
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<NamedIndividual>()),
+            )
+            .saturating_add(
+                self.node_insts
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<u32>>()),
+            );
+        for ind in &self.individuals {
+            bytes = bytes.saturating_add(ind.as_str().len());
+        }
+        for insts in &self.node_insts {
+            bytes =
+                bytes.saturating_add(insts.capacity().saturating_mul(std::mem::size_of::<u32>()));
+        }
+        bytes
+    }
+
+    pub(super) fn describe(&self, c: &Class) -> Option<Description> {
+        let node = self.taxonomy.node_of(c)?;
+        let sorted = |mut v: Vec<Class>| {
+            v.sort();
+            v.dedup();
+            v
+        };
+        if !self.consistent {
+            let eq: Vec<Class> = self
+                .taxonomy
+                .bottom()
+                .classes
+                .iter()
+                .filter(|&k| k != c)
+                .cloned()
+                .collect();
+            return Some(Description {
+                satisfiable: false,
+                equivalents: sorted(eq),
+                instances: self.individuals.clone(),
+                ..Default::default()
+            });
+        }
+        if node == taxonomy::BOTTOM_NODE {
+            let eq: Vec<Class> = self
+                .taxonomy
+                .bottom()
+                .classes
+                .iter()
+                .filter(|&k| k != c)
+                .cloned()
+                .collect();
+            return Some(Description {
+                satisfiable: false,
+                equivalents: sorted(eq),
+                ..Default::default()
+            });
+        }
+        let equivalents: Vec<Class> = self
+            .taxonomy
+            .node(node)
+            .classes
+            .iter()
+            .filter(|&k| k != c)
+            .cloned()
+            .collect();
+        let classes_of = |nodes: &[usize]| -> Vec<Class> {
+            let mut out = Vec::new();
+            for &ni in nodes {
+                out.extend(self.taxonomy.node(ni).classes.iter().cloned());
+            }
+            sorted(out)
+        };
+        let direct_superclasses = classes_of(&self.taxonomy.node(node).parents);
+        let superclasses = classes_of(&self.taxonomy.ancestors(node));
+        let direct_subclasses = classes_of(&self.taxonomy.node(node).children);
+        let subclasses = classes_of(&self.taxonomy.descendants(node));
+        let instances = if node == taxonomy::TOP_NODE {
+            self.individuals.clone()
+        } else {
+            self.node_insts
+                .get(node)
+                .map(|is| {
+                    is.iter()
+                        .map(|&j| self.individuals[j as usize].clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Some(Description {
+            satisfiable: true,
+            equivalents: sorted(equivalents),
+            superclasses,
+            direct_superclasses,
+            subclasses,
+            direct_subclasses,
+            instances,
+        })
+    }
+}
+
 enum BuildCanonErr {
     Poll(Error),
     Memory(usize),
+}
+
+enum LeafExportResult {
+    Inconsistent,
+    Consistent {
+        vis_subs: Vec<(bool, Vec<u32>)>,
+        vis_top: Vec<u32>,
+        leaf_insts: Vec<Vec<u32>>,
+        owned_bytes: usize,
+    },
+    ExcludedOrIncomplete,
 }
 
 /// Normalizes an individual key so asserted (`Individual::Anonymous`) and harvested
@@ -1798,6 +2101,71 @@ impl Merge {
         self.shared = Some(canon.clone());
         Ok(Some(canon))
     }
+
+    /// Returns the canonical representative of `n` in this partition without mutating
+    /// path compression (or `n` itself when `n` is not in the union-find).
+    fn rep_of_named_ref<'a>(&'a self, n: &'a NamedIndividual) -> &'a NamedIndividual {
+        let (is_anon, raw) = canonical_merge_parts(false, n.as_str());
+        let h = merge_name_hash(is_anon, raw);
+        let Some(&id) = self
+            .ids
+            .find(h, |&i| merge_name_eq(&self.names[i as usize], is_anon, raw))
+        else {
+            return n;
+        };
+        let mut r = id;
+        while self.parent[r as usize] != r {
+            r = self.parent[r as usize];
+        }
+        &self.names[self.best[r as usize] as usize]
+    }
+
+    /// Clones this union-find table for a child split branch, pre-admitting exact UF bytes
+    /// against `admit` before allocation while sharing immutable `Arc<CanonMap>` read-only.
+    fn clone_admitted(
+        &self,
+        live_base: usize,
+        admit: &mut impl FnMut(usize) -> bool,
+    ) -> Result<Merge, usize> {
+        let add = self.uf_bytes();
+        let Some(peak) = live_base.checked_add(add) else {
+            return Err(usize::MAX);
+        };
+        if !admit(peak) {
+            return Err(peak);
+        }
+        let mut names = Vec::with_capacity(self.names.len());
+        for n in &self.names {
+            names.push(index::exact_individual(n));
+        }
+        let mut hashes = Vec::with_capacity(self.hashes.len());
+        hashes.extend_from_slice(&self.hashes);
+        let mut ids = hashbrown::HashTable::with_capacity(self.ids.len());
+        for (i, &h) in hashes.iter().enumerate() {
+            ids.insert_unique(h, i as u32, |&idx| hashes[idx as usize]);
+        }
+        let mut parent = Vec::with_capacity(self.parent.len());
+        parent.extend_from_slice(&self.parent);
+        let mut size = Vec::with_capacity(self.size.len());
+        size.extend_from_slice(&self.size);
+        let mut best = Vec::with_capacity(self.best.len());
+        best.extend_from_slice(&self.best);
+        let active_hub = self.active_hub.as_ref().map(index::exact_individual);
+        Ok(Merge {
+            names,
+            hashes,
+            ids,
+            parent,
+            size,
+            best,
+            name_str_bytes: self.name_str_bytes,
+            active_hub,
+            shared: self.shared.clone(),
+            spent: 0,
+            restarts: 0,
+            frozen_bound: None,
+        })
+    }
 }
 
 /// The rules of a run whose contexts the next run may keep.
@@ -1822,6 +2190,7 @@ struct RuleKey {
     counting: bool,
     rooted: bool,
     rooted_merge: bool,
+    rooted_eq_split: bool,
     number_order: bool,
     eager: bool,
     skip_dl: bool,
@@ -2349,7 +2718,9 @@ impl Classifier {
         let excluded = self.sat.excluded();
         if !excluded.is_empty() {
             if limits.strict {
-                return Err(Error::Incomplete(excluded.to_vec()));
+                let err = excluded.to_vec();
+                self.sat.invalidate_for_error();
+                return Err(Error::Incomplete(err));
             }
             let held: Vec<&AxiomKind> = self
                 .axioms
@@ -2362,7 +2733,9 @@ impl Classifier {
             }
         }
         if limits.strict && !out.complete {
-            return Err(Error::Incomplete(excluded.to_vec()));
+            let err = self.sat.excluded().to_vec();
+            self.sat.invalidate_for_error();
+            return Err(Error::Incomplete(err));
         }
         Ok(out)
     }
@@ -2471,7 +2844,20 @@ impl Saturation {
             active_hub: None,
             merge_stop: None,
             merge_disabled: false,
+            split_answer: None,
+            split_stop: None,
+            split_cfg: None,
+            leaf_individuals: Vec::new(),
+            split_ineligible: false,
         }
+    }
+
+    /// Invalidates any retained classification/saturation answer before returning an
+    /// error through a public API (`Classifier::classify`, `Saturation::classify`, or
+    /// split abort) so `describe(&C)` returns `None`.
+    fn invalidate_for_error(&mut self) {
+        self.dirty = true;
+        self.split_answer = None;
     }
 
     /// The axioms of the last run that it left out or used only in part, in order.
@@ -2497,6 +2883,7 @@ impl Saturation {
         })?;
         if !self.excluded.is_empty() {
             if limits.strict {
+                self.invalidate_for_error();
                 return Err(Error::Incomplete(self.excluded.clone()));
             }
             if !limits.cover_later {
@@ -2504,6 +2891,7 @@ impl Saturation {
             }
         }
         if limits.strict && !out.complete {
+            self.invalidate_for_error();
             return Err(Error::Incomplete(self.excluded.clone()));
         }
         Ok(out)
@@ -2533,6 +2921,9 @@ impl Saturation {
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        // Drop any retained split answer without forcing `self.dirty = true`, so ordinary
+        // switch-off incremental runs keep their contexts untouched.
+        self.split_answer = None;
         // the class assertions that another one stands for add nothing (roadmap item
         // 1281), and the run reads the other axioms, whose list it holds beside the
         // caller's
@@ -2718,11 +3109,19 @@ impl Saturation {
         }
     }
 
-    /// Runs `self.run(...)`, handling item 1061 phase 2 clean constant-merge restarts
-    /// against the same enclosing work bound while preserving memory high-water marks,
-    /// pool credit, deadlines, cancellation, and genuine fallback semantics.
+    /// Runs `self.run(...)`, handling item 1075 demand-driven binary equality splitting
+    /// (`S1-Bin` + `S2`) composed with item 1061 phase 2 clean constant-merge restarts.
+    ///
+    /// - Eligible ONLY on full `classify` calls (`with_taxonomy && !limits.partial`) when
+    ///   `limits.rooted && limits.rooted_eq_split && !limits.el_only && !self.no_rooted && !self.skip_dl`.
+    /// - When 0 splits occur, returns directly on the no-fork fast path with
+    ///   `self.split_answer = None`, `self.index.is_some()`, `self.dirty = false`.
+    /// - When a fork occurs, evaluates the binary DFS tree within one frozen `attempt_bound`,
+    ///   pre-admits every structure against one synchronized ledger, validates complete
+    ///   consistency across all real nominals (including anonymous witnesses and generated
+    ///   hubs), projects to the original visible signature, and publishes one `SplitAnswer`.
     #[allow(clippy::too_many_arguments)]
-    fn run_merging(
+    fn run_splitting(
         &mut self,
         axioms: &[&AxiomKind],
         mut changes: Option<Changes<'_>>,
@@ -2732,9 +3131,1738 @@ impl Saturation {
         call_peak: &mut usize,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
-        self.merge.spent = 0;
+        let eligible = limits.rooted
+            && limits.rooted_eq_split
+            && !limits.el_only
+            && !limits.partial
+            && with_taxonomy
+            && !self.no_rooted
+            && !self.skip_dl;
+        if !eligible {
+            return self.run_merging(
+                axioms,
+                changes,
+                held_bytes,
+                limits,
+                admitted,
+                call_peak,
+                with_taxonomy,
+            );
+        }
+
+        // Single synchronized outer ledger shared across the whole split tree.
+        struct SplitLedger<'a> {
+            held_base: usize,
+            live: AtomicUsize,
+            peak: AtomicUsize,
+            admitted: &'a std::sync::Arc<AtomicUsize>,
+            limits: &'a Limits,
+            lock: parking_lot::Mutex<()>,
+        }
+        impl SplitLedger<'_> {
+            fn delta(&self, d: isize) -> Result<(), usize> {
+                let _g = self.lock.lock();
+                if d >= 0 {
+                    let add = d as usize;
+                    let Some(next) = self.live.load(Ordering::Relaxed).checked_add(add) else {
+                        return Err(usize::MAX);
+                    };
+                    let Some(used) = self.held_base.checked_add(next) else {
+                        return Err(usize::MAX);
+                    };
+                    let mut paid = self.admitted.load(Ordering::Relaxed);
+                    let charge_fn = self
+                        .limits
+                        .charge
+                        .as_deref()
+                        .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+                    if !cover_memory(used, self.limits.max_memory, charge_fn, &mut paid) {
+                        return Err(used);
+                    }
+                    self.admitted.store(paid, Ordering::Relaxed);
+                    self.live.store(next, Ordering::Relaxed);
+                    self.peak.fetch_max(used, Ordering::Relaxed);
+                    Ok(())
+                } else {
+                    let sub = d.unsigned_abs();
+                    let cur = self.live.load(Ordering::Relaxed);
+                    self.live.store(cur.saturating_sub(sub), Ordering::Relaxed);
+                    Ok(())
+                }
+            }
+            fn add(&self, bytes: usize) -> Result<(), usize> {
+                if bytes == 0 {
+                    return Ok(());
+                }
+                let Ok(d) = isize::try_from(bytes) else {
+                    return Err(usize::MAX);
+                };
+                self.delta(d)
+            }
+            fn sub(&self, bytes: usize) {
+                if bytes == 0 {
+                    return;
+                }
+                if let Ok(d) = isize::try_from(bytes) {
+                    let _ = self.delta(-d);
+                }
+            }
+            fn live_bytes(&self) -> usize {
+                self.live.load(Ordering::Relaxed)
+            }
+            fn note_peak(&self, p: usize) {
+                self.peak.fetch_max(p, Ordering::Relaxed);
+            }
+        }
+
+        struct SplitFrame {
+            depth: usize,
+            merge: Merge,
+            uf_bytes: usize,
+            neq: Vec<(NamedIndividual, NamedIndividual)>,
+            neq_bytes: usize,
+        }
+        impl SplitFrame {
+            fn neq_owned_bytes(neq: &[(NamedIndividual, NamedIndividual)]) -> usize {
+                neq.len()
+                    .saturating_mul(std::mem::size_of::<(NamedIndividual, NamedIndividual)>())
+                    .saturating_add(
+                        neq.iter()
+                            .map(|(a, b)| a.as_str().len().saturating_add(b.as_str().len()))
+                            .sum::<usize>(),
+                    )
+            }
+        }
+
+        struct SplitAcc {
+            consistent_leaves: usize,
+            subs: Vec<(bool, Vec<u32>)>,
+            top: Vec<u32>,
+            insts: Vec<Vec<u32>>,
+            debit: usize,
+        }
+        impl SplitAcc {
+            fn new() -> Self {
+                Self {
+                    consistent_leaves: 0,
+                    subs: Vec::new(),
+                    top: Vec::new(),
+                    insts: Vec::new(),
+                    debit: 0,
+                }
+            }
+        }
+
+        fn sorted_intersect_in_place(a: &mut Vec<u32>, b: &[u32]) {
+            let (mut i, mut j, mut out) = (0, 0, 0);
+            while i < a.len() && j < b.len() {
+                match a[i].cmp(&b[j]) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        a[out] = a[i];
+                        out += 1;
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+            a.truncate(out);
+        }
+
+        fn distinct_canon_bytes<'a>(
+            arcs: impl Iterator<Item = &'a std::sync::Arc<index::CanonMap>>,
+        ) -> usize {
+            let mut ptrs: Vec<*const index::CanonMap> = Vec::new();
+            let mut sum = 0usize;
+            for arc in arcs {
+                let p = std::sync::Arc::as_ptr(arc);
+                if !ptrs.contains(&p) {
+                    ptrs.push(p);
+                    sum = sum.saturating_add(arc.owned_bytes());
+                }
+            }
+            sum
+        }
+
+        // Collect original visible classes and genuine original named individuals once.
+        let ledger = SplitLedger {
+            held_base: held_bytes,
+            live: AtomicUsize::new(0),
+            peak: AtomicUsize::new(*call_peak),
+            admitted,
+            limits,
+            lock: parking_lot::Mutex::new(()),
+        };
+        let mut raw_classes: FxHashSet<&str> = FxHashSet::default();
+        let mut raw_inds: FxHashMap<&str, bool> = FxHashMap::default();
+        for (idx, k) in axioms.iter().enumerate() {
+            if idx.is_multiple_of(POLL_AXIOMS)
+                && let Err(e) = poll(limits)
+            {
+                self.invalidate_for_error();
+                return Err(e);
+            }
+            let non_decl = !matches!(k, AxiomKind::Declaration(_));
+            crate::model::Signature::visit_classes_and_individuals(
+                k,
+                &mut |c| {
+                    if c.as_str() != crate::vocab::OWL_THING
+                        && c.as_str() != crate::vocab::OWL_NOTHING
+                    {
+                        raw_classes.insert(c.as_str());
+                    }
+                },
+                &mut |n| {
+                    raw_inds
+                        .entry(n.as_str())
+                        .and_modify(|v| *v |= non_decl)
+                        .or_insert(non_decl);
+                },
+            );
+        }
+        // Checked domain bounds: disable splitting cleanly if < 2 genuine named individuals
+        // or if class/individual counts exceed sentinel/rank bounds.
+        if raw_inds.len() < 2
+            || raw_classes.len() > taxonomy::MAX_CLASS_COUNT
+            || raw_inds.len() >= u32::MAX as usize
+        {
+            return self.run_merging(
+                axioms,
+                changes,
+                held_bytes,
+                limits,
+                admitted,
+                call_peak,
+                with_taxonomy,
+            );
+        }
+
+        let orig_classes_bytes = raw_classes
+            .len()
+            .checked_mul(std::mem::size_of::<Class>())
+            .and_then(|b| {
+                raw_classes
+                    .iter()
+                    .try_fold(b, |acc, s| acc.checked_add(s.len()))
+            })
+            .ok_or(Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used: usize::MAX,
+            })?;
+        let orig_inds_bytes = raw_inds
+            .len()
+            .checked_mul(
+                std::mem::size_of::<(NamedIndividual, bool)>()
+                    + std::mem::size_of::<NamedIndividual>(),
+            )
+            .and_then(|b| {
+                raw_inds
+                    .keys()
+                    .try_fold(b, |acc, s| acc.checked_add(2 * s.len()))
+            })
+            .ok_or(Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used: usize::MAX,
+            })?;
+        let orig_sig_bytes =
+            orig_classes_bytes
+                .checked_add(orig_inds_bytes)
+                .ok_or(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: usize::MAX,
+                })?;
+        if let Err(used) = ledger.add(orig_sig_bytes) {
+            *call_peak = (*call_peak).max(used);
+            self.invalidate_for_error();
+            return Err(Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used,
+            });
+        }
+        let mut orig_classes: Vec<Class> = Vec::with_capacity(raw_classes.len());
+        for s in raw_classes {
+            orig_classes.push(Class::new(s.to_owned()));
+        }
+        orig_classes.sort_unstable();
+        let mut orig_individuals: Vec<(NamedIndividual, bool)> = Vec::with_capacity(raw_inds.len());
+        for (s, non_decl) in raw_inds {
+            orig_individuals.push((NamedIndividual::new(s.to_owned()), non_decl));
+        }
+        orig_individuals.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        let orig_ind_names_arc: std::sync::Arc<[NamedIndividual]> = orig_individuals
+            .iter()
+            .map(|(n, _)| index::exact_individual(n))
+            .collect::<Vec<_>>()
+            .into();
+
+        let probe = split_probe_threshold();
+        let child_eager = split_child_eager();
+        let max_depth = split_max_depth();
+        let max_leaves = split_max_leaves().max(1);
+
+        // Initial root frame inherits any prepass asserted `SameIndividual` partition.
+        let root_merge = std::mem::take(&mut self.merge);
+        let root_uf_bytes = root_merge.uf_bytes();
+        if root_uf_bytes > 0 {
+            ledger.live.fetch_add(root_uf_bytes, Ordering::Relaxed);
+        }
+        let mut stack: Vec<SplitFrame> = vec![SplitFrame {
+            depth: 0,
+            merge: root_merge,
+            uf_bytes: root_uf_bytes,
+            neq: Vec::new(),
+            neq_bytes: 0,
+        }];
+        let mut acc = SplitAcc::new();
+        let mut forked = false;
+        let mut planned_leaves = 1usize;
+        let mut splits = 0usize;
+        let mut leaves = 0usize;
+        let mut restarts = 0usize;
+        let mut dl_rooted_spent = 0usize;
+        let mut leaf_work = 0usize;
+        let mut attempt_bound: Option<usize> = None;
+        let mut epoch_counter = 0u32;
+        let mut agg_stats = Stats {
+            threads: threads_of(limits),
+            added: self.source_len.unwrap_or(axioms.len()),
+            ..Stats::default()
+        };
+        let split_start = Instant::now();
+
+        enum LoopExit {
+            Done,
+            NoForkResult(bool, Option<Taxonomy>, Box<Stats>),
+            ExcludedAbort,
+            Error(Error),
+        }
+
+        let mut exit = LoopExit::Done;
+
+        // Remaps every disequality in `neq` through `merge`. Returns `Ok(true)` if any
+        // pair collapsed to `a == b` (proving the branch inconsistent), `Ok(false)` on
+        // surviving deduplicated pairs, or `Err(used)` on memory admission failure.
+        let remap_neq = |merge: &Merge,
+                         neq: &mut Vec<(NamedIndividual, NamedIndividual)>,
+                         neq_bytes: &mut usize,
+                         ledger: &SplitLedger<'_>|
+         -> Result<bool, usize> {
+            if neq.is_empty() {
+                return Ok(false);
+            }
+            let mut remapped: Vec<(NamedIndividual, NamedIndividual)> =
+                Vec::with_capacity(neq.len());
+            let mut new_bytes = neq
+                .len()
+                .saturating_mul(std::mem::size_of::<(NamedIndividual, NamedIndividual)>());
+            for (a, b) in neq.iter() {
+                let ra = merge.rep_of_named_ref(a);
+                let rb = merge.rep_of_named_ref(b);
+                if ra == rb {
+                    return Ok(true);
+                }
+                let (lo, hi) = if ra.as_str() <= rb.as_str() {
+                    (ra, rb)
+                } else {
+                    (rb, ra)
+                };
+                new_bytes = new_bytes
+                    .saturating_add(lo.as_str().len())
+                    .saturating_add(hi.as_str().len());
+            }
+            ledger.add(new_bytes)?;
+            for (a, b) in neq.iter() {
+                let ra = merge.rep_of_named_ref(a);
+                let rb = merge.rep_of_named_ref(b);
+                let (lo, hi) = if ra.as_str() <= rb.as_str() {
+                    (ra, rb)
+                } else {
+                    (rb, ra)
+                };
+                remapped.push((index::exact_individual(lo), index::exact_individual(hi)));
+            }
+            remapped.sort_unstable_by(|x, y| {
+                x.0.as_str()
+                    .cmp(y.0.as_str())
+                    .then_with(|| x.1.as_str().cmp(y.1.as_str()))
+            });
+            remapped.dedup();
+            let old_bytes = *neq_bytes;
+            let exact_new = SplitFrame::neq_owned_bytes(&remapped);
+            *neq = remapped;
+            *neq_bytes = exact_new;
+            ledger.sub(old_bytes.saturating_add(new_bytes.saturating_sub(exact_new)));
+            Ok(false)
+        };
+
+        'dfs: while let Some(mut frame) = stack.pop() {
+            if let Err(e) = poll(limits) {
+                ledger.sub(frame.uf_bytes.saturating_add(frame.neq_bytes));
+                exit = LoopExit::Error(e);
+                break 'dfs;
+            }
+            let mut frame_consumed = false;
+            let mut force_no_split = false;
+
+            'branch: loop {
+                if let Err(e) = poll(limits) {
+                    exit = LoopExit::Error(e);
+                    break 'dfs;
+                }
+                epoch_counter = epoch_counter.wrapping_add(1).max(1);
+                let can_split =
+                    !force_no_split && frame.depth < max_depth && planned_leaves < max_leaves;
+                let mode = if !can_split {
+                    dl_rules::SplitMode::Disabled
+                } else if (frame.depth >= 1 && child_eager) || probe == 0 {
+                    dl_rules::SplitMode::EagerPureThenProbe
+                } else {
+                    dl_rules::SplitMode::ProbeOnly
+                };
+
+                // Build synthetic `DifferentIndividuals` axioms for branch disequalities.
+                let mut synth_axioms: Vec<AxiomKind> = Vec::new();
+                let mut branch_refs: Vec<&AxiomKind> = Vec::new();
+                let mut synth_bytes = 0usize;
+                if !frame.neq.is_empty() {
+                    let ax_bytes = frame
+                        .neq
+                        .len()
+                        .checked_mul(
+                            std::mem::size_of::<AxiomKind>()
+                                + 2 * std::mem::size_of::<Individual>(),
+                        )
+                        .and_then(|b| {
+                            frame.neq.iter().try_fold(b, |acc, (a, b)| {
+                                acc.checked_add(a.as_str().len())?
+                                    .checked_add(b.as_str().len())
+                            })
+                        })
+                        .and_then(|b| {
+                            b.checked_add(
+                                axioms
+                                    .len()
+                                    .checked_add(frame.neq.len())?
+                                    .checked_mul(std::mem::size_of::<&AxiomKind>())?,
+                            )
+                        })
+                        .and_then(|b| b.checked_add(frame.neq_bytes));
+                    let Some(sb) = ax_bytes else {
+                        exit = LoopExit::Error(Error::Memory {
+                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                            used: usize::MAX,
+                        });
+                        break 'dfs;
+                    };
+                    if let Err(used) = ledger.add(sb) {
+                        ledger.note_peak(used);
+                        exit = LoopExit::Error(Error::Memory {
+                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                            used,
+                        });
+                        break 'dfs;
+                    }
+                    synth_bytes = sb;
+                    synth_axioms.reserve_exact(frame.neq.len());
+                    for (a, b) in &frame.neq {
+                        synth_axioms.push(AxiomKind::DifferentIndividuals(
+                            [
+                                Individual::Named(index::exact_individual(a)),
+                                Individual::Named(index::exact_individual(b)),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ));
+                    }
+                    branch_refs.reserve_exact(axioms.len() + synth_axioms.len());
+                    branch_refs.extend_from_slice(axioms);
+                    for a in &synth_axioms {
+                        branch_refs.push(a);
+                    }
+                }
+                let run_axioms: &[&AxiomKind] = if synth_axioms.is_empty() {
+                    axioms
+                } else {
+                    &branch_refs
+                };
+
+                // Move branch partition into `self.merge` and set frozen bound / carried work.
+                self.merge = frame.merge;
+                self.merge.spent = dl_rooted_spent.saturating_add(leaf_work);
+                self.merge.restarts = restarts;
+                self.merge.frozen_bound = attempt_bound;
+                self.merge_stop = None;
+                self.split_stop = None;
+                self.split_ineligible = false;
+                self.split_cfg = Some(SplitBranchCfg {
+                    mode,
+                    probe,
+                    epoch: epoch_counter,
+                    forked,
+                    orig_individuals: orig_ind_names_arc.clone(),
+                    neq: frame.neq.clone(),
+                });
+
+                // Outer live bytes held concurrently while this branch saturates:
+                // everything tracked in `ledger` EXCEPT `frame.uf_bytes` (which `self.merge`
+                // accounts for inside `self.run`), plus any distinct `Arc<CanonMap>` on `stack`.
+                let stack_canon_bytes =
+                    distinct_canon_bytes(stack.iter().filter_map(|f| f.merge.shared.as_ref()));
+                let outer_held = held_bytes
+                    .saturating_add(ledger.live_bytes().saturating_sub(frame.uf_bytes))
+                    .saturating_add(stack_canon_bytes);
+                let mut branch_peak = ledger.peak.load(Ordering::Relaxed);
+                let r = self.run(
+                    run_axioms,
+                    if !forked { changes.take() } else { None },
+                    outer_held,
+                    limits,
+                    admitted,
+                    &mut branch_peak,
+                    !forked,
+                );
+                ledger.note_peak(branch_peak);
+                self.split_cfg = None;
+                drop(branch_refs);
+                drop(synth_axioms);
+                ledger.sub(synth_bytes);
+                frame.merge = std::mem::take(&mut self.merge);
+
+                match r {
+                    Ok((consistent, taxonomy, mut stats)) => {
+                        if !forked {
+                            // No-fork fast path: preserve normal `index`, `dirty = false`, and `describe`.
+                            stats.dl_rooted_merged =
+                                self.interner.canon.as_ref().map_or(0, |c| c.len());
+                            stats.dl_rooted_spent = dl_rooted_spent;
+                            stats.dl_rooted_restarts = restarts;
+                            stats.dl_rooted_splits = 0;
+                            stats.dl_rooted_leaves = 0;
+                            stats.peak_memory =
+                                stats.peak_memory.max(ledger.peak.load(Ordering::Relaxed));
+                            *call_peak = (*call_peak).max(stats.peak_memory);
+                            self.merge.clear();
+                            self.canon_want = None;
+                            exit = LoopExit::NoForkResult(consistent, taxonomy, Box::new(stats));
+                            break 'dfs;
+                        }
+                        // Forked terminal leaf finished saturation!
+                        leaf_work = leaf_work.saturating_add(stats.dl_work);
+                        agg_stats.conclusions =
+                            agg_stats.conclusions.saturating_add(stats.conclusions);
+                        agg_stats.dl_contexts = agg_stats.dl_contexts.max(stats.dl_contexts);
+                        agg_stats.dl_stored = agg_stats.dl_stored.max(stats.dl_stored);
+                        agg_stats.clauses = agg_stats.clauses.max(stats.clauses);
+                        agg_stats.outside_el = stats.outside_el;
+                        agg_stats.tier = stats.tier;
+                        if attempt_bound.is_none() {
+                            attempt_bound = frame.merge.frozen_bound;
+                        }
+                        if !self.excluded.is_empty() {
+                            exit = LoopExit::ExcludedAbort;
+                            break 'dfs;
+                        }
+                        if !consistent {
+                            leaves += 1;
+                            if split_trace() {
+                                eprintln!(
+                                    "SPLIT leaf={} depth={} consistent=false work={} spent={}",
+                                    leaves, frame.depth, stats.dl_work, dl_rooted_spent
+                                );
+                            }
+                            self.reset();
+                            break 'branch;
+                        }
+                        // Complete leaf consistency check + original-signature S2 export.
+                        let stop = || poll(limits).is_err();
+                        let budget = |d: isize| ledger.delta(d);
+                        let exported = self.export_split_leaf(
+                            &orig_classes,
+                            &orig_individuals,
+                            limits,
+                            &stop,
+                            &budget,
+                        );
+                        self.reset();
+                        match exported {
+                            Ok(LeafExportResult::Inconsistent) => {
+                                leaves += 1;
+                                if split_trace() {
+                                    eprintln!(
+                                        "SPLIT leaf={} depth={} consistent=false(closed) work={}",
+                                        leaves, frame.depth, stats.dl_work
+                                    );
+                                }
+                                break 'branch;
+                            }
+                            Ok(LeafExportResult::Consistent {
+                                vis_subs,
+                                vis_top,
+                                leaf_insts,
+                                owned_bytes,
+                            }) => {
+                                leaves += 1;
+                                if split_trace() {
+                                    eprintln!(
+                                        "SPLIT leaf={} depth={} consistent=true work={}",
+                                        leaves, frame.depth, stats.dl_work
+                                    );
+                                }
+                                if acc.consistent_leaves == 0 {
+                                    acc.subs = vis_subs;
+                                    acc.top = vis_top;
+                                    acc.insts = leaf_insts;
+                                    acc.debit = owned_bytes;
+                                } else {
+                                    sorted_intersect_in_place(&mut acc.top, &vis_top);
+                                    for (i, ((acc_u, acc_row), (leaf_u, leaf_row))) in
+                                        acc.subs.iter_mut().zip(vis_subs).enumerate()
+                                    {
+                                        match (*acc_u, leaf_u) {
+                                            (true, true) => {
+                                                acc_row.clear();
+                                            }
+                                            (true, false) => {
+                                                *acc_u = false;
+                                                *acc_row = leaf_row;
+                                            }
+                                            (false, true) => {}
+                                            (false, false) => {
+                                                sorted_intersect_in_place(acc_row, &leaf_row);
+                                            }
+                                        }
+                                        sorted_intersect_in_place(
+                                            &mut acc.insts[i],
+                                            &leaf_insts[i],
+                                        );
+                                    }
+                                    // Reconcile accumulator capacity debit after in-place meets.
+                                    let new_debit = acc
+                                        .subs
+                                        .capacity()
+                                        .saturating_mul(std::mem::size_of::<(bool, Vec<u32>)>())
+                                        .saturating_add(
+                                            acc.subs
+                                                .iter()
+                                                .map(|(_, v)| v.capacity() * 4)
+                                                .sum::<usize>(),
+                                        )
+                                        .saturating_add(acc.top.capacity() * 4)
+                                        .saturating_add(
+                                            acc.insts
+                                                .capacity()
+                                                .saturating_mul(std::mem::size_of::<Vec<u32>>()),
+                                        )
+                                        .saturating_add(
+                                            acc.insts
+                                                .iter()
+                                                .map(|v| v.capacity() * 4)
+                                                .sum::<usize>(),
+                                        );
+                                    let total_before = acc.debit.saturating_add(owned_bytes);
+                                    if total_before > new_debit {
+                                        ledger.sub(total_before - new_debit);
+                                    }
+                                    acc.debit = new_debit;
+                                }
+                                acc.consistent_leaves += 1;
+                                break 'branch;
+                            }
+                            Ok(LeafExportResult::ExcludedOrIncomplete) => {
+                                exit = LoopExit::ExcludedAbort;
+                                break 'dfs;
+                            }
+                            Err(e) => {
+                                if let Error::Memory { used, .. } = e {
+                                    ledger.note_peak(used);
+                                }
+                                exit = LoopExit::Error(e);
+                                break 'dfs;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if self.split_ineligible {
+                            self.split_ineligible = false;
+                            exit = LoopExit::ExcludedAbort;
+                            break 'dfs;
+                        }
+                        if let Some(stop) = self.merge_stop.take() {
+                            // Item 1061 Phase 2 STOP_MERGE inside this branch!
+                            ledger.note_peak(stop.peak);
+                            if let Err(pe) = poll(limits) {
+                                exit = LoopExit::Error(pe);
+                                break 'dfs;
+                            }
+                            let old_inds = std::mem::take(&mut self.interner.individuals);
+                            let old_inds_bytes = old_inds.exact_bytes();
+                            self.reset();
+                            self.reduced = false;
+                            self.canon_want = None;
+                            frame.merge.shared = None;
+
+                            let mut paid = admitted.load(Ordering::Relaxed);
+                            let charge_fn = limits
+                                .charge
+                                .as_deref()
+                                .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+                            let mut admit_fn = |used: usize| -> bool {
+                                let ok =
+                                    cover_memory(used, limits.max_memory, charge_fn, &mut paid);
+                                if ok {
+                                    ledger.note_peak(used);
+                                    admitted.store(paid, Ordering::Relaxed);
+                                }
+                                ok
+                            };
+                            let union_base = held_bytes
+                                .saturating_add(ledger.live_bytes())
+                                .saturating_add(old_inds_bytes)
+                                .saturating_add(stop.pairs_bytes);
+                            if let Err(used) = frame.merge.set_active_hub(
+                                stop.active_hub,
+                                union_base,
+                                &mut admit_fn,
+                            ) {
+                                drop((old_inds, stop.pairs));
+                                self.dl_worked.store(false, Ordering::Relaxed);
+                                exit =
+                                    LoopExit::Error(poll(limits).err().unwrap_or(Error::Memory {
+                                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                                        used,
+                                    }));
+                                break 'dfs;
+                            }
+                            let mut joined = false;
+                            let mut invalid_id = false;
+                            for (idx, &(u, v)) in stop.pairs.iter().enumerate() {
+                                if idx.is_multiple_of(POLL_AXIOMS)
+                                    && let Err(pe) = poll(limits)
+                                {
+                                    drop((old_inds, stop.pairs));
+                                    exit = LoopExit::Error(pe);
+                                    break 'dfs;
+                                }
+                                let old_slice: &[NamedIndividual] = &old_inds;
+                                let (Some(nu), Some(nv)) =
+                                    (old_slice.get(u as usize), old_slice.get(v as usize))
+                                else {
+                                    invalid_id = true;
+                                    break;
+                                };
+                                match frame.merge.union_named(nu, nv, union_base, &mut admit_fn) {
+                                    Ok(did) => joined |= did,
+                                    Err(used) => {
+                                        drop((old_inds, stop.pairs));
+                                        self.dl_worked.store(false, Ordering::Relaxed);
+                                        exit = LoopExit::Error(poll(limits).err().unwrap_or(
+                                            Error::Memory {
+                                                limit: limits.max_memory.unwrap_or(usize::MAX),
+                                                used,
+                                            },
+                                        ));
+                                        break 'dfs;
+                                    }
+                                }
+                            }
+                            drop((stop.pairs, old_inds));
+                            let new_uf = frame.merge.uf_bytes();
+                            if new_uf > frame.uf_bytes {
+                                ledger
+                                    .live
+                                    .fetch_add(new_uf - frame.uf_bytes, Ordering::Relaxed);
+                            } else {
+                                ledger.sub(frame.uf_bytes - new_uf);
+                            }
+                            frame.uf_bytes = new_uf;
+                            if invalid_id || !joined {
+                                self.dl_worked.store(false, Ordering::Relaxed);
+                                exit = LoopExit::Error(Error::Memory {
+                                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                                    used: ledger.peak.load(Ordering::Relaxed),
+                                });
+                                break 'dfs;
+                            }
+                            dl_rooted_spent = stop.spent.saturating_sub(leaf_work);
+                            restarts += 1;
+                            attempt_bound.get_or_insert(stop.bound);
+                            // Mandatory full disequality remapping after derived unit merge!
+                            match remap_neq(
+                                &frame.merge,
+                                &mut frame.neq,
+                                &mut frame.neq_bytes,
+                                &ledger,
+                            ) {
+                                Ok(true) => {
+                                    // Self-disequality collision proves branch inconsistent immediately!
+                                    leaves += 1;
+                                    if split_trace() {
+                                        eprintln!(
+                                            "SPLIT leaf={} depth={} inconsistent(merge-neq-collision)",
+                                            leaves, frame.depth
+                                        );
+                                    }
+                                    break 'branch;
+                                }
+                                Ok(false) => {}
+                                Err(used) => {
+                                    self.dl_worked.store(false, Ordering::Relaxed);
+                                    exit = LoopExit::Error(Error::Memory {
+                                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                                        used,
+                                    });
+                                    break 'dfs;
+                                }
+                            }
+                            let canon_base = held_bytes.saturating_add(ledger.live_bytes());
+                            match frame.merge.build_canon(canon_base, limits, &mut admit_fn) {
+                                Ok(_) => continue 'branch,
+                                Err(BuildCanonErr::Poll(pe)) => {
+                                    exit = LoopExit::Error(pe);
+                                    break 'dfs;
+                                }
+                                Err(BuildCanonErr::Memory(used)) => {
+                                    self.dl_worked.store(false, Ordering::Relaxed);
+                                    exit = LoopExit::Error(poll(limits).err().unwrap_or(
+                                        Error::Memory {
+                                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                                            used,
+                                        },
+                                    ));
+                                    break 'dfs;
+                                }
+                            }
+                        }
+
+                        if let Some(stop) = self.split_stop.take() {
+                            // Item 1075 STOP_SPLIT! Fork binary children B_eq (u == v) and B_ne (u != v).
+                            ledger.note_peak(stop.peak);
+                            if let Err(pe) = poll(limits) {
+                                exit = LoopExit::Error(pe);
+                                break 'dfs;
+                            }
+                            self.reset();
+                            self.reduced = false;
+                            self.canon_want = None;
+                            dl_rooted_spent = stop.spent.saturating_sub(leaf_work);
+                            attempt_bound.get_or_insert(stop.bound);
+
+                            let ru = index::exact_individual(frame.merge.rep_of_named_ref(&stop.u));
+                            let rv = index::exact_individual(frame.merge.rep_of_named_ref(&stop.v));
+                            let (lo, hi) = if ru.as_str() <= rv.as_str() {
+                                (ru, rv)
+                            } else {
+                                (rv, ru)
+                            };
+                            let already_neq = frame
+                                .neq
+                                .binary_search_by(|p| {
+                                    p.0.as_str()
+                                        .cmp(lo.as_str())
+                                        .then_with(|| p.1.as_str().cmp(hi.as_str()))
+                                })
+                                .is_ok();
+                            if lo == hi
+                                || already_neq
+                                || frame.depth >= max_depth
+                                || planned_leaves >= max_leaves
+                            {
+                                // Candidate is already decided or caps reached; finish this branch
+                                // without further splitting.
+                                force_no_split = true;
+                                continue 'branch;
+                            }
+
+                            forked = true;
+                            splits += 1;
+                            planned_leaves += 1;
+                            let next_depth = frame.depth + 1;
+                            if split_trace() {
+                                eprintln!(
+                                    "SPLIT fork={} depth={}->{next_depth} prio={} pair=({}, {}) spent={} bound={}",
+                                    splits,
+                                    frame.depth,
+                                    stop.prio,
+                                    lo.as_str(),
+                                    hi.as_str(),
+                                    dl_rooted_spent,
+                                    stop.bound
+                                );
+                            }
+
+                            let mut paid = admitted.load(Ordering::Relaxed);
+                            let charge_fn = limits
+                                .charge
+                                .as_deref()
+                                .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+                            let mut admit_fn = |used: usize| -> bool {
+                                let ok =
+                                    cover_memory(used, limits.max_memory, charge_fn, &mut paid);
+                                if ok {
+                                    ledger.note_peak(used);
+                                    admitted.store(paid, Ordering::Relaxed);
+                                }
+                                ok
+                            };
+
+                            // Clone parent Merge for B_eq before moving parent into B_ne.
+                            let clone_base = held_bytes.saturating_add(ledger.live_bytes());
+                            let mut eq_merge =
+                                match frame.merge.clone_admitted(clone_base, &mut admit_fn) {
+                                    Ok(m) => m,
+                                    Err(used) => {
+                                        self.dl_worked.store(false, Ordering::Relaxed);
+                                        exit = LoopExit::Error(poll(limits).err().unwrap_or(
+                                            Error::Memory {
+                                                limit: limits.max_memory.unwrap_or(usize::MAX),
+                                                used,
+                                            },
+                                        ));
+                                        break 'dfs;
+                                    }
+                                };
+                            let mut eq_uf_bytes = eq_merge.uf_bytes();
+                            ledger.live.fetch_add(eq_uf_bytes, Ordering::Relaxed);
+
+                            // Prepare right branch B_ne (u != v): pre-admit the full cloned Vec
+                            // plus new pair BEFORE cloning `frame.neq`.
+                            let ne_pair_bytes =
+                                std::mem::size_of::<(NamedIndividual, NamedIndividual)>()
+                                    + lo.as_str().len()
+                                    + hi.as_str().len();
+                            let ne_add = frame.neq_bytes.saturating_add(ne_pair_bytes);
+                            if let Err(used) = ledger.add(ne_add) {
+                                ledger.sub(eq_uf_bytes);
+                                self.dl_worked.store(false, Ordering::Relaxed);
+                                exit = LoopExit::Error(Error::Memory {
+                                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                                    used,
+                                });
+                                break 'dfs;
+                            }
+                            let mut ne_neq = Vec::with_capacity(frame.neq.len() + 1);
+                            for (a, b) in &frame.neq {
+                                ne_neq
+                                    .push((index::exact_individual(a), index::exact_individual(b)));
+                            }
+                            ne_neq
+                                .push((index::exact_individual(&lo), index::exact_individual(&hi)));
+                            ne_neq.sort_unstable_by(|x, y| {
+                                x.0.as_str()
+                                    .cmp(y.0.as_str())
+                                    .then_with(|| x.1.as_str().cmp(y.1.as_str()))
+                            });
+                            ne_neq.dedup();
+                            let ne_neq_bytes = SplitFrame::neq_owned_bytes(&ne_neq);
+                            if ne_add > ne_neq_bytes {
+                                ledger.sub(ne_add - ne_neq_bytes);
+                            }
+
+                            // Move parent's `merge` (keeping `frame.uf_bytes` in ledger) to B_ne,
+                            // and parent's `neq` (keeping `frame.neq_bytes` in ledger) to B_eq.
+                            let mut eq_neq = frame.neq;
+                            let mut eq_neq_bytes = frame.neq_bytes;
+                            frame_consumed = true;
+                            stack.push(SplitFrame {
+                                depth: next_depth,
+                                merge: frame.merge,
+                                uf_bytes: frame.uf_bytes,
+                                neq: ne_neq,
+                                neq_bytes: ne_neq_bytes,
+                            });
+
+                            // Prepare left branch B_eq (u == v): union + mandatory full disequality remap.
+                            let eq_base = held_bytes.saturating_add(ledger.live_bytes());
+                            match eq_merge.union_named(&lo, &hi, eq_base, &mut admit_fn) {
+                                Ok(_) => {}
+                                Err(used) => {
+                                    ledger.sub(eq_uf_bytes.saturating_add(eq_neq_bytes));
+                                    self.dl_worked.store(false, Ordering::Relaxed);
+                                    exit = LoopExit::Error(poll(limits).err().unwrap_or(
+                                        Error::Memory {
+                                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                                            used,
+                                        },
+                                    ));
+                                    break 'dfs;
+                                }
+                            }
+                            let new_eq_uf = eq_merge.uf_bytes();
+                            if new_eq_uf > eq_uf_bytes {
+                                ledger
+                                    .live
+                                    .fetch_add(new_eq_uf - eq_uf_bytes, Ordering::Relaxed);
+                            } else {
+                                ledger.sub(eq_uf_bytes - new_eq_uf);
+                            }
+                            eq_uf_bytes = new_eq_uf;
+                            match remap_neq(&eq_merge, &mut eq_neq, &mut eq_neq_bytes, &ledger) {
+                                Ok(true) => {
+                                    // B_eq immediately inconsistent via disequality collision!
+                                    leaves += 1;
+                                    ledger.sub(eq_uf_bytes.saturating_add(eq_neq_bytes));
+                                    drop((eq_merge, eq_neq));
+                                    break 'branch;
+                                }
+                                Ok(false) => {}
+                                Err(used) => {
+                                    ledger.sub(eq_uf_bytes.saturating_add(eq_neq_bytes));
+                                    self.dl_worked.store(false, Ordering::Relaxed);
+                                    exit = LoopExit::Error(Error::Memory {
+                                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                                        used,
+                                    });
+                                    break 'dfs;
+                                }
+                            }
+                            let canon_base = held_bytes.saturating_add(ledger.live_bytes());
+                            match eq_merge.build_canon(canon_base, limits, &mut admit_fn) {
+                                Ok(_) => {}
+                                Err(BuildCanonErr::Poll(pe)) => {
+                                    ledger.sub(eq_uf_bytes.saturating_add(eq_neq_bytes));
+                                    exit = LoopExit::Error(pe);
+                                    break 'dfs;
+                                }
+                                Err(BuildCanonErr::Memory(used)) => {
+                                    ledger.sub(eq_uf_bytes.saturating_add(eq_neq_bytes));
+                                    self.dl_worked.store(false, Ordering::Relaxed);
+                                    exit = LoopExit::Error(poll(limits).err().unwrap_or(
+                                        Error::Memory {
+                                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                                            used,
+                                        },
+                                    ));
+                                    break 'dfs;
+                                }
+                            }
+                            stack.push(SplitFrame {
+                                depth: next_depth,
+                                merge: eq_merge,
+                                uf_bytes: eq_uf_bytes,
+                                neq: eq_neq,
+                                neq_bytes: eq_neq_bytes,
+                            });
+                            break 'branch;
+                        }
+
+                        // Ordinary abort (`WorkExhausted`, `Declined`, `Memory`, `Cancelled`, `Timeout`).
+                        if let Error::Memory { used, .. } = e {
+                            ledger.note_peak(used);
+                        }
+                        exit = LoopExit::Error(e);
+                        break 'dfs;
+                    }
+                }
+            }
+            if !frame_consumed {
+                ledger.sub(frame.uf_bytes.saturating_add(frame.neq_bytes));
+            }
+        }
+
+        // Handle non-completion exits cleanly before assembling `SplitAnswer`.
+        match exit {
+            LoopExit::NoForkResult(c, t, s) => return Ok((c, t, *s)),
+            LoopExit::Error(e) => {
+                *call_peak = (*call_peak).max(ledger.peak.load(Ordering::Relaxed));
+                drop((
+                    stack,
+                    acc,
+                    orig_classes,
+                    orig_individuals,
+                    orig_ind_names_arc,
+                ));
+                self.merge.clear();
+                self.canon_want = None;
+                self.split_cfg = None;
+                self.split_stop = None;
+                self.reset();
+                self.invalidate_for_error();
+                return Err(e);
+            }
+            LoopExit::ExcludedAbort => {
+                let spent_so_far = dl_rooted_spent.saturating_add(leaf_work);
+                let bound = attempt_bound.unwrap_or_else(|| {
+                    limits
+                        .dl_work
+                        .unwrap_or_else(|| {
+                            rooted_work_bound(orig_classes.len(), rooted_bound_per_class())
+                        })
+                        .max(1)
+                });
+                *call_peak = (*call_peak).max(ledger.peak.load(Ordering::Relaxed));
+                drop((
+                    stack,
+                    acc,
+                    orig_classes,
+                    orig_individuals,
+                    orig_ind_names_arc,
+                ));
+                self.merge.clear();
+                self.canon_want = None;
+                self.split_cfg = None;
+                self.split_stop = None;
+                self.reset();
+                self.invalidate_for_error();
+                let remaining = bound.saturating_sub(spent_so_far);
+                if remaining == 0 {
+                    self.dl_worked.store(true, Ordering::Relaxed);
+                    return Err(Error::Memory {
+                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                        used: *call_peak,
+                    });
+                }
+                // Run ONE clean disabled-split retry on original axioms carrying `spent_so_far`
+                // against the exact same frozen `attempt_bound`.
+                let disabled = Limits {
+                    rooted_eq_split: false,
+                    ..limits.clone()
+                };
+                if disabled.rooted
+                    && disabled.rooted_merge
+                    && !disabled.el_only
+                    && !self.merge_disabled
+                {
+                    self.collect_same(axioms, held_bytes, &disabled, admitted, call_peak)?;
+                }
+                return self.run_merging_with_carry(
+                    axioms,
+                    None,
+                    held_bytes,
+                    &disabled,
+                    admitted,
+                    call_peak,
+                    with_taxonomy,
+                    spent_so_far,
+                    Some(bound),
+                );
+            }
+            LoopExit::Done => {}
+        }
+
+        // All DFS frames completed! Assemble final Taxonomy + SplitAnswer simultaneously.
+        let threads = threads_of(limits);
+        let stop = || poll(limits).is_err();
+        let budget = |d: isize| ledger.delta(d);
+        let tax_start = Instant::now();
+        let (consistent, taxonomy, tax_bytes, node_insts) = if acc.consistent_leaves == 0 {
+            let (tax, bytes) = taxonomy::build_inconsistent(&orig_classes, threads, &stop, &budget)
+                .map_err(|h| {
+                    self.invalidate_for_error();
+                    match h {
+                        taxonomy::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+                        taxonomy::Halt::Memory(used) => {
+                            *call_peak = (*call_peak).max(used);
+                            Error::Memory {
+                                limit: limits.max_memory.unwrap_or(usize::MAX),
+                                used,
+                            }
+                        }
+                    }
+                })?;
+            (false, tax, bytes, Vec::new())
+        } else {
+            let (tax, bytes) = taxonomy::build_from_rows(
+                &orig_classes,
+                &acc.subs,
+                &acc.top,
+                threads,
+                &stop,
+                &budget,
+            )
+            .map_err(|h| {
+                self.invalidate_for_error();
+                match h {
+                    taxonomy::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+                    taxonomy::Halt::Memory(used) => {
+                        *call_peak = (*call_peak).max(used);
+                        Error::Memory {
+                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                            used,
+                        }
+                    }
+                }
+            })?;
+            let mut node_insts: Vec<Vec<u32>> = Vec::new();
+            let ni_hdr = tax
+                .nodes()
+                .len()
+                .checked_mul(std::mem::size_of::<Vec<u32>>())
+                .ok_or_else(|| {
+                    self.invalidate_for_error();
+                    Error::Memory {
+                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                        used: usize::MAX,
+                    }
+                })?;
+            if let Err(used) = ledger.add(ni_hdr) {
+                *call_peak = (*call_peak).max(used);
+                self.invalidate_for_error();
+                return Err(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used,
+                });
+            }
+            node_insts.resize_with(tax.nodes().len(), Vec::new);
+            for (ni, node) in tax.nodes().iter().enumerate().skip(2) {
+                if let Some(first) = node.classes.first()
+                    && let Ok(vis_c) =
+                        orig_classes.binary_search_by(|c| c.as_str().cmp(first.as_str()))
+                {
+                    node_insts[ni] = std::mem::take(&mut acc.insts[vis_c]);
+                }
+            }
+            (true, tax, bytes, node_insts)
+        };
+
+        // Pre-admit BOTH returned `Classification.taxonomy` and retained `SplitAnswer`
+        // simultaneously before dropping `SplitAcc`.
+        let retained_ind_names: Vec<NamedIndividual> = orig_individuals
+            .iter()
+            .map(|(n, _)| index::exact_individual(n))
+            .collect();
+        let retained_split_extra = std::mem::size_of::<SplitAnswer>()
+            .checked_add(tax_bytes)
+            .and_then(|b| {
+                b.checked_add(
+                    retained_ind_names
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<NamedIndividual>())?,
+                )
+            })
+            .and_then(|b| {
+                retained_ind_names
+                    .iter()
+                    .try_fold(b, |acc, n| acc.checked_add(n.as_str().len()))
+            })
+            .ok_or_else(|| {
+                self.invalidate_for_error();
+                Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: usize::MAX,
+                }
+            })?;
+        if let Err(used) = ledger.add(retained_split_extra) {
+            *call_peak = (*call_peak).max(used);
+            self.invalidate_for_error();
+            return Err(Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used,
+            });
+        }
+        let retained_tax = taxonomy.clone();
+        let split_answer = Box::new(SplitAnswer {
+            consistent,
+            taxonomy: retained_tax,
+            individuals: retained_ind_names,
+            node_insts,
+        });
+        drop(acc);
+        drop((orig_classes, orig_individuals, orig_ind_names_arc));
+
+        self.index = None;
+        self.ctx = Vec::new();
+        self.disjoint = Vec::new();
+        self.worlds.clear();
+        self.dynamic = None;
+        self.dl_run = None;
+        self.merge.clear();
+        self.canon_want = None;
+        self.active_hub = None;
+        self.excluded.clear();
+        self.reduced = false;
+        self.dirty = false;
+        self.consistent = consistent;
+        let split_bytes = split_answer.owned_bytes();
+        self.split_answer = Some(split_answer);
+
+        let final_peak = ledger.peak.load(Ordering::Relaxed).max(
+            held_bytes
+                .saturating_add(split_bytes)
+                .saturating_add(tax_bytes),
+        );
+        *call_peak = (*call_peak).max(final_peak);
+        agg_stats.dl_work = leaf_work;
+        agg_stats.dl_rooted_spent = dl_rooted_spent;
+        agg_stats.dl_rooted_restarts = restarts;
+        agg_stats.dl_rooted_splits = splits;
+        agg_stats.dl_rooted_leaves = leaves;
+        agg_stats.taxonomy = tax_start.elapsed();
+        agg_stats.saturation = split_start.elapsed().saturating_sub(agg_stats.taxonomy);
+        agg_stats.taxonomy_memory = tax_bytes;
+        agg_stats.memory = held_bytes
+            .saturating_add(split_bytes)
+            .saturating_add(tax_bytes)
+            .saturating_add(self.residual_outer_bytes());
+        agg_stats.peak_memory = final_peak.max(agg_stats.memory);
+        poll(limits).inspect_err(|_| self.invalidate_for_error())?;
+        Ok((consistent, Some(taxonomy), agg_stats))
+    }
+
+    /// Exports one completed forked leaf into visible original-signature closed subsumer
+    /// rows and public instance lists, after validating complete consistency across ALL
+    /// real nominals (including anonymous witnesses and reduction-generated hubs) and
+    /// closing over ALL met classes (including hidden reduction-generated classes).
+    fn export_split_leaf(
+        &self,
+        orig_classes: &[Class],
+        orig_individuals: &[(NamedIndividual, bool)],
+        limits: &Limits,
+        stop: &(dyn Fn() -> bool + Sync),
+        budget: &(dyn Fn(isize) -> Result<(), usize> + Sync),
+    ) -> Result<LeafExportResult, Error> {
+        let Some(ix) = self.index.as_ref() else {
+            return Ok(LeafExportResult::ExcludedOrIncomplete);
+        };
+        let n = orig_classes.len();
+        // Collect ALL met `Node::Class` expressions in `self.interner` (visible + hidden).
+        let mut met_ex: Vec<Ex> = Vec::new();
+        let mut all_to_vis: Vec<u32> = Vec::new();
+        let mut vis_to_all: Vec<u32> = vec![u32::MAX; n];
+        let mut ex_to_all: Vec<u32> = vec![u32::MAX; self.interner.len()];
+        let m_all_count = self
+            .interner
+            .met
+            .iter()
+            .enumerate()
+            .filter(|&(id, &m)| m && self.interner.get(&Node::Class(id as u32)).is_some())
+            .count();
+        if m_all_count > taxonomy::MAX_CLASS_COUNT {
+            return Ok(LeafExportResult::ExcludedOrIncomplete);
+        }
+        let map_bytes = m_all_count
+            .checked_mul(2 * std::mem::size_of::<u32>() + std::mem::size_of::<(bool, Vec<u32>)>())
+            .and_then(|b| b.checked_add(n.checked_mul(std::mem::size_of::<u32>())?))
+            .and_then(|b| {
+                b.checked_add(
+                    self.interner
+                        .len()
+                        .checked_mul(std::mem::size_of::<u32>())?,
+                )
+            })
+            .ok_or(Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used: usize::MAX,
+            })?;
+        budget(map_bytes as isize).map_err(|used| Error::Memory {
+            limit: limits.max_memory.unwrap_or(usize::MAX),
+            used,
+        })?;
+        struct ScratchRelease<'b> {
+            budget: &'b (dyn Fn(isize) -> Result<(), usize> + Sync),
+            bytes: usize,
+        }
+        impl Drop for ScratchRelease<'_> {
+            fn drop(&mut self) {
+                if self.bytes > 0
+                    && let Ok(d) = isize::try_from(self.bytes)
+                {
+                    let _ = (self.budget)(-d);
+                }
+            }
+        }
+        let mut scratch_rel = ScratchRelease {
+            budget,
+            bytes: map_bytes,
+        };
+        met_ex.reserve_exact(m_all_count);
+        all_to_vis.reserve_exact(m_all_count);
+        for (id, &m) in self.interner.met.iter().enumerate() {
+            if id.is_multiple_of(POLL_AXIOMS) {
+                poll(limits)?;
+            }
+            if !m {
+                continue;
+            }
+            let Some(e) = self.interner.get(&Node::Class(id as u32)) else {
+                continue;
+            };
+            let idx = met_ex.len() as u32;
+            met_ex.push(e);
+            ex_to_all[e as usize] = idx;
+            let cls = &self.interner.classes[id];
+            let vis = if self.reduced && cls.as_str().starts_with(dl_reduce::PREFIX) {
+                u32::MAX
+            } else {
+                orig_classes
+                    .binary_search_by(|c| c.as_str().cmp(cls.as_str()))
+                    .ok()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(u32::MAX)
+            };
+            all_to_vis.push(vis);
+            if vis != u32::MAX {
+                vis_to_all[vis as usize] = idx;
+            }
+        }
+
+        // Two-pass count -> pre-admit -> fill raw subsumers for 0..m_all and TOP.
+        let mut all_subs: Vec<(bool, Vec<u32>)> = Vec::with_capacity(m_all_count);
+        let mut all_subs_vec_bytes = 0usize;
+        for (idx, &e) in met_ex.iter().enumerate() {
+            if idx.is_multiple_of(POLL_AXIOMS) {
+                poll(limits)?;
+            }
+            let mut count = 0usize;
+            let mut unsat = false;
+            if let Some(u) = self.for_each_raw_subsumer(e, |s| {
+                if ex_to_all[s as usize] != u32::MAX {
+                    count += 1;
+                }
+            }) {
+                unsat = u;
+            } else {
+                count = 1;
+            }
+            let row_bytes = count
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: usize::MAX,
+                })?;
+            budget(row_bytes as isize).map_err(|used| Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used,
+            })?;
+            scratch_rel.bytes = scratch_rel.bytes.saturating_add(row_bytes);
+            let mut row = Vec::with_capacity(count);
+            if self
+                .for_each_raw_subsumer(e, |s| {
+                    let a = ex_to_all[s as usize];
+                    if a != u32::MAX {
+                        row.push(a);
+                    }
+                })
+                .is_none()
+            {
+                row.push(idx as u32);
+            }
+            row.sort_unstable();
+            row.dedup();
+            all_subs_vec_bytes = all_subs_vec_bytes.saturating_add(row.capacity() * 4);
+            all_subs.push((unsat, row));
+        }
+
+        let mut raw_top_count = 0usize;
+        let _ = self.for_each_raw_subsumer(TOP, |s| {
+            if ex_to_all[s as usize] != u32::MAX {
+                raw_top_count += 1;
+            }
+        });
+        let raw_top_bytes = raw_top_count * std::mem::size_of::<u32>();
+        budget(raw_top_bytes as isize).map_err(|used| Error::Memory {
+            limit: limits.max_memory.unwrap_or(usize::MAX),
+            used,
+        })?;
+        scratch_rel.bytes = scratch_rel.bytes.saturating_add(raw_top_bytes);
+        let mut raw_top = Vec::with_capacity(raw_top_count);
+        let _ = self.for_each_raw_subsumer(TOP, |s| {
+            let a = ex_to_all[s as usize];
+            if a != u32::MAX {
+                raw_top.push(a);
+            }
+        });
+        raw_top.sort_unstable();
+        raw_top.dedup();
+
+        let closed_top = taxonomy::close_rows_admitted(&mut all_subs, &raw_top, stop, budget)
+            .map_err(|h| match h {
+                taxonomy::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+                taxonomy::Halt::Memory(used) => Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used,
+                },
+            })?;
+        // Track updated `all_subs` capacity delta + `closed_top` capacity in `scratch_rel`.
+        let new_all_subs_vec_bytes: usize = all_subs.iter().map(|(_, v)| v.capacity() * 4).sum();
+        let closed_top_bytes = closed_top.capacity() * 4;
+        scratch_rel.bytes = scratch_rel
+            .bytes
+            .saturating_sub(all_subs_vec_bytes)
+            .saturating_add(new_all_subs_vec_bytes)
+            .saturating_add(closed_top_bytes);
+
+        if closed_top.iter().any(|&c| all_subs[c as usize].0) {
+            return Ok(LeafExportResult::Inconsistent);
+        }
+
+        // Validate closed consistency across ALL real nominals in the leaf (including
+        // scoped anonymous witnesses and any active reduction-generated hub).
+        let mut required_noms: FxHashSet<Ex> = FxHashSet::default();
+        for &e in self.leaf_individuals.iter().chain(ix.nominals.iter()) {
+            required_noms.insert(e);
+        }
+        let mut all_noms: Vec<Ex> = Vec::new();
+        for (e, node) in self.interner.nodes.iter().enumerate() {
+            if matches!(node, Node::Nominal(_)) {
+                all_noms.push(e as Ex);
+            }
+        }
+        all_noms.extend(required_noms.iter().copied());
+        all_noms.sort_unstable();
+        all_noms.dedup();
+        for (ni, &e) in all_noms.iter().enumerate() {
+            if ni.is_multiple_of(POLL_AXIOMS) {
+                poll(limits)?;
+            }
+            let mut reaches_unsat = false;
+            let ctx_res = self.for_each_raw_subsumer(e, |s| {
+                if s == index::BOTTOM {
+                    reaches_unsat = true;
+                } else if let Some(&all_c) = ex_to_all.get(s as usize)
+                    && all_c != u32::MAX
+                    && all_subs[all_c as usize].0
+                {
+                    reaches_unsat = true;
+                }
+            });
+            match ctx_res {
+                None => {
+                    if required_noms.contains(&e) {
+                        return Ok(LeafExportResult::ExcludedOrIncomplete);
+                    }
+                }
+                Some(nom_unsat) => {
+                    if nom_unsat || reaches_unsat {
+                        return Ok(LeafExportResult::Inconsistent);
+                    }
+                }
+            }
+        }
+
+        // Project `closed_top` to visible `0..n` indices.
+        let vis_top_count = closed_top
+            .iter()
+            .filter(|&&c| all_to_vis[c as usize] != u32::MAX)
+            .count();
+        let vis_top_bytes = vis_top_count * 4;
+        budget(vis_top_bytes as isize).map_err(|used| Error::Memory {
+            limit: limits.max_memory.unwrap_or(usize::MAX),
+            used,
+        })?;
+        let mut out_rel = ScratchRelease {
+            budget,
+            bytes: vis_top_bytes,
+        };
+        let mut vis_top = Vec::with_capacity(vis_top_count);
+        for &c in &closed_top {
+            let v = all_to_vis[c as usize];
+            if v != u32::MAX {
+                vis_top.push(v);
+            }
+        }
+        vis_top.sort_unstable();
+        vis_top.dedup();
+
+        // Project `all_subs` to visible `vis_subs[0..n]`.
+        let vis_subs_hdr = n * std::mem::size_of::<(bool, Vec<u32>)>();
+        budget(vis_subs_hdr as isize).map_err(|used| Error::Memory {
+            limit: limits.max_memory.unwrap_or(usize::MAX),
+            used,
+        })?;
+        out_rel.bytes = out_rel.bytes.saturating_add(vis_subs_hdr);
+        let mut vis_subs: Vec<(bool, Vec<u32>)> = Vec::with_capacity(n);
+        for (vis_c, &all_c) in vis_to_all.iter().enumerate().take(n) {
+            if vis_c.is_multiple_of(POLL_AXIOMS) {
+                poll(limits)?;
+            }
+            if all_c == u32::MAX {
+                // Class not met in this leaf: satisfiable, subsumed by itself and `vis_top`.
+                let len = vis_top.len() + 1;
+                let rb = len * 4;
+                budget(rb as isize).map_err(|used| Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used,
+                })?;
+                out_rel.bytes = out_rel.bytes.saturating_add(rb);
+                let mut row = Vec::with_capacity(len);
+                row.extend_from_slice(&vis_top);
+                row.push(vis_c as u32);
+                row.sort_unstable();
+                row.dedup();
+                vis_subs.push((false, row));
+            } else {
+                let (unsat, full_row) = &all_subs[all_c as usize];
+                if *unsat {
+                    vis_subs.push((true, Vec::new()));
+                } else {
+                    let count = full_row
+                        .iter()
+                        .filter(|&&k| all_to_vis[k as usize] != u32::MAX)
+                        .count()
+                        + 1;
+                    let rb = count * 4;
+                    budget(rb as isize).map_err(|used| Error::Memory {
+                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                        used,
+                    })?;
+                    out_rel.bytes = out_rel.bytes.saturating_add(rb);
+                    let mut row = Vec::with_capacity(count);
+                    for &k in full_row {
+                        let v = all_to_vis[k as usize];
+                        if v != u32::MAX {
+                            row.push(v);
+                        }
+                    }
+                    row.push(vis_c as u32);
+                    row.sort_unstable();
+                    row.dedup();
+                    vis_subs.push((false, row));
+                }
+            }
+        }
+
+        // Public instance export (genuine original public names ONLY + declared-only rule).
+        let inst_hdr = n * std::mem::size_of::<Vec<u32>>();
+        budget(inst_hdr as isize).map_err(|used| Error::Memory {
+            limit: limits.max_memory.unwrap_or(usize::MAX),
+            used,
+        })?;
+        out_rel.bytes = out_rel.bytes.saturating_add(inst_hdr);
+        let mut leaf_insts: Vec<Vec<u32>> = Vec::with_capacity(n);
+        leaf_insts.resize_with(n, Vec::new);
+        let mut seen_vis: Vec<u32> = Vec::new();
+
+        for (j, (ind, in_non_decl)) in orig_individuals.iter().enumerate() {
+            if j.is_multiple_of(POLL_AXIOMS) {
+                poll(limits)?;
+            }
+            let j32 = u32::try_from(j).expect("checked orig_individuals len");
+            let rep = self
+                .interner
+                .canon
+                .as_deref()
+                .and_then(|c| c.get(ind))
+                .unwrap_or(ind);
+            let ex_opt = self
+                .interner
+                .individuals
+                .get(rep)
+                .and_then(|id| self.interner.get(&Node::Nominal(id)));
+            seen_vis.clear();
+            match ex_opt {
+                Some(e_j) => {
+                    let has_ctx = self.for_each_raw_subsumer(e_j, |s| {
+                        if let Some(&all_c) = ex_to_all.get(s as usize)
+                            && all_c != u32::MAX
+                        {
+                            let v = all_to_vis[all_c as usize];
+                            if v != u32::MAX {
+                                seen_vis.push(v);
+                            }
+                            for &k in &all_subs[all_c as usize].1 {
+                                let vk = all_to_vis[k as usize];
+                                if vk != u32::MAX {
+                                    seen_vis.push(vk);
+                                }
+                            }
+                        }
+                    });
+                    if has_ctx.is_some() {
+                        seen_vis.extend_from_slice(&vis_top);
+                    } else if *in_non_decl || required_noms.contains(&e_j) {
+                        return Ok(LeafExportResult::ExcludedOrIncomplete);
+                    } else {
+                        // Unconstrained declared-only individual interned without a context.
+                        seen_vis.extend_from_slice(&vis_top);
+                    }
+                }
+                None => {
+                    if *in_non_decl {
+                        return Ok(LeafExportResult::ExcludedOrIncomplete);
+                    }
+                    // Truly unconstrained declared-only individual inherits `vis_top`.
+                    seen_vis.extend_from_slice(&vis_top);
+                }
+            }
+            seen_vis.sort_unstable();
+            seen_vis.dedup();
+            for &vis_c in &seen_vis {
+                // Skip unsatisfiable visible classes: they contribute zero instances.
+                if vis_subs[vis_c as usize].0 {
+                    continue;
+                }
+                let slot = &mut leaf_insts[vis_c as usize];
+                if slot.len() == slot.capacity() {
+                    let next_cap =
+                        dl_clause::next_vec_cap(slot.capacity(), std::mem::size_of::<u32>())
+                            .ok_or(Error::Memory {
+                                limit: limits.max_memory.unwrap_or(usize::MAX),
+                                used: usize::MAX,
+                            })?;
+                    let old_b = slot.capacity() * 4;
+                    let new_b = next_cap * 4;
+                    budget(new_b as isize).map_err(|used| Error::Memory {
+                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                        used,
+                    })?;
+                    slot.reserve_exact(next_cap - slot.len());
+                    if old_b > 0 {
+                        let _ = budget(-(old_b as isize));
+                    }
+                    out_rel.bytes = out_rel.bytes.saturating_sub(old_b).saturating_add(new_b);
+                }
+                slot.push(j32);
+            }
+        }
+        drop(seen_vis);
+        drop(all_subs);
+        drop(closed_top);
+        drop(scratch_rel);
+
+        let owned_bytes = out_rel.bytes;
+        out_rel.bytes = 0;
+        Ok(LeafExportResult::Consistent {
+            vis_subs,
+            vis_top,
+            leaf_insts,
+            owned_bytes,
+        })
+    }
+
+    /// Runs `self.run(...)`, handling item 1061 phase 2 clean constant-merge restarts
+    /// against the same enclosing work bound while preserving memory high-water marks,
+    /// pool credit, deadlines, cancellation, and genuine fallback semantics.
+    #[allow(clippy::too_many_arguments)]
+    fn run_merging(
+        &mut self,
+        axioms: &[&AxiomKind],
+        changes: Option<Changes<'_>>,
+        held_bytes: usize,
+        limits: &Limits,
+        admitted: &std::sync::Arc<AtomicUsize>,
+        call_peak: &mut usize,
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        self.run_merging_with_carry(
+            axioms,
+            changes,
+            held_bytes,
+            limits,
+            admitted,
+            call_peak,
+            with_taxonomy,
+            0,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_merging_with_carry(
+        &mut self,
+        axioms: &[&AxiomKind],
+        mut changes: Option<Changes<'_>>,
+        held_bytes: usize,
+        limits: &Limits,
+        admitted: &std::sync::Arc<AtomicUsize>,
+        call_peak: &mut usize,
+        with_taxonomy: bool,
+        init_spent: usize,
+        init_bound: Option<usize>,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        self.merge.spent = init_spent;
         self.merge.restarts = 0;
-        self.merge.frozen_bound = None;
+        self.merge.frozen_bound = init_bound;
         self.merge_stop = None;
         loop {
             let r = self.run(
@@ -2935,7 +5063,7 @@ impl Saturation {
         }
         self.dl_worked.store(false, Ordering::Relaxed);
         self.rooted_declined = false;
-        let mut r = self.run_merging(
+        let mut r = self.run_splitting(
             axioms,
             changes,
             held_bytes,
@@ -2968,7 +5096,7 @@ impl Saturation {
             if limits.rooted && limits.rooted_merge && !limits.el_only && !self.merge_disabled {
                 self.collect_same(axioms, held_bytes, limits, &admitted, &mut call_peak)?;
             }
-            r = self.run_merging(
+            r = self.run_splitting(
                 axioms,
                 None,
                 held_bytes,
@@ -3029,7 +5157,7 @@ impl Saturation {
                 }
                 return Err(e);
             }
-            r = self.run_merging(
+            r = self.run_splitting(
                 axioms,
                 None,
                 held_bytes,
@@ -3083,7 +5211,7 @@ impl Saturation {
                     return Err(e);
                 }
             }
-            r = self.run_merging(
+            r = self.run_splitting(
                 axioms,
                 None,
                 held_bytes,
@@ -3319,6 +5447,8 @@ impl Saturation {
         self.disjoint = Vec::new();
         self.dynamic = None;
         self.dl_run = None;
+        self.split_answer = None;
+        self.leaf_individuals.clear();
     }
 
     /// Normalizes the axioms inside OWL 2 EL and builds the index. `outside` names the
@@ -3802,8 +5932,7 @@ impl Saturation {
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
         let want_canon = if limits.rooted
-            && limits.rooted_merge
-            && !self.merge_disabled
+            && ((limits.rooted_merge && !self.merge_disabled) || self.split_cfg.is_some())
             && !self.no_rooted
             && !limits.el_only
             && !self.skip_dl
@@ -3947,6 +6076,14 @@ impl Saturation {
                             }
                             _ => {
                                 red.restore(axioms, &mut self.excluded);
+                                if self.split_cfg.as_ref().is_some_and(|c| c.forked) {
+                                    self.split_ineligible = true;
+                                    self.reset();
+                                    return Err(Error::Memory {
+                                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                                        used: *call_peak,
+                                    });
+                                }
                                 if self.merge.restarts > 0
                                     || self.merge.active_hub.is_some()
                                     || self.canon_want.is_some()
@@ -3961,6 +6098,14 @@ impl Saturation {
                         }
                     }
                 }
+            }
+            if declined && self.split_cfg.as_ref().is_some_and(|c| c.forked) {
+                self.split_ineligible = true;
+                self.reset();
+                return Err(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: *call_peak,
+                });
             }
             if declined
                 && (self.merge.restarts > 0
@@ -4052,6 +6197,7 @@ impl Saturation {
             counting: limits.counting,
             rooted: limits.rooted,
             rooted_merge: limits.rooted_merge,
+            rooted_eq_split: limits.rooted_eq_split,
             number_order: limits.number_order,
             eager: limits.expansion == Expansion::Eager,
             skip_dl: self.skip_dl,
@@ -4187,6 +6333,17 @@ impl Saturation {
         self.horn_tried = horn;
         let disj = ax.dl.is_some();
         self.dl_tried = disj;
+        if self.split_cfg.as_ref().is_some_and(|c| c.forked)
+            && (!disj
+                || ix.dl.as_deref().and_then(|d| d.root).is_none()
+                || ax.dl.as_ref().is_some_and(|d| d.counting))
+        {
+            self.split_ineligible = true;
+            return Err(Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used: normalized_peak,
+            });
+        }
         if self.merge.restarts > 0 && (!disj || ix.dl.as_deref().and_then(|d| d.root).is_none()) {
             // Rooted eligibility was lost after a derived merge restart: never answer in
             // Horn/EL/unrooted-DL using aliases derived by the discarded rooted theory.
@@ -4285,6 +6442,7 @@ impl Saturation {
                     }
                     d.rebase(n as Ex);
                 }
+                d.sync_unadmitted_on_begin_run();
                 Some(d)
             }
             Some(h) => {
@@ -4434,7 +6592,13 @@ impl Saturation {
             dl_run.is_some() && !self.dl_rooted && !self.dl_counted && !self.no_counting;
         let merge_discover =
             self.dl_rooted && !self.dl_counted && limits.rooted_merge && !self.merge_disabled;
-        if merge_discover
+        let split_active = self.dl_rooted
+            && !self.dl_counted
+            && self
+                .split_cfg
+                .as_ref()
+                .is_some_and(|c| c.mode != dl_rules::SplitMode::Disabled);
+        if (merge_discover || split_active)
             && merge_root_first()
             && let Some(root) = rooted
             && let Some(at) = roots.iter().position(|&r| r == root)
@@ -4461,17 +6625,90 @@ impl Saturation {
                 #[cfg(test)]
                 LAST_ROOTED_WORK_LIMIT.with(|c| c.set(limit));
                 d.set_work_limit(limit);
+                if self.merge.spent > 0 {
+                    d.add_carried(self.merge.spent);
+                }
                 if merge_discover {
                     d.set_merge(true);
-                    if self.merge.spent > 0 {
-                        d.add_carried(self.merge.spent);
-                    }
                     if !merge_hub()
                         && let Some(hub) = &self.active_hub
                         && let Some(id) = self.interner.individuals.get(hub)
                     {
                         d.merge_skip = Some(id);
                     }
+                }
+                if let Some(cfg) = &self.split_cfg
+                    && cfg.mode != dl_rules::SplitMode::Disabled
+                    && self.interner.individuals.len() < u32::MAX as usize
+                {
+                    let n_inds = self.interner.individuals.len();
+                    let rank_bytes = n_inds.checked_mul(std::mem::size_of::<u32>());
+                    let neq_bytes = cfg.neq.len().checked_mul(std::mem::size_of::<(u32, u32)>());
+                    let Some(meta_bytes) =
+                        rank_bytes.and_then(|r| neq_bytes.and_then(|q| r.checked_add(q)))
+                    else {
+                        return Err(Error::Memory {
+                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                            used: usize::MAX,
+                        });
+                    };
+                    let meta_peak = base.saturating_add(meta_bytes);
+                    let meta_more = meta_peak.saturating_sub(normalized_peak);
+                    if limits.max_memory.is_some_and(|m| meta_peak > m)
+                        || charge_fn.is_some_and(|f| meta_more > 0 && !f(meta_more))
+                    {
+                        return Err(Error::Memory {
+                            limit: limits.max_memory.unwrap_or(meta_peak),
+                            used: meta_peak,
+                        });
+                    }
+                    normalized_peak = normalized_peak.max(meta_peak);
+                    let mut const_rank = vec![u32::MAX; n_inds];
+                    for (epoch_id, ind) in self.interner.individuals.iter().enumerate() {
+                        if index::is_anonymous(ind)
+                            || self.active_hub.as_ref().is_some_and(|h| h == ind)
+                        {
+                            continue;
+                        }
+                        if let Ok(rank) = cfg
+                            .orig_individuals
+                            .binary_search_by(|o| o.as_str().cmp(ind.as_str()))
+                            && let Ok(r32) = u32::try_from(rank)
+                        {
+                            const_rank[epoch_id] = r32;
+                        }
+                    }
+                    let mut branch_neq = Vec::with_capacity(cfg.neq.len());
+                    for (a, b) in &cfg.neq {
+                        let ra = self
+                            .interner
+                            .canon
+                            .as_deref()
+                            .and_then(|c| c.get(a))
+                            .unwrap_or(a);
+                        let rb = self
+                            .interner
+                            .canon
+                            .as_deref()
+                            .and_then(|c| c.get(b))
+                            .unwrap_or(b);
+                        if let (Some(ua), Some(ub)) = (
+                            self.interner.individuals.get(ra),
+                            self.interner.individuals.get(rb),
+                        ) && ua != ub
+                        {
+                            branch_neq.push((ua.min(ub), ua.max(ub)));
+                        }
+                    }
+                    branch_neq.sort_unstable();
+                    branch_neq.dedup();
+                    d.configure_split(
+                        cfg.mode,
+                        cfg.probe,
+                        cfg.epoch,
+                        const_rank.into_boxed_slice(),
+                        branch_neq.into_boxed_slice(),
+                    );
                 }
             } else if self.no_counting {
                 d.set_work_limit(DL_RETRY_WORK);
@@ -4562,7 +6799,10 @@ impl Saturation {
             Stop::Timeout => Error::Timeout,
             // the bound on derived conclusions goes back as the memory error that the
             // fallback chain of `run_with` takes
-            Stop::Memory { used } | Stop::Work { used } | Stop::Merge { used } => Error::Memory {
+            Stop::Memory { used }
+            | Stop::Work { used }
+            | Stop::Merge { used }
+            | Stop::Split { used } => Error::Memory {
                 limit: limits.max_memory.unwrap_or(usize::MAX),
                 used,
             },
@@ -4578,11 +6818,12 @@ impl Saturation {
         {
             (t, None) => t,
             (_, Some(Stop::Merge { used })) => {
-                // Disable merge discovery outside the main round and inspect the winning
-                // payload after all workers have joined. A merge stop never returns a
-                // partial taxonomy.
+                // Disable merge and split discovery outside the main round and inspect the
+                // winning payload after all workers have joined.
                 if let Some(d) = &dl_run {
                     d.set_merge(false);
+                    d.set_split_mode(dl_rules::SplitMode::Disabled);
+                    let _ = d.take_winning_split();
                     let spent = d.work_total();
                     let bound = d.work_limit();
                     let exhausted = d.over_work() || (bound != 0 && spent >= bound);
@@ -4614,12 +6855,63 @@ impl Saturation {
                     used,
                 });
             }
+            (_, Some(Stop::Split { used })) => {
+                if let Some(d) = &dl_run {
+                    d.set_merge(false);
+                    d.set_split_mode(dl_rules::SplitMode::Disabled);
+                    let _ = d.take_merged();
+                    let spent = d.work_total();
+                    let bound = d.work_limit();
+                    let exhausted = d.over_work() || (bound != 0 && spent >= bound);
+                    let winner = d.take_winning_split();
+                    let inds: &[NamedIndividual] = &self.interner.individuals;
+                    if !exhausted
+                        && let Some(cand) = winner
+                        && cand.epoch == d.split_epoch()
+                        && let (Some(u), Some(v)) =
+                            (inds.get(cand.u_id as usize), inds.get(cand.v_id as usize))
+                        && u != v
+                        && !index::is_anonymous(u)
+                        && !index::is_anonymous(v)
+                        && self.active_hub.as_ref().is_none_or(|h| h != u && h != v)
+                    {
+                        self.dl_worked.store(false, Ordering::Relaxed);
+                        self.split_stop = Some(SplitStop {
+                            u: u.clone(),
+                            v: v.clone(),
+                            spent,
+                            bound,
+                            peak: used,
+                            prio: cand.prio,
+                        });
+                        return Err(Error::Memory {
+                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                            used,
+                        });
+                    }
+                    self.dl_worked.store(true, Ordering::Relaxed);
+                    #[cfg(test)]
+                    PASSED_AT.with(|p| p.set(d.work()));
+                }
+                return Err(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used,
+                });
+            }
             (t, Some(s)) if partial => {
+                if let Some(d) = &dl_run {
+                    let _ = d.take_merged();
+                    let _ = d.take_winning_split();
+                }
                 over_work = matches!(s, Stop::Work { .. });
                 halted = Some(stopped(s));
                 t
             }
             (_, Some(s)) => {
+                if let Some(d) = &dl_run {
+                    let _ = d.take_merged();
+                    let _ = d.take_winning_split();
+                }
                 self.dl_worked
                     .store(matches!(s, Stop::Work { .. }), Ordering::Relaxed);
                 #[cfg(test)]
@@ -4630,8 +6922,9 @@ impl Saturation {
             }
         };
         if let Some(d) = &dl_run {
-            // Never trigger merge discovery in later marking/test rounds.
+            // Never trigger merge or split discovery in later marking/test rounds.
             d.set_merge(false);
+            d.set_split_mode(dl_rules::SplitMode::Disabled);
         }
         // the candidates whose tests ended without a contradiction
         let mut refuted: FxHashSet<(Ex, Ex)> = FxHashSet::default();
@@ -4717,10 +7010,75 @@ impl Saturation {
                 if tests.is_empty() {
                     break;
                 }
-                let ids: Vec<Ex> = tests
-                    .iter()
-                    .map(|(x, bs)| dl_rules::test(d, *x, bs))
-                    .collect();
+                struct TestDriverBudget<'a> {
+                    totals: &'a mut saturate::Totals,
+                    d: &'a saturate::Dynamic,
+                    dl_unadmitted: usize,
+                    max_memory: Option<usize>,
+                    charge_fn: Option<&'a (dyn Fn(usize) -> bool + Sync)>,
+                    refused: Option<usize>,
+                }
+                impl saturate::DynamicBudget for TestDriverBudget<'_> {
+                    fn admit(&mut self, add: usize) -> bool {
+                        let Some(next_mem) = self.totals.memory.checked_add(add) else {
+                            self.totals.peak = usize::MAX;
+                            self.refused = Some(usize::MAX);
+                            return false;
+                        };
+                        let Some(live) = next_mem
+                            .checked_add(self.d.unadmitted_bytes())
+                            .and_then(|n| n.checked_add(self.dl_unadmitted))
+                        else {
+                            self.totals.peak = usize::MAX;
+                            self.refused = Some(usize::MAX);
+                            return false;
+                        };
+                        self.totals.peak = self.totals.peak.max(live);
+                        if !cover_memory(
+                            live,
+                            self.max_memory,
+                            self.charge_fn,
+                            &mut self.totals.paid,
+                        ) {
+                            self.refused = Some(live);
+                            return false;
+                        }
+                        self.totals.memory = next_mem;
+                        true
+                    }
+                    fn credit(&mut self, back: usize) {
+                        self.totals.memory = self.totals.memory.saturating_sub(back);
+                    }
+                    fn on_overflow(&mut self) {
+                        self.totals.peak = usize::MAX;
+                        self.refused = Some(usize::MAX);
+                    }
+                }
+                let mut ids: Vec<Ex> = Vec::with_capacity(tests.len());
+                let mut test_budget = TestDriverBudget {
+                    totals: &mut totals,
+                    d,
+                    dl_unadmitted: dl_run.as_ref().map_or(0, |r| r.bytes()),
+                    max_memory,
+                    charge_fn,
+                    refused: None,
+                };
+                for (x, bs) in &tests {
+                    match dl_rules::test_admitted(d, *x, bs, &mut test_budget) {
+                        Some(id) => ids.push(id),
+                        None => {
+                            over_work = false;
+                            halted = Some(Error::Memory {
+                                limit: max_memory.unwrap_or(usize::MAX),
+                                used: test_budget.refused.unwrap_or(test_budget.totals.peak),
+                            });
+                            break;
+                        }
+                    }
+                }
+                if halted.is_some() {
+                    break;
+                }
                 if let Err(s) = round(&[], &ids, &mut totals) {
                     over_work = matches!(s, Stop::Work { .. });
                     halted = Some(stopped(s));
@@ -5089,7 +7447,9 @@ impl Saturation {
                             used: usize::MAX,
                         })?
                 } else {
-                    totals.memory + d.bytes() + dynamic.as_ref().map_or(0, |dy| dy.bytes())
+                    totals.memory
+                        + d.bytes()
+                        + dynamic.as_ref().map_or(0, |dy| dy.unadmitted_bytes())
                 };
                 #[cfg(test)]
                 let mut scan = SCAN_EXTRA.with(|x| x.get()) as isize;
@@ -5273,7 +7633,14 @@ impl Saturation {
         // of the clauses they sent one another
         self.dl_run = dl_run.filter(|_| kept_now.is_some_and(|k| k.tier == KeptTier::Disj));
         if let Some(d) = &dynamic {
-            totals.memory += d.bytes();
+            totals.memory =
+                totals
+                    .memory
+                    .checked_add(d.unadmitted_bytes())
+                    .ok_or(Error::Memory {
+                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                        used: usize::MAX,
+                    })?;
             totals.peak = totals.peak.max(totals.memory);
             if horn {
                 stats.conjunctions = d.len();
@@ -5339,6 +7706,9 @@ impl Saturation {
                 root_bytes,
                 paid: totals.paid,
             });
+        }
+        if self.split_cfg.is_some() && !with_taxonomy {
+            self.leaf_individuals = ax.individuals.clone();
         }
         drop(ax);
         Self::admit_retained(held, &mut totals, limits).inspect_err(|_| {
@@ -5546,7 +7916,33 @@ impl Saturation {
             + self.disjoint.iter().map(|d| d.len() * 4).sum::<usize>()
     }
 
+    fn residual_outer_bytes(&self) -> usize {
+        self.ctx
+            .capacity()
+            .saturating_mul(std::mem::size_of::<OnceLock<Box<saturate::Ctx>>>())
+            .saturating_add(self.disjoint.capacity().saturating_mul(24))
+            .saturating_add(
+                self.disjoint
+                    .iter()
+                    .map(|d| d.capacity().saturating_mul(4))
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.worlds_bytes())
+            .saturating_add(excluded_copy_bytes(&self.excluded))
+            .saturating_add(
+                self.chain_ranged
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<AxiomKind>()),
+            )
+            .saturating_add(self.interner.bytes())
+    }
+
     fn retained_bytes(&self, held_bytes: usize, root_bytes: usize, world_bytes: usize) -> usize {
+        if let Some(split) = &self.split_answer {
+            return held_bytes
+                .saturating_add(split.owned_bytes())
+                .saturating_add(self.residual_outer_bytes());
+        }
         self.index_bytes(self.index.as_ref().expect("completed index"))
             + held_bytes
             + root_bytes
@@ -5912,6 +8308,28 @@ impl Saturation {
         #[cfg(test)]
         scratch_audit::record(budget, live, maps, grown);
         Ok(cleared)
+    }
+
+    /// Zero-allocation streaming visitor over raw named subsumers of a saturated context
+    /// (`self.worlds` or `self.ctx`). Returns `None` if `e` has no saturated context, or
+    /// `Some(unsat)` after invoking `f(sub)` for every `Node::Class` or `Node::Top` subsumer.
+    fn for_each_raw_subsumer(&self, e: Ex, mut f: impl FnMut(Ex)) -> Option<bool> {
+        if let Some((bottom, subs)) = self.worlds.get(&e) {
+            for &s in subs {
+                if matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top) {
+                    f(s);
+                }
+            }
+            return Some(*bottom);
+        }
+        let c = self.ctx.get(e as usize)?.get()?;
+        let st = c.st.lock();
+        for &s in &st.subs {
+            if matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top) {
+                f(s);
+            }
+        }
+        Some(st.bottom)
     }
 
     /// The subsumers of a saturated context that are named classes, with their
@@ -6395,6 +8813,11 @@ impl<'a> WorldBudget<'a> {
     /// Takes a change of what a world holds, and answers whether the worlds go on.
     fn tell(&self, delta: isize) -> bool {
         let now = self.held.fetch_add(delta, Ordering::Relaxed) + delta;
+        // Negative rollback during panic unwind retires the in-flight delta cleanly
+        // without re-invoking a potentially panicking cancellation callback.
+        if delta < 0 && std::thread::panicking() {
+            return false;
+        }
         #[cfg(test)]
         if delta > 0 {
             admission_test::hit(admission_test::Point::Observed);
@@ -6415,6 +8838,7 @@ impl<'a> WorldBudget<'a> {
                 return false;
             }
         }
+        let _panic = WorldChargePanic(self, std::thread::panicking());
         let why = if limits.deadline.is_some_and(|d| Instant::now() >= d) {
             WORLD_TIMEOUT
         } else if limits.cancelled.as_ref().is_some_and(|f| f()) {
