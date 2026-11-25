@@ -687,7 +687,7 @@ public data class ClassifyQuery @JvmOverloads public constructor(
     public val threads: Int = 0,
     public val target: String? = null,
     public val message: String? = null,
-    /** answer what a run with the disjunctive rules proved when the operation's deadline or cancellation stops it */
+    /** answer what the active EL, Horn or disjunctive run proved when the operation's deadline, cancellation or memory budget stops it after saturation begins */
     public val partial: Boolean = false,
     /** the expansion strategy of the disjunctive rules, `cautious` (the default) or `eager` */
     public val expansion: String? = null,

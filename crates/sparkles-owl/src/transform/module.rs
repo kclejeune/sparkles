@@ -4,7 +4,7 @@
 //! classes, as ROBOT writes the `BOT` module that its `extract` computes. The module
 //! holds every justification of each entailment over the signature.
 //!
-//! [`coverage`] decides, for a classification that left axioms out, which classes still
+//! [`coverage_refs`] decides, for a classification that left axioms out, which classes still
 //! have their complete answer and whether the run's consistency holds for the whole
 //! ontology. Its soundness rests on the locality rules below, so a rule that is unsure
 //! calls an axiom non-local, which only makes a module larger.
@@ -113,12 +113,26 @@ pub struct Coverage {
 /// own deadline.
 pub type Dropped<'d> = dyn FnMut(&mut dyn FnMut(&AxiomKind) -> bool) -> bool + 'd;
 
-/// Why [`coverage`] stopped before an answer: its caller's stop said so.
+/// Why [`coverage_refs`] stopped before an answer: its caller's stop said so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Stopped;
 
 /// How often an extraction asks its caller whether to stop, in axioms it looks at.
 const POLL_EVERY: usize = 4096;
+
+/// Borrowed result of [`coverage_refs`], allowing callers to admit the retained
+/// `Vec<Class>` bytes before cloning any class IRI strings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CoverageRefs<'c> {
+    /// whether the run's verdict on consistency holds for the whole ontology
+    pub consistency_known: bool,
+    /// the classes whose answer may miss entailments, in IRI order: every class when the
+    /// consistency is not known
+    pub incomplete: Vec<&'c Class>,
+    /// the extraction passed its work bound, and the classes it had not decided are
+    /// incomplete
+    pub over_budget: bool,
+}
 
 /// Which of `classes` keep their complete answer when a run over `axioms` left out or
 /// used only in part the axioms `left_out`, and found the rest consistent or not. See the
@@ -128,30 +142,33 @@ const POLL_EVERY: usize = 4096;
 /// The extractions look at no more than `budget` axioms in all, after which the classes
 /// not yet decided are incomplete, so that the answer depends on the input alone. `stop`
 /// is asked every few thousand axioms, and true ends the pass with [`Stopped`].
-pub(crate) fn coverage<'c>(
+///
+/// Returns borrowed references into `classes` without cloning class IRIs so callers can
+/// enforce memory admission before materializing an owned `Vec<Class>`.
+pub(crate) fn coverage_refs<'c>(
     axioms: &[&AxiomKind],
     left_out: &[&AxiomKind],
     consistent: bool,
     classes: impl IntoIterator<Item = &'c Class>,
     budget: usize,
     stop: &dyn Fn() -> bool,
-) -> Result<Coverage, Stopped> {
-    let classes: Vec<&Class> = classes
+) -> Result<CoverageRefs<'c>, Stopped> {
+    let classes: Vec<&'c Class> = classes
         .into_iter()
         .filter(|c| c.as_str() != vocab::OWL_THING && c.as_str() != vocab::OWL_NOTHING)
         .collect();
-    let all = |classes: &[&Class]| {
-        let mut v: Vec<Class> = classes.iter().map(|c| (*c).clone()).collect();
-        v.sort();
+    let all = |classes: &[&'c Class]| {
+        let mut v: Vec<&'c Class> = classes.to_vec();
+        v.sort_unstable();
         v.dedup();
         v
     };
     if !consistent || left_out.is_empty() {
         // nothing left out, or an inconsistency, which is sound and makes every class
         // unsatisfiable whatever was left out
-        return Ok(Coverage {
+        return Ok(CoverageRefs {
             consistency_known: true,
-            ..Coverage::default()
+            ..CoverageRefs::default()
         });
     }
     let mut ix = Index::new(axioms);
@@ -177,7 +194,7 @@ pub(crate) fn coverage<'c>(
         halted: std::cell::Cell::new(None),
     };
     // the answer when the consistency is not known: every class incomplete
-    let unknown = |over_budget| Coverage {
+    let unknown = |over_budget| CoverageRefs {
         consistency_known: false,
         incomplete: all(&classes),
         over_budget,
@@ -244,10 +261,10 @@ pub(crate) fn coverage<'c>(
         None => (bottom, bottom_hit),
     };
     if base_hit {
-        return Ok(Coverage {
+        return Ok(CoverageRefs {
             consistency_known,
             incomplete: all(&classes),
-            ..Coverage::default()
+            ..CoverageRefs::default()
         });
     }
     base.freeze();
@@ -256,13 +273,13 @@ pub(crate) fn coverage<'c>(
     for e in base.signature_ids() {
         status[e as usize] = 1;
     }
-    let mut incomplete: Vec<Class> = Vec::new();
+    let mut incomplete: Vec<&'c Class> = Vec::new();
     let mut over_budget = false;
-    for c in &classes {
+    for &c in &classes {
         if over_budget {
             // past the bound, a class no clean module covered is incomplete
             if ix.id(c.as_str()).is_some_and(|id| status[id as usize] != 1) {
-                incomplete.push((*c).clone());
+                incomplete.push(c);
             }
             continue;
         }
@@ -273,7 +290,7 @@ pub(crate) fn coverage<'c>(
         match status[id as usize] {
             1 => continue,
             2 => {
-                incomplete.push((*c).clone());
+                incomplete.push(c);
                 continue;
             }
             _ => {}
@@ -306,10 +323,10 @@ pub(crate) fn coverage<'c>(
                 return Err(Stopped);
             }
             over_budget = true;
-            incomplete.push((*c).clone());
+            incomplete.push(c);
         } else if dirty.get() {
             status[id as usize] = 2;
-            incomplete.push((*c).clone());
+            incomplete.push(c);
         } else {
             // the module of each entity of a clean module is inside it, so clean too
             for e in base.added() {
@@ -318,12 +335,30 @@ pub(crate) fn coverage<'c>(
             status[id as usize] = 1;
         }
     }
-    incomplete.sort();
+    incomplete.sort_unstable();
     incomplete.dedup();
-    Ok(Coverage {
+    Ok(CoverageRefs {
         consistency_known,
         incomplete,
         over_budget,
+    })
+}
+
+/// Owned wrapper over [`coverage_refs`] used by module coverage tests.
+#[cfg(test)]
+pub(crate) fn coverage<'c>(
+    axioms: &[&AxiomKind],
+    left_out: &[&AxiomKind],
+    consistent: bool,
+    classes: impl IntoIterator<Item = &'c Class>,
+    budget: usize,
+    stop: &dyn Fn() -> bool,
+) -> Result<Coverage, Stopped> {
+    let c = coverage_refs(axioms, left_out, consistent, classes, budget, stop)?;
+    Ok(Coverage {
+        consistency_known: c.consistency_known,
+        incomplete: c.incomplete.into_iter().cloned().collect(),
+        over_budget: c.over_budget,
     })
 }
 

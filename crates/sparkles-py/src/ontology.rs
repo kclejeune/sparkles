@@ -728,9 +728,10 @@ impl PyOntologies {
     /// unsatisfiable classes, the axioms left out or used in part, and on request one
     /// class (`about`) and the taxonomy's nodes (`nodes`, `limit` from `offset`).
     /// `target` writes the taxonomy to that named graph in one commit. `partial` answers
-    /// what a run with the disjunctive rules proved when `timeout` or `cancel` stops it,
-    /// with `partial` true, the `incomplete` classes and the `consistency`, and
-    /// `expansion` (`cautious` or `eager`) picks those rules' expansion strategy.
+    /// what a run at any tier (EL, Horn, or disjunctive) proved when `timeout` or
+    /// `cancel` stops it after saturation begins, with `partial` true, the `incomplete`
+    /// classes and the `consistency`, and `expansion` (`cautious` or `eager`) picks the
+    /// disjunctive rules' expansion strategy.
     /// `complete` is true only when the answer is complete for the whole ontology, and
     /// `strict` raises `UnsupportedError`, with `code` `classification-incomplete`, when
     /// the classifier would leave an axiom out or use one only in part.

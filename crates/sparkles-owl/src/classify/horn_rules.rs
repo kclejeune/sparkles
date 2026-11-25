@@ -109,6 +109,11 @@ impl HornSt {
             + self.told.bytes()
     }
 
+    /// Whether the context has no pending R3 extension or R5 merge waiting for [`flush`].
+    pub fn is_idle(&self) -> bool {
+        !self.dirty && self.pending.is_empty() && self.merges.is_empty()
+    }
+
     /// Forgets which successors dominate which, which [`sync`] finds again from the
     /// successors in their order, for a state whose context ids change.
     pub fn forget_dominance(&mut self) {
@@ -679,7 +684,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S) -> bool {
         let gave = merge_all(ix, st, s, b, &mut sends, out);
         // a run that stopped keeps nothing of the flush
         if sends.stop {
-            return sent | gave;
+            return false;
         }
         // The conclusions R5 gives the context wait in the activation's own list, which
         // no bound counts. One restriction gives at most a link for each successor it
@@ -745,7 +750,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S) -> bool {
         sent |= extend(ix, real, fs, n, r, &mut sends, out);
         // a run that stopped keeps nothing of the flush
         if sends.stop {
-            break;
+            return false;
         }
     }
     sent

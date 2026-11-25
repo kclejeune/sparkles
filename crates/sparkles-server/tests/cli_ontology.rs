@@ -577,6 +577,115 @@ fn classify_answers_in_part_under_a_deadline() {
 }
 
 #[test]
+fn classify_el_and_horn_partial_under_deadline() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+
+    let mut el_ofn = String::from(
+        "Prefix(:=<http://ex.org/>)\nOntology(\n\
+         TransitiveObjectProperty(:part)\n\
+         SubObjectPropertyOf(ObjectPropertyChain(:r1 :r2) :s)\n",
+    );
+    let en = if cfg!(debug_assertions) { 100 } else { 300 };
+    for i in 0..en {
+        let next = (i + 1) % en;
+        el_ofn.push_str(&format!(
+            "SubClassOf(:A{i} :A{next})\n\
+             SubClassOf(:A{i} ObjectSomeValuesFrom(:r1 :B{i}))\n\
+             SubClassOf(:B{i} ObjectSomeValuesFrom(:r2 :C{next}))\n\
+             SubClassOf(:C{i} ObjectSomeValuesFrom(:part :P{next}))\n\
+             SubClassOf(:P{i} ObjectSomeValuesFrom(:part :P{next}))\n\
+             SubClassOf(ObjectSomeValuesFrom(:s :C{i}) :D{i})\n",
+        ));
+    }
+    el_ofn.push_str(")\n");
+
+    let mut horn_ofn = String::from(
+        "Prefix(:=<http://ex.org/>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\n\
+         InverseObjectProperties(:r :rinv)\n",
+    );
+    let hn = if cfg!(debug_assertions) { 90 } else { 300 };
+    for i in 0..hn {
+        let b = (7 * i + 3) % hn;
+        let d_idx = (11 * i + 5) % hn;
+        horn_ofn.push_str(&format!(
+            "SubClassOf(:H{i} ObjectSomeValuesFrom(:r :M{i}))\n\
+             SubClassOf(:H{i} ObjectAllValuesFrom(:r :F{b}))\n\
+             SubClassOf(:H{i} ObjectMaxCardinality(1 :r owl:Thing))\n\
+             SubClassOf(:H{i} ObjectSomeValuesFrom(:r :G{d_idx}))\n\
+             SubClassOf(:M{i} ObjectAllValuesFrom(:rinv :Back{i}))\n",
+        ));
+    }
+    horn_ofn.push_str(")\n");
+
+    for (tier, file, src) in [("el", "el.ofn", el_ofn), ("horn", "horn.ofn", horn_ofn)] {
+        std::fs::write(dir.join(file), src).unwrap();
+        let args = [
+            "ontology",
+            "classify",
+            file,
+            "--threads",
+            "1",
+            "--format",
+            "json",
+        ];
+        let o = sparkles(dir, &args);
+        assert_eq!(o.status.code(), Some(0), "{tier}: {}", err(&o));
+        let full: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        assert_eq!(full["tier"], tier, "{tier}: {full}");
+        assert_eq!(full["partial"], false, "{tier}: {full}");
+        let s = &full["stats"];
+        let took = (s["indexMs"].as_f64().unwrap()
+            + s["saturationMs"].as_f64().unwrap()
+            + s["taxonomyMs"].as_f64().unwrap())
+            / 1000.0;
+        let limit = ((took * 20000.0) as u64).max(2000);
+        let saw_partial = std::cell::Cell::new(false);
+        let answered = std::cell::Cell::new(0usize);
+        let run = |ms: u64| -> bool {
+            let t = format!("{}", ms as f64 / 1000.0);
+            let o = sparkles(dir, &[&args[..], &["--partial", "--timeout", &t]].concat());
+            let Ok(j) = serde_json::from_slice::<serde_json::Value>(&o.stdout) else {
+                assert_eq!(o.status.code(), Some(1), "{tier}: {}", err(&o));
+                return false;
+            };
+            answered.set(answered.get() + 1);
+            assert_eq!(j["tier"], tier, "{tier}: {j}");
+            if j["partial"] == true {
+                assert_eq!(j["complete"], false, "{tier}: {j}");
+                assert_eq!(o.status.code(), Some(2), "{tier}: {}", err(&o));
+                assert!(err(&o).contains("partial answer"), "{tier}: {}", err(&o));
+                saw_partial.set(true);
+            }
+            true
+        };
+        let after = |ms: u64| ms + (ms * 8 / 100).max(1);
+        let (mut lo, mut ms) = (0, 2);
+        while ms < limit && !run(ms) {
+            lo = ms;
+            ms = after(ms);
+        }
+        let mut hi = ms;
+        while hi - lo > 1 && !saw_partial.get() {
+            let mid = (lo + hi) / 2;
+            if run(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        while !saw_partial.get() && answered.get() < 20 && ms < limit {
+            ms = after(ms);
+            run(ms);
+        }
+        assert!(
+            saw_partial.get(),
+            "{tier}: no deadline gave a partial CLI answer"
+        );
+    }
+}
+
+#[test]
 fn classify_leaves_the_consistency_unknown_when_stopped_early() {
     let seen = partial_on_the_command_line(true);
     assert!(seen.iter().any(|c| c == "unknown"), "{seen:?}");

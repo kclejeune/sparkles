@@ -1486,6 +1486,88 @@ async fn partial_classification_reports_per_class_incomplete_on_frame_and_about(
     assert_eq!(j["frame"]["outcome"]["complete"], true, "{j}");
 }
 
+#[tokio::test]
+async fn classify_answers_in_part_for_el_and_horn_under_budgets() {
+    let n = if cfg!(debug_assertions) { 50 } else { 150 };
+    let prefixes = "@prefix : <http://ex.org/> .\n\
+                    @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+                    @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n";
+    let mut el_body = format!(
+        "{prefixes}:r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . :s a owl:ObjectProperty .\n\
+         :part a owl:ObjectProperty , owl:TransitiveProperty .\n\
+         :s owl:propertyChainAxiom ( :r1 :r2 ) .\n",
+    );
+    for i in 0..n {
+        let next = (i + 1) % n;
+        el_body.push_str(&format!(
+            ":A{i} a owl:Class ; rdfs:subClassOf :A{next} , [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B{i} ] .\n\
+             :B{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :C{next} ] .\n\
+             :C{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :part ; owl:someValuesFrom :P{next} ] .\n\
+             :P{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :part ; owl:someValuesFrom :P{next} ] .\n\
+             [ a owl:Restriction ; owl:onProperty :s ; owl:someValuesFrom :C{i} ] rdfs:subClassOf :D{i} .\n",
+        ));
+    }
+    let hn = if cfg!(debug_assertions) { 45 } else { 120 };
+    let mut horn_body = format!(
+        "{prefixes}:r a owl:ObjectProperty . :rinv a owl:ObjectProperty ; owl:inverseOf :r .\n"
+    );
+    for i in 0..hn {
+        let b = (7 * i + 3) % hn;
+        let d = (11 * i + 5) % hn;
+        horn_body.push_str(&format!(
+            ":H{i} a owl:Class ;\n\
+              rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :M{i} ] ,\n\
+                              [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :F{b} ] ,\n\
+                              [ a owl:Restriction ; owl:onProperty :r ; owl:maxCardinality 1 ] ,\n\
+                              [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :G{d} ] .\n\
+             :M{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :rinv ; owl:allValuesFrom :Back{i} ] .\n",
+        ));
+    }
+
+    for (tier, data) in [("el", el_body), ("horn", horn_body)] {
+        let full = post(
+            &server_of(&data).app,
+            "/$/ontology/t/classify",
+            json!({"partial": true, "threads": 1, "limit": 10000}),
+        )
+        .await
+        .json();
+        assert_eq!(full["complete"], true, "{tier}: {full}");
+        assert_eq!(full["partial"], false, "{tier}: {full}");
+        assert_eq!(full["tier"], tier, "{tier}: {full}");
+        let estimate = full["stats"]["estimatedBytes"].as_u64().unwrap();
+        let mut saw_partial = false;
+        for k in 1..20 {
+            let s = server_with_memory(&data, Some(estimate * k / 20));
+            let r = post(
+                &s.app,
+                "/$/ontology/t/classify",
+                json!({"partial": true, "threads": 1, "limit": 10000}),
+            )
+            .await;
+            if r.status == StatusCode::INSUFFICIENT_STORAGE {
+                continue;
+            }
+            assert_eq!(r.status, StatusCode::OK, "{tier}: {}", r.text());
+            let j = r.json();
+            assert_eq!(j["tier"], tier, "{tier}: {j}");
+            if j["partial"] == true {
+                assert_eq!(j["complete"], false, "{tier}: {j}");
+                let open = j["incomplete"].as_array().unwrap();
+                assert_eq!(
+                    j["incompleteCount"].as_u64(),
+                    Some(open.len() as u64),
+                    "{tier}: {j}"
+                );
+                let c = j["consistency"].as_str().unwrap();
+                assert!(c == "consistent" || c == "unknown", "{tier}: {j}");
+                saw_partial = true;
+            }
+        }
+        assert!(saw_partial, "{tier}: no budget gave a partial HTTP answer");
+    }
+}
+
 /// Every quad of dataset `t`, as sorted N-Quads lines.
 async fn quads(app: &Router, ds: &str) -> Vec<String> {
     let r = send(
