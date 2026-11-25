@@ -10,14 +10,8 @@
   } from '$lib/classification-read';
   import { fmtCount } from '$lib/format';
   import { iriForm } from '$lib/iri-form.svelte';
-  import {
-    consistencyInfo,
-    OWL_THING,
-    parseDeadlineInput,
-    type AxiomItem,
-    type ClassificationExpansion,
-    type ClassifyOptions,
-  } from '$lib/ontology';
+  import { consistencyInfo, OWL_THING, type AxiomItem, type ClassifyOptions } from '$lib/ontology';
+  import { ClassifyOptionsState } from '$lib/explicit-classification.svelte';
   import type { InferredPins } from '$lib/inferred-read';
 
   let {
@@ -49,31 +43,17 @@
     () => pins?.classificationId,
     (result) => pins?.acceptClassification(result.resultId) ?? true,
   );
-  let partial = $state(false);
-  let deadline = $state('');
-  let expansion = $state<ClassificationExpansion>('cautious');
+  const opts = new ClassifyOptionsState(
+    untrack(() => target),
+    untrack(() => graph),
+    untrack(() => classifyOptions),
+  );
   $effect(() => {
-    if (!classifyOptions) return;
-    const nextPartial = !!classifyOptions.partial;
-    const nextDeadline =
-      classifyOptions.timeoutMs != null && classifyOptions.timeoutMs > 0
-        ? String(Number((classifyOptions.timeoutMs / 1000).toFixed(3)))
-        : '';
-    const nextExpansion = classifyOptions.expansion ?? 'cautious';
-    untrack(() => {
-      partial = nextPartial;
-      deadline = nextDeadline;
-      expansion = nextExpansion;
-    });
+    opts.sync(target, graph, classifyOptions);
   });
-  const parsedDeadline = $derived(parseDeadlineInput(deadline));
   function runClassify() {
-    if (parsedDeadline.error) return;
-    void model.classify({
-      partial: partial || undefined,
-      timeoutMs: parsedDeadline.timeoutMs,
-      expansion,
-    });
+    if (opts.parsedDeadline.error) return;
+    void model.classify(opts.requestOptions);
   }
   // The read has pinned labels but no proven historical prefix map. Rendering
   // preferences therefore fall back to the complete IRI outside label mode.
@@ -146,7 +126,7 @@
       class="check"
       title="Return proved subsumptions if the deadline stops a disjunctive classification"
     >
-      <input type="checkbox" bind:checked={partial} />
+      <input type="checkbox" bind:checked={opts.partial} />
       Allow partial
     </label>
     <label class="field">
@@ -155,27 +135,29 @@
         class="input sm"
         type="text"
         inputmode="decimal"
-        size="6"
-        placeholder="No limit"
+        size="12"
+        placeholder="Server default"
         aria-label="Frame classification deadline in seconds"
-        aria-invalid={!!parsedDeadline.error}
-        bind:value={deadline}
+        aria-invalid={!!opts.parsedDeadline.error}
+        bind:value={opts.deadline}
       />
     </label>
     <label class="field">
       <span>Expansion</span>
-      <select class="select sm" aria-label="Frame expansion strategy" bind:value={expansion}>
+      <select class="select sm" aria-label="Frame expansion strategy" bind:value={opts.expansion}>
         <option value="cautious">Cautious</option>
         <option value="eager">Eager</option>
       </select>
     </label>
     <button
       class="btn sm ghost"
-      disabled={model.computing || model.loading || !!parsedDeadline.error}
+      disabled={model.computing || model.loading || !!opts.parsedDeadline.error}
       onclick={runClassify}>{buttonLabel}</button
     >
   </div>
-  {#if parsedDeadline.error}<p class="note error" role="alert">{parsedDeadline.error}</p>{/if}
+  {#if opts.parsedDeadline.error}<p class="note error" role="alert">
+      {opts.parsedDeadline.error}
+    </p>{/if}
 {/snippet}
 
 <section class="classified-frame" aria-label="Inferred class axioms" aria-live="polite">
@@ -282,7 +264,6 @@
                       onclick={() => onopen?.(row.iri)}>{display(row)}</button
                     >{:else}<span title={row.iri}>{display(row)}</span>{/if}
                   <span class="badge">Inferred</span>
-                  {#if row.incomplete}<span class="badge warn">Open</span>{/if}
                   {#if (row.equivalenceCount ?? 0) > 1}<span class="note"
                       >parent group of {row.equivalenceCount} equivalent classes</span
                     >{/if}
@@ -314,11 +295,11 @@
         This is a partial classification ({outcome.tier.toUpperCase()}). It leaves
         {fmtCount(outcome.incompleteCount, 'class', 'classes')} open and can miss clauses for them.
       </p>{/if}
-    {#if !outcome.complete && !outcome.partial && outcome.excludedCount > 0}<p class="note">
+    {#if !outcome.complete && outcome.excludedCount > 0}<p class="note">
         The {outcome.tier.toUpperCase()} classification omitted or partly used {outcome.excludedCount}
         axioms and can miss clauses.
       </p>{/if}
-    {#if !outcome.complete && !outcome.partial && outcome.unmappedCount > 0}<p class="note">
+    {#if !outcome.complete && outcome.unmappedCount > 0}<p class="note">
         {outcome.unmappedCount}
         {outcome.unmappedCount === 1 ? 'triple' : 'triples'} of the input map to no axiom, so the classification
         can miss clauses.
@@ -397,6 +378,8 @@
         {/if}
       {/each}
     </details>
+  {:else if commit != null && !model.loading && !model.computing && model.error}
+    {@render classifyForm('Classify')}
   {/if}
 </section>
 
@@ -472,9 +455,6 @@
   .reclassify {
     margin: 0.5rem 0;
     font-size: 0.85rem;
-  }
-  .badge.warn {
-    color: var(--warn);
   }
   .clause {
     margin-block: 0.75rem;

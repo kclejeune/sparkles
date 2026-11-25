@@ -163,23 +163,48 @@ describe('explicit legacy classification tree pages', () => {
 });
 
 describe('deadline parsing and timeout formatting', () => {
-  it('parses blank, seconds, decimals and millisecond suffixes', () => {
+  it('parses blank, seconds, decimals, millisecond suffixes and enforces precision and bounds', () => {
     expect(parseDeadlineInput('')).toEqual({});
     expect(parseDeadlineInput('   ')).toEqual({});
     expect(parseDeadlineInput('5')).toEqual({ timeoutMs: 5000 });
     expect(parseDeadlineInput('0.5s')).toEqual({ timeoutMs: 500 });
     expect(parseDeadlineInput('250ms')).toEqual({ timeoutMs: 250 });
+    expect(parseDeadlineInput('0.4ms')).toEqual({ timeoutMs: 0.4 });
+    expect(parseDeadlineInput('1.4ms')).toEqual({ timeoutMs: 1.4 });
+    expect(parseDeadlineInput('0.001ms')).toEqual({ timeoutMs: 0.001 });
+    expect(parseDeadlineInput('86400')).toEqual({ timeoutMs: 86_400_000 });
     expect(parseDeadlineInput('0').error).toMatch(/greater than zero/i);
     expect(parseDeadlineInput('-2').error).toMatch(/positive deadline/i);
     expect(parseDeadlineInput('abc').error).toMatch(/positive deadline/i);
+    expect(parseDeadlineInput('1e20').error).toMatch(/positive deadline/i);
+    expect(parseDeadlineInput('0.0001ms').error).toMatch(/microsecond/i);
+    expect(parseDeadlineInput('0.0000001s').error).toMatch(/microsecond/i);
+    expect(parseDeadlineInput('1.2345ms').error).toMatch(/microsecond/i);
+    expect(parseDeadlineInput('86401').error).toMatch(/at most 86400/i);
+    expect(parseDeadlineInput('99999999999999999999').error).toMatch(/at most 86400/i);
   });
-  it('formats positive millisecond deadlines as seconds', () => {
+  it('formats positive millisecond deadlines as exact decimal seconds without truncation or scientific notation', () => {
     expect(formatTimeoutSeconds(undefined)).toBeUndefined();
     expect(formatTimeoutSeconds(0)).toBeUndefined();
     expect(formatTimeoutSeconds(-10)).toBeUndefined();
+    expect(formatTimeoutSeconds(0.0001)).toBeUndefined();
+    expect(formatTimeoutSeconds(86_400_001)).toBeUndefined();
+    expect(formatTimeoutSeconds(1e20)).toBeUndefined();
+    expect(formatTimeoutSeconds(0.001)).toBe('0.000001');
+    expect(formatTimeoutSeconds(0.4)).toBe('0.0004');
+    expect(formatTimeoutSeconds(1.4)).toBe('0.0014');
     expect(formatTimeoutSeconds(500)).toBe('0.5');
     expect(formatTimeoutSeconds(5000)).toBe('5');
     expect(formatTimeoutSeconds(1250)).toBe('1.25');
+    expect(formatTimeoutSeconds(86_400_000)).toBe('86400');
+    // Round-trip accepted sub-millisecond and fractional millisecond values without drift.
+    for (const input of ['0.4ms', '1.4ms', '0.001ms', '2.5', '10', '86400']) {
+      const parsed = parseDeadlineInput(input);
+      expect(parsed.error).toBeUndefined();
+      const formatted = formatTimeoutSeconds(parsed.timeoutMs);
+      expect(formatted).toBeDefined();
+      expect(parseDeadlineInput(formatted!)).toEqual(parsed);
+    }
   });
 });
 

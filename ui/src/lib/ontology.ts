@@ -245,29 +245,42 @@ export type ClassifyOptions = {
   expansion?: ClassificationExpansion;
 };
 
-/** Format a positive millisecond deadline as a positive seconds string for `?timeout=`. */
+export const MIN_DEADLINE_MS = 0.001;
+export const MAX_DEADLINE_SECONDS = 86_400;
+
+/** Format a positive millisecond deadline as a decimal seconds string for `?timeout=`. */
 export function formatTimeoutSeconds(timeoutMs: number | undefined): string | undefined {
-  if (timeoutMs == null || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return undefined;
+  if (timeoutMs == null || !Number.isFinite(timeoutMs) || timeoutMs < MIN_DEADLINE_MS)
+    return undefined;
   const secs = timeoutMs / 1000;
-  return secs >= 0.001 ? String(Number(secs.toFixed(3))) : String(secs);
+  if (!Number.isFinite(secs) || secs > MAX_DEADLINE_SECONDS) return undefined;
+  return secs.toFixed(6).replace(/(\.\d*?[1-9])0+$|\.0+$/, '$1');
 }
 
 /**
  * Parse a Workbench deadline input (in seconds, or with an explicit `ms` / `s` suffix).
- * Blank input means no deadline.
+ * Enforces microsecond resolution and a bounded range so controls and `?timeout=` agree.
+ * Blank input omits the override and uses the server default.
  */
 export function parseDeadlineInput(text: string): { timeoutMs?: number; error?: string } {
   const raw = text.trim();
   if (!raw) return {};
   const match = /^([0-9]+(?:\.[0-9]+)?|\.[0-9]+)\s*(ms|s)?$/i.exec(raw);
   if (!match) return { error: 'Enter a positive deadline in seconds (for example, 5 or 0.5).' };
-  const value = Number(match[1]);
+  const numText = match[1];
+  const unit = (match[2] ?? 's').toLowerCase();
+  const frac = numText.includes('.') ? numText.split('.')[1].replace(/0+$/, '') : '';
+  const maxFrac = unit === 'ms' ? 3 : 6;
+  if (frac.length > maxFrac)
+    return { error: 'Deadline supports up to microsecond precision (0.000001s or 0.001ms).' };
+  const value = Number(numText);
   if (!Number.isFinite(value) || value <= 0)
     return { error: 'Deadline must be greater than zero.' };
-  const unit = (match[2] ?? 's').toLowerCase();
   const timeoutMs = unit === 'ms' ? value : value * 1000;
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
-    return { error: 'Deadline must be greater than zero.' };
+  if (!Number.isFinite(timeoutMs) || timeoutMs < MIN_DEADLINE_MS)
+    return { error: 'Deadline must be at least 0.001ms (0.000001s).' };
+  if (timeoutMs > MAX_DEADLINE_SECONDS * 1000)
+    return { error: `Deadline must be at most ${MAX_DEADLINE_SECONDS} seconds.` };
   return { timeoutMs };
 }
 

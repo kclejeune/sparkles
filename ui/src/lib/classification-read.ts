@@ -21,7 +21,6 @@ export type ClassificationName = {
   equivalenceCount?: number;
   children?: number;
   parents?: number;
-  incomplete?: boolean;
 };
 export type ClassificationSourceRow =
   | { kind: 'requestedGraph'; ordinal: number; graph: string }

@@ -603,9 +603,9 @@ describe('source-pinned inferred regions', () => {
     expect(calls[0].init.method ?? 'GET').toBe('GET');
     model.drop();
   });
-  it('tracks incomplete classes from kept hierarchy rows and entity status', async () => {
+  it('tracks incomplete singleton classes from entity status without relying on row-level flags or alias-only group flags', async () => {
     const result: ClassificationResult = {
-      resultId: 'kept-partial',
+      resultId: 'kept-incomplete',
       classifiedCommit: 7,
       boundStoreId: 'branch',
       familyId: 'family',
@@ -616,7 +616,7 @@ describe('source-pinned inferred regions', () => {
       mode: 'lenient',
       assertions: false,
       elOnly: false,
-      partialRequested: true,
+      partialRequested: false,
       expansion: 'cautious',
       sourceCounts: { requestedGraphs: 1, resolvedGraphs: 1, imports: 0, warnings: 0 },
       capabilities: ['namedClassRoots', 'namedClassDirectChildren'],
@@ -630,33 +630,30 @@ describe('source-pinned inferred regions', () => {
         part === 'roots'
           ? [
               {
-                iri: 'urn:OpenRoot',
-                label: 'OpenRoot',
+                iri: 'urn:OpenSingleton',
+                label: 'OpenSingleton',
                 labelLang: 'en',
                 children: 1,
                 parents: 1,
                 equivalenceCount: 1,
-                incomplete: true,
               },
               {
-                iri: 'urn:ClosedRoot',
-                label: 'ClosedRoot',
+                iri: 'urn:GroupedRoot',
+                label: 'GroupedRoot',
                 labelLang: 'en',
-                children: 0,
+                children: 1,
                 parents: 1,
-                equivalenceCount: 1,
-                incomplete: false,
+                equivalenceCount: 2,
               },
             ]
           : [
               {
-                iri: 'urn:OpenChild',
-                label: 'OpenChild',
+                iri: 'urn:Child',
+                label: 'Child',
                 labelLang: 'en',
                 children: 0,
                 parents: 1,
                 equivalenceCount: 1,
-                incomplete: true,
               },
             ];
       return {
@@ -667,11 +664,11 @@ describe('source-pinned inferred regions', () => {
         activity: null,
         staleCommit: null,
         outcome: {
-          tier: 'disjunctive',
-          partial: true,
+          tier: 'el',
+          partial: false,
           complete: false,
           consistency: 'unknown',
-          excludedCount: 0,
+          excludedCount: 1,
           incompleteCount: 2,
           unmappedCount: 0,
         },
@@ -681,10 +678,10 @@ describe('source-pinned inferred regions', () => {
               present: true,
               representative: about,
               unsatisfiable: false,
-              incomplete: about === 'urn:OpenRoot',
+              incomplete: true,
               children: 1,
               parents: 1,
-              equivalenceCount: 1,
+              equivalenceCount: about === 'urn:GroupedRoot' ? 2 : 1,
             }
           : null,
         page: {
@@ -701,10 +698,11 @@ describe('source-pinned inferred regions', () => {
     const model = new InferredTree();
     model.reset(view, 'Class');
     await model.tree.load(null);
-    expect(model.incomplete['urn:OpenRoot']).toBe(true);
-    expect(model.incomplete['urn:ClosedRoot']).toBe(false);
-    await model.tree.load('urn:OpenRoot');
-    expect(model.incomplete['urn:OpenChild']).toBe(true);
+    expect(model.incomplete).toEqual({});
+    await model.tree.load('urn:OpenSingleton');
+    expect(model.incomplete['urn:OpenSingleton']).toBe(true);
+    await model.tree.load('urn:GroupedRoot');
+    expect(model.incomplete['urn:GroupedRoot']).toBeUndefined();
     model.drop();
     expect(model.incomplete).toEqual({});
   });

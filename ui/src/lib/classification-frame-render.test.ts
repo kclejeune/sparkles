@@ -77,6 +77,7 @@ const fixture = vi.hoisted(() => ({
     },
   },
   isolated: false,
+  error: null as string | null,
 }));
 
 vi.mock('./classification-frame.svelte', () => ({
@@ -85,7 +86,7 @@ vi.mock('./classification-frame.svelte', () => ({
     parts = fixture.parts;
     loading = false;
     computing = false;
-    error = null;
+    error = fixture.error;
     isolated = fixture.isolated;
     reset() {}
     drop() {}
@@ -137,10 +138,11 @@ beforeEach(() => {
     excluded: emptyPage(),
   };
   fixture.isolated = false;
+  fixture.error = null;
 });
 
 describe('ClassificationFrame partial classification rendering', () => {
-  it('renders deadline, partial and expansion controls when no kept classification is available', () => {
+  it('renders deadline, partial and expansion controls initialized from classifyOptions when no kept classification is available', () => {
     fixture.reply = {
       commit: 7,
       status: 'unavailable',
@@ -154,29 +156,60 @@ describe('ClassificationFrame partial classification rendering', () => {
     };
     const body = renderFrame({ partial: true, timeoutMs: 2500, expansion: 'eager' });
     expect(body).toContain('Allow partial');
+    expect(body).toContain('checked');
     expect(body).toContain('Deadline (s)');
+    expect(body).toContain('placeholder="Server default"');
+    expect(body).toContain('value="2.5"');
     expect(body).toContain('Expansion');
     expect(body).toContain('Cautious');
     expect(body).toContain('Eager');
     expect(body).toContain('Classify');
   });
 
-  it('shows partial hierarchy, tier, open-class marker and unknown consistency distinctly', () => {
+  it('preserves sub-millisecond classifyOptions deadlines on initial render without disabling Classify', () => {
+    fixture.reply = {
+      commit: 7,
+      status: 'unavailable',
+      reason: 'notKept',
+      result: null,
+      outcome: null,
+      entity: null,
+      activity: null,
+      page: null,
+      staleCommit: null,
+    };
+    const body = renderFrame({ timeoutMs: 0.4 });
+    expect(body).toContain('value="0.0004"');
+    expect(body).not.toContain('Deadline must be greater than zero.');
+  });
+
+  it('keeps the classify form visible after a POST error so users can adjust options and retry', () => {
+    fixture.reply = null;
+    fixture.error = 'classification timed out';
+    const body = renderFrame({ timeoutMs: 500 });
+    expect(body).toContain('classification timed out');
+    expect(body).toContain('Allow partial');
+    expect(body).toContain('Deadline (s)');
+    expect(body).toContain('value="0.5"');
+    expect(body).toContain('Classify');
+  });
+
+  it('shows partial hierarchy, tier, open-class marker, unknown consistency and excluded/unmapped notices without fabricated row badges', () => {
     fixture.reply = availableReply(
       {
         tier: 'disjunctive',
         partial: true,
         complete: false,
         consistency: 'unknown',
-        excludedCount: 0,
+        excludedCount: 2,
         incompleteCount: 3,
-        unmappedCount: 0,
+        unmappedCount: 1,
       },
       { iri: 'urn:OpenClass', present: true, unsatisfiable: false, incomplete: true },
     );
     fixture.parts.parents = {
       ...emptyPage(),
-      items: [{ iri: 'urn:OpenParent', label: 'Open Parent', labelLang: 'en', incomplete: true }],
+      items: [{ iri: 'urn:OpenParent', label: 'Open Parent', labelLang: 'en' }],
       total: 1,
     };
     fixture.isolated = true;
@@ -192,7 +225,9 @@ describe('ClassificationFrame partial classification rendering', () => {
       'This class is left open in this partial classification and may miss inferred clauses.',
     );
     expect(body).toContain('Open Parent');
-    expect(body).toContain('>Open<');
+    expect(body).not.toContain('>Open<');
+    expect(body).toContain('omitted or partly used 2');
+    expect(body).toContain('triple of the input map to no axiom');
     expect(body).toContain('Classify with deadline or partial options');
   });
 

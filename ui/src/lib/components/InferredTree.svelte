@@ -164,13 +164,13 @@
           Complete for its supported source.
         {:else}
           Classification is incomplete.
-          {#if outcome && outcome.excludedCount > 0}
-            {outcome.excludedCount} omitted or partly used axioms.
-          {/if}
-          {#if outcome && outcome.unmappedCount > 0}
-            {outcome.unmappedCount}
-            {outcome.unmappedCount === 1 ? 'triple' : 'triples'} of the input map to no axiom.
-          {/if}
+        {/if}
+        {#if outcome && !outcome.complete && outcome.excludedCount > 0}
+          {outcome.excludedCount} omitted or partly used axioms.
+        {/if}
+        {#if outcome && !outcome.complete && outcome.unmappedCount > 0}
+          {outcome.unmappedCount}
+          {outcome.unmappedCount === 1 ? 'triple' : 'triples'} of the input map to no axiom.
         {/if}
         {#if outcome?.consistency === 'unknown'}Consistency is unknown.{/if}
         {outcome?.consistency === 'inconsistent'

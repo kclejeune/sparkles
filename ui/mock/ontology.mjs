@@ -1213,14 +1213,7 @@ function mockClassification(ds, graph, commit, body, taxonomy, opts = {}) {
   const incomplete = opts.incomplete ?? [];
   const consistency = opts.consistency ?? 'consistent';
   const tier = opts.tier ?? 'el';
-  const inputFingerprint = fingerprint([
-    boundStoreId,
-    commit,
-    input,
-    !!body.assertions,
-    !!body.partial,
-    body.expansion ?? 'cautious',
-  ]);
+  const inputFingerprint = fingerprint([boundStoreId, commit, input, !!body.assertions, false]);
   const contentFingerprint = fingerprint([taxonomy.nodes, tier, partial, consistency, incomplete]);
   const sources = [
     { kind: 'requestedGraph', ordinal: 0, graph },
@@ -1302,21 +1295,16 @@ function mockClassificationRows(kept, part, about, languages) {
         : part === 'parents' && node
           ? node.parents.map((p) => nodes[p])
           : [];
-  const incompleteSet = kept.incompleteSet ?? new Set();
   if (part === 'equivalents')
     return (node?.classes ?? [])
       .filter((c) => c !== about)
       .toSorted()
-      .map((iri) => ({
-        ...kept.name(iri, languages),
-        ...(incompleteSet.has(iri) ? { incomplete: true } : {}),
-      }));
+      .map((iri) => kept.name(iri, languages));
   return rows.map((n) => ({
     ...kept.name(n.classes[0], languages),
     equivalenceCount: n.classes.length,
     children: n.children,
     parents: n.parents.length,
-    ...(n.classes.some((c) => incompleteSet.has(c)) ? { incomplete: true } : {}),
   }));
 }
 
@@ -1802,7 +1790,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
               iri: about,
               present,
               unsatisfiable: present ? false : null,
-              incomplete: present ? false : null,
+              incomplete: present ? (kept.incompleteSet?.has(about) ?? false) : null,
               representative: entityNode?.classes[0] ?? null,
               equivalenceCount: entityNode?.classes.length ?? null,
               children: entityNode?.children ?? null,

@@ -425,7 +425,7 @@
         <li
           role="treeitem"
           id={rowDomId(i)}
-          aria-label={name(id)}
+          aria-label={b ? `${name(id)}, ${b}` : name(id)}
           aria-level={row.depth + 1}
           aria-setsize={row.size}
           aria-posinset={row.pos}

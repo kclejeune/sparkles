@@ -121,6 +121,40 @@ describe('mock ontology partial classification', () => {
       incompleteCount: incomplete.length,
     });
     expect(frame.retention).toEqual({ kept: false, resultId: null });
+    for (const row of (frame.parents as { items: Record<string, unknown>[] }).items)
+      expect('incomplete' in row).toBe(false);
+    for (const row of (frame.equivalents as { items: Record<string, unknown>[] }).items)
+      expect('incomplete' in row).toBe(false);
+  });
+
+  it('keeps inputFingerprint independent of partial/expansion and omits row-level incomplete on kept pages', async () => {
+    const { ctx } = makeDataset();
+    const full = await call(ctx, 'POST', '/$/ontology/uni/classify', {
+      graph: 'default',
+      imports: true,
+      nodes: true,
+    });
+    const partial = await call(ctx, 'POST', '/$/ontology/uni/classify?timeout=2', {
+      graph: 'default',
+      imports: true,
+      nodes: true,
+      partial: true,
+      expansion: 'eager',
+    });
+    expect(
+      (partial.body?.classificationSource as { inputFingerprint: string }).inputFingerprint,
+    ).toBe((full.body?.classificationSource as { inputFingerprint: string }).inputFingerprint);
+
+    const roots = await call(
+      ctx,
+      'GET',
+      '/$/ontology/uni/classification?graph=default&at=commit:1&part=roots',
+    );
+    expect(roots.status).toBe(200);
+    expect(roots.body?.status).toBe('available');
+    const items = (roots.body?.page as { items: Record<string, unknown>[] }).items;
+    expect(items.length).toBeGreaterThan(0);
+    for (const row of items) expect('incomplete' in row).toBe(false);
   });
 
   it('rejects an invalid expansion value', async () => {

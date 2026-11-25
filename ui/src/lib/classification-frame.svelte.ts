@@ -150,6 +150,7 @@ export class ClassificationFrame {
     this.#abort = new AbortController();
     this.reply = null;
     this.parts = emptyParts();
+    this.isolated = false;
     this.error = null;
     this.computing = true;
     try {
@@ -162,7 +163,11 @@ export class ClassificationFrame {
         frame.result.classifiedCommit !== view.commit
       )
         throw new Error('The classification changed the displayed source. Read again.');
+      if (frame.outcome.partial && !options?.partial)
+        throw new Error('A partial classification was returned without being requested.');
       const kept = frame.retention.kept;
+      if (frame.outcome.partial && kept)
+        throw new Error('A partial classification cannot be retained for shared reads.');
       if (kept && frame.retention.resultId !== frame.result.resultId)
         throw new Error('The classification returned an invalid retained pin.');
       if (kept && !this.acceptResult(frame.result))
@@ -204,6 +209,7 @@ export class ClassificationFrame {
       if (epoch === this.#epoch) {
         this.reply = null;
         this.parts = emptyParts();
+        this.isolated = false;
         this.error = errorMessage(e);
       }
     } finally {

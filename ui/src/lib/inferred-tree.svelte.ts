@@ -63,7 +63,7 @@ function sameResult(a: ClassificationResult, b: ClassificationResult) {
 }
 
 export class InferredTree {
-  names = $state<Record<string, Name & { equivalenceCount?: number; incomplete?: boolean }>>({});
+  names = $state<Record<string, Name & { equivalenceCount?: number }>>({});
   aliases = $state<Record<string, string>>({});
   incomplete = $state<Record<string, boolean>>({});
   source = $state<MaterializationSource | null>(null);
@@ -239,15 +239,14 @@ export class InferredTree {
       throw new Error('The kept hierarchy returned an invalid page.');
     if (iri && reply.entity?.present && reply.entity.representative)
       this.aliases = { ...this.aliases, [iri]: reply.entity.representative };
-    const openUpdates: Record<string, boolean> = {};
-    for (const row of page.items as ClassificationName[]) {
-      if (row.incomplete != null) openUpdates[row.iri] = row.incomplete;
-    }
-    if (reply.entity?.present && reply.entity.incomplete != null) {
+    if (
+      reply.entity?.present &&
+      reply.entity.incomplete != null &&
+      (reply.entity.equivalenceCount ?? 1) === 1
+    ) {
       const targetIri = reply.entity.representative ?? iri;
-      if (targetIri) openUpdates[targetIri] = reply.entity.incomplete;
+      if (targetIri) this.incomplete = { ...this.incomplete, [targetIri]: reply.entity.incomplete };
     }
-    if (Object.keys(openUpdates).length) this.incomplete = { ...this.incomplete, ...openUpdates };
     return { reply, page, nodes: page.items.map((row) => emptyNode(row as ClassificationName)) };
   }
   async #classHierarchy(

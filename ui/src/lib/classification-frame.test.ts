@@ -353,4 +353,126 @@ describe('one pinned class frame', () => {
     expect(controller.reply?.entity?.incomplete).toBe(true);
     expect(calls.every((c) => c.init.method !== 'POST')).toBe(true);
   });
+  it('rejects an unrequested partial frame POST before accepting a pin or publishing', async () => {
+    const acceptResult = vi.fn(() => true);
+    server((c) =>
+      c.init.method === 'POST'
+        ? response({
+            commit: 7,
+            frame: {
+              iri: 'urn:A',
+              result,
+              outcome: {
+                tier: 'disjunctive',
+                partial: true,
+                complete: false,
+                consistency: 'unknown',
+                excludedCount: 0,
+                incompleteCount: 2,
+                unmappedCount: 0,
+              },
+              unsatisfiable: false,
+              incomplete: true,
+              parents: { items: [], total: 0, truncated: false, limit: 100 },
+              equivalents: { items: [], total: 0, truncated: false, limit: 100 },
+              sources: { items: [], total: 0, truncated: false },
+              excluded: { items: [], total: 0, truncated: false, limit: 100 },
+              retention: { kept: false, resultId: null },
+            },
+          })
+        : response(available({ status: 'unavailable', result: null, outcome: null, entity: null })),
+    );
+    const controller = new ClassificationFrame(undefined, acceptResult);
+    await controller.reset(view);
+    await controller.classify({ timeoutMs: 500 });
+    expect(controller.reply).toBeNull();
+    expect(controller.isolated).toBe(false);
+    expect(controller.error).toMatch(
+      /partial classification was returned without being requested/i,
+    );
+    expect(acceptResult).not.toHaveBeenCalled();
+  });
+  it('rejects a partial frame projection that advertises shared retention', async () => {
+    const acceptResult = vi.fn(() => true);
+    server((c) =>
+      c.init.method === 'POST'
+        ? response({
+            commit: 7,
+            frame: {
+              iri: 'urn:A',
+              result: { ...result, partialRequested: true },
+              outcome: {
+                tier: 'disjunctive',
+                partial: true,
+                complete: false,
+                consistency: 'unknown',
+                excludedCount: 0,
+                incompleteCount: 1,
+                unmappedCount: 0,
+              },
+              unsatisfiable: false,
+              incomplete: true,
+              parents: { items: [], total: 0, truncated: false, limit: 100 },
+              equivalents: { items: [], total: 0, truncated: false, limit: 100 },
+              sources: { items: [], total: 0, truncated: false },
+              excluded: { items: [], total: 0, truncated: false, limit: 100 },
+              retention: { kept: true, resultId: result.resultId },
+            },
+          })
+        : response(available({ status: 'unavailable', result: null, outcome: null, entity: null })),
+    );
+    const controller = new ClassificationFrame(undefined, acceptResult);
+    await controller.reset(view);
+    await controller.classify({ partial: true, timeoutMs: 500 });
+    expect(controller.reply).toBeNull();
+    expect(controller.isolated).toBe(false);
+    expect(controller.error).toMatch(/cannot be retained/i);
+    expect(acceptResult).not.toHaveBeenCalled();
+  });
+  it('recovers directly from a failed POST timeout by retrying classify without refresh', async () => {
+    let posts = 0;
+    server((c) => {
+      if (c.init.method !== 'POST')
+        return response(
+          available({ status: 'unavailable', result: null, outcome: null, entity: null }),
+        );
+      posts++;
+      if (posts === 1) return response({ error: 'classification timed out' }, 408);
+      return response({
+        commit: 7,
+        frame: {
+          iri: 'urn:A',
+          result: { ...result, partialRequested: true },
+          outcome: {
+            tier: 'disjunctive',
+            partial: true,
+            complete: false,
+            consistency: 'consistent',
+            excludedCount: 0,
+            incompleteCount: 1,
+            unmappedCount: 0,
+          },
+          unsatisfiable: false,
+          incomplete: true,
+          parents: { items: [name('urn:Parent')], total: 1, truncated: false, limit: 100 },
+          equivalents: { items: [], total: 0, truncated: false, limit: 100 },
+          sources: { items: [], total: 0, truncated: false },
+          excluded: { items: [], total: 0, truncated: false, limit: 100 },
+          retention: { kept: false, resultId: null },
+        },
+      });
+    });
+    const controller = new ClassificationFrame();
+    await controller.reset(view);
+    await controller.classify({ timeoutMs: 200 });
+    expect(controller.reply).toBeNull();
+    expect(controller.isolated).toBe(false);
+    expect(controller.error).toMatch(/timed out/i);
+
+    await controller.classify({ partial: true, timeoutMs: 2000 });
+    expect(controller.error).toBeNull();
+    expect(controller.isolated).toBe(true);
+    expect(controller.reply?.outcome?.partial).toBe(true);
+    expect(controller.parts.parents.items).toEqual([name('urn:Parent')]);
+  });
 });

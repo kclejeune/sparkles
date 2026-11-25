@@ -20,6 +20,7 @@
   import ClassificationFrame from '$components/ClassificationFrame.svelte';
   import InferredTreeView from '$components/InferredTree.svelte';
   import MaterializedFrame from '$components/MaterializedFrame.svelte';
+  import { ExplicitClassification } from '$lib/explicit-classification.svelte';
   import { InferredPins } from '$lib/inferred-read';
   import type { InferredKind } from '$lib/inferred-tree.svelte';
   import { app, toasts } from '$lib/app.svelte';
@@ -40,7 +41,6 @@
     describeAxiom,
     annotationAssertion,
     buildTree,
-    classifyOntology,
     dlQuery,
     DL_ANSWERS,
     declaration,
@@ -64,7 +64,6 @@
     ontologyEntity,
     ontologyHead,
     ontologySummary,
-    parseDeadlineInput,
     RDFS_LABEL,
     renameUpdate,
     savePolicy,
@@ -79,9 +78,6 @@
     type AxiomInput,
     type AxiomJson,
     type AxiomItem,
-    type Classification,
-    type ClassificationExpansion,
-    type ClassifyOptions,
     type DlAnswer,
     type DlQueryResult,
     type DlReasoning,
@@ -251,7 +247,6 @@
    */
   let loadSeq = 0;
   let frameSeq = 0;
-  let classifySeq = 0;
 
   const langs = $derived(iriForm.languages);
   /** The name of `iri` as a tree draws it: the tree's own levels carry the labels. */
@@ -455,7 +450,8 @@
       resetLazy();
       for (const lt of levelTrees.values()) lt.drop();
       individualLevel.drop();
-      classification = null;
+      explicit.clear();
+      explicit.resetOptions();
       session.reset(`sparkles.onto.undo.${target}|${graph ?? ''}`);
       void loadAll();
       void loadSide();
@@ -475,7 +471,7 @@
     resetLazy();
     for (const lt of levelTrees.values()) lt.drop();
     individualLevel.drop();
-    classification = null;
+    explicit.clear();
     void loadAll();
   }
   let importsShown: string | null = null;
@@ -798,92 +794,25 @@
     });
   });
   // --- the inferred tree ---------------------------------------------------------------
-  let classification = $state<Classification | null>(null);
-  let classifyError = $state<string | null>(null);
-  let classifying = $state(false);
-  let classifyAbort: AbortController | null = null;
-  let inferredScope: { target: string; selection: Selection; commit: number } | null = null;
-  let classifyPartial = $state(false);
-  let classifyDeadline = $state('');
-  let classifyExpansion = $state<ClassificationExpansion>('cautious');
-  const parsedDeadline = $derived(parseDeadlineInput(classifyDeadline));
-  const classifyOptions = $derived<ClassifyOptions>({
-    partial: classifyPartial || undefined,
-    timeoutMs: parsedDeadline.timeoutMs,
-    expansion: classifyExpansion,
-  });
-  const inferredLabels = new SvelteMap<string, Lit[]>();
-  const inferredBatch = new LabelBatch(
-    (iris) => {
-      const scope = inferredScope;
-      return scope
-        ? ontologyLabelsFor(
-            scope.target,
-            scope.selection,
-            iris,
-            undefined,
-            `commit:${scope.commit}`,
-          )
-        : Promise.resolve(new Map());
-    },
-    (more) => {
-      for (const [iri, labels] of more) inferredLabels.set(iri, labels);
-    },
-  );
-  function clearClassification() {
-    classifySeq++;
-    classifyAbort?.abort();
-    classifyAbort = null;
-    classification = null;
-    inferredScope = null;
-    inferredBatch.reset();
-    inferredLabels.clear();
-    classifying = false;
-    classifyError = null;
-  }
+  const explicit = new ExplicitClassification();
+  const classification = $derived(explicit.classification);
+  const classifyError = $derived(explicit.error);
+  const classifying = $derived(explicit.classifying);
+  const parsedDeadline = $derived(explicit.parsedDeadline);
+  const classifyOptions = $derived(explicit.options);
   async function classify() {
-    if (!summary || classifying) return;
-    if (parsedDeadline.error) {
-      classifyError = parsedDeadline.error;
-      return;
-    }
-    const my = ++classifySeq;
-    const input = { target, selection: { ...sel }, commit: summary.commit };
-    const options = { ...classifyOptions };
-    classifyAbort?.abort();
-    const abort = new AbortController();
-    classifyAbort = abort;
-    classifying = true;
-    classifyError = null;
-    try {
-      const c = await classifyOntology(
-        input.target,
-        input.selection,
-        abort.signal,
-        `commit:${input.commit}`,
-        options,
-      );
-      if (my !== classifySeq) return;
-      inferredScope = { ...input, commit: c.commit };
-      inferredBatch.reset();
-      inferredLabels.clear();
-      classification = c;
-    } catch (e) {
-      if (my === classifySeq) classifyError = api.errorMessage(e);
-    } finally {
-      if (my === classifySeq) {
-        classifying = false;
-        classifyAbort = null;
-      }
-    }
+    if (!summary) return;
+    await explicit.run(target, sel, summary.commit);
   }
   // Reading/toggling the tree, including inferred=1, never starts classification.
   $effect(() => {
     void target;
     void graph;
+    void withImports;
+    void importsRev;
     void summary?.commit;
-    untrack(clearClassification);
-    return () => classifyAbort?.abort();
+    untrack(() => explicit.clear());
+    return () => explicit.abort();
   });
   const inferred = $derived(classification ? taxonomyTree(classification) : null);
   const inferredIncomplete = $derived(new Set(classification?.incomplete ?? []));
@@ -898,8 +827,8 @@
   );
   const inferredIriName = (iri: string) => {
     if (iriForm.mode !== 'label') return iri;
-    inferredBatch.want(iri);
-    return preferredLabel(inferredLabels.get(iri), langs) ?? iri;
+    explicit.wantLabel(iri);
+    return preferredLabel(explicit.labels.get(iri), langs) ?? iri;
   };
   const inferredName = (id: string) => {
     const cs = inferred?.classesOf.get(id) ?? [];
@@ -1916,7 +1845,7 @@
                         class="check"
                         title="Ask the disjunctive classifier to return proved subsumptions if the deadline stops it"
                       >
-                        <input type="checkbox" bind:checked={classifyPartial} />
+                        <input type="checkbox" bind:checked={explicit.partial} />
                         Allow partial
                       </label>
                       <label class="classify-field">
@@ -1925,11 +1854,11 @@
                           class="input sm"
                           type="text"
                           inputmode="decimal"
-                          size="6"
-                          placeholder="No limit"
+                          size="12"
+                          placeholder="Server default"
                           aria-label="Classification deadline in seconds"
                           aria-invalid={!!parsedDeadline.error}
-                          bind:value={classifyDeadline}
+                          bind:value={explicit.deadline}
                         />
                       </label>
                       <label class="classify-field">
@@ -1937,7 +1866,7 @@
                         <select
                           class="select sm"
                           aria-label="Expansion strategy"
-                          bind:value={classifyExpansion}
+                          bind:value={explicit.expansion}
                         >
                           <option value="cautious">Cautious</option>
                           <option value="eager">Eager</option>
@@ -1956,10 +1885,12 @@
                       This explicit action reads the taxonomy in POST pages.
                     </p>
                     {#if classification?.nodesTruncated}<p class="note pad-x">
-                        The browser's taxonomy display limit was reached.
+                        {classification.partial
+                          ? 'This partial classification is not retained across pages, so only its first page of taxonomy nodes is shown.'
+                          : "The browser's taxonomy display limit was reached."}
                       </p>{/if}
                     <div class="tree-scroll">
-                      {#if classifying && !inferred}<p class="faint">
+                      {#if classifying}<p class="faint">
                           <span class="spinner"></span> Classifying…
                         </p>{/if}
                       {#if classifyError}<p class="error-box" role="alert">{classifyError}</p>{/if}
@@ -2002,6 +1933,12 @@
                               )} of {fmtInt(classification.incompleteCount ?? 0)} open classes.
                             {/if}
                           </p>
+                        {:else if (classification.incompleteCount ?? 0) > (classification.incomplete?.length ?? 0)}
+                          <p class="warn-box" role="status">
+                            Showing open-class markers for the first {fmtInt(
+                              classification.incomplete?.length ?? 0,
+                            )} of {fmtInt(classification.incompleteCount ?? 0)} incomplete classes.
+                          </p>
                         {/if}
                         {#if inferredConsistency?.state === 'inconsistent'}
                           <p class="error-box" role="alert">
@@ -2020,7 +1957,7 @@
                           onview={(ids) => {
                             for (const id of ids)
                               for (const c of inferred?.classesOf.get(id) ?? [])
-                                inferredBatch.want(c);
+                                explicit.wantLabel(c);
                           }}
                           badge={(id) =>
                             inferredNodeStatus(id, inferred.classesOf, inferredIncomplete).badge}
@@ -2137,8 +2074,16 @@
                 {@const sup = inferredParents(selected)}
                 {#if inferredIncomplete.has(selected)}
                   <p class="inferred-sup warn-box" role="status">
-                    <span class="badge warn">Open</span> This class was left open in the partial classification
-                    and may miss inferred superclasses.
+                    <span class="badge warn">Open</span>
+                    {#if classification?.partial}
+                      This class was left open in the partial classification and may miss inferred
+                      superclasses.
+                    {:else if (classification?.excludedCount ?? 0) > 0 || (classification?.stats?.unmapped ?? 0) > 0}
+                      This class is incomplete because the classification excluded or could not map
+                      part of the input, and may miss inferred superclasses.
+                    {:else}
+                      This class is incomplete and may miss inferred superclasses.
+                    {/if}
                   </p>
                 {/if}
                 {#if sup.length}

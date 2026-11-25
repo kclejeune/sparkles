@@ -136,6 +136,23 @@ describe('the actual inferred-tree outcome region', () => {
     expect(body).toContain('Consistency unknown');
     expect(body).toContain('Consistency is unknown.');
     expect(body).toContain('>open<');
+    expect(body).toContain('aria-label="OpenClass, open"');
+    expect(body).toContain('aria-label="ClosedClass"');
     expect(body).toContain('warn');
+  });
+  it('retains excluded-axiom and unmapped-triple notices alongside a partial outcome', () => {
+    fixture.outcome = {
+      tier: 'disjunctive',
+      complete: false,
+      partial: true,
+      consistency: 'unknown',
+      excludedCount: 2,
+      incompleteCount: 3,
+      unmappedCount: 1,
+    };
+    const body = html().replace(/\s+/g, ' ');
+    expect(body).toContain('Partial classification.');
+    expect(body).toContain('2 omitted or partly used axioms.');
+    expect(body).toContain('1 triple of the input map to no axiom.');
   });
 });
