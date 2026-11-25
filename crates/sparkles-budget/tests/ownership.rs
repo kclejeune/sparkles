@@ -348,3 +348,38 @@ fn explicit_unpooled_domain_is_stable_and_distinct_from_bounded_roots() {
     assert_eq!(first.id(), second.id());
     assert_ne!(first.id(), MemoryDomain::new().id());
 }
+
+#[test]
+fn detached_remove_and_trim_defer_parent_release_until_lease_drop() {
+    let domain = MemoryDomain::new();
+    let (p, c) = parent(&domain, 4 * LIVE_SLACK);
+    let mut live = LiveCredit::new(p);
+    live.try_add(2 * LIVE_SLACK + LIVE_STEP).unwrap();
+    let before_reserved = c.reserved.load(Ordering::SeqCst);
+
+    // Within slack: no detached lease, no release.
+    assert!(live.remove_detached(LIVE_SLACK).unwrap().is_none());
+    assert_eq!(c.releases.load(Ordering::SeqCst), 0);
+
+    // Past slack: excess is split off without releasing yet.
+    let detached = live
+        .remove_detached(1)
+        .unwrap()
+        .expect("shrink past LIVE_SLACK returns a detached lease");
+    assert_eq!(c.releases.load(Ordering::SeqCst), 0);
+    assert_eq!(c.reserved.load(Ordering::SeqCst), before_reserved);
+    assert!(detached.bytes() > 0);
+    drop(detached);
+    assert_eq!(c.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(c.reserved.load(Ordering::SeqCst), live.reserved());
+
+    // Dropping live to 0 within slack keeps credit until trim_detached drops its lease.
+    let rem = live.live();
+    let detached_rem = live.remove_detached(rem).unwrap();
+    assert_eq!(live.live(), 0);
+    let trimmed = live.trim_detached();
+    assert_eq!(live.reserved(), 0);
+    drop(detached_rem);
+    drop(trimmed);
+    assert_eq!(c.reserved.load(Ordering::SeqCst), 0);
+}
