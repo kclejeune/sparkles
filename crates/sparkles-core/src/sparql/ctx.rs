@@ -4447,6 +4447,9 @@ impl OwnedCharge {
     pub(crate) fn resize(&mut self, bytes: u64) -> Result<()> {
         self.lease.resize(self.ctx.mem_limit, bytes)
     }
+    pub(crate) fn check(&self) -> Result<()> {
+        self.ctx.check()
+    }
     /// Adopt the actual predecoded payload guard; the existing cursor ledger is
     /// required and checked before the source is consumed.
     pub(super) fn adopt_charge(&mut self, source: &mut Option<Charge<'_>>) -> Result<()> {

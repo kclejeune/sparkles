@@ -10144,9 +10144,30 @@ impl RemoteAnswer {
         );
         // A streamed answer reads the start of a JSON response first to see whether
         // sparesults would buffer it, and charges what the parser holds as it reads.
+        // Late-head JSON responses are validated to EOF before sparesults reads them so
+        // trailing truncation or garbage after `"vars"` cannot look like clean EOF.
         let mut buffered_before_output = false;
         let (body, window): (Box<dyn std::io::Read + Send>, _) = match meter {
-            None => (Box::new(body), None),
+            None => {
+                if syntax == crate::nesting::Syntax::Json {
+                    let mut body = body;
+                    let start = super::svcread::json_start(&mut body, None, ctx)
+                        .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                    let reader: Box<dyn std::io::Read + Send> = if start.late {
+                        let bytes = super::svcread::read_late_json(start, &mut body, None, ctx)
+                            .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                        Box::new(std::io::Cursor::new(bytes))
+                    } else {
+                        Box::new(std::io::Read::chain(
+                            std::io::Cursor::new(start.bytes),
+                            body,
+                        ))
+                    };
+                    (reader, None)
+                } else {
+                    (Box::new(body), None)
+                }
+            }
             Some(meter) => {
                 let mut body = body;
                 let mut charge = super::svcread::charge(meter.ctx)?;
@@ -10154,7 +10175,7 @@ impl RemoteAnswer {
                 let reader: Box<dyn std::io::Read + Send> = if syntax
                     == crate::nesting::Syntax::Json
                 {
-                    let start = super::svcread::json_start(&mut body, &mut charge)
+                    let start = super::svcread::json_start(&mut body, Some(&mut charge), meter.ctx)
                         .map_err(|e| Self::failed(url.as_str(), e.into()))?;
                     if start.late && meter.strict {
                         return Err(Error::Service(format!(
@@ -10164,15 +10185,31 @@ impl RemoteAnswer {
                         )));
                     }
                     buffered_before_output = start.late;
-                    let base = (start.decided as u64).saturating_mul(super::svcread::head_factor());
-                    let bytes = std::io::Cursor::new(start.bytes);
-                    Box::new(super::svcread::Metered::new(
-                        std::io::Read::chain(bytes, body),
-                        charge,
-                        base,
-                        start.late,
-                        window.clone(),
-                    ))
+                    if start.late {
+                        let bytes = super::svcread::read_late_json(
+                            start,
+                            &mut body,
+                            Some(&mut charge),
+                            meter.ctx,
+                        )
+                        .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                        Box::new(super::svcread::Metered::precharged(
+                            std::io::Cursor::new(bytes),
+                            charge,
+                            window.clone(),
+                        ))
+                    } else {
+                        let base =
+                            (start.decided as u64).saturating_mul(super::svcread::head_factor());
+                        let bytes = std::io::Cursor::new(start.bytes);
+                        Box::new(super::svcread::Metered::new(
+                            std::io::Read::chain(bytes, body),
+                            charge,
+                            base,
+                            false,
+                            window.clone(),
+                        ))
+                    }
                 } else {
                     Box::new(super::svcread::Metered::new(
                         body,

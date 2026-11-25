@@ -1345,10 +1345,11 @@ answer enters the cache only when it was read to its end, and the copy for the c
 dropped once it grows past the largest entry the cache keeps or past what the budget
 holds beside the answer. The outbound timeout counts from the start of the request, while
 the query's deadline leaves out the time a consumer keeps the cursor waiting, so a slow
-consumer can expire a transfer that an eager run would finish. The strict policy refuses
-a SILENT SERVICE, which needs its whole answer before its first row, and a JSON response
-whose results come before its head, which [item 1125](../../ROADMAP.md) decodes in either
-order. Under the permissive policy, a late-head JSON response is buffered under a memory
+consumer can expire a transfer that an eager run would finish. In part 2, the strict policy
+refused a SILENT SERVICE, which needed its whole answer before its first row, and a JSON
+response whose results come before its head, which [item 1125](../../ROADMAP.md) decodes in
+either order; part 3 below moves SILENT SERVICE onto a native budget-buffered cursor. Under
+the permissive policy, a late-head JSON response is buffered under a memory
 charge, and the runtime plan reports and retains `fullInputBeforeOutput` on that SERVICE
 node after the response is released. Its refusal inside an EXISTS fails the query, as it
 does outside one.

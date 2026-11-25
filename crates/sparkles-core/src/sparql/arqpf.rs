@@ -1307,6 +1307,49 @@ impl<'a> Lists<'a> {
 // ------------------------------------------------------------ streaming leaf reader ----
 
 const RANGE_CHUNK: usize = 256;
+const ID_BUF_BYTES: u64 = (RANGE_CHUNK * std::mem::size_of::<Id>()) as u64;
+const PAIR_BUF_BYTES: u64 = (RANGE_CHUNK * std::mem::size_of::<(Id, Id)>()) as u64;
+
+fn hashset_id_bytes(cap: usize) -> u64 {
+    (cap as u64).saturating_mul(16)
+}
+
+fn hashset_id_growth_bytes(cap: usize) -> u64 {
+    let old = hashset_id_bytes(cap);
+    let next = hashset_id_bytes((cap * 2).max(8));
+    old.saturating_add(next)
+}
+
+/// Conservative heap estimate for `BTreeMap<u64, Id>`: each leaf node (B=6, up to 11
+/// entries) is 192 B and each internal node is 288 B; non-root nodes keep at least 5
+/// entries, so `ceil(len / 5) * 288` bounds the initial leaf allocation, internal nodes,
+/// and partially filled nodes left live during `pop_first` draining.
+fn btree_map_bytes(len: usize) -> u64 {
+    if len == 0 {
+        0
+    } else {
+        (len.div_ceil(5) as u64).saturating_mul(288)
+    }
+}
+
+fn prepare_id_buf(buf: &mut Vec<Id>, admit: &mut dyn FnMut(u64) -> Result<()>) -> Result<()> {
+    if buf.capacity() < RANGE_CHUNK {
+        admit(ID_BUF_BYTES)?;
+        buf.reserve_exact(RANGE_CHUNK - buf.len());
+    }
+    Ok(())
+}
+
+fn prepare_pair_buf(
+    buf: &mut Vec<(Id, Id)>,
+    admit: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    if buf.capacity() < RANGE_CHUNK {
+        admit(PAIR_BUF_BYTES)?;
+        buf.reserve_exact(RANGE_CHUNK - buf.len());
+    }
+    Ok(())
+}
 
 fn key_successor(mut key: [u64; 4]) -> Option<[u64; 4]> {
     for i in (0..4).rev() {
@@ -1331,8 +1374,13 @@ fn has_any(ctx: &Ctx, graph: &GraphFilter, perm: Perm, prefix: &[u64]) -> Result
     let (lo, hi) = (pad(prefix, 0), pad(prefix, u64::MAX));
     let mut found = false;
     let mut scanned = 0usize;
-    ctx.snap
-        .scan_between_cols(perm, lo, hi, crate::index::ALL_COLS, |c| {
+    ctx.snap.scan_between_cols_checked(
+        perm,
+        lo,
+        hi,
+        crate::index::ALL_COLS,
+        || ctx.check(),
+        |c| {
             match c {
                 Chunk::Block(b, s, e) => {
                     for i in s..e {
@@ -1358,7 +1406,8 @@ fn has_any(ctx: &Ctx, graph: &GraphFilter, perm: Perm, prefix: &[u64]) -> Result
                 }
             }
             Ok(true)
-        })?;
+        },
+    )?;
     Ok(found)
 }
 
@@ -1376,8 +1425,13 @@ fn first_col(
     let (lo, hi) = (pad(prefix, 0), pad(prefix, u64::MAX));
     let mut found = None;
     let mut scanned = 0usize;
-    ctx.snap
-        .scan_between_cols(perm, lo, hi, crate::index::ALL_COLS, |c| {
+    ctx.snap.scan_between_cols_checked(
+        perm,
+        lo,
+        hi,
+        crate::index::ALL_COLS,
+        || ctx.check(),
+        |c| {
             match c {
                 Chunk::Block(b, s, e) => {
                     for i in s..e {
@@ -1403,7 +1457,8 @@ fn first_col(
                 }
             }
             Ok(true)
-        })?;
+        },
+    )?;
     Ok(found)
 }
 
@@ -1422,8 +1477,13 @@ fn has_any_col_ne(
     let (lo, hi) = (pad(prefix, 0), pad(prefix, u64::MAX));
     let mut found = false;
     let mut scanned = 0usize;
-    ctx.snap
-        .scan_between_cols(perm, lo, hi, crate::index::ALL_COLS, |c| {
+    ctx.snap.scan_between_cols_checked(
+        perm,
+        lo,
+        hi,
+        crate::index::ALL_COLS,
+        || ctx.check(),
+        |c| {
             match c {
                 Chunk::Block(b, s, e) => {
                     for i in s..e {
@@ -1449,7 +1509,8 @@ fn has_any_col_ne(
                 }
             }
             Ok(true)
-        })?;
+        },
+    )?;
     Ok(found)
 }
 
@@ -1488,6 +1549,7 @@ impl RangeCursor {
         out: &mut Vec<Id>,
         limit: usize,
     ) -> Result<()> {
+        debug_assert!(out.capacity() >= limit);
         out.clear();
         let Some(lo) = self.lo else {
             return Ok(());
@@ -1497,8 +1559,13 @@ impl RangeCursor {
         let mut stopped = false;
         let mut scanned = 0usize;
         let mut last_id = self.last_id;
-        ctx.snap
-            .scan_between_cols(self.perm, lo, self.hi, crate::index::ALL_COLS, |c| {
+        ctx.snap.scan_between_cols_checked(
+            self.perm,
+            lo,
+            self.hi,
+            crate::index::ALL_COLS,
+            || ctx.check(),
+            |c| {
                 match c {
                     Chunk::Block(b, s, e) => {
                         for i in s..e {
@@ -1545,7 +1612,8 @@ impl RangeCursor {
                     }
                 }
                 Ok(true)
-            })?;
+            },
+        )?;
         self.last_id = last_id;
         self.lo = if stopped {
             last_key
@@ -1571,6 +1639,7 @@ impl RangeCursor {
         out: &mut Vec<(Id, Id)>,
         limit: usize,
     ) -> Result<()> {
+        debug_assert!(out.capacity() >= limit);
         out.clear();
         let Some(lo) = self.lo else {
             return Ok(());
@@ -1580,8 +1649,13 @@ impl RangeCursor {
         let mut stopped = false;
         let mut scanned = 0usize;
         let mut last_pair = self.last_pair;
-        ctx.snap
-            .scan_between_cols(self.perm, lo, self.hi, crate::index::ALL_COLS, |c| {
+        ctx.snap.scan_between_cols_checked(
+            self.perm,
+            lo,
+            self.hi,
+            crate::index::ALL_COLS,
+            || ctx.check(),
+            |c| {
                 match c {
                     Chunk::Block(b, s, e) => {
                         for i in s..e {
@@ -1628,7 +1702,8 @@ impl RangeCursor {
                     }
                 }
                 Ok(true)
-            })?;
+            },
+        )?;
         self.last_pair = last_pair;
         self.lo = if stopped {
             last_key.and_then(key_successor).filter(|k| *k <= self.hi)
@@ -1720,7 +1795,7 @@ impl ListWalk {
     }
 
     fn bytes(&self) -> u64 {
-        (self.seen.capacity() as u64).saturating_mul(16)
+        hashset_id_bytes(self.seen.capacity())
     }
 
     fn step(
@@ -1737,10 +1812,12 @@ impl ListWalk {
             }
             if !self.seen.contains(&c) {
                 if self.seen.len() == self.seen.capacity() {
-                    let grown = (self.seen.capacity() * 2).max(8);
-                    admit_extra((grown as u64).saturating_mul(16))?;
+                    admit_extra(hashset_id_growth_bytes(self.seen.capacity()))?;
+                    self.seen.insert(c);
+                    admit_extra(self.bytes())?;
+                } else {
+                    self.seen.insert(c);
                 }
-                self.seen.insert(c);
             } else {
                 self.cell = None;
                 return Ok(None);
@@ -1782,7 +1859,13 @@ impl HeadScan {
         (self.buf.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64)
     }
 
-    fn next_head(&mut self, ctx: &Ctx, graph: &GraphFilter, ids: &StoreIds) -> Result<Option<Id>> {
+    fn next_head(
+        &mut self,
+        ctx: &Ctx,
+        graph: &GraphFilter,
+        ids: &StoreIds,
+        admit_buf: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Option<Id>> {
         loop {
             while self.at < self.buf.len() {
                 let s = self.buf[self.at];
@@ -1792,12 +1875,15 @@ impl HeadScan {
                 }
             }
             if !self.rest_scan.is_done() {
+                ctx.check()?;
+                prepare_id_buf(&mut self.buf, admit_buf)?;
                 self.rest_scan
                     .next_ids(ctx, graph, 1, true, &mut self.buf, RANGE_CHUNK)?;
                 self.at = 0;
                 continue;
             }
             if !self.checked_nil {
+                ctx.check()?;
                 self.checked_nil = true;
                 let as_object = has_any_col_ne(ctx, graph, Perm::Osp, &[ids.nil.0], 2, ids.rest.0)?;
                 let as_subject = has_any(ctx, graph, Perm::Spo, &[ids.nil.0])?;
@@ -1810,7 +1896,7 @@ impl HeadScan {
     }
 }
 
-/// Walk backwards from a list cell to its list head, charging the cycle set.
+/// Walk backwards from a list cell to its list head, charging the cycle set until dropped.
 fn head_of_cell(
     ctx: &Ctx,
     graph: &GraphFilter,
@@ -1818,27 +1904,32 @@ fn head_of_cell(
     cell: Id,
     admit: &mut dyn FnMut(u64) -> Result<()>,
 ) -> Result<Id> {
-    let mut c = cell;
-    let mut seen = FxHashSet::default();
-    while seen.len() < MAX_CELLS && !seen.contains(&c) {
-        if seen.len() == seen.capacity() {
-            let grown = (seen.capacity() * 2).max(8);
-            admit((grown as u64).saturating_mul(16))?;
+    let head = {
+        let mut c = cell;
+        let mut seen = FxHashSet::default();
+        while seen.len() < MAX_CELLS && !seen.contains(&c) {
+            if seen.len() == seen.capacity() {
+                admit(hashset_id_growth_bytes(seen.capacity()))?;
+                seen.insert(c);
+                admit(hashset_id_bytes(seen.capacity()))?;
+            } else {
+                seen.insert(c);
+            }
+            if seen.len().is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            match first_col(ctx, graph, Perm::Pos, &[ids.rest.0, c.0], 2)? {
+                Some(prev) => c = prev,
+                None => break,
+            }
         }
-        seen.insert(c);
-        if seen.len().is_multiple_of(1024) {
-            ctx.check()?;
-        }
-        match first_col(ctx, graph, Perm::Pos, &[ids.rest.0, c.0], 2)? {
-            Some(prev) => c = prev,
-            None => break,
-        }
-    }
+        c
+    };
     admit(0)?;
-    Ok(c)
+    Ok(head)
 }
 
-/// Compute the length of one list starting at `head`, charging its cycle set.
+/// Compute the length of one list starting at `head`, charging its cycle set until dropped.
 fn list_length(
     ctx: &Ctx,
     graph: &GraphFilter,
@@ -1849,122 +1940,224 @@ fn list_length(
     if !ids.is_list(ctx, graph, head)? {
         return Ok(None);
     }
-    let mut len = 0usize;
-    let mut cell = head;
-    let mut seen = FxHashSet::default();
-    while cell != ids.nil && seen.len() < MAX_CELLS && !seen.contains(&cell) {
-        if seen.len() == seen.capacity() {
-            let grown = (seen.capacity() * 2).max(8);
-            admit((grown as u64).saturating_mul(16))?;
+    let len = {
+        let mut len = 0usize;
+        let mut cell = head;
+        let mut seen = FxHashSet::default();
+        while cell != ids.nil && seen.len() < MAX_CELLS && !seen.contains(&cell) {
+            if seen.len() == seen.capacity() {
+                admit(hashset_id_growth_bytes(seen.capacity()))?;
+                seen.insert(cell);
+                admit(hashset_id_bytes(seen.capacity()))?;
+            } else {
+                seen.insert(cell);
+            }
+            len += 1;
+            if seen.len().is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            match first_col(ctx, graph, Perm::Pso, &[ids.rest.0, cell.0], 2)? {
+                Some(next) => cell = next,
+                None => break,
+            }
         }
-        seen.insert(cell);
-        len += 1;
-        if seen.len().is_multiple_of(1024) {
-            ctx.check()?;
-        }
-        match first_col(ctx, graph, Perm::Pso, &[ids.rest.0, cell.0], 2)? {
-            Some(next) => cell = next,
-            None => break,
-        }
-    }
+        len
+    };
     admit(0)?;
     Ok(Some(len))
 }
 
-/// Resumable O(1)-memory iterator reproducing [`java_split`] verbatim.
+/// Compile a `regex_automata::meta::Regex` for `apf:strSplit`, pre-admitting its
+/// compilation envelope and retained program/cache bytes against the query memory budget.
+fn compile_split_regex(
+    ctx: &Ctx,
+    pattern: &str,
+    charge: &mut super::ctx::OwnedCharge,
+    base_bytes: u64,
+    bad: &dyn Fn(&str) -> Error,
+) -> Result<(
+    regex_automata::meta::Regex,
+    regex_automata::meta::Cache,
+    u64,
+)> {
+    let pat_envelope = (pattern.len() as u64)
+        .saturating_mul(256)
+        .saturating_add(4096);
+    let available = ctx.memory_remaining();
+    let maximum = ((available.saturating_sub(pat_envelope) / 48).min(4 << 20)) as usize;
+    if maximum < 1024 {
+        return Err(ctx.memory_exceeded(ctx.mem_limit.saturating_add(1)));
+    }
+    charge.resize(base_bytes.saturating_add(pat_envelope))?;
+    let mut nfa = maximum.min(pattern.len().saturating_mul(128).saturating_add(8192));
+    let (program, hybrid) = loop {
+        ctx.check()?;
+        let hybrid = (nfa * 2).min(2 << 20);
+        let build_bytes = pat_envelope
+            .saturating_add((nfa as u64).saturating_mul(32))
+            .saturating_add((hybrid as u64).saturating_mul(4));
+        charge.resize(base_bytes.saturating_add(build_bytes))?;
+        let built = regex_automata::meta::Regex::builder()
+            .configure(
+                regex_automata::meta::Regex::config()
+                    .nfa_size_limit(Some(nfa))
+                    .hybrid_cache_capacity(hybrid)
+                    .dfa(false)
+                    .pool_capacity(0)
+                    .onepass(false)
+                    .backtrack(false),
+            )
+            .build(pattern);
+        match built {
+            Ok(program) => break (program, hybrid),
+            Err(e) if e.size_limit().is_some() && nfa < maximum => {
+                nfa = nfa.saturating_mul(2).min(maximum);
+            }
+            Err(e) if e.size_limit().is_some() && maximum < (4 << 20) => {
+                return Err(ctx.memory_exceeded(ctx.mem_limit.saturating_add(1)));
+            }
+            Err(e) => return Err(bad(&e.to_string())),
+        }
+    };
+    let cache_bytes = (program.memory_usage() as u64)
+        .saturating_mul(
+            (program.captures_len() as u64)
+                .saturating_mul(8)
+                .saturating_add(16),
+        )
+        .saturating_add((hybrid as u64).saturating_mul(2))
+        .saturating_add((program.captures_len() as u64).saturating_mul(512))
+        .saturating_add(4096);
+    let retained = (program.memory_usage() as u64)
+        .saturating_add(cache_bytes)
+        .saturating_add(4096);
+    charge.resize(base_bytes.saturating_add(retained))?;
+    let cache = program.create_cache();
+    ctx.check()?;
+    Ok((program, cache, retained))
+}
+
+/// Resumable O(1)-extra-memory iterator reproducing [`java_split`] verbatim.
 struct StrSplitIter {
-    re: regex::Regex,
+    re: regex_automata::meta::Regex,
+    cache: regex_automata::meta::Cache,
+    regex_bytes: u64,
     text: String,
     search_at: usize,
+    last_match_end: Option<usize>,
     last: usize,
     pending_empty: usize,
-    next_non_empty: Option<String>,
-    emitted_any: bool,
+    next_non_empty: Option<(usize, usize)>,
     empty_input: bool,
     finished_scan: bool,
 }
 
 impl StrSplitIter {
-    fn new(re: regex::Regex, text: String) -> Self {
+    fn new(
+        re: regex_automata::meta::Regex,
+        cache: regex_automata::meta::Cache,
+        regex_bytes: u64,
+        text: String,
+    ) -> Self {
         let empty_input = text.is_empty();
         Self {
             re,
+            cache,
+            regex_bytes,
             text,
             search_at: 0,
+            last_match_end: None,
             last: 0,
             pending_empty: 0,
             next_non_empty: None,
-            emitted_any: false,
             empty_input,
             finished_scan: empty_input,
         }
     }
 
-    fn next_token(&mut self) -> Option<String> {
+    fn bytes(&self) -> u64 {
+        (self.text.capacity() as u64).saturating_add(self.regex_bytes)
+    }
+
+    fn next_token(&mut self, ctx: &Ctx) -> Result<Option<&str>> {
+        self.next_token_checked(|| ctx.check())
+    }
+
+    fn next_token_checked(
+        &mut self,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<Option<&str>> {
         if self.empty_input {
             self.empty_input = false;
-            return Some(String::new());
+            return Ok(Some(""));
         }
+        let mut steps = 0usize;
         loop {
-            if let Some(next) = self.next_non_empty.as_ref() {
+            if let Some((start, end)) = self.next_non_empty {
                 if self.pending_empty > 0 {
                     self.pending_empty -= 1;
-                    self.emitted_any = true;
-                    return Some(String::new());
+                    return Ok(Some(""));
                 }
-                let out = next.trim().to_string();
                 self.next_non_empty = None;
-                self.emitted_any = true;
-                return Some(out);
+                return Ok(Some(self.text[start..end].trim()));
             }
             if self.finished_scan {
                 // Any remaining pending_empty are trailing empty strings and are dropped.
                 self.pending_empty = 0;
-                return None;
+                return Ok(None);
             }
-            let part: &str = loop {
+            let (start, end) = loop {
+                steps += 1;
+                if steps.is_multiple_of(1024) {
+                    check()?;
+                }
                 if self.search_at > self.text.len() {
                     self.finished_scan = true;
-                    break &self.text[self.last..];
+                    break (self.last, self.text.len());
                 }
-                match self.re.find_at(&self.text, self.search_at) {
-                    Some(m) => {
-                        if m.start() == m.end() {
-                            if m.end() == 0 {
-                                self.search_at = self.text[0..]
-                                    .chars()
-                                    .next()
-                                    .map_or(self.text.len() + 1, char::len_utf8);
-                                continue;
-                            }
-                            if m.start() >= self.text.len() {
-                                self.finished_scan = true;
-                                break &self.text[self.last..];
-                            }
-                            let p = &self.text[self.last..m.start()];
-                            self.last = m.end();
-                            self.search_at = self.text[m.end()..]
-                                .chars()
-                                .next()
-                                .map_or(self.text.len() + 1, |c| m.end() + c.len_utf8());
-                            break p;
-                        } else {
-                            let p = &self.text[self.last..m.start()];
-                            self.last = m.end();
-                            self.search_at = m.end();
-                            break p;
-                        }
-                    }
-                    None => {
+                let input = regex_automata::Input::new(&self.text).range(self.search_at..);
+                let Some(mut m) = self.re.search_with(&mut self.cache, &input) else {
+                    self.finished_scan = true;
+                    break (self.last, self.text.len());
+                };
+                // Reproduce `regex::Regex::find_iter` (`Searcher::try_advance`): skip a
+                // zero-width match immediately following the previous match by advancing
+                // one UTF-8 scalar value.
+                if m.is_empty() && Some(m.end()) == self.last_match_end {
+                    if m.end() >= self.text.len() {
                         self.finished_scan = true;
-                        break &self.text[self.last..];
+                        break (self.last, self.text.len());
                     }
+                    let next_at = m.end()
+                        + self.text[m.end()..]
+                            .chars()
+                            .next()
+                            .map_or(1, char::len_utf8);
+                    let next_input = regex_automata::Input::new(&self.text).range(next_at..);
+                    let Some(m2) = self.re.search_with(&mut self.cache, &next_input) else {
+                        self.finished_scan = true;
+                        break (self.last, self.text.len());
+                    };
+                    m = m2;
                 }
+                self.search_at = m.end();
+                self.last_match_end = Some(m.end());
+                if m.end() == 0 {
+                    // A zero-length match at the start gives no leading empty string.
+                    continue;
+                }
+                if m.start() == m.end() && m.start() >= self.text.len() {
+                    self.finished_scan = true;
+                    break (self.last, self.text.len());
+                }
+                let range = (self.last, m.start());
+                self.last = m.end();
+                break range;
             };
-            if part.is_empty() {
+            if start == end {
                 self.pending_empty += 1;
             } else {
-                self.next_non_empty = Some(part.to_owned());
+                self.next_non_empty = Some((start, end));
             }
         }
     }
@@ -2021,7 +2214,7 @@ impl OneContainer {
                 ..
             } => (pair_buf.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<(Id, Id)>() as u64)
-                .saturating_add((by_number.len() as u64).saturating_mul(40)),
+                .saturating_add(btree_map_bytes(by_number.len())),
         }
     }
 }
@@ -2090,7 +2283,7 @@ impl ContainerStream {
             ContainerCandidates::Done => 0,
             ContainerCandidates::ByType { buf, seen, .. } => (buf.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<Id>() as u64)
-                .saturating_add((seen.capacity() as u64).saturating_mul(16)),
+                .saturating_add(hashset_id_bytes(seen.capacity())),
             ContainerCandidates::ByMember { buf, .. } => {
                 (buf.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64)
             }
@@ -2099,13 +2292,37 @@ impl ContainerStream {
     }
 }
 
+/// One candidate slot tuple produced by [`LeafReader::next_solution`].
+/// Every built-in function except `apf:concat` has at most 3 slots and stays stack-only.
+enum Solution {
+    Fixed([Id; 3], u8),
+    Wide(Vec<Id>),
+}
+
+impl Solution {
+    fn pair(a: Id, b: Id) -> Self {
+        Self::Fixed([a, b, Id::UNDEF], 2)
+    }
+
+    fn triple(a: Id, b: Id, c: Id) -> Self {
+        Self::Fixed([a, b, c], 3)
+    }
+
+    fn as_slice(&self) -> &[Id] {
+        match self {
+            Self::Fixed(arr, len) => &arr[..usize::from(*len)],
+            Self::Wide(v) => v.as_slice(),
+        }
+    }
+}
+
 enum ReaderMode {
     Done,
     /// Pre-evaluated 0-or-1-row constant result (`Version`, `Assign`, `BNode`, `Str`,
     /// `Concat`, `SplitIri`, or bound-subject `StrSplit`).
-    Single(Option<Vec<Id>>),
+    Single(Option<Solution>),
     StrSplit {
-        iter: StrSplitIter,
+        iter: Box<StrSplitIter>,
         s: Id,
         re: Id,
     },
@@ -2179,45 +2396,83 @@ pub(crate) struct LeafReader {
     graph: GraphFilter,
     same_var_pairs: Vec<(usize, usize)>,
     out_slot: Vec<usize>,
+    row_buf: Vec<Id>,
     ids: Option<StoreIds>,
     numbers: FxHashMap<Id, Option<u64>>,
     mode: ReaderMode,
     charge: super::ctx::OwnedCharge,
-    scratch_bytes: u64,
 }
 
 impl LeafReader {
     pub(crate) fn open(ctx: &std::sync::Arc<Ctx>, spec: &PfSpec, vars: &[VarId]) -> Result<Self> {
         ctx.check()?;
-        let args: Vec<Option<Id>> = spec
-            .slots
-            .iter()
-            .map(|s| match s {
+        let mut charge = super::ctx::OwnedCharge::new(ctx, 0)?;
+
+        // Pre-admit open-time metadata vectors (`args`, O(k) `same_var_pairs`, `out_slot`,
+        // `row_buf`, and the temporary first-occurrence map for duplicate slots).
+        let args_bytes =
+            (spec.slots.len() as u64).saturating_mul(std::mem::size_of::<Option<Id>>() as u64);
+        let pairs_upper = (spec.slots.len().next_power_of_two() as u64)
+            .saturating_mul(std::mem::size_of::<(usize, usize)>() as u64);
+        let out_slot_bytes =
+            (vars.len() as u64).saturating_mul(std::mem::size_of::<usize>() as u64);
+        let row_buf_bytes = (vars.len() as u64).saturating_mul(std::mem::size_of::<Id>() as u64);
+        let first_pos_bytes = (spec.slots.len().next_power_of_two() as u64).saturating_mul(24);
+        let open_meta_peak = args_bytes
+            .saturating_add(pairs_upper)
+            .saturating_add(out_slot_bytes)
+            .saturating_add(row_buf_bytes)
+            .saturating_add(first_pos_bytes);
+        charge.resize(open_meta_peak)?;
+
+        let mut args = Vec::with_capacity(spec.slots.len());
+        for s in &spec.slots {
+            args.push(match s {
                 PathEnd::Const(id) => Some(*id),
                 PathEnd::Var(_) => None,
-            })
-            .collect();
+            });
+        }
         let mut same_var_pairs = Vec::new();
-        for (j, s) in spec.slots.iter().enumerate() {
-            let PathEnd::Var(v) = s else {
-                continue;
-            };
-            for (k, t) in spec.slots.iter().enumerate().skip(j + 1) {
-                if matches!(t, PathEnd::Var(x) if x == v) {
-                    same_var_pairs.push((j, k));
+        {
+            let mut first_pos: FxHashMap<VarId, usize> = FxHashMap::default();
+            for (j, s) in spec.slots.iter().enumerate() {
+                let PathEnd::Var(v) = s else {
+                    continue;
+                };
+                match first_pos.entry(*v) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(j);
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        same_var_pairs.push((*e.get(), j));
+                    }
                 }
             }
         }
-        let out_slot: Vec<usize> = vars
-            .iter()
-            .map(|v| {
+        let mut out_slot = Vec::with_capacity(vars.len());
+        for v in vars {
+            out_slot.push(
                 spec.slots
                     .iter()
                     .position(|s| matches!(s, PathEnd::Var(x) if x == v))
-                    .expect("a leaf property-function variable belongs to a slot")
-            })
-            .collect();
-        let mut charge = super::ctx::OwnedCharge::new(ctx, 0)?;
+                    .expect("a leaf property-function variable belongs to a slot"),
+            );
+        }
+        let row_buf = vec![Id::UNDEF; vars.len()];
+
+        let retained_meta = (same_var_pairs.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<(usize, usize)>() as u64)
+            .saturating_add(
+                (out_slot.capacity() as u64).saturating_mul(std::mem::size_of::<usize>() as u64),
+            )
+            .saturating_add(
+                (row_buf.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64),
+            );
+        let open_base = retained_meta.saturating_add(
+            (args.capacity() as u64).saturating_mul(std::mem::size_of::<Option<Id>>() as u64),
+        );
+        charge.resize(open_base)?;
+
         let int = |n: i64| ctx.intern_value(&Value::Integer(n.into()));
         let string = |s: &str| ctx.intern_value(&Value::Str(s.into()));
         let bad = |m: &str| Error::invalid(format!("{}: {m}", spec.kind.name()));
@@ -2249,16 +2504,17 @@ impl LeafReader {
                 ids = Some(sids);
                 match (args[0], args[1]) {
                     (Some(l), o) => {
-                        let len =
-                            list_length(ctx, &spec.graph, &sids, l, &mut |b| charge.resize(b))?;
+                        let len = list_length(ctx, &spec.graph, &sids, l, &mut |b| {
+                            charge.resize(open_base.saturating_add(b))
+                        })?;
                         match len {
                             Some(n) => {
                                 let nid = int(n as i64);
                                 ctx.check()?;
                                 match o {
-                                    None => ReaderMode::Single(Some(vec![l, nid])),
+                                    None => ReaderMode::Single(Some(Solution::pair(l, nid))),
                                     Some(x) if integer(ctx, x) == integer(ctx, nid) => {
-                                        ReaderMode::Single(Some(vec![l, x]))
+                                        ReaderMode::Single(Some(Solution::pair(l, x)))
                                     }
                                     Some(_) => ReaderMode::Done,
                                 }
@@ -2280,12 +2536,14 @@ impl LeafReader {
                     Some(i) => match integer(ctx, i) {
                         Some(p) if p >= 0 => Some(p),
                         _ => {
-                            return Ok(Self::empty(
+                            drop(args);
+                            return Self::empty(
                                 spec.graph.clone(),
                                 same_var_pairs,
                                 out_slot,
+                                row_buf,
                                 charge,
-                            ));
+                            );
                         }
                     },
                     None => None,
@@ -2361,93 +2619,148 @@ impl LeafReader {
             }
             PfKind::StrSplit => {
                 let (Some(s), Some(re_arg)) = (args[1], args[2]) else {
-                    return Ok(Self::empty(
+                    drop(args);
+                    return Self::empty(
                         spec.graph.clone(),
                         same_var_pairs,
                         out_slot,
+                        row_buf,
                         charge,
-                    ));
+                    );
                 };
-                let (Some(text), Some(pattern)) =
-                    (literal_lexical(ctx, s), literal_lexical(ctx, re_arg))
+                let (Some(Term::Literal(text_lit)), Some(Term::Literal(pat_lit))) =
+                    (ctx.term(s), ctx.term(re_arg))
                 else {
-                    return Ok(Self::empty(
+                    ctx.check()?;
+                    drop(args);
+                    return Self::empty(
                         spec.graph.clone(),
                         same_var_pairs,
                         out_slot,
+                        row_buf,
                         charge,
-                    ));
+                    );
                 };
                 ctx.check()?;
-                let re = regex::Regex::new(&pattern).map_err(|e| bad(&e.to_string()))?;
+                let text_len = text_lit.value().len() as u64;
+                let with_text = open_base.saturating_add(text_len);
+                charge.resize(with_text)?;
+                let (program, cache, regex_bytes) =
+                    compile_split_regex(ctx, pat_lit.value(), &mut charge, with_text, &bad)?;
+                let mut text = String::new();
+                text.reserve_exact(text_lit.value().len());
+                text.push_str(text_lit.value());
+                drop(text_lit);
+                drop(pat_lit);
+                let mut iter = StrSplitIter::new(program, cache, regex_bytes, text);
+                let box_bytes = std::mem::size_of::<StrSplitIter>() as u64;
+                charge.resize(
+                    open_base
+                        .saturating_add(iter.bytes())
+                        .saturating_add(box_bytes),
+                )?;
                 match args[0] {
-                    None => {
-                        charge.resize(text.capacity() as u64)?;
-                        ReaderMode::StrSplit {
-                            iter: StrSplitIter::new(re, text),
-                            s,
-                            re: re_arg,
-                        }
-                    }
+                    None => ReaderMode::StrSplit {
+                        iter: Box::new(iter),
+                        s,
+                        re: re_arg,
+                    },
                     Some(x) => match ctx.value(x) {
                         Some(Value::Str(v)) => {
-                            let mut iter = StrSplitIter::new(re, text);
                             let mut matched = false;
                             let mut checked = 0usize;
-                            while let Some(tok) = iter.next_token() {
+                            while let Some(tok) = iter.next_token(ctx)? {
                                 checked += 1;
                                 if checked.is_multiple_of(1024) {
                                     ctx.check()?;
                                 }
-                                if tok == *v {
+                                if *tok == *v {
                                     matched = true;
                                     break;
                                 }
                             }
+                            drop(iter);
+                            charge.resize(open_base)?;
                             if matched {
-                                ReaderMode::Single(Some(vec![x, s, re_arg]))
+                                ReaderMode::Single(Some(Solution::triple(x, s, re_arg)))
                             } else {
                                 ReaderMode::Done
                             }
                         }
-                        _ => ReaderMode::Done,
+                        _ => {
+                            drop(iter);
+                            charge.resize(open_base)?;
+                            ReaderMode::Done
+                        }
                     },
                 }
             }
             PfKind::Concat => {
-                let mut text = String::new();
-                for a in &args[1..] {
+                let mut total_len = 0usize;
+                for (idx, a) in args[1..].iter().enumerate() {
+                    if idx.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
                     let Some(a) = a else {
-                        return Ok(Self::empty(
+                        drop(args);
+                        return Self::empty(
                             spec.graph.clone(),
                             same_var_pairs,
                             out_slot,
+                            row_buf,
                             charge,
-                        ));
+                        );
                     };
-                    match ctx.term(*a) {
-                        Some(Term::NamedNode(n)) => text.push_str(n.as_str()),
-                        Some(Term::Literal(l)) => text.push_str(l.value()),
+                    let piece_len = match ctx.term(*a) {
+                        Some(Term::NamedNode(n)) => n.as_str().len(),
+                        Some(Term::Literal(l)) => l.value().len(),
                         _ => {
-                            return Ok(Self::empty(
+                            ctx.check()?;
+                            drop(args);
+                            return Self::empty(
                                 spec.graph.clone(),
                                 same_var_pairs,
                                 out_slot,
+                                row_buf,
                                 charge,
-                            ));
+                            );
+                        }
+                    };
+                    total_len = total_len
+                        .checked_add(piece_len)
+                        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+                }
+                charge.resize(open_base.saturating_add(total_len as u64))?;
+                let v = {
+                    let mut text = String::new();
+                    text.reserve_exact(total_len);
+                    for (idx, a) in args[1..].iter().enumerate() {
+                        if idx.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        match ctx.term(a.expect("validated arg")) {
+                            Some(Term::NamedNode(n)) => text.push_str(n.as_str()),
+                            Some(Term::Literal(l)) => text.push_str(l.value()),
+                            _ => unreachable!("validated above"),
                         }
                     }
-                }
-                let v = string(&text);
+                    string(&text)
+                };
                 ctx.check()?;
+                let sol_bytes =
+                    (args.len() as u64).saturating_mul(std::mem::size_of::<Id>() as u64);
+                charge.resize(open_base.saturating_add(sol_bytes))?;
                 match args[0] {
-                    None => ReaderMode::Single(Some(
-                        std::iter::once(v)
-                            .chain(args[1..].iter().flatten().copied())
-                            .collect(),
-                    )),
+                    None => {
+                        let mut sol = Vec::with_capacity(args.len());
+                        sol.push(v);
+                        sol.extend(args[1..].iter().flatten().copied());
+                        ReaderMode::Single(Some(Solution::Wide(sol)))
+                    }
                     Some(x) if x == v => {
-                        ReaderMode::Single(Some(args.iter().flatten().copied().collect()))
+                        let mut sol = Vec::with_capacity(args.len());
+                        sol.extend(args.iter().flatten().copied());
+                        ReaderMode::Single(Some(Solution::Wide(sol)))
                     }
                     Some(_) => ReaderMode::Done,
                 }
@@ -2456,12 +2769,15 @@ impl LeafReader {
                 if let Some(s) = args[0]
                     && !matches!(ctx.term(s), Some(Term::Literal(_)))
                 {
-                    return Ok(Self::empty(
+                    ctx.check()?;
+                    drop(args);
+                    return Self::empty(
                         spec.graph.clone(),
                         same_var_pairs,
                         out_slot,
+                        row_buf,
                         charge,
-                    ));
+                    );
                 }
                 let Some(o) = args[1] else {
                     return Err(bad("the object is an unbound variable"));
@@ -2469,31 +2785,39 @@ impl LeafReader {
                 let v = match ctx.term(o) {
                     Some(Term::NamedNode(n)) => string(n.as_str()),
                     Some(Term::Literal(l)) => string(l.value()),
-                    _ => return Err(bad("the object is a blank node")),
+                    _ => {
+                        ctx.check()?;
+                        return Err(bad("the object is a blank node"));
+                    }
                 };
                 ctx.check()?;
                 match args[0] {
-                    None => ReaderMode::Single(Some(vec![v, o])),
-                    Some(s) if s == v => ReaderMode::Single(Some(vec![s, o])),
+                    None => ReaderMode::Single(Some(Solution::pair(v, o))),
+                    Some(s) if s == v => ReaderMode::Single(Some(Solution::pair(s, o))),
                     Some(_) => ReaderMode::Done,
                 }
             }
             PfKind::SplitIri => {
                 let Some(s) = args[0] else {
-                    return Ok(Self::empty(
+                    drop(args);
+                    return Self::empty(
                         spec.graph.clone(),
                         same_var_pairs,
                         out_slot,
+                        row_buf,
                         charge,
-                    ));
+                    );
                 };
                 let Some(Term::NamedNode(iri)) = ctx.term(s) else {
-                    return Ok(Self::empty(
+                    ctx.check()?;
+                    drop(args);
+                    return Self::empty(
                         spec.graph.clone(),
                         same_var_pairs,
                         out_slot,
+                        row_buf,
                         charge,
-                    ));
+                    );
                 };
                 let at = super::fnlib::split_xml(iri.as_str());
                 let (ns, local) = iri.as_str().split_at(at);
@@ -2510,12 +2834,14 @@ impl LeafReader {
                             _ => None,
                         };
                         if text.as_deref() != Some(ns) {
-                            return Ok(Self::empty(
+                            drop(args);
+                            return Self::empty(
                                 spec.graph.clone(),
                                 same_var_pairs,
                                 out_slot,
+                                row_buf,
                                 charge,
-                            ));
+                            );
                         }
                         x
                     }
@@ -2528,28 +2854,30 @@ impl LeafReader {
                     }
                     Some(x) => {
                         if string_literal(ctx, x).as_deref() != Some(local) {
-                            return Ok(Self::empty(
+                            drop(args);
+                            return Self::empty(
                                 spec.graph.clone(),
                                 same_var_pairs,
                                 out_slot,
+                                row_buf,
                                 charge,
-                            ));
+                            );
                         }
                         x
                     }
                 };
-                ReaderMode::Single(Some(vec![s, nsv, lv]))
+                ReaderMode::Single(Some(Solution::triple(s, nsv, lv)))
             }
             PfKind::Assign => match (args[0], args[1]) {
                 (None, None) => return Err(bad("both the subject and the object are unbound")),
-                (None, Some(o)) => ReaderMode::Single(Some(vec![o, o])),
-                (Some(s), None) => ReaderMode::Single(Some(vec![s, s])),
+                (None, Some(o)) => ReaderMode::Single(Some(Solution::pair(o, o))),
+                (Some(s), None) => ReaderMode::Single(Some(Solution::pair(s, s))),
                 (Some(s), Some(o)) => {
                     let same = s == o
                         || matches!((ctx.term(s), ctx.term(o)), (Some(a), Some(b))
                             if super::cdt::same_value(&a, &b).unwrap_or(false));
                     if same {
-                        ReaderMode::Single(Some(vec![s, o]))
+                        ReaderMode::Single(Some(Solution::pair(s, o)))
                     } else {
                         ReaderMode::Done
                     }
@@ -2560,18 +2888,21 @@ impl LeafReader {
                     return Err(bad("the subject is an unbound variable"));
                 };
                 let Some(Term::BlankNode(b)) = ctx.term(s) else {
-                    return Ok(Self::empty(
+                    ctx.check()?;
+                    drop(args);
+                    return Self::empty(
                         spec.graph.clone(),
                         same_var_pairs,
                         out_slot,
+                        row_buf,
                         charge,
-                    ));
+                    );
                 };
                 let label = string(b.as_str());
                 ctx.check()?;
                 match args[1] {
-                    None => ReaderMode::Single(Some(vec![s, label])),
-                    Some(o) if o == label => ReaderMode::Single(Some(vec![s, o])),
+                    None => ReaderMode::Single(Some(Solution::pair(s, label))),
+                    Some(o) if o == label => ReaderMode::Single(Some(Solution::pair(s, o))),
                     Some(_) => ReaderMode::Done,
                 }
             }
@@ -2582,22 +2913,23 @@ impl LeafReader {
                 ctx.check()?;
                 match (args[0], args[1]) {
                     (s, o) if s.is_none_or(|s| s == subject) && o.is_none_or(|o| o == version) => {
-                        ReaderMode::Single(Some(vec![subject, version]))
+                        ReaderMode::Single(Some(Solution::pair(subject, version)))
                     }
                     _ => ReaderMode::Done,
                 }
             }
         };
 
+        drop(args);
         let mut reader = Self {
             graph: spec.graph.clone(),
             same_var_pairs,
             out_slot,
+            row_buf,
             ids,
             numbers: FxHashMap::default(),
             mode,
             charge,
-            scratch_bytes: 0,
         };
         reader.sync_charge(0)?;
         Ok(reader)
@@ -2607,25 +2939,53 @@ impl LeafReader {
         graph: GraphFilter,
         same_var_pairs: Vec<(usize, usize)>,
         out_slot: Vec<usize>,
+        row_buf: Vec<Id>,
         charge: super::ctx::OwnedCharge,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let mut reader = Self {
             graph,
             same_var_pairs,
             out_slot,
+            row_buf,
             ids: None,
             numbers: FxHashMap::default(),
             mode: ReaderMode::Done,
             charge,
-            scratch_bytes: 0,
-        }
+        };
+        reader.sync_charge(0)?;
+        Ok(reader)
+    }
+
+    fn fixed_meta_bytes(&self) -> u64 {
+        (self.same_var_pairs.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<(usize, usize)>() as u64)
+            .saturating_add(
+                (self.out_slot.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<usize>() as u64),
+            )
+            .saturating_add(
+                (self.row_buf.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64),
+            )
+    }
+
+    fn base_fixed_bytes(&self) -> u64 {
+        self.fixed_meta_bytes()
+            .saturating_add((self.numbers.capacity() as u64).saturating_mul(32))
     }
 
     fn base_bytes(&self) -> u64 {
-        let nums = (self.numbers.capacity() as u64).saturating_mul(32);
+        let fixed = self.base_fixed_bytes();
         let mode = match &self.mode {
-            ReaderMode::Done | ReaderMode::Single(_) => 0,
-            ReaderMode::StrSplit { iter, .. } => iter.text.capacity() as u64,
+            ReaderMode::Done => 0,
+            ReaderMode::Single(slot) => match slot {
+                Some(Solution::Wide(v)) => {
+                    (v.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64)
+                }
+                Some(Solution::Fixed(..)) | None => 0,
+            },
+            ReaderMode::StrSplit { iter, .. } => iter
+                .bytes()
+                .saturating_add(std::mem::size_of::<StrSplitIter>() as u64),
             ReaderMode::MemberBound { walk, .. } | ReaderMode::IndexBound { walk, .. } => {
                 walk.bytes()
             }
@@ -2648,7 +3008,7 @@ impl LeafReader {
                         (buf.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64)
                     }
                 };
-                h.saturating_add((seen_heads.capacity() as u64).saturating_mul(16))
+                h.saturating_add(hashset_id_bytes(seen_heads.capacity()))
                     .saturating_add(walk.as_ref().map_or(0, ListWalk::bytes))
             }
             ReaderMode::Container(c) => c.bytes(),
@@ -2662,7 +3022,7 @@ impl LeafReader {
                 }
             },
         };
-        nums.saturating_add(mode).saturating_add(self.scratch_bytes)
+        fixed.saturating_add(mode)
     }
 
     fn sync_charge(&mut self, extra: u64) -> Result<()> {
@@ -2674,8 +3034,11 @@ impl LeafReader {
         if let Some(&cached) = self.numbers.get(&p) {
             return Ok(cached);
         }
-        if self.numbers.len() == self.numbers.capacity() {
+        let growing = self.numbers.len() == self.numbers.capacity();
+        if growing {
             let grown = (self.numbers.capacity() * 2).max(8);
+            // `sync_charge` already includes the old `self.numbers.capacity() * 32`, so adding
+            // `grown * 32` covers both old and new tables during rehash.
             self.sync_charge((grown as u64).saturating_mul(32))?;
         }
         let num = match ctx.term(p) {
@@ -2685,29 +3048,34 @@ impl LeafReader {
                 .and_then(|l| l.strip_prefix('_'))
                 .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|d| d.parse().ok()),
-            _ => None,
+            _ => {
+                ctx.check()?;
+                None
+            }
         };
         self.numbers.insert(p, num);
+        if growing {
+            self.sync_charge(0)?;
+        }
         Ok(num)
     }
 
-    fn push_solution(&self, sol: &[Id], out: &mut Table, row_buf: &mut [Id]) -> bool {
+    fn push_solution(&mut self, sol: &[Id], out: &mut Table) -> bool {
         for &(j, k) in &self.same_var_pairs {
             if sol[j] != sol[k] {
                 return false;
             }
         }
         for (c, &slot_idx) in self.out_slot.iter().enumerate() {
-            row_buf[c] = sol[slot_idx];
+            self.row_buf[c] = sol[slot_idx];
         }
-        out.push_row(row_buf);
+        out.push_row(&self.row_buf);
         true
     }
 
     /// Fill `out` with up to `cap` rows. Returns `true` once the reader is exhausted.
     pub(crate) fn next(&mut self, ctx: &Ctx, out: &mut Table, cap: usize) -> Result<bool> {
         let want = cap.max(1);
-        let mut row_buf = vec![Id::UNDEF; self.out_slot.len()];
         let mut skipped = 0usize;
         while out.len < want {
             ctx.check()?;
@@ -2716,7 +3084,7 @@ impl LeafReader {
                 self.sync_charge(0)?;
                 return Ok(true);
             };
-            if !self.push_solution(&sol, out, &mut row_buf) {
+            if !self.push_solution(sol.as_slice(), out) {
                 skipped += 1;
                 if skipped.is_multiple_of(1024) {
                     ctx.check()?;
@@ -2727,7 +3095,7 @@ impl LeafReader {
         Ok(matches!(self.mode, ReaderMode::Done))
     }
 
-    fn next_solution(&mut self, ctx: &Ctx) -> Result<Option<Vec<Id>>> {
+    fn next_solution(&mut self, ctx: &Ctx) -> Result<Option<Solution>> {
         let mut spins = 0usize;
         loop {
             spins += 1;
@@ -2743,17 +3111,17 @@ impl LeafReader {
                 }
                 ReaderMode::StrSplit { iter, s, re } => {
                     let (s, re) = (*s, *re);
-                    let Some(tok) = iter.next_token() else {
+                    let Some(tok) = iter.next_token(ctx)? else {
                         self.mode = ReaderMode::Done;
                         return Ok(None);
                     };
                     let id = ctx.intern_value(&Value::Str(tok.into()));
                     ctx.check()?;
-                    return Ok(Some(vec![id, s, re]));
+                    return Ok(Some(Solution::triple(id, s, re)));
                 }
                 ReaderMode::MemberBound { .. } => {
                     let ids = self.ids.expect("list ids");
-                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let base = self.base_fixed_bytes();
                     let (graph, charge) = (&self.graph, &mut self.charge);
                     let ReaderMode::MemberBound { walk, filter_m } = &mut self.mode else {
                         unreachable!()
@@ -2766,12 +3134,12 @@ impl LeafReader {
                         return Ok(None);
                     };
                     if filter_m.is_none_or(|want| want == m) {
-                        return Ok(Some(vec![walk.head, m]));
+                        return Ok(Some(Solution::pair(walk.head, m)));
                     }
                 }
                 ReaderMode::MemberAll { .. } => {
                     let ids = self.ids.expect("list ids");
-                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let base = self.base_fixed_bytes();
                     let (graph, charge) = (&self.graph, &mut self.charge);
                     let ReaderMode::MemberAll { heads, walk } = &mut self.mode else {
                         unreachable!()
@@ -2781,11 +3149,15 @@ impl LeafReader {
                         if let Some((_, m)) = w.step(ctx, graph, &ids, &mut |walk_b| {
                             charge.resize(base.saturating_add(hb).saturating_add(walk_b))
                         })? {
-                            return Ok(Some(vec![w.head, m]));
+                            return Ok(Some(Solution::pair(w.head, m)));
                         }
                         *walk = None;
+                        charge.resize(base.saturating_add(hb))?;
                     }
-                    let Some(h) = heads.next_head(ctx, graph, &ids)? else {
+                    let Some(h) = heads.next_head(ctx, graph, &ids, &mut |buf_b| {
+                        charge.resize(base.saturating_add(buf_b))
+                    })?
+                    else {
                         self.mode = ReaderMode::Done;
                         return Ok(None);
                     };
@@ -2793,7 +3165,7 @@ impl LeafReader {
                 }
                 ReaderMode::MemberByObject { .. } => {
                     let ids = self.ids.expect("list ids");
-                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let base = self.base_fixed_bytes();
                     let (graph, charge) = (&self.graph, &mut self.charge);
                     let ReaderMode::MemberByObject { m, cells, buf, at } = &mut self.mode else {
                         unreachable!()
@@ -2807,23 +3179,28 @@ impl LeafReader {
                         let head = head_of_cell(ctx, graph, &ids, cell, &mut |extra| {
                             charge.resize(base.saturating_add(buf_b).saturating_add(extra))
                         })?;
-                        return Ok(Some(vec![head, m]));
+                        return Ok(Some(Solution::pair(head, m)));
                     }
                     if cells.is_done() {
                         self.mode = ReaderMode::Done;
                         return Ok(None);
                     }
+                    ctx.check()?;
+                    prepare_id_buf(buf, &mut |buf_b| charge.resize(base.saturating_add(buf_b)))?;
                     cells.next_ids(ctx, graph, 2, false, buf, RANGE_CHUNK)?;
                     *at = 0;
                 }
                 ReaderMode::LengthAll { .. } => {
                     let ids = self.ids.expect("list ids");
-                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let base = self.base_fixed_bytes();
                     let (graph, charge) = (&self.graph, &mut self.charge);
                     let ReaderMode::LengthAll { heads } = &mut self.mode else {
                         unreachable!()
                     };
-                    let Some(h) = heads.next_head(ctx, graph, &ids)? else {
+                    let Some(h) = heads.next_head(ctx, graph, &ids, &mut |buf_b| {
+                        charge.resize(base.saturating_add(buf_b))
+                    })?
+                    else {
                         self.mode = ReaderMode::Done;
                         return Ok(None);
                     };
@@ -2833,12 +3210,12 @@ impl LeafReader {
                     })? {
                         let n = ctx.intern_value(&Value::Integer((len as i64).into()));
                         ctx.check()?;
-                        return Ok(Some(vec![h, n]));
+                        return Ok(Some(Solution::pair(h, n)));
                     }
                 }
                 ReaderMode::IndexBound { .. } => {
                     let ids = self.ids.expect("list ids");
-                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let base = self.base_fixed_bytes();
                     let (graph, charge) = (&self.graph, &mut self.charge);
                     let ReaderMode::IndexBound {
                         walk,
@@ -2864,7 +3241,7 @@ impl LeafReader {
                                 self.mode = ReaderMode::Done;
                                 let pid = ctx.intern_value(&Value::Integer(p.into()));
                                 ctx.check()?;
-                                return Ok(Some(vec![head, pid, m]));
+                                return Ok(Some(Solution::triple(head, pid, m)));
                             }
                         }
                         (Some(target), m) => {
@@ -2872,7 +3249,7 @@ impl LeafReader {
                                 let head = walk.head;
                                 self.mode = ReaderMode::Done;
                                 if m.is_none_or(|m| m == x) {
-                                    return Ok(Some(vec![head, i_arg.unwrap(), x]));
+                                    return Ok(Some(Solution::triple(head, i_arg.unwrap(), x)));
                                 }
                                 return Ok(None);
                             }
@@ -2881,13 +3258,13 @@ impl LeafReader {
                             let head = walk.head;
                             let pid = ctx.intern_value(&Value::Integer(p.into()));
                             ctx.check()?;
-                            return Ok(Some(vec![head, pid, x]));
+                            return Ok(Some(Solution::triple(head, pid, x)));
                         }
                     }
                 }
                 ReaderMode::IndexAll { .. } => {
                     let ids = self.ids.expect("list ids");
-                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let base = self.base_fixed_bytes();
                     let (graph, charge) = (&self.graph, &mut self.charge);
                     let ReaderMode::IndexAll {
                         heads,
@@ -2908,7 +3285,7 @@ impl LeafReader {
                                 IndexHeads::ByMember { buf, .. } => (buf.capacity() as u64)
                                     .saturating_mul(std::mem::size_of::<Id>() as u64),
                             })
-                            .saturating_add((seen_heads.capacity() as u64).saturating_mul(16));
+                            .saturating_add(hashset_id_bytes(seen_heads.capacity()));
                         match w.step(ctx, graph, &ids, &mut |walk_b| {
                             charge.resize(fixed.saturating_add(walk_b))
                         })? {
@@ -2917,9 +3294,10 @@ impl LeafReader {
                                     if x == m {
                                         let head = w.head;
                                         *walk = None;
+                                        charge.resize(fixed)?;
                                         let pid = ctx.intern_value(&Value::Integer(p.into()));
                                         ctx.check()?;
-                                        return Ok(Some(vec![head, pid, m]));
+                                        return Ok(Some(Solution::triple(head, pid, m)));
                                     }
                                     continue;
                                 }
@@ -2927,8 +3305,13 @@ impl LeafReader {
                                     if p == target {
                                         let head = w.head;
                                         *walk = None;
+                                        charge.resize(fixed)?;
                                         if m.is_none_or(|m| m == x) {
-                                            return Ok(Some(vec![head, i_arg.unwrap(), x]));
+                                            return Ok(Some(Solution::triple(
+                                                head,
+                                                i_arg.unwrap(),
+                                                x,
+                                            )));
                                         }
                                     }
                                     continue;
@@ -2937,17 +3320,23 @@ impl LeafReader {
                                     let head = w.head;
                                     let pid = ctx.intern_value(&Value::Integer(p.into()));
                                     ctx.check()?;
-                                    return Ok(Some(vec![head, pid, x]));
+                                    return Ok(Some(Solution::triple(head, pid, x)));
                                 }
                             },
                             None => {
                                 *walk = None;
+                                charge.resize(fixed)?;
                             }
                         }
                     }
                     // Advance to next unique head.
+                    let seen_b = hashset_id_bytes(seen_heads.capacity());
                     let next_h = match heads {
-                        IndexHeads::All(scan) => scan.next_head(ctx, graph, &ids)?,
+                        IndexHeads::All(scan) => {
+                            scan.next_head(ctx, graph, &ids, &mut |buf_b| {
+                                charge.resize(base.saturating_add(seen_b).saturating_add(buf_b))
+                            })?
+                        }
                         IndexHeads::ByMember { cells, buf, at } => loop {
                             if *at < buf.len() {
                                 let cell = buf[*at];
@@ -2957,9 +3346,7 @@ impl LeafReader {
                                         (buf.capacity() as u64)
                                             .saturating_mul(std::mem::size_of::<Id>() as u64),
                                     )
-                                    .saturating_add(
-                                        (seen_heads.capacity() as u64).saturating_mul(16),
-                                    );
+                                    .saturating_add(seen_b);
                                 break Some(head_of_cell(ctx, graph, &ids, cell, &mut |ex| {
                                     charge.resize(fixed.saturating_add(ex))
                                 })?);
@@ -2967,6 +3354,10 @@ impl LeafReader {
                             if cells.is_done() {
                                 break None;
                             }
+                            ctx.check()?;
+                            prepare_id_buf(buf, &mut |buf_b| {
+                                charge.resize(base.saturating_add(seen_b).saturating_add(buf_b))
+                            })?;
                             cells.next_ids(ctx, graph, 2, false, buf, RANGE_CHUNK)?;
                             *at = 0;
                         },
@@ -2976,19 +3367,24 @@ impl LeafReader {
                         return Ok(None);
                     };
                     if !seen_heads.contains(&h) {
+                        let hb = match heads {
+                            IndexHeads::All(s) => s.bytes(),
+                            IndexHeads::ByMember { buf, .. } => (buf.capacity() as u64)
+                                .saturating_mul(std::mem::size_of::<Id>() as u64),
+                        };
                         if seen_heads.len() == seen_heads.capacity() {
-                            let grown = (seen_heads.capacity() * 2).max(8);
-                            let hb = match heads {
-                                IndexHeads::All(s) => s.bytes(),
-                                IndexHeads::ByMember { buf, .. } => (buf.capacity() as u64)
-                                    .saturating_mul(std::mem::size_of::<Id>() as u64),
-                            };
+                            charge
+                                .resize(base.saturating_add(hb).saturating_add(
+                                    hashset_id_growth_bytes(seen_heads.capacity()),
+                                ))?;
+                            seen_heads.insert(h);
                             charge.resize(
                                 base.saturating_add(hb)
-                                    .saturating_add((grown as u64).saturating_mul(16)),
+                                    .saturating_add(hashset_id_bytes(seen_heads.capacity())),
                             )?;
+                        } else {
+                            seen_heads.insert(h);
                         }
-                        seen_heads.insert(h);
                         *walk = Some(ListWalk::new(ctx, graph, &ids, h)?);
                     }
                 }
@@ -3000,6 +3396,8 @@ impl LeafReader {
                     return Ok(None);
                 }
                 ReaderMode::RdfsMember { .. } => {
+                    let base = self.base_fixed_bytes();
+                    let (graph, charge) = (&self.graph, &mut self.charge);
                     let stored_sol = match &mut self.mode {
                         ReaderMode::RdfsMember { stored, .. } => match stored {
                             RdfsStored::Single(slot) => slot.take(),
@@ -3022,7 +3420,11 @@ impl LeafReader {
                                 if scan.is_done() {
                                     break None;
                                 }
-                                scan.next_ids(ctx, &self.graph, 2, false, buf, RANGE_CHUNK)?;
+                                ctx.check()?;
+                                prepare_id_buf(buf, &mut |buf_b| {
+                                    charge.resize(base.saturating_add(buf_b))
+                                })?;
+                                scan.next_ids(ctx, graph, 2, false, buf, RANGE_CHUNK)?;
                                 *at = 0;
                             },
                             RdfsStored::Pairs { scan, buf, at } => loop {
@@ -3034,25 +3436,30 @@ impl LeafReader {
                                 if scan.is_done() {
                                     break None;
                                 }
-                                scan.next_pairs(ctx, &self.graph, [1, 2], buf, RANGE_CHUNK)?;
+                                ctx.check()?;
+                                prepare_pair_buf(buf, &mut |buf_b| {
+                                    charge.resize(base.saturating_add(buf_b))
+                                })?;
+                                scan.next_pairs(ctx, graph, [1, 2], buf, RANGE_CHUNK)?;
                                 *at = 0;
                             },
                         },
                         _ => unreachable!(),
                     };
                     if let Some((s, o)) = stored_sol {
-                        return Ok(Some(vec![s, o]));
+                        return Ok(Some(Solution::pair(s, o)));
                     }
                     let ReaderMode::RdfsMember { s_arg, m_arg, .. } = self.mode else {
                         unreachable!()
                     };
                     self.mode = ReaderMode::Container(ContainerStream::new(None, s_arg, m_arg));
+                    self.sync_charge(0)?;
                 }
             }
         }
     }
 
-    fn step_container(&mut self, ctx: &Ctx) -> Result<Option<Vec<Id>>> {
+    fn step_container(&mut self, ctx: &Ctx) -> Result<Option<Solution>> {
         let ids = self.ids.expect("container ids");
         loop {
             ctx.check()?;
@@ -3075,6 +3482,13 @@ impl LeafReader {
                 );
                 if is_bound {
                     let mut candidate_p = None;
+                    let base_without_cur = self.base_bytes().saturating_sub(match &self.mode {
+                        ReaderMode::Container(stream) => {
+                            stream.current.as_ref().map_or(0, OneContainer::bytes)
+                        }
+                        _ => 0,
+                    });
+                    let (graph, charge) = (&self.graph, &mut self.charge);
                     let (c, m) = match &mut self.mode {
                         ReaderMode::Container(ContainerStream {
                             current:
@@ -3098,7 +3512,11 @@ impl LeafReader {
                                     active_done = true;
                                     break;
                                 }
-                                scan.next_ids(ctx, &self.graph, 2, false, buf, RANGE_CHUNK)?;
+                                ctx.check()?;
+                                prepare_id_buf(buf, &mut |buf_b| {
+                                    charge.resize(base_without_cur.saturating_add(buf_b))
+                                })?;
+                                scan.next_ids(ctx, graph, 2, false, buf, RANGE_CHUNK)?;
                                 *at = 0;
                             }
                             (c, m)
@@ -3107,26 +3525,29 @@ impl LeafReader {
                     };
                     if let Some(p) = candidate_p {
                         if self.predicate_number(ctx, p)?.is_some() {
-                            return Ok(Some(vec![c, m]));
+                            return Ok(Some(Solution::pair(c, m)));
                         }
                         continue;
                     }
                 } else {
                     // UnboundMember: scan `Perm::Spo [c]` into `by_number`, then pop_first.
                     loop {
+                        let base_now = self.base_bytes();
+                        let (graph, charge) = (&self.graph, &mut self.charge);
                         let next_pair = match &mut self.mode {
                             ReaderMode::Container(ContainerStream {
                                 current: Some(OneContainer::UnboundMember { scan, pair_buf, .. }),
                                 ..
                             }) => {
                                 if pair_buf.is_empty() && !scan.is_done() {
-                                    scan.next_pairs(
-                                        ctx,
-                                        &self.graph,
-                                        [1, 2],
-                                        pair_buf,
-                                        RANGE_CHUNK,
-                                    )?;
+                                    ctx.check()?;
+                                    let cur_pair_b = (pair_buf.capacity() as u64)
+                                        .saturating_mul(std::mem::size_of::<(Id, Id)>() as u64);
+                                    let base_without_pair = base_now.saturating_sub(cur_pair_b);
+                                    prepare_pair_buf(pair_buf, &mut |buf_b| {
+                                        charge.resize(base_without_pair.saturating_add(buf_b))
+                                    })?;
+                                    scan.next_pairs(ctx, graph, [1, 2], pair_buf, RANGE_CHUNK)?;
                                     pair_buf.reverse();
                                 }
                                 pair_buf.pop()
@@ -3138,15 +3559,18 @@ impl LeafReader {
                         };
                         ctx.check()?;
                         if let Some(n) = self.predicate_number(ctx, p)? {
-                            let already = match &self.mode {
+                            let (already, cur_len) = match &self.mode {
                                 ReaderMode::Container(ContainerStream {
                                     current: Some(OneContainer::UnboundMember { by_number, .. }),
                                     ..
-                                }) => by_number.contains_key(&n),
+                                }) => (by_number.contains_key(&n), by_number.len()),
                                 _ => unreachable!(),
                             };
                             if !already {
-                                self.sync_charge(40)?;
+                                let cur_b = btree_map_bytes(cur_len);
+                                let peak_b =
+                                    btree_map_bytes(cur_len + 1).max(cur_b.saturating_add(288));
+                                self.sync_charge(peak_b.saturating_sub(cur_b))?;
                             }
                             if let ReaderMode::Container(ContainerStream {
                                 current: Some(OneContainer::UnboundMember { by_number, .. }),
@@ -3154,6 +3578,9 @@ impl LeafReader {
                             }) = &mut self.mode
                             {
                                 by_number.insert(n, o);
+                            }
+                            if !already {
+                                self.sync_charge(0)?;
                             }
                         }
                     }
@@ -3165,7 +3592,7 @@ impl LeafReader {
                         _ => unreachable!(),
                     };
                     if let Some((c, o)) = popped {
-                        return Ok(Some(vec![c, o]));
+                        return Ok(Some(Solution::pair(c, o)));
                     }
                     active_done = true;
                 }
@@ -3179,12 +3606,8 @@ impl LeafReader {
 
             // Advance to next candidate container.
             let next_c = {
-                let (graph, mode, charge, numbers_cap) = (
-                    &self.graph,
-                    &mut self.mode,
-                    &mut self.charge,
-                    self.numbers.capacity(),
-                );
+                let base_fixed = self.base_fixed_bytes();
+                let (graph, mode, charge) = (&self.graph, &mut self.mode, &mut self.charge);
                 let ReaderMode::Container(stream) = mode else {
                     unreachable!()
                 };
@@ -3208,19 +3631,23 @@ impl LeafReader {
                                 let c = buf[*at];
                                 *at += 1;
                                 if !seen.contains(&c) {
+                                    let buf_b = (buf.capacity() as u64)
+                                        .saturating_mul(std::mem::size_of::<Id>() as u64);
                                     if seen.len() == seen.capacity() {
-                                        let grown = (seen.capacity() * 2).max(8);
-                                        let bytes = (numbers_cap as u64)
-                                            .saturating_mul(32)
-                                            .saturating_add(
-                                                (buf.capacity() as u64).saturating_mul(
-                                                    std::mem::size_of::<Id>() as u64,
-                                                ),
-                                            )
-                                            .saturating_add((grown as u64).saturating_mul(16));
-                                        charge.resize(bytes)?;
+                                        charge.resize(
+                                            base_fixed.saturating_add(buf_b).saturating_add(
+                                                hashset_id_growth_bytes(seen.capacity()),
+                                            ),
+                                        )?;
+                                        seen.insert(c);
+                                        charge.resize(
+                                            base_fixed
+                                                .saturating_add(buf_b)
+                                                .saturating_add(hashset_id_bytes(seen.capacity())),
+                                        )?;
+                                    } else {
+                                        seen.insert(c);
                                     }
-                                    seen.insert(c);
                                     break Some((c, stream.m));
                                 }
                                 continue;
@@ -3228,6 +3655,13 @@ impl LeafReader {
                             if let Some(s) = scan.as_mut()
                                 && !s.is_done()
                             {
+                                ctx.check()?;
+                                let seen_b = hashset_id_bytes(seen.capacity());
+                                prepare_id_buf(buf, &mut |buf_b| {
+                                    charge.resize(
+                                        base_fixed.saturating_add(seen_b).saturating_add(buf_b),
+                                    )
+                                })?;
                                 s.next_ids(ctx, graph, 2, false, buf, RANGE_CHUNK)?;
                                 *at = 0;
                                 continue;
@@ -3257,6 +3691,10 @@ impl LeafReader {
                             if scan.is_done() {
                                 break None;
                             }
+                            ctx.check()?;
+                            prepare_id_buf(buf, &mut |buf_b| {
+                                charge.resize(base_fixed.saturating_add(buf_b))
+                            })?;
                             scan.next_ids(ctx, graph, 1, true, buf, RANGE_CHUNK)?;
                             *at = 0;
                         },
@@ -3276,10 +3714,22 @@ impl LeafReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{Store, StoreOptions};
+    use std::sync::Arc;
+
+    fn test_ctx(limit: u64) -> Arc<Ctx> {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = limit;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_owner();
+        ctx
+    }
 
     /// Streaming [`StrSplitIter`] agrees verbatim with [`java_split`] across edge cases:
-    /// empty inputs, whitespace-only segments, leading/trailing delimiters, empty/zero-width
-    /// regexes, and multi-byte UTF-8.
+    /// empty inputs, whitespace-only segments, leading/trailing delimiters, nullable and
+    /// zero-width regexes, and multi-byte UTF-8 following positive-width matches.
     #[test]
     fn str_split_iter_matches_java_split() {
         let cases = [
@@ -3298,16 +3748,266 @@ mod tests {
             ("foo", "^"),
             ("foo", "$"),
             ("a|b|c|", r"\|"),
+            // Nullable regexes (adjacent positive-width and zero-width matches)
+            ("ab", "a*"),
+            ("a", "a*"),
+            ("aba", "a*"),
+            ("a,b", ",*"),
+            ("xya", "y*"),
+            ("1a2", r"\d*"),
+            ("aαb", "a*"),
+            ("aαb", "a?"),
+            ("ab", "a?"),
+            ("aba", "a|"),
+            ("a\nb", "(?m)^"),
         ];
         for (s, pat) in cases {
             let re = regex::Regex::new(pat).unwrap();
             let expected = java_split(&re, s);
-            let mut iter = StrSplitIter::new(re, s.to_string());
+            let meta = regex_automata::meta::Regex::new(pat).unwrap();
+            let cache = meta.create_cache();
+            let mut iter = StrSplitIter::new(meta, cache, 0, s.to_string());
             let mut got = Vec::new();
-            while let Some(tok) = iter.next_token() {
-                got.push(tok);
+            while let Some(tok) = iter.next_token_checked(|| Ok(())).unwrap() {
+                got.push(tok.to_string());
             }
             assert_eq!(got, expected, "s={s:?} pat={pat:?}");
+        }
+    }
+
+    /// `apf:strSplit` pre-admits its compiled regex against the remaining memory grant so
+    /// a large pattern fails with `BudgetKind::Memory` before exceeding the grant.
+    #[test]
+    fn str_split_regex_refuses_when_program_exceeds_remaining_grant() {
+        let ctx = test_ctx(64 << 10);
+        let text = ctx.intern_value(&Value::Str("abcdef".into()));
+        // A pattern with large repetition whose compiled NFA exceeds 64 KiB budget.
+        let pat = ctx.intern_value(&Value::Str("[a-z]{400}".into()));
+        let var = ctx.var("t");
+        let spec = PfSpec {
+            kind: PfKind::StrSplit,
+            slots: vec![PathEnd::Var(var), PathEnd::Const(text), PathEnd::Const(pat)],
+            inputs: Default::default(),
+            graph: GraphFilter::Default,
+        };
+        let err = LeafReader::open(&ctx, &spec, &[var]).err();
+        assert!(
+            matches!(
+                err,
+                Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+            ),
+            "expected Memory BudgetExceeded, got {err:?}"
+        );
+    }
+
+    /// `apf:bnode` on a constant blank-node subject yields its label when the object is
+    /// unbound or matches, and yields nothing when the object disagrees.
+    #[test]
+    fn leaf_reader_bnode_handles_blank_node_subject() {
+        let ctx = test_ctx(16 << 20);
+        let bnode = ctx.intern_term(&Term::BlankNode(oxrdf::BlankNode::new("leafbn42").unwrap()));
+        let Some(Term::BlankNode(expected_bn)) = ctx.term(bnode) else {
+            panic!("expected interned blank node");
+        };
+        let expected_label = expected_bn.as_str().to_string();
+        let label_var = ctx.var("label");
+        let spec = PfSpec {
+            kind: PfKind::BNode,
+            slots: vec![PathEnd::Const(bnode), PathEnd::Var(label_var)],
+            inputs: Default::default(),
+            graph: GraphFilter::Default,
+        };
+        let mut reader = LeafReader::open(&ctx, &spec, &[label_var]).unwrap();
+        let mut out = Table::new(vec![label_var]);
+        assert!(reader.next(&ctx, &mut out, 8).unwrap());
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            ctx.value(out.cols[0][0]),
+            Some(Value::Str(s)) if &*s == expected_label.as_str()
+        ));
+
+        let matching = ctx.intern_value(&Value::Str(expected_label.as_str().into()));
+        let spec_match = PfSpec {
+            kind: PfKind::BNode,
+            slots: vec![PathEnd::Const(bnode), PathEnd::Const(matching)],
+            inputs: Default::default(),
+            graph: GraphFilter::Default,
+        };
+        let mut reader = LeafReader::open(&ctx, &spec_match, &[]).unwrap();
+        let mut out = Table::new(vec![]);
+        assert!(reader.next(&ctx, &mut out, 8).unwrap());
+        assert_eq!(out.len(), 1);
+
+        let wrong = ctx.intern_value(&Value::Str("other".into()));
+        let spec_miss = PfSpec {
+            kind: PfKind::BNode,
+            slots: vec![PathEnd::Const(bnode), PathEnd::Const(wrong)],
+            inputs: Default::default(),
+            graph: GraphFilter::Default,
+        };
+        let mut reader = LeafReader::open(&ctx, &spec_miss, &[]).unwrap();
+        let mut out = Table::new(vec![]);
+        assert!(reader.next(&ctx, &mut out, 8).unwrap());
+        assert_eq!(out.len(), 0);
+    }
+
+    /// `LeafReader` pre-admits scan chunks (`ID_BUF_BYTES`), container `BTreeMap` first
+    /// node insertion, bound-subject `apf:strSplit` text, and `apf:concat` aggregate text
+    /// before allocating them.
+    #[test]
+    fn leaf_reader_pre_admits_chunk_container_and_string_buffers() {
+        // 1. Scan chunk pre-admission on a one-row pull of `list:member ?l ?m`.
+        {
+            let store = Store::in_memory(StoreOptions::default());
+            store
+                .load(&[crate::io::Source::from_bytes(
+                    b"<urn:l> <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> 1 ; \
+                      <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> ."
+                        .to_vec(),
+                    oxrdfio::RdfFormat::Turtle,
+                    None,
+                )])
+                .unwrap();
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 16 << 20;
+            raw.enable_cursor_accounting().unwrap();
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+            let l = ctx.var("l");
+            let m = ctx.var("m");
+            let spec = PfSpec {
+                kind: PfKind::Member,
+                slots: vec![PathEnd::Var(l), PathEnd::Var(m)],
+                inputs: Default::default(),
+                graph: GraphFilter::Default,
+            };
+            let mut reader = LeafReader::open(&ctx, &spec, &[l, m]).unwrap();
+            let before = ctx.memory().live.load(std::sync::atomic::Ordering::Relaxed);
+            // Fill the remaining budget except 512 B (< ID_BUF_BYTES = 2048 B).
+            let hold = super::super::ctx::OwnedCharge::new(
+                &ctx,
+                ctx.memory_remaining().saturating_sub(512),
+            )
+            .unwrap();
+            let mut out = Table::new(vec![l, m]);
+            let err = reader.next(&ctx, &mut out, 1).err();
+            assert!(
+                matches!(
+                    err,
+                    Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+                ),
+                "expected scan chunk refusal, got {err:?} (before={before})"
+            );
+            drop(hold);
+        }
+
+        // 2. First container numbered-member BTreeMap node pre-admission.
+        {
+            let store = Store::in_memory(StoreOptions::default());
+            store
+                .load(&[crate::io::Source::from_bytes(
+                    b"<urn:b> a <http://www.w3.org/1999/02/22-rdf-syntax-ns#Bag> ; \
+                      <http://www.w3.org/1999/02/22-rdf-syntax-ns#_1> 1 ."
+                        .to_vec(),
+                    oxrdfio::RdfFormat::Turtle,
+                    None,
+                )])
+                .unwrap();
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 16 << 20;
+            raw.enable_cursor_accounting().unwrap();
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+            let bag = ctx.intern_term(&Term::NamedNode(oxrdf::NamedNode::new("urn:b").unwrap()));
+            let m = ctx.var("m");
+            let spec = PfSpec {
+                kind: PfKind::Container(None),
+                slots: vec![PathEnd::Const(bag), PathEnd::Var(m)],
+                inputs: Default::default(),
+                graph: GraphFilter::Default,
+            };
+            let mut reader = LeafReader::open(&ctx, &spec, &[m]).unwrap();
+            // Leave room for pair_buf (4096 B) + numbers map (256 B), but not the first
+            // BTreeMap leaf node (288 B).
+            let leave = PAIR_BUF_BYTES + 256 + 64;
+            let hold = super::super::ctx::OwnedCharge::new(
+                &ctx,
+                ctx.memory_remaining().saturating_sub(leave),
+            )
+            .unwrap();
+            let mut out = Table::new(vec![m]);
+            let err = reader.next(&ctx, &mut out, 1).err();
+            assert!(
+                matches!(
+                    err,
+                    Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+                ),
+                "expected first container node refusal, got {err:?}"
+            );
+            drop(hold);
+        }
+
+        // 3. Bound-subject `apf:strSplit` charges `text` before allocating it.
+        {
+            let ctx = test_ctx(16 << 20);
+            let target = ctx.intern_value(&Value::Str("hit".into()));
+            let big = ctx.intern_value(&Value::Str("a,".repeat(40_000).into()));
+            let pat = ctx.intern_value(&Value::Str(",".into()));
+            let spec = PfSpec {
+                kind: PfKind::StrSplit,
+                slots: vec![
+                    PathEnd::Const(target),
+                    PathEnd::Const(big),
+                    PathEnd::Const(pat),
+                ],
+                inputs: Default::default(),
+                graph: GraphFilter::Default,
+            };
+            let hold = super::super::ctx::OwnedCharge::new(
+                &ctx,
+                ctx.memory_remaining().saturating_sub(4096),
+            )
+            .unwrap();
+            let err = LeafReader::open(&ctx, &spec, &[]).err();
+            assert!(
+                matches!(
+                    err,
+                    Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+                ),
+                "expected bound-subject strSplit text refusal, got {err:?}"
+            );
+            drop(hold);
+        }
+
+        // 4. `apf:concat` pre-admits aggregate string before allocating it.
+        {
+            let ctx = test_ctx(16 << 20);
+            let piece = ctx.intern_value(&Value::Str("x".repeat(4096).into()));
+            let var = ctx.var("s");
+            let mut slots = vec![PathEnd::Var(var)];
+            for _ in 0..20 {
+                slots.push(PathEnd::Const(piece));
+            }
+            let spec = PfSpec {
+                kind: PfKind::Concat,
+                slots,
+                inputs: Default::default(),
+                graph: GraphFilter::Default,
+            };
+            let hold = super::super::ctx::OwnedCharge::new(
+                &ctx,
+                ctx.memory_remaining().saturating_sub(8192),
+            )
+            .unwrap();
+            let err = LeafReader::open(&ctx, &spec, &[var]).err();
+            assert!(
+                matches!(
+                    err,
+                    Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+                ),
+                "expected concat string refusal, got {err:?}"
+            );
+            drop(hold);
         }
     }
 }

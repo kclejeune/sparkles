@@ -70,12 +70,24 @@ pub(super) const SILENT_REASON: &str = "Service (SILENT) buffers its answer unde
 /// Largest chunk pulled per step while draining a `SILENT` SERVICE into its buffer.
 const SILENT_CHUNK_MAX: usize = 4096;
 
-/// Errors that `SILENT` SERVICE must propagate rather than suppress into an empty row.
-fn is_non_suppressible(err: &Error) -> bool {
+/// Errors that `SILENT` SERVICE must propagate rather than suppress into an empty row,
+/// matching [`crate::sparql::ctx::Ctx`] sticky refusal classification plus `NotPermitted`.
+fn is_non_suppressible(err: &Error, strict: bool) -> bool {
     matches!(
         err,
         Error::Cancelled | Error::Timeout | Error::NotPermitted(_) | Error::BudgetExceeded(_)
     ) || matches!(err, Error::Unsupported(m) if m.starts_with(super::REFUSAL))
+        || matches!(err, Error::Service(m) if strict && m.starts_with(super::LATE_HEAD))
+        || crate::sparql::extensions::is_unconfigured(err)
+        || matches!(
+            err,
+            Error::Component(component)
+                if component
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.downcast_ref::<sparkles_budget::ParentRefused>())
+                    .is_some()
+        )
 }
 
 pub(super) struct Service {
@@ -395,8 +407,9 @@ impl Service {
             let cap = chunk
                 .min(SILENT_CHUNK_MAX)
                 .min(ctx.rows_within_budget(self.vars.len()).max(1));
-            if let Some(batch) = self.fill(ctx, cap)? {
+            if let Some(batch) = self.fill(ctx, cap, Some(all.table.len))? {
                 merge::append(ctx, &mut all, &batch.table, 0..batch.table.len)?;
+                ctx.check_output_rows(all.table.len)?;
             }
             chunk = chunk.saturating_mul(2).min(SILENT_CHUNK_MAX);
         }
@@ -412,9 +425,11 @@ impl Service {
         self.at = 0;
         self.bnodes.clear();
         ctx.check()?;
-        if is_non_suppressible(&err) {
+        let strict = self.fallback.at_pull(ctx) == FallbackPolicy::RejectMaterialization;
+        if is_non_suppressible(&err, strict) {
             return Err(err);
         }
+        ctx.check_output_rows(1)?;
         let mut unit = Buffer::new(ctx, &self.vars, 1)?;
         let row = vec![Id::UNDEF; self.vars.len()];
         unit.table.push_row(&row);
@@ -457,10 +472,20 @@ impl Service {
             }
         }
         if let Some(buf) = &self.buffered {
+            if let Err(err) = ctx.check() {
+                self.release();
+                return Err(err);
+            }
             if self.at == 0 && buf.table.len <= cap {
                 return Ok(self.buffered.take());
             }
-            let batch = copy_rows(ctx, &buf.table, self.at, cap)?;
+            let batch = match copy_rows(ctx, &buf.table, self.at, cap) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    self.release();
+                    return Err(err);
+                }
+            };
             self.at += batch.as_ref().map_or(0, |b| b.table.len);
             if self.at >= buf.table.len {
                 self.buffered = None;
@@ -471,7 +496,7 @@ impl Service {
         if self.source.is_none() {
             return Ok(None);
         }
-        let result = self.fill(ctx, cap);
+        let result = self.fill(ctx, cap, None);
         if result.is_err() {
             // a failed answer is closed, and its body and its copy released, now
             self.source = None;
@@ -479,7 +504,12 @@ impl Service {
         result
     }
 
-    fn fill(&mut self, ctx: &Arc<Ctx>, cap: usize) -> Result<Option<Buffer>> {
+    fn fill(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        cap: usize,
+        silent_prior: Option<usize>,
+    ) -> Result<Option<Buffer>> {
         let mut b = Buffer::new(ctx, &self.vars, cap)?;
         let mut row = vec![Id::UNDEF; self.vars.len()];
         let (names, bnodes) = (&self.names, &mut self.bnodes);
@@ -509,6 +539,14 @@ impl Service {
                     };
                     let solution = solution?;
                     ctx.check()?;
+                    if let Some(prior) = silent_prior {
+                        ctx.check_output_rows(
+                            prior
+                                .checked_add(b.table.len)
+                                .and_then(|n| n.checked_add(1))
+                                .unwrap_or(usize::MAX),
+                        )?;
+                    }
                     if let Some(copy) = tee.take() {
                         *tee = copy.push(&solution)?;
                     }
@@ -545,6 +583,14 @@ impl Service {
                 let names = rows.variables();
                 while *at < rows.len() && b.table.len < cap {
                     ctx.check()?;
+                    if let Some(prior) = silent_prior {
+                        ctx.check_output_rows(
+                            prior
+                                .checked_add(b.table.len)
+                                .and_then(|n| n.checked_add(1))
+                                .unwrap_or(usize::MAX),
+                        )?;
+                    }
                     let row = rows.row(*at)?;
                     push(&mut b, bnodes, &ServiceSolution::Local { names, row: &row });
                     ctx.check()?;
@@ -716,7 +762,7 @@ mod tests {
                 tee: None,
             },
         );
-        let err = svc.fill(&ctx, 10).err();
+        let err = svc.fill(&ctx, 10, None).err();
         assert!(
             matches!(err, Some(Error::Cancelled)),
             "expected Cancelled, got {err:?}"
@@ -772,7 +818,7 @@ mod tests {
                 tee: Some(tee),
             },
         );
-        let err = svc.fill(&ctx, 4).err();
+        let err = svc.fill(&ctx, 4, None).err();
         assert!(
             matches!(
                 err,
@@ -825,7 +871,7 @@ mod tests {
                 },
             );
             ctx.cancel.store(true, Ordering::Relaxed);
-            let err = svc.fill(&ctx, 4).err();
+            let err = svc.fill(&ctx, 4, None).err();
             assert!(matches!(err, Some(Error::Cancelled)), "{err:?}");
             assert!(matches!(svc.source, Some(Source::Cached { at: 0, .. })));
         }
@@ -851,7 +897,7 @@ mod tests {
                     _charge: charge,
                 },
             );
-            let err = svc.fill(&ctx, 4).err();
+            let err = svc.fill(&ctx, 4, None).err();
             assert!(matches!(err, Some(Error::Timeout)), "{err:?}");
             assert!(matches!(svc.source, Some(Source::Cached { at: 0, .. })));
         }
@@ -873,7 +919,7 @@ mod tests {
             );
             let oversized = Term::Literal(Literal::new_simple_literal("x".repeat(32 << 10)));
             assert_eq!(ctx.intern_term(&oversized), Id::UNDEF);
-            let err = svc.fill(&ctx, 4).err();
+            let err = svc.fill(&ctx, 4, None).err();
             assert!(
                 matches!(
                     err,
@@ -883,5 +929,78 @@ mod tests {
             );
             assert!(matches!(svc.source, Some(Source::Cached { at: 0, .. })));
         }
+    }
+
+    #[test]
+    fn is_non_suppressible_matches_strict_and_resource_refusals() {
+        let late_head = Error::Service(format!("{}<http://ep/sparql>", super::super::LATE_HEAD));
+        assert!(is_non_suppressible(&late_head, true));
+        assert!(!is_non_suppressible(&late_head, false));
+
+        let ordinary = Error::Service("<http://ep/sparql>: 500".into());
+        assert!(!is_non_suppressible(&ordinary, true));
+        assert!(!is_non_suppressible(&ordinary, false));
+
+        let unconfigured = crate::sparql::extensions::unconfigured();
+        assert!(is_non_suppressible(&unconfigured, true));
+        assert!(is_non_suppressible(&unconfigured, false));
+
+        let parent_refused = Error::Component(Box::new(
+            crate::error::ComponentError::new("query-memory", "ownership", "overflow")
+                .with_source(sparkles_budget::ParentRefused::Overflow),
+        ));
+        assert!(is_non_suppressible(&parent_refused, true));
+        assert!(is_non_suppressible(&parent_refused, false));
+
+        let other_component = Error::Component(Box::new(crate::error::ComponentError::new(
+            "service",
+            "other",
+            "transient",
+        )));
+        assert!(!is_non_suppressible(&other_component, true));
+    }
+
+    /// If copying out of `Service::buffered` fails (e.g. tight memory budget), `Service::next`
+    /// releases `self.buffered` so its charge is not leaked.
+    #[test]
+    fn buffered_copy_rows_error_releases_buffered_charge() {
+        let ctx = ctx(16 << 10);
+        let var = ctx.var("s");
+        let mut buf = Buffer::new(&ctx, &[var], 128).unwrap();
+        for i in 0..128u64 {
+            buf.table.push_row(&[Id(i + 1)]);
+        }
+        buf.reconcile().unwrap();
+        let mut svc = Service {
+            endpoint: PathEnd::Const(Id::UNDEF),
+            query: "SELECT ?s { ?s ?p ?o }".into(),
+            silent: true,
+            cache: CacheMode::Default,
+            vars: vec![var],
+            names: vec![ctx.var_name(var)],
+            fallback: FallbackPolicy::RejectMaterialization,
+            opened: true,
+            buffered_before_output: false,
+            source: None,
+            buffered: Some(buf),
+            at: 0,
+            bnodes: FxHashMap::default(),
+        };
+        assert!(ctx.memory().live.load(Ordering::Relaxed) > 0);
+        // Leave less than `copy_rows`'s 64-row buffer needs so `copy_rows` itself fails.
+        let hold = OwnedCharge::new(&ctx, ctx.memory_remaining().saturating_sub(64)).unwrap();
+        let opts = CursorOptions::default();
+        let err = svc.next(&ctx, &opts, 64).err();
+        assert!(
+            matches!(
+                err,
+                Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+            ),
+            "expected Memory BudgetExceeded, got {err:?}"
+        );
+        assert!(svc.buffered.is_none(), "buffered rows must be released");
+        assert!(svc.done());
+        drop(hold);
+        assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 0);
     }
 }

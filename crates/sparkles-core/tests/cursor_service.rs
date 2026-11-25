@@ -1143,6 +1143,197 @@ fn a_late_head_refusal_inside_exists_fails_the_query() {
             );
         }
     }
+
+    // An enclosing `SERVICE SILENT` around an in-process callee that calls a non-SILENT
+    // late-head endpoint propagates the strict refusal under `RejectMaterialization` and
+    // yields the bindings under `AllowMaterialization`.
+    let silent_nested = format!(
+        "SELECT ?x ?s ?o {{ SERVICE SILENT <http://local/sparql> {{ ?x <urn:p> ?v SERVICE <{}> {{ ?s ?p ?o }} }} }}",
+        late.url
+    );
+    let r = streamed(&snap, &silent_nested, &o, &strict(4));
+    assert!(
+        matches!(&r, Err(Error::Service(m)) if m.contains("before the variables of its head")),
+        "enclosing SILENT must propagate strict callee LATE_HEAD: {:?}",
+        r.map(|(rows, _)| rows)
+    );
+    let allow = CursorOptions {
+        fallback: FallbackPolicy::AllowMaterialization,
+        ..strict(4)
+    };
+    assert_eq!(
+        streamed(&snap, &silent_nested, &o, &allow).unwrap().0,
+        eager(&snap, &silent_nested, &o).unwrap()
+    );
+}
+
+/// Truncated or trailing-malformed late-head JSON responses never emit partial rows and
+/// never populate the service cache, under both `SILENT SERVICE` and permissive
+/// non-`SILENT SERVICE`.
+#[test]
+fn malformed_late_head_responses_never_emit_partial_rows_or_cache() {
+    let s = store();
+    let snap = s.snapshot();
+    let cached = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    let allow = CursorOptions {
+        fallback: FallbackPolicy::AllowMaterialization,
+        ..strict(2)
+    };
+    let cases: [(&str, &[u8]); 2] = [
+        (
+            "truncated after vars",
+            br#"{"results":{"bindings":[{"s":{"type":"uri","value":"urn:s"}}]},"head":{"vars":["s"]"#,
+        ),
+        (
+            "trailing garbage",
+            br#"{"results":{"bindings":[{"s":{"type":"uri","value":"urn:s"}}]},"head":{"vars":["s"]}} trailing"#,
+        ),
+    ];
+    for (label, body) in cases {
+        let payload = body.to_vec();
+        let ep = Endpoint::start(Arc::new(move || (200, vec![Part::Bytes(payload.clone())])));
+        s.result_cache().service.clear();
+
+        let silent_q = format!(
+            "SELECT ?s {{ SERVICE SILENT <cache:{}> {{ ?s ?p ?o }} }}",
+            ep.url
+        );
+        let unit = vec![vec![None]];
+        assert_eq!(eager(&snap, &silent_q, &opts()).unwrap(), unit, "{label}");
+        assert_eq!(
+            streamed(&snap, &silent_q, &cached, &strict(1)).unwrap().0,
+            unit,
+            "{label}: first silent streamed"
+        );
+        assert_eq!(
+            s.result_cache().service.entries(),
+            0,
+            "{label}: malformed late-head must not populate cache"
+        );
+        let calls_after_first = ep.calls();
+        assert_eq!(
+            streamed(&snap, &silent_q, &cached, &strict(1)).unwrap().0,
+            unit,
+            "{label}: second silent streamed"
+        );
+        assert_eq!(
+            ep.calls(),
+            calls_after_first + 1,
+            "{label}: second cache-enabled call must contact endpoint again"
+        );
+
+        let non_silent_q = format!("SELECT ?s {{ SERVICE <cache:{}> {{ ?s ?p ?o }} }}", ep.url);
+        let r = streamed(&snap, &non_silent_q, &cached, &allow);
+        assert!(
+            matches!(&r, Err(Error::Service(_))),
+            "{label}: permissive non-silent must fail: {:?}",
+            r.map(|(rows, _)| rows)
+        );
+        assert_eq!(
+            s.result_cache().service.entries(),
+            0,
+            "{label}: failed permissive late-head must not populate cache"
+        );
+    }
+}
+
+/// `SILENT SERVICE` enforces `max_rows` and `max_rows_produced` per accepted row before
+/// reading malformed trailing content, never caches a failed stream, and serves a
+/// succeeding cache hit directly without hitting the endpoint again.
+#[test]
+fn silent_service_enforces_row_budgets_per_row_and_cache_semantics() {
+    let s = store();
+    let snap = s.snapshot();
+
+    // 2 valid rows followed by malformed JSON.
+    let cut = format!("{HEAD}{},{{\"s\":", rows(2));
+    let broken = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(cut.clone().into_bytes())])
+    }));
+    let q_broken = format!(
+        "SELECT ?s ?o {{ SERVICE SILENT <cache:{}> {{ ?s ?p ?o }} }}",
+        broken.url
+    );
+    let cached = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+
+    // max_rows = 1 crosses the limit on row 2 before the malformed JSON arrives.
+    let over_rows = QueryOptions {
+        max_rows: Some(1),
+        ..opts()
+    };
+    let r = streamed(&snap, &q_broken, &over_rows, &strict(1));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Rows),
+        "expected BudgetKind::Rows, got {:?}",
+        r.map(|(rows, _)| rows)
+    );
+
+    // max_rows = 2 stays within the limit, hits malformed JSON, and suppresses to 1 empty row.
+    let within_rows = QueryOptions {
+        max_rows: Some(2),
+        ..opts()
+    };
+    let unit = vec![vec![None, None]];
+    assert_eq!(
+        streamed(&snap, &q_broken, &within_rows, &strict(1))
+            .unwrap()
+            .0,
+        unit
+    );
+
+    // max_rows_produced = 1 crosses the produced-row limit before malformed JSON arrives.
+    let over_produced = QueryOptions {
+        max_rows_produced: Some(1),
+        ..opts()
+    };
+    let r = streamed(&snap, &q_broken, &over_produced, &strict(1));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+        "expected BudgetKind::RowsProduced, got {:?}",
+        r.map(|(rows, _)| rows)
+    );
+
+    // Mid-stream failure never populates the service cache.
+    s.result_cache().service.clear();
+    let before = broken.calls();
+    assert_eq!(
+        streamed(&snap, &q_broken, &cached, &strict(1)).unwrap().0,
+        unit
+    );
+    assert_eq!(s.result_cache().service.entries(), 0);
+    assert_eq!(
+        streamed(&snap, &q_broken, &cached, &strict(1)).unwrap().0,
+        unit
+    );
+    assert_eq!(broken.calls(), before + 2);
+
+    // A succeeding SILENT SERVICE populates the cache once and serves later runs from cache.
+    let ok = Endpoint::start(answer(9));
+    let q_ok = format!(
+        "SELECT ?s ?o {{ SERVICE SILENT <cache:{}> {{ ?s ?p ?o }} }}",
+        ok.url
+    );
+    s.result_cache().service.clear();
+    let (first_rows, _) = streamed(&snap, &q_ok, &cached, &strict(2)).unwrap();
+    assert_eq!(first_rows.len(), 9);
+    assert_eq!(ok.calls(), 1);
+    assert_eq!(s.result_cache().service.entries(), 1);
+    for batch_rows in [1, 4096] {
+        let (hit_rows, plan) = streamed(&snap, &q_ok, &cached, &strict(batch_rows)).unwrap();
+        assert_eq!(hit_rows, first_rows, "batch_rows={batch_rows}");
+        assert!(!materializes(&plan));
+    }
+    assert_eq!(
+        ok.calls(),
+        1,
+        "SILENT cache hit must not call endpoint again"
+    );
 }
 
 /// An ordinary failure inside EXISTS stays a false filter under the strict policy even
