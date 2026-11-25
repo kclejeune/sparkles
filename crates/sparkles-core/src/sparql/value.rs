@@ -497,7 +497,43 @@ pub fn arith(op: NumOp, a: &Value, b: &Value) -> EvalResult<Value> {
 }
 
 /// The scale of oxsdatatypes' decimals, which hold `value × 10^-18` in an `i128`.
-const DECIMAL_SCALE: i128 = 1_000_000_000_000_000_000;
+pub(crate) const DECIMAL_SCALE: i128 = 1_000_000_000_000_000_000;
+
+const DEC_Q_MAX: i128 = i128::MAX.div_euclid(DECIMAL_SCALE);
+const DEC_R_MAX: i128 = i128::MAX.rem_euclid(DECIMAL_SCALE);
+const DEC_Q_MIN: i128 = i128::MIN.div_euclid(DECIMAL_SCALE);
+const DEC_R_MIN: i128 = i128::MIN.rem_euclid(DECIMAL_SCALE);
+
+/// The raw `i128` value (`d × 10^18`) stored inside an `oxsdatatypes::Decimal`.
+#[inline]
+pub(crate) fn decimal_raw(d: Decimal) -> i128 {
+    i128::from_be_bytes(d.to_be_bytes())
+}
+
+/// Construct an `oxsdatatypes::Decimal` from its raw `i128` value (`d × 10^18`).
+#[inline]
+pub(crate) fn decimal_from_raw(raw: i128) -> Decimal {
+    Decimal::from_be_bytes(raw.to_be_bytes())
+}
+
+/// Exact `dec + int * 10^18` checked over `[i128::MIN, i128::MAX]` without overflowing
+/// when `int * 10^18` alone exceeds `i128` while the sum with `dec` stays in range.
+pub(crate) fn add_scaled_int(dec: i128, int: i128) -> Option<i128> {
+    let q = dec.div_euclid(DECIMAL_SCALE);
+    let r = dec.rem_euclid(DECIMAL_SCALE);
+    let nq = q.checked_add(int)?;
+    if nq > DEC_Q_MAX || (nq == DEC_Q_MAX && r > DEC_R_MAX) {
+        return None;
+    }
+    if nq < DEC_Q_MIN || (nq == DEC_Q_MIN && r < DEC_R_MIN) {
+        return None;
+    }
+    if nq == DEC_Q_MIN {
+        Some((nq + 1) * DECIMAL_SCALE - (DECIMAL_SCALE - r))
+    } else {
+        Some(nq * DECIMAL_SCALE + r)
+    }
+}
 
 /// An exact integer sum as a value to add further numbers to. It is an `xsd:integer` when
 /// it fits one and otherwise an `xsd:decimal`, so that adding a decimal or a double to a

@@ -9,5 +9,6 @@
 
 pub(crate) mod acc;
 pub(crate) mod op;
+mod par;
 
 pub(crate) use op::{Grouping, hashable, order_free, whole};

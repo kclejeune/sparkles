@@ -7396,20 +7396,55 @@ pub(super) fn stat_aggregate(func: &AggregateFunction) -> Option<super::aggext::
     }
 }
 
+/// Decimal accumulator state with exact prefix bounds so merging two exact sums matches
+/// a single sequential pass on every intermediate overflow boundary.
+pub(super) struct DecimalSum {
+    /// Current scaled decimal sum (`value × 10^18`).
+    val: i128,
+    /// Minimum scaled decimal value across all decimal steps in this partition.
+    min: i128,
+    /// Maximum scaled decimal value across all decimal steps in this partition.
+    max: i128,
+    /// Unscaled integer sum just before the first decimal arrived.
+    int_before: i128,
+    /// Minimum unscaled integer prefix sum before the first decimal arrived (including 0).
+    int_min: i128,
+    /// Maximum unscaled integer prefix sum before the first decimal arrived (including 0).
+    int_max: i128,
+    /// Whether `int_min`/`int_max` are exact (false only after `retract`).
+    exact_int_prefix: bool,
+}
+
+/// Running numeric state of `SUM` / `AVG`.
+pub(super) enum SumAcc {
+    /// Pure exact integer sum in `i128`, with exact prefix bounds `[min, max]` (including 0).
+    Int {
+        sum: i128,
+        min: i128,
+        max: i128,
+    },
+    /// Pure integer sum after a retraction, whose historical prefix bounds are unknown.
+    IntRetracted(i128),
+    /// Exact decimal sum with prefix bounds for merge verification.
+    Decimal(Box<DecimalSum>),
+    Float(oxsdatatypes::Float),
+    Double(oxsdatatypes::Double),
+    /// Failed on `Id::UNDEF` or a non-numeric value: guaranteed to fail any single pass.
+    HardError,
+    /// Failed on a decimal or `exact_sum` overflow: may succeed if preceded by a non-empty
+    /// left partition that shifts the sum or promotes to float/double.
+    Overflow,
+}
+
 /// Running state of one aggregate of one group (same results as [`aggregate`]).
 pub(super) enum AggState {
     /// COUNT(*) / COUNT(?v): rows / bound values
     Count(u64),
-    /// SUM / AVG: an exact integer sum while every value is an inline integer, then the
-    /// generic numeric sum; `ok` is false once a value was unbound or not numeric. The
-    /// integer sum is held in an `i128`, so that a sum whose result fits an
-    /// `xsd:integer` is found whatever the order of its rows, and only the result is
-    /// checked. `errs` counts the rows whose argument was an error, apart from values
-    /// that are not numbers, for the reading in which AVG over only errors is zero.
+    /// SUM / AVG: an exact integer sum while every value is an integer, then decimal,
+    /// float or double, or a recorded failure. `errs` counts rows whose argument was
+    /// `Id::UNDEF`, for the reading in which AVG over only errors is zero.
     Sum {
-        int: i128,
-        generic: Option<Value>,
-        ok: bool,
+        acc: SumAcc,
         rows: u64,
         errs: u64,
     },
@@ -7429,9 +7464,11 @@ impl AggState {
         }
         match agg.func {
             AggregateFunction::Sum | AggregateFunction::Avg => AggState::Sum {
-                int: 0,
-                generic: None,
-                ok: true,
+                acc: SumAcc::Int {
+                    sum: 0,
+                    min: 0,
+                    max: 0,
+                },
                 rows: 0,
                 errs: 0,
             },
@@ -7446,46 +7483,26 @@ impl AggState {
     pub(super) fn add(&mut self, ctx: &Ctx, agg: &Agg, id: Option<Id>) {
         match self {
             AggState::Count(n) => *n += id.is_none_or(|id| !id.is_undef()) as u64,
-            AggState::Sum {
-                int,
-                generic,
-                ok,
-                rows,
-                errs,
-            } => {
+            AggState::Sum { acc, rows, .. } => {
                 *rows += 1;
                 let id = id.unwrap_or(Id::UNDEF);
-                *errs += u64::from(id.is_undef());
-                if !*ok {
-                    return;
-                }
-                if generic.is_none()
+                if let SumAcc::Int { sum, min, max } = acc
                     && id.tag() == crate::id::Tag::Int
-                    && let Some(s) = int.checked_add(id.as_i64().into())
                 {
-                    *int = s;
-                    return;
+                    let x = id.as_i64();
+                    if let Some(s) = sum.checked_add(x.into()) {
+                        *sum = s;
+                        if x >= 0 {
+                            if s > *max {
+                                *max = s;
+                            }
+                        } else if s < *min {
+                            *min = s;
+                        }
+                        return;
+                    }
                 }
-                let value = (!id.is_undef()).then(|| ctx.value(id)).flatten();
-                // An integer too large to be inlined joins the exact sum as well.
-                if generic.is_none()
-                    && let Some(Value::Integer(i)) = &value
-                    && let Some(s) = int.checked_add(i64::from(*i).into())
-                {
-                    *int = s;
-                    return;
-                }
-                let Some(acc) = generic.take().or_else(|| super::value::exact_sum(*int)) else {
-                    *ok = false;
-                    return;
-                };
-                match value {
-                    Some(v) => match arith(NumOp::Add, &acc, &v) {
-                        Ok(v) => *generic = Some(v),
-                        Err(_) => *ok = false,
-                    },
-                    None => *ok = false,
-                }
+                self.add_sum_slow(ctx, id);
             }
             AggState::Best(best, best_v, errs) => {
                 let Some(id) = id.filter(|id| !id.is_undef()) else {
@@ -7518,54 +7535,444 @@ impl AggState {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn add_sum_slow(&mut self, ctx: &Ctx, id: Id) {
+        let AggState::Sum { acc, errs, .. } = self else {
+            unreachable!()
+        };
+        *errs += u64::from(id.is_undef());
+        if matches!(acc, SumAcc::HardError | SumAcc::Overflow) {
+            return;
+        }
+        if id.is_undef() {
+            *acc = SumAcc::HardError;
+            return;
+        }
+        match (&mut *acc, id.tag()) {
+            (SumAcc::IntRetracted(sum), crate::id::Tag::Int) => {
+                if let Some(s) = sum.checked_add(id.as_i64().into()) {
+                    *sum = s;
+                    return;
+                }
+            }
+            (SumAcc::Decimal(ds), crate::id::Tag::Int) => {
+                let raw = i128::from(id.as_i64()) * super::value::DECIMAL_SCALE;
+                match ds.val.checked_add(raw) {
+                    Some(v) => {
+                        ds.val = v;
+                        ds.min = ds.min.min(v);
+                        ds.max = ds.max.max(v);
+                    }
+                    None => *acc = SumAcc::Overflow,
+                }
+                return;
+            }
+            (SumAcc::Float(f), crate::id::Tag::Int) => {
+                *f = *f + oxsdatatypes::Float::from(oxsdatatypes::Integer::from(id.as_i64()));
+                return;
+            }
+            (SumAcc::Float(f), crate::id::Tag::Double) => {
+                *acc = SumAcc::Double(
+                    oxsdatatypes::Double::from(*f) + oxsdatatypes::Double::from(id.as_f64()),
+                );
+                return;
+            }
+            (SumAcc::Double(d), crate::id::Tag::Int) => {
+                *d = *d + oxsdatatypes::Double::from(oxsdatatypes::Integer::from(id.as_i64()));
+                return;
+            }
+            (SumAcc::Double(d), crate::id::Tag::Double) => {
+                *d = *d + oxsdatatypes::Double::from(id.as_f64());
+                return;
+            }
+            _ => {}
+        }
+        let Some(value) = ctx.value(id) else {
+            *acc = SumAcc::HardError;
+            return;
+        };
+        if !value.is_numeric() {
+            *acc = SumAcc::HardError;
+            return;
+        }
+        match (&mut *acc, value) {
+            (SumAcc::Int { sum, min, max }, Value::Integer(i)) => {
+                let x = i64::from(i);
+                if let Some(s) = sum.checked_add(x.into()) {
+                    *sum = s;
+                    if x >= 0 {
+                        if s > *max {
+                            *max = s;
+                        }
+                    } else if s < *min {
+                        *min = s;
+                    }
+                } else {
+                    *acc = SumAcc::Overflow;
+                }
+            }
+            (SumAcc::IntRetracted(sum), Value::Integer(i)) => {
+                if let Some(s) = sum.checked_add(i64::from(i).into()) {
+                    *sum = s;
+                } else {
+                    *acc = SumAcc::Overflow;
+                }
+            }
+            (SumAcc::Int { sum, min, max }, Value::Decimal(d)) => {
+                let (int_before, int_min, int_max) = (*sum, *min, *max);
+                match int_before
+                    .checked_mul(super::value::DECIMAL_SCALE)
+                    .and_then(|s| s.checked_add(super::value::decimal_raw(d)))
+                {
+                    Some(v) => {
+                        *acc = SumAcc::Decimal(Box::new(DecimalSum {
+                            val: v,
+                            min: v,
+                            max: v,
+                            int_before,
+                            int_min,
+                            int_max,
+                            exact_int_prefix: true,
+                        }));
+                    }
+                    None => *acc = SumAcc::Overflow,
+                }
+            }
+            (SumAcc::IntRetracted(sum), Value::Decimal(d)) => {
+                let int_before = *sum;
+                match int_before
+                    .checked_mul(super::value::DECIMAL_SCALE)
+                    .and_then(|s| s.checked_add(super::value::decimal_raw(d)))
+                {
+                    Some(v) => {
+                        *acc = SumAcc::Decimal(Box::new(DecimalSum {
+                            val: v,
+                            min: v,
+                            max: v,
+                            int_before,
+                            int_min: 0,
+                            int_max: 0,
+                            exact_int_prefix: false,
+                        }));
+                    }
+                    None => *acc = SumAcc::Overflow,
+                }
+            }
+            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Value::Float(f)) => {
+                let Some(base) = super::value::exact_sum(*sum) else {
+                    *acc = SumAcc::Overflow;
+                    return;
+                };
+                match arith(NumOp::Add, &base, &Value::Float(f)) {
+                    Ok(Value::Float(v)) => *acc = SumAcc::Float(v),
+                    _ => *acc = SumAcc::Overflow,
+                }
+            }
+            (SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum), Value::Double(d)) => {
+                let Some(base) = super::value::exact_sum(*sum) else {
+                    *acc = SumAcc::Overflow;
+                    return;
+                };
+                match arith(NumOp::Add, &base, &Value::Double(d)) {
+                    Ok(Value::Double(v)) => *acc = SumAcc::Double(v),
+                    _ => *acc = SumAcc::Overflow,
+                }
+            }
+            (SumAcc::Decimal(ds), Value::Integer(i)) => {
+                let raw = i128::from(i64::from(i)) * super::value::DECIMAL_SCALE;
+                match ds.val.checked_add(raw) {
+                    Some(v) => {
+                        ds.val = v;
+                        ds.min = ds.min.min(v);
+                        ds.max = ds.max.max(v);
+                    }
+                    None => *acc = SumAcc::Overflow,
+                }
+            }
+            (SumAcc::Decimal(ds), Value::Decimal(d)) => {
+                match ds.val.checked_add(super::value::decimal_raw(d)) {
+                    Some(v) => {
+                        ds.val = v;
+                        ds.min = ds.min.min(v);
+                        ds.max = ds.max.max(v);
+                    }
+                    None => *acc = SumAcc::Overflow,
+                }
+            }
+            (SumAcc::Decimal(ds), Value::Float(f)) => {
+                let dec = Value::Decimal(super::value::decimal_from_raw(ds.val));
+                match arith(NumOp::Add, &dec, &Value::Float(f)) {
+                    Ok(Value::Float(v)) => *acc = SumAcc::Float(v),
+                    _ => *acc = SumAcc::Overflow,
+                }
+            }
+            (SumAcc::Decimal(ds), Value::Double(d)) => {
+                let dec = Value::Decimal(super::value::decimal_from_raw(ds.val));
+                match arith(NumOp::Add, &dec, &Value::Double(d)) {
+                    Ok(Value::Double(v)) => *acc = SumAcc::Double(v),
+                    _ => *acc = SumAcc::Overflow,
+                }
+            }
+            (SumAcc::Float(f), Value::Integer(i)) => {
+                *f = *f + oxsdatatypes::Float::from(i);
+            }
+            (SumAcc::Float(f), Value::Decimal(d)) => {
+                *f = *f + oxsdatatypes::Float::from(d);
+            }
+            (SumAcc::Float(f), Value::Float(g)) => {
+                *f = *f + g;
+            }
+            (SumAcc::Float(f), Value::Double(d)) => {
+                *acc = SumAcc::Double(oxsdatatypes::Double::from(*f) + d);
+            }
+            (SumAcc::Double(d), Value::Integer(i)) => {
+                *d = *d + oxsdatatypes::Double::from(i);
+            }
+            (SumAcc::Double(d), Value::Decimal(x)) => {
+                *d = *d + oxsdatatypes::Double::from(x);
+            }
+            (SumAcc::Double(d), Value::Float(f)) => {
+                *d = *d + oxsdatatypes::Double::from(f);
+            }
+            (SumAcc::Double(d), Value::Double(x)) => {
+                *d = *d + x;
+            }
+            (SumAcc::HardError | SumAcc::Overflow, _) => unreachable!(),
+            (_, _) => *acc = SumAcc::HardError,
+        }
+    }
+
+    /// Whether [`AggState::merge`] of `other` into `self` is guaranteed to match a single
+    /// sequential pass bit-for-bit without mutating either state.
+    pub(super) fn can_merge(&self, other: &AggState) -> bool {
+        match (self, other) {
+            (AggState::Count(_), AggState::Count(_))
+            | (AggState::Best(..), AggState::Best(..))
+            | (AggState::Sample(_), AggState::Sample(_)) => true,
+            (
+                AggState::Sum {
+                    acc: la, rows: lr, ..
+                },
+                AggState::Sum {
+                    acc: ra,
+                    rows: rr,
+                    errs: re,
+                },
+            ) => {
+                if *lr == 0 || *rr == 0 {
+                    return true;
+                }
+                if matches!(la, SumAcc::HardError | SumAcc::Overflow) {
+                    return true;
+                }
+                if matches!(ra, SumAcc::HardError) {
+                    return true;
+                }
+                if matches!(ra, SumAcc::Overflow) {
+                    return *re > 0;
+                }
+                match (la, ra) {
+                    (
+                        SumAcc::Int { sum: ls, .. },
+                        SumAcc::Int {
+                            sum: rs,
+                            min: rmin,
+                            max: rmax,
+                        },
+                    ) => {
+                        ls.checked_add(*rs).is_some()
+                            && ls.checked_add(*rmin).is_some()
+                            && ls.checked_add(*rmax).is_some()
+                    }
+                    (
+                        SumAcc::Int { sum: ls, .. } | SumAcc::IntRetracted(ls),
+                        SumAcc::Int { sum: rs, .. } | SumAcc::IntRetracted(rs),
+                    ) => ls.checked_add(*rs).is_some(),
+                    (SumAcc::Decimal(_), SumAcc::Int { .. }) => true,
+                    (SumAcc::Int { sum: ls, .. }, SumAcc::Decimal(r)) => {
+                        ls.checked_add(r.int_before).is_some()
+                            && (!r.exact_int_prefix
+                                || (ls.checked_add(r.int_min).is_some()
+                                    && ls.checked_add(r.int_max).is_some()))
+                    }
+                    (SumAcc::Decimal(_), SumAcc::Decimal(r)) => r.exact_int_prefix,
+                    (SumAcc::Decimal(_), SumAcc::IntRetracted(_))
+                    | (SumAcc::IntRetracted(_), SumAcc::Decimal(_)) => false,
+                    (
+                        SumAcc::Float(_) | SumAcc::Double(_),
+                        SumAcc::Int { .. }
+                        | SumAcc::Decimal(_)
+                        | SumAcc::Float(_)
+                        | SumAcc::Double(_),
+                    )
+                    | (
+                        SumAcc::Int { .. } | SumAcc::IntRetracted(_) | SumAcc::Decimal(_),
+                        SumAcc::Float(_) | SumAcc::Double(_),
+                    ) => *rr == 1,
+                    (SumAcc::Float(_) | SumAcc::Double(_), SumAcc::IntRetracted(_)) => false,
+                    (SumAcc::HardError | SumAcc::Overflow, _)
+                    | (_, SumAcc::HardError | SumAcc::Overflow) => unreachable!(),
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Fold `other`, the state of the same aggregate over rows that come after this
     /// state's rows, into this one, so that the result is what one state over all the
     /// rows in that order gives. `false`, with this state unchanged, for a state that
-    /// cannot be combined exactly, such as ARQ's shifted sums.
-    #[allow(dead_code, reason = "the parallel split and item 418's view operator")]
+    /// cannot be combined exactly, such as ARQ's shifted sums, multi-row float/double
+    /// subtotals, or a right-side numeric overflow that a single pass might have avoided.
     pub(super) fn merge(&mut self, ctx: &Ctx, agg: &Agg, other: AggState) -> bool {
+        if !self.can_merge(&other) {
+            let _ = ctx;
+            return false;
+        }
         match (&mut *self, other) {
             (AggState::Count(a), AggState::Count(b)) => *a += b,
             (
+                AggState::Sum { acc, rows, errs },
                 AggState::Sum {
-                    int,
-                    generic,
-                    ok,
-                    rows,
-                    errs,
-                },
-                AggState::Sum {
-                    int: oint,
-                    generic: ogeneric,
-                    ok: ook,
+                    acc: oacc,
                     rows: orows,
                     errs: oerrs,
                 },
             ) => {
+                if orows == 0 {
+                    return true;
+                }
+                if *rows == 0 {
+                    *acc = oacc;
+                    *rows = orows;
+                    *errs = oerrs;
+                    return true;
+                }
                 *rows += orows;
                 *errs += oerrs;
-                if !*ok {
+                if matches!(acc, SumAcc::HardError | SumAcc::Overflow) {
                     return true;
                 }
-                if !ook {
-                    *ok = false;
-                    return true;
-                }
-                if generic.is_none()
-                    && ogeneric.is_none()
-                    && let Some(s) = int.checked_add(oint)
+                if matches!(oacc, SumAcc::HardError)
+                    || (matches!(oacc, SumAcc::Overflow) && oerrs > 0)
                 {
-                    *int = s;
+                    *acc = SumAcc::HardError;
                     return true;
                 }
-                let left = generic.take().or_else(|| super::value::exact_sum(*int));
-                let right = ogeneric.or_else(|| super::value::exact_sum(oint));
-                match (left, right) {
-                    (Some(l), Some(r)) => match arith(NumOp::Add, &l, &r) {
-                        Ok(v) => *generic = Some(v),
-                        Err(_) => *ok = false,
-                    },
-                    _ => *ok = false,
+                match (&mut *acc, oacc) {
+                    (
+                        SumAcc::Int { sum, min, max },
+                        SumAcc::Int {
+                            sum: osum,
+                            min: omin,
+                            max: omax,
+                        },
+                    ) => {
+                        let base = *sum;
+                        *sum = base + osum;
+                        *min = (*min).min(base + omin);
+                        *max = (*max).max(base + omax);
+                    }
+                    (
+                        SumAcc::Int { sum: ls, .. } | SumAcc::IntRetracted(ls),
+                        SumAcc::Int { sum: rs, .. } | SumAcc::IntRetracted(rs),
+                    ) => {
+                        *acc = SumAcc::IntRetracted(*ls + rs);
+                    }
+                    (
+                        SumAcc::Decimal(l),
+                        SumAcc::Int {
+                            sum: osum,
+                            min: omin,
+                            max: omax,
+                        },
+                    ) => {
+                        let shifted_min = super::value::add_scaled_int(l.val, omin);
+                        let shifted_max = super::value::add_scaled_int(l.val, omax);
+                        let new_val = super::value::add_scaled_int(l.val, osum);
+                        match (shifted_min, shifted_max, new_val) {
+                            (Some(smin), Some(smax), Some(val)) => {
+                                l.val = val;
+                                l.min = l.min.min(smin);
+                                l.max = l.max.max(smax);
+                            }
+                            _ => *acc = SumAcc::Overflow,
+                        }
+                    }
+                    (SumAcc::Int { sum, min, max }, SumAcc::Decimal(mut r)) => {
+                        let base = *sum;
+                        let trans_int = base + r.int_before;
+                        let trans_ok = trans_int.checked_mul(super::value::DECIMAL_SCALE).is_some();
+                        let shifted_min = super::value::add_scaled_int(r.min, base);
+                        let shifted_max = super::value::add_scaled_int(r.max, base);
+                        let new_val = super::value::add_scaled_int(r.val, base);
+                        if !trans_ok {
+                            *acc = SumAcc::Overflow;
+                        } else if let (Some(smin), Some(smax), Some(val)) =
+                            (shifted_min, shifted_max, new_val)
+                        {
+                            r.val = val;
+                            r.min = smin;
+                            r.max = smax;
+                            r.int_before = trans_int;
+                            if r.exact_int_prefix {
+                                r.int_min = (*min).min(base + r.int_min);
+                                r.int_max = (*max).max(base + r.int_max);
+                            }
+                            *acc = SumAcc::Decimal(r);
+                        } else {
+                            *acc = SumAcc::Overflow;
+                        }
+                    }
+                    (SumAcc::Decimal(l), SumAcc::Decimal(r)) => {
+                        let int_min = super::value::add_scaled_int(l.val, r.int_min);
+                        let int_max = super::value::add_scaled_int(l.val, r.int_max);
+                        let dec_min = l.val.checked_add(r.min);
+                        let dec_max = l.val.checked_add(r.max);
+                        let new_val = l.val.checked_add(r.val);
+                        match (int_min, int_max, dec_min, dec_max, new_val) {
+                            (Some(imin), Some(imax), Some(dmin), Some(dmax), Some(val)) => {
+                                l.val = val;
+                                l.min = l.min.min(imin).min(dmin);
+                                l.max = l.max.max(imax).max(dmax);
+                            }
+                            _ => *acc = SumAcc::Overflow,
+                        }
+                    }
+                    // Single-row right partition with Float or Double on either side.
+                    (left_acc, right_acc) => {
+                        debug_assert_eq!(orows, 1);
+                        let left_val = match left_acc {
+                            SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum) => {
+                                super::value::exact_sum(*sum)
+                            }
+                            SumAcc::Decimal(ds) => {
+                                Some(Value::Decimal(super::value::decimal_from_raw(ds.val)))
+                            }
+                            SumAcc::Float(f) => Some(Value::Float(*f)),
+                            SumAcc::Double(d) => Some(Value::Double(*d)),
+                            SumAcc::HardError | SumAcc::Overflow => unreachable!(),
+                        };
+                        let right_val = match right_acc {
+                            SumAcc::Int { sum, .. } => super::value::exact_sum(sum),
+                            SumAcc::Decimal(ds) => {
+                                Some(Value::Decimal(super::value::decimal_from_raw(ds.val)))
+                            }
+                            SumAcc::Float(f) => Some(Value::Float(f)),
+                            SumAcc::Double(d) => Some(Value::Double(d)),
+                            SumAcc::IntRetracted(_) | SumAcc::HardError | SumAcc::Overflow => {
+                                unreachable!()
+                            }
+                        };
+                        match (left_val, right_val) {
+                            (Some(l), Some(r)) => match arith(NumOp::Add, &l, &r) {
+                                Ok(Value::Float(f)) => *left_acc = SumAcc::Float(f),
+                                Ok(Value::Double(d)) => *left_acc = SumAcc::Double(d),
+                                _ => *left_acc = SumAcc::Overflow,
+                            },
+                            _ => *left_acc = SumAcc::Overflow,
+                        }
+                    }
                 }
             }
             (AggState::Best(best, best_v, errs), AggState::Best(Some(id), v, oerrs)) => {
@@ -7592,10 +7999,7 @@ impl AggState {
                     *x = y;
                 }
             }
-            _ => {
-                let _ = ctx;
-                return false;
-            }
+            _ => unreachable!("validated by can_merge"),
         }
         true
     }
@@ -7604,7 +8008,7 @@ impl AggState {
     /// and an exact sum of inline integers. `false`, with this state unchanged, for any
     /// other, since a minimum, a sample or a sum that left the exact integers keeps no
     /// record of the rows it would have to give up.
-    #[allow(dead_code, reason = "the parallel split and item 418's view operator")]
+    #[allow(dead_code, reason = "item 418's view operator")]
     pub(super) fn retract(&mut self, id: Option<Id>) -> bool {
         match self {
             AggState::Count(n) => {
@@ -7613,20 +8017,18 @@ impl AggState {
                 }
                 true
             }
-            AggState::Sum {
-                int,
-                generic: None,
-                ok: true,
-                rows,
-                ..
-            } => {
+            AggState::Sum { acc, rows, .. } => {
+                let sum = match acc {
+                    SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum) => *sum,
+                    _ => return false,
+                };
                 let Some(id) = id.filter(|id| id.tag() == crate::id::Tag::Int) else {
                     return false;
                 };
-                let Some(s) = int.checked_sub(id.as_i64().into()) else {
+                let Some(s) = sum.checked_sub(id.as_i64().into()) else {
                     return false;
                 };
-                *int = s;
+                *acc = SumAcc::IntRetracted(s);
                 *rows = rows.saturating_sub(1);
                 true
             }
@@ -7637,13 +8039,7 @@ impl AggState {
     pub(super) fn finish(self, ctx: &Ctx, agg: &Agg) -> Id {
         match self {
             AggState::Count(n) => Id::from_i64(n as i64).unwrap_or(Id::UNDEF),
-            AggState::Sum {
-                int,
-                generic,
-                ok,
-                rows,
-                errs,
-            } => {
+            AggState::Sum { acc, rows, errs } => {
                 // AVG is Sum over Count, and Count leaves the errors out
                 if rows > 0
                     && errs == rows
@@ -7652,15 +8048,17 @@ impl AggState {
                 {
                     return ctx.intern_value(&Value::Integer(0.into()));
                 }
-                if !ok {
-                    return Id::UNDEF;
-                }
-                let sum = match generic {
-                    Some(sum) => sum,
-                    None => match i64::try_from(int) {
-                        Ok(int) => Value::Integer(int.into()),
-                        Err(_) => return Id::UNDEF,
-                    },
+                let sum = match acc {
+                    SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum) => {
+                        match i64::try_from(sum) {
+                            Ok(int) => Value::Integer(int.into()),
+                            Err(_) => return Id::UNDEF,
+                        }
+                    }
+                    SumAcc::Decimal(ds) => Value::Decimal(super::value::decimal_from_raw(ds.val)),
+                    SumAcc::Float(f) => Value::Float(f),
+                    SumAcc::Double(d) => Value::Double(d),
+                    SumAcc::HardError | SumAcc::Overflow => return Id::UNDEF,
                 };
                 let v = if matches!(agg.func, AggregateFunction::Avg) {
                     if rows == 0 {

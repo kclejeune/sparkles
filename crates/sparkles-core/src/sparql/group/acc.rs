@@ -238,12 +238,9 @@ impl Accumulator for Running {
         Ok(())
     }
 
-    /// A merged SUM or AVG can differ from one pass in three ways. A float or double
-    /// subtotal can round differently. An integer subtotal beyond the decimal range
-    /// leaves the result unbound where one pass would have promoted it to a double. A
-    /// decimal sum that overflows partway through one pass, and so stays unbound, can
-    /// fit when its parts are summed apart. No caller merges these yet. Roadmap item
-    /// 1066, the parallel split that merges partitions, settles them before it does.
+    /// `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` and `SAMPLE` support merging; `SUM` and `AVG`
+    /// verify exactness against single-pass semantics per group and refuse cleanly when
+    /// a float/double subtotal or right-side numeric overflow could differ.
     fn mergeable(&self) -> bool {
         crate::sparql::exec::stat_aggregate(&self.agg.func).is_none()
     }
@@ -253,12 +250,20 @@ impl Accumulator for Running {
             .as_any()
             .downcast_mut::<Running>()
             .expect("an accumulator of the same kind");
+        if other.states.len() != into.len()
+            || other
+                .states
+                .iter()
+                .zip(into)
+                .any(|(state, &to)| !self.states[to as usize].can_merge(state))
+        {
+            return Err(crate::error::Error::unsupported(
+                "this aggregate cannot be merged",
+            ));
+        }
         for (state, &to) in std::mem::take(&mut other.states).into_iter().zip(into) {
-            if !self.states[to as usize].merge(ctx, &self.agg, state) {
-                return Err(crate::error::Error::unsupported(
-                    "this aggregate cannot be merged",
-                ));
-            }
+            let merged = self.states[to as usize].merge(ctx, &self.agg, state);
+            debug_assert!(merged, "validated by can_merge");
         }
         if self.is_best() {
             for (from, &to) in std::mem::take(&mut other.payload).iter().zip(into) {
