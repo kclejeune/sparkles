@@ -3221,3 +3221,131 @@ async fn dl663_http_strict_refusal_leaves_the_target_unpublished() {
     assert_eq!(r.json()["total"], 0);
     println!("dl663 ok: HTTP strict leaves target unpublished");
 }
+
+#[tokio::test]
+async fn patterns_preview_dry_run_and_atomic_apply_robot_and_dosdp() {
+    let s = server();
+    let ds = s._state.get("t").unwrap();
+    let initial_head = ds.store.head_commit().seq;
+
+    let robot_body = json!({
+        "table": {
+            "format": "csv",
+            "data": "ID,Label,Type,Parent,Note\nID,LABEL@en,TYPE,SC %,A rdfs:comment\nex:Lecturer,Lecturer,owl:Class,ex:Person,Teaches classes\nex:Seminar,Seminar,owl:Class,ex:Course,Small class\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        },
+        "declare": true,
+        "limit": 50
+    });
+
+    // 1. Preview returns generated axioms, diff summary, ETag, and leaves dataset unchanged.
+    let prev = post(&s.app, "/$/ontology/t/patterns/preview", robot_body.clone()).await;
+    assert_eq!(prev.status, StatusCode::OK, "{}", prev.text());
+    let etag = prev
+        .headers
+        .get(header::ETAG)
+        .expect("preview returns ETag")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let pj = prev.json();
+    assert_eq!(pj["valid"], true);
+    assert_eq!(pj["rowsProcessed"], 2);
+    assert_eq!(pj["rowsWithErrors"], 0);
+    assert!(pj["newAxioms"].as_u64().unwrap() >= 6);
+    assert!(pj["estimatedTriples"].as_u64().unwrap() >= 6);
+    assert_eq!(ds.store.head_commit().seq, initial_head);
+
+    // 2. Dry-run apply returns WritePreview parity without committing.
+    let dry_body = json!({
+        "table": robot_body["table"],
+        "spec": robot_body["spec"],
+        "declare": true,
+        "message": "Import roles from ROBOT sheet"
+    });
+    let dry = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/patterns/apply?dryRun=true",
+        &[("content-type", "application/json"), ("if-match", &etag)],
+        &dry_body.to_string(),
+    )
+    .await;
+    assert_eq!(dry.status, StatusCode::OK, "{}", dry.text());
+    let dj = dry.json();
+    assert_eq!(dj["dryRun"], true, "{dj}");
+    assert!(dj["commit"]["inserted"].as_u64().unwrap() >= 6, "{dj}");
+    assert_eq!(ds.store.head_commit().seq, initial_head);
+
+    // 3. Apply commits atomically in one commit with If-Match.
+    let applied = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/patterns/apply?receipt=true",
+        &[("content-type", "application/json"), ("if-match", &etag)],
+        &dry_body.to_string(),
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::OK, "{}", applied.text());
+    let aj = applied.json();
+    assert_eq!(aj["committed"], true, "{aj}");
+    assert!(aj["added"].as_u64().unwrap() >= 6);
+    assert_eq!(aj["pattern"]["rowsProcessed"], 2);
+    assert_eq!(ds.store.head_commit().seq, initial_head + 1);
+
+    // 4. Reusing stale If-Match returns 412 Precondition Failed.
+    let stale = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/patterns/apply",
+        &[("content-type", "application/json"), ("if-match", &etag)],
+        &dry_body.to_string(),
+    )
+    .await;
+    assert_eq!(
+        stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{}",
+        stale.text()
+    );
+
+    // 5. DOSDP pattern mode with errors aborts by default (422) and commits valid rows with onError=skip.
+    let dosdp_err = json!({
+        "table": {
+            "data": "cls,parent\nAdjunct,ex:Person\nBad One,not a valid ( expr\n"
+        },
+        "spec": {
+            "mode": "pattern",
+            "baseIri": "http://ex.org/",
+            "prefixes": { "ex": "http://ex.org/" },
+            "declarations": [{ "column": "cls", "kind": "Class" }],
+            "rules": [{
+                "name": "sub",
+                "template": "${cls|iri} SubClassOf ${parent}",
+                "syntax": "manchester"
+            }]
+        }
+    });
+    let aborted = post(&s.app, "/$/ontology/t/patterns/apply", dosdp_err.clone()).await;
+    assert_eq!(
+        aborted.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        aborted.text()
+    );
+    assert_eq!(aborted.json()["code"], "pattern-errors");
+    assert_eq!(ds.store.head_commit().seq, initial_head + 1);
+
+    let mut dosdp_skip = dosdp_err;
+    dosdp_skip["onError"] = json!("skip");
+    let skipped = post(&s.app, "/$/ontology/t/patterns/apply", dosdp_skip).await;
+    assert_eq!(skipped.status, StatusCode::OK, "{}", skipped.text());
+    let sj = skipped.json();
+    assert_eq!(sj["committed"], true, "{sj}");
+    assert_eq!(sj["pattern"]["rowsWithErrors"], 1);
+    assert_eq!(ds.store.head_commit().seq, initial_head + 2);
+}

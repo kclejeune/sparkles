@@ -54,6 +54,8 @@ pub(super) use imports::{
     catalog as imports_catalog, fetch as imports_fetch, get_map as imports_get,
     patch_map as imports_patch,
 };
+mod patterns;
+pub(super) use patterns::{apply as patterns_apply, preview as patterns_preview};
 
 /// The ontology the query parameters name, with the import map and the vocabulary
 /// resources its imports may resolve through (spec U12, import resolution).

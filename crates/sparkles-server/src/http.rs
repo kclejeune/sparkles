@@ -236,6 +236,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/$/ontology/{ds}/imports/fetch",
             post(ontology::imports_fetch),
         )
+        .route(
+            "/$/ontology/{ds}/patterns/preview",
+            post(ontology::patterns_preview),
+        )
+        .route(
+            "/$/ontology/{ds}/patterns/apply",
+            post(ontology::patterns_apply),
+        )
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
         .route("/$/skos/shapes", get(skos_shapes))

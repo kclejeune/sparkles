@@ -2621,6 +2621,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ontology/{ds}/patterns/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Generate and commit axioms from a table
+         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, `If-Match` preconditions, `receipt=true`, and `dryRun=true` preview parity. With `onError: "abort"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: "skip"` skips erroneous rows and commits the valid axioms.
+         */
+        post: operations["applyOntologyPatterns"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ontology/{ds}/patterns/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview axioms generated from a table
+         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the ontology's entity tag for `If-Match` on apply.
+         */
+        post: operations["previewOntologyPatterns"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/ontology/{ds}/search": {
         parameters: {
             query?: never;
@@ -21206,6 +21246,347 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    applyOntologyPatterns: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Run the write as a preview and roll it back. `dryRun` with no value means true. */
+                dryRun?: components["parameters"]["dryRun"];
+                /** @description With `dryRun`: list up to this many changed quads. */
+                changes?: components["parameters"]["changes"];
+                /** @description Add a commit receipt to the body. */
+                receipt?: components["parameters"]["receipt"];
+                /** @description `false` skips write-time validation when the server allows it (`--allow-unvalidated-writes`). */
+                validate?: components["parameters"]["validate"];
+                /** @description The most validation results reported when a write is rejected. */
+                validationLimit?: number;
+                /** @description Include complete candidate entailment changes in a JSON dry run. Requires dryRun=true. */
+                entailments?: boolean;
+                /** @description The shared reasoning profile. Omit it to use the recorded program. */
+                profile?: string;
+                /** @description Jena rule text for the rules profile. */
+                rules?: string;
+                /** @description JSON AnalysisInputs with dataGraphs, ontologyGraphs, imports and locationMapping. */
+                inputs?: string;
+                /** @description A JSON array of built-in vocabulary names. */
+                vocabularies?: string;
+                /** @description Include GeoSPARQL default geometry inference. */
+                geoDefaultGeometry?: boolean;
+                /** @description The analysis memory allowance in bytes, capped at the server budget. */
+                maxMemory?: number;
+                /** @description The most inferred triples, capped at the server reasoning limit. */
+                maxInferred?: number;
+                /** @description HTTP uses the server reasoning pool. */
+                threads?: number;
+            };
+            header?: {
+                /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
+                "Sparkles-Commit-Message"?: components["parameters"]["commitMessage"];
+                /** @description `true` runs the write as a preview. */
+                "Sparkles-Dry-Run"?: components["parameters"]["dryRunHeader"];
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The table, pattern specification, and commit options. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    declare?: boolean;
+                    /** @description A graph IRI or `default`, or a list of them. */
+                    graph?: unknown;
+                    imports?: boolean;
+                    message?: string;
+                    /** @enum {string} */
+                    mode?: "lenient" | "strict";
+                    /**
+                     * @description Whether row errors refuse the commit (`abort`, the default) or skip the erroneous entries (`skip`).
+                     * @enum {string}
+                     */
+                    onError?: "abort" | "skip";
+                    spec: {
+                        /** @description Optional base IRI for resolving bare local names. */
+                        baseIri?: string | null;
+                        columns?: {
+                            column: string;
+                            directive: string;
+                            split?: string | null;
+                        }[];
+                        declarations?: {
+                            column: string;
+                            /** @enum {string} */
+                            kind: "Class" | "ObjectProperty" | "DataProperty" | "AnnotationProperty" | "NamedIndividual" | "Datatype";
+                            split?: string | null;
+                        }[];
+                        /** @description In `robot` mode, whether row 2 carries the directive strings. */
+                        headerTemplateRow?: boolean;
+                        /**
+                         * @description `robot` for ROBOT-template column directives, or `pattern` for DOSDP/Cellfie-style parameterized axiom rules.
+                         * @enum {string}
+                         */
+                        mode: "robot" | "pattern";
+                        /** @description Extra prefix bindings merged on top of the dataset's prefixes. */
+                        prefixes?: {
+                            [key: string]: string;
+                        };
+                        rules?: {
+                            annotations?: {
+                                datatype?: string | null;
+                                iri?: boolean;
+                                lang?: string | null;
+                                property: string;
+                                value: string;
+                            }[];
+                            name?: string | null;
+                            requiredColumns?: string[];
+                            skipIfEmpty?: boolean;
+                            split?: {
+                                [key: string]: string;
+                            };
+                            /** @enum {string} */
+                            syntax?: "manchester" | "functional";
+                            template: string;
+                        }[];
+                    };
+                    table: {
+                        /** @description CSV or TSV spreadsheet text (at most 2 MiB and 5,000 data rows). */
+                        data: string;
+                        /**
+                         * @description Delimiter selection (`auto` by default).
+                         * @enum {string}
+                         */
+                        format?: "auto" | "csv" | "tsv";
+                    };
+                    /** @description The graph that takes the added axioms. */
+                    target?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description What the commit wrote, with pattern counts and diagnostics and the receipt when asked for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        absent?: string[];
+                        added?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        addedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                        axiomsTruncated?: boolean;
+                        committed?: boolean;
+                        declared?: string[];
+                        deleted?: number;
+                        inserted?: number;
+                        kept?: number;
+                        pattern?: {
+                            delimiter?: string;
+                            diagnostics?: {
+                                code?: string;
+                                column?: string | null;
+                                message?: string;
+                                /** @description 1-based source line number. */
+                                row?: number;
+                                /** @enum {string} */
+                                severity?: "error" | "warning";
+                            }[];
+                            diagnosticsTruncated?: boolean;
+                            generated?: number;
+                            headers?: string[];
+                            rowsProcessed?: number;
+                            rowsSkipped?: number;
+                            rowsWithErrors?: number;
+                            valid?: boolean;
+                        };
+                        present?: number;
+                        removed?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        removedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            412: components["responses"]["PreconditionFailed"];
+            413: components["responses"]["PayloadTooLarge"];
+            422: components["responses"]["Unprocessable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    previewOntologyPatterns: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description A graph read: an IRI or `default` (repeatable). The default graph when none is named. */
+                graph?: string;
+                /** @description Follow `owl:imports` to graphs of the dataset (the default). */
+                imports?: boolean;
+                /** @description How the reverse mapping reads the graphs: `lenient` (the default) types undeclared entities from their use, `strict` keeps every triple outside the mapping unmapped. */
+                mode?: "lenient" | "strict";
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The table, pattern specification, and preview options. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Whether missing entity declarations would be added on apply (true by default). */
+                    declare?: boolean;
+                    /** @description A graph IRI or `default`, or a list of them. */
+                    graph?: unknown;
+                    imports?: boolean;
+                    /** @description The most generated axioms listed in `axioms` (200 by default). */
+                    limit?: number;
+                    /** @enum {string} */
+                    mode?: "lenient" | "strict";
+                    spec: {
+                        /** @description Optional base IRI for resolving bare local names. */
+                        baseIri?: string | null;
+                        columns?: {
+                            column: string;
+                            directive: string;
+                            split?: string | null;
+                        }[];
+                        declarations?: {
+                            column: string;
+                            /** @enum {string} */
+                            kind: "Class" | "ObjectProperty" | "DataProperty" | "AnnotationProperty" | "NamedIndividual" | "Datatype";
+                            split?: string | null;
+                        }[];
+                        /** @description In `robot` mode, whether row 2 carries the directive strings. */
+                        headerTemplateRow?: boolean;
+                        /**
+                         * @description `robot` for ROBOT-template column directives, or `pattern` for DOSDP/Cellfie-style parameterized axiom rules.
+                         * @enum {string}
+                         */
+                        mode: "robot" | "pattern";
+                        /** @description Extra prefix bindings merged on top of the dataset's prefixes. */
+                        prefixes?: {
+                            [key: string]: string;
+                        };
+                        rules?: {
+                            annotations?: {
+                                datatype?: string | null;
+                                iri?: boolean;
+                                lang?: string | null;
+                                property: string;
+                                value: string;
+                            }[];
+                            name?: string | null;
+                            requiredColumns?: string[];
+                            skipIfEmpty?: boolean;
+                            split?: {
+                                [key: string]: string;
+                            };
+                            /** @enum {string} */
+                            syntax?: "manchester" | "functional";
+                            template: string;
+                        }[];
+                    };
+                    table: {
+                        /** @description CSV or TSV spreadsheet text (at most 2 MiB and 5,000 data rows). */
+                        data: string;
+                        /**
+                         * @description Delimiter selection (`auto` by default).
+                         * @enum {string}
+                         */
+                        format?: "auto" | "csv" | "tsv";
+                    };
+                    /** @description The graph that would take the added axioms. */
+                    target?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The preview of generated axioms, diff summary, and row diagnostics. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        autoDeclarations?: {
+                            iri?: string;
+                            kind?: string;
+                        }[];
+                        axioms?: {
+                            axiom?: Record<string, never>;
+                            manchester?: string | null;
+                            ofn?: string;
+                            rows?: number[];
+                            /** @enum {string} */
+                            status?: "new" | "existing";
+                            type?: string;
+                        }[];
+                        axiomsTruncated?: boolean;
+                        commit?: number;
+                        dataset?: string;
+                        /** @enum {string} */
+                        delimiter?: "csv" | "tsv";
+                        diagnostics?: {
+                            code?: string;
+                            column?: string | null;
+                            message?: string;
+                            /** @description 1-based source line number. */
+                            row?: number;
+                            /** @enum {string} */
+                            severity?: "error" | "warning";
+                        }[];
+                        diagnosticsTruncated?: boolean;
+                        estimatedTriples?: number;
+                        existingAxioms?: number;
+                        generated?: number;
+                        graphs?: string[];
+                        headers?: string[];
+                        newAxioms?: number;
+                        rowsProcessed?: number;
+                        rowsSkipped?: number;
+                        rowsWithErrors?: number;
+                        target?: string;
+                        valid?: boolean;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            413: components["responses"]["PayloadTooLarge"];
             default: components["responses"]["Error"];
         };
     };

@@ -607,3 +607,93 @@ async fn the_import_map_needs_admin_and_shows_readers_their_graphs() {
     );
     assert_eq!(r.json()["closure"][0]["via"], "map");
 }
+
+/// Pattern-based axiom generation (spec U12, item 623): readers can preview patterns on
+/// graphs they can read, while applying requires dataset write access and graph write grants.
+#[tokio::test]
+async fn ontology_patterns_preview_reads_and_apply_enforces_write_grants() {
+    let (_dir, app) = server();
+    let payload = json!({
+        "graph": "http://ex/open",
+        "target": "http://ex/open",
+        "table": {
+            "data": "ID,Label,Parent\nID,LABEL,SC %\nhttp://ex/Generated,Generated class,http://ex/A\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true
+        }
+    });
+
+    // Anonymous gets 401 on both preview and apply.
+    let r = call(
+        &app,
+        "POST",
+        "/$/ontology/ont/patterns/preview",
+        &[("content-type", "application/json")],
+        &payload.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+    let r = call(
+        &app,
+        "POST",
+        "/$/ontology/ont/patterns/apply",
+        &[("content-type", "application/json")],
+        &payload.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+
+    // Reader can preview, but apply is 403 Forbidden.
+    let prev = as_user(
+        &app,
+        "oread",
+        "POST",
+        "/$/ontology/ont/patterns/preview",
+        &payload,
+    )
+    .await;
+    assert_eq!(prev.status, StatusCode::OK, "{}", prev.text());
+    assert_eq!(prev.json()["valid"], true);
+    let deny = as_user(
+        &app,
+        "oread",
+        "POST",
+        "/$/ontology/ont/patterns/apply",
+        &payload,
+    )
+    .await;
+    assert_eq!(deny.status, StatusCode::FORBIDDEN, "{}", deny.text());
+
+    // Graph-restricted writer cannot apply to a graph outside its write grant.
+    let mut secret_payload = payload.clone();
+    secret_payload["graph"] = json!("http://ex/secret");
+    secret_payload["target"] = json!("http://ex/secret");
+    let deny_graph = as_user(
+        &app,
+        "oopen",
+        "POST",
+        "/$/ontology/ont/patterns/apply",
+        &secret_payload,
+    )
+    .await;
+    assert_eq!(
+        deny_graph.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        deny_graph.text()
+    );
+
+    // Full writer can apply to the open graph in one commit.
+    let ok = as_user(
+        &app,
+        "ofull",
+        "POST",
+        "/$/ontology/ont/patterns/apply",
+        &payload,
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.text());
+    assert_eq!(ok.json()["committed"], true);
+}
