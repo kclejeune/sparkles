@@ -1806,8 +1806,45 @@ impl Ctx {
 
     /// Keep the selectivity measured for the conjunct shown as `text` (the first one
     /// measured stays, so that every plan compared sees the same).
-    pub(super) fn set_sampled(&self, text: String, s: super::sample::Sampled) {
-        self.sampled.lock().entry(text).or_insert(s);
+    pub(super) fn set_sampled(
+        &self,
+        scratch: Option<Charge<'_>>,
+        text: String,
+        s: super::sample::Sampled,
+    ) {
+        use sparkles_budget::sizes::{table_bytes, table_grown};
+        let mut samples = self.sampled.lock();
+        if samples.contains_key(&text) {
+            return;
+        }
+        if let Some(held) = &scratch {
+            let cap = samples.capacity();
+            let grown = table_grown(cap, samples.len(), 1);
+            let elem = size_of::<(String, super::sample::Sampled)>();
+            let new_table = if grown == cap {
+                0
+            } else {
+                table_bytes(grown, elem)
+            };
+            let text_bytes = text.capacity();
+            if held
+                .resize(text_bytes.saturating_add(new_table) as u64)
+                .is_err()
+            {
+                return;
+            }
+            samples.insert(text, s);
+            let retired = if grown == cap {
+                0
+            } else {
+                table_bytes(cap, elem)
+            };
+            let _ = held.resize(text_bytes.saturating_add(new_table - retired) as u64);
+            // The query owns the sample text and its table until the context drops.
+            held.disarm();
+        } else {
+            samples.insert(text, s);
+        }
     }
 
     #[inline]
@@ -3879,15 +3916,24 @@ impl Charge<'_> {
     /// Resize this live charge to `bytes` and transfer ownership into a [`RetainedCharge`]
     /// without releasing or double-charging.
     pub(super) fn into_retained(self, bytes: u64) -> Result<Option<RetainedCharge>> {
-        let owner = self.ctx.owner.lock().clone();
+        Self::transfer_retained(&mut Some(self), bytes)
+    }
+
+    /// Transfer a charge without consuming it if admission fails.
+    pub(super) fn transfer_retained(
+        source: &mut Option<Self>,
+        bytes: u64,
+    ) -> Result<Option<RetainedCharge>> {
+        let held = source.as_ref().expect("live charge to transfer");
+        let owner = held.ctx.owner.lock().clone();
         if owner.strong_count() == 0 {
-            if !self.ctx.streams {
+            if !held.ctx.streams {
                 return Ok(None);
             }
             return Err(Error::invalid("cursor context owner has not been attached"));
         }
-        self.resize(bytes)?;
-        let id = self.disarm();
+        held.resize(bytes)?;
+        let id = source.take().expect("admitted live charge").disarm();
         Ok(Some(RetainedCharge {
             owner,
             id: (bytes > 0).then_some(id).flatten(),

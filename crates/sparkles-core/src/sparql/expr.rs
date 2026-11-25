@@ -237,29 +237,17 @@ impl ExistsSpec {
             None if ctx.shared().is_some() => Some(ctx.charge(0)?),
             None => None,
         };
-        let mut seen: rustc_hash::FxHashSet<VarId> = rustc_hash::FxHashSet::default();
+        let mut seen = super::exists::VarSet::new(scratch.as_ref());
         let mut steps = 0usize;
-        let mut charged_cap = 0usize;
         super::plan::try_visit_pattern_vars(pattern, &mut |name| -> Result<()> {
             steps += 1;
             if steps.is_multiple_of(1024) {
                 ctx.check()?;
             }
-            let id = ctx.var(name);
-            if !seen.contains(&id) {
-                if let Some(scratch) = &scratch
-                    && seen.len() >= charged_cap
-                {
-                    let next_cap = charged_cap.max(4).saturating_mul(2);
-                    scratch.resize((next_cap as u64).saturating_mul(12))?;
-                    charged_cap = next_cap;
-                }
-                seen.insert(id);
-            }
-            Ok(())
+            seen.insert(ctx.var(name))
         })?;
-        let vars_len = seen.len();
-        let bound_len = seen.iter().filter(|v| subst.contains_key(v)).count();
+        let vars_len = seen.ids.len();
+        let bound_len = seen.ids.iter().filter(|v| subst.contains_key(v)).count();
         let spec_bytes = Self::spec_bytes(vars_len, bound_len);
         let spec_charge = ctx.retained_charge(spec_bytes)?;
         let spec_admission = if spec_charge.is_none()
@@ -272,7 +260,8 @@ impl ExistsSpec {
             None
         };
         let mut vars = Vec::with_capacity(vars_len);
-        vars.extend(seen);
+        vars.extend(seen.ids.iter().copied());
+        drop(seen);
         vars.sort_unstable();
         let mut bound = Vec::with_capacity(bound_len);
         for &v in &vars {
@@ -2768,4 +2757,45 @@ pub(super) fn compile_expression<T>(
             Expr::Call(f, args)
         }
     })
+}
+
+#[cfg(test)]
+mod exists_admission_tests {
+    use super::*;
+
+    #[test]
+    fn deep_exists_nested_variable_rehash_refuses_before_allocating_the_new_table() {
+        use sparkles_budget::sizes::{table_bytes, table_capacity};
+        let variables: Vec<_> = (0..3_600)
+            .map(|i| oxrdf::Variable::new_unchecked(format!("v{i}")))
+            .collect();
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        for var in &variables {
+            ctx.var(var.as_str());
+        }
+        let pattern = GraphPattern::Values {
+            variables,
+            bindings: Vec::new(),
+        };
+        let old = table_bytes(table_capacity(3_584), size_of::<VarId>());
+        let new = table_bytes(table_capacity(3_585), size_of::<VarId>());
+        let scratch_room = 56 << 10;
+        assert!(old < scratch_room && old + new > scratch_room);
+        ctx.mem_limit = ExistsSpec::ordinary_pattern_bytes(&pattern) + scratch_room as u64;
+        let admission = ctx.charge(0).unwrap();
+        let largest = crate::test_alloc::record_largest(|| {
+            let spec = ExistsSpec::compile_ordinary_with_admission(
+                &ctx,
+                &pattern,
+                None,
+                super::super::plan::ActiveGraph::Default,
+                &FxHashMap::default(),
+                Some(&admission),
+            );
+            assert!(matches!(spec, Err(crate::error::Error::BudgetExceeded(_))));
+        });
+        assert!(largest < new, "rehash allocated {largest} bytes");
+        assert_eq!(ctx.live_bytes(), 0);
+    }
 }

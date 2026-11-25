@@ -216,6 +216,28 @@ pub(super) fn spatial_leaf(p: &Planner<'_>, c: SpatialCall, g: &ActiveGraph) -> 
     on::spatial_leaf(p, c, g)
 }
 
+/// Whether spatial pushdown may copy these conjuncts while it builds its candidate.
+pub(super) fn copies_filters<'a>(
+    n: &Node,
+    mut exprs: impl Iterator<Item = &'a Expr>,
+    ctx: &Ctx,
+) -> bool {
+    #[cfg(feature = "geo")]
+    {
+        let super::plan::Kind::Scan(spec) = &n.kind else {
+            return false;
+        };
+        ctx.opt.spatial_pushdown
+            && ScanShape::of(spec)
+                .is_some_and(|shape| exprs.any(|e| on::spatial_conjunct(e, shape.obj)))
+    }
+    #[cfg(not(feature = "geo"))]
+    {
+        let _ = (n, &mut exprs, ctx);
+        false
+    }
+}
+
 /// Move spatial conjuncts over the object of an indexed predicate's scan into a
 /// `SpatialScan`; returns the plan and the conjuncts left for an ordinary filter.
 pub fn push_spatial(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
@@ -770,7 +792,7 @@ mod on {
 
     /// Whether a (conjunction of) filter expressions has a `geof:` test of `w` at its
     /// top level (a quick check before the conjuncts are taken apart).
-    fn spatial_conjunct(e: &Expr, w: VarId) -> bool {
+    pub(super) fn spatial_conjunct(e: &Expr, w: VarId) -> bool {
         match e {
             Expr::And(a, b) => spatial_conjunct(a, w) || spatial_conjunct(b, w),
             Expr::Cmp(a, b, _) => {

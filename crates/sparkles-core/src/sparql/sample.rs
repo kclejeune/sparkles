@@ -29,7 +29,7 @@
 //! conjunct's text (see [`Ctx::sampled`]), so that every plan the join ordering compares
 //! sees the same estimate for a conjunct.
 
-use super::ctx::Ctx;
+use super::ctx::{Charge, Ctx};
 use super::expr::Expr;
 use super::plan::{Kind, Node, ScanSpec};
 use super::table::{Table, VarId};
@@ -66,20 +66,33 @@ const WHOLE_RANGE: u64 = 4096;
 /// Measure the selectivity of the conjuncts in `filters` that one triple pattern of the
 /// group binds (`leaves` are the patterns' access paths), keeping it in the query's
 /// context for the planner.
-pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) {
+pub(super) fn prepare(
+    ctx: &Ctx,
+    leaves: &[Vec<Node>],
+    filters: &[Expr],
+    budget: Option<&Charge<'_>>,
+) {
     for f in filters {
         if f.has_exists() {
             continue;
         }
-        let vars = f.var_set();
-        if vars.is_empty() {
+        // A single scan binds at most the four quad columns. Deduplicate while
+        // visiting the expression so repeated occurrences do not allocate.
+        let mut vars = [0; 4];
+        let mut len = 0;
+        let visit = f.visit_vars(&mut |v| -> std::result::Result<(), ()> {
+            if !vars[..len].contains(&v) {
+                *vars.get_mut(len).ok_or(())? = v;
+                len += 1;
+            }
+            Ok(())
+        });
+        if visit.is_err() || len == 0 {
             continue;
         }
-        let text = f.display(ctx);
-        if ctx.sampled(&text).is_some() {
-            continue;
-        }
-        // the smallest pattern binding every variable of the conjunct
+        let vars = &mut vars[..len];
+        vars.sort_unstable();
+        // The smallest pattern binding every variable of the conjunct.
         let Some(opts) = leaves
             .iter()
             .filter(|l| {
@@ -89,7 +102,7 @@ pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) {
         else {
             continue;
         };
-        // read sorted on another variable when the pattern has one
+        // Read sorted on another variable when the pattern has one.
         let spec = opts
             .iter()
             .filter_map(|o| match &o.kind {
@@ -98,8 +111,29 @@ pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) {
             })
             .min_by_key(|s| s.cols.first().is_some_and(|(_, v)| vars.contains(v)));
         let Some(spec) = spec else { continue };
-        match selectivity(ctx, spec, f, &vars, &text) {
-            Ok(Some(s)) => ctx.set_sampled(text, s),
+        let scratch = budget.map(Charge::part);
+        if let Some(held) = &scratch {
+            let text = super::plan::description_bytes(f, ctx);
+            let names = {
+                let names = ctx.var_names.read();
+                vars.iter().map(|&v| names[v as usize].len()).sum::<usize>()
+            };
+            // The filter text grows as it is written. While it is live the
+            // snapshot cache lookup also formats the scan and the same text.
+            let workspace = text
+                .saturating_add(names)
+                .saturating_add(512)
+                .saturating_mul(6);
+            if held.add(workspace as u64).is_err() {
+                continue;
+            }
+        }
+        let text = f.display(ctx);
+        if ctx.sampled(&text).is_some() {
+            continue;
+        }
+        match selectivity(ctx, spec, f, vars, &text) {
+            Ok(Some(s)) => ctx.set_sampled(scratch, text, s),
             Ok(None) => {}
             Err(e) => {
                 tracing::debug!(target: "sparkles::sparql::sample", "no sampled selectivity for {text}: {e}")

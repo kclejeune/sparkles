@@ -318,6 +318,39 @@ struct Plan {
     _charge: Option<RetainedCharge>,
 }
 
+/// The key vectors drop before whichever charge currently covers them.
+struct KeyMeta<'a> {
+    keys: Vec<VarId>,
+    risky: Vec<VarId>,
+    live: Option<Charge<'a>>,
+    retained: Option<RetainedCharge>,
+}
+
+impl KeyMeta<'_> {
+    fn bytes(&self) -> u64 {
+        self.keys
+            .capacity()
+            .saturating_add(self.risky.capacity())
+            .saturating_mul(std::mem::size_of::<VarId>()) as u64
+    }
+
+    fn retain(&mut self, bytes: u64) -> Result<()> {
+        self.retained = Charge::transfer_retained(&mut self.live, bytes)?;
+        Ok(())
+    }
+
+    fn finish(self, solutions: usize, full: KeySet) -> Build {
+        Build {
+            keys: self.keys,
+            risky: self.risky,
+            solutions,
+            full,
+            partial: Mutex::new(FxHashMap::default()),
+            _charge: self.retained,
+        }
+    }
+}
+
 struct Build {
     keys: Vec<VarId>,
     risky: Vec<VarId>,
@@ -760,6 +793,38 @@ fn slots(spec: &ExistsSpec, t: &Table, vars: &[VarId]) -> Vec<Slot> {
     vars.iter().map(|&v| Slot::of(spec, t, v)).collect()
 }
 
+/// Count the risky slots that can affect these rows. A substituted risky variable
+/// rules out probing. Variables absent from the table need no slot.
+fn risky_slot_count(
+    ctx: &Ctx,
+    spec: &ExistsSpec,
+    t: &Table,
+    vars: &[VarId],
+) -> Result<Option<usize>> {
+    let mut count = 0;
+    for (i, &v) in vars.iter().enumerate() {
+        if i.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        let slot = Slot::of(spec, t, v);
+        if slot.constant.is_some() {
+            return Ok(None);
+        }
+        count += usize::from(!slot.unbound());
+    }
+    Ok(Some(count))
+}
+
+fn risky_slots(spec: &ExistsSpec, t: &Table, vars: &[VarId], count: usize) -> Vec<Slot> {
+    let mut slots = Vec::with_capacity(count);
+    slots.extend(
+        vars.iter()
+            .map(|&v| Slot::of(spec, t, v))
+            .filter(|s| !s.unbound()),
+    );
+    slots
+}
+
 /// Filter `t` by the EXISTS conjunct `e` from its key set, if it has (or gets) one.
 fn probe(ctx: &Ctx, t: &mut Table, e: &Expr, spec: &ExistsSpec, negated: bool) -> Result<bool> {
     let Some(keep) = answers(ctx, t, e, spec, negated)? else {
@@ -867,15 +932,13 @@ fn probe_rows<'a>(
         return Ok(None);
     };
     let decor = &spec.decor;
-    let keys = slots(spec, t, &build.keys);
-    let risky = slots(spec, t, &build.risky);
-    if risky.iter().any(|s| s.constant.is_some()) {
+    let Some(risky_count) = risky_slot_count(ctx, spec, t, &build.risky)? else {
         decor.note(RISKY_BOUND);
         return Ok(None);
-    }
+    };
     // The probe vectors are transient. Retained key sets carry their own charges, and
     // those of a context that was never shared are held while the rows are probed.
-    let probe = t.len() as u64 + extra + (build.keys.len() + build.risky.len()) as u64 * 64 + 1024;
+    let probe = t.len() as u64 + extra + (build.keys.len() + risky_count) as u64 * 64 + 1024;
     let held = match ctx.charge(if build._charge.is_some() {
         probe
     } else {
@@ -888,6 +951,8 @@ fn probe_rows<'a>(
         }
         Err(e) => return Err(e),
     };
+    let keys = slots(spec, t, &build.keys);
+    let risky = risky_slots(spec, t, &build.risky, risky_count);
     // one key read from a column that binds it on every row with a plain term: each row
     // is one lookup (what the loop below does, without its per-row bookkeeping)
     if let ([key], [], KeySet::One(set)) = (keys.as_slice(), risky.as_slice(), &build.full)
@@ -1115,16 +1180,29 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
     let State::Planned(plan) = &*st else {
         unreachable!("planned above")
     };
-    let keys = slots(spec, t, &plan.meta.keys);
-    let risky = slots(spec, t, &plan.meta.risky);
-    if keys.iter().all(|s| s.unbound()) {
+    let unbound_keys = plan
+        .meta
+        .keys
+        .iter()
+        .filter(|&&v| Slot::of(spec, t, v).unbound())
+        .count();
+    if unbound_keys == plan.meta.keys.len() {
         decor.note("the outer solutions bind none of its variables");
         return Ok(None);
     }
-    if risky.iter().any(|s| s.constant.is_some()) {
+    let Some(risky_count) = risky_slot_count(ctx, spec, t, &plan.meta.risky)? else {
         decor.note(RISKY_BOUND);
         return Ok(None);
-    }
+    };
+    let slot_bytes =
+        (plan.meta.keys.len() + risky_count) as u64 * std::mem::size_of::<Slot>() as u64;
+    let slots_charge = match ctx.charge(slot_bytes) {
+        Ok(held) => held,
+        Err(Error::BudgetExceeded(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let keys = slots(spec, t, &plan.meta.keys);
+    let risky = risky_slots(spec, t, &plan.meta.risky, risky_count);
     // worth it when the pattern costs less than evaluating it for every distinct key of
     // the rows a probe can answer
     let cost = plan.node.cost.max(plan.node.est);
@@ -1192,9 +1270,12 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
         spec.plan_cache.release_plan();
         return Ok(None);
     }
+    drop(risky);
+    drop(keys);
+    drop(slots_charge);
+    drop(local);
     // the keys are the variables these rows can bind (the rows of this filter all have
     // the same columns); a row binding another one is evaluated per row
-    let unbound_keys = keys.iter().filter(|s| s.unbound()).count();
     let keyed_len = plan.meta.keys.len() - unbound_keys;
     let risky_len = plan.meta.risky.len() + unbound_keys;
     let copy_bytes = keyed_len
@@ -1213,8 +1294,8 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
     let mut keyed = Vec::with_capacity(keyed_len);
     let mut risky = Vec::with_capacity(risky_len);
     risky.extend_from_slice(&plan.meta.risky);
-    for (&v, s) in plan.meta.keys.iter().zip(&keys) {
-        if s.unbound() {
+    for &v in &plan.meta.keys {
+        if Slot::of(spec, t, v).unbound() {
             risky.push(v);
         } else {
             keyed.push(v);
@@ -1237,10 +1318,16 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
             error => Err(error),
         };
     }
+    let meta = KeyMeta {
+        keys: keyed,
+        risky,
+        live: Some(copy_charge),
+        retained: None,
+    };
     let node = plan.node.clone();
     let built = match ctx.cursor_owner() {
-        Some(owner) => build_streaming(&owner, &node, keyed, risky, copy_charge),
-        None => build(ctx, &node, keyed, risky, copy_charge),
+        Some(owner) => build_streaming(&owner, &node, meta),
+        None => build(ctx, &node, meta),
     };
     match built {
         Ok(b) => {
@@ -1267,14 +1354,7 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
 }
 
 /// Evaluate the pattern and collect its distinct keys.
-fn build(
-    ctx: &Ctx,
-    node: &Node,
-    keys: Vec<VarId>,
-    risky: Vec<VarId>,
-    copy_charge: Charge<'_>,
-) -> Result<Build> {
-    let mut copy_charge = Some(copy_charge);
+fn build(ctx: &Ctx, node: &Node, mut meta: KeyMeta<'_>) -> Result<Build> {
     // Compatibility estimates drop after the input backing. An actual paid
     // materialization keeps its own owner and must not be charged a second time.
     let held = ctx.charge(0)?;
@@ -1283,7 +1363,8 @@ fn build(
     if !input.has_credit() {
         held.add(t.mem_bytes())?;
     }
-    let cols: Vec<&[Id]> = keys
+    let cols: Vec<&[Id]> = meta
+        .keys
         .iter()
         .map(|&v| {
             t.col_of(v)
@@ -1295,22 +1376,12 @@ fn build(
         return Err(Error::invalid("a key variable is unbound in a solution"));
     }
     let width = cols.len();
-    let meta_bytes = keys
-        .capacity()
-        .saturating_add(risky.capacity())
-        .saturating_mul(std::mem::size_of::<VarId>()) as u64;
     // The hash table may reserve almost twice its cardinality, and multi-column
-    // keys allocate individually. Transfer `copy_charge` directly into the retained
-    // charge so `keys`/`risky` are never double-charged or released in between.
-    let target = meta_bytes.saturating_add(t.len() as u64 * (width as u64 * 8 + 128) + 1024);
-    let charge = if ctx.shared().is_some() {
-        copy_charge
-            .take()
-            .expect("key-set metadata charge")
-            .into_retained(target)?
-    } else {
-        None
-    };
+    // keys allocate individually. Reuse the metadata credit for the retained set.
+    let target = meta
+        .bytes()
+        .saturating_add(t.len() as u64 * (width as u64 * 8 + 128) + 1024);
+    meta.retain(target)?;
     let full = if width == 1 {
         KeySet::One(cols[0].iter().copied().collect())
     } else {
@@ -1325,31 +1396,17 @@ fn build(
     };
     // A context that was never shared charges the set while the solutions are held, so
     // that it fails over budget (and so falls back) before they are dropped.
-    if charge.is_none() {
+    if meta.retained.is_none() {
         held.add(full.bytes(width))?;
     }
-    drop(copy_charge);
-    Ok(Build {
-        keys,
-        risky,
-        solutions: t.len(),
-        full,
-        partial: Mutex::new(FxHashMap::default()),
-        _charge: charge,
-    })
+    Ok(meta.finish(t.len(), full))
 }
 
 /// Collect the distinct keys of the pattern from a cursor over its plan. Only the key
 /// set is kept, never the pattern's solutions, and it is charged before every batch
 /// grows it.
-fn build_streaming(
-    ctx: &Arc<Ctx>,
-    node: &Node,
-    keys: Vec<VarId>,
-    risky: Vec<VarId>,
-    copy_charge: Charge<'_>,
-) -> Result<Build> {
-    let width = keys.len();
+fn build_streaming(ctx: &Arc<Ctx>, node: &Node, mut meta: KeyMeta<'_>) -> Result<Build> {
+    let width = meta.keys.len();
     // A key's slot, control byte and the old table while the set doubles, plus the
     // boxed ids of a key over several variables.
     let entry = if width == 1 {
@@ -1357,12 +1414,13 @@ fn build_streaming(
     } else {
         width as u64 * 8 + 80
     };
-    let meta_bytes = keys
-        .capacity()
-        .saturating_add(risky.capacity())
-        .saturating_mul(std::mem::size_of::<VarId>()) as u64;
-    let base = meta_bytes.saturating_add(1024);
-    let mut charge = copy_charge.into_retained(base)?;
+    let base = meta.bytes().saturating_add(1024);
+    meta.retain(base)?;
+    let KeyMeta {
+        keys,
+        retained: charge,
+        ..
+    } = &mut meta;
     let mut one: FxHashSet<Id> = FxHashSet::default();
     let mut many: FxHashSet<Box<[Id]>> = FxHashSet::default();
     // Size the set for the pattern's estimated solutions when a quarter of the
@@ -1431,14 +1489,7 @@ fn build_streaming(
     } else {
         KeySet::Many(many)
     };
-    Ok(Build {
-        keys,
-        risky,
-        solutions,
-        full,
-        partial: Mutex::new(FxHashMap::default()),
-        _charge: charge,
-    })
+    Ok(meta.finish(solutions, full))
 }
 
 // ------------------------------------------------------------------ admission ------
@@ -1489,16 +1540,20 @@ fn admit_meta(
         } else if let ActiveGraph::Var(_) = spec.graph {
             Err("its active graph is a variable".into())
         } else {
-            let mut risky = FxHashSet::default();
-            let mut tracker = SetScratch::new(&scratch);
-            match certain_budgeted(ctx, spec.pattern(), &mut risky, Some(&mut tracker))? {
+            let mut risky = VarSet::new(Some(&scratch));
+            let mut steps = 0;
+            match certain_budgeted(ctx, spec.pattern(), &mut risky, Some(&scratch), &mut steps)? {
                 Err(reason) => Err(Arc::<str>::from(reason)),
                 Ok(cert) => {
                     let mut keys_len = 0usize;
+                    let mut risky_len = 0usize;
                     let mut missing_key = None;
                     for &v in &spec.vars {
-                        if !risky.contains(&v) {
-                            if !cert.contains(&v) {
+                        check_step(ctx, Some(&scratch), &mut steps)?;
+                        if risky.ids.contains(&v) {
+                            risky_len += 1;
+                        } else {
+                            if !cert.ids.contains(&v) {
                                 missing_key = Some(v);
                                 break;
                             }
@@ -1512,7 +1567,6 @@ fn admit_meta(
                     } else if keys_len > 64 {
                         Err("it has more than 64 variables".into())
                     } else {
-                        let risky_len = risky.iter().filter(|v| spec.vars.contains(v)).count();
                         let est_bytes = std::mem::size_of::<AdmitMeta>()
                             .saturating_add(2 * std::mem::size_of::<usize>())
                             .saturating_add(
@@ -1529,19 +1583,19 @@ fn admit_meta(
                             _ => ctx.charge(est_bytes)?,
                         };
                         let mut keys = Vec::with_capacity(keys_len);
+                        let mut risky_vec = Vec::with_capacity(risky_len);
                         for &v in &spec.vars {
-                            if !risky.contains(&v) {
+                            check_step(ctx, Some(&scratch), &mut steps)?;
+                            if risky.ids.contains(&v) {
+                                risky_vec.push(v);
+                            } else {
                                 keys.push(v);
                             }
                         }
-                        let mut risky_vec = Vec::with_capacity(risky_len);
-                        for v in risky {
-                            if spec.vars.contains(&v) {
-                                risky_vec.push(v);
-                            }
-                        }
                         risky_vec.sort_unstable();
+                        risky_vec.dedup();
                         drop(cert);
+                        drop(risky);
                         let meta = Arc::new(AdmitMeta {
                             keys,
                             risky: risky_vec,
@@ -1603,53 +1657,51 @@ fn admit_meta(
     Ok((computed, None))
 }
 
-/// Scratch charge tracker for temporary `FxHashSet<VarId>` buffers during structural
-/// admission so wide filters charge growth before allocating.
-struct SetScratch<'a, 'b> {
-    charge: &'a Charge<'b>,
-    charged_slots: usize,
-    steps: usize,
+/// A variable set whose credit follows its live table, including both tables during growth.
+pub(super) struct VarSet<'a> {
+    pub(super) ids: FxHashSet<VarId>,
+    charge: Option<Charge<'a>>,
 }
 
-impl<'a, 'b> SetScratch<'a, 'b> {
-    fn new(charge: &'a Charge<'b>) -> Self {
+impl<'a> VarSet<'a> {
+    pub(super) fn new(budget: Option<&'a Charge<'_>>) -> Self {
         Self {
-            charge,
-            charged_slots: 0,
-            steps: 0,
+            ids: FxHashSet::default(),
+            charge: budget.map(Charge::part),
         }
     }
 
-    fn check_step(&mut self, ctx: &Ctx) -> Result<()> {
-        self.steps += 1;
-        if self.steps.is_multiple_of(1024) {
+    pub(super) fn insert(&mut self, value: VarId) -> Result<()> {
+        use sparkles_budget::sizes::{table_bytes, table_grown};
+        if let Some(charge) = &self.charge
+            && self.ids.len() == self.ids.capacity()
+        {
+            if self.ids.contains(&value) {
+                return Ok(());
+            }
+            let slots = self.ids.capacity();
+            let grown = table_grown(slots, self.ids.len(), 1);
+            let elem = std::mem::size_of::<VarId>();
+            let next = table_bytes(grown, elem);
+            charge.resize(table_bytes(slots, elem).saturating_add(next) as u64)?;
+            self.ids.insert(value);
+            debug_assert_eq!(self.ids.capacity(), grown);
+            charge.resize(next as u64)?;
+        } else {
+            self.ids.insert(value);
+        }
+        Ok(())
+    }
+}
+
+fn check_step(ctx: &Ctx, budget: Option<&Charge<'_>>, steps: &mut usize) -> Result<()> {
+    if budget.is_some() {
+        *steps += 1;
+        if steps.is_multiple_of(1024) {
             ctx.check()?;
         }
-        Ok(())
     }
-
-    fn insert(&mut self, set: &mut FxHashSet<VarId>, value: VarId) -> Result<()> {
-        if set.contains(&value) {
-            return Ok(());
-        }
-        if set.len() == set.capacity() {
-            let add_slots = set.capacity().max(4);
-            self.charged_slots = self.charged_slots.saturating_add(add_slots);
-            // `FxHashSet<VarId>` holds 4-byte IDs plus 1 control byte (~5 B/slot);
-            // 12 B/slot conservatively covers old + new tables during rehash.
-            self.charge
-                .resize((self.charged_slots as u64).saturating_mul(12))?;
-        }
-        set.insert(value);
-        Ok(())
-    }
-
-    fn extend(&mut self, dst: &mut FxHashSet<VarId>, src: FxHashSet<VarId>) -> Result<()> {
-        for v in src {
-            self.insert(dst, v)?;
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Check the pattern against the admitted algebra and reuse its unsubstituted plan.
@@ -1704,41 +1756,34 @@ pub(super) fn certain(
     gp: &GraphPattern,
     risky: &mut FxHashSet<VarId>,
 ) -> std::result::Result<FxHashSet<VarId>, String> {
-    certain_budgeted(ctx, gp, risky, None).expect("unbudgeted certain check cannot fail with Error")
+    let mut tracked = VarSet::new(None);
+    tracked.ids = std::mem::take(risky);
+    let result = certain_budgeted(ctx, gp, &mut tracked, None, &mut 0)
+        .expect("unbudgeted certain check cannot fail with Error");
+    *risky = tracked.ids;
+    result.map(|set| set.ids)
 }
 
-fn certain_budgeted(
+fn certain_budgeted<'a>(
     ctx: &Ctx,
     gp: &GraphPattern,
-    risky: &mut FxHashSet<VarId>,
-    mut scratch: Option<&mut SetScratch<'_, '_>>,
-) -> Result<std::result::Result<FxHashSet<VarId>, String>> {
+    risky: &mut VarSet<'_>,
+    budget: Option<&'a Charge<'_>>,
+    steps: &mut usize,
+) -> Result<std::result::Result<VarSet<'a>, String>> {
     use GraphPattern as GP;
-    let mut out = FxHashSet::default();
-    let insert = |set: &mut FxHashSet<VarId>,
-                  v: VarId,
-                  scratch: &mut Option<&mut SetScratch<'_, '_>>|
-     -> Result<()> {
-        if let Some(tracker) = scratch.as_deref_mut() {
-            tracker.insert(set, v)
-        } else {
-            set.insert(v);
-            Ok(())
-        }
-    };
+    let mut out = VarSet::new(budget);
     match gp {
         GP::Bgp { patterns } => {
             if let Err(reason) = property_functions(patterns) {
                 return Ok(Err(reason));
             }
             for t in patterns {
-                if let Some(tracker) = scratch.as_deref_mut() {
-                    tracker.check_step(ctx)?;
-                }
+                check_step(ctx, budget, steps)?;
                 for x in [&t.subject, &t.object] {
                     match x {
                         TermPattern::Variable(v) => {
-                            insert(&mut out, ctx.var(v.as_str()), &mut scratch)?;
+                            out.insert(ctx.var(v.as_str()))?;
                         }
                         TermPattern::Triple(_) => {
                             return Ok(Err("it has a triple term pattern".into()));
@@ -1747,7 +1792,7 @@ fn certain_budgeted(
                     }
                 }
                 if let NamedNodePattern::Variable(v) = &t.predicate {
-                    insert(&mut out, ctx.var(v.as_str()), &mut scratch)?;
+                    out.insert(ctx.var(v.as_str()))?;
                 }
             }
         }
@@ -1762,7 +1807,7 @@ fn certain_budgeted(
             for x in [subject, object] {
                 match x {
                     TermPattern::Variable(v) => {
-                        insert(&mut out, ctx.var(v.as_str()), &mut scratch)?;
+                        out.insert(ctx.var(v.as_str()))?;
                     }
                     TermPattern::Triple(_) => {
                         return Ok(Err("it has a triple term pattern".into()));
@@ -1772,31 +1817,30 @@ fn certain_budgeted(
             }
         }
         GP::Join { left, right } => {
-            out = match certain_budgeted(ctx, left, risky, scratch.as_deref_mut())? {
+            out = match certain_budgeted(ctx, left, risky, budget, steps)? {
                 Ok(set) => set,
                 Err(reason) => return Ok(Err(reason)),
             };
-            let right_out = match certain_budgeted(ctx, right, risky, scratch.as_deref_mut())? {
+            let right_out = match certain_budgeted(ctx, right, risky, budget, steps)? {
                 Ok(set) => set,
                 Err(reason) => return Ok(Err(reason)),
             };
-            if let Some(tracker) = scratch.as_deref_mut() {
-                tracker.extend(&mut out, right_out)?;
-            } else {
-                out.extend(right_out);
+            for &v in &right_out.ids {
+                check_step(ctx, budget, steps)?;
+                out.insert(v)?;
             }
         }
         GP::Graph { name, inner } => {
-            out = match certain_budgeted(ctx, inner, risky, scratch.as_deref_mut())? {
+            out = match certain_budgeted(ctx, inner, risky, budget, steps)? {
                 Ok(set) => set,
                 Err(reason) => return Ok(Err(reason)),
             };
             if let NamedNodePattern::Variable(v) = name {
-                insert(&mut out, ctx.var(v.as_str()), &mut scratch)?;
+                out.insert(ctx.var(v.as_str()))?;
             }
         }
         GP::Filter { expr, inner } => {
-            out = match certain_budgeted(ctx, inner, risky, scratch.as_deref_mut())? {
+            out = match certain_budgeted(ctx, inner, risky, budget, steps)? {
                 Ok(set) => set,
                 Err(reason) => return Ok(Err(reason)),
             };
@@ -1804,12 +1848,10 @@ fn certain_budgeted(
                 return Ok(Err("a FILTER inside it is not deterministic".into()));
             }
             try_visit_expr_vars(expr, &mut |name| -> Result<()> {
-                if let Some(tracker) = scratch.as_deref_mut() {
-                    tracker.check_step(ctx)?;
-                }
+                check_step(ctx, budget, steps)?;
                 let v = ctx.var(name);
-                if !out.contains(&v) {
-                    insert(risky, v, &mut scratch)?;
+                if !out.ids.contains(&v) {
+                    risky.insert(v)?;
                 }
                 Ok(())
             })?;
@@ -1839,21 +1881,24 @@ fn construct(gp: &GraphPattern) -> &'static str {
 /// Property functions compute their solutions instead of matching triples (a text
 /// search with a result limit and a bound subject is not the unbound search restricted).
 fn property_functions(patterns: &[TriplePattern]) -> std::result::Result<(), String> {
-    let call = |found: crate::error::Result<bool>| match found {
-        Ok(false) => Ok(()),
-        _ => Err("it calls a property function".to_string()),
-    };
-    call(Ok(super::arqpf::has_calls(patterns)))?;
-    call(super::textpf::extract(patterns).map(|(c, _)| !c.is_empty()))?;
-    call(
-        super::textpf::take_calls(patterns, crate::vector::VECTOR_SEARCH, "spk:vectorSearch")
-            .map(|(c, _)| !c.is_empty()),
-    )?;
-    call(
-        super::textpf::take_calls(patterns, super::hybrid::HYBRID_SEARCH, "spk:hybridSearch")
-            .map(|(c, _)| !c.is_empty()),
-    )?;
-    call(super::geopf::take_spatial_calls(patterns).map(|(c, _)| !c.is_empty()))
+    let calls = super::arqpf::has_calls(patterns)
+        || patterns.iter().any(|triple| {
+            let NamedNodePattern::NamedNode(predicate) = &triple.predicate else {
+                return false;
+            };
+            let iri = predicate.as_str();
+            matches!(
+                iri,
+                super::textpf::TEXT_QUERY
+                    | crate::vector::VECTOR_SEARCH
+                    | super::hybrid::HYBRID_SEARCH
+            ) || crate::geo::SpatialPfKind::from_iri(iri).is_some()
+        });
+    if calls {
+        Err("it calls a property function".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Can the path match a zero-length path (`*` or `?` anywhere in it)?
@@ -2030,6 +2075,138 @@ mod borrowed_input_tests {
     use super::*;
 
     #[test]
+    fn deep_exists_structural_admission_releases_consumed_sets_and_borrows_bgps() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 256;
+        ctx.var("key");
+        let literal_size = 64 << 10;
+        let triple = TriplePattern {
+            subject: TermPattern::Variable(oxrdf::Variable::new_unchecked("key")),
+            predicate: NamedNodePattern::NamedNode(oxrdf::NamedNode::new_unchecked("urn:p")),
+            object: TermPattern::Literal(oxrdf::Literal::new_simple_literal(
+                "x".repeat(literal_size),
+            )),
+        };
+        let leaf = GraphPattern::Bgp {
+            patterns: vec![triple],
+        };
+        let mut pattern = leaf.clone();
+        for _ in 0..128 {
+            pattern = GraphPattern::Join {
+                left: Box::new(pattern),
+                right: Box::new(leaf.clone()),
+            };
+        }
+
+        let budget = ctx.charge(0).unwrap();
+        let mut risky = VarSet::new(Some(&budget));
+        let largest = crate::test_alloc::record_largest(|| {
+            let cert = certain_budgeted(&ctx, &pattern, &mut risky, Some(&budget), &mut 0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(cert.ids.len(), 1);
+        });
+        assert!(
+            largest < literal_size,
+            "classified BGP allocated {largest} bytes"
+        );
+        assert_eq!(ctx.live_bytes(), 0);
+
+        for predicate in [
+            super::super::textpf::TEXT_QUERY,
+            crate::vector::VECTOR_SEARCH,
+            super::super::hybrid::HYBRID_SEARCH,
+            "http://jena.apache.org/spatial#nearby",
+            "http://jena.apache.org/ARQ/list#member",
+        ] {
+            let triple = TriplePattern {
+                subject: TermPattern::Variable(oxrdf::Variable::new_unchecked("key")),
+                predicate: NamedNodePattern::NamedNode(oxrdf::NamedNode::new_unchecked(predicate)),
+                object: TermPattern::Literal(oxrdf::Literal::new_simple_literal("argument")),
+            };
+            assert!(property_functions(&[triple]).is_err(), "{predicate}");
+        }
+    }
+
+    #[test]
+    fn deep_exists_key_set_slots_require_admission_before_allocation() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 4096;
+        let spec = ExistsSpec::new(
+            GraphPattern::Bgp {
+                patterns: Vec::new(),
+            },
+            ActiveGraph::Default,
+            Vec::new(),
+            Vec::new(),
+        );
+        let vars: Vec<VarId> = (0..257).collect();
+        let risky = vars[1..].to_vec();
+        let value = Id::from_i64(1).unwrap();
+        let mut rows = Table::new(vars);
+        let mut row = vec![Id::UNDEF; 257];
+        row[0] = value;
+        rows.push_row(&row);
+        *spec.decor.state.lock() = State::Planned(Box::new(Plan {
+            meta: Arc::new(AdmitMeta {
+                keys: vec![0],
+                risky: risky.clone(),
+            }),
+            node: Arc::new(Node::unit()),
+            _charge: None,
+        }));
+        let largest = crate::test_alloc::record_largest(|| {
+            assert!(prepare(&ctx, &spec, &rows).unwrap().is_none());
+        });
+        let slot_bytes = risky.len() * std::mem::size_of::<Slot>();
+        assert!(slot_bytes > ctx.mem_limit as usize);
+        assert!(largest < slot_bytes, "preparing allocated {largest} bytes");
+        assert!(spec.decor.is_planned());
+        assert_eq!(ctx.live_bytes(), 0);
+
+        *spec.decor.state.lock() = State::Built(Arc::new(Build {
+            keys: vec![0],
+            risky,
+            solutions: 1,
+            full: KeySet::One([value].into_iter().collect()),
+            partial: Mutex::default(),
+            _charge: None,
+        }));
+        let largest = crate::test_alloc::record_largest(|| {
+            assert!(probe_rows(&ctx, &rows, &spec, 0, false).unwrap().is_none());
+        });
+        assert!(largest < slot_bytes, "probing allocated {largest} bytes");
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
+    fn deep_exists_key_metadata_stays_charged_on_transfer_refusal_and_releases_on_drain_failure() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 64 << 10;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = ctx.into_shared();
+        let metadata = vec![0; 256];
+        let bytes = (metadata.capacity() * std::mem::size_of::<VarId>()) as u64;
+        let mut meta = KeyMeta {
+            keys: metadata,
+            risky: Vec::new(),
+            live: Some(ctx.charge(bytes).unwrap()),
+            retained: None,
+        };
+        assert!(matches!(
+            meta.retain(ctx.mem_limit + 1),
+            Err(Error::BudgetExceeded(_))
+        ));
+        assert_eq!(ctx.live_bytes(), bytes);
+        // Unit yields a row without the key column, so the drain fails after retention.
+        assert!(build_streaming(&ctx, &Node::unit(), meta).is_err());
+        assert_eq!(ctx.live_bytes(), 0);
+    }
+
+    #[test]
     fn reviewed_exists_build_keeps_borrowed_table_without_forced_ledger_or_duplicate_input() {
         let store = crate::store::Store::in_memory(Default::default());
         let mut ctx = Ctx::new(store.snapshot());
@@ -2050,7 +2227,13 @@ mod borrowed_input_tests {
         );
         let before = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
         let copy_charge = ctx.charge(std::mem::size_of::<VarId>() as u64).unwrap();
-        let built = build(&ctx, &node, vec![0], Vec::new(), copy_charge).unwrap();
+        let meta = KeyMeta {
+            keys: vec![0],
+            risky: Vec::new(),
+            live: Some(copy_charge),
+            retained: None,
+        };
+        let built = build(&ctx, &node, meta).unwrap();
         assert_eq!(built.solutions, 1);
         assert_eq!(
             super::super::query_memory::LEDGER_OPS.with(|n| n.get()),

@@ -43,6 +43,10 @@ impl<'a> Layout<'a> {
         }
     }
 
+    pub(super) fn is_checked(&self) -> bool {
+        self.preparation.is_some()
+    }
+
     pub(super) fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -796,6 +800,15 @@ pub(super) fn expressions_copy_bytes(exprs: &[Expr]) -> u64 {
     let _ = layout.slice(exprs);
     for expr in exprs {
         let _ = layout.expr(expr);
+    }
+    layout.bytes()
+}
+
+/// Owned expression backing beyond the list that holds the expressions.
+pub(super) fn expressions_owned_bytes<'a>(exprs: impl Iterator<Item = &'a Expr>) -> u64 {
+    let mut layout = Layout::unchecked(true);
+    for expr in exprs {
+        let _ = layout.expression(expr);
     }
     layout.bytes()
 }

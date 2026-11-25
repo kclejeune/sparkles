@@ -1376,14 +1376,13 @@ pub(super) fn auto_streaming_lease(
         }
     }
     ctx.check()?;
-    // An ASK pulls one row through the cursor, which stops at it, unless the planner
-    // found its input small enough to run whole (item 827).
+    // ASK pulls one row unless the planner runs its input whole (item 827).
     if kind == QueryKind::Ask {
-        return Ok((!super::demand::whole_slice(node), None));
-    }
-    // A plan expected to pass the row budgets stays eager, so that it fails before the
-    // first byte of output with an error status rather than partway through a stream.
-    if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
+        if super::demand::whole_slice(node) || !cursor_open_fits(ctx, node, pattern, query, None)? {
+            return Ok((false, None));
+        }
+    // A SELECT expected to exceed the row budgets stays eager so the error precedes output.
+    } else if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
         return Ok((false, None));
     }
     let admission = ctx.charge(0)?;
@@ -1401,14 +1400,12 @@ pub(super) fn auto_streaming_lease(
     // Declared after `admission` so on eager fallback, error, or unwind, cached plans
     // and structural metadata drop before `admission` releases its reservation.
     let mut clear_guard = ClearOnDrop { node, keep: false };
-    let admitted = if spill_admitted(ctx, node, kind, Some(&admission))?
+    let admitted = if kind == QueryKind::Ask {
+        cursor_open_fits(ctx, node, pattern, query, Some(&admission))?
+    } else if spill_admitted(ctx, node, kind, Some(&admission))?
         || memory_admitted(ctx, node, pattern, query, kind, options, Some(&admission))?
     {
-        match cursor_open_bytes(ctx, node, pattern, query) {
-            Ok((_, open_peak)) => open_peak <= admission_room_bytes(ctx),
-            Err(Error::BudgetExceeded(_)) => false,
-            Err(error) => return Err(error),
-        }
+        cursor_open_fits(ctx, node, pattern, query, None)?
     } else {
         let scanned = node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node);
         if !(scanned || grouped(ctx, node, Some(&admission))?) {
@@ -1441,6 +1438,20 @@ pub(super) fn auto_streaming_lease(
     };
     clear_guard.keep = true;
     Ok((true, lease))
+}
+
+fn cursor_open_fits(
+    ctx: &Ctx,
+    node: &Node,
+    pattern: Option<&spargebra::algebra::GraphPattern>,
+    query: &str,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<bool> {
+    match cursor_open_bytes_with_admission(ctx, node, pattern, query, admission) {
+        Ok((_, open_peak)) => Ok(open_peak <= admission_room_bytes(ctx)),
+        Err(Error::BudgetExceeded(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether the cursor's batches are large enough for automatic admission to pay off.
@@ -1612,10 +1623,23 @@ fn cursor_open_bytes(
     pattern: Option<&spargebra::algebra::GraphPattern>,
     query: &str,
 ) -> Result<(u64, u64)> {
+    cursor_open_bytes_with_admission(ctx, node, pattern, query, None)
+}
+
+fn cursor_open_bytes_with_admission(
+    ctx: &Ctx,
+    node: &Node,
+    pattern: Option<&spargebra::algebra::GraphPattern>,
+    query: &str,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<(u64, u64)> {
     let plan = plan_bytes(node).saturating_add((query.len() as u64).saturating_mul(16));
     let (var_retained, var_workspace) = Variables::estimate_bytes(ctx, pattern, &node.vars, query)?;
     let retained = plan.saturating_add(var_retained);
-    let transient = var_workspace.max(validation_clone_peak(node));
+    let transient = var_workspace.max(validation_clone_peak(
+        node,
+        admission.map(|held| (ctx, held)),
+    )?);
     Ok((retained, retained.saturating_add(transient)))
 }
 
@@ -3303,8 +3327,15 @@ fn cloned_plan_bytes(node: &Node) -> u64 {
 
 /// Peak temporary bytes `exists_streams` will reserve to clone cached `EXISTS` plans
 /// during cursor construction, accounting for nested clones live together on the stack.
-fn validation_clone_peak(node: &Node) -> u64 {
-    fn at(node: &Node, seen: &mut FxHashSet<usize>) -> u64 {
+fn validation_clone_peak(
+    node: &Node,
+    planning: Option<(&Ctx, &super::ctx::Charge<'_>)>,
+) -> Result<u64> {
+    fn at(
+        node: &Node,
+        seen: &mut FxHashSet<usize>,
+        planning: Option<(&Ctx, &super::ctx::Charge<'_>)>,
+    ) -> Result<u64> {
         let mut peak = 0u64;
         let mut specs = Vec::new();
         for expr in own_exprs(&node.kind) {
@@ -3314,21 +3345,41 @@ fn validation_clone_peak(node: &Node) -> u64 {
             if spec.plan_cache.strict().is_some() || !seen.insert(Arc::as_ptr(spec) as usize) {
                 continue;
             }
-            if let Some(inner) = spec.plan_cache.cached_plan() {
-                let nested = super::depth::guard_exists(|| at(&inner, seen));
+            // Auto ASK does not check native streaming before estimating its opening
+            // costs, so it needs to prepare the plans that validation can copy.
+            let inner = if let Some((ctx, admission)) = planning {
+                match super::exists::unsubstituted_plan_with_admission(ctx, spec, Some(admission)) {
+                    Ok(inner) => Some(inner),
+                    Err(
+                        error @ (Error::BudgetExceeded(_)
+                        | Error::Cancelled
+                        | Error::Timeout
+                        | Error::Io(_)
+                        | Error::Corrupt(_)),
+                    ) => return Err(error),
+                    Err(_) => None,
+                }
+            } else {
+                spec.plan_cache.cached_plan()
+            };
+            if let Some(inner) = inner {
+                let nested = super::depth::guard_exists(|| at(&inner, seen, planning))?;
                 peak = peak.max(cloned_plan_bytes(&inner).saturating_add(nested));
             }
         }
-        if let Kind::OrderedTopK(top) = &node.kind {
-            peak = peak.max(at(&top.fallback, seen));
+        match &node.kind {
+            Kind::OrderedTopK(top) => peak = peak.max(at(&top.fallback, seen, planning)?),
+            Kind::GraphBranches(branches) if let [branch] = branches.inputs.as_slice() => {
+                peak = peak.max(at(branch, seen, planning)?);
+            }
+            _ => {}
         }
         for child in &node.children {
-            peak = peak.max(at(child, seen));
+            peak = peak.max(at(child, seen, planning)?);
         }
-        peak
+        Ok(peak)
     }
-    let mut seen = FxHashSet::default();
-    at(node, &mut seen)
+    at(node, &mut FxHashSet::default(), planning)
 }
 
 enum State {
@@ -9229,6 +9280,10 @@ mod retained_variable_tests {
         let tight_opts = QueryOptions {
             max_memory_bytes: Some(tight_limit),
             pool: Some(tight_pool.clone()),
+            optimizations: Some(super::super::ctx::Optimizations {
+                sampled_filters: false,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let tight_p =
@@ -9279,6 +9334,10 @@ mod retained_variable_tests {
         let single_opts = QueryOptions {
             max_memory_bytes: Some(tight_limit),
             pool: Some(single_pool.clone()),
+            optimizations: Some(super::super::ctx::Optimizations {
+                sampled_filters: false,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let single_p =
@@ -9316,6 +9375,10 @@ mod retained_variable_tests {
         let roomy_opts = QueryOptions {
             max_memory_bytes: Some(roomy_limit),
             pool: Some(roomy_pool.clone()),
+            optimizations: Some(super::super::ctx::Optimizations {
+                sampled_filters: false,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let roomy_p =
@@ -9557,112 +9620,137 @@ mod retained_variable_tests {
         );
         assert_eq!(pool.granted(), 0);
 
-        // 2. Separate phase peaks in cursor_fits: when opening phase fits AND pull phase
-        //    fits, but their sum exceeds admission_room, cursor_fits must still return true.
-        let probe_p = super::super::prepare_query(
-            store.snapshot(),
-            &parsed,
-            &QueryOptions::default(),
-            None,
-            None,
-        )
-        .unwrap();
-        let phase_node = probe_p.node.clone();
-        // Inflate group rows so pull-phase state * 2 + headroom is sizable, matching
-        // opening peak while their sum exceeds the room.
-        let pull_state_probe = cursor_state_bytes(&probe_p.ctx, &phase_node, None).unwrap();
-        assert!(pull_state_probe.is_finite());
-        let phase_limit = cached_bytes
-            .saturating_add(open_peak)
-            .saturating_add(256 << 10);
-        let phase_pool = super::super::pool::QueryPool::new(phase_limit);
-        let phase_opts = QueryOptions {
-            max_memory_bytes: Some(phase_limit),
-            pool: Some(phase_pool.clone()),
-            ..Default::default()
-        };
-        let mut phase_p =
-            super::super::prepare_query(store.snapshot(), &parsed, &phase_opts, None, None)
-                .unwrap();
-        // Keep open_peak <= room and open_retained + state*2 + headroom <= room while
-        // open_peak + state*2 + headroom > room (verified directly below).
-        let mut g = &mut phase_p.node;
-        while !matches!(g.kind, Kind::Group { .. }) {
-            g = &mut g.children[0];
-        }
-        g.est = 2_000.0;
-        let fits = cursor_fits(
-            &phase_p.ctx,
-            &phase_p.node,
-            Some(&phase_p.pattern),
-            "",
-            phase_p.kind,
-            &CursorOptions::default(),
-            false,
-            None,
-        )
-        .unwrap();
-        let (ph_ret, ph_open) =
-            cursor_open_bytes(&phase_p.ctx, &phase_p.node, Some(&phase_p.pattern), "").unwrap();
-        let ph_state = cursor_state_bytes(&phase_p.ctx, &phase_p.node, None).unwrap();
-        let ph_headroom = cursor_headroom(
-            &phase_p.ctx,
-            &phase_p.node,
-            &CursorOptions::default(),
-            false,
-        ) as f64;
-        let ph_room = admission_room(&phase_p.ctx);
-        assert!(ph_open as f64 <= ph_room);
-        assert!((ph_ret as f64) + ph_state * 2.0 + ph_headroom <= ph_room);
-        assert!(
-            fits,
-            "cursor_fits must compare opening and pull phase peaks separately"
-        );
-        // Also test the explicit sum-exceeds-room boundary by tightening room just below
-        // open_peak + pull_peak while keeping max(open_peak, pull_peak) <= room.
-        let clone_only = ph_open - ph_ret;
-        assert!(clone_only > 0);
-        let tight_phase = cached_bytes
-            .saturating_add(ph_open.max(ph_ret + (ph_state * 2.0 + ph_headroom).ceil() as u64))
-            .saturating_add(64 << 10);
-        let sum_exceeds = (ph_ret as f64) + (clone_only as f64) + ph_state * 2.0 + ph_headroom
-            > (tight_phase.saturating_sub(cached_bytes)) as f64;
-        if sum_exceeds {
-            let split_pool = super::super::pool::QueryPool::new(tight_phase);
-            let split_opts = QueryOptions {
-                max_memory_bytes: Some(tight_phase),
-                pool: Some(split_pool.clone()),
-                ..Default::default()
-            };
-            let mut split_p =
-                super::super::prepare_query(store.snapshot(), &parsed, &split_opts, None, None)
-                    .unwrap();
-            let mut g = &mut split_p.node;
+        // Use the same query text and plan shape both times. The charged cached
+        // plan reduces the room available for the two phases.
+        let cursor = CursorOptions::default();
+        let prepare = |opts: &QueryOptions| {
+            let mut p =
+                super::super::prepare_query(store.snapshot(), &parsed, opts, None, None).unwrap();
+            let mut g = &mut p.node;
             while !matches!(g.kind, Kind::Group { .. }) {
                 g = &mut g.children[0];
             }
             g.est = 2_000.0;
-            assert!(
-                cursor_fits(
-                    &split_p.ctx,
-                    &split_p.node,
-                    Some(&split_p.pattern),
-                    "",
-                    split_p.kind,
-                    &CursorOptions::default(),
-                    false,
-                    None,
-                )
-                .unwrap(),
-                "cursor_fits must admit when opening and pull peaks each fit even if their sum exceeds room"
-            );
-            drop(split_p);
-            assert_eq!(split_pool.granted(), 0);
-        }
-        drop(phase_node);
-        drop(phase_p);
-        assert_eq!(phase_pool.granted(), 0);
-        drop(probe_p);
+            p
+        };
+        let phases = |p: &super::super::PreparedQuery,
+                      admission: &super::super::ctx::Charge<'_>| {
+            assert!(streams_natively_with_admission(&p.ctx, &p.node, Some(admission)).unwrap());
+            let (retained, open) =
+                cursor_open_bytes(&p.ctx, &p.node, Some(&p.pattern), "").unwrap();
+            let state = cursor_state_bytes(&p.ctx, &p.node, Some(admission)).unwrap();
+            let headroom = cursor_headroom(&p.ctx, &p.node, &cursor, false) as f64;
+            assert!(state.is_finite());
+            (open, state * 2.0 + headroom, retained)
+        };
+        let fixed_limit = 16 << 20;
+        let roomy = prepare(&QueryOptions {
+            max_memory_bytes: Some(fixed_limit),
+            ..Default::default()
+        });
+        let admission = roomy.ctx.charge(0).unwrap();
+        let (open, pull, retained) = phases(&roomy, &admission);
+        let tight_phase =
+            roomy.ctx.live_bytes() + open.max(retained + pull.ceil() as u64) + (16 << 10);
+        drop(admission);
+        drop(roomy);
+        let pool = super::super::pool::QueryPool::new(tight_phase);
+        let split = prepare(&QueryOptions {
+            max_memory_bytes: Some(fixed_limit),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        });
+        let admission = split.ctx.charge(0).unwrap();
+        let (open, pull, retained) = phases(&split, &admission);
+        let room = admission_room_bytes(&split.ctx);
+        assert!(split.ctx.live_bytes() >= cached_bytes);
+        assert!(open <= room, "opening needs {open}, room {room}");
+        assert!(retained as f64 + pull <= room as f64, "pull does not fit");
+        assert!(
+            open as f64 + pull > room as f64,
+            "summed phases still fit: open={open}, pull={pull}, room={room}"
+        );
+        assert!(
+            cursor_fits(
+                &split.ctx,
+                &split.node,
+                Some(&split.pattern),
+                "",
+                split.kind,
+                &cursor,
+                false,
+                Some(&admission),
+            )
+            .unwrap()
+        );
+        drop(admission);
+        drop(split);
+        assert_eq!(pool.granted(), 0);
+
+        // An ASK uses the same opening reservation. Its short-circuit means the
+        // inner VALUES are never executed, but strict cursor validation clones them.
+        let ask = format!(
+            "ASK {{ <urn:s0> <urn:e0> ?v0 FILTER(IF(false, EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }}, false)) }}"
+        );
+        let ask_parsed = super::super::parse_query(&ask, None, &[]).unwrap();
+        let prepare_ask = |limit| {
+            let opts = QueryOptions {
+                max_memory_bytes: limit,
+                ..Default::default()
+            };
+            super::super::prepare_query(store.snapshot(), &ask_parsed, &opts, None, None).unwrap()
+        };
+        let roomy = prepare_ask(None);
+        assert!(!super::super::demand::whole_slice(&roomy.node));
+        assert!(
+            auto_streaming_lease(
+                &roomy.ctx,
+                &roomy.node,
+                Some(&roomy.pattern),
+                &ask,
+                roomy.kind,
+                &cursor,
+            )
+            .unwrap()
+            .0
+        );
+        let (retained, opening) =
+            cursor_open_bytes(&roomy.ctx, &roomy.node, Some(&roomy.pattern), &ask).unwrap();
+        assert!(opening > retained);
+        let clone_limit = roomy.ctx.live_bytes() + retained + (opening - retained) / 2;
+        let tight = prepare_ask(Some(clone_limit));
+        assert!(
+            cursor_open_fits(&tight.ctx, &tight.node, Some(&tight.pattern), &ask, None).unwrap()
+        );
+        assert!(
+            !auto_streaming_lease(
+                &tight.ctx,
+                &tight.node,
+                Some(&tight.pattern),
+                &ask,
+                tight.kind,
+                &cursor,
+            )
+            .unwrap()
+            .0
+        );
+        assert_eq!(tight.ctx.live_bytes(), 0);
+
+        let padded = format!("{ask}\n#{}", "padding".repeat(1 << 16));
+        let tight = prepare_ask(Some(clone_limit));
+        assert!((padded.len() as u64) * 16 > clone_limit);
+        assert!(
+            !auto_streaming_lease(
+                &tight.ctx,
+                &tight.node,
+                Some(&tight.pattern),
+                &padded,
+                tight.kind,
+                &cursor,
+            )
+            .unwrap()
+            .0
+        );
     }
 
     #[test]
@@ -9889,115 +9977,96 @@ mod retained_variable_tests {
             )])
             .unwrap();
 
-        // 1. Wide FILTER over a 4-branch UNION inside EXISTS under a 1.5x one-copy budget
-        //    must refuse before cloning filters across all union arms.
-        let list_len = 20_000usize;
-        let mut in_list = String::with_capacity(list_len * 4);
-        for i in 0..list_len {
-            if i > 0 {
-                in_list.push_str(", ");
+        let width = 20_000;
+        let repeated = vec!["?v0"; width].join(", ");
+        let plan = |q: &str, limit| {
+            let parsed = super::super::parse_query(q, None, &[]).unwrap();
+            let opts = QueryOptions {
+                max_memory_bytes: limit,
+                ..Default::default()
+            };
+            let prepared =
+                super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+            let mut specs = Vec::new();
+            for expr in own_exprs(&prepared.node.children[0].kind) {
+                expr.exists_specs(&mut specs);
             }
-            in_list.push_str("?v1");
-        }
-        let one_branch_q = format!(
-            "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> <urn:n1> FILTER(?v0 IN ({})) }} }}",
-            in_list.replace("?v1", "?v0")
-        );
-        let one_parsed = super::super::parse_query(&one_branch_q, None, &[]).unwrap();
-        let probe_p = super::super::prepare_query(
-            store.snapshot(),
-            &one_parsed,
-            &QueryOptions::default(),
-            None,
-            None,
-        )
-        .unwrap();
-        let mut probe_specs = Vec::new();
-        for e in own_exprs(&probe_p.node.children[0].kind) {
-            e.exists_specs(&mut probe_specs);
-        }
-        let probe_cached =
-            super::super::exists::unsubstituted_plan(&probe_p.ctx, probe_specs[0]).unwrap();
-        let one_copy = cloned_plan_bytes(&probe_cached);
-        drop(probe_cached);
-        drop(probe_p);
-
-        let union_q = format!(
-            "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ {{ {{ ?v0 <urn:e1> ?v1 }} UNION {{ ?v0 <urn:e1> ?v1 }} UNION {{ ?v0 <urn:e1> ?v1 }} UNION {{ ?v0 <urn:e1> ?v1 }} }} FILTER(?v1 IN ({in_list})) }} }}"
-        );
-        let union_parsed = super::super::parse_query(&union_q, None, &[]).unwrap();
-        let union_limit = one_copy + one_copy / 2;
-        let union_pool = super::super::pool::QueryPool::new(union_limit);
-        let union_opts = QueryOptions {
-            max_memory_bytes: Some(union_limit),
-            pool: Some(union_pool.clone()),
-            ..Default::default()
+            let spec = specs[0].clone();
+            (prepared, spec)
         };
-        let union_p =
-            super::super::prepare_query(store.snapshot(), &union_parsed, &union_opts, None, None)
+        // Precompile the original expression outside the allocation observer so a
+        // refusal at final reconciliation cannot hide a clone in an arm or join.
+        for (pattern, needle) in [
+            (
+                "{ { ?v0 <urn:absent> ?v1 } UNION { ?v0 <urn:e1> ?v1 } }",
+                "?v0",
+            ),
+            ("?v0 <urn:e1> ?v1 . ?v1 <urn:e2> ?v2", "?v0"),
+            ("?v0 <urn:e1> ?v1 . ?v1 <urn:e2> ?v2", "?v2"),
+        ] {
+            let q = format!(
+                "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ {pattern} FILTER({needle} IN ({repeated})) }} }}"
+            );
+            let expr_copy = width * size_of::<Expr>();
+            let limit = (expr_copy + expr_copy / 2) as u64;
+            let (tight, spec) = plan(&q, Some(limit));
+            let spargebra::algebra::GraphPattern::Filter { expr, inner } = spec.pattern() else {
+                panic!("expected inner filter");
+            };
+            let compiled = super::super::plan::Planner::new(&tight.ctx)
+                .compile(expr, &spec.graph)
                 .unwrap();
-        let mut specs = Vec::new();
-        for e in own_exprs(&union_p.node.children[0].kind) {
-            e.exists_specs(&mut specs);
+            let filters = vec![compiled];
+            let bytes = super::super::checked_layout::expressions_copy_bytes(&filters);
+            let held = tight.ctx.charge(bytes).unwrap();
+            let mut planner =
+                super::super::plan::Planner::for_exists_with_charge(&tight.ctx, &spec, Some(&held));
+            let largest = crate::test_alloc::record_largest(|| {
+                let err = planner
+                    .plan(inner, &spec.graph, filters)
+                    .err()
+                    .expect("planning must refuse the filter copy");
+                assert!(matches!(err, Error::BudgetExceeded(_)), "{pattern}: {err}");
+            });
+            assert!(largest < expr_copy, "{pattern}: copied {largest} bytes");
+            assert!(tight.ctx.mem_peak() <= limit);
         }
-        let spec = specs[0].clone();
-        let err = super::super::exists::unsubstituted_plan(&union_p.ctx, &spec)
-            .err()
-            .expect("wide FILTER over 4-branch UNION must refuse under 1.5x budget");
-        assert!(matches!(err, Error::BudgetExceeded(_)), "got {err}");
-        assert!(!spec.plan_cache.has_cached_plan());
-        assert!(
-            union_p.ctx.mem_peak() <= union_limit,
-            "peak {} exceeded union limit {union_limit}",
-            union_p.ctx.mem_peak()
-        );
-        let ctx = union_p.ctx.clone();
-        drop(spec);
-        drop(union_p);
-        assert_eq!(ctx.live_bytes(), 0);
-        drop(ctx);
-        assert_eq!(union_pool.granted(), 0);
 
-        // 2. Nested EXISTS with wide repeated variable filter inside outer EXISTS under a
-        //    64 KiB budget must refuse before building uncharged variable scratch.
-        let nested_q = format!(
-            "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?v1 FILTER EXISTS {{ ?v1 <urn:e2> ?v2 FILTER(?v2 IN ({})) }} }} }}",
-            in_list.replace("?v1", "?v2")
-        );
-        let nested_parsed = super::super::parse_query(&nested_q, None, &[]).unwrap();
-        let low_limit = 64 << 10;
-        let nested_pool = super::super::pool::QueryPool::new(low_limit);
-        let nested_opts = QueryOptions {
-            max_memory_bytes: Some(low_limit),
-            pool: Some(nested_pool.clone()),
-            ..Default::default()
-        };
-        let nested_p =
-            super::super::prepare_query(store.snapshot(), &nested_parsed, &nested_opts, None, None)
-                .unwrap();
-        let mut specs = Vec::new();
-        for e in own_exprs(&nested_p.node.children[0].kind) {
-            e.exists_specs(&mut specs);
+        // With long names the rendered strings dwarf the copied compact IDs. The
+        // final plan fits but the diagnostic rendering workspace does not.
+        let variable = format!("?v{}", "x".repeat(255));
+        let values = vec![variable.as_str(); 2_000].join(", ");
+        for pattern in [
+            format!("{variable} <urn:e1> ?v1"),
+            format!("{{ {{ {variable} <urn:e1> ?v1 }} UNION {{ {variable} <urn:e1> ?v1 }} }}"),
+        ] {
+            let q = format!(
+                "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ {pattern} FILTER({variable} IN ({values})) }} }}"
+            );
+            let limit = 1536 << 10;
+            let (roomy, spec) = plan(&q, None);
+            let cached = super::super::exists::unsubstituted_plan(&roomy.ctx, &spec).unwrap();
+            assert!(
+                plan_bytes(&cached) <= limit,
+                "{pattern}: retained plan needs {}, limit {limit}",
+                plan_bytes(&cached)
+            );
+            let (tight, spec) = plan(&q, Some(limit));
+            let largest = crate::test_alloc::record_largest(|| {
+                let err = super::super::exists::unsubstituted_plan(&tight.ctx, &spec)
+                    .err()
+                    .expect("rendering must be refused");
+                assert!(matches!(err, Error::BudgetExceeded(_)), "{err}");
+            });
+            assert!(
+                largest < values.len(),
+                "rendered filter allocated {largest} bytes"
+            );
+            assert!(!spec.plan_cache.has_cached_plan());
+            assert_eq!(tight.ctx.live_bytes(), 0);
         }
-        let spec = specs[0].clone();
-        let err = super::super::exists::unsubstituted_plan(&nested_p.ctx, &spec)
-            .err()
-            .expect("nested EXISTS with wide filter must refuse under 64 KiB budget");
-        assert!(matches!(err, Error::BudgetExceeded(_)), "got {err}");
-        assert!(!spec.plan_cache.has_cached_plan());
-        assert!(
-            nested_p.ctx.mem_peak() <= low_limit,
-            "peak {} exceeded low limit {low_limit}",
-            nested_p.ctx.mem_peak()
-        );
-        let ctx = nested_p.ctx.clone();
-        drop(spec);
-        drop(nested_p);
-        assert_eq!(ctx.live_bytes(), 0);
-        drop(ctx);
-        assert_eq!(nested_pool.granted(), 0);
 
-        // 3. Structural key-set admission (admit_meta / certain) with 4,000 distinct
+        // Structural key-set admission (admit_meta / certain) with 4,000 distinct
         //    filter-only variables under a tight 32 KiB budget must refuse scratch growth
         //    within the budget and leak nothing.
         let mut risky_list = String::new();
@@ -10157,6 +10226,30 @@ mod retained_variable_tests {
         let competitor_bytes = capacity.saturating_sub(granule);
         let competitor = pool.empty_grant();
         competitor.charge(competitor_bytes).unwrap();
+        assert_eq!(pool.granted(), competitor_bytes);
+
+        let cursor = CursorOptions::default();
+        let started = Instant::now();
+        let prepared = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &opts,
+            Some(started),
+            Some((&cursor, &q)),
+        )
+        .unwrap();
+        assert!(prepared.ctx.streams());
+        let kind = prepared.kind;
+        let depth = prepared.plan_depth;
+        let error = from_prepared(
+            prepared, &parsed, &q, &opts, &cursor, started, 0.0, 0.0, depth, kind,
+        )
+        .err()
+        .expect("held grant must prevent cursor opening");
+        assert!(
+            matches!(error, Error::BudgetExceeded(b) if b.kind == crate::error::BudgetKind::ServerMemory),
+            "{error:?}"
+        );
         assert_eq!(pool.granted(), competitor_bytes);
 
         let exec = query_execution(
@@ -10355,7 +10448,12 @@ mod retained_variable_tests {
                 }
             }
             let _reset_force = ResetForce(super::super::exists::FORCE.with(|f| f.replace(true)));
-            let _ = super::super::exists::mask(&ctx, &batch, filter_expr).unwrap();
+            let before_peak = ctx.mem_peak();
+            assert_eq!(
+                super::super::exists::mask(&ctx, &batch, filter_expr).unwrap(),
+                Some(vec![false]),
+            );
+            assert!(ctx.mem_peak() <= limit.max(before_peak));
             drop(_reset_force);
             assert!(
                 spec.decor.is_built(),
