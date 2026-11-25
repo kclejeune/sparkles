@@ -3271,12 +3271,14 @@ impl Ctx {
     }
 
     fn batch_key_decode_bytes(&self, key: &[u8]) -> Result<u64> {
+        let envelope = (key.len() as u64).saturating_mul(8).saturating_add(128);
         if id::is_key_triple(key) {
             // Compact triple keys can hide a component vector and boxed triple
-            // at each level, even when there is very little lexical text.
-            output_key_bytes(self, key, 0)
+            // at each level, even when there is very little lexical text, while
+            // wide triple terms still need the legacy eightfold envelope floor.
+            Ok(output_key_bytes(self, key, 0)?.max(envelope))
         } else {
-            Ok((key.len() as u64).saturating_mul(8).saturating_add(128))
+            Ok(envelope)
         }
     }
 

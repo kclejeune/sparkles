@@ -957,4 +957,104 @@ mod tests {
         std::thread::sleep(end.saturating_duration_since(Instant::now()));
         assert!(matches!(child.next_batch(), Err(Error::Timeout)));
     }
+
+    #[test]
+    fn construct_view_rebuild_refuses_wide_triple_term_before_blank_key_encoding() {
+        use crate::error::BudgetKind;
+        use crate::id::{Id, Tag};
+        use oxrdf::{Literal, NamedNode, NamedOrBlankNode, Term, Triple};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let literal = "a".repeat(256 << 10);
+        let wide: Term = Triple::new(
+            NamedNode::new_unchecked("x:s"),
+            NamedNode::new_unchecked("x:p"),
+            Literal::new_simple_literal(literal.clone()),
+        )
+        .into();
+        let mut txn = store.write();
+        let s = txn.intern(&NamedNode::new_unchecked("x:s").into()).unwrap();
+        let p = txn.intern(&NamedNode::new_unchecked("x:p").into()).unwrap();
+        let o = txn.intern(&wide).unwrap();
+        assert!(txn.insert([s, p, o, Id::DEFAULT_GRAPH]).unwrap());
+        txn.commit().unwrap();
+        assert_eq!(o.tag(), Tag::Delta);
+
+        let limit = 16 << 20;
+        let cursor_opts = CursorOptions {
+            batch_rows: 1,
+            ..Default::default()
+        };
+        let open = || {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = limit;
+            let ctx = ctx.into_shared();
+            let mut construct = rebuild(
+                &store,
+                "CONSTRUCT { _:b <x:tag> <x:ok> } WHERE { <x:s> <x:p> ?o }",
+            );
+            construct.template_columns = Some(Arc::from(["o".to_string()]));
+            let (child, spec) = View::open_rebuild(&ctx, &cursor_opts, &construct).unwrap();
+            graph::GraphCursor::for_view(
+                child,
+                spec.unwrap(),
+                construct.template_columns.as_deref(),
+            )
+            .unwrap()
+        };
+
+        // Leave room between the decode-only estimate's 2x reservation (~2 * L)
+        // and the live peak (>= 3 * L across the decoded Term, component Vec, and key).
+        let live_peak_floor = (literal.len() as u64) * 3;
+        let decode_only_reservation = (literal.len() as u64 + 1024) * 2;
+        let room = (decode_only_reservation + live_peak_floor) / 2;
+        assert!(decode_only_reservation < room && room < live_peak_floor);
+
+        let mut graph = open();
+        let graph_ctx = graph.output_ctx();
+        let held = graph_ctx
+            .charge(graph_ctx.memory_remaining() - room)
+            .unwrap();
+        let mut pulled = Ok(None);
+        let largest = crate::test_alloc::record_largest(|| {
+            pulled = graph.next_batch();
+        });
+        assert_eq!(
+            graph.plan().children[0].operator.actual_rows,
+            1,
+            "the WHERE scan must pull the triple-term row before blank-node key construction"
+        );
+        assert!(
+            largest < literal.len(),
+            "view blank key construction allocated {largest} bytes with only {room} bytes left"
+        );
+        assert!(
+            matches!(
+                pulled,
+                Err(Error::BudgetExceeded(ref b)) if b.kind == BudgetKind::Memory
+            ),
+            "expected memory budget refusal, got {:?}",
+            pulled
+                .as_ref()
+                .map(|b| b.as_ref().map(graph::GraphBatch::len))
+        );
+        assert!(graph_ctx.mem_peak() <= limit);
+        drop(held);
+        drop(graph);
+
+        let mut graph = open();
+        let batch = graph
+            .next_batch()
+            .unwrap()
+            .expect("rebuilt CONSTRUCT batch");
+        assert_eq!(batch.len(), 1);
+        let quad = &batch.quads()[0];
+        assert!(matches!(quad.subject, NamedOrBlankNode::BlankNode(_)));
+        assert_eq!(quad.predicate.as_str(), "x:tag");
+        assert_eq!(
+            quad.object,
+            Term::NamedNode(NamedNode::new_unchecked("x:ok"))
+        );
+        assert!(graph.next_batch().unwrap().is_none());
+    }
 }
