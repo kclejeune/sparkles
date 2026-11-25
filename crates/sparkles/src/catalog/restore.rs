@@ -114,13 +114,25 @@ pub(super) fn write_keep_marker(replaced: &Path, kept_name: &str) -> Result<()> 
 }
 
 #[cfg(feature = "backup")]
-pub(super) fn remove_keep_marker(replaced: &Path) -> Result<()> {
-    match std::fs::remove_file(replaced.join(delete::KEEP_REPLACED_MARKER)) {
+fn remove_regular_marker(replaced: &Path, name: &str) -> Result<()> {
+    let path = replaced.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     }
     super::sync_dir(replaced)
+}
+
+#[cfg(feature = "backup")]
+pub(super) fn remove_keep_marker(replaced: &Path) -> Result<()> {
+    remove_regular_marker(replaced, delete::KEEP_REPLACED_MARKER)
 }
 
 #[cfg(feature = "backup")]
@@ -131,12 +143,7 @@ pub(super) fn remove_swap_marker(replaced: &Path) -> Result<()> {
             hook(replaced);
         }
     });
-    match std::fs::remove_file(replaced.join(SWAP_MARKER)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
-    super::sync_dir(replaced)
+    remove_regular_marker(replaced, SWAP_MARKER)
 }
 
 fn read_swap_marker(replaced: &RecoveryDir, dataset: &str) -> Result<Option<SwapMarker>> {
@@ -554,11 +561,24 @@ pub(super) fn recover(
             );
             // Clear any pre-published keep marker and sync before unlinking the
             // swap marker so power loss cannot leave an orphan keep marker.
+            // Preserve unexpected non-regular entries (such as a directory at
+            // `.keep-replaced-v1`) because `keep_replaced_target` only recognizes
+            // regular files.
             match replaced
                 .dir()
-                .remove_file(OsStr::new(delete::KEEP_REPLACED_MARKER))
+                .entry(OsStr::new(delete::KEEP_REPLACED_MARKER))
             {
-                Ok(()) => {}
+                Ok(entry) if entry.kind == Kind::File => {
+                    match replaced
+                        .dir()
+                        .remove_file(OsStr::new(delete::KEEP_REPLACED_MARKER))
+                    {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Ok(_) => {}
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
