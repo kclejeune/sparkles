@@ -250,6 +250,15 @@ HermiT but g2-150, whose answer holds one subsumption that HermiT 1.4.5 does not
 since HermiT does not apply a key over the universal property. HermiT derives that subsumption once the key's property is a named one with the
 same values. The gap of `owl:Thing` that item 805 found is closed.
 
+Item 1086 closes the taxonomy and class-description gap when a run places a class in the
+top node without also recording every class above it as a subsumer of `owl:Thing`.
+Taxonomy construction now closes the set of top-equivalent classes upward transitively
+over satisfiable subsumers, covering multi-hop chains, equivalence classes in any IRI
+order and paths through hidden internal classes from item 805's rewriting without leaking
+internal names, breaking parent and child links or altering inconsistent ontologies.
+`Saturation::describe` applies the same upward closure so direct descriptions agree with
+the taxonomy.
+
 Item 1220 first turned off the selection of ground body literals in rooted runs and
 narrowed the restriction on ground inferences in Join, since each could make a run that
 reported itself complete miss an entailed subsumption or an unsatisfiable class. A Join
