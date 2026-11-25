@@ -714,8 +714,7 @@ fn at_consts<S: Sink>(
         }
         if let Some(cids) = dl(st).and_then(|x| x.pred_in.get(&w)) {
             for &cid in cids {
-                let c = out.dl().table.get(cid).clone();
-                if !root_pred(ix, st, e, u, &c, Some((l, prem)), found, out) {
+                if !root_pred(ix, st, e, u, cid, Some((l, prem)), found, out) {
                     mark_interrupted(st);
                     return false;
                 }
@@ -890,23 +889,25 @@ pub(super) fn univ_from_x<S: Sink>(
     true
 }
 
-/// The premises of a ground inference whose maximal literal is `l`, with the selected
-/// clauses too when `sel` is set.
-fn partners_of(st: &State, l: Lit, sel: bool) -> Vec<Side> {
+/// Visits each live premise whose maximal literal is `l` directly from the borrowed store
+/// without allocating an intermediate `Vec<Side>`, including selected clauses when `sel` is
+/// set, stopping early when `cb` returns `false`. Passes `(body, head, without)`.
+fn for_each_partner_of(
+    st: &State,
+    l: Lit,
+    sel: bool,
+    mut cb: impl FnMut(&[Lit], &[Lit], Option<Lit>) -> bool,
+) -> bool {
     let Some(d) = dl(st) else {
-        return Vec::new();
+        return true;
     };
-    d.store
-        .by_xl
-        .get(&l)
-        .into_iter()
-        .flatten()
-        .filter(|&&i| {
-            let s = &d.store.clauses[i as usize];
-            !s.dead && (sel || !s.sel)
-        })
-        .map(|&i| side(&d.store.clauses[i as usize].c, l))
-        .collect()
+    for &i in d.store.by_xl.get(&l).into_iter().flatten() {
+        let s = &d.store.clauses[i as usize];
+        if !s.dead && (sel || !s.sel) && !cb(s.c.body(), s.c.head(), Some(l)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Visits each live, unselected premise of `a(u)` directly from the borrowed store in
@@ -1707,7 +1708,7 @@ fn hyper_at<S: Sink>(
                 };
                 ps
             };
-            if !found.reserve_prod_admitted(prod_bytes, prune_scratch, out) {
+            if !found.reserve_prod_admitted(prod_bytes, prune_scratch, 0, out) {
                 mark_interrupted(st);
                 return false;
             }
@@ -1736,6 +1737,10 @@ fn hyper_at<S: Sink>(
                 }
             }
             let base: Side = (Vec::new(), h_lits);
+            debug_assert_eq!(
+                super::dl_rules::prod_inner_bytes(lists.capacity(), &lists, &base),
+                prod_bytes
+            );
             found.ground_products(lists, base);
             out.release_to(found.held_bytes());
         }
@@ -2750,12 +2755,12 @@ fn succ_at<S: Sink>(
     }
     if let Some(cids) = dl(st).and_then(|x| x.pred_in.get(&w)) {
         for &cid in cids {
-            let c = out.dl().table.get(cid);
-            if share && super::dl_rules::constants_only(ix, dx, &out.dl().lits, c) {
+            if share
+                && super::dl_rules::constants_only(ix, dx, &out.dl().lits, out.dl().table.get(cid))
+            {
                 continue;
             }
-            let c = c.clone();
-            if !root_pred(ix, st, e, u, &c, None, found, out) {
+            if !root_pred(ix, st, e, u, cid, None, found, out) {
                 mark_interrupted(st);
                 return w;
             }
@@ -2764,7 +2769,31 @@ fn succ_at<S: Sink>(
     w
 }
 
-/// Pred along the edge over `f_e(u)` with the clause `c` of its successor, in any context:
+#[derive(Clone, Copy)]
+enum PredClause<'a> {
+    ById(u32),
+    #[allow(dead_code)]
+    Ref(&'a Clause),
+}
+
+fn resolve_pred_clause<'a, S: Sink>(
+    g: &'a Option<&mut Guard<'_, S>>,
+    fb: Option<&'a super::dl_clause::Lits>,
+    clause: PredClause<'a>,
+) -> (&'a super::dl_clause::Lits, &'a Clause) {
+    let lits = match (g, fb) {
+        (Some(g), _) => &g.dl().lits,
+        (None, Some(l)) => l,
+        (None, None) => unreachable!(),
+    };
+    let c = match clause {
+        PredClause::ById(cid) => g.as_ref().expect("guard for cid").dl().table.get(cid),
+        PredClause::Ref(c) => c,
+    };
+    (lits, c)
+}
+
+/// Pred along the edge over `f_e(u)` with the clause `cid` of its successor, in any context:
 /// y is read as u and x as `f_e(u)`. Each body atom `B(x)` takes a premise whose maximal
 /// literal is `B(f_e(u))`, each role atom `s(y, x)` one whose maximal literal is a role
 /// atom below s from u to `f_e(u)`, and the ground body literals stay. `fixed` is the
@@ -2776,7 +2805,7 @@ pub(super) fn root_pred<S: Sink>(
     st: &State,
     e: Ex,
     u: u32,
-    c: &Clause,
+    cid: u32,
     fixed: Option<(Lit, &Side)>,
     found: &mut Found,
     guard: &mut Guard<'_, S>,
@@ -2786,7 +2815,7 @@ pub(super) fn root_pred<S: Sink>(
         st,
         e,
         u,
-        c,
+        PredClause::ById(cid),
         fixed,
         found,
         Some(guard),
@@ -2818,7 +2847,18 @@ fn root_pred_of(
             unreachable!()
         }
     }
-    let _ = root_pred_of_admitted::<NoSink>(ix, st, e, u, c, fixed, found, None, Some(lits), sel);
+    let _ = root_pred_of_admitted::<NoSink>(
+        ix,
+        st,
+        e,
+        u,
+        PredClause::Ref(c),
+        fixed,
+        found,
+        None,
+        Some(lits),
+        sel,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2827,15 +2867,17 @@ fn root_pred_of_admitted<S: Sink>(
     st: &State,
     e: Ex,
     u: u32,
-    c: &Clause,
+    clause: PredClause<'_>,
     fixed: Option<(Lit, &Side)>,
     found: &mut Found,
     mut guard: Option<&mut Guard<'_, S>>,
     lits_fallback: Option<&super::dl_clause::Lits>,
     sel: bool,
 ) -> bool {
-    found.rule = "rpredc";
     use super::dl_clause::{RY, X as KX};
+    use std::mem::size_of;
+
+    found.rule = "rpredc";
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
     let f = RTerm::Fc(e, u);
@@ -2846,112 +2888,338 @@ fn root_pred_of_admitted<S: Sink>(
         RTerm::C(_) => Some(t),
         _ => None,
     };
-    // the premises: an atom over f_e(u), or a role below s from u to f_e(u)
+    let map_head_xl = |v: XLit| match v {
+        XLit::Atom(a, b) => map(b).map(|b| XLit::Atom(a, b)),
+        XLit::Role(r, a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Role(r, a, b)),
+        XLit::Eq(a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Eq(a, b)),
+        XLit::Ne(a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Ne(a, b)),
+    };
     enum Need {
         Atom(Lit),
         Role(Role),
     }
-    let mut need = Vec::new();
-    let mut ground = Vec::new();
-    let mut head = Vec::with_capacity(c.head().len());
-    let (free, base, matches) = {
-        let lits = match (&guard, lits_fallback) {
-            (Some(g), _) => &g.dl().lits,
-            (None, Some(l)) => l,
-            (None, None) => unreachable!(),
-        };
+    let role_of = |lits: &super::dl_clause::Lits, p: Lit| match lits.view(p, inv) {
+        XLit::Role(t, a, b) if a == at && b == f => Some(t),
+        XLit::Role(t, a, b) if a == f && b == at => dx.inv(ix, t),
+        _ => None,
+    };
+    let fits = |lits: &super::dl_clause::Lits, n: &Need, p: Lit| match n {
+        Need::Atom(k) => *k == p,
+        Need::Role(s) => role_of(lits, p).is_some_and(|t| dx.sub(ix, t, *s)),
+    };
+
+    // Pass 0 (zero allocations): validate body/head, count `ground_len`, `head_len`,
+    // `need_len`, and verify `fixed` fits at least one body place. Uses `lits.get` for
+    // body atoms so uninterned atoms short-circuit with zero `Lits` growth.
+    let (ground_len, head_len, need_len, c_head_len) = {
+        let (lits, c) = resolve_pred_clause(&guard, lits_fallback, clause);
+        let mut ground_len = 0usize;
+        let mut need_len = 0usize;
+        let mut any_fit = fixed.is_none();
         for &l in c.body() {
             match l.kind() {
-                KX => match lits.lit(XLit::Atom(l.atom(), f), inv) {
-                    Made::Lit(k) => need.push(Need::Atom(k)),
-                    _ => return true,
-                },
-                RY => need.push(Need::Role(l.atom())),
-                XL if lits.view(l, inv).is_ground() => ground.push(l),
+                KX => {
+                    let Some(k) = lits.get(XLit::Atom(l.atom(), f), inv) else {
+                        return true;
+                    };
+                    if let Some((p, _)) = fixed
+                        && k == p
+                    {
+                        any_fit = true;
+                    }
+                    need_len += 1;
+                }
+                RY => {
+                    if let Some((p, _)) = fixed
+                        && role_of(lits, p).is_some_and(|t| dx.sub(ix, t, l.atom()))
+                    {
+                        any_fit = true;
+                    }
+                    need_len += 1;
+                }
+                XL if lits.view(l, inv).is_ground() => ground_len += 1,
                 _ => return true,
             }
         }
-        let role_of = |p: Lit| match lits.view(p, inv) {
-            XLit::Role(t, a, b) if a == at && b == f => Some(t),
-            XLit::Role(t, a, b) if a == f && b == at => dx.inv(ix, t),
-            _ => None,
-        };
-        let fits = |n: &Need, p: Lit| match n {
-            Need::Atom(k) => *k == p,
-            Need::Role(s) => role_of(p).is_some_and(|t| dx.sub(ix, t, *s)),
-        };
-        let matches: Vec<usize> = match fixed {
-            Some((p, _)) => {
-                let m: Vec<usize> = need
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, n)| fits(n, p))
-                    .map(|(k, _)| k)
-                    .collect();
-                if m.is_empty() {
-                    return true;
-                }
-                m
-            }
-            None => Vec::new(),
-        };
+        if !any_fit {
+            return true;
+        }
+        let mut head_len = 0usize;
         for &l in c.head() {
-            let w = match lits.view(l, inv) {
-                XLit::Atom(a, b) => map(b).map(|b| XLit::Atom(a, b)),
-                XLit::Role(r, a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Role(r, a, b)),
-                XLit::Eq(a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Eq(a, b)),
-                XLit::Ne(a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Ne(a, b)),
+            let Some(w) = map_head_xl(lits.view(l, inv)) else {
+                return true;
             };
-            match w.map(|w| lits.lit(w, inv)) {
-                Some(Made::Lit(m)) => head.push(m),
-                Some(Made::False) => {}
-                Some(Made::True) | None => return true,
+            match w {
+                XLit::Eq(a, b) if a == b => return true,
+                XLit::Ne(a, b) if a == b => {}
+                _ => head_len += 1,
             }
         }
-        let roles = |s: Role| -> Vec<Side> {
-            let Some(x) = dl(st) else { return Vec::new() };
+        (ground_len, head_len, need_len, c.head().len())
+    };
+
+    let Some(base_bytes) = side_exact_bytes(ground_len, head_len) else {
+        if let Some(g) = guard.as_deref_mut() {
+            g.data_overflow();
+        }
+        return false;
+    };
+
+    let for_each_need =
+        |lits: &super::dl_clause::Lits, c: &Clause, cb: &mut dyn FnMut(usize, Need) -> bool| {
+            let mut idx = 0usize;
+            for &l in c.body() {
+                let item = match l.kind() {
+                    KX => Need::Atom(
+                        lits.get(XLit::Atom(l.atom(), f), inv)
+                            .expect("validated in pass 0"),
+                    ),
+                    RY => Need::Role(l.atom()),
+                    _ => continue,
+                };
+                if !cb(idx, item) {
+                    return;
+                }
+                idx += 1;
+            }
+        };
+
+    type RolePartnerCb<'a> = dyn FnMut(&[Lit], &[Lit], Option<Lit>) -> bool + 'a;
+    let for_each_role_partner =
+        |lits: &super::dl_clause::Lits, s: Role, cb: &mut RolePartnerCb<'_>| -> bool {
+            let Some(x) = dl(st) else { return true };
             let Some(t) = x.store.terms.as_deref() else {
-                return Vec::new();
+                return true;
             };
-            let mut out = Vec::new();
             for &i in t.any.get(&f).into_iter().flatten() {
                 let sc = &x.store.clauses[i as usize];
                 if sc.dead {
                     continue;
                 }
                 for &m in x.store.maxima(i) {
-                    if role_of(m).is_some_and(|t| dx.sub(ix, t, s)) {
-                        out.push(side(&sc.c, m));
+                    if role_of(lits, m).is_some_and(|rt| dx.sub(ix, rt, s))
+                        && !cb(sc.c.body(), sc.c.head(), Some(m))
+                    {
+                        return false;
                     }
                 }
             }
-            out
+            true
         };
-        let free: Vec<Vec<Side>> = need
-            .iter()
-            .map(|n| match n {
-                Need::Atom(k) => partners_of(st, *k, sel),
-                Need::Role(s) => roles(*s),
-            })
-            .collect();
-        (free, (ground, head), matches)
-    };
-    let mut push_prod = |lists: Vec<Vec<Side>>, b: Side| -> bool {
-        match guard.as_deref_mut() {
-            Some(g) => found.push_product_admitted(lists, b, false, g),
-            None => {
-                found.products(lists, b);
+
+    let empty_side = unit();
+    let emit_place = |fixed_place: Option<(usize, &Side)>,
+                      found: &mut Found,
+                      guard: &mut Option<&mut Guard<'_, S>>|
+     -> bool {
+        // Pass 1 (zero allocations): count borrowed partners and exact bytes.
+        let (prod_bytes, prune_scratch, empty_pos) = {
+            let (lits, c) = resolve_pred_clause(guard, lits_fallback, clause);
+            let Some(mut lists_bytes) = need_len.checked_mul(size_of::<Vec<Side>>()) else {
+                if let Some(g) = guard.as_deref_mut() {
+                    g.data_overflow();
+                }
+                return false;
+            };
+            let mut max_list_len = 0usize;
+            let mut empty_pos = false;
+            let mut overflow = false;
+            for_each_need(lits, c, &mut |j, n| {
+                let mut count = 0usize;
+                let mut sides_bytes = 0usize;
+                if let Some((k, prem)) = fixed_place
+                    && j == k
+                {
+                    count = 1;
+                    let Some(b) = side_exact_bytes(prem.0.len(), prem.1.len()) else {
+                        overflow = true;
+                        return false;
+                    };
+                    sides_bytes = b;
+                } else {
+                    let mut acc = |pb: &[Lit], ph: &[Lit], without: Option<Lit>| -> bool {
+                        let Some(sb) = side_parts_bytes(&empty_side, pb, ph, without, None)
+                            .and_then(|b| sides_bytes.checked_add(b))
+                        else {
+                            overflow = true;
+                            return false;
+                        };
+                        let Some(nc) = count.checked_add(1) else {
+                            overflow = true;
+                            return false;
+                        };
+                        count = nc;
+                        sides_bytes = sb;
+                        true
+                    };
+                    match n {
+                        Need::Atom(k) => {
+                            for_each_partner_of(st, k, sel, &mut acc);
+                        }
+                        Need::Role(s) => {
+                            for_each_role_partner(lits, s, &mut acc);
+                        }
+                    }
+                    if overflow {
+                        return false;
+                    }
+                }
+                if count == 0 {
+                    empty_pos = true;
+                    return false;
+                }
+                max_list_len = max_list_len.max(count);
+                let Some(pos_bytes) = count
+                    .checked_mul(size_of::<Side>())
+                    .and_then(|b| b.checked_add(sides_bytes))
+                    .and_then(|b| lists_bytes.checked_add(b))
+                else {
+                    overflow = true;
+                    return false;
+                };
+                lists_bytes = pos_bytes;
                 true
+            });
+            if overflow {
+                if let Some(g) = guard.as_deref_mut() {
+                    g.data_overflow();
+                }
+                return false;
+            }
+            if empty_pos {
+                (0, 0, true)
+            } else {
+                let Some(prod_bytes) = lists_bytes.checked_add(base_bytes) else {
+                    if let Some(g) = guard.as_deref_mut() {
+                        g.data_overflow();
+                    }
+                    return false;
+                };
+                let prune_scratch = if max_list_len < 2 {
+                    0
+                } else {
+                    let Some(ps) = max_list_len.checked_mul(PRUNE_SCRATCH_ELEM) else {
+                        if let Some(g) = guard.as_deref_mut() {
+                            g.data_overflow();
+                        }
+                        return false;
+                    };
+                    ps
+                };
+                (prod_bytes, prune_scratch, false)
+            }
+        };
+        if empty_pos {
+            return true;
+        }
+        if let Some(g) = guard.as_deref_mut()
+            && !found.reserve_prod_admitted(prod_bytes, prune_scratch, 0, g)
+        {
+            return false;
+        }
+        // Pass 2 (post-admission): build exact-capacity `(ground, head)` and `lists`.
+        let mut ground = Vec::with_capacity(ground_len);
+        {
+            let (lits, c) = resolve_pred_clause(guard, lits_fallback, clause);
+            for &l in c.body() {
+                if l.kind() == XL && lits.view(l, inv).is_ground() {
+                    ground.push(l);
+                }
             }
         }
+        let mut head = Vec::with_capacity(head_len);
+        for idx in 0..c_head_len {
+            let w = {
+                let (lits, c) = resolve_pred_clause(guard, lits_fallback, clause);
+                map_head_xl(lits.view(c.head()[idx], inv)).expect("validated in pass 0")
+            };
+            let made = match guard.as_deref_mut() {
+                Some(g) => {
+                    let Some(m) = super::dl_clause::admit_lit(w, inv, g) else {
+                        drop(ground);
+                        drop(head);
+                        g.release_to(found.held_bytes());
+                        return false;
+                    };
+                    m
+                }
+                None => lits_fallback.expect("lits fallback").lit(w, inv),
+            };
+            if let Made::Lit(m) = made {
+                head.push(m);
+            }
+        }
+        let mut lists = Vec::with_capacity(need_len);
+        {
+            let (lits, c) = resolve_pred_clause(guard, lits_fallback, clause);
+            for_each_need(lits, c, &mut |j, n| {
+                if let Some((k, prem)) = fixed_place
+                    && j == k
+                {
+                    lists.push(vec![(prem.0.clone(), prem.1.clone())]);
+                } else {
+                    let mut count = 0usize;
+                    let mut count_cb = |_: &[Lit], _: &[Lit], _: Option<Lit>| {
+                        count += 1;
+                        true
+                    };
+                    match n {
+                        Need::Atom(k) => {
+                            for_each_partner_of(st, k, sel, &mut count_cb);
+                        }
+                        Need::Role(s) => {
+                            for_each_role_partner(lits, s, &mut count_cb);
+                        }
+                    }
+                    let mut v = Vec::with_capacity(count);
+                    let mut push_cb = |pb: &[Lit], ph: &[Lit], without: Option<Lit>| {
+                        v.push(merge_parts(&empty_side, pb, ph, without, None));
+                        true
+                    };
+                    match n {
+                        Need::Atom(k) => {
+                            for_each_partner_of(st, k, sel, &mut push_cb);
+                        }
+                        Need::Role(s) => {
+                            for_each_role_partner(lits, s, &mut push_cb);
+                        }
+                    }
+                    lists.push(v);
+                }
+                true
+            });
+        }
+        let base = (ground, head);
+        debug_assert_eq!(
+            super::dl_rules::prod_inner_bytes(lists.capacity(), &lists, &base),
+            prod_bytes
+        );
+        found.products(lists, base);
+        if let Some(g) = guard.as_deref_mut() {
+            g.release_to(found.held_bytes());
+        }
+        true
     };
+
     match fixed {
-        None => push_prod(free, base),
-        Some((_, prem)) => {
-            for k in matches {
-                let mut lists = free.clone();
-                lists[k] = vec![prem.clone()];
-                if !push_prod(lists, base.clone()) {
+        None => emit_place(None, found, &mut guard),
+        Some((p, prem)) => {
+            for k in 0..need_len {
+                let mut matches_k = false;
+                {
+                    let (lits, c) = resolve_pred_clause(&guard, lits_fallback, clause);
+                    for_each_need(lits, c, &mut |j, n| {
+                        if j == k {
+                            matches_k = fits(lits, &n, p);
+                            return false;
+                        }
+                        true
+                    });
+                }
+                if !matches_k {
+                    continue;
+                }
+                if !emit_place(Some((k, prem)), found, &mut guard) {
                     return false;
                 }
             }

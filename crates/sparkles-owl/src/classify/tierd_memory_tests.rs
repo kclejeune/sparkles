@@ -3515,3 +3515,739 @@ fn hyper_at_conj_then_ground_hyper_product_admits_peak_and_refuses_tight_cap() {
         }
     }
 }
+
+/// Sol r4 P1 #1: ordinary `pred` and rooted `root_pred` reached through `pred_c` must
+/// count borrowed premises and refuse a tight first-product cap before materializing
+/// partner lists, edge snapshots, or cloned `Clause` buffers.
+#[test]
+fn pred_and_root_pred_refuse_first_product_before_materializing_premises() {
+    struct BudgetSink<'a> {
+        run: &'a DlRun,
+        cap: usize,
+        live: usize,
+        peak: usize,
+        stopped: bool,
+    }
+    impl Sink for BudgetSink<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            if self.stopped || self.live.saturating_add(bytes) > self.cap {
+                self.stopped = true;
+                return false;
+            }
+            self.live += bytes;
+            self.peak = self.peak.max(self.live);
+            true
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.live = self.live.saturating_sub(bytes);
+        }
+        fn admit_dl(&mut self, bytes: usize) -> bool {
+            self.reserve_data(bytes)
+        }
+        fn commit_dl(&mut self, admitted: usize, kept: usize) {
+            self.live = self.live.saturating_sub(admitted.saturating_sub(kept));
+        }
+        fn go_on(&self) -> bool {
+            !self.stopped
+        }
+        fn stopped(&self) -> bool {
+            self.stopped
+        }
+        fn worked(&mut self, _: usize) {}
+    }
+
+    let mut body = String::new();
+    for i in 0..520 {
+        body.push_str(&format!("Declaration(Class(:H{i}))\n"));
+    }
+    body.push_str(
+        "Declaration(Class(:A))\n\
+         Declaration(Class(:B))\n\
+         Declaration(Class(:C))\n\
+         Declaration(Class(:Seed))\n\
+         Declaration(ObjectProperty(:r))\n\
+         SubClassOf(:Seed ObjectSomeValuesFrom(:r :C))\n\
+         SubClassOf(:Seed ObjectUnionOf(:U0 :U1))\n\
+         ClassAssertion(:Seed :u0)\n",
+    );
+    let input = axioms(&body);
+    let mut it = Interner::new();
+    let mut ax = Axioms::default();
+    let mut outside = Vec::new();
+    for a in &input {
+        if super::index::normalize(&a.kind, &mut it, &mut ax).is_some() {
+            outside.push(&a.kind);
+        }
+    }
+    let allowed = super::dl_norm::Allowed {
+        rooted: true,
+        ..Default::default()
+    };
+    let mut dl_ax = super::dl_norm::normalize(&outside, &mut it, &mut ax, None, &|| false, allowed)
+        .expect("dl_norm")
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let root = dl_ax.root.unwrap_or_else(|| {
+        let r = it.fresh_class();
+        dl_ax.root = Some(r);
+        r
+    });
+    for set in &mut ax.disjoint {
+        set.sort_unstable();
+    }
+    ax.dl = Some(Box::new(dl_ax));
+    let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+    let dx = ix.dl.as_deref().expect("rooted dl index");
+    let a_cls = it.class(&Class::new("urn:tierd1291:A"));
+    let b_cls = it.class(&Class::new("urn:tierd1291:B"));
+    let c_cls = it.class(&Class::new("urn:tierd1291:C"));
+    let seed_cls = it.class(&Class::new("urn:tierd1291:Seed"));
+    let h_cls: Vec<Ex> = (0..520)
+        .map(|i| it.class(&Class::new(format!("urn:tierd1291:H{i}"))))
+        .collect();
+    let exist_e = (0..it.nodes.len() as Ex)
+        .find(|&e| {
+            matches!(ix.head(e).node, super::index::Node::Exist(..)) && ix.head(e).succ == c_cls
+        })
+        .expect("existential restriction for :r :C");
+    let u0 = dx.consts[0].0;
+    let hyp_w = dx.hyp[&exist_e];
+    let inv = |r: super::index::Role| dx.inv(&ix, r);
+
+    let run = DlRun::new(false, Default::default()).with_shared_facts(true);
+    let cid = run
+        .table
+        .push(Clause::new(vec![Lit::x(a_cls)], vec![Lit::y(b_cls)]));
+
+    // 1. Ordinary `pred` through `dl_rules::pred_c` with 513 live `F(e, A)` partners.
+    let build_ord_state = |subsume_output: bool| {
+        let mut st = State::default();
+        let x = super::dl_rules::ds(&mut st);
+        x.edges.push((exist_e, c_cls));
+        let ground_total = super::dl_clause::ground_total();
+        let o = Rooted {
+            ix: &ix,
+            lits: &run.lits,
+            inv: &inv,
+            ground_total,
+        };
+        let mut max = Vec::new();
+        let lf = Lit::f(exist_e, a_cls);
+        for i in 0..513usize {
+            let mut head = vec![lf];
+            for j in 0..7usize {
+                head.push(Lit::x(h_cls[(i + j * 73) % 520]));
+            }
+            let c = Clause::new(vec![Lit::x(h_cls[i])], head);
+            let _ = x.store.add(c);
+            let id = x.store.peek_live().expect("F(e, A) partner queued");
+            let _ = x.store.next_prepare_id(&ix, Some(&o), id, &mut max);
+            let _ = x.store.next_commit(&ix, Some(&o), id, &max);
+            assert!(max.contains(&lf));
+        }
+        if subsume_output {
+            let _ = x.store.add(Clause::new(Vec::new(), vec![Lit::x(b_cls)]));
+            let id = x.store.peek_live().expect("B(x) subsumer queued");
+            let _ = x.store.next_prepare_id(&ix, Some(&o), id, &mut max);
+            let _ = x.store.next_commit(&ix, Some(&o), id, &max);
+        }
+        st
+    };
+
+    let tight_cap = 4096usize;
+    let mut st_ord_tight = build_ord_state(false);
+    let mut tight = BudgetSink {
+        run: &run,
+        cap: tight_cap,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (_, sample_ord_tight) = measure(|| {
+        super::dl_rules::pred_c(&ix, seed_cls, &mut st_ord_tight, c_cls, cid, &mut tight)
+    });
+    assert!(
+        tight.stopped,
+        "ordinary pred_c must refuse the first 513-partner product under tight cap"
+    );
+    assert!(
+        super::dl_rules::dl(&st_ord_tight).is_some_and(|x| x.store.interrupted),
+        "ordinary pred_c refusal must mark store interrupted"
+    );
+    assert!(
+        sample_ord_tight.peak <= tight_cap + 4096,
+        "ordinary pred_c materialized premises before admission: peak = {} B > cap + 4096 ({})",
+        sample_ord_tight.peak,
+        tight_cap + 4096
+    );
+
+    let mut st_ord_unbounded = build_ord_state(true);
+    let mut unbounded = BudgetSink {
+        run: &run,
+        cap: usize::MAX,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (ok, sample_ord_unbounded) = measure(|| {
+        super::dl_rules::pred_c(
+            &ix,
+            seed_cls,
+            &mut st_ord_unbounded,
+            c_cls,
+            cid,
+            &mut unbounded,
+        )
+    });
+    assert!(ok);
+    assert!(
+        unbounded.peak >= sample_ord_unbounded.peak,
+        "ordinary pred_c admitted peak ({}) < measured peak ({})",
+        unbounded.peak,
+        sample_ord_unbounded.peak
+    );
+    assert!(
+        unbounded.live <= 4096,
+        "ordinary pred_c leaked reservation ({} B)",
+        unbounded.live
+    );
+
+    // 2. Rooted `root_pred` through `dl_rules::pred_c` with 513 live `A(f_e(u0))` partners.
+    let mk_xl = |xl: XLit| match run.lits.lit(xl, inv) {
+        Made::Lit(l) => l,
+        _ => unreachable!(),
+    };
+    let la_fc = mk_xl(XLit::Atom(a_cls, RTerm::Fc(exist_e, u0)));
+    let lb_u0 = mk_xl(XLit::Atom(b_cls, RTerm::C(u0)));
+    let lh_u0: Vec<Lit> = h_cls
+        .iter()
+        .map(|&c| mk_xl(XLit::Atom(c, RTerm::C(u0))))
+        .collect();
+
+    let build_root_state = |subsume_output: bool| {
+        let mut st = State::default();
+        let mut setup_sink = BudgetSink {
+            run: &run,
+            cap: usize::MAX,
+            live: 0,
+            peak: 0,
+            stopped: false,
+        };
+        let x = super::dl_rules::ds(&mut st);
+        // Seed first partner and flush once so `at_consts -> succ_at` registers `(exist_e, u0)`
+        // in `r.by_succ[hyp_w]` via the real production path.
+        let mut first_head = vec![la_fc];
+        for j in 0..7usize {
+            first_head.push(lh_u0[(j * 73) % 520]);
+        }
+        let _ = x.store.add(Clause::new(vec![Lit::x(h_cls[0])], first_head));
+        let _ = super::dl_root::flush(&ix, &mut st, &mut setup_sink, 1);
+        assert!(
+            super::dl_rules::dl(&st)
+                .and_then(|d| d.root.as_deref())
+                .is_some_and(|r| r.edges_to(hyp_w).contains(&(exist_e, u0))),
+            "succ_at must register (exist_e, u0) edge to hyp_w"
+        );
+        let x = super::dl_rules::ds(&mut st);
+        let ground_total = super::dl_clause::ground_total();
+        let o = Rooted {
+            ix: &ix,
+            lits: &run.lits,
+            inv: &inv,
+            ground_total,
+        };
+        let mut max = Vec::new();
+        for i in 1..513usize {
+            let mut head = vec![la_fc];
+            for j in 0..7usize {
+                head.push(lh_u0[(i + j * 73) % 520]);
+            }
+            let c = Clause::new(vec![Lit::x(h_cls[i])], head);
+            let _ = x.store.add(c);
+            let id = x.store.peek_live().expect("A(f_e(u0)) partner queued");
+            let _ = x.store.next_prepare_id(&ix, Some(&o), id, &mut max);
+            let _ = x.store.next_commit(&ix, Some(&o), id, &max);
+            assert!(max.contains(&la_fc));
+        }
+        if subsume_output {
+            let _ = x.store.add(Clause::new(Vec::new(), vec![lb_u0]));
+            let id = x.store.peek_live().expect("B(u0) subsumer queued");
+            let _ = x.store.next_prepare_id(&ix, Some(&o), id, &mut max);
+            let _ = x.store.next_commit(&ix, Some(&o), id, &max);
+        }
+        st
+    };
+
+    let mut st_root_tight = build_root_state(false);
+    let mut root_tight = BudgetSink {
+        run: &run,
+        cap: tight_cap,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (_, sample_root_tight) = measure(|| {
+        super::dl_rules::pred_c(&ix, root, &mut st_root_tight, hyp_w, cid, &mut root_tight)
+    });
+    assert!(
+        root_tight.stopped,
+        "rooted pred_c must refuse the first 513-partner product under tight cap"
+    );
+    assert!(
+        super::dl_rules::dl(&st_root_tight).is_some_and(|x| x.store.interrupted),
+        "rooted pred_c refusal must mark store interrupted"
+    );
+    assert!(
+        sample_root_tight.peak <= tight_cap + 4096,
+        "rooted pred_c materialized premises before admission: peak = {} B > cap + 4096 ({})",
+        sample_root_tight.peak,
+        tight_cap + 4096
+    );
+
+    let mut st_root_unbounded = build_root_state(true);
+    let mut root_unbounded = BudgetSink {
+        run: &run,
+        cap: usize::MAX,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (ok, sample_root_unbounded) = measure(|| {
+        super::dl_rules::pred_c(
+            &ix,
+            root,
+            &mut st_root_unbounded,
+            hyp_w,
+            cid,
+            &mut root_unbounded,
+        )
+    });
+    assert!(ok);
+    assert!(
+        root_unbounded.peak >= sample_root_unbounded.peak,
+        "rooted pred_c admitted peak ({}) < measured peak ({})",
+        root_unbounded.peak,
+        sample_root_unbounded.peak
+    );
+    assert!(
+        root_unbounded.live <= 4096,
+        "rooted pred_c leaked reservation ({} B)",
+        root_unbounded.live
+    );
+}
+
+/// Sol r4 P1 #1: `at_most` (and its `on_rl` caller) must count borrowed holder and role
+/// partners before materializing premise lists and cover retained setup buffers for their
+/// full lifetime across admission, prune, and early refusal.
+#[test]
+fn at_most_refuses_first_product_before_materializing_partners_and_covers_setup() {
+    struct BudgetSink<'a> {
+        run: &'a DlRun,
+        cap: usize,
+        live: usize,
+        peak: usize,
+        stopped: bool,
+    }
+    impl Sink for BudgetSink<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            if self.stopped || self.live.saturating_add(bytes) > self.cap {
+                self.stopped = true;
+                return false;
+            }
+            self.live += bytes;
+            self.peak = self.peak.max(self.live);
+            true
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.live = self.live.saturating_sub(bytes);
+        }
+        fn admit_dl(&mut self, bytes: usize) -> bool {
+            self.reserve_data(bytes)
+        }
+        fn commit_dl(&mut self, admitted: usize, kept: usize) {
+            self.live = self.live.saturating_sub(admitted.saturating_sub(kept));
+        }
+        fn go_on(&self) -> bool {
+            !self.stopped
+        }
+        fn stopped(&self) -> bool {
+            self.stopped
+        }
+        fn worked(&mut self, _: usize) {}
+    }
+
+    let mut body = String::new();
+    for i in 0..520 {
+        body.push_str(&format!("Declaration(Class(:H{i}))\n"));
+    }
+    body.push_str(
+        "Declaration(Class(:M))\n\
+         Declaration(Class(:C0))\n\
+         Declaration(Class(:C1))\n\
+         Declaration(Class(:Seed))\n\
+         Declaration(ObjectProperty(:r))\n\
+         SubClassOf(:M ObjectMaxCardinality(1 :r))\n\
+         SubClassOf(:Seed ObjectSomeValuesFrom(:r :C0))\n\
+         SubClassOf(:Seed ObjectSomeValuesFrom(:r :C1))\n\
+         SubClassOf(:Seed ObjectUnionOf(:U0 :U1))\n",
+    );
+    let input = axioms(&body);
+    let mut it = Interner::new();
+    let mut ax = Axioms::default();
+    let mut outside = Vec::new();
+    for a in &input {
+        if super::index::normalize(&a.kind, &mut it, &mut ax).is_some() {
+            outside.push(&a.kind);
+        }
+    }
+    let allowed = super::dl_norm::Allowed {
+        counting: true,
+        ..Default::default()
+    };
+    let dl_ax = super::dl_norm::normalize(&outside, &mut it, &mut ax, None, &|| false, allowed)
+        .expect("dl_norm")
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let (holder_m, _, q_role, _) = *dl_ax
+        .atmost
+        .first()
+        .expect("expected atmost holder entry in dl_ax.atmost");
+    ax.dl = Some(Box::new(dl_ax));
+    let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+    let dx = ix.dl.as_deref().expect("counting dl index");
+    assert!(dx.counting, "expected counting Tier D index");
+    let c0_cls = it.class(&Class::new("urn:tierd1291:C0"));
+    let c1_cls = it.class(&Class::new("urn:tierd1291:C1"));
+    let seed_cls = it.class(&Class::new("urn:tierd1291:Seed"));
+    let h_cls: Vec<Ex> = (0..520)
+        .map(|i| it.class(&Class::new(format!("urn:tierd1291:H{i}"))))
+        .collect();
+    let f0 = (0..it.nodes.len() as Ex)
+        .find(|&e| {
+            matches!(ix.head(e).node, super::index::Node::Exist(..)) && ix.head(e).succ == c0_cls
+        })
+        .expect("existential for :r :C0");
+    let f1 = (0..it.nodes.len() as Ex)
+        .find(|&e| {
+            matches!(ix.head(e).node, super::index::Node::Exist(..)) && ix.head(e).succ == c1_cls
+        })
+        .expect("existential for :r :C1");
+
+    let run = DlRun::new(false, Default::default());
+
+    let build_state = |n_partners: usize, extra_lits: usize| {
+        let mut st = State::default();
+        let x = super::dl_rules::ds(&mut st);
+        // Pre-populate edge for f1 so `process` does not allocate `edges` during the trigger.
+        x.edges.push((f1, c1_cls));
+        let mut max = Vec::new();
+        // 1. Live `X(holder_m)` holder premises (`X` > `Y`, so `X(holder_m)` is always maximal).
+        for i in 0..n_partners {
+            let mut head = vec![Lit::x(holder_m)];
+            for j in 0..extra_lits {
+                head.push(Lit::y(h_cls[(i + j * 7) % 520]));
+            }
+            let _ = x.store.add(Clause::new(vec![Lit::x(h_cls[i % 520])], head));
+            let id = x.store.peek_live().expect("holder partner queued");
+            let _ = x.store.next_prepare_id(&ix, None, id, &mut max);
+            let _ = x.store.next_commit(&ix, None, id, &max);
+            assert!(max.contains(&Lit::x(holder_m)));
+        }
+        // 2. Live `RL(f0, q_role)` successor premises (`RL` > `Y`).
+        let l_rl0 = Lit::rl(f0, q_role);
+        for i in 0..n_partners {
+            let mut head = vec![l_rl0];
+            for j in 0..extra_lits {
+                head.push(Lit::y(h_cls[(i + j * 11) % 520]));
+            }
+            let _ = x
+                .store
+                .add(Clause::new(vec![Lit::x(h_cls[(i + 1) % 520])], head));
+            let id = x.store.peek_live().expect("role partner queued");
+            let _ = x.store.next_prepare_id(&ix, None, id, &mut max);
+            let _ = x.store.next_commit(&ix, None, id, &max);
+            assert!(max.contains(&l_rl0));
+        }
+        // 3. Queue trigger clause `-> RL(f1, q_role)` which invokes `on_rl -> at_most`.
+        let _ = x
+            .store
+            .add(Clause::new(Vec::new(), vec![Lit::rl(f1, q_role)]));
+        st
+    };
+
+    // 1. Tight cap refusing before setup/first product on 513 holder + 513 role partners (~115 KiB).
+    let tight_cap = 2048usize;
+    let mut st_tight = build_state(513, 7);
+    let mut tight = BudgetSink {
+        run: &run,
+        cap: tight_cap,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (_, sample_tight) =
+        measure(|| super::dl_rules::flush(&ix, seed_cls, &mut st_tight, &mut tight, 1));
+    assert!(
+        tight.stopped,
+        "at_most must refuse the first product under tight cap"
+    );
+    assert!(
+        super::dl_rules::dl(&st_tight).is_some_and(|x| x.store.interrupted),
+        "at_most refusal must mark store interrupted"
+    );
+    assert!(
+        sample_tight.peak <= tight_cap + 4096,
+        "at_most materialized holder/role partners before admission: peak = {} B > cap + 4096 ({})",
+        sample_tight.peak,
+        tight_cap + 4096
+    );
+    assert!(
+        tight.live <= 256,
+        "tight refusal leaked reservation beyond trigger store index growth ({} B)",
+        tight.live
+    );
+
+    // 2. Mid cap admitting compact setup metadata (~8 KiB) but refusing the ~115 KiB first product.
+    let mid_cap = 24 << 10;
+    let mut st_mid = build_state(513, 7);
+    let mut mid = BudgetSink {
+        run: &run,
+        cap: mid_cap,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (_, sample_mid) =
+        measure(|| super::dl_rules::flush(&ix, seed_cls, &mut st_mid, &mut mid, 1));
+    assert!(
+        mid.stopped,
+        "at_most must refuse the first 513-partner product under mid cap"
+    );
+    assert!(
+        super::dl_rules::dl(&st_mid).is_some_and(|x| x.store.interrupted),
+        "at_most mid-cap refusal must mark store interrupted"
+    );
+    assert!(
+        sample_mid.peak <= mid_cap + 4096,
+        "at_most overshot mid cap ({mid_cap}): measured peak = {} B",
+        sample_mid.peak
+    );
+    assert!(
+        mid.peak >= sample_mid.peak,
+        "at_most admitted peak ({}) < measured peak ({}) under mid cap",
+        mid.peak,
+        sample_mid.peak
+    );
+    assert_eq!(
+        mid.live, tight.live,
+        "mid-cap refusal must release 100% of admitted setup reservation"
+    );
+
+    // 3. Unbounded cap with 16x16 multi-literal partners: admitted peak must cover setup +
+    //    product + prune + drain, and retained `unbounded.live` must match permanent `Store`
+    //    growth with zero leaked temporary reservation.
+    let mut st_unbounded = build_state(16, 32);
+    let before_store_bytes = super::dl_rules::dl(&st_unbounded)
+        .expect("dl state")
+        .store
+        .bytes();
+    let mut unbounded = BudgetSink {
+        run: &run,
+        cap: usize::MAX,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (processed, sample_unbounded) =
+        measure(|| super::dl_rules::flush(&ix, seed_cls, &mut st_unbounded, &mut unbounded, 1));
+    assert_eq!(processed, 1);
+    let after_store_bytes = super::dl_rules::dl(&st_unbounded)
+        .expect("dl state")
+        .store
+        .bytes();
+    let store_growth = after_store_bytes.saturating_sub(before_store_bytes);
+    assert!(
+        unbounded.peak >= sample_unbounded.peak,
+        "at_most unbounded admitted peak ({}) < measured peak ({})",
+        unbounded.peak,
+        sample_unbounded.peak
+    );
+    assert!(
+        unbounded.live <= store_growth + 256,
+        "at_most unbounded leaked reservation: live ({}) > store growth ({}) + 256",
+        unbounded.live,
+        store_growth
+    );
+}
+
+/// Sol r4 P1 #2: growing `Found::prods` from a full product vector (`cap == 64 -> 128`)
+/// with singleton premise lists (`prune_scratch == 0`) must not undercharge the moving
+/// realloc peak by overlapping an already-allocated payload with both old and new slot
+/// buffers.
+#[test]
+fn pred_product_vector_growth_from_full_prods_with_singleton_lists_covers_realloc_peak() {
+    struct BudgetSink<'a> {
+        run: &'a DlRun,
+        cap: usize,
+        live: usize,
+        peak: usize,
+        stopped: bool,
+    }
+    impl Sink for BudgetSink<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            if self.stopped || self.live.saturating_add(bytes) > self.cap {
+                self.stopped = true;
+                return false;
+            }
+            self.live += bytes;
+            self.peak = self.peak.max(self.live);
+            true
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.live = self.live.saturating_sub(bytes);
+        }
+        fn admit_dl(&mut self, bytes: usize) -> bool {
+            self.reserve_data(bytes)
+        }
+        fn commit_dl(&mut self, admitted: usize, kept: usize) {
+            self.live = self.live.saturating_sub(admitted.saturating_sub(kept));
+        }
+        fn go_on(&self) -> bool {
+            !self.stopped
+        }
+        fn stopped(&self) -> bool {
+            self.stopped
+        }
+        fn worked(&mut self, _: usize) {}
+    }
+
+    let mut body = String::new();
+    for i in 0..520 {
+        body.push_str(&format!("Declaration(Class(:H{i}))\n"));
+    }
+    body.push_str(
+        "Declaration(Class(:A))\n\
+         Declaration(Class(:C))\n\
+         Declaration(Class(:Seed))\n\
+         Declaration(ObjectProperty(:r))\n\
+         SubClassOf(:Seed ObjectSomeValuesFrom(:r :C))\n\
+         SubClassOf(:Seed ObjectUnionOf(:U0 :U1))\n",
+    );
+    let input = axioms(&body);
+    let mut it = Interner::new();
+    let mut ax = Axioms::default();
+    let mut outside = Vec::new();
+    for a in &input {
+        if super::index::normalize(&a.kind, &mut it, &mut ax).is_some() {
+            outside.push(&a.kind);
+        }
+    }
+    let dl_ax = super::dl_norm::normalize(
+        &outside,
+        &mut it,
+        &mut ax,
+        None,
+        &|| false,
+        Default::default(),
+    )
+    .expect("dl_norm")
+    .map(|(_, d)| d)
+    .unwrap_or_default();
+    ax.dl = Some(Box::new(dl_ax));
+    let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+    let a_cls = it.class(&Class::new("urn:tierd1291:A"));
+    let c_cls = it.class(&Class::new("urn:tierd1291:C"));
+    let seed_cls = it.class(&Class::new("urn:tierd1291:Seed"));
+    let h_cls: Vec<Ex> = (0..520)
+        .map(|i| it.class(&Class::new(format!("urn:tierd1291:H{i}"))))
+        .collect();
+    let exist_e = (0..it.nodes.len() as Ex)
+        .find(|&e| {
+            matches!(ix.head(e).node, super::index::Node::Exist(..)) && ix.head(e).succ == c_cls
+        })
+        .expect("existential for :r :C");
+
+    let run = DlRun::new(false, Default::default());
+    let mut cids = Vec::with_capacity(65);
+    for k in 0..65usize {
+        // Large head (> 4 KiB) so incoming payload is comparable to/larger than `old_cap_bytes`
+        // (64 * 96 = 6144 B) when `Found::prods` grows from cap 64 to cap 128.
+        let mut head = Vec::with_capacity(512);
+        for j in 0..512usize {
+            head.push(Lit::y(h_cls[(k + j) % 520]));
+        }
+        cids.push(run.table.push(Clause::new(vec![Lit::x(a_cls)], head)));
+    }
+
+    let mut st = State::default();
+    let x = super::dl_rules::ds(&mut st);
+    x.edges.push((exist_e, c_cls));
+    x.pred_in.insert(c_cls, cids);
+    // Exactly ONE live partner clause for `F(e, A)` -> singleton premise list (`prune_scratch == 0`).
+    let lf = Lit::f(exist_e, a_cls);
+    let mut p_head = vec![lf];
+    for &hc in &h_cls[..256] {
+        p_head.push(Lit::x(hc));
+    }
+    let _ = x.store.add(Clause::new(vec![Lit::x(h_cls[519])], p_head));
+    let mut max = Vec::new();
+    let id = x.store.peek_live().expect("singleton partner queued");
+    let _ = x.store.next_prepare_id(&ix, None, id, &mut max);
+    let _ = x.store.next_commit(&ix, None, id, &max);
+    assert!(max.contains(&lf));
+
+    let mut sink = BudgetSink {
+        run: &run,
+        cap: usize::MAX,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let ((replayed, prods_len), sample) = super::dl_rules::with_late_unit_mode_override(2, || {
+        measure(|| {
+            let mut guard = super::saturate::Guard::new(&mut sink);
+            let mut found = Found::default();
+            let ok = super::dl_rules::late(
+                &ix,
+                seed_cls,
+                &mut st,
+                exist_e,
+                c_cls,
+                "realloc-test",
+                &mut found,
+                &mut guard,
+            );
+            let len = found.products_len();
+            drop(found);
+            drop(guard);
+            (ok, len)
+        })
+    });
+    assert!(
+        replayed,
+        "late replay of 65 singleton products must succeed"
+    );
+    assert_eq!(prods_len, 65, "expected 65 queued products (cap 64 -> 128)");
+    assert!(
+        sink.peak >= sample.peak,
+        "Found::prods growth from full cap=64 with singleton lists undercharged realloc peak: admitted peak ({}) < measured peak ({})",
+        sink.peak,
+        sample.peak
+    );
+    assert_eq!(sink.live, 0, "dropping guard must release all reservations");
+}
