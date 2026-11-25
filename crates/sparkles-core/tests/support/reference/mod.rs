@@ -65,12 +65,21 @@ impl Origin {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum SpellingDependency {
+    #[default]
+    None,
+    /// Only the lexical form can change. The term's metadata and presence are fixed.
+    Lexical,
+    /// The spelling can also affect the term's metadata or presence.
+    Term,
+}
+
 #[derive(Clone)]
 struct Binding {
     term: Term,
     origin: Origin,
-    /// A computation that depends on a spelling beyond carrying it into this term.
-    spelling_dependent: bool,
+    spelling: SpellingDependency,
 }
 
 impl Binding {
@@ -78,7 +87,7 @@ impl Binding {
         Self {
             term,
             origin: Origin::Exact,
-            spelling_dependent: false,
+            spelling: SpellingDependency::None,
         }
     }
 
@@ -86,12 +95,16 @@ impl Binding {
         Self {
             term,
             origin: Origin::ComputedNumber,
-            spelling_dependent: false,
+            spelling: SpellingDependency::None,
         }
     }
 
-    fn reads_spelling(&self) -> bool {
-        self.spelling_dependent || matches!(self.origin, Origin::NumericLexical(_))
+    fn spelling(&self) -> SpellingDependency {
+        if matches!(self.origin, Origin::NumericLexical(_)) {
+            self.spelling.max(SpellingDependency::Lexical)
+        } else {
+            self.spelling
+        }
     }
 }
 
@@ -101,7 +114,8 @@ impl Binding {
 pub(crate) struct Solution {
     terms: BTreeMap<Variable, Term>,
     origins: BTreeMap<Variable, Origin>,
-    spelling_dependent: HashSet<Variable>,
+    /// Includes unbound variables whose expression may succeed under another spelling.
+    spelling: HashMap<Variable, SpellingDependency>,
 }
 
 impl std::ops::Deref for Solution {
@@ -121,11 +135,15 @@ impl Solution {
         self.origins.get(v).copied().unwrap_or_default()
     }
 
+    fn spelling(&self, v: &Variable) -> SpellingDependency {
+        self.spelling.get(v).copied().unwrap_or_default()
+    }
+
     fn binding(&self, v: &Variable) -> Option<Binding> {
         Some(Binding {
             term: self.get(v)?.clone(),
             origin: self.origin(v),
-            spelling_dependent: self.spelling_dependent.contains(v),
+            spelling: self.spelling(v),
         })
     }
 
@@ -139,10 +157,10 @@ impl Solution {
         } else {
             self.origins.insert(v.clone(), binding.origin);
         }
-        if binding.spelling_dependent {
-            self.spelling_dependent.insert(v.clone());
+        if binding.spelling == SpellingDependency::None {
+            self.spelling.remove(&v);
         } else {
-            self.spelling_dependent.remove(&v);
+            self.spelling.insert(v.clone(), binding.spelling);
         }
         self.terms.insert(v, binding.term);
     }
@@ -150,7 +168,7 @@ impl Solution {
     fn project(&mut self, variables: &[Variable]) {
         self.terms.retain(|v, _| variables.contains(v));
         self.origins.retain(|v, _| variables.contains(v));
-        self.spelling_dependent.retain(|v| variables.contains(v));
+        self.spelling.retain(|v, _| variables.contains(v));
     }
 }
 
@@ -797,19 +815,24 @@ pub(crate) fn merge(a: &Solution, b: &Solution) -> Solution {
     let mut out = a.clone();
     for (k, v) in b.iter() {
         let mut origin = b.origin(k);
-        let mut spelling_dependent = b.spelling_dependent.contains(k);
+        let mut spelling = b.spelling(k);
         if a.get(k) == Some(v) {
             origin = origin.shared(a.origin(k));
-            spelling_dependent |= a.spelling_dependent.contains(k);
+            spelling = spelling.max(a.spelling(k));
         }
         out.bind(
             k.clone(),
             Binding {
                 term: v.clone(),
                 origin,
-                spelling_dependent,
+                spelling,
             },
         );
+    }
+    for (v, &spelling) in &b.spelling {
+        if !out.contains_key(v) {
+            out.spelling.insert(v.clone(), spelling);
+        }
     }
     // The merge keeps the number that BNODE reads only where it is the numbered solution
     // itself, the other side binding nothing new. Otherwise it is a new solution, which a
@@ -1131,8 +1154,9 @@ impl<'a> Evaluator<'a> {
                         let n = self.fresh_id();
                         s.insert(row_variable(), int_term(n as i128));
                     }
-                    let (v, read_open) =
-                        self.tracking(|| self.soft(self.binding(expression, cx, &s)));
+                    let ((v, read_open), reads_spelling) = self.tracking_spelling(|| {
+                        self.tracking(|| self.soft(self.binding(expression, cx, &s)))
+                    });
                     open |= read_open;
                     if let Some(mut v) = v? {
                         if s.get(variable).is_some_and(|old| *old != v.term) {
@@ -1141,9 +1165,12 @@ impl<'a> Evaluator<'a> {
                         }
                         if s.contains_key(variable) {
                             v.origin = v.origin.shared(s.origin(variable));
-                            v.spelling_dependent |= s.spelling_dependent.contains(variable);
+                            v.spelling = v.spelling.max(s.spelling(variable));
                         }
                         s.bind(variable.clone(), v);
+                    } else if reads_spelling && !s.contains_key(variable) {
+                        s.spelling
+                            .insert(variable.clone(), SpellingDependency::Term);
                     }
                     out.push(s);
                 }
@@ -1383,9 +1410,7 @@ impl<'a> Evaluator<'a> {
     fn tracking_spelling<T>(&self, f: impl FnOnce() -> T) -> (T, bool) {
         let outer = self.read_spelling.replace(false);
         let result = f();
-        let read = self.read_spelling.get();
-        self.read_spelling.set(outer || read);
-        (result, read)
+        (result, self.read_spelling.replace(outer))
     }
 
     /// Note that `v` holds open values.
@@ -1504,9 +1529,10 @@ impl<'a> Evaluator<'a> {
                             // If an exact term also produced this row, it must still be
                             // represented even if the computed binding changes spelling.
                             distinct[slot].origins.retain(|v, o| *o == s.origin(v));
-                            distinct[slot]
-                                .spelling_dependent
-                                .extend(s.spelling_dependent);
+                            for (v, spelling) in s.spelling {
+                                let own = distinct[slot].spelling.entry(v).or_default();
+                                *own = (*own).max(spelling);
+                            }
                             let f = kept[slot];
                             if let Some((k, _)) = &mut keys
                                 && let Some(other) = k[i].take()
@@ -1827,6 +1853,11 @@ impl<'a> Evaluator<'a> {
             let members = &groups[&key];
             let mut row = Solution::new();
             for (v, t) in variables.iter().zip(&key) {
+                let spelling = members
+                    .iter()
+                    .map(|s| s.spelling(v))
+                    .max()
+                    .unwrap_or_default();
                 if let Some(t) = t {
                     let origin = members
                         .iter()
@@ -1838,16 +1869,20 @@ impl<'a> Evaluator<'a> {
                         Binding {
                             term: t.clone(),
                             origin,
-                            spelling_dependent: members
-                                .iter()
-                                .any(|s| s.spelling_dependent.contains(v)),
+                            spelling,
                         },
                     );
+                } else if spelling != SpellingDependency::None {
+                    row.spelling.insert(v.clone(), spelling);
                 }
             }
             for (v, a) in aggregates {
-                if let Some(t) = self.aggregate(v, a, members, inner_open, cx)? {
+                let (result, reads_spelling) =
+                    self.tracking_spelling(|| self.aggregate(v, a, members, inner_open, cx));
+                if let Some(t) = result? {
                     row.bind(v.clone(), t);
+                } else if reads_spelling {
+                    row.spelling.insert(v.clone(), SpellingDependency::Term);
                 }
             }
             out.push(row);
@@ -1866,6 +1901,7 @@ impl<'a> Evaluator<'a> {
         inner_open: bool,
         cx: &Cx,
     ) -> R<Option<Binding>> {
+        use SpellingDependency as Spelling;
         use value::*;
         let (name, expr, distinct) = match a {
             AggregateExpression::CountSolutions { distinct } => {
@@ -1902,35 +1938,50 @@ impl<'a> Evaluator<'a> {
         // BNODE(label) gives each solution its own blank node.
         let numbers = reads_bnode(expr);
         let mut values = Vec::new();
-        let (r, open) = self.tracking(|| -> R<()> {
-            for s in members {
-                let v = if numbers && !s.contains_key(&row_variable()) {
-                    let mut s = s.clone();
-                    s.insert(row_variable(), int_term(self.fresh_id() as i128));
-                    self.soft(self.binding(expr, cx, &s))?
-                } else {
-                    self.soft(self.binding(expr, cx, s))?
-                };
-                values.push(v);
-            }
-            Ok(())
+        let ((r, open), spelling_error) = self.tracking_spelling(|| {
+            self.tracking(|| -> R<()> {
+                for s in members {
+                    let v = if numbers && !s.contains_key(&row_variable()) {
+                        let mut s = s.clone();
+                        s.insert(row_variable(), int_term(self.fresh_id() as i128));
+                        self.soft(self.binding(expr, cx, &s))?
+                    } else {
+                        self.soft(self.binding(expr, cx, s))?
+                    };
+                    values.push(v);
+                }
+                Ok(())
+            })
         });
         r?;
         if open {
             self.mark_open(out);
         }
+        let inputs = values
+            .iter()
+            .flatten()
+            .map(Binding::spelling)
+            .max()
+            .unwrap_or_default();
+        let reads_spelling = spelling_error || inputs != Spelling::None;
+        // An unbound aggregate result may become bound under another spelling.
+        self.read_spelling.set(reads_spelling);
         if distinct {
             let mut seen = HashSet::new();
-            // An exact duplicate may also have been produced by a fixed binding.
-            let mut origins = HashMap::new();
+            // Different producers of an equal term share its stricter cell policy,
+            // and any of their values can change when the spelling changes.
+            let mut provenance: HashMap<_, (Origin, Spelling)> = HashMap::new();
             for b in values.iter().flatten() {
-                origins
+                provenance
                     .entry(b.term.clone())
-                    .and_modify(|o: &mut Origin| *o = o.shared(b.origin))
-                    .or_insert(b.origin);
+                    .and_modify(|(origin, spelling)| {
+                        *origin = origin.shared(b.origin);
+                        *spelling = (*spelling).max(b.spelling());
+                    })
+                    .or_insert((b.origin, b.spelling()));
             }
             for b in values.iter_mut().flatten() {
-                b.origin = origins[&b.term];
+                (b.origin, b.spelling) = provenance[&b.term];
             }
             values.retain(|v| match v {
                 Some(b) => seen.insert(b.term.clone()),
@@ -1939,8 +1990,8 @@ impl<'a> Evaluator<'a> {
         }
         let has_error = values.iter().any(Option::is_none);
         let terms: Vec<&Term> = values.iter().flatten().map(|b| &b.term).collect();
-        Ok(match name {
-            // Count removes the errors
+        let mut result = match name {
+            // Count removes the errors.
             AggregateFunction::Count => Some(Binding::number(int_term(terms.len() as i128))),
             AggregateFunction::Sum | AggregateFunction::Avg => {
                 // Avg is zero where Count, which removes the errors, is zero, and Sum
@@ -1954,7 +2005,11 @@ impl<'a> Evaluator<'a> {
                             return Ok(None);
                         }
                     }
-                    return Ok(Some(Binding::number(int_term(0))));
+                    let mut zero = Binding::number(int_term(0));
+                    if reads_spelling {
+                        zero.spelling = Spelling::Term;
+                    }
+                    return Ok(Some(zero));
                 }
                 if has_error {
                     return Ok(None);
@@ -2033,10 +2088,13 @@ impl<'a> Evaluator<'a> {
                     Binding {
                         term: term.clone(),
                         origin,
-                        spelling_dependent: values
+                        spelling: values
                             .iter()
                             .flatten()
-                            .any(|b| &b.term == term && b.spelling_dependent),
+                            .filter(|b| &b.term == term)
+                            .map(Binding::spelling)
+                            .max()
+                            .unwrap_or_default(),
                     }
                 })
             }
@@ -2081,7 +2139,22 @@ impl<'a> Evaluator<'a> {
                 Some(Binding::exact(string_term(parts.join(&sep))))
             }
             AggregateFunction::Custom(_) => unreachable!(),
-        })
+        };
+        if let Some(binding) = &mut result {
+            let spelling = match name {
+                AggregateFunction::Count
+                    if spelling_error || inputs == Spelling::Term || distinct && reads_spelling =>
+                {
+                    Spelling::Lexical
+                }
+                AggregateFunction::Sum | AggregateFunction::Avg if reads_spelling => Spelling::Term,
+                AggregateFunction::GroupConcat { .. } if !spelling_error => inputs,
+                _ if spelling_error => Spelling::Term,
+                _ => Spelling::None,
+            };
+            binding.spelling = binding.spelling.max(spelling);
+        }
+        Ok(result)
     }
 
     // ------------------------------------------------------------------ CONSTRUCT ------

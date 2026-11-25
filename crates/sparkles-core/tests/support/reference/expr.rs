@@ -3,7 +3,10 @@
 //! variable or a dropped solution where it says so.
 
 use super::value::*;
-use super::{Binding, Cx, Evaluator, Fail, Origin, R, Solution, merge, row_variable, unsupported};
+use super::{
+    Binding, Cx, Evaluator, Fail, Origin, R, Solution, SpellingDependency, merge, row_variable,
+    unsupported,
+};
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{BlankNode, Literal, NamedNode, Term, Triple};
 use oxsdatatypes::{Boolean, DateTime, Decimal, Double, Float};
@@ -101,7 +104,7 @@ impl Evaluator<'_> {
 
     pub(crate) fn expr(&self, e: &Expression, cx: &Cx, s: &Solution) -> R<Term> {
         let binding = self.binding(e, cx, s)?;
-        if binding.reads_spelling() {
+        if binding.spelling() != SpellingDependency::None {
             self.read_spelling.set(true);
         }
         Ok(binding.term)
@@ -113,7 +116,9 @@ impl Evaluator<'_> {
         let read = self.read_spelling.replace(outer);
         match result {
             Ok(mut binding) => {
-                binding.spelling_dependent |= read;
+                if read {
+                    binding.spelling = SpellingDependency::Term;
+                }
                 Ok(binding)
             }
             Err(error) => {
@@ -127,12 +132,38 @@ impl Evaluator<'_> {
 
     fn eval_binding(&self, e: &Expression, cx: &Cx, s: &Solution) -> R<Binding> {
         use Expression as E;
+        use SpellingDependency as Spelling;
         match e {
             E::Variable(v) => {
                 if self.open_vars.borrow().contains(v) {
                     self.read_open.set(true);
                 }
-                s.binding(v).or_else(|| cx.env.binding(v)).ok_or(Fail::Type)
+                if let Some(binding) = s.binding(v) {
+                    return Ok(binding);
+                }
+                let from_env = cx.env.binding(v);
+                if s.spelling(v) == Spelling::Term
+                    || from_env.is_none() && cx.env.spelling(v) == Spelling::Term
+                {
+                    self.read_spelling.set(true);
+                }
+                from_env.ok_or(Fail::Type)
+            }
+            E::Bound(v) => {
+                if self.open_vars.borrow().contains(v) {
+                    self.read_open.set(true);
+                }
+                let bound = s.contains_key(v) || cx.env.contains_key(v);
+                let fixed_bound = [s, cx.env]
+                    .iter()
+                    .any(|row| row.contains_key(v) && row.spelling(v) != Spelling::Term);
+                let mut binding = Binding::exact(bool_term(bound));
+                if !fixed_bound
+                    && (s.spelling(v) == Spelling::Term || cx.env.spelling(v) == Spelling::Term)
+                {
+                    binding.spelling = Spelling::Lexical;
+                }
+                Ok(binding)
             }
             E::If(c, a, b) => {
                 let c = self.expr(c, cx, s)?;
@@ -170,6 +201,7 @@ impl Evaluator<'_> {
                 }
                 let mut values = Vec::with_capacity(args.len());
                 let mut first_origin = Origin::Exact;
+                let mut spelling = Spelling::None;
                 let metadata_only = matches!(
                     f,
                     Function::Lang
@@ -186,6 +218,16 @@ impl Evaluator<'_> {
                     f,
                     Function::Str | Function::StrDt | Function::StrLang | Function::StrLangDir
                 );
+                // These operations accept or reject a term by its metadata. The
+                // characters they read can change the output's value only.
+                let stable_metadata = matches!(
+                    f,
+                    Function::UCase
+                        | Function::LCase
+                        | Function::StrLen
+                        | Function::EncodeForUri
+                        | Function::Concat
+                );
                 for (i, a) in args.iter().enumerate() {
                     let b = self.binding(a, cx, s)?;
                     if i == 0 {
@@ -195,12 +237,16 @@ impl Evaluator<'_> {
                         && (lexical_constructor
                             || matches!(f, Function::Custom(n) if n.as_str() == xsd::STRING.as_str())
                                 && matches!(&b.term, Term::Literal(l) if is_string_literal(l)));
-                    // A metadata read ignores lexical variation, but still depends on
-                    // computations that can change the argument's metadata or success.
-                    if b.spelling_dependent
-                        || !metadata_only && !copies_spelling && b.reads_spelling()
-                    {
-                        self.read_spelling.set(true);
+                    match b.spelling() {
+                        Spelling::None => {}
+                        Spelling::Lexical if metadata_only => {}
+                        // A lexical copy retains the origin, as well as any
+                        // lexical dependence independent of that origin.
+                        Spelling::Lexical if copies_spelling => {
+                            spelling = spelling.max(b.spelling);
+                        }
+                        Spelling::Lexical if stable_metadata => spelling = Spelling::Lexical,
+                        _ => self.read_spelling.set(true),
                     }
                     values.push(b.term);
                 }
@@ -244,7 +290,7 @@ impl Evaluator<'_> {
                 Ok(Binding {
                     term,
                     origin,
-                    spelling_dependent: false,
+                    spelling,
                 })
             }
             E::Add(..)
@@ -347,14 +393,9 @@ impl Evaluator<'_> {
                 )?;
                 Ok(bool_term(!found.is_empty()))
             }
-            E::Bound(v) => {
-                // whether an open value is bound is open too
-                if self.open_vars.borrow().contains(v) {
-                    self.read_open.set(true);
-                }
-                Ok(bool_term(s.contains_key(v) || cx.env.contains_key(v)))
+            E::Bound(_) | E::Variable(_) | E::If(..) | E::Coalesce(_) | E::FunctionCall(..) => {
+                unreachable!()
             }
-            E::Variable(_) | E::If(..) | E::Coalesce(_) | E::FunctionCall(..) => unreachable!(),
         }
     }
 

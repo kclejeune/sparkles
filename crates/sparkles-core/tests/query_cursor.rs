@@ -7248,6 +7248,163 @@ fn reference_str_1093_rejects_inversions_with_ambiguous_matches() {
 }
 
 #[test]
+fn reference_str_1093_checks_slice_boundaries_with_ambiguous_matches() {
+    use reference::check::Outcome;
+    let two = &[r#""02""#][..];
+    let first = &[r#""first""#][..];
+    let priority = r#"SELECT ?s {
+        { VALUES (?s ?priority) { ("first" 0) ("02" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(1 AS ?priority) }
+    } ORDER BY ?priority ?s"#;
+    assert!(check_str_1093(&format!("{priority} LIMIT 1"), &[two]).is_err());
+    assert!(matches!(
+        check_str_1093(&format!("{priority} LIMIT 1"), &[first]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check_str_1093(
+            &priority.replace("ORDER BY ?priority ?s", "ORDER BY ?priority LIMIT 1"),
+            &[first]
+        ),
+        Ok(Outcome::Compared)
+    );
+
+    let lexical = r#"SELECT ?s {
+        { VALUES ?s { "01" "02" } } UNION { BIND(STR(2 + 0) AS ?s) }
+    }"#;
+    assert!(check_str_1093(&format!("{lexical} ORDER BY ?s LIMIT 1"), &[two]).is_err());
+    assert!(check_str_1093(&format!("{lexical} ORDER BY DESC(?s) OFFSET 2"), &[two]).is_err());
+
+    let between = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("middle" 1) ("last" 2) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s"#;
+    let last = &[r#""last""#][..];
+    assert!(check_str_1093(&format!("{between} LIMIT 2 OFFSET 1"), &[two, last]).is_err());
+
+    let surplus = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("02" 0) ("last" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 2"#;
+    assert!(check_str_1093(surplus, &[two, last]).is_err());
+
+    let unresolved = r#"SELECT ?s {
+        { VALUES ?s { "02" } } UNION { BIND(STR(2 + 0) AS ?s) }
+    } ORDER BY ?s LIMIT 1"#;
+    assert!(matches!(
+        check_str_1093(unresolved, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_tracks_failed_binds_in_order_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+        BIND(IF(?n = 10, 1, IF(?s = "2", 1 / 0, 2)) AS ?key)
+    }"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    assert!(matches!(
+        check_str_1093(&format!("{query} ORDER BY ?key"), &[ten, two]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    assert!(check_str_1093(&format!("{query} ORDER BY ?n ?key"), &[ten, two]).is_err());
+
+    let union = r#"SELECT ?n ?s {
+        VALUES ?group { 0 }
+        { VALUES (?n ?s ?key ?group) { (10 "10" 0 0) } }
+        UNION
+        { SELECT ?n ?s ?key ?group {
+            BIND(2 AS ?n) BIND(STR(2 + 0) AS ?s) BIND(0 AS ?group)
+            BIND(IF(?s = "2", 1 / 0, 1) AS ?key)
+        } }
+    } ORDER BY ?key ?n"#;
+    assert!(matches!(
+        check_str_1093(union, &[ten, two]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_tracks_boundness_in_order_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+        BIND(IF(?s = "2", 1, 1 / 0) AS ?key)
+    }"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    assert!(matches!(
+        check_str_1093(&format!("{query} ORDER BY BOUND(?key) ?n"), &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    assert!(check_str_1093(&format!("{query} ORDER BY BOUND(?s) ?n"), &[ten, two]).is_err());
+    assert!(
+        check_str_1093(
+            &format!("{query} ORDER BY DESC(?n) BOUND(?key)"),
+            &[two, ten]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn reference_str_1093_tracks_aggregate_value_dependencies_in_order_keys() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ?s"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    for aggregate in ["SUM(STRLEN(?s))", "AVG(STRLEN(?s))"] {
+        let ordered = format!("{query} ORDER BY {aggregate}");
+        assert!(
+            matches!(
+                check_str_1093(&ordered, &[ten, two]),
+                Ok(Outcome::OrderUnchecked(_))
+            ),
+            "{ordered}"
+        );
+    }
+    let ordered = format!("{query} ORDER BY GROUP_CONCAT(?s)");
+    assert!(matches!(
+        check_str_1093(&ordered, &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_tracks_aggregate_presence_and_distinct_values() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES (?n ?copy) { (2 true) (2 false) (10 true) (10 false) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ?s"#;
+    let two = &["2", r#""002""#][..];
+    let ten = &["10", r#""10""#][..];
+    for aggregate in [
+        r#"COUNT(IF(?copy || ?s != "2", 1, 1 / 0))"#,
+        r#"COUNT(DISTINCT IF(?copy, "2", ?s))"#,
+        "MAX(DISTINCT IF(?copy, IF(?n = 2, 1, 2), STRLEN(?s)))",
+    ] {
+        let ordered = format!("{query} ORDER BY {aggregate} DESC(?n)");
+        assert!(
+            matches!(
+                check_str_1093(&ordered, &[ten, two]),
+                Ok(Outcome::OrderUnchecked(_))
+            ),
+            "{ordered}"
+        );
+    }
+    assert!(check_str_1093(&format!("{query} ORDER BY COUNT(?s) ?n"), &[ten, two]).is_err());
+}
+
+#[test]
 fn reference_str_1093_keeps_distinct_sort_prefixes() {
     use reference::check::Outcome;
     let query = r#"SELECT DISTINCT ?n ?s {
@@ -7303,7 +7460,12 @@ fn reference_str_1093_keeps_order_after_spelling_invariant_metadata() {
     }"#;
     let two = &["2", r#""2""#][..];
     let ten = &["10", r#""10""#][..];
-    for metadata in ["LANG(?s)", "DATATYPE(STR(?n + 0))"] {
+    for metadata in [
+        "LANG(?s)",
+        "DATATYPE(STR(?n + 0))",
+        "LANG(UCASE(?s))",
+        "DATATYPE(LCASE(UCASE(?s)))",
+    ] {
         let ordered = format!("{query} ORDER BY {metadata} ?n");
         assert!(check_str_1093(&ordered, &[ten, two]).is_err());
         assert_eq!(check_str_1093(&ordered, &[two, ten]), Ok(Outcome::Compared));

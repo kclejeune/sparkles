@@ -502,8 +502,12 @@ fn check_alternative_keys(
     let sliced = got.len() < order.items.len();
     let mut varies = false;
     let mut budget = ORDER_BUDGET;
-    let unchecked = |why: &str| Ok(Outcome::OrderUnchecked(why.into()));
-    let mut alternatives = Vec::new();
+    let unchecked = || {
+        Ok(Outcome::OrderUnchecked(
+            "the order check's budget ran out".into(),
+        ))
+    };
+    let mut alternatives: Vec<Vec<Option<KeyTerms>>> = Vec::new();
     for (i, row) in got.iter().enumerate() {
         let chosen = order.items[matching.chosen[i]].1.as_ref();
         let outside = observed(chosen, None);
@@ -511,7 +515,7 @@ fn check_alternative_keys(
         for &g in &matching.candidates[i] {
             for &key in &group_keys[g] {
                 let Some(left) = budget.checked_sub(1) else {
-                    return unchecked("the order check's budget ran out");
+                    return unchecked();
                 };
                 budget = left;
                 keys.insert(observed(key, Some(row.as_slice())));
@@ -521,35 +525,89 @@ fn check_alternative_keys(
             }
         }
         varies |= keys.len() > 1;
-        alternatives.push(keys);
+        alternatives.push(keys.into_iter().collect());
     }
     if !varies {
         return Err(message);
     }
-    // Check every pair of returned rows, including pairs unrelated to the ambiguity.
-    // If even independently chosen candidate keys force an inversion, a consistent
-    // matching of the whole bag cannot avoid it.
-    for (j, later) in alternatives.iter().enumerate() {
-        for earlier in &alternatives[..j] {
-            let mut inverted = true;
-            'pairs: for a in later {
-                for b in earlier {
-                    let Some(left) = budget.checked_sub(1) else {
-                        return unchecked("the order check's budget ran out");
-                    };
-                    budget = left;
-                    if !matches!((a, b), (Some(a), Some(b))
-                        if super::strictly_before(a, b, &order.descending, order.term_ties))
-                    {
-                        inverted = false;
-                        break 'pairs;
-                    }
+    let mut all_before = |left: &[Option<KeyTerms>], right: &[Option<KeyTerms>]| -> Option<bool> {
+        for a in left {
+            for b in right {
+                budget = budget.checked_sub(1)?;
+                if !matches!((a, b), (Some(a), Some(b))
+                    if super::strictly_before(a, b, &order.descending, order.term_ties))
+                {
+                    return Some(false);
                 }
             }
-            if inverted {
-                return Err(format!("row {j} belongs before an earlier row"));
+        }
+        Some(true)
+    };
+    // Keys are chosen independently here. An inversion that holds under every
+    // such choice also holds under every consistent matching of the whole bag.
+    for (j, later) in alternatives.iter().enumerate() {
+        for earlier in &alternatives[..j] {
+            match all_before(later, earlier) {
+                None => return unchecked(),
+                Some(true) => return Err(format!("row {j} belongs before an earlier row")),
+                Some(false) => {}
             }
         }
+    }
+    if sliced {
+        let mut possible_returns = vec![0; matching.groups.len()];
+        for &g in matching.candidates.iter().flatten() {
+            possible_returns[g] += 1;
+        }
+        let mut forced_before = 0;
+        let mut forced_after = 0;
+        for (group, max_returned) in matching.groups.iter().zip(possible_returns) {
+            if group.expected.len() <= max_returned {
+                continue;
+            }
+            let mut before = 0;
+            let mut after = 0;
+            let mut both = 0;
+            for &i in &group.expected {
+                let outside = observed(order.items[i].1.as_ref(), None);
+                let outside = std::slice::from_ref(&outside);
+                let mut is_before = false;
+                let mut is_after = false;
+                for returned in &alternatives {
+                    if !is_before {
+                        let Some(forced) = all_before(outside, returned) else {
+                            return unchecked();
+                        };
+                        is_before = forced;
+                    }
+                    if !is_after {
+                        let Some(forced) = all_before(returned, outside) else {
+                            return unchecked();
+                        };
+                        is_after = forced;
+                    }
+                }
+                before += usize::from(is_before);
+                after += usize::from(is_after);
+                both += usize::from(is_before && is_after);
+            }
+            // At most this many rows in the group can be used by any matching.
+            // A larger set of forced rows must leave some outside the slice.
+            if both > max_returned {
+                return Err(
+                    "an omitted reference row belongs both before and after returned rows".into(),
+                );
+            }
+            forced_before += before.saturating_sub(max_returned);
+            forced_after += after.saturating_sub(max_returned);
+        }
+        let n = order.items.len();
+        check_slice_capacity(
+            order.offset.min(n),
+            n - got.len(),
+            forced_before,
+            forced_after,
+        )?;
     }
     Ok(Outcome::OrderUnchecked(format!(
         "equal rows can have different sort keys, and the first matching found {message}"
@@ -663,17 +721,7 @@ fn check_order(
         forced_after += usize::from(is_after);
     }
     let rest = n - chosen.len();
-    if forced_before > from {
-        return Err(format!(
-            "{forced_before} rows belong before the returned rows, more than the offset {from}"
-        ));
-    }
-    if from + forced_after > rest {
-        return Err(format!(
-            "{forced_after} rows belong after the returned rows, more than the {} rows after the slice",
-            rest - from
-        ));
-    }
+    check_slice_capacity(from, rest, forced_before, forced_after)?;
     // A slice without ORDER BY has no constraints between its rows.
     if keys.iter().all(Option::is_none) {
         return Ok(Outcome::Compared);
@@ -707,4 +755,24 @@ fn check_order(
         }
     }
     Ok(Outcome::Compared)
+}
+
+fn check_slice_capacity(
+    from: usize,
+    rest: usize,
+    forced_before: usize,
+    forced_after: usize,
+) -> Result<(), String> {
+    if forced_before > from {
+        return Err(format!(
+            "{forced_before} rows belong before the returned rows, more than the offset {from}"
+        ));
+    }
+    if from + forced_after > rest {
+        return Err(format!(
+            "{forced_after} rows belong after the returned rows, more than the {} rows after the slice",
+            rest - from
+        ));
+    }
+    Ok(())
 }
