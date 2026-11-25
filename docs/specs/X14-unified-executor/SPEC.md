@@ -1415,8 +1415,24 @@ rebuilds use the maintained VALUES terms for template blank-node identity and ch
 distinct graph state as the graph streams. Strict policy also
 applies inside the child. A custom source that only implements eager view reads requires
 the permissive policy. The cursor inventory and heap audit cover the maintained readers.
-The inventory test `cursor_inventory.rs` lists every form as native or refused with
-its decision or row.
+The inventory test `cursor_inventory.rs` lists every built-in plan form as native.
+
+Leaf ARQ property functions (`Kind::PropertyFn` without plan inputs) and `SILENT SERVICE`
+now run natively under `FallbackPolicy::RejectMaterialization`, completing item 829.
+`cursor/propertyfn.rs` and `arqpf::LeafReader` stream store-backed collections, RDF
+containers, `rdfs:member` triples and `apf:strSplit` tokens a batch at a time under
+`OwnedCharge` with cooperative control polling, and emit constant scalar functions on
+first pull. `cursor/service.rs` runs `SILENT SERVICE` lazily by draining remote and
+in-process responses into a memory-charged buffer before the first row so open-time and
+mid-stream endpoint failures become one empty solution while cancellation, query
+deadlines, policy refusals, budget limits and strict callee refusals still propagate;
+cache hits stream directly and late-head JSON is accepted under byte metering because the
+operator already reports `fullInputBeforeOutput`. Every built-in form in
+`cursor_inventory.rs` runs natively, and the ARQ property-function and CDT streaming
+suites record zero eager fallbacks. Strict cursors still refuse only unprefixed
+user-registered property functions, legacy eager-only `ViewSource` implementations,
+late-head JSON responses on non-`SILENT` `SERVICE` (tracked in
+[item 1125](../../ROADMAP.md)) and operators whose `EXISTS` embeds one of those shapes.
 
 Tests compare each reader with eager answers at batch sizes down to one row, refuse the
 budget and row limits where eager execution refuses, measure each reader's heap against
