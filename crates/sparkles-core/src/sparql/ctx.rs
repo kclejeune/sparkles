@@ -2143,7 +2143,7 @@ impl Ctx {
             });
             let bytes = fixed_bytes
                 .saturating_add(name_bytes)
-                .saturating_add(local.len().saturating_mul(64));
+                .saturating_add(local.append_only_clone_bytes());
             if bytes <= admitted {
                 *trial.var_names.get_mut() = names.clone();
                 *trial.local.get_mut() = local.clone();

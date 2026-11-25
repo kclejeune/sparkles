@@ -13,6 +13,9 @@ use georust::{
     Coord, Geometry, GeometryCollection, LineString, MultiLineString, MultiPoint, MultiPolygon,
     Point, Polygon,
 };
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::Value;
+use std::fmt;
 
 /// Deepest nesting of geometry collections.
 pub const MAX_DEPTH: usize = 32;
@@ -552,7 +555,7 @@ fn dim_tag(word: &str) -> Option<Layout> {
 /// Additional space for the JSON value tree and its overlap with geometry construction.
 /// The caller separately covers the lexical copy, JSON strings and string scratch.
 pub(super) fn geojson_structure_bytes(lex: &str) -> u64 {
-    let value = std::mem::size_of::<serde_json::Value>() as u64;
+    let value = std::mem::size_of::<Value>() as u64;
     let geometry = std::mem::size_of::<Geometry<f64>>() as u64;
     let mut bytes = 0u64;
     let mut in_string = false;
@@ -587,13 +590,74 @@ pub(super) fn geojson_structure_bytes(lex: &str) -> u64 {
     bytes
 }
 
+// serde_json's Value deserializer can interpret a special first map key as a
+// protocol for parsing JSON inside a string. Read ordinary JSON keys at every
+// depth so the tree only allocates for syntax covered by the admission scan.
+struct GeoJsonValue(Value);
+
+impl<'de> Deserialize<'de> for GeoJsonValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(GeoJsonVisitor).map(Self)
+    }
+}
+
+struct GeoJsonVisitor;
+
+impl<'de> Visitor<'de> for GeoJsonVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(GeoJsonValue(value)) = access.next_element()? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Value, A::Error> {
+        let mut values = serde_json::Map::new();
+        while let Some((key, GeoJsonValue(value))) = access.next_entry()? {
+            values.insert(key, value);
+        }
+        Ok(Value::Object(values))
+    }
+}
+
 fn parse_geojson(lex: &str, max_vertices: u32) -> Result<Geom, GeomError> {
     let crs = CrsRef::Known(CRS84);
     let text = lex.trim();
     if text.is_empty() || text == "null" {
         return Ok(Geom::empty(crs, GeomType::GeometryCollection));
     }
-    let v: serde_json::Value = serde_json::from_str(lex).map_err(|e| {
+    let GeoJsonValue(v) = serde_json::from_str(lex).map_err(|e| {
         let offset = lex
             .split_inclusive('\n')
             .take(e.line().saturating_sub(1))
@@ -608,7 +672,7 @@ fn parse_geojson(lex: &str, max_vertices: u32) -> Result<Geom, GeomError> {
 }
 
 fn json_geometry(
-    v: &serde_json::Value,
+    v: &Value,
     depth: usize,
     acc: &mut Acc,
 ) -> Result<(GeomType, Geometry<f64>), String> {
@@ -651,7 +715,13 @@ fn json_geometry(
         "Feature" | "FeatureCollection" => {
             return Err(format!("a GeoJSON {ty} is not a geometry"));
         }
-        _ => return Err(format!("unknown GeoJSON geometry type {ty:?}")),
+        _ => {
+            // Debug escaping can expand each input byte. Keep the diagnostic
+            // inside the parser's fixed allowance even for a very long type.
+            let preview = &ty[..ty.floor_char_boundary(16)];
+            let suffix = if preview.len() < ty.len() { "…" } else { "" };
+            return Err(format!("unknown GeoJSON geometry type {preview:?}{suffix}"));
+        }
     };
     let cv = obj
         .get("coordinates")
@@ -689,12 +759,12 @@ fn json_geometry(
     Ok((declared, g))
 }
 
-fn json_array(v: &serde_json::Value) -> Result<&Vec<serde_json::Value>, String> {
+fn json_array(v: &Value) -> Result<&Vec<Value>, String> {
     v.as_array()
         .ok_or_else(|| "GeoJSON coordinates must be arrays".into())
 }
 
-fn json_position(v: &serde_json::Value, acc: &mut Acc) -> Result<Coord<f64>, String> {
+fn json_position(v: &Value, acc: &mut Acc) -> Result<Coord<f64>, String> {
     let a = json_array(v)?;
     if a.len() < 2 || a.len() > 3 {
         return Err(format!(
@@ -712,11 +782,11 @@ fn json_position(v: &serde_json::Value, acc: &mut Acc) -> Result<Coord<f64>, Str
     acc.coord(&ords[..a.len()])
 }
 
-fn json_positions(a: &[serde_json::Value], acc: &mut Acc) -> Result<Vec<Coord<f64>>, String> {
+fn json_positions(a: &[Value], acc: &mut Acc) -> Result<Vec<Coord<f64>>, String> {
     a.iter().map(|p| json_position(p, acc)).collect()
 }
 
-fn json_line(a: &[serde_json::Value], acc: &mut Acc) -> Result<LineString<f64>, String> {
+fn json_line(a: &[Value], acc: &mut Acc) -> Result<LineString<f64>, String> {
     let v = json_positions(a, acc)?;
     if v.len() == 1 {
         return Err("a line has 1 point, at least 2 needed".into());
@@ -724,7 +794,7 @@ fn json_line(a: &[serde_json::Value], acc: &mut Acc) -> Result<LineString<f64>, 
     Ok(LineString::new(v))
 }
 
-fn json_polygon(a: &[serde_json::Value], acc: &mut Acc) -> Result<Polygon<f64>, String> {
+fn json_polygon(a: &[Value], acc: &mut Acc) -> Result<Polygon<f64>, String> {
     let mut rings = a.iter().map(|r| {
         let v = json_positions(json_array(r)?, acc)?;
         check_ring(&v)?;

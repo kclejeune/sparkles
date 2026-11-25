@@ -952,6 +952,61 @@ mod tests {
         assert_eq!(control.live_bytes_for_tests(), baseline);
     }
 
+    fn check_geojson_parse_peak(lex: &str, check: impl FnOnce(&Slot)) {
+        use crate::sparql::ctx::Ctx;
+        use crate::store::{Store, StoreOptions};
+        use oxrdf::{Literal, NamedNode, Term};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        let id = ctx.intern_term(&Term::Literal(Literal::new_typed_literal(
+            lex,
+            NamedNode::new_unchecked(GEOJSON_LITERAL),
+        )));
+        let baseline = ctx.live_bytes_for_tests();
+        const HEADROOM: usize = 320 * 1024;
+        ctx.mem_limit = baseline + HEADROOM as u64;
+        let mut slot = None;
+        let peak = crate::test_alloc::record_peak_live(|| {
+            let charge = ctx.charge(0).unwrap();
+            slot =
+                Some(classify_controlled(&ctx, id, &GeoConfig::default(), true, &charge).unwrap());
+        });
+        assert!(peak <= HEADROOM, "GeoJSON parse allocated {peak} bytes");
+        let slot = slot.unwrap();
+        check(&slot);
+        if let Slot::Geom(entry) = &slot {
+            assert!(ctx.live_bytes_for_tests() >= baseline + entry.bytes());
+        }
+        drop(slot);
+        assert_eq!(ctx.live_bytes_for_tests(), baseline);
+    }
+
+    #[test]
+    fn geojson_foreign_member_does_not_parse_a_value_tree_inside_a_string() {
+        // The escaped spelling tests the decoded key. Its array text must
+        // stay a string even when this is the first key of a nested object.
+        let lex = format!(
+            r#"{{"type":"Point","coordinates":[1,2],"properties":{{"$serde_json::private::\u0052awValue":"[{}0]"}}}}"#,
+            "0,".repeat(32767)
+        );
+        check_geojson_parse_peak(&lex, |slot| {
+            let Slot::Geom(entry) = slot else {
+                panic!("the foreign member must not affect the point");
+            };
+            assert_eq!(entry.bbox84(), [1.0, 2.0, 1.0, 2.0]);
+        });
+    }
+
+    #[test]
+    fn geojson_unknown_type_diagnostic_stays_in_the_parse_budget() {
+        // JSON allows raw DEL, which Rust's Debug can expand to six bytes.
+        let lex = format!(r#"{{"type":"{}"}}"#, "\x7f".repeat(65536));
+        check_geojson_parse_peak(&lex, |slot| {
+            assert!(matches!(slot, Slot::Skipped(Skip::Malformed)));
+        });
+    }
+
     #[test]
     fn classify_literals() {
         let cfg = GeoConfig::default();

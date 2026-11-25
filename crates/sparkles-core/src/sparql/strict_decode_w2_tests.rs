@@ -1534,6 +1534,55 @@ fn filter_trial_admits_setup_before_copying() {
     assert_eq!(ctx.live_bytes(), baseline);
 }
 
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn filter_trial_admits_vocabulary_after_map_growth() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    // Just past 7,168 members, the index grows to 16,384 buckets.
+    const ENTRIES: u64 = 7169;
+    const COPY_BYTES: u64 = 16384 * 25 + ENTRIES * 16;
+    let mut last = Id::UNDEF;
+    for i in 0..ENTRIES {
+        last = ctx.intern_term(&Term::Literal(Literal::new_simple_literal(i.to_string())));
+    }
+    assert_eq!(last, Id::local(ENTRIES - 1));
+    ctx.mem_limit = ctx.live_bytes() + MIB;
+    ctx.enable_cursor_accounting().unwrap();
+
+    // The old 64-byte estimate per term fits, but the backing storage does not.
+    let hold = hold_all_but(&ctx, 480 * 1024);
+    let baseline = ctx.live_bytes();
+    let mut result = None;
+    let peak = crate::test_alloc::record_peak_live(|| {
+        result = Some(ctx.with_sampling_trial(|_| Ok(Some(()))));
+    });
+    assert!(
+        peak < 8 * 1024,
+        "trial allocated {peak} bytes before refusal"
+    );
+    assert!(matches!(result.unwrap(), Ok(None)));
+    assert_eq!(ctx.live_bytes(), baseline);
+    ctx.check().unwrap();
+    drop(hold);
+
+    let baseline = ctx.live_bytes();
+    let result = ctx
+        .with_sampling_trial(|trial| {
+            assert!(ctx.live_bytes() >= baseline + COPY_BYTES);
+            assert_eq!(
+                trial.term_checked(last)?,
+                Some(Term::Literal(Literal::new_simple_literal(
+                    (ENTRIES - 1).to_string()
+                )))
+            );
+            Ok(Some(()))
+        })
+        .unwrap();
+    assert_eq!(result, Some(()));
+    assert_eq!(ctx.live_bytes(), baseline);
+}
+
 // =========================================================================
 // T12: Decode-envelope mutex released before pool wake (Sol #5)
 // =========================================================================

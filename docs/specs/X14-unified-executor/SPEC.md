@@ -1593,8 +1593,10 @@ streaming and eager group accumulators, DESCRIBE, SERVICE, text highlighting, da
 restriction, incremental passes, SHACL embedded query results and GeoSPARQL execution.
 Optional FILTER selectivity sampling skips impure expressions and uses a disposable
 trial on a snapshot cache miss. The trial admits copies of query setup before cloning
-them and releases its decode, cache and local-term state before execution starts.
+them, including the local vocabulary's backing buckets, and releases its decode,
+cache and local-term state before execution starts.
 Triple keys validate their framing and nesting depth before recursive decoding, and
 vocabulary read locks are released before memory admission or geometry parsing.
-GeoJSON fallback and recheck paths admit the JSON value tree before parsing. The
+GeoJSON fallback and recheck paths admit the JSON value tree before parsing. The parser
+reads object keys as ordinary strings and bounds the unknown-type diagnostic. The
 nearest-neighbour fallback keeps parsed entry credit through distance measurement.
