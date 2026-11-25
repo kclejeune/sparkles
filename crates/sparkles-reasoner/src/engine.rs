@@ -2516,7 +2516,9 @@ pub(crate) fn run_program(
     warnings: &mut crate::budget::WorkingWarnings,
 ) -> anyhow::Result<Outcome> {
     use crate::ir::lower::Shape;
-    let lowered = program.lower(&limits.budget)?;
+    let lowered = program
+        .lower(&limits.budget)
+        .map_err(crate::ir::lower::LowerError::into_anyhow)?;
     if lowered.shape != Shape::Jena || !program.relations.is_empty() {
         g.set_relations();
     }

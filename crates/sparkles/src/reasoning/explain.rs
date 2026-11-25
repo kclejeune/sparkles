@@ -625,6 +625,7 @@ fn materialized_for(
             deadline,
             cancel: req.cancel.clone(),
             max_memory: query.max_memory,
+            memory_parent: ds.state().pool.as_ref().map(|p| p.work_parent()),
         };
         let mut found =
             sparkles_reasoner::explain::explain(&input, triple, &opts).map_err(|e| {
@@ -651,12 +652,15 @@ fn materialized_for(
                 }
             };
             if fallback_inferred || generalized {
-                let reasoner = sparkles_reasoner::query::QueryReasoner::new(
+                let mut reasoner = sparkles_reasoner::query::QueryReasoner::new(
                     profile.clone(),
                     &extras,
                     rec.run_inputs()?,
                 )
                 .map_err(crate::handles::from_anyhow)?;
+                if let Some(pool) = &ds.state().pool {
+                    reasoner = reasoner.with_pool(pool.clone());
+                }
                 let d = demand_with_for(ds, query, snap.clone(), deadline, &reasoner)?;
                 found = d.explained;
             }
@@ -763,6 +767,7 @@ fn demand_with_for(
         deadline,
         cancel: req.cancel.clone(),
         max_memory: query.max_memory,
+        memory_parent: ds.state().pool.as_ref().map(|p| p.work_parent()),
     };
     let convert = |e: anyhow::Error| match e.downcast::<crate::explain::ExplainBudgetExceeded>() {
         Ok(b) => budget_error(b.0),

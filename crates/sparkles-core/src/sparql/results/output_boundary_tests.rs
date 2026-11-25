@@ -452,6 +452,7 @@ fn an_actual_parent_ownership_refusal_keeps_its_typed_source_through_serde() {
             bound: Vec::new(),
             kind: QueryKind::Select,
             plan_depth,
+            _rewrite_guard: None,
         };
         let r = crate::sparql::execute_prepared(&parsed, &Default::default(), 0.0, 0.0, prepared)
             .unwrap();

@@ -48,6 +48,7 @@ pub const RULES_CODE: &str = "reasoning-rules";
 /// How often a derivation checks the query's deadline and cancellation.
 const STOP_POLL: Duration = Duration::from_millis(5);
 
+#[derive(Clone)]
 struct Shared {
     profile: Profile,
     extras: Extras,
@@ -72,6 +73,19 @@ struct Shared {
     /// whether the sessions close the adorned copies of transitive rules with closure
     /// operators (spec F23 Phase 2); `SPARKLES_DEMAND_CLOSURES=0` turns them off
     closures: bool,
+    /// the server/dataset query pool used when a caller passes no explicit parent handle
+    pool: Option<Arc<sparkles_core::sparql::pool::QueryPool>>,
+    /// explicit parent handle override for sessions/rewrites when `req.memory_parent` is absent
+    memory_parent: Option<crate::ParentHandle>,
+}
+
+impl Shared {
+    fn resolve_memory_parent(&self, req: &SessionRequest) -> Option<crate::ParentHandle> {
+        req.memory_parent
+            .clone()
+            .or_else(|| self.memory_parent.clone())
+            .or_else(|| self.pool.as_ref().map(|p| p.work_parent()))
+    }
 }
 
 /// A rule program of the IR over a session's terms.
@@ -136,6 +150,8 @@ impl QueryReasoner {
                 program,
                 direct_program: false,
                 closures: std::env::var("SPARKLES_DEMAND_CLOSURES").map_or(true, |v| v != "0"),
+                pool: None,
+                memory_parent: None,
             }),
         })
     }
@@ -143,48 +159,40 @@ impl QueryReasoner {
     /// The same reasoner with at most `n` derived facts per query (`usize::MAX` sets no
     /// limit).
     pub fn with_max_derived(self, n: usize) -> QueryReasoner {
-        let s = &self.shared;
+        let mut s = (*self.shared).clone();
+        s.max_derived = n;
         QueryReasoner {
-            shared: Arc::new(Shared {
-                profile: s.profile.clone(),
-                extras: s.extras.clone(),
-                rules: s.rules.clone(),
-                sources: s.sources.clone(),
-                geo_default: s.geo_default,
-                inputs: s.inputs.clone(),
-                digest: s.digest,
-                max_derived: n,
-                max_iterations: s.max_iterations,
-                max_union: s.max_union,
-                warnings: s.warnings.clone(),
-                program: s.program.clone(),
-                direct_program: s.direct_program,
-                closures: s.closures,
-            }),
+            shared: Arc::new(s),
         }
     }
 
     /// The same reasoner with at most `n` branches in the OWL 2 QL rewriting of one basic
     /// graph pattern (`budget.maxUnion`, spec F17 §7). Only the `owl-ql` profile rewrites.
     pub fn with_max_union(self, n: usize) -> QueryReasoner {
-        let s = &self.shared;
+        let mut s = (*self.shared).clone();
+        s.max_union = n.max(1);
         QueryReasoner {
-            shared: Arc::new(Shared {
-                profile: s.profile.clone(),
-                extras: s.extras.clone(),
-                rules: s.rules.clone(),
-                sources: s.sources.clone(),
-                geo_default: s.geo_default,
-                inputs: s.inputs.clone(),
-                digest: s.digest,
-                max_derived: s.max_derived,
-                max_iterations: s.max_iterations,
-                max_union: n.max(1),
-                warnings: s.warnings.clone(),
-                program: s.program.clone(),
-                direct_program: s.direct_program,
-                closures: s.closures,
-            }),
+            shared: Arc::new(s),
+        }
+    }
+
+    /// Bind this reasoner to `pool` so sessions and OWL 2 QL rewrites without a query-level
+    /// parent handle reserve from fresh per-run `pool.work_parent()` handles.
+    pub fn with_pool(self, pool: Arc<sparkles_core::sparql::pool::QueryPool>) -> QueryReasoner {
+        let mut s = (*self.shared).clone();
+        s.pool = Some(pool);
+        QueryReasoner {
+            shared: Arc::new(s),
+        }
+    }
+
+    /// Bind this reasoner to an explicit parent handle used when `SessionRequest::memory_parent`
+    /// is `None`.
+    pub fn with_memory_parent(self, parent: crate::ParentHandle) -> QueryReasoner {
+        let mut s = (*self.shared).clone();
+        s.memory_parent = Some(parent);
+        QueryReasoner {
+            shared: Arc::new(s),
         }
     }
 
@@ -194,24 +202,12 @@ impl QueryReasoner {
     /// keys name the profile's rule text and not `source`.
     #[cfg(test)]
     pub(crate) fn with_program(self, source: ProgramSource) -> QueryReasoner {
-        let s = &self.shared;
+        let mut s = (*self.shared).clone();
+        s.sources = vec!["rules".to_string()];
+        s.program = Some(source);
+        s.direct_program = true;
         QueryReasoner {
-            shared: Arc::new(Shared {
-                profile: s.profile.clone(),
-                extras: s.extras.clone(),
-                rules: s.rules.clone(),
-                sources: vec!["rules".to_string()],
-                geo_default: s.geo_default,
-                inputs: s.inputs.clone(),
-                digest: s.digest,
-                max_derived: s.max_derived,
-                max_iterations: s.max_iterations,
-                max_union: s.max_union,
-                warnings: s.warnings.clone(),
-                program: Some(source),
-                direct_program: true,
-                closures: s.closures,
-            }),
+            shared: Arc::new(s),
         }
     }
 
@@ -219,22 +215,7 @@ impl QueryReasoner {
     /// for the tests that compare the two.
     #[cfg(test)]
     pub(crate) fn with_closures(self, on: bool) -> QueryReasoner {
-        let mut shared = Arc::try_unwrap(self.shared).unwrap_or_else(|s| Shared {
-            profile: s.profile.clone(),
-            extras: s.extras.clone(),
-            rules: s.rules.clone(),
-            sources: s.sources.clone(),
-            geo_default: s.geo_default,
-            inputs: s.inputs.clone(),
-            digest: s.digest,
-            max_derived: s.max_derived,
-            max_iterations: s.max_iterations,
-            max_union: s.max_union,
-            warnings: s.warnings.clone(),
-            program: s.program.clone(),
-            direct_program: s.direct_program,
-            closures: s.closures,
-        });
+        let mut shared = Arc::try_unwrap(self.shared).unwrap_or_else(|s| (*s).clone());
         shared.closures = on;
         QueryReasoner {
             shared: Arc::new(shared),
@@ -253,7 +234,12 @@ impl QueryReasoner {
         if self.shared.profile != Profile::OwlQl {
             return Ok(None);
         }
-        crate::qlrewrite::tbox(req, &self.shared.inputs).map(Some)
+        let parent = self.shared.resolve_memory_parent(req);
+        let budget = crate::budget::Budget::with_parent(
+            req.max_memory.map(|m| m.min(usize::MAX as u64) as usize),
+            parent,
+        );
+        crate::qlrewrite::tbox_charged(req, &self.shared.inputs, &budget).map(|c| Some(c.tbox))
     }
 
     /// The limit of derived facts per query.
@@ -384,6 +370,10 @@ impl ReasoningProvider for QueryReasoner {
         Ok(Box::new(Session::new(self.shared.clone(), req)?))
     }
 
+    fn rewrites(&self) -> bool {
+        self.shared.profile == Profile::OwlQl
+    }
+
     /// Under `owl-ql`, the query rewritten against the OWL 2 QL axioms of the input
     /// graphs the caller reads (spec F17 §7).
     fn rewrite(
@@ -392,16 +382,32 @@ impl ReasoningProvider for QueryReasoner {
         bound: &[(String, oxrdf::Term)],
         req: &SessionRequest,
     ) -> Result<Option<sparkles_core::sparql::reasoning::Rewritten>> {
+        Ok(self
+            .rewrite_guarded(query, bound, req)?
+            .map(sparkles_core::sparql::reasoning::GuardedRewritten::into_rewritten))
+    }
+
+    fn rewrite_guarded(
+        &self,
+        query: &spargebra::Query,
+        bound: &[(String, oxrdf::Term)],
+        req: &SessionRequest,
+    ) -> Result<Option<sparkles_core::sparql::reasoning::GuardedRewritten>> {
         if self.shared.profile != Profile::OwlQl {
             return Ok(None);
         }
-        let tbox = crate::qlrewrite::tbox(req, &self.shared.inputs)?;
-        crate::qlrewrite::rewrite_query(
+        let parent = self.shared.resolve_memory_parent(req);
+        let budget = crate::budget::Budget::with_parent(
+            req.max_memory.map(|m| m.min(usize::MAX as u64) as usize),
+            parent,
+        );
+        let charged_tbox = crate::qlrewrite::tbox_charged(req, &self.shared.inputs, &budget)?;
+        crate::qlrewrite::rewrite_query_in_budget(
             query,
             bound,
-            &tbox,
+            &charged_tbox.tbox,
             self.shared.max_union,
-            req.max_memory,
+            &budget,
             &*req.stop,
         )
     }
@@ -711,7 +717,6 @@ pub(crate) struct Session {
     _graphs_held: Held,
     absent: bool,
     stop: Arc<dyn Fn() -> Result<()> + Send + Sync>,
-    budget: Arc<Budget>,
     /// the cache's view key, when the view is a committed one and the query may read
     /// cached tables
     view: Option<String>,
@@ -803,13 +808,20 @@ pub(crate) struct Session {
     killed: usize,
     /// what the closure operators of the session's runs did
     closure_stats: crate::closure::Stats,
+    /// Declared last so every session payload (`graph`, `terms`, `compiled`, `warnings`,
+    /// `_graphs_held`, `demands`, `reports`, `seeds`, `magic`) drops before parent credit returns.
+    budget: Arc<Budget>,
 }
 
 impl Session {
     fn new(shared: Arc<Shared>, req: SessionRequest) -> Result<Session> {
         let t0 = std::time::Instant::now();
+        let parent = shared.resolve_memory_parent(&req);
         let snap = req.snap;
-        let budget = Budget::new(req.max_memory.map(|m| m.min(usize::MAX as u64) as usize));
+        let budget = Budget::with_parent(
+            req.max_memory.map(|m| m.min(usize::MAX as u64) as usize),
+            parent,
+        );
         let terms = Terms::new_in_controlled(snap.clone(), &budget, session_check(&req.stop))
             .map_err(|e| session_compile_error(e, "the rules"))?;
         let mut warnings = WorkingWarnings::try_clone_from(&shared.warnings, &budget)
@@ -1156,8 +1168,7 @@ impl Session {
         }
         let base = Base::new(self.snap.clone(), &self.graphs)
             .map_err(|e| component("reasoning-failed", format!("{e:#}")))?;
-        let mut g = Graph::with_base(Arc::new(base));
-        g.set_budget(&self.budget)
+        let mut g = Graph::with_base_in(Arc::new(base), &self.budget)
             .map_err(|e| memory_error(e, "the input graphs"))?;
         // relation facts are hidden from every atom with a variable predicate
         if self.compiled.relations().is_some_and(|r| !r.is_empty()) {
@@ -2706,6 +2717,7 @@ mod compact_tests {
                 readable: None,
                 stop: Arc::new(|| Ok(())),
                 max_memory: None,
+                memory_parent: None,
                 no_cache: true,
             },
         )
@@ -3045,6 +3057,7 @@ mod equality_cache_tests {
                 readable: None,
                 stop: Arc::new(|| Ok(())),
                 max_memory: None,
+                memory_parent: None,
                 no_cache: true,
             },
         )
@@ -3103,6 +3116,7 @@ mod equality_cache_tests {
                     readable: None,
                     stop: Arc::new(|| Ok(())),
                     max_memory: None,
+                    memory_parent: None,
                     no_cache: false,
                 },
                 true,
@@ -3175,6 +3189,7 @@ mod equality_workspace_tests {
                 readable: None,
                 stop: Arc::new(|| Ok(())),
                 max_memory: Some(1 << 30),
+                memory_parent: None,
                 no_cache: true,
             },
         )
@@ -3212,6 +3227,7 @@ mod equality_workspace_tests {
                 readable: None,
                 stop: Arc::new(|| Ok(())),
                 max_memory: Some(1 << 30),
+                memory_parent: None,
                 no_cache: true,
             },
         )
@@ -3415,6 +3431,7 @@ mod program_identity_tests {
                     readable: None,
                     stop: Arc::new(|| Ok(())),
                     max_memory: None,
+                    memory_parent: None,
                     no_cache: true,
                 },
             )

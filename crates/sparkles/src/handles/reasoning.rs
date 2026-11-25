@@ -71,11 +71,32 @@ impl Reasoning {
         opts: &sparkles_reasoner::diagnostics::DiagnoseOptions,
     ) -> Result<crate::reasoning::Diagnostics> {
         let state = self.ds.state();
-        crate::reasoning::diagnose_with(
+        let owned_opts;
+        let opts = if opts.grant.is_none()
+            && let Some(pool) = &state.pool
+        {
+            let mut pooled = opts.clone();
+            pooled.grant = Some(Arc::new(pool.empty_grant()));
+            owned_opts = pooled;
+            &owned_opts
+        } else {
+            opts
+        };
+        let controls = sparkles_reasoner::diagnostics::DiagnosticControls {
+            memory_parent: opts
+                .grant
+                .as_ref()
+                .map(|g| g.memory_parent())
+                .or_else(|| state.pool.as_ref().map(|p| p.work_parent())),
+            ..Default::default()
+        };
+        crate::reasoning::run::diagnose_snapshot_with(
             self.ds.store(),
             self.record().as_ref(),
             Some(&state.closure),
             opts,
+            self.ds.store().snapshot(),
+            &controls,
         )
     }
 

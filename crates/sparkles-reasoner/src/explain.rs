@@ -88,6 +88,8 @@ pub struct ExplainOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     /// the memory the search and its rule evaluations may hold, unbounded when `None`
     pub max_memory: Option<usize>,
+    /// parent memory handle that the explanation's budget reserves from (`None`: unpooled)
+    pub memory_parent: Option<crate::ParentHandle>,
 }
 
 impl Default for ExplainOptions {
@@ -99,6 +101,7 @@ impl Default for ExplainOptions {
             deadline: None,
             cancel: None,
             max_memory: None,
+            memory_parent: None,
         }
     }
 }
@@ -1044,12 +1047,11 @@ fn materialized(
     opts: &ExplainOptions,
 ) -> anyhow::Result<Explained> {
     let snap = input.snap.clone();
-    let budget = Budget::new(opts.max_memory);
+    let budget = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
     let mut graphs: Vec<Id> = input.inputs.to_vec();
     graphs.extend(input.inferred);
     let base = Arc::new(Base::new(snap.clone(), &graphs)?);
-    let mut g = Graph::with_base(base);
-    g.set_budget(&budget)?;
+    let mut g = Graph::with_base_in(base, &budget)?;
     let terms = Terms::new_in_controlled(snap.clone(), &budget, || check_controls(opts))?;
     let mut warnings = WorkingWarnings::new(&budget);
     let parsed = crate::profile_rules(input.profile, input.extras)?;
@@ -1255,12 +1257,11 @@ fn program_search(
     triple: &[Term; 3],
     opts: &ExplainOptions,
 ) -> anyhow::Result<Explained> {
-    let budget = Budget::new(opts.max_memory);
+    let budget = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
     let mut graphs: Vec<Id> = inputs.to_vec();
     graphs.extend(inferred);
     let base = Arc::new(Base::new(snap.clone(), &graphs)?);
-    let mut g = Graph::with_base(base);
-    g.set_budget(&budget)?;
+    let mut g = Graph::with_base_in(base, &budget)?;
     let terms = Terms::new_in_controlled(snap.clone(), &budget, || check_controls(opts))?;
     // the generalized facts, saved as term keys, in this explanation's terms; the credit
     // also holds the metadata of the rules below while the search runs
@@ -1287,11 +1288,15 @@ fn program_search(
             crate::ir::ProgramError::Memory(m) => anyhow::Error::from(m),
             e => anyhow::anyhow!("{e}"),
         })?;
-    let mut lowered = program.lower(&budget)?;
+    let mut lowered = program
+        .lower(&budget)
+        .map_err(crate::ir::lower::LowerError::into_anyhow)?;
     let (rules, infos) = flat_rules(program, &mut lowered, &mut held, &info.lines)?;
     let mut makes_terms = false;
     if let Some(part) = &part {
-        let lp = part.lower(&budget)?;
+        let lp = part
+            .lower(&budget)
+            .map_err(crate::ir::lower::LowerError::into_anyhow)?;
         makes_terms = lp
             .strata
             .iter()
@@ -1626,6 +1631,7 @@ pub(crate) fn demand_session(
                 readable: input.readable.clone(),
                 stop: session_stop(opts),
                 max_memory: opts.max_memory.map(|m| m as u64),
+                memory_parent: opts.memory_parent.clone(),
                 no_cache: false,
             },
             cached,

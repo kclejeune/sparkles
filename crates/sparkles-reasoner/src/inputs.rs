@@ -913,7 +913,19 @@ pub fn resolve_ids_controlled(
     max_memory: Option<usize>,
     check: &mut dyn FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<(Vec<Id>, usize)> {
-    let budget = Budget::new(max_memory);
+    resolve_ids_controlled_with_parent(snap, inputs, readable, max_memory, None, check)
+}
+
+/// [`resolve_ids_controlled`], reserving from `memory_parent` when present.
+pub fn resolve_ids_controlled_with_parent(
+    snap: &Snapshot,
+    inputs: &Inputs,
+    readable: Option<&GraphAccess>,
+    max_memory: Option<usize>,
+    memory_parent: Option<crate::ParentHandle>,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<(Vec<Id>, usize)> {
+    let budget = Budget::with_parent(max_memory, memory_parent);
     let (graphs, held) =
         resolve_inputs_controlled_inner(snap, inputs, readable, None, &budget, check)?;
     let bytes = held.bytes();
@@ -930,7 +942,19 @@ pub fn graph_refs_controlled(
     max_memory: Option<usize>,
     check: &mut dyn FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<(Vec<GraphRef>, usize)> {
-    let budget = Budget::new(max_memory);
+    graph_refs_controlled_with_parent(snap, graphs, extra, max_memory, None, check)
+}
+
+/// [`graph_refs_controlled`], reserving from `memory_parent` when present.
+pub fn graph_refs_controlled_with_parent(
+    snap: &Snapshot,
+    graphs: &[Id],
+    extra: &[GraphRef],
+    max_memory: Option<usize>,
+    memory_parent: Option<crate::ParentHandle>,
+    check: &mut dyn FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<(Vec<GraphRef>, usize)> {
+    let budget = Budget::with_parent(max_memory, memory_parent);
     let ctrl = Control {
         budget: &budget,
         check: std::cell::RefCell::new(check),

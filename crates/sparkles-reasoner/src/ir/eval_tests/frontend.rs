@@ -131,6 +131,7 @@ r(?x) :- (?x ex:p ?y).
         readable: None,
         stop: std::sync::Arc::new(|| Ok(())),
         max_memory: None,
+        memory_parent: None,
         no_cache: true,
     };
     let mut session = qr.test_session(req, true).unwrap();

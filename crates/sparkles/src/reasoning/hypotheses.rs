@@ -30,6 +30,12 @@ fn replace(term: &Term, placeholders: &HashMap<String, Term>) -> Term {
 }
 
 fn bounded(error: &Error) -> bool {
+    if matches!(
+        error,
+        Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::ServerMemory
+    ) {
+        return false;
+    }
     matches!(
         error.code(),
         "reasoning-budget" | "budget-exceeded" | "timeout" | "storage-full"
@@ -121,12 +127,14 @@ pub fn check_consistency(
         });
         let mut program = analysis::program(dataset, &options)?;
         let view = analysis::view(snapshot, &options)?;
+        let pool = dataset.state().pool.clone();
         let (graphs, graphs_bytes) = analysis::input_graphs_controlled(
             &view,
             &program,
             &options,
             &control,
             options.max_memory,
+            pool.as_ref().map(|p| p.work_parent()),
         )?;
         let after_graphs = options
             .max_memory
@@ -161,6 +169,7 @@ pub fn check_consistency(
             &graphs,
             &[sparkles_reasoner::GraphRef::Named(graph.as_str().into())],
             after_graphs,
+            pool.as_ref().map(|p| p.work_parent()),
             &control,
         )?;
         program.inputs = sparkles_reasoner::Inputs {
@@ -177,13 +186,15 @@ pub fn check_consistency(
             service_cache_bytes: 0,
             ..Default::default()
         };
-        let base = Dataset::from_store(copy_visible(
-            dataset.store(),
-            &view,
-            copy_options,
-            &control,
-            |quad| Ok(graphs.contains(&quad[3])),
-        )?);
+        let base = Dataset::from_store_with(
+            copy_visible(dataset.store(), &view, copy_options, &control, |quad| {
+                Ok(graphs.contains(&quad[3]))
+            })?,
+            crate::DatasetOptions {
+                pool: pool.clone(),
+                ..Default::default()
+            },
+        );
         drop(graphs);
 
         let checks: Vec<_> = CHECKS
@@ -227,13 +238,19 @@ pub fn check_consistency(
             .all(|check| check_complete(&before.diagnostics, check));
         for hypothesis in hypotheses.iter_mut() {
             control.check()?;
-            let candidate = Dataset::from_store(copy_visible(
-                base.store(),
-                &base_snapshot,
-                candidate_copy_options.clone(),
-                &control,
-                |_| Ok(true),
-            )?);
+            let candidate = Dataset::from_store_with(
+                copy_visible(
+                    base.store(),
+                    &base_snapshot,
+                    candidate_copy_options.clone(),
+                    &control,
+                    |_| Ok(true),
+                )?,
+                crate::DatasetOptions {
+                    pool: pool.clone(),
+                    ..Default::default()
+                },
+            );
             (|| -> Result<()> {
                 let mut transaction = candidate
                     .store()

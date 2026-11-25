@@ -590,6 +590,12 @@ impl Tools<'_> {
                             .limits
                             .query_memory_bytes
                             .map(|m| m as usize),
+                        memory_parent: reader
+                            .opts
+                            .grant
+                            .as_ref()
+                            .map(|g| g.memory_parent())
+                            .or_else(|| ds.dataset.pool().map(|p| p.work_parent())),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -627,10 +633,8 @@ impl Tools<'_> {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        if e.chain()
-                            .any(|c| matches!(c.downcast_ref::<Error>(), Some(Error::Cancelled)))
-                        {
-                            return Err(ctx.engine(Error::Cancelled));
+                        if let Some(fatal) = fatal_why_not_error(&e) {
+                            return Err(ctx.engine(fatal));
                         }
                         f["whyNotError"] = e.to_string().into();
                     }
@@ -687,5 +691,74 @@ pub(crate) fn verdict(first: &Value) -> &'static str {
         Some("join" | "filter") if !absent => "data",
         Some("pattern") if absent => "data",
         _ => "unknown",
+    }
+}
+
+#[cfg(feature = "reasoning")]
+fn fatal_why_not_error(e: &anyhow::Error) -> Option<Error> {
+    let core = e
+        .downcast_ref::<Error>()
+        .or_else(|| e.chain().find_map(|c| c.downcast_ref::<Error>()))?;
+    match core {
+        Error::Cancelled => Some(Error::Cancelled),
+        Error::BudgetExceeded(b) if b.kind == sparkles::BudgetKind::ServerMemory => {
+            Some(Error::BudgetExceeded(*b))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "reasoning"))]
+mod tests {
+    use super::fatal_why_not_error;
+    use oxrdf::{NamedNode, Term};
+    use sparkles::sparql::pool::QueryPool;
+    use sparkles::store::{Store, StoreOptions};
+    use sparkles::{Budget, BudgetKind, Error};
+
+    #[test]
+    fn why_not_target_intern_refusal_is_recovered_as_server_memory() {
+        let store = Store::in_memory(StoreOptions::default());
+        let reasoner = sparkles_reasoner::query::QueryReasoner::new(
+            sparkles_reasoner::Profile::RdfsSimple,
+            &sparkles_reasoner::Extras::default(),
+            sparkles_reasoner::Inputs::default(),
+        )
+        .unwrap();
+        let snap = store.snapshot();
+        // Pool fits Session::new (~128 KiB) but refuses interning a 512 KiB target IRI
+        // via `try_id_for_controlled` after the demand session opens.
+        let pool = QueryPool::new(256 * 1024);
+        let input = sparkles_reasoner::explain::DemandInput {
+            reasoner: &reasoner,
+            snap,
+            readable: None,
+        };
+        let huge_iri = format!("http://ex.org/{}", "a".repeat(512 * 1024));
+        let triple = [
+            Term::NamedNode(NamedNode::new_unchecked(huge_iri)),
+            Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()),
+            Term::NamedNode(NamedNode::new_unchecked("http://ex.org/Class")),
+        ];
+        let options = sparkles_reasoner::whynot::WhyNotOptions {
+            explain: sparkles_reasoner::explain::ExplainOptions {
+                max_memory: Some(16 << 20),
+                memory_parent: Some(pool.work_parent()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = sparkles_reasoner::whynot::why_not(&input, &triple, &options).unwrap_err();
+        assert!(
+            matches!(
+                fatal_why_not_error(&err),
+                Some(Error::BudgetExceeded(Budget {
+                    kind: BudgetKind::ServerMemory,
+                    ..
+                }))
+            ),
+            "expected ServerMemory recovery, got: {err:#}"
+        );
+        assert_eq!(pool.granted(), 0);
     }
 }

@@ -2511,6 +2511,49 @@ mod tests {
         );
         assert_eq!(pool.granted(), 0);
     }
+
+    #[test]
+    fn auto_reads_all_reasoning_takes_no_ledger_operations() {
+        use crate::sparql::reasoning::{
+            Materialization, ReasoningProvider, ReasoningSession, SessionRequest,
+        };
+        use crate::sparql::{QueryOptions, query};
+        struct ReadsAllProvider;
+        impl ReasoningProvider for ReadsAllProvider {
+            fn label(&self) -> String {
+                "auto, profile rdfs".into()
+            }
+            fn auto(&self) -> bool {
+                true
+            }
+            fn rewrites(&self) -> bool {
+                false
+            }
+            fn reads_all(&self, _req: &SessionRequest) -> Option<Materialization> {
+                Some(Materialization::Fresh)
+            }
+            fn start(&self, _req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
+                unreachable!("reads_all must not start a session")
+            }
+        }
+
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = QueryPool::new(64 * MB);
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            max_memory_bytes: Some(32 * MB),
+            reasoning: Some(Arc::new(ReadsAllProvider)),
+            ..Default::default()
+        };
+        let before = LEDGER_OPS.with(|n| n.get());
+        query(store.snapshot(), "SELECT * WHERE { ?s ?p ?o }", &opts).unwrap();
+        assert_eq!(
+            LEDGER_OPS.with(|n| n.get()) - before,
+            0,
+            "reads_all fast path must not touch the query memory ledger"
+        );
+        assert_eq!(pool.granted(), 0);
+    }
     /// A LIMIT over a path pulls the path's cursor, which takes the query's ledger, and
     /// a long narrow walk then charges a step at a time and checks its output each
     /// time it doubles, rather than taking the ledger's lock several times per level.
