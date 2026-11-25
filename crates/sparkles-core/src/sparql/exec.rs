@@ -3396,21 +3396,39 @@ fn lexical_check(
     };
     let vocab = &ctx.snap.generation.vocab;
     let last = run.lo - 1;
-    let Some(key) = vocab.get(Id(last).payload()) else {
-        return Ok(Lexical::Step);
-    };
-    let lex = match key.split_first() {
-        Some((b'"', rest)) => match rest.iter().position(|&b| b == crate::id::KEY_SEP) {
-            Some(end) => &rest[..end],
-            None => return Ok(Lexical::Step),
-        },
-        _ => return Ok(Lexical::Step),
-    };
-    if s.as_bytes() > lex {
-        return Ok(Lexical::Step);
-    }
-    let Ok(lex) = std::str::from_utf8(lex) else {
-        return Ok(Lexical::Step);
+    // Reconstruct the last key with controlled scratch admission and live controls,
+    // copying only the bounded prefix needed for prefix lookups.
+    let prefix = match ctx.with_controlled_vocab_key(Id(last).payload(), |key| {
+        let lex = match key.split_first() {
+            Some((b'"', rest)) => match rest.iter().position(|&b| b == crate::id::KEY_SEP) {
+                Some(end) => &rest[..end],
+                None => return Ok(Err(Lexical::Step)),
+            },
+            _ => return Ok(Err(Lexical::Step)),
+        };
+        if s.as_bytes() > lex {
+            return Ok(Err(Lexical::Step));
+        }
+        let Ok(lex_str) = std::str::from_utf8(lex) else {
+            return Ok(Err(Lexical::Step));
+        };
+        // Retain only the characters needed to enumerate the eligible prefixes.
+        let mut take = 0usize;
+        for (end, c) in lex_str.char_indices() {
+            let p = &lex_str[..end];
+            if p > &**s {
+                break;
+            }
+            if end > LEXICAL_PREFIX_BYTES {
+                return Ok(Err(Lexical::Generic));
+            }
+            take = end + c.len_utf8();
+        }
+        Ok(Ok(lex_str[..take].to_owned()))
+    })? {
+        Some(Ok(prefix)) => prefix,
+        Some(Err(verdict)) => return Ok(verdict),
+        None => return Ok(Lexical::Step),
     };
     let scan = &spec.scan;
     let bound = |v: u64, fill: u64| {
@@ -3419,23 +3437,27 @@ fn lexical_check(
         k
     };
     let mut read = Vec::new();
+    let find_scratch = ctx.charge(0)?;
+    let mut find_reserved = 0u64;
     // the key of the prefix, grown a character at a time, without its 0xFF
     let mut probe = vec![b'"'];
     // the proper prefixes, shortest first: once one is greater than the k-th
     // candidate, so are the longer ones
-    for (n, (end, c)) in lex.char_indices().enumerate() {
-        let p = &lex[..end];
-        if p > &**s {
-            break;
-        }
-        if end > LEXICAL_PREFIX_BYTES {
-            return Ok(Lexical::Generic);
-        }
+    for (n, c) in prefix.chars().enumerate() {
         if n % 32 == 31 {
             ctx.check()?;
         }
         probe.push(crate::id::KEY_SEP);
-        let found = vocab.find(&probe);
+        let found = vocab.find_with_controlled(
+            &probe,
+            |need| {
+                let bytes = (need as u64).saturating_mul(2);
+                find_scratch.add(bytes.saturating_sub(find_reserved))?;
+                find_reserved = find_reserved.max(bytes);
+                Ok(())
+            },
+            |_| ctx.check(),
+        )?;
         probe.pop();
         let mut utf8 = [0; 4];
         probe.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
@@ -4048,6 +4070,7 @@ fn morsel_best(
     }
     drop(decoded);
     if t.len() > spec.k {
+        let mut heap_rows = EagerHeapRows::new(ctx)?;
         let mut heap: TopK<usize> = TopK::new(spec.k, vec![spec.asc]);
         offer_rows(
             ctx,
@@ -4055,9 +4078,10 @@ fn morsel_best(
             &t,
             keys,
             &mut ExprReport::default(),
-            &mut RowIndex,
+            &mut heap_rows,
         )?;
         let mut rows: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
+        drop(heap_rows);
         rows.sort_unstable();
         t = t.take_rows(&rows);
     }
@@ -5517,6 +5541,9 @@ fn unfold(
             let entry = match ctx.term_checked_into(id, &decode)? {
                 Some(t) => match super::cdt::unfold(&t) {
                     Some(parts) => {
+                        let entry_bytes =
+                            (parts.len() as u64).saturating_mul(16).saturating_add(64);
+                        seen_charge.add(entry_bytes)?;
                         let mut pairs = Vec::with_capacity(parts.len());
                         for (a, b) in parts {
                             let ia = a.map_or(Id::UNDEF, |x| ctx.intern_term(&x));
@@ -5526,17 +5553,18 @@ fn unfold(
                         }
                         Some(pairs)
                     }
-                    None => None,
+                    None => {
+                        seen_charge.add(64)?;
+                        None
+                    }
                 },
-                None => None,
+                None => {
+                    seen_charge.add(64)?;
+                    None
+                }
             };
-            drop(decode);
-            let entry_bytes = entry
-                .as_ref()
-                .map_or(0, |p| (p.len() as u64).saturating_mul(16))
-                .saturating_add(64);
-            seen_charge.add(entry_bytes)?;
             e.insert(entry);
+            drop(decode);
         }
         let elems = &seen[&id];
         row.clear();
@@ -6261,10 +6289,13 @@ fn order_by(
         && heap_eligible(ctx)
     {
         let n = t.len();
+        // Declare heap credit BEFORE `heap` so entries drop before their credit on unwind.
+        let mut rows = EagerHeapRows::new(ctx)?;
         let mut heap = TopK::new(k, keys.iter().map(|(_, asc)| *asc).collect());
-        let ranked = offer_rows(ctx, &mut heap, &t, keys, report, &mut RowIndex)?;
+        let ranked = offer_rows(ctx, &mut heap, &t, keys, report, &mut rows)?;
         ctx.check()?;
         let idx: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
+        drop(rows);
         ctx.check_output(idx.len(), t.width())?;
         notes.push(format!(
             "[top-k heap kept {} of {n} rows, {ranked} ranked on every key]",
@@ -6311,14 +6342,49 @@ pub(super) trait HeapRows<P> {
     fn release(&mut self, entry: Entry<P>) -> Result<()>;
 }
 
-/// Eager execution keeps the input table, so an entry is a row index.
-struct RowIndex;
+/// Eager execution keeps the input table, so an entry is a row index plus live credit
+/// for the `SortKey` payloads retained inside the heap until eviction or drop.
+struct EagerHeapRows<'a> {
+    charge: super::ctx::Charge<'a>,
+    bytes: u64,
+    step: u64,
+}
 
-impl HeapRows<usize> for RowIndex {
-    fn keep(&mut self, i: usize, _: &[SortKey]) -> Result<usize> {
+impl<'a> EagerHeapRows<'a> {
+    fn new(ctx: &'a Ctx) -> Result<Self> {
+        Ok(Self {
+            charge: ctx.charge(0)?,
+            bytes: 0,
+            step: ctx.reservation_step(),
+        })
+    }
+
+    fn entry_bytes(keys: &[SortKey]) -> u64 {
+        (std::mem::size_of::<Entry<usize>>() as u64)
+            .saturating_add(
+                (keys.len() as u64).saturating_mul(std::mem::size_of::<SortKey>() as u64),
+            )
+            .saturating_add(keys.iter().map(SortKey::payload_bytes).sum::<u64>())
+    }
+}
+
+impl HeapRows<usize> for EagerHeapRows<'_> {
+    fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<usize> {
+        let added = Self::entry_bytes(keys);
+        let next = self.bytes.saturating_add(added);
+        self.charge.cover(next, self.step)?;
+        self.bytes = next;
         Ok(i)
     }
-    fn release(&mut self, _: Entry<usize>) -> Result<()> {
+
+    fn release(&mut self, entry: Entry<usize>) -> Result<()> {
+        let freed = Self::entry_bytes(&entry.keys);
+        // Drop the evicted entry's payloads before releasing their credit.
+        drop(entry);
+        self.bytes = self.bytes.saturating_sub(freed);
+        if self.charge.bytes() > self.bytes.saturating_add(self.step) {
+            self.charge.resize(self.bytes)?;
+        }
         Ok(())
     }
 }
@@ -6436,14 +6502,30 @@ pub(super) fn offer_rows<P>(
                 first
             }
         };
+        let row_decode = ctx.charge(0)?;
         let mut row = Vec::with_capacity(keys.len());
         row.push(first);
-        for k in 1..keys.len() {
-            row.push(key_of(i, k)?);
+        for (k, source) in sources.iter().enumerate().skip(1) {
+            let sk = match source {
+                HeapKey::Var(Some(col)) => {
+                    SortKey::new(ctx.value_checked_into(col[i], &row_decode)?)
+                }
+                _ => {
+                    let sk = key_of(i, k)?;
+                    let p = sk.payload_bytes();
+                    if p > 0 {
+                        row_decode.add(p)?;
+                    }
+                    sk
+                }
+            };
+            row.push(sk);
         }
         ranked += 1;
         let payload = rows.keep(i, &row)?;
-        if let Some(out) = heap.offer(row, payload) {
+        let evicted = heap.offer(row, payload);
+        drop(row_decode);
+        if let Some(out) = evicted {
             rows.release(out)?;
         }
     }
@@ -6549,11 +6631,173 @@ fn key_payload(value: &Option<Value>) -> u64 {
     }
 }
 
+/// Evaluate an ORDER BY expression over `t`, admitting each row's heap payload BEFORE
+/// retaining it in the result vector. Large parallel inputs evaluate in chunks, each
+/// holding a `RetainedCharge::part` (or local `Charge` when unowned) that transfers to
+/// `charge` without any release gap; on refusal every allocated value drops before its
+/// credit.
+fn key_rows_admitted(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    dec: Option<&super::expr::DecodedCols>,
+    charge: &mut Option<super::ctx::RetainedCharge>,
+) -> Result<Vec<Option<Value>>> {
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    let exists = nested.as_ref().map(|n| &n.answers);
+    let map = t.var_map(ctx.nvars());
+    let step = ctx.reservation_step();
+    let eval_row = |i: usize| -> Result<Option<Value>> {
+        match eval(
+            e,
+            &Row {
+                table: t,
+                i,
+                map: &map,
+                dec,
+                exists,
+            },
+            ctx,
+        ) {
+            Ok(Val::Id(id)) => {
+                let v = ctx.value(id);
+                if v.is_none() && ctx.has_memory_failure() {
+                    ctx.check()?;
+                }
+                Ok(v)
+            }
+            Ok(Val::V(v) | Val::Dec(_, v)) => Ok(Some(v)),
+            Err(_) => {
+                if ctx.has_memory_failure() {
+                    ctx.check()?;
+                }
+                Ok(None)
+            }
+        }
+    };
+    let mut out: Vec<Option<Value>> = vec![None; t.len()];
+    if t.len() > PAR_THRESHOLD && e.parallel() {
+        let owner = charge.as_ref();
+        let mut pieces: Vec<_> = out
+            .par_chunks_mut(PAR_MIN_LEN)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let part = match owner {
+                    Some(c) => c.part(ctx),
+                    None => match ctx.charge(0) {
+                        Ok(c) => c,
+                        Err(e) => return (Err(e), 0u64, 0u64, None),
+                    },
+                };
+                let mut bytes = 0u64;
+                let mut covered = 0u64;
+                let start = chunk_idx * PAR_MIN_LEN;
+                let res = (|| -> Result<()> {
+                    ctx.check()?;
+                    for (offset, slot) in chunk.iter_mut().enumerate() {
+                        if offset.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        let val = eval_row(start + offset)?;
+                        let p = key_payload(&val);
+                        if p > 0 {
+                            bytes = bytes.saturating_add(p);
+                            if bytes > covered {
+                                let ahead = bytes.saturating_add(step);
+                                match part.add(ahead - covered) {
+                                    Ok(()) => covered = ahead,
+                                    Err(_) => {
+                                        part.add(bytes - covered)?;
+                                        covered = bytes;
+                                    }
+                                }
+                            }
+                        }
+                        *slot = val;
+                    }
+                    ctx.check()
+                })();
+                (res, bytes, covered, Some(part))
+            })
+            .collect();
+        if let Some(at) = pieces.iter().position(|(res, ..)| res.is_err()) {
+            let (res, _, _, part) = pieces.swap_remove(at);
+            // Values drop before the charges that admitted them.
+            out.par_iter_mut()
+                .with_min_len(PAR_MIN_LEN)
+                .for_each(|v| *v = None);
+            drop((part, pieces));
+            return Err(res.unwrap_err());
+        }
+        let mut slack = 0u64;
+        for (_, bytes, covered, part) in pieces {
+            if let Some(part) = part {
+                if let Some(charge) = charge.as_mut() {
+                    slack = slack.saturating_add(covered.saturating_sub(bytes));
+                    charge.absorb(part);
+                } else {
+                    drop(part);
+                }
+            }
+        }
+        if let Some(charge) = charge.as_mut()
+            && slack > 0
+        {
+            charge.resize(charge.bytes().saturating_sub(slack))?;
+        }
+        return Ok(out);
+    }
+    let part = match charge.as_ref() {
+        Some(c) => c.part(ctx),
+        None => ctx.charge(0)?,
+    };
+    let mut bytes = 0u64;
+    let mut covered = 0u64;
+    let res = (|| -> Result<()> {
+        for (i, slot) in out.iter_mut().enumerate() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let val = eval_row(i)?;
+            let p = key_payload(&val);
+            if p > 0 {
+                bytes = bytes.saturating_add(p);
+                if bytes > covered {
+                    let ahead = bytes.saturating_add(step);
+                    match part.add(ahead - covered) {
+                        Ok(()) => covered = ahead,
+                        Err(_) => {
+                            part.add(bytes - covered)?;
+                            covered = bytes;
+                        }
+                    }
+                }
+            }
+            *slot = val;
+        }
+        ctx.check()
+    })();
+    if let Err(err) = res {
+        drop(out);
+        drop(part);
+        return Err(err);
+    }
+    if let Some(charge) = charge.as_mut() {
+        let slack = covered.saturating_sub(bytes);
+        charge.absorb(part);
+        if slack > 0 {
+            charge.resize(charge.bytes().saturating_sub(slack))?;
+        }
+    } else {
+        drop(part);
+    }
+    Ok(out)
+}
+
 /// The value of an ORDER key on every row, charged until the sort releases it. An input
 /// of at most [`PAR_THRESHOLD`] rows is evaluated on this thread, each value admitted
-/// before the column keeps it. A larger input is evaluated in parallel, with `dec`'s
-/// decoded columns, after its slots are charged, and its values' payload is charged
-/// once they are made, so a query over its budget fails after one column's payload.
+/// before the column keeps it. A larger input is evaluated in parallel chunks, admitting
+/// each chunk's payload onto an owned charge before retaining values.
 fn key_column_charged(
     ctx: &Ctx,
     t: &Table,
@@ -6565,15 +6809,7 @@ fn key_column_charged(
     }
     let slots = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
     let mut charge = ctx.retained_charge(slots)?;
-    let vals = key_rows(ctx, t, e, dec)?;
-    let payload: u64 = vals
-        .par_iter()
-        .with_min_len(PAR_MIN_LEN)
-        .map(key_payload)
-        .sum();
-    if let Some(charge) = &mut charge {
-        charge.resize(slots.saturating_add(payload))?;
-    }
+    let vals = key_rows_admitted(ctx, t, e, dec, &mut charge)?;
     Ok(super::exprcache::Column::Rows {
         vals,
         _charge: charge,
@@ -6635,6 +6871,64 @@ pub(super) fn key_rows_charged(
     })
 }
 
+#[cfg(test)]
+#[test]
+fn order_keys_refuse_before_accumulating_an_oversized_payload() {
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{Literal, Term};
+    use spargebra::algebra::Function;
+
+    let store = Store::in_memory(StoreOptions::default());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        // An allocation probe on this worker observes the parallel chunks, too.
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 4 << 20;
+        let ctx = ctx.into_shared();
+        let a = ctx.var("a");
+        let b = ctx.var("b");
+        let x = ctx.intern_term(&Term::Literal(Literal::new_simple_literal("a".repeat(512))));
+        let y = ctx.intern_term(&Term::Literal(Literal::new_simple_literal("b".repeat(512))));
+        let n = PAR_THRESHOLD + 1;
+        let mut table = Table::new(vec![a, b]);
+        table.cols = vec![vec![x; n], vec![y; n]];
+        table.len = n;
+        let expr = Expr::Call(
+            super::expr::Func::Builtin(Function::Concat),
+            (0..4).flat_map(|_| [Expr::Var(a), Expr::Var(b)]).collect(),
+        );
+
+        let peak = crate::test_alloc::record_peak_live(|| {
+            let error = key_column_charged(&ctx, &table, &expr, None).err();
+            assert!(
+                matches!(error, Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory),
+                "large ORDER expression column returned {error:?}"
+            );
+        });
+        assert!(peak < 8 << 20, "sort allocated {peak} bytes before refusing");
+
+        let keys = [(Expr::Const(Id::from_bool(true)), true), (expr, true)];
+        let peak = crate::test_alloc::record_peak_live(|| {
+            let error = order_by(
+                &ctx,
+                table,
+                &keys,
+                Some(3_000),
+                &mut ExprReport::default(),
+            )
+            .err();
+            assert!(
+                matches!(error, Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory),
+                "eager top-k returned {error:?}"
+            );
+        });
+        assert!(peak < 8 << 20, "heap allocated {peak} bytes before refusing");
+    });
+}
+
 /// The value of an ORDER BY key once per distinct input value, where the key is pure
 /// over one variable and its values repeat (see [`super::exprcache`]).
 fn key_per_value(
@@ -6665,20 +6959,10 @@ fn key_per_value(
     if t.len() < super::exprcache::MIN_ROWS {
         return Ok(None);
     }
-    let mut values = super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
-        key_rows(ctx, v, e, Decoded::cols(&decode_for(ctx, v, &[e])?))
-    })?;
-    // The distinct keys' payloads stay with them until the sort is done.
-    if let Some(values) = &mut values {
-        let payload: u64 = values
-            .vals
-            .par_iter()
-            .with_min_len(PAR_MIN_LEN)
-            .map(key_payload)
-            .sum();
-        values.retain(ctx, payload)?;
-    }
-    Ok(values)
+    super::exprcache::per_value_charged(ctx, t, &[e], false, report, |v, charge| {
+        let dec = decode_for(ctx, v, &[e])?;
+        key_rows_admitted(ctx, v, e, Decoded::cols(&dec), charge)
+    })
 }
 
 /// The value of an ORDER BY key on every row, per distinct value where it can be.
@@ -6994,6 +7278,8 @@ impl AggState {
                     on_best(key_payload(&v))?;
                     *best = Some(id);
                     *best_v = v;
+                } else {
+                    drop(v);
                 }
                 drop(decode);
             }
@@ -9161,7 +9447,8 @@ pub(super) fn vector_search(
                             None => continue,
                         }
                     }
-                    _ => {
+                    other => {
+                        drop(other);
                         drop(decode);
                         entity_vector(ctx, spec, pred, id)?
                     }

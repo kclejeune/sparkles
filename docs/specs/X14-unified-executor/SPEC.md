@@ -1581,3 +1581,17 @@ included 1.0, as did the eager control's. A streamed answer still took 0.21 to 0
 more wall time than an eager one on those queries, against 0.23 to 0.31 ms in the base,
 because the hand-off between threads that the phase trace measured lies outside the
 writer.
+
+### Strict decoding across non-SELECT callers
+
+Item 1308 Wave 2 closed the eager decode bypass in `Ctx` by removing `envelope_refuses`
+and unifying `DecodeEnvelope` across both accounting modes, which lowered the
+bounded-reads check from seven to six sites. Eager and streaming execution now enforce
+the same memory budget and live request controls across expression combinators, batch
+loops, executor operators, ORDER BY and top-k heaps, external sort frame reloads,
+streaming and eager group accumulators, DESCRIBE, SERVICE, text highlighting, dataset
+restriction, incremental passes, SHACL embedded query results and GeoSPARQL execution.
+Optional FILTER selectivity sampling runs on a disposable trial context so a declined
+estimate releases its decode, cache and local-term state before execution starts. Triple
+keys validate their framing and nesting depth before recursive decoding, and vocabulary
+read locks are released before memory admission or geometry parsing.

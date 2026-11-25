@@ -249,6 +249,7 @@ Item 827 removed the reads in `has_predicate` and `limited_input` that an earlie
 of this section listed. Before the change the test counts eight sites, the mode branch of
 `query_execution_with_plan`, the EXISTS key set accumulated across batches in
 `exists::prepare`, `envelope_refuses`, `string_order_mask` and the four direct reads.
+Item 1308 Wave 2 later removed `envelope_refuses`, lowering the bound to six.
 
 The floors decode inside the envelope, and `decode_for` decodes through the one sorted
 pre-decode. Floors cached per batch measured 24.8% and 33.4% slower than the direct
@@ -514,10 +515,10 @@ and sampled filters planning choices that do not depend on the mode. The result 
 serves a cursor's subtree when the subtree is materialized anyway, and sampled filters
 prepare their samples once per plan. EXPLAIN then prints one plan for a query whatever
 the mode, which `plan_fidelity_tests.rs` checks, with a spill-configured DISTINCT over
-ORDER BY among its cases. After item 1069 the mode is read in seven places, the mode
-branch of `query_execution_with_plan`, the EXISTS key set of `exists::prepare`,
-`envelope_refuses` and the four direct reads in `ctx.rs`, and the bounded-reads test's
-bound is seven. The merge removes the rest.
+ORDER BY among its cases. After item 1069 the mode was read in seven places, and item 1308 Wave 2 removed
+`envelope_refuses` to bring the bounded-reads test down to six: the mode branch of
+`query_execution_with_plan`, the EXISTS key set of `exists::prepare` and the four direct
+reads in `ctx.rs`. The merge removes the rest.
 
 The phase then routes every ASK and unordered LIMIT through pull demand. A streaming
 request already pulls its ASK through the cursor, so the change is that automatic and

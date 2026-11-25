@@ -303,7 +303,7 @@ impl GraphCursor {
                         Some(buffer) => buffer,
                         None => Buffer::new(&ctx, &self.where_cursor.variables.ids, 0)?,
                     };
-                    let triples = crate::sparql::describe::describe_batch(
+                    let mut described = crate::sparql::describe::describe_batch(
                         &ctx,
                         &table.table,
                         options,
@@ -315,19 +315,31 @@ impl GraphCursor {
                     self.truncated = self.described.truncated();
                     self.described_all = last || self.truncated;
                     let mut pending_bytes = 128u64;
-                    for triple in &triples {
+                    for triple in &described.triples {
                         pending_bytes = pending_bytes.saturating_add(
                             crate::sparql::graph_triple_bytes(triple).saturating_add(256),
                         );
                     }
-                    let pending_charge = OwnedCharge::new(&ctx, pending_bytes.saturating_mul(2))?;
-                    let pending = triples
+                    let quad_slots = (described.triples.len() as u64)
+                        .saturating_mul(std::mem::size_of::<Quad>() as u64);
+                    // Preserve `described.charge` continuously across handoff: admit any
+                    // extra Quad-vector slots before allocating `pending`, then reconcile
+                    // downward once `described.triples` has been moved into `pending`.
+                    let peak = described
+                        .charge
+                        .bytes()
+                        .max(pending_bytes)
+                        .saturating_add(quad_slots);
+                    described.charge.resize(peak)?;
+                    let pending = described
+                        .triples
                         .into_iter()
                         .map(|triple| triple.in_graph(GraphName::DefaultGraph))
                         .collect::<Vec<_>>();
+                    described.charge.resize(pending_bytes)?;
                     self.pending = Some(Pending {
                         quads: pending.into_iter(),
-                        _charge: pending_charge,
+                        _charge: described.charge,
                     });
                 }
                 Spec::Construct { template, graphs } => {

@@ -24,7 +24,7 @@ use super::search::{self, Hit, SearchStats};
 use super::tree::PackedTree;
 use crate::error::{Budget, BudgetKind, Error, Result};
 use crate::id::Id;
-use crate::sparql::ctx::Ctx;
+use crate::sparql::ctx::{Charge, Ctx};
 use crate::sparql::geojoin::{JoinSide, JoinTest, SpatialJoinSpec};
 use crate::sparql::geopf::ScanShape;
 use crate::sparql::plan::{PathEnd, ScanSpec};
@@ -311,13 +311,17 @@ fn add_stats(st: &mut SearchStats, s: &SearchStats) {
 // ------------------------------------------------------------------- the operator --
 
 /// One input's rows and its distinct geometries (item `i` is `items[i]`, its rows
-/// `rows[i]` of `table`).
-struct Side {
+/// `rows[i]` of `table`). `_charge` is declared last so `table`, `items`, `rows`,
+/// and `by_id` all drop before their retained credit.
+struct Side<'a> {
     table: Table,
     items: Vec<JoinItem>,
     rows: Vec<Vec<u32>>,
     /// literal → its item, for the rows read from the index
     by_id: FxHashMap<Id, u32>,
+    bytes: u64,
+    step: u64,
+    _charge: Charge<'a>,
 }
 
 /// The box a join gives a geometry (`None`: it passes no test, being empty).
@@ -334,24 +338,34 @@ fn item_box(g: &Geom) -> Option<[f64; 4]> {
     })
 }
 
-impl Side {
-    fn new(table: Table) -> Side {
-        Side {
+impl<'a> Side<'a> {
+    fn new(ctx: &'a Ctx, table: Table) -> Result<Side<'a>> {
+        Ok(Side {
             table,
             items: Vec::new(),
             rows: Vec::new(),
             by_id: FxHashMap::default(),
-        }
+            bytes: 0,
+            step: ctx.reservation_step(),
+            _charge: ctx.charge(0)?,
+        })
+    }
+
+    fn admit(&mut self, added: u64) -> Result<()> {
+        let next = self.bytes.saturating_add(added);
+        self._charge.cover(next, self.step)?;
+        self.bytes = next;
+        Ok(())
     }
 
     /// A child's rows, grouped by their geometry `v` as the functions read it (rows
     /// whose `v` is unbound or not a geometry pass no test and are dropped).
-    fn of_table(ctx: &Ctx, table: Table, v: VarId) -> Result<Side> {
-        let mut s = Side::new(table);
+    fn of_table(ctx: &'a Ctx, table: Table, v: VarId) -> Result<Side<'a>> {
+        let mut s = Side::new(ctx, table)?;
         let Some(c) = s.table.col_of(v) else {
             return Ok(s);
         };
-        // literal → its item (u32::MAX: no geometry)
+        // literal → its item (u32::MAX: no geometry); `seen_charge` covers only `seen`
         let seen_charge = ctx.charge(0)?;
         let mut seen: FxHashMap<Id, u32> = FxHashMap::default();
         for i in 0..s.table.len() {
@@ -368,12 +382,13 @@ impl Side {
                 let g = super::memo::by_id_checked(ctx, id)?;
                 let idx = match g.as_ref().and_then(|g| item_box(g)) {
                     Some(b) => {
-                        seen_charge.add(128)?;
+                        let g = g.expect("checked Some");
+                        s.admit((g.mem_size() as u64).saturating_add(128))?;
                         s.items.push(JoinItem {
                             row: s.items.len() as u32,
                             id,
                             bbox84: b,
-                            geom: g.expect("checked Some"),
+                            geom: g,
                         });
                         s.rows.push(Vec::new());
                         (s.items.len() - 1) as u32
@@ -385,6 +400,11 @@ impl Side {
                 idx
             };
             if item != u32::MAX {
+                let row_vec = &mut s.rows[item as usize];
+                if row_vec.len() == row_vec.capacity() {
+                    let grow = (row_vec.capacity().max(4) as u64).saturating_mul(4);
+                    s.admit(grow)?;
+                }
                 s.rows[item as usize].push(i as u32);
             }
         }
@@ -396,13 +416,27 @@ impl Side {
 
     /// Add the index's rows of a literal not seen before (all its rows come together:
     /// a search hands out every row of a literal whose box meets a window).
-    fn add_hits(&mut self, ctx: &Ctx, ix: &IndexSide, hits: &[Hit]) -> Option<u32> {
-        let o = hits.first()?.o;
+    fn add_hits(&mut self, ctx: &Ctx, ix: &IndexSide, hits: &[Hit]) -> Result<Option<u32>> {
+        let Some(first) = hits.first() else {
+            return Ok(None);
+        };
+        let o = first.o;
         if let Some(&i) = self.by_id.get(&o) {
-            return Some(i);
+            return Ok(Some(i));
         }
-        let g = super::memo::noted(ctx, hits[0].entry.geom(&ctx.snap)).ok()?;
-        let b = item_box(&g)?;
+        let Ok(g) = super::memo::noted(ctx, first.entry.geom(&ctx.snap)) else {
+            return Ok(None);
+        };
+        let Some(b) = item_box(&g) else {
+            return Ok(None);
+        };
+        let row_bytes = (hits.len() as u64)
+            .saturating_mul(4u64.saturating_add((ix.cols.len() as u64).saturating_mul(8)));
+        self.admit(
+            (g.mem_size() as u64)
+                .saturating_add(row_bytes)
+                .saturating_add(160),
+        )?;
         let item = self.items.len() as u32;
         self.items.push(JoinItem {
             row: item,
@@ -426,7 +460,7 @@ impl Side {
         }
         self.rows.push(rows);
         self.by_id.insert(o, item);
-        Some(item)
+        Ok(Some(item))
     }
 
     /// Union of the boxes of the placed items, expanded for the test (`None`: no item).
@@ -533,10 +567,15 @@ impl<'a> IndexSide<'a> {
     }
 
     /// Every row of the scan near `windows`, as a side.
-    fn read(&self, ctx: &Ctx, windows: &[[f64; 4]], st: &mut SearchStats) -> Result<Side> {
-        let mut side = Side::new(Table::new(self.vars.clone()));
+    fn read<'c>(
+        &self,
+        ctx: &'c Ctx,
+        windows: &[[f64; 4]],
+        st: &mut SearchStats,
+    ) -> Result<Side<'c>> {
+        let mut side = Side::new(ctx, Table::new(self.vars.clone()))?;
         self.search(ctx, windows, st, &mut |group| {
-            side.add_hits(ctx, self, group);
+            side.add_hits(ctx, self, group)?;
             ctx.check_output(side.table.len(), side.table.width())
         })?;
         Ok(side)
@@ -553,26 +592,27 @@ impl<'a> IndexSide<'a> {
 /// The index nested loop: each item of `outer` searches the index side, and its
 /// candidates are tested; returns the index side's rows read and the passing pairs
 /// `(outer item, inner item)`.
-fn probe(
-    ctx: &Ctx,
+fn probe<'c>(
+    ctx: &'c Ctx,
     exact: &Exact<'_>,
-    outer: &Side,
+    outer: &Side<'_>,
     ix: &IndexSide<'_>,
     outer_is_left: bool,
     st: &mut SearchStats,
-) -> Result<(Side, Vec<Pair>)> {
+) -> Result<(Side<'c>, Vec<Pair>)> {
     let budget = Candidates {
         ctx,
         total: AtomicU64::new(0),
     };
     let test = exact.test;
-    let placed_items: Vec<usize> = (0..outer.items.len())
-        .filter(|&i| placed(&outer.items[i].bbox84))
+    let outer_items = &outer.items;
+    let placed_items: Vec<usize> = (0..outer_items.len())
+        .filter(|&i| placed(&outer_items[i].bbox84))
         .collect();
     let size = (placed_items.len() / (rayon::current_num_threads() * 4)).clamp(1, 64);
     // per outer item, the index rows of the literals that pass
     type Found = Vec<(u32, Vec<Hit>)>;
-    let mut side = Side::new(Table::new(ix.vars.clone()));
+    let mut side = Side::new(ctx, Table::new(ix.vars.clone()))?;
     let mut out = Vec::new();
     for wave in placed_items.chunks(WAVE) {
         let parts: Vec<(Found, SearchStats)> = wave
@@ -581,7 +621,7 @@ fn probe(
                 let mut st = SearchStats::default();
                 let mut found: Found = Vec::new();
                 for &o in chunk {
-                    let it = &outer.items[o];
+                    let it = &outer_items[o];
                     let prep = std::cell::OnceCell::new();
                     let mut cands = 0usize;
                     let mut groups: Vec<Vec<Hit>> = Vec::new();
@@ -629,7 +669,7 @@ fn probe(
             add_stats(st, &s);
             for (o, hits) in found {
                 for g in hits.chunk_by(|a, b| a.o == b.o) {
-                    if let Some(i) = side.add_hits(ctx, ix, g) {
+                    if let Some(i) = side.add_hits(ctx, ix, g)? {
                         out.push(if outer_is_left { (o, i) } else { (i, o) });
                     }
                 }
@@ -654,7 +694,7 @@ pub fn spatial_join(
     let mut st = SearchStats::default();
     let mut probes = false;
     let mut inputs: Vec<Option<Table>> = inputs.into_iter().map(Some).collect();
-    let mut table_side = |s: &JoinSide| -> Result<Option<Side>> {
+    let mut table_side = |s: &JoinSide| -> Result<Option<Side<'_>>> {
         match s {
             JoinSide::Plan { child, geom_var } => {
                 let t = inputs
@@ -755,22 +795,22 @@ pub fn spatial_join(
 /// A table joined with an index side: probed per geometry of the table when the table is
 /// small next to the scan (and the index can serve it), else the scan's rows near the
 /// table read once and joined as a table. Returns the index side's rows and the pairs.
-fn with_index(
-    ctx: &Ctx,
+fn with_index<'c>(
+    ctx: &'c Ctx,
     exact: &Exact<'_>,
-    table: &Side,
+    table: &Side<'_>,
     ix: &IndexSide<'_>,
     table_is_left: bool,
     st: &mut SearchStats,
     probes: &mut bool,
-) -> Result<(Side, Vec<Pair>)> {
+) -> Result<(Side<'c>, Vec<Pair>)> {
     let usable = search::indexed(&ctx.snap, &[ix.pred]).is_some();
     if usable && (table.items.len() as u64).saturating_mul(PROBE_RATIO as u64) <= ix.rows(ctx) {
         *probes = true;
         return probe(ctx, exact, table, ix, table_is_left, st);
     }
     let Some(reach) = table.reach(exact.test) else {
-        return Ok((Side::new(Table::new(ix.vars.clone())), Vec::new()));
+        return Ok((Side::new(ctx, Table::new(ix.vars.clone()))?, Vec::new()));
     };
     let other = ix.read(ctx, &reach, st)?;
     let (l, r) = if table_is_left {
@@ -787,7 +827,13 @@ fn with_index(
 }
 
 /// The joined rows: each passing pair's rows of both sides, in `vars` order.
-fn assemble(ctx: &Ctx, l: &Side, r: &Side, found: &[Pair], vars: &[VarId]) -> Result<Table> {
+fn assemble(
+    ctx: &Ctx,
+    l: &Side<'_>,
+    r: &Side<'_>,
+    found: &[Pair],
+    vars: &[VarId],
+) -> Result<Table> {
     let total: usize = found
         .iter()
         .map(|&(a, b)| l.rows[a as usize].len() * r.rows[b as usize].len())

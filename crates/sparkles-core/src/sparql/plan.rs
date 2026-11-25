@@ -4391,7 +4391,7 @@ impl<'a> Planner<'a> {
             leaves.push(options);
         }
         if self.ctx.opt.sampled_filters && !filters.is_empty() {
-            super::sample::prepare(self.ctx, &leaves, &filters);
+            super::sample::prepare(self.ctx, &leaves, &filters)?;
         }
         if self.ctx.opt.characteristic_sets {
             use super::charsets::Term;

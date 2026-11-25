@@ -1236,8 +1236,13 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
     let a0 = || arg(args, 0, row, ctx);
     let a1 = || arg(args, 1, row, ctx);
     let a2 = || arg(args, 2, row, ctx);
-    let id0 =
-        || -> EvalResult<Id> { Ok(eval(args.first().ok_or(TypeError)?, row, ctx)?.into_id(ctx)) };
+    let id0 = || -> EvalResult<Id> {
+        let id = eval(args.first().ok_or(TypeError)?, row, ctx)?.into_id(ctx);
+        if ctx.has_memory_failure() {
+            return Err(TypeError);
+        }
+        Ok(id)
+    };
     Ok(match f {
         F::Str => {
             let v = eval(&args[0], row, ctx)?;
@@ -1305,7 +1310,11 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                             && id.payload() & Id::LOCAL_BNODE_BIT != 0)
                     })
                     .collect();
-                Val::Id(ctx.bnode_for_row(key, st))
+                let id = ctx.bnode_for_row(key, st);
+                if ctx.has_memory_failure() {
+                    return Err(TypeError);
+                }
+                Val::Id(id)
             }
         }
         F::Rand => Val::V(Value::Double(rand::random::<f64>().into())),

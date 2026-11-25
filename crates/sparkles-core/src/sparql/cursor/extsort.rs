@@ -353,6 +353,7 @@ impl External {
 }
 
 /// One run's place in the merge: its current frame and the frame's key values.
+/// `_charge` is declared last so `reader`, `columns`, and `keys` all drop before credit.
 struct Head {
     reader: SpillReader,
     columns: Vec<Vec<Id>>,
@@ -362,110 +363,168 @@ struct Head {
     _charge: Option<OwnedCharge>,
 }
 
+type HeadFrame = (Vec<Vec<Id>>, Vec<Vec<SortKey>>, usize, u64);
+
 impl Head {
     /// Read the next frame, or return false at the end of the run.
     fn load(&mut self, ctx: &Arc<Ctx>, keys: &Keys) -> Result<bool> {
-        self.keys.clear();
-        self.columns.clear();
+        // Free both outer and inner frame/key vectors before shrinking credit.
+        self.keys = Vec::new();
+        self.columns = Vec::new();
         self.len = 0;
         self.at = 0;
-        self._charge = None;
-        ctx.check()?;
-        let Some((frame_cols, len)) = self.reader.next_frame()? else {
-            return Ok(false);
-        };
-        let mut bytes = frame_cols.len() as u64 * len as u64 * 8 + 256;
-        let mut charge = OwnedCharge::new(ctx, bytes)?;
-        let mut columns = Some(frame_cols);
-        let step = ctx.reservation_step();
-        let decoded = match keys {
-            Keys::Raw(_) => Vec::new(),
-            Keys::Values { keys, vars } => {
-                let mut decoded = Vec::with_capacity(keys.len());
-                for (key, _) in keys {
-                    let column: Vec<SortKey> = match key {
-                        Key::Column(c) => {
-                            let slots_bytes =
-                                (len as u64).saturating_mul(size_of::<SortKey>() as u64);
-                            bytes = bytes.saturating_add(slots_bytes);
-                            charge.cover(bytes, step)?;
-                            let mut col = Vec::with_capacity(len);
-                            let col_ids = &columns.as_ref().expect("frame columns")[*c];
-                            for (row, &id) in col_ids.iter().enumerate() {
-                                if row.is_multiple_of(1024) {
-                                    ctx.check()?;
-                                }
-                                match id.tag() {
-                                    crate::id::Tag::Vocab
-                                    | crate::id::Tag::Delta
-                                    | crate::id::Tag::Local => {
-                                        let decode = ctx.charge(0)?;
-                                        let val = ctx.value_checked_into(id, &decode)?;
-                                        let sk = SortKey::new(val);
-                                        bytes = bytes.saturating_add(sk.payload_bytes());
-                                        charge.cover(bytes, step)?;
-                                        col.push(sk);
-                                        drop(decode);
-                                    }
-                                    _ => {
-                                        let sk = SortKey::new(ctx.value(id));
-                                        bytes = bytes.saturating_add(sk.payload_bytes());
-                                        charge.cover(bytes, step)?;
-                                        col.push(sk);
-                                    }
-                                }
-                            }
-                            col
-                        }
-                        Key::Expr(e) => {
-                            let mut table = crate::sparql::table::Table::new(vars.clone());
-                            table.cols = columns.take().expect("frame columns");
-                            table.len = len;
-                            let evaluated = exec::key_rows_charged(ctx, &table, e);
-                            columns = Some(std::mem::take(&mut table.cols));
-                            let evaluated = evaluated?;
-                            let slots_bytes =
-                                (len as u64).saturating_mul(size_of::<SortKey>() as u64);
-                            bytes = bytes.saturating_add(slots_bytes);
-                            charge.cover(bytes, step)?;
-                            let mut col = Vec::with_capacity(len);
-                            let crate::sparql::exprcache::Column::Rows {
-                                vals: raw_vals,
-                                _charge,
-                            } = evaluated
-                            else {
-                                unreachable!("key_rows_charged always returns Column::Rows");
-                            };
-                            let _eval_charge = _charge;
-                            let vals = raw_vals;
-                            for (row, val) in vals.into_iter().enumerate() {
-                                if row.is_multiple_of(1024) {
-                                    ctx.check()?;
-                                }
-                                let sk = SortKey::new(val);
-                                bytes = bytes.saturating_add(sk.payload_bytes());
-                                charge.cover(bytes, step)?;
-                                col.push(sk);
-                            }
-                            drop(_eval_charge);
-                            col
-                        }
-                    };
-                    decoded.push(column);
+        // Retain persistent reader buffer credit across frame reloads.
+        let reader_cap = self.reader.buffer_capacity();
+        let mut charge = match self._charge.take() {
+            Some(mut c) => {
+                if c.bytes() > reader_cap {
+                    c.resize(reader_cap)?;
                 }
-                decoded
+                c
             }
+            None => OwnedCharge::new(ctx, reader_cap)?,
         };
-        ctx.check()?;
-        if charge.bytes() > bytes {
-            charge.resize(bytes)?;
+        // Keep the persistent reader buffer credited even if `check()` or `next_frame_with`
+        // fails before installing a new frame.
+        let result = (|| -> Result<Option<HeadFrame>> {
+            ctx.check()?;
+            let Some((frame_cols, len)) = self
+                .reader
+                .next_frame_with(|need| charge.resize(need.max(charge.bytes())))?
+            else {
+                return Ok(None);
+            };
+            let step = ctx.reservation_step();
+            let col_meta =
+                (frame_cols.len() as u64).saturating_mul(std::mem::size_of::<Vec<Id>>() as u64);
+            let mut bytes = self
+                .reader
+                .buffer_capacity()
+                .saturating_add(col_meta)
+                .saturating_add(
+                    (frame_cols.len() as u64)
+                        .saturating_mul(len as u64)
+                        .saturating_mul(8),
+                )
+                .saturating_add(256);
+            // `columns` is bound inside this closure AFTER `charge` so on any unwind
+            // `columns` and `decoded` drop before `charge` is shrunk back to `reader_cap`.
+            let mut columns = Some(frame_cols);
+            let decoded = match keys {
+                Keys::Raw(_) => Vec::new(),
+                Keys::Values { keys, vars } => {
+                    let keys_meta = (keys.len() as u64)
+                        .saturating_mul(std::mem::size_of::<Vec<SortKey>>() as u64);
+                    bytes = bytes.saturating_add(keys_meta);
+                    charge.cover(bytes, step)?;
+                    let mut decoded = Vec::with_capacity(keys.len());
+                    for (key, _) in keys {
+                        let column: Vec<SortKey> = match key {
+                            Key::Column(c) => {
+                                let slots_bytes =
+                                    (len as u64).saturating_mul(size_of::<SortKey>() as u64);
+                                bytes = bytes.saturating_add(slots_bytes);
+                                charge.cover(bytes, step)?;
+                                let mut col = Vec::with_capacity(len);
+                                let col_ids = &columns.as_ref().expect("frame columns")[*c];
+                                for (row, &id) in col_ids.iter().enumerate() {
+                                    if row.is_multiple_of(1024) {
+                                        ctx.check()?;
+                                    }
+                                    match id.tag() {
+                                        crate::id::Tag::Vocab
+                                        | crate::id::Tag::Delta
+                                        | crate::id::Tag::Local => {
+                                            let decode = ctx.charge(0)?;
+                                            let val = ctx.value_checked_into(id, &decode)?;
+                                            let sk = SortKey::new(val);
+                                            bytes = bytes.saturating_add(sk.payload_bytes());
+                                            charge.cover(bytes, step)?;
+                                            col.push(sk);
+                                            drop(decode);
+                                        }
+                                        _ => {
+                                            let sk = SortKey::new(ctx.value(id));
+                                            bytes = bytes.saturating_add(sk.payload_bytes());
+                                            charge.cover(bytes, step)?;
+                                            col.push(sk);
+                                        }
+                                    }
+                                }
+                                col
+                            }
+                            Key::Expr(e) => {
+                                let mut table = crate::sparql::table::Table::new(vars.clone());
+                                table.cols = columns.take().expect("frame columns");
+                                table.len = len;
+                                let evaluated = exec::key_rows_charged(ctx, &table, e);
+                                columns = Some(std::mem::take(&mut table.cols));
+                                let evaluated = evaluated?;
+                                let slots_bytes =
+                                    (len as u64).saturating_mul(size_of::<SortKey>() as u64);
+                                bytes = bytes.saturating_add(slots_bytes);
+                                charge.cover(bytes, step)?;
+                                let mut col = Vec::with_capacity(len);
+                                let crate::sparql::exprcache::Column::Rows {
+                                    vals: raw_vals,
+                                    _charge,
+                                } = evaluated
+                                else {
+                                    unreachable!("key_rows_charged always returns Column::Rows");
+                                };
+                                let _eval_charge = _charge;
+                                let vals = raw_vals;
+                                for (row, val) in vals.into_iter().enumerate() {
+                                    if row.is_multiple_of(1024) {
+                                        ctx.check()?;
+                                    }
+                                    let sk = SortKey::new(val);
+                                    bytes = bytes.saturating_add(sk.payload_bytes());
+                                    charge.cover(bytes, step)?;
+                                    col.push(sk);
+                                }
+                                drop(_eval_charge);
+                                col
+                            }
+                        };
+                        decoded.push(column);
+                    }
+                    decoded
+                }
+            };
+            ctx.check()?;
+            Ok(Some((columns.expect("frame columns"), decoded, len, bytes)))
+        })();
+        match result {
+            Ok(Some((cols, decoded, len, bytes))) => {
+                if charge.bytes() > bytes {
+                    charge.resize(bytes)?;
+                }
+                self.columns = cols;
+                self.keys = decoded;
+                self.len = len;
+                self.at = 0;
+                self._charge = Some(charge);
+                Ok(true)
+            }
+            Ok(None) => {
+                // Free the reader's payload buffer before releasing its credit at EOF.
+                self.reader.release_buffer();
+                drop(charge);
+                self._charge = None;
+                Ok(false)
+            }
+            Err(err) => {
+                // Frame columns and decoded keys have already dropped inside the closure;
+                // shrink back to whatever reader buffer remains allocated and retain credit.
+                let keep = self.reader.buffer_capacity();
+                if charge.bytes() > keep {
+                    let _ = charge.resize(keep);
+                }
+                self._charge = Some(charge);
+                Err(err)
+            }
         }
-        self.columns = columns.expect("frame columns");
-        self.keys = decoded;
-        self.len = len;
-        self.at = 0;
-        self._charge = Some(charge);
-        Ok(true)
     }
 }
 
@@ -652,4 +711,145 @@ pub(super) fn load(
     external.write_run(ctx, input)?;
     external.finish(ctx)?;
     Ok(None)
+}
+
+#[cfg(test)]
+mod head_reload_tests {
+    use super::*;
+    use crate::spill::{Spill, SpillOptions};
+    use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn head_load_retains_reader_credit_across_reloads_refuses_before_decode_and_releases_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = Spill::open(&SpillOptions {
+            dir: dir.path().to_path_buf(),
+            max_bytes: 64 << 20,
+            query_bytes: 64 << 20,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+
+        let store = Store::in_memory(StoreOptions::default());
+        let pad = "z".repeat(4096);
+        let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+        for i in 0..8 {
+            ttl.push_str(&format!(
+                "ex:s{i} ex:small \"s{i}\" ; ex:big \"b{i}-{pad}\" .\n"
+            ));
+        }
+        store
+            .load(&[crate::io::Source::from_bytes(
+                ttl.into_bytes(),
+                crate::io::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+        let small_ids: Vec<Id> = (0..8)
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                    format!("s{i}"),
+                )))
+                .unwrap()
+            })
+            .collect();
+        let big_ids: Vec<Id> = (0..8)
+            .map(|i| {
+                snap.lookup_term(&oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(
+                    format!("b{i}-{pad}"),
+                )))
+                .unwrap()
+            })
+            .collect();
+
+        // Write one SpillRun containing two frames: frame 1 has short literals, frame 2
+        // has 8 × 4 KiB literals.
+        let qspill = Arc::new(spill.query(None));
+        let mut writer = qspill.create(SpillKind::SortRun, 1).unwrap();
+        writer.set_frame_rows(8);
+        writer.write(&[small_ids.as_slice()], 8).unwrap();
+        writer.write(&[big_ids.as_slice()], 8).unwrap();
+        let run = Arc::new(writer.finish().unwrap());
+
+        let mut ctx = Ctx::new(snap);
+        ctx.mem_limit = 512 * 1024;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = ctx.into_shared();
+        let keys = Keys::Values {
+            keys: vec![(Key::Column(0), true)],
+            vars: vec![0],
+        };
+
+        let mut head = Head {
+            reader: run.reader().unwrap(),
+            columns: Vec::new(),
+            keys: Vec::new(),
+            at: 0,
+            len: 0,
+            _charge: None,
+        };
+        assert!(head.load(&ctx, &keys).unwrap(), "frame 1 loads");
+        assert_eq!(head.len, 8);
+        let live_after_f1 = ctx.live_bytes();
+        assert!(live_after_f1 > 0, "frame 1 holds live credit");
+
+        // Hold almost all remaining budget so frame 1 releases cleanly during reload,
+        // while frame 2's 8 × 4 KiB literals exceed the budget during Head::load.
+        let room = ctx.memory_remaining();
+        let hold = ctx.charge(room.saturating_sub(4096)).unwrap();
+        let err = head
+            .load(&ctx, &keys)
+            .expect_err("frame 2 must refuse under tight budget");
+        assert!(
+            matches!(
+                err,
+                Error::BudgetExceeded(b)
+                    if matches!(b.kind, crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory)
+            ),
+            "expected Memory BudgetExceeded on frame 2 reload, got {err:?}"
+        );
+        assert_eq!(head.len, 0);
+        assert!(head.columns.is_empty() && head.keys.is_empty());
+        assert_eq!(
+            head._charge.as_ref().map_or(0, OwnedCharge::bytes),
+            head.reader.buffer_capacity(),
+            "after refusal only persistent reader buffer credit remains"
+        );
+        drop(hold);
+
+        // Fresh reader: load both frames cleanly, then hit EOF and verify reader buffer
+        // and all live credit are released back to 0.
+        let mut head_ok = Head {
+            reader: run.reader().unwrap(),
+            columns: Vec::new(),
+            keys: Vec::new(),
+            at: 0,
+            len: 0,
+            _charge: None,
+        };
+        assert!(head_ok.load(&ctx, &keys).unwrap(), "frame 1 loads");
+        assert!(head_ok.load(&ctx, &keys).unwrap(), "frame 2 loads");
+        let charged_before_eof = head_ok._charge.as_ref().map_or(0, OwnedCharge::bytes);
+        let live_before_eof = ctx.live_bytes();
+        assert!(charged_before_eof > 0, "frame 2 holds live credit");
+        assert!(!head_ok.load(&ctx, &keys).unwrap(), "EOF returns false");
+        assert_eq!(
+            head_ok.reader.buffer_capacity(),
+            0,
+            "EOF must release reader payload buffer"
+        );
+        assert!(head_ok._charge.is_none());
+        let live_after_eof = ctx.live_bytes();
+        assert_eq!(
+            live_before_eof - live_after_eof,
+            charged_before_eof,
+            "EOF must release exactly Head's entire live credit (reader + frame + keys)"
+        );
+        drop(head);
+        drop(head_ok);
+        ctx.release_work();
+    }
 }

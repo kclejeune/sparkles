@@ -82,9 +82,9 @@ impl DatasetSpec {
                 }
             }
         };
-        let filter_graphs = |graphs: Vec<Id>| -> Result<Vec<Id>> {
+        let filter_graphs = |graphs: &[Id]| -> Result<Vec<Id>> {
             let mut kept = Vec::with_capacity(graphs.len());
-            for g in graphs {
+            for &g in graphs {
                 if allowed(&g)? {
                     kept.push(g);
                 }
@@ -92,7 +92,7 @@ impl DatasetSpec {
             Ok(kept)
         };
         let union = || visible.to_vec();
-        self.default = match self.default.take() {
+        let new_default = match self.default.as_deref() {
             // every named graph is visible: the union of them all, with its fast paths
             None if every && (self.union_default || snap.union_default_graph) => None,
             _ if self.union_default => Some(union()),
@@ -102,14 +102,19 @@ impl DatasetSpec {
             None => Some(Vec::new()),
             Some(l) => Some(filter_graphs(l)?),
         };
-        if self.default.is_some() {
-            self.union_default = false;
-        }
-        self.named = match self.named.take() {
+        let new_union_default = if new_default.is_some() {
+            false
+        } else {
+            self.union_default
+        };
+        let new_named = match self.named.as_deref() {
             None if every => None,
             None => Some(union()),
             Some(l) => Some(filter_graphs(l)?),
         };
+        self.default = new_default;
+        self.union_default = new_union_default;
+        self.named = new_named;
         Ok(())
     }
 }
@@ -208,7 +213,7 @@ impl ValueCache {
             Value::Iri(a) | Value::BNode(a) | Value::Str(a) => text(a),
             Value::Lang(a, b) | Value::LangDir(a, b, _) => text(a) + text(b),
             Value::Other { lex, dt } => text(lex) + text(dt),
-            Value::Triple(t) => 64 + t.to_string().len() as u64,
+            Value::Triple(t) => 64 + super::graph_triple_bytes(t),
             _ => 0,
         };
         2 * (std::mem::size_of::<(Id, Value)>() as u64 + 1) + heap
@@ -1187,6 +1192,7 @@ enum ResourceRefusal {
     Cancelled,
     Timeout,
     UnconfiguredExtension,
+    Corrupt(String),
 }
 
 impl ResourceRefusal {
@@ -1195,6 +1201,7 @@ impl ResourceRefusal {
             Error::BudgetExceeded(budget) => Some(Self::Budget(*budget)),
             Error::Cancelled => Some(Self::Cancelled),
             Error::Timeout => Some(Self::Timeout),
+            Error::Corrupt(message) => Some(Self::Corrupt(message.clone())),
             error if super::extensions::is_unconfigured(error) => Some(Self::UnconfiguredExtension),
             Error::Component(component) => component
                 .source
@@ -1216,6 +1223,7 @@ impl ResourceRefusal {
             Self::Cancelled => Error::Cancelled,
             Self::Timeout => Error::Timeout,
             Self::UnconfiguredExtension => super::extensions::unconfigured(),
+            Self::Corrupt(message) => Error::Corrupt(message),
             Self::Parent {
                 component,
                 code,
@@ -1464,6 +1472,16 @@ impl Ctx {
     #[cfg(all(test, feature = "geo"))]
     pub(crate) fn live_bytes_for_tests(&self) -> u64 {
         self.live_bytes()
+    }
+
+    #[cfg(test)]
+    pub(super) fn decode_state_unlocked(&self) -> bool {
+        self.decode.state.try_lock().is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn intern_local_raw_for_test(&self, key: &[u8]) -> Id {
+        Id::local(self.local.write().insert(key).0)
     }
 
     /// The query's live estimate, from the ledger once it exists.
@@ -1942,7 +1960,7 @@ impl Ctx {
             return Err(Error::invalid("cursor context owner has not been attached"));
         }
         let charge = self.charge(bytes)?;
-        let id = charge.disarm();
+        let id = charge.into_disarmed();
         Ok(Some(RetainedCharge { owner, id, bytes }))
     }
 
@@ -2078,30 +2096,69 @@ impl Ctx {
         }
     }
 
-    /// Run an optional single-threaded planning estimator (such as FILTER selectivity
-    /// sampling) that may decline on a memory budget refusal without poisoning the query's
-    /// sticky failure latch. Pre-existing failures, cancellation, and timeout always
-    /// propagate and are never cleared.
-    pub(super) fn try_optional_memory_budget<T>(
+    /// Build a disposable trial context for optional planning estimation (such as FILTER
+    /// selectivity sampling) bounded by the remaining memory of `self`. All decode
+    /// envelopes, value caches, local terms, compiled regexes, and parsed geometries
+    /// live only on the trial context and are released when it drops.
+    fn sampling_trial(&self) -> Result<Arc<Ctx>> {
+        self.check()?;
+        let mut trial = Ctx::new(self.snap.clone());
+        trial.mem_limit = self.memory_remaining();
+        trial.set_grant(self.grant.clone());
+        if self.has_ledger() {
+            trial.set_memory_parent(self.memory_parent()?)?;
+            trial.enable_cursor_accounting()?;
+        }
+        trial.source_preparation = self.source_preparation.clone();
+        trial.read_source = self.read_source.clone();
+        trial.deadline = self.deadline;
+        trial.deadline_pause = self.deadline_pause.clone();
+        trial.cancel = self.cancel.clone();
+        trial.cancellation = self.cancellation.clone();
+        trial.dataset = self.dataset.clone();
+        trial.graphs = self.graphs.clone();
+        trial.base_iri = self.base_iri.clone();
+        if let Some(now) = self.now.get() {
+            let _ = trial.now.set(*now);
+        }
+        trial.opt = self.opt;
+        trial.aggregate_errors = self.aggregate_errors;
+        *trial.var_names.write() = self.var_names.read().clone();
+        let local_metadata = self.local.read().len().saturating_mul(64);
+        if !trial.retain_bytes(local_metadata) {
+            trial.check()?;
+        }
+        *trial.local.write() = self.local.read().clone();
+        trial
+            .next_bnode
+            .store(self.next_bnode.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(trial.into_shared())
+    }
+
+    /// Run an optional planning estimator on a disposable trial context so a declined
+    /// sample leaves zero decode-envelope, value-cache, local-term, regex, or geometry
+    /// state on `self`. Pre-existing failures, cancellation, and timeout always propagate.
+    pub(super) fn with_sampling_trial<T>(
         &self,
-        f: impl FnOnce() -> Result<Option<T>>,
+        f: impl FnOnce(&Ctx) -> Result<Option<T>>,
     ) -> Result<Option<T>> {
         self.check()?;
-        match f() {
-            Ok(v) => Ok(v),
+        let res = self.sampling_trial().and_then(|trial| {
+            let result = f(&trial).and_then(|value| {
+                trial.check()?;
+                Ok(value)
+            });
+            trial.release_work();
+            result
+        });
+        match res {
+            Ok(v) => {
+                self.check()?;
+                Ok(v)
+            }
             Err(Error::BudgetExceeded(b))
                 if matches!(b.kind, BudgetKind::Memory | BudgetKind::ServerMemory) =>
             {
-                let mut slot = self.memory_failure.failure.lock();
-                if matches!(
-                    slot.as_ref(),
-                    Some(ResourceRefusal::Budget(latched))
-                        if matches!(latched.kind, BudgetKind::Memory | BudgetKind::ServerMemory)
-                ) {
-                    *slot = None;
-                    self.memory_failure.failed.store(false, Ordering::Release);
-                }
-                drop(slot);
                 self.check()?;
                 Ok(None)
             }
@@ -2132,6 +2189,28 @@ impl Ctx {
         }
     }
 
+    #[inline]
+    fn decode_need(bytes: usize) -> u64 {
+        let workers = if rayon::current_thread_index().is_some() {
+            rayon::current_num_threads() as u64 + 1
+        } else {
+            1
+        };
+        (bytes as u64)
+            .saturating_mul(8)
+            .saturating_add(1024)
+            .saturating_mul(workers)
+    }
+
+    /// Lock-free check whether the decode envelope already covers `bytes` with no
+    /// latched failure. Used under vocabulary read locks so the hot path never
+    /// double-locks and the cold growth/refusal path always runs after unlocking.
+    #[inline]
+    fn decode_envelope_covers(&self, bytes: usize) -> bool {
+        !self.memory_failure.failed.load(Ordering::Acquire)
+            && self.decode.reserved.load(Ordering::Acquire) >= Self::decode_need(bytes)
+    }
+
     /// Admit transient decoding of a key of `bytes` bytes for an explicitly fallible
     /// operation. A refused sort trial can release its storage and try a smaller piece,
     /// so it must not poison the context as an infallible scalar evaluation would. The
@@ -2140,15 +2219,7 @@ impl Ctx {
     #[inline]
     pub(super) fn reserve_decode_checked(&self, bytes: usize) -> Result<()> {
         self.check_memory_failure()?;
-        let workers = if rayon::current_thread_index().is_some() {
-            rayon::current_num_threads() as u64 + 1
-        } else {
-            1
-        };
-        let need = (bytes as u64)
-            .saturating_mul(8)
-            .saturating_add(1024)
-            .saturating_mul(workers);
+        let need = Self::decode_need(bytes);
         if self.decode.reserved.load(Ordering::Acquire) >= need {
             return Ok(());
         }
@@ -2174,11 +2245,14 @@ impl Ctx {
     #[inline(never)]
     fn grow_decode(&self, need: u64) -> Result<()> {
         let envelope = &self.decode;
+        // A refused charge is dropped after the guard, since even an empty cursor
+        // charge can synchronously wake pool waiters.
+        let charge = self.charge(0)?;
         let mut state = envelope.state.lock();
         let (peak, owners) = &mut *state;
         if need > *peak {
             let delta = need - *peak;
-            let charge = self.charge(delta)?;
+            charge.add(delta)?;
             if let Some(id) = charge.disarm() {
                 if let Some((_, owned)) = owners.iter_mut().find(|(owner, _)| *owner == id) {
                     *owned += delta;
@@ -2190,6 +2264,7 @@ impl Ctx {
             envelope.reserved.store(need, Ordering::Release);
         }
         drop(state);
+        drop(charge);
         self.check_memory_failure()
     }
 
@@ -2210,15 +2285,20 @@ impl Ctx {
     /// decoding inside the envelope. A refusal records a failure and gives `None`.
     #[inline]
     fn with_vocab_key<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
+        let decode = |key: &[u8]| -> Result<Option<T>> {
+            id::validate_key_framing(key)?;
+            Ok(self.reserve_decode(key.len()).then(|| f(key)))
+        };
         if self.is_strict_decode() {
             return match self.snap.generation.vocab.get_with_controlled(
                 id,
                 |need| self.reserve_decode_checked(need),
                 |_| self.check(),
-                |key| self.reserve_decode(key.len()).then(|| f(key)),
+                decode,
             ) {
-                Ok(found) => found.flatten(),
-                Err(error) => {
+                Ok(Some(Ok(found))) => found,
+                Ok(None) => None,
+                Ok(Some(Err(error))) | Err(error) => {
                     self.fail_memory(&error);
                     None
                 }
@@ -2227,10 +2307,11 @@ impl Ctx {
         match self.snap.generation.vocab.get_with_checked(
             id,
             |need| self.reserve_decode_checked(need),
-            |key| self.reserve_decode(key.len()).then(|| f(key)),
+            decode,
         ) {
-            Ok(found) => found.flatten(),
-            Err(error) => {
+            Ok(Some(Ok(found))) => found,
+            Ok(None) => None,
+            Ok(Some(Err(error))) | Err(error) => {
                 self.fail_memory(&error);
                 None
             }
@@ -2759,32 +2840,120 @@ impl Ctx {
         }
     }
 
+    fn decode_local_infallible<T>(
+        &self,
+        payload: u64,
+        mut decode: impl FnMut(&[u8]) -> T,
+    ) -> Option<T> {
+        if self.is_strict_decode()
+            && let Err(error) = self.check()
+        {
+            self.fail_memory(&error);
+            return None;
+        }
+        enum Fast<T> {
+            Done(T),
+            NeedGrow(usize),
+            Corrupt(Error),
+        }
+        let fast = {
+            let local = self.local.read();
+            let key = local.get(payload)?;
+            if self.decode_envelope_covers(key.len()) {
+                match id::validate_key_framing(key) {
+                    Ok(()) => Fast::Done(decode(key)),
+                    Err(error) => Fast::Corrupt(error),
+                }
+            } else {
+                Fast::NeedGrow(key.len())
+            }
+        };
+        match fast {
+            Fast::Done(val) => Some(val),
+            Fast::Corrupt(error) => {
+                self.fail_memory(&error);
+                None
+            }
+            Fast::NeedGrow(len) => {
+                if !self.reserve_decode(len) {
+                    return None;
+                }
+                let res = {
+                    let local = self.local.read();
+                    let key = local.get(payload)?;
+                    id::validate_key_framing(key).map(|()| decode(key))
+                };
+                match res {
+                    Ok(val) => Some(val),
+                    Err(error) => {
+                        self.fail_memory(&error);
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    fn decode_delta_infallible<T>(
+        &self,
+        payload: u64,
+        mut decode: impl FnMut(&[u8]) -> T,
+    ) -> Option<T> {
+        if payload >= self.snap.dvocab_len {
+            return None;
+        }
+        if self.is_strict_decode()
+            && let Err(error) = self.check()
+        {
+            self.fail_memory(&error);
+            return None;
+        }
+        enum Fast<T> {
+            Done(T),
+            NeedGrow(usize),
+            Corrupt(Error),
+        }
+        let fast = self.snap.generation.dvocab.with(|vocab| {
+            let key = vocab.get(payload)?;
+            Some(if self.decode_envelope_covers(key.len()) {
+                match id::validate_key_framing(key) {
+                    Ok(()) => Fast::Done(decode(key)),
+                    Err(error) => Fast::Corrupt(error),
+                }
+            } else {
+                Fast::NeedGrow(key.len())
+            })
+        })?;
+        match fast {
+            Fast::Done(val) => Some(val),
+            Fast::Corrupt(error) => {
+                self.fail_memory(&error);
+                None
+            }
+            Fast::NeedGrow(len) => {
+                if !self.reserve_decode(len) {
+                    return None;
+                }
+                let res = self.snap.generation.dvocab.with(|vocab| {
+                    let key = vocab.get(payload)?;
+                    Some(id::validate_key_framing(key).map(|()| decode(key)))
+                })?;
+                match res {
+                    Ok(val) => Some(val),
+                    Err(error) => {
+                        self.fail_memory(&error);
+                        None
+                    }
+                }
+            }
+        }
+    }
+
     pub fn term(&self, id: Id) -> Option<Term> {
         match id.tag() {
-            Tag::Local => {
-                if self.is_strict_decode() && self.check().is_err() {
-                    return None;
-                }
-                let local = self.local.read();
-                let key = local.get(id.payload())?;
-                self.reserve_decode(key.len())
-                    .then(|| copied_output_key(key))
-            }
+            Tag::Local => self.decode_local_infallible(id.payload(), copied_output_key),
             Tag::Vocab => self.with_vocab_key(id.payload(), copied_output_key),
-            Tag::Delta => {
-                if id.payload() >= self.snap.dvocab_len {
-                    return None;
-                }
-                if self.is_strict_decode() && self.check().is_err() {
-                    return None;
-                }
-                self.snap.generation.dvocab.with(|vocab| {
-                    vocab.get(id.payload()).and_then(|key| {
-                        self.reserve_decode(key.len())
-                            .then(|| copied_output_key(key))
-                    })
-                })
-            }
+            Tag::Delta => self.decode_delta_infallible(id.payload(), copied_output_key),
             Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
             _ => self.snap.term(id),
         }
@@ -2807,7 +2976,12 @@ impl Ctx {
         match id.tag() {
             Tag::Undef | Tag::Special => Ok(None),
             Tag::Local => {
-                let len = self.local.read().get(id.payload()).map(<[u8]>::len);
+                let len = self
+                    .local
+                    .read()
+                    .get(id.payload())
+                    .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                    .transpose()?;
                 let Some(len) = len else {
                     return Ok(None);
                 };
@@ -2816,6 +2990,7 @@ impl Ctx {
                 Ok(self.local.read().get(id.payload()).map(copied_output_key))
             }
             Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| {
+                id::validate_key_framing(key)?;
                 credit.add(Self::checked_decode_bytes(key.len()))?;
                 self.check()?;
                 Ok(copied_output_key(key))
@@ -2828,7 +3003,12 @@ impl Ctx {
                     .snap
                     .generation
                     .dvocab
-                    .with(|vocab| vocab.get(id.payload()).map(<[u8]>::len));
+                    .with(|vocab| {
+                        vocab
+                            .get(id.payload())
+                            .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                    })
+                    .transpose()?;
                 let Some(len) = len else {
                     return Ok(None);
                 };
@@ -2858,7 +3038,7 @@ impl Ctx {
     /// budget, propagating any memory or control refusal with its original error instead
     /// of returning `None`. Callers that retain or decode multiple terms together should
     /// pass a live [`Charge`] to [`Ctx::term_checked_into`].
-    pub(crate) fn term_checked(&self, id: Id) -> Result<Option<Term>> {
+    pub fn term_checked(&self, id: Id) -> Result<Option<Term>> {
         let decode = self.charge(0)?;
         self.term_checked_into(id, &decode)
     }
@@ -2896,6 +3076,7 @@ impl Ctx {
                 }
                 let v = match id.tag() {
                     Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| {
+                        id::validate_key_framing(key)?;
                         credit.add(Self::checked_decode_bytes(key.len()))?;
                         self.check()?;
                         Ok(decode_value_key(key))
@@ -2908,7 +3089,11 @@ impl Ctx {
                             .snap
                             .generation
                             .dvocab
-                            .with(|v| v.get(id.payload()).map(<[u8]>::len));
+                            .with(|v| {
+                                v.get(id.payload())
+                                    .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                            })
+                            .transpose()?;
                         match len {
                             Some(len) => {
                                 credit.add(Self::checked_decode_bytes(len))?;
@@ -2922,7 +3107,12 @@ impl Ctx {
                         }
                     }
                     Tag::Local => {
-                        let len = self.local.read().get(id.payload()).map(<[u8]>::len);
+                        let len = self
+                            .local
+                            .read()
+                            .get(id.payload())
+                            .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                            .transpose()?;
                         match len {
                             Some(len) => {
                                 credit.add(Self::checked_decode_bytes(len))?;
@@ -3467,6 +3657,7 @@ impl Ctx {
                     return Ok(Some(value));
                 }
                 self.with_controlled_vocab_key(id.payload(), |key| {
+                    id::validate_key_framing(key)?;
                     self.reserve_decode_checked(key.len())?;
                     self.check()?;
                     Ok(decode_value_key(key))
@@ -3480,7 +3671,11 @@ impl Ctx {
                     .snap
                     .generation
                     .dvocab
-                    .with(|v| v.get(id.payload()).map(<[u8]>::len));
+                    .with(|v| {
+                        v.get(id.payload())
+                            .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                    })
+                    .transpose()?;
                 let Some(len) = len else {
                     return Ok(None);
                 };
@@ -3493,7 +3688,12 @@ impl Ctx {
                     .with(|v| v.get(id.payload()).map(decode_value_key)))
             }
             Tag::Local => {
-                let len = self.local.read().get(id.payload()).map(<[u8]>::len);
+                let len = self
+                    .local
+                    .read()
+                    .get(id.payload())
+                    .map(|key| id::validate_key_framing(key).map(|()| key.len()))
+                    .transpose()?;
                 let Some(len) = len else {
                     return Ok(None);
                 };
@@ -3525,30 +3725,10 @@ impl Ctx {
                 if let Some(v) = self.values.get(id) {
                     return Some(v);
                 }
-                let decode = |key: &[u8]| {
-                    self.reserve_decode(key.len())
-                        .then(|| decode_value_key(key))
-                };
                 let v = match id.tag() {
                     Tag::Vocab => self.with_vocab_key(id.payload(), decode_value_key),
-                    Tag::Delta => {
-                        if id.payload() >= self.snap.dvocab_len {
-                            return None;
-                        }
-                        if self.is_strict_decode() && self.check().is_err() {
-                            return None;
-                        }
-                        self.snap
-                            .generation
-                            .dvocab
-                            .with(|v| v.get(id.payload()).and_then(decode))
-                    }
-                    Tag::Local => {
-                        if self.is_strict_decode() && self.check().is_err() {
-                            return None;
-                        }
-                        self.local.read().get(id.payload()).and_then(decode)
-                    }
+                    Tag::Delta => self.decode_delta_infallible(id.payload(), decode_value_key),
+                    Tag::Local => self.decode_local_infallible(id.payload(), decode_value_key),
                     _ => unreachable!("dictionary value tag"),
                 }?;
                 self.cache_value(id, &v);
@@ -3603,7 +3783,7 @@ impl Ctx {
     /// bytes. A small budget takes small steps, so that the slack of the steps never
     /// holds more than a sixty-fourth of it.
     #[inline]
-    pub(super) fn reservation_step(&self) -> u64 {
+    pub(crate) fn reservation_step(&self) -> u64 {
         (self.mem_limit / 64).clamp(256, EAGER_STEP)
     }
 
@@ -4131,7 +4311,7 @@ impl Charge<'_> {
             .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
         let owner = self.owner.get().or(part.owner.get());
         let part = source.take().expect("checked live input credit");
-        part.disarm();
+        part.into_disarmed();
         self.owner.set(owner);
         self.bytes.set(bytes);
         Ok(())
@@ -4164,9 +4344,29 @@ impl Charge<'_> {
         self.bytes.set(owned);
         Ok(())
     }
+    /// Grow the charge to cover `bytes`, `step` bytes ahead when the budget and the pool
+    /// allow it and exactly otherwise.
+    pub(crate) fn cover(&self, bytes: u64, step: u64) -> Result<()> {
+        let current = self.bytes.get();
+        if bytes <= current {
+            return Ok(());
+        }
+        match self.add(bytes.saturating_add(step).saturating_sub(current)) {
+            Err(Error::BudgetExceeded(_)) if step > 0 => self.add(bytes - current),
+            result => result,
+        }
+    }
     fn disarm(&self) -> Option<u64> {
         self.bytes.set(0);
         self.owner.take()
+    }
+    /// Transfer this charge's ownership without running `Drop` (and without invoking
+    /// `trim_zero` or pool wakers when nothing was released).
+    fn into_disarmed(self) -> Option<u64> {
+        let owner = self.owner.take();
+        self.bytes.set(0);
+        std::mem::forget(self);
+        owner
     }
     /// Transfer this already admitted physical allocation to an immutable output.
     /// The receiving context is the actual account owner, not a domain token.
@@ -4176,7 +4376,7 @@ impl Charge<'_> {
             "output account owner"
         );
         let bytes = self.bytes.get();
-        let owner = self.disarm();
+        let owner = self.into_disarmed();
         OutputCredit {
             ctx: ctx.clone(),
             owner,
@@ -4187,7 +4387,7 @@ impl Charge<'_> {
 
     /// Move query-only input ownership into the returned backing without a release
     /// interval. Existing nonalgorithm kernels retain their estimate policy.
-    pub(super) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
+    pub(crate) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
         if bytes > self.bytes.get() {
             self.add(bytes - self.bytes.get())?;
         } else {
@@ -4329,7 +4529,7 @@ impl OutputCredit {
             .checked_add(part.bytes.get())
             .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
         let part = slot.take().expect("validated worker credit");
-        let owner = part.disarm();
+        let owner = part.into_disarmed();
         self.owner = self.owner.or(owner);
         self.bytes = bytes;
         Ok(())
@@ -4367,8 +4567,7 @@ impl OutputCredit {
         };
         let result = held.resize(bytes);
         let bytes = held.bytes();
-        let owner = held.disarm();
-        drop(held);
+        let owner = held.into_disarmed();
         self.bytes = bytes;
         self.owner = owner;
         result
@@ -4436,7 +4635,7 @@ impl RetainedCharge {
                 owner: std::cell::Cell::new(self.id),
             };
             charge.add(bytes - self.bytes)?;
-            self.id = charge.disarm();
+            self.id = charge.into_disarmed();
         } else {
             ctx.release_live(self.id, self.bytes - bytes);
         }
@@ -4480,7 +4679,7 @@ impl RetainedCharge {
     /// charge, without releasing and charging them again.
     pub(super) fn absorb(&mut self, part: Charge<'_>) {
         let bytes = part.bytes.get();
-        let id = part.disarm();
+        let id = part.into_disarmed();
         if bytes == 0 {
             return;
         }
@@ -4565,7 +4764,7 @@ impl OwnedCharge {
             .checked_add(held.bytes())
             .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
         let held = source.take().expect("validated graph payload");
-        held.disarm();
+        held.into_disarmed();
         self.lease.bytes = bytes;
         Ok(())
     }

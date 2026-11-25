@@ -183,6 +183,11 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
 
 ### Planning and execution
 
+* Eager and streaming operators charge for decoding vocabulary values. A refused
+  decode fails the request with its memory budget error. An optional FILTER sample
+  that cannot fit releases its working memory and leaves the planner to estimate
+  the filter from its usual defaults.
+
 * The planner estimates joins from statistics that a bulk load or compaction counts:
   the characteristic sets of subjects and of nodes over both directions, each with a
   remainder for the nodes outside the 32,768 sets kept, and key probes of small inputs.

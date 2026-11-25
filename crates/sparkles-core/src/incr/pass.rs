@@ -701,3 +701,44 @@ fn scan_prefix(s: Option<Id>, p: Option<Id>, o: Option<Id>, g: GraphSel) -> (Per
         (None, None, None, GraphSel::Named) => (Perm::Spo, vec![]),
     }
 }
+
+#[cfg(test)]
+#[test]
+fn pass_refuses_decoding_a_locally_bound_result() {
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::Literal;
+
+    let snap = Store::in_memory(StoreOptions::default()).snapshot();
+    let vis = Vis::new(None, &snap);
+    let control = Control::none();
+    let vars = ["value".to_owned()];
+    let expression = Expression::Variable(Variable::new_unchecked("value"));
+    let mut terms = Terms::default();
+    for (value, fits) in [("small".to_owned(), true), ("x".repeat(8 << 10), false)] {
+        let term = Term::Literal(Literal::new_simple_literal(value));
+        let id = terms.intern(&snap, &term);
+        assert_eq!(id.tag(), Tag::Local);
+        let row = [id];
+        let mut pass = Pass::new(
+            snap.clone(),
+            None,
+            &[],
+            &[],
+            &mut terms,
+            &vis,
+            None,
+            &control,
+            &vars,
+        );
+        pass.max_memory_bytes = Some(24 << 10);
+        let result = pass.eval(&[0], &[&row], &expression, false);
+        if fits {
+            assert_eq!(result.unwrap(), vec![Some(id)]);
+        } else {
+            assert!(
+                matches!(result, Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory),
+                "{result:?}"
+            );
+        }
+    }
+}

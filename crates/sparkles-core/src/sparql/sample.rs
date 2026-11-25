@@ -66,14 +66,13 @@ const WHOLE_RANGE: u64 = 4096;
 /// Measure the selectivity of the conjuncts in `filters` that one triple pattern of the
 /// group binds (`leaves` are the patterns' access paths), keeping it in the query's
 /// context for the planner.
-pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) {
-    if leaves.iter().any(|l| matches!(l[0].kind, Kind::Empty)) || ctx.check().is_err() {
-        return;
+pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) -> Result<()> {
+    ctx.check()?;
+    if leaves.iter().any(|l| matches!(l[0].kind, Kind::Empty)) {
+        return Ok(());
     }
     for f in filters {
-        if ctx.check().is_err() {
-            return;
-        }
+        ctx.check()?;
         if f.has_exists() {
             continue;
         }
@@ -104,20 +103,22 @@ pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) {
             })
             .min_by_key(|s| s.cols.first().is_some_and(|(_, v)| vars.contains(v)));
         let Some(spec) = spec else { continue };
-        match ctx.try_optional_memory_budget(|| selectivity(ctx, spec, f, &vars, &text)) {
+        match ctx.with_sampling_trial(|trial| selectivity(trial, spec, f, &vars, &text)) {
             Ok(Some(s)) => ctx.set_sampled(text, s),
             Ok(None) => {}
             Err(e) => {
+                ctx.check()?;
                 tracing::debug!(target: "sparkles::sparql::sample", "no sampled selectivity for {text}: {e}");
                 if matches!(
                     e,
                     crate::error::Error::Cancelled | crate::error::Error::Timeout
                 ) {
-                    return;
+                    return Err(e);
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// The selectivity of `f` (with variables `vars`, shown as `text`) on a sample of the

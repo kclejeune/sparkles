@@ -1052,8 +1052,17 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
     let ev = |i: usize| eval(args.get(i).ok_or(TypeError)?, row, ctx);
     let term = |i: usize| -> EvalResult<Term> { term_of(ev(i)?, ctx) };
     let n = args.len();
-    let list = |l: &[Elem]| Ok(Val::V(list_value(l)));
-    let map = |m: &[(Term, Elem)]| Ok(Val::V(map_value(m)));
+    let admit_value = |v: Value| -> EvalResult<Val> {
+        if let Value::Other { ref lex, .. } = v
+            && !ctx.reserve_decode(lex.len())
+        {
+            drop(v);
+            return Err(TypeError);
+        }
+        Ok(Val::V(v))
+    };
+    let list = |l: &[Elem]| admit_value(list_value(l));
+    let map = |m: &[(Term, Elem)]| admit_value(map_value(m));
     let arity = |lo: usize, hi: usize| {
         if (lo..=hi).contains(&n) {
             Ok(())
@@ -1127,7 +1136,11 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         },
         "contains" => {
             arity(2, 2)?;
-            let l = list_arg(&term(0)?)?;
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
+            let l = list_arg(&term_of_into(ev(0)?, ctx, &decode)?)?;
             let x = ev(1)?;
             let id = x.clone().into_id(ctx);
             if ctx.has_memory_failure() {
@@ -1157,11 +1170,17 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                     Elem::Null => {}
                 }
             }
+            drop((l, x));
+            drop(decode);
             Ok(Val::Id(crate::id::Id::from_bool(found)))
         }
         "containsTerm" => {
             arity(2, 2)?;
-            let l = list_arg(&term(0)?)?;
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
+            let l = list_arg(&term_of_into(ev(0)?, ctx, &decode)?)?;
             let id = ev(1)?.into_id(ctx);
             if ctx.has_memory_failure() {
                 return Err(TypeError);
@@ -1179,22 +1198,34 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                     }
                 }
             }
+            drop(l);
+            drop(decode);
             Ok(Val::Id(crate::id::Id::from_bool(found)))
         }
         "containsKey" => {
             arity(2, 2)?;
-            let m = map_arg(&term(0)?)?;
-            let key = match term(1) {
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
+            let m = map_arg(&term_of_into(ev(0)?, ctx, &decode)?)?;
+            let key = match ev(1).and_then(|v| term_of_into(v, ctx, &decode)) {
                 Ok(t) => key_of(t),
                 Err(_) if ctx.has_memory_failure() => return Err(TypeError),
                 Err(_) => None,
             };
             let found = key.is_some_and(|k| map_get(&m, &k).is_some());
+            drop(m);
+            drop(decode);
             Ok(Val::Id(crate::id::Id::from_bool(found)))
         }
         "get" => {
             arity(2, 2)?;
-            let t = term(0)?;
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
+            let t = term_of_into(ev(0)?, ctx, &decode)?;
             match &t {
                 Term::Literal(l) if l.datatype().as_str() == LIST => {
                     let i = integer(&ev(1)?.value(ctx)?)?;
@@ -1205,7 +1236,7 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                     elem_val(&l[i as usize - 1], ctx)
                 }
                 Term::Literal(l) if l.datatype().as_str() == MAP => {
-                    let k = key_of(term(1)?).ok_or(TypeError)?;
+                    let k = key_of(term_of_into(ev(1)?, ctx, &decode)?).ok_or(TypeError)?;
                     let m = parse_map(l.value()).ok_or(TypeError)?;
                     elem_val(map_get(&m, &k).ok_or(TypeError)?, ctx)
                 }
@@ -1278,9 +1309,13 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         "remove" => {
             arity(2, 2)?;
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
             let v1 = ev(0)?;
-            let mut m = map_arg(&term_of(v1.clone(), ctx)?)?;
-            let k = match ev(1).and_then(|v| term_of(v, ctx)) {
+            let mut m = map_arg(&term_of_into(v1.clone(), ctx, &decode)?)?;
+            let k = match ev(1).and_then(|v| term_of_into(v, ctx, &decode)) {
                 Ok(t) => match key_of(t) {
                     Some(k) => k,
                     None => return Ok(v1),

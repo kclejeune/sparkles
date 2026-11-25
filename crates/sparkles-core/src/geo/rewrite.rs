@@ -271,9 +271,24 @@ impl<'a> Relate<'a> {
             return Ok(cached.clone());
         }
         let g = super::memo::by_id_checked(self.ctx, lit)?;
-        self.geoms_charge.add(64)?;
+        let bytes = g
+            .as_ref()
+            .map_or(64, |g| (g.mem_size() as u64).saturating_add(64));
+        self.geoms_charge.add(bytes)?;
         self.geoms.insert(lit, g.clone());
         Ok(g)
+    }
+
+    /// Keep the geometry itself when a search's charged column entry is temporary.
+    fn retain_hit(&mut self, hit: &search::Hit) -> Result<()> {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.geoms.entry(hit.o)
+            && let Ok(g) = super::memo::noted(self.ctx, hit.entry.geom(&self.ctx.snap))
+        {
+            self.geoms_charge
+                .add((g.mem_size() as u64).saturating_add(64))?;
+            entry.insert(Some(g));
+        }
+        Ok(())
     }
 
     /// The serialization rows of geometry `s`.
@@ -380,29 +395,17 @@ impl<'a> Relate<'a> {
         let ctx = self.ctx;
         if search::indexed(&ctx.snap, &self.preds).is_some() {
             // the index's geometries, so that only the literals it leaves out are parsed
-            let mut known: Vec<(Id, GeomRef)> = Vec::new();
             let mut st = SearchStats::default();
-            search::window_with(
-                ctx,
-                &self.preds,
-                &[WORLD],
-                &self.spec.graph,
-                false,
-                &mut st,
-                &mut |hits| {
-                    for h in hits {
-                        if let Ok(g) = super::memo::noted(ctx, h.entry.geom(&ctx.snap)) {
-                            known.push((h.o, g));
-                        }
-                    }
-                    Ok(())
-                },
-            )?;
+            let preds = self.preds.clone();
+            let graph = self.spec.graph.clone();
+            search::window_with(ctx, &preds, &[WORLD], &graph, false, &mut st, &mut |hits| {
+                for h in hits {
+                    self.retain_hit(h)?;
+                }
+                Ok(())
+            })?;
             self.st.nodes += st.nodes;
             self.st.rechecked += st.rechecked;
-            for (o, g) in known {
-                self.geoms.entry(o).or_insert(Some(g));
-            }
         } else {
             self.st.fallback = true;
         }
@@ -441,35 +444,23 @@ impl<'a> Relate<'a> {
         match window {
             Some(w) if search::indexed(&ctx.snap, &self.preds).is_some() => {
                 let mut rows = Vec::new();
-                let mut found: Vec<(Id, GeomRef)> = Vec::new();
                 let mut st = SearchStats::default();
-                search::window_with(
-                    ctx,
-                    &self.preds,
-                    &[w],
-                    &self.spec.graph,
-                    false,
-                    &mut st,
-                    &mut |hits| {
-                        for h in hits {
-                            rows.push(Ser {
-                                s: h.s,
-                                o: h.o,
-                                g: h.g,
-                            });
-                            if let Ok(g) = super::memo::noted(ctx, h.entry.geom(&ctx.snap)) {
-                                found.push((h.o, g));
-                            }
-                        }
-                        Ok(())
-                    },
-                )?;
+                let preds = self.preds.clone();
+                let graph = self.spec.graph.clone();
+                search::window_with(ctx, &preds, &[w], &graph, false, &mut st, &mut |hits| {
+                    for h in hits {
+                        rows.push(Ser {
+                            s: h.s,
+                            o: h.o,
+                            g: h.g,
+                        });
+                        self.retain_hit(h)?;
+                    }
+                    Ok(())
+                })?;
                 self.st.candidates += st.candidates;
                 self.st.nodes += st.nodes;
                 self.st.rechecked += st.rechecked;
-                for (o, g) in found {
-                    self.geoms.entry(o).or_insert(Some(g));
-                }
                 Ok(rows)
             }
             // an empty geometry meets nothing

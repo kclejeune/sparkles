@@ -18,7 +18,7 @@
 //! them.
 
 use super::GeomRef;
-use super::column::{Slot, classify};
+use super::column::{Slot, classify_controlled};
 use super::exec::{Counters, config, state};
 use super::geom::Geom;
 use super::ops::in_crs;
@@ -294,8 +294,9 @@ fn rows_without_distance(
         op_vertices: ctx.geo.op_vertices(),
         crs: FxHashMap::default(),
     };
-    let mut rechecked = Rechecked::new(ctx);
+    let mut rechecked = Rechecked::new(ctx)?;
     // literal → whether its distance is an error
+    let memo_charge = ctx.charge(0)?;
     let mut memo: FxHashMap<u64, bool> = FxHashMap::default();
     let mut out = Vec::new();
     let mut last: Option<[u64; 3]> = None;
@@ -332,19 +333,21 @@ fn rows_without_distance(
             let is_bad = if !matches!(o.tag(), Tag::Vocab | Tag::Delta) {
                 true
             } else {
+                let parse_charge = ctx.charge(0)?;
                 let slot = match base.as_ref().and_then(|b| b.column.get(o.0)) {
                     Some(slot) => slot,
-                    None => ctx
-                        .with_controlled_key(o, |key| Ok(classify(key, &cfg)))?
-                        .unwrap_or(Slot::Other),
+                    None => classify_controlled(ctx, o, &cfg, false, &parse_charge)?,
                 };
                 let geom = match slot {
                     Slot::Geom(e) => e.geom(snap).ok(),
                     s if s.rechecked() => rechecked.entry(o.0)?.and_then(|e| e.geom(snap).ok()),
                     _ => None,
                 };
-                geom.is_none_or(|g| !test.measurable(&g))
+                let bad = geom.is_none_or(|g| !test.measurable(&g));
+                drop(parse_charge);
+                bad
             };
+            memo_charge.add(32)?;
             memo.insert(o.0, is_bad);
             is_bad
         };

@@ -59,10 +59,23 @@ impl Slots {
 struct Offer<'a> {
     slots: &'a mut Slots,
     table: &'a crate::sparql::table::Table,
+    charge: &'a mut OwnedCharge,
+    keys_len: usize,
+    step: u64,
+    base_entries: usize,
 }
 
 impl HeapRows<u32> for Offer<'_> {
     fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<u32> {
+        let added = keys.iter().map(SortKey::payload_bytes).sum::<u64>();
+        let next_key_bytes = self.slots.key_bytes.saturating_add(added);
+        let need = 1024
+            + self
+                .slots
+                .bytes(self.base_entries, self.keys_len)
+                .saturating_sub(self.slots.key_bytes)
+            + next_key_bytes;
+        self.charge.cover(need, self.step)?;
         let w = self.slots.width();
         let slot = match self.slots.free.pop() {
             Some(slot) => slot,
@@ -76,19 +89,17 @@ impl HeapRows<u32> for Offer<'_> {
         for (j, col) in self.slots.batch.iter().enumerate() {
             self.slots.ids[at + j] = col.map_or(Id::UNDEF, |c| self.table.cols[c][i]);
         }
-        self.slots.key_bytes = self
-            .slots
-            .key_bytes
-            .saturating_add(keys.iter().map(SortKey::payload_bytes).sum::<u64>());
+        self.slots.key_bytes = next_key_bytes;
         Ok(slot)
     }
 
     fn release(&mut self, entry: Entry<u32>) -> Result<()> {
-        self.slots.key_bytes = self
-            .slots
-            .key_bytes
-            .saturating_sub(entry.keys.iter().map(SortKey::payload_bytes).sum::<u64>());
-        self.slots.free.push(entry.payload);
+        let freed = entry.keys.iter().map(SortKey::payload_bytes).sum::<u64>();
+        let slot = entry.payload;
+        // Drop evicted sort keys before shrinking key_bytes / credit.
+        drop(entry);
+        self.slots.key_bytes = self.slots.key_bytes.saturating_sub(freed);
+        self.slots.free.push(slot);
         Ok(())
     }
 }
@@ -182,10 +193,15 @@ impl TopK {
             let used = slots.ids.len() / width.max(1);
             let room = (heap.k().saturating_add(1).saturating_sub(used)).min(table.len);
             slots.ids.reserve(room * width);
-            charge.resize(1024 + slots.bytes(heap.kept() + room, keys.len()))?;
+            let base_entries = heap.kept() + room;
+            charge.resize(1024 + slots.bytes(base_entries, keys.len()))?;
             let mut rows = Offer {
                 slots: &mut *slots,
                 table,
+                charge,
+                keys_len: keys.len(),
+                step: ctx.reservation_step(),
+                base_entries,
             };
             exec::offer_rows(ctx, heap, table, keys, &mut report, &mut rows)?;
             charge.resize(1024 + slots.bytes(heap.kept(), keys.len()))?;

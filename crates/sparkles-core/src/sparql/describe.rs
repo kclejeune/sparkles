@@ -19,7 +19,7 @@
 //! (`?r rdf:subject s ; rdf:predicate p ; rdf:object o`). Options add the labels of the
 //! IRIs the description links to, and bound its depth and its size.
 
-use super::ctx::{Charge, Ctx, OutputCredit, PlanWarning, RetainedCharge, TermKind};
+use super::ctx::{Charge, Ctx, OutputCredit, OwnedCharge, PlanWarning, RetainedCharge, TermKind};
 use super::plan::GraphFilter;
 use super::table::Table;
 use crate::error::{Error, Result};
@@ -348,9 +348,13 @@ struct Describer<'a> {
     bytes: u64,
     /// the triples earlier batches of a streamed DESCRIBE returned
     emitted: u64,
-    /// The bytes of `bytes` that the output and the queue hold, which a streamed
-    /// DESCRIBE releases once it hands its batch on, keeping only the traversal state.
+    /// The bytes of `bytes` that the queue holds, which a streamed DESCRIBE releases once
+    /// it hands its batch on, keeping only the traversal state.
     transient: u64,
+    /// Dedicated credit for `out` during streamed `describe_batch`, transferred intact to
+    /// the graph cursor without any zero-credit release gap.
+    out_charge: Option<OwnedCharge>,
+    out_bytes: u64,
 }
 
 /// Where a description reads: the graphs of the dataset and the reification
@@ -511,20 +515,30 @@ impl Streamed {
     }
 }
 
+/// One batch of triples from a streamed DESCRIBE together with the live credit covering
+/// them. `triples` is declared before `charge` so triples always drop before their credit.
+pub(super) struct DescribedBatch {
+    pub(super) triples: Vec<Triple>,
+    pub(super) charge: OwnedCharge,
+}
+
 /// The triples that describe the resources of the solutions `t` that no earlier batch
 /// named, after those that earlier batches returned. `last` says that no batch follows,
 /// so the labels of the linked IRIs come last. Only a cursor streams a DESCRIBE, and the
 /// state it keeps holds a retained charge.
 pub(super) fn describe_batch(
-    ctx: &Ctx,
+    ctx: &Arc<Ctx>,
     t: &Table,
     opts: &DescribeOptions,
     explicit: bool,
     state: &mut Streamed,
     last: bool,
-) -> Result<Vec<Triple>> {
+) -> Result<DescribedBatch> {
     if state.truncated {
-        return Ok(Vec::new());
+        return Ok(DescribedBatch {
+            triples: Vec::new(),
+            charge: OwnedCharge::new(ctx, 0)?,
+        });
     }
     let setup = match &state.setup {
         Some(setup) => setup.clone(),
@@ -544,6 +558,7 @@ pub(super) fn describe_batch(
                 .ok_or_else(|| Error::invalid("a streamed DESCRIBE runs in a cursor"))?
         }
     };
+    let out_charge = OwnedCharge::new(ctx, 0)?;
     let mut d = Describer {
         ctx,
         opts,
@@ -566,6 +581,8 @@ pub(super) fn describe_batch(
         bytes: state.bytes,
         emitted: state.emitted,
         transient: 0,
+        out_charge: Some(out_charge),
+        out_bytes: 0,
     };
     // the resources this batch added, in the set of described resources
     let added = (state.described.len() - before) as u64 * 48;
@@ -581,15 +598,25 @@ pub(super) fn describe_batch(
     state.linked = std::mem::take(&mut d.linked);
     state.truncated = d.truncated;
     state.emitted = d.emitted.saturating_add(d.out.len() as u64);
-    // The triples go to the caller, which charges them itself, and the queue is empty.
+    // The queue may still contain work on truncation or refusal. Free its allocation
+    // before returning its credit. The triples carry their own credit to the cursor.
+    drop(std::mem::take(&mut d.queue));
     state.bytes = d.bytes.saturating_sub(d.transient).max(4096);
     let DescriptionCharge { inner, .. } = d.charge;
     if let DescriptionChargeKind::Cursor(mut charge) = inner {
         let _ = charge.resize(state.bytes);
         state.charge = Some(charge);
     }
-    result?;
-    Ok(d.out)
+    if let Err(err) = result {
+        // Drop partial triples before their `out_charge`.
+        drop(d.out);
+        drop(d.out_charge);
+        return Err(err);
+    }
+    Ok(DescribedBatch {
+        triples: d.out,
+        charge: d.out_charge.expect("streamed DESCRIBE batch charge"),
+    })
 }
 
 /// Describe the IRIs and blank nodes of the solutions `t`. `explicit` says whether the
@@ -625,6 +652,8 @@ pub(super) fn describe<'a>(
         bytes: 4096,
         emitted: 0,
         transient: 0,
+        out_charge: None,
+        out_bytes: 0,
     };
     d.describe_all(resources, true)?;
     if d.truncated {
@@ -852,8 +881,14 @@ impl<'a> Describer<'a> {
             // envelope so `Described::into_output` never exceeds its original admission.
             let slot_envelope = (std::mem::size_of::<Triple>() as u64).saturating_mul(2);
             let bytes = payload.saturating_add(slot_envelope);
-            self.reserve(bytes)?;
-            self.transient = self.transient.saturating_add(bytes);
+            if let Some(out_charge) = &mut self.out_charge {
+                let next = self.out_bytes.saturating_add(bytes);
+                out_charge.resize(next)?;
+                self.out_bytes = next;
+            } else {
+                self.reserve(bytes)?;
+                self.transient = self.transient.saturating_add(bytes);
+            }
             self.out.push(triple);
         }
         drop(decode);

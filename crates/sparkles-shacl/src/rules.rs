@@ -409,7 +409,7 @@ impl RuleData {
                 let Some(&(_, col)) = all.iter().find(|(n, _)| n == name) else {
                     return Ok(None);
                 };
-                match Engine::fresh_result_term(&ctx, table.get(row, col), &tag) {
+                match Engine::fresh_result_term(&ctx, table.get(row, col), &tag)? {
                     Some(t) => Ok(Some(self.node(self.data.resolve_shared(&t, true))?)),
                     None => Ok(None),
                 }

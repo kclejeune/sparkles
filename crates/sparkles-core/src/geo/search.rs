@@ -13,7 +13,7 @@
 //! With `"wgs84": true`, searching the `wgs84_pos:lat` predicate finds the W3C Basic Geo
 //! points (rows whose object is a point's id, see [`super::wgs84`]), indexed or scanned.
 
-use super::column::{Column, ColumnEntry, Slot, classify, recheck};
+use super::column::{Column, ColumnEntry, Slot, classify_controlled, slot_bytes};
 use super::config::GeoConfig;
 use super::geom::Geom;
 use super::index::{GeoBase, GeoView, Row, intersects};
@@ -22,7 +22,7 @@ use super::tree::{PackedTree, Tree};
 use crate::error::Result;
 use crate::id::{Id, Tag};
 use crate::index::Perm;
-use crate::sparql::ctx::Ctx;
+use crate::sparql::ctx::{Charge, Ctx};
 use crate::sparql::plan::GraphFilter;
 use crate::store::{Chunk, Snapshot};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -70,16 +70,19 @@ pub struct SearchStats {
 }
 
 /// The geometries of skipped literals that searches hand out anyway, parsed once per
-/// search.
+/// search. `_charge` is declared last so `memo` drops before its retained credit.
 pub(crate) struct Rechecked<'a> {
     ctx: &'a Ctx,
     cfg: Arc<GeoConfig>,
     memo: FxHashMap<u64, Option<Arc<ColumnEntry>>>,
+    bytes: u64,
+    step: u64,
+    _charge: Charge<'a>,
 }
 
 impl<'a> Rechecked<'a> {
-    pub(crate) fn new(ctx: &'a Ctx) -> Rechecked<'a> {
-        Rechecked {
+    pub(crate) fn new(ctx: &'a Ctx) -> Result<Rechecked<'a>> {
+        Ok(Rechecked {
             ctx,
             cfg: ctx
                 .snap
@@ -87,19 +90,27 @@ impl<'a> Rechecked<'a> {
                 .as_ref()
                 .map_or_else(|| Arc::new(GeoConfig::default()), |v| v.config.clone()),
             memo: FxHashMap::default(),
-        }
+            bytes: 0,
+            step: ctx.reservation_step(),
+            _charge: ctx.charge(0)?,
+        })
     }
 
     pub(crate) fn entry(&mut self, o: u64) -> Result<Option<Arc<ColumnEntry>>> {
         if let Some(cached) = self.memo.get(&o) {
             return Ok(cached.clone());
         }
-        let cfg = &self.cfg;
-        let entry = self
-            .ctx
-            .with_controlled_key(Id(o), |k| Ok(recheck(k, cfg)))?
-            .flatten();
+        let parse_charge = self.ctx.charge(0)?;
+        let slot = classify_controlled(self.ctx, Id(o), &self.cfg, true, &parse_charge)?;
+        let entry = match slot {
+            Slot::Geom(e) => Some(e),
+            _ => None,
+        };
+        let next = self.bytes.saturating_add(64);
+        self._charge.cover(next, self.step)?;
+        self.bytes = next;
         self.memo.insert(o, entry.clone());
+        drop(parse_charge);
         Ok(entry)
     }
 }
@@ -187,7 +198,7 @@ pub fn window_with(
         }
     }
     // skipped rows that may still match, whatever the window
-    let mut re = Rechecked::new(ctx);
+    let mut re = Rechecked::new(ctx)?;
     let delta = view.overlay.skipped.iter().chain(view.skipped.iter());
     for (r, from_base) in base
         .skipped
@@ -262,7 +273,7 @@ pub fn nearest_with(
     }
     // skipped rows that may still match, by the bound of their own envelope (the whole
     // world, a bound of 0, when it has no place on the globe)
-    let mut re = Rechecked::new(ctx);
+    let mut re = Rechecked::new(ctx)?;
     for r in &base.skipped {
         if f.base_valid(r)
             && let Some(en) = re.entry(r.o)?
@@ -580,18 +591,24 @@ struct Literals<'a> {
     base: Option<&'a Arc<GeoBase>>,
     memo: FxHashMap<u64, Slot>,
     rechecked: Rechecked<'a>,
+    bytes: u64,
+    step: u64,
+    _charge: Charge<'a>,
 }
 
 impl<'a> Literals<'a> {
-    fn new(ctx: &'a Ctx) -> Literals<'a> {
+    fn new(ctx: &'a Ctx) -> Result<Literals<'a>> {
         let view = ctx.snap.geo.as_deref();
-        Literals {
+        Ok(Literals {
             ctx,
             cfg: view.map_or_else(|| Arc::new(GeoConfig::default()), |v| v.config.clone()),
             base: view.and_then(|v| v.base.as_ref()),
             memo: FxHashMap::default(),
-            rechecked: Rechecked::new(ctx),
-        }
+            rechecked: Rechecked::new(ctx)?,
+            bytes: 0,
+            step: ctx.reservation_step(),
+            _charge: ctx.charge(0)?,
+        })
     }
 
     /// The geometry of literal `o`, and whether the index skipped it (a candidate
@@ -606,12 +623,14 @@ impl<'a> Literals<'a> {
                 if let Some(cached) = self.memo.get(&o) {
                     cached.clone()
                 } else {
-                    let cfg = &self.cfg;
-                    let slot = self
-                        .ctx
-                        .with_controlled_key(Id(o), |k| Ok(classify(k, cfg)))?
-                        .unwrap_or(Slot::Other);
+                    let parse_charge = self.ctx.charge(0)?;
+                    let slot =
+                        classify_controlled(self.ctx, Id(o), &self.cfg, false, &parse_charge)?;
+                    let next = self.bytes.saturating_add(slot_bytes(&slot));
+                    self._charge.cover(next, self.step)?;
+                    self.bytes = next;
                     self.memo.insert(o, slot.clone());
+                    drop(parse_charge);
                     slot
                 }
             }
@@ -639,7 +658,7 @@ fn scan_fallback(
     st.fallback = true;
     let snap = &*ctx.snap;
     let view = snap.geo.as_deref();
-    let mut lits = Literals::new(ctx);
+    let mut lits = Literals::new(ctx)?;
     let mut triples: FxHashSet<(u64, u64, u64)> = FxHashSet::default();
     let mut out: Vec<Hit> = Vec::with_capacity(CHUNK);
     let mut n = 0usize;

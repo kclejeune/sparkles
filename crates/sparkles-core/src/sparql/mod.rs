@@ -1225,7 +1225,7 @@ pub(crate) fn restrict_ctx(
     let snap = ctx.snap.clone();
     // a view not bound yet is decided against the context's snapshot
     let a = &a.bound(&snap);
-    let mut ds = std::mem::take(&mut ctx.dataset);
+    let mut ds = ctx.dataset.clone();
     ds.restrict_checked(&snap, a, &|id| ctx.term_checked(id))?;
     ctx.dataset = ds;
     ctx.graphs = Some(a.clone());
