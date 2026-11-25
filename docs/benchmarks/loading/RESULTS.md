@@ -231,9 +231,11 @@ with one process per arm so `VmHWM` measures each arm cleanly.
 | In-memory file `LOAD` | 1.192 s | 2.090 s | 798 MiB | 1,013 MiB | — | 5 to 27 µs |
 | In-memory loopback HTTP `LOAD` | 1.750 s | 2.190 s | 778 MiB | 1,016 MiB | 13.8 ms | 5 to 27 µs |
 
-*Measured on an 8-vCPU, 16 GiB Boat worker (`sparql_load_profile`, release build). Boat
-worker timings are approximate directional figures rather than a quiet Intel host A/B
-comparison. The lock probe polls `try_write_with(no_wait)` every 1 ms and reports the first
-observed busy sample (`first_busy`), which estimates pre-lock fetch and probe time at
-millisecond resolution rather than timing the writer's full hold interval. Every bulk arm
-left an empty delta and kept concurrent snapshot reads lock-free.*
+*Measured at commit `59862356` on an 8-vCPU, 16 GiB Boat worker (`sparql_load_profile`,
+release build, one process per arm). Boat worker timings are approximate directional
+figures rather than a quiet Intel host A/B comparison, and are recorded directly from the
+ad-hoc profile harness without a separate raw run file under `runs/`. The lock probe polls
+`try_write_with(no_wait)` every 1 ms and reports the first observed busy sample
+(`first_busy`), which estimates pre-lock fetch and probe time at millisecond resolution
+rather than timing the writer's full hold interval. Every bulk arm left an empty delta and
+kept concurrent snapshot reads lock-free.*

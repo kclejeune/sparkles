@@ -1728,7 +1728,7 @@ struct BulkCommit {
     skip_if_unchanged: bool,
 }
 
-/// What [`Store::build_generation`] builds a bulk commit's generation from.
+/// What [`Store::build_generation_classified`] builds a bulk commit's generation from.
 struct GenerationInput<'a> {
     extra: &'a [Source],
     extra_quads: &'a [[Id; 4]],
@@ -1738,8 +1738,6 @@ struct GenerationInput<'a> {
     /// the most changed quads the build collects for the change log
     change_cap: Option<u64>,
     opts: &'a crate::guard::WriteOptions,
-    /// a dry run, which records a refused storage check instead of failing
-    dry: bool,
 }
 
 /// A bulk commit's generation, built and not yet published.
@@ -1749,7 +1747,6 @@ struct BuiltGeneration {
     /// the temporary directory of an in-memory store's generation
     tmp: Option<tempfile::TempDir>,
     meta: IndexMeta,
-    storage: crate::preview::StorageCheck,
     /// the quads the sources gave, when the change tap collected them all
     sourced: Option<Vec<QuadKey>>,
     /// the quads of the dropped graphs, unless there were more than the change cap
@@ -5573,7 +5570,10 @@ impl Store {
                 txn.guard.next_bnode = txn.start_bnode;
                 let drained = self.after_refusal(error, Some(o));
                 if is_source
-                    && !matches!(drained, Error::Poisoned | Error::Cancelled | Error::Timeout)
+                    && !matches!(
+                        drained,
+                        Error::Poisoned | Error::Cancelled | Error::Timeout | Error::WriterBusy
+                    )
                 {
                     return Err(SparqlLoadError::Source(drained));
                 }
@@ -5843,9 +5843,10 @@ impl Store {
     ) -> std::result::Result<(u64, Receipt), SparqlLoadError> {
         let (changes, o) = check;
         // The graphs it drops are checked here, and its sources are checked quad by quad
-        // while the build reads them.
+        // while the build reads them. When `skip_if_unchanged` is set, branch protection
+        // runs only once the built generation is known to change quads.
         let as_new_branch = o.preview_as_new_branch && o.dry_run.is_some();
-        if !as_new_branch {
+        if !as_new_branch && !bulk.skip_if_unchanged {
             self.check_protected(bulk.kind)
                 .map_err(SparqlLoadError::Store)?;
         }
@@ -5910,7 +5911,6 @@ impl Store {
             name,
             tmp,
             meta,
-            storage,
             sourced,
             dropped,
             parsed,
@@ -5924,30 +5924,38 @@ impl Store {
                 fence,
                 change_cap,
                 opts: o,
-                dry: dry.is_some(),
             },
         )?;
-        let mut gen_ =
-            Generation::open(&dir, &name, self.root.is_some()).map_err(SparqlLoadError::Store)?;
-        gen_._tmp = tmp;
-        let gen_ = Arc::new(gen_);
-        let head_seq = w.head.seq;
-        // not a committed state: its result cache is its own and empty
-        let candidate = || {
-            Arc::new(
-                self.snapshot_of(gen_.clone(), head_seq)
-                    .cacheable(false)
-                    .results(Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)))
-                    .build(),
-            )
+        let cleanup_dir = |dir: &Path| {
+            if self.root.is_some() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            self.quota.invalidate();
         };
+        let head_seq = w.head.seq;
         let unchanged = bulk.skip_if_unchanged && bulk.net_del == 0 && meta.quads == bulk.start_len;
         if unchanged {
             if let Some(dr) = &dry {
+                let mut gen_ = match Generation::open(&dir, &name, self.root.is_some()) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        drop(tmp);
+                        cleanup_dir(&dir);
+                        return Err(SparqlLoadError::Store(e));
+                    }
+                };
+                gen_._tmp = tmp;
+                let gen_ = Arc::new(gen_);
+                let candidate = Arc::new(
+                    self.snapshot_of(gen_.clone(), head_seq)
+                        .cacheable(false)
+                        .results(Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)))
+                        .build(),
+                );
                 let preview = self.preview_bulk(crate::store::preview::BulkPreview {
                     head: w.head,
                     view: snap,
-                    candidate: &candidate(),
+                    candidate: &candidate,
                     commit: None,
                     kind: bulk.kind,
                     changes,
@@ -5958,22 +5966,19 @@ impl Store {
                     storage: crate::preview::StorageCheck::default(),
                     message: None,
                 });
+                drop(candidate);
                 drop(gen_);
-                if self.root.is_some() {
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
-                self.quota.invalidate();
+                cleanup_dir(&dir);
                 return Err(SparqlLoadError::Store(Error::DryRun(Box::new(
                     preview.map_err(SparqlLoadError::Store)?,
                 ))));
             }
             let checked = o.check();
-            drop(gen_);
-            if self.root.is_some() {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
-            self.quota.invalidate();
+            drop(tmp);
+            cleanup_dir(&dir);
             checked.map_err(SparqlLoadError::Store)?;
+            self.add_prefixes(meta.prefixes)
+                .map_err(SparqlLoadError::Store)?;
             return Ok((
                 parsed,
                 Receipt {
@@ -5985,6 +5990,50 @@ impl Store {
                 },
             ));
         }
+        if bulk.skip_if_unchanged
+            && !as_new_branch
+            && let Err(e) = self.check_protected(bulk.kind)
+        {
+            drop(tmp);
+            cleanup_dir(&dir);
+            return Err(SparqlLoadError::Store(e));
+        }
+        let mut storage = crate::preview::StorageCheck::default();
+        let old = snap.generation.dir.as_deref();
+        if dry.is_some() {
+            storage = self.rebuild_storage(old, &dir);
+        }
+        let fits = self
+            .check_memory(dir_size(&dir))
+            .and_then(|_| self.quota.check_rebuild(old, &dir));
+        match fits {
+            Err(e) if dry.is_some() => storage.refused = Some(e),
+            Err(e) => {
+                drop(tmp);
+                cleanup_dir(&dir);
+                return Err(SparqlLoadError::Store(e));
+            }
+            Ok(()) => {}
+        }
+        let mut gen_ = match Generation::open(&dir, &name, self.root.is_some()) {
+            Ok(g) => g,
+            Err(e) => {
+                drop(tmp);
+                cleanup_dir(&dir);
+                return Err(SparqlLoadError::Store(e));
+            }
+        };
+        gen_._tmp = tmp;
+        let gen_ = Arc::new(gen_);
+        // not a committed state: its result cache is its own and empty
+        let candidate = || {
+            Arc::new(
+                self.snapshot_of(gen_.clone(), head_seq)
+                    .cacheable(false)
+                    .results(Arc::new(crate::sparql::cache::ResultCache::new(0, 0.0)))
+                    .build(),
+            )
+        };
         if dry.is_none() {
             w.next_bnode = w.next_bnode.max(meta.next_bnode);
         }
@@ -6213,9 +6262,9 @@ impl Store {
 
     /// Build the generation of a bulk commit next to the current one: the quads of
     /// `snap` outside the dropped graphs, the encoded extra quads and the sources. A
-    /// build that fails removes its directory. A bulk commit also checks the built
-    /// generation's size against the memory limit and quota, which a dry run records
-    /// in the returned storage check instead of failing.
+    /// build that fails removes its directory. Publication-fit checks against the
+    /// memory limit and dataset quota run in [`rebuild_locked_classified`] once the
+    /// generation is known to be published or previewed as a candidate commit.
     fn build_generation_classified(
         &self,
         w: &WriterState,
@@ -6229,7 +6278,6 @@ impl Store {
             fence,
             change_cap,
             opts: o,
-            dry,
         } = input;
         let (dir, name, tmp) = match &self.root {
             Some(root) => {
@@ -6312,27 +6360,14 @@ impl Store {
             if let Some(i) = &interrupt {
                 i().map_err(SparqlLoadError::Store)?;
             }
-            let mut storage = crate::preview::StorageCheck::default();
-            let old = snap.generation.dir.as_deref();
-            if dry {
-                storage = self.rebuild_storage(old, &dir);
-            }
-            let fits = self
-                .check_memory(dir_size(&dir))
-                .and_then(|_| self.quota.check_rebuild(old, &dir));
-            match fits {
-                Err(e) if dry => storage.refused = Some(e),
-                r => r.map_err(SparqlLoadError::Store)?,
-            }
-            Ok((meta, storage))
+            Ok(meta)
         })();
         match built {
-            Ok((meta, storage)) => Ok(BuiltGeneration {
+            Ok(meta) => Ok(BuiltGeneration {
                 dir,
                 name,
                 tmp,
                 meta,
-                storage,
                 sourced,
                 dropped: (!dropped_over).then_some(dropped),
                 parsed,

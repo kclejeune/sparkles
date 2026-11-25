@@ -1021,22 +1021,34 @@ impl Read for LoadHttpBody {
 
 /// Wraps an HTTP `LOAD` body reader so plain I/O failures (connection drops, corrupt
 /// compressed payloads) become `Error::Invalid("LOAD <url>: …")` while typed engine
-/// errors (budgets, cancellation, timeout) keep their own variants.
+/// errors (budgets, cancellation, timeout) keep their own variants, including when a
+/// decompressor masked a control or budget error recorded by [`LoadHttpBody`].
 struct LoadHttpReader<R> {
     inner: R,
     url: String,
+    fatal: Arc<parking_lot::Mutex<Option<Error>>>,
 }
 
 impl<R: Read> Read for LoadHttpReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.inner
-            .read(buf)
-            .map_err(|e| match crate::codec::io_error(e) {
+        self.inner.read(buf).map_err(|e| {
+            let err = match crate::codec::io_error(e) {
                 Error::Io(raw) => {
-                    std::io::Error::other(Error::invalid(format!("LOAD {}: {raw}", self.url)))
+                    if let Some(f) = self.fatal.lock().as_ref().and_then(|err| match err {
+                        Error::Cancelled => Some(Error::Cancelled),
+                        Error::Timeout => Some(Error::Timeout),
+                        Error::BudgetExceeded(b) => Some(Error::BudgetExceeded(*b)),
+                        _ => None,
+                    }) {
+                        f
+                    } else {
+                        Error::invalid(format!("LOAD {}: {raw}", self.url))
+                    }
                 }
-                other => std::io::Error::other(other),
-            })
+                other => other,
+            };
+            std::io::Error::other(err)
+        })
     }
 }
 
@@ -1171,6 +1183,7 @@ fn prepare_load_source(
         LoadHttpReader {
             inner: r,
             url: url.to_string(),
+            fatal: Arc::clone(&fatal),
         },
         format,
         graph,
@@ -1206,13 +1219,15 @@ fn run_single_load(
     let receipt = match prepare_load_source(source, destination, req, &wopts) {
         Ok((src, fatal)) => match store.load_sparql(&src, kind, &wopts) {
             Ok(r) => r,
-            Err(e) => {
+            Err(SparqlLoadError::Store(e)) => return Err(e),
+            Err(SparqlLoadError::Source(e)) => {
                 if let Some(f) = fatal.as_ref().and_then(|slot| slot.lock().take()) {
                     return Err(f);
                 }
-                match e {
-                    SparqlLoadError::Source(_) if silent => noop(wopts)?,
-                    other => return Err(other.into_inner()),
+                if silent {
+                    noop(wopts)?
+                } else {
+                    return Err(e);
                 }
             }
         },

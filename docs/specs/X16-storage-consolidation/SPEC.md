@@ -772,13 +772,17 @@ triple protections and multi-operation atomicity are unchanged. `LOAD <uri>` and
 `LOAD <uri> INTO GRAPH <g>` keep their default-graph remapping and named-graph retention
 across all RDF, Jena and OWL functional-style syntaxes, and a bulk `LOAD INTO GRAPH`
 leaves the commit's default-graph change flag false. Repeating an above-threshold `LOAD` of
-already-present ground quads preserves the head commit and returns `committed: false`.
+already-present ground quads preserves the head commit, returns `committed: false`,
+skips commit-only branch protection and publication-fit checks, and still registers newly
+declared source prefixes. For a single-operation `LOAD` through `run_single_load`,
 `LOAD SILENT` carries source-error provenance through preparation, probing and parsing so
 it hides only source, fetch, format and parse failures (returning an unchanged-head
 receipt) while preserving permission refusals, outbound timeouts and response-size
 ceilings, outbound and decompression budgets, cancellation, deadlines, preconditions, write
 guards, publish hooks, dry runs, managed-graph boundaries, storage limits and store or
-builder failures.
+builder failures. Multi-operation updates and `update_in` stay on the legacy transactional
+handler, where outbound policy timeouts and raw response-size limits still surface as
+`Error::Invalid`.
 
 File permission checks, codec detection, outbound HTTP requests and the stream size probe
 now run before the exclusive writer lock is acquired, so network latency and stream

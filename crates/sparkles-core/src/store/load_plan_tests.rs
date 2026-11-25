@@ -1605,6 +1605,13 @@ fn sparql_load_transactional_refusal_drains_group_commit() {
     });
     sealed_rx.recv().unwrap();
 
+    let (draining_tx, draining_rx) = mpsc::channel();
+    s.set_failpoint(
+        "group-draining",
+        Some(Arc::new(move |_| {
+            let _ = draining_tx.send(());
+        })),
+    );
     let s_load = Arc::clone(&s);
     let load_url = file_url.clone();
     let restricted_load = std::thread::spawn(move || {
@@ -1617,10 +1624,13 @@ fn sparql_load_transactional_refusal_drains_group_commit() {
         )));
         update(&s_load, &format!("LOAD <{load_url}>"), &opts)
     });
-    // Wait briefly for the second writer to enter the refusal drain, then fail the fence.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Wait until the load thread has entered the refusal drain, then fail the fence.
+    draining_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("transactional load refusal did not enter group-draining");
     s.fail_next_group_sync();
     let _ = go_tx.send(());
+    s.set_failpoint("group-draining", None);
     s.set_failpoint("group-sealed", None);
 
     let first_res = first.join().unwrap();
@@ -1633,6 +1643,430 @@ fn sparql_load_transactional_refusal_drains_group_commit() {
         matches!(load_res, Err(Error::Poisoned)),
         "transactional load refusal must drain via after_refusal and report Poisoned: {load_res:?}"
     );
+}
+
+#[test]
+fn sparql_load_silent_http_limit_preserves_group_poisoned_and_writer_busy() {
+    use crate::error::Error;
+    use crate::outbound::OutboundPolicy;
+    use crate::sparql::{QueryOptions, update::update};
+    use crate::store::SparqlLoadError;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // 1. Force the transactional plan, start HTTP LOAD SILENT from a speculative group-commit
+    // head, exceed max_response_bytes after sniffing, and fail the predecessor's fence during
+    // the refusal drain. Store(Poisoned) must take precedence over LoadHttpBody's recorded limit.
+    let big_nt = ntriples(0, 200); // ~16 KiB, exceeds max_response_bytes = 2048 after sniffing
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = big_nt.clone();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut head = Vec::new();
+            let mut b = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut b).unwrap_or(0) == 1 {
+                head.push(b[0]);
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/n-triples\r\nconnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(&body);
+        }
+    });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let s = Arc::new(
+        Store::open(
+            &db_dir.path().join("db-poison"),
+            StoreOptions {
+                bulk_threshold: u64::MAX,
+                group_commit: true,
+                group_commit_idle_direct: false,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+    s.load(&[bytes(0, 1)]).unwrap();
+
+    let (sealed_tx, sealed_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+    let go_rx = Arc::new(parking_lot::Mutex::new(go_rx));
+    s.set_failpoint(
+        "group-sealed",
+        Some(Arc::new(move |_| {
+            let _ = sealed_tx.send(());
+            let _ = go_rx.lock().recv();
+        })),
+    );
+    let s_bg = Arc::clone(&s);
+    let first = std::thread::spawn(move || {
+        update(
+            &s_bg,
+            "INSERT DATA { <http://ex.org/gc-http> <http://ex.org/p> 1 }",
+            &QueryOptions::default(),
+        )
+    });
+    sealed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let (draining_tx, draining_rx) = mpsc::channel();
+    s.set_failpoint(
+        "group-draining",
+        Some(Arc::new(move |_| {
+            let _ = draining_tx.send(());
+        })),
+    );
+    let s_load = Arc::clone(&s);
+    let http_load = std::thread::spawn(move || {
+        let opts = QueryOptions {
+            outbound: OutboundPolicy {
+                allow_private: true,
+                max_response_bytes: 2048,
+                ..OutboundPolicy::default()
+            },
+            ..QueryOptions::default()
+        };
+        update(
+            &s_load,
+            &format!("LOAD SILENT <http://127.0.0.1:{port}/streamed.nt>"),
+            &opts,
+        )
+    });
+    draining_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("HTTP LOAD SILENT refusal did not enter group-draining");
+    s.fail_next_group_sync();
+    let _ = go_tx.send(());
+    s.set_failpoint("group-draining", None);
+    s.set_failpoint("group-sealed", None);
+
+    let first_res = first.join().unwrap();
+    let load_res = http_load.join().unwrap();
+    assert!(
+        matches!(first_res, Err(Error::Poisoned)),
+        "first: {first_res:?}"
+    );
+    assert!(
+        matches!(load_res, Err(Error::Poisoned)),
+        "Store(Poisoned) must take precedence over LoadHttpBody's recorded limit error: {load_res:?}"
+    );
+
+    // 2. When after_refusal returns Error::WriterBusy under no_wait=true, load_sparql must
+    // classify it as SparqlLoadError::Store(Error::WriterBusy) (not Source).
+    let tmp = tempfile::tempdir().unwrap();
+    let bad_nt = tmp.path().join("bad.nt");
+    std::fs::write(&bad_nt, "not valid ntriples\n").unwrap();
+    let s2 = Arc::new(
+        Store::open(
+            &db_dir.path().join("db-busy"),
+            StoreOptions {
+                bulk_threshold: E,
+                group_commit: true,
+                group_commit_idle_direct: false,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+    s2.load(&[bytes(0, 1)]).unwrap();
+
+    let (sealed2_tx, sealed2_rx) = mpsc::channel();
+    let (go2_tx, go2_rx) = mpsc::channel();
+    let go2_rx = Arc::new(parking_lot::Mutex::new(go2_rx));
+    s2.set_failpoint(
+        "group-sealed",
+        Some(Arc::new(move |_| {
+            let _ = sealed2_tx.send(());
+            let _ = go2_rx.lock().recv();
+        })),
+    );
+    let s2_bg = Arc::clone(&s2);
+    let first2 = std::thread::spawn(move || {
+        update(
+            &s2_bg,
+            "INSERT DATA { <http://ex.org/gc-busy> <http://ex.org/p> 1 }",
+            &QueryOptions::default(),
+        )
+    });
+    sealed2_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let src = Source::from_path(&bad_nt, None).unwrap();
+    let no_wait = WriteOptions {
+        no_wait: true,
+        ..WriteOptions::default()
+    };
+    let res = s2.load_sparql(&src, CommitKind::Update, &no_wait);
+    assert!(
+        matches!(res, Err(SparqlLoadError::Store(Error::WriterBusy))),
+        "after_refusal WriterBusy must stay SparqlLoadError::Store: {}",
+        match res {
+            Ok(_) => "Ok".to_string(),
+            Err(SparqlLoadError::Source(e)) => format!("Source({e:?})"),
+            Err(SparqlLoadError::Store(e)) => format!("Store({e:?})"),
+        }
+    );
+    let mut silent_opts = QueryOptions::default();
+    silent_opts.write.no_wait = true;
+    let err = update(
+        &s2,
+        &format!("LOAD SILENT <file://{}>", bad_nt.display()),
+        &silent_opts,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::WriterBusy), "{err:?}");
+
+    let _ = go2_tx.send(());
+    s2.set_failpoint("group-sealed", None);
+    first2.join().unwrap().unwrap();
+}
+
+#[test]
+fn sparql_load_bulk_unchanged_protected_quota_and_prefixes() {
+    use crate::error::Error;
+    use crate::sparql::{QueryOptions, update::update};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file_url = |p: &std::path::Path| format!("file://{}", p.display());
+
+    // Build two distinct above-threshold N-Triples files and a Turtle file restating the
+    // first file's ground triples under a fresh prefix.
+    let large_bytes = ntriples(0, E + 2);
+    let large_nt = tmp.path().join("large.nt");
+    std::fs::write(&large_nt, &large_bytes).unwrap();
+    let mut extra_buf = String::new();
+    for i in 0..200u64 {
+        extra_buf.push_str(&format!(
+            "<http://ex.org/extra/{i}> <http://ex.org/p> \"unique-payload-{i:0>60}\" .\n"
+        ));
+    }
+    let extra_nt = tmp.path().join("extra.nt");
+    std::fs::write(&extra_nt, &extra_buf).unwrap();
+
+    let large_str = std::str::from_utf8(&large_bytes).unwrap();
+    // Same ground triples as large.nt, plus enough long prefix declarations that the
+    // scratch generation's meta.json is strictly larger on disk than the existing one.
+    let mut padded_ttl = String::new();
+    for i in 0..40 {
+        padded_ttl.push_str(&format!(
+            "@prefix qpad{i}: <http://ex.org/quota-pad-{i}/{}> .\n",
+            "a".repeat(160)
+        ));
+    }
+    padded_ttl.push_str(large_str);
+    let padded_ttl_path = tmp.path().join("same_padded.ttl");
+    std::fs::write(&padded_ttl_path, &padded_ttl).unwrap();
+
+    let same_ttl = format!("@prefix fresh: <http://ex.org/fresh/> .\n{large_str}");
+    let same_ttl_path = tmp.path().join("same_prefix.ttl");
+    std::fs::write(&same_ttl_path, &same_ttl).unwrap();
+
+    let same_ttl2 = format!("@prefix fresh2: <http://ex.org/fresh2/> .\n{large_str}");
+    let same_ttl2_path = tmp.path().join("same_prefix2.ttl");
+    std::fs::write(&same_ttl2_path, &same_ttl2).unwrap();
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("db");
+    let persistent = Store::open(
+        &db_path,
+        StoreOptions {
+            bulk_threshold: E,
+            ..StoreOptions::default()
+        },
+    )
+    .unwrap();
+    let first = update(
+        &persistent,
+        &format!("LOAD <{}>", file_url(&large_nt)),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let first_r = first.commit.as_ref().unwrap();
+    assert!(first_r.committed && first_r.commit.bulk);
+    let head_seq = first_r.commit.seq;
+
+    // 1. Protected branch: repeat ground bulk LOAD succeeds with unchanged head (live and
+    // ordinary dry-run), while a load adding new quads is still refused with Error::Branch.
+    persistent.set_branch_protected("main", true).unwrap();
+    let repeat = update(
+        &persistent,
+        &format!("LOAD <{}>", file_url(&large_nt)),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let repeat_r = repeat.commit.as_ref().unwrap();
+    assert!(!repeat_r.committed);
+    assert_eq!(repeat_r.commit.seq, head_seq);
+    assert_eq!(repeat.inserted, 0);
+
+    let mut dry = QueryOptions::default();
+    dry.write.dry_run = Some(Default::default());
+    let p = crate::preview::catch(
+        update(
+            &persistent,
+            &format!("LOAD <{}>", file_url(&large_nt)),
+            &dry,
+        )
+        .map(|st| st.commit.unwrap()),
+    )
+    .unwrap();
+    assert!(p.commit.is_none());
+    assert!(p.graphs.is_empty());
+
+    let err = update(
+        &persistent,
+        &format!("LOAD <{}>", file_url(&extra_nt)),
+        &QueryOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Branch(_)), "{err:?}");
+
+    let err = update(
+        &persistent,
+        &format!("LOAD <{}>", file_url(&extra_nt)),
+        &dry,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Branch(_)), "{err:?}");
+
+    let mut preview_branch = dry.clone();
+    preview_branch.write.preview_as_new_branch = true;
+    let p = crate::preview::catch(
+        update(
+            &persistent,
+            &format!("LOAD <{}>", file_url(&extra_nt)),
+            &preview_branch,
+        )
+        .map(|st| st.commit.unwrap()),
+    )
+    .unwrap();
+    assert!(p.commit.as_ref().unwrap().bulk);
+
+    // 2. Lowered quota: duplicate-only bulk LOAD discards the scratch generation without
+    // tripping publication-fit checks even when the scratch generation is larger on disk
+    // than the current one, while a changing load still fails with BudgetExceeded(DatasetBytes)
+    // (or records storage.refused on dry run).
+    persistent.set_branch_protected("main", false).unwrap();
+    persistent.set_quota(Some(1)).unwrap();
+
+    let repeat_q = update(
+        &persistent,
+        &format!("LOAD <{}>", file_url(&padded_ttl_path)),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert!(!repeat_q.commit.as_ref().unwrap().committed);
+    assert_eq!(repeat_q.commit.as_ref().unwrap().commit.seq, head_seq);
+
+    let p_q = crate::preview::catch(
+        update(
+            &persistent,
+            &format!("LOAD <{}>", file_url(&padded_ttl_path)),
+            &dry,
+        )
+        .map(|st| st.commit.unwrap()),
+    )
+    .unwrap();
+    assert!(p_q.commit.is_none());
+    assert!(p_q.storage.refused.is_none());
+
+    let err = update(
+        &persistent,
+        &format!("LOAD <{}>", file_url(&extra_nt)),
+        &QueryOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::BudgetExceeded(b) if b.kind == crate::error::BudgetKind::DatasetBytes
+        ),
+        "{err:?}"
+    );
+
+    let p_over = crate::preview::catch(
+        update(
+            &persistent,
+            &format!("LOAD <{}>", file_url(&extra_nt)),
+            &dry,
+        )
+        .map(|st| st.commit.unwrap()),
+    )
+    .unwrap();
+    assert!(p_over.commit.is_some());
+    assert!(p_over.storage.refused.is_some());
+
+    // 3. Prefix registration on duplicate-only bulk LOAD: dry run skips registration, live
+    // load registers and persists the fresh prefix without allocating a quad commit, and a
+    // metadata write failure surfaces as a store error even under LOAD SILENT.
+    persistent.set_quota(None).unwrap();
+    assert_eq!(
+        persistent
+            .source_plan(
+                SparqlLoad,
+                &[Source::from_path(&same_ttl_path, None).unwrap()],
+                &WriteOptions::default()
+            )
+            .unwrap(),
+        Bulk
+    );
+    let p_ttl = crate::preview::catch(
+        update(
+            &persistent,
+            &format!("LOAD <{}>", file_url(&same_ttl_path)),
+            &dry,
+        )
+        .map(|st| st.commit.unwrap()),
+    )
+    .unwrap();
+    assert!(p_ttl.commit.is_none());
+    assert!(!persistent.prefixes().contains_key("fresh"));
+
+    let st_ttl = update(
+        &persistent,
+        &format!("LOAD <{}>", file_url(&same_ttl_path)),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let r_ttl = st_ttl.commit.as_ref().unwrap();
+    assert!(!r_ttl.committed);
+    assert_eq!(r_ttl.commit.seq, head_seq);
+    assert_eq!(
+        persistent.prefixes().get("fresh").map(String::as_str),
+        Some("http://ex.org/fresh/")
+    );
+
+    // Reopen to confirm the prefix persisted without allocating a quad commit, then replace
+    // prefixes.json with a directory so persisting a second fresh prefix fails under SILENT.
+    drop(persistent);
+    let persistent = Store::open(
+        &db_path,
+        StoreOptions {
+            bulk_threshold: E,
+            ..StoreOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(persistent.snapshot().commit, head_seq);
+    assert_eq!(
+        persistent.prefixes().get("fresh").map(String::as_str),
+        Some("http://ex.org/fresh/")
+    );
+
+    let prefixes_path = db_path.join("prefixes.json");
+    std::fs::remove_file(&prefixes_path).unwrap();
+    std::fs::create_dir(&prefixes_path).unwrap();
+    let err = update(
+        &persistent,
+        &format!("LOAD SILENT <{}>", file_url(&same_ttl2_path)),
+        &QueryOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    std::fs::remove_dir(&prefixes_path).unwrap();
 }
 
 /// Measures wall time, 1 ms lock-probe samples (`first_busy_ms` estimating pre-lock time
