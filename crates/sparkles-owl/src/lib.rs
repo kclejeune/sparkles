@@ -49,6 +49,7 @@ pub mod manchester;
 pub mod model;
 pub mod ofn;
 pub mod ofn_read;
+pub mod patterns;
 pub mod profiles;
 pub mod read;
 pub mod transform;

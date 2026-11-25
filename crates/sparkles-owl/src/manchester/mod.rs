@@ -291,6 +291,17 @@ impl Vocabulary {
             .insert(iri.to_string());
     }
 
+    /// Adds or replaces a `(prefix, namespace)` binding.
+    pub fn add_prefix(&mut self, prefix: impl Into<String>, namespace: impl Into<String>) {
+        let prefix = prefix.into();
+        let namespace = namespace.into();
+        if let Some((_, existing)) = self.prefixes.iter_mut().find(|(p, _)| *p == prefix) {
+            *existing = namespace;
+        } else {
+            self.prefixes.push((prefix, namespace));
+        }
+    }
+
     /// Adds an entity, which its IRI's local name then names.
     pub fn add_entity(&mut self, e: Entity) {
         let iri = e.iri().as_str().to_string();
