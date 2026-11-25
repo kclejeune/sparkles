@@ -4382,34 +4382,41 @@ fn scan_lane_charged<O: ChargedSink>(
                 }
                 None => std::slice::from_ref(&x),
             };
-            snap.scan_between_cols(lane.perm, pad(key, 0), pad(key, u64::MAX), mask, |c| {
-                match c {
-                    Chunk::Block(b, s, e) => {
-                        for i in s..e {
+            snap.scan_between_cols_checked(
+                lane.perm,
+                pad(key, 0),
+                pad(key, u64::MAX),
+                mask,
+                || ctx.check(),
+                |c| {
+                    match c {
+                        Chunk::Block(b, s, e) => {
+                            for i in s..e {
+                                scanned += 1;
+                                if scanned.is_multiple_of(4096) {
+                                    ctx.check()?;
+                                }
+                                let p = pc.map_or(fixed_p, |c| b.cols[c][i]);
+                                emit(x, b.cols[nc][i], p, b.cols[gc][i], out)?;
+                                if out.len() >= cap {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                        Chunk::Row(k) => {
                             scanned += 1;
                             if scanned.is_multiple_of(4096) {
                                 ctx.check()?;
                             }
-                            let p = pc.map_or(fixed_p, |c| b.cols[c][i]);
-                            emit(x, b.cols[nc][i], p, b.cols[gc][i], out)?;
-                            if out.len() >= cap {
-                                return Ok(false);
-                            }
+                            emit(x, k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out)?;
                         }
                     }
-                    Chunk::Row(k) => {
-                        scanned += 1;
-                        if scanned.is_multiple_of(4096) {
-                            ctx.check()?;
-                        }
-                        emit(x, k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out)?;
+                    if O::CHECKS {
+                        ctx.check()?;
                     }
-                }
-                if O::CHECKS {
-                    ctx.check()?;
-                }
-                Ok(out.len() < cap)
-            })?;
+                    Ok(out.len() < cap)
+                },
+            )?;
         }
         return Ok(());
     }
@@ -4429,49 +4436,56 @@ fn scan_lane_charged<O: ChargedSink>(
     };
     let mut j = 0;
     let mut scanned = 0usize;
-    snap.scan_between_cols(lane.perm, pad(lo, 0), pad(hi, u64::MAX), mask, |c| {
-        ctx.check()?;
-        match c {
-            Chunk::Block(b, s, e) => {
-                let keys = &b.cols[kc][s..e];
-                let mut i = 0;
-                while i < keys.len() && j < frontier.len() {
+    snap.scan_between_cols_checked(
+        lane.perm,
+        pad(lo, 0),
+        pad(hi, u64::MAX),
+        mask,
+        || ctx.check(),
+        |c| {
+            ctx.check()?;
+            match c {
+                Chunk::Block(b, s, e) => {
+                    let keys = &b.cols[kc][s..e];
+                    let mut i = 0;
+                    while i < keys.len() && j < frontier.len() {
+                        scanned += 1;
+                        if scanned.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
+                        let (k, f) = (keys[i], frontier[j]);
+                        if k < f {
+                            i += keys[i..].partition_point(|&x| x < f);
+                        } else if k > f {
+                            j += frontier[j..].partition_point(|&x| x < k);
+                        } else {
+                            while i < keys.len() && keys[i] == f {
+                                scanned += 1;
+                                if scanned.is_multiple_of(4096) {
+                                    ctx.check()?;
+                                }
+                                let r = s + i;
+                                let p = pc.map_or(fixed_p, |c| b.cols[c][r]);
+                                emit(f, b.cols[nc][r], p, b.cols[gc][r], out)?;
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                Chunk::Row(k) => {
                     scanned += 1;
                     if scanned.is_multiple_of(4096) {
                         ctx.check()?;
                     }
-                    let (k, f) = (keys[i], frontier[j]);
-                    if k < f {
-                        i += keys[i..].partition_point(|&x| x < f);
-                    } else if k > f {
-                        j += frontier[j..].partition_point(|&x| x < k);
-                    } else {
-                        while i < keys.len() && keys[i] == f {
-                            scanned += 1;
-                            if scanned.is_multiple_of(4096) {
-                                ctx.check()?;
-                            }
-                            let r = s + i;
-                            let p = pc.map_or(fixed_p, |c| b.cols[c][r]);
-                            emit(f, b.cols[nc][r], p, b.cols[gc][r], out)?;
-                            i += 1;
-                        }
+                    j += frontier[j..].partition_point(|&x| x < k[kc]);
+                    if j < frontier.len() && frontier[j] == k[kc] {
+                        emit(k[kc], k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out)?;
                     }
                 }
             }
-            Chunk::Row(k) => {
-                scanned += 1;
-                if scanned.is_multiple_of(4096) {
-                    ctx.check()?;
-                }
-                j += frontier[j..].partition_point(|&x| x < k[kc]);
-                if j < frontier.len() && frontier[j] == k[kc] {
-                    emit(k[kc], k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out)?;
-                }
-            }
-        }
-        Ok(j < frontier.len())
-    })?;
+            Ok(j < frontier.len())
+        },
+    )?;
     Ok(())
 }
 
@@ -5540,6 +5554,10 @@ impl SearchContext {
         let mut n = 0u64;
         let mut last_cost: Option<Cost> = None;
         while let Some(Reverse((d, u))) = heap.pop() {
+            n += 1;
+            if n.is_multiple_of(4096) {
+                ctx.check()?;
+            }
             if last_cost.is_some_and(|c| d > c) {
                 break;
             }
@@ -5552,10 +5570,6 @@ impl SearchContext {
                 base = tree.push_order((u, 0), charge, base)?;
             }
             self.visit(spec, 1)?;
-            n += 1;
-            if n.is_multiple_of(4096) {
-                ctx.check()?;
-            }
             if targets.is_some() {
                 missing.remove(&u);
                 if missing.is_empty() {
@@ -5659,7 +5673,10 @@ impl SearchContext {
                         (_, cur_base) = insert_hb_map(&mut dist, y, nd, charge, cur_base)?;
                         cur_base = tree.insert_first(y, parent, 0, charge, cur_base)?;
                         let freed = tree.remove_extra(y);
-                        cur_base = cur_base.saturating_sub(freed);
+                        if freed > 0 {
+                            cur_base = cur_base.saturating_sub(freed);
+                            charge.resize(cur_base)?;
+                        }
                         let _ = push_heap(&mut heap, Reverse((nd, y)), charge, cur_base)?;
                     }
                 }
@@ -5737,6 +5754,10 @@ impl SearchContext {
                         break;
                     }
                     heaps[i].pop();
+                    n += 1;
+                    if n.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
                 }
             }
             let (Some(&Reverse((df, _))), Some(&Reverse((db, _)))) =
@@ -5970,6 +5991,10 @@ impl SearchContext {
                         break;
                     }
                     heaps[i].pop();
+                    n += 1;
+                    if n.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
                 }
                 tops[i] = heaps[i].peek().map_or(Cost::INFINITE, |r| r.0.0);
             }
@@ -6070,7 +6095,10 @@ impl SearchContext {
                         (_, cur_base) = insert_hb_map(&mut dist[side], y, nd, charge, cur_base)?;
                         cur_base = trees[side].insert_first(y, parent, 0, charge, cur_base)?;
                         let freed = trees[side].remove_extra(y);
-                        cur_base = cur_base.saturating_sub(freed);
+                        if freed > 0 {
+                            cur_base = cur_base.saturating_sub(freed);
+                            charge.resize(cur_base)?;
+                        }
                         let _ = push_heap(&mut heaps[side], Reverse((nd, y)), charge, cur_base)?;
                     }
                 }
@@ -6232,6 +6260,7 @@ impl SearchContext {
         drop(heaps);
         let at_end = dist[0].get(&tt).copied().filter(|&c| c < tops[0]);
         let mut joins: Vec<(Edge, Cost)> = Vec::new();
+        let mut min_cost: Option<Cost> = at_end;
         let jbase = self
             .retained_bytes()
             .saturating_add(outer_bytes)
@@ -6262,9 +6291,10 @@ impl SearchContext {
             let total_c = dist[0][&e.from].add(w).add(dist[1][&e.to]);
             let cur_jbase = self.retained_bytes().saturating_add(w_outer);
             let _ = push_vec(&mut joins, (e, total_c), charge, cur_jbase)?;
+            min_cost = Some(min_cost.map_or(total_c, |m| m.min(total_c)));
         }
         drop(meets);
-        let Some(mu) = joins.iter().map(|j| j.1).chain(at_end).min() else {
+        let Some(mu) = min_cost else {
             drop(trees);
             drop(dist);
             drop(joins);
@@ -6278,7 +6308,19 @@ impl SearchContext {
             charge.resize(self.retained_bytes().saturating_add(outer_bytes))?;
             return Ok(BidiWeightedOutcome::FallbackSingleSource);
         }
-        joins.retain(|j| j.1 == mu);
+        let mut keep = 0usize;
+        for idx in 0..joins.len() {
+            if idx.is_multiple_of(4096) {
+                ctx.check()?;
+            }
+            if joins[idx].1 == mu {
+                if keep != idx {
+                    joins[keep] = joins[idx];
+                }
+                keep += 1;
+            }
+        }
+        joins.truncate(keep);
         sort_checked_by_key(&mut joins, ctx, |(e, _)| (e.from, e.to, e.p, e.rev))?;
         let mut rbase = self
             .retained_bytes()
@@ -6721,7 +6763,19 @@ impl TreeStreamJob {
         }
         let pending_zero = spec.min_len == 0 && close;
         if pending_zero {
-            ends.retain(|&m| m != VIRT);
+            let mut keep = 0usize;
+            for idx in 0..ends.len() {
+                if idx.is_multiple_of(4096) {
+                    ctx.check()?;
+                }
+                if ends[idx] != VIRT {
+                    if keep != idx {
+                        ends[keep] = ends[idx];
+                    }
+                    keep += 1;
+                }
+            }
+            ends.truncate(keep);
         }
         let job = Self {
             tree,
@@ -7457,12 +7511,39 @@ impl YenJob {
                         let root_slice = &cur_edges[..i];
                         let mut cmp_work = 0usize;
                         for (p, _) in &self.a {
-                            cmp_work += if p.len() > i { i.max(1) } else { 1 };
-                            if cmp_work >= 4096 {
-                                cmp_work = 0;
-                                ctx.check()?;
+                            if p.len() <= i {
+                                cmp_work += 1;
+                                if cmp_work >= 4096 {
+                                    cmp_work = 0;
+                                    ctx.check()?;
+                                }
+                                continue;
                             }
-                            if p.len() > i && p[..i] == *root_slice {
+                            let mut same = true;
+                            if i == 0 {
+                                cmp_work += 1;
+                                if cmp_work >= 4096 {
+                                    cmp_work = 0;
+                                    ctx.check()?;
+                                }
+                            } else {
+                                let mut pos = 0usize;
+                                while pos < i {
+                                    let chunk = (i - pos).min(4096 - cmp_work);
+                                    let eq = p[pos..pos + chunk] == root_slice[pos..pos + chunk];
+                                    cmp_work += chunk;
+                                    if cmp_work >= 4096 {
+                                        cmp_work = 0;
+                                        ctx.check()?;
+                                    }
+                                    if !eq {
+                                        same = false;
+                                        break;
+                                    }
+                                    pos += chunk;
+                                }
+                            }
+                            if same {
                                 (_, loop_base) =
                                     insert_hb_set(&mut banned_edges, p[i], charge, loop_base)?;
                             }
@@ -8376,14 +8457,15 @@ impl Reader {
                 });
             }
             drop(fwd_any);
-            sort_checked_by_key(&mut forward, ctx, |j| j.source)?;
-            let bwd_len = bwd_set.len();
             let bwd_base = search
                 .retained_bytes()
                 .saturating_add(state.index_bytes())
                 .saturating_add(vec_bytes::<ForwardJob>(forward.capacity()))
                 .saturating_add(forward_target_bytes)
                 .saturating_add(set_bytes(&bwd_set));
+            charge.resize(bwd_base)?;
+            sort_checked_by_key(&mut forward, ctx, |j| j.source)?;
+            let bwd_len = bwd_set.len();
             charge.resize(bwd_base.saturating_add(vec_bytes::<u64>(bwd_len)))?;
             backward.reserve_exact(bwd_len);
             for (idx, t) in bwd_set.into_iter().enumerate() {
@@ -8392,6 +8474,13 @@ impl Reader {
                 }
                 backward.push(t);
             }
+            let post_bwd = search
+                .retained_bytes()
+                .saturating_add(state.index_bytes())
+                .saturating_add(vec_bytes::<ForwardJob>(forward.capacity()))
+                .saturating_add(forward_target_bytes)
+                .saturating_add(vec_bytes::<u64>(backward.capacity()));
+            charge.resize(post_bwd)?;
             sort_checked_by_key(&mut backward, ctx, |&t| t)?;
             Some(state)
         } else {
@@ -8812,39 +8901,42 @@ impl Reader {
                                     cost,
                                 }));
                             }
-                        } else {
-                            if !both_ends || fallback_from_both {
-                                let close = any
-                                    || targets_opt
-                                        .as_ref()
-                                        .is_some_and(|ts| ts.binary_search(&s).is_ok());
-                                let job = TreeStreamJob::open(
-                                    ctx,
-                                    spec,
-                                    &mut self.search,
-                                    s,
-                                    true,
-                                    targets_opt.as_deref(),
-                                    all,
-                                    close,
-                                    !both_ends,
-                                    &mut self.charge,
-                                    outer,
-                                )?;
-                                self.charge.resize(
-                                    self.search
-                                        .retained_bytes()
-                                        .saturating_add(outer)
-                                        .saturating_add(job.retained_bytes())
-                                        .saturating_add(size_of::<TreeStreamJob>() as u64),
-                                )?;
-                                self.active = ActiveJob::Tree(Box::new(job));
-                            }
+                        } else if !both_ends || fallback_from_both {
+                            let close = any
+                                || targets_opt
+                                    .as_ref()
+                                    .is_some_and(|ts| ts.binary_search(&s).is_ok());
+                            let job = TreeStreamJob::open(
+                                ctx,
+                                spec,
+                                &mut self.search,
+                                s,
+                                true,
+                                targets_opt.as_deref(),
+                                all,
+                                close,
+                                !both_ends,
+                                &mut self.charge,
+                                outer,
+                            )?;
                             if targets_opt.is_some() {
                                 drop(targets_opt);
                                 self.forward_target_bytes =
                                     self.forward_target_bytes.saturating_sub(moved_bytes);
                             }
+                            let post_outer = self.fixed_bytes_excluding_active();
+                            self.charge.resize(
+                                self.search
+                                    .retained_bytes()
+                                    .saturating_add(post_outer)
+                                    .saturating_add(job.retained_bytes())
+                                    .saturating_add(size_of::<TreeStreamJob>() as u64),
+                            )?;
+                            self.active = ActiveJob::Tree(Box::new(job));
+                        } else if targets_opt.is_some() {
+                            drop(targets_opt);
+                            self.forward_target_bytes =
+                                self.forward_target_bytes.saturating_sub(moved_bytes);
                         }
                     }
                 }
@@ -9076,7 +9168,8 @@ impl Reader {
             let mut finished_current = false;
             'emit: while out.len() < cap {
                 ticks += 1;
-                if ticks.is_multiple_of(4096) {
+                if ticks >= 4096 {
+                    ticks = 0;
                     ctx.check()?;
                 }
                 let input_row_idx: Option<usize> = if let Some(inp) = &self.input {
@@ -9115,12 +9208,18 @@ impl Reader {
                 };
                 if let (Some(inp), Some(idx)) = (&self.input, input_row_idx) {
                     for (j, c) in inp.in_cols.iter().enumerate() {
+                        ticks += 1;
+                        if ticks >= 4096 {
+                            ticks = 0;
+                            ctx.check()?;
+                        }
                         self.in_row[j] = c.map_or(Id::UNDEF, |c| inp.table.cols[c][idx]);
                     }
                 }
                 while out.len() < cap {
                     ticks += 1;
-                    if ticks.is_multiple_of(4096) {
+                    if ticks >= 4096 {
+                        ticks = 0;
                         ctx.check()?;
                     }
                     let edge_k = {
@@ -9132,7 +9231,22 @@ impl Reader {
                         cur.edge_at += 1;
                         k
                     };
-                    self.row_buf.copy_from_slice(&self.path_row);
+                    if width <= 4096 {
+                        self.row_buf.copy_from_slice(&self.path_row);
+                    } else {
+                        let mut pos = 0usize;
+                        while pos < width {
+                            let chunk = (width - pos).min(4096 - ticks);
+                            self.row_buf[pos..pos + chunk]
+                                .copy_from_slice(&self.path_row[pos..pos + chunk]);
+                            ticks += chunk;
+                            if ticks >= 4096 {
+                                ticks = 0;
+                                ctx.check()?;
+                            }
+                            pos += chunk;
+                        }
+                    }
                     if per_edge {
                         let edge_opt = self
                             .current
@@ -9192,6 +9306,11 @@ impl Reader {
                     if input_row_idx.is_some() {
                         let mut ok = true;
                         for j in 0..width {
+                            ticks += 1;
+                            if ticks >= 4096 {
+                                ticks = 0;
+                                ctx.check()?;
+                            }
                             match (self.in_row[j].is_undef(), self.row_buf[j].is_undef()) {
                                 (_, true) => self.row_buf[j] = self.in_row[j],
                                 (true, false) => {}
@@ -9202,6 +9321,11 @@ impl Reader {
                             out.push_row(&self.row_buf);
                         }
                     } else {
+                        ticks += width;
+                        if ticks >= 4096 {
+                            ticks = 0;
+                            ctx.check()?;
+                        }
                         out.push_row(&self.row_buf);
                     }
                 }
@@ -9535,90 +9659,235 @@ mod tree_tests {
     #[test]
     fn hb_table_growth_after_deletions_admits_old_plus_new_and_tombstone_reuse() {
         use crate::store::{Store, StoreOptions};
+        use std::collections::VecDeque;
         use std::sync::Arc;
 
         let store = Store::in_memory(StoreOptions::default());
         let snap = store.snapshot();
-
-        // Build a 32-bucket HbSet with 28 live entries (0 headroom), then delete 14 to
-        // leave 14 live entries and 14 tombstones (reported capacity drops while physical
-        // allocation stays at 32 buckets).
         let ctx_unbounded = Arc::new(Ctx::new(snap.clone()));
+
+        // Build a 256-bucket HbSet (`full_cap = 224`), then churn inserts and deletions
+        // without growing until tombstones pull `capacity()` below `full_cap / 2` (under
+        // half the buckets). Topping up to `len == capacity` leaves a full table whose
+        // next insert must pre-admit old + 2*old yet rehash in place (reusing tombstones)
+        // before later inserts grow to 512 buckets.
         let mut charge = super::super::ctx::OwnedCharge::new(&ctx_unbounded, 0).unwrap();
         let mut set: HbSet<u64> = HbSet::default();
+        let mut live: VecDeque<u64> = VecDeque::new();
         let mut base = 0u64;
-        for k in 0..28u64 {
-            let (_, next) = insert_hb_set(&mut set, k, &mut charge, base).unwrap();
+        let mut next_key = 0u64;
+        while set.capacity() < 224 {
+            let (_, next) = insert_hb_set(&mut set, next_key, &mut charge, base).unwrap();
             base = next;
+            live.push_back(next_key);
+            next_key += 1;
         }
-        let alloc_32 = set_bytes(&set);
-        assert!(alloc_32 > 0);
-        assert_eq!(base, alloc_32);
-        for k in 0..14u64 {
-            assert!(set.remove(&k));
+        let full_cap = set.capacity();
+        let alloc_256 = set_bytes(&set);
+        assert!(alloc_256 > 0);
+        assert_eq!(base, alloc_256);
+        let target_len = full_cap / 2;
+        let drain_to = full_cap / 5;
+        let mut rounds = 0usize;
+        loop {
+            while set.len() < set.capacity() {
+                let (_, next) = insert_hb_set(&mut set, next_key, &mut charge, base).unwrap();
+                base = next;
+                live.push_back(next_key);
+                next_key += 1;
+            }
+            assert_eq!(set_bytes(&set), alloc_256);
+            if set.len() < target_len {
+                break;
+            }
+            rounds += 1;
+            assert!(
+                rounds < 64,
+                "HbSet tombstones did not pull full length below {target_len} (len={}, cap={})",
+                set.len(),
+                set.capacity()
+            );
+            while set.len() > drain_to {
+                let k = live.pop_front().unwrap();
+                assert!(set.remove(&k));
+            }
         }
-        assert_eq!(set.len(), 14);
+        let full_tombstone_len = set.len();
+        assert_eq!(
+            set.len(),
+            set.capacity(),
+            "tombstones must exhaust hashbrown growth_left for HbSet"
+        );
+        assert!(
+            set.capacity() < target_len,
+            "tombstone-laden HbSet capacity ({}) must be below half full capacity ({target_len})",
+            set.capacity()
+        );
         assert_eq!(
             set_bytes(&set),
-            alloc_32,
-            "physical allocation stays at 32 buckets after deletions"
+            alloc_256,
+            "physical allocation stays at 256 buckets after deletions"
         );
 
-        // Under a tight budget that covers old + 32-bucket growth but NOT old + 64-bucket
-        // growth (`3 * alloc_32`), an insertion when `len == cap` must refuse BEFORE
-        // allocating a 64-bucket table.
-        if set.len() == set.capacity() {
+        // Under a tight budget that covers old + 256-bucket growth (`2 * alloc_256`) but
+        // NOT old + 512-bucket growth (`3 * alloc_256`), inserting when `len == cap` must
+        // refuse unconditionally BEFORE allocating or modifying the table.
+        {
             let mut tight = Ctx::new(snap.clone());
-            tight.mem_limit = alloc_32 + alloc_32; // too small for old + 2*old
+            tight.mem_limit = alloc_256 + alloc_256;
             let tight = Arc::new(tight);
-            let mut tight_charge = super::super::ctx::OwnedCharge::new(&tight, alloc_32).unwrap();
-            let err = insert_hb_set(&mut set, 10_000, &mut tight_charge, alloc_32);
+            let mut tight_charge = super::super::ctx::OwnedCharge::new(&tight, alloc_256).unwrap();
+            let err = insert_hb_set(&mut set, 10_000_000, &mut tight_charge, alloc_256);
             assert!(
                 matches!(err, Err(Error::BudgetExceeded(b)) if b.kind == crate::error::BudgetKind::Memory),
-                "expected pre-allocation memory refusal: {err:?}"
+                "expected pre-allocation memory refusal for HbSet: {err:?}"
             );
-            assert_eq!(set_bytes(&set), alloc_32);
-            assert_eq!(tight_charge.bytes(), alloc_32);
+            assert_eq!(set.len(), full_tombstone_len);
+            assert_eq!(set_bytes(&set), alloc_256);
+            assert_eq!(tight_charge.bytes(), alloc_256);
         }
 
-        // Now allow old + 2*old and insert keys until we see both tombstone reuse /
-        // in-place rehash (allocation stays at `alloc_32`) and allocating growth to 64
-        // buckets (charge settles to exact 64-bucket `allocation_size()`).
+        // Now allow old + 2*old and insert keys until allocating growth occurs. The first
+        // insert at `len == cap` must reuse tombstones (in-place rehash: physical
+        // allocation stays at `alloc_256` while `capacity()` recovers above `len()`)
+        // BEFORE later inserts grow to 512 buckets.
+        let mut saw_tombstone_reuse = false;
         let mut saw_growth = false;
-        let mut key = 100u64;
-        while !saw_growth && key < 500 {
-            let before = set_bytes(&set);
-            let (_, next) = insert_hb_set(&mut set, key, &mut charge, base).unwrap();
+        let mut steps = 0usize;
+        while !saw_growth && steps < 1000 {
+            let before_bytes = set_bytes(&set);
+            let was_full = set.len() == set.capacity();
+            let (_, next) = insert_hb_set(&mut set, next_key, &mut charge, base).unwrap();
             base = next;
-            let after = set_bytes(&set);
-            assert_eq!(base, after);
-            assert_eq!(charge.bytes(), after);
-            if after > before {
+            next_key += 1;
+            steps += 1;
+            let after_bytes = set_bytes(&set);
+            assert_eq!(base, after_bytes);
+            assert_eq!(charge.bytes(), after_bytes);
+            if was_full && after_bytes == before_bytes && set.capacity() > set.len() {
+                assert!(
+                    !saw_growth,
+                    "tombstone reuse should happen before allocating growth"
+                );
+                saw_tombstone_reuse = true;
+            }
+            if after_bytes > before_bytes {
+                assert!(
+                    saw_tombstone_reuse,
+                    "expected tombstone reuse before 512-bucket growth for HbSet"
+                );
                 saw_growth = true;
             }
-            key += 1;
         }
-        assert!(saw_growth, "expected table to grow past 32 buckets");
+        assert!(saw_tombstone_reuse, "expected HbSet tombstone reuse");
+        assert!(saw_growth, "expected HbSet to grow past 256 buckets");
 
-        // Same verification for HbMap<u64, u64>.
+        // Same shape, unconditional refusal, tombstone reuse, and growth checks for HbMap.
         let mut map: HbMap<u64, u64> = HbMap::default();
+        let mut mlive: VecDeque<u64> = VecDeque::new();
         let mut mcharge = super::super::ctx::OwnedCharge::new(&ctx_unbounded, 0).unwrap();
         let mut mbase = 0u64;
-        for k in 0..28u64 {
-            let (_, next) = insert_hb_map(&mut map, k, k * 2, &mut mcharge, mbase).unwrap();
+        let mut mkey = 0u64;
+        while map.capacity() < 224 {
+            let (_, next) = insert_hb_map(&mut map, mkey, mkey * 2, &mut mcharge, mbase).unwrap();
             mbase = next;
+            mlive.push_back(mkey);
+            mkey += 1;
         }
-        let m_alloc_32 = map_bytes(&map);
-        for k in 0..14u64 {
-            assert!(map.remove(&k).is_some());
+        let m_full_cap = map.capacity();
+        let m_alloc_256 = map_bytes(&map);
+        assert!(m_alloc_256 > 0);
+        assert_eq!(mbase, m_alloc_256);
+        let m_target_len = m_full_cap / 2;
+        let m_drain_to = m_full_cap / 5;
+        let mut mrounds = 0usize;
+        loop {
+            while map.len() < map.capacity() {
+                let (_, next) =
+                    insert_hb_map(&mut map, mkey, mkey * 2, &mut mcharge, mbase).unwrap();
+                mbase = next;
+                mlive.push_back(mkey);
+                mkey += 1;
+            }
+            assert_eq!(map_bytes(&map), m_alloc_256);
+            if map.len() < m_target_len {
+                break;
+            }
+            mrounds += 1;
+            assert!(
+                mrounds < 64,
+                "HbMap tombstones did not pull full length below {m_target_len} (len={}, cap={})",
+                map.len(),
+                map.capacity()
+            );
+            while map.len() > m_drain_to {
+                let k = mlive.pop_front().unwrap();
+                assert!(map.remove(&k).is_some());
+            }
         }
-        assert_eq!(map_bytes(&map), m_alloc_32);
-        for k in 100..200u64 {
-            let (_, next) = insert_hb_map(&mut map, k, k * 2, &mut mcharge, mbase).unwrap();
+        let m_full_tombstone_len = map.len();
+        assert_eq!(
+            map.len(),
+            map.capacity(),
+            "tombstones must exhaust hashbrown growth_left for HbMap"
+        );
+        assert!(
+            map.capacity() < m_target_len,
+            "tombstone-laden HbMap capacity ({}) must be below half full capacity ({m_target_len})",
+            map.capacity()
+        );
+        assert_eq!(map_bytes(&map), m_alloc_256);
+        {
+            let mut tight = Ctx::new(snap);
+            tight.mem_limit = m_alloc_256 + m_alloc_256;
+            let tight = Arc::new(tight);
+            let mut tight_charge =
+                super::super::ctx::OwnedCharge::new(&tight, m_alloc_256).unwrap();
+            let err = insert_hb_map(
+                &mut map,
+                10_000_000,
+                20_000_000,
+                &mut tight_charge,
+                m_alloc_256,
+            );
+            assert!(
+                matches!(err, Err(Error::BudgetExceeded(b)) if b.kind == crate::error::BudgetKind::Memory),
+                "expected pre-allocation memory refusal for HbMap: {err:?}"
+            );
+            assert_eq!(map.len(), m_full_tombstone_len);
+            assert_eq!(map_bytes(&map), m_alloc_256);
+            assert_eq!(tight_charge.bytes(), m_alloc_256);
+        }
+        let mut m_saw_tombstone_reuse = false;
+        let mut m_saw_growth = false;
+        let mut msteps = 0usize;
+        while !m_saw_growth && msteps < 1000 {
+            let before_bytes = map_bytes(&map);
+            let was_full = map.len() == map.capacity();
+            let (_, next) = insert_hb_map(&mut map, mkey, mkey * 2, &mut mcharge, mbase).unwrap();
             mbase = next;
-            assert_eq!(mbase, map_bytes(&map));
-            assert_eq!(mcharge.bytes(), map_bytes(&map));
+            mkey += 1;
+            msteps += 1;
+            let after_bytes = map_bytes(&map);
+            assert_eq!(mbase, after_bytes);
+            assert_eq!(mcharge.bytes(), after_bytes);
+            if was_full && after_bytes == before_bytes && map.capacity() > map.len() {
+                assert!(
+                    !m_saw_growth,
+                    "tombstone reuse should happen before allocating growth"
+                );
+                m_saw_tombstone_reuse = true;
+            }
+            if after_bytes > before_bytes {
+                assert!(
+                    m_saw_tombstone_reuse,
+                    "expected tombstone reuse before 512-bucket growth for HbMap"
+                );
+                m_saw_growth = true;
+            }
         }
+        assert!(m_saw_tombstone_reuse, "expected HbMap tombstone reuse");
+        assert!(m_saw_growth, "expected HbMap to grow past 256 buckets");
     }
 
     #[test]
@@ -9631,16 +9900,21 @@ mod tree_tests {
 
         let store = Store::in_memory(StoreOptions::default());
         let mut data = String::from("@prefix ex: <http://example.org/> .\n");
-        data.push_str("ex:s ex:p ex:t1 .\nex:s ex:p ex:t2 .\n");
+        data.push_str("ex:s ex:p ex:t1 .\nex:s ex:p ex:t2 .\nex:s ex:p ex:t3 .\n");
+        // 5,000 distinct reifiers on (ex:s, ex:p, ex:t1) with minimum late in the scan.
         for i in 0..5000 {
             let w = if i == 4200 { "2.5" } else { "10.0" };
             data.push_str(&format!("<< ex:s ex:p ex:t1 ~ ex:r{i} >> ex:w {w} .\n"));
         }
-        data.push_str("<< ex:s ex:p ex:t2 ~ ex:singleR >> ex:w 5.0 .\n");
-        for i in 0..5000 {
-            let w = if i == 4500 { "0.5" } else { "9.0" };
-            data.push_str(&format!("ex:singleR ex:w {w} .\n"));
+        // Single reifier on (ex:s, ex:p, ex:t2) with 20,000 distinct xsd:integer weights
+        // (Tag::Int = 3) plus 0.5 as xsd:decimal (Tag::Decimal = 9 > Tag::Int), placing
+        // the minimum weight strictly LAST in Perm::Pso key order.
+        data.push_str("<< ex:s ex:p ex:t2 ~ ex:singleR >> ex:w 0.5 .\n");
+        for i in 10..20_010 {
+            data.push_str(&format!("ex:singleR ex:w {i} .\n"));
         }
+        // Small baseline edge (1 reifier, 1 weight) for poll-count comparison.
+        data.push_str("<< ex:s ex:p ex:t3 ~ ex:smallR >> ex:w 3.0 .\n");
         store
             .load(&[Source::from_bytes(
                 data.into_bytes(),
@@ -9654,8 +9928,47 @@ mod tree_tests {
         let p = find("http://example.org/p");
         let t1 = find("http://example.org/t1");
         let t2 = find("http://example.org/t2");
+        let t3 = find("http://example.org/t3");
         let w = find("http://example.org/w");
+        let single_r = find("http://example.org/singleR");
         let reifies = find(RDF_REIFIES);
+        assert_eq!(
+            snap.count(Perm::Pso, &[w.0, single_r.0]).unwrap(),
+            20_001,
+            "ex:singleR must hold 20,001 distinct weight quads"
+        );
+        // Confirm the minimum 0.5 is genuinely the last key in Perm::Pso order.
+        let mut last_weight_id = 0u64;
+        let mut weight_count = 0usize;
+        snap.scan_between_cols(
+            Perm::Pso,
+            pad(&[w.0, single_r.0], 0),
+            pad(&[w.0, single_r.0], u64::MAX),
+            1 << 2,
+            |c| {
+                match c {
+                    Chunk::Block(b, s_i, e_i) => {
+                        weight_count += e_i - s_i;
+                        last_weight_id = b.cols[2][e_i - 1];
+                    }
+                    Chunk::Row(k) => {
+                        weight_count += 1;
+                        last_weight_id = k[2];
+                    }
+                }
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(weight_count, 20_001);
+        let ctx = Arc::new(Ctx::new(snap));
+        assert_eq!(
+            ctx.value(Id(last_weight_id))
+                .as_ref()
+                .and_then(super::super::value::approx_f64),
+            Some(0.5),
+            "minimum weight must be last in PSO key order"
+        );
         let spec = PathSearchSpec {
             algorithm: Algorithm::Shortest,
             source: PathEnd::Const(s),
@@ -9684,15 +9997,43 @@ mod tree_tests {
             cost: None,
             graph: GraphFilter::Default,
         };
-        let ctx = Arc::new(Ctx::new(snap));
+        // Warm ctx term cache for the endpoints so CHECKS measures scan polling only.
+        let _ = (
+            ctx.term(s),
+            ctx.term(p),
+            ctx.term(t1),
+            ctx.term(t2),
+            ctx.term(t3),
+        );
+        let c0 = super::super::ctx::CHECKS.with(Cell::get);
+        assert_eq!(
+            lookup_weight_charged(&ctx, &spec, Some(w.0), (s.0, p.0, t3.0)).unwrap(),
+            3.0
+        );
+        let checks_small = super::super::ctx::CHECKS.with(Cell::get) - c0;
+
+        let c1 = super::super::ctx::CHECKS.with(Cell::get);
         assert_eq!(
             lookup_weight_charged(&ctx, &spec, Some(w.0), (s.0, p.0, t1.0)).unwrap(),
             2.5
         );
+        let checks_reifiers = super::super::ctx::CHECKS.with(Cell::get) - c1;
+        assert!(
+            checks_reifiers >= 5000,
+            "outer reifier scan must poll during work, got only {checks_reifiers} checks"
+        );
+
+        let c2 = super::super::ctx::CHECKS.with(Cell::get);
         assert_eq!(
             lookup_weight_charged(&ctx, &spec, Some(w.0), (s.0, p.0, t2.0)).unwrap(),
             0.5
         );
+        let checks_weights = super::super::ctx::CHECKS.with(Cell::get) - c2;
+        assert!(
+            checks_weights >= checks_small + 3,
+            "inner 20,001-weight scan must poll mid-scan (got {checks_weights} vs baseline {checks_small})"
+        );
+
         ctx.cancel.store(true, Ordering::Relaxed);
         assert!(matches!(
             lookup_weight_charged(&ctx, &spec, Some(w.0), (s.0, p.0, t1.0)),
@@ -9702,6 +10043,245 @@ mod tree_tests {
             lookup_weight_charged(&ctx, &spec, Some(w.0), (s.0, p.0, t2.0)),
             Err(Error::Cancelled)
         ));
+    }
+
+    #[test]
+    fn r2_deleted_adjacency_scan_and_inner_loops_poll_after_start() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        use oxrdfio::RdfFormat;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        // 1. Deleted base edges in a delta: both non-sweep and sweep branches of
+        //    `scan_lane_charged` must poll via `scan_between_cols_checked` even when
+        //    the visible-row callback is never invoked.
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..5000 {
+            data.push_str(&format!("<urn:del:s> <urn:del:p> <urn:del:o:{i}> .\n"));
+        }
+        // Extra distinct IRIs (without <urn:del:p> edges) to build a >=64 sweep frontier.
+        for i in 0..512 {
+            data.push_str(&format!("<urn:del:f:{i}> <urn:del:tag> 1 .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap0 = store.snapshot();
+        let s = snap0.lookup_iri("urn:del:s").unwrap();
+        let p = snap0.lookup_iri("urn:del:p").unwrap();
+        let mut tx = store.write();
+        for i in 0..5000 {
+            let o = snap0.lookup_iri(&format!("urn:del:o:{i}")).unwrap();
+            assert!(tx.delete([s, p, o, Id::DEFAULT_GRAPH]).unwrap());
+        }
+        tx.commit().unwrap();
+        let snap = store.snapshot();
+        let ctx = Arc::new(Ctx::new(snap.clone()));
+        let spec = PathSearchSpec {
+            algorithm: Algorithm::Shortest,
+            source: PathEnd::Const(s),
+            target: PathEnd::Var(0),
+            predicates: Some(vec![p.0]),
+            directions: vec![Direction::Forward],
+            direction: Direction::Forward,
+            exclude: Vec::new(),
+            max_degree: None,
+            edge_pattern: None,
+            min_len: 1,
+            max_len: None,
+            k: 1,
+            limit: None,
+            max_visited: 100_000,
+            weight: None,
+            default_weight: 1.0,
+            reifies: None,
+            path_index: None,
+            edge_index: None,
+            edge_s: None,
+            edge_p: None,
+            edge_o: None,
+            edge: None,
+            length: None,
+            cost: None,
+            graph: GraphFilter::Default,
+        };
+        let lane = Lane {
+            perm: Perm::Pso,
+            p: Some(p.0),
+            subject_side: true,
+            pattern: false,
+        };
+
+        // Non-sweep branch: 0 visible rows, >= 5,000 delta deletion checks.
+        let mut sweeps = 0u64;
+        let mut out: Vec<(u64, Step)> = Vec::new();
+        let before = super::super::ctx::CHECKS.with(Cell::get);
+        scan_lane_charged(
+            false,
+            &mut sweeps,
+            &ctx,
+            &spec,
+            &lane,
+            &[s.0],
+            false,
+            false,
+            &mut out,
+            usize::MAX,
+            None,
+        )
+        .unwrap();
+        let non_sweep_checks = super::super::ctx::CHECKS.with(Cell::get) - before;
+        assert!(out.is_empty());
+        assert_eq!(sweeps, 0);
+        assert!(
+            non_sweep_checks >= 5000,
+            "non-sweep scan must poll across 5,000 deleted delta rows, got {non_sweep_checks}"
+        );
+
+        // Sweep branch: 513-node sorted frontier forces sweep; 0 visible rows, >= 5,000 checks.
+        let mut frontier: Vec<u64> = (0..512)
+            .map(|i| snap.lookup_iri(&format!("urn:del:f:{i}")).unwrap().0)
+            .collect();
+        frontier.push(s.0);
+        frontier.sort_unstable();
+        frontier.dedup();
+        let before_sweep = super::super::ctx::CHECKS.with(Cell::get);
+        scan_lane_charged(
+            false,
+            &mut sweeps,
+            &ctx,
+            &spec,
+            &lane,
+            &frontier,
+            false,
+            false,
+            &mut out,
+            usize::MAX,
+            None,
+        )
+        .unwrap();
+        let sweep_checks = super::super::ctx::CHECKS.with(Cell::get) - before_sweep;
+        assert!(out.is_empty());
+        assert_eq!(sweeps, 1);
+        assert!(
+            sweep_checks >= 5000,
+            "sweep scan must poll across 5,000 deleted delta rows, got {sweep_checks}"
+        );
+
+        ctx.cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            scan_lane_charged(
+                false,
+                &mut sweeps,
+                &ctx,
+                &spec,
+                &lane,
+                &[s.0],
+                false,
+                false,
+                &mut out,
+                usize::MAX,
+                None,
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            scan_lane_charged(
+                false,
+                &mut sweeps,
+                &ctx,
+                &spec,
+                &lane,
+                &frontier,
+                false,
+                false,
+                &mut out,
+                usize::MAX,
+                None,
+            ),
+            Err(Error::Cancelled)
+        ));
+
+        // 2. Wide grouped emission column copy/join loops poll inside `Reader::next`.
+        let gstore = Store::in_memory(StoreOptions::default());
+        gstore
+            .load(&[Source::from_bytes(
+                b"<urn:g:s> <urn:g:p> <urn:g:t> .\n".to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let gsnap = gstore.snapshot();
+        let gs = gsnap.lookup_iri("urn:g:s").unwrap();
+        let gp = gsnap.lookup_iri("urn:g:p").unwrap();
+        let gctx = Arc::new(Ctx::new(gsnap));
+        let width = 200usize;
+        let vars: Vec<VarId> = (0..width as u32).collect();
+        let mut in_table = Table::new(vars.clone());
+        let mut row = vec![Id::from_i64(7).unwrap(); width];
+        row[0] = gs;
+        row[1] = Id::from_i64(99).unwrap(); // incompatible with length 1
+        for _ in 0..50 {
+            in_table.push_row(&row);
+        }
+        let gspec = PathSearchSpec {
+            algorithm: Algorithm::Shortest,
+            source: PathEnd::Var(0),
+            target: PathEnd::Var(2),
+            predicates: Some(vec![gp.0]),
+            directions: vec![Direction::Forward],
+            direction: Direction::Forward,
+            exclude: Vec::new(),
+            max_degree: None,
+            edge_pattern: None,
+            min_len: 1,
+            max_len: None,
+            k: 1,
+            limit: None,
+            max_visited: 100_000,
+            weight: None,
+            default_weight: 1.0,
+            reifies: None,
+            path_index: None,
+            edge_index: None,
+            edge_s: None,
+            edge_p: None,
+            edge_o: None,
+            edge: None,
+            length: Some(1),
+            cost: None,
+            graph: GraphFilter::Default,
+        };
+        let in_charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
+        let charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
+        let mut reader = Reader::open(
+            &gctx,
+            &gspec,
+            &vars,
+            Some((in_table, in_charge)),
+            ChargedPatternEdges::new(),
+            charge,
+        )
+        .unwrap();
+        let mut out_table = Table::new(vars.clone());
+        let c_before = super::super::ctx::CHECKS.with(Cell::get);
+        let done = reader
+            .next(&gctx, &gspec, &vars, &mut out_table, 64)
+            .unwrap();
+        let col_checks = super::super::ctx::CHECKS.with(Cell::get) - c_before;
+        assert!(done);
+        assert!(out_table.is_empty());
+        // 50 rows * (200 copy + 200 join) = 20,000 column operations -> >= 4 inner polls.
+        assert!(
+            col_checks >= 4,
+            "wide grouped copy/join must poll inside column loops, got {col_checks}"
+        );
     }
 
     #[test]

@@ -1220,7 +1220,7 @@ fn path_search_r1_parity_cancellation_and_release() {
     let q_multi = format!(
         "{P}SELECT ?t ?p ?i {{ SERVICE path:search {{ [] path:source <urn:s:0> ; path:target ?t ; path:predicate <urn:q> ; path:algorithm path:all ; path:maxLength 4 ; path:pathIndex ?p ; path:edgeIndex ?i }} }}"
     );
-    // 3a. Mid-pull cancel after first batch succeeds.
+    // 3a. Cancel between pulls after first batch succeeds.
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_opts = QueryOptions {
         no_cache: true,
@@ -1234,6 +1234,60 @@ fn path_search_r1_parity_cancellation_and_release() {
     assert!(matches!(c.next_batch(), Err(Error::Cancelled)));
     drop(c);
     assert_eq!(meter.live_bytes(), 0);
+
+    // 3a-ii. True within-pull cancellation AFTER work has started inside `next_batch()`:
+    // `cancel` is false at entry; a watcher thread waits until `meter.live_bytes()` rises
+    // above its pre-pull value (proving `PathSearch` opened and started exploring paths on
+    // a dense K_12 graph whose incompatible length join yields no rows) before setting the
+    // flag.
+    let dense = Store::in_memory(StoreOptions::default());
+    let mut dense_data = String::new();
+    for i in 0..12 {
+        for j in 0..12 {
+            if i != j {
+                dense_data.push_str(&format!("<urn:k:{i}> <urn:e> <urn:k:{j}> .\n"));
+            }
+        }
+    }
+    load(&dense, &dense_data, RdfFormat::Turtle);
+    let q_in_pull = format!(
+        "{P}SELECT ?s ?t ?l {{ VALUES (?s ?t ?l) {{ (<urn:k:0> <urn:k:11> 99) }} SERVICE path:search {{ [] path:source ?s ; path:target ?t ; path:predicate <urn:e> ; path:algorithm path:all ; path:maxLength 10 ; path:maxVisited 50000000 ; path:length ?l }} }}"
+    );
+    let in_pull_cancel = Arc::new(AtomicBool::new(false));
+    let in_pull_opts = QueryOptions {
+        no_cache: true,
+        cancel: Some(in_pull_cancel.clone()),
+        ..Default::default()
+    };
+    let mut c_in_pull =
+        select_cursor(dense.snapshot(), &q_in_pull, &in_pull_opts, &strict).unwrap();
+    let meter_in_pull = c_in_pull.memory_meter();
+    let watcher_meter = c_in_pull.memory_meter();
+    let open_bytes = meter_in_pull.live_bytes();
+    let watcher = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if watcher_meter.live_bytes() > open_bytes {
+                in_pull_cancel.store(true, Ordering::Release);
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        in_pull_cancel.store(true, Ordering::Release);
+        false
+    });
+    let res = c_in_pull.next_batch().map(|b| b.is_some());
+    let observed_in_flight = watcher.join().unwrap();
+    assert!(
+        observed_in_flight,
+        "watcher must observe memory growth inside next_batch() before cancelling"
+    );
+    assert!(
+        matches!(res, Err(Error::Cancelled)),
+        "expected mid-pull cancellation inside next_batch(): {res:?}"
+    );
+    drop(c_in_pull);
+    assert_eq!(meter_in_pull.live_bytes(), 0);
 
     // 3b. Release on early drop after one batch.
     let mut c = select_cursor(snap.clone(), &q_multi, &opts, &strict).unwrap();
