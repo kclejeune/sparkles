@@ -5048,8 +5048,6 @@ mod tests {
 
             let db = std::path::absolute(dir.path()).unwrap().join("databases");
             let keep_dir = db.join("ds").join(KEEP_REPLACED_MARKER);
-            std::fs::create_dir(&keep_dir).unwrap();
-            std::fs::write(keep_dir.join("sentinel.txt"), b"keep-dir-startup").unwrap();
 
             let staged = db.join(".restore-ds-12");
             let restored = Store::open(&staged, Default::default()).unwrap();
@@ -5061,9 +5059,18 @@ mod tests {
             .unwrap();
             drop(restored);
 
+            // Inject the `.keep-replaced-v1` directory after rename 1 and swap-marker
+            // publication (bypassing live preflight) so live rollback fails and startup
+            // recovery exercises an already-staged root carrying both markers.
+            restore::BEFORE_KEEP_MARKER_WRITE.set(Some(Box::new(|replaced| {
+                let staged_keep_dir = replaced.join(KEEP_REPLACED_MARKER);
+                std::fs::create_dir(&staged_keep_dir).unwrap();
+                std::fs::write(staged_keep_dir.join("sentinel.txt"), b"keep-dir-startup").unwrap();
+            })));
             swap::FAIL_ROLLBACK_RENAME.set(true);
             let res = swap::replace_in_place(&catalog, "ds", &staged, "12", true);
             swap::FAIL_ROLLBACK_RENAME.set(false);
+            restore::BEFORE_KEEP_MARKER_WRITE.set(None);
             assert!(res.is_err());
 
             let replaced = db.join(".replaced-ds-12");
@@ -5095,6 +5102,334 @@ mod tests {
                 std::fs::read(keep_dir.join("sentinel.txt")).unwrap(),
                 b"keep-dir-startup"
             );
+        }
+    }
+
+    #[cfg(feature = "backup")]
+    #[test]
+    fn r10_live_swap_refuses_non_regular_markers_before_rename() {
+        use crate::catalog::{restore, swap};
+        use crate::store::Store;
+
+        // Subtest A: pre-existing `.restore-swap.json` directory is refused BEFORE rename 1.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let healthy = catalog.create("healthy", &Default::default()).unwrap();
+            healthy
+                .update("INSERT DATA { <urn:r10-healthy-a> <urn:p> 1 }")
+                .unwrap();
+            let healthy_id = healthy.dataset_id();
+            let healthy_head = healthy.head_commit();
+            drop(healthy);
+
+            let pred = catalog.create("ds", &Default::default()).unwrap();
+            pred.update("INSERT DATA { <urn:r10-pred-a> <urn:p> 2 }")
+                .unwrap();
+            let pred_id = pred.dataset_id();
+            let pred_head = pred.head_commit();
+            drop(pred);
+
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let swap_dir = db.join("ds").join(restore::SWAP_MARKER);
+            std::fs::create_dir(&swap_dir).unwrap();
+            std::fs::write(swap_dir.join("sentinel.txt"), b"swap-dir-live").unwrap();
+
+            let staged = db.join(".restore-ds-13");
+            let restored = Store::open(&staged, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &restored,
+                "INSERT DATA { <urn:r10-restored-a> <urn:p> 3 . <urn:r10-restored-a> <urn:p> 4 }",
+                &Default::default(),
+            )
+            .unwrap();
+            drop(restored);
+
+            // Arm CRASH_AFTER(1): if rename 1 were ever attempted, `ds` would be moved
+            // aside to `.replaced-ds-13` and left detached.
+            swap::CRASH_AFTER.set(1);
+            let res = swap::replace_in_place(&catalog, "ds", &staged, "13", false);
+            swap::CRASH_AFTER.set(0);
+            assert!(
+                res.is_err(),
+                "swap must fail when .restore-swap.json is a directory"
+            );
+
+            let active = catalog
+                .get("ds")
+                .expect("preflight must refuse before rename 1 and keep ds open");
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (pred_id, pred_head)
+            );
+            let h = catalog
+                .get("healthy")
+                .expect("healthy sibling must stay online");
+            assert_eq!(
+                (h.dataset_id(), h.head_commit()),
+                (healthy_id, healthy_head)
+            );
+            assert!(!db.join(".replaced-ds-13").exists());
+            assert!(swap_dir.is_dir());
+            assert_eq!(
+                std::fs::read(swap_dir.join("sentinel.txt")).unwrap(),
+                b"swap-dir-live"
+            );
+            drop((active, h, catalog));
+
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            let h = reopened.get("healthy").unwrap();
+            assert_eq!(
+                (h.dataset_id(), h.head_commit()),
+                (healthy_id, healthy_head)
+            );
+            let active = reopened.get("ds").unwrap();
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (pred_id, pred_head)
+            );
+            assert_eq!(
+                std::fs::read(swap_dir.join("sentinel.txt")).unwrap(),
+                b"swap-dir-live"
+            );
+        }
+
+        // Subtest B: pre-existing `.keep-replaced-v1` directory with `keepReplaced` is refused
+        // BEFORE rename 1.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let pred = catalog.create("ds", &Default::default()).unwrap();
+            pred.update("INSERT DATA { <urn:r10-pred-b> <urn:p> 2 }")
+                .unwrap();
+            let pred_id = pred.dataset_id();
+            let pred_head = pred.head_commit();
+            drop(pred);
+
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let keep_dir = db.join("ds").join(KEEP_REPLACED_MARKER);
+            std::fs::create_dir(&keep_dir).unwrap();
+            std::fs::write(keep_dir.join("sentinel.txt"), b"keep-dir-preflight").unwrap();
+
+            let staged = db.join(".restore-ds-14");
+            drop(Store::open(&staged, Default::default()).unwrap());
+
+            swap::CRASH_AFTER.set(1);
+            let res = swap::replace_in_place(&catalog, "ds", &staged, "14", true);
+            swap::CRASH_AFTER.set(0);
+            assert!(res.is_err());
+
+            let active = catalog
+                .get("ds")
+                .expect("keepReplaced preflight must refuse before rename 1");
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (pred_id, pred_head)
+            );
+            assert!(!db.join(".replaced-ds-14").exists());
+            assert_eq!(
+                std::fs::read(keep_dir.join("sentinel.txt")).unwrap(),
+                b"keep-dir-preflight"
+            );
+        }
+
+        // Subtest C (Unix): pre-existing symlink at `.restore-swap.json` is refused BEFORE rename 1.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let pred = catalog.create("ds", &Default::default()).unwrap();
+            let pred_id = pred.dataset_id();
+            drop(pred);
+
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let swap_link = db.join("ds").join(restore::SWAP_MARKER);
+            std::os::unix::fs::symlink(dir.path().join("nonexistent-target"), &swap_link).unwrap();
+
+            let staged = db.join(".restore-ds-15");
+            drop(Store::open(&staged, Default::default()).unwrap());
+
+            swap::CRASH_AFTER.set(1);
+            let res = swap::replace_in_place(&catalog, "ds", &staged, "15", false);
+            swap::CRASH_AFTER.set(0);
+            assert!(res.is_err());
+
+            assert_eq!(catalog.get("ds").unwrap().dataset_id(), pred_id);
+            assert!(!db.join(".replaced-ds-15").exists());
+            assert!(std::fs::symlink_metadata(&swap_link).unwrap().is_symlink());
+        }
+    }
+
+    #[test]
+    fn r10_startup_rollback_preserves_swap_marker_directory_and_sibling() {
+        use super::super::CONFIG_FILE;
+        use crate::catalog::restore;
+        use crate::store::Store;
+
+        // Subtest A: already-staged predecessor carrying a sentinel directory at
+        // `.restore-swap.json` rolls back cleanly on startup, preserves the sentinel,
+        // and keeps healthy siblings online.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let healthy = catalog.create("healthy", &Default::default()).unwrap();
+            healthy
+                .update("INSERT DATA { <urn:r10-startup-healthy> <urn:p> 1 }")
+                .unwrap();
+            let healthy_id = healthy.dataset_id();
+            let healthy_head = healthy.head_commit();
+            drop(healthy);
+
+            let pred = catalog.create("ds", &Default::default()).unwrap();
+            pred.update("INSERT DATA { <urn:r10-startup-pred> <urn:p> 2 }")
+                .unwrap();
+            let pred_id = pred.dataset_id();
+            let pred_head = pred.head_commit();
+            drop((pred, catalog));
+
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let replaced = db.join(".replaced-ds-14");
+            std::fs::rename(db.join("ds"), &replaced).unwrap();
+            let swap_dir = replaced.join(restore::SWAP_MARKER);
+            std::fs::create_dir(&swap_dir).unwrap();
+            std::fs::write(swap_dir.join("sentinel.txt"), b"swap-dir-startup").unwrap();
+
+            let reopened = Catalog::open(dir.path(), Default::default()).expect(
+                "startup rollback must preserve .restore-swap.json directory and open catalog",
+            );
+            let h = reopened
+                .get("healthy")
+                .expect("healthy sibling must remain available");
+            assert_eq!(
+                (h.dataset_id(), h.head_commit()),
+                (healthy_id, healthy_head)
+            );
+            let active = reopened
+                .get("ds")
+                .expect("predecessor must roll back on startup");
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (pred_id, pred_head)
+            );
+            assert!(!replaced.exists());
+            let live_swap_dir = db.join("ds").join(restore::SWAP_MARKER);
+            assert!(live_swap_dir.is_dir());
+            assert_eq!(
+                std::fs::read(live_swap_dir.join("sentinel.txt")).unwrap(),
+                b"swap-dir-startup"
+            );
+        }
+
+        // Subtest B: distinct-UUID rollback when staged replacement UUID B has a sentinel
+        // directory at `.restore-swap.json` still reinstates B, preserves the sentinel,
+        // keeps healthy siblings online, and retires prior UUID A.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let healthy = catalog.create("healthy", &Default::default()).unwrap();
+            healthy
+                .update("INSERT DATA { <urn:r10-distinct-healthy> <urn:p> 1 }")
+                .unwrap();
+            let healthy_id = healthy.dataset_id();
+            let healthy_head = healthy.head_commit();
+            drop(healthy);
+
+            let doomed = catalog.create("doomed", &Default::default()).unwrap();
+            doomed
+                .update("INSERT DATA { <urn:r10-distinct-a> <urn:p> 2 }")
+                .unwrap();
+            drop(doomed);
+
+            CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+            assert!(catalog.delete("doomed").is_err());
+            CRASH_AFTER.set(0);
+            drop(catalog);
+
+            let intent = read_intents(dir.path()).unwrap().pop().unwrap();
+            let db = dir.path().join("databases");
+            let kept = db.join(intent.kept_name());
+            let journal = dir.path().join(INTENT_FILE);
+
+            let replaced = db.join(".replaced-doomed-43");
+            let replacement = Store::open(&replaced, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &replacement,
+                "INSERT DATA { <urn:r10-distinct-b> <urn:p> 3 . <urn:r10-distinct-b> <urn:p> 4 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let replacement_id = replacement.dataset_id();
+            let replacement_head = replacement.head_commit();
+            assert_ne!(replacement_id, intent.id);
+            drop(replacement);
+
+            let mut reg = read_registry(dir.path()).unwrap();
+            let row = reg
+                .datasets
+                .iter_mut()
+                .find(|entry| entry.name == "doomed")
+                .expect("doomed row must exist");
+            row.id = Some(replacement_id);
+            row.revision = Some(Uuid::new_v4());
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                sparkles_core::formats::settings_to_vec(CONFIG_FILE, &reg).unwrap(),
+            )
+            .unwrap();
+
+            let swap_dir = replaced.join(restore::SWAP_MARKER);
+            std::fs::create_dir(&swap_dir).unwrap();
+            std::fs::write(swap_dir.join("sentinel.txt"), b"distinct-swap-dir").unwrap();
+
+            let reopened = Catalog::open(dir.path(), Default::default())
+                .expect("distinct-UUID rollback with .restore-swap.json directory must succeed");
+            let h = reopened.get("healthy").unwrap();
+            assert_eq!(
+                (h.dataset_id(), h.head_commit()),
+                (healthy_id, healthy_head)
+            );
+            let restored_b = reopened.get("doomed").unwrap();
+            assert_eq!(
+                (restored_b.dataset_id(), restored_b.head_commit()),
+                (replacement_id, replacement_head)
+            );
+            let live_swap_dir = db.join("doomed").join(restore::SWAP_MARKER);
+            assert!(live_swap_dir.is_dir());
+            assert_eq!(
+                std::fs::read(live_swap_dir.join("sentinel.txt")).unwrap(),
+                b"distinct-swap-dir"
+            );
+            assert!(!replaced.exists());
+            assert!(!kept.exists());
+            assert!(!journal.exists());
+        }
+
+        // Subtest C: malformed and unsupported regular `.restore-swap.json` files remain
+        // rejected with Corrupt and Unsupported respectively.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            drop(catalog.create("ds", &Default::default()).unwrap());
+            drop(catalog);
+
+            let db = dir.path().join("databases");
+            let replaced = db.join(".replaced-ds-15");
+            std::fs::rename(db.join("ds"), &replaced).unwrap();
+            let marker = replaced.join(restore::SWAP_MARKER);
+
+            std::fs::write(&marker, b"{\"format\":1,").unwrap();
+            let err = Catalog::open(dir.path(), Default::default())
+                .err()
+                .expect("malformed regular swap marker must still fail closed");
+            assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+            assert!(replaced.exists() && !db.join("ds").exists());
+
+            std::fs::write(&marker, br#"{"format":99,"dataset":"ds"}"#).unwrap();
+            let err = Catalog::open(dir.path(), Default::default())
+                .err()
+                .expect("future regular swap marker must still report Unsupported");
+            assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+            assert!(replaced.exists() && !db.join("ds").exists());
         }
     }
 

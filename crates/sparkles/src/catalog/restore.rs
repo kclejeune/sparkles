@@ -159,8 +159,13 @@ fn read_swap_marker(replaced: &RecoveryDir, dataset: &str) -> Result<Option<Swap
     };
     let mut file = match replaced.open_file(OsStr::new(SWAP_MARKER), false) {
         Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) if error.kind() == ErrorKind::InvalidData => return Err(corrupt(&error)),
+        // Sparkles only ever publishes regular files for `.restore-swap.json`.
+        // Treat pre-existing non-regular entries (such as a directory or symlink)
+        // as unmarked so already-staged roots can still roll back cleanly and
+        // preserve them without aborting catalog startup for healthy siblings.
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::InvalidData) => {
+            return Ok(None);
+        }
         Err(error) => return Err(error.into()),
     };
     let mut bytes = Vec::new();

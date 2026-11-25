@@ -4,8 +4,9 @@
 //! open rolls back both renames. Catalog::open repairs interrupted swaps while holding
 //! the directory lock.
 
+use super::delete::KEEP_REPLACED_MARKER;
 use super::restore::{
-    KEPT_PREFIX, REPLACED_PREFIX, RESTORE_PREFIX, SwapMarker, remove_keep_marker,
+    KEPT_PREFIX, REPLACED_PREFIX, RESTORE_PREFIX, SWAP_MARKER, SwapMarker, remove_keep_marker,
     remove_swap_marker, write_keep_marker, write_swap_marker,
 };
 use super::{Catalog, RegistryCommitError, Reservation, ReservationKind, sync_dir};
@@ -20,6 +21,27 @@ pub const DRAIN: Duration = Duration::from_secs(30);
 
 fn io(what: &str, path: &Path, e: std::io::Error) -> BackupError {
     BackupError::internal(format!("{what} {}: {e}", path.display()))
+}
+
+fn check_marker_path(root: &Path, name: &str) -> Result<(), BackupError> {
+    let path = root.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err(BackupError::internal(format!(
+            "cannot publish restore swap marker at {}: path exists and is not a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io("checking restore swap marker", &path, error)),
+    }
+}
+
+fn check_marker_paths(root: &Path, keep_replaced: bool) -> Result<(), BackupError> {
+    check_marker_path(root, SWAP_MARKER)?;
+    if keep_replaced {
+        check_marker_path(root, KEEP_REPLACED_MARKER)?;
+    }
+    Ok(())
 }
 
 /// Publish `restored` as the new dataset of `reservation` (renamed into
@@ -214,6 +236,10 @@ fn swap(
             format!("/{name} is an in-memory dataset"),
         ));
     };
+    if let Err(err) = check_marker_paths(&root, keep_replaced) {
+        st.reinsert(name, old);
+        return Err(err);
+    }
     // A restore intentionally publishes another identity. Read only its scalar
     // identity before closing the old graph; the existing-only opener validates
     // the complete header and the same UUID under its process lock later.
@@ -321,6 +347,9 @@ fn swap(
         .unwrap_or_else(|| st.dir().expect("persistent catalog").join("databases"));
     let replaced = databases.join(format!("{REPLACED_PREFIX}{name}-{task}"));
     let kept_name = keep_replaced.then(|| format!("{KEPT_PREFIX}{name}-{task}"));
+    if let Err(err) = check_marker_paths(&root, keep_replaced) {
+        return Err(reopen_after(st, name, err));
+    }
     if let Err(e) = std::fs::rename(&root, &replaced) {
         let err = io("moving aside", &root, e);
         return Err(reopen_after(st, name, err));
