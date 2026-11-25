@@ -4964,7 +4964,7 @@ export interface paths {
         put?: never;
         /**
          * Recall facts
-         * @description The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact.
+         * @description The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact. A request using a review or matching policy returns `409 evidence-settings-drift` while the evidence settings need reconciliation.
          */
         post: operations["recallFacts"];
         delete?: never;
@@ -23768,7 +23768,9 @@ export interface operations {
         /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. */
         requestBody: {
             content: {
-                "application/json": Record<string, never>;
+                "application/json": {
+                    [key: string]: unknown;
+                };
             };
         };
         responses: {
@@ -23787,6 +23789,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             412: components["responses"]["PreconditionFailed"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -23825,6 +23828,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             412: components["responses"]["PreconditionFailed"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -23846,7 +23850,9 @@ export interface operations {
         /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. */
         requestBody: {
             content: {
-                "application/json": Record<string, never>;
+                "application/json": {
+                    [key: string]: unknown;
+                };
             };
         };
         responses: {
@@ -23865,6 +23871,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             412: components["responses"]["PreconditionFailed"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };
@@ -28101,6 +28108,8 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
             default: components["responses"]["Error"];
         };
     };

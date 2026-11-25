@@ -13394,15 +13394,21 @@ settings, digest, revision, managed and detached graphs, and the `drift` flag.
 The dataset-wide settings listing includes this kind only for dataset administrators.
 
 Startup and SIGHUP resolve the declarations without changing the recorded settings or
-graph protection. Typed evidence operations answer `409 evidence-settings-drift`
-while the effective and recorded values disagree. Record the effective settings
-with `DELETE /$/settings/{ds}/evidence` to clear runtime overrides and apply the
-declared values, or use `PUT` or `PATCH` on the layered route to reconcile while
-setting permitted overrides. The complete settings endpoint also reconciles and
+graph protection. Typed evidence operations, including recall and ask with a review
+or matching policy, answer `409 evidence-settings-drift` while the effective and
+recorded values disagree. Claims-mode ingestion and GraphRAG builds and refreshes
+with a review policy also refuse drift in their task results. A valid disabled
+declaration for a dataset that never configured evidence supplies defaults for
+future enablement and reports no drift.
+Record the effective settings with `DELETE /$/settings/{ds}/evidence` to clear runtime
+overrides and apply the declared values, or use `PUT` or `PATCH` on the layered route
+to reconcile while setting permitted overrides. A `PATCH` with a named policy set to
+`null` clears its runtime override and reveals any declared policy. The complete settings endpoint also reconciles and
 records any differences from the declared values as runtime overrides. Both routes
 refuse changes that violate the locks or remove a protected graph. Detaching a graph
 returns `409 locked-by-config` when the declaration locks evidence enabled and
-locks a role or policy that requires that graph.
+locks a role or policy that requires that graph. Dataset backups keep the runtime
+overrides for use when the restored dataset has the same declarations.
 
 ### Evidence holds
 

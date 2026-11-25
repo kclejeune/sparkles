@@ -468,7 +468,12 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // the settings file and the model configuration are the operator's
         "/$/settings" => Server(ServerPerm::ServerAdmin),
         "/$/settings/{ds}" => Dataset(Read),
-        "/$/settings/{ds}/{kind}" if get => Dataset(Read),
+        "/$/settings/{ds}/{kind}"
+            if get
+                && !uri.path().rsplit('/').next().is_some_and(|kind| {
+                    percent_encoding::percent_decode_str(kind).decode_utf8_lossy()
+                        == crate::settings::evidence::NAME
+                }) => Dataset(Read),
         "/$/settings/{ds}/{kind}" => Dataset(Admin),
         // the model configuration and its keys: the server's outbound connections
         "/$/server/settings/{kind}" | "/$/server/secrets" | "/$/server/secrets/{name}" => {

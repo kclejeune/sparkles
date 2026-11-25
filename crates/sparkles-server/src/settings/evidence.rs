@@ -5,9 +5,8 @@
 //! `evidence.json` always holds the complete canonical object whose SHA-256 digest
 //! `managed.json` records, and is written only through [`sparkles::evidence::configure`],
 //! which never weakens protection. When `serve --settings` declares evidence settings or
-//! locks for a dataset, explicit runtime overrides of unlocked fields live in
-//! `evidence-overrides.json` (or `AppState::volatile` for in-memory datasets), keeping
-//! the file empty and absent whenever the recorded settings match the declared layer.
+//! locks for a dataset, the registry entry also records sparse runtime overrides of
+//! unlocked fields. A single durable registry replacement publishes both layers.
 //! While the effective settings differ from the recorded ones, typed evidence operations
 //! refuse with `409 evidence-settings-drift` without weakening protection.
 
@@ -16,19 +15,14 @@ use super::merge::{at, diff, merged, path_string, prune, starts_with};
 use super::{Declared, Kind, Providers, Resolved, Scope, resolve};
 use crate::http::ApiResult;
 use crate::state::{AppState, Dataset};
-use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 use sparkles::evidence::{Settings, SettingsStatus};
-use sparkles::managed::{ManagedError, ManagedErrorKind};
+use sparkles::managed::{EvidenceOverrides, ManagedError, ManagedErrorKind, OwnerKind};
 use sparkles::task::Control;
 use std::sync::Arc;
 
 /// The kind's name in `serve --settings` and `/$/settings/{ds}/evidence`.
 pub const NAME: &str = "evidence";
-
-/// The sparse C19 runtime override file kept beside `evidence.json` when declared
-/// settings exist and an unlocked field is overridden at runtime.
-pub const OVERRIDES_FILE: &str = "evidence-overrides.json";
 
 /// Top-level members of the `evidence` kind.
 pub const MEMBERS: &[&str] = &[
@@ -61,9 +55,9 @@ const MATCHING_POLICY_FIELDS: &[&str] = &["version", "boundary", "decisions", "m
 pub static EVIDENCE: Kind = Kind {
     name: NAME,
     scope: Scope::Dataset,
-    file: OVERRIDES_FILE,
+    file: "evidence.json",
     members: MEMBERS,
-    removable: &["policies", "matchingPolicies"],
+    removable: &[],
     shared: false,
     defaults: defaults_value,
     normalize: normalize_value,
@@ -188,55 +182,42 @@ fn main_of(ds: &Dataset) -> Option<Arc<Dataset>> {
     ds.main()
 }
 
-/// Read the sparse runtime override layer from `evidence-overrides.json`.
-fn read_overrides(st: &AppState, ds: &Dataset) -> anyhow::Result<Value> {
-    let main = main_of(ds);
-    let ds = main.as_deref().unwrap_or(ds);
-    let v = crate::assist::read_file(st, ds, OVERRIDES_FILE)?;
-    Ok(match v {
-        None => Value::Object(Map::new()),
-        Some(Value::Object(mut m)) => {
-            if let Some(f) = sparkles::formats::settings_file(OVERRIDES_FILE) {
-                m.remove(f.member);
-            }
-            Value::Object(m)
-        }
-        Some(_) => anyhow::bail!("{OVERRIDES_FILE} of {} is not a JSON object", ds.name),
-    })
+fn override_layer(overrides: Option<EvidenceOverrides>) -> Value {
+    Value::Object(overrides.map_or_else(Map::new, EvidenceOverrides::into_patch))
 }
 
-/// Store or remove `evidence-overrides.json`.
-fn write_overrides(st: &AppState, ds: &Dataset, layer: &Value) -> anyhow::Result<()> {
-    let main = main_of(ds);
-    let ds = main.as_deref().unwrap_or(ds);
-    let m = match layer {
-        Value::Object(m) => m,
-        _ => return crate::assist::remove_file(st, ds, OVERRIDES_FILE),
-    };
-    if m.is_empty() {
-        crate::assist::remove_file(st, ds, OVERRIDES_FILE)
-    } else {
-        crate::assist::write_file(st, ds, OVERRIDES_FILE, layer)
-    }
-}
-
-/// The runtime layer of `evidence` for C19 resolution:
-/// - When `serve --settings` declares values or locks for this dataset, the sparse
-///   overrides in `evidence-overrides.json`.
-/// - Otherwise, the diff of the recorded `evidence.json` against built-in defaults.
-pub fn runtime_layer(st: &AppState, ds: &Dataset) -> anyhow::Result<Value> {
-    let main = main_of(ds);
-    let ds = main.as_deref().unwrap_or(ds);
-    let declared = st.settings.declared();
-    if has_declared(&declared, &ds.name) {
-        return read_overrides(st, ds);
-    }
-    let status = sparkles::evidence::settings(&ds.dataset)?;
+fn recorded_layer(status: &SettingsStatus) -> sparkles::Result<Value> {
     if status.digest.is_none() {
         return Ok(Value::Object(Map::new()));
     }
-    let recorded = status.settings.canonical(&Control::none())?.value().clone();
-    Ok(diff(&defaults_value(), &recorded).unwrap_or_else(|| Value::Object(Map::new())))
+    let recorded = status.settings.canonical(&Control::none())?;
+    Ok(diff(&defaults_value(), recorded.value()).unwrap_or_else(|| Value::Object(Map::new())))
+}
+
+/// The runtime layer for an evidence write, and the revision the write plans against.
+/// A declared kind can still plan a repair from the registry's recorded entry after
+/// an interrupted write has left the canonical settings file mismatched.
+fn runtime_at(ds: &Dataset, declared: &Declared) -> sparkles::Result<(Value, u64)> {
+    if has_declared(declared, &ds.name) {
+        let Some(mut snapshot) = ds.store.managed_snapshot()? else {
+            return Ok((Value::Object(Map::new()), 0));
+        };
+        let overrides = snapshot
+            .graphs
+            .owners
+            .remove(&OwnerKind::Evidence)
+            .and_then(|e| e.evidence_overrides);
+        return Ok((override_layer(overrides), snapshot.graphs.revision));
+    }
+    let status = sparkles::evidence::settings(&ds.dataset)?;
+    Ok((recorded_layer(&status)?, status.revision))
+}
+
+/// The sparse override if declarations apply, or the recorded settings over the defaults.
+pub fn runtime_layer(st: &AppState, ds: &Dataset) -> anyhow::Result<Value> {
+    let main = main_of(ds);
+    let ds = main.as_deref().unwrap_or(ds);
+    Ok(runtime_at(ds, &st.settings.declared())?.0)
 }
 
 /// The resolved C19 view alongside the dataset's recorded evidence settings and drift state.
@@ -250,37 +231,19 @@ pub struct EvidenceState {
 pub fn inspect(st: &AppState, ds: &Dataset) -> sparkles::Result<EvidenceState> {
     let main = main_of(ds);
     let ds = main.as_deref().unwrap_or(ds);
-    inspect_declared(st, ds, &st.settings.declared())
+    inspect_declared(ds, &st.settings.declared())
 }
 
-fn inspect_declared(
-    st: &AppState,
-    ds: &Dataset,
-    declared: &Declared,
-) -> sparkles::Result<EvidenceState> {
-    let recorded = sparkles::evidence::settings(&ds.dataset)?;
-    if !has_declared(declared, &ds.name) {
-        let rt = if recorded.digest.is_some() {
-            let rec = recorded.settings.canonical(&Control::none())?;
-            diff(&defaults_value(), rec.value()).unwrap_or_else(|| Value::Object(Map::new()))
-        } else {
-            Value::Object(Map::new())
-        };
-        let resolved = resolve(&EVIDENCE, declared, &ds.name, rt, Providers::Unchecked);
-        return Ok(EvidenceState {
-            resolved,
-            recorded,
-            drift: false,
-        });
-    }
-    let rt = read_overrides(st, ds).map_err(|e| {
-        ManagedError::error(
-            ManagedErrorKind::Unavailable,
-            format!("cannot read {OVERRIDES_FILE} of /{}: {e:#}", ds.name),
-        )
-    })?;
+fn inspect_declared(ds: &Dataset, declared: &Declared) -> sparkles::Result<EvidenceState> {
+    let (recorded, overrides) = sparkles::evidence::settings_with_overrides(&ds.dataset)?;
+    let declared_kind = has_declared(declared, &ds.name);
+    let rt = if declared_kind {
+        override_layer(overrides)
+    } else {
+        recorded_layer(&recorded)?
+    };
     let resolved = resolve(&EVIDENCE, declared, &ds.name, rt, Providers::Unchecked);
-    let drift = compute_drift(&resolved, &recorded)?;
+    let drift = declared_kind && compute_drift(&resolved, &recorded)?;
     Ok(EvidenceState {
         resolved,
         recorded,
@@ -291,6 +254,11 @@ fn inspect_declared(
 fn compute_drift(resolved: &Resolved, recorded: &SettingsStatus) -> sparkles::Result<bool> {
     if resolved.status.is_err() {
         return Ok(true);
+    }
+    if recorded.digest.is_none() && resolved.effective["enabled"] == Value::Bool(false) {
+        // An unconfigured dataset records no disabled settings. Its declaration
+        // can still supply role defaults for a later enablement.
+        return Ok(false);
     }
     let canonical = recorded.settings.canonical(&Control::none())?;
     Ok(&resolved.effective != canonical.value())
@@ -329,68 +297,78 @@ pub fn require_reconciled(st: &AppState, ds: &Dataset) -> sparkles::Result<()> {
     let main = main_of(ds);
     let ds = main.as_deref().unwrap_or(ds);
     let declared = st.settings.declared();
-    if has_declared(&declared, &ds.name) && inspect_declared(st, ds, &declared)?.drift {
+    if has_declared(&declared, &ds.name) && inspect_declared(ds, &declared)?.drift {
         return Err(drift_error(&ds.name));
     }
     Ok(())
 }
 
-/// The state seen by a typed write. The publication fence checks later declarations
-/// against this snapshot without taking a store lock on the committing thread.
-#[derive(Clone)]
+/// The settings selected at admission of a typed operation. The store checks its
+/// capability against the installed registry, and the publication fence verifies
+/// that this is the registry admitted here. Neither check takes a dataset writer.
 pub struct DriftFence {
     dataset: String,
     declared_at_start: Arc<Declared>,
-    runtime_at_start: Value,
-    recorded: Value,
+    handle: sparkles::Dataset,
+    admitted: Option<AdmittedSettings>,
+}
+
+struct AdmittedSettings {
+    runtime: Value,
+    recorded: SettingsStatus,
 }
 
 impl DriftFence {
-    /// Capture the current declared and recorded state after verifying no drift exists.
+    /// Capture the current declaration and its reconciled registry, if declared.
     pub fn capture(st: &AppState, ds: &Dataset) -> sparkles::Result<Self> {
         let main = main_of(ds);
-        let main_ds = main.as_deref().unwrap_or(ds);
+        let ds = main.as_deref().unwrap_or(ds);
         let declared_at_start = st.settings.declared();
-        let (runtime_at_start, recorded) = if has_declared(&declared_at_start, &main_ds.name) {
-            let state = inspect_declared(st, main_ds, &declared_at_start)?;
+        let admitted = if has_declared(&declared_at_start, &ds.name) {
+            let state = inspect_declared(ds, &declared_at_start)?;
             if state.drift {
-                return Err(drift_error(&main_ds.name));
+                return Err(drift_error(&ds.name));
             }
-            let recorded = state.recorded.settings.canonical(&Control::none())?;
-            (state.resolved.runtime, recorded.value().clone())
+            Some(AdmittedSettings {
+                runtime: state.resolved.runtime,
+                recorded: state.recorded,
+            })
         } else {
-            (Value::Object(Map::new()), Value::Null)
+            None
         };
         Ok(Self {
-            dataset: main_ds.name.clone(),
+            dataset: ds.name.clone(),
             declared_at_start,
-            runtime_at_start,
-            recorded,
+            handle: ds.dataset.clone(),
+            admitted,
         })
     }
 
-    /// Re-check immediately before publication while holding the declarations guard.
+    /// Re-check immediately before publication or returning a typed read, with the
+    /// declaration read guard held. A registry revision also pins the runtime layer.
     pub fn check(&self, st: &AppState) -> sparkles::Result<()> {
         let now = st.settings.declared();
-        if Arc::ptr_eq(&now, &self.declared_at_start) {
-            return Ok(());
-        }
         if !has_declared(&now, &self.dataset) {
             return Ok(());
         }
-        if !has_declared(&self.declared_at_start, &self.dataset) {
-            // A newly declared layer can activate overrides left from an earlier
-            // declaration. Re-admit the operation so it reads that layer.
+        let Some(admitted) = &self.admitted else {
+            // A new declaration can activate a previously dormant runtime layer.
             return Err(drift_error(&self.dataset));
+        };
+        if self.handle.store().managed_revision()? != admitted.recorded.revision {
+            return Err(drift_error(&self.dataset));
+        }
+        if Arc::ptr_eq(&now, &self.declared_at_start) {
+            return Ok(());
         }
         let resolved = resolve(
             &EVIDENCE,
             &now,
             &self.dataset,
-            self.runtime_at_start.clone(),
+            admitted.runtime.clone(),
             Providers::Unchecked,
         );
-        if resolved.status.is_err() || resolved.effective != self.recorded {
+        if compute_drift(&resolved, &admitted.recorded)? {
             return Err(drift_error(&self.dataset));
         }
         Ok(())
@@ -424,7 +402,7 @@ pub fn check_put_locks(declared: &Declared, dataset: &str, target: &Value) -> Ap
 }
 
 /// Refuse `POST /$/evidence/{ds}/detach` when `enabled` is locked to `true` and `graph`
-/// is required by a locked role or locked policy field of the effective settings.
+/// is required by a locked role or locked policy field of the declared settings.
 /// Detaching a graph that is no longer required by the locked settings stays allowed so
 /// an administrator can reconcile drift without weakening protection automatically.
 pub fn check_detach_locks(st: &AppState, ds: &Dataset, graph: &str) -> ApiResult<()> {
@@ -435,25 +413,23 @@ pub fn check_detach_locks(st: &AppState, ds: &Dataset, graph: &str) -> ApiResult
     if locked.is_empty() {
         return Ok(());
     }
-    let rt = read_overrides(st, ds).map_err(|e| {
-        ManagedError::error(
-            ManagedErrorKind::Unavailable,
-            format!("cannot read {OVERRIDES_FILE} of /{}: {e:#}", ds.name),
-        )
-    })?;
-    let resolved = resolve(&EVIDENCE, &declared, &ds.name, rt, Providers::Unchecked);
+    let resolved = resolve(
+        &EVIDENCE,
+        &declared,
+        &ds.name,
+        Value::Object(Map::new()),
+        Providers::Unchecked,
+    );
     let enabled_locked = locked
         .iter()
         .any(|l| l.is_empty() || (l.len() == 1 && l[0] == "enabled"));
     if !enabled_locked || resolved.base["enabled"] != Value::Bool(true) {
         return Ok(());
     }
-    let Ok(eff) = parse_value(&resolved.effective) else {
-        return Err(drift_error(&ds.name).into());
-    };
+    let base = parse_value(&resolved.base)?;
     let mut refused: Vec<String> = Vec::new();
     if locked.iter().any(Vec::is_empty) {
-        if eff.managed_graphs().iter().any(|g| g == graph) {
+        if base.managed_graphs().iter().any(|g| g == graph) {
             return Err(locked_error_of(
                 NAME,
                 &[String::new()],
@@ -463,12 +439,12 @@ pub fn check_detach_locks(st: &AppState, ds: &Dataset, graph: &str) -> ApiResult
         return Ok(());
     }
     let role_lists: [(&str, &[String]); 6] = [
-        ("sourceRecords", &eff.source_records),
-        ("proposals", &eff.proposals),
-        ("decisions", &eff.decisions),
-        ("supports", &eff.supports),
-        ("identity", &eff.identity),
-        ("projections", &eff.projections),
+        ("sourceRecords", &base.source_records),
+        ("proposals", &base.proposals),
+        ("decisions", &base.decisions),
+        ("supports", &base.supports),
+        ("identity", &base.identity),
+        ("projections", &base.projections),
     ];
     for (role, graphs) in role_lists {
         if graphs.iter().any(|g| g == graph) {
@@ -478,7 +454,7 @@ pub fn check_detach_locks(st: &AppState, ds: &Dataset, graph: &str) -> ApiResult
             }
         }
     }
-    for (name, policy) in &eff.policies {
+    for (name, policy) in &base.policies {
         for (field, matches) in [
             ("boundary", policy.boundary.iter().any(|g| g == graph)),
             ("decisions", policy.decisions == graph),
@@ -496,7 +472,7 @@ pub fn check_detach_locks(st: &AppState, ds: &Dataset, graph: &str) -> ApiResult
             }
         }
     }
-    for (name, policy) in &eff.matching_policies {
+    for (name, policy) in &base.matching_policies {
         for (field, matches) in [
             ("boundary", policy.boundary.iter().any(|g| g == graph)),
             ("decisions", policy.decisions == graph),
@@ -524,9 +500,9 @@ pub fn check_detach_locks(st: &AppState, ds: &Dataset, graph: &str) -> ApiResult
     Ok(())
 }
 
-/// Record `settings` through `sparkles::evidence::configure` and sync the C19 override
-/// layer. Must be called while holding `st.settings.write_lock(&main.name, &EVIDENCE)`.
-pub fn configure_and_sync(
+/// Record complete settings and their sparse runtime layer together.
+/// Must be called while holding the evidence settings and declaration guards.
+pub fn configure_complete(
     st: &AppState,
     ds: &Dataset,
     settings: &Settings,
@@ -534,52 +510,51 @@ pub fn configure_and_sync(
 ) -> ApiResult<SettingsStatus> {
     let main = main_of(ds);
     let ds = main.as_deref().unwrap_or(ds);
-    let canonical = settings.canonical(control).map_err(|e| match e {
-        sparkles::Error::Unsupported(message) => ManagedError::error(
-            ManagedErrorKind::UnsupportedProfile,
-            message
-                .strip_prefix("unsupported-profile: ")
-                .unwrap_or(&message)
-                .to_string(),
-        ),
-        e => e,
-    })?;
+    let canonical = settings.canonical(control)?;
     let declared = st.settings.declared();
     check_put_locks(&declared, &ds.name, canonical.value())?;
-    let status = sparkles::evidence::configure(&ds.dataset, settings, control)?;
-    sync_overrides(st, ds, &declared, canonical.value())?;
-    Ok(status)
-}
-
-fn sync_overrides(
-    st: &AppState,
-    ds: &Dataset,
-    declared: &Declared,
-    recorded_canonical: &Value,
-) -> ApiResult<()> {
-    let internal =
-        |e: anyhow::Error| crate::http::err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
-    if has_declared(declared, &ds.name) {
+    let layer = if has_declared(&declared, &ds.name) {
         let cur = resolve(
             &EVIDENCE,
-            declared,
+            &declared,
             &ds.name,
             Value::Object(Map::new()),
             Providers::Unchecked,
         );
         let base = normalize_value(&cur.base).unwrap_or(cur.base);
-        let mut layer =
-            diff(&base, recorded_canonical).unwrap_or_else(|| Value::Object(Map::new()));
-        prune(&mut layer);
-        write_overrides(st, ds, &layer).map_err(internal)?;
+        Some(sparse_patch(
+            diff(&base, canonical.value()).unwrap_or_default(),
+        ))
     } else {
-        write_overrides(st, ds, &Value::Object(Map::new())).map_err(internal)?;
+        None
+    };
+    Ok(sparkles::evidence::configure_layered(
+        &ds.dataset,
+        settings,
+        layer,
+        None,
+        control,
+    )?)
+}
+
+fn sparse_patch(mut layer: Value) -> Map<String, Value> {
+    prune(&mut layer);
+    match layer {
+        Value::Object(layer) => layer,
+        _ => Map::new(),
     }
-    Ok(())
+}
+
+/// A settings-specific error shared by PUT normalization and PATCH validation.
+pub(super) fn write_error(e: String) -> crate::http::ApiError {
+    if let Some(message) = e.strip_prefix("unsupported-profile: ") {
+        return ManagedError::error(ManagedErrorKind::UnsupportedProfile, message).into();
+    }
+    bad(format!("{NAME}: {e}"))
 }
 
 /// Apply a C19 write (`PUT`, `PATCH`, `DELETE`) on `/$/settings/{ds}/evidence`.
-/// Always records the resulting effective settings through `sparkles::evidence::configure`
+/// Records the effective settings and runtime layer through `configure_layered`
 /// so protection is never weakened and `evidence.json` stays canonical and synchronized
 /// with `managed.json`.
 pub fn write_c19(
@@ -590,16 +565,11 @@ pub fn write_c19(
 ) -> ApiResult<EvidenceState> {
     let main = main_of(ds);
     let ds = main.as_deref().unwrap_or(ds);
-    let internal =
-        |e: anyhow::Error| crate::http::err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     let lock = st.settings.write_lock(&ds.name, &EVIDENCE);
     let _g = lock.lock();
     let _declared = st.settings.hold_evidence_declarations();
     let declared = st.settings.declared();
-    let rt = runtime_layer(st, ds).map_err(|e| match e.downcast::<sparkles::Error>() {
-        Ok(se) => se.into(),
-        Err(e) => internal(e),
-    })?;
+    let (rt, revision) = runtime_at(ds, &declared)?;
     let cur = resolve(&EVIDENCE, &declared, &ds.name, rt, Providers::Unchecked);
     let owner = format!("/{}", ds.name);
     let is_put = matches!(op, Op::Put(_));
@@ -618,42 +588,31 @@ pub fn write_c19(
             return Err(locked_error_of(NAME, &refused, &owner));
         }
     }
-    let r = resolve(&EVIDENCE, &declared, &ds.name, new, Providers::Unchecked);
-    if let Err(e) = &r.status {
-        if e.contains("unsupported-profile") {
-            return Err(ManagedError::error(
-                ManagedErrorKind::UnsupportedProfile,
-                e.strip_prefix("unsupported-profile: ")
-                    .unwrap_or(e)
-                    .to_string(),
-            )
-            .into());
-        }
-        return Err(bad(format!("{NAME}: {e}")));
+    let mut resolved = resolve(&EVIDENCE, &declared, &ds.name, new, Providers::Unchecked);
+    if let Err(e) = &resolved.status {
+        return Err(write_error(e.clone()));
     }
-    let settings = parse_value(&r.effective).map_err(|e| match e {
-        sparkles::Error::Invalid(m) => bad(format!("{NAME}: {m}")),
-        e => e.into(),
-    })?;
-    let recorded = sparkles::evidence::configure(&ds.dataset, &settings, &Control::none())?;
-    let layer = if has_declared(&declared, &ds.name) {
-        r.runtime
-    } else {
-        Value::Object(Map::new())
-    };
-    write_overrides(st, ds, &layer).map_err(internal)?;
-    let final_rt = runtime_layer(st, ds).map_err(|e| match e.downcast::<sparkles::Error>() {
-        Ok(se) => se.into(),
-        Err(e) => internal(e),
-    })?;
-    let resolved = resolve(
-        &EVIDENCE,
-        &declared,
-        &ds.name,
-        final_rt,
-        Providers::Unchecked,
-    );
-    let drift = compute_drift(&resolved, &recorded)?;
+    let settings = parse_value(&resolved.effective)?;
+    let declared_kind = has_declared(&declared, &ds.name);
+    let layer = declared_kind.then(|| sparse_patch(resolved.runtime.clone()));
+    let recorded = sparkles::evidence::configure_layered(
+        &ds.dataset,
+        &settings,
+        layer,
+        Some(revision),
+        &Control::none(),
+    )?;
+    if !declared_kind {
+        // With no declaration the response uses the newly recorded settings.
+        resolved = resolve(
+            &EVIDENCE,
+            &declared,
+            &ds.name,
+            recorded_layer(&recorded)?,
+            Providers::Unchecked,
+        );
+    }
+    let drift = declared_kind && compute_drift(&resolved, &recorded)?;
     Ok(EvidenceState {
         resolved,
         recorded,

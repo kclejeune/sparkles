@@ -242,6 +242,19 @@ impl Store {
         self.enable_managed_checked(owner, entry, settings, Some(expected))
     }
 
+    /// The installed registry revision, or zero before its first publication.
+    /// Reads one in-memory snapshot and never takes a dataset writer.
+    pub fn managed_revision(&self) -> Result<u64> {
+        match self.managed_state().as_deref() {
+            None => Ok(0),
+            Some(ManagedState::Installed(i)) => Ok(i.graphs.revision),
+            Some(ManagedState::Unavailable { reason, .. }) => Err(ManagedError::error(
+                ManagedErrorKind::Unavailable,
+                reason.clone(),
+            )),
+        }
+    }
+
     /// The bytes of `owner`'s settings file as the installed registry records them,
     /// `None` when the owner is not enabled. Fails with `managed-unavailable` when the
     /// registry cannot be enforced.

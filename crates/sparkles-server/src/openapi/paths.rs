@@ -3730,10 +3730,10 @@ fn assist(p: &mut Paths) {
         "/{ds}/recall",
         "recallFacts",
         "Recall facts",
-        "The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact.",
+        "The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact. A request using a review or matching policy returns `409 evidence-settings-drift` while the evidence settings need reconciliation.",
         "RecallRequest",
         "RecallResult",
-    ));
+    ).errors(&[409, 503]));
     p.add(
         op(POST, "/{ds}/facts", "assertFacts", "SPARQL", "Write facts with provenance")
             .doc("The MCP tool `assert_facts` as the caller, with its checks. Needs `write` on the graphs written and counts as an update. `sparkles memory import` and `assert` call it.")
@@ -4509,7 +4509,7 @@ fn assist(p: &mut Paths) {
         o.body(
             true,
             "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs.",
-            json!({ "application/json": { "schema": { "type": "object" } } }),
+            json!({ "application/json": { "schema": { "type": "object", "additionalProperties": true } } }),
         )
         .header(
             "If-Match",
@@ -4517,14 +4517,14 @@ fn assist(p: &mut Paths) {
             "The `etag` of the runtime layer the change is based on.",
         )
         .json("200", "The kind after the change.", "SettingsKind")
-        .errors(&[400, 409, 412])
+        .errors(&[400, 409, 412, 503])
     };
     p.add(
         op(GET, "/$/settings/{ds}/{kind}", "getSettings", "Datasets", "Get a settings kind")
             .doc("The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer. The `evidence` kind needs `admin` on the dataset and includes `recorded`.")
             .see("settings")
             .json("200", "The kind.", "SettingsKind")
-            .errors(&[403, 404, 503]),
+            .errors(&[401, 403, 404, 503]),
     );
     p.add(kind_body(
         op(PATCH, "/$/settings/{ds}/{kind}", "patchSettings", "Datasets", "Change settings fields")
@@ -4543,7 +4543,7 @@ fn assist(p: &mut Paths) {
             .query("field", json!({ "type": "string" }), "A dotted field such as `historyDays` or `budget.perRequest`.")
             .header("If-Match", json!({ "type": "string" }), "The `etag` of the runtime layer the change is based on.")
             .json("200", "The kind after the change.", "SettingsKind")
-            .errors(&[400, 409, 412]),
+            .errors(&[400, 409, 412, 503]),
     );
     let server_body = |o: super::Op| {
         o.body(

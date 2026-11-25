@@ -804,3 +804,36 @@ async fn evidence_settings_require_admin_and_drift_does_not_disclose() {
     // Keep tempdir alive until end of test.
     drop(dir);
 }
+
+#[tokio::test]
+async fn evidence_settings_reads_use_admin_middleware() {
+    let s = build(super::reader_fixture());
+    let admin = b("alice");
+    let reader = bearer(&tok('R'));
+    for path in [
+        "/$/settings/public/evidence",
+        "/$/settings/public/%65vidence",
+    ] {
+        for method in ["GET", "HEAD"] {
+            let r = call(&s.app, method, path, &[], "").await;
+            assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+            assert!(!r.all("www-authenticate").is_empty());
+            let r = call(&s.app, method, path, &[("authorization", &reader)], "").await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+            assert!(
+                r.all("www-authenticate")
+                    .iter()
+                    .any(|h| h.contains("insufficient_scope"))
+            );
+            let r = call(
+                &s.app,
+                method,
+                path,
+                &[("authorization", &admin), ("sec-fetch-site", "cross-site")],
+                "",
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+        }
+    }
+}

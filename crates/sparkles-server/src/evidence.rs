@@ -90,7 +90,7 @@ async fn put_settings(
         let lock = st.settings.write_lock(&ds.name, &crate::settings::EVIDENCE);
         let _g = lock.lock();
         let _declared = st.settings.hold_evidence_declarations();
-        body(crate::settings::evidence::configure_and_sync(
+        body(crate::settings::evidence::configure_complete(
             &st, &ds, &settings, &control,
         )?)
     })
@@ -769,16 +769,25 @@ pub(crate) fn execute(
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let main = crate::http::main_dataset(&st, &name)?;
-    crate::settings::evidence::require_reconciled(&st, &main)?;
-    match operation {
-        "propose" => claims::propose_now(st, name, principal, bytes, execution),
-        "review" => review::review_now(st, name, principal, bytes, execution),
-        "withdraw" => review::withdraw_now(st, name, principal, bytes, execution),
-        "resolve" => resolve_now(st, name, principal, bytes, execution),
-        "identities" => review::identities_now(st, name, principal, bytes, execution),
-        "dependents" => review::dependents_now(st, name, principal, bytes, execution),
-        _ => unreachable!("unregistered evidence operation"),
+    if matches!(operation, "propose" | "review" | "withdraw") {
+        crate::settings::evidence::require_reconciled(&st, &main)?;
+        return match operation {
+            "propose" => claims::propose_now(st, name, principal, bytes, execution),
+            "review" => review::review_now(st, name, principal, bytes, execution),
+            "withdraw" => review::withdraw_now(st, name, principal, bytes, execution),
+            _ => unreachable!("unregistered evidence write"),
+        };
     }
+    let fence = crate::settings::evidence::DriftFence::capture(&st, &main)?;
+    let result = match operation {
+        "resolve" => resolve_now(st.clone(), name, principal, bytes, execution),
+        "identities" => review::identities_now(st.clone(), name, principal, bytes, execution),
+        "dependents" => review::dependents_now(st.clone(), name, principal, bytes, execution),
+        _ => unreachable!("unregistered evidence read"),
+    };
+    let _declared = st.settings.hold_evidence_declarations();
+    fence.check(&st)?;
+    result
 }
 
 async fn run_http(

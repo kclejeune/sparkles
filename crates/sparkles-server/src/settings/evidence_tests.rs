@@ -348,13 +348,11 @@ async fn declared_evidence_drift_refuses_all_typed_operations_until_reconciled()
     assert_eq!(v["revision"], 1);
     assert_eq!(v["managed"].as_array().unwrap().len(), 7);
 
-    // No overrides file should exist when recorded matches declared.
+    let registry = ds.store.managed_snapshot().unwrap().unwrap();
     assert!(
-        !ds.store
-            .root()
-            .unwrap()
-            .join(evidence::OVERRIDES_FILE)
-            .exists()
+        registry.graphs.owners[&sparkles::managed::OwnerKind::Evidence]
+            .evidence_overrides
+            .is_none()
     );
 
     // GET /$/settings/ev/evidence now reports drift: false.
@@ -857,4 +855,326 @@ async fn unlocked_reload_and_rust_api_divergence_cause_drift_including_in_memory
     let (s, v, _) = send(&app, req("POST", "/mem/claims", Some(sample_proposal()))).await;
     assert_eq!(s, StatusCode::CONFLICT, "{v}");
     assert_eq!(v["code"], "evidence-settings-drift");
+}
+
+fn declared_evidence(f: &std::path::Path, evidence: Value, locked: &[&str]) {
+    let settings = json!({"datasets":{"ev":{"evidence":evidence,"locked":locked}}});
+    std::fs::write(f, settings.to_string()).unwrap();
+}
+
+#[tokio::test]
+async fn invalid_runtime_can_detach_a_retired_locked_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    let mut initial = full_settings();
+    initial["sourceRecords"] = json!(["urn:ev:sources", "urn:ev:retired"]);
+    let locks = ["evidence.enabled", "evidence.sourceRecords"];
+    declared_evidence(&f, initial.clone(), &locks);
+    let st = state_with_settings(&dir.path().join("data"), Some(&f));
+    st.attach("ev", DbType::Memory, None).unwrap();
+    let app = crate::http::router(st.clone());
+    let put = "/$/settings/ev/evidence";
+    let (s, v, _) = send(&app, req("DELETE", put, None)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let patch = json!({"projections":["urn:ev:accepted", "urn:ev:people"]});
+    let (s, v, _) = send(&app, req("PATCH", put, Some(patch))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let mut narrowed = full_settings();
+    narrowed["projections"] = json!(["urn:ev:accepted", "urn:ev:people", "urn:ev:second"]);
+    narrowed["policies"]["second"] = narrowed["policies"]["advisories"].clone();
+    narrowed["policies"]["second"]["output"] = json!("urn:ev:second");
+    declared_evidence(&f, narrowed, &locks);
+    st.settings.reload(None).unwrap();
+    let (_, v, _) = send(&app, req("GET", put, None)).await;
+    assert_eq!(v["status"]["valid"], false, "{v}");
+
+    let detach = "/$/evidence/ev/detach";
+    let (_, v, _) = send(
+        &app,
+        req("POST", detach, Some(json!({"graph":"urn:ev:sources"}))),
+    )
+    .await;
+    assert_eq!(v["code"], "locked-by-config", "{v}");
+    let (s, v, _) = send(
+        &app,
+        req("POST", detach, Some(json!({"graph":"urn:ev:retired"}))),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v, _) = send(&app, req("DELETE", put, None)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["recorded"]["drift"], false, "{v}");
+}
+
+#[tokio::test]
+async fn disabled_declared_template_needs_no_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    std::fs::write(&f, json!({
+        "defaults":{"evidence":{"decisions":["urn:ev:decisions"]},"locked":["evidence.decisions"]},
+        "datasets":{"ev":{"evidence":{"supports":["urn:ev:supports"]}}}
+    }).to_string()).unwrap();
+    let st = state_with_settings(&dir.path().join("data"), Some(&f));
+    for name in ["ev", "other"] {
+        st.attach(name, DbType::Memory, None).unwrap();
+    }
+    let app = crate::http::router(st);
+    for name in ["ev", "other"] {
+        let path = format!("/$/settings/{name}/evidence");
+        for method in ["GET", "DELETE"] {
+            let (s, v, _) = send(&app, req(method, &path, None)).await;
+            assert_eq!(s, StatusCode::OK, "{v}");
+            assert_eq!(v["recorded"]["drift"], false, "{v}");
+            assert!(v["recorded"]["digest"].is_null(), "{v}");
+            assert_eq!(v["recorded"]["managed"], json!([]));
+        }
+    }
+}
+
+#[tokio::test]
+async fn policy_null_resets_to_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    let declared = full_settings();
+    declared_evidence(&f, declared, &[]);
+    let st = state_with_settings(&dir.path().join("data"), Some(&f));
+    st.attach("ev", DbType::Memory, None).unwrap();
+    let app = crate::http::router(st);
+    let path = "/$/settings/ev/evidence";
+    let patch = json!({"policies":{"advisories":{"admittedKinds":["reported", "observation"]}}});
+    let (s, v, _) = send(&app, req("PATCH", path, Some(patch))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let patch = json!({"policies":{"advisories":null}});
+    let (s, v, _) = send(&app, req("PATCH", path, Some(patch))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["effective"]["policies"]["advisories"]["admittedKinds"],
+        json!(["reported"])
+    );
+    assert_eq!(v["runtime"], json!({}));
+    assert_eq!(v["recorded"]["drift"], false);
+}
+
+#[tokio::test]
+async fn version_and_nested_policy_lock_refusals() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    let mut declared = full_settings();
+    declared_evidence(
+        &f,
+        declared.clone(),
+        &["evidence.policies.advisories.conflicts"],
+    );
+    let st = state_with_settings(&dir.path().join("data"), Some(&f));
+    st.attach("ev", DbType::Memory, None).unwrap();
+    let app = crate::http::router(st);
+    let path = "/$/settings/ev/evidence";
+    for field in ["format", "profile"] {
+        for method in ["PUT", "PATCH"] {
+            let mut body = full_settings();
+            body[field] = json!(2);
+            let (s, v, _) = send(&app, req(method, path, Some(body))).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{method} {v}");
+            assert_eq!(v["code"], "unsupported-profile", "{method} {v}");
+        }
+    }
+    declared["policies"]
+        .as_object_mut()
+        .unwrap()
+        .remove("advisories");
+    declared["projections"] = json!(["urn:ev:people"]);
+    let (s, v, _) = send(&app, req("PUT", path, Some(declared))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "locked-by-config", "{v}");
+    assert_eq!(v["fields"], json!(["policies.advisories.conflicts"]));
+    let mut same = full_settings();
+    same["policies"]["advisories"]
+        .as_object_mut()
+        .unwrap()
+        .remove("conflicts");
+    let (s, v, _) = send(&app, req("PUT", path, Some(same))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+#[tokio::test]
+async fn restored_evidence_overrides_hold_for_both_capture_paths() {
+    for kind in [DbType::Persistent, DbType::Memory] {
+        restore_with_overrides(kind).await;
+    }
+}
+
+async fn restore_with_overrides(kind: DbType) {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    declared_evidence(&f, full_settings(), &[]);
+    let st = state_with_settings(&dir.path().join("data"), Some(&f));
+    let ds = st.attach("ev", kind, None).unwrap();
+    let app = crate::http::router(st);
+    let path = "/$/settings/ev/evidence";
+    let patch = json!({"proposals":["urn:ev:claims","urn:ev:extra"]});
+    let (s, v, _) = send(&app, req("PATCH", path, Some(patch))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let restored = dir.path().join("restore");
+    let capture = if kind == DbType::Memory {
+        ds.store.memory_backup_capture(
+            "evidence-overrides",
+            &sparkles::store::MemoryCaptureOptions {
+                tmp_dir: dir.path().join("scratch"),
+                ..Default::default()
+            },
+        )
+    } else {
+        ds.store.backup_capture("evidence-overrides")
+    };
+    capture.unwrap().write_to(&restored).unwrap();
+
+    let st = state_with_settings(&dir.path().join("restored-data"), Some(&f));
+    st.attach("ev", DbType::Persistent, Some(&restored))
+        .unwrap();
+    let app = crate::http::router(st);
+    let (s, v, _) = send(&app, req("GET", path, None)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["recorded"]["drift"], false, "{v}");
+    assert_eq!(v["effective"], v["recorded"]["settings"]);
+    assert_eq!(
+        v["runtime"]["proposals"],
+        json!(["urn:ev:claims", "urn:ev:extra"])
+    );
+    let (s, v, _) = send(
+        &app,
+        sparql_update(
+            "/ev/update",
+            "INSERT DATA { GRAPH <urn:ev:extra> { <urn:x> <urn:p> 1 } }",
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "profile-managed-graph");
+    let mut proposal = sample_proposal();
+    proposal["proposalGraph"] = json!("urn:ev:extra");
+    let (s, v, _) = send(&app, req("POST", "/ev/claims", Some(proposal))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["committed"], true);
+}
+
+#[tokio::test]
+async fn interruption_after_registry_commit_and_reset_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    declared_evidence(&f, full_settings(), &[]);
+    let data = dir.path().join("data");
+    {
+        let st = state_with_settings(&data, Some(&f));
+        let ds = st.attach("ev", DbType::Persistent, None).unwrap();
+        let app = crate::http::router(st.clone());
+        let (s, v, _) = send(&app, req("DELETE", "/$/settings/ev/evidence", None)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        ds.store.set_failpoint(
+            "managed-published",
+            Some(Arc::new(|_| {
+                panic!("interrupt after the durable registry commit")
+            })),
+        );
+        let mut changed = full_settings();
+        changed["policies"]["advisories"]["admittedKinds"] = json!(["reported", "observation"]);
+        let (s, v, _) = send(&app, req("PUT", "/$/evidence/ev/settings", Some(changed))).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    }
+
+    for reset in [true, false] {
+        let st = state_with_settings(&data, Some(&f));
+        st.attach("ev", DbType::Persistent, None).unwrap();
+        let app = crate::http::router(st);
+        let path = "/$/settings/ev/evidence";
+        let (_, v, _) = send(&app, req("GET", path, None)).await;
+        assert_eq!(v["recorded"]["drift"], false, "{v}");
+        assert_eq!(v["effective"], v["recorded"]["settings"]);
+        assert_eq!(v["recorded"]["managed"].as_array().unwrap().len(), 7);
+        if reset {
+            assert_ne!(v["runtime"], json!({}), "{v}");
+            let (s, v, _) = send(&app, req("DELETE", path, None)).await;
+            assert_eq!(s, StatusCode::OK, "{v}");
+        } else {
+            assert_eq!(v["runtime"], json!({}), "{v}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn fenced_proposal_refuses_recording_after_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    declared_evidence(&f, full_settings(), &[]);
+    let st = state_with_settings(&dir.path().join("data"), Some(&f));
+    let ds = st.attach("ev", DbType::Memory, None).unwrap();
+    let app = crate::http::router(st.clone());
+    let (s, v, _) = send(&app, req("DELETE", "/$/settings/ev/evidence", None)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let mut changed = full_settings();
+    changed["proposals"] = json!(["urn:ev:claims", "urn:ev:extra"]);
+    let dataset = ds.dataset.clone();
+    ds.store.set_failpoint(
+        "evidence-admitted",
+        Some(Arc::new(move |_| {
+            let control = sparkles::task::Control::none();
+            let settings =
+                sparkles::evidence::parse_settings(changed.to_string().as_bytes(), &control)
+                    .unwrap();
+            sparkles::evidence::configure(&dataset, &settings, &control).unwrap();
+        })),
+    );
+    let head = ds.store.head_commit().seq;
+    let mut proposal = sample_proposal();
+    proposal["proposalGraph"] = json!("urn:ev:extra");
+    let (s, v, _) = send(&app, req("POST", "/ev/claims", Some(proposal))).await;
+    ds.store.set_failpoint("evidence-admitted", None);
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "evidence-settings-drift", "{v}");
+    assert_eq!(ds.store.head_commit().seq, head);
+}
+
+#[tokio::test]
+async fn the_override_envelope_has_its_own_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    declared_evidence(&f, full_settings(), &[]);
+    let data = dir.path().join("data");
+    let root = {
+        let st = state_with_settings(&data, Some(&f));
+        let ds = st.attach("ev", DbType::Persistent, None).unwrap();
+        let app = crate::http::router(st);
+        let (s, v, _) = send(
+            &app,
+            req(
+                "PATCH",
+                "/$/settings/ev/evidence",
+                Some(json!({"format":1})),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["runtime"], json!({"format":1}));
+        ds.store.root().unwrap().to_path_buf()
+    };
+
+    let path = root.join(sparkles::managed::FILE);
+    let mut registry: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let envelope = &mut registry["owners"]["evidence"]["evidenceOverrides"];
+    assert_eq!(*envelope, json!({"overridesFormat":1,"patch":{"format":1}}));
+    envelope["overridesFormat"] = json!(2);
+    std::fs::write(&path, registry.to_string()).unwrap();
+    let st = state_with_settings(&data, Some(&f));
+    st.attach("ev", DbType::Persistent, None).unwrap();
+    let app = crate::http::router(st);
+    let (s, v, _) = send(&app, req("GET", "/$/settings/ev/evidence", None)).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert_eq!(v["code"], "managed-unavailable");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("evidence overrides format 2")
+    );
 }

@@ -161,6 +161,13 @@ pub struct SettingsStatus {
 /// The evidence settings of `dataset`. Fails with `managed-unavailable` when the
 /// dataset's managed-graph registry cannot be enforced.
 pub fn settings(dataset: &Dataset) -> Result<SettingsStatus> {
+    settings_with_overrides(dataset).map(|(status, _)| status)
+}
+
+/// The recorded evidence settings and their sparse runtime layer from one registry.
+pub fn settings_with_overrides(
+    dataset: &Dataset,
+) -> Result<(SettingsStatus, Option<crate::managed::EvidenceOverrides>)> {
     let snapshot = dataset.store().managed_snapshot()?;
     if let Some(reason) = snapshot.as_ref().and_then(|s| s.unavailable.as_ref()) {
         return Err(unavailable(reason.clone()));
@@ -168,7 +175,11 @@ pub fn settings(dataset: &Dataset) -> Result<SettingsStatus> {
     let bytes = snapshot
         .as_ref()
         .and_then(|s| s.settings.get(&OwnerKind::Evidence).cloned());
-    status_from(snapshot.as_ref().map(|s| &s.graphs), bytes.as_deref())
+    let status = status_from(snapshot.as_ref().map(|s| &s.graphs), bytes.as_deref())?;
+    let overrides = snapshot
+        .and_then(|mut s| s.graphs.owners.remove(&OwnerKind::Evidence))
+        .and_then(|entry| entry.evidence_overrides);
+    Ok((status, overrides))
 }
 
 fn unavailable(reason: String) -> Error {
@@ -263,6 +274,40 @@ pub fn configure(
     settings: &Settings,
     control: &Control,
 ) -> Result<SettingsStatus> {
+    configure_recorded(dataset, settings, OverrideUpdate::Preserve, None, control)
+}
+
+/// Record settings and replace their sparse runtime layer in the same publication.
+/// `None` for `overrides` means no declaration applies. An empty declared layer can
+/// reconcile an unconfigured disabled template without recording any settings.
+pub fn configure_layered(
+    dataset: &Dataset,
+    settings: &Settings,
+    overrides: Option<serde_json::Map<String, serde_json::Value>>,
+    expected: Option<u64>,
+    control: &Control,
+) -> Result<SettingsStatus> {
+    configure_recorded(
+        dataset,
+        settings,
+        OverrideUpdate::Replace(overrides),
+        expected,
+        control,
+    )
+}
+
+enum OverrideUpdate {
+    Preserve,
+    Replace(Option<serde_json::Map<String, serde_json::Value>>),
+}
+
+fn configure_recorded(
+    dataset: &Dataset,
+    settings: &Settings,
+    overrides: OverrideUpdate,
+    expected: Option<u64>,
+    control: &Control,
+) -> Result<SettingsStatus> {
     let store = dataset.store();
     let canonical = settings.canonical(control).map_err(unsupported_profile)?;
     // A registry whose settings file does not match, as after a crash between the
@@ -270,6 +315,13 @@ pub fn configure(
     // records and repaired by this configuration.
     let snapshot = store.managed_snapshot()?;
     let revision = snapshot.as_ref().map_or(0, |s| s.graphs.revision);
+    if let Some(expected) = expected
+        && revision != expected
+    {
+        return Err(Error::Conflict(format!(
+            "the managed-graph registry is at revision {revision}, not {expected}; read it again"
+        )));
+    }
     let current = snapshot
         .as_ref()
         .and_then(|s| s.graphs.owners.get(&OwnerKind::Evidence));
@@ -287,7 +339,9 @@ pub fn configure(
     }
     if current.is_none() && !settings.enabled {
         let defaults = Settings::default().canonical(control)?;
-        if canonical.bytes() != defaults.bytes() {
+        let disabled_template =
+            matches!(&overrides, OverrideUpdate::Replace(Some(patch)) if patch.is_empty());
+        if canonical.bytes() != defaults.bytes() && !disabled_template {
             return Err(Error::invalid(
                 "the evidence profile is not enabled; enable it before storing disabled settings",
             ));
@@ -301,7 +355,11 @@ pub fn configure(
         return status_from(snapshot.as_ref().map(|s| &s.graphs), bytes.as_deref());
     }
     control.check()?;
-    let entry = OwnerEntry::for_settings(settings.profile, roles, canonical.bytes());
+    let mut entry = OwnerEntry::for_settings(settings.profile, roles, canonical.bytes());
+    entry.evidence_overrides = match overrides {
+        OverrideUpdate::Preserve => current.and_then(|entry| entry.evidence_overrides.clone()),
+        OverrideUpdate::Replace(patch) => patch.and_then(crate::managed::EvidenceOverrides::new),
+    };
     let graphs =
         store.enable_managed_at(OwnerKind::Evidence, entry, canonical.bytes(), revision)?;
     status_from(Some(&graphs), Some(canonical.bytes()))

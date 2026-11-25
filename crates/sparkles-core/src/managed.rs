@@ -25,7 +25,9 @@
 //! it begins.
 //!
 //! Each owner keeps its settings in its own file, such as `evidence.json`, whose SHA-256
-//! digest `managed.json` records. A dataset with `managed.json` needs dataset reader 6
+//! digest `managed.json` records. An evidence entry can also carry a versioned sparse
+//! override, published with the entry and captured by the same backups. Older builds
+//! refuse the unknown entry member. A dataset with `managed.json` needs dataset reader 6
 //! ([`READER`]), so a release that does not enforce the registry refuses to open it.
 //!
 //! A `managed.json` of a format this build does not read, an owner it does not know, a
@@ -176,6 +178,10 @@ pub struct OwnerEntry {
     pub profile: u32,
     /// `sha256:` and the lowercase hex SHA-256 digest of the owner's settings file.
     pub settings_digest: String,
+    /// Sparse runtime overrides of declared evidence settings. This independently
+    /// versioned extension is stored only on the evidence entry and only when nonempty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_overrides: Option<EvidenceOverrides>,
     /// The absolute IRIs of the graphs the owner manages.
     pub graphs: Vec<String>,
     /// The protection nonce of each managed graph, chosen at random when the graph
@@ -195,6 +201,43 @@ pub struct OwnerEntry {
     /// it.
     #[serde(default)]
     pub merge: MergePolicy,
+}
+
+/// Versioned settings-layer data attached to the evidence entry at publication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceOverrides {
+    #[serde(deserialize_with = "read_overrides_format")]
+    overrides_format: u32,
+    patch: serde_json::Map<String, serde_json::Value>,
+}
+
+impl EvidenceOverrides {
+    /// An empty runtime patch has no representation in the registry.
+    pub fn new(patch: serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        (!patch.is_empty()).then_some(Self {
+            overrides_format: 1,
+            patch,
+        })
+    }
+
+    /// The sparse settings patch with its version envelope removed.
+    pub fn into_patch(self) -> serde_json::Map<String, serde_json::Value> {
+        self.patch
+    }
+}
+
+fn read_overrides_format<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u32, D::Error> {
+    let format = u32::deserialize(deserializer)?;
+    if format == 1 {
+        Ok(format)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "evidence overrides format {format} is unsupported; this build reads format 1"
+        )))
+    }
 }
 
 /// An owner's [`OwnerEntry::visibility`].
@@ -236,6 +279,7 @@ impl OwnerEntry {
         OwnerEntry {
             profile,
             settings_digest: settings_digest(settings),
+            evidence_overrides: None,
             graphs,
             protections: BTreeMap::new(),
             visibility: Visibility::Public,
@@ -562,6 +606,13 @@ impl Installed {
     ) -> Result<Installed> {
         let mut by_key = FxHashMap::default();
         for (owner, entry) in &graphs.owners {
+            if let Some(overrides) = &entry.evidence_overrides
+                && (*owner != OwnerKind::Evidence || overrides.patch.is_empty())
+            {
+                return Err(Error::invalid(
+                    "only an evidence entry can carry a nonempty evidence override",
+                ));
+            }
             for g in &entry.graphs {
                 let key = crate::id::iri_key(g).into_boxed_slice();
                 if let Some(other) = by_key.insert(key, *owner)

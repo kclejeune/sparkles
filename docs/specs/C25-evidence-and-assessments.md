@@ -694,16 +694,23 @@ The open questions of this step were decided as follows.
 
 The C19 `evidence` kind accepts declarations in `serve --settings` under `defaults`
 and named `datasets`. An operator can lock the whole kind, a field, a named policy or
-a policy field. The server keeps explicit runtime overrides of declared settings in
-`evidence-overrides.json` format 1 and continues to bind canonical `evidence.json` to
-the digest in `managed.json`. Without a declaration or lock, the recorded settings
-provide the runtime values.
+a policy field. The evidence entry in `managed.json` carries nonempty runtime
+overrides as an `evidenceOverrides` object with `overridesFormat` 1 and a sparse
+`patch` object. The same registry replacement publishes the override and the
+digest of canonical `evidence.json`, together with the protected graphs. Backups
+capture that registry entry with the recorded settings. A reset that empties the
+override removes its member in the same publication. Without a declaration or lock,
+the recorded settings provide the runtime values.
 
 Dataset administrators can compare the effective and recorded settings in
 `GET /$/settings/{ds}/evidence`. Startup and reload apply declarations to the
 effective view without recording a configuration or detaching graphs. The server
 refuses typed evidence operations with `409 evidence-settings-drift` while the
-settings differ. Ordinary writes continue to enforce the recorded protection.
+settings differ. Policy-backed recall and ask, claims-mode ingestion and
+policy-backed GraphRAG builds and refreshes also check for drift. Ordinary writes
+continue to enforce the recorded protection. A valid disabled declaration can
+supply defaults for an unconfigured dataset without recording settings or reporting
+drift. Resetting that runtime layer leaves the dataset unconfigured.
 An administrator reconciles drift by writing the layered kind or recording a
 complete configuration through the evidence settings route. Both honor locks
 and require an explicit detach before dropping a protected graph. A detach is

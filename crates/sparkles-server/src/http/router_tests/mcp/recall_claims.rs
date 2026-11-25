@@ -685,4 +685,39 @@ async fn ask_withholds_claims_when_authority_changes() {
         assert_eq!(summaries.load(Ordering::SeqCst), 1, "{mode}");
     }
     assert!(m.requests().iter().all(|r| r.path != "/redirected"));
+
+    let declared = crate::settings::Declared::parse(
+        r#"{"datasets":{"ev":{"evidence":{"enabled":true,"sourceRecords":["urn:ev:changed"],"proposals":["urn:ev:claims"]}}}}"#,
+        crate::settings::Providers::Unchecked,
+    ).unwrap();
+    s.state
+        .settings
+        .replace_declared_for_test(Arc::new(declared));
+    let before = m.requests().len();
+    let r = ask().await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["error"]["code"], "evidence-settings-drift");
+    assert_eq!(m.requests().len(), before);
+}
+
+#[tokio::test]
+async fn declared_drift_refuses_policy_recall() {
+    use crate::settings::{Declared, Providers};
+    let s = server(true);
+    let declared = Declared::parse(
+        r#"{"datasets":{"ev":{"evidence":{"enabled":true,"sourceRecords":["urn:ev:changed"],"proposals":["urn:ev:claims"]}}}}"#,
+        Providers::Unchecked,
+    ).unwrap();
+    s.state
+        .settings
+        .replace_declared_for_test(Arc::new(declared));
+    for args in [
+        json!({"seeds": ["urn:release"], "reviewPolicy": "main"}),
+        json!({"seeds": ["urn:release"], "matchingPolicy": "people"}),
+    ] {
+        let r = recall(&s, "evr", args).await;
+        assert_eq!(tool_error(&r), "evidence-settings-drift", "{r}");
+    }
+    let r = recall(&s, "evr", json!({"seeds": ["urn:release"]})).await;
+    assert_eq!(r["isError"], false, "{r}");
 }

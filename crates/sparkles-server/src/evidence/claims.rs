@@ -999,6 +999,8 @@ pub(super) fn propose_now(
     options.author = crate::http::author(&p);
     options.write = opts.graphs.clone();
     let drift = crate::settings::evidence::DriftFence::capture(&st, &main)?;
+    #[cfg(test)]
+    main.store.failpoint("evidence-admitted");
     options.authority = Some(Arc::new(CallerFence {
         st: st.clone(),
         p: p.clone(),

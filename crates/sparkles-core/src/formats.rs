@@ -813,7 +813,6 @@ pub const SETTINGS: &[SettingsFile] = &[
     // the managed-graph registry and its owners' settings (see `crate::managed`)
     ds("managed.json", 3),
     ds("evidence.json", 1),
-    ds("evidence-overrides.json", 1),
     ds("jobs.json", crate::jobs::FORMAT),
     // durable source holds (see `crate::holds`)
     ds("holds.json", 1),

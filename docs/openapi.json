@@ -50991,6 +50991,9 @@
           "412": {
             "$ref": "#/components/responses/PreconditionFailed"
           },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
           "default": {
             "$ref": "#/components/responses/Error"
           }
@@ -51092,6 +51095,7 @@
           "content": {
             "application/json": {
               "schema": {
+                "additionalProperties": true,
                 "type": "object"
               }
             }
@@ -51127,6 +51131,9 @@
           },
           "412": {
             "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
           },
           "default": {
             "$ref": "#/components/responses/Error"
@@ -51182,6 +51189,7 @@
           "content": {
             "application/json": {
               "schema": {
+                "additionalProperties": true,
                 "type": "object"
               }
             }
@@ -51217,6 +51225,9 @@
           },
           "412": {
             "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
           },
           "default": {
             "$ref": "#/components/responses/Error"
@@ -61074,7 +61085,7 @@
     },
     "/{ds}/recall": {
       "post": {
-        "description": "The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact.",
+        "description": "The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact. A request using a review or matching policy returns `409 evidence-settings-drift` while the evidence settings need reconciliation.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#checking-and-explaining-queries"
         },
@@ -61120,6 +61131,12 @@
           },
           "408": {
             "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
           },
           "default": {
             "$ref": "#/components/responses/Error"

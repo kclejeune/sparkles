@@ -169,15 +169,39 @@ pub(crate) fn plan(
                 // `GET /$/assistant/{ds}` adds it
                 m.remove("status");
             }
+            let locked_values = if super::evidence::is(kind) {
+                let omitted_policies: Vec<_> = cur
+                    .locked
+                    .iter()
+                    .filter(|l| {
+                        l.len() == 3
+                            && at(&cur.base, l).is_some()
+                            && !at(&body, &l[..2]).is_some_and(Value::is_object)
+                    })
+                    .map(|l| path_string(l))
+                    .collect();
+                if !omitted_policies.is_empty() {
+                    return Err(locked_error_of(kind.name, &omitted_policies, owner));
+                }
+                &cur.base
+            } else {
+                &cur.effective
+            };
             // a locked field left out keeps its value
             for l in &cur.locked {
                 if at(&body, l).is_none()
-                    && let Some(v) = at(&cur.effective, l)
+                    && let Some(v) = at(locked_values, l)
                 {
                     set_at(&mut body, l, v.clone());
                 }
             }
-            let target = (kind.normalize)(&body).map_err(bad)?;
+            let target = (kind.normalize)(&body).map_err(|e| {
+                if super::evidence::is(kind) {
+                    super::evidence::write_error(e)
+                } else {
+                    bad(e)
+                }
+            })?;
             let base = (kind.normalize)(&cur.base).unwrap_or_else(|_| cur.base.clone());
             diff(&base, &target).unwrap_or_else(|| Value::Object(Map::new()))
         }
@@ -442,16 +466,9 @@ async fn get_all(
 async fn get_kind(
     State(st): St,
     Path((name, kind)): Path<(String, String)>,
-    p: Option<Extension<Principal>>,
 ) -> ApiResult<Response> {
     let ds = dataset(&st, &name)?;
     let kind = kind_of(&kind)?;
-    if super::evidence::is(kind) && !can_read_evidence(&p, &ds.name) {
-        return Err(err(
-            StatusCode::FORBIDDEN,
-            format!("evidence settings need admin on /{}", ds.name),
-        ));
-    }
     blocking(move || {
         if super::evidence::is(kind) {
             return evidence_response(super::evidence::inspect(&st, &ds)?, &ds.name);
