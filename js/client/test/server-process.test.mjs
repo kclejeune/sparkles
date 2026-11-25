@@ -198,13 +198,38 @@ test('seed setup finishing after child exit does not announce readiness', async 
   }
 });
 
+async function waitForReadyLine(stream, signal, timeoutMs = 8_000) {
+  signal.throwIfAborted();
+  const lines = createInterface({ input: stream });
+  let timedOut = false;
+  const abort = () => lines.close();
+  const timer = setTimeout(() => {
+    timedOut = true;
+    lines.close();
+  }, timeoutMs);
+  signal.addEventListener('abort', abort, { once: true });
+  try {
+    for await (const line of lines) {
+      if (line.startsWith('ready ')) return line;
+    }
+    signal.throwIfAborted();
+    if (timedOut) {
+      throw new Error(`seed did not print ready within ${timeoutMs / 1000} s`);
+    }
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', abort);
+    lines.close();
+  }
+}
+
 test(
   'design seed sends readiness and setup writes directly to its child',
   {
     skip: !process.allowedNodeEnvironmentFlags.has('--use-env-proxy'),
     timeout: 10_000,
   },
-  async () => {
+  async (t) => {
     const dir = await mkdtemp(join(tmpdir(), 'sparkles-seed-proxy-'));
     const fixture = join(dir, 'sparkles');
     const requests = join(dir, 'requests');
@@ -261,12 +286,7 @@ test(
     child.stderr.on('data', (data) => (diagnostics += data));
     let ready;
     try {
-      for await (const line of createInterface({ input: child.stdout })) {
-        if (line.startsWith('ready ')) {
-          ready = line;
-          break;
-        }
-      }
+      ready = await waitForReadyLine(child.stdout, t.signal);
       assert.deepEqual(proxyRequests, []);
       assert.match(ready ?? diagnostics, /^ready http:\/\/127\.0\.0\.1:\d+$/);
       const rows = (await readFile(requests, 'utf8'))
@@ -293,9 +313,35 @@ test(
       assert.equal(JSON.parse(rows[7][2]).enabled, true);
     } finally {
       await stopServer(child);
+      child.stdout.destroy();
       await closed;
       proxy.close();
+      proxy.closeAllConnections();
       await rm(dir, { recursive: true, force: true });
     }
   },
 );
+
+test('readiness line wait honors cancellation when a seed stays alive', async () => {
+  const child = spawn(process.execPath, [
+    '-e',
+    "console.log('listening http://127.0.0.1:1234'); setTimeout(() => console.error('started'), 50); setInterval(() => {}, 1000);",
+  ]);
+  const closed = once(child, 'close');
+  const controller = new AbortController();
+  child.stderr.on('data', () => {
+    if (!controller.signal.aborted) controller.abort(new Error('test cancelled'));
+  });
+  try {
+    await assert.rejects(
+      waitForReadyLine(child.stdout, controller.signal, 5_000),
+      /test cancelled/,
+    );
+    assert.equal(child.exitCode, null);
+    assert.equal(child.signalCode, null);
+  } finally {
+    await stopServer(child);
+    child.stdout.destroy();
+    await closed;
+  }
+});
