@@ -64,6 +64,8 @@ use worker::*;
 pub(crate) use cell::{Cell, Slot};
 use internal::InternalCell;
 pub use internal::InternalCircuit;
+#[cfg(test)]
+pub(crate) use key::COMPILER;
 pub use key::{access_fingerprint, covers, whole_reason};
 #[cfg(test)]
 pub(crate) fn checkpoint_fingerprint_for_compiler(compiler: &str, q: &Query, text: &str) -> u64 {

@@ -8,19 +8,24 @@
 //! the design. `init` makes room for new groups, `add_batch` folds rows into their
 //! groups, `merge` folds the groups of another accumulator that saw later rows into
 //! this one, `finish` gives a group's value, and `retract` takes rows back for a state
-//! that can, which item 418's view operator needs.
+//! that can, which the incremental view operator in `incr/ops/group.rs` calls with signed
+//! weights.
 
-use crate::error::Result;
-use crate::id::Id;
+use crate::error::{Error, Result};
+use crate::id::{Id, Tag};
+use crate::incr::persist::{Reader, Writer};
+use crate::incr::zset::row_bytes;
 use crate::sparql::ctx::Ctx;
 use crate::sparql::exec::AggState;
 use crate::sparql::expr::Expr;
 use crate::sparql::plan::Agg;
 use crate::sparql::table::Table;
-use crate::sparql::value::Value;
-use rustc_hash::FxHashSet;
+use crate::sparql::value::{NumOp, Value, arith, exact_sum, order_cmp};
+use oxsdatatypes::{Decimal, Double, Float};
+use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::AggregateFunction;
 use std::any::Any;
+use std::cmp::Ordering;
 
 /// Where an aggregate's argument comes from in a batch.
 #[derive(Clone, Copy)]
@@ -40,6 +45,9 @@ pub(crate) struct Batch<'a> {
     pub arg: Arg<'a>,
     /// The rows of each slot, when the batch holds every row of each of its groups
     pub rows: Option<&'a RowIndex>,
+    /// Signed multiplicity of each row (`None`: every row has unit weight). `add_batch`
+    /// folds positive weights and `retract` takes back rows using their weight magnitude.
+    pub weights: Option<&'a [i64]>,
     /// The row of `table` that the batch's first row is
     pub base: usize,
 }
@@ -89,12 +97,73 @@ impl Batch<'_> {
             Arg::Column(values) => Some(values[row]),
         }
     }
+
+    /// Positive multiplicity for [`Accumulator::add_batch`].
+    #[inline]
+    fn add_weight(&self, row: usize) -> u64 {
+        self.weights
+            .map_or(1, |w| u64::try_from(w[row]).unwrap_or(0))
+    }
+
+    /// Magnitude to take back for [`Accumulator::retract`] (accepts signed negative
+    /// delta weights `-k` as well as positive retraction counts `+k`).
+    #[inline]
+    fn retract_weight(&self, row: usize) -> u64 {
+        self.weights.map_or(1, |w| w[row].unsigned_abs())
+    }
 }
 
-/// How one aggregate folds the rows of its groups. `merge` and `retract` have no caller
-/// in the operator yet: a parallel split of a grouping merges, and item 418's view
-/// operator retracts.
-#[allow(dead_code, reason = "merge and retract serve later callers")]
+/// Shared finalization for `SUM` and `AVG` across both one-off query accumulators and
+/// retractable view accumulators, keeping `AggregateErrors` readings identical.
+pub(crate) fn finish_sum_avg(
+    ctx: &Ctx,
+    is_avg: bool,
+    rows: u64,
+    undef: u64,
+    sum: Option<Value>,
+) -> Id {
+    // AVG is Sum over Count, and Count leaves the errors out
+    if rows > 0 && undef == rows && is_avg && ctx.aggregate_errors.avg_of_errors_zero() {
+        return ctx.intern_value(&Value::Integer(0.into()));
+    }
+    let Some(sum) = sum else {
+        return Id::UNDEF;
+    };
+    let v = if is_avg {
+        if rows == 0 {
+            Some(Value::Integer(0.into()))
+        } else {
+            arith(NumOp::Div, &sum, &Value::Integer((rows as i64).into())).ok()
+        }
+    } else {
+        Some(sum)
+    };
+    v.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
+}
+
+/// Shared finalization for `MIN` and `MAX` across one-off and retractable accumulators.
+pub(crate) fn finish_best(ctx: &Ctx, is_min: bool, errs: u64, best: Option<Id>) -> Id {
+    if errs > 0 && ctx.aggregate_errors.best_errs(is_min) {
+        Id::UNDEF
+    } else {
+        best.unwrap_or(Id::UNDEF)
+    }
+}
+
+/// Shared finalization for `GROUP_CONCAT` across one-off and retractable accumulators.
+pub(crate) fn finish_concat(ctx: &Ctx, distinct: bool, empty: bool, ok: bool, text: String) -> Id {
+    let nothing = empty && distinct && ctx.aggregate_errors.distinct_concat_of_nothing_unbound();
+    if ok && !nothing {
+        // SPARQL 1.1: the result is a simple literal
+        ctx.intern_value(&Value::Str(text.into()))
+    } else {
+        Id::UNDEF
+    }
+}
+
+/// How one aggregate folds the rows of its groups. `merge` serves item 1066's parallel
+/// grouping split, and `retract` serves the incremental view operator in
+/// `incr/ops/group.rs`.
 pub(crate) trait Accumulator: Send {
     /// Add `groups` groups with empty state, after those held.
     fn init(&mut self, groups: usize);
@@ -104,6 +173,7 @@ pub(crate) trait Accumulator: Send {
     fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()>;
 
     /// Whether [`Accumulator::merge`] gives what one accumulator over all the rows gives.
+    #[allow(dead_code, reason = "merge serves item 1066's parallel grouping")]
     fn mergeable(&self) -> bool {
         false
     }
@@ -112,14 +182,21 @@ pub(crate) trait Accumulator: Send {
     /// accumulator, into group `into[j]` of this one, for every group of `other`.
     /// `other` is of the same kind and aggregate. An accumulator that is not
     /// [`mergeable`](Accumulator::mergeable) leaves its groups as they are and fails.
+    #[allow(dead_code, reason = "merge serves item 1066's parallel grouping")]
     fn merge(&mut self, _ctx: &Ctx, _other: &mut dyn Accumulator, _into: &[u32]) -> Result<()> {
-        Err(crate::error::Error::unsupported(
-            "this aggregate cannot be merged",
-        ))
+        Err(Error::unsupported("this aggregate cannot be merged"))
     }
 
     /// The value of group `group`, which the call takes out of the accumulator.
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id>;
+
+    /// Read the current value of group `group` without destroying its state, for
+    /// persistent callers such as incremental views.
+    fn read(&mut self, _ctx: &Ctx, _group: usize) -> Result<Id> {
+        Err(Error::unsupported(
+            "this aggregate cannot be read without finishing",
+        ))
+    }
 
     /// Whether [`Accumulator::retract`] can take back every row.
     fn retractable(&self) -> bool {
@@ -134,6 +211,32 @@ pub(crate) trait Accumulator: Send {
         Ok(false)
     }
 
+    /// Drop every group's state.
+    fn clear(&mut self) {}
+
+    /// Remove group `group` by swapping in the last group, keeping slots dense.
+    fn swap_remove(&mut self, _group: usize) {}
+
+    /// Approximate bytes retained across all live groups, for view memory budgeting.
+    fn retained_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Persist group `group`'s state to a checkpoint or remap writer.
+    fn save_group(&self, _group: usize, _w: &mut Writer) -> Result<()> {
+        Err(Error::unsupported("this aggregate cannot be checkpointed"))
+    }
+
+    /// Restore group `group`'s state from a checkpoint or remap reader.
+    fn load_group(&mut self, _group: usize, _r: &mut Reader) -> Result<()> {
+        Err(Error::unsupported("this aggregate cannot be checkpointed"))
+    }
+
+    /// Clone this accumulator as a boxed trait object when supported.
+    fn clone_box(&self) -> Option<Box<dyn Accumulator>> {
+        None
+    }
+
     /// The bytes of state each new group takes, which the operator charges.
     fn group_bytes(&self) -> u64;
 
@@ -146,8 +249,46 @@ pub(crate) trait Accumulator: Send {
     fn as_any(&mut self) -> &mut dyn Any;
 }
 
+/// Construct a retractable accumulator for an incremental view aggregate.
+pub(crate) fn retractable(agg: &Agg, row_width: usize) -> Result<Box<dyn Accumulator>> {
+    match &agg.func {
+        AggregateFunction::Count => {
+            if agg.distinct {
+                let mut inner_agg = agg.clone();
+                inner_agg.distinct = false;
+                let inner: Box<dyn Accumulator> = Box::new(Running::new(&inner_agg, false));
+                Ok(Box::new(RetractableDistinct::new(
+                    inner,
+                    agg.expr.is_none(),
+                    row_width,
+                )))
+            } else {
+                Ok(Box::new(Running::new(agg, false)))
+            }
+        }
+        AggregateFunction::Sum | AggregateFunction::Avg => {
+            let mut inner_agg = agg.clone();
+            inner_agg.distinct = false;
+            let inner: Box<dyn Accumulator> = Box::new(RetractableSum::new(&inner_agg));
+            if agg.distinct {
+                Ok(Box::new(RetractableDistinct::new(inner, false, row_width)))
+            } else {
+                Ok(inner)
+            }
+        }
+        AggregateFunction::Min
+        | AggregateFunction::Max
+        | AggregateFunction::Sample
+        | AggregateFunction::GroupConcat { .. } => Ok(Box::new(Ordered::new(agg))),
+        AggregateFunction::Custom(_) => Err(Error::unsupported(
+            "custom aggregates do not have a retractable accumulator",
+        )),
+    }
+}
+
 /// The aggregates whose state is [`AggState`]: COUNT, SUM, AVG, MIN, MAX, SAMPLE and
 /// ARQ's variance and deviation aggregates.
+#[derive(Clone)]
 pub(crate) struct Running {
     agg: Agg,
     /// Whether the decoded bytes of the best values are tracked, for a charged grouping
@@ -199,6 +340,43 @@ impl Accumulator for Running {
 
     fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()> {
         let agg = &self.agg;
+        if let Some(weights) = batch.weights {
+            match (&agg.func, batch.arg) {
+                (AggregateFunction::Count, Arg::Star) => {
+                    for (&slot, &w) in slots.iter().zip(weights) {
+                        if w > 0
+                            && let AggState::Count(n) = &mut self.states[slot as usize]
+                        {
+                            *n += w as u64;
+                        }
+                    }
+                }
+                (AggregateFunction::Count, Arg::Column(values)) => {
+                    for ((&slot, id), &w) in slots.iter().zip(values).zip(weights) {
+                        if w > 0
+                            && !id.is_undef()
+                            && let AggState::Count(n) = &mut self.states[slot as usize]
+                        {
+                            *n += w as u64;
+                        }
+                    }
+                }
+                (AggregateFunction::Count, Arg::Unbound) => {}
+                _ => {
+                    for (row, &slot) in slots.iter().enumerate() {
+                        if row.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        let w = batch.add_weight(row);
+                        if w == 0 {
+                            continue;
+                        }
+                        self.states[slot as usize].add_weighted(ctx, agg, batch.value(row), w);
+                    }
+                }
+            }
+            return Ok(());
+        }
         match (&agg.func, batch.arg) {
             // running counts need no per-row dispatch
             (AggregateFunction::Count, Arg::Star) => {
@@ -255,9 +433,7 @@ impl Accumulator for Running {
             .expect("an accumulator of the same kind");
         for (state, &to) in std::mem::take(&mut other.states).into_iter().zip(into) {
             if !self.states[to as usize].merge(ctx, &self.agg, state) {
-                return Err(crate::error::Error::unsupported(
-                    "this aggregate cannot be merged",
-                ));
+                return Err(Error::unsupported("this aggregate cannot be merged"));
             }
         }
         if self.is_best() {
@@ -277,6 +453,10 @@ impl Accumulator for Running {
         Ok(state.finish(ctx, &self.agg))
     }
 
+    fn read(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        Ok(self.states[group].read(ctx, &self.agg))
+    }
+
     fn retractable(&self) -> bool {
         matches!(
             self.agg.func,
@@ -289,11 +469,64 @@ impl Accumulator for Running {
             return Ok(false);
         }
         for (row, &slot) in slots.iter().enumerate() {
-            if !self.states[slot as usize].retract(batch.value(row)) {
+            let w = batch.retract_weight(row);
+            if w == 0 {
+                continue;
+            }
+            if !self.states[slot as usize].retract(batch.value(row), w) {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    fn clear(&mut self) {
+        self.states.clear();
+        self.payload.clear();
+        self.growth = 0;
+    }
+
+    fn swap_remove(&mut self, group: usize) {
+        self.states.swap_remove(group);
+        if self.is_best() {
+            self.payload.swap_remove(group);
+        }
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        if matches!(self.agg.func, AggregateFunction::Count) {
+            self.states.len() as u64 * 8
+        } else {
+            self.states.len() as u64 * size_of::<AggState>() as u64
+        }
+    }
+
+    fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
+        match &self.states[group] {
+            AggState::Count(n) => {
+                w.u64(*n);
+                Ok(())
+            }
+            _ => Err(Error::unsupported(
+                "only COUNT Running accumulators can be checkpointed",
+            )),
+        }
+    }
+
+    fn load_group(&mut self, group: usize, r: &mut Reader) -> Result<()> {
+        match &mut self.states[group] {
+            AggState::Count(n) => {
+                *n = r.u64()?;
+                Ok(())
+            }
+            _ => Err(Error::unsupported(
+                "only COUNT Running accumulators can be checkpointed",
+            )),
+        }
+    }
+
+    fn clone_box(&self) -> Option<Box<dyn Accumulator>> {
+        Some(Box::new(self.clone()))
     }
 
     fn group_bytes(&self) -> u64 {
@@ -302,6 +535,883 @@ impl Accumulator for Running {
 
     fn take_growth(&mut self) -> u64 {
         std::mem::take(&mut self.growth)
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// A 256-bit two's complement integer, for exact sums of 128-bit products.
+#[derive(Default)]
+struct Wide {
+    hi: u128,
+    lo: u128,
+}
+
+impl Wide {
+    fn add(&mut self, hi: u128, lo: u128) {
+        let (lo, carry) = self.lo.overflowing_add(lo);
+        self.lo = lo;
+        self.hi = self.hi.wrapping_add(hi).wrapping_add(u128::from(carry));
+    }
+
+    /// Add `a × b`.
+    fn add_product(&mut self, a: i128, b: i64) {
+        let negative = (a < 0) != (b < 0);
+        let (m, n) = (a.unsigned_abs(), u128::from(b.unsigned_abs()));
+        // |a| × |b| as two 128-bit limbs, from the 64-bit halves of |a|
+        let low = (m & u128::from(u64::MAX)) * n;
+        let high = (m >> 64) * n;
+        let (lo, carry) = low.overflowing_add(high << 64);
+        let hi = (high >> 64) + u128::from(carry);
+        if negative {
+            // two's complement: invert and add one
+            let (lo, carry) = (!lo).overflowing_add(1);
+            self.add((!hi).wrapping_add(u128::from(carry)), lo);
+        } else {
+            self.add(hi, lo);
+        }
+    }
+
+    /// The value when it fits in 128 bits.
+    fn to_i128(&self) -> Option<i128> {
+        let v = self.lo as i128;
+        let sign = if v < 0 { u128::MAX } else { 0 };
+        (self.hi == sign).then_some(v)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SumState {
+    rows: i64,
+    /// Arguments that were errors or not numbers, which make the sum unbound
+    errs: i64,
+    /// Arguments that were errors (`Id::UNDEF`), apart from non-numeric values, for
+    /// the reading in which AVG over only errors is zero
+    undef: i64,
+    /// The integer sum, in wrapping arithmetic so that removals stay exact
+    int: i128,
+    /// The decimal values as counts by their 128-bit encoding
+    decs: FxHashMap<i128, i64>,
+    floats: FxHashMap<u32, i64>,
+    doubles: FxHashMap<u64, i64>,
+}
+
+impl SumState {
+    /// Add `w` copies of a value (`None`: an error or non-numeric value).
+    fn add(&mut self, v: Option<&Value>, w: i64) {
+        self.rows += w;
+        match v {
+            Some(Value::Integer(i)) => {
+                self.int = self
+                    .int
+                    .wrapping_add((i64::from(*i) as i128).wrapping_mul(w as i128));
+            }
+            Some(Value::Decimal(d)) => {
+                let k = i128::from_be_bytes(d.to_be_bytes());
+                let n = self.decs.entry(k).or_insert(0);
+                *n += w;
+                if *n == 0 {
+                    self.decs.remove(&k);
+                }
+            }
+            Some(Value::Float(f)) => {
+                let b = f32::from(*f).to_bits();
+                let n = self.floats.entry(b).or_insert(0);
+                *n += w;
+                if *n == 0 {
+                    self.floats.remove(&b);
+                }
+            }
+            Some(Value::Double(d)) => {
+                let b = f64::from(*d).to_bits();
+                let n = self.doubles.entry(b).or_insert(0);
+                *n += w;
+                if *n == 0 {
+                    self.doubles.remove(&b);
+                }
+            }
+            _ => self.errs += w,
+        }
+    }
+
+    fn sum(&self) -> Option<Value> {
+        if self.errs != 0 {
+            return None;
+        }
+        let mut acc = if !self.decs.is_empty() {
+            // Summed exactly in 256 bits so values that cancel out do not overflow on
+            // the way; the integers join the decimals as a one-off evaluation promotes
+            // them.
+            let mut acc = Wide::default();
+            for (k, n) in &self.decs {
+                acc.add_product(*k, *n);
+            }
+            acc.add_product(self.int, 1_000_000_000_000_000_000);
+            Value::Decimal(Decimal::from_be_bytes(acc.to_i128()?.to_be_bytes()))
+        } else if !self.floats.is_empty() || !self.doubles.is_empty() {
+            // Promote an i64-overflowing integer sum through exact_sum just as
+            // AggState::Sum does before adding floats or doubles.
+            exact_sum(self.int)?
+        } else {
+            Value::Integer(i64::try_from(self.int).ok()?.into())
+        };
+        let mut floats: Vec<(f32, i64)> = self
+            .floats
+            .iter()
+            .map(|(b, n)| (f32::from_bits(*b), *n))
+            .collect();
+        floats.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (f, n) in floats {
+            acc = arith(NumOp::Add, &acc, &Value::Float(Float::from(f * n as f32))).ok()?;
+        }
+        let mut doubles: Vec<(f64, i64)> = self
+            .doubles
+            .iter()
+            .map(|(b, n)| (f64::from_bits(*b), *n))
+            .collect();
+        doubles.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (d, n) in doubles {
+            acc = arith(NumOp::Add, &acc, &Value::Double(Double::from(d * n as f64))).ok()?;
+        }
+        Some(acc)
+    }
+
+    fn bytes(&self) -> u64 {
+        96 + (self.floats.len() + self.doubles.len()) as u64 * 24 + self.decs.len() as u64 * 40
+    }
+
+    fn save(&self, w: &mut Writer) {
+        w.i64(self.rows);
+        w.i64(self.errs);
+        w.i64(self.undef);
+        w.i128(self.int);
+        w.u64(self.decs.len() as u64);
+        for (k, n) in &self.decs {
+            w.i128(*k);
+            w.i64(*n);
+        }
+        w.u64(self.floats.len() as u64);
+        for (b, n) in &self.floats {
+            w.u64(*b as u64);
+            w.i64(*n);
+        }
+        w.u64(self.doubles.len() as u64);
+        for (b, n) in &self.doubles {
+            w.u64(*b);
+            w.i64(*n);
+        }
+    }
+
+    fn load(r: &mut Reader) -> Result<Self> {
+        let mut s = Self {
+            rows: r.i64()?,
+            errs: r.i64()?,
+            undef: r.i64()?,
+            int: r.i128()?,
+            ..Default::default()
+        };
+        for _ in 0..r.u64()? {
+            let k = r.i128()?;
+            s.decs.insert(k, r.i64()?);
+        }
+        for _ in 0..r.u64()? {
+            let b = r.u64()? as u32;
+            s.floats.insert(b, r.i64()?);
+        }
+        for _ in 0..r.u64()? {
+            let b = r.u64()?;
+            s.doubles.insert(b, r.i64()?);
+        }
+        Ok(s)
+    }
+}
+
+/// Retractable `SUM` and `AVG` accumulator with exact integer and decimal tracking and
+/// refcounted float, double and error states.
+#[derive(Clone)]
+pub(crate) struct RetractableSum {
+    is_avg: bool,
+    groups: Vec<SumState>,
+}
+
+impl RetractableSum {
+    pub(crate) fn new(agg: &Agg) -> Self {
+        Self {
+            is_avg: matches!(agg.func, AggregateFunction::Avg),
+            groups: Vec::new(),
+        }
+    }
+
+    fn fold(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32], retract: bool) -> Result<()> {
+        for (row, &slot) in slots.iter().enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let mag = if retract {
+                batch.retract_weight(row)
+            } else {
+                batch.add_weight(row)
+            };
+            if mag == 0 {
+                continue;
+            }
+            let w = if retract { -(mag as i64) } else { mag as i64 };
+            let s = &mut self.groups[slot as usize];
+            let id = batch.value(row).unwrap_or(Id::UNDEF);
+            if id.is_undef() {
+                s.add(None, w);
+                s.undef += w;
+            } else if id.tag() == Tag::Int {
+                s.rows += w;
+                s.int = s
+                    .int
+                    .wrapping_add((id.as_i64() as i128).wrapping_mul(w as i128));
+            } else {
+                let v = ctx.value(id);
+                ctx.check()?;
+                s.add(v.as_ref(), w);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Accumulator for RetractableSum {
+    fn init(&mut self, groups: usize) {
+        self.groups
+            .resize_with(self.groups.len() + groups, SumState::default);
+    }
+
+    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()> {
+        self.fold(ctx, batch, slots, false)
+    }
+
+    fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        let id = self.read(ctx, group)?;
+        self.groups[group] = SumState::default();
+        Ok(id)
+    }
+
+    fn read(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        let s = &self.groups[group];
+        Ok(finish_sum_avg(
+            ctx,
+            self.is_avg,
+            s.rows.max(0) as u64,
+            s.undef.max(0) as u64,
+            s.sum(),
+        ))
+    }
+
+    fn retractable(&self) -> bool {
+        true
+    }
+
+    fn retract(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
+        self.fold(ctx, batch, slots, true)?;
+        Ok(true)
+    }
+
+    fn clear(&mut self) {
+        self.groups.clear();
+    }
+
+    fn swap_remove(&mut self, group: usize) {
+        self.groups.swap_remove(group);
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        self.groups.iter().map(SumState::bytes).sum()
+    }
+
+    fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
+        self.groups[group].save(w);
+        Ok(())
+    }
+
+    fn load_group(&mut self, group: usize, r: &mut Reader) -> Result<()> {
+        self.groups[group] = SumState::load(r)?;
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Option<Box<dyn Accumulator>> {
+        Some(Box::new(self.clone()))
+    }
+
+    fn group_bytes(&self) -> u64 {
+        96
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// The values of a group as an ordered multiset: the distinct values in the order of
+/// `ORDER BY` with their counts. Values the order does not tell apart, such as
+/// `"01"^^xsd:integer` and `"1"^^xsd:integer`, form a run in the order they entered the
+/// group, which a checkpoint and a generation switch keep, since the vector is saved and
+/// loaded in its order and the order depends on the terms and not on their ids.
+#[derive(Clone, Debug, Default)]
+struct Multiset {
+    vals: Vec<(Id, i64)>,
+    /// Count of arguments that were errors (`Id::UNDEF`), which make `GROUP_CONCAT`
+    /// unbound and `MIN` or `MAX` unbound under readings where errors propagate.
+    errs: i64,
+    /// `SAMPLE`: the value reported, kept while the group holds it
+    sample: Option<Id>,
+}
+
+impl Multiset {
+    fn position(
+        &self,
+        ctx: &Ctx,
+        v: Id,
+        value: Option<&Value>,
+    ) -> std::result::Result<usize, usize> {
+        let cmp = |x: Id| order_cmp(ctx.value(x).as_ref(), value);
+        let i = self.vals.binary_search_by(|(x, _)| cmp(*x))?;
+        let mut lo = i;
+        while lo > 0 && cmp(self.vals[lo - 1].0) == Ordering::Equal {
+            lo -= 1;
+        }
+        let mut hi = i + 1;
+        while hi < self.vals.len() && cmp(self.vals[hi].0) == Ordering::Equal {
+            hi += 1;
+        }
+        match self.vals[lo..hi].iter().position(|(x, _)| *x == v) {
+            Some(k) => Ok(lo + k),
+            None => Err(hi),
+        }
+    }
+
+    fn add(&mut self, ctx: &Ctx, v: Id, w: i64) -> Result<()> {
+        let value = ctx.value(v);
+        ctx.check()?;
+        match self.position(ctx, v, value.as_ref()) {
+            Ok(i) => {
+                self.vals[i].1 += w;
+                if self.vals[i].1 == 0 {
+                    self.vals.remove(i);
+                }
+            }
+            Err(i) => self.vals.insert(i, (v, w)),
+        }
+        ctx.check()
+    }
+
+    fn first_of_run(&self, ctx: &Ctx, i: usize) -> Id {
+        let value = ctx.value(self.vals[i].0);
+        let mut lo = i;
+        while lo > 0
+            && self.vals[lo - 1].1 > 0
+            && order_cmp(ctx.value(self.vals[lo - 1].0).as_ref(), value.as_ref()) == Ordering::Equal
+        {
+            lo -= 1;
+        }
+        self.vals[lo].0
+    }
+
+    fn min(&self) -> Option<Id> {
+        self.vals.iter().find(|(_, n)| *n > 0).map(|(v, _)| *v)
+    }
+
+    fn max(&self, ctx: &Ctx) -> Option<Id> {
+        let i = self.vals.iter().rposition(|(_, n)| *n > 0)?;
+        Some(self.first_of_run(ctx, i))
+    }
+
+    fn settle(&mut self, ctx: &Ctx) {
+        if let Some(s) = self.sample {
+            let value = ctx.value(s);
+            if let Ok(i) = self.position(ctx, s, value.as_ref())
+                && self.vals[i].1 > 0
+            {
+                return;
+            }
+        }
+        self.sample = self.min();
+    }
+}
+
+#[derive(Clone)]
+enum OrderedKind {
+    Min,
+    Max,
+    Sample,
+    Concat { separator: String, distinct: bool },
+}
+
+/// Retractable accumulator for `MIN`, `MAX`, `SAMPLE` and `GROUP_CONCAT` (with or
+/// without `DISTINCT`), backed by an ordered [`Multiset`] per group.
+#[derive(Clone)]
+pub(crate) struct Ordered {
+    kind: OrderedKind,
+    groups: Vec<Multiset>,
+}
+
+impl Ordered {
+    pub(crate) fn new(agg: &Agg) -> Self {
+        let kind = match &agg.func {
+            AggregateFunction::Min => OrderedKind::Min,
+            AggregateFunction::Max => OrderedKind::Max,
+            AggregateFunction::Sample => OrderedKind::Sample,
+            AggregateFunction::GroupConcat { separator } => OrderedKind::Concat {
+                separator: separator.as_deref().unwrap_or(" ").to_string(),
+                distinct: agg.distinct,
+            },
+            _ => unreachable!("an ordered retractable aggregate"),
+        };
+        Self {
+            kind,
+            groups: Vec::new(),
+        }
+    }
+
+    fn fold(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32], retract: bool) -> Result<()> {
+        for (row, &slot) in slots.iter().enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let mag = if retract {
+                batch.retract_weight(row)
+            } else {
+                batch.add_weight(row)
+            };
+            if mag == 0 {
+                continue;
+            }
+            let w = if retract { -(mag as i64) } else { mag as i64 };
+            let m = &mut self.groups[slot as usize];
+            let id = batch.value(row).unwrap_or(Id::UNDEF);
+            if id.is_undef() {
+                m.errs += w;
+            } else {
+                m.add(ctx, id, w)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Accumulator for Ordered {
+    fn init(&mut self, groups: usize) {
+        self.groups
+            .resize_with(self.groups.len() + groups, Multiset::default);
+    }
+
+    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()> {
+        self.fold(ctx, batch, slots, false)
+    }
+
+    fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        let id = self.read(ctx, group)?;
+        self.groups[group] = Multiset::default();
+        Ok(id)
+    }
+
+    fn read(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        let m = &mut self.groups[group];
+        match &self.kind {
+            OrderedKind::Min => Ok(finish_best(ctx, true, m.errs.max(0) as u64, m.min())),
+            OrderedKind::Max => {
+                let best = m.max(ctx);
+                ctx.check()?;
+                Ok(finish_best(ctx, false, m.errs.max(0) as u64, best))
+            }
+            OrderedKind::Sample => {
+                m.settle(ctx);
+                ctx.check()?;
+                Ok(m.sample.unwrap_or(Id::UNDEF))
+            }
+            OrderedKind::Concat {
+                separator,
+                distinct,
+            } => {
+                if m.errs > 0 {
+                    return Ok(Id::UNDEF);
+                }
+                let strings = ctx.aggregate_errors.concat_strings_only();
+                let mut out = String::new();
+                let mut empty = true;
+                for (v, n) in &m.vals {
+                    if *n <= 0 {
+                        continue;
+                    }
+                    let val = ctx.value(*v);
+                    ctx.check()?;
+                    let Some(s) = val
+                        .filter(|v| !strings || v.is_string())
+                        .and_then(|v| v.lexical().ok())
+                    else {
+                        return Ok(Id::UNDEF);
+                    };
+                    let reps = if *distinct { 1 } else { *n };
+                    for _ in 0..reps {
+                        if !empty {
+                            out.push_str(separator);
+                        }
+                        empty = false;
+                        out.push_str(&s);
+                    }
+                }
+                Ok(finish_concat(ctx, *distinct, empty, true, out))
+            }
+        }
+    }
+
+    fn retractable(&self) -> bool {
+        true
+    }
+
+    fn retract(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
+        self.fold(ctx, batch, slots, true)?;
+        Ok(true)
+    }
+
+    fn clear(&mut self) {
+        self.groups.clear();
+    }
+
+    fn swap_remove(&mut self, group: usize) {
+        self.groups.swap_remove(group);
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        self.groups
+            .iter()
+            .map(|m| 40 + m.vals.len() as u64 * 16)
+            .sum()
+    }
+
+    fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
+        let m = &self.groups[group];
+        w.u64(m.vals.len() as u64);
+        for (v, n) in &m.vals {
+            w.id(*v)?;
+            w.i64(*n);
+        }
+        w.i64(m.errs);
+        match m.sample {
+            Some(v) => {
+                w.u64(1);
+                w.id(v)?;
+            }
+            None => w.u64(0),
+        }
+        Ok(())
+    }
+
+    fn load_group(&mut self, group: usize, r: &mut Reader) -> Result<()> {
+        let mut m = Multiset::default();
+        // The entries were written in their order, which the terms keep.
+        for _ in 0..r.u64()? {
+            let v = r.id()?;
+            m.vals.push((v, r.i64()?));
+        }
+        m.errs = r.i64()?;
+        m.sample = match r.u64()? {
+            0 => None,
+            _ => Some(r.id()?),
+        };
+        self.groups[group] = m;
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Option<Box<dyn Accumulator>> {
+        Some(Box::new(self.clone()))
+    }
+
+    fn group_bytes(&self) -> u64 {
+        40
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+#[derive(Clone)]
+enum DistinctGroup {
+    Values(FxHashMap<Id, i64>),
+    Rows(FxHashMap<Box<[Id]>, i64>),
+}
+
+/// Retractable `DISTINCT` wrapper over any retractable accumulator. Each group counts
+/// occurrences of each distinct value (or full row for `COUNT(DISTINCT *)`), forwarding
+/// transitions across zero to `inner` and passing errors (`Id::UNDEF`) through
+/// un-deduplicated with their full weight.
+pub(crate) struct RetractableDistinct {
+    inner: Box<dyn Accumulator>,
+    groups: Vec<DistinctGroup>,
+    star: bool,
+    row_width: usize,
+}
+
+impl RetractableDistinct {
+    pub(crate) fn new(inner: Box<dyn Accumulator>, star: bool, row_width: usize) -> Self {
+        Self {
+            inner,
+            groups: Vec::new(),
+            star,
+            row_width,
+        }
+    }
+
+    fn empty_group(&self) -> DistinctGroup {
+        if self.star {
+            DistinctGroup::Rows(FxHashMap::default())
+        } else {
+            DistinctGroup::Values(FxHashMap::default())
+        }
+    }
+}
+
+impl Accumulator for RetractableDistinct {
+    fn init(&mut self, groups: usize) {
+        for _ in 0..groups {
+            self.groups.push(self.empty_group());
+        }
+        self.inner.init(groups);
+    }
+
+    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()> {
+        let mut keep_slots: Vec<u32> = Vec::new();
+        let mut keep_vals: Vec<Id> = Vec::new();
+        let mut keep_weights: Vec<i64> = Vec::new();
+        for (row, &slot) in slots.iter().enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let w = batch.add_weight(row) as i64;
+            if w == 0 {
+                continue;
+            }
+            match &mut self.groups[slot as usize] {
+                DistinctGroup::Rows(m) => {
+                    let key: Box<[Id]> = batch
+                        .table
+                        .cols
+                        .iter()
+                        .map(|c| c[batch.base + row])
+                        .collect();
+                    let e = m.entry(key.clone()).or_insert(0);
+                    let before = *e;
+                    *e += w;
+                    let after = *e;
+                    if after == 0 {
+                        m.remove(&key);
+                    }
+                    if before <= 0 && after > 0 {
+                        keep_slots.push(slot);
+                        keep_weights.push(1);
+                    }
+                }
+                DistinctGroup::Values(m) => {
+                    let id = batch.value(row).unwrap_or(Id::UNDEF);
+                    if id.is_undef() {
+                        // An error is never a duplicate.
+                        keep_slots.push(slot);
+                        keep_vals.push(Id::UNDEF);
+                        keep_weights.push(w);
+                    } else {
+                        let e = m.entry(id).or_insert(0);
+                        let before = *e;
+                        *e += w;
+                        let after = *e;
+                        if after == 0 {
+                            m.remove(&id);
+                        }
+                        if before <= 0 && after > 0 {
+                            keep_slots.push(slot);
+                            keep_vals.push(id);
+                            keep_weights.push(1);
+                        }
+                    }
+                }
+            }
+        }
+        if keep_slots.is_empty() {
+            return Ok(());
+        }
+        let arg = if self.star {
+            Arg::Star
+        } else {
+            Arg::Column(&keep_vals)
+        };
+        let inner = Batch {
+            table: batch.table,
+            arg,
+            rows: None,
+            weights: Some(&keep_weights),
+            base: batch.base,
+        };
+        self.inner.add_batch(ctx, &inner, &keep_slots)
+    }
+
+    fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        let id = self.inner.finish(ctx, group)?;
+        self.groups[group] = self.empty_group();
+        Ok(id)
+    }
+
+    fn read(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
+        self.inner.read(ctx, group)
+    }
+
+    fn retractable(&self) -> bool {
+        self.inner.retractable()
+    }
+
+    fn retract(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<bool> {
+        let mut drop_slots: Vec<u32> = Vec::new();
+        let mut drop_vals: Vec<Id> = Vec::new();
+        let mut drop_weights: Vec<i64> = Vec::new();
+        for (row, &slot) in slots.iter().enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let w = batch.retract_weight(row) as i64;
+            if w == 0 {
+                continue;
+            }
+            match &mut self.groups[slot as usize] {
+                DistinctGroup::Rows(m) => {
+                    let key: Box<[Id]> = batch
+                        .table
+                        .cols
+                        .iter()
+                        .map(|c| c[batch.base + row])
+                        .collect();
+                    let e = m.entry(key.clone()).or_insert(0);
+                    let before = *e;
+                    *e -= w;
+                    let after = *e;
+                    if after == 0 {
+                        m.remove(&key);
+                    }
+                    if before > 0 && after <= 0 {
+                        drop_slots.push(slot);
+                        drop_weights.push(-1);
+                    }
+                }
+                DistinctGroup::Values(m) => {
+                    let id = batch.value(row).unwrap_or(Id::UNDEF);
+                    if id.is_undef() {
+                        drop_slots.push(slot);
+                        drop_vals.push(Id::UNDEF);
+                        drop_weights.push(-w);
+                    } else {
+                        let e = m.entry(id).or_insert(0);
+                        let before = *e;
+                        *e -= w;
+                        let after = *e;
+                        if after == 0 {
+                            m.remove(&id);
+                        }
+                        if before > 0 && after <= 0 {
+                            drop_slots.push(slot);
+                            drop_vals.push(id);
+                            drop_weights.push(-1);
+                        }
+                    }
+                }
+            }
+        }
+        if drop_slots.is_empty() {
+            return Ok(true);
+        }
+        let arg = if self.star {
+            Arg::Star
+        } else {
+            Arg::Column(&drop_vals)
+        };
+        let inner = Batch {
+            table: batch.table,
+            arg,
+            rows: None,
+            weights: Some(&drop_weights),
+            base: batch.base,
+        };
+        self.inner.retract(ctx, &inner, &drop_slots)
+    }
+
+    fn clear(&mut self) {
+        self.groups.clear();
+        self.inner.clear();
+    }
+
+    fn swap_remove(&mut self, group: usize) {
+        self.groups.swap_remove(group);
+        self.inner.swap_remove(group);
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        let own: u64 = self
+            .groups
+            .iter()
+            .map(|g| match g {
+                DistinctGroup::Rows(m) => m.len() as u64 * row_bytes(self.row_width),
+                DistinctGroup::Values(m) => m.len() as u64 * 24 + 96,
+            })
+            .sum();
+        own + self.inner.retained_bytes()
+    }
+
+    fn save_group(&self, group: usize, w: &mut Writer) -> Result<()> {
+        match &self.groups[group] {
+            DistinctGroup::Rows(m) => {
+                w.u64(m.len() as u64);
+                for (r, n) in m {
+                    w.row(r)?;
+                    w.i64(*n);
+                }
+            }
+            DistinctGroup::Values(m) => {
+                w.u64(m.len() as u64);
+                for (v, n) in m {
+                    w.id(*v)?;
+                    w.i64(*n);
+                }
+            }
+        }
+        self.inner.save_group(group, w)
+    }
+
+    fn load_group(&mut self, group: usize, r: &mut Reader) -> Result<()> {
+        match &mut self.groups[group] {
+            DistinctGroup::Rows(m) => {
+                m.clear();
+                for _ in 0..r.u64()? {
+                    let row = r.row()?;
+                    m.insert(row, r.i64()?);
+                }
+            }
+            DistinctGroup::Values(m) => {
+                m.clear();
+                for _ in 0..r.u64()? {
+                    let v = r.id()?;
+                    m.insert(v, r.i64()?);
+                }
+            }
+        }
+        self.inner.load_group(group, r)
+    }
+
+    fn clone_box(&self) -> Option<Box<dyn Accumulator>> {
+        let inner = self.inner.clone_box()?;
+        Some(Box::new(Self {
+            inner,
+            groups: self.groups.clone(),
+            star: self.star,
+            row_width: self.row_width,
+        }))
+    }
+
+    fn group_bytes(&self) -> u64 {
+        self.inner.group_bytes() + 96
     }
 
     fn as_any(&mut self) -> &mut dyn Any {
@@ -426,15 +1536,13 @@ impl Accumulator for Concat {
                 empty: true,
             },
         );
-        let nothing = state.empty
-            && self.distinct
-            && ctx.aggregate_errors.distinct_concat_of_nothing_unbound();
-        Ok(if state.ok && !nothing {
-            // SPARQL 1.1: the result is a simple literal
-            ctx.intern_value(&Value::Str(state.text.into()))
-        } else {
-            Id::UNDEF
-        })
+        Ok(finish_concat(
+            ctx,
+            self.distinct,
+            state.empty,
+            state.ok,
+            state.text,
+        ))
     }
 
     fn group_bytes(&self) -> u64 {
@@ -531,6 +1639,7 @@ impl Accumulator for Distinct {
             table: batch.table,
             arg,
             rows: None,
+            weights: None,
             base: batch.base,
         };
         self.inner.add_batch(ctx, &inner, &keep)

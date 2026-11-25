@@ -1321,3 +1321,261 @@ fn exists_with_ordered_reduced_slice_on_shared_var_matches_oracle() {
         check(&s, &c, q, "after delete");
     }
 }
+
+/// Incremental views using the shared `Accumulator` trait agree with fresh SPARQL queries
+/// across inserts, updates, deletes, retractions to zero, numeric promotions and demotions,
+/// `DISTINCT`, `MIN`/`MAX`/`SAMPLE` retractions, `BIND`-computed local arguments, all
+/// `AggregateErrors` readings, compactions, and checkpoint round-trips (item 1073).
+#[test]
+fn view_aggregates_agree_with_fresh_queries_across_inserts_updates_and_deletes() {
+    use crate::sparql::AggregateErrors;
+
+    const XSD: &str = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+
+    let oracle_with_mode = |store: &Store, q: &str, cols: &[String], mode: AggregateErrors| {
+        let r = sparql::query(
+            store.snapshot(),
+            &format!("{PREFIX}{XSD}{q}"),
+            &QueryOptions {
+                no_cache: true,
+                aggregate_errors: Some(mode),
+                ..Default::default()
+            },
+        )
+        .expect("oracle query");
+        let idx: Vec<usize> = cols
+            .iter()
+            .map(|c| r.variables().iter().position(|v| v == c).expect("column"))
+            .collect();
+        let mut out: Vec<String> = r
+            .test_application_rows()
+            .iter()
+            .map(|row| {
+                idx.iter()
+                    .map(|&i| canon(&row[i]))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        out.sort();
+        out
+    };
+
+    let build_with_mode = |store: &Store, q: &str, mode: AggregateErrors| -> Circuit {
+        let parsed = sparql::parse_query(&format!("{PREFIX}{XSD}{q}"), None, &[]).expect("parse");
+        let mut c = Circuit::new(compile(&parsed, None).expect("compile"), None);
+        c.aggregate_errors = Some(mode);
+        c.build(store.snapshot(), &Control::none()).expect("build");
+        c
+    };
+
+    let check_mode = |store: &Store, c: &Circuit, q: &str, mode: AggregateErrors, what: &str| {
+        let got = result(c);
+        let want = oracle_with_mode(store, q, &c.columns(), mode);
+        assert_eq!(got, want, "{mode} {what}: {q}");
+    };
+
+    // 1. Grouped & implicit COUNT, COUNT(DISTINCT *), COUNT(DISTINCT ?v), SUM, SUM(DISTINCT),
+    //    AVG, AVG(DISTINCT), MIN, MAX across inserts, updates, deletes, retractions to zero,
+    //    group removal/re-insertion (slot swap_remove), and numeric type promotions/demotions.
+    let queries = [
+        "SELECT ?g (COUNT(*) AS ?c) (COUNT(DISTINCT *) AS ?cd) (COUNT(?v) AS ?cv) (COUNT(DISTINCT ?v) AS ?cvd) (SUM(?v) AS ?s) (SUM(DISTINCT ?v) AS ?sd) (AVG(?v) AS ?a) (AVG(DISTINCT ?v) AS ?ad) (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?x :g ?g OPTIONAL { ?x :v ?v } } GROUP BY ?g",
+        "SELECT (COUNT(*) AS ?c) (COUNT(DISTINCT *) AS ?cd) (COUNT(?v) AS ?cv) (COUNT(DISTINCT ?v) AS ?cvd) (SUM(?v) AS ?s) (SUM(DISTINCT ?v) AS ?sd) (AVG(?v) AS ?a) (AVG(DISTINCT ?v) AS ?ad) (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?x :g ?g OPTIONAL { ?x :v ?v } }",
+        // BIND-computed Tag::Local aggregate argument
+        "SELECT ?g (SUM(?w) AS ?s) (AVG(?w) AS ?a) (MIN(?lbl) AS ?lo) (MAX(?lbl) AS ?hi) WHERE { ?x :g ?g . ?x :v ?v BIND(?v + 0.25 AS ?w) BIND(CONCAT(\"k-\", STR(?v)) AS ?lbl) } GROUP BY ?g",
+    ];
+    let updates = [
+        "INSERT DATA { :a :g :g1 ; :v 10 . :b :g :g1 ; :v 10 . :c :g :g1 ; :v 20 . :d :g :g2 ; :v 5 }",
+        // promote g1 to decimal, then float, then double
+        "INSERT DATA { :e :g :g1 ; :v 2.5 }",
+        "INSERT DATA { :f :g :g1 ; :v \"1.5\"^^xsd:float }",
+        "INSERT DATA { :h :g :g1 ; :v 0.5e0 }",
+        // demote g1 back through float -> decimal -> integer
+        "DELETE DATA { :h :g :g1 ; :v 0.5e0 }",
+        "DELETE DATA { :f :g :g1 ; :v \"1.5\"^^xsd:float }",
+        "DELETE DATA { :e :g :g1 ; :v 2.5 }",
+        // retract g1's max (20) and duplicate min (10)
+        "DELETE DATA { :c :g :g1 ; :v 20 }",
+        "DELETE DATA { :a :g :g1 ; :v 10 }",
+        // remove g2 completely (slot swap_remove), add g3, then remove g1 completely
+        "DELETE DATA { :d :g :g2 ; :v 5 }",
+        "INSERT DATA { :i :g :g3 ; :v 100 . :j :g :g3 ; :v 200 }",
+        "DELETE DATA { :b :g :g1 ; :v 10 }",
+        // re-insert g1 and then retract everything to zero (empty implicit group!)
+        "INSERT DATA { :k :g :g1 ; :v 7 }",
+        "DELETE DATA { :i :g :g3 ; :v 100 . :j :g :g3 ; :v 200 . :k :g :g1 ; :v 7 }",
+    ];
+    fn has_group(n: &super::ops::PlanNode) -> bool {
+        n.operator == "Group" || n.children.iter().any(has_group)
+    }
+    for q in queries {
+        let s = Store::in_memory(StoreOptions::default());
+        let mut c = build_with_mode(&s, q, AggregateErrors::Jena);
+        assert!(
+            has_group(&c.plan()),
+            "expected Group operator in plan for {q}"
+        );
+        check_mode(&s, &c, q, AggregateErrors::Jena, "empty build");
+        let mut peak_bytes = 0u64;
+        for (idx, u) in updates.iter().enumerate() {
+            upd(&s, &format!("{PREFIX}{XSD}{u}")).unwrap();
+            step(&s, &mut c);
+            peak_bytes = peak_bytes.max(c.root.bytes());
+            check_mode(&s, &c, q, AggregateErrors::Jena, u);
+            // Mid-sequence checkpoint round-trip and compaction
+            if idx == 3 || idx == 7 {
+                let snap = s.snapshot();
+                let encoded = c.encode(&snap).expect("encode");
+                let parsed = sparql::parse_query(&format!("{PREFIX}{XSD}{q}"), None, &[]).unwrap();
+                let mut restored = Circuit::new(compile(&parsed, None).unwrap(), None);
+                restored.aggregate_errors = Some(AggregateErrors::Jena);
+                restored.decode(&encoded, &snap).expect("decode");
+                restored.set_applied(c.applied);
+                assert_eq!(
+                    result(&restored),
+                    result(&c),
+                    "checkpoint round-trip at {idx}"
+                );
+                c = restored;
+                s.compact().unwrap();
+                step(&s, &mut c);
+                check_mode(&s, &c, q, AggregateErrors::Jena, "after compact");
+            }
+        }
+        assert!(peak_bytes > 0);
+        // After all rows are deleted, non-implicit grouped state drops to 0 bytes.
+        if q.contains("GROUP BY") {
+            assert_eq!(c.root.bytes(), 0, "deleted groups release retained bytes");
+        }
+    }
+
+    // 2. Integer sum overflowing i64 promoted by a double, then double retracted back to
+    //    unbound overflowing integer sum, then one integer retracted back to i64::MAX.
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        let q = "SELECT (SUM(?v) AS ?s) (AVG(?v) AS ?a) WHERE { ?x :v ?v }";
+        let mut c = build_with_mode(&s, q, AggregateErrors::Jena);
+        for u in [
+            "INSERT DATA { :a :v 9223372036854775807 . :b :v 9223372036854775807 }",
+            "INSERT DATA { :c :v 1.0e0 }",
+            "DELETE DATA { :c :v 1.0e0 }",
+            "DELETE DATA { :b :v 9223372036854775807 }",
+        ] {
+            upd(&s, &format!("{PREFIX}{XSD}{u}")).unwrap();
+            step(&s, &mut c);
+            check_mode(&s, &c, q, AggregateErrors::Jena, u);
+        }
+    }
+
+    // 3. Error propagation & retraction across all three AggregateErrors readings.
+    for mode in AggregateErrors::ALL {
+        let s = Store::in_memory(StoreOptions::default());
+        let q = "SELECT ?g (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) (SUM(?v) AS ?s) (AVG(?v) AS ?a) (AVG(DISTINCT ?v) AS ?ad) (GROUP_CONCAT(?v; SEPARATOR=\"|\") AS ?gc) (GROUP_CONCAT(DISTINCT ?v; SEPARATOR=\"|\") AS ?gcd) WHERE { ?x :g ?g OPTIONAL { ?x :v ?v } } GROUP BY ?g";
+        let q_impl = "SELECT (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) (AVG(?v) AS ?a) (AVG(DISTINCT ?v) AS ?ad) (GROUP_CONCAT(DISTINCT ?v; SEPARATOR=\"|\") AS ?gcd) WHERE { ?x :g ?g OPTIONAL { ?x :v ?v } }";
+        let mut c = build_with_mode(&s, q, mode);
+        let mut ci = build_with_mode(&s, q_impl, mode);
+        check_mode(&s, &ci, q_impl, mode, "implicit empty");
+
+        let steps = [
+            // group with only unbound errors
+            "INSERT DATA { :e1 :g :g1 . :e2 :g :g1 }",
+            // add non-numeric string alongside errors
+            "INSERT DATA { :s1 :g :g1 ; :v \"bad\" }",
+            // retract the string -> back to only errors (Spec AVG -> 0)
+            "DELETE DATA { :s1 :g :g1 ; :v \"bad\" }",
+            // add valid numbers alongside errors
+            "INSERT DATA { :n1 :g :g1 ; :v 2 . :n2 :g :g1 ; :v 6 }",
+            // retract one error (still one error left)
+            "DELETE DATA { :e1 :g :g1 }",
+            // retract last error -> MIN/MAX/SUM/AVG/GROUP_CONCAT recover!
+            "DELETE DATA { :e2 :g :g1 }",
+            // retract all remaining rows -> implicit group returns to empty
+            "DELETE DATA { :n1 :g :g1 ; :v 2 . :n2 :g :g1 ; :v 6 }",
+        ];
+        let norm_concat = |rows: Vec<String>, concat_cols: &[usize]| -> Vec<String> {
+            let mut out: Vec<String> = rows
+                .into_iter()
+                .map(|row| {
+                    let mut cols: Vec<String> = row.split(' ').map(String::from).collect();
+                    for &ci_col in concat_cols {
+                        if let Some(cell) = cols.get_mut(ci_col)
+                            && let Some(inner) =
+                                cell.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                        {
+                            let mut parts: Vec<&str> = inner.split('|').collect();
+                            parts.sort();
+                            *cell = format!("\"{}\"", parts.join("|"));
+                        }
+                    }
+                    cols.join(" ")
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        for u in steps {
+            upd(&s, &format!("{PREFIX}{XSD}{u}")).unwrap();
+            step(&s, &mut c);
+            step(&s, &mut ci);
+            assert_eq!(
+                norm_concat(result(&c), &[6, 7]),
+                norm_concat(oracle_with_mode(&s, q, &c.columns(), mode), &[6, 7]),
+                "{mode} grouped {u}"
+            );
+            assert_eq!(
+                norm_concat(result(&ci), &[4]),
+                norm_concat(oracle_with_mode(&s, q_impl, &ci.columns(), mode), &[4]),
+                "{mode} implicit {u}"
+            );
+        }
+    }
+
+    // 4. SAMPLE stability and fallback when the sampled value is deleted.
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        upd(
+            &s,
+            &format!("{PREFIX}INSERT DATA {{ :a :g :g1 ; :v 2 . :b :g :g1 ; :v 1 }}"),
+        )
+        .unwrap();
+        let q = "SELECT ?g (SAMPLE(?v) AS ?sv) WHERE { ?x :g ?g . ?x :v ?v } GROUP BY ?g";
+        let mut c = build_with_mode(&s, q, AggregateErrors::Jena);
+        let first = result(&c);
+        assert_eq!(first.len(), 1);
+        // Delete whichever value was sampled; the remaining value must be reported.
+        let sampled_is_1 = first[0].contains("\"1\"");
+        if sampled_is_1 {
+            upd(&s, &format!("{PREFIX}DELETE DATA {{ :b :g :g1 ; :v 1 }}")).unwrap();
+        } else {
+            upd(&s, &format!("{PREFIX}DELETE DATA {{ :a :g :g1 ; :v 2 }}")).unwrap();
+        }
+        step(&s, &mut c);
+        check_mode(
+            &s,
+            &c,
+            q,
+            AggregateErrors::Jena,
+            "after deleting sampled value",
+        );
+    }
+
+    // 5. Unknown Group checkpoint state version is cleanly refused with Error::Unsupported.
+    {
+        let s = Store::in_memory(StoreOptions::default());
+        upd(&s, &format!("{PREFIX}INSERT DATA {{ :a :g :g1 ; :v 1 }}")).unwrap();
+        let q = "SELECT ?g (COUNT(?v) AS ?n) WHERE { ?x :g ?g . ?x :v ?v } GROUP BY ?g";
+        let c = build_with_mode(&s, q, AggregateErrors::Jena);
+        let snap = s.snapshot();
+        let mut w = super::persist::Writer::new(&snap, &c.terms);
+        w.zset(&c.result).unwrap();
+        w.u64(super::ops::group::GROUP_STATE_VERSION + 1);
+        let bad_body = w.finish();
+        let parsed = sparql::parse_query(&format!("{PREFIX}{XSD}{q}"), None, &[]).unwrap();
+        let mut target = Circuit::new(compile(&parsed, None).unwrap(), None);
+        let err = target.decode(&bad_body, &snap).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(_)),
+            "expected Unsupported for unknown group checkpoint version, got {err:?}"
+        );
+    }
+}

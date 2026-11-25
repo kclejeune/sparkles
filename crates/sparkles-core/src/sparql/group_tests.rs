@@ -3,7 +3,7 @@
 //! value of a group once, and a retracted row leaves the state it had before it was
 //! added.
 
-use super::group::acc::{Accumulator, Arg, Batch, Concat, Distinct, Running};
+use super::group::acc::{Accumulator, Arg, Batch, Concat, Distinct, Running, retractable};
 use super::plan::Agg;
 use super::table::Table;
 use super::value::Value;
@@ -36,6 +36,7 @@ fn fold(ctx: &Ctx, acc: &mut dyn Accumulator, values: &[Id], slots: &[u32]) {
         table: &table,
         arg: Arg::Column(values),
         rows: None,
+        weights: None,
         base: 0,
     };
     acc.add_batch(ctx, &batch, slots).unwrap();
@@ -207,6 +208,7 @@ fn count_distinct_star_tells_rows_apart() {
         table: &table,
         arg: Arg::Star,
         rows: None,
+        weights: None,
         base: 0,
     };
     count.add_batch(&ctx, &batch, &[0, 0, 0, 0]).unwrap();
@@ -232,6 +234,7 @@ fn retract_undoes_an_add_for_counts_and_integer_sums() {
             table: &table,
             arg: Arg::Column(&values[1..]),
             rows: None,
+            weights: None,
             base: 0,
         };
         assert!(acc.retract(&ctx, &batch, &[0, 0]).unwrap());
@@ -258,6 +261,7 @@ fn retract_undoes_an_add_for_counts_and_integer_sums() {
         table: &table,
         arg: Arg::Column(&[half]),
         rows: None,
+        weights: None,
         base: 0,
     };
     assert!(!acc.retract(&ctx, &batch, &[0]).unwrap());
@@ -282,4 +286,106 @@ fn distinct_charges_what_it_passes_on() {
         ctx.mem_peak()
     );
     assert_eq!(results(&ctx, &mut acc, 1), ["1"]);
+}
+
+#[test]
+fn weighted_add_and_signed_retract_across_retractable_accumulators() {
+    let ctx = ctx();
+    let v2 = int(&ctx, 2);
+    let v5 = int(&ctx, 5);
+    let v10 = int(&ctx, 10);
+    let table = Table::new(vec![0]);
+
+    let read_str = |acc: &mut dyn Accumulator, slot: usize| -> String {
+        let id = acc.read(&ctx, slot).unwrap();
+        ctx.value(id)
+            .and_then(|v| v.lexical().ok().map(|l| l.to_string()))
+            .unwrap_or_else(|| "unbound".to_string())
+    };
+
+    let specs = [
+        (agg(AggregateFunction::Count, true, false), "5", "2"),
+        (agg(AggregateFunction::Count, true, true), "3", "2"),
+        (agg(AggregateFunction::Sum, true, false), "21", "12"),
+        (agg(AggregateFunction::Sum, true, true), "17", "12"),
+        (agg(AggregateFunction::Avg, true, false), "4.2", "6"),
+        (agg(AggregateFunction::Min, true, false), "2", "2"),
+        (agg(AggregateFunction::Max, true, false), "10", "10"),
+        (
+            agg(
+                AggregateFunction::GroupConcat {
+                    separator: Some(",".into()),
+                },
+                true,
+                false,
+            ),
+            "2,2,2,5,10",
+            "2,10",
+        ),
+        (
+            agg(
+                AggregateFunction::GroupConcat {
+                    separator: Some(",".into()),
+                },
+                true,
+                true,
+            ),
+            "2,5,10",
+            "2,10",
+        ),
+    ];
+
+    for (a, after_add, after_retract) in specs {
+        let mut acc = retractable(&a, 1).unwrap();
+        assert!(acc.retractable());
+        acc.init(2);
+        let add_vals = [v2, v5, v10, v5];
+        let add_weights = [3i64, 1, 1, 2];
+        let add_slots = [0u32, 0, 0, 1];
+        let add_batch = Batch {
+            table: &table,
+            arg: Arg::Column(&add_vals),
+            rows: None,
+            weights: Some(&add_weights),
+            base: 0,
+        };
+        acc.add_batch(&ctx, &add_batch, &add_slots).unwrap();
+        assert_eq!(read_str(&mut *acc, 0), after_add, "{:?}", a.func);
+        assert!(acc.retained_bytes() > 0);
+
+        let neg_vals = [v2, v5];
+        let neg_weights = [-2i64, -1];
+        let neg_slots = [0u32, 0];
+        let neg_batch = Batch {
+            table: &table,
+            arg: Arg::Column(&neg_vals),
+            rows: None,
+            weights: Some(&neg_weights),
+            base: 0,
+        };
+        assert!(acc.retract(&ctx, &neg_batch, &neg_slots).unwrap());
+        assert_eq!(read_str(&mut *acc, 0), after_retract, "{:?}", a.func);
+
+        // Removing slot 0 swaps slot 1 into slot 0 and frees slot 0's state.
+        acc.swap_remove(0);
+        acc.swap_remove(0);
+        assert_eq!(acc.retained_bytes(), 0);
+    }
+
+    // Overflowing i64 integer sum mixed with a double matches Running (AggState::Sum).
+    let max_i = ctx.intern_value(&Value::Integer(i64::MAX.into()));
+    let one_d = ctx.intern_value(&Value::Double(1.0f64.into()));
+    let sum_agg = agg(AggregateFunction::Sum, true, false);
+    let mut running = Running::new(&sum_agg, false);
+    let mut ret = retractable(&sum_agg, 1).unwrap();
+    running.init(1);
+    ret.init(1);
+    let vals = [max_i, max_i, one_d];
+    let slots = [0u32, 0, 0];
+    fold(&ctx, &mut running, &vals, &slots);
+    fold(&ctx, &mut *ret, &vals, &slots);
+    let got_run = running.finish(&ctx, 0).unwrap();
+    let got_ret = ret.read(&ctx, 0).unwrap();
+    assert!(ctx.term(got_ret).is_some());
+    assert_eq!(ctx.term(got_ret), ctx.term(got_run));
 }

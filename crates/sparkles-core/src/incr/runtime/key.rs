@@ -5,7 +5,7 @@ use super::*;
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-pub(super) const COMPILER: &str = "f13-phase2-4";
+pub(crate) const COMPILER: &str = "f13-phase2-5";
 
 /// Whether `access` has protections that depend on the data, with the reason the
 /// whole query is then evaluated again (spec F13 §6.2).
@@ -149,6 +149,9 @@ mod compiler_tests {
         // an EXISTS whose LIMIT/OFFSET slice mentions an outer variable compiles to
         // substitution (exists or recompute under GRAPH) instead of a match join (item 1121)
         ("f13-phase2-4", "33695b11351c501e"),
+        // the group operator runs over the shared Accumulator trait with versioned
+        // per-accumulator checkpoint state (item 1073)
+        ("f13-phase2-5", "33695b11351c501e"),
     ];
 
     /// The variants of `ops::Op` as the source declares them, without comments or

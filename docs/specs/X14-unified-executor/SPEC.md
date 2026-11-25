@@ -1157,11 +1157,19 @@ the aggregate underneath once. `Rows` runs the per-group kernel `exec::aggregate
 registered aggregate over its group's rows, which FOLD, registered aggregates and the
 other custom aggregates, `MEDIAN` and `MODE` among them, need. `AggState` gained `merge` and
 `retract`. `merge` keeps row order for SAMPLE, GROUP_CONCAT and the ties of MIN and MAX,
-and a statistics aggregate does not merge. `retract` takes back unit-weight rows of
-COUNT, SUM and AVG without DISTINCT. The view operator of `incr/ops/group.rs` keeps its
-own states, which item 418 extended with an ordered multiset of each group's values, and
-adds and retracts with a weight per change. It does not use the trait, and moving it
-there would give `Batch` a weight column.
+and a statistics aggregate does not merge. `retract` takes back rows with an optional
+signed weight column on `Batch`, defaulting to unit weight for one-off queries. The
+incremental view operator in `incr/ops/group.rs` runs every aggregate through the shared
+`Accumulator` trait via `acc::retractable`, folding positive weights with `add_batch` and
+negative weights with `retract`, and reading live groups without destroying their state.
+`COUNT` uses `Running` directly, `SUM` and `AVG` use `RetractableSum`, `MIN`, `MAX`,
+`SAMPLE` and `GROUP_CONCAT` use `Ordered` over an ordered multiset, and `DISTINCT`
+aggregates wrap their inner accumulator in `RetractableDistinct`. All one-off and view
+accumulators share `finish_sum_avg`, `finish_best` and `finish_concat` so every reading of
+`aggregate-errors`, empty groups and numeric promotions agrees across both paths. Deleted
+non-implicit groups release their slot and state with `swap_remove`, and `Group::save`
+writes a versioned state header alongside the bumped incremental compiler version
+`f13-phase2-5` so unknown versions and earlier checkpoints are refused cleanly.
 
 The operator finds each row's group through a hash table on the keys, in order of first
 appearance. When every aggregate keeps running state, rows arrive in any batches, and a

@@ -7397,6 +7397,7 @@ pub(super) fn stat_aggregate(func: &AggregateFunction) -> Option<super::aggext::
 }
 
 /// Running state of one aggregate of one group (same results as [`aggregate`]).
+#[derive(Clone)]
 pub(super) enum AggState {
     /// COUNT(*) / COUNT(?v): rows / bound values
     Count(u64),
@@ -7600,16 +7601,56 @@ impl AggState {
         true
     }
 
-    /// Take back one row that [`AggState::add`] counted, for a state that can: a count,
-    /// and an exact sum of inline integers. `false`, with this state unchanged, for any
-    /// other, since a minimum, a sample or a sum that left the exact integers keeps no
-    /// record of the rows it would have to give up.
-    #[allow(dead_code, reason = "the parallel split and item 418's view operator")]
-    pub(super) fn retract(&mut self, id: Option<Id>) -> bool {
+    /// Add `weight` copies of one row; `id` is the aggregated column's value (`None` for COUNT(*)).
+    pub(super) fn add_weighted(&mut self, ctx: &Ctx, agg: &Agg, id: Option<Id>, weight: u64) {
+        if weight == 0 {
+            return;
+        }
         match self {
             AggState::Count(n) => {
                 if id.is_none_or(|id| !id.is_undef()) {
-                    *n = n.saturating_sub(1);
+                    *n += weight;
+                }
+            }
+            AggState::Sum {
+                int,
+                generic: None,
+                ok: true,
+                rows,
+                ..
+            } if id.is_some_and(|id| id.tag() == crate::id::Tag::Int) => {
+                let id = id.expect("checked above");
+                if let Some(delta) = i128::from(id.as_i64()).checked_mul(i128::from(weight))
+                    && let Some(s) = int.checked_add(delta)
+                {
+                    *int = s;
+                    *rows += weight;
+                    return;
+                }
+                for _ in 0..weight {
+                    self.add(ctx, agg, Some(id));
+                }
+            }
+            _ => {
+                for _ in 0..weight {
+                    self.add(ctx, agg, id);
+                }
+            }
+        }
+    }
+
+    /// Take back `weight` copies of one row that [`AggState::add`] counted, for a state
+    /// that can: a count, and an exact sum of inline integers. `false`, with this state
+    /// unchanged, for any other, since a minimum, a sample or a sum that left the exact
+    /// integers keeps no record of the rows it would have to give up.
+    pub(super) fn retract(&mut self, id: Option<Id>, weight: u64) -> bool {
+        if weight == 0 {
+            return true;
+        }
+        match self {
+            AggState::Count(n) => {
+                if id.is_none_or(|id| !id.is_undef()) {
+                    *n = n.saturating_sub(weight);
                 }
                 true
             }
@@ -7623,14 +7664,55 @@ impl AggState {
                 let Some(id) = id.filter(|id| id.tag() == crate::id::Tag::Int) else {
                     return false;
                 };
-                let Some(s) = int.checked_sub(id.as_i64().into()) else {
+                let Some(delta) = i128::from(id.as_i64()).checked_mul(i128::from(weight)) else {
+                    return false;
+                };
+                let Some(s) = int.checked_sub(delta) else {
                     return false;
                 };
                 *int = s;
-                *rows = rows.saturating_sub(1);
+                *rows = rows.saturating_sub(weight);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Read the aggregate's current value without consuming this state.
+    pub(super) fn read(&self, ctx: &Ctx, agg: &Agg) -> Id {
+        match self {
+            AggState::Count(n) => Id::from_i64(*n as i64).unwrap_or(Id::UNDEF),
+            AggState::Sum {
+                int,
+                generic,
+                ok,
+                rows,
+                errs,
+            } => {
+                let sum = if !*ok {
+                    None
+                } else {
+                    match generic {
+                        Some(sum) => Some(sum.clone()),
+                        None => i64::try_from(*int).ok().map(|v| Value::Integer(v.into())),
+                    }
+                };
+                super::group::acc::finish_sum_avg(
+                    ctx,
+                    matches!(agg.func, AggregateFunction::Avg),
+                    *rows,
+                    *errs,
+                    sum,
+                )
+            }
+            AggState::Best(best, _, errs) => super::group::acc::finish_best(
+                ctx,
+                matches!(agg.func, AggregateFunction::Min),
+                *errs,
+                *best,
+            ),
+            AggState::Sample(x) => x.unwrap_or(Id::UNDEF),
+            AggState::Stat(arq, acc) => acc.clone().finish(ctx, *arq),
         }
     }
 
@@ -7644,43 +7726,28 @@ impl AggState {
                 rows,
                 errs,
             } => {
-                // AVG is Sum over Count, and Count leaves the errors out
-                if rows > 0
-                    && errs == rows
-                    && matches!(agg.func, AggregateFunction::Avg)
-                    && ctx.aggregate_errors.avg_of_errors_zero()
-                {
-                    return ctx.intern_value(&Value::Integer(0.into()));
-                }
-                if !ok {
-                    return Id::UNDEF;
-                }
-                let sum = match generic {
-                    Some(sum) => sum,
-                    None => match i64::try_from(int) {
-                        Ok(int) => Value::Integer(int.into()),
-                        Err(_) => return Id::UNDEF,
-                    },
-                };
-                let v = if matches!(agg.func, AggregateFunction::Avg) {
-                    if rows == 0 {
-                        Some(Value::Integer(0.into()))
-                    } else {
-                        arith(NumOp::Div, &sum, &Value::Integer((rows as i64).into())).ok()
+                let sum = if !ok {
+                    None
+                } else {
+                    match generic {
+                        Some(sum) => Some(sum),
+                        None => i64::try_from(int).ok().map(|v| Value::Integer(v.into())),
                     }
-                } else {
-                    Some(sum)
                 };
-                v.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
+                super::group::acc::finish_sum_avg(
+                    ctx,
+                    matches!(agg.func, AggregateFunction::Avg),
+                    rows,
+                    errs,
+                    sum,
+                )
             }
-            AggState::Best(best, _, errs) => {
-                let min = matches!(agg.func, AggregateFunction::Min);
-                if errs > 0 && ctx.aggregate_errors.best_errs(min) {
-                    Id::UNDEF
-                } else {
-                    best.unwrap_or(Id::UNDEF)
-                }
-            }
+            AggState::Best(best, _, errs) => super::group::acc::finish_best(
+                ctx,
+                matches!(agg.func, AggregateFunction::Min),
+                errs,
+                best,
+            ),
             AggState::Sample(x) => x.unwrap_or(Id::UNDEF),
             AggState::Stat(arq, acc) => acc.finish(ctx, arq),
         }

@@ -128,6 +128,14 @@ impl Terms {
         self.keys.len()
     }
 
+    pub(crate) fn key_bytes(&self, index: usize) -> Option<&[u8]> {
+        self.keys.get(index).map(|k| k.bytes.as_ref())
+    }
+
+    pub(crate) fn push_local_key(&mut self, key: Vec<u8>) -> Id {
+        self.local(key)
+    }
+
     pub fn bytes(&self) -> u64 {
         self.keys.iter().map(|k| k.retained_bytes() + 48).sum()
     }

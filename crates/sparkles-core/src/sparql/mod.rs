@@ -30,7 +30,7 @@ mod fnlib;
 pub mod geojoin;
 pub mod geopf;
 pub mod georewrite;
-mod group;
+pub(crate) mod group;
 pub mod history_svc;
 pub mod hybrid;
 pub mod indexjoin;

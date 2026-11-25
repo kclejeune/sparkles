@@ -3773,6 +3773,17 @@ impl Ctx {
     pub fn local_len(&self) -> u64 {
         self.local.read().len()
     }
+
+    /// Append a key directly into the query-local vocabulary, returning its local index.
+    /// Used by incremental view passes to keep `Ctx` and `incr::terms::Terms` indices aligned.
+    pub(crate) fn push_local_key(&self, key: &[u8]) -> u64 {
+        self.local.write().insert(key).0
+    }
+
+    /// Copy the vocabulary key of a query-local id.
+    pub(crate) fn local_key(&self, id: u64) -> Option<Vec<u8>> {
+        self.local.read().get(id).map(|k| k.to_vec())
+    }
 }
 
 /// The term of one decoded vocabulary key, admitted on `row` before it is built.

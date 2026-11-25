@@ -501,6 +501,7 @@ impl Grouping {
                         other => other,
                     },
                     rows: index.as_ref(),
+                    weights: None,
                     base,
                 };
                 self.accs[a].add_batch(ctx, &batch, &slots[base..end])?;

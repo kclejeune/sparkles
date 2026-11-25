@@ -159,6 +159,9 @@ pub struct Pass<'a> {
     #[cfg(test)]
     pub estimated: std::cell::Cell<u64>,
     ctx: Option<Arc<Ctx>>,
+    /// Dedicated context for grouping accumulators, kept in lockstep with `self.terms`
+    /// so `Tag::Local` ids agree between `Ctx` and the circuit's term table.
+    agg_ctx: Option<(Arc<Ctx>, usize)>,
     union_changes: Option<Vec<([Id; 3], i64)>>,
     work: u64,
 }
@@ -202,6 +205,7 @@ impl<'a> Pass<'a> {
             #[cfg(test)]
             estimated: std::cell::Cell::new(0),
             ctx: None,
+            agg_ctx: None,
             union_changes: None,
             work: 0,
         }
@@ -429,6 +433,44 @@ impl<'a> Pass<'a> {
             self.ctx = Some(c.into_shared());
         }
         Ok(self.ctx.as_deref().expect("made above"))
+    }
+
+    /// Run `f` with a [`Ctx`] whose query-local vocabulary stays aligned 1-to-1 with
+    /// `self.terms`, so `Tag::Local` ids mean the same term in both directions.
+    pub(crate) fn with_agg_ctx<T>(&mut self, f: impl FnOnce(&Ctx) -> Result<T>) -> Result<T> {
+        if self.agg_ctx.is_none() {
+            let mut c = Ctx::new(self.new.clone());
+            c.use_cache = false;
+            c.aggregate_errors = self.aggregate_errors;
+            c.base_iri = self.base.clone();
+            c.deadline = self.control.deadline;
+            c.cancel = self.control.cancel.flag();
+            self.agg_ctx = Some((c.into_shared(), 0));
+        }
+        let (ctx, synced) = self.agg_ctx.as_mut().expect("made above");
+        let term_count = self.terms.key_count();
+        for i in *synced..term_count {
+            let key = self.terms.key_bytes(i).expect("term index in bounds");
+            let idx = ctx.push_local_key(key);
+            debug_assert_eq!(idx, i as u64, "Terms and agg_ctx local index mismatch");
+        }
+        *synced = term_count;
+        let ctx = ctx.clone();
+        let res = f(&ctx);
+        let ctx_len = ctx.local_len() as usize;
+        if let Some((_, synced)) = self.agg_ctx.as_mut() {
+            for i in *synced..ctx_len {
+                let key = ctx.local_key(i as u64).expect("ctx local index in bounds");
+                let id = self.terms.push_local_key(key);
+                debug_assert_eq!(
+                    id,
+                    Id::local(i as u64),
+                    "agg_ctx and Terms local index mismatch"
+                );
+            }
+            *synced = ctx_len;
+        }
+        res
     }
 
     /// Evaluate `e` over rows of `schema` (circuit variables): the id of each value, or

@@ -2420,8 +2420,11 @@ fn shared_exists_window_skips_old_compiler_checkpoint() {
     let parsed = spargebra::SparqlParser::new().parse_query(QUERY).unwrap();
     let old_fp =
         super::runtime::checkpoint_fingerprint_for_compiler("f13-phase2-3", &parsed, QUERY);
-    let new_fp =
-        super::runtime::checkpoint_fingerprint_for_compiler("f13-phase2-4", &parsed, QUERY);
+    let new_fp = super::runtime::checkpoint_fingerprint_for_compiler(
+        super::runtime::COMPILER,
+        &parsed,
+        QUERY,
+    );
     assert_eq!(header.fingerprint, new_fp);
     assert_ne!(old_fp, new_fp);
     let old_bytes = super::persist::encode_as(
