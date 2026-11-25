@@ -141,6 +141,16 @@ impl Comps {
         self.component(d).is_some_and(|c| self.checker[c as usize])
     }
 
+    /// Whether component `comp` is taken by the checker.
+    pub fn is_checker(&self, comp: u32) -> bool {
+        self.checker.get(comp as usize).copied().unwrap_or(false)
+    }
+
+    /// Every data property named by the run's axioms with its component id.
+    pub fn iter(&self) -> impl Iterator<Item = (&DataProperty, u32)> {
+        self.comp.iter().map(|(d, &c)| (d, c))
+    }
+
     /// Whether any component is the checker's.
     pub fn any(&self) -> bool {
         self.checker.iter().any(|&c| c)

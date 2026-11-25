@@ -443,6 +443,45 @@ const SCOPE_BYTES: usize = 48;
 /// The expressions that [`Index::changed`] compares between two polls of its stop.
 pub(super) const POLL_CHANGED: usize = 4096;
 
+#[inline]
+fn tick_changed(ticks: &mut usize, stop: &dyn Fn() -> bool) -> bool {
+    *ticks += 1;
+    if *ticks >= POLL_CHANGED {
+        *ticks = 0;
+        stop()
+    } else {
+        false
+    }
+}
+
+fn slice_eq_poll<T: PartialEq>(
+    a: &[T],
+    b: &[T],
+    ticks: &mut usize,
+    stop: &dyn Fn() -> bool,
+) -> Option<bool> {
+    if a.len() != b.len() {
+        return Some(false);
+    }
+    let mut i = 0;
+    while i < a.len() {
+        let step = POLL_CHANGED.saturating_sub(*ticks).max(1);
+        let end = (i + step).min(a.len());
+        if a[i..end] != b[i..end] {
+            return Some(false);
+        }
+        *ticks += end - i;
+        i = end;
+        if *ticks >= POLL_CHANGED {
+            *ticks = 0;
+            if stop() {
+                return None;
+            }
+        }
+    }
+    Some(true)
+}
+
 struct ValueInsertionPlan {
     vector_capacity: usize,
     bytes: usize,
@@ -1231,6 +1270,8 @@ pub struct Roles {
     pub data_range: Vec<Option<u32>>,
     /// for each data role, its functional superroles, itself included
     pub functional: Vec<Vec<Role>>,
+    /// whether any data role has a functional superrole
+    pub any_functional: bool,
     /// roles under the bottom object or data property, which relate nothing
     pub empty: Vec<bool>,
     /// whether any role is empty
@@ -2384,6 +2425,10 @@ impl Index {
 
 #[cfg(test)]
 impl Index {
+    pub(super) fn head_count(&self) -> usize {
+        self.heads.len()
+    }
+
     /// The fixture may replace only key records after a production index build.
     pub(super) fn assert_key_fixture_equivalent(&self, expected: &Index) {
         let Index {
@@ -2488,6 +2533,7 @@ impl Index {
             range: a_range,
             data_range: a_data_range,
             functional: a_functional,
+            any_functional: a_any_functional,
             empty: a_empty,
             any_empty: a_any_empty,
             inv: a_inv,
@@ -2504,6 +2550,7 @@ impl Index {
             range: b_range,
             data_range: b_data_range,
             functional: b_functional,
+            any_functional: b_any_functional,
             empty: b_empty,
             any_empty: b_any_empty,
             inv: b_inv,
@@ -2511,6 +2558,7 @@ impl Index {
             linear: b_linear,
             comp_fwd: b_comp_fwd,
         } = b_roles;
+        assert_eq!(a_any_functional, b_any_functional, "fixture any_functional");
         assert_eq!(
             (
                 a_sup,
@@ -2673,84 +2721,137 @@ impl Index {
     }
 
     /// Whether a later run may compare this index with its own
-    /// ([`Index::same_tables`]): it has no data, individuals, universal roles or keys,
-    /// with which that comparison always fails. A run over such an index keeps no
-    /// contexts for the next, which then holds no last index beside its own.
+    /// ([`Index::same_tables`]): it has no individuals, universal roles, keys, or top
+    /// data property, with which that comparison fails. Data restrictions (both the EL
+    /// lattice, including functional data properties, and Item 972's datatype checker)
+    /// are comparable across runs (roadmap item 753).
     pub fn comparable(&self) -> bool {
-        self.roles.data_range.iter().all(|r| r.is_none())
-            && self.roles.functional.iter().all(|f| f.is_empty())
-            && self.vals.is_empty()
-            && self.dt.is_none()
-            && self.neg_data.is_empty()
-            && self.universal.is_empty()
+        self.universal.is_empty()
             && self.keys.is_empty()
             && self.nominals.is_empty()
             && !self.nominal_selfs
+            && self.tops[1].is_none()
     }
 
     /// Whether a context that a run over `old` saturated reads the same tables here
     /// when it holds none of the expressions that [`Index::changed`] lists (roadmap
     /// item 753): the tables that no expression keys are equal on the roles of `old`,
-    /// neither index has individuals, universal roles, keys or data, and both have the
-    /// Horn rules or neither, and Tier D or neither, where Tier D's tables are those
-    /// its expressions key ([`DlIx::keyed_by_expressions`](super::dl_rules::DlIx)).
+    /// neither index has individuals, universal roles or keys, both agree on `plain` /
+    /// `dominate` parity and datatype-checker mode assignment for every old data
+    /// property, and both have the Horn rules or neither, and Tier D or neither, where
+    /// Tier D's tables are those its expressions key
+    /// ([`DlIx::keyed_by_expressions`](super::dl_rules::DlIx)).
     /// Roles that `old` lacks may be new here, since a kept context holds no link by
     /// them.
+    #[allow(dead_code)]
     pub fn same_tables(&self, old: &Index) -> bool {
+        self.same_tables_with_stop(old, &|| false).unwrap_or(false)
+    }
+
+    /// Cooperative polling variant of [`Index::same_tables`]; returns `None` when `stop`
+    /// signals cancellation or deadline expiry.
+    pub fn same_tables_with_stop(&self, old: &Index, stop: &dyn Fn() -> bool) -> Option<bool> {
         let (a, b) = (&old.roles, &self.roles);
         let n = a.sup.len();
-        let prefix = |x: &[bool], y: &[bool]| y.len() >= x.len() && y[..x.len()] == *x;
-        let sorted = |v: &[(Role, Ex)]| {
-            let mut v = v.to_vec();
-            v.sort_unstable();
-            v
-        };
-        let comp_within = |x: &FxHashMap<(Role, Role), Vec<Role>>,
-                           y: &FxHashMap<(Role, Role), Vec<Role>>| {
-            x.iter()
-                .filter(|(k, _)| (k.0 as usize) < n && (k.1 as usize) < n)
-                .all(|(k, v)| y.get(k) == Some(v))
-        };
-        b.sup.len() >= n
-            && b.sup[..n] == a.sup[..]
-            && comp_within(&a.comp, &b.comp)
-            && comp_within(&b.comp, &a.comp)
-            && prefix(&a.right, &b.right)
-            && prefix(&a.left, &b.left)
-            && a.reflexive == b.reflexive
-            && b.range.len() >= a.range.len()
-            && b.range[..a.range.len()] == a.range[..]
-            && a.data_range.iter().all(|r| r.is_none())
-            && b.data_range.iter().all(|r| r.is_none())
-            && a.functional.iter().all(|f| f.is_empty())
-            && b.functional.iter().all(|f| f.is_empty())
-            && prefix(&a.empty, &b.empty)
-            && prefix(&a.linear, &b.linear)
-            && b.inv.len() >= a.inv.len()
-            && b.inv[..a.inv.len()] == a.inv[..]
-            && a.clash == b.clash
-            && sorted(&old.selfs) == sorted(&self.selfs)
-            && old.vals.is_empty()
-            && self.vals.is_empty()
-            && old.dt.is_none()
-            && self.dt.is_none()
-            && old.neg_data.is_empty()
-            && self.neg_data.is_empty()
-            && old.universal.is_empty()
-            && self.universal.is_empty()
-            && old.keys.is_empty()
-            && self.keys.is_empty()
-            && old.nominals.is_empty()
-            && self.nominals.is_empty()
-            && !old.nominal_selfs
-            && !self.nominal_selfs
-            && old.tops == self.tops
-            && old.horn.is_some() == self.horn.is_some()
-            && match (&old.dl, &self.dl) {
-                (None, None) => true,
-                (Some(a), Some(b)) => a.keyed_by_expressions() && b.keyed_by_expressions(),
-                _ => false,
+        if b.sup.len() < n
+            || b.right.len() < a.right.len()
+            || b.left.len() < a.left.len()
+            || a.reflexive.len() != b.reflexive.len()
+            || b.range.len() < a.range.len()
+            || b.data_range.len() < a.data_range.len()
+            || b.functional.len() < a.functional.len()
+            || b.empty.len() < a.empty.len()
+            || b.linear.len() < a.linear.len()
+            || b.inv.len() < a.inv.len()
+            || a.clash.len() != b.clash.len()
+            || old.selfs.len() != self.selfs.len()
+            || super::saturate::plain(old) != super::saturate::plain(self)
+            || !old.universal.is_empty()
+            || !self.universal.is_empty()
+            || !old.keys.is_empty()
+            || !self.keys.is_empty()
+            || !old.nominals.is_empty()
+            || !self.nominals.is_empty()
+            || old.nominal_selfs
+            || self.nominal_selfs
+            || old.tops != self.tops
+            || self.tops[1].is_some()
+            || old.horn.as_ref().map(|h| h.dominate) != self.horn.as_ref().map(|h| h.dominate)
+            || old.dt.is_some() != self.dt.is_some()
+        {
+            return Some(false);
+        }
+        match (&old.dl, &self.dl) {
+            (None, None) => {}
+            (Some(da), Some(db)) if da.keyed_by_expressions() && db.keyed_by_expressions() => {}
+            _ => return Some(false),
+        }
+        let mut ticks = 0usize;
+        for (sa, sb) in a.sup.iter().zip(&b.sup[..n]) {
+            if tick_changed(&mut ticks, stop) {
+                return None;
             }
+            if !slice_eq_poll(sa, sb, &mut ticks, stop)? {
+                return Some(false);
+            }
+        }
+        for (x, y) in [(&a.comp, &b.comp), (&b.comp, &a.comp)] {
+            for (k, v) in x {
+                if tick_changed(&mut ticks, stop) {
+                    return None;
+                }
+                if (k.0 as usize) < n && (k.1 as usize) < n {
+                    let Some(yv) = y.get(k) else {
+                        return Some(false);
+                    };
+                    if !slice_eq_poll(v, yv, &mut ticks, stop)? {
+                        return Some(false);
+                    }
+                }
+            }
+        }
+        if !slice_eq_poll(&a.right, &b.right[..a.right.len()], &mut ticks, stop)?
+            || !slice_eq_poll(&a.left, &b.left[..a.left.len()], &mut ticks, stop)?
+            || !slice_eq_poll(&a.reflexive, &b.reflexive, &mut ticks, stop)?
+            || !slice_eq_poll(&a.range, &b.range[..a.range.len()], &mut ticks, stop)?
+        {
+            return Some(false);
+        }
+        for (va, vb) in a.data_range.iter().zip(&b.data_range[..a.data_range.len()]) {
+            if tick_changed(&mut ticks, stop) {
+                return None;
+            }
+            let same = match (va, vb) {
+                (None, None) => true,
+                (Some(va), Some(vb)) => old.vals.get(*va as usize) == self.vals.get(*vb as usize),
+                _ => false,
+            };
+            if !same {
+                return Some(false);
+            }
+        }
+        for (fa, fb) in a.functional.iter().zip(&b.functional[..a.functional.len()]) {
+            if tick_changed(&mut ticks, stop) {
+                return None;
+            }
+            if !slice_eq_poll(fa, fb, &mut ticks, stop)? {
+                return Some(false);
+            }
+        }
+        if !slice_eq_poll(&a.empty, &b.empty[..a.empty.len()], &mut ticks, stop)?
+            || !slice_eq_poll(&a.linear, &b.linear[..a.linear.len()], &mut ticks, stop)?
+            || !slice_eq_poll(&a.inv, &b.inv[..a.inv.len()], &mut ticks, stop)?
+            || !slice_eq_poll(&a.clash, &b.clash, &mut ticks, stop)?
+            || !slice_eq_poll(&old.selfs, &self.selfs, &mut ticks, stop)?
+        {
+            return Some(false);
+        }
+        if let (Some(a_dt), Some(b_dt)) = (&old.dt, &self.dt)
+            && !b_dt.modes_compatible_with_stop(a_dt, n, stop)?
+        {
+            return Some(false);
+        }
+        Some(true)
     }
 
     fn disjoint_set_count<E>(&self, poll: &impl Fn() -> Result<(), E>) -> Result<usize, E> {
@@ -2766,12 +2867,26 @@ impl Index {
     /// here than a run over `old` gave it (roadmap item 753): another successor, told
     /// superexpressions, conjunctions, negative existential restrictions or
     /// disjointness sets, as sets, or other flags of the Horn rules, on the expression
-    /// or, for a universal restriction, on its filler, and in a run of Tier D other
-    /// clauses with the expression in their body or another hypothetical successor.
-    /// `poll` can stop disjointness numbering and the scan of the old expressions.
+    /// or, for a universal restriction, on its filler, changed EL data ranges or
+    /// negative data restrictions, changed datatype-checker components or refire
+    /// triggers, and in a run of Tier D other clauses with the expression in their body
+    /// or another hypothetical successor. `poll` can stop disjointness numbering and
+    /// the scan of the old expressions.
+    #[allow(dead_code)]
     pub fn changed<E>(
         &self,
         old: &Index,
+        poll: &impl Fn() -> Result<(), E>,
+    ) -> Result<Vec<bool>, E> {
+        self.changed_with_dt(old, None, poll)
+    }
+
+    /// [`Index::changed`], incorporating pre-aligned [`DtIx`](super::dt_sat::DtIx)
+    /// component changes when datatype-checker components are active.
+    pub fn changed_with_dt<E>(
+        &self,
+        old: &Index,
+        dt_align: Option<&super::dt_sat::DtAlign>,
         poll: &impl Fn() -> Result<(), E>,
     ) -> Result<Vec<bool>, E> {
         let n = old.heads.len();
@@ -2844,6 +2959,60 @@ impl Index {
                 .and_then(|h| h.flags.get(e).copied())
                 .unwrap_or(0)
         };
+        // Data roles of `old` whose negative data restrictions changed (as sets of
+        // `(DataVal, Ex)` pairs). Any `DataSome(r, _)` with a superrole in this set
+        // must be marked changed so functional data groups re-run `data_matches`.
+        // Each `neg_data` list is canonicalized during `Index::build`, so comparison
+        // is a zero-allocation linear scan with cooperative stop polling, and both
+        // role sets are pre-sized to avoid transient rehash memory.
+        let mut changed_neg_roles: FxHashSet<Role> = FxHashSet::default();
+        if !old.neg_data.is_empty() || !self.neg_data.is_empty() {
+            let old_roles = old.roles.sup.len();
+            let max_roles = (old.neg_data.len() + self.neg_data.len()).min(old_roles);
+            let mut seen_roles: FxHashSet<Role> =
+                FxHashSet::with_capacity_and_hasher(max_roles, Default::default());
+            changed_neg_roles = FxHashSet::with_capacity_and_hasher(max_roles, Default::default());
+            #[cfg(test)]
+            let (seen_init_cap, changed_init_cap) =
+                (seen_roles.capacity(), changed_neg_roles.capacity());
+            let mut ticks = 0usize;
+            for &r in old.neg_data.keys().chain(self.neg_data.keys()) {
+                ticks += 1;
+                if ticks >= POLL_CHANGED {
+                    ticks = 0;
+                    poll()?;
+                }
+                if (r as usize) >= old_roles || !seen_roles.insert(r) {
+                    continue;
+                }
+                let old_v = old.neg_data.get(&r).map_or(&[][..], Vec::as_slice);
+                let new_v = self.neg_data.get(&r).map_or(&[][..], Vec::as_slice);
+                let mut same_neg = old_v.len() == new_v.len();
+                if same_neg {
+                    for (&(wa, xa), &(wb, xb)) in old_v.iter().zip(new_v) {
+                        ticks += 1;
+                        if ticks >= POLL_CHANGED {
+                            ticks = 0;
+                            poll()?;
+                        }
+                        if xa != xb || old.vals[wa as usize] != self.vals[wb as usize] {
+                            same_neg = false;
+                            break;
+                        }
+                    }
+                }
+                if !same_neg {
+                    changed_neg_roles.insert(r);
+                }
+            }
+            #[cfg(test)]
+            neg_role_set_record(
+                seen_init_cap,
+                seen_roles.capacity(),
+                changed_init_cap,
+                changed_neg_roles.capacity(),
+            );
+        }
         let mut changed = vec![false; n];
         for (e, changed) in changed.iter_mut().enumerate() {
             if e.is_multiple_of(POLL_CHANGED) {
@@ -2867,8 +3036,35 @@ impl Index {
                 Node::Forall(_, f) => flag(old, f as usize) != flag(self, f as usize),
                 _ => false,
             };
+            let succ_changed = match a.node {
+                Node::DataSome(..) => {
+                    a.succ != b.succ
+                        && old.vals.get(a.succ as usize) != self.vals.get(b.succ as usize)
+                }
+                _ => a.succ != b.succ,
+            };
+            let data_changed =
+                match a.node {
+                    Node::DataSome(r, _) => {
+                        !changed_neg_roles.is_empty()
+                            && old.roles.sup.get(r as usize).is_some_and(|sup| {
+                                sup.iter().any(|g| changed_neg_roles.contains(g))
+                            })
+                    }
+                    Node::DtAtom(id) => match (&old.dt, dt_align) {
+                        (Some(old_dt), Some(align)) => old_dt
+                            .keys
+                            .get(id as usize)
+                            .and_then(|k| old_dt.roles.get(&k.role))
+                            .and_then(|ri| align.changed_comps.get(ri.comp as usize).copied())
+                            .unwrap_or(true),
+                        _ => false,
+                    },
+                    _ => false,
+                };
             *changed = a.node != b.node
-                || a.succ != b.succ
+                || succ_changed
+                || data_changed
                 || filler
                 || flag(old, e) != flag(self, e)
                 || old.told_of(a) != self.told_of(b)
@@ -2876,6 +3072,44 @@ impl Index {
                 || old.exist_of(a) != self.exist_of(b)
                 || a.disj.len != b.disj.len
                 || (a.disj.len != 0 && sets(old, a, &old_sets) != sets(self, b, &new_sets));
+        }
+        if let (Some(old_dt), Some(new_dt), Some(align)) = (&old.dt, &self.dt, dt_align) {
+            let mut ticks = 0usize;
+            for e in 0..n {
+                ticks += 1;
+                if ticks >= POLL_CHANGED {
+                    ticks = 0;
+                    poll()?;
+                }
+                if let Node::DtFire(t) = old.heads[e].node {
+                    let refire_same = match (old_dt.refire_of(t), new_dt.refire_of(t)) {
+                        (None, None) => true,
+                        (Some(old_cs), Some(new_cs)) if old_cs.len() == new_cs.len() => {
+                            let mut same = true;
+                            for &oc in old_cs {
+                                ticks += 1;
+                                if ticks >= POLL_CHANGED {
+                                    ticks = 0;
+                                    poll()?;
+                                }
+                                let mapped = align.comp_map.get(oc as usize).copied().flatten();
+                                if !mapped.is_some_and(|nc| new_cs.binary_search(&nc).is_ok()) {
+                                    same = false;
+                                    break;
+                                }
+                            }
+                            same
+                        }
+                        _ => false,
+                    };
+                    if !refire_same {
+                        changed[e] = true;
+                        if (t as usize) < n {
+                            changed[t as usize] = true;
+                        }
+                    }
+                }
+            }
         }
         drop(old_sets);
         drop(new_sets);
@@ -2891,16 +3125,30 @@ impl Index {
         self.heads.len()
     }
 
-    /// Upper bound on peak scratch bytes that [`Index::changed`] allocates for the
-    /// comparison with `old`: disjointness set numbering (dropped before `changed`), the
-    /// `changed` mark vector with per-head disjointness comparison (dropped before Tier D),
-    /// and the `changed` mark vector with Tier D's clause-key sets. Per-head `told`, `conj`
-    /// and `exist` slices are pre-sorted in [`Index::build`] and compared without allocation.
+    /// Upper bound on peak scratch bytes that [`Index::changed_with_dt`] and
+    /// [`DtIx::align`](super::dt_sat::DtIx::align) allocate for the comparison with
+    /// `old`: disjointness set numbering (dropped before `changed`), the `changed` mark
+    /// vector with per-head disjointness comparison and negative-data role tables
+    /// (dropped before Tier D), datatype-checker alignment tables, and the `changed` mark
+    /// vector with Tier D's clause-key sets. Per-head `told`, `conj` and `exist` slices
+    /// are pre-sorted in [`Index::build`] and compared without allocation.
     pub fn changed_scratch<E>(
         &self,
         old: &Index,
         poll: &impl Fn() -> Result<(), E>,
     ) -> Result<usize, E> {
+        let neg_roles = (old.neg_data.len() + self.neg_data.len()).min(old.roles.sup.len());
+        let neg_tables = if neg_roles > 0 {
+            super::dtcheck::range::map_buckets_for(neg_roles)
+                .saturating_mul((std::mem::size_of::<Role>() + 1) * 2)
+                .saturating_add(64)
+        } else {
+            0
+        };
+        let dt_scratch = match (&old.dt, &self.dt) {
+            (Some(a), Some(b)) => b.align_scratch(a),
+            _ => 0,
+        };
         let old_sets = old.disjoint_set_count(poll)?;
         let new_sets = self.disjoint_set_count(poll)?;
         let sets = old_sets.saturating_add(new_sets);
@@ -2914,7 +3162,8 @@ impl Index {
                     old_sets
                         .max(new_sets)
                         .saturating_mul(std::mem::size_of::<Vec<Ex>>()),
-                );
+                )
+                .saturating_add(dt_scratch);
         // Only equal-length spans can allocate both comparison buffers.
         let mut max_span = 0;
         if old_sets != 0 && new_sets != 0 {
@@ -2944,11 +3193,17 @@ impl Index {
             .heads
             .len()
             .saturating_add(numbering_bytes)
-            .saturating_add(max_span.saturating_mul(2 * std::mem::size_of::<u32>()));
-        let dl_phase = old.heads.len().saturating_add(match (&old.dl, &self.dl) {
-            (Some(a), Some(b)) => b.changed_scratch(a, poll)?,
-            _ => 0,
-        });
+            .saturating_add(max_span.saturating_mul(2 * std::mem::size_of::<u32>()))
+            .saturating_add(neg_tables)
+            .saturating_add(dt_scratch);
+        let dl_phase = old
+            .heads
+            .len()
+            .saturating_add(dt_scratch)
+            .saturating_add(match (&old.dl, &self.dl) {
+                (Some(a), Some(b)) => b.changed_scratch(a, poll)?,
+                _ => 0,
+            });
         poll()?;
         Ok(disj_phase.max(scan_phase).max(dl_phase))
     }
@@ -3071,6 +3326,16 @@ impl Index {
             ix.neg_data.entry(r).or_default().push((w, x));
         }
         ix.vals = it.copy_values()?;
+        for ns in ix.neg_data.values_mut() {
+            ns.sort_unstable_by(|&(w1, x1), &(w2, x2)| {
+                ix.vals[w1 as usize]
+                    .cmp(&ix.vals[w2 as usize])
+                    .then_with(|| x1.cmp(&x2))
+            });
+            ns.dedup_by(|(w1, x1), (w2, x2)| {
+                *x1 == *x2 && ix.vals[*w1 as usize] == ix.vals[*w2 as usize]
+            });
+        }
         ix.numeric_ledger = it.ranges.ledger.clone();
         // An individual has an instance in every model, so a told `{a} ⊑ ∃r.{b}`, which
         // a property assertion `r(a, b)` is, puts `b` in the range of `r`. The index
@@ -3219,9 +3484,15 @@ impl Index {
         // markers are interned before the Horn index, whose conjunctions' contexts take
         // the ids above every expression
         let run = it.dt_run.take();
-        let refire = match run.as_deref() {
-            Some(run) => dt_fires(it, run, &b, &mut told),
-            None => FxHashMap::default(),
+        let (refire, refire_guard) = match run.as_deref() {
+            Some(r) => match dt_fires(it, r, &b, &mut told) {
+                Ok(out) => out,
+                Err(e) => {
+                    it.dt_run = run;
+                    return Err(e);
+                }
+            },
+            None => (RefireMap::default(), None),
         };
         it.dt_run = run;
         if let Some(h) = &ax.horn {
@@ -3263,6 +3534,7 @@ impl Index {
         ix.disjoint = group(&disj, |h| &mut h.disj, &mut ix.heads);
         ix.nominal_selfs = !b.selfs.is_empty() && !it.individuals.is_empty();
         ix.selfs = std::mem::take(&mut b.selfs);
+        ix.selfs.sort_unstable();
         ix.keys = ax.keys.clone();
         ix.nominals = it.nominals().collect();
         ix.anonymous = it.anonymous_nominals();
@@ -3281,7 +3553,15 @@ impl Index {
         if ax.dl.is_none()
             && let Some(run) = it.dt_run.as_deref()
         {
-            ix.dt = Some(Box::new(dt_index(ax, it, run, &ix, &b, refire)?));
+            ix.dt = Some(Box::new(dt_index(
+                ax,
+                it,
+                run,
+                &ix,
+                &b,
+                refire,
+                refire_guard,
+            )?));
         }
         Ok(ix)
     }
@@ -3296,10 +3576,11 @@ fn dt_index(
     run: &DtRun,
     ix: &Index,
     b: &Builder,
-    refire: FxHashMap<Ex, Vec<u32>>,
+    refire: RefireMap,
+    refire_guard: Option<super::numeric::ScratchGuard>,
 ) -> Result<super::dt_sat::DtIx, Halt> {
     use super::dt_sat::{Body, DtIx, RoleIx};
-    use super::dtcheck::range::{map_backing_bytes, map_buckets_for};
+    use super::dtcheck::range::map_buckets_for;
     let checker_comp = |r: Role| -> Option<u32> {
         match it.roles.get(r as usize) {
             Some(RoleName::Data(d)) if run.comps.checker(d) => run.comps.component(d),
@@ -3377,21 +3658,16 @@ fn dt_index(
                 .map_or_else(super::dtcheck::range::Ranges::default_bytes, |r| r.bytes()),
         )
         .saturating_add(run.comps.bytes());
-    let refire_est = map_backing_bytes(&refire).saturating_add(
-        refire
-            .values()
-            .map(|v| v.capacity().saturating_mul(std::mem::size_of::<u32>()))
-            .sum::<usize>(),
-    );
     let total_est = roles_est
         .saturating_add(body_est)
         .saturating_add(disjoint_est)
         .saturating_add(clone_est)
-        .saturating_add(refire_est)
+        .saturating_add(refire.bytes())
         .saturating_add(256);
-    let mut guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    let mut guard = refire_guard.or_else(|| it.ranges.budget.as_ref().map(|b| b.scratch_guard()));
     if let Some(g) = guard.as_mut() {
-        g.grow(total_est).map_err(|e| match e {
+        let extra = total_est.saturating_sub(g.bytes());
+        g.grow(extra).map_err(|e| match e {
             super::Error::Memory { used, .. } => Halt::Memory(used),
             _ => Halt::Stopped,
         })?;
@@ -3480,14 +3756,23 @@ fn dt_index(
                 v.into_boxed_slice()
             })
             .filter(|ts| {
-                ts.iter()
-                    .all(|&t| t == TOP || refire.get(&t).is_some_and(|cs| cs.contains(&comp)))
+                ts.iter().all(|&t| {
+                    t == TOP
+                        || refire
+                            .get(&t)
+                            .is_some_and(|cs| cs.binary_search(&comp).is_ok())
+                })
             });
         debug_assert!(
             key.at_least,
             "a body atom of the Horn tier is an at-least atom"
         );
         body[comp as usize].push(Body { e, told });
+    }
+    // Canonicalize body order by expression id so reordering unchanged axioms does not
+    // alter `DtIx::align` or cache keys.
+    for v in &mut body {
+        v.sort_unstable_by_key(|b| b.e);
     }
     let mut disjoint: Vec<(Role, Role)> = Vec::with_capacity(exact_disjoint);
     for &(a, b) in &ax.dt_disjoint {
@@ -3532,42 +3817,335 @@ fn dt_comp(it: &Interner, run: &DtRun, e: Ex) -> Option<u32> {
     }
 }
 
+/// The low bits record whether the vector is sorted and whether it has resumed after
+/// a deferred growth. A target indexes `Interner::nodes`, whose entries are at least
+/// two bytes and whose backing is bounded by `isize::MAX` bytes.
+struct RefireEntry {
+    target_and_flags: usize,
+    components: Vec<u32>,
+}
+
+const _: () = assert!(std::mem::size_of::<RefireEntry>() == std::mem::size_of::<(Ex, Vec<u32>)>());
+const _: () = assert!(std::mem::size_of::<Node>() >= 2);
+
+impl RefireEntry {
+    const SORTED: usize = 1;
+    const RESUMED: usize = 2;
+
+    fn target(&self) -> Ex {
+        (self.target_and_flags >> 2) as Ex
+    }
+
+    fn sorted(&self) -> bool {
+        self.target_and_flags & Self::SORTED != 0
+    }
+
+    fn resumed(&self) -> bool {
+        self.target_and_flags & Self::RESUMED != 0
+    }
+
+    fn set_sorted(&mut self) {
+        self.target_and_flags |= Self::SORTED;
+    }
+
+    fn resume(&mut self) {
+        self.target_and_flags = (self.target_and_flags & !Self::SORTED) | Self::RESUMED;
+    }
+}
+
+#[derive(Default)]
+pub(super) struct RefireMap {
+    table: hashbrown::HashTable<RefireEntry>,
+}
+
+const _: () =
+    assert!(std::mem::size_of::<RefireMap>() == std::mem::size_of::<FxHashMap<Ex, Vec<u32>>>());
+
+impl RefireMap {
+    #[inline]
+    fn hash(target: Ex) -> u64 {
+        use std::hash::BuildHasher;
+        rustc_hash::FxBuildHasher.hash_one(target)
+    }
+
+    pub(super) fn get(&self, target: &Ex) -> Option<&Vec<u32>> {
+        self.table
+            .find(Self::hash(*target), |entry| entry.target() == *target)
+            .map(|entry| &entry.components)
+    }
+
+    /// Inserts an absent target that indexes the interner's node vector.
+    pub(super) fn insert(&mut self, target: Ex, components: Vec<u32>) {
+        debug_assert!(target as usize <= usize::MAX >> 2);
+        self.table.insert_unique(
+            Self::hash(target),
+            RefireEntry {
+                target_and_flags: (target as usize) << 2,
+                components,
+            },
+            |entry| Self::hash(entry.target()),
+        );
+    }
+
+    fn table_bytes(&self) -> usize {
+        super::dtcheck::range::table_backing_bytes::<RefireEntry>(self.table.capacity())
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.table_bytes().saturating_add(
+            self.table
+                .iter()
+                .map(|entry| {
+                    entry
+                        .components
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<u32>())
+                })
+                .sum::<usize>(),
+        )
+    }
+
+    pub(super) fn logical_bytes(&self) -> usize {
+        self.table
+            .len()
+            .saturating_mul(std::mem::size_of::<RefireEntry>())
+            .saturating_add(
+                self.table
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .components
+                            .len()
+                            .saturating_mul(std::mem::size_of::<u32>())
+                    })
+                    .sum::<usize>(),
+            )
+    }
+}
+
+/// Doubles a refire component vector's capacity through `refire_guard`, admitting the full
+/// destination allocation while the old backing is still charged and releasing the old
+/// backing charge immediately afterward.
+fn dt_fires_grow_vec(
+    cs: &mut Vec<u32>,
+    refire_guard: &mut Option<super::numeric::ScratchGuard>,
+    map_charged: usize,
+    vec_charged: &mut usize,
+) -> Result<(), Halt> {
+    let old_bytes = cs.capacity().saturating_mul(std::mem::size_of::<u32>());
+    let next_cap = cs.capacity().saturating_mul(2).max(4);
+    let next_bytes = next_cap.saturating_mul(std::mem::size_of::<u32>());
+    if let Some(g) = refire_guard.as_mut() {
+        g.grow(next_bytes).map_err(dt_fires_halt)?;
+    }
+    cs.reserve_exact(next_cap - cs.len());
+    let new_bytes = cs.capacity().saturating_mul(std::mem::size_of::<u32>());
+    *vec_charged = vec_charged
+        .saturating_sub(old_bytes)
+        .saturating_add(new_bytes);
+    if let Some(g) = refire_guard.as_mut() {
+        let target = map_charged.saturating_add(*vec_charged);
+        if g.bytes() > target {
+            g.shrink(g.bytes() - target);
+        } else if target > g.bytes() {
+            g.grow(target - g.bytes()).map_err(dt_fires_halt)?;
+        }
+    }
+    Ok(())
+}
+
+type RefireScratch = (RefireMap, Option<super::numeric::ScratchGuard>);
+
+enum RefireGrowth {
+    Deferred { skipped: bool },
+    Eager,
+}
+
 /// Tells each told subsumer of a body atom whose occurrences are all told its
-/// [`Node::DtFire`] marker, and gives for each subsumer the components it re-evaluates.
+/// [`Node::DtFire`] marker, and gives for each subsumer the components it re-evaluates
+/// alongside the live scratch reservation covering the returned `refire` map.
 fn dt_fires(
     it: &mut Interner,
     run: &DtRun,
     b: &Builder,
     told: &mut Vec<(Ex, Ex)>,
-) -> FxHashMap<Ex, Vec<u32>> {
-    let mut by: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
-    for &(a, c) in told.iter().chain(&b.told) {
-        if c != TOP && matches!(it.nodes[a as usize], Node::DtAtom(_)) {
-            by.entry(a).or_default().push(c);
-        }
+) -> Result<RefireScratch, Halt> {
+    let mut growth = RefireGrowth::Deferred { skipped: false };
+    match dt_fires_attempt(it, run, b, told, &mut growth) {
+        Ok(Some(result)) => return Ok(result),
+        Ok(None) => {}
+        // Deferral can reorder overlapping allocations across targets.
+        Err(Halt::Memory(_)) if matches!(growth, RefireGrowth::Deferred { skipped: true }) => {}
+        Err(error) => return Err(error),
     }
-    let mut refire: FxHashMap<Ex, Vec<u32>> = FxHashMap::default();
+    // The first scan dropped its scratch before publishing markers. Replay in the
+    // original growth order under the same budget and its already paid peak.
+    if let Some(budget) = &it.ranges.budget {
+        budget.poll().map_err(dt_fires_halt)?;
+    }
+    Ok(
+        dt_fires_attempt(it, run, b, told, &mut RefireGrowth::Eager)?
+            .expect("eager scan completes without replay"),
+    )
+}
+
+fn dt_fires_halt(error: super::Error) -> Halt {
+    match error {
+        super::Error::Memory { used, .. } => Halt::Memory(used),
+        _ => Halt::Stopped,
+    }
+}
+
+fn dt_fires_attempt(
+    it: &mut Interner,
+    run: &DtRun,
+    b: &Builder,
+    told: &mut Vec<(Ex, Ex)>,
+    growth: &mut RefireGrowth,
+) -> Result<Option<RefireScratch>, Halt> {
+    use super::dtcheck::range::table_growth;
+    let n_eligible = b
+        .dt_body
+        .iter()
+        .filter(|&&e| !b.dt_other.contains(&e) && dt_comp(it, run, e).is_some())
+        .count();
+    if n_eligible == 0 {
+        return Ok(Some((RefireMap::default(), None)));
+    }
+    let mut eligible_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    if let Some(g) = eligible_guard.as_mut() {
+        g.grow(n_eligible.saturating_mul(std::mem::size_of::<(Ex, u32)>()))
+            .map_err(dt_fires_halt)?;
+    }
+    let mut eligible: Vec<(Ex, u32)> = Vec::with_capacity(n_eligible);
     for &e in &b.dt_body {
         if b.dt_other.contains(&e) {
             continue;
         }
-        let Some(comp) = dt_comp(it, run, e) else {
-            continue;
-        };
-        for &t in by.get(&e).map_or(&[][..], |v| v.as_slice()) {
-            let cs = refire.entry(t).or_default();
-            if !cs.contains(&comp) {
-                cs.push(comp);
-            }
+        if let Some(comp) = dt_comp(it, run, e) {
+            eligible.push((e, comp));
         }
     }
-    let mut ts: Vec<Ex> = refire.keys().copied().collect();
+    eligible.sort_unstable_by_key(|&(e, _)| e);
+    eligible.dedup();
+    let mut refire_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    let mut map_charged = 0usize;
+    let mut vec_charged = 0usize;
+    let mut refire = RefireMap::default();
+    for &(a, c) in told.iter().chain(&b.told) {
+        if c == TOP || !matches!(it.nodes[a as usize], Node::DtAtom(_)) {
+            continue;
+        }
+        let Ok(pos) = eligible.binary_search_by_key(&a, |&(e, _)| e) else {
+            continue;
+        };
+        let comp = eligible[pos].1;
+        let hash = RefireMap::hash(c);
+        let matches_target = |entry: &RefireEntry| entry.target() == c;
+        if refire.table.find(hash, matches_target).is_none() {
+            let table_growth =
+                table_growth::<RefireEntry>(refire.table.len(), refire.table.capacity());
+            if let Some(g) = refire_guard.as_mut() {
+                g.grow(table_growth).map_err(dt_fires_halt)?;
+            }
+            refire.insert(c, Vec::new());
+            let new_map_bytes = refire.table_bytes();
+            if let Some(g) = refire_guard.as_mut() {
+                let target = vec_charged.saturating_add(new_map_bytes);
+                if g.bytes() > target {
+                    g.shrink(g.bytes() - target);
+                } else if target > g.bytes() {
+                    g.grow(target - g.bytes()).map_err(dt_fires_halt)?;
+                }
+            }
+            map_charged = new_map_bytes;
+        }
+        let entry = refire
+            .table
+            .find_mut(hash, matches_target)
+            .expect("inserted above");
+        let sorted = entry.sorted();
+        let resumed = entry.resumed();
+        let cs = &mut entry.components;
+        if cs.last() == Some(&comp) {
+            continue;
+        }
+        if sorted {
+            if cs.binary_search(&comp).is_ok() {
+                continue;
+            }
+            // The first deferred growth is one the eager scan already took. After
+            // resuming, grow only when the new distinct component cannot fit at all.
+            if resumed && cs.len() < cs.capacity() {
+                return Ok(None);
+            }
+            dt_fires_grow_vec(cs, &mut refire_guard, map_charged, &mut vec_charged)?;
+            cs.push(comp);
+            entry.resume();
+            continue;
+        }
+        if cs.len() == cs.capacity() {
+            if !cs.is_empty() {
+                #[cfg(test)]
+                dt_fires_record_compaction(cs.len());
+                cs.sort_unstable();
+                cs.dedup();
+            }
+            let dense = cs.len() == cs.capacity()
+                || cs.len().saturating_mul(4) > cs.capacity().saturating_mul(3);
+            let duplicate = cs.binary_search(&comp).is_ok();
+            if dense
+                && duplicate
+                && let RefireGrowth::Deferred { skipped } = growth
+            {
+                entry.set_sorted();
+                *skipped = true;
+                continue;
+            }
+            if dense {
+                // Suppressed duplicates changed the compaction points. A near-full
+                // vector could grow here and reach dt_index larger than in eager order.
+                if resumed && cs.len() < cs.capacity() {
+                    return Ok(None);
+                }
+                dt_fires_grow_vec(cs, &mut refire_guard, map_charged, &mut vec_charged)?;
+            }
+            if duplicate {
+                continue;
+            }
+        }
+        cs.push(comp);
+    }
+    drop(eligible);
+    drop(eligible_guard);
+    for entry in &mut refire.table {
+        if !entry.sorted() {
+            entry.components.sort_unstable();
+            entry.components.dedup();
+        }
+    }
+    let mut ts_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    if let Some(g) = ts_guard.as_mut() {
+        g.grow(refire.table.len().saturating_mul(std::mem::size_of::<Ex>()))
+            .map_err(dt_fires_halt)?;
+    }
+    let mut ts: Vec<Ex> = Vec::with_capacity(refire.table.len());
+    ts.extend(refire.table.iter().map(RefireEntry::target));
     ts.sort_unstable();
     for t in ts {
         let f = it.node(Node::DtFire(t));
         told.push((t, f));
     }
-    refire
+    drop(ts_guard);
+    #[cfg(debug_assertions)]
+    if let Some(g) = refire_guard.as_ref() {
+        debug_assert_eq!(
+            g.bytes(),
+            refire.bytes(),
+            "refire_guard bytes must match live refire backing"
+        );
+    }
+    Ok(Some((refire, refire_guard)))
 }
 
 /// The index of the Horn rules, built after the occurrences of the normalized axioms:
@@ -4438,6 +5016,7 @@ fn roles(
         is_functional[r as usize] = true;
     }
     let mut functional: Vec<Vec<Role>> = vec![Vec::new(); n];
+    let mut any_functional = false;
     for r in 0..n {
         if !matches!(it.roles[r], RoleName::Data(_)) {
             continue;
@@ -4454,6 +5033,7 @@ fn roles(
             }
             if is_functional[s as usize] {
                 functional[r].push(s);
+                any_functional = true;
             }
         }
         if let Some(v) = acc {
@@ -4500,6 +5080,7 @@ fn roles(
         range,
         data_range,
         functional,
+        any_functional,
         any_empty: false,
         empty,
         inv,
@@ -4524,6 +5105,45 @@ fn roles(
 #[cfg(test)]
 thread_local! {
     static A1_ACCOUNTING_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Last `(seen_init_cap, seen_final_cap, changed_init_cap, changed_final_cap)` observed
+    // by `Index::changed_with_dt`'s negative-role comparison loop.
+    static NEG_ROLE_SET_STATS: std::cell::Cell<Option<(usize, usize, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+    // `(compactions, entries_inspected)` recorded inside `dt_fires`'s compaction branch.
+    static DT_FIRES_COMPACT_STATS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+#[cfg(test)]
+fn dt_fires_record_compaction(entries: usize) {
+    DT_FIRES_COMPACT_STATS.with(|s| {
+        let (count, inspected) = s.get();
+        s.set((count + 1, inspected + entries));
+    });
+}
+#[cfg(test)]
+fn reset_dt_fires_compaction_stats() {
+    DT_FIRES_COMPACT_STATS.with(|s| s.set((0, 0)));
+}
+#[cfg(test)]
+fn dt_fires_compaction_stats() -> (usize, usize) {
+    DT_FIRES_COMPACT_STATS.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+fn neg_role_set_record(
+    seen_init: usize,
+    seen_final: usize,
+    changed_init: usize,
+    changed_final: usize,
+) {
+    NEG_ROLE_SET_STATS.with(|s| s.set(Some((seen_init, seen_final, changed_init, changed_final))));
+}
+#[cfg(test)]
+pub(super) fn reset_neg_role_set_stats() {
+    NEG_ROLE_SET_STATS.with(|s| s.set(None));
+}
+#[cfg(test)]
+pub(super) fn neg_role_set_stats() -> Option<(usize, usize, usize, usize)> {
+    NEG_ROLE_SET_STATS.with(std::cell::Cell::get)
 }
 #[cfg(test)]
 fn a1_record_accounting_visit() {
@@ -4617,5 +5237,1079 @@ mod minimal_roles_tests {
         );
         assert_eq!(r, Err(()));
         assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn dt_fires_reserves_sort_vector_through_build_budget() {
+        use super::super::Limits;
+        use super::super::dtcheck::{
+            atoms::{DtKey, DtRun, Stop},
+            comp::Comps,
+            range::{Defs, Ranges as DtRanges},
+        };
+        use super::super::numeric::Budget;
+        use super::{Builder, Ex, Halt, Interner, Node, RoleName, dt_fires};
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty, DataRange, Datatype};
+        use crate::vocab;
+
+        let n_atoms = 4000usize;
+        let dp = DataProperty::new("urn:dt:p");
+        let target_cls = Class::new("urn:dt:Target");
+        let ax = AxiomKind::SubClassOf(
+            ClassExpression::Class(target_cls.clone()),
+            ClassExpression::DataAllValuesFrom(
+                vec![dp.clone()],
+                DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+            ),
+        );
+        let comps = Comps::of(&[&ax], &Defs::default(), &|| false).expect("checker comp");
+        assert!(comps.checker(&dp));
+        let mut it = Interner::new();
+        let role = it.role(RoleName::Data(dp));
+        let target = it.class(&target_cls);
+        let mut b = Builder::default();
+        let mut told_base: Vec<(Ex, Ex)> = Vec::with_capacity(n_atoms);
+        for i in 0..n_atoms {
+            let id = it.dt.id(DtKey {
+                role,
+                at_least: true,
+                n: (i + 1) as u64,
+                range: DtRanges::FULL,
+            });
+            let e = it.node(Node::DtAtom(id));
+            b.dt_body.push(e);
+            told_base.push((e, target));
+        }
+        let run = DtRun {
+            comps,
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: None,
+            stopped: None,
+        };
+        let expected_eligible_bytes = n_atoms * std::mem::size_of::<(Ex, u32)>();
+
+        // 1. Uncapped run must charge `eligible` + live `refire` against `it.ranges.budget`,
+        //    keep `refire` charged via its returned guard, and release scratch once dropped.
+        let uncap = Budget::new(&Limits::default(), 0, None);
+        it.ranges.begin(uncap.clone());
+        let mut told = told_base.clone();
+        let (refire, refire_guard) = dt_fires(&mut it, &run, &b, &mut told).expect("uncapped");
+        assert_eq!(refire.table.len(), 1);
+        assert_eq!(refire.get(&target).map(Vec::len), Some(1));
+        assert!(
+            uncap.peak() >= expected_eligible_bytes,
+            "expected dt_fires peak {} >= eligible bytes {expected_eligible_bytes}",
+            uncap.peak()
+        );
+        let refire1_bytes = refire.bytes();
+        assert_eq!(
+            refire_guard.as_ref().expect("live refire guard").bytes(),
+            refire1_bytes,
+            "carried refire guard must match exact final live backing"
+        );
+        assert_eq!(
+            uncap.retained_storage().1,
+            refire1_bytes,
+            "live refire guard must keep exact refire bytes charged until consumed or dropped"
+        );
+        drop((refire, refire_guard));
+        it.ranges.end();
+        assert_eq!(uncap.retained_storage().1, 0, "scratch must be released");
+
+        // Tight cap below `eligible` must refuse before allocating `eligible`.
+        let tight = Budget::new(
+            &Limits {
+                max_memory: Some(expected_eligible_bytes - 1),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it.ranges.begin(tight);
+        let mut told = told_base;
+        let err = dt_fires(&mut it, &run, &b, &mut told);
+        it.ranges.end();
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory under tight cap, got {:?}",
+            err.err()
+        );
+
+        // 2. Overlapping `eligible` + multi-target `refire` growth must both be charged
+        //    concurrently, and alternating duplicate components must stay bounded.
+        let dp0 = DataProperty::new("urn:dt:p0");
+        let dp1 = DataProperty::new("urn:dt:p1");
+        let ax0 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:dt:A0")),
+            ClassExpression::DataAllValuesFrom(
+                vec![dp0.clone()],
+                DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+            ),
+        );
+        let ax1 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:dt:A1")),
+            ClassExpression::DataAllValuesFrom(
+                vec![dp1.clone()],
+                DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+            ),
+        );
+        let comps2 = Comps::of(&[&ax0, &ax1], &Defs::default(), &|| false).expect("2 comps");
+        let c0 = comps2.component(&dp0).expect("comp 0");
+        let c1 = comps2.component(&dp1).expect("comp 1");
+        assert_ne!(c0, c1);
+        let mut it2 = Interner::new();
+        let r0 = it2.role(RoleName::Data(dp0));
+        let r1 = it2.role(RoleName::Data(dp1));
+        let alt = it2.class(&Class::new("urn:dt:Alt"));
+        let m = 1000usize;
+        let mut b2 = Builder::default();
+        let mut told2_base: Vec<(Ex, Ex)> = Vec::with_capacity(m * 2);
+        for i in 0..m {
+            let role = if i % 2 == 0 { r0 } else { r1 };
+            let id = it2.dt.id(DtKey {
+                role,
+                at_least: true,
+                n: (i + 1) as u64,
+                range: DtRanges::FULL,
+            });
+            let e = it2.node(Node::DtAtom(id));
+            let t = it2.class(&Class::new(format!("urn:dt:T{i}")));
+            b2.dt_body.push(e);
+            told2_base.push((e, t));
+            told2_base.push((e, alt));
+        }
+        let run2 = DtRun {
+            comps: comps2,
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: None,
+            stopped: None,
+        };
+        let eligible2_bytes = m * std::mem::size_of::<(Ex, u32)>();
+
+        let uncap2 = Budget::new(&Limits::default(), 0, None);
+        it2.ranges.begin(uncap2.clone());
+        let mut told2 = told2_base.clone();
+        let (refire2, guard2) = dt_fires(&mut it2, &run2, &b2, &mut told2).expect("uncapped 2");
+        assert_eq!(refire2.table.len(), m + 1);
+        let alt_comps = refire2.get(&alt).expect("alt refire");
+        let mut expected_alt = vec![c0, c1];
+        expected_alt.sort_unstable();
+        assert_eq!(alt_comps.as_slice(), expected_alt.as_slice());
+        assert!(
+            alt_comps.capacity() <= 4,
+            "alternating duplicates must not bloat component vec capacity, got {}",
+            alt_comps.capacity()
+        );
+        let refire2_bytes = refire2.bytes();
+        assert_eq!(
+            guard2.as_ref().expect("live refire2 guard").bytes(),
+            refire2_bytes,
+            "carried refire2 guard must release superseded map rehashes and match final backing"
+        );
+        assert_eq!(uncap2.retained_storage().1, refire2_bytes);
+        assert!(
+            uncap2.peak() >= eligible2_bytes + refire2_bytes,
+            "peak {} must cover overlapping eligible ({eligible2_bytes}) + refire ({refire2_bytes})",
+            uncap2.peak()
+        );
+        drop((refire2, guard2));
+        it2.ranges.end();
+        assert_eq!(uncap2.retained_storage().1, 0);
+
+        // A cap at the true live peak must succeed (cumulative historical rehash charges would
+        // exceed it and spuriously fail).
+        let exact2 = Budget::new(
+            &Limits {
+                max_memory: Some(uncap2.peak()),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it2.ranges.begin(exact2);
+        let mut told2 = told2_base.clone();
+        let (refire2_exact, guard2_exact) =
+            dt_fires(&mut it2, &run2, &b2, &mut told2).expect("live-peak cap must succeed");
+        assert_eq!(guard2_exact.as_ref().expect("guard").bytes(), refire2_bytes);
+        drop((refire2_exact, guard2_exact));
+        it2.ranges.end();
+
+        // Cap strictly above `eligible2_bytes` (which would pass an `items`-only guard) must
+        // refuse while `refire` grows alongside live `eligible`.
+        let tight2 = Budget::new(
+            &Limits {
+                max_memory: Some(eligible2_bytes + 1),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it2.ranges.begin(tight2);
+        let mut told2 = told2_base;
+        let err2 = dt_fires(&mut it2, &run2, &b2, &mut told2);
+        it2.ranges.end();
+        assert!(
+            matches!(err2, Err(Halt::Memory(_))),
+            "expected Halt::Memory when refire overlaps live eligible, got {:?}",
+            err2.err()
+        );
+    }
+
+    #[test]
+    fn dt_fires_near_full_compaction_avoids_quadratic_resorting() {
+        use super::super::dtcheck::{
+            atoms::{DtKey, DtRun, Stop},
+            comp::Comps,
+            range::{Defs, Ranges as DtRanges},
+        };
+        use super::{
+            Builder, Ex, Interner, Node, RoleName, dt_fires, dt_fires_compaction_stats,
+            reset_dt_fires_compaction_stats,
+        };
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty, DataRange, Datatype};
+        use crate::vocab;
+
+        let k = 128usize;
+        let tail = 1000usize;
+        let props: Vec<DataProperty> = (0..k)
+            .map(|i| DataProperty::new(format!("urn:dt:nf_p{i}")))
+            .collect();
+        let axioms: Vec<AxiomKind> = props
+            .iter()
+            .enumerate()
+            .map(|(i, dp)| {
+                AxiomKind::SubClassOf(
+                    ClassExpression::Class(Class::new(format!("urn:dt:NF_A{i}"))),
+                    ClassExpression::DataAllValuesFrom(
+                        vec![dp.clone()],
+                        DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+                    ),
+                )
+            })
+            .collect();
+        let refs: Vec<&AxiomKind> = axioms.iter().collect();
+        let comps = Comps::of(&refs, &Defs::default(), &|| false).expect("k comps");
+
+        // Cover both `K - 1` (near-full at capacity K) and `K` (full at capacity K) distinct
+        // components followed by a long alternating duplicate tail over the first two components.
+        for distinct in [k - 1, k] {
+            let mut it = Interner::new();
+            let mut role_comps: Vec<(Role, u32)> = props
+                .iter()
+                .map(|dp| {
+                    let c = comps.component(dp).expect("checker comp");
+                    (it.role(RoleName::Data(dp.clone())), c)
+                })
+                .collect();
+            role_comps.sort_unstable_by_key(|&(_, c)| c);
+            let target = it.class(&Class::new("urn:dt:NFTarget"));
+            let mut b = Builder::default();
+            let mut told: Vec<(Ex, Ex)> = Vec::with_capacity(distinct + tail);
+            for (idx, &(role, _)) in role_comps.iter().take(distinct).enumerate() {
+                let id = it.dt.id(DtKey {
+                    role,
+                    at_least: true,
+                    n: (idx + 1) as u64,
+                    range: DtRanges::FULL,
+                });
+                let e = it.node(Node::DtAtom(id));
+                b.dt_body.push(e);
+                told.push((e, target));
+            }
+            let r0 = role_comps[0].0;
+            let r1 = role_comps[1].0;
+            for j in 0..tail {
+                let role = if j % 2 == 0 { r0 } else { r1 };
+                let id = it.dt.id(DtKey {
+                    role,
+                    at_least: true,
+                    n: (distinct + j + 1) as u64,
+                    range: DtRanges::FULL,
+                });
+                let e = it.node(Node::DtAtom(id));
+                b.dt_body.push(e);
+                told.push((e, target));
+            }
+            let run = DtRun {
+                comps: comps.clone(),
+                defs: Defs::default(),
+                stop: Stop::default(),
+                budget: None,
+                stopped: None,
+            };
+            reset_dt_fires_compaction_stats();
+            let (refire, _guard) = dt_fires(&mut it, &run, &b, &mut told).expect("dt_fires");
+            let (compactions, inspected) = dt_fires_compaction_stats();
+            let cs = refire.get(&target).expect("target refire");
+            let expected: Vec<u32> = role_comps.iter().take(distinct).map(|&(_, c)| c).collect();
+            assert_eq!(cs.as_slice(), expected.as_slice());
+            assert!(
+                cs.capacity() <= 2 * k,
+                "distinct={distinct}: capacity {} must stay bounded within 2*K ({})",
+                cs.capacity(),
+                2 * k
+            );
+            assert!(
+                compactions <= 20,
+                "distinct={distinct}: expected O(T/K) compactions (<= 20), got {compactions}"
+            );
+            assert!(
+                inspected <= 4 * (distinct + tail),
+                "distinct={distinct}: expected linear inspected entries (<= {}), got {inspected}",
+                4 * (distinct + tail)
+            );
+        }
+    }
+
+    #[test]
+    fn dt_fires_releases_superseded_vector_growth_charges() {
+        use super::super::Limits;
+        use super::super::dtcheck::{
+            atoms::{DtKey, DtRun, Stop},
+            comp::Comps,
+            range::{Defs, Ranges as DtRanges},
+        };
+        use super::super::numeric::Budget;
+        use super::{Builder, Ex, Halt, Interner, Node, RoleName, dt_fires};
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty, DataRange, Datatype};
+        use crate::vocab;
+
+        // 1,024 distinct components targeting one class grows the component vector from
+        // 4 -> 8 -> ... -> 1,024. The live old+new overlap peak is 512 + 1,024 = 1,536 entries,
+        // while cumulative historical growth would charge 2,044 entries.
+        let k = 1024usize;
+        let props: Vec<DataProperty> = (0..k)
+            .map(|i| DataProperty::new(format!("urn:dt:vg_p{i}")))
+            .collect();
+        let axioms: Vec<AxiomKind> = props
+            .iter()
+            .enumerate()
+            .map(|(i, dp)| {
+                AxiomKind::SubClassOf(
+                    ClassExpression::Class(Class::new(format!("urn:dt:VG_A{i}"))),
+                    ClassExpression::DataAllValuesFrom(
+                        vec![dp.clone()],
+                        DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+                    ),
+                )
+            })
+            .collect();
+        let refs: Vec<&AxiomKind> = axioms.iter().collect();
+        let comps = Comps::of(&refs, &Defs::default(), &|| false).expect("1024 comps");
+        let mut it = Interner::new();
+        let target = it.class(&Class::new("urn:dt:VGTarget"));
+        let mut b = Builder::default();
+        let mut told_base: Vec<(Ex, Ex)> = Vec::with_capacity(k);
+        for (i, dp) in props.iter().enumerate() {
+            let role = it.role(RoleName::Data(dp.clone()));
+            let id = it.dt.id(DtKey {
+                role,
+                at_least: true,
+                n: (i + 1) as u64,
+                range: DtRanges::FULL,
+            });
+            let e = it.node(Node::DtAtom(id));
+            b.dt_body.push(e);
+            told_base.push((e, target));
+        }
+        let run = DtRun {
+            comps,
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: None,
+            stopped: None,
+        };
+        let eligible_bytes = k * std::mem::size_of::<(Ex, u32)>();
+
+        let uncap = Budget::new(&Limits::default(), 0, None);
+        it.ranges.begin(uncap.clone());
+        let mut told = told_base.clone();
+        let (refire, guard) = dt_fires(&mut it, &run, &b, &mut told).expect("uncapped");
+        let cs = refire.get(&target).expect("target refire");
+        assert_eq!(cs.len(), k);
+        assert_eq!(cs.capacity(), k);
+        let map_bytes = refire.table_bytes();
+        let final_refire_bytes = map_bytes + k * std::mem::size_of::<u32>();
+        assert_eq!(
+            guard.as_ref().expect("guard").bytes(),
+            final_refire_bytes,
+            "carried refire guard must match live final backing"
+        );
+        assert_eq!(uncap.retained_storage().1, final_refire_bytes);
+        let expected_live_peak =
+            eligible_bytes + map_bytes + (k / 2 + k) * std::mem::size_of::<u32>();
+        let cumulative_peak = eligible_bytes + map_bytes + (2 * k - 4) * std::mem::size_of::<u32>();
+        assert!(expected_live_peak < cumulative_peak);
+        assert_eq!(
+            uncap.peak(),
+            expected_live_peak,
+            "peak must cover eligible + map + 512..1024 overlap without accumulating prior backings"
+        );
+        drop((refire, guard));
+        it.ranges.end();
+        assert_eq!(uncap.retained_storage().1, 0);
+
+        // Cap at the true live peak succeeds (would fail under cumulative growth accounting).
+        let live_cap = Budget::new(
+            &Limits {
+                max_memory: Some(expected_live_peak),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it.ranges.begin(live_cap);
+        let mut told = told_base.clone();
+        let (refire_ok, guard_ok) =
+            dt_fires(&mut it, &run, &b, &mut told).expect("live-peak cap must succeed");
+        assert_eq!(
+            guard_ok.as_ref().expect("guard").bytes(),
+            final_refire_bytes
+        );
+        drop((refire_ok, guard_ok));
+        it.ranges.end();
+
+        // Cap one byte below the 512 + 1,024 overlap peak must still refuse.
+        let under_cap = Budget::new(
+            &Limits {
+                max_memory: Some(expected_live_peak - 1),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it.ranges.begin(under_cap);
+        let mut told = told_base;
+        let err = dt_fires(&mut it, &run, &b, &mut told);
+        it.ranges.end();
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory one byte below live overlap peak, got {:?}",
+            err.err()
+        );
+    }
+
+    #[test]
+    fn dt_fires_single_target_fits_under_prior_peak() {
+        dt_fires_at_prior_peak(&[1], &[], 4, 4);
+    }
+
+    #[test]
+    fn dt_fires_reversed_growth_fits_under_prior_peak() {
+        // A and B grew on their duplicate edges, in that order. Growing on the
+        // fresh components instead would reverse the order and need 512 slots.
+        // Replay uses the prior growth order, which peaks at 448.
+        dt_fires_at_prior_peak(&[128, 64], &[(1, 64), (0, 128)], 448, 384);
+    }
+
+    #[test]
+    fn dt_fires_retained_vectors_fit_under_prior_index_peak() {
+        use super::super::Limits;
+        use super::super::dtcheck::{
+            atoms::{DtKey, DtRun, Stop},
+            comp::Comps,
+            range::{Defs, Ranges as DtRanges},
+        };
+        use super::super::numeric::Budget;
+        use super::{Axioms, Halt, Index, Interner, Node, RoleName};
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty, DataRange, Datatype};
+        use crate::vocab;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let class = Class::new("urn:dt:RefireIndexTarget");
+        let mut props: Vec<_> = (0..8)
+            .map(|i| DataProperty::new(format!("urn:dt:RefireIndexP{i}")))
+            .collect();
+        let axioms: Vec<_> = props
+            .iter()
+            .map(|dp| {
+                AxiomKind::SubClassOf(
+                    ClassExpression::Class(class.clone()),
+                    ClassExpression::DataAllValuesFrom(
+                        vec![dp.clone()],
+                        DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+                    ),
+                )
+            })
+            .collect();
+        let comps = Comps::of(
+            &axioms.iter().collect::<Vec<_>>(),
+            &Defs::default(),
+            &|| false,
+        )
+        .expect("checker components");
+        props.sort_unstable_by_key(|dp| comps.component(dp).expect("component"));
+        let sequence = [0, 1, 2, 3, 0, 1, 0, 1, 4, 0, 5, 6, 7];
+        let build = |group_duplicates, limits: &Limits| {
+            let mut it = Interner::new();
+            let target = it.class(&class);
+            let roles: Vec<_> = props
+                .iter()
+                .map(|dp| it.role(RoleName::Data(dp.clone())))
+                .collect();
+            let mut edges: Vec<_> = sequence
+                .iter()
+                .enumerate()
+                .map(|(i, &comp)| {
+                    let id = it.dt.id(DtKey {
+                        role: roles[comp],
+                        at_least: true,
+                        n: (i + 1) as u64,
+                        range: DtRanges::FULL,
+                    });
+                    (comp, (it.node(Node::DtAtom(id)), target))
+                })
+                .collect();
+            if group_duplicates {
+                // Adjacent duplicates are skipped in both growth orders. The eight
+                // distinct components then finish at capacity eight in both scans.
+                edges.sort_unstable_by_key(|&(comp, _)| comp);
+            }
+            let ax = Axioms {
+                subs: edges.into_iter().map(|(_, edge)| edge).collect(),
+                ..Axioms::default()
+            };
+            it.dt_run = Some(Box::new(DtRun {
+                comps: comps.clone(),
+                defs: Defs::default(),
+                stop: Stop::default(),
+                budget: None,
+                stopped: None,
+            }));
+            let budget = Budget::new(limits, 0, None);
+            it.ranges.begin(budget.clone());
+            let result = Index::build(&ax, &mut it, None, &|| false);
+            it.ranges.end();
+            assert_eq!(budget.retained_storage().1, 0);
+            result.map(|ix| {
+                let told = ix.told_of(ix.head(target));
+                assert_eq!(told.len(), 1);
+                assert_eq!(it.nodes[told[0] as usize], Node::DtFire(target));
+                let dt = ix.dt.expect("datatype index");
+                assert_eq!(dt.refire_of(target), Some(&[0, 1, 2, 3, 4, 5, 6, 7][..]));
+                (budget.peak(), dt.bytes())
+            })
+        };
+        let (cap, retained) = build(true, &Limits::default()).expect("grouped control");
+        let capped = |limit| Limits {
+            max_memory: Some(limit),
+            ..Limits::default()
+        };
+        assert!(matches!(
+            build(false, &capped(cap - 1)),
+            Err(Halt::Memory(_))
+        ));
+        assert_eq!(
+            build(false, &capped(cap)).expect("prior index peak must fit"),
+            (cap, retained)
+        );
+        let paid = Arc::new(AtomicUsize::new(0));
+        let pool = paid.clone();
+        let pooled = Limits {
+            charge: Some(Arc::new(move |more| {
+                pool.try_update(Ordering::Relaxed, Ordering::Relaxed, |paid| {
+                    paid.checked_add(more).filter(|&total| total <= cap)
+                })
+                .is_ok()
+            })),
+            ..Limits::default()
+        };
+        assert_eq!(
+            build(false, &pooled).expect("prior index pool peak must fit"),
+            (cap, retained)
+        );
+        assert_eq!(paid.load(Ordering::Relaxed), cap);
+    }
+
+    fn dt_fires_at_prior_peak(
+        distinct: &[usize],
+        appends: &[(usize, usize)],
+        peak_slots: usize,
+        retained_slots: usize,
+    ) {
+        use super::super::Limits;
+        use super::super::dtcheck::{
+            atoms::{DtKey, DtRun, Stop},
+            comp::Comps,
+            range::{Defs, Ranges as DtRanges, map_buckets_for},
+        };
+        use super::super::numeric::Budget;
+        use super::{Builder, Ex, Halt, Interner, Node, RoleName, dt_fires};
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty, DataRange, Datatype};
+        use crate::vocab;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let n_props = distinct[0] + usize::from(!appends.is_empty());
+        let props: Vec<_> = (0..n_props)
+            .map(|i| DataProperty::new(format!("urn:dt:PriorCapP{i}")))
+            .collect();
+        let axioms: Vec<_> = props
+            .iter()
+            .map(|dp| {
+                AxiomKind::SubClassOf(
+                    ClassExpression::Class(Class::new("urn:dt:PriorCapBody")),
+                    ClassExpression::DataAllValuesFrom(
+                        vec![dp.clone()],
+                        DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+                    ),
+                )
+            })
+            .collect();
+        let refs: Vec<_> = axioms.iter().collect();
+        let run = DtRun {
+            comps: Comps::of(&refs, &Defs::default(), &|| false).expect("checker components"),
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: None,
+            stopped: None,
+        };
+        let mut it = Interner::new();
+        let targets: Vec<_> = (0..distinct.len())
+            .map(|i| it.class(&Class::new(format!("urn:dt:PriorCapT{i}"))))
+            .collect();
+        let mut b = Builder::default();
+        let mut atoms: Vec<_> = props
+            .iter()
+            .map(|dp| {
+                let role = it.role(RoleName::Data(dp.clone()));
+                let id = it.dt.id(DtKey {
+                    role,
+                    at_least: true,
+                    n: 1,
+                    range: DtRanges::FULL,
+                });
+                (
+                    run.comps.component(dp).expect("component"),
+                    role,
+                    it.node(Node::DtAtom(id)),
+                )
+            })
+            .collect();
+        atoms.sort_unstable();
+        b.dt_body.extend(atoms.iter().map(|&(_, _, atom)| atom));
+        let mut told = Vec::new();
+        for (&target, &n) in targets.iter().zip(distinct) {
+            told.extend(atoms[..n].iter().map(|&(_, _, atom)| (atom, target)));
+        }
+        if !appends.is_empty() {
+            let duplicate = it.dt.id(DtKey {
+                role: atoms[0].1,
+                at_least: true,
+                n: 2,
+                range: DtRanges::FULL,
+            });
+            let duplicate = it.node(Node::DtAtom(duplicate));
+            b.dt_body.push(duplicate);
+            told.extend(targets.iter().map(|&target| (duplicate, target)));
+            b.told
+                .extend(appends.iter().map(|&(t, c)| (atoms[c].2, targets[t])));
+        }
+        let eligible_bytes = b.dt_body.len() * std::mem::size_of::<(Ex, u32)>();
+        let map_bytes =
+            map_buckets_for(targets.len()) * (std::mem::size_of::<(Ex, Vec<u32>)>() + 1) + 16;
+        let cap = eligible_bytes + map_bytes + peak_slots * std::mem::size_of::<u32>();
+        let retained = map_bytes + retained_slots * std::mem::size_of::<u32>();
+        let n_told = told.len();
+        let pooled_bytes = Arc::new(AtomicUsize::new(0));
+        let pooled = pooled_bytes.clone();
+        let pool_limit = Limits {
+            charge: Some(Arc::new(move |more| {
+                pooled
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |paid| {
+                        paid.checked_add(more).filter(|&total| total <= cap)
+                    })
+                    .is_ok()
+            })),
+            ..Limits::default()
+        };
+        let capped = |limit| Limits {
+            max_memory: Some(limit),
+            ..Limits::default()
+        };
+        for limits in [capped(cap - 1), capped(cap), pool_limit] {
+            let n_nodes = it.nodes.len();
+            let budget = Budget::new(&limits, 0, None);
+            it.ranges.begin(budget.clone());
+            let result = dt_fires(&mut it, &run, &b, &mut told);
+            if limits.max_memory == Some(cap - 1) {
+                assert!(matches!(result, Err(Halt::Memory(_))));
+                assert_eq!(it.nodes.len(), n_nodes);
+                assert_eq!(told.len(), n_told);
+            } else {
+                let (refire, guard) = result.expect("prior peak must fit");
+                assert_eq!(budget.peak(), cap);
+                assert_eq!(budget.retained_storage().1, retained);
+                assert_eq!(guard.as_ref().expect("refire guard").bytes(), retained);
+                let markers = &told[n_told..];
+                assert_eq!(markers.len(), targets.len());
+                for ((&target, &n), &(from, to)) in targets.iter().zip(distinct).zip(markers) {
+                    let cs = refire.get(&target).expect("target refire");
+                    let len = n + usize::from(!appends.is_empty());
+                    assert!(
+                        cs.iter()
+                            .copied()
+                            .eq(atoms[..len].iter().map(|&(c, _, _)| c))
+                    );
+                    assert_eq!(cs.capacity(), (2 * n).max(4));
+                    assert_eq!(
+                        (from, it.nodes[to as usize]),
+                        (target, Node::DtFire(target))
+                    );
+                }
+            }
+            it.ranges.end();
+            assert_eq!(budget.retained_storage().1, 0);
+            told.truncate(n_told);
+        }
+        assert_eq!(pooled_bytes.load(Ordering::Relaxed), cap);
+    }
+
+    #[test]
+    fn dt_fires_two_full_targets_fit_under_prior_peak() {
+        use super::super::Limits;
+        use super::super::dtcheck::{
+            atoms::{DtKey, DtRun, Stop},
+            comp::Comps,
+            range::{Defs, Ranges as DtRanges, map_buckets_for},
+        };
+        use super::super::numeric::Budget;
+        use super::{Builder, Ex, Interner, Node, RoleName, dt_fires};
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty, DataRange, Datatype};
+        use crate::vocab;
+
+        let props: Vec<_> = (0..4)
+            .map(|i| DataProperty::new(format!("urn:dt:cap_p{i}")))
+            .collect();
+        let axioms: Vec<_> = props
+            .iter()
+            .map(|dp| {
+                AxiomKind::SubClassOf(
+                    ClassExpression::Class(Class::new("urn:dt:CapBody")),
+                    ClassExpression::DataAllValuesFrom(
+                        vec![dp.clone()],
+                        DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+                    ),
+                )
+            })
+            .collect();
+        let refs: Vec<_> = axioms.iter().collect();
+        let run = DtRun {
+            comps: Comps::of(&refs, &Defs::default(), &|| false).expect("checker components"),
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: None,
+            stopped: None,
+        };
+        let mut it = Interner::new();
+        let targets = [
+            it.class(&Class::new("urn:dt:CapA")),
+            it.class(&Class::new("urn:dt:CapB")),
+        ];
+        let mut b = Builder::default();
+        let mut told = Vec::new();
+        // The fifth atom repeats the first component with a distinct cardinality.
+        for (i, dp) in props.iter().chain(&props[..1]).enumerate() {
+            let role = it.role(RoleName::Data(dp.clone()));
+            let id = it.dt.id(DtKey {
+                role,
+                at_least: true,
+                n: (i + 1) as u64,
+                range: DtRanges::FULL,
+            });
+            let e = it.node(Node::DtAtom(id));
+            b.dt_body.push(e);
+            told.extend(targets.map(|t| (e, t)));
+        }
+        let eligible_bytes = b.dt_body.len() * std::mem::size_of::<(Ex, u32)>();
+        let map_bytes =
+            map_buckets_for(targets.len()) * (std::mem::size_of::<(Ex, Vec<u32>)>() + 1) + 16;
+        // The prior implementation grew both vectors. The second growth admitted a new
+        // capacity-8 vector while the first capacity-8 and second capacity-4 were live.
+        let cap = eligible_bytes + map_bytes + (8 + 4 + 8) * std::mem::size_of::<u32>();
+        let budget = Budget::new(
+            &Limits {
+                max_memory: Some(cap),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it.ranges.begin(budget.clone());
+        let n_told = told.len();
+        let (refire, guard) = dt_fires(&mut it, &run, &b, &mut told).expect("prior peak must fit");
+        let mut expected: Vec<_> = props
+            .iter()
+            .map(|dp| run.comps.component(dp).expect("component"))
+            .collect();
+        expected.sort_unstable();
+        for t in targets {
+            assert_eq!(refire.get(&t).expect("target refire"), &expected);
+        }
+        let markers = &told[n_told..];
+        assert_eq!(markers.len(), targets.len());
+        for (&(from, to), target) in markers.iter().zip(targets) {
+            assert_eq!(from, target);
+            assert_eq!(it.nodes[to as usize], Node::DtFire(target));
+        }
+        let refire_bytes = refire.table_bytes() + 8 * std::mem::size_of::<u32>();
+        assert_eq!(budget.peak(), eligible_bytes + refire_bytes);
+        assert_eq!(budget.retained_storage().1, refire_bytes);
+        drop((refire, guard));
+        it.ranges.end();
+        assert_eq!(budget.retained_storage().1, 0);
+    }
+
+    #[test]
+    fn dt_fires_full_duplicate_tail_does_not_grow_or_exceed_cap() {
+        use super::super::Limits;
+        use super::super::dtcheck::{
+            atoms::{DtKey, DtRun, Stop},
+            comp::Comps,
+            range::{Defs, Ranges as DtRanges, map_buckets_for},
+        };
+        use super::super::numeric::Budget;
+        use super::{
+            Builder, Ex, Halt, Interner, Node, RoleName, dt_fires, dt_fires_compaction_stats,
+            reset_dt_fires_compaction_stats,
+        };
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty, DataRange, Datatype};
+        use crate::vocab;
+
+        // 1. Feed one target 1,024 distinct components in order (filling capacity 1,024),
+        //    followed by a 1,000-edge alternating duplicate tail starting with component 0.
+        //    The duplicate tail must not double capacity to 2,048, must not raise the
+        //    512 + 1,024 overlap peak, must fit under the live-overlap cap, and must avoid
+        //    quadratic re-compaction.
+        let k = 1024usize;
+        let tail = 1000usize;
+        let props: Vec<DataProperty> = (0..k)
+            .map(|i| DataProperty::new(format!("urn:dt:dup_p{i}")))
+            .collect();
+        let axioms: Vec<AxiomKind> = props
+            .iter()
+            .enumerate()
+            .map(|(i, dp)| {
+                AxiomKind::SubClassOf(
+                    ClassExpression::Class(Class::new(format!("urn:dt:DUP_A{i}"))),
+                    ClassExpression::DataAllValuesFrom(
+                        vec![dp.clone()],
+                        DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+                    ),
+                )
+            })
+            .collect();
+        let refs: Vec<&AxiomKind> = axioms.iter().collect();
+        let comps = Comps::of(&refs, &Defs::default(), &|| false).expect("1024 comps");
+        let mut it = Interner::new();
+        let mut role_comps: Vec<(Role, u32)> = props
+            .iter()
+            .map(|dp| {
+                let c = comps.component(dp).expect("checker comp");
+                (it.role(RoleName::Data(dp.clone())), c)
+            })
+            .collect();
+        role_comps.sort_unstable_by_key(|&(_, c)| c);
+        let target = it.class(&Class::new("urn:dt:DupTarget"));
+        let mut b = Builder::default();
+        let mut atoms = Vec::with_capacity(k);
+        let mut told_base: Vec<(Ex, Ex)> = Vec::with_capacity(k + tail);
+        for (idx, &(role, _)) in role_comps.iter().enumerate() {
+            let id = it.dt.id(DtKey {
+                role,
+                at_least: true,
+                n: (idx + 1) as u64,
+                range: DtRanges::FULL,
+            });
+            let e = it.node(Node::DtAtom(id));
+            b.dt_body.push(e);
+            atoms.push(e);
+            told_base.push((e, target));
+        }
+        for j in 0..tail {
+            told_base.push((atoms[j % 2], target));
+        }
+        let run = DtRun {
+            comps,
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: None,
+            stopped: None,
+        };
+        let expected: Vec<u32> = role_comps.iter().map(|&(_, c)| c).collect();
+        let eligible_bytes = k * std::mem::size_of::<(Ex, u32)>();
+
+        let uncap = Budget::new(&Limits::default(), 0, None);
+        it.ranges.begin(uncap.clone());
+        let mut told = told_base.clone();
+        reset_dt_fires_compaction_stats();
+        let (refire, guard) = dt_fires(&mut it, &run, &b, &mut told).expect("uncapped");
+        let (compactions, inspected) = dt_fires_compaction_stats();
+        let cs = refire.get(&target).expect("target refire");
+        assert_eq!(cs.as_slice(), expected.as_slice());
+        assert_eq!(
+            cs.capacity(),
+            k,
+            "duplicate-only tail on full vec must preserve capacity {k}, got {}",
+            cs.capacity()
+        );
+        let map_bytes = refire.table_bytes();
+        let final_refire_bytes = map_bytes + k * std::mem::size_of::<u32>();
+        assert_eq!(
+            guard.as_ref().expect("guard").bytes(),
+            final_refire_bytes,
+            "carried refire guard must match un-doubled live backing"
+        );
+        assert_eq!(uncap.retained_storage().1, final_refire_bytes);
+        let expected_live_peak =
+            eligible_bytes + map_bytes + (k / 2 + k) * std::mem::size_of::<u32>();
+        assert_eq!(
+            uncap.peak(),
+            expected_live_peak,
+            "duplicate tail must not trigger a 1024 + 2048 growth overlap peak"
+        );
+        assert!(
+            compactions <= 20,
+            "expected bounded compactions (<= 20), got {compactions}"
+        );
+        assert!(
+            inspected <= 4 * (k + tail),
+            "expected linear inspected entries (<= {}), got {inspected}",
+            4 * (k + tail)
+        );
+        drop((refire, guard));
+        it.ranges.end();
+        assert_eq!(uncap.retained_storage().1, 0);
+
+        // Must succeed at the exact 512 + 1,024 live-overlap cap (strictly below both
+        // cumulative historical charges and a spurious 1,024 + 2,048 duplicate-triggered growth).
+        let live_cap = Budget::new(
+            &Limits {
+                max_memory: Some(expected_live_peak),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it.ranges.begin(live_cap);
+        let mut told = told_base.clone();
+        let (refire_ok, guard_ok) =
+            dt_fires(&mut it, &run, &b, &mut told).expect("live-peak cap must succeed");
+        let cs_ok = refire_ok.get(&target).expect("target refire");
+        assert_eq!(cs_ok.capacity(), k);
+        assert_eq!(
+            guard_ok.as_ref().expect("guard").bytes(),
+            final_refire_bytes
+        );
+        drop((refire_ok, guard_ok));
+        it.ranges.end();
+
+        // One byte below the true 512 + 1,024 overlap peak must still refuse.
+        let under_cap = Budget::new(
+            &Limits {
+                max_memory: Some(expected_live_peak - 1),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it.ranges.begin(under_cap);
+        let mut told = told_base;
+        let err = dt_fires(&mut it, &run, &b, &mut told);
+        it.ranges.end();
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory one byte below live overlap peak, got {:?}",
+            err.err()
+        );
+
+        // 2. Exercise both full targets at the prior peak for real growth. A second new
+        //    component on t0 also checks that its first append cleared sorted mode.
+        let m = 128usize;
+        let mut it2 = Interner::new();
+        let t0 = it2.class(&Class::new("urn:dt:MultiDupT0"));
+        let t1 = it2.class(&Class::new("urn:dt:MultiDupT1"));
+        let mut b2 = Builder::default();
+        let mut atoms2 = Vec::with_capacity(m + 2);
+        for (idx, dp) in props.iter().take(m + 2).enumerate() {
+            let role = it2.role(RoleName::Data(dp.clone()));
+            let id = it2.dt.id(DtKey {
+                role,
+                at_least: true,
+                n: (idx + 1) as u64,
+                range: DtRanges::FULL,
+            });
+            let e = it2.node(Node::DtAtom(id));
+            b2.dt_body.push(e);
+            atoms2.push((e, run.comps.component(dp).expect("comp")));
+        }
+        atoms2.sort_unstable_by_key(|&(_, c)| c);
+        let mut told2 = Vec::new();
+        for &(e, _) in atoms2.iter().take(m) {
+            told2.push((e, t0));
+            told2.push((e, t1));
+        }
+        // Interleaved alternating duplicates across both full targets.
+        for j in 0..500usize {
+            let e = atoms2[j % 2].0;
+            told2.push((e, t0));
+            told2.push((e, t1));
+        }
+        // Append the two new components in descending order on t0.
+        told2.push((atoms2[m + 1].0, t0));
+        told2.push((atoms2[m].0, t0));
+        told2.push((atoms2[m].0, t1));
+        for j in 0..500usize {
+            let e = atoms2[j % 2].0;
+            told2.push((e, t0));
+            told2.push((e, t1));
+        }
+        let eligible2_bytes = b2.dt_body.len() * std::mem::size_of::<(Ex, u32)>();
+        let map2_bytes = map_buckets_for(2) * (std::mem::size_of::<(Ex, Vec<u32>)>() + 1) + 16;
+        let peak2 = eligible2_bytes + map2_bytes + 5 * m * std::mem::size_of::<u32>();
+        let cap2 = Budget::new(
+            &Limits {
+                max_memory: Some(peak2),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it2.ranges.begin(cap2.clone());
+        reset_dt_fires_compaction_stats();
+        let total_edges = told2.len();
+        let (refire2, guard2) = dt_fires(&mut it2, &run, &b2, &mut told2).expect("multi-target");
+        let (compactions2, inspected2) = dt_fires_compaction_stats();
+        let cs0 = refire2.get(&t0).expect("t0 refire");
+        let cs1 = refire2.get(&t1).expect("t1 refire");
+        let expected0: Vec<u32> = atoms2.iter().map(|&(_, c)| c).collect();
+        let expected1: Vec<u32> = atoms2.iter().take(m + 1).map(|&(_, c)| c).collect();
+        assert_eq!(cs0.as_slice(), expected0.as_slice());
+        assert_eq!(cs1.as_slice(), expected1.as_slice());
+        assert_eq!(cs0.capacity(), 2 * m);
+        assert_eq!(cs1.capacity(), 2 * m);
+        let expected_refire2_bytes = map2_bytes + 4 * m * std::mem::size_of::<u32>();
+        assert_eq!(
+            guard2.as_ref().expect("guard2").bytes(),
+            expected_refire2_bytes,
+            "refire guard must match live backing"
+        );
+        assert_eq!(cap2.retained_storage().1, expected_refire2_bytes);
+        assert_eq!(cap2.peak(), peak2);
+        assert!(
+            compactions2 <= 30,
+            "expected bounded multi-target compactions (<= 30), got {compactions2}"
+        );
+        assert!(
+            inspected2 <= 4 * total_edges,
+            "expected linear multi-target inspected entries (<= {}), got {inspected2}",
+            4 * total_edges
+        );
+        drop((refire2, guard2));
+        it2.ranges.end();
+        assert_eq!(cap2.retained_storage().1, 0);
     }
 }

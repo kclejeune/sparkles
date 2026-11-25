@@ -289,6 +289,10 @@ pub struct ScratchGuard {
 }
 
 impl ScratchGuard {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     pub fn grow(&mut self, more: usize) -> Result<(), Error> {
         if more == 0 {
             return Ok(());
@@ -304,6 +308,11 @@ impl ScratchGuard {
             self.bytes -= drop_bytes;
             self.budget.release_scratch(drop_bytes);
         }
+    }
+
+    /// Release `less` temporary scratch bytes without reducing [`Budget::peak`].
+    pub fn shrink(&mut self, less: usize) {
+        self.release(less);
     }
 
     /// Atomically transfers `retained` bytes from this scratch guard into the budget's

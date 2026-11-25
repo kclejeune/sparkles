@@ -167,6 +167,56 @@ impl DlAx {
 /// Why an axiom stays left out.
 type Why = &'static str;
 
+/// Whether `dl_norm::normalize` can accept `ax` (ignoring counting/rooted flags, nesting
+/// depth, and role regularity): `ax` is an axiom kind Tier D handles and every
+/// subexpression that [`Norm::pos`] and [`Norm::neg`] visit avoids self restrictions and
+/// `Data*` restrictions.
+///
+/// In particular, `ObjectMinCardinality(0, ..)` short-circuits to `TOP` in both positive
+/// and negative positions without inspecting its filler, and `DisjointClasses` with fewer
+/// than two unique operands skips those unique operands while forcing each repeated
+/// operand empty, so data restrictions in those unvisited positions do not prevent Tier D
+/// from taking the axiom.
+pub fn may_accept(ax: &AxiomKind) -> bool {
+    use AxiomKind as K;
+    use ClassExpression as C;
+    fn expr_ok(c: &C) -> bool {
+        match c {
+            C::Class(_) | C::ObjectMinCardinality(0, ..) => true,
+            C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs.iter().all(expr_ok),
+            C::ObjectComplementOf(f)
+            | C::ObjectSomeValuesFrom(_, f)
+            | C::ObjectAllValuesFrom(_, f) => expr_ok(f),
+            C::ObjectMinCardinality(_, _, f)
+            | C::ObjectMaxCardinality(_, _, f)
+            | C::ObjectExactCardinality(_, _, f) => f.as_deref().is_none_or(expr_ok),
+            C::ObjectOneOf(_) | C::ObjectHasValue(..) => true,
+            C::ObjectHasSelf(_)
+            | C::DataSomeValuesFrom(..)
+            | C::DataAllValuesFrom(..)
+            | C::DataHasValue(..)
+            | C::DataMinCardinality(..)
+            | C::DataMaxCardinality(..)
+            | C::DataExactCardinality(..) => false,
+        }
+    }
+    match ax {
+        K::SubClassOf(a, b) => expr_ok(a) && expr_ok(b),
+        K::EquivalentClasses(cs) => cs.len() <= 1 || cs.iter().all(expr_ok),
+        K::DisjointClasses(cs) => {
+            let (unique, repeated) = super::dl::split_multiset(cs);
+            repeated.iter().all(|c| expr_ok(c))
+                && (unique.len() < 2 || unique.iter().all(|c| expr_ok(c)))
+        }
+        K::DisjointUnion(_, cs) => cs.iter().all(expr_ok),
+        K::ObjectPropertyDomain(_, c) | K::ObjectPropertyRange(_, c) | K::ClassAssertion(c, _) => {
+            expr_ok(c)
+        }
+        K::ObjectPropertyAssertion(..) | K::NegativeObjectPropertyAssertion(..) => true,
+        _ => false,
+    }
+}
+
 /// Whether the EL part of a run lets Tier D take the axioms outside OWL 2 EL: no top or
 /// bottom properties, data properties, self restrictions or reflexive roles, whose rules
 /// this phase does not have, and no individuals or nominals unless `rooted` lets the run

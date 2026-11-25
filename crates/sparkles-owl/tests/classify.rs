@@ -586,15 +586,31 @@ fn dp(s: &str) -> DataProperty {
 }
 
 #[test]
-fn a_change_to_a_data_axiom_runs_everything_again() {
+fn a_change_to_a_data_domain_updates_incrementally() {
     let has = ClassExpression::DataHasValue(dp("p"), Literal::simple("x"));
-    let mut k = Classifier::of(&[sub(c("A"), has)]);
+    let mut k = Classifier::of(&[sub(c("A"), has), sub(c("K"), ce("L"))]);
     k.classify(&Limits::default()).unwrap();
     let domain = ax(AxiomKind::DataPropertyDomain(dp("p"), ce("D")));
     k.add([&domain]);
     let out = k.classify(&Limits::default()).unwrap();
-    assert!(!out.stats.incremental);
+    assert!(out.stats.incremental);
     assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    assert!(out.taxonomy.is_subclass(&c("K"), &c("L")));
+}
+
+#[test]
+fn a_change_to_a_data_range_runs_everything_again() {
+    let has = ClassExpression::DataHasValue(dp("p"), Literal::simple("x"));
+    let mut k = Classifier::of(&[sub(c("A"), has)]);
+    k.classify(&Limits::default()).unwrap();
+    let range = ax(AxiomKind::DataPropertyRange(
+        dp("p"),
+        DataRange::Datatype(Datatype::new("http://www.w3.org/2001/XMLSchema#integer")),
+    ));
+    k.add([&range]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
 }
 
 #[test]

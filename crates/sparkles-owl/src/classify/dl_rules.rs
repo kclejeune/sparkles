@@ -1723,20 +1723,22 @@ impl DlSt {
         Ok(false)
     }
 
-    /// Removes the contexts in `gone` from the predecessors that registered, which
-    /// register again when a run saturates them again (roadmap item 753), polling `tick`
-    /// across the predecessor list.
-    pub fn drop_predecessors_poll(
+    /// Cooperative polling removal of the contexts for which `gone` answers true from the
+    /// predecessors that registered, which register again when a run saturates them again
+    /// (roadmap item 753). On `Err`, the caller's dirty flag discards the kept state.
+    pub fn drop_predecessors_poll<E>(
         &mut self,
-        gone: &FxHashSet<Ex>,
-        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
-    ) -> Result<(), super::Error> {
-        let mut write = 0;
+        gone: impl Fn(Ex) -> bool,
+        tick: &mut impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut write = 0usize;
         for read in 0..self.dpreds.len() {
             tick(1)?;
             let item = self.dpreds[read];
-            if !gone.contains(&item.0) {
-                self.dpreds[write] = item;
+            if !gone(item.0) {
+                if write != read {
+                    self.dpreds[write] = item;
+                }
                 write += 1;
             }
         }

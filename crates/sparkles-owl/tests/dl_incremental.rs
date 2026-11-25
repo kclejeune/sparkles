@@ -2137,3 +2137,923 @@ fn eager_kept_run_memory_budget_charge_cancellation_and_partial() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2: EL data lattice & Item 972 DtIx checker incremental maintenance
+// ---------------------------------------------------------------------------
+
+/// Functional-syntax helper with XSD, RDF, RDFS, and OWL prefixes for data tests.
+fn data_axioms(body: &str) -> Vec<Axiom> {
+    let doc = ofn_read::parse(&format!(
+        "Prefix(:=<{EX}>)\n\
+         Prefix(owl:=<http://www.w3.org/2002/07/owl#>)\n\
+         Prefix(rdf:=<http://www.w3.org/1999/02/22-rdf-syntax-ns#>)\n\
+         Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)\n\
+         Prefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)\n\
+         Ontology(\n{body}\n)"
+    ))
+    .unwrap();
+    doc.axioms
+}
+
+fn data_started(base: &str, threads: usize) -> (Classifier, Vec<Axiom>) {
+    let held = data_axioms(base);
+    let mut k = Classifier::of(&held);
+    let out = same_as_fresh(&mut k, &held, threads, "at the start");
+    assert!(!out.stats.incremental);
+    (k, held)
+}
+
+fn data_add(k: &mut Classifier, held: &mut Vec<Axiom>, body: &str) {
+    let more = data_axioms(body);
+    k.add(&more);
+    held.extend(more);
+}
+
+fn data_remove(k: &mut Classifier, held: &mut Vec<Axiom>, body: &str) {
+    let gone = data_axioms(body);
+    k.remove(&gone);
+    held.retain(|a| !gone.iter().any(|g| g.kind == a.kind));
+}
+
+#[test]
+fn el_data_lattice_additions_deletions_and_functional_groups_stay_incremental() {
+    let base = "SubDataPropertyOf(:d1 :df)
+        SubDataPropertyOf(:d2 :df)
+        FunctionalDataProperty(:df)
+        DataPropertyRange(:d1 xsd:integer)
+        SubClassOf(:A DataSomeValuesFrom(:d1 xsd:decimal))
+        SubClassOf(:A DataHasValue(:d2 \"5\"^^xsd:integer))
+        SubClassOf(:K :L)
+        SubClassOf(:P DataSomeValuesFrom(:u xsd:string))
+        SubClassOf(DataSomeValuesFrom(:u xsd:string) :Q)";
+    for threads in [1, 4, 8] {
+        let (mut k, mut held) = data_started(base, threads);
+        let init = same_as_fresh(&mut k, &held, threads, "initial functional EL data");
+        assert!(init.taxonomy.is_subclass(&c("P"), &c("Q")));
+        assert!(!init.taxonomy.is_unsatisfiable(&c("A")));
+
+        // Editing an unrelated class keeps all functional/data contexts untouched.
+        data_add(&mut k, &mut held, "SubClassOf(:M :K)");
+        let out = same_as_fresh(&mut k, &held, threads, "unrelated leaf added");
+        assert!(out.stats.incremental);
+        assert_eq!(out.stats.cleared, 0);
+
+        // Adding a negative data restriction matching A's merged functional group (:d1 + :d2 -> 5)
+        // must clear A via `changed_neg_roles` even though :d1 alone only had xsd:integer.
+        let hit_d1 = "SubClassOf(DataHasValue(:d1 \"5.0\"^^xsd:decimal) :HitD1)";
+        data_add(&mut k, &mut held, hit_d1);
+        let out = same_as_fresh(&mut k, &held, threads, "negative data restriction on :d1");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("HitD1")));
+
+        // Adding a negative data restriction on the functional superproperty :df also matches.
+        let hit_df = "SubClassOf(DataHasValue(:df \"5\"^^xsd:integer) :HitDf)";
+        data_add(&mut k, &mut held, hit_df);
+        let out = same_as_fresh(&mut k, &held, threads, "negative data restriction on :df");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("HitDf")));
+
+        // Removing the negative restriction retracts the subsumption incrementally.
+        data_remove(&mut k, &mut held, hit_d1);
+        let out = same_as_fresh(&mut k, &held, threads, "removed :d1 negative data");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("HitD1")));
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("HitDf")));
+
+        // Adding a conflicting functional value makes A unsatisfiable; removing restores it.
+        let conflict = "SubClassOf(:A DataHasValue(:d2 \"6\"^^xsd:integer))";
+        data_add(&mut k, &mut held, conflict);
+        let out = same_as_fresh(&mut k, &held, threads, "functional conflict added");
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+        assert!(!out.taxonomy.is_unsatisfiable(&c("P")));
+
+        data_remove(&mut k, &mut held, conflict);
+        let out = same_as_fresh(&mut k, &held, threads, "functional conflict removed");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("HitDf")));
+
+        // Editing a non-functional EL data restriction on :u works incrementally too.
+        data_remove(
+            &mut k,
+            &mut held,
+            "SubClassOf(DataSomeValuesFrom(:u xsd:string) :Q)",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "removed :u negative restriction");
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_subclass(&c("P"), &c("Q")));
+    }
+}
+
+#[test]
+fn horn_with_el_data_and_functional_groups_stays_incremental_and_falls_back_on_role_edits() {
+    let base = "FunctionalDataProperty(:df)
+        DataPropertyRange(:df xsd:integer)
+        SubClassOf(:A ObjectAllValuesFrom(:r :B))
+        SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+        SubClassOf(ObjectIntersectionOf(:B :C) DataHasValue(:df \"10\"^^xsd:integer))
+        SubClassOf(:C DataHasValue(:df \"10\"^^xsd:integer))
+        SubClassOf(DataSomeValuesFrom(:df xsd:decimal) :Num)
+        SubClassOf(:K :L)";
+    for threads in [1, 4, 8] {
+        let (mut k, mut held) = data_started(base, threads);
+        data_add(&mut k, &mut held, "SubClassOf(:M :K)");
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "unrelated edit in Horn+functional data",
+        );
+        assert!(out.stats.incremental);
+        assert_eq!(out.stats.cleared, 0);
+
+        // Adding a conflicting functional value under :B makes :B ⊓ :C (and thus :A) unsat.
+        let bad = "SubClassOf(:B DataHasValue(:df \"11\"^^xsd:integer))";
+        data_add(&mut k, &mut held, bad);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "functional conflict in Horn successor",
+        );
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+
+        data_remove(&mut k, &mut held, bad);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "functional conflict removed in Horn",
+        );
+        assert!(out.stats.incremental);
+        assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+
+        // Role-table and datatype-definition edits safely fall back to full rebuilds.
+        data_add(
+            &mut k,
+            &mut held,
+            "DataPropertyRange(:df xsd:nonNegativeInteger)",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "DataPropertyRange fallback");
+        assert!(!out.stats.incremental);
+
+        data_remove(&mut k, &mut held, "FunctionalDataProperty(:df)");
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "FunctionalDataProperty removal fallback",
+        );
+        assert!(!out.stats.incremental);
+
+        data_add(
+            &mut k,
+            &mut held,
+            "DatatypeDefinition(:SmallInt DatatypeRestriction(xsd:integer xsd:maxInclusive \"5\"^^xsd:integer))",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "DatatypeDefinition fallback");
+        assert!(!out.stats.incremental);
+
+        data_add(
+            &mut k,
+            &mut held,
+            "SubClassOf(:K DataSomeValuesFrom(owl:topDataProperty xsd:integer))",
+        );
+        let out = same_as_fresh(&mut k, &held, threads, "topDataProperty fallback");
+        assert!(!out.stats.incremental);
+    }
+}
+
+#[test]
+fn removing_data_axiom_later_allows_tier_d_to_take_added_disjunction() {
+    let base = "SubClassOf(:A DataSomeValuesFrom(:d xsd:integer))
+        SubClassOf(:A :G)";
+    let (mut k, mut held) = data_started(base, 1);
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:A DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after removing data axiom");
+    assert!(out.stats.incremental);
+    // Now add a disjunction: stale_tier must force a fresh interner so Tier D takes it.
+    data_add(
+        &mut k,
+        &mut held,
+        "SubClassOf(:B ObjectUnionOf(:C :D))
+         SubClassOf(:C :E)
+         SubClassOf(:D :E)",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after adding disjunction");
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("B"), &c("E")));
+    assert!(k.excluded().is_empty());
+}
+
+#[test]
+fn deleting_data_axiom_with_mixed_zero_min_disjunction_restarts_into_tier_d() {
+    // Tier D short-circuits ObjectMinCardinality(0, ..) to TOP without inspecting its
+    // filler, so a disjunctive axiom containing data only beneath a zero minimum is
+    // accepted by Tier D once the blocking EL data axiom is removed.
+    let horn_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        SubClassOf(:P ObjectAllValuesFrom(:r :Q))
+        SubClassOf(:A ObjectIntersectionOf(
+            ObjectUnionOf(:B :C)
+            ObjectMinCardinality(0 :r DataSomeValuesFrom(:z xsd:integer))))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(horn_base, 1);
+    assert!(
+        !k.classify(&limits(1))
+            .unwrap()
+            .taxonomy
+            .is_subclass(&c("A"), &c("G"))
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed zero-min disjunction (Horn)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // Same transition when the initial run had no Horn axiom (KeptTier::El).
+    let el_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        SubClassOf(:A ObjectIntersectionOf(
+            ObjectUnionOf(:B :C)
+            ObjectMinCardinality(0 :r DataSomeValuesFrom(:z xsd:integer))))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(el_base, 1);
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed zero-min disjunction (EL)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // And when the mixed zero-min disjunction is added only after an earlier data deletion.
+    let (mut k, mut held) = data_started(
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+         SubClassOf(:B :G)
+         SubClassOf(:C :G)",
+        1,
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after deleting data axiom");
+    assert!(out.stats.incremental);
+    data_add(
+        &mut k,
+        &mut held,
+        "SubClassOf(:A ObjectIntersectionOf(
+            ObjectUnionOf(:B :C)
+            ObjectMinCardinality(0 :r DataSomeValuesFrom(:z xsd:integer))))",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after adding mixed zero-min disjunction");
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // DisjointClasses with 1 unique data operand and a repeated disjunctive non-data
+    // operand is accepted by Tier D because Norm::axiom skips unique operands when
+    // unique.len() < 2 while forcing every repeated operand empty.
+    let disj_horn_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        SubClassOf(:P ObjectAllValuesFrom(:r :Q))
+        DisjointClasses(
+            DataSomeValuesFrom(:z xsd:integer)
+            ObjectComplementOf(ObjectUnionOf(:B :C))
+            ObjectComplementOf(ObjectUnionOf(:B :C)))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(disj_horn_base, 1);
+    assert!(
+        !k.classify(&limits(1))
+            .unwrap()
+            .taxonomy
+            .is_subclass(&Class::thing(), &c("G"))
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed DisjointClasses (Horn)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // Same DisjointClasses transition from KeptTier::El.
+    let disj_el_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        DisjointClasses(
+            DataSomeValuesFrom(:z xsd:integer)
+            ObjectComplementOf(ObjectUnionOf(:B :C))
+            ObjectComplementOf(ObjectUnionOf(:B :C)))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(disj_el_base, 1);
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed DisjointClasses (EL)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // And when the mixed DisjointClasses is added after an earlier data deletion.
+    let (mut k, mut held) = data_started(
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+         SubClassOf(:B :G)
+         SubClassOf(:C :G)",
+        1,
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting data axiom before DisjointClasses",
+    );
+    assert!(out.stats.incremental);
+    data_add(
+        &mut k,
+        &mut held,
+        "DisjointClasses(
+            DataSomeValuesFrom(:z xsd:integer)
+            ObjectComplementOf(ObjectUnionOf(:B :C))
+            ObjectComplementOf(ObjectUnionOf(:B :C)))",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after adding mixed DisjointClasses");
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("G")));
+    assert!(k.excluded().is_empty());
+}
+
+#[test]
+fn dtix_multi_component_edits_preserve_untouched_components_across_renumbering() {
+    // Component 1 (:d): facet + cover; Component 2 (:e1, :e2): disjoint/cardinality;
+    // Component 3 (:g): unrelated EL data property.
+    let base = "SubClassOf(:A DataSomeValuesFrom(:d DataUnionOf(xsd:integer xsd:string)))
+        SubClassOf(DataSomeValuesFrom(:d xsd:integer) :B1)
+        SubClassOf(DataSomeValuesFrom(:d xsd:string) :B2)
+        SubClassOf(:KeepD DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"10\"^^xsd:integer)))
+        SubClassOf(DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"0\"^^xsd:integer)) :NonNeg)
+        SubClassOf(:E DataMinCardinality(2 :e1 xsd:integer))
+        SubClassOf(DataSomeValuesFrom(:e1 xsd:integer) :HasE1)
+        SubClassOf(:E2 DataSomeValuesFrom(:e2 xsd:int))
+        SubClassOf(:G DataSomeValuesFrom(:g xsd:string))
+        SubClassOf(DataSomeValuesFrom(:g xsd:string) :GOut)
+        SubClassOf(:K :L)";
+    for threads in [1, 4, 8] {
+        let (mut k, mut held) = data_started(base, threads);
+        let init = same_as_fresh(&mut k, &held, threads, "initial multi-component DtIx");
+        assert!(init.taxonomy.is_subclass(&c("KeepD"), &c("NonNeg")));
+        assert!(init.taxonomy.is_subclass(&c("E"), &c("HasE1")));
+        assert!(init.taxonomy.is_subclass(&c("G"), &c("GOut")));
+        assert!(
+            !k.excluded().is_empty(),
+            "component :d should report COVER in excluded"
+        );
+
+        // Editing component :e1/:e2 (adding DisjointDataProperties, merging :e1 and :e2
+        // and shifting component IDs!) must stay incremental and keep :KeepD and :A's COVER.
+        let disj = "DisjointDataProperties(:e1 :e2)";
+        data_add(&mut k, &mut held, disj);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "added DisjointDataProperties(:e1 :e2)",
+        );
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("KeepD"), &c("NonNeg")));
+        assert!(out.taxonomy.is_subclass(&c("G"), &c("GOut")));
+
+        // Add a brand-new checker component :z to further shift component numbering.
+        let comp_z = "SubClassOf(:Z DataMaxCardinality(1 :z xsd:integer))
+            SubClassOf(:Z DataMinCardinality(2 :z xsd:integer))";
+        data_add(&mut k, &mut held, comp_z);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "added brand-new checker component :z",
+        );
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_unsatisfiable(&c("Z")));
+
+        // Remove DisjointDataProperties(:e1 :e2) (splitting component back).
+        data_remove(&mut k, &mut held, disj);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "removed DisjointDataProperties(:e1 :e2)",
+        );
+        assert!(out.stats.incremental);
+
+        // Transition :A's component :d from COVER -> FINE by telling :A :B1 (DtFire refire!),
+        // then back from FINE -> COVER.
+        let resolve = "SubClassOf(:A :B1)";
+        data_add(&mut k, &mut held, resolve);
+        let out = same_as_fresh(&mut k, &held, threads, "resolved COVER via DtFire");
+        assert!(out.stats.incremental);
+        assert!(k.excluded().is_empty(), "COVER should have cleared");
+
+        data_remove(&mut k, &mut held, resolve);
+        let out = same_as_fresh(&mut k, &held, threads, "re-exposed COVER");
+        assert!(out.stats.incremental);
+        assert!(!k.excluded().is_empty(), "COVER should have returned");
+
+        // Remove brand-new component :z completely.
+        data_remove(&mut k, &mut held, comp_z);
+        let out = same_as_fresh(&mut k, &held, threads, "removed component :z completely");
+        assert!(out.stats.incremental);
+    }
+}
+
+#[test]
+fn dtix_orphan_and_cyclic_cover_cleanup_and_reconnection() {
+    // Anonymous conjunction successor (:X ⊓ ∃d.(int ∪ str)) produces COVER on :d,
+    // and links to a kept successor :U via :s, while :KeepD holds a FINE atom on :d.
+    let base = "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:X DataSomeValuesFrom(:d DataUnionOf(xsd:integer xsd:string)))))
+        SubClassOf(DataSomeValuesFrom(:d xsd:integer) :B1)
+        SubClassOf(DataSomeValuesFrom(:d xsd:string) :B2)
+        SubClassOf(:X ObjectSomeValuesFrom(:s :U))
+        SubClassOf(:U :V)
+        SubClassOf(ObjectSomeValuesFrom(:s :V) :HasV)
+        SubClassOf(:KeepD DataSomeValuesFrom(:d xsd:int))
+        SubClassOf(:CycRoot ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C1 :C2)))
+        SubClassOf(ObjectIntersectionOf(:C1 :C2) ObjectSomeValuesFrom(:t ObjectIntersectionOf(:C2 :C3)))
+        SubClassOf(ObjectIntersectionOf(:C2 :C3) ObjectSomeValuesFrom(:t ObjectIntersectionOf(:C1 :C2)))
+        SubClassOf(ObjectIntersectionOf(:C2 :C3) DataSomeValuesFrom(:e DataUnionOf(xsd:integer xsd:string)))
+        SubClassOf(DataSomeValuesFrom(:e xsd:integer) :E1)
+        SubClassOf(DataSomeValuesFrom(:e xsd:string) :E2)
+        SubClassOf(:KeepE DataSomeValuesFrom(:e xsd:int))";
+    for threads in [1, 4, 8] {
+        let (mut k, mut held) = data_started(base, threads);
+        assert!(!k.excluded().is_empty());
+
+        // Remove link from :A to the conjunction context: orphan_prune must clear it
+        // so :d no longer reports COVER in excluded.
+        let link_a = "SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:X DataSomeValuesFrom(:d DataUnionOf(xsd:integer xsd:string)))))";
+        data_remove(&mut k, &mut held, link_a);
+        let out = same_as_fresh(&mut k, &held, threads, "removed link to COVER orphan");
+        assert!(out.stats.incremental);
+
+        // Remove link from :CycRoot to the disconnected 2-cycle of conjunction contexts:
+        // forward reachability in orphan_prune must clear the entire cycle so :e's COVER
+        // also disappears!
+        let link_cyc =
+            "SubClassOf(:CycRoot ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C1 :C2)))";
+        data_remove(&mut k, &mut held, link_cyc);
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "removed link to cyclic COVER orphan",
+        );
+        assert!(out.stats.incremental);
+        assert!(
+            k.excluded().is_empty(),
+            "all orphan COVERs must be pruned: {:?}",
+            k.excluded()
+        );
+
+        // Re-connect :A to the previously pruned conjunction context (which links to kept :U)
+        // and verify :U replays its propagations (:HasV) cleanly!
+        data_add(&mut k, &mut held, link_a);
+        data_add(
+            &mut k,
+            &mut held,
+            "SubClassOf(ObjectSomeValuesFrom(:r :HasV) :AReachV)",
+        );
+        let out = same_as_fresh(
+            &mut k,
+            &held,
+            threads,
+            "reconnected pruned orphan to kept :U",
+        );
+        assert!(out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("AReachV")));
+    }
+}
+
+#[test]
+fn el_lattice_to_and_from_dtix_checker_transitions_fall_back_safely() {
+    for threads in [1, 4, 8] {
+        // 1. Whole ontology transitions: None -> Some -> None
+        let (mut k, mut held) = data_started(
+            "SubClassOf(:A DataSomeValuesFrom(:d xsd:integer))
+             SubClassOf(DataSomeValuesFrom(:d xsd:decimal) :B)",
+            threads,
+        );
+        let facet = "SubClassOf(:A DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"1\"^^xsd:integer)))";
+        data_add(&mut k, &mut held, facet);
+        let out = same_as_fresh(&mut k, &held, threads, "whole ontology EL -> DtIx");
+        assert!(!out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+
+        data_remove(&mut k, &mut held, facet);
+        let out = same_as_fresh(&mut k, &held, threads, "whole ontology DtIx -> EL");
+        assert!(!out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+
+        // 2. Single property switches mode while another checker component (:c) remains active:
+        //    :e switches EL -> checker and then checker -> EL.
+        let (mut k, mut held) = data_started(
+            "SubClassOf(:C DataAllValuesFrom(:c xsd:integer))
+             SubClassOf(:C DataSomeValuesFrom(:c xsd:string))
+             SubClassOf(:A DataSomeValuesFrom(:e xsd:integer))
+             SubClassOf(DataSomeValuesFrom(:e xsd:decimal) :B)",
+            threads,
+        );
+        let e_trigger = "SubClassOf(:A DataAllValuesFrom(:e xsd:integer))";
+        data_add(&mut k, &mut held, e_trigger);
+        let out = same_as_fresh(&mut k, &held, threads, "property :e EL -> checker");
+        assert!(!out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+        assert!(out.taxonomy.is_unsatisfiable(&c("C")));
+
+        data_remove(&mut k, &mut held, e_trigger);
+        let out = same_as_fresh(&mut k, &held, threads, "property :e checker -> EL");
+        assert!(!out.stats.incremental);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+        assert!(out.taxonomy.is_unsatisfiable(&c("C")));
+    }
+}
+
+#[test]
+fn incremental_data_and_dtix_memory_budget_and_cancellation() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let pad: String = (0..48)
+        .map(|i| format!("SubClassOf(:Pad{i} :L)\n"))
+        .collect();
+    let base = format!(
+        "FunctionalDataProperty(:df)
+         SubClassOf(:A DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"0\"^^xsd:integer)))
+         SubClassOf(DataSomeValuesFrom(:d xsd:integer) :NumD)
+         SubClassOf(:E DataMinCardinality(2 :e xsd:integer))
+         SubClassOf(DataSomeValuesFrom(:e xsd:integer) :HasE)
+         SubClassOf(:F DataHasValue(:df \"1\"^^xsd:integer))
+         SubClassOf(:K :L)
+         {pad}"
+    );
+    let edit = "SubClassOf(:M :K)\nSubClassOf(:E2 DataAllValuesFrom(:e xsd:integer))";
+    let mut held = data_axioms(&base);
+    held.extend(data_axioms(edit));
+
+    // Find tight fresh budget for the edited ontology.
+    let fresh = |limit: usize| {
+        let mut k = Classifier::of(&held);
+        let out = k
+            .classify(&Limits {
+                max_memory: Some(limit),
+                ..limits(1)
+            })
+            .ok()?;
+        k.excluded().is_empty().then_some(out)
+    };
+    let (mut low, mut high) = (0usize, 1usize << 30);
+    assert!(fresh(high).is_some());
+    while high - low > 128 {
+        let mid = low + (high - low) / 2;
+        if fresh(mid).is_some() {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    let want = fresh(high).unwrap();
+
+    // Tight memory cap + pool charge callback must never exceed cap and must match fresh.
+    for more in [0usize, 512, 4096] {
+        let cap = high + more;
+        let granted = Arc::new(AtomicUsize::new(0));
+        let g = granted.clone();
+        let bounded = Limits {
+            max_memory: Some(cap),
+            charge: Some(Arc::new(move |bytes| {
+                let prev = g.fetch_add(bytes, Ordering::Relaxed);
+                if prev.saturating_add(bytes) > cap {
+                    g.fetch_sub(bytes, Ordering::Relaxed);
+                    false
+                } else {
+                    true
+                }
+            })),
+            ..limits(1)
+        };
+        let (mut k, _) = data_started(&base, 1);
+        k.add(&data_axioms(edit));
+        let out = k.classify(&bounded).unwrap();
+        assert!(
+            granted.load(Ordering::Relaxed) <= cap,
+            "pool charge exceeded cap {cap}"
+        );
+        assert_eq!(answer(&out), answer(&want));
+        assert_eq!(out.taxonomy, want.taxonomy);
+        assert_eq!(k.excluded(), Vec::new());
+    }
+
+    // Pool-credited LateRestart::Incompatible on EL-lattice -> DtIx mode switch:
+    // total pool grant must stay bounded by peak (not double-charging build).
+    let (mut k, mut mode_held) = data_started(
+        "SubClassOf(:C DataAllValuesFrom(:c xsd:integer))
+         SubClassOf(:A DataSomeValuesFrom(:e xsd:integer))
+         SubClassOf(DataSomeValuesFrom(:e xsd:decimal) :B)",
+        1,
+    );
+    let switch = "SubClassOf(:A DataAllValuesFrom(:e xsd:integer))";
+    data_add(&mut k, &mut mode_held, switch);
+    let granted = Arc::new(AtomicUsize::new(0));
+    let g = granted.clone();
+    let out = k
+        .classify(&Limits {
+            charge: Some(Arc::new(move |bytes| {
+                g.fetch_add(bytes, Ordering::Relaxed);
+                true
+            })),
+            ..limits(1)
+        })
+        .unwrap();
+    assert!(!out.stats.incremental);
+    assert!(
+        granted.load(Ordering::Relaxed) <= out.stats.peak_memory,
+        "granted {} exceeded reported peak {}",
+        granted.load(Ordering::Relaxed),
+        out.stats.peak_memory
+    );
+
+    // Cooperative cancellation & deadline polling across incremental data + DtIx edits.
+    let mut stopped = 0;
+    for polls in 0..50usize {
+        let (mut k, mut h) = data_started(&base, 1);
+        data_add(&mut k, &mut h, edit);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let s = seen.clone();
+        let cancelled = Limits {
+            cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= polls)),
+            ..limits(1)
+        };
+        if k.classify(&cancelled).is_err() {
+            stopped += 1;
+        }
+        same_as_fresh(&mut k, &h, 1, &format!("after cancel at poll {polls}"));
+    }
+    assert!(stopped > 0, "expected at least one cancellation stop");
+
+    let (mut k, mut h) = data_started(&base, 1);
+    data_add(&mut k, &mut h, edit);
+    let late = Limits {
+        deadline: Some(std::time::Instant::now()),
+        ..limits(1)
+    };
+    assert!(k.classify(&late).is_err());
+    same_as_fresh(&mut k, &h, 1, "after expired deadline");
+}
+
+#[test]
+fn random_horn_el_data_and_dtix_edit_sequences_match_fresh() {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    let xsd = |s: &str| Datatype::new(format!("http://www.w3.org/2001/XMLSchema#{s}"));
+    let dp = |s: &str| DataProperty::new(format!("{EX}{s}"));
+    let op = |s: &str| ObjectPropertyExpression::Property(ObjectProperty::new(format!("{EX}{s}")));
+    let cl = |i: usize| ClassExpression::Class(c(&format!("C{i}")));
+
+    let random_data_expr = |rng: &mut Rng,
+                            prop_idx: usize,
+                            allow_checker: bool|
+     -> ClassExpression {
+        let p = dp(&format!("d{prop_idx}"));
+        let kind = if allow_checker {
+            rng.below(9)
+        } else {
+            rng.below(4)
+        };
+        match kind {
+            0 => ClassExpression::DataSomeValuesFrom(vec![p], DataRange::Datatype(xsd("integer"))),
+            1 => ClassExpression::DataSomeValuesFrom(vec![p], DataRange::Datatype(xsd("decimal"))),
+            2 => ClassExpression::DataSomeValuesFrom(vec![p], DataRange::Datatype(xsd("string"))),
+            3 => {
+                let v = rng.below(3);
+                ClassExpression::DataHasValue(
+                    p,
+                    Literal::typed(v.to_string(), "http://www.w3.org/2001/XMLSchema#integer"),
+                )
+            }
+            4 => {
+                let bound = rng.below(4);
+                ClassExpression::DataSomeValuesFrom(
+                    vec![p],
+                    DataRange::DatatypeRestriction(
+                        xsd("integer"),
+                        std::collections::BTreeSet::from([FacetRestriction {
+                            facet: Iri::new("http://www.w3.org/2001/XMLSchema#minInclusive")
+                                .unwrap(),
+                            value: Literal::typed(
+                                bound.to_string(),
+                                "http://www.w3.org/2001/XMLSchema#integer",
+                            ),
+                        }]),
+                    ),
+                )
+            }
+            5 => ClassExpression::DataSomeValuesFrom(
+                vec![p],
+                DataRange::UnionOf(std::collections::BTreeSet::from([
+                    DataRange::Datatype(xsd("integer")),
+                    DataRange::Datatype(xsd("string")),
+                ])),
+            ),
+            6 => ClassExpression::DataAllValuesFrom(
+                vec![p],
+                DataRange::Datatype(if rng.below(2) == 0 {
+                    xsd("integer")
+                } else {
+                    xsd("string")
+                }),
+            ),
+            7 => ClassExpression::DataMinCardinality(
+                1 + rng.below(2) as u32,
+                p,
+                Some(DataRange::Datatype(xsd("integer"))),
+            ),
+            _ => {
+                ClassExpression::DataMaxCardinality(1, p, Some(DataRange::Datatype(xsd("integer"))))
+            }
+        }
+    };
+
+    let random_axiom = |rng: &mut Rng| -> Axiom {
+        match rng.below(14) {
+            0..=3 => {
+                // EL-data property d0 (functional) or d1 (plain)
+                let prop = rng.below(2);
+                let de = random_data_expr(rng, prop, false);
+                let a = cl(rng.below(6));
+                if rng.below(2) == 0 {
+                    Axiom::sub_class_of(a, de)
+                } else {
+                    Axiom::sub_class_of(de, a)
+                }
+            }
+            4..=8 => {
+                // Checker properties d2, d3, or mode-switching d4
+                let prop = 2 + rng.below(3);
+                let allow_checker = prop < 4 || rng.below(3) == 0;
+                let de = random_data_expr(rng, prop, allow_checker);
+                let a = cl(rng.below(6));
+                if rng.below(2) == 0 {
+                    Axiom::sub_class_of(a, de)
+                } else {
+                    Axiom::sub_class_of(de, a)
+                }
+            }
+            9 => {
+                // Horn object restriction carrying a data restriction
+                let a = cl(rng.below(6));
+                let b = cl(rng.below(6));
+                if rng.below(2) == 0 {
+                    Axiom::sub_class_of(a, ClassExpression::some(op("r"), b))
+                } else {
+                    Axiom::sub_class_of(a, ClassExpression::all(op("r"), b))
+                }
+            }
+            10 => Axiom::sub_class_of(cl(rng.below(6)), cl(rng.below(6))),
+            11 => {
+                let a = rng.below(6);
+                let b = (a + 1 + rng.below(5)) % 6;
+                Axiom::disjoint_classes([cl(a), cl(b)])
+            }
+            12 => Axiom::new(AxiomKind::DisjointDataProperties(
+                vec![dp("d2"), dp("d3")].into(),
+            )),
+            _ => Axiom::new(AxiomKind::DataPropertyDomain(
+                dp(&format!("d{}", rng.below(4))),
+                cl(rng.below(6)),
+            )),
+        }
+    };
+
+    let mut total_steps = 0usize;
+    let mut incremental_steps = 0usize;
+    let mut kept_some = 0usize;
+    for threads in [1, 4, 8] {
+        for seed in 1..=12u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (threads as u64));
+            let mut held = data_axioms(
+                "FunctionalDataProperty(:d0)
+                 DataPropertyRange(:d1 xsd:integer)
+                 SubClassOf(:C0 DataAllValuesFrom(:d2 xsd:integer))
+                 SubClassOf(:C1 DataSomeValuesFrom(:d3 xsd:int))
+                 Declaration(Class(:C2))
+                 Declaration(Class(:C3))
+                 Declaration(Class(:C4))
+                 Declaration(Class(:C5))",
+            );
+            for _ in 0..8 {
+                let a = random_axiom(&mut rng);
+                if !held.iter().any(|h| h.kind == a.kind) {
+                    held.push(a);
+                }
+            }
+            let mut k = Classifier::of(&held);
+            same_as_fresh(&mut k, &held, threads, &format!("seed {seed} init"));
+            for step in 0..10 {
+                // Remove 0..=2 editable axioms (keep the first 2 role axioms fixed most of the time).
+                let mut removed = Vec::new();
+                for _ in 0..rng.below(3) {
+                    if held.len() > 8 {
+                        let idx = 2 + rng.below(held.len() - 2);
+                        removed.push(held.remove(idx));
+                    }
+                }
+                let mut added = Vec::new();
+                for _ in 0..1 + rng.below(2) {
+                    let a = random_axiom(&mut rng);
+                    if !held.iter().any(|h| h.kind == a.kind)
+                        && !added.iter().any(|h: &Axiom| h.kind == a.kind)
+                    {
+                        added.push(a);
+                    }
+                }
+                k.remove(&removed);
+                k.add(&added);
+                held.extend(added);
+                let out = same_as_fresh(
+                    &mut k,
+                    &held,
+                    threads,
+                    &format!("threads {threads} seed {seed} step {step}"),
+                );
+                total_steps += 1;
+                if out.stats.incremental {
+                    incremental_steps += 1;
+                    if out.stats.cleared < out.taxonomy.classes().count() {
+                        kept_some += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        incremental_steps * 2 >= total_steps,
+        "expected most data/DtIx edits to run incrementally: {incremental_steps}/{total_steps}"
+    );
+    assert!(
+        kept_some > 0,
+        "expected incremental data/DtIx runs to keep untouched classes"
+    );
+}

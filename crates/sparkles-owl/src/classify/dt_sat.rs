@@ -15,7 +15,7 @@ use super::dtcheck::comp::Comps;
 use super::dtcheck::range::{Ranges, Rid, map_backing_bytes, map_buckets_for, map_growth};
 use super::dtcheck::rule::{self, Group, Units};
 use super::dtcheck::solve::{Atom, Bounds, Problem, Prop, Why};
-use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
+use super::index::{BOTTOM, Ex, Index, Node, RefireMap, Role, TOP};
 use super::saturate::{Concl, Contexts, Dynamic, Sink, State};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -55,7 +55,7 @@ pub struct DtIx {
     /// the run's components
     pub comps: Comps,
     /// for each told subsumer of a body atom, the components it re-evaluates
-    refire: FxHashMap<Ex, Vec<u32>>,
+    refire: RefireMap,
     /// the worst last evaluation of each component in the states of worlds, which go
     /// when their world does
     sticky: Mutex<Vec<u8>>,
@@ -86,17 +86,84 @@ pub struct DtSt {
     pub last: u8,
 }
 
+/// Component alignment between an earlier [`DtIx`] and the current one for incremental
+/// maintenance (roadmap item 753).
+pub struct DtAlign {
+    /// For each old component id `0..old.body.len()`, its component id in `self`, or
+    /// `None` if the component changed, split, merged, or disappeared.
+    pub comp_map: Vec<Option<u32>>,
+    /// For each old component id `0..old.body.len()`, whether the component changed
+    /// (`changed_comps[c] == comp_map[c].is_none()`).
+    pub changed_comps: Vec<bool>,
+}
+
+/// Outcome of aligning a new [`DtIx`] against the previous run's [`DtIx`].
+pub enum DtAlignOutcome {
+    Aligned(DtAlign),
+    /// A data property switched between EL-lattice and checker modes, or checker bounds
+    /// changed; the caller must fall back to a fresh full rebuild.
+    Incompatible,
+    /// Cooperative cancellation or deadline stop triggered during alignment.
+    Stopped,
+}
+
+/// Items processed between cooperative stop polls inside [`DtIx::align`].
+const POLL_ALIGN: usize = 4096;
+
+#[inline]
+fn tick_align(ticks: &mut usize, n: usize, stop: &dyn Fn() -> bool) -> bool {
+    *ticks += n;
+    if *ticks >= POLL_ALIGN {
+        *ticks = 0;
+        stop()
+    } else {
+        false
+    }
+}
+
+fn slice_eq_poll<T: PartialEq>(
+    a: &[T],
+    b: &[T],
+    ticks: &mut usize,
+    stop: &dyn Fn() -> bool,
+) -> Option<bool> {
+    if a.len() != b.len() {
+        return Some(false);
+    }
+    let mut i = 0;
+    while i < a.len() {
+        let step = POLL_ALIGN.saturating_sub(*ticks).max(1);
+        let end = (i + step).min(a.len());
+        if a[i..end] != b[i..end] {
+            return Some(false);
+        }
+        *ticks += end - i;
+        i = end;
+        if *ticks >= POLL_ALIGN {
+            *ticks = 0;
+            if stop() {
+                return None;
+            }
+        }
+    }
+    Some(true)
+}
+
 impl DtIx {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         keys: Vec<DtKey>,
-        roles: FxHashMap<Role, RoleIx>,
+        mut roles: FxHashMap<Role, RoleIx>,
         body: Vec<Vec<Body>>,
         disjoint: Vec<(Role, Role)>,
         ranges: Ranges,
         comps: Comps,
-        refire: FxHashMap<Ex, Vec<u32>>,
+        refire: RefireMap,
     ) -> DtIx {
+        for ri in roles.values_mut() {
+            ri.ranges.sort_unstable();
+            ri.ranges.dedup();
+        }
         let n = comps.len();
         DtIx {
             comps,
@@ -116,6 +183,12 @@ impl DtIx {
     #[cfg(test)]
     pub(super) fn forget(&self) {
         self.cache.lock().clear();
+    }
+
+    /// Number of cached evaluations currently stored for checker component `comp`.
+    #[cfg(test)]
+    pub(super) fn cache_entries_for(&self, comp: u32) -> usize {
+        self.cache.lock().keys().filter(|k| k.0 == comp).count()
     }
 
     /// The bytes the tables hold, the cache and the ranges with them. The saturation
@@ -182,13 +255,7 @@ impl DtIx {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(Role, Role)>()),
             )
-            .saturating_add(map_backing_bytes(&self.refire))
-            .saturating_add(
-                self.refire
-                    .values()
-                    .map(|v| v.capacity().saturating_mul(std::mem::size_of::<u32>()))
-                    .sum::<usize>(),
-            )
+            .saturating_add(self.refire.bytes())
             .saturating_add(self.sticky.lock().capacity())
             .saturating_add(self.comps.bytes())
             .saturating_add(self.ranges.lock().bytes())
@@ -244,17 +311,7 @@ impl DtIx {
                     .len()
                     .saturating_mul(std::mem::size_of::<(Role, Role)>()),
             )
-            .saturating_add(
-                self.refire
-                    .len()
-                    .saturating_mul(std::mem::size_of::<(u32, Vec<u32>)>()),
-            )
-            .saturating_add(
-                self.refire
-                    .values()
-                    .map(|v| v.len().saturating_mul(std::mem::size_of::<u32>()))
-                    .sum::<usize>(),
-            )
+            .saturating_add(self.refire.logical_bytes())
             .saturating_add(self.sticky.lock().len())
     }
 
@@ -265,6 +322,271 @@ impl DtIx {
         } else {
             Atom::AtMost(i, a.n, a.range)
         }
+    }
+
+    /// Components re-evaluated when a context derives `t`.
+    pub fn refire_of(&self, t: Ex) -> Option<&[u32]> {
+        self.refire.get(&t).map(Vec::as_slice)
+    }
+
+    /// Zero-allocation compatibility check: whether checker bounds match and no existing
+    /// data property switched between the EL data lattice and the datatype checker.
+    #[allow(dead_code)]
+    pub fn modes_compatible(&self, old: &DtIx, old_roles_len: usize) -> bool {
+        self.modes_compatible_with_stop(old, old_roles_len, &|| false)
+            .unwrap_or(false)
+    }
+
+    /// Cooperative polling variant of [`DtIx::modes_compatible`]; returns `None` when
+    /// `stop` signals cancellation or deadline expiry.
+    pub fn modes_compatible_with_stop(
+        &self,
+        old: &DtIx,
+        old_roles_len: usize,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<bool> {
+        if (self.bounds.props, self.bounds.types, self.bounds.nodes)
+            != (old.bounds.props, old.bounds.types, old.bounds.nodes)
+        {
+            return Some(false);
+        }
+        let mut ticks = 0usize;
+        let mut poll = || -> bool {
+            ticks += 1;
+            if ticks >= POLL_ALIGN {
+                ticks = 0;
+                stop()
+            } else {
+                false
+            }
+        };
+        // Any role already interned in `old` that is now a checker role must already have
+        // been a checker role in `old`; otherwise it switched from EL lattice (or was
+        // previously removed and re-entered as a checker role).
+        for &r in self.roles.keys() {
+            if poll() {
+                return None;
+            }
+            if (r as usize) < old_roles_len && !old.roles.contains_key(&r) {
+                return Some(false);
+            }
+        }
+        // Any data property present in both runs' component maps must keep the same
+        // EL-lattice vs checker assignment.
+        for (d, old_c) in old.comps.iter() {
+            if poll() {
+                return None;
+            }
+            if let Some(new_c) = self.comps.component(d)
+                && old.comps.is_checker(old_c) != self.comps.is_checker(new_c)
+            {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// Upper-bound scratch bytes allocated by [`DtIx::align`] and `refire` comparison.
+    pub fn align_scratch(&self, old: &DtIx) -> usize {
+        let old_comps = old.body.len();
+        let new_comps = self.body.len();
+        let groups = old_comps
+            .saturating_mul(std::mem::size_of::<Vec<Role>>())
+            .saturating_add(
+                old.roles
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Role>() * 4),
+            );
+        let counts = new_comps.saturating_mul(std::mem::size_of::<usize>());
+        let disj = (old_comps + new_comps)
+            .saturating_mul(std::mem::size_of::<Vec<(Role, Role)>>())
+            .saturating_add(
+                (old.disjoint.len() + self.disjoint.len())
+                    .saturating_mul(std::mem::size_of::<(Role, Role)>() * 8),
+            );
+        let out = old_comps.saturating_mul(std::mem::size_of::<Option<u32>>() + 1);
+        groups
+            .saturating_add(counts)
+            .saturating_add(disj)
+            .saturating_add(out)
+            .saturating_add(64)
+    }
+
+    /// Aligns components of `old` against `self` for incremental maintenance.
+    ///
+    /// An old checker component `old_c` maps to `Some(new_c)` iff `new_c` has the exact
+    /// same role set, per-role superroles/ranges/functionality, touching disjointness
+    /// pairs, and body atoms (with identical `told` subsumer lists).
+    pub fn align(
+        &self,
+        old: &DtIx,
+        old_roles_len: usize,
+        stop: &dyn Fn() -> bool,
+    ) -> DtAlignOutcome {
+        match self.modes_compatible_with_stop(old, old_roles_len, stop) {
+            Some(true) => {}
+            Some(false) => return DtAlignOutcome::Incompatible,
+            None => return DtAlignOutcome::Stopped,
+        }
+        let mut ticks = 0usize;
+
+        let mut old_groups: Vec<Vec<Role>> = vec![Vec::new(); old.body.len()];
+        for (&r, ri) in &old.roles {
+            if tick_align(&mut ticks, 1, stop) {
+                return DtAlignOutcome::Stopped;
+            }
+            old_groups[ri.comp as usize].push(r);
+        }
+
+        let mut new_counts: Vec<usize> = vec![0; self.body.len()];
+        for ri in self.roles.values() {
+            if tick_align(&mut ticks, 1, stop) {
+                return DtAlignOutcome::Stopped;
+            }
+            new_counts[ri.comp as usize] += 1;
+        }
+
+        let mut old_disj: Vec<Vec<(Role, Role)>> = vec![Vec::new(); old.body.len()];
+        for &(a, b) in &old.disjoint {
+            if tick_align(&mut ticks, 1, stop) {
+                return DtAlignOutcome::Stopped;
+            }
+            if let Some(ca) = old.roles.get(&a).map(|r| r.comp) {
+                old_disj[ca as usize].push((a, b));
+                if let Some(cb) = old.roles.get(&b).map(|r| r.comp)
+                    && cb != ca
+                {
+                    old_disj[cb as usize].push((a, b));
+                }
+            }
+        }
+        let mut new_disj: Vec<Vec<(Role, Role)>> = vec![Vec::new(); self.body.len()];
+        for &(a, b) in &self.disjoint {
+            if tick_align(&mut ticks, 1, stop) {
+                return DtAlignOutcome::Stopped;
+            }
+            if let Some(ca) = self.roles.get(&a).map(|r| r.comp) {
+                new_disj[ca as usize].push((a, b));
+                if let Some(cb) = self.roles.get(&b).map(|r| r.comp)
+                    && cb != ca
+                {
+                    new_disj[cb as usize].push((a, b));
+                }
+            }
+        }
+
+        let mut comp_map = vec![None; old.body.len()];
+        let mut changed_comps = vec![true; old.body.len()];
+        for old_c in 0..old.body.len() {
+            if tick_align(&mut ticks, 1, stop) {
+                return DtAlignOutcome::Stopped;
+            }
+            let roles = &old_groups[old_c];
+            let Some(&first) = roles.first() else {
+                continue;
+            };
+            let Some(new_c) = self.roles.get(&first).map(|ri| ri.comp) else {
+                continue;
+            };
+            if new_counts[new_c as usize] != roles.len() {
+                continue;
+            }
+            // `roles` holds the distinct keys of `old.roles` in `old_c`; verifying every
+            // role maps to `new_c` alongside equal cardinality proves exact set equality
+            // without sorting or hashing whole role lists.
+            let mut same_members = true;
+            for &r in roles {
+                if tick_align(&mut ticks, 1, stop) {
+                    return DtAlignOutcome::Stopped;
+                }
+                if self.roles.get(&r).map(|ri| ri.comp) != Some(new_c) {
+                    same_members = false;
+                    break;
+                }
+            }
+            if !same_members {
+                continue;
+            }
+            match slice_eq_poll(
+                &old_disj[old_c],
+                &new_disj[new_c as usize],
+                &mut ticks,
+                stop,
+            ) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => return DtAlignOutcome::Stopped,
+            }
+            let old_body = &old.body[old_c];
+            let new_body = &self.body[new_c as usize];
+            if old_body.len() != new_body.len() {
+                continue;
+            }
+            let mut body_same = true;
+            for (a, b) in old_body.iter().zip(new_body) {
+                if tick_align(&mut ticks, 1, stop) {
+                    return DtAlignOutcome::Stopped;
+                }
+                if a.e != b.e {
+                    body_same = false;
+                    break;
+                }
+                let told_same = match (a.told.as_deref(), b.told.as_deref()) {
+                    (None, None) => true,
+                    (Some(ta), Some(tb)) => match slice_eq_poll(ta, tb, &mut ticks, stop) {
+                        Some(eq) => eq,
+                        None => return DtAlignOutcome::Stopped,
+                    },
+                    _ => false,
+                };
+                if !told_same {
+                    body_same = false;
+                    break;
+                }
+            }
+            if !body_same {
+                continue;
+            }
+            let mut roles_same = true;
+            for &r in roles {
+                if tick_align(&mut ticks, 1, stop) {
+                    return DtAlignOutcome::Stopped;
+                }
+                let old_ri = &old.roles[&r];
+                let new_ri = &self.roles[&r];
+                if old_ri.functional != new_ri.functional {
+                    roles_same = false;
+                    break;
+                }
+                match slice_eq_poll(&old_ri.supers, &new_ri.supers, &mut ticks, stop) {
+                    Some(true) => {}
+                    Some(false) => {
+                        roles_same = false;
+                        break;
+                    }
+                    None => return DtAlignOutcome::Stopped,
+                }
+                match slice_eq_poll(&old_ri.ranges, &new_ri.ranges, &mut ticks, stop) {
+                    Some(true) => {}
+                    Some(false) => {
+                        roles_same = false;
+                        break;
+                    }
+                    None => return DtAlignOutcome::Stopped,
+                }
+            }
+            if roles_same {
+                comp_map[old_c] = Some(new_c);
+                changed_comps[old_c] = false;
+            }
+        }
+        if stop() {
+            return DtAlignOutcome::Stopped;
+        }
+        DtAlignOutcome::Aligned(DtAlign {
+            comp_map,
+            changed_comps,
+        })
     }
 }
 
@@ -326,7 +648,7 @@ pub fn refire<S: Sink>(ix: &Index, st: &mut State, t: Ex, out: &mut S) {
     let Some(dt) = ix.dt.as_deref() else {
         return;
     };
-    let Some(comps) = dt.refire.get(&t) else {
+    let Some(comps) = dt.refire_of(t) else {
         return;
     };
     for &c in comps {
@@ -759,7 +1081,7 @@ mod tests {
             Vec::new(),
             Ranges::new(),
             Comps::default(),
-            FxHashMap::default(),
+            RefireMap::default(),
         );
         let key: Key = (0, vec![1u32, 2].into_boxed_slice(), Box::new([]));
         let make_ans = || {
@@ -941,7 +1263,7 @@ mod tests {
             Vec::new(),
             Ranges::new(),
             Comps::default(),
-            FxHashMap::default(),
+            RefireMap::default(),
         );
         // Pre-populate cache with the exact key that `evaluate` would build.
         let key: Key = (
@@ -1117,7 +1439,7 @@ mod tests {
             Vec::new(),
             Ranges::new(),
             Comps::default(),
-            FxHashMap::default(),
+            RefireMap::default(),
         );
         let key513: Key = (
             0,
@@ -1288,7 +1610,7 @@ mod tests {
             Vec::new(),
             Ranges::new(),
             Comps::default(),
-            FxHashMap::default(),
+            RefireMap::default(),
         );
         // Fill `cache` to exact capacity boundary 896 (1024 buckets -> next insert rehashes to 2048).
         {
@@ -1349,7 +1671,7 @@ mod tests {
         // Build a `DtIx` with 897 roles (2048 buckets), 897 refire keys (2048 buckets),
         // 256 components (outer `body` Vec + `sticky` Vec) and spare inner `body` capacity.
         let mut roles = FxHashMap::default();
-        let mut refire = FxHashMap::default();
+        let mut refire = RefireMap::default();
         for i in 0..897u32 {
             roles.insert(
                 i,
@@ -1364,26 +1686,28 @@ mod tests {
         }
         let mut body: Vec<Vec<Body>> = (0..256).map(|_| Vec::new()).collect();
         body[0].reserve(512);
+        let refire_bytes = map_buckets_for(897) * (std::mem::size_of::<(Ex, Vec<u32>)>() + 1)
+            + 16
+            + 897 * std::mem::size_of::<u32>();
         let expected_min = std::mem::size_of::<DtIx>()
             + map_backing_bytes(&roles)
             + body.capacity() * std::mem::size_of::<Vec<Body>>()
             + body[0].capacity() * std::mem::size_of::<Body>()
-            + map_backing_bytes(&refire)
-            + refire
-                .values()
-                .map(|v| v.capacity() * std::mem::size_of::<u32>())
-                .sum::<usize>()
+            + refire_bytes
             + 256; // sticky
         // Build `DtIx` with `body.len() == 256`; `sticky` has length `comps.len()`.
-        let dt = DtIx::new(
+        let mut dt = DtIx::new(
             Vec::new(),
             roles,
             body,
             Vec::new(),
             Ranges::new(),
             Comps::default(),
-            refire,
+            RefireMap::default(),
         );
+        let without_refire = dt.bytes();
+        dt.refire = refire;
+        assert_eq!(dt.bytes() - without_refire, refire_bytes);
         // Reserve 256 bytes in `sticky` to mirror 256 components.
         dt.sticky.lock().resize(256, FINE);
         assert!(
