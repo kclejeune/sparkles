@@ -1007,6 +1007,9 @@ impl DlRun {
         *self.work_limit.get_mut() = 0;
         *self.width_limit.get_mut() = 0;
         *self.exhausted.get_mut() = false;
+        for c in &mut self.mcount {
+            *c.get_mut() = 0;
+        }
         self.adaptive = None;
     }
     /// Enables Option 2 (`rawQ`) adaptive tracking for this attempt. When `enforce` is
@@ -1523,17 +1526,19 @@ impl DlSt {
         }
     }
 
-    /// Whether a marker or a stored clause of the context, dead or not, names an
-    /// expression that `changed` marks, or one it does not cover (roadmap item 753).
-    /// Every rule reads the index by the atoms and the successor terms of its premises,
-    /// and a premise is a unit of the context, a marker or a clause its store took, so a
-    /// context that names no marked expression here or among its units made no inference
-    /// that the changed rules give or take. A clause the store subsumed on arrival was a
-    /// premise of none. The equalities and the interned literals of runs that count or
-    /// have a root are not read, and count as marked.
+    /// Whether a marker, a denied test class, a registered existential restriction, or a
+    /// stored clause of the context, dead or not, names an expression that `changed` marks,
+    /// or one it does not cover (roadmap item 753). Every rule reads the index by the atoms
+    /// and the successor terms of its premises, and a premise is a unit of the context, a
+    /// marker or a clause its store took, so a context that names no marked expression here
+    /// or among its units made no inference that the changed rules give or take. A clause
+    /// the store subsumed on arrival was a premise of none. The equalities and the interned
+    /// literals of runs that count or have a root are not read, and count as marked.
     pub fn names_changed(&self, changed: &[bool]) -> bool {
         let hit = |e: Ex| changed.get(e as usize).copied().unwrap_or(true);
         self.hyps.iter().any(|&a| hit(a))
+            || self.neg.iter().any(|&a| hit(a))
+            || self.edges.iter().any(|&(e, _)| hit(e))
             || self.store.clauses.iter().any(|s| {
                 s.c.body().iter().chain(s.c.head()).any(|l| match l.kind() {
                     X | Y => hit(l.atom()),
@@ -1611,9 +1616,21 @@ pub fn has_test(d: &super::saturate::Dynamic, x: Ex, bs: &[Ex]) -> bool {
     d.find(&core).is_some()
 }
 
-/// The class that a test context with the core `core` tests.
+/// The class that a test context with the core `core` tests, or `None` when `core` has no
+/// denied class (such as an eager conjunction context whose core holds only positive
+/// expressions).
 pub fn tested_class(core: &[Ex]) -> Option<Ex> {
-    core.iter().copied().find(|&m| m & NEG == 0)
+    core.iter()
+        .any(|&m| m & NEG != 0)
+        .then(|| core.iter().copied().find(|&m| m & NEG == 0))
+        .flatten()
+}
+
+/// Whether any expression named by a dynamic context's `core` (positive or denied) is
+/// marked in `changed`, or lies outside `changed` (roadmap item 753).
+pub(super) fn core_changed(core: &[Ex], changed: &[bool]) -> bool {
+    core.iter()
+        .any(|&m| changed.get((m & !NEG) as usize).copied().unwrap_or(true))
 }
 
 /// Starts a test context: its core, `owl:Thing` and the class it denies.
@@ -7821,5 +7838,65 @@ mod tests {
             true
         }));
         assert_eq!(visited, vec![2, 15]);
+    }
+
+    #[test]
+    fn tested_class_ignores_eager_conjunction_cores_without_neg_bits() {
+        // Test contexts carry the tested class alongside one or more denied (`NEG`) classes.
+        assert_eq!(tested_class(&[5, 9 | NEG]), Some(5));
+        assert_eq!(tested_class(&[5, 7 | NEG, 9 | NEG]), Some(5));
+        // Eager conjunction contexts carry only positive expressions (no `NEG` bit) and
+        // must never be misidentified as a test of their first member.
+        assert_eq!(tested_class(&[2, 5]), None);
+        assert_eq!(tested_class(&[2, 5, 8]), None);
+        assert_eq!(tested_class(&[]), None);
+        assert_eq!(tested_class(&[9 | NEG]), None);
+    }
+
+    #[test]
+    fn core_changed_checks_positive_and_denied_members() {
+        let mut changed = vec![false; 12];
+        assert!(!core_changed(&[2, 5], &changed));
+        assert!(!core_changed(&[5, 9 | NEG], &changed));
+
+        // Marking a denied class in a test core invalidates the test context.
+        changed[9] = true;
+        assert!(core_changed(&[5, 9 | NEG], &changed));
+        assert!(!core_changed(&[2, 5], &changed));
+
+        // Marking a positive member in an eager conjunction core invalidates it.
+        changed[9] = false;
+        changed[5] = true;
+        assert!(core_changed(&[2, 5], &changed));
+        assert!(core_changed(&[5, 9 | NEG], &changed));
+
+        // Any expression outside `changed` is conservatively treated as changed.
+        changed[5] = false;
+        assert!(core_changed(&[2, 20], &changed));
+        assert!(core_changed(&[2, 20 | NEG], &changed));
+    }
+
+    #[test]
+    fn names_changed_checks_neg_and_edge_restrictions_only() {
+        let mut st = State::default();
+        let x = ds(&mut st);
+        x.neg.push(4);
+        // Edge `(e = 3, v = 100)` targets a dynamic context id `100` past `changed.len()`.
+        // `names_changed` must check the restriction `e = 3` and NOT treat target `v = 100`
+        // as an out-of-range changed expression.
+        x.insert_edge(3, 100);
+
+        let mut changed = vec![false; 10];
+        assert!(!x.names_changed(&changed));
+
+        changed[4] = true;
+        assert!(x.names_changed(&changed));
+
+        changed[4] = false;
+        changed[3] = true;
+        assert!(x.names_changed(&changed));
+
+        changed[3] = false;
+        assert!(!x.names_changed(&changed));
     }
 }

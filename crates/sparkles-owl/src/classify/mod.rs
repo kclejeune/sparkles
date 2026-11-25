@@ -3774,10 +3774,10 @@ impl Saturation {
         }
         // the rules of this run, when a later run may keep its contexts: the EL rules,
         // the Horn rules without individuals, universal roles, keys or data, whose
-        // contexts depend on one another only along their links, or Tier D
-        // with the cautious strategy and without a bound on its conclusions, which a
-        // run that counts, a rooted run and the run after a passed bound have, and whose
-        // count of conclusions a kept context would change
+        // contexts depend on one another only along their links, or Tier D (cautious or
+        // eager) without a bound on its conclusions, which a run that counts, a rooted
+        // run and the run after a passed bound have, and whose count of conclusions a
+        // kept context would change
         let tier = match (horn, disj) {
             (false, false) => Some(KeptTier::El),
             // also a run whose Horn normalization gave the index no rule that can fire,
@@ -3788,7 +3788,6 @@ impl Saturation {
                     && ix.dl.as_deref().is_some_and(|d| d.keyed_by_expressions())
                     && saturate::plain(&ix)
                     && ix.comparable()
-                    && limits.expansion == Expansion::Cautious
                     && !self.no_counting =>
             {
                 Some(KeptTier::Disj)
@@ -3848,10 +3847,16 @@ impl Saturation {
                 let from = d.base();
                 let delta = n as Ex - from;
                 if delta > 0 {
-                    for c in self.ctx.iter_mut().filter_map(|c| c.get_mut()) {
+                    for (idx, c) in self.ctx.iter_mut().filter_map(|c| c.get_mut()).enumerate() {
+                        if idx.is_multiple_of(POLL_INVALIDATE) {
+                            poll(limits)?;
+                        }
                         c.st.get_mut().shift_contexts(from, delta);
                     }
                     for i in 0..d.len() as Ex {
+                        if (i as usize).is_multiple_of(POLL_INVALIDATE) {
+                            poll(limits)?;
+                        }
                         if let Some(c) = d.get_ctx(from + i) {
                             c.st.lock().shift_contexts(from, delta);
                         }
@@ -3882,6 +3887,7 @@ impl Saturation {
         let dl_run = ix.dl.as_ref().map(|_| match self.dl_run.take() {
             // the kept contexts name the clauses of the last run's table by id
             Some(mut d) if reuse => {
+                debug_assert_eq!(d.eager, limits.expansion == Expansion::Eager);
                 d.begin_run();
                 d
             }
@@ -3926,15 +3932,15 @@ impl Saturation {
             // clause table, with its marks and the set and the queue of the
             // invalidation, which count against the budget as the kept state does; a
             // run that passes it starts again in full (`run_with`)
-            let scratch = ix.changed_scratch(&old) + (self.ctx.len() + d.len()) * 16;
-            let held = self.index_bytes(&ix)
-                + old.bytes()
+            let inv_scratch = (self.ctx.len() + d.len()) * 16;
+            let live_without_old = self.index_bytes(&ix)
                 + held_bytes
                 + ax.bytes()
                 + self.context_bytes()
                 + d.retained_bytes()
                 + dl_run.as_ref().map_or(0, |d| d.bytes())
-                + scratch;
+                + inv_scratch;
+            let held = live_without_old + old.bytes() + ix.changed_scratch(&old);
             let more = held.saturating_sub(normalized_peak);
             if limits.max_memory.is_some_and(|m| held > m)
                 || limits
@@ -3962,8 +3968,16 @@ impl Saturation {
             let Some(changed) = changed else {
                 return Err(stopped.into_inner().unwrap_or(Error::Cancelled));
             };
-            stats.cleared = self.invalidate_changed(&changed, &ix, d);
             drop(old);
+            stats.cleared = self.invalidate_changed(
+                &changed,
+                &ix,
+                d,
+                renumbered,
+                limits,
+                live_without_old,
+                &mut normalized_peak,
+            )?;
             poll(limits)?;
         }
         let mut roots: Vec<Ex> = ax.classes.clone();
@@ -5296,21 +5310,28 @@ impl Saturation {
     /// and number their disjointness sets by the new index. The answer is the number
     /// cleared.
     ///
-    /// In a run of Tier D a context holds an expression when a unit, a marker or a
-    /// stored clause names it, the contexts above the index's are the tests, and a
-    /// test that held and is cleared clears its class, whose subsumer it gave. A kept
-    /// context there need not be as a run that starts again leaves it: it keeps the
-    /// markers that cleared predecessors sent, which are tautologies, and the clauses
-    /// they gave. Each kept clause follows from the ontology as it is now, and the
+    /// In a run of Tier D a context holds an expression when a unit, a marker, a denied
+    /// test class, a registered restriction, its dynamic core, or a stored clause names
+    /// it. The contexts above the index's are the tests and, under `Expansion::Eager`,
+    /// the dynamic conjunction successors; only a test context (one whose core has a
+    /// denied class) that held and is cleared clears its tested class, whose subsumer it
+    /// gave. A kept context there need not be as a run that starts again leaves it: it
+    /// keeps the markers that cleared predecessors sent, which are tautologies, and the
+    /// clauses they gave. Each kept clause follows from the ontology as it is now, and the
     /// saturation closes every context under the rules, which is what the
     /// completeness of the calculus asks (Bate and others, JAIR 2018, Theorem 9, for
     /// any context structure to which no rule applies, with Theorem 8 for soundness).
+    #[allow(clippy::too_many_arguments)]
     fn invalidate_changed(
         &mut self,
         changed: &[bool],
         ix: &Index,
         dynamic: &saturate::Dynamic,
-    ) -> usize {
+        renumbered: bool,
+        limits: &Limits,
+        live_without_old: usize,
+        normalized_peak: &mut usize,
+    ) -> Result<usize, Error> {
         let base = dynamic.base();
         let count = dynamic.len() as Ex;
         let ctx = &self.ctx;
@@ -5326,13 +5347,17 @@ impl Saturation {
         };
         let all = (0..ctx.len() as Ex).chain((0..count).map(|i| base + i));
         let mut affected: FxHashSet<Ex> = FxHashSet::default();
-        for e in all.clone() {
+        for (idx, e) in all.clone().enumerate() {
+            if idx.is_multiple_of(POLL_INVALIDATE) {
+                poll(limits)?;
+            }
             with(e, &mut |st| {
                 if st.init
                     && (st
                         .subs
                         .iter()
                         .any(|&s| changed.get(s as usize).copied().unwrap_or(true))
+                        || (e >= base && dl_rules::core_changed(dynamic.core(e), changed))
                         || dl_rules::dl(st).is_some_and(|d| d.names_changed(changed)))
                 {
                     affected.insert(e);
@@ -5344,7 +5369,13 @@ impl Saturation {
         // over the predecessor, and the class whose subsumer a test that held gave
         let tests = ix.dl.is_some();
         let mut queue: Vec<Ex> = affected.iter().copied().collect();
+        let mut visited = 0usize;
         while let Some(e) = queue.pop() {
+            visited += 1;
+            if visited.is_multiple_of(POLL_INVALIDATE) {
+                poll(limits)?;
+            }
+            let mut edges = 0usize;
             with(e, &mut |st| {
                 let mut add = |s: Ex| {
                     if affected.insert(s) {
@@ -5352,11 +5383,13 @@ impl Saturation {
                     }
                 };
                 for (_, srcs) in &st.back {
+                    edges += srcs.list.len();
                     for &s in &srcs.list {
                         add(s);
                     }
                 }
                 if let Some(d) = dl_rules::dl(st) {
+                    edges += d.dpreds.len();
                     for &(u, _) in &d.dpreds {
                         add(u);
                     }
@@ -5369,9 +5402,48 @@ impl Saturation {
                     add(x);
                 }
             });
+            if edges >= POLL_INVALIDATE {
+                poll(limits)?;
+            }
+            visited += edges;
+        }
+        if renumbered {
+            let mut maps = 0usize;
+            for (idx, e) in all.clone().enumerate() {
+                if idx.is_multiple_of(POLL_INVALIDATE) {
+                    poll(limits)?;
+                }
+                if affected.contains(&e) {
+                    continue;
+                }
+                with(e, &mut |st| {
+                    if st.init && !st.disj.is_empty() {
+                        maps = maps.saturating_add(st.disjoint_growth(ix));
+                    }
+                });
+            }
+            if maps > 0 {
+                let used = live_without_old.saturating_add(maps);
+                let more = used.saturating_sub(*normalized_peak);
+                if limits.max_memory.is_some_and(|m| used > m)
+                    || limits
+                        .charge
+                        .as_deref()
+                        .is_some_and(|f| more > 0 && !f(more))
+                {
+                    return Err(Error::Memory {
+                        limit: limits.max_memory.unwrap_or(used),
+                        used,
+                    });
+                }
+                *normalized_peak = (*normalized_peak).max(used);
+            }
         }
         let mut cleared = 0;
-        for e in all {
+        for (idx, e) in all.enumerate() {
+            if idx.is_multiple_of(POLL_INVALIDATE) {
+                poll(limits)?;
+            }
             let c = if e < base {
                 ctx.get(e as usize).and_then(|c| c.get()).map(|c| &**c)
             } else {
@@ -5387,11 +5459,13 @@ impl Saturation {
                 let mut st = c.st.lock();
                 if st.init {
                     st.drop_predecessors(&affected);
-                    st.reindex_disjoint(ix);
+                    if renumbered && !st.disj.is_empty() {
+                        st.reindex_disjoint(ix);
+                    }
                 }
             }
         }
-        cleared
+        Ok(cleared)
     }
 
     /// Clears the contexts that the changed axioms can affect: those that derived the
@@ -6033,6 +6107,10 @@ fn range_table(
 
 /// The axioms normalized between two polls of the run's deadline and cancellation.
 const POLL_AXIOMS: usize = 65_536;
+
+/// The contexts or edges scanned between two polls of the run's deadline and cancellation
+/// during index-diff invalidation and dynamic context rebasing.
+const POLL_INVALIDATE: usize = 4096;
 
 /// The run's deadline and cancellation, as an error when either has come.
 /// Why the worlds stopped.
