@@ -423,6 +423,16 @@ appear after the follower bound a generation, the follower's names of hierarchy 
 that came and went, and the mail cases that C21's Outcome lists. `ui/src/lib/watches.test.ts`,
 `ui/tests/mock/watches.spec.ts` and `ui/tests/e2e/watches.spec.ts` cover the UI.
 
+### Pattern-based axiom generation
+
+Item 623 adds a **Patterns** tab to the ontology editor and a spreadsheet-to-axiom engine in `sparkles_owl::patterns` for the pattern-generation part of the "Patterns, imports, rendering and bulk edits" phase. The engine reads RFC 4180 CSV or TSV inputs with automatic or explicit delimiter detection and evaluates two declarative specification modes against the open ontology's vocabulary and prefixes.
+
+In `robot` mode, column directives follow ROBOT template conventions (`ID`, `LABEL` and `LABEL@lang`, `TYPE`, `SC`, `EC`, `DC`, `SP`, `C`, `I`, `A`, `AL`, `AT`, `AI`, `SPLIT=<sep>`, and axiom annotations `>A`, `>AL`, `>AT`, `>AI`), read either from row 2 of the table or from explicit column directive mappings. In `pattern` mode, DOSDP- and Cellfie-style parameterized rules expand `${col}` and typed or escaped placeholder filters (`iri`, `slug`, `str`, `lang(...)`, `type(...)`) into OWL 2 Manchester syntax or functional-style syntax axioms, with optional entity declarations, per-column cell splitting, and axiom annotations. Evaluation runs in two passes so entities and labels declared on earlier or later rows of the same table resolve inside Manchester expressions across the batch. Every generated IRI and axiom is validated through `sparkles_owl::validate::axiom` and deduplicated deterministically with 1-based source line provenance. Inputs are bounded to 2 MiB, 5,000 data rows, 128 columns, 50,000 generated axioms, 1,000 recorded diagnostics, and 256 split-expansion combinations per rule per row.
+
+Two server routes expose preview and atomic commit over HTTP. `POST /$/ontology/{ds}/patterns/preview` requires dataset read access and returns deduplicated generated axioms (capped at 2,000 per response, 200 by default) with Manchester and functional-style renderings, new versus existing status, auto-declarations matching `POST /$/ontology/{ds}/axioms`, estimated RDF triple count, per-row diagnostics, and the ontology's entity tag. `POST /$/ontology/{ds}/patterns/apply` requires dataset write access on the `update` endpoint, honors read-only mode, protected branches, graph write grants, `If-Match` preconditions, `receipt=true`, and `dryRun=true` preview parity, and commits all generated axioms as one atomic ontology edit. By default (`onError: "abort"`), any row diagnostic error refuses the commit with `422` (`pattern-errors`) without writing; `onError: "skip"` skips erroneous entries and commits the valid axioms.
+
+The workbench **Patterns** tab offers CSV/TSV file upload or paste, starter presets for ROBOT hierarchies, existential restrictions with `SPLIT`, DOSDP/Cellfie Manchester rules, and TSV individuals, column placeholder chips, live preview with status and text filtering, diagnostics display, dry-run triple diff inspection, and single-commit apply. Readers and protected branches can preview tables and templates without committing.
+
 ### Bulk edits
 
 Item 626 adds a **Bulk edits** tab to the ontology editor, beside **Discussions**, for the

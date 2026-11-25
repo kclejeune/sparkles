@@ -2658,6 +2658,33 @@ commit. A destination the policy refuses is `403`, and a document that does not 
 head, and if the map cannot be written after the commit, the `500` answer
 (`import-map-unwritten`) carries the commit and the entries to `PATCH`.
 
+### Pattern-based axiom generation
+
+`POST /$/ontology/{ds}/patterns/preview` evaluates CSV or TSV spreadsheet rows against a
+declarative template or pattern specification without modifying the dataset, requiring
+dataset read access on the `query` endpoint. The request body carries `table` (`{"data",
+"format"?: "auto" | "csv" | "tsv"}`), `spec` (`{"mode": "robot" | "pattern", "baseIri"?,
+"prefixes"?, ...}`), and optional `graph`, `imports`, `mode`, `declare`, `target`, and
+`limit` (1 to 2,000, default 200). In `robot` mode, `headerTemplateRow` reads ROBOT
+column directives (`ID`, `LABEL`, `LABEL@lang`, `TYPE`, `SC`, `EC`, `DC`, `SP`, `C`, `I`,
+`A`, `AL`, `AT`, `AI`, `SPLIT=<sep>`, and axiom annotations `>A`, `>AL`, `>AT`, `>AI`)
+from row 2 or from explicit `columns` entries. In `pattern` mode, `rules` define
+parameterized Manchester or functional-style axiom templates with `${col}` placeholders
+and optional filters (`iri`, `slug`, `str`, `lang(...)`, `type(...)`), optional
+`declarations`, per-column `split` delimiters, and axiom `annotations`. Inputs are bounded
+at 2 MiB, 5,000 data rows, 128 columns, 50,000 generated axioms, 1,000 diagnostics, and
+256 combinations per rule per row. The answer reports row counts, generated axioms with
+their `new` or `existing` status, auto-declarations, estimated RDF triples, and per-row
+diagnostics, together with the ontology's entity tag.
+
+`POST /$/ontology/{ds}/patterns/apply` evaluates the same table and specification and
+commits all generated axioms in one atomic ontology edit, requiring dataset write access
+on the `update` endpoint. It honors read-only mode, protected branches, graph write
+grants, `If-Match`, `receipt=true`, `message`, and `dryRun=true` preview parity. With
+`onError: "abort"` (the default), any row diagnostic error refuses the commit with `422`
+(`pattern-errors`) and writes nothing. With `onError: "skip"`, valid axioms are committed
+and diagnostics are returned alongside the edit outcome under `pattern`.
+
 ## Per-dataset SPARQL protocol (Fuseki compatible)
 
 | Method     | Path                  | Description |
