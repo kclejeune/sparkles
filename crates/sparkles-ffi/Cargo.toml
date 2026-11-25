@@ -41,7 +41,7 @@ sparkles-reasoner = { path = "../sparkles-reasoner", optional = true }
 sparkles-shacl = { path = "../sparkles-shacl", optional = true }
 sparkles-shex = { path = "../sparkles-shex", optional = true }
 sparkles-fmt = { path = "../sparkles-fmt", optional = true }
-sparkles-alloc = { path = "../sparkles-alloc", optional = true }
+sparkles-alloc = { path = "../sparkles-alloc", optional = true, features = ["local-dynamic-tls"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", default-features = false, optional = true }
