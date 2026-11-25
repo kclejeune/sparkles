@@ -708,6 +708,7 @@ pub(crate) struct Session {
     /// whether the demand program rewrites linear recursion (see [`demand::transform`])
     rewrite_linear: bool,
     graphs: Vec<Id>,
+    _graphs_held: Held,
     absent: bool,
     stop: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     budget: Arc<Budget>,
@@ -828,7 +829,7 @@ impl Session {
         };
         let closures = (!shared.closures).then_some(false);
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
-        let graphs = {
+        let (graphs, _graphs_held) = {
             let mut check = session_check(&req.stop);
             inputs::resolve_session_inputs_controlled(
                 &snap,
@@ -885,6 +886,7 @@ impl Session {
             compiled,
             rewrite_linear: true,
             graphs,
+            _graphs_held,
             absent,
             stop: req.stop,
             budget,

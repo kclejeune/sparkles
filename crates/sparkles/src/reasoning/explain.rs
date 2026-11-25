@@ -312,7 +312,12 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
                 if rule.default_graph {
                     graphs.push(Id::DEFAULT_GRAPH);
                 }
-                for iri in &rule.iris {
+                let exact_iris = rule
+                    .default_graph
+                    .then_some(crate::sparql::ctx::DEFAULT_GRAPH_IRI)
+                    .into_iter()
+                    .chain(rule.iris.iter().map(String::as_str));
+                for iri in exact_iris {
                     check_controls(req, deadline)?;
                     if !bound_ref.read.allows_named_iri(iri) {
                         continue;

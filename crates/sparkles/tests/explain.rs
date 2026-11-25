@@ -1596,6 +1596,173 @@ fn restricted_explanation_access_avoids_unchecked_graph_decode() {
 
 #[cfg(feature = "reasoning")]
 #[test]
+fn public_why_not_consistency_respects_budget_across_long_delta_imports() {
+    use sparkles::reasoning::{
+        QuerySetting,
+        explain::ExplainMode,
+        reasoner::{GraphRef, ImportMode, Inputs, whynot::WhyNot},
+    };
+    use sparkles_core::id::Tag;
+
+    let long = "z".repeat(65_536);
+    let imp1 = format!("http://imp.org/one_{long}");
+    let imp2 = format!("http://imp.org/two_{long}");
+    let imp3 = format!("http://imp.org/three_{long}");
+    let owl_imports = "http://www.w3.org/2002/07/owl#imports";
+
+    let (_dir, ds) = open();
+    ds.update(&format!(
+        "INSERT DATA {{ \
+            <http://ex.org/ont> <{owl_imports}> <{imp1}>, <{imp2}>, <{imp3}> . \
+            GRAPH <{imp1}> {{ <http://ex.org/a1> <http://ex.org/r> <http://ex.org/b1> }} \
+            GRAPH <{imp2}> {{ <http://ex.org/a2> <http://ex.org/r> <http://ex.org/b2> }} \
+            GRAPH <{imp3}> {{ <http://ex.org/a3> <http://ex.org/r> <http://ex.org/b3> }} \
+        }}"
+    ))
+    .unwrap();
+    let snap = ds.store().snapshot();
+    for iri in [&imp1, &imp2, &imp3] {
+        assert_eq!(snap.lookup_iri(iri).unwrap().tag(), Tag::Delta);
+    }
+    ds.set_query_reasoning(Some(QuerySetting {
+        profile: Some("rules".into()),
+        rules: Some("@prefix ex: <http://ex.org/> . [derive: (?x ex:p ?y) -> (?x ex:q ?y)]".into()),
+        inputs: Some(
+            serde_json::to_value(Inputs {
+                data_graphs: vec![GraphRef::Default],
+                imports: ImportMode::Dataset,
+                ..Default::default()
+            })
+            .unwrap(),
+        ),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    // Headroom fits the outer why-not session plus its inner verification session resolving
+    // one 64 KiB import name at a time, while excluding holding all three 64 KiB names live.
+    let cap = 176 * 1024;
+    assert!(cap < 3 * 65_536);
+
+    for (label, access) in [
+        ("unrestricted", None),
+        (
+            "restricted-all-imports",
+            only(&["default", &imp1, &imp2, &imp3]),
+        ),
+    ] {
+        let mut req = ExplainRequest::new([ex("s"), ex("q"), ex("o")]);
+        req.mode = ExplainMode::WhyNot;
+        req.max_missing = 1;
+        req.max_memory = Some(cap);
+        req.access = access;
+        let (result, alloc) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| caller_allocations::measure(|| ds.reasoning().explain(&req)))
+                .join()
+                .unwrap()
+        });
+        let ans = result.unwrap_or_else(|e| panic!("{label} public why-not failed: {e}"));
+        let Some(WhyNot::NotEntailed { hypotheses, .. }) = ans.why_not else {
+            panic!("{label} expected WhyNot::NotEntailed");
+        };
+        assert!(
+            !hypotheses.is_empty(),
+            "{label} expected a nonempty hypothesis to enter consistency checking"
+        );
+        assert!(
+            hypotheses.iter().all(|h| h.inconsistent.is_none()),
+            "{label} expected consistency checking to stop within budget, got {hypotheses:?}"
+        );
+        assert!(
+            alloc.peak < 3 * 65_536,
+            "{label} public why-not consistency pass buffered 64 KiB import names outside budget (peak={}, largest={}, cap={cap})",
+            alloc.peak,
+            alloc.largest
+        );
+    }
+
+    // When access denies all three 64 KiB imports, the demand session treats them as
+    // unresolved and must refuse before accumulating three 64 KiB retained warnings.
+    let mut denied_req = ExplainRequest::new([ex("s"), ex("q"), ex("o")]);
+    denied_req.mode = ExplainMode::WhyNot;
+    denied_req.max_missing = 1;
+    denied_req.max_memory = Some(cap);
+    denied_req.access = only(&["default"]);
+    let (result, alloc) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| caller_allocations::measure(|| ds.reasoning().explain(&denied_req)))
+            .join()
+            .unwrap()
+    });
+    let err = result.map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "restricted-default-only expected reasoning-budget on unresolved 64 KiB warnings, got {err:?}"
+    );
+    assert!(
+        alloc.peak < 3 * 65_536,
+        "restricted-default-only exceeded budget before refusing unresolved 64 KiB warnings (peak={}, largest={}, cap={cap})",
+        alloc.peak,
+        alloc.largest
+    );
+
+    // With sufficient budget, consistency checking still completes normally.
+    let mut uncapped = ExplainRequest::new([ex("s"), ex("q"), ex("o")]);
+    uncapped.mode = ExplainMode::WhyNot;
+    uncapped.max_missing = 1;
+    let ans = ds.reasoning().explain(&uncapped).unwrap();
+    let Some(WhyNot::NotEntailed { hypotheses, .. }) = ans.why_not else {
+        panic!("uncapped expected WhyNot::NotEntailed");
+    };
+    assert!(!hypotheses.is_empty());
+    assert!(
+        hypotheses.iter().all(|h| h.inconsistent == Some(false)),
+        "uncapped consistency checking should complete, got {hypotheses:?}"
+    );
+}
+
+#[test]
+fn exact_only_rdfs_access_includes_stored_default_graph_iri() {
+    use sparkles::reasoning::rdfs::NewSchema;
+
+    let (_dir, ds) = open();
+    ds.load_str(
+        "<http://ex.org/tom> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/Cat> <urn:x-arq:DefaultGraph> .\n",
+        RdfFormat::NQuads,
+    )
+    .unwrap();
+    let stored_id = ds
+        .store()
+        .snapshot()
+        .lookup_iri("urn:x-arq:DefaultGraph")
+        .expect("stored urn:x-arq:DefaultGraph graph must be interned");
+    assert_ne!(stored_id, sparkles_core::id::Id::DEFAULT_GRAPH);
+
+    ds.reasoning()
+        .rdfs()
+        .set(NewSchema::Triples(vec![oxrdf::Triple::new(
+            NamedNode::new("http://ex.org/Cat").unwrap(),
+            oxrdf::vocab::rdfs::SUB_CLASS_OF.into_owned(),
+            NamedNode::new("http://ex.org/Animal").unwrap(),
+        )]))
+        .unwrap();
+
+    for grant in ["default", "urn:x-arq:DefaultGraph"] {
+        let mut req = ExplainRequest::new([ex("tom"), ty(), ex("Animal")]);
+        req.access = only(&[grant]);
+        let ans = ds.reasoning().explain(&req).unwrap();
+        assert_eq!(
+            ans.source,
+            Some(ExplainSource::RdfsOnRead),
+            "grant {grant} should explain RDFS derivation from stored urn:x-arq:DefaultGraph"
+        );
+        assert_eq!(found(ans.explained).len(), 1);
+    }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
 fn demand_session_refuses_before_allocating_terms_table() {
     use sparkles::reasoning::{
         ReasonRequest,

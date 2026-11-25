@@ -62,6 +62,50 @@ fn reserve_term(term: &Term, next: &mut u64, ordinals: &mut u64) -> Result<()> {
     Ok(())
 }
 
+fn key_may_name_bnodes(key: &[u8]) -> bool {
+    match key.first() {
+        Some(b'(') => true,
+        Some(b'"') => {
+            let Some(sep) = key.iter().rposition(|&b| b == id::KEY_SEP) else {
+                return false;
+            };
+            let suffix = &key[sep + 1..];
+            if suffix.is_empty() || suffix[0] == b'@' {
+                return false;
+            }
+            let Ok(dt) = std::str::from_utf8(suffix) else {
+                return false;
+            };
+            crate::sparql::cdt::is_cdt(dt) && key[1..sep].windows(2).any(|w| w == b"_:")
+        }
+        _ => false,
+    }
+}
+
+fn copy_key_into(
+    copied: &Store,
+    transaction: &mut WriteTxn<'_>,
+    key: &[u8],
+    next_ordinal: &mut u64,
+) -> Result<Id> {
+    if key_may_name_bnodes(key) {
+        if copied.opts.max_memory_bytes.is_some() {
+            let decode_bytes = id::key_decode_bytes(key)?;
+            copied.check_memory(transaction.memory_size().saturating_add(decode_bytes))?;
+        }
+        let term = id::key_to_term(key);
+        crate::nesting::check_triple_term(&term)?;
+        reserve_term(&term, &mut transaction.guard.next_bnode, next_ordinal)?;
+    }
+    if let Some(existing) = transaction.lookup_key(key) {
+        return Ok(existing);
+    }
+    if copied.opts.max_memory_bytes.is_some() {
+        copied.check_memory(transaction.memory_size().saturating_add(key.len() as u64))?;
+    }
+    transaction.intern_key(key)
+}
+
 impl Store {
     /// Reserve an otherwise unused stored-blank range in an isolated memory family.
     /// Analysis callers share this range across their copies, without changing the
@@ -150,30 +194,74 @@ impl Store {
             if !keep(ids)? {
                 return Ok(());
             }
-            let quad = view
-                .quad_to_terms(ids)
-                .ok_or_else(|| Error::invalid("the simulated view contains an unknown term"))?;
-            for &id in ids {
-                reserve(id, &mut transaction.guard.next_bnode, &mut next_ordinal)?;
+            let mut copied_ids = [Id::UNDEF; 4];
+            for (pos, &id) in ids.iter().enumerate() {
+                copied_ids[pos] = if pos == 3 && id == Id::DEFAULT_GRAPH {
+                    Id::DEFAULT_GRAPH
+                } else {
+                    match id.tag() {
+                        crate::id::Tag::Bool
+                        | crate::id::Tag::Int
+                        | crate::id::Tag::Double
+                        | crate::id::Tag::Decimal
+                        | crate::id::Tag::DateTime
+                        | crate::id::Tag::Date => id,
+                        crate::id::Tag::BNode => {
+                            reserve(id, &mut transaction.guard.next_bnode, &mut next_ordinal)?;
+                            id
+                        }
+                        crate::id::Tag::Delta => view.generation.dvocab.with(|v| {
+                            let key = v.get(id.payload()).ok_or_else(|| {
+                                Error::invalid("the simulated view contains an unknown term")
+                            })?;
+                            copy_key_into(&copied, &mut transaction, key, &mut next_ordinal)
+                        })?,
+                        crate::id::Tag::Vocab => {
+                            let base_mem = transaction.memory_size();
+                            view.generation
+                                .vocab
+                                .get_with_controlled_capacity_checked(
+                                    id.payload(),
+                                    |old, new| {
+                                        if copied.opts.max_memory_bytes.is_some() {
+                                            copied
+                                                .check_memory(base_mem.saturating_add(
+                                                    old.saturating_add(new) as u64,
+                                                ))?;
+                                        }
+                                        Ok(())
+                                    },
+                                    |cap| {
+                                        if copied.opts.max_memory_bytes.is_some() {
+                                            copied.check_memory(
+                                                base_mem.saturating_add(cap as u64),
+                                            )?;
+                                        }
+                                        Ok(())
+                                    },
+                                    |_| control.check(),
+                                    |key| {
+                                        copy_key_into(
+                                            &copied,
+                                            &mut transaction,
+                                            key,
+                                            &mut next_ordinal,
+                                        )
+                                    },
+                                )?
+                                .ok_or_else(|| {
+                                    Error::invalid("the simulated view contains an unknown term")
+                                })?
+                        }
+                        _ => {
+                            return Err(Error::invalid(
+                                "the simulated view contains an unknown term",
+                            ));
+                        }
+                    }
+                };
             }
-            reserve_term(
-                &quad.object,
-                &mut transaction.guard.next_bnode,
-                &mut next_ordinal,
-            )?;
-            let subject = match quad.subject {
-                NamedOrBlankNode::NamedNode(node) => Term::NamedNode(node),
-                NamedOrBlankNode::BlankNode(node) => Term::BlankNode(node),
-            };
-            let s = transaction.intern(&subject)?;
-            let p = transaction.intern(&Term::NamedNode(quad.predicate))?;
-            let o = transaction.intern(&quad.object)?;
-            let g = match quad.graph_name {
-                GraphName::DefaultGraph => Id::DEFAULT_GRAPH,
-                GraphName::NamedNode(node) => transaction.intern(&Term::NamedNode(node))?,
-                GraphName::BlankNode(node) => transaction.intern(&Term::BlankNode(node))?,
-            };
-            transaction.insert([s, p, o, g])?;
+            transaction.insert(copied_ids)?;
             transaction.check_storage()?;
             Ok(())
         })?;

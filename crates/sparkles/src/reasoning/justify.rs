@@ -385,8 +385,10 @@ fn finding_support(
     probe: Option<Term>,
 ) -> Result<JustifiedTarget> {
     let view = analysis::view(&snapshot, options)?;
-    let graphs = analysis::input_graphs(&view, &program, options);
+    let (graphs, graphs_bytes) =
+        analysis::input_graphs_controlled(&view, &program, options, control, options.max_memory)?;
     let mut bytes = 0;
+    hold(options.max_memory, &mut bytes, graphs_bytes)?;
     let mut quads = Vec::new();
     view.for_each_quad(|quad| {
         control.check()?;
@@ -493,13 +495,16 @@ fn class_support(
     request: &JustifyRequest,
 ) -> Result<JustifiedTarget> {
     let view = analysis::view(snapshot, options)?;
-    let graphs = analysis::input_graphs(&view, program, options);
+    let (graphs, graphs_bytes) =
+        analysis::input_graphs_controlled(&view, program, options, control, options.max_memory)?;
     let copy = dataset
         .store()
         .copy_view_to_memory(
             &view,
             crate::store::StoreOptions {
-                max_memory_bytes: options.max_memory.map(|limit| (limit / 8) as u64),
+                max_memory_bytes: options
+                    .max_memory
+                    .map(|limit| (limit.saturating_sub(graphs_bytes) / 8) as u64),
                 result_cache_bytes: 0,
                 service_cache_bytes: 0,
                 ..Default::default()

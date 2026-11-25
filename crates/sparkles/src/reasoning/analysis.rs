@@ -199,25 +199,41 @@ pub(crate) fn view(snapshot: &Arc<Snapshot>, options: &AnalysisOptions) -> Resul
     }
 }
 
-pub(crate) fn input_graphs(
+pub(crate) fn input_graphs_controlled(
     snapshot: &Arc<Snapshot>,
     program: &AnalysisProgram,
     options: &AnalysisOptions,
-) -> Vec<crate::id::Id> {
+    control: &AnalysisControl,
+    max_memory: Option<usize>,
+) -> Result<(Vec<crate::id::Id>, usize)> {
     let bound = options
         .access
         .as_ref()
         .filter(|access| !access.reads_all())
         .map(|access| access.bound(snapshot));
-    let Some(bound) = bound else {
-        return sparkles_reasoner::inputs::resolve(snapshot, &program.inputs).ids(snapshot);
-    };
-    let readable = |graph: &sparkles_reasoner::inputs::GraphRef| match graph {
-        sparkles_reasoner::inputs::GraphRef::Default => bound.read.default_graph(),
-        sparkles_reasoner::inputs::GraphRef::Named(iri) => bound.read.allows_named_iri(iri),
-    };
-    sparkles_reasoner::inputs::resolve_readable_iri(snapshot, &program.inputs, &readable)
-        .readable_ids(snapshot, &readable)
+    let mut check = || control.check().map_err(anyhow::Error::new);
+    sparkles_reasoner::inputs::resolve_ids_controlled(
+        snapshot,
+        &program.inputs,
+        bound.as_deref(),
+        max_memory,
+        &mut check,
+    )
+    .map_err(|error| materialization_error(control, error))
+}
+
+pub(crate) fn graph_refs_controlled(
+    snapshot: &Snapshot,
+    graphs: &[crate::id::Id],
+    extra: &[sparkles_reasoner::GraphRef],
+    max_memory: Option<usize>,
+    control: &AnalysisControl,
+) -> Result<(Vec<sparkles_reasoner::GraphRef>, usize)> {
+    let mut check = || control.check().map_err(anyhow::Error::new);
+    sparkles_reasoner::inputs::graph_refs_controlled(
+        snapshot, graphs, extra, max_memory, &mut check,
+    )
+    .map_err(|error| materialization_error(control, error))
 }
 
 pub(crate) type Facts = std::collections::BTreeMap<String, [oxrdf::Term; 3]>;
@@ -282,8 +298,6 @@ pub(crate) fn stored(
     .map_err(|error| materialization_error(control, error))?;
     let summary_complete = typings.is_some();
     let typings = typings.unwrap_or_default();
-    let graphs = input_graphs(snapshot, program, options);
-    let inferred = snapshot.lookup_iri(super::INFERRED_GRAPH);
     let mut asserted = Facts::new();
     let mut closure = Facts::new();
     let mut bytes = typings
@@ -294,6 +308,15 @@ pub(crate) fn stored(
         })
         .sum();
     hold(share, &mut bytes, 0)?;
+    let (graphs, graphs_bytes) = input_graphs_controlled(
+        snapshot,
+        program,
+        options,
+        control,
+        share.map(|limit| limit.saturating_sub(bytes)),
+    )?;
+    hold(share, &mut bytes, graphs_bytes)?;
+    let inferred = snapshot.lookup_iri(super::INFERRED_GRAPH);
     snapshot.for_each_quad(|quad| {
         control.check()?;
         let input = graphs.contains(&quad[3]);
@@ -316,17 +339,19 @@ pub(crate) fn stored(
         }
         Ok(())
     })?;
-    let mut names: Vec<_> = graphs
-        .iter()
-        .filter_map(|graph| {
-            if *graph == crate::id::Id::DEFAULT_GRAPH {
-                Some("default".to_string())
-            } else {
-                match snapshot.term(*graph) {
-                    Some(oxrdf::Term::NamedNode(node)) => Some(node.into_string()),
-                    _ => None,
-                }
-            }
+    let (graph_refs, names_bytes) = graph_refs_controlled(
+        snapshot,
+        &graphs,
+        &[],
+        share.map(|limit| limit.saturating_sub(bytes)),
+        control,
+    )?;
+    hold(share, &mut bytes, names_bytes)?;
+    let mut names: Vec<_> = graph_refs
+        .into_iter()
+        .map(|graph| match graph {
+            sparkles_reasoner::GraphRef::Default => "default".to_string(),
+            sparkles_reasoner::GraphRef::Named(name) => name,
         })
         .collect();
     if names.is_empty() {
@@ -431,11 +456,9 @@ fn analyze_with_cache_limit(
     checks: &[String],
     cache_limit: Option<usize>,
 ) -> Result<State> {
-    use crate::id::Id;
     use sparkles_reasoner::{GraphRef, ImportMode};
     control.check()?;
     let snapshot = view(snapshot, options)?;
-    let graphs = input_graphs(&snapshot, program, options);
     let available = options
         .max_memory
         .map(|limit| {
@@ -449,6 +472,8 @@ fn analyze_with_cache_limit(
     // The data copy, reasoner, diagnostic query and retained output each have a
     // separate share. Their overlapping lifetimes stay inside one request grant.
     let share = available.map(|bytes| bytes / 8);
+    let (graphs, graphs_bytes) =
+        input_graphs_controlled(&snapshot, program, options, control, share)?;
     let copied = dataset
         .store()
         .copy_view_to_memory(
@@ -500,6 +525,7 @@ fn analyze_with_cache_limit(
     let before = copied.store().snapshot();
     let mut asserted = Facts::new();
     let mut bytes = 0;
+    hold(share, &mut bytes, graphs_bytes)?;
     before.for_each_quad(|quad| {
         control.check()?;
         let triple = [
@@ -515,26 +541,28 @@ fn analyze_with_cache_limit(
         Ok(())
     })?;
     drop(before);
-    let mut selected: Vec<_> = graphs
-        .iter()
-        .filter_map(|graph| {
-            if *graph == Id::DEFAULT_GRAPH {
-                Some(GraphRef::Default)
-            } else {
-                match snapshot.term(*graph) {
-                    Some(oxrdf::Term::NamedNode(node)) => Some(GraphRef::Named(node.into_string())),
-                    _ => None,
-                }
-            }
-        })
-        .collect();
+    let (mut selected, selected_bytes) = graph_refs_controlled(
+        &snapshot,
+        &graphs,
+        &[],
+        share.map(|limit| limit.saturating_sub(bytes)),
+        control,
+    )?;
+    hold(share, &mut bytes, selected_bytes)?;
     if selected.is_empty() {
         selected.push(GraphRef::Default);
     }
-    let input_names: Vec<_> = selected
-        .iter()
-        .map(|graph| graph.as_str().to_string())
-        .collect();
+    let mut input_names = Vec::new();
+    for graph in &selected {
+        control.check()?;
+        let name = graph.as_str();
+        hold(
+            share,
+            &mut bytes,
+            std::mem::size_of::<String>() + name.len(),
+        )?;
+        input_names.push(name.to_string());
+    }
     let request = sparkles_reasoner::ReasonOptions {
         analysis: Some(context.clone()),
         inputs: Inputs {

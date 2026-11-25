@@ -2820,9 +2820,10 @@ mod partial_tests {
         // Zero literals so rank 0 is an IRI and the FSST IRI table trains directly.
         // Block 0: rdf:first/nil/rest/type + fillers so Terms::new_in_controlled succeeds
         //          without touching any 64 KiB block.
-        // Block 1: owl:a, 64 KiB owl:b{long}, owl:imports + fillers.
-        // Block 2: x:a, 64 KiB x:b{long}, x:g (named input graph), x:imp (imported graph) + fillers.
-        // Block 3+: z:* used by rules and target triple.
+        // Block 1: owl:a, 64 KiB owl:b{long}, owl:imports + owl:j* fillers.
+        // Block 2: short owl:r* fillers so owl:sameAs probes stay out of Block 1.
+        // Block 3: x:a, 64 KiB x:b{long}, x:g (named input graph), x:imp (imported graph) + fillers.
+        // Block 4+: z:* used by rules and target triple.
         let mut data = String::from(
             "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
              @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
@@ -2837,7 +2838,10 @@ mod partial_tests {
         }
         data.push_str(&format!(", owl:a, <http://www.w3.org/2002/07/owl#b{long}>"));
         for i in 0..(fc - 3) {
-            data.push_str(&format!(", <http://www.w3.org/2002/07/owl#z{i:02}>"));
+            data.push_str(&format!(", <http://www.w3.org/2002/07/owl#j{i:02}>"));
+        }
+        for i in 0..fc {
+            data.push_str(&format!(", <http://www.w3.org/2002/07/owl#r{i:02}>"));
         }
         data.push_str(&format!(", x:a, <http://x.org/b{long}>"));
         for i in 0..(fc - 4) {
@@ -2956,6 +2960,97 @@ mod partial_tests {
                 "{label} expected Cancelled"
             );
         }
+
+        // Empty readable input set: when access denies the sole configured default graph,
+        // the session must skip the owl:imports vocabulary probe rather than triggering
+        // the 64 KiB FSST block decode and refusing under the 48 KiB cap.
+        let import_inputs = crate::Inputs {
+            data_graphs: vec![crate::inputs::GraphRef::Default],
+            imports: crate::inputs::ImportMode::Dataset,
+            ..Default::default()
+        };
+        let reasoner = QueryReasoner::new(rules, &extras, import_inputs).unwrap();
+        let denied = Arc::new(sparkles_core::access::GraphAccess::graphs(
+            sparkles_core::access::Graphs::none(),
+            sparkles_core::access::Graphs::none(),
+        ));
+        let denied_input = DemandInput {
+            reasoner: &reasoner,
+            snap: snap.clone(),
+            readable: Some(denied),
+        };
+        let opts_48k = ExplainOptions {
+            max_memory: Some(48 * 1024),
+            ..Default::default()
+        };
+        let (session_res, peak, largest) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    crate::alloc_probe::peak_and_largest_of(|| {
+                        demand_session(&denied_input, &opts_48k, true).map(|_| ())
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(
+            largest < 65_536,
+            "denied default graph session probed 64 KiB owl:imports FSST block (peak={peak}, largest={largest})"
+        );
+        assert!(
+            session_res.is_ok(),
+            "denied default graph session should succeed under 48 KiB cap without probing owl:imports, got {session_res:?}"
+        );
+
+        let opts_60k = ExplainOptions {
+            max_memory: Some(60 * 1024),
+            ..Default::default()
+        };
+        let (res, peak, largest) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    crate::alloc_probe::peak_and_largest_of(|| {
+                        explain_demand(&denied_input, &[z("s"), z("q"), z("o")], &opts_60k)
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(
+            largest < 65_536,
+            "denied default graph demand probed 64 KiB owl:imports FSST block (peak={peak}, largest={largest})"
+        );
+        assert!(
+            matches!(res, Ok(Explained::NotFound)),
+            "denied default graph demand should return NotFound without probing owl:imports, got {res:?}"
+        );
+
+        let wn_opts = crate::whynot::WhyNotOptions {
+            explain: opts_48k,
+            ..Default::default()
+        };
+        let (res, peak, largest) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    crate::alloc_probe::peak_and_largest_of(|| {
+                        crate::whynot::why_not(
+                            &denied_input,
+                            &[z("s"), z("unrelated"), z("o")],
+                            &wn_opts,
+                        )
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(
+            largest < 65_536,
+            "denied default graph why-not probed 64 KiB owl:imports FSST block (peak={peak}, largest={largest})"
+        );
+        assert!(
+            matches!(res, Ok(crate::whynot::WhyNot::NotEntailed { .. })),
+            "denied default graph why-not should return NotEntailed without probing owl:imports, got {res:?}"
+        );
     }
 
     #[test]
