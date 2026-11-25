@@ -1378,11 +1378,14 @@ pub(super) fn auto_streaming_lease(
     ctx.check()?;
     // ASK pulls one row unless the planner runs its input whole (item 827).
     if kind == QueryKind::Ask {
-        if super::demand::whole_slice(node) || !cursor_open_fits(ctx, node, pattern, query, None)? {
-            return Ok((false, None));
-        }
+        // Cursor construction plans and validates EXISTS in operator order, under
+        // the opening charges. Auto can still fall back before pulling its first row.
+        let fits =
+            !super::demand::whole_slice(node) && cursor_open_fits(ctx, node, pattern, query)?;
+        return Ok((fits, None));
+    }
     // A SELECT expected to exceed the row budgets stays eager so the error precedes output.
-    } else if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
+    if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
         return Ok((false, None));
     }
     let admission = ctx.charge(0)?;
@@ -1400,12 +1403,10 @@ pub(super) fn auto_streaming_lease(
     // Declared after `admission` so on eager fallback, error, or unwind, cached plans
     // and structural metadata drop before `admission` releases its reservation.
     let mut clear_guard = ClearOnDrop { node, keep: false };
-    let admitted = if kind == QueryKind::Ask {
-        cursor_open_fits(ctx, node, pattern, query, Some(&admission))?
-    } else if spill_admitted(ctx, node, kind, Some(&admission))?
+    let admitted = if spill_admitted(ctx, node, kind, Some(&admission))?
         || memory_admitted(ctx, node, pattern, query, kind, options, Some(&admission))?
     {
-        cursor_open_fits(ctx, node, pattern, query, None)?
+        cursor_open_fits(ctx, node, pattern, query)?
     } else {
         let scanned = node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node);
         if !(scanned || grouped(ctx, node, Some(&admission))?) {
@@ -1445,9 +1446,8 @@ fn cursor_open_fits(
     node: &Node,
     pattern: Option<&spargebra::algebra::GraphPattern>,
     query: &str,
-    admission: Option<&super::ctx::Charge<'_>>,
 ) -> Result<bool> {
-    match cursor_open_bytes_with_admission(ctx, node, pattern, query, admission) {
+    match cursor_open_bytes(ctx, node, pattern, query) {
         Ok((_, open_peak)) => Ok(open_peak <= admission_room_bytes(ctx)),
         Err(Error::BudgetExceeded(_)) => Ok(false),
         Err(error) => Err(error),
@@ -1623,23 +1623,10 @@ fn cursor_open_bytes(
     pattern: Option<&spargebra::algebra::GraphPattern>,
     query: &str,
 ) -> Result<(u64, u64)> {
-    cursor_open_bytes_with_admission(ctx, node, pattern, query, None)
-}
-
-fn cursor_open_bytes_with_admission(
-    ctx: &Ctx,
-    node: &Node,
-    pattern: Option<&spargebra::algebra::GraphPattern>,
-    query: &str,
-    admission: Option<&super::ctx::Charge<'_>>,
-) -> Result<(u64, u64)> {
     let plan = plan_bytes(node).saturating_add((query.len() as u64).saturating_mul(16));
     let (var_retained, var_workspace) = Variables::estimate_bytes(ctx, pattern, &node.vars, query)?;
     let retained = plan.saturating_add(var_retained);
-    let transient = var_workspace.max(validation_clone_peak(
-        node,
-        admission.map(|held| (ctx, held)),
-    )?);
+    let transient = var_workspace.max(validation_clone_peak(node));
     Ok((retained, retained.saturating_add(transient)))
 }
 
@@ -3325,17 +3312,10 @@ fn cloned_plan_bytes(node: &Node) -> u64 {
         .saturating_add(node_count(node).saturating_mul(1024))
 }
 
-/// Peak temporary bytes `exists_streams` will reserve to clone cached `EXISTS` plans
-/// during cursor construction, accounting for nested clones live together on the stack.
-fn validation_clone_peak(
-    node: &Node,
-    planning: Option<(&Ctx, &super::ctx::Charge<'_>)>,
-) -> Result<u64> {
-    fn at(
-        node: &Node,
-        seen: &mut FxHashSet<usize>,
-        planning: Option<(&Ctx, &super::ctx::Charge<'_>)>,
-    ) -> Result<u64> {
+/// Peak temporary bytes `exists_streams` can reserve for plans cached during
+/// admission, accounting for nested clones live together on the stack.
+fn validation_clone_peak(node: &Node) -> u64 {
+    fn at(node: &Node, seen: &mut FxHashSet<usize>) -> u64 {
         let mut peak = 0u64;
         let mut specs = Vec::new();
         for expr in own_exprs(&node.kind) {
@@ -3345,41 +3325,24 @@ fn validation_clone_peak(
             if spec.plan_cache.strict().is_some() || !seen.insert(Arc::as_ptr(spec) as usize) {
                 continue;
             }
-            // Auto ASK does not check native streaming before estimating its opening
-            // costs, so it needs to prepare the plans that validation can copy.
-            let inner = if let Some((ctx, admission)) = planning {
-                match super::exists::unsubstituted_plan_with_admission(ctx, spec, Some(admission)) {
-                    Ok(inner) => Some(inner),
-                    Err(
-                        error @ (Error::BudgetExceeded(_)
-                        | Error::Cancelled
-                        | Error::Timeout
-                        | Error::Io(_)
-                        | Error::Corrupt(_)),
-                    ) => return Err(error),
-                    Err(_) => None,
-                }
-            } else {
-                spec.plan_cache.cached_plan()
-            };
-            if let Some(inner) = inner {
-                let nested = super::depth::guard_exists(|| at(&inner, seen, planning))?;
+            if let Some(inner) = spec.plan_cache.cached_plan() {
+                let nested = super::depth::guard_exists(|| at(&inner, seen));
                 peak = peak.max(cloned_plan_bytes(&inner).saturating_add(nested));
             }
         }
         match &node.kind {
-            Kind::OrderedTopK(top) => peak = peak.max(at(&top.fallback, seen, planning)?),
+            Kind::OrderedTopK(top) => peak = peak.max(at(&top.fallback, seen)),
             Kind::GraphBranches(branches) if let [branch] = branches.inputs.as_slice() => {
-                peak = peak.max(at(branch, seen, planning)?);
+                peak = peak.max(at(branch, seen));
             }
             _ => {}
         }
         for child in &node.children {
-            peak = peak.max(at(child, seen, planning)?);
+            peak = peak.max(at(child, seen));
         }
-        Ok(peak)
+        peak
     }
-    at(node, &mut FxHashSet::default(), planning)
+    at(node, &mut FxHashSet::default())
 }
 
 enum State {
@@ -9693,64 +9656,72 @@ mod retained_variable_tests {
             "ASK {{ <urn:s0> <urn:e0> ?v0 FILTER(IF(false, EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }}, false)) }}"
         );
         let ask_parsed = super::super::parse_query(&ask, None, &[]).unwrap();
-        let prepare_ask = |limit| {
-            let opts = QueryOptions {
-                max_memory_bytes: limit,
-                ..Default::default()
-            };
-            super::super::prepare_query(store.snapshot(), &ask_parsed, &opts, None, None).unwrap()
-        };
-        let roomy = prepare_ask(None);
+        let roomy = super::super::prepare_query(
+            store.snapshot(),
+            &ask_parsed,
+            &QueryOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!super::super::demand::whole_slice(&roomy.node));
-        assert!(
-            auto_streaming_lease(
-                &roomy.ctx,
-                &roomy.node,
-                Some(&roomy.pattern),
-                &ask,
-                roomy.kind,
-                &cursor,
-            )
-            .unwrap()
-            .0
-        );
+        let mut filter = &roomy.node;
+        while !matches!(filter.kind, Kind::Filter(_)) {
+            filter = &filter.children[0];
+        }
+        let mut specs = Vec::new();
+        for expr in own_exprs(&filter.kind) {
+            expr.exists_specs(&mut specs);
+        }
+        assert_eq!(specs.len(), 1);
+        super::super::exists::unsubstituted_plan(&roomy.ctx, specs[0]).unwrap();
         let (retained, opening) =
             cursor_open_bytes(&roomy.ctx, &roomy.node, Some(&roomy.pattern), &ask).unwrap();
         assert!(opening > retained);
         let clone_limit = roomy.ctx.live_bytes() + retained + (opening - retained) / 2;
-        let tight = prepare_ask(Some(clone_limit));
-        assert!(
-            cursor_open_fits(&tight.ctx, &tight.node, Some(&tight.pattern), &ask, None).unwrap()
-        );
-        assert!(
-            !auto_streaming_lease(
-                &tight.ctx,
-                &tight.node,
-                Some(&tight.pattern),
-                &ask,
-                tight.kind,
-                &cursor,
+        let opts = QueryOptions {
+            max_memory_bytes: Some(clone_limit),
+            ..Default::default()
+        };
+        let prepare_ask = |query| {
+            super::super::prepare_query(
+                store.snapshot(),
+                &ask_parsed,
+                &opts,
+                Some(Instant::now()),
+                Some((&cursor, query)),
             )
             .unwrap()
-            .0
-        );
-        assert_eq!(tight.ctx.live_bytes(), 0);
+        };
+        let tight = prepare_ask(&ask);
+        assert!(tight.ctx.streams(), "the fixed opening costs fit");
+        let levels = tight.plan_depth;
+        let error = from_prepared(
+            tight,
+            &ask_parsed,
+            &ask,
+            &opts,
+            &cursor,
+            Instant::now(),
+            0.0,
+            0.0,
+            levels,
+            QueryKind::Ask,
+        )
+        .err()
+        .expect("the EXISTS validation plan and its clone cannot fit together");
+        assert!(matches!(error, Error::BudgetExceeded(_)), "{error}");
+        let result = query_execution(store.snapshot(), &ask, &opts, &cursor, ExecutionMode::Auto)
+            .expect("Auto ASK must retry a memory refusal before pulling");
+        let QueryExecution::Eager(result) = result else {
+            panic!("expected eager ASK fallback");
+        };
+        assert!(!result.value());
 
         let padded = format!("{ask}\n#{}", "padding".repeat(1 << 16));
-        let tight = prepare_ask(Some(clone_limit));
+        let tight = prepare_ask(&padded);
         assert!((padded.len() as u64) * 16 > clone_limit);
-        assert!(
-            !auto_streaming_lease(
-                &tight.ctx,
-                &tight.node,
-                Some(&tight.pattern),
-                &padded,
-                tight.kind,
-                &cursor,
-            )
-            .unwrap()
-            .0
-        );
+        assert!(!tight.ctx.streams(), "the fixed opening costs do not fit");
     }
 
     #[test]
@@ -10122,6 +10093,181 @@ mod retained_variable_tests {
         assert_eq!(ctx.live_bytes(), 0);
         drop(ctx);
         assert_eq!(admit_pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_filter_preflight_refuses_wide_stored_term_before_decoding() {
+        use crate::id::Tag;
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let literal = "x".repeat(512 << 10);
+        store
+            .load(&[Source::from_bytes(
+                format!("<urn:s> <urn:p> \"{literal}\" .").into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let limit = 64 << 10;
+        let opts = QueryOptions {
+            max_memory_bytes: Some(limit),
+            ..Default::default()
+        };
+        let parsed = super::super::parse_query(
+            "SELECT ?s { ?s <urn:p> ?o FILTER EXISTS { ?s <urn:p> ?o } }",
+            None,
+            &[],
+        )
+        .unwrap();
+        let prepared =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let filter_node = &prepared.node.children[0];
+        let mut specs = Vec::new();
+        for expr in own_exprs(&filter_node.kind) {
+            expr.exists_specs(&mut specs);
+        }
+        let spec = specs[0];
+        let id = prepared
+            .ctx
+            .intern_term(&oxrdf::Literal::new_simple_literal(literal.as_str()).into());
+        assert!(matches!(id.tag(), Tag::Vocab | Tag::Delta));
+        assert!(!prepared.ctx.streams());
+        assert!(prepared.ctx.memory_remaining() < literal.len() as u64);
+        let expr = Expr::SameTerm(
+            Box::new(Expr::Var(prepared.ctx.var("o"))),
+            Box::new(Expr::Const(id)),
+        );
+        let held = prepared.ctx.charge(0).unwrap();
+        let planner =
+            super::super::plan::Planner::for_exists_with_charge(&prepared.ctx, spec, Some(&held));
+        let largest = crate::test_alloc::record_largest(|| {
+            let error = planner
+                .plan_filter_scratch(&filter_node.children[0], std::iter::once(&expr), false)
+                .err()
+                .expect("admission must refuse the wide stored term");
+            assert!(matches!(error, Error::BudgetExceeded(_)), "{error}");
+        });
+        assert!(
+            largest < literal.len(),
+            "preflight allocated {largest} bytes while sizing the description"
+        );
+        assert!(prepared.ctx.mem_peak() <= limit);
+    }
+
+    #[test]
+    fn deep_exists_auto_ask_open_skips_specs_after_strict_refusal() {
+        use super::super::exists::EXISTS_PLANS_BUILT;
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s> <urn:p> <urn:o> .".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let query = "ASK { ?s <urn:p> ?o
+            FILTER(IF(true, true,
+                EXISTS { SERVICE SILENT <urn:unused> { ?s <urn:p> ?o } }
+                || EXISTS { { ?s <urn:p> ?y FILTER(isIRI(?y)) } UNION { ?s <urn:q> ?y } }
+            )) }";
+        for mode in [ExecutionMode::Streaming, ExecutionMode::Auto] {
+            EXISTS_PLANS_BUILT.with(|n| n.set(0));
+            let execution = query_execution_with_plan(
+                store.snapshot(),
+                query,
+                &QueryOptions::default(),
+                &CursorOptions::default(),
+                mode,
+            )
+            .unwrap_or_else(|err| panic!("{mode:?}: {}", err.error));
+            let QueryExecution::Ask(result) = execution else {
+                panic!("{mode:?} should use the permissive ASK cursor");
+            };
+            assert!(result.value());
+            assert_eq!(
+                EXISTS_PLANS_BUILT.with(|n| n.get()),
+                1,
+                "{mode:?} planned another EXISTS after the first strict refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_exists_auto_refusal_releases_sample_workspace() {
+        use super::super::exists::EXISTS_PLANS_BUILT;
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s> <urn:p> <urn:o> .\n<urn:o> <urn:q> 7 .".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let var = format!("?v{}", "x".repeat(2_048));
+        let query = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:p> ?o FILTER EXISTS {{
+                ?o <urn:q> {var} FILTER(isLITERAL({var}))
+            }} }}"
+        );
+        let parsed = super::super::parse_query(&query, None, &[]).unwrap();
+        let limit = 2 << 20;
+        let opts = QueryOptions {
+            max_memory_bytes: Some(limit),
+            ..Default::default()
+        };
+        let prepare =
+            || super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let control = prepare();
+        fn spec(node: &Node) -> &super::super::expr::ExistsSpec {
+            let mut specs = Vec::new();
+            for expr in own_exprs(&node.kind) {
+                expr.exists_specs(&mut specs);
+            }
+            match specs.as_slice() {
+                [spec] => spec,
+                [] if node.children.len() == 1 => spec(&node.children[0]),
+                _ => panic!("expected one EXISTS"),
+            }
+        }
+        super::super::exists::unsubstituted_plan(&control.ctx, spec(&control.node)).unwrap();
+        assert!(
+            control.ctx.has_sampled(),
+            "ordinary planning must sample the FILTER"
+        );
+        drop(control);
+
+        let mut prepared = prepare();
+        let mut group = &mut prepared.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        let padded = format!("{query}\n#{}", "padding".repeat(32_000));
+        assert!(padded.len() as u64 * 16 > limit);
+        assert!(!prepared.ctx.has_sampled());
+        let baseline = prepared.ctx.live_bytes();
+        EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        let (streamed, lease) = auto_streaming_lease(
+            &prepared.ctx,
+            &prepared.node,
+            Some(&prepared.pattern),
+            &padded,
+            prepared.kind,
+            &CursorOptions::default(),
+        )
+        .unwrap();
+        assert!(!streamed && lease.is_none());
+        assert_eq!(EXISTS_PLANS_BUILT.with(|n| n.get()), 1);
+        assert!(!spec(&prepared.node).plan_cache.has_cached_plan());
+        assert_eq!(prepared.ctx.live_bytes(), baseline);
+        assert!(!prepared.ctx.has_sampled());
     }
 
     #[test]

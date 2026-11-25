@@ -525,11 +525,11 @@ pub(super) fn unsubstituted_plan_with_admission(
         n.set(next);
         next
     });
-    let node = Planner::for_exists_with_charge(ctx, spec, Some(&plan_guard)).plan(
-        spec.pattern(),
-        &spec.graph,
-        Vec::new(),
-    )?;
+    let mut planner = Planner::for_exists_with_charge(ctx, spec, Some(&plan_guard));
+    // A discarded plan must leave no sample text or credit in the query context.
+    // Sampling also evaluates expressions, so leave it to non-speculative planning.
+    planner.sample_filters &= admission.is_none();
+    let node = planner.plan(spec.pattern(), &spec.graph, Vec::new())?;
     super::depth::check_plan(node.depth())?;
     let bytes = super::cursor::plan_bytes(&node);
     let node = Arc::new(node);

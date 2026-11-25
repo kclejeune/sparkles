@@ -999,6 +999,7 @@ pub struct Planner<'a> {
     /// Live planning charge for speculative EXISTS planning so ordinary VALUES tables and
     /// unattached nested EXISTS syntax reserve memory before allocating.
     plan_charge: Option<&'a super::ctx::Charge<'a>>,
+    pub(super) sample_filters: bool,
 }
 
 #[cfg(test)]
@@ -1067,6 +1068,7 @@ impl<'a> Planner<'a> {
             seen: Default::default(),
             source_counts: Default::default(),
             plan_charge: None,
+            sample_filters: ctx.opt.sampled_filters,
         }
     }
 
@@ -4557,7 +4559,7 @@ impl<'a> Planner<'a> {
             }
             leaves.push(options);
         }
-        if self.ctx.opt.sampled_filters && !filters.is_empty() {
+        if self.sample_filters && !filters.is_empty() {
             super::sample::prepare(self.ctx, &leaves, &filters, self.plan_charge);
         }
         if self.ctx.opt.characteristic_sets {
@@ -6779,19 +6781,6 @@ fn filter_binds(f: &Expr, constant: bool, contains: impl Fn(VarId) -> bool) -> b
         && (constant || any)
 }
 
-pub(super) fn description_bytes(expr: &Expr, ctx: &Ctx) -> usize {
-    struct Count(usize);
-    impl std::fmt::Write for Count {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            self.0 = self.0.saturating_add(s.len());
-            Ok(())
-        }
-    }
-    let mut text = Count(0);
-    let _ = expr.write_description(ctx, &mut text);
-    text.0
-}
-
 /// The most that [`filter`] of `n` under `exprs` allocates at once, counting what the
 /// FILTER keeps but not what it keeps of `n`, and the copies of `exprs` when `copies`.
 /// Moving range conjuncts into a scan of `n` splits the filters into their conjuncts,
@@ -6812,7 +6801,7 @@ pub(super) fn filter_bound<'e>(
         conjuncts = conjuncts.saturating_add(e.conjunct_count());
         text = text
             .saturating_add(8)
-            .saturating_add(description_bytes(e, ctx));
+            .saturating_add(e.description_bytes(ctx)?);
         let mut occurrences = 0usize;
         let _ = e.visit_vars(&mut |_| {
             occurrences += 1;

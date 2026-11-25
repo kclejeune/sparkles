@@ -1990,7 +1990,14 @@ cached `Arc<Node>` remains live. Once a key set consumes its structural admissio
 or transitions to `State::Built` or `State::Rejected`, `PlanCache` drops the cached plan,
 metadata, and retained charges. When automatic admission keeps a query eager or aborts on
 error, `clear_cached_plans` drops all cached plans and structural admission metadata
-before the admission reservation releases.
+before the admission reservation releases. Speculative EXISTS planning uses selectivities
+already recorded in the query context and the standard estimates for the remaining filters.
+Ordinary planning can evaluate and record new samples.
+
+Automatic ASK checks the fixed opening costs before attempting to build a cursor. The
+cursor plans and strictly validates EXISTS in operator order under the opening charges.
+It stops at the first strict refusal for an operator. A memory refusal during opening
+can retry eagerly before any row is pulled, using the original deadline.
 
 Query preparation installs the `started`-anchored deadline before automatic admission,
 and automatic admission, state estimation, strict validation, and key-set admission all

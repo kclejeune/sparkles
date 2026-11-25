@@ -843,11 +843,60 @@ impl Expr {
         text
     }
 
-    /// The same rendering for ordinary strings and admitted diagnostic buffers.
-    pub(super) fn write_description(
+    /// Count the rendered bytes without allocating the description. Dictionary
+    /// reconstruction and each temporary term must fit before they are decoded.
+    pub(super) fn description_bytes(&self, ctx: &Ctx) -> Result<usize> {
+        use std::fmt::Write;
+
+        struct Count(usize);
+        impl Write for Count {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0 = self.0.saturating_add(s.len());
+                Ok(())
+            }
+        }
+        let mut text = Count(0);
+        let mut error = None;
+        let written = self.write_description_with(ctx, &mut text, &mut |id, text| {
+            let rendered = (|| {
+                let scratch = ctx.charge(0)?;
+                let term = ctx.covered_batch_term(id, |bytes| scratch.add(bytes))?;
+                Ok(match term {
+                    Some(term) => write!(text, "{term}"),
+                    None => text.write_str("UNDEF"),
+                })
+            })();
+            match rendered {
+                Ok(written) => written,
+                Err(e) => {
+                    error = Some(e);
+                    Err(std::fmt::Error)
+                }
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        written.expect("counting filter description bytes");
+        Ok(text.0)
+    }
+
+    pub(super) fn write_description<W: std::fmt::Write + ?Sized>(
         &self,
         ctx: &Ctx,
-        text: &mut (impl std::fmt::Write + ?Sized),
+        text: &mut W,
+    ) -> std::fmt::Result {
+        self.write_description_with(ctx, text, &mut |id, text| match ctx.term(id) {
+            Some(term) => write!(text, "{term}"),
+            None => text.write_str("UNDEF"),
+        })
+    }
+
+    fn write_description_with<W: std::fmt::Write + ?Sized>(
+        &self,
+        ctx: &Ctx,
+        text: &mut W,
+        term: &mut impl FnMut(Id, &mut W) -> std::fmt::Result,
     ) -> std::fmt::Result {
         fn binary<W: std::fmt::Write + ?Sized>(
             ctx: &Ctx,
@@ -855,24 +904,26 @@ impl Expr {
             a: &Expr,
             op: &str,
             b: &Expr,
+            term: &mut impl FnMut(Id, &mut W) -> std::fmt::Result,
         ) -> std::fmt::Result {
             text.write_char('(')?;
-            a.write_description(ctx, text)?;
+            a.write_description_with(ctx, text, term)?;
             write!(text, " {op} ")?;
-            b.write_description(ctx, text)?;
+            b.write_description_with(ctx, text, term)?;
             text.write_char(')')
         }
         fn arguments<W: std::fmt::Write + ?Sized>(
             ctx: &Ctx,
             text: &mut W,
             args: &[Expr],
+            term: &mut impl FnMut(Id, &mut W) -> std::fmt::Result,
         ) -> std::fmt::Result {
             text.write_char('(')?;
             for (index, arg) in args.iter().enumerate() {
                 if index > 0 {
                     text.write_str(", ")?;
                 }
-                arg.write_description(ctx, text)?;
+                arg.write_description_with(ctx, text, term)?;
             }
             text.write_char(')')
         }
@@ -887,14 +938,11 @@ impl Expr {
         }
 
         match self {
-            Expr::Const(id) | Expr::Lit(id, _) => match ctx.term(*id) {
-                Some(term) => write!(text, "{term}"),
-                None => text.write_str("UNDEF"),
-            },
+            Expr::Const(id) | Expr::Lit(id, _) => term(*id, text),
             Expr::Var(var) => write!(text, "?{}", ctx.var_names.read()[*var as usize]),
-            Expr::Or(a, b) => binary(ctx, text, a, "||", b),
-            Expr::And(a, b) => binary(ctx, text, a, "&&", b),
-            Expr::Eq(a, b) => binary(ctx, text, a, "=", b),
+            Expr::Or(a, b) => binary(ctx, text, a, "||", b, term),
+            Expr::And(a, b) => binary(ctx, text, a, "&&", b, term),
+            Expr::Eq(a, b) => binary(ctx, text, a, "=", b, term),
             Expr::Cmp(a, b, op) => binary(
                 ctx,
                 text,
@@ -906,6 +954,7 @@ impl Expr {
                     CmpOp::Ge => ">=",
                 },
                 b,
+                term,
             ),
             Expr::Arith(a, b, op) => binary(
                 ctx,
@@ -918,39 +967,40 @@ impl Expr {
                     ArithOp::Div => "/",
                 },
                 b,
+                term,
             ),
             Expr::Not(a) => {
                 text.write_char('!')?;
-                a.write_description(ctx, text)
+                a.write_description_with(ctx, text, term)
             }
             Expr::Neg(a) => {
                 text.write_char('-')?;
-                a.write_description(ctx, text)
+                a.write_description_with(ctx, text, term)
             }
-            Expr::Pos(a) => a.write_description(ctx, text),
+            Expr::Pos(a) => a.write_description_with(ctx, text, term),
             Expr::Bound(var) => write!(text, "BOUND(?{})", ctx.var_names.read()[*var as usize]),
             Expr::Exists(_) => text.write_str("EXISTS{…}"),
             Expr::SameTerm(a, b) => {
                 text.write_str("sameTerm")?;
-                binary(ctx, text, a, ",", b)
+                binary(ctx, text, a, ",", b, term)
             }
             Expr::In(a, list) => {
-                a.write_description(ctx, text)?;
+                a.write_description_with(ctx, text, term)?;
                 text.write_str(" IN ")?;
-                arguments(ctx, text, list)
+                arguments(ctx, text, list, term)
             }
             Expr::If(a, b, c) => {
                 text.write_str("IF(")?;
-                a.write_description(ctx, text)?;
+                a.write_description_with(ctx, text, term)?;
                 text.write_str(", ")?;
-                b.write_description(ctx, text)?;
+                b.write_description_with(ctx, text, term)?;
                 text.write_str(", ")?;
-                c.write_description(ctx, text)?;
+                c.write_description_with(ctx, text, term)?;
                 text.write_char(')')
             }
             Expr::Coalesce(args) => {
                 text.write_str("COALESCE")?;
-                arguments(ctx, text, args)
+                arguments(ctx, text, args, term)
             }
             Expr::Call(function, args) => {
                 match function {
@@ -964,7 +1014,7 @@ impl Expr {
                     )?,
                     Func::Ext(iri) => write!(text, "<{iri}>")?,
                 }
-                arguments(ctx, text, args)
+                arguments(ctx, text, args, term)
             }
         }
     }

@@ -803,7 +803,21 @@ mod on {
     }
 
     fn mentions(e: &Expr, v: VarId) -> bool {
-        e.var_set().contains(&v)
+        e.visit_vars(&mut |found| if found == v { Err(()) } else { Ok(()) })
+            .is_err()
+    }
+
+    #[test]
+    fn spatial_conjunct_borrows_filter_variables() {
+        let expr = Expr::Call(
+            Func::Ext(format!("{}sfIntersects", vocab::GEOF)),
+            vec![Expr::Coalesce((0..4096).map(Expr::Var).collect())],
+        );
+        let largest = crate::test_alloc::record_largest(|| {
+            assert!(spatial_conjunct(&expr, 0));
+            assert!(!spatial_conjunct(&expr, 4096));
+        });
+        assert_eq!(largest, 0);
     }
 
     /// The constant geometry of an argument (a literal or a constant expression).

@@ -804,7 +804,7 @@ impl<'a> Group<'a> {
                 }
                 (None, true) => {
                     let _text = pl.plan_scratch(|layout| {
-                        layout.add(plan::description_bytes(f, ctx).saturating_mul(3).max(8))
+                        layout.add(f.description_bytes(ctx)?.saturating_mul(3).max(8))
                     })?;
                     ctx.sampled(&f.display(ctx)).map(|s| s.sel)
                 }

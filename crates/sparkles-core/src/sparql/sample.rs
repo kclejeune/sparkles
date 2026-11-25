@@ -113,7 +113,9 @@ pub(super) fn prepare(
         let Some(spec) = spec else { continue };
         let scratch = budget.map(Charge::part);
         if let Some(held) = &scratch {
-            let text = super::plan::description_bytes(f, ctx);
+            let Ok(text) = f.description_bytes(ctx) else {
+                continue;
+            };
             let names = {
                 let names = ctx.var_names.read();
                 vars.iter().map(|&v| names[v as usize].len()).sum::<usize>()
