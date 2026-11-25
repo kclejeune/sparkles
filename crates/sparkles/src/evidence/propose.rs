@@ -1071,8 +1071,12 @@ impl OperationStores {
         };
         for store in self.all_stores() {
             control.check()?;
-            let Ok(ranges) = store.published_history_ranges(&preparation, READS_BYTES) else {
-                return Ok(true);
+            let ranges = match store.published_history_ranges(&preparation, READS_BYTES) {
+                Ok(ranges) => ranges,
+                Err(_) => {
+                    control.check()?;
+                    return Ok(true);
+                }
             };
             for (first, last) in ranges {
                 if remaining == 0 {
@@ -1083,19 +1087,29 @@ impl OperationStores {
                 query.from = Some(HistoryBound::Commit(first.saturating_add(1)));
                 query.to = Some(HistoryBound::Commit(last));
                 query.limit = remaining;
-                let changes = (first < last)
-                    .then(|| {
-                        if no_wait {
-                            store.try_published_history_changes(&query)
-                        } else {
-                            store.published_history_changes(&query)
+                let changes = if first < last {
+                    let result = if no_wait {
+                        store.try_published_history_changes(&query)
+                    } else {
+                        store.published_history_changes(&query)
+                    };
+                    match result {
+                        Ok(result)
+                            if !result.truncated
+                                && result.unrecorded.is_empty()
+                                && result.to == last =>
+                        {
+                            Some(result)
                         }
-                        .ok()
-                    })
-                    .flatten()
-                    .filter(|result| {
-                        !result.truncated && result.unrecorded.is_empty() && result.to == last
-                    });
+                        Ok(_) => None,
+                        Err(_) => {
+                            control.check()?;
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let mut states: Box<dyn Iterator<Item = u64>> = match changes.as_ref() {
                     Some(changes) => {
                         let mut commits: Vec<_> = changes
@@ -1113,15 +1127,24 @@ impl OperationStores {
                     remaining -= 1;
                     match store.snapshot_at_published(seq, &preparation, READS_BYTES) {
                         Ok(snap) => {
-                            if Reads::new(&preparation, &snap)
-                                .describes_hold(op, target, commits)?
+                            store.failpoint("evidence-reconcile-historical-read");
+                            match Reads::new(&preparation, &snap)
+                                .describes_hold(op, target, commits)
                             {
-                                return Ok(true);
+                                Ok(true) => return Ok(true),
+                                Ok(false) => {}
+                                Err(_) => {
+                                    control.check()?;
+                                    return Ok(true);
+                                }
                             }
                         }
                         // Without the first state, a complete log still cannot
                         // establish which operation descriptions were inherited.
-                        Err(_) => return Ok(true),
+                        Err(_) => {
+                            control.check()?;
+                            return Ok(true);
+                        }
                     }
                 }
                 if states.next().is_some() {

@@ -2750,3 +2750,205 @@ fn reconciliation_keeps_a_synced_receipt_after_unwind_and_process_exit() {
             .any(|hold| hold.id == id)
     );
 }
+
+#[test]
+fn reconciliation_keeps_foreign_hold_when_historical_read_exceeds_scan_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let origin = catalog.create("origin", &Default::default()).unwrap();
+    let target = catalog.create("target", &Default::default()).unwrap();
+    configured(&origin);
+    let fact = with_fact(&target);
+    let foreign_orphan = uuid::Uuid::from_u128(1);
+    let local_orphan = uuid::Uuid::from_u128(2);
+    evidence::acquire_hold_for(
+        &target,
+        foreign_orphan,
+        &[evidence::CommitRef {
+            branch_id: target.dataset_id(),
+            seq: fact,
+        }],
+        Some(origin.dataset_id()),
+    )
+    .unwrap();
+    evidence::acquire_hold(
+        &target,
+        local_orphan,
+        &[evidence::CommitRef {
+            branch_id: target.dataset_id(),
+            seq: fact,
+        }],
+    )
+    .unwrap();
+    origin.store().set_failpoint(
+        "evidence-reconcile-historical-read",
+        Some(Arc::new(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+        })),
+    );
+    let released = evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0);
+    origin
+        .store()
+        .set_failpoint("evidence-reconcile-historical-read", None);
+    let released =
+        released.expect("internal scan bound must keep the foreign hold without aborting");
+    assert_eq!(released, [local_orphan]);
+    let held: Vec<_> = evidence::holds(&target)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(held, [foreign_orphan]);
+}
+
+#[test]
+fn post_commit_reconciliation_cancels_during_historical_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let origin = catalog.create("origin", &Default::default()).unwrap();
+    let target = catalog.create("target", &Default::default()).unwrap();
+    configured(&origin);
+    let fact = with_fact(&target);
+    let foreign_orphan = uuid::Uuid::from_u128(1);
+    let local_orphan = uuid::Uuid::from_u128(2);
+    evidence::acquire_hold_for(
+        &target,
+        foreign_orphan,
+        &[evidence::CommitRef {
+            branch_id: target.dataset_id(),
+            seq: fact,
+        }],
+        Some(origin.dataset_id()),
+    )
+    .unwrap();
+    evidence::acquire_hold(
+        &target,
+        local_orphan,
+        &[evidence::CommitRef {
+            branch_id: target.dataset_id(),
+            seq: fact,
+        }],
+    )
+    .unwrap();
+    let future = target.store().head_commit().timestamp_ms + 2 * sparkles::holds::DEFAULT_GRACE_MS;
+    target.store().set_clock(Arc::new(move || future));
+
+    let control = Control::none();
+    let cancel = control.cancel.clone();
+    origin.store().set_failpoint(
+        "evidence-reconcile-historical-read",
+        Some(Arc::new(move |_| cancel.cancel())),
+    );
+    let proposed = evidence::propose(
+        Some(&catalog),
+        &origin,
+        &origin,
+        &batch_for_fact(&target, target.dataset_id(), fact),
+        &options(),
+        &mut |_, _| all(),
+        &control,
+    )
+    .unwrap();
+    origin
+        .store()
+        .set_failpoint("evidence-reconcile-historical-read", None);
+    assert!(proposed.committed);
+    assert!(matches!(control.check(), Err(sparkles::Error::Cancelled)));
+    let held: Vec<_> = evidence::holds(&target)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(held.len(), 3);
+    assert!(held.contains(&foreign_orphan));
+    assert!(held.contains(&local_orphan));
+    assert!(held.contains(&proposed.hold.unwrap()));
+}
+
+#[test]
+fn reconciliation_keeps_holds_when_an_expected_attachment_is_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin_loc = dir.path().join("origin-loc");
+    let copied_root = dir.path().join("copy");
+    let (origin_id, hold_id, orphan_id);
+    {
+        let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+        let origin = catalog
+            .attach(
+                "origin",
+                sparkles::catalog::Attach::Directory(origin_loc.clone()),
+            )
+            .unwrap();
+        let target = catalog.create("target", &Default::default()).unwrap();
+        configured(&origin);
+        copy_dataset(origin.store().root().unwrap(), &copied_root);
+        origin_id = origin.dataset_id();
+        let fact = with_fact(&target);
+        hold_id = evidence::propose(
+            Some(&catalog),
+            &origin,
+            &origin,
+            &batch_for_fact(&target, target.dataset_id(), fact),
+            &options(),
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap()
+        .hold
+        .unwrap();
+        orphan_id = uuid::Uuid::new_v4();
+        evidence::acquire_hold_for(
+            &target,
+            orphan_id,
+            &[evidence::CommitRef {
+                branch_id: target.dataset_id(),
+                seq: fact,
+            }],
+            Some(origin_id),
+        )
+        .unwrap();
+    }
+
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    assert!(catalog.opening().is_empty());
+    let target = catalog.get("target").unwrap();
+    let copy = catalog
+        .attach("copy", sparkles::catalog::Attach::Directory(copied_root))
+        .unwrap();
+    assert_eq!(copy.dataset_id(), origin_id);
+    assert!(!evidence::operation_recorded(&copy, hold_id, &Control::none()).unwrap());
+
+    catalog.expect("origin").unwrap();
+    assert!(catalog.is_expected("origin"));
+    let released = evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0).unwrap();
+    assert!(
+        released.is_empty(),
+        "released a hold while an expected startup attachment was still pending: {released:?}"
+    );
+    assert!(
+        evidence::holds(&target)
+            .unwrap()
+            .iter()
+            .any(|hold| hold.id == hold_id)
+    );
+
+    let origin = catalog
+        .attach_expected("origin", sparkles::catalog::Attach::Directory(origin_loc))
+        .unwrap();
+    assert!(!catalog.is_expected("origin"));
+    assert_eq!(origin.dataset_id(), origin_id);
+    assert!(evidence::operation_recorded(&origin, hold_id, &Control::none()).unwrap());
+
+    drop(copy);
+    assert!(catalog.delete("copy").unwrap());
+    let released = evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0).unwrap();
+    assert_eq!(released, [orphan_id]);
+    assert_eq!(
+        evidence::holds(&target)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect::<Vec<_>>(),
+        [hold_id]
+    );
+}

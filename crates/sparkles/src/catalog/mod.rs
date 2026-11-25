@@ -730,7 +730,8 @@ impl Catalog {
     }
 
     /// The open registry alone cannot prove uniqueness while a registered dataset
-    /// is closed or a management operation is changing its registration.
+    /// is closed, an expected startup attachment has not been attached yet, or a
+    /// management operation is changing registrations.
     pub(crate) fn try_pin_reconciliation(
         &self,
         target: &Dataset,
@@ -742,6 +743,11 @@ impl Catalog {
             return Ok(None);
         };
         let closed = self.inner.detached.try_lock().ok_or(Error::WriterBusy)?;
+        let expected = self.inner.expected.try_lock().ok_or(Error::WriterBusy)?;
+        if !expected.is_empty() {
+            return Ok(None);
+        }
+        drop(expected);
         let pin = ReconcileCatalogIdentities {
             open,
             closed,

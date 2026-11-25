@@ -9,7 +9,7 @@
 //! that catalog on the thread has released the lock.
 //!
 //! The lock order is the management lock, then `entries`, then `detached` or `refused`.
-//! The queue's mutex is a leaf that is never held while an operation runs.
+//! `expected` and the queue's mutex are leaves that are never held while an operation runs.
 
 use super::{Catalog, Inner};
 use crate::{Error, Result};
