@@ -1112,6 +1112,7 @@ impl Vocab {
     /// or the key before it is longer than [`PREV_KEY_BYTES`], and the caller reads that
     /// key on its own. The key before is copied to the stack before the walk overwrites
     /// it, which costs less than a second walk of the block.
+    #[cfg(test)]
     pub(crate) fn get_with_prev<T>(
         &self,
         id: u64,
@@ -1128,6 +1129,7 @@ impl Vocab {
         }
     }
 
+    #[cfg(test)]
     #[inline(always)]
     fn get_with_prev_at<const P: bool, T>(
         &self,

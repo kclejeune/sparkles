@@ -179,8 +179,9 @@ fn update_check_graph_id_propagates_memory_error_for_compacted_vocab_graph() {
 #[test]
 fn update_delete_insert_propagates_memory_error_on_decode_instead_of_dropping_quad() {
     // 4 KiB * 2 = 8 KiB local string from CONCAT:
-    // - WHERE interning (`retain_bytes(8194 + 96)`) fits easily inside 32 KiB.
-    // - Template `to_store` checked decode (`8 * 8194 + 128 = 65,680` bytes) exceeds 32 KiB.
+    // - WHERE decodes 4 KiB `?v` (envelope ~34 KiB) and interns 8 KiB `?out` (~8.3 KiB),
+    //   fitting inside 48 KiB.
+    // - Template `to_store` checked decode (`8 * 8194 + 128 = 65,680` bytes) exceeds 48 KiB.
     let big = "u".repeat(4 * 1024);
     let ttl = format!(
         "@prefix ex: <http://example.org/> .\n\
@@ -190,13 +191,13 @@ fn update_delete_insert_propagates_memory_error_on_decode_instead_of_dropping_qu
     let before = store.snapshot().len();
 
     let opts = QueryOptions {
-        max_memory_bytes: Some(32 * 1024),
+        max_memory_bytes: Some(48 * 1024),
         ..Default::default()
     };
     let where_select = "PREFIX ex: <http://example.org/> \
                         SELECT ?out WHERE { ex:s ex:p ?v . BIND(CONCAT(?v, ?v) AS ?out) }";
     let select_res = query(store.snapshot(), where_select, &opts)
-        .expect("WHERE clause must fit inside 32 KiB so UPDATE fails specifically in to_store");
+        .expect("WHERE clause must fit inside 48 KiB so UPDATE fails specifically in to_store");
     assert_eq!(select_res.len(), 1);
 
     let res = super::update::update(

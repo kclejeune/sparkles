@@ -45,7 +45,6 @@ struct Account {
     /// admitted high point, kept until the result drops. Under cursor accounting it
     /// follows `live` in steps of [`LIVE_STEP`] and never falls below it.
     eager: u64,
-    decode: u64,
     /// Nested contexts own actual upstream credit instead of charging their grant
     /// metadata again. Drop or split only after leaving the ledger lock.
     lease: Option<MemoryLease>,
@@ -230,7 +229,6 @@ impl QueryMemoryLedger {
                     owner: Arc::new(MemoryOwner { id: PRIMARY, grant }),
                     live,
                     eager,
-                    decode: 0,
                     lease: None,
                 }],
                 next: PRIMARY,
@@ -330,7 +328,6 @@ impl QueryMemoryLedger {
                 owner: owner.clone(),
                 live: 0,
                 eager: 0,
-                decode: 0,
                 lease,
             });
             drop(state);
@@ -397,7 +394,7 @@ impl QueryMemoryLedger {
             .iter_mut()
             .find(|a| a.owner.id == owner.id)
             .expect("exact child account");
-        assert!(account.exact && account.decode == 0);
+        assert!(account.exact);
         let next = account
             .live
             .checked_add(bytes)
@@ -434,14 +431,7 @@ impl QueryMemoryLedger {
             .owner
             .clone()
     }
-    fn admit(
-        &self,
-        state: &mut State,
-        owner: &MemoryOwner,
-        limit: u64,
-        bytes: u64,
-        decode: bool,
-    ) -> Result<()> {
+    fn admit(&self, state: &mut State, owner: &MemoryOwner, limit: u64, bytes: u64) -> Result<()> {
         let prior = self.live.load(Ordering::Relaxed);
         let live = prior
             .checked_add(bytes)
@@ -457,10 +447,6 @@ impl QueryMemoryLedger {
             .live
             .checked_add(bytes)
             .ok_or_else(|| memory(limit, u64::MAX))?;
-        let own_decode = account
-            .decode
-            .checked_add(if decode { bytes } else { 0 })
-            .ok_or_else(|| memory(limit, u64::MAX))?;
         if account.lease.is_some() {
             account.reserve_upstream(own_live).map_err(parent_error)?;
         } else if let Some(grant) = &owner.grant {
@@ -472,22 +458,15 @@ impl QueryMemoryLedger {
             }
         }
         account.live = own_live;
-        account.decode = own_decode;
         self.live.store(live, Ordering::Release);
         self.peak.fetch_max(live, Ordering::Relaxed);
         Ok(())
     }
-    pub(crate) fn reserve(
-        &self,
-        owner: &MemoryOwner,
-        limit: u64,
-        bytes: u64,
-        decode: bool,
-    ) -> Result<()> {
+    pub(crate) fn reserve(&self, owner: &MemoryOwner, limit: u64, bytes: u64) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
-        self.admit(&mut self.lock(), owner, limit, bytes, decode)
+        self.admit(&mut self.lock(), owner, limit, bytes)
     }
     /// A concrete mutable receiver adds an exact contribution alongside the
     /// executor's existing amortized allowance. Returning it cannot consume that
@@ -537,10 +516,7 @@ impl QueryMemoryLedger {
                 .iter_mut()
                 .find(|a| a.owner.id == id)
                 .expect("receiving owner");
-            assert!(
-                bytes <= account.live - account.decode,
-                "owned receiving bytes"
-            );
+            assert!(bytes <= account.live, "owned receiving bytes");
             account.live -= bytes;
             account.eager = account
                 .eager
@@ -553,24 +529,13 @@ impl QueryMemoryLedger {
         release.finish();
     }
 
-    fn release_locked(&self, state: &mut State, id: u64, bytes: u64, decode: bool) -> Release {
+    fn release_locked(&self, state: &mut State, id: u64, bytes: u64) -> Release {
         let cursor = state.cursor;
         let account = state
             .owners
             .iter_mut()
             .find(|a| a.owner.id == id)
             .expect("retained owner");
-        if decode {
-            account.decode = account
-                .decode
-                .checked_sub(bytes)
-                .expect("owned decode bytes");
-        } else {
-            assert!(
-                bytes <= account.live - account.decode,
-                "release only owned nondecode bytes"
-            );
-        }
         account.live = account.live.checked_sub(bytes).expect("owned live bytes");
         let live = self
             .live
@@ -597,7 +562,7 @@ impl QueryMemoryLedger {
     pub(crate) fn release(&self, id: u64, bytes: u64) {
         let release = {
             let mut state = self.lock();
-            self.release_locked(&mut state, id, bytes, false)
+            self.release_locked(&mut state, id, bytes)
         };
         release.finish();
     }
@@ -607,24 +572,6 @@ impl QueryMemoryLedger {
         let cursor = self.lock().cursor;
         if cursor && let Some(grant) = grant {
             grant.release(0);
-        }
-    }
-    pub(crate) fn release_decode(&self) {
-        // One original owner at a time; no allocation, grant wake or callback under lock.
-        loop {
-            let release = {
-                let mut state = self.lock();
-                let Some((id, bytes)) = state
-                    .owners
-                    .iter()
-                    .find(|a| a.decode != 0)
-                    .map(|a| (a.owner.id, a.decode))
-                else {
-                    break;
-                };
-                self.release_locked(&mut state, id, bytes, true)
-            };
-            release.finish();
         }
     }
     pub(crate) fn check_output(&self, owner: &MemoryOwner, limit: u64, bytes: u64) -> Result<()> {
@@ -828,13 +775,7 @@ impl QueryMemoryLedger {
             })
             .transpose()?;
         if bytes != 0 {
-            self.admit(
-                &mut state,
-                &service.owner,
-                service.query_limit,
-                bytes,
-                false,
-            )?;
+            self.admit(&mut state, &service.owner, service.query_limit, bytes)?;
         }
         service.used.store(next, Ordering::Relaxed);
         service.peak.fetch_max(next, Ordering::Relaxed);
@@ -880,7 +821,7 @@ impl QueryMemoryLedger {
                     .checked_sub(bytes)
                     .expect("frame owned bytes")
             });
-            let release = self.release_locked(&mut state, service.owner.id, bytes, false);
+            let release = self.release_locked(&mut state, service.owner.id, bytes);
             service.used.store(remaining, Ordering::Relaxed);
             if let (Some(frame), Some(next)) = (frame, residual) {
                 frame.store(next, Ordering::Relaxed);
@@ -975,7 +916,7 @@ impl QueryMemoryLease {
             }
         } else if bytes > self.bytes {
             self.ledger
-                .reserve(&self.owner, limit, bytes - self.bytes, false)?;
+                .reserve(&self.owner, limit, bytes - self.bytes)?;
         } else {
             self.ledger.release(self.owner.id, self.bytes - bytes);
         }
@@ -1030,7 +971,7 @@ mod tests {
         let ledger = QueryMemoryLedger::nested(None, parent);
         callback_ledger.set(Arc::downgrade(&ledger)).unwrap();
         let owner = ledger.owner(None).unwrap();
-        ledger.reserve(&owner, 256 << 10, 4096, false).unwrap();
+        ledger.reserve(&owner, 256 << 10, 4096).unwrap();
         let base = used.load(Ordering::Relaxed);
         ledger.reserve_receiving(&owner, 256 << 10, 8192).unwrap();
         assert_eq!(used.load(Ordering::Relaxed), base + 8192);

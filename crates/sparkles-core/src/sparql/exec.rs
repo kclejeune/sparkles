@@ -5018,11 +5018,7 @@ fn string_cross(
         if j.is_multiple_of(1024) {
             ctx.check()?;
         }
-        let key = with_string_lexical(ctx, id, |s| {
-            index_charge.add(s.len() as u64)?;
-            Ok(Box::<str>::from(s))
-        })?
-        .expect("proved string domain");
+        let key = string_lexical_boxed(ctx, id, &index_charge)?.expect("proved string domain");
         index.push((key, j));
     }
     // One array, no extra sort scratch. Including row numbers in the key keeps
@@ -5041,12 +5037,10 @@ fn string_cross(
         if i.is_multiple_of(1024) {
             ctx.check()?;
         }
-        with_string_lexical(ctx, id, |s| {
-            let (begin, end) = range(s);
-            rows = rows.saturating_add(end - begin);
-            ctx.check_output_rows(rows)
-        })?
-        .expect("proved string domain");
+        let (begin, end) =
+            with_string_lexical(ctx, id, |s| Ok(range(s)))?.expect("proved string domain");
+        rows = rows.saturating_add(end - begin);
+        ctx.check_output_rows(rows)?;
     }
     // Includes the pair array while the matching table is materialized, with all
     // lexical index payloads and the input tables still charged and alive.
@@ -5060,17 +5054,14 @@ fn string_cross(
         if i.is_multiple_of(1024) {
             ctx.check()?;
         }
-        with_string_lexical(ctx, id, |s| {
-            let (begin, end) = range(s);
-            for (_, j) in &index[begin..end] {
-                if pairs.len().is_multiple_of(1024) {
-                    ctx.check()?;
-                }
-                pairs.push((i as u32, *j as u32));
+        let (begin, end) =
+            with_string_lexical(ctx, id, |s| Ok(range(s)))?.expect("proved string domain");
+        for (_, j) in &index[begin..end] {
+            if pairs.len().is_multiple_of(1024) {
+                ctx.check()?;
             }
-            Ok(())
-        })?
-        .expect("proved string domain");
+            pairs.push((i as u32, *j as u32));
+        }
     }
     ctx.check()?;
     // Pair capacity is already live; admit only the output columns here.
@@ -5095,28 +5086,49 @@ fn string_lexical_key(key: &[u8]) -> Option<&str> {
     std::str::from_utf8(&key[1..sep]).ok()
 }
 
-/// Read a borrowed lexical key with the existing charged vocabulary scratch.
-/// Unlike Ctx::value this does not populate the eager decoded-value cache.
+/// Read a borrowed lexical key with controlled vocabulary scratch and live request
+/// controls. `f` must only inspect the borrowed string without calling `ctx.charge()`.
+/// Unlike `Ctx::value` this does not populate the eager decoded-value cache.
 fn with_string_lexical<T>(
     ctx: &Ctx,
     id: Id,
     mut f: impl FnMut(&str) -> Result<T>,
 ) -> Result<Option<T>> {
-    use crate::id::Tag;
-    let mut read = |key: &[u8]| match string_lexical_key(key) {
+    ctx.with_controlled_key(id, |key| match string_lexical_key(key) {
         Some(s) => f(s).map(Some),
         None => Ok(None),
-    };
+    })
+    .map(Option::flatten)
+}
+
+/// Copy one string lexical form into a boxed string, admitting its bytes onto `credit`
+/// before allocating and never calling `credit.add` while holding a delta or local lock.
+fn string_lexical_boxed(
+    ctx: &Ctx,
+    id: Id,
+    credit: &super::ctx::Charge<'_>,
+) -> Result<Option<Box<str>>> {
+    use crate::id::Tag;
+    ctx.check()?;
     match id.tag() {
         Tag::Vocab => ctx
-            .with_cursor_vocab_key(id.payload(), &mut read)?
-            .unwrap_or(Ok(None)),
-        Tag::Delta => ctx
-            .snap
-            .generation
-            .dvocab
-            .with(|v| v.get(id.payload()).map(&mut read).unwrap_or(Ok(None))),
-        Tag::Local => ctx.with_local_key(id.payload(), read).unwrap_or(Ok(None)),
+            .with_controlled_vocab_key(id.payload(), |key| {
+                let Some(s) = string_lexical_key(key) else {
+                    return Ok(None);
+                };
+                credit.add(s.len() as u64)?;
+                ctx.check()?;
+                Ok(Some(Box::<str>::from(s)))
+            })
+            .map(Option::flatten),
+        Tag::Delta | Tag::Local => {
+            let Some(len) = with_string_lexical(ctx, id, |s| Ok(s.len()))? else {
+                return Ok(None);
+            };
+            credit.add(len as u64)?;
+            ctx.check()?;
+            with_string_lexical(ctx, id, |s| Ok(Box::<str>::from(s)))
+        }
         _ => Ok(None),
     }
 }

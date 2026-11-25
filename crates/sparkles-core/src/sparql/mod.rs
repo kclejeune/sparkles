@@ -2696,6 +2696,8 @@ mod strfilter_tests;
 #[cfg(test)]
 mod strict_decode_tests;
 #[cfg(test)]
+mod strict_decode_w2_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

@@ -51,17 +51,7 @@ pub(super) fn eq_key(ctx: &Ctx, value: Id) -> Result<EqKey> {
         // whose term is unknown is left to the condition
         TermKind::Triple | TermKind::None => return Ok(EqKey::Loose),
     }
-    let classify = |key: &[u8]| literal_key(value, key);
-    let key = match value.tag() {
-        Tag::Vocab => ctx.with_cursor_vocab_key(value.payload(), classify)?,
-        Tag::Delta => ctx.snap.generation.dvocab.with(|v| {
-            (value.payload() < ctx.snap.dvocab_len)
-                .then(|| v.get(value.payload()).map(classify))
-                .flatten()
-        }),
-        Tag::Local => ctx.with_local_key(value.payload(), classify),
-        _ => None,
-    };
+    let key = ctx.with_controlled_key(value, |key| Ok(literal_key(value, key)))?;
     Ok(key.unwrap_or(EqKey::Loose))
 }
 

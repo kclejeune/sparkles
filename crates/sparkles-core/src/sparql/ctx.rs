@@ -1213,8 +1213,8 @@ impl ResourceRefusal {
 /// when it grows and released when the work ends (see [`Ctx::reserve_decode_checked`]).
 #[derive(Default)]
 struct DecodeEnvelope {
-    /// the reserved bytes, with the owner of an eager reservation
-    state: parking_lot::Mutex<(u64, Option<u64>)>,
+    /// the reserved bytes, with the `(owner, bytes)` charges backing the envelope
+    state: parking_lot::Mutex<(u64, Vec<(u64, u64)>)>,
     /// the reserved bytes, read without the lock
     reserved: AtomicU64,
 }
@@ -1855,9 +1855,9 @@ impl Ctx {
         }
     }
 
-    /// Whether the query streams through pull cursors. Both modes charge the same state,
-    /// so only the routing of a query, the accumulation of an EXISTS key set across
-    /// batches and whether a decoding envelope can refuse read it.
+    /// Whether the query streams through pull cursors. Both modes charge the same state
+    /// and refuse decode-envelope overflows alike, so only the routing of a query and the
+    /// accumulation of an EXISTS key set across batches read it.
     #[inline]
     pub(super) fn streams(&self) -> bool {
         self.accounting() == Accounting::Cursor
@@ -2007,18 +2007,22 @@ impl Ctx {
     fn release_decode_envelope(&self) {
         let envelope = &self.decode;
         let mut state = envelope.state.lock();
-        let (bytes, owner) = std::mem::take(&mut *state);
+        let (bytes, owners) = std::mem::take(&mut *state);
         envelope.reserved.store(0, Ordering::Release);
         drop(state);
         if bytes == 0 {
             return;
         }
-        match owner {
-            // An eager envelope is a charge of its own.
-            Some(owner) => self.release_live(Some(owner), bytes),
-            // A cursor's is decode bytes on the ledger.
-            None => self.memory().release_decode(),
+        for (owner, owned) in owners {
+            self.release_live(Some(owner), owned);
         }
+    }
+
+    /// Lightweight relaxed probe for latched fatal refusals on cold error paths.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline]
+    pub(crate) fn has_memory_failure(&self) -> bool {
+        self.memory_failure.failed.load(Ordering::Relaxed)
     }
 
     /// Fail with the refusal that infallible code recorded (see
@@ -2101,23 +2105,16 @@ impl Ctx {
         self.grow_decode(need)
     }
 
-    /// Whether the decode envelope can refuse a key before it is rebuilt. A cursor's
-    /// callers report a refusal through the next check, and eager callers cannot.
-    #[inline]
-    fn envelope_refuses(&self) -> bool {
-        self.streams()
-    }
-
     /// Whether a scoped strict-decode guard is active on this context (for example,
-    /// constant folding during planning), requiring eager decodes to refuse on budget
-    /// overflow and check live controls during vocabulary reconstruction.
+    /// constant folding during planning), requiring decodes to check live controls
+    /// during vocabulary reconstruction.
     #[inline]
     fn is_strict_decode(&self) -> bool {
         self.strict_decode.load(Ordering::Relaxed) != 0
     }
 
     /// Enable strict decoding for the lifetime of the returned guard so evaluator term
-    /// and value decodes propagate budget and control refusals even in eager mode.
+    /// and value decodes check live controls during vocabulary reconstruction.
     pub(super) fn strict_decode_guard(&self) -> StrictDecodeGuard<'_> {
         self.strict_decode.fetch_add(1, Ordering::AcqRel);
         StrictDecodeGuard { ctx: self }
@@ -2128,29 +2125,15 @@ impl Ctx {
     fn grow_decode(&self, need: u64) -> Result<()> {
         let envelope = &self.decode;
         let mut state = envelope.state.lock();
-        let (peak, owner) = &mut *state;
+        let (peak, owners) = &mut *state;
         if need > *peak {
-            // A cursor's callers of `term` and `value` report a refusal through the
-            // next check, so its envelope reserves on the ledger and can fail.
-            if self.envelope_refuses() {
-                let ledger = self.memory();
-                let account = ledger.owner(self.grant.as_ref())?;
-                ledger.reserve(&account, self.mem_limit, need - *peak, true)?;
-            } else {
-                // Eager callers of `term` and `value`, the planner's plan text and the
-                // readers of a finished result among them, cannot report a refusal. An
-                // eager envelope is therefore charged when the budget and the pool allow
-                // it, and otherwise the key is decoded without it, unless a scoped
-                // strict-decode guard is active. The next growth tries the charge again.
-                let charge = match self.charge(need - *peak) {
-                    Ok(charge) => charge,
-                    Err(error) if self.is_strict_decode() => return Err(error),
-                    Err(_) => return Ok(()),
-                };
-                let id = charge.disarm();
-                debug_assert!(owner.is_none() || id.is_none() || *owner == id);
-                if owner.is_none() {
-                    *owner = id;
+            let delta = need - *peak;
+            let charge = self.charge(delta)?;
+            if let Some(id) = charge.disarm() {
+                if let Some((_, owned)) = owners.iter_mut().find(|(owner, _)| *owner == id) {
+                    *owned += delta;
+                } else {
+                    owners.push((id, delta));
                 }
             }
             *peak = need;
@@ -2177,8 +2160,7 @@ impl Ctx {
     /// decoding inside the envelope. A refusal records a failure and gives `None`.
     #[inline]
     fn with_vocab_key<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
-        let strict = self.is_strict_decode();
-        if strict {
+        if self.is_strict_decode() {
             return match self.snap.generation.vocab.get_with_controlled(
                 id,
                 |need| self.reserve_decode_checked(need),
@@ -2191,18 +2173,6 @@ impl Ctx {
                     None
                 }
             };
-        }
-        if !self.envelope_refuses() {
-            // An envelope that never refuses is charged after the key is rebuilt, on the
-            // vocabulary's unchecked path. Checking it before each step of the rebuild
-            // made an eager `term` about a quarter slower, which writing a large answer
-            // term by term pays for every cell.
-            return self
-                .snap
-                .generation
-                .vocab
-                .get_with(id, |key| self.reserve_decode(key.len()).then(|| f(key)))
-                .flatten();
         }
         match self.snap.generation.vocab.get_with_checked(
             id,
@@ -2319,7 +2289,7 @@ impl Ctx {
     pub(super) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
         let ledger = self.memory();
         let owner = ledger.owner(self.grant.as_ref())?;
-        ledger.reserve(&owner, self.mem_limit, bytes, false)?;
+        ledger.reserve(&owner, self.mem_limit, bytes)?;
         Ok(QueryMemoryLease {
             ledger: ledger.clone(),
             owner,
@@ -2747,16 +2717,21 @@ impl Ctx {
                 }
                 let local = self.local.read();
                 let key = local.get(id.payload())?;
-                self.reserve_decode(key.len()).then(|| id::key_to_term(key))
+                self.reserve_decode(key.len())
+                    .then(|| copied_output_key(key))
             }
-            Tag::Vocab => self.with_vocab_key(id.payload(), id::key_to_term),
+            Tag::Vocab => self.with_vocab_key(id.payload(), copied_output_key),
             Tag::Delta => {
+                if id.payload() >= self.snap.dvocab_len {
+                    return None;
+                }
                 if self.is_strict_decode() && self.check().is_err() {
                     return None;
                 }
                 self.snap.generation.dvocab.with(|vocab| {
                     vocab.get(id.payload()).and_then(|key| {
-                        self.reserve_decode(key.len()).then(|| id::key_to_term(key))
+                        self.reserve_decode(key.len())
+                            .then(|| copied_output_key(key))
                     })
                 })
             }
@@ -2788,14 +2763,17 @@ impl Ctx {
                 };
                 credit.add(Self::checked_decode_bytes(len))?;
                 self.check()?;
-                Ok(self.local.read().get(id.payload()).map(id::key_to_term))
+                Ok(self.local.read().get(id.payload()).map(copied_output_key))
             }
             Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| {
                 credit.add(Self::checked_decode_bytes(key.len()))?;
                 self.check()?;
-                Ok(id::key_to_term(key))
+                Ok(copied_output_key(key))
             }),
             Tag::Delta => {
+                if id.payload() >= self.snap.dvocab_len {
+                    return Ok(None);
+                }
                 let len = self
                     .snap
                     .generation
@@ -2810,7 +2788,7 @@ impl Ctx {
                     .snap
                     .generation
                     .dvocab
-                    .with(|vocab| vocab.get(id.payload()).map(id::key_to_term)))
+                    .with(|vocab| vocab.get(id.payload()).map(copied_output_key)))
             }
             Tag::BNode => {
                 credit.add(Self::checked_decode_bytes(0))?;
@@ -2870,9 +2848,12 @@ impl Ctx {
                     Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| {
                         credit.add(Self::checked_decode_bytes(key.len()))?;
                         self.check()?;
-                        Ok(Value::from_key(key))
+                        Ok(decode_value_key(key))
                     })?,
                     Tag::Delta => {
+                        if id.payload() >= self.snap.dvocab_len {
+                            return Ok(None);
+                        }
                         let len = self
                             .snap
                             .generation
@@ -2885,7 +2866,7 @@ impl Ctx {
                                 self.snap
                                     .generation
                                     .dvocab
-                                    .with(|v| v.get(id.payload()).map(Value::from_key))
+                                    .with(|v| v.get(id.payload()).map(decode_value_key))
                             }
                             None => None,
                         }
@@ -2896,7 +2877,7 @@ impl Ctx {
                             Some(len) => {
                                 credit.add(Self::checked_decode_bytes(len))?;
                                 self.check()?;
-                                self.local.read().get(id.payload()).map(Value::from_key)
+                                self.local.read().get(id.payload()).map(decode_value_key)
                             }
                             None => None,
                         }
@@ -3256,6 +3237,29 @@ impl Ctx {
             .transpose()
     }
 
+    /// Inspect the borrowed vocabulary key of `id` across base, delta, and query-local
+    /// vocabularies with live request controls and query-owned scratch admission.
+    /// `f` must only inspect the borrowed bytes and must not call `ctx.charge()` or
+    /// `ctx.check()`, because delta and local closures run under vocabulary locks.
+    pub(crate) fn with_controlled_key<T>(
+        &self,
+        id: Id,
+        mut f: impl FnMut(&[u8]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        self.check()?;
+        match id.tag() {
+            Tag::Vocab => self.with_controlled_vocab_key(id.payload(), f),
+            Tag::Delta => self.snap.generation.dvocab.with(|v| {
+                if id.payload() >= self.snap.dvocab_len {
+                    return Ok(None);
+                }
+                v.get(id.payload()).map(&mut f).transpose()
+            }),
+            Tag::Local => self.with_local_key(id.payload(), &mut f).transpose(),
+            _ => Ok(None),
+        }
+    }
+
     /// Algorithm-owned key reconstruction never populates the eager value cache.
     pub(super) fn with_algo_key<T>(
         &self,
@@ -3365,16 +3369,22 @@ impl Ctx {
     }
 
     pub(super) fn decoded_bytes(&self, id: Id) -> Result<u64> {
+        self.check()?;
         let size = match id.tag() {
             Tag::Local => self.local.read().get(id.payload()).map_or(0, <[u8]>::len),
             Tag::Vocab => self
-                .with_cursor_vocab_key(id.payload(), <[u8]>::len)?
+                .with_controlled_vocab_key(id.payload(), |key| Ok(key.len()))?
                 .unwrap_or(0),
-            Tag::Delta => self
-                .snap
-                .generation
-                .dvocab
-                .with(|v| v.get(id.payload()).map_or(0, <[u8]>::len)),
+            Tag::Delta => {
+                if id.payload() >= self.snap.dvocab_len {
+                    0
+                } else {
+                    self.snap
+                        .generation
+                        .dvocab
+                        .with(|v| v.get(id.payload()).map_or(0, <[u8]>::len))
+                }
+            }
             _ => 0,
         };
         Ok((size as u64).saturating_mul(8).saturating_add(128))
@@ -3391,26 +3401,56 @@ impl Ctx {
     /// Inline and numeric-column values keep their existing paths. Dictionary
     /// reconstruction and admitted decoding retain the same owner and charges.
     pub(super) fn cursor_value_checked(&self, id: Id) -> Result<Option<Value>> {
-        self.check_memory_failure()?;
-        let decode = |key: &[u8]| -> Result<Value> {
-            self.reserve_decode_checked(key.len())?;
-            Ok(Value::from_key(key))
-        };
+        self.check()?;
         match id.tag() {
+            Tag::Undef | Tag::Special => Ok(None),
+            Tag::Int => Ok(Some(Value::Integer(id.as_i64().into()))),
+            Tag::Bool => Ok(Some(Value::Bool(id.as_bool()))),
+            Tag::Double => Ok(Some(Value::Double(id.as_f64().into()))),
+            Tag::Decimal => Ok(Some(Value::Decimal(id::unpack_decimal(id.payload())))),
+            Tag::DateTime | Tag::Date => {
+                Ok(id::inline_to_literal(id).map(|l| Value::from_literal(&l)))
+            }
+            Tag::BNode => Ok(Some(Value::BNode(bnode_for(id).as_str().into()))),
             Tag::Vocab => {
                 if let Some(value) = self.column_value(id.payload()) {
                     return Ok(Some(value));
                 }
-                self.with_cursor_vocab_key(id.payload(), decode)?
-                    .transpose()
+                self.with_controlled_vocab_key(id.payload(), |key| {
+                    self.reserve_decode_checked(key.len())?;
+                    self.check()?;
+                    Ok(decode_value_key(key))
+                })
             }
-            Tag::Delta => self
-                .snap
-                .generation
-                .dvocab
-                .with(|v| v.get(id.payload()).map(decode).transpose()),
-            Tag::Local => self.with_local_key(id.payload(), decode).transpose(),
-            _ => Ok(self.value(id)),
+            Tag::Delta => {
+                if id.payload() >= self.snap.dvocab_len {
+                    return Ok(None);
+                }
+                let len = self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(<[u8]>::len));
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                self.reserve_decode_checked(len)?;
+                self.check()?;
+                Ok(self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(decode_value_key)))
+            }
+            Tag::Local => {
+                let len = self.local.read().get(id.payload()).map(<[u8]>::len);
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                self.reserve_decode_checked(len)?;
+                self.check()?;
+                Ok(self.local.read().get(id.payload()).map(decode_value_key))
+            }
         }
     }
 
@@ -3435,11 +3475,16 @@ impl Ctx {
                 if let Some(v) = self.values.get(id) {
                     return Some(v);
                 }
-                let decode =
-                    |key: &[u8]| self.reserve_decode(key.len()).then(|| Value::from_key(key));
+                let decode = |key: &[u8]| {
+                    self.reserve_decode(key.len())
+                        .then(|| decode_value_key(key))
+                };
                 let v = match id.tag() {
-                    Tag::Vocab => self.with_vocab_key(id.payload(), Value::from_key),
+                    Tag::Vocab => self.with_vocab_key(id.payload(), decode_value_key),
                     Tag::Delta => {
+                        if id.payload() >= self.snap.dvocab_len {
+                            return None;
+                        }
                         if self.is_strict_decode() && self.check().is_err() {
                             return None;
                         }
@@ -3625,30 +3670,39 @@ impl Ctx {
             };
         }
         // The reconstruction of both keys is reserved before it grows them, within the
-        // high-water envelope of transient decoding ([`Ctx::reserve_decode`]). That
+        // high-water envelope of transient decoding ([`Ctx::reserve_decode_checked`]). That
         // envelope covers a key of the largest size seen so far on every worker, both
         // keys of a comparison included, is charged once when it grows and is released
         // when the work ends, so a comparison of keys within it takes no lock. A
-        // reservation that fails records the failure, and the generic comparison
-        // follows.
-        let reserve = |need: usize| {
-            if self.reserve_decode(need) {
-                Ok(())
-            } else {
-                Err(())
+        // reservation that fails records the failure and gives `None`.
+        let mut order = None;
+        let outer = v.get_with_checked(
+            x,
+            |need| self.reserve_decode_checked(need),
+            |kx| {
+                let Some(rx) = lexical(kx) else {
+                    return Ok(());
+                };
+                v.get_with_checked(
+                    y,
+                    |need| self.reserve_decode_checked(need),
+                    |ky| {
+                        if let Some(ry) = lexical(ky) {
+                            order = Some(kx[rx.clone()].cmp(&ky[ry]));
+                        }
+                    },
+                )
+                .map(|_| ())
+            },
+        );
+        match outer {
+            Ok(Some(Ok(()))) => order,
+            Ok(Some(Err(error))) | Err(error) => {
+                self.fail_memory(&error);
+                None
             }
-        };
-        let order = v.get_with_checked(x, reserve, |kx| {
-            let rx = lexical(kx)?;
-            v.get_with_checked(y, reserve, |ky| {
-                let ry = lexical(ky)?;
-                Some(kx[rx.clone()].cmp(&ky[ry]))
-            })
-            .ok()
-            .flatten()
-            .flatten()
-        });
-        order.ok().flatten().flatten()
+            Ok(None) => None,
+        }
     }
 
     /// For a base-vocabulary simple literal, the first base id whose key starts with its
@@ -3696,20 +3750,22 @@ impl Ctx {
 
     /// `f(prev, key)` of the key of base vocabulary id `id` and, when the same walk of
     /// its block gives it, the key before it
-    /// ([`crate::vocab::Vocab::get_with_prev`]), with both reconstructions and decodings
-    /// inside the envelope. A refusal records a failure and gives `None`.
+    /// ([`crate::vocab::Vocab::get_with_prev_checked`]), with both reconstructions and
+    /// decodings inside the envelope. A refusal records a failure and gives `None`.
     ///
-    /// A cursor's walk admits at most [`PAIR_WALK_BYTES`] of reconstruction, and only what
-    /// the envelope grants. A longer key on the way, or one the envelope refuses, such as
-    /// a long string before a short language-tagged one that needs no floor, sends the
+    /// The walk admits at most [`PAIR_WALK_BYTES`] of reconstruction, and only what the
+    /// envelope grants. A longer key on the way, or one the envelope refuses, such as a
+    /// long string before a short language-tagged one that needs no floor, sends the
     /// read to [`Ctx::with_vocab_key`] of `id` alone with `prev` `None`, so the key before
-    /// is reserved only when the caller reads it. An eager walk cannot be refused, so it
-    /// reads both keys in one walk whatever their length.
+    /// is reserved only when the caller reads it.
     fn with_vocab_key_prev<T>(
         &self,
         id: u64,
         f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
     ) -> Option<T> {
+        if self.check_memory_failure().is_err() {
+            return None;
+        }
         let mut f = Some(f);
         let mut decode = |prev: Option<&[u8]>, key: &[u8]| {
             let longest = prev.map_or(0, <[u8]>::len).max(key.len());
@@ -3721,14 +3777,6 @@ impl Ctx {
         if self.is_strict_decode() {
             return self
                 .with_vocab_key(id, |key| f.take().map(|f| f(None, key)))
-                .flatten();
-        }
-        if !self.envelope_refuses() {
-            return self
-                .snap
-                .generation
-                .vocab
-                .get_with_prev(id, &mut decode)
                 .flatten();
         }
         // The walk is a shortcut, so a key on the way that is long or that the envelope
@@ -3747,6 +3795,9 @@ impl Ctx {
         match walked {
             Ok(found) => found.flatten(),
             Err(()) => {
+                if self.check_memory_failure().is_err() {
+                    return None;
+                }
                 let mut f = f.take();
                 self.with_vocab_key(id, |key| f.take().map(|f| f(None, key)))
                     .flatten()
@@ -3865,10 +3916,6 @@ impl Ctx {
                 }
             };
         }
-        if !self.envelope_refuses() {
-            let (Ok(i) | Err(i)) = v.find(key);
-            return Some(i);
-        }
         match v.find_with_checked(key, |need| self.reserve_decode_checked(need)) {
             Ok(Ok(i) | Err(i)) => Some(i),
             Err(error) => {
@@ -3915,6 +3962,14 @@ fn copied_output_key(key: &[u8]) -> Term {
         super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || id::key_to_term(key))
     } else {
         id::key_to_term(key)
+    }
+}
+
+fn decode_value_key(key: &[u8]) -> Value {
+    if key.first() == Some(&b'(') {
+        super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || Value::from_key(key))
+    } else {
+        Value::from_key(key)
     }
 }
 
@@ -4054,7 +4109,7 @@ impl Charge<'_> {
             Some(id) => ledger.owner_by_id(id),
             None => ledger.owner(self.ctx.grant.as_ref())?,
         };
-        ledger.reserve(&owner, self.ctx.mem_limit, bytes, false)?;
+        ledger.reserve(&owner, self.ctx.mem_limit, bytes)?;
         self.owner.set(Some(owner.id));
         self.bytes.set(owned);
         Ok(())
@@ -4406,7 +4461,7 @@ impl OwnedCharge {
     pub(super) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
         let ledger = ctx.memory();
         let owner = ledger.owner(ctx.grant.as_ref())?;
-        ledger.reserve(&owner, ctx.mem_limit, bytes, false)?;
+        ledger.reserve(&owner, ctx.mem_limit, bytes)?;
         Ok(Self {
             ctx: ctx.clone(),
             lease: QueryMemoryLease {
@@ -4703,14 +4758,14 @@ mod charge_tests {
     }
 
     /// The executors read the accounting mode in at most this many places outside tests.
-    /// Stage 4 of item 453 lowered it as each twin merged, and item 827 took the planning
-    /// reads out, so that a query plans alike in every mode. The routing of
-    /// `query_execution_with_plan`, the EXISTS key set accumulated across batches and the
-    /// decoding envelope remain, with the four reads of the flag that decide whether a
-    /// cursor owner exists, whether a context without an owner may keep retained state
-    /// uncharged, whether an empty release trims the ledger and whether a finished
-    /// query's pool contribution shrinks.
-    const MODE_CHECKS: usize = 7;
+    /// Stage 4 of item 453 lowered it as each twin merged, item 827 took the planning
+    /// reads out so that a query plans alike in every mode, and item 1308 Wave 2 removed
+    /// the eager decoding-envelope bypass. The routing of `query_execution_with_plan` and
+    /// the EXISTS key set accumulated across batches remain, with the four reads of the
+    /// flag that decide whether a cursor owner exists, whether a context without an owner
+    /// may keep retained state uncharged, whether an empty release trims the ledger and
+    /// whether a finished query's pool contribution shrinks.
+    const MODE_CHECKS: usize = 6;
 
     /// Counts the reads of the accounting mode in the non-test sources of the SPARQL
     /// engine, and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453). A
@@ -5152,15 +5207,11 @@ mod charge_tests {
             ctx.release_work();
             assert_eq!(ctx.live_bytes(), live, "cursor {cursor}: and released");
             let held = ctx.charge(MIB - live - 100).unwrap();
-            if cursor {
-                assert_eq!(ctx.term(literals[1].0), None);
-                assert!(
-                    matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
-                );
-            } else {
-                assert!(ctx.term(literals[1].0).is_some());
-                assert!(ctx.check().is_ok());
-            }
+            assert_eq!(ctx.term(literals[1].0), None, "cursor {cursor}");
+            assert!(
+                matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                "cursor {cursor}"
+            );
             drop(held);
         }
     }
@@ -5233,11 +5284,11 @@ mod charge_tests {
     }
 
     /// The floor of every stored string is the same in both modes and is the first id
-    /// whose key starts with its lexical form. A cursor reserves the keys a floor reads
+    /// whose key starts with its lexical form. Both modes reserve the keys a floor reads
     /// and the search for it, so a long string refuses once the budget is held, and the
-    /// refusal fails the next check. An eager floor reads it unchecked.
+    /// refusal fails the next check.
     #[test]
-    fn string_floors_agree_across_modes_and_reserve_their_reads_in_a_cursor() {
+    fn string_floors_agree_across_modes_and_reserve_their_reads_in_both_modes() {
         use crate::io::Source;
         use oxrdfio::RdfFormat;
         let store = Store::in_memory(StoreOptions::default());
@@ -5308,15 +5359,11 @@ mod charge_tests {
             }
             let held = ctx.charge(MIB - ctx.live_bytes() - 100).unwrap();
             let floor = ctx.string_floor(Id::vocab(long_id));
-            if cursor {
-                assert_eq!(floor, None);
-                assert!(
-                    matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
-                );
-            } else {
-                assert_eq!(floor, expected[long_id as usize]);
-                assert!(ctx.check().is_ok());
-            }
+            assert_eq!(floor, None, "cursor {cursor}");
+            assert!(
+                matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                "cursor {cursor}"
+            );
             drop(held);
         }
     }
