@@ -494,7 +494,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
         let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) else {
             break;
         };
-        let Some(id) = x.store.peek_live() else {
+        let Some(id) = x.store.peek_live(max_guard.dl()) else {
             break;
         };
         let Some((views_bytes, max_realloc)) =
@@ -544,7 +544,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
                 inv: &inv,
                 ground_total,
             };
-            x.store.next_commit(ix, Some(&o), id, &max)
+            x.store.next_commit(ix, Some(&o), id, &max, max_guard.dl())
         };
         max_guard.commit_dl(bound, delta);
         index_consts(ix, x, &max, id, &mut max_guard);
@@ -1099,6 +1099,7 @@ fn derive_covered<S: Sink>(
     if st.bottom {
         return false;
     }
+    out.dl().count_root(1);
     out.worked(1);
     let inv = inv_of(ix, dix(ix));
     let lits = &out.dl().lits;
@@ -1968,6 +1969,7 @@ fn m_note<S: Sink>(
     }
     match RootSt::ins_admit(&mut r.mw().mheld, l, out) {
         Some(true) => {
+            out.dl().count_mrepair(1);
             out.worked(1);
             out.send(root, Concl::RMark(me, l.xid()));
         }
@@ -2121,6 +2123,7 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
     }
     r.mw().reached = true;
     out.send(root, Concl::RReach(me));
+    out.dl().count_mrepair(1);
     out.worked(1);
     for (k, w) in successors(ix, st).into_iter().enumerate() {
         if !m_poll(k, st, out) {
@@ -2145,6 +2148,7 @@ fn m_tell<S: Sink>(st: &mut State, w: Ex, out: &mut S) {
     match RootSt::ins_admit(&mut r.mw().told, w, out) {
         Some(true) => {
             out.send(w, Concl::RReach(TOP));
+            out.dl().count_mrepair(1);
             out.worked(1);
         }
         Some(false) => {}
@@ -2181,13 +2185,17 @@ impl Scan {
         if polls == 0 {
             return true;
         }
-        out.worked(polls * (M_SCAN / WORK_READS));
+        let charge = polls * (M_SCAN / WORK_READS);
+        out.dl().count_mrepair(charge);
+        out.worked(charge);
         out.go_on()
     }
 
     /// Charges the reads since the last check.
     fn end<S: Sink>(self, out: &mut S) {
-        out.worked(self.0 % M_SCAN / WORK_READS);
+        let charge = self.0 % M_SCAN / WORK_READS;
+        out.dl().count_mrepair(charge);
+        out.worked(charge);
     }
 }
 
@@ -2241,6 +2249,7 @@ fn m_fwd<S: Sink>(r: &mut RootSt, d: Ex, l: Lit, out: &mut S) -> bool {
     match RootSt::ins_admit(&mut r.gsent, (d, l), out) {
         Some(true) => {
             out.send(d, Concl::HypL(l.xid()));
+            out.dl().count_mrepair(1);
             out.worked(1);
             out.dl().mcount[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
@@ -2423,6 +2432,7 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
         }
         let cid = ret_id(ds(st), i, &mut guard);
         guard.send(h, Concl::RRet(cid));
+        guard.dl().count_mrepair(1);
         guard.worked(1);
         guard.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2615,6 +2625,7 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
                 break;
             }
             guard.send(h, Concl::RRet(cid));
+            guard.dl().count_mrepair(1);
             guard.worked(1);
             guard.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }

@@ -45,7 +45,7 @@ use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Guard, Sink, State, flatten, table_bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// A clause of the axioms with two or more disjuncts: its body, where an empty one is
 /// `owl:Thing`, and its head.
@@ -550,6 +550,350 @@ impl DlIx {
     }
 }
 
+/// Which work-bound guard first requested a stop for a Tier D run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum WorkStopGuard {
+    #[default]
+    None = 0,
+    /// Hard total-work limit (`work > work_limit`, including fixed bounds, Option 2's
+    /// `2^25` ceiling, and `past(n)`).
+    TotalLimit = 1,
+    /// Option 2 root-derivation guard (`root_work > R`, evaluated at a `2^16` sample).
+    RootWork = 2,
+    /// Option 2 post-warmup absolute queue guard (`work >= W && raw_queue > Qmax`).
+    QueueAbs = 3,
+    /// Option 2 post-warmup queue-ratio guard (`work >= W && 10 * raw_queue > 3 * raw_pushed`).
+    QueueRatio = 4,
+    /// Product width-limit exhaustion (`too_wide`).
+    WidthExhausted = 5,
+    /// Unconditional forced exhaustion (`Found::over`, e.g., late-unit containment or
+    /// at-most expansion).
+    ForcedExhaust = 6,
+}
+
+impl WorkStopGuard {
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::TotalLimit,
+            2 => Self::RootWork,
+            3 => Self::QueueAbs,
+            4 => Self::QueueRatio,
+            5 => Self::WidthExhausted,
+            6 => Self::ForcedExhaust,
+            _ => Self::None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::TotalLimit => "total_limit",
+            Self::RootWork => "root_work",
+            Self::QueueAbs => "queue_abs",
+            Self::QueueRatio => "queue_ratio",
+            Self::WidthExhausted => "width_exhausted",
+            Self::ForcedExhaust => "forced_exhaust",
+        }
+    }
+}
+
+/// Option 2 (`rawQ`) adaptive rooted stopping parameters (immutable for a run).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdaptivePolicy {
+    /// Sample cadence as a bit shift: `16` => every `2^16 = 65,536` total work.
+    pub sample_shift: u32,
+    /// Rational backlog ratio numerator (`3` in `3 / 10`).
+    pub ratio_num: u32,
+    /// Rational backlog ratio denominator (`10` in `3 / 10`), tested as
+    /// `(raw_queue as u128) * (ratio_den as u128) > (raw_pushed as u128) * (ratio_num as u128)`.
+    pub ratio_den: u32,
+    /// Maximum root derivations (`dl_root::derive_covered`) before stopping (`2^19`).
+    pub root_limit: usize,
+    /// Minimum total work before queue backlog guards activate (`2^22`, inclusive).
+    pub warmup_work: usize,
+    /// Maximum resident clause-heap entries across all stores after warmup (`2^17`).
+    pub queue_max: usize,
+    /// Hard total-work ceiling (`2^25`), also mirrored into `DlRun::work_limit`.
+    pub ceiling: usize,
+}
+
+impl AdaptivePolicy {
+    pub const PROVISIONAL: Self = Self {
+        sample_shift: 16, // 2^16 = 65,536
+        ratio_num: 3,
+        ratio_den: 10,
+        root_limit: 1 << 19,  // 524,288
+        warmup_work: 1 << 22, // 4,194,304
+        queue_max: 1 << 17,   // 131,072
+        ceiling: 1 << 25,     // 33,554,432
+    };
+}
+
+/// Attempt metadata carried for streamed observe/enforce diagnostic rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AdaptiveMeta {
+    pub run_id: u64,
+    pub attempt: u32,
+    pub after_counting: bool,
+    pub policy_name: &'static str,
+    pub effective_cap: usize,
+    pub mrepair: u8,
+    pub threads: usize,
+}
+
+/// Boxed per-attempt state for Option 2 (`rawQ`) adaptive stopping and observe-only
+/// diagnostics. Keeping this behind `Option<Box<AdaptiveState>>` keeps `DlRun` (and
+/// idle `Saturation`) overhead to one pointer with zero heap allocations when off.
+pub(super) struct AdaptiveState {
+    policy: AdaptivePolicy,
+    enforce: bool,
+    diag: bool,
+    meta: AdaptiveMeta,
+    /// Derivations counted strictly at `dl_root::derive_covered` (after `st.bottom`).
+    root_work: AtomicUsize,
+    /// Resident clause-heap entries across all participating stores (`sum(store.queue.len())`).
+    raw_queue: AtomicUsize,
+    /// Cumulative successful clause-heap pushes across all participating stores (`P`).
+    raw_pushed: AtomicUsize,
+    /// Direct marker-repair work charges (`dl_root.rs`), tracked only when `diag` is on.
+    mrepair_work: AtomicUsize,
+    /// Latched first requesting guard (`WorkStopGuard` as `u8`), written only when `enforce`.
+    stop_guard: AtomicU8,
+    /// Total `work` at the exact moment `stop_guard` first latched.
+    stop_requested_at: AtomicUsize,
+    /// Latched first hypothetical guard in observe-only mode (`!enforce`).
+    hypothetical_guard: AtomicU8,
+    /// Total `work` at the exact moment `hypothetical_guard` first latched.
+    hypothetical_at: AtomicUsize,
+    /// Number of `2^sample_shift` sample crossings observed.
+    samples: AtomicUsize,
+    /// Set at the joined saturation boundary so post-saturation rounds (e.g. entangled
+    /// individual marking) emit no late `ADAPTIVE-SAMPLE` rows and latch no policy guards.
+    sampling_stopped: std::sync::atomic::AtomicBool,
+    /// Set ONLY when `enforce` is active and a non-work stop has already won on a
+    /// `partial = true` run, disarming adaptive work-bound enforcement for the subsequent
+    /// individual-marking round without modifying fixed-limit or non-adaptive paths.
+    enforce_disarmed: std::sync::atomic::AtomicBool,
+}
+
+impl AdaptiveState {
+    fn new(policy: AdaptivePolicy, enforce: bool, diag: bool, meta: AdaptiveMeta) -> Self {
+        debug_assert!(policy.sample_shift < usize::BITS);
+        debug_assert!(policy.ceiling > 0);
+        Self {
+            policy,
+            enforce,
+            diag,
+            meta,
+            root_work: AtomicUsize::new(0),
+            raw_queue: AtomicUsize::new(0),
+            raw_pushed: AtomicUsize::new(0),
+            mrepair_work: AtomicUsize::new(0),
+            stop_guard: AtomicU8::new(WorkStopGuard::None as u8),
+            stop_requested_at: AtomicUsize::new(0),
+            hypothetical_guard: AtomicU8::new(WorkStopGuard::None as u8),
+            hypothetical_at: AtomicUsize::new(0),
+            samples: AtomicUsize::new(0),
+            sampling_stopped: std::sync::atomic::AtomicBool::new(false),
+            enforce_disarmed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[inline]
+    fn latch_stop(&self, guard: WorkStopGuard, at_work: usize) {
+        if guard == WorkStopGuard::None {
+            return;
+        }
+        if self.stop_guard.load(Ordering::Relaxed) != WorkStopGuard::None as u8 {
+            return;
+        }
+        if self
+            .stop_guard
+            .compare_exchange(
+                WorkStopGuard::None as u8,
+                guard as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.stop_requested_at.store(at_work, Ordering::Relaxed);
+            #[cfg(test)]
+            ON_ADAPTIVE_LATCH_TEST.with(|c| {
+                if let Some(f) = c.borrow().as_ref() {
+                    f(guard, at_work);
+                }
+            });
+        }
+    }
+
+    #[inline]
+    fn latch_hypothetical(&self, guard: WorkStopGuard, at_work: usize) {
+        if guard == WorkStopGuard::None {
+            return;
+        }
+        if self.hypothetical_guard.load(Ordering::Relaxed) != WorkStopGuard::None as u8 {
+            return;
+        }
+        if self
+            .hypothetical_guard
+            .compare_exchange(
+                WorkStopGuard::None as u8,
+                guard as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.hypothetical_at.store(at_work, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn latch_policy_guard(&self, guard: WorkStopGuard, at_work: usize) {
+        if self.enforce {
+            self.latch_stop(guard, at_work);
+        } else {
+            self.latch_hypothetical(guard, at_work);
+        }
+    }
+}
+
+#[cfg(test)]
+type AdaptiveLatchHook = std::sync::Arc<dyn Fn(WorkStopGuard, usize) + Send + Sync>;
+#[cfg(test)]
+type AdaptiveSampleHook = std::sync::Arc<dyn Fn(usize, WorkStopGuard) + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    static ROOTED_ADAPTIVE_BOUND_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static ROOTED_ADAPTIVE_DIAG_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static ROOTED_ADAPTIVE_POLICY_TEST: std::cell::Cell<Option<AdaptivePolicy>> =
+        const { std::cell::Cell::new(None) };
+    static ON_ADAPTIVE_LATCH_TEST: std::cell::RefCell<Option<AdaptiveLatchHook>> =
+        const { std::cell::RefCell::new(None) };
+    static ON_ADAPTIVE_SAMPLE_TEST: std::cell::RefCell<Option<AdaptiveSampleHook>> =
+        const { std::cell::RefCell::new(None) };
+    static ADAPTIVE_ALLOC_COUNT_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Whether Option 2 (`rawQ`) adaptive rooted stopping is enabled
+/// (`SPARKLES_ROOTED_ADAPTIVE_BOUND=1`), off by default.
+pub(super) fn rooted_adaptive_bound() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ROOTED_ADAPTIVE_BOUND_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_ADAPTIVE_BOUND").is_some_and(|v| v == "1"))
+}
+
+/// Whether observe-only / streamed adaptive diagnostics are enabled
+/// (`SPARKLES_ROOTED_ADAPTIVE_DIAG=1`), off by default.
+pub(super) fn rooted_adaptive_diag() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ROOTED_ADAPTIVE_DIAG_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_ADAPTIVE_DIAG").is_some_and(|v| v == "1"))
+}
+
+/// Active [`AdaptivePolicy`] for the current thread (always [`AdaptivePolicy::PROVISIONAL`]
+/// outside tests).
+pub(super) fn active_adaptive_policy() -> AdaptivePolicy {
+    #[cfg(test)]
+    if let Some(p) = ROOTED_ADAPTIVE_POLICY_TEST.with(|c| c.get()) {
+        return p;
+    }
+    AdaptivePolicy::PROVISIONAL
+}
+
+#[cfg(test)]
+pub(super) fn with_rooted_adaptive_bound<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ROOTED_ADAPTIVE_BOUND_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = ROOTED_ADAPTIVE_BOUND_TEST.with(|c| c.replace(Some(on)));
+    let _reset = Reset(prev);
+    f()
+}
+
+#[cfg(test)]
+pub(super) fn with_rooted_adaptive_diag<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ROOTED_ADAPTIVE_DIAG_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = ROOTED_ADAPTIVE_DIAG_TEST.with(|c| c.replace(Some(on)));
+    let _reset = Reset(prev);
+    f()
+}
+
+#[cfg(test)]
+pub(super) fn with_rooted_adaptive_policy<R>(policy: AdaptivePolicy, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<AdaptivePolicy>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ROOTED_ADAPTIVE_POLICY_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = ROOTED_ADAPTIVE_POLICY_TEST.with(|c| c.replace(Some(policy)));
+    let _reset = Reset(prev);
+    f()
+}
+
+#[cfg(test)]
+pub(super) fn with_on_adaptive_latch<R>(
+    hook: impl Fn(WorkStopGuard, usize) + Send + Sync + 'static,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Reset(Option<AdaptiveLatchHook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ON_ADAPTIVE_LATCH_TEST.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = ON_ADAPTIVE_LATCH_TEST.with(|c| c.borrow_mut().replace(std::sync::Arc::new(hook)));
+    let _reset = Reset(prev);
+    f()
+}
+
+#[cfg(test)]
+pub(super) fn with_on_adaptive_sample<R>(
+    hook: impl Fn(usize, WorkStopGuard) + Send + Sync + 'static,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Reset(Option<AdaptiveSampleHook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ON_ADAPTIVE_SAMPLE_TEST.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = ON_ADAPTIVE_SAMPLE_TEST.with(|c| c.borrow_mut().replace(std::sync::Arc::new(hook)));
+    let _reset = Reset(prev);
+    f()
+}
+
+#[cfg(test)]
+pub(super) fn reset_adaptive_alloc_count() {
+    ADAPTIVE_ALLOC_COUNT_TEST.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn adaptive_alloc_count() -> usize {
+    ADAPTIVE_ALLOC_COUNT_TEST.with(|c| c.get())
+}
+
 /// What a saturation with Tier D shares: the table of the clauses that contexts send one
 /// another and the bytes of the clause stores.
 #[derive(Default)]
@@ -587,6 +931,8 @@ pub struct DlRun {
     /// the repair's counts, for measurements: the notices of held triggers the root took,
     /// the markers it sent and the clauses it returned
     pub mcount: [AtomicUsize; 3],
+    /// Option 2 (`rawQ`) adaptive stopping / observe-only diagnostic state (`None` when off).
+    adaptive: Option<Box<AdaptiveState>>,
 }
 
 /// [`DlRun::mrepair`]: M-send and M-return are on.
@@ -625,7 +971,13 @@ impl DlRun {
         }
     }
     pub fn bytes(&self) -> usize {
-        self.table.bytes() + self.lits.unadmitted_bytes() + self.stores.load(Ordering::Relaxed)
+        self.table.bytes()
+            + self.lits.unadmitted_bytes()
+            + self.stores.load(Ordering::Relaxed)
+            + self
+                .adaptive
+                .as_ref()
+                .map_or(0, |_| std::mem::size_of::<AdaptiveState>())
     }
     /// Starts another run over the table of the last one, whose kept contexts name its
     /// clauses by id (roadmap item 753). The bytes of the kept contexts' stores count
@@ -645,6 +997,147 @@ impl DlRun {
         *self.work_limit.get_mut() = 0;
         *self.width_limit.get_mut() = 0;
         *self.exhausted.get_mut() = false;
+        self.adaptive = None;
+    }
+    /// Enables Option 2 (`rawQ`) adaptive tracking for this attempt. When `enforce` is
+    /// `true`, also sets `work_limit = policy.ceiling` and arms the adaptive stop latch;
+    /// when `enforce` is `false` (observe-only diagnostic mode), keeps the caller-selected
+    /// fixed `work_limit` and leaves the stop latch untouched.
+    pub(super) fn enable_adaptive(
+        &mut self,
+        policy: AdaptivePolicy,
+        enforce: bool,
+        diag: bool,
+        meta: AdaptiveMeta,
+    ) {
+        #[cfg(test)]
+        ADAPTIVE_ALLOC_COUNT_TEST.with(|c| c.set(c.get() + 1));
+        self.adaptive = Some(Box::new(AdaptiveState::new(policy, enforce, diag, meta)));
+        if enforce {
+            self.set_work_limit(policy.ceiling);
+        }
+    }
+    /// Stops adaptive sampling at the joined saturation boundary so post-saturation
+    /// rounds (such as entangled individual marking) emit no late `ADAPTIVE-SAMPLE` rows
+    /// and latch no post-saturation policy guards, without affecting fixed-limit or
+    /// forced-exhaustion work enforcement.
+    pub(super) fn stop_adaptive_sampling(&self) {
+        if let Some(a) = self.adaptive.as_deref() {
+            a.sampling_stopped.store(true, Ordering::Relaxed);
+        }
+    }
+    /// Disarms adaptive work-bound enforcement once a non-work stop has already won on a
+    /// `partial = true` run, keeping `AdaptiveState` allocated so `bytes()` accounting
+    /// remains accurate through individual marking and partial result construction.
+    /// Non-adaptive (`adaptive.is_none()`) and observe-only (`!a.enforce`) runs are
+    /// completely unaffected and keep their verbatim fixed-limit, width-limit, and
+    /// forced-exhaustion enforcement.
+    pub(super) fn disarm_adaptive_work_bound(&self) {
+        if let Some(a) = self.adaptive.as_deref()
+            && a.enforce
+        {
+            a.sampling_stopped.store(true, Ordering::Relaxed);
+            a.enforce_disarmed.store(true, Ordering::Relaxed);
+        }
+    }
+    #[inline]
+    pub(super) fn tracks_adaptive(&self) -> bool {
+        self.adaptive.is_some()
+    }
+    #[inline]
+    pub(super) fn is_adaptive_enforced(&self) -> bool {
+        self.adaptive.as_deref().is_some_and(|a| a.enforce)
+    }
+    #[inline]
+    pub(super) fn is_adaptive_diag(&self) -> bool {
+        self.adaptive.as_deref().is_some_and(|a| a.diag)
+    }
+    pub(super) fn adaptive_meta(&self) -> Option<AdaptiveMeta> {
+        self.adaptive.as_deref().map(|a| a.meta)
+    }
+    pub(super) fn root_work(&self) -> usize {
+        self.adaptive
+            .as_deref()
+            .map_or(0, |a| a.root_work.load(Ordering::Relaxed))
+    }
+    pub(super) fn raw_queue(&self) -> usize {
+        self.adaptive
+            .as_deref()
+            .map_or(0, |a| a.raw_queue.load(Ordering::Relaxed))
+    }
+    pub(super) fn raw_pushed(&self) -> usize {
+        self.adaptive
+            .as_deref()
+            .map_or(0, |a| a.raw_pushed.load(Ordering::Relaxed))
+    }
+    pub(super) fn mrepair_work(&self) -> usize {
+        self.adaptive
+            .as_deref()
+            .map_or(0, |a| a.mrepair_work.load(Ordering::Relaxed))
+    }
+    pub(super) fn stop_guard(&self) -> WorkStopGuard {
+        self.adaptive.as_deref().map_or(WorkStopGuard::None, |a| {
+            WorkStopGuard::from_u8(a.stop_guard.load(Ordering::Relaxed))
+        })
+    }
+    pub(super) fn stop_requested_at(&self) -> usize {
+        self.adaptive
+            .as_deref()
+            .map_or(0, |a| a.stop_requested_at.load(Ordering::Relaxed))
+    }
+    pub(super) fn hypothetical_guard(&self) -> WorkStopGuard {
+        self.adaptive.as_deref().map_or(WorkStopGuard::None, |a| {
+            WorkStopGuard::from_u8(a.hypothetical_guard.load(Ordering::Relaxed))
+        })
+    }
+    pub(super) fn hypothetical_at(&self) -> usize {
+        self.adaptive
+            .as_deref()
+            .map_or(0, |a| a.hypothetical_at.load(Ordering::Relaxed))
+    }
+    pub(super) fn adaptive_samples(&self) -> usize {
+        self.adaptive
+            .as_deref()
+            .map_or(0, |a| a.samples.load(Ordering::Relaxed))
+    }
+    /// Counts `n` attempted root derivations in `dl_root::derive_covered`.
+    #[inline]
+    pub(super) fn count_root(&self, n: usize) {
+        if let Some(a) = self.adaptive.as_deref() {
+            a.root_work.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+    /// Counts `n` direct marker-repair work units when diagnostic mode is active.
+    #[inline]
+    pub(super) fn count_mrepair(&self, n: usize) {
+        if n > 0
+            && let Some(a) = self.adaptive.as_deref()
+            && a.diag
+        {
+            a.mrepair_work.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+    /// Records one successful insertion into a participating store's processing heap.
+    #[inline]
+    pub(super) fn on_queue_push(&self) {
+        if let Some(a) = self.adaptive.as_deref() {
+            a.raw_pushed.fetch_add(1, Ordering::Relaxed);
+            a.raw_queue.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    /// Records `n` pops (dead or live) from a participating store's processing heap.
+    #[inline]
+    pub(super) fn on_queue_pop(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(a) = self.adaptive.as_deref() {
+            let prev = a.raw_queue.fetch_sub(n, Ordering::Relaxed);
+            assert!(
+                prev >= n,
+                "raw_queue underflow: attempted to pop {n} with raw_queue={prev}"
+            );
+        }
     }
     pub(super) fn grow(&self, bytes: usize) {
         self.stores.fetch_add(bytes, Ordering::Relaxed);
@@ -684,16 +1177,122 @@ impl DlRun {
     }
     /// Counts `n` derived conclusions.
     pub(super) fn count(&self, n: usize) {
-        self.work.fetch_add(n, Ordering::Relaxed);
+        let Some(a) = self.adaptive.as_deref() else {
+            self.work.fetch_add(n, Ordering::Relaxed);
+            return;
+        };
+        self.count_adaptive(a, n);
+    }
+    #[inline]
+    fn count_adaptive(&self, a: &AdaptiveState, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if a.sampling_stopped.load(Ordering::Relaxed) {
+            self.work.fetch_add(n, Ordering::Relaxed);
+            return;
+        }
+        let old = self
+            .work
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
+                Some(w.saturating_add(n))
+            })
+            .unwrap_or(usize::MAX);
+        let new = old.saturating_add(n);
+        let old_total = self.carried.saturating_add(old);
+        let new_total = self.carried.saturating_add(new);
+        let crossed = (old_total >> a.policy.sample_shift) != (new_total >> a.policy.sample_shift);
+        if crossed {
+            self.evaluate_adaptive_sample(a, new_total);
+        } else if new_total > a.policy.ceiling {
+            a.latch_policy_guard(WorkStopGuard::TotalLimit, new_total);
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn evaluate_adaptive_sample(&self, a: &AdaptiveState, work: usize) {
+        a.samples.fetch_add(1, Ordering::Relaxed);
+        if a.enforce && !a.diag && a.stop_guard.load(Ordering::Relaxed) != WorkStopGuard::None as u8
+        {
+            return;
+        }
+        let root_work = a.root_work.load(Ordering::Relaxed);
+        let raw_q = a.raw_queue.load(Ordering::Relaxed);
+        let raw_p = a.raw_pushed.load(Ordering::Relaxed);
+        assert!(
+            raw_q <= raw_p,
+            "raw_queue ({raw_q}) exceeded raw_pushed ({raw_p})"
+        );
+        let p = &a.policy;
+        // Declared simultaneous-crossing priority: total, root, absolute queue, ratio.
+        let guard = if work > p.ceiling {
+            WorkStopGuard::TotalLimit
+        } else if root_work > p.root_limit {
+            WorkStopGuard::RootWork
+        } else if work >= p.warmup_work {
+            if raw_q > p.queue_max {
+                WorkStopGuard::QueueAbs
+            } else if raw_p > 0
+                && (raw_q as u128) * (p.ratio_den as u128) > (raw_p as u128) * (p.ratio_num as u128)
+            {
+                WorkStopGuard::QueueRatio
+            } else {
+                WorkStopGuard::None
+            }
+        } else {
+            WorkStopGuard::None
+        };
+        if guard != WorkStopGuard::None {
+            a.latch_policy_guard(guard, work);
+        }
+        #[cfg(test)]
+        ON_ADAPTIVE_SAMPLE_TEST.with(|c| {
+            if let Some(f) = c.borrow().as_ref() {
+                f(work, guard);
+            }
+        });
+        if a.diag {
+            let first = if a.enforce {
+                WorkStopGuard::from_u8(a.stop_guard.load(Ordering::Relaxed))
+            } else {
+                WorkStopGuard::from_u8(a.hypothetical_guard.load(Ordering::Relaxed))
+            };
+            let mw = a.mrepair_work.load(Ordering::Relaxed);
+            eprintln!(
+                "ADAPTIVE-SAMPLE run={} attempt={} mode={} policy={} cap={} after_counting={} mrepair={} threads={} work={} root_work={} raw_q={} raw_p={} mrepair_work={} trigger={} first={}",
+                a.meta.run_id,
+                a.meta.attempt,
+                if a.enforce { "enforce" } else { "observe" },
+                a.meta.policy_name,
+                a.meta.effective_cap,
+                usize::from(a.meta.after_counting),
+                a.meta.mrepair,
+                a.meta.threads,
+                work,
+                root_work,
+                raw_q,
+                raw_p,
+                mw,
+                guard.as_str(),
+                first.as_str(),
+            );
+        }
     }
     /// Whether `n` conclusions alone, with those of the runs whose contexts this one
     /// keeps, are more than the run's bound, and marks the run past its bound when they
     /// are.
     pub(super) fn past(&self, n: usize) -> bool {
+        if self
+            .adaptive
+            .as_deref()
+            .is_some_and(|a| a.enforce && a.enforce_disarmed.load(Ordering::Relaxed))
+        {
+            return false;
+        }
         let l = self.work_limit.load(Ordering::Relaxed);
         let past = l != 0 && self.carried.saturating_add(n) > l;
         if past {
-            self.exhaust();
+            self.exhaust_with(WorkStopGuard::TotalLimit);
         }
         past
     }
@@ -701,17 +1300,67 @@ impl DlRun {
     pub fn work(&self) -> usize {
         self.work.load(Ordering::Relaxed)
     }
+    /// Passes the bound on derived conclusions at once, recording `guard` when adaptive
+    /// enforcement is active.
+    fn exhaust_with(&self, guard: WorkStopGuard) {
+        if let Some(a) = self.adaptive.as_deref()
+            && a.enforce
+        {
+            if a.enforce_disarmed.load(Ordering::Relaxed) {
+                return;
+            }
+            let w = self
+                .carried
+                .saturating_add(self.work.load(Ordering::Relaxed));
+            a.latch_stop(guard, w);
+        }
+        self.exhausted.store(true, Ordering::Relaxed);
+    }
     /// Passes the bound on derived conclusions at once, for an inference too wide to make.
     /// The mark stays, where a sum would wrap once four inferences added a quarter of
     /// the range each before a check read it, and the run would then end as complete
     /// without them.
-    fn exhaust(&self) {
-        self.exhausted.store(true, Ordering::Relaxed);
+    #[cfg(test)]
+    pub(super) fn exhaust(&self) {
+        self.exhaust_with(WorkStopGuard::ForcedExhaust);
+    }
+    #[inline]
+    fn over_work_adaptive(&self, a: &AdaptiveState) -> bool {
+        if self.exhausted.load(Ordering::Relaxed) {
+            let w = self
+                .carried
+                .saturating_add(self.work.load(Ordering::Relaxed));
+            a.latch_stop(WorkStopGuard::ForcedExhaust, w);
+            self.worked.store(true, Ordering::Relaxed);
+            return true;
+        }
+        if a.stop_guard.load(Ordering::Relaxed) != WorkStopGuard::None as u8 {
+            self.worked.store(true, Ordering::Relaxed);
+            return true;
+        }
+        let l = self.work_limit.load(Ordering::Relaxed);
+        let w = self
+            .carried
+            .saturating_add(self.work.load(Ordering::Relaxed));
+        let over = l != 0 && w > l;
+        if over {
+            a.latch_stop(WorkStopGuard::TotalLimit, w);
+            self.worked.store(true, Ordering::Relaxed);
+        }
+        over
     }
     /// Whether the run derived more conclusions than its bound, with those of the runs
     /// whose contexts it keeps, or left out an inference too wide to make, which passes
     /// the bound even when the run has none, since the run is incomplete without it.
     pub fn over_work(&self) -> bool {
+        if let Some(a) = self.adaptive.as_deref()
+            && a.enforce
+        {
+            if a.enforce_disarmed.load(Ordering::Relaxed) {
+                return false;
+            }
+            return self.over_work_adaptive(a);
+        }
         let l = self.work_limit.load(Ordering::Relaxed);
         let over = self.exhausted.load(Ordering::Relaxed)
             || l != 0
@@ -1588,6 +2237,10 @@ impl Found {
     pub(super) fn one_sides(&self) -> Vec<Side> {
         self.one.iter().map(|(s, _)| s.clone()).collect()
     }
+    /// Marks this batch as unconditionally exhausted, for tests.
+    pub(super) fn mark_over(&mut self) {
+        self.over = true;
+    }
 }
 
 impl Found {
@@ -2243,7 +2896,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
     slack_covered: usize,
 ) {
     if found.over {
-        out.dl().exhaust();
+        out.dl().exhaust_with(WorkStopGuard::ForcedExhaust);
         mark_interrupted(st);
         return;
     }
@@ -2290,7 +2943,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
         // a product past the run's limit on choices ends the run as its bound does, before
         // the product spends its work (roadmap item 1011)
         if held_guard.dl().too_wide(&lists) {
-            held_guard.dl().exhaust();
+            held_guard.dl().exhaust_with(WorkStopGuard::WidthExhausted);
             mark_interrupted(st);
             return;
         }
@@ -3952,7 +4605,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
         };
         let dx = dix(ix);
         let rooted = dx.root.is_some();
-        let Some(id) = x.store.peek_live() else {
+        let Some(id) = x.store.peek_live(max_guard.dl()) else {
             break;
         };
         let Some((views_bytes, max_realloc)) =
@@ -4004,7 +4657,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
                     inv: &inv,
                     ground_total,
                 };
-                x.store.next_commit(ix, Some(&o), id, &max)
+                x.store.next_commit(ix, Some(&o), id, &max, max_guard.dl())
             };
             max_guard.commit_dl(bound, delta);
         } else {
@@ -4019,7 +4672,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
                 x.store.interrupted = true;
                 break;
             }
-            let delta = x.store.next_commit(ix, None, id, &max);
+            let delta = x.store.next_commit(ix, None, id, &max, max_guard.dl());
             max_guard.commit_dl(bound, delta);
         }
         if rooted {

@@ -94,6 +94,8 @@ mod numeric;
 mod query;
 #[cfg(test)]
 mod retained_accounting_tests;
+#[cfg(test)]
+mod rooted_adaptive_tests;
 mod saturate;
 #[cfg(test)]
 mod scratch_admission_tests;
@@ -196,6 +198,200 @@ fn drawing_on(
 /// Of the 50 `shoi` fixtures, 45 finish within 190,000 conclusions on one and on four
 /// threads, and the other five derive millions, as F24's measured effect records.
 const ROOTED_WORK_BOUND: usize = 1 << 19;
+
+/// Policy selected for a rooted, non-counting Tier D attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootedBoundPolicy {
+    /// Explicit caller `Limits::dl_work = Some(n)` (wins over all switches).
+    ExplicitFixed(usize),
+    /// Qualified deterministic Option 2 (`rawQ`) adaptive policy (fixed ceiling `2^25`).
+    Adaptive(dl_rules::AdaptivePolicy),
+    /// Fallback fixed rooted bound (`ROOTED_WORK_BOUND`, or per-class selector if present).
+    DefaultFixed(usize),
+}
+
+impl RootedBoundPolicy {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ExplicitFixed(_) => "explicit_fixed",
+            Self::Adaptive(_) => "adaptive",
+            Self::DefaultFixed(_) => "default_fixed",
+        }
+    }
+
+    fn work_limit(self) -> usize {
+        match self {
+            Self::ExplicitFixed(n) | Self::DefaultFixed(n) => n,
+            Self::Adaptive(p) => p.ceiling,
+        }
+    }
+}
+
+/// Precedence selector for rooted non-counting Tier D attempts:
+/// 1. Explicit `Some(n)` always wins with `n.max(1)`.
+/// 2. Qualified deterministic adaptive (`dl_steps && adaptive_enabled`) uses `policy`
+///    with its fixed ceiling (`2^25`), independent of any per-class fallback bound.
+/// 3. Otherwise falls through to `fallback_fixed.max(1)`.
+pub(crate) fn select_rooted_bound(
+    explicit_work: Option<usize>,
+    dl_steps: bool,
+    adaptive_enabled: bool,
+    policy: dl_rules::AdaptivePolicy,
+    fallback_fixed: usize,
+) -> RootedBoundPolicy {
+    if let Some(n) = explicit_work {
+        RootedBoundPolicy::ExplicitFixed(n.max(1))
+    } else if dl_steps && adaptive_enabled {
+        debug_assert!(policy.ceiling > 0);
+        RootedBoundPolicy::Adaptive(policy)
+    } else {
+        RootedBoundPolicy::DefaultFixed(fallback_fixed.max(1))
+    }
+}
+
+/// Winning outcome of a joined `saturate_counted` call, captured immediately on return
+/// before error translation, `partial=true` routing, marker decline, or store teardown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WinningStop {
+    SaturationFinished,
+    Work,
+    Memory,
+    Timeout,
+    Cancelled,
+}
+
+impl WinningStop {
+    fn from_stop(stop: Option<Stop>) -> Self {
+        match stop {
+            None => Self::SaturationFinished,
+            Some(Stop::Work { .. }) => Self::Work,
+            Some(Stop::Memory { .. }) => Self::Memory,
+            Some(Stop::Timeout) => Self::Timeout,
+            Some(Stop::Cancelled) => Self::Cancelled,
+        }
+    }
+
+    fn event_name(self) -> &'static str {
+        match self {
+            Self::SaturationFinished => "saturation_finished",
+            _ => "saturation_stopped",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SaturationFinished => "none",
+            Self::Work => "work",
+            Self::Memory => "memory",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Snapshot captured immediately after `saturate_counted` for a tracked rooted attempt.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdaptiveSnapshot {
+    pub attempt: u32,
+    pub after_counting: bool,
+    pub enforce: bool,
+    pub policy_name: &'static str,
+    pub effective_cap: usize,
+    pub winning_stop: WinningStop,
+    pub stop_guard: dl_rules::WorkStopGuard,
+    pub stop_requested_at: usize,
+    pub hypothetical_guard: dl_rules::WorkStopGuard,
+    pub hypothetical_at: usize,
+    pub final_work: usize,
+    pub root_work: usize,
+    pub raw_queue: usize,
+    pub raw_pushed: usize,
+    pub mrepair_work: usize,
+    pub samples: usize,
+    pub oracle_queue: usize,
+}
+
+#[cfg(test)]
+impl AdaptiveSnapshot {
+    pub(crate) fn overshoot(&self) -> usize {
+        if self.stop_guard != dl_rules::WorkStopGuard::None {
+            self.final_work.saturating_sub(self.stop_requested_at)
+        } else {
+            0
+        }
+    }
+}
+
+/// Final public classification/saturation outcome recorded when adaptive diagnostics run.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdaptiveOutcome {
+    Ok {
+        run_id: u64,
+        attempts: u32,
+        consistency: Consistency,
+        complete: bool,
+        complete_for_taken: bool,
+        dl_rooted_over: bool,
+        dl_rooted_declined: bool,
+        dl_counting_over: bool,
+        dl_over_budget: bool,
+        horn_over_budget: bool,
+        outside_horn: usize,
+        outside_disj: usize,
+        excluded: usize,
+        incomplete: usize,
+    },
+    Err {
+        run_id: u64,
+        attempts: u32,
+        kind: &'static str,
+    },
+}
+
+fn consistency_str(c: Consistency) -> &'static str {
+    match c {
+        Consistency::Consistent => "consistent",
+        Consistency::Inconsistent => "inconsistent",
+        Consistency::Unknown => "unknown",
+    }
+}
+
+fn error_kind_str(e: &Error) -> &'static str {
+    match e {
+        Error::Memory { .. } => "memory",
+        Error::Timeout => "timeout",
+        Error::Cancelled => "cancelled",
+        Error::Incomplete(_) => "incomplete",
+    }
+}
+
+fn next_adaptive_run_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Sums resident clause-heap lengths across all already-initialized base and dynamic
+/// contexts without materializing any context or allocating a snapshot.
+fn count_actual_queue_len(ctx: &Contexts, dynamic: Option<&saturate::Dynamic>) -> usize {
+    let mut total = 0usize;
+    for slot in ctx {
+        if let Some(c) = slot.get()
+            && let Some(dl) = c.st.lock().extra.as_ref().and_then(|x| x.dl.as_ref())
+        {
+            total += dl.store.queue_len();
+        }
+    }
+    if let Some(dy) = dynamic {
+        dy.each(|c| {
+            if let Some(dl) = c.st.lock().extra.as_ref().and_then(|x| x.dl.as_ref()) {
+                total += dl.store.queue_len();
+            }
+        });
+    }
+    total
+}
 
 /// The most conclusions a run of Tier D with counting derives, kept or redundant, before
 /// it passes its bound and the run starts again without counting.
@@ -1153,6 +1349,10 @@ pub struct Saturation {
     /// the clause table of the last run of Tier D whose contexts the next run may keep,
     /// which name its clauses by id
     dl_run: Option<dl_rules::DlRun>,
+    /// diagnostic run id for top-level `run_with_all` (non-zero only when adaptive diag is on)
+    adaptive_run_id: u64,
+    /// number of tracked rooted attempts executed in the current top-level `run_with_all`
+    adaptive_attempts: u32,
 }
 
 /// The rules of a run whose contexts the next run may keep.
@@ -1778,36 +1978,43 @@ impl Classifier {
     pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
         let r = self.run_held(limits, true);
         let partial = self.sat.partial.take();
-        let mut out = r.map(|(consistent, taxonomy, stats)| {
-            Classification::new(consistent, taxonomy, stats, partial)
-        })?;
-        let excluded = self.sat.excluded();
-        if !excluded.is_empty() {
-            if limits.strict {
+        let res = (|| {
+            let mut out = r.map(|(consistent, taxonomy, stats)| {
+                Classification::new(consistent, taxonomy, stats, partial)
+            })?;
+            let excluded = self.sat.excluded();
+            if !excluded.is_empty() {
+                if limits.strict {
+                    return Err(Error::Incomplete(excluded.to_vec()));
+                }
+                let held: Vec<&AxiomKind> = self
+                    .axioms
+                    .iter()
+                    .filter(|(_, h)| h.count > 0)
+                    .map(|(k, _)| k)
+                    .collect();
+                if !limits.cover_later {
+                    out.cover(&held, excluded, None, limits);
+                }
+            }
+            if limits.strict && !out.complete {
                 return Err(Error::Incomplete(excluded.to_vec()));
             }
-            let held: Vec<&AxiomKind> = self
-                .axioms
-                .iter()
-                .filter(|(_, h)| h.count > 0)
-                .map(|(k, _)| k)
-                .collect();
-            if !limits.cover_later {
-                out.cover(&held, excluded, None, limits);
-            }
-        }
-        if limits.strict && !out.complete {
-            return Err(Error::Incomplete(excluded.to_vec()));
-        }
-        Ok(out)
+            Ok(out)
+        })();
+        self.sat.emit_adaptive_classify_outcome(&res);
+        res
     }
 
     /// Saturates the axioms held as [`classify`](Self::classify) does, again only what
     /// changed since the last run, but builds no taxonomy. [`describe`](Self::describe)
     /// then answers for one class from the saturated contexts.
     pub fn saturate(&mut self, limits: &Limits) -> Result<Saturated, Error> {
-        self.run_held(limits, false)
-            .map(|(consistent, _, stats)| Saturated { consistent, stats })
+        let res = self
+            .run_held(limits, false)
+            .map(|(consistent, _, stats)| Saturated { consistent, stats });
+        self.sat.emit_adaptive_saturate_outcome(&res);
+        res
     }
 
     /// What the last run says about the class `c` ([`Saturation::describe`]), or `None`
@@ -1919,6 +2126,8 @@ impl Saturation {
             kept: None,
             reused: false,
             dl_run: None,
+            adaptive_run_id: 0,
+            adaptive_attempts: 0,
         }
     }
 
@@ -1940,21 +2149,25 @@ impl Saturation {
     ) -> Result<Classification, Error> {
         let r = self.run_with(axioms, changes, 0, limits, true);
         let partial = self.partial.take();
-        let mut out = r.map(|(consistent, taxonomy, stats)| {
-            Classification::new(consistent, taxonomy, stats, partial)
-        })?;
-        if !self.excluded.is_empty() {
-            if limits.strict {
+        let res = (|| {
+            let mut out = r.map(|(consistent, taxonomy, stats)| {
+                Classification::new(consistent, taxonomy, stats, partial)
+            })?;
+            if !self.excluded.is_empty() {
+                if limits.strict {
+                    return Err(Error::Incomplete(self.excluded.clone()));
+                }
+                if !limits.cover_later {
+                    out.cover(axioms, &self.excluded, None, limits);
+                }
+            }
+            if limits.strict && !out.complete {
                 return Err(Error::Incomplete(self.excluded.clone()));
             }
-            if !limits.cover_later {
-                out.cover(axioms, &self.excluded, None, limits);
-            }
-        }
-        if limits.strict && !out.complete {
-            return Err(Error::Incomplete(self.excluded.clone()));
-        }
-        Ok(out)
+            Ok(out)
+        })();
+        self.emit_adaptive_classify_outcome(&res);
+        res
     }
 
     /// Saturates `axioms` as [`classify`](Saturation::classify) does, but builds no
@@ -1967,8 +2180,11 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         limits: &Limits,
     ) -> Result<Saturated, Error> {
-        self.run_with(axioms, changes, 0, limits, false)
-            .map(|(consistent, _, stats)| Saturated { consistent, stats })
+        let res = self
+            .run_with(axioms, changes, 0, limits, false)
+            .map(|(consistent, _, stats)| Saturated { consistent, stats });
+        self.emit_adaptive_saturate_outcome(&res);
+        res
     }
 
     /// [`classify`](Saturation::classify), with the bytes of the caller's copy of the
@@ -1981,6 +2197,14 @@ impl Saturation {
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        self.adaptive_attempts = 0;
+        self.adaptive_run_id = 0;
+        #[cfg(test)]
+        LAST_ADAPTIVE_ATTEMPTS.with(|c| c.borrow_mut().clear());
+        #[cfg(test)]
+        LAST_ADAPTIVE_OUTCOME.with(|c| *c.borrow_mut() = None);
+        #[cfg(test)]
+        LAST_ADAPTIVE_PREADMIT.with(|c| c.set(None));
         // the class assertions that another one stands for add nothing (roadmap item
         // 1281), and the run reads the other axioms, whose list it holds beside the
         // caller's
@@ -2391,6 +2615,239 @@ impl Saturation {
             stats.dl_over_budget = true;
         }
         r
+    }
+
+    /// Emits `ADAPTIVE-OUTCOME` from the final `Result<Classification, Error>` returned by
+    /// `Classifier::classify` or `Saturation::classify`, after partial construction,
+    /// exclusion coverage, and `limits.strict` checks have completed.
+    fn emit_adaptive_classify_outcome(&self, res: &Result<Classification, Error>) {
+        if self.adaptive_run_id == 0 {
+            return;
+        }
+        match res {
+            Ok(out) => {
+                let excluded = self.excluded.len();
+                let incomplete = out.incomplete.len();
+                eprintln!(
+                    "ADAPTIVE-OUTCOME run={} attempts={} status=ok consistency={} complete={} complete_for_taken={} dl_rooted_over={} dl_rooted_declined={} dl_counting_over={} dl_over_budget={} horn_over_budget={} outside_horn={} outside_disj={} excluded={} incomplete={}",
+                    self.adaptive_run_id,
+                    self.adaptive_attempts,
+                    consistency_str(out.consistency),
+                    out.complete,
+                    out.complete_for_taken,
+                    out.stats.dl_rooted_over,
+                    out.stats.dl_rooted_declined,
+                    out.stats.dl_counting_over,
+                    out.stats.dl_over_budget,
+                    out.stats.horn_over_budget,
+                    out.stats.outside_el.horn,
+                    out.stats.outside_el.disjunctive,
+                    excluded,
+                    incomplete,
+                );
+                #[cfg(test)]
+                LAST_ADAPTIVE_OUTCOME.with(|c| {
+                    *c.borrow_mut() = Some(AdaptiveOutcome::Ok {
+                        run_id: self.adaptive_run_id,
+                        attempts: self.adaptive_attempts,
+                        consistency: out.consistency,
+                        complete: out.complete,
+                        complete_for_taken: out.complete_for_taken,
+                        dl_rooted_over: out.stats.dl_rooted_over,
+                        dl_rooted_declined: out.stats.dl_rooted_declined,
+                        dl_counting_over: out.stats.dl_counting_over,
+                        dl_over_budget: out.stats.dl_over_budget,
+                        horn_over_budget: out.stats.horn_over_budget,
+                        outside_horn: out.stats.outside_el.horn,
+                        outside_disj: out.stats.outside_el.disjunctive,
+                        excluded,
+                        incomplete,
+                    });
+                });
+            }
+            Err(e) => {
+                let kind = error_kind_str(e);
+                eprintln!(
+                    "ADAPTIVE-OUTCOME run={} attempts={} status=err err={kind}",
+                    self.adaptive_run_id, self.adaptive_attempts,
+                );
+                #[cfg(test)]
+                LAST_ADAPTIVE_OUTCOME.with(|c| {
+                    *c.borrow_mut() = Some(AdaptiveOutcome::Err {
+                        run_id: self.adaptive_run_id,
+                        attempts: self.adaptive_attempts,
+                        kind,
+                    });
+                });
+            }
+        }
+    }
+
+    /// Emits `ADAPTIVE-OUTCOME` from the final `Result<Saturated, Error>` returned by
+    /// `Classifier::saturate` or `Saturation::saturate`.
+    fn emit_adaptive_saturate_outcome(&self, res: &Result<Saturated, Error>) {
+        if self.adaptive_run_id == 0 {
+            return;
+        }
+        match res {
+            Ok(out) => {
+                let consistency = if out.consistent {
+                    Consistency::Consistent
+                } else {
+                    Consistency::Inconsistent
+                };
+                let excluded = self.excluded.len();
+                let complete = excluded == 0;
+                eprintln!(
+                    "ADAPTIVE-OUTCOME run={} attempts={} status=ok consistency={} complete={} complete_for_taken=true dl_rooted_over={} dl_rooted_declined={} dl_counting_over={} dl_over_budget={} horn_over_budget={} outside_horn={} outside_disj={} excluded={} incomplete=0",
+                    self.adaptive_run_id,
+                    self.adaptive_attempts,
+                    consistency_str(consistency),
+                    complete,
+                    out.stats.dl_rooted_over,
+                    out.stats.dl_rooted_declined,
+                    out.stats.dl_counting_over,
+                    out.stats.dl_over_budget,
+                    out.stats.horn_over_budget,
+                    out.stats.outside_el.horn,
+                    out.stats.outside_el.disjunctive,
+                    excluded,
+                );
+                #[cfg(test)]
+                LAST_ADAPTIVE_OUTCOME.with(|c| {
+                    *c.borrow_mut() = Some(AdaptiveOutcome::Ok {
+                        run_id: self.adaptive_run_id,
+                        attempts: self.adaptive_attempts,
+                        consistency,
+                        complete,
+                        complete_for_taken: true,
+                        dl_rooted_over: out.stats.dl_rooted_over,
+                        dl_rooted_declined: out.stats.dl_rooted_declined,
+                        dl_counting_over: out.stats.dl_counting_over,
+                        dl_over_budget: out.stats.dl_over_budget,
+                        horn_over_budget: out.stats.horn_over_budget,
+                        outside_horn: out.stats.outside_el.horn,
+                        outside_disj: out.stats.outside_el.disjunctive,
+                        excluded,
+                        incomplete: 0,
+                    });
+                });
+            }
+            Err(e) => {
+                let kind = error_kind_str(e);
+                eprintln!(
+                    "ADAPTIVE-OUTCOME run={} attempts={} status=err err={kind}",
+                    self.adaptive_run_id, self.adaptive_attempts,
+                );
+                #[cfg(test)]
+                LAST_ADAPTIVE_OUTCOME.with(|c| {
+                    *c.borrow_mut() = Some(AdaptiveOutcome::Err {
+                        run_id: self.adaptive_run_id,
+                        attempts: self.adaptive_attempts,
+                        kind,
+                    });
+                });
+            }
+        }
+    }
+
+    /// Captures the joined saturation's counters, resident clause-heap oracle, and winning
+    /// stop reason immediately after `saturate_counted`.
+    fn record_adaptive_saturation(
+        &self,
+        d: &dl_rules::DlRun,
+        dynamic: Option<&saturate::Dynamic>,
+        stop: Option<Stop>,
+    ) {
+        let winning = WinningStop::from_stop(stop);
+        let final_work = d.work();
+        let root_work = d.root_work();
+        let raw_queue = d.raw_queue();
+        let raw_pushed = d.raw_pushed();
+        let mrepair_work = d.mrepair_work();
+        let stop_guard = d.stop_guard();
+        let stop_requested_at = d.stop_requested_at();
+        let hyp_guard = d.hypothetical_guard();
+        let hyp_at = d.hypothetical_at();
+        let check_oracle = cfg!(any(debug_assertions, test)) || d.is_adaptive_diag();
+        let oracle_queue = if check_oracle {
+            let actual = count_actual_queue_len(&self.ctx, dynamic);
+            assert_eq!(
+                raw_queue, actual,
+                "raw_queue ({raw_queue}) != sum(store.queue_len()) ({actual})"
+            );
+            assert!(
+                raw_queue <= raw_pushed,
+                "raw_queue ({raw_queue}) exceeded raw_pushed ({raw_pushed})"
+            );
+            actual
+        } else {
+            raw_queue
+        };
+        if d.is_adaptive_diag()
+            && let Some(meta) = d.adaptive_meta()
+        {
+            let overshoot = if stop_guard != dl_rules::WorkStopGuard::None {
+                final_work.saturating_sub(stop_requested_at)
+            } else {
+                0
+            };
+            eprintln!(
+                "ADAPTIVE-SAT run={} attempt={} mode={} policy={} cap={} after_counting={} mrepair={} threads={} event={} stop={} guard={} req_at={} overshoot={} hyp_guard={} hyp_at={} work={} root_work={} raw_q={} raw_p={} oracle_q={} mrepair_work={} samples={}",
+                meta.run_id,
+                meta.attempt,
+                if d.is_adaptive_enforced() {
+                    "enforce"
+                } else {
+                    "observe"
+                },
+                meta.policy_name,
+                meta.effective_cap,
+                usize::from(meta.after_counting),
+                meta.mrepair,
+                meta.threads,
+                winning.event_name(),
+                winning.as_str(),
+                stop_guard.as_str(),
+                stop_requested_at,
+                overshoot,
+                hyp_guard.as_str(),
+                hyp_at,
+                final_work,
+                root_work,
+                raw_queue,
+                raw_pushed,
+                oracle_queue,
+                mrepair_work,
+                d.adaptive_samples(),
+            );
+        }
+        #[cfg(test)]
+        if let Some(meta) = d.adaptive_meta() {
+            LAST_ADAPTIVE_ATTEMPTS.with(|c| {
+                c.borrow_mut().push(AdaptiveSnapshot {
+                    attempt: meta.attempt,
+                    after_counting: meta.after_counting,
+                    enforce: d.is_adaptive_enforced(),
+                    policy_name: meta.policy_name,
+                    effective_cap: meta.effective_cap,
+                    winning_stop: winning,
+                    stop_guard,
+                    stop_requested_at,
+                    hypothetical_guard: hyp_guard,
+                    hypothetical_at: hyp_at,
+                    final_work,
+                    root_work,
+                    raw_queue,
+                    raw_pushed,
+                    mrepair_work,
+                    samples: d.adaptive_samples(),
+                    oracle_queue,
+                });
+            });
+        }
+        #[cfg(not(test))]
+        let _ = oracle_queue;
     }
 
     /// After a rooted run that withdrew its answer (item 1231), which `rooted_declined`
@@ -3367,7 +3824,7 @@ impl Saturation {
             }
             _ => dl_rules::DlRun::new(limits.expansion == Expansion::Eager, self.dl_worked.clone()),
         });
-        let dl_run = dl_run.map(|mut d| {
+        let mut dl_run = dl_run.map(|mut d| {
             d.mrepair = dl_root::marker_repair(limits.rooted_marker_repair);
             d
         });
@@ -3485,7 +3942,14 @@ impl Saturation {
         self.dl_counted = ax.dl.as_ref().is_some_and(|d| d.counting);
         self.dl_attempt =
             dl_run.is_some() && !self.dl_rooted && !self.dl_counted && !self.no_counting;
-        if let Some(d) = &dl_run {
+        let mut pending_adaptive: Option<(
+            dl_rules::AdaptivePolicy,
+            bool,
+            bool,
+            &'static str,
+            usize,
+        )> = None;
+        if let Some(d) = &mut dl_run {
             // a run that counts has the bound of the limits, and the run that starts again
             // without counting after it passed that bound has the larger one of a run that
             // cannot expect to finish soon, before the Horn rules take over; a rooted run
@@ -3494,7 +3958,35 @@ impl Saturation {
             // only an attempt has a limit on the choices of a product
             d.set_width_limit(0);
             if self.dl_rooted && !self.dl_counted {
-                d.set_work_limit(limits.dl_work.unwrap_or(ROOTED_WORK_BOUND).max(1));
+                let (adaptive_on, diag_on) = if limits.dl_steps {
+                    (
+                        limits.dl_work.is_none() && dl_rules::rooted_adaptive_bound(),
+                        dl_rules::rooted_adaptive_diag(),
+                    )
+                } else {
+                    (false, false)
+                };
+                let policy = if adaptive_on || diag_on {
+                    dl_rules::active_adaptive_policy()
+                } else {
+                    dl_rules::AdaptivePolicy::PROVISIONAL
+                };
+                let selected = select_rooted_bound(
+                    limits.dl_work,
+                    limits.dl_steps,
+                    adaptive_on,
+                    policy,
+                    ROOTED_WORK_BOUND,
+                );
+                let effective_cap = selected.work_limit();
+                d.set_work_limit(effective_cap);
+                if limits.dl_steps
+                    && (matches!(selected, RootedBoundPolicy::Adaptive(_)) || diag_on)
+                {
+                    let enforce = matches!(selected, RootedBoundPolicy::Adaptive(_));
+                    pending_adaptive =
+                        Some((policy, enforce, diag_on, selected.name(), effective_cap));
+                }
             } else if self.no_counting {
                 d.set_work_limit(DL_RETRY_WORK);
             } else if self.dl_counted {
@@ -3549,6 +4041,65 @@ impl Saturation {
             && !self.dl_attempt;
         let steps = fixed && rooted.is_none() && limits.expansion == Expansion::Cautious;
         let saturation_threads = if fixed && !steps { 1 } else { threads };
+        // Admit the pending `Box<AdaptiveState>` overlap before allocating it, reusing any
+        // paid normalization headroom and charging the state once in the live ledger.
+        let adaptive_bytes = if pending_adaptive.is_some() {
+            std::mem::size_of::<dl_rules::AdaptiveState>()
+        } else {
+            0
+        };
+        let pre_sat = if adaptive_bytes > 0 {
+            let dyn_before = dynamic.as_ref().map_or(0, |d| d.bytes());
+            let dl_before = dl_run.as_ref().map_or(0, |d| d.bytes());
+            let Some(total) = base
+                .checked_add(dyn_before)
+                .and_then(|n| n.checked_add(dl_before))
+                .and_then(|n| n.checked_add(adaptive_bytes))
+            else {
+                return Err(Error::Memory {
+                    limit: max_memory.unwrap_or(usize::MAX),
+                    used: usize::MAX,
+                });
+            };
+            total
+        } else {
+            base
+        };
+        let pre_cap = if adaptive_bytes > 0 {
+            max_memory
+        } else {
+            limits.max_memory
+        };
+        // the pool has been charged for the peak of a parallel normalization
+        let more = pre_sat.saturating_sub(normalized_peak);
+        #[cfg(test)]
+        if adaptive_bytes > 0 {
+            LAST_ADAPTIVE_PREADMIT.with(|c| c.set(Some((normalized_peak, pre_sat, more))));
+        }
+        if pre_cap.is_some_and(|m| pre_sat > m) || charge_fn.is_some_and(|f| more > 0 && !f(more)) {
+            return Err(Error::Memory {
+                limit: pre_cap.unwrap_or(pre_sat),
+                used: pre_sat,
+            });
+        }
+        if let Some((policy, enforce, diag_on, policy_name, effective_cap)) = pending_adaptive
+            && let Some(d) = &mut dl_run
+        {
+            if diag_on && self.adaptive_run_id == 0 {
+                self.adaptive_run_id = next_adaptive_run_id();
+            }
+            self.adaptive_attempts += 1;
+            let meta = dl_rules::AdaptiveMeta {
+                run_id: self.adaptive_run_id,
+                attempt: self.adaptive_attempts,
+                after_counting: self.no_counting,
+                policy_name,
+                effective_cap,
+                mrepair: d.mrepair,
+                threads: limits.threads,
+            };
+            d.enable_adaptive(policy, enforce, diag_on, meta);
+        }
         let bounds = Bounds {
             threads: saturation_threads,
             deadline: limits.deadline,
@@ -3557,9 +4108,13 @@ impl Saturation {
             charge: charge_fn,
             base_memory: base,
             base_queued: 0,
-            peak_memory: normalized_peak,
+            peak_memory: if adaptive_bytes > 0 {
+                normalized_peak.max(pre_sat)
+            } else {
+                normalized_peak
+            },
             paid_memory: if charge_fn.is_some() {
-                normalized_peak.max(base)
+                normalized_peak.max(pre_sat)
             } else {
                 0
             },
@@ -3568,16 +4123,6 @@ impl Saturation {
             partial: limits.partial && disj && with_taxonomy,
             steps,
         };
-        // the pool has been charged for the peak of a parallel normalization
-        let more = base.saturating_sub(normalized_peak);
-        if limits.max_memory.is_some_and(|m| base > m)
-            || charge_fn.is_some_and(|f| more > 0 && !f(more))
-        {
-            return Err(Error::Memory {
-                limit: limits.max_memory.unwrap_or(base),
-                used: base,
-            });
-        }
         let t = Instant::now();
         let stopped = |stop: Stop| match stop {
             Stop::Cancelled => Error::Cancelled,
@@ -3596,8 +4141,16 @@ impl Saturation {
         // the stop to the caller's deadline, cancellation or memory refusal does not count
         let mut over_work = false;
         let partial = bounds.partial;
-        let mut totals = match saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds)
-        {
+        let (sat_totals, sat_stop) =
+            saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds);
+        // Capture saturation counters, heap occupancy oracle, and winning stop reason
+        // immediately after `saturate_counted`, before error translation, `partial=true`
+        // routing, marker decline, or partial store teardown.
+        if let Some(d) = dl_run.as_ref().filter(|d| d.tracks_adaptive()) {
+            self.record_adaptive_saturation(d, dynamic.as_ref(), sat_stop);
+            d.stop_adaptive_sampling();
+        }
+        let mut totals = match (sat_totals, sat_stop) {
             (t, None) => t,
             (t, Some(s)) if partial => {
                 over_work = matches!(s, Stop::Work { .. });
@@ -3784,6 +4337,16 @@ impl Saturation {
             };
             (incomplete, consistency)
         });
+        // A non-work stop already won and a partial answer is being constructed: disarm
+        // adaptive work-bound enforcement on `dl_run` before the individual-marking round
+        // so a previously latched adaptive guard cannot abort the partial answer with a
+        // late `Stop::Work`, while keeping `dl_run.bytes()` intact and preserving fixed /
+        // non-adaptive work enforcement verbatim.
+        if open.is_some()
+            && let Some(d) = dl_run.as_ref()
+        {
+            d.disarm_adaptive_work_bound();
+        }
         // Dependency recording has seen the stopped to-do lists. The messages still
         // occupy memory while marking and retained output run.
         let pending_messages = || {
@@ -5612,6 +6175,37 @@ thread_local! {
     /// `(base, allowance_base, own)` observed by the last Horn/Tier D run on this thread.
     pub(super) static LAST_ALLOWANCE: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
+    /// Snapshots captured immediately after `saturate_counted` for each tracked rooted
+    /// attempt in the last top-level classification on this thread.
+    pub(super) static LAST_ADAPTIVE_ATTEMPTS: std::cell::RefCell<Vec<AdaptiveSnapshot>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Final public outcome recorded by `emit_adaptive_*_outcome` when diagnostics ran.
+    pub(super) static LAST_ADAPTIVE_OUTCOME: std::cell::RefCell<Option<AdaptiveOutcome>> =
+        const { std::cell::RefCell::new(None) };
+    /// `(normalized_peak, pre_sat, more)` witnessed at the pre-box adaptive admission
+    /// check in `Saturation::run`.
+    pub(super) static LAST_ADAPTIVE_PREADMIT: std::cell::Cell<Option<(usize, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn last_adaptive_attempts() -> Vec<AdaptiveSnapshot> {
+    LAST_ADAPTIVE_ATTEMPTS.with(|c| c.borrow().clone())
+}
+
+#[cfg(test)]
+pub(super) fn last_adaptive_outcome() -> Option<AdaptiveOutcome> {
+    LAST_ADAPTIVE_OUTCOME.with(|c| *c.borrow())
+}
+
+#[cfg(test)]
+pub(super) fn reset_adaptive_preadmit() {
+    LAST_ADAPTIVE_PREADMIT.with(|c| c.set(None));
+}
+
+#[cfg(test)]
+pub(super) fn last_adaptive_preadmit() -> Option<(usize, usize, usize)> {
+    LAST_ADAPTIVE_PREADMIT.with(|c| c.get())
 }
 
 fn poll(limits: &Limits) -> Result<(), Error> {

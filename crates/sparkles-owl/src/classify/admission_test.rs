@@ -64,10 +64,13 @@ pub(super) fn with_hook<T>(hook: impl FnMut(Point) + 'static, run: impl FnOnce()
     run()
 }
 
+pub(super) fn with_point_hook<T>(hook: impl FnMut(Point) + 'static, run: impl FnOnce() -> T) -> T {
+    with_hook(hook, run)
+}
+
 pub(super) fn has_hook() -> bool {
     HOOK.with(|slot| slot.borrow().is_some())
 }
-
 pub(super) fn hit(point: Point) {
     HOOK.with(|h| {
         if let Some(hook) = h.borrow_mut().as_mut() {
