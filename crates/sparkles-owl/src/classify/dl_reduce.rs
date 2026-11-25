@@ -37,7 +37,7 @@ use super::index::Gap;
 use super::{Error, Excluded, ScratchBudget};
 use crate::model::*;
 use crate::vocab;
-use rustc_hash::{FxHashSet, FxHasher};
+use rustc_hash::FxHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
@@ -121,22 +121,23 @@ impl Reduction {
 
     /// Restores the original axioms in a sorted report. A rewritten axiom can stand
     /// for several originals, and is also kept when it was stated unchanged.
+    /// Returns whether the report excluded or partially used any rewritten axiom.
     pub fn restore(
         &self,
         axioms: &[&AxiomKind],
         excluded: &mut Vec<Excluded>,
         admit: &mut impl FnMut(usize) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         use std::mem::size_of;
 
         let start = |k: &AxiomKind| excluded.partition_point(|e| e.axiom < *k);
         let reported = |k: &AxiomKind| excluded.get(start(k)).is_some_and(|e| e.axiom == *k);
         if excluded.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let matches = self.axioms.iter().filter(|k| reported(k)).count();
         if matches == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         let scratch = btree_map_bytes::<usize, [usize; 2]>(matches.min(axioms.len()))
@@ -205,7 +206,7 @@ impl Reduction {
         out.sort_unstable();
         out.dedup();
         *excluded = out;
-        Ok(())
+        Ok(true)
     }
 
     /// Which original axioms stand for a rewritten chain or are a chain as stated.
@@ -225,17 +226,6 @@ impl Reduction {
                     .enumerate()
                     .filter_map(move |(i, (k, &replaced))| (!replaced && is_chain(k)).then_some(i)),
             )
-    }
-
-    /// Whether the run left out or used only in part any axiom that the rewriting made.
-    /// The lookup holds only the report's axioms, so it costs memory in proportion to
-    /// the report and not to the rewriting.
-    pub fn excludes_rewritten(&self, excluded: &[Excluded]) -> bool {
-        if excluded.is_empty() {
-            return false;
-        }
-        let left: FxHashSet<&AxiomKind> = excluded.iter().map(|e| &e.axiom).collect();
-        self.axioms.iter().any(|k| left.contains(k))
     }
 
     /// What the original axioms outside OWL 2 EL need, for the run's statistics, with the

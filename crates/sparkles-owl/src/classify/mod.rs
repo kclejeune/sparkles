@@ -1835,6 +1835,8 @@ pub struct Saturation {
     excluded: Vec<Excluded>,
     /// whether the current attempt published its replacement exclusion report
     report_replaced: bool,
+    /// whether the current reduced attempt excluded or partially used any rewritten axiom
+    rewritten_excluded: bool,
     /// set when a run stopped part way, so that the next run starts again
     dirty: bool,
     /// the subsumers of the classes that the last run classified in worlds of their own,
@@ -3742,6 +3744,7 @@ impl Saturation {
             source_len: None,
             excluded: Vec::new(),
             report_replaced: false,
+            rewritten_excluded: false,
             dirty: true,
             worlds: FxHashMap::default(),
             query_cache: std::sync::OnceLock::new(),
@@ -8291,17 +8294,20 @@ impl Saturation {
         }
         excluded.sort_unstable();
         excluded.dedup();
-        if let Some((red, original)) = reduction {
+        let rewritten_excluded = if let Some((red, original)) = reduction {
             // Reductions exclude datatype axioms, so the checker cannot add a gap later.
             debug_assert!(ix.dt.is_none());
             let base = report_base().saturating_add(excluded_copy_bytes(&excluded));
             red.restore(original, &mut excluded, &mut |extra| {
                 budget.baseline(base.saturating_add(extra))
-            })?;
-        }
+            })?
+        } else {
+            false
+        };
         self.chain_ranged = chain_ranged;
         self.excluded = excluded;
         self.report_replaced = true;
+        self.rewritten_excluded = rewritten_excluded;
         outside_el.taken = taken.len();
         Ok((ax, ix, peak, outside_el, visible_named_classes))
     }
@@ -8473,7 +8479,7 @@ impl Saturation {
                             Ok(ControlFlow::Continue(mut r))
                                 if self.dl_tried
                                     || (r.2.tier != Tier::Disjunctive
-                                        && !red.excludes_rewritten(&self.excluded)) =>
+                                        && !self.rewritten_excluded) =>
                             {
                                 self.reduced = true;
                                 drop(all);
@@ -8664,6 +8670,7 @@ impl Saturation {
         self.numeric_halt = false;
         self.last_paid = 0;
         self.report_replaced = false;
+        self.rewritten_excluded = false;
         // the profile check of each axiom, which depends on it alone
         let outside: Vec<(usize, (String, String))> =
             par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
@@ -22113,22 +22120,11 @@ mod tests {
         );
 
         // 2. Tier D ontology whose `dl_norm::normalize` / `Index::build` peak exceeds
-        //    Horn/EL's full peak: many distinct disjunctive axioms over a small class
-        //    signature (skipped by Horn/EL) with no outgoing axioms on the disjuncts so
-        //    unconstrained Tier D finishes rapidly while `build()` holds all 300 clauses.
-        let mut dl_text =
-            String::from("Prefix(:=<urn:pre-sat-dl:>)\nOntology(\nSubClassOf(:Seed0 :Seed1)\n");
-        for i in 0..300usize {
-            let a = i % 15;
-            let b0 = (i / 15) % 24;
-            let b1 = (b0 + 1 + (i % 5)) % 24;
-            let b2 = (b1 + 1 + ((i / 5) % 5)) % 24;
-            let b3 = (b2 + 1) % 24;
-            dl_text.push_str(&format!(
-                "SubClassOf(:A{a} ObjectUnionOf(:B{b0} :B{b1} :B{b2} :B{b3}))\n"
-            ));
-        }
-        dl_text.push(')');
+        //    EL's full peak (including exclusion-report admission): the Horn automata core
+        //    plus a disjunction on `:C0` so unconstrained Tier D finishes rapidly while
+        //    `build()` exceeds EL's peak memory.
+        let mut dl_text = horn_text.trim_end_matches(')').to_string();
+        dl_text.push_str("SubClassOf(:C0 ObjectUnionOf(:D0 :D1))\n)");
         let dl_doc = crate::ofn_read::parse(&dl_text).unwrap();
         let dl_kinds: Vec<&AxiomKind> = dl_doc.axioms.iter().map(|a| &a.kind).collect();
         let dl_outside: Vec<(usize, (String, String))> = dl_kinds

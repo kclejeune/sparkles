@@ -645,6 +645,9 @@ pub struct ViewRebuild {
     pub aggregate_errors: super::AggregateErrors,
     pub commit: u64,
     pub evaluated_under: Option<super::AggregateErrors>,
+    /// The view runtime's shared [`QueryPool`], so an unpooled caller running a
+    /// streaming fallback rebuild still charges the runtime's pool.
+    pub fallback_pool: Option<Arc<super::pool::QueryPool>>,
 }
 
 impl ViewRebuild {

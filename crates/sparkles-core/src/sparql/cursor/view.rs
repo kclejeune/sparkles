@@ -441,6 +441,11 @@ impl View {
         options: &CursorOptions,
         rebuild: &ViewRebuild,
     ) -> Result<(QueryCursor, Option<graph::Spec>)> {
+        let (grant, pool, parent) = match (ctx.grant(), &rebuild.fallback_pool) {
+            (Some(grant), _) => (Some(grant.clone()), None, ctx.memory_parent()?),
+            (None, Some(pool)) => (None, Some(pool.clone()), pool.work_parent()),
+            (None, None) => (None, None, ctx.memory_parent()?),
+        };
         let child_opts = QueryOptions {
             graphs: rebuild.access.clone(),
             deadline: rebuild.deadline,
@@ -456,8 +461,8 @@ impl View {
             max_rows_produced: Some(ctx.max_rows_produced),
             work: Some(ctx.rows_produced.clone()),
             union_default_graph: Some(rebuild.union_default_graph),
-            grant: ctx.grant().cloned(),
-            pool: None,
+            grant,
+            pool,
             allow_service: false,
             forbid_service: true,
             defaults_applied: true,
@@ -490,7 +495,7 @@ impl View {
             &rebuild.query,
             &child_opts,
             &child_cursor,
-            ctx.memory_parent()?,
+            parent,
             &inherited,
         )
     }
@@ -828,6 +833,7 @@ mod tests {
             commit: 0,
             snap: s.snapshot(),
             evaluated_under: None,
+            fallback_pool: None,
         }
     }
 

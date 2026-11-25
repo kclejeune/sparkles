@@ -1704,6 +1704,7 @@ impl Axioms {
         let mut total = self.subs.capacity() * 8
             + self.disjoint.capacity() * 24
             + self.role_subs.capacity() * 8
+            + self.chains.capacity() * std::mem::size_of::<(Vec<Role>, Role)>()
             + self.reflexive.capacity() * 4
             + self.ranges.capacity() * 8
             + self.data_ranges.capacity() * 8
@@ -1718,7 +1719,7 @@ impl Axioms {
         }
         for (c, _) in &self.chains {
             tick(1)?;
-            total += 32 + c.capacity() * 4;
+            total += c.capacity() * std::mem::size_of::<Role>();
         }
         for k in &self.keys {
             tick(1)?;

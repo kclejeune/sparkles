@@ -683,18 +683,9 @@ fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
     );
 
     // 2. Verify Tier D pre-saturation memory refusal preserves Tier D under `partial: true`
-    //    (never silently downgrading to Horn), while `dl_attempt_work` still falls back.
-    let mut dl_body = String::from("SubClassOf(:Seed0 :Seed1)\n");
-    for i in 0..300usize {
-        let a = i % 15;
-        let b0 = (i / 15) % 24;
-        let b1 = (b0 + 1 + (i % 5)) % 24;
-        let b2 = (b1 + 1 + ((i / 5) % 5)) % 24;
-        let b3 = (b2 + 1) % 24;
-        dl_body.push_str(&format!(
-            "SubClassOf(:A{a} ObjectUnionOf(:B{b0} :B{b1} :B{b2} :B{b3}))\n"
-        ));
-    }
+    //    (never silently downgrading to Horn or EL), while `partial: false` still falls back.
+    let mut dl_body = horn_body;
+    dl_body.push_str("SubClassOf(:C0 ObjectUnionOf(:D0 :D1))\n");
     let dl_ax = axioms(&dl_body);
     let dl_full = Classifier::of(&dl_ax)
         .classify(&Limits {

@@ -502,6 +502,7 @@ impl Runtime {
             aggregate_errors,
             commit: snap.commit,
             evaluated_under,
+            fallback_pool: self.pool.clone(),
         };
         // The planner clones algebra and template terms from the stored query.
         // Cover that staging before handing the parsed query to the child.

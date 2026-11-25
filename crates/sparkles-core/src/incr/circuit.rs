@@ -825,15 +825,21 @@ impl Circuit {
         self.root.plan(&self.vars)
     }
 
+    /// Approximate retained bytes of the published immutable view version (excluding
+    /// local term key bytes already accounted in [`Terms::bytes`]).
+    pub fn version_bytes(&self) -> u64 {
+        self.version.as_ref().map_or(0, |v| {
+            v.retained_bytes()
+                .saturating_sub(v.terms.key_storage_bytes())
+        })
+    }
+
     /// The approximate memory of the state and the result.
     pub fn bytes(&self) -> u64 {
         self.root.bytes()
             + self.result.bytes(self.root.schema.len())
             + self.terms.bytes()
-            + self.version.as_ref().map_or(0, |v| {
-                v.retained_bytes()
-                    .saturating_sub(v.terms.key_storage_bytes())
-            })
+            + self.version_bytes()
             + prov::map_bytes(&self.ann, self.root.schema.len())
             + self.facts.bytes()
     }
@@ -1225,18 +1231,20 @@ impl Circuit {
                 return Err(e);
             }
         }
-        if let Err(e) = self
-            .budget
-            .commit_pass_with_scratch(self.bytes(), &mut out_lease)
-        {
-            self.clear_state();
-            drop(out_lease);
-            return Err(e);
-        }
+        let prev_applied = self.applied;
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.last = stats;
         self.publish_fresh_version();
+        if let Err(e) = self
+            .budget
+            .commit_pass_with_scratch(self.bytes(), &mut out_lease)
+        {
+            self.applied = prev_applied;
+            self.clear_state();
+            drop(out_lease);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -1303,14 +1311,14 @@ impl Circuit {
             self.clear_state();
             return Err(e);
         }
-        if let Err(e) = self.budget.commit_pass(self.bytes()) {
-            self.clear_state();
-            return Err(e);
-        }
         self.snap = Some(snap.clone());
         self.resolved = None;
         self.inferred = InferredFootprint::default();
         self.publish_fresh_version();
+        if let Err(e) = self.budget.commit_pass(self.bytes()) {
+            self.clear_state();
+            return Err(e);
+        }
         Ok(())
     }
 

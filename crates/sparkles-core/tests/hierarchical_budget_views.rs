@@ -860,9 +860,9 @@ fn slot_history_evicts_under_pressure_and_active_state_takes_priority() {
     let store = Store::in_memory(StoreOptions::default());
     load_rows(&store, "h", 100, 128);
 
-    // Give the view a 128 KiB local ceiling: initial build (100 rows + 64 KiB child
-    // step) easily fits, Update 1 stores an ~80 KiB replay diff in Slot::history
-    // alongside ~15 KiB active state, and Update 2's active pass + growth exceeds 128
+    // Give the view a 140 KiB local ceiling: initial build (100 rows + published version)
+    // easily fits, Update 1 stores an ~80 KiB replay diff in Slot::history alongside ~25 KiB
+    // active state and published version, and Update 2's active pass + growth exceeds 140
     // KiB unless Slot::history is evicted during admission.
     let pool = QueryPool::new(16 * MB);
     let rt = Runtime::open_with_pool(
@@ -873,7 +873,7 @@ fn slot_history_evicts_under_pressure_and_active_state_takes_priority() {
     );
     rt.set_host(Arc::new(OpenHost));
     let mut def = ViewDef::table("SELECT ?s ?o WHERE { ?s <urn:p> ?o }");
-    def.memory_bytes = 128 * KB;
+    def.memory_bytes = 140 * KB;
     rt.put(&store, "hist_prio", def).unwrap();
     rt.round(&store);
     assert!(matches!(
@@ -2121,6 +2121,7 @@ fn distinct_sum_checkpoint_recovery_matches_steady_state_bytes() {
     circ.set_pool(Some(pool.clone()), Some(pool.work_parent()));
     circ.build(snap.clone(), &Control::none()).unwrap();
     let steady = circ.bytes();
+    let version_bytes = circ.version_bytes();
     // 200 decimals (200 * 40 = 8,000) + 200 doubles (200 * 24 = 4,800) must be included
     // in `steady` on top of `vals` (400 * 24 = 9,600).
     assert!(
@@ -2132,7 +2133,9 @@ fn distinct_sum_checkpoint_recovery_matches_steady_state_bytes() {
     assert_eq!(pool.granted(), 0);
 
     // Include the checkpoint buffer and the reader's ID table. The term table
-    // starts with the varint count of serialized IDs, excluding UNDEF.
+    // starts with the varint count of serialized IDs, excluding UNDEF. During decode,
+    // the reader's ID table drops before `publish_fresh_version` runs and `commit_pass`
+    // commits the published version's bytes.
     let mut keys = 0usize;
     for (shift, &byte) in body.iter().enumerate() {
         keys |= usize::from(byte & 0x7f) << (7 * shift);
@@ -2141,8 +2144,9 @@ fn distinct_sum_checkpoint_recovery_matches_steady_state_bytes() {
         }
     }
     let slots = (keys + 1).next_power_of_two().max(4);
-    let peak =
-        steady + body.len() as u64 + (slots * std::mem::size_of::<sparkles_core::id::Id>()) as u64;
+    let peak = body.len() as u64
+        + (steady - version_bytes + (slots * std::mem::size_of::<sparkles_core::id::Id>()) as u64)
+            .max(steady);
     let mut recovered = Circuit::new(compile(&q, None).unwrap(), None);
     recovered.set_pool(Some(pool.clone()), Some(pool.work_parent()));
     recovered.max_memory_bytes = Some(peak);
