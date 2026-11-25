@@ -1276,9 +1276,9 @@ export class Administration {
        * Classify by OWL 2 EL (spec F24): consistency, the unsatisfiable classes, the axioms
        * left out or used in part, one class (`about`) and the taxonomy's nodes (`nodes`,
        * `limit` from `offset`). `target` writes the taxonomy to that named graph in one commit.
-       * `partial` answers what a run with the disjunctive rules proved when its deadline or
-       * cancellation stops it, with `partial` true, the `incomplete` classes and the
-       * `consistency`.
+       * `partial` answers what a classification run at any tier (EL, Horn, or disjunctive)
+       * proved when its deadline or cancellation stops it after saturation begins, with
+       * `partial` true, the `incomplete` classes and the `consistency`.
        */
       classify: <P extends 'frame' | undefined = undefined>(
         o: OntologySelection &
@@ -1292,7 +1292,7 @@ export class Administration {
             threads?: number;
             target?: OntologyGraph;
             message?: string;
-            /** answer what a run with the disjunctive rules proved when `timeout` or `signal` stops it */
+            /** answer what a classification run at any tier proved when `timeout` or `signal` stops it */
             partial?: boolean;
             /**
              * refuse with `UnsupportedError`, whose `details.code` is

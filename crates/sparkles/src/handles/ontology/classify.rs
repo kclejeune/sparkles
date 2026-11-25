@@ -92,11 +92,11 @@ pub struct ClassifyRequest {
     /// ([`sparkles_owl::classify::Limits::el_only`]). Such a run does not use the
     /// dataset's kept classification.
     pub el_only: bool,
-    /// a run with the disjunctive rules that its deadline, cancellation or memory budget
-    /// stops answers with what it proved, a [`Classification`] whose
-    /// [`complete`](Classification::complete) is false, instead of failing
-    /// ([`sparkles_owl::classify::Limits::partial`]). A run of the other tiers fails as
-    /// before. A classification that writes its taxonomy refuses it.
+    /// a classification run (EL, Horn, or disjunctive) that its deadline, cancellation or
+    /// memory budget stops after saturation begins answers with what it proved, a
+    /// [`Classification`] whose [`complete`](Classification::complete) is false, instead
+    /// of failing ([`sparkles_owl::classify::Limits::partial`]). A classification that
+    /// writes its taxonomy refuses it.
     pub partial: bool,
     /// the expansion strategy of the disjunctive rules, which gives the same answer
     /// either way ([`sparkles_owl::classify::Limits::expansion`])

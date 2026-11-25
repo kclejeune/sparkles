@@ -2392,10 +2392,11 @@ gigabyte. A run is bounded by the request's deadline and memory budget, from ind
 to the taxonomy, and answers `507` with `budget: "memory"` past the budget.
 
 `tier` names the rules that the ontology's axioms need, `el`, `horn` or `disjunctive`.
-`partial: true` in the body or the query string asks a run of the disjunctive rules that
-its deadline, cancellation or memory budget stops to answer what it proved instead of
-failing with `408` or `507`. Runs of the EL and Horn rules fail as before. The answer of
-such a run has `partial: true` and `complete: false`. Its subsumptions and unsatisfiable
+`partial: true` in the body or the query string asks a classification run at any tier
+(EL, Horn or disjunctive) that its deadline, cancellation or memory budget stops after
+saturation begins to answer what it proved instead of failing with `408` or `507`. The
+answer of such a run has `partial: true` and `complete: false`. Its subsumptions and
+unsatisfiable
 classes are entailed, `incomplete` lists the classes whose superclasses it may miss, at
 most `limit` of them in IRI order with `incompleteCount` counting them all, and every
 other class has its full answer. `consistency` is `consistent`, `inconsistent` or `unknown`.

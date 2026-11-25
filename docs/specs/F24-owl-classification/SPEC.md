@@ -5901,3 +5901,22 @@ invalidation and taxonomy costs, fallback edits, retained bytes and peak memory.
 Acceptance requires a measured benefit for localized edits and a documented memory
 tradeoff. Existing full-classification gates still apply, and accepted slowdowns get a
 roadmap follow-up. This does not promise cheap updates for arbitrary OWL 2 DL.
+
+### Partial answers from every tier (item 714)
+
+`Limits::partial` and `ClassifyRequest::partial` now apply to EL (`Plain` and `Full`)
+and Horn (`Horn` and `HornFull`) classifications alongside Tier D across the library,
+HTTP, CLI and language bindings, while `Saturation::saturate`, DL queries and ROBOT
+commands remain non-partial. When a deadline, cancellation or memory budget stops an EL
+or Horn run after saturation begins, the classifier records interrupted activations on
+`State::interrupted` inside `Run::process`'s existing partial epilogue without adding
+branches to the non-partial hot loops, bounds `Run::flush_links` uniformly and stops
+`horn_rules::flush` promptly on `sends.stop`. A unified two-pass flat-CSR and compact
+bitset dependency recorder (`classify::partial::record`) handles EL, Horn and Tier D
+stops with strict pre-allocation admission against `max_memory` and `charge`, a
+zero-allocation inconsistency pass over `owl:Thing`, individuals and real contexts, exact
+Phase 1 and Phase 2 backward reachability, Phase 3 partial world retention and a
+zero-scratch conservative fallback when admission fails. Before admitting retained state
+and building a partial EL or Horn taxonomy, the classifier frees conjunction contexts,
+pending to-do buffers and non-subsumer tables and sets `partial_over` on memory refusal
+so a Horn run preserves its tier rather than silently downgrading to EL.

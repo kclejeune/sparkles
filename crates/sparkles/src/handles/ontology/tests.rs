@@ -2934,6 +2934,105 @@ mod classification {
     }
 
     #[test]
+    fn el_and_horn_partial_answers_under_budgets_and_non_retention() {
+        let n = if cfg!(debug_assertions) { 50 } else { 150 };
+        let mut el_body = String::from(
+            ":r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . :s a owl:ObjectProperty .\n\
+             :part a owl:ObjectProperty , owl:TransitiveProperty .\n\
+             :s owl:propertyChainAxiom ( :r1 :r2 ) .\n",
+        );
+        for i in 0..n {
+            let next = (i + 1) % n;
+            el_body.push_str(&format!(
+                ":A{i} a owl:Class ; rdfs:subClassOf :A{next} , [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B{i} ] .\n\
+                 :B{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :C{next} ] .\n\
+                 :C{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :part ; owl:someValuesFrom :P{next} ] .\n\
+                 :P{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :part ; owl:someValuesFrom :P{next} ] .\n\
+                 [ a owl:Restriction ; owl:onProperty :s ; owl:someValuesFrom :C{i} ] rdfs:subClassOf :D{i} .\n",
+            ));
+        }
+        let mut horn_body = String::from(
+            ":r a owl:ObjectProperty . :rinv a owl:ObjectProperty ; owl:inverseOf :r .\n",
+        );
+        let hn = if cfg!(debug_assertions) { 45 } else { 120 };
+        for i in 0..hn {
+            let b = (7 * i + 3) % hn;
+            let d = (11 * i + 5) % hn;
+            horn_body.push_str(&format!(
+                ":H{i} a owl:Class ;\n\
+                  rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :M{i} ] ,\n\
+                                  [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :F{b} ] ,\n\
+                                  [ a owl:Restriction ; owl:onProperty :r ; owl:maxCardinality 1 ] ,\n\
+                                  [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :G{d} ] .\n\
+                 :M{i} a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :rinv ; owl:allValuesFrom :Back{i} ] .\n",
+            ));
+        }
+
+        let req = OntologyRequest::default();
+        for (tier, body) in [("el", el_body), ("horn", horn_body)] {
+            let full = dataset(&body)
+                .ontology()
+                .classify(&req, &partial_request(), &opts())
+                .unwrap();
+            assert!(full.complete());
+            assert_eq!(full.classification.stats.tier.as_str(), tier);
+            let peak = full.classification.stats.peak_memory as u64;
+            let (ds, part) = (1..20)
+                .find_map(|k| {
+                    let ds = dataset(&body);
+                    let o = QueryOptions {
+                        max_memory_bytes: Some(peak * k / 20),
+                        ..opts()
+                    };
+                    match ds.ontology().classify(&req, &partial_request(), &o) {
+                        Ok(c) if !c.classification.complete_for_taken => Some((ds, c)),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| panic!("{tier}: no budget produced a partial answer"));
+            assert!(!part.complete());
+            assert_eq!(part.classification.stats.tier.as_str(), tier);
+            assert!(!part.classification.stats.horn_over_budget);
+            // Soundness: every emitted subsumption must hold in full.
+            let got = pairs(&part.classification.taxonomy);
+            let want = pairs(&full.classification.taxonomy);
+            assert!(
+                got.is_subset(&want),
+                "{tier}: partial answer added unentailed pairs"
+            );
+            // Non-retention: partial answer is not cached, so next full call runs fresh.
+            let next = ds
+                .ontology()
+                .classify(&req, &ClassifyRequest::default(), &opts())
+                .unwrap();
+            assert!(!next.reused, "{tier}: partial answer was kept");
+            assert!(next.complete());
+            // Target write with partial is rejected.
+            let writes = ClassifyRequest {
+                target: Some(named("http://ex.org/taxonomy")),
+                ..partial_request()
+            };
+            assert!(matches!(
+                ds.ontology().classify(&req, &writes, &opts()),
+                Err(Error::Invalid(_))
+            ));
+            // Assertions + partial completes cleanly on an EL/Horn dataset.
+            let with_assertions = ds
+                .ontology()
+                .classify(
+                    &req,
+                    &ClassifyRequest {
+                        assertions: true,
+                        ..partial_request()
+                    },
+                    &opts(),
+                )
+                .unwrap();
+            assert!(with_assertions.complete());
+        }
+    }
+
+    #[test]
     fn file_classification_complete_and_per_class_incomplete_on_wire_and_frame() {
         let body = cases(if cfg!(debug_assertions) { 120 } else { 400 }, false);
         let ttl = format!(
