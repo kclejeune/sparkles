@@ -289,6 +289,10 @@ pub struct ScratchGuard {
 }
 
 impl ScratchGuard {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     pub fn grow(&mut self, more: usize) -> Result<(), Error> {
         if more == 0 {
             return Ok(());

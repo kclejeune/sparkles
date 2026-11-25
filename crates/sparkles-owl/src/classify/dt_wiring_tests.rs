@@ -2405,6 +2405,7 @@ fn neg_data_897_role_deletion_fits_changed_scratch_without_rehash() {
     let kept = axioms("SubClassOf(:A :B)");
     let kept_refs: Vec<&AxiomKind> = kept.iter().collect();
     let removed_refs: Vec<&AxiomKind> = ax1[1..].iter().collect();
+    index::reset_neg_role_set_stats();
     let second = sat
         .classify(
             &kept_refs,
@@ -2416,6 +2417,16 @@ fn neg_data_897_role_deletion_fits_changed_scratch_without_rehash() {
         )
         .unwrap();
     assert!(second.stats.incremental);
+    let (seen_init, seen_final, changed_init, changed_final) = index::neg_role_set_stats()
+        .expect("changed_with_dt must record negative-role set capacities");
+    assert!(
+        seen_init >= n && seen_final == seen_init,
+        "seen_roles must be pre-sized without rehash: init={seen_init}, final={seen_final}, n={n}"
+    );
+    assert!(
+        changed_init >= n && changed_final == changed_init,
+        "changed_neg_roles must be pre-sized without rehash: init={changed_init}, final={changed_final}, n={n}"
+    );
     let new_ix = sat.index.as_ref().unwrap();
     assert!(new_ix.neg_data.is_empty());
 
@@ -2478,33 +2489,133 @@ fn same_tables_with_stop_polls_dense_role_closure_and_data_tables() {
         "same_tables_with_stop must stop on first poll"
     );
 
-    // 2. Pure EL ontology with 4,200 data properties having ranges and functionality
-    //    (each > POLL_CHANGED), asserting polls across `sup`, `data_range`, and `functional`.
+    // 2a. Isolate `data_range` polling by placing a controlled mismatch immediately after
+    //     `data_range` at `functional[0]`. Both indexes have `any_functional = true` so
+    //     `plain` matches and `same_tables_with_stop` traverses `sup`, `right`, `left`,
+    //     `range`, and `data_range` before hitting `functional[0]`.
     let n = 4200usize;
-    let mut data_doc = String::with_capacity(n * 80);
+    let mut base_dr = String::with_capacity(n * 48 + 64);
     for i in 0..n {
-        data_doc.push_str(&format!(
+        base_dr.push_str(&format!("DataPropertyRange(:d{i} xsd:integer)\n"));
+    }
+    let ax_dr_a = axioms(&format!("{base_dr}FunctionalDataProperty(:d0)\n"));
+    let ax_dr_b = axioms(&format!("{base_dr}FunctionalDataProperty(:d1)\n"));
+    let refs_dr_a: Vec<&AxiomKind> = ax_dr_a.iter().collect();
+    let refs_dr_b: Vec<&AxiomKind> = ax_dr_b.iter().collect();
+    let mut sat_dr_a = Saturation::new();
+    let mut sat_dr_b = Saturation::new();
+    sat_dr_a.classify(&refs_dr_a, None, &limits).unwrap();
+    sat_dr_b.classify(&refs_dr_b, None, &limits).unwrap();
+    let ix_dr_a = sat_dr_a.index.as_ref().unwrap();
+    let ix_dr_b = sat_dr_b.index.as_ref().unwrap();
+    assert_eq!(ix_dr_a.roles.sup.len(), n);
+    assert_eq!(ix_dr_b.roles.sup.len(), n);
+    assert!(ix_dr_a.roles.any_functional && ix_dr_b.roles.any_functional);
+    // Exact ticks before `data_range`: `sup` (2*n) + `right` (n) + `left` (n) + `range` (n) = 5*n.
+    let pre_dr_polls = (5 * n) / index::POLL_CHANGED;
+    let dr_polls = AtomicUsize::new(0);
+    assert_eq!(
+        ix_dr_b.same_tables_with_stop(ix_dr_a, &|| {
+            dr_polls.fetch_add(1, Ordering::Relaxed);
+            false
+        }),
+        Some(false)
+    );
+    assert!(
+        dr_polls.load(Ordering::Relaxed) > pre_dr_polls,
+        "data_range loop must trigger a poll beyond pre-data_range polls ({pre_dr_polls}), got {}",
+        dr_polls.load(Ordering::Relaxed)
+    );
+    let cancel_dr = AtomicUsize::new(0);
+    assert_eq!(
+        ix_dr_b.same_tables_with_stop(ix_dr_a, &|| {
+            cancel_dr.fetch_add(1, Ordering::Relaxed) == pre_dr_polls
+        }),
+        None,
+        "cancellation inside data_range must fire before reaching functional[0] mismatch"
+    );
+
+    // 2b. Isolate `functional` (outer row ticks + inner `slice_eq_poll`) by placing a
+    //     controlled mismatch after `functional` at `selfs[0]`.
+    let mut base_fn = String::with_capacity(n * 80 + 128);
+    base_fn.push_str(
+        "SubClassOf(ObjectSomeValuesFrom(:r0 :A) :A)\n\
+         SubClassOf(ObjectSomeValuesFrom(:r1 :A) :A)\n",
+    );
+    for i in 0..n {
+        base_fn.push_str(&format!(
             "DataPropertyRange(:d{i} xsd:integer)\nFunctionalDataProperty(:d{i})\n"
         ));
     }
-    let ax2 = axioms(&data_doc);
-    let refs2: Vec<&AxiomKind> = ax2.iter().collect();
-    let mut sat2 = Saturation::new();
-    sat2.classify(&refs2, None, &limits).unwrap();
-    let ix2 = sat2.index.as_ref().unwrap();
-    assert!(ix2.dt.is_none());
-    let polls2 = AtomicUsize::new(0);
+    let ax_fn_a = axioms(&format!("{base_fn}SubClassOf(ObjectHasSelf(:r0) :Q)\n"));
+    let ax_fn_b = axioms(&format!("{base_fn}SubClassOf(ObjectHasSelf(:r1) :Q)\n"));
+    let refs_fn_a: Vec<&AxiomKind> = ax_fn_a.iter().collect();
+    let refs_fn_b: Vec<&AxiomKind> = ax_fn_b.iter().collect();
+    let mut sat_fn_a = Saturation::new();
+    let mut sat_fn_b = Saturation::new();
+    sat_fn_a.classify(&refs_fn_a, None, &limits).unwrap();
+    sat_fn_b.classify(&refs_fn_b, None, &limits).unwrap();
+    let ix_fn_a = sat_fn_a.index.as_ref().unwrap();
+    let ix_fn_b = sat_fn_b.index.as_ref().unwrap();
+    let roles_fn = ix_fn_a.roles.sup.len();
+    assert_eq!(roles_fn, n + 2);
+    assert_eq!(ix_fn_b.roles.sup.len(), roles_fn);
+    assert_eq!(ix_fn_a.selfs.len(), 1);
+    assert_eq!(ix_fn_b.selfs.len(), 1);
+    assert_ne!(ix_fn_a.selfs, ix_fn_b.selfs);
+    // Without inner `functional` slice ticks, `sup` (2R) + `right`/`left`/`range`/`data_range`
+    // (4R) + `functional` outer (R) + `empty` (R) = 8*R ticks; inner `functional` adds `n` ticks.
+    let without_inner_func_polls = (8 * roles_fn) / index::POLL_CHANGED;
+    let fn_polls = AtomicUsize::new(0);
     assert_eq!(
-        ix2.same_tables_with_stop(ix2, &|| {
-            polls2.fetch_add(1, Ordering::Relaxed);
+        ix_fn_b.same_tables_with_stop(ix_fn_a, &|| {
+            fn_polls.fetch_add(1, Ordering::Relaxed);
             false
         }),
-        Some(true)
+        Some(false)
     );
     assert!(
-        polls2.load(Ordering::Relaxed) >= 4,
-        "expected polls across sup, data_range, functional, and flags; got {}",
-        polls2.load(Ordering::Relaxed)
+        fn_polls.load(Ordering::Relaxed) > without_inner_func_polls,
+        "functional outer+inner polling must exceed non-inner poll bound ({without_inner_func_polls}), got {}",
+        fn_polls.load(Ordering::Relaxed)
+    );
+    let cancel_fn = AtomicUsize::new(0);
+    assert_eq!(
+        ix_fn_b.same_tables_with_stop(ix_fn_a, &|| {
+            cancel_fn.fetch_add(1, Ordering::Relaxed) == without_inner_func_polls
+        }),
+        None,
+        "cancellation inside functional/empty must fire before reaching selfs mismatch"
+    );
+
+    // 2c. Cached `Roles::any_functional` makes `saturate::plain` O(1) and rejects a newly
+    //     appended functional data role in 0 polls.
+    let ax_plain = axioms(&base_dr);
+    let refs_plain: Vec<&AxiomKind> = ax_plain.iter().collect();
+    let mut sat_plain = Saturation::new();
+    sat_plain.classify(&refs_plain, None, &limits).unwrap();
+    let ix_plain = sat_plain.index.as_ref().unwrap();
+    assert!(!ix_plain.roles.any_functional);
+    let ax_appended = axioms(&format!("{base_dr}FunctionalDataProperty(:d_new)\n"));
+    let refs_appended: Vec<&AxiomKind> = ax_appended.iter().collect();
+    let mut sat_appended = Saturation::new();
+    sat_appended
+        .classify(&refs_appended, None, &limits)
+        .unwrap();
+    let ix_appended = sat_appended.index.as_ref().unwrap();
+    assert!(ix_appended.roles.any_functional);
+    let plain_polls = AtomicUsize::new(0);
+    assert_eq!(
+        ix_appended.same_tables_with_stop(ix_plain, &|| {
+            plain_polls.fetch_add(1, Ordering::Relaxed);
+            false
+        }),
+        Some(false)
+    );
+    assert_eq!(
+        plain_polls.load(Ordering::Relaxed),
+        0,
+        "plain-mode mismatch from newly appended functional role must reject in O(1) before scanning"
     );
 }
 
@@ -3037,4 +3148,208 @@ fn high_fanout_invalidation_and_orphan_prune_poll_within_bound() {
         &mut totals,
     );
     assert!(matches!(err, Err(Error::Cancelled)));
+}
+
+#[test]
+fn changed_with_dt_polls_skipped_new_neg_data_roles() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Adding 5,000 distinct `SubClassOf(DataSomeValuesFrom(:d_i xsd:integer) :Q)` axioms
+    // on brand-new data roles to a tiny kept EL ontology produces 5,000 `self.neg_data`
+    // keys that all satisfy `r >= old_roles`. The negative-role loop must tick before the
+    // filter so cooperative stop polling still fires across the skipped keys.
+    let base = axioms("SubClassOf(:A :B)");
+    let base_refs: Vec<&AxiomKind> = base.iter().collect();
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat_old = Saturation::new();
+    sat_old.classify(&base_refs, None, &limits).unwrap();
+    let old_ix = sat_old.index.as_ref().unwrap();
+    assert!(old_ix.neg_data.is_empty());
+    assert_eq!(old_ix.roles.sup.len(), 0);
+
+    let n = 5000usize;
+    let mut added_doc = String::with_capacity(n * 64 + 32);
+    added_doc.push_str("SubClassOf(:A :B)\n");
+    for i in 0..n {
+        added_doc.push_str(&format!(
+            "SubClassOf(DataSomeValuesFrom(:d{i} xsd:integer) :Q)\n"
+        ));
+    }
+    let full = axioms(&added_doc);
+    let full_refs: Vec<&AxiomKind> = full.iter().collect();
+    let added_refs: Vec<&AxiomKind> = full[1..].iter().collect();
+    let mut sat = Saturation::new();
+    sat.classify(&base_refs, None, &limits).unwrap();
+    let inc = sat
+        .classify(
+            &full_refs,
+            Some(Changes {
+                added: &added_refs,
+                removed: &[],
+            }),
+            &limits,
+        )
+        .unwrap();
+    assert!(inc.stats.incremental);
+    let new_ix = sat.index.as_ref().unwrap();
+    assert_eq!(new_ix.neg_data.len(), n);
+    assert!(
+        new_ix
+            .neg_data
+            .keys()
+            .all(|&r| (r as usize) >= old_ix.roles.sup.len())
+    );
+
+    let polls = AtomicUsize::new(0);
+    assert!(
+        new_ix
+            .changed_with_dt(old_ix, None, &|| {
+                polls.fetch_add(1, Ordering::Relaxed);
+                false
+            })
+            .is_some()
+    );
+    // Expression loop polls once (old_ix has < POLL_CHANGED heads) + 1 final stop check.
+    let expr_and_final = 1 + (old_ix.head_count() - 1) / index::POLL_CHANGED + 1;
+    assert!(
+        polls.load(Ordering::Relaxed) >= expr_and_final + n / index::POLL_CHANGED,
+        "skipped new neg_data keys must still poll: got {}, expected >= {}",
+        polls.load(Ordering::Relaxed),
+        expr_and_final + n / index::POLL_CHANGED
+    );
+
+    let stop_polls = AtomicUsize::new(0);
+    assert!(
+        new_ix
+            .changed_with_dt(old_ix, None, &|| {
+                stop_polls.fetch_add(1, Ordering::Relaxed) == 0
+            })
+            .is_none()
+    );
+    assert_eq!(stop_polls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn dtix_align_polls_inside_single_large_checker_component() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Connect 9,000 subproperties to one superproperty with `DataAllValuesFrom` on the
+    // superproperty so every property lands in a single checker component (> 2 * POLL_ALIGN).
+    let n = 9000usize;
+    let mut base_doc = String::with_capacity(n * 40 + 128);
+    base_doc.push_str("SubClassOf(:A DataAllValuesFrom(:root xsd:integer))\n");
+    for i in 0..n {
+        base_doc.push_str(&format!("SubDataPropertyOf(:p{i} :root)\n"));
+    }
+    let ax_old = axioms(&base_doc);
+    let refs_old: Vec<&AxiomKind> = ax_old.iter().collect();
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+
+    let mut sat_old = Saturation::new();
+    sat_old.classify(&refs_old, None, &limits).unwrap();
+    let old_ix = sat_old.index.as_ref().unwrap();
+    let old_dt = old_ix.dt.as_ref().unwrap();
+    let old_roles_len = old_ix.roles.sup.len();
+    assert_eq!(old_dt.body.len(), 1);
+    assert_eq!(old_dt.roles.len(), n + 1);
+
+    // Self-alignment must succeed and keep component 0 unchanged.
+    match old_dt.align(old_dt, old_roles_len, &|| false) {
+        dt_sat::DtAlignOutcome::Aligned(a) => {
+            assert_eq!(a.comp_map, vec![Some(0)]);
+            assert_eq!(a.changed_comps, vec![false]);
+        }
+        _ => panic!("self-alignment of single large component must succeed"),
+    }
+
+    // Variant A: add 1 subproperty -> cardinality mismatch skips the role-set membership walk.
+    let extra_role = axioms("SubDataPropertyOf(:p_extra :root)");
+    let mut ax_a = ax_old.clone();
+    ax_a.extend(extra_role.iter().cloned());
+    let refs_a: Vec<&AxiomKind> = ax_a.iter().collect();
+    let added_a: Vec<&AxiomKind> = extra_role.iter().collect();
+    let mut sat_a = Saturation::new();
+    sat_a.classify(&refs_old, None, &limits).unwrap();
+    sat_a
+        .classify(
+            &refs_a,
+            Some(Changes {
+                added: &added_a,
+                removed: &[],
+            }),
+            &limits,
+        )
+        .unwrap();
+    let dt_a = sat_a.index.as_ref().unwrap().dt.as_ref().unwrap();
+    assert_eq!(dt_a.body.len(), 1);
+    assert_eq!(dt_a.roles.len(), n + 2);
+
+    // Variant B: same 9,001 roles, add 1 body atom -> runs the membership walk over all
+    // 9,001 roles and then exits on `old_body.len() != new_body.len()` before per-role checks.
+    let extra_body = axioms("SubClassOf(DataSomeValuesFrom(:root xsd:integer) :Extra)");
+    let mut ax_b = ax_old.clone();
+    ax_b.extend(extra_body.iter().cloned());
+    let refs_b: Vec<&AxiomKind> = ax_b.iter().collect();
+    let added_b: Vec<&AxiomKind> = extra_body.iter().collect();
+    let mut sat_b = Saturation::new();
+    sat_b.classify(&refs_old, None, &limits).unwrap();
+    sat_b
+        .classify(
+            &refs_b,
+            Some(Changes {
+                added: &added_b,
+                removed: &[],
+            }),
+            &limits,
+        )
+        .unwrap();
+    let dt_b = sat_b.index.as_ref().unwrap().dt.as_ref().unwrap();
+    assert_eq!(dt_b.body.len(), 1);
+    assert_eq!(dt_b.roles.len(), n + 1);
+    assert_ne!(dt_b.body[0].len(), old_dt.body[0].len());
+
+    let polls_a = AtomicUsize::new(0);
+    match dt_a.align(old_dt, old_roles_len, &|| {
+        polls_a.fetch_add(1, Ordering::Relaxed);
+        false
+    }) {
+        dt_sat::DtAlignOutcome::Aligned(a) => assert_eq!(a.changed_comps, vec![true]),
+        _ => panic!("expected Aligned with changed_comps=[true] for variant A"),
+    }
+    let polls_b = AtomicUsize::new(0);
+    match dt_b.align(old_dt, old_roles_len, &|| {
+        polls_b.fetch_add(1, Ordering::Relaxed);
+        false
+    }) {
+        dt_sat::DtAlignOutcome::Aligned(a) => assert_eq!(a.changed_comps, vec![true]),
+        _ => panic!("expected Aligned with changed_comps=[true] for variant B"),
+    }
+    let count_a = polls_a.load(Ordering::Relaxed);
+    let count_b = polls_b.load(Ordering::Relaxed);
+    let min_walk_polls = (n + 1) / 4096;
+    assert!(
+        count_b >= count_a + min_walk_polls,
+        "membership walk over {} roles must add >= {min_walk_polls} polls: count_a={count_a}, count_b={count_b}",
+        n + 1
+    );
+
+    // Cancelling inside the membership walk (after cardinality-skip polls, before final stop)
+    // must abort with `DtAlignOutcome::Stopped` rather than completing the component.
+    let cancel_at = count_a;
+    assert!(cancel_at < count_b - 1);
+    let cpolls = AtomicUsize::new(0);
+    let stopped = dt_b.align(old_dt, old_roles_len, &|| {
+        cpolls.fetch_add(1, Ordering::Relaxed) >= cancel_at
+    });
+    assert!(
+        matches!(stopped, dt_sat::DtAlignOutcome::Stopped),
+        "expected DtAlignOutcome::Stopped inside single-component membership walk"
+    );
+    assert_eq!(cpolls.load(Ordering::Relaxed), cancel_at + 1);
 }

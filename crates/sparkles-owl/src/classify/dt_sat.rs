@@ -406,15 +406,14 @@ impl DtIx {
     pub fn align_scratch(&self, old: &DtIx) -> usize {
         let old_comps = old.body.len();
         let new_comps = self.body.len();
-        let groups = (old_comps + new_comps)
+        let groups = old_comps
             .saturating_mul(std::mem::size_of::<Vec<Role>>())
             .saturating_add(
-                (old.roles.len() + self.roles.len())
+                old.roles
+                    .len()
                     .saturating_mul(std::mem::size_of::<Role>() * 4),
             );
-        let by_roles = map_buckets_for(new_comps)
-            .saturating_mul(std::mem::size_of::<(&[Role], u32)>() + 1)
-            .saturating_add(32);
+        let counts = new_comps.saturating_mul(std::mem::size_of::<usize>());
         let disj = (old_comps + new_comps)
             .saturating_mul(std::mem::size_of::<Vec<(Role, Role)>>())
             .saturating_add(
@@ -423,7 +422,7 @@ impl DtIx {
             );
         let out = old_comps.saturating_mul(std::mem::size_of::<Option<u32>>() + 1);
         groups
-            .saturating_add(by_roles)
+            .saturating_add(counts)
             .saturating_add(disj)
             .saturating_add(out)
             .saturating_add(64)
@@ -454,36 +453,13 @@ impl DtIx {
             }
             old_groups[ri.comp as usize].push(r);
         }
-        for g in &mut old_groups {
-            if tick_align(&mut ticks, g.len().max(1), stop) {
-                return DtAlignOutcome::Stopped;
-            }
-            g.sort_unstable();
-        }
 
-        let mut new_groups: Vec<Vec<Role>> = vec![Vec::new(); self.body.len()];
-        for (&r, ri) in &self.roles {
+        let mut new_counts: Vec<usize> = vec![0; self.body.len()];
+        for ri in self.roles.values() {
             if tick_align(&mut ticks, 1, stop) {
                 return DtAlignOutcome::Stopped;
             }
-            new_groups[ri.comp as usize].push(r);
-        }
-        for g in &mut new_groups {
-            if tick_align(&mut ticks, g.len().max(1), stop) {
-                return DtAlignOutcome::Stopped;
-            }
-            g.sort_unstable();
-        }
-
-        let mut new_by_roles: FxHashMap<&[Role], u32> =
-            FxHashMap::with_capacity_and_hasher(self.body.len(), Default::default());
-        for (c, g) in new_groups.iter().enumerate() {
-            if tick_align(&mut ticks, g.len().max(1), stop) {
-                return DtAlignOutcome::Stopped;
-            }
-            if !g.is_empty() {
-                new_by_roles.insert(g.as_slice(), c as u32);
-            }
+            new_counts[ri.comp as usize] += 1;
         }
 
         let mut old_disj: Vec<Vec<(Role, Role)>> = vec![Vec::new(); old.body.len()];
@@ -522,15 +498,31 @@ impl DtIx {
                 return DtAlignOutcome::Stopped;
             }
             let roles = &old_groups[old_c];
-            if roles.is_empty() {
-                continue;
-            }
-            if tick_align(&mut ticks, roles.len(), stop) {
-                return DtAlignOutcome::Stopped;
-            }
-            let Some(&new_c) = new_by_roles.get(roles.as_slice()) else {
+            let Some(&first) = roles.first() else {
                 continue;
             };
+            let Some(new_c) = self.roles.get(&first).map(|ri| ri.comp) else {
+                continue;
+            };
+            if new_counts[new_c as usize] != roles.len() {
+                continue;
+            }
+            // `roles` holds the distinct keys of `old.roles` in `old_c`; verifying every
+            // role maps to `new_c` alongside equal cardinality proves exact set equality
+            // without sorting or hashing whole role lists.
+            let mut same_members = true;
+            for &r in roles {
+                if tick_align(&mut ticks, 1, stop) {
+                    return DtAlignOutcome::Stopped;
+                }
+                if self.roles.get(&r).map(|ri| ri.comp) != Some(new_c) {
+                    same_members = false;
+                    break;
+                }
+            }
+            if !same_members {
+                continue;
+            }
             match slice_eq_poll(
                 &old_disj[old_c],
                 &new_disj[new_c as usize],

@@ -3895,7 +3895,7 @@ pub fn init_conjunction<S: Sink>(
 /// derives an individual, becomes real, takes a link to an individual or keeps data
 /// values, and the saturation runs the rules without their checks.
 pub fn plain(ix: &Index) -> bool {
-    !ix.has_individuals() && !ix.nominal_selfs && ix.roles.functional.iter().all(|f| f.is_empty())
+    !ix.has_individuals() && !ix.nominal_selfs && !ix.roles.any_functional
 }
 
 /// The rules a saturation runs, as constants that the compiler folds, so that each set

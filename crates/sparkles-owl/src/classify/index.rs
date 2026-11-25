@@ -1169,6 +1169,8 @@ pub struct Roles {
     pub data_range: Vec<Option<u32>>,
     /// for each data role, its functional superroles, itself included
     pub functional: Vec<Vec<Role>>,
+    /// whether any data role has a functional superrole
+    pub any_functional: bool,
     /// roles under the bottom object or data property, which relate nothing
     pub empty: Vec<bool>,
     /// whether any role is empty
@@ -2413,6 +2415,7 @@ impl Index {
             range: a_range,
             data_range: a_data_range,
             functional: a_functional,
+            any_functional: a_any_functional,
             empty: a_empty,
             any_empty: a_any_empty,
             inv: a_inv,
@@ -2429,6 +2432,7 @@ impl Index {
             range: b_range,
             data_range: b_data_range,
             functional: b_functional,
+            any_functional: b_any_functional,
             empty: b_empty,
             any_empty: b_any_empty,
             inv: b_inv,
@@ -2436,6 +2440,7 @@ impl Index {
             linear: b_linear,
             comp_fwd: b_comp_fwd,
         } = b_roles;
+        assert_eq!(a_any_functional, b_any_functional, "fixture any_functional");
         assert_eq!(
             (
                 a_sup,
@@ -2794,13 +2799,16 @@ impl Index {
             let mut seen_roles: FxHashSet<Role> =
                 FxHashSet::with_capacity_and_hasher(max_roles, Default::default());
             changed_neg_roles = FxHashSet::with_capacity_and_hasher(max_roles, Default::default());
+            #[cfg(test)]
+            let (seen_init_cap, changed_init_cap) =
+                (seen_roles.capacity(), changed_neg_roles.capacity());
             let mut ticks = 0usize;
             for &r in old.neg_data.keys().chain(self.neg_data.keys()) {
-                if (r as usize) >= old_roles || !seen_roles.insert(r) {
-                    continue;
-                }
                 if tick_changed(&mut ticks, stop) {
                     return None;
+                }
+                if (r as usize) >= old_roles || !seen_roles.insert(r) {
+                    continue;
                 }
                 let old_v = old.neg_data.get(&r).map_or(&[][..], Vec::as_slice);
                 let new_v = self.neg_data.get(&r).map_or(&[][..], Vec::as_slice);
@@ -2820,6 +2828,13 @@ impl Index {
                     changed_neg_roles.insert(r);
                 }
             }
+            #[cfg(test)]
+            neg_role_set_record(
+                seen_init_cap,
+                seen_roles.capacity(),
+                changed_init_cap,
+                changed_neg_roles.capacity(),
+            );
         }
         let mut changed = vec![false; n];
         for (e, changed) in changed.iter_mut().enumerate() {
@@ -3215,15 +3230,15 @@ impl Index {
         // markers are interned before the Horn index, whose conjunctions' contexts take
         // the ids above every expression
         let run = it.dt_run.take();
-        let refire = match run.as_deref() {
+        let (refire, refire_guard) = match run.as_deref() {
             Some(r) => match dt_fires(it, r, &b, &mut told) {
-                Ok(refire) => refire,
+                Ok(out) => out,
                 Err(e) => {
                     it.dt_run = run;
                     return Err(e);
                 }
             },
-            None => FxHashMap::default(),
+            None => (FxHashMap::default(), None),
         };
         it.dt_run = run;
         if let Some(h) = &ax.horn {
@@ -3284,7 +3299,15 @@ impl Index {
         if ax.dl.is_none()
             && let Some(run) = it.dt_run.as_deref()
         {
-            ix.dt = Some(Box::new(dt_index(ax, it, run, &ix, &b, refire)?));
+            ix.dt = Some(Box::new(dt_index(
+                ax,
+                it,
+                run,
+                &ix,
+                &b,
+                refire,
+                refire_guard,
+            )?));
         }
         Ok(ix)
     }
@@ -3300,6 +3323,7 @@ fn dt_index(
     ix: &Index,
     b: &Builder,
     refire: FxHashMap<Ex, Vec<u32>>,
+    refire_guard: Option<super::numeric::ScratchGuard>,
 ) -> Result<super::dt_sat::DtIx, Halt> {
     use super::dt_sat::{Body, DtIx, RoleIx};
     use super::dtcheck::range::{map_backing_bytes, map_buckets_for};
@@ -3392,9 +3416,10 @@ fn dt_index(
         .saturating_add(clone_est)
         .saturating_add(refire_est)
         .saturating_add(256);
-    let mut guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    let mut guard = refire_guard.or_else(|| it.ranges.budget.as_ref().map(|b| b.scratch_guard()));
     if let Some(g) = guard.as_mut() {
-        g.grow(total_est).map_err(|e| match e {
+        let extra = total_est.saturating_sub(g.bytes());
+        g.grow(extra).map_err(|e| match e {
             super::Error::Memory { used, .. } => Halt::Memory(used),
             _ => Halt::Stopped,
         })?;
@@ -3544,60 +3569,107 @@ fn dt_comp(it: &Interner, run: &DtRun, e: Ex) -> Option<u32> {
     }
 }
 
+type RefireMap = FxHashMap<Ex, Vec<u32>>;
+
 /// Tells each told subsumer of a body atom whose occurrences are all told its
-/// [`Node::DtFire`] marker, and gives for each subsumer the components it re-evaluates.
+/// [`Node::DtFire`] marker, and gives for each subsumer the components it re-evaluates
+/// alongside the live scratch reservation covering the returned `refire` map.
 fn dt_fires(
     it: &mut Interner,
     run: &DtRun,
     b: &Builder,
     told: &mut Vec<(Ex, Ex)>,
-) -> Result<FxHashMap<Ex, Vec<u32>>, Halt> {
-    let mut by: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
-    for &(a, c) in told.iter().chain(&b.told) {
-        if c != TOP && matches!(it.nodes[a as usize], Node::DtAtom(_)) {
-            by.entry(a).or_default().push(c);
-        }
-    }
-    let n_items = b
+) -> Result<(RefireMap, Option<super::numeric::ScratchGuard>), Halt> {
+    use super::dtcheck::range::map_growth;
+    let halt_err = |e: super::Error| match e {
+        super::Error::Memory { used, .. } => Halt::Memory(used),
+        _ => Halt::Stopped,
+    };
+    let n_eligible = b
         .dt_body
         .iter()
         .filter(|&&e| !b.dt_other.contains(&e) && dt_comp(it, run, e).is_some())
         .count();
-    let mut items_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
-    if let Some(g) = items_guard.as_mut() {
-        g.grow(n_items.saturating_mul(std::mem::size_of::<(u32, Ex)>()))
-            .map_err(|e| match e {
-                super::Error::Memory { used, .. } => Halt::Memory(used),
-                _ => Halt::Stopped,
-            })?;
+    if n_eligible == 0 {
+        return Ok((FxHashMap::default(), None));
     }
-    let mut items: Vec<(u32, Ex)> = Vec::with_capacity(n_items);
+    let mut eligible_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    if let Some(g) = eligible_guard.as_mut() {
+        g.grow(n_eligible.saturating_mul(std::mem::size_of::<(Ex, u32)>()))
+            .map_err(halt_err)?;
+    }
+    let mut eligible: Vec<(Ex, u32)> = Vec::with_capacity(n_eligible);
     for &e in &b.dt_body {
         if b.dt_other.contains(&e) {
             continue;
         }
         if let Some(comp) = dt_comp(it, run, e) {
-            items.push((comp, e));
+            eligible.push((e, comp));
         }
     }
-    items.sort_unstable_by_key(|&(comp, _)| comp);
+    eligible.sort_unstable_by_key(|&(e, _)| e);
+    eligible.dedup();
+    let mut refire_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
     let mut refire: FxHashMap<Ex, Vec<u32>> = FxHashMap::default();
-    for (comp, e) in items {
-        for &t in by.get(&e).map_or(&[][..], |v| v.as_slice()) {
-            let cs = refire.entry(t).or_default();
-            if cs.last() != Some(&comp) {
-                cs.push(comp);
+    for &(a, c) in told.iter().chain(&b.told) {
+        if c == TOP || !matches!(it.nodes[a as usize], Node::DtAtom(_)) {
+            continue;
+        }
+        let Ok(pos) = eligible.binary_search_by_key(&a, |&(e, _)| e) else {
+            continue;
+        };
+        let comp = eligible[pos].1;
+        if !refire.contains_key(&c) {
+            if let Some(g) = refire_guard.as_mut() {
+                g.grow(map_growth(&refire)).map_err(halt_err)?;
+            }
+            refire.insert(c, Vec::new());
+        }
+        let cs = refire.get_mut(&c).expect("inserted above");
+        if cs.last() == Some(&comp) {
+            continue;
+        }
+        if cs.len() == cs.capacity() {
+            if !cs.is_empty() {
+                cs.sort_unstable();
+                cs.dedup();
+                if cs.binary_search(&comp).is_ok() {
+                    continue;
+                }
+            }
+            if cs.len() == cs.capacity()
+                || cs.len().saturating_mul(4) > cs.capacity().saturating_mul(3)
+            {
+                let next_cap = cs.capacity().saturating_mul(2).max(4);
+                if let Some(g) = refire_guard.as_mut() {
+                    g.grow(next_cap.saturating_mul(std::mem::size_of::<u32>()))
+                        .map_err(halt_err)?;
+                }
+                cs.reserve_exact(next_cap - cs.len());
             }
         }
+        cs.push(comp);
     }
-    drop(items_guard);
-    let mut ts: Vec<Ex> = refire.keys().copied().collect();
+    drop(eligible);
+    drop(eligible_guard);
+    for cs in refire.values_mut() {
+        cs.sort_unstable();
+        cs.dedup();
+    }
+    let mut ts_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    if let Some(g) = ts_guard.as_mut() {
+        g.grow(refire.len().saturating_mul(std::mem::size_of::<Ex>()))
+            .map_err(halt_err)?;
+    }
+    let mut ts: Vec<Ex> = Vec::with_capacity(refire.len());
+    ts.extend(refire.keys().copied());
     ts.sort_unstable();
     for t in ts {
         let f = it.node(Node::DtFire(t));
         told.push((t, f));
     }
-    Ok(refire)
+    drop(ts_guard);
+    Ok((refire, refire_guard))
 }
 
 /// The index of the Horn rules, built after the occurrences of the normalized axioms:
@@ -4468,6 +4540,7 @@ fn roles(
         is_functional[r as usize] = true;
     }
     let mut functional: Vec<Vec<Role>> = vec![Vec::new(); n];
+    let mut any_functional = false;
     for r in 0..n {
         if !matches!(it.roles[r], RoleName::Data(_)) {
             continue;
@@ -4484,6 +4557,7 @@ fn roles(
             }
             if is_functional[s as usize] {
                 functional[r].push(s);
+                any_functional = true;
             }
         }
         if let Some(v) = acc {
@@ -4530,6 +4604,7 @@ fn roles(
         range,
         data_range,
         functional,
+        any_functional,
         any_empty: false,
         empty,
         inv,
@@ -4554,6 +4629,27 @@ fn roles(
 #[cfg(test)]
 thread_local! {
     static A1_ACCOUNTING_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Last `(seen_init_cap, seen_final_cap, changed_init_cap, changed_final_cap)` observed
+    // by `Index::changed_with_dt`'s negative-role comparison loop.
+    static NEG_ROLE_SET_STATS: std::cell::Cell<Option<(usize, usize, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+fn neg_role_set_record(
+    seen_init: usize,
+    seen_final: usize,
+    changed_init: usize,
+    changed_final: usize,
+) {
+    NEG_ROLE_SET_STATS.with(|s| s.set(Some((seen_init, seen_final, changed_init, changed_final))));
+}
+#[cfg(test)]
+pub(super) fn reset_neg_role_set_stats() {
+    NEG_ROLE_SET_STATS.with(|s| s.set(None));
+}
+#[cfg(test)]
+pub(super) fn neg_role_set_stats() -> Option<(usize, usize, usize, usize)> {
+    NEG_ROLE_SET_STATS.with(std::cell::Cell::get)
 }
 #[cfg(test)]
 fn a1_record_accounting_visit() {
@@ -4655,7 +4751,7 @@ mod minimal_roles_tests {
         use super::super::dtcheck::{
             atoms::{DtKey, DtRun, Stop},
             comp::Comps,
-            range::{Defs, Ranges as DtRanges},
+            range::{Defs, Ranges as DtRanges, map_backing_bytes},
         };
         use super::super::numeric::Budget;
         use super::{Builder, Ex, Halt, Interner, Node, RoleName, dt_fires};
@@ -4697,29 +4793,33 @@ mod minimal_roles_tests {
             budget: None,
             stopped: None,
         };
-        let expected_items_bytes = n_atoms * std::mem::size_of::<(u32, Ex)>();
+        let expected_eligible_bytes = n_atoms * std::mem::size_of::<(Ex, u32)>();
 
-        // Uncapped run must charge the sort vector against `it.ranges.budget` and release
-        // the scratch reservation once `items` is consumed.
+        // 1. Uncapped run must charge `eligible` + live `refire` against `it.ranges.budget`,
+        //    keep `refire` charged via its returned guard, and release scratch once dropped.
         let uncap = Budget::new(&Limits::default(), 0, None);
         it.ranges.begin(uncap.clone());
         let mut told = told_base.clone();
-        let refire = dt_fires(&mut it, &run, &b, &mut told).expect("uncapped dt_fires");
-        it.ranges.end();
+        let (refire, refire_guard) = dt_fires(&mut it, &run, &b, &mut told).expect("uncapped");
         assert_eq!(refire.len(), 1);
         assert_eq!(refire.get(&target).map(Vec::len), Some(1));
         assert!(
-            uncap.peak() >= expected_items_bytes,
-            "expected dt_fires peak {} >= items bytes {expected_items_bytes}",
+            uncap.peak() >= expected_eligible_bytes,
+            "expected dt_fires peak {} >= eligible bytes {expected_eligible_bytes}",
             uncap.peak()
         );
+        assert!(
+            uncap.retained_storage().1 > 0,
+            "live refire guard must keep refire bytes charged until consumed or dropped"
+        );
+        drop((refire, refire_guard));
+        it.ranges.end();
         assert_eq!(uncap.retained_storage().1, 0, "scratch must be released");
 
-        // Tight cap below the sort vector size must refuse before allocating `items`,
-        // even though the resulting `refire` map has only a single 1-element entry.
+        // Tight cap below `eligible` must refuse before allocating `eligible`.
         let tight = Budget::new(
             &Limits {
-                max_memory: Some(expected_items_bytes - 1),
+                max_memory: Some(expected_eligible_bytes - 1),
                 ..Limits::default()
             },
             0,
@@ -4731,7 +4831,108 @@ mod minimal_roles_tests {
         it.ranges.end();
         assert!(
             matches!(err, Err(Halt::Memory(_))),
-            "expected Halt::Memory under tight cap, got {err:?}"
+            "expected Halt::Memory under tight cap, got {:?}",
+            err.err()
+        );
+
+        // 2. Overlapping `eligible` + multi-target `refire` growth must both be charged
+        //    concurrently, and alternating duplicate components must stay bounded.
+        let dp0 = DataProperty::new("urn:dt:p0");
+        let dp1 = DataProperty::new("urn:dt:p1");
+        let ax0 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:dt:A0")),
+            ClassExpression::DataAllValuesFrom(
+                vec![dp0.clone()],
+                DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+            ),
+        );
+        let ax1 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:dt:A1")),
+            ClassExpression::DataAllValuesFrom(
+                vec![dp1.clone()],
+                DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+            ),
+        );
+        let comps2 = Comps::of(&[&ax0, &ax1], &Defs::default(), &|| false).expect("2 comps");
+        let c0 = comps2.component(&dp0).expect("comp 0");
+        let c1 = comps2.component(&dp1).expect("comp 1");
+        assert_ne!(c0, c1);
+        let mut it2 = Interner::new();
+        let r0 = it2.role(RoleName::Data(dp0));
+        let r1 = it2.role(RoleName::Data(dp1));
+        let alt = it2.class(&Class::new("urn:dt:Alt"));
+        let m = 1000usize;
+        let mut b2 = Builder::default();
+        let mut told2_base: Vec<(Ex, Ex)> = Vec::with_capacity(m * 2);
+        for i in 0..m {
+            let role = if i % 2 == 0 { r0 } else { r1 };
+            let id = it2.dt.id(DtKey {
+                role,
+                at_least: true,
+                n: (i + 1) as u64,
+                range: DtRanges::FULL,
+            });
+            let e = it2.node(Node::DtAtom(id));
+            let t = it2.class(&Class::new(format!("urn:dt:T{i}")));
+            b2.dt_body.push(e);
+            told2_base.push((e, t));
+            told2_base.push((e, alt));
+        }
+        let run2 = DtRun {
+            comps: comps2,
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: None,
+            stopped: None,
+        };
+        let eligible2_bytes = m * std::mem::size_of::<(Ex, u32)>();
+
+        let uncap2 = Budget::new(&Limits::default(), 0, None);
+        it2.ranges.begin(uncap2.clone());
+        let mut told2 = told2_base.clone();
+        let (refire2, guard2) = dt_fires(&mut it2, &run2, &b2, &mut told2).expect("uncapped 2");
+        assert_eq!(refire2.len(), m + 1);
+        let alt_comps = refire2.get(&alt).expect("alt refire");
+        let mut expected_alt = vec![c0, c1];
+        expected_alt.sort_unstable();
+        assert_eq!(alt_comps.as_slice(), expected_alt.as_slice());
+        assert!(
+            alt_comps.capacity() <= 4,
+            "alternating duplicates must not bloat component vec capacity, got {}",
+            alt_comps.capacity()
+        );
+        let refire2_bytes = map_backing_bytes(&refire2)
+            + refire2
+                .values()
+                .map(|v| v.capacity() * std::mem::size_of::<u32>())
+                .sum::<usize>();
+        assert!(
+            uncap2.peak() >= eligible2_bytes + refire2_bytes,
+            "peak {} must cover overlapping eligible ({eligible2_bytes}) + refire ({refire2_bytes})",
+            uncap2.peak()
+        );
+        drop((refire2, guard2));
+        it2.ranges.end();
+        assert_eq!(uncap2.retained_storage().1, 0);
+
+        // Cap strictly above `eligible2_bytes` (which would pass an `items`-only guard) must
+        // refuse while `refire` grows alongside live `eligible`.
+        let tight2 = Budget::new(
+            &Limits {
+                max_memory: Some(eligible2_bytes + 1),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it2.ranges.begin(tight2);
+        let mut told2 = told2_base;
+        let err2 = dt_fires(&mut it2, &run2, &b2, &mut told2);
+        it2.ranges.end();
+        assert!(
+            matches!(err2, Err(Halt::Memory(_))),
+            "expected Halt::Memory when refire overlaps live eligible, got {:?}",
+            err2.err()
         );
     }
 }
