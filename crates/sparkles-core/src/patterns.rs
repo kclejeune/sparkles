@@ -691,19 +691,19 @@ fn read_run(
         let mut shift = 0;
         loop {
             let b = byte()?;
+            if shift == 63 && b > 1 {
+                return Err(bad());
+            }
             v |= u64::from(b & 0x7F) << shift;
             if b < 0x80 {
                 return Ok(v);
             }
             shift += 7;
-            if shift > 63 {
-                return Err(bad());
-            }
         }
     };
     let mut s = 0u64;
     for _ in 0..entries {
-        s += varint()?;
+        s = s.checked_add(varint()?).ok_or_else(bad)?;
         let a = varint()?;
         let b = varint()?;
         f(s, [a, b])?;
@@ -2160,5 +2160,70 @@ mod tests {
         put_varint(&mut out, u64::MAX);
         let mut pos = 0;
         assert_eq!(get_varint(&out, &mut pos), Some(u64::MAX));
+    }
+
+    #[test]
+    fn temporary_pattern_run_rejects_overflowing_varints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("patterns.run");
+
+        let write_entry = |delta: &[u8], codes: [u64; 2]| {
+            let mut bytes = delta.to_vec();
+            put_varint(&mut bytes, codes[0]);
+            put_varint(&mut bytes, codes[1]);
+            std::fs::write(&path, &bytes).unwrap();
+        };
+
+        let mut max_delta = [0xff; 10];
+        max_delta[9] = 0x01;
+        write_entry(&max_delta, [1, 2]);
+        let mut rows = Vec::new();
+        read_run(&path, 1, |s, codes| {
+            rows.push((s, codes));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, vec![(u64::MAX, [1, 2])]);
+
+        let mut padded_five = [0x80; 10];
+        padded_five[0] = 0x85;
+        padded_five[9] = 0x00;
+        write_entry(&padded_five, [3, 0]);
+        rows.clear();
+        read_run(&path, 1, |s, codes| {
+            rows.push((s, codes));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, vec![(5, [3, 0])]);
+
+        for terminal in (0x02u8..=0x7f).chain([0x80, 0xff]) {
+            let mut overflowing = [0x80; 10];
+            overflowing[0] = 0x85;
+            overflowing[9] = terminal;
+            write_entry(&overflowing, [1, 0]);
+            let mut called = false;
+            let err = read_run(&path, 1, |_, _| {
+                called = true;
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::Corrupt(_)),
+                "tenth byte {terminal:#x}: {err:?}"
+            );
+            assert!(!called, "tenth byte {terminal:#x} invoked callback");
+        }
+
+        let mut two_entries = Vec::new();
+        two_entries.extend_from_slice(&max_delta);
+        put_varint(&mut two_entries, 1);
+        put_varint(&mut two_entries, 0);
+        put_varint(&mut two_entries, 1);
+        put_varint(&mut two_entries, 1);
+        put_varint(&mut two_entries, 0);
+        std::fs::write(&path, &two_entries).unwrap();
+        let err = read_run(&path, 2, |_, _| Ok(())).unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
     }
 }

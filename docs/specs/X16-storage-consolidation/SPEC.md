@@ -815,14 +815,17 @@ user-space instructions per request within the noise floor of the counts, with r
 placement rather than added work, and [item 1246](../../ROADMAP.md) confirms them on the forge matrix
 after the push.
 
-Item 1208 closes a tenth-byte overflow gap in the shared delta-varint decoders of Phase 5.
-`read_varint10` loops over the first nine bytes and validates the tenth byte only after nine
-continuation bytes, accepting `0x00` or `0x01` and rejecting `0x02` through `0xff` as corrupt
-so that index column frames and builder run blocks cannot truncate values wider than 64 bits.
-`read_varint_checked` applies the same tenth-byte bound at shift 63 for bounded point column
-reads and the other checked varint callers. Unit tests cover every overflowing tenth byte from
-`0x02` through `0x7f`, non-terminating tenth bytes, and round-trips of the largest valid
-64-bit varint in index column frames, bounded reads and builder run blocks.
+Item 1208 closes a tenth-byte overflow gap in the shared delta-varint decoders of Phase 5
+and the temporary pattern run reader. `read_varint10` loops over the first nine bytes and
+validates the tenth byte only after nine continuation bytes, accepting `0x00` or `0x01` and
+rejecting `0x02` through `0xff` as corrupt so that index column frames and builder run blocks
+cannot truncate values wider than 64 bits. `read_varint_checked` and `patterns::read_run`
+apply the same tenth-byte bound at shift 63 for bounded point column reads, temporary pattern
+runs and the other checked varint callers, and `patterns::read_run` checks cumulative subject
+addition for overflow. Unit tests cover every overflowing tenth byte from `0x02` through
+`0x7f`, non-terminating tenth bytes, padded tenth-byte zero encodings and round-trips of the
+largest valid 64-bit varint across index column frames, bounded reads, builder run blocks and
+temporary pattern runs.
 
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
