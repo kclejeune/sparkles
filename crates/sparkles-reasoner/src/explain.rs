@@ -123,8 +123,8 @@ pub struct DemandInput<'a> {
     pub reasoner: &'a QueryReasoner,
     /// the snapshot of the caller's view
     pub snap: Arc<Snapshot>,
-    /// whether the caller may read a graph, `None` for every graph
-    pub readable: Option<Arc<dyn Fn(Id) -> bool + Send + Sync>>,
+    /// the caller's bound graph access, `None` for every graph
+    pub readable: Option<Arc<sparkles_core::access::GraphAccess>>,
 }
 
 /// The OWL 2 RL rule id of a rule of the `owl-rl` profile: its name when the name follows
@@ -3103,6 +3103,219 @@ mod partial_tests {
                 .expect("expected cancellation")
                 .downcast_ref::<sparkles_core::Error>()
                 .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+        );
+    }
+
+    #[test]
+    fn explanation_owl_imports_retains_decode_credit_across_long_delta_iris() {
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let long = "z".repeat(65_536);
+        let imp1 = format!("http://imp.org/one_{long}");
+        let imp2 = format!("http://imp.org/two_{long}");
+        let imp3 = format!("http://imp.org/three_{long}");
+        let owl_imports = crate::inputs::OWL_IMPORTS;
+
+        let extras = Extras::default();
+        let rules = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . [derive: (?x ex:p ?y) -> (?x ex:q ?y)]".into(),
+        );
+        let inputs = crate::Inputs {
+            data_graphs: vec![crate::inputs::GraphRef::Default],
+            imports: crate::inputs::ImportMode::Dataset,
+            ..Default::default()
+        };
+        let reasoner = QueryReasoner::new(rules, &extras, inputs).unwrap();
+
+        // Baseline session memory without long owl:imports IRIs.
+        let base_store = sparkles_core::store::Store::in_memory(Default::default());
+        sparkles_core::sparql::update::update(
+            &base_store,
+            "INSERT DATA { <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> }",
+            &Default::default(),
+        )
+        .unwrap();
+        let base_input = DemandInput {
+            reasoner: &reasoner,
+            snap: base_store.snapshot(),
+            readable: None,
+        };
+        let probe = demand_session(&base_input, &ExplainOptions::default(), true).unwrap();
+        let base_used = probe.budget().used();
+        drop(probe);
+
+        // Headroom fits one 64 KiB decoded import name, strictly below two simultaneous 64 KiB names.
+        let cap = base_used + 96 * 1024;
+        assert!(cap < base_used + 2 * 65_536);
+        let opts = ExplainOptions {
+            max_memory: Some(cap),
+            ..Default::default()
+        };
+
+        // 1. Three distinct long delta owl:imports IRIs that do not resolve to graphs:
+        //    credit must stay with each live decoded name and its retained warning so the
+        //    cap refuses before accumulating multiple 64 KiB strings in memory.
+        let unresolved_store = sparkles_core::store::Store::in_memory(Default::default());
+        sparkles_core::sparql::update::update(
+            &unresolved_store,
+            &format!(
+                "INSERT DATA {{ \
+                    <http://ex.org/ont> <{owl_imports}> <{imp1}>, <{imp2}>, <{imp3}> . \
+                    <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> . \
+                }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let unresolved_snap = unresolved_store.snapshot();
+        for iri in [&imp1, &imp2, &imp3] {
+            assert_eq!(unresolved_snap.lookup_iri(iri).unwrap().tag(), Tag::Delta);
+        }
+        let unresolved_input = DemandInput {
+            reasoner: &reasoner,
+            snap: unresolved_snap,
+            readable: None,
+        };
+
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            explain_demand(&unresolved_input, &[ex("s"), ex("q"), ex("o")], &opts)
+        });
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some(),
+            "unresolved long delta imports expected ExplainBudgetExceeded"
+        );
+        assert!(
+            peak < base_used + 112 * 1024,
+            "unresolved long delta imports exceeded single-name headroom (peak={peak}, cap={cap}, largest={largest})"
+        );
+
+        let wn_opts = crate::whynot::WhyNotOptions {
+            explain: opts.clone(),
+            ..Default::default()
+        };
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            crate::whynot::why_not(&unresolved_input, &[ex("s"), ex("q"), ex("o")], &wn_opts)
+        });
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some(),
+            "unresolved long delta imports why-not expected ExplainBudgetExceeded"
+        );
+        assert!(
+            peak < base_used + 112 * 1024,
+            "unresolved long delta imports why-not exceeded single-name headroom (peak={peak}, cap={cap}, largest={largest})"
+        );
+
+        // 2. Three distinct long delta owl:imports IRIs that DO resolve to existing graphs:
+        //    processing each decoded name incrementally while holding its credit keeps peak
+        //    within single-name headroom and derives the triple from the 3rd imported graph.
+        let resolved_store = sparkles_core::store::Store::in_memory(Default::default());
+        sparkles_core::sparql::update::update(
+            &resolved_store,
+            &format!(
+                "INSERT DATA {{ \
+                    <http://ex.org/ont> <{owl_imports}> <{imp1}>, <{imp2}>, <{imp3}> . \
+                    GRAPH <{imp1}> {{ <http://ex.org/a1> <http://ex.org/r> <http://ex.org/b1> }} \
+                    GRAPH <{imp2}> {{ <http://ex.org/a2> <http://ex.org/r> <http://ex.org/b2> }} \
+                    GRAPH <{imp3}> {{ <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> }} \
+                }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let resolved_input = DemandInput {
+            reasoner: &reasoner,
+            snap: resolved_store.snapshot(),
+            readable: None,
+        };
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            explain_demand(&resolved_input, &[ex("s"), ex("q"), ex("o")], &opts)
+        });
+        assert!(
+            matches!(res, Ok(Explained::Found { ref trees, .. }) if !trees.is_empty()),
+            "resolved long delta imports should derive from 3rd graph, got {res:?}"
+        );
+        assert!(
+            peak < base_used + 112 * 1024,
+            "resolved long delta imports held multiple 64 KiB names live at once (peak={peak}, cap={cap}, largest={largest})"
+        );
+    }
+
+    #[test]
+    fn demand_debug_trace_avoids_unchecked_predicate_decode() {
+        struct DemandDebugSubscriber;
+        impl tracing::Subscriber for DemandDebugSubscriber {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.target() == "sparkles_reasoner::demand"
+                    && *meta.level() <= tracing::Level::DEBUG
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let long = "z".repeat(65_536);
+        let long_p = format!("http://ex.org/p_{long}");
+        sparkles_core::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ \
+                    <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> . \
+                    <http://ex.org/a> <{long_p}> <http://ex.org/b> . \
+                }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let snap = store.snapshot();
+        assert_eq!(snap.lookup_iri(&long_p).unwrap().tag(), Tag::Delta);
+
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let extras = Extras::default();
+        let rules = Profile::Rules(format!(
+            "@prefix ex: <http://ex.org/> . \
+             [r1: (?x ex:p ?y) -> (?x <{long_p}> ?y)] \
+             [r2: (?x <{long_p}> ?y) -> (?x ex:q ?y)]"
+        ));
+        let reasoner = QueryReasoner::new(rules, &extras, crate::Inputs::default()).unwrap();
+        let input = DemandInput {
+            reasoner: &reasoner,
+            snap,
+            readable: None,
+        };
+        let mut session = demand_session(&input, &ExplainOptions::default(), true).unwrap();
+        let target_ids = [
+            session.terms().try_id_for(&ex("s")).unwrap(),
+            session.terms().try_id_for(&ex("q")).unwrap(),
+            session.terms().try_id_for(&ex("o")).unwrap(),
+        ];
+
+        let (res, peak, largest) = tracing::subscriber::with_default(DemandDebugSubscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            crate::alloc_probe::peak_and_largest_of(|| {
+                session.derive_ids(&[[
+                    Some(target_ids[0]),
+                    Some(target_ids[1]),
+                    Some(target_ids[2]),
+                ]])
+            })
+        });
+        assert!(res.is_ok(), "derive_ids with debug tracing failed: {res:?}");
+        assert!(
+            largest < 32_768 && peak < 65_536,
+            "demand debug trace decoded 64 KiB delta predicate (peak={peak}, largest={largest})"
         );
     }
 

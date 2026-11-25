@@ -1082,10 +1082,7 @@ impl StageBuilder<'_> {
         if tracing::enabled!(target: "sparkles_reasoner::demand", tracing::Level::DEBUG) {
             let show = |k: &Key| {
                 let p = match k.p {
-                    KeyP::Const(c) => self
-                        .terms
-                        .term(c)
-                        .map_or_else(|| format!("#{c}"), |t| t.to_string()),
+                    KeyP::Const(c) => format!("#{c}"),
                     p => format!("{p:?}"),
                 };
                 format!("{p}^{}{}", k.adornment(), if k.neq { "!" } else { "" })

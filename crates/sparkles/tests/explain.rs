@@ -1251,6 +1251,351 @@ fn explanation_graph_name_lookups_admit_fsst_scratch() {
 
 #[cfg(feature = "reasoning")]
 #[test]
+fn restricted_explanation_access_avoids_unchecked_graph_decode() {
+    use sparkles::reasoning::{
+        ReasonRequest,
+        explain::ExplainMode,
+        rdfs::NewSchema,
+        reasoner::{GraphRef, Inputs, Profile},
+    };
+    use sparkles_core::{
+        builder::{BuildOptions, VocabCodec},
+        id::Tag,
+        store::StoreOptions,
+    };
+
+    let z = |local: &str| Term::NamedNode(NamedNode::new(format!("http://z.org/{local}")).unwrap());
+    let long = "z".repeat(65_536);
+
+    // 1. Restricted public demand and why-not over a long 64 KiB delta graph name must
+    //    check readability by known IRI name instead of decoding the ID via Snapshot::term.
+    let long_graph = format!("http://x.org/g_{long}");
+    let (_dir, ds) = open();
+    ds.update(&format!(
+        "INSERT DATA {{ GRAPH <{long_graph}> {{ <http://z.org/s> <http://z.org/p> <http://z.org/o> }} }}"
+    ))
+    .unwrap();
+    assert_eq!(
+        ds.store()
+            .snapshot()
+            .lookup_iri(&long_graph)
+            .expect("long delta graph in snapshot")
+            .tag(),
+        Tag::Delta
+    );
+    ds.reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::Rules(
+                "@prefix z: <http://z.org/> . [derive: (?x z:p ?y) -> (?x z:q ?y)]".into(),
+            ),
+            inputs: Inputs {
+                data_graphs: vec![GraphRef::Named(long_graph.clone())],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+
+    // Denied long delta graph: public explain rejects it by known IRI name before probing
+    // or decoding the 65,552-byte vocabulary key (`<` + long_graph).
+    let key_len = long_graph.len() + 1;
+    for (mode, triple) in [
+        (ExplainMode::Why, [z("s"), z("q"), z("o")]),
+        (ExplainMode::WhyNot, [z("s"), z("unrelated"), z("o")]),
+    ] {
+        let mut req = ExplainRequest::new(triple);
+        req.source = Some(ExplainSource::Demand);
+        req.mode = mode;
+        req.access = only(&["default"]);
+        let (result, alloc) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| caller_allocations::measure(|| ds.reasoning().explain(&req)))
+                .join()
+                .unwrap()
+        });
+        let ans = result.expect("denied restricted demand should succeed");
+        if mode == ExplainMode::Why {
+            assert!(matches!(ans.explained, Explained::NotFound));
+        }
+        assert!(
+            alloc.largest < key_len,
+            "denied restricted {mode:?} probed or decoded 64 KiB delta graph vocab key (peak={}, largest={}, key_len={key_len})",
+            alloc.peak,
+            alloc.largest
+        );
+    }
+
+    // Allowed long delta graph: public restricted explain must not add unchecked 64 KiB
+    // Snapshot::term copies on top of unrestricted explain.
+    for (mode, triple) in [
+        (ExplainMode::Why, [z("s"), z("q"), z("missing")]),
+        (ExplainMode::WhyNot, [z("s"), z("unrelated"), z("o")]),
+    ] {
+        let mut unres_req = ExplainRequest::new(triple.clone());
+        unres_req.source = Some(ExplainSource::Demand);
+        unres_req.mode = mode;
+        let (unres_res, unres_alloc) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| caller_allocations::measure(|| ds.reasoning().explain(&unres_req)))
+                .join()
+                .unwrap()
+        });
+        assert!(
+            unres_res.is_ok(),
+            "unrestricted {mode:?} failed: {unres_res:?}"
+        );
+
+        let mut req = ExplainRequest::new(triple);
+        req.source = Some(ExplainSource::Demand);
+        req.mode = mode;
+        req.access = only(&[&long_graph]);
+        let (result, alloc) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| caller_allocations::measure(|| ds.reasoning().explain(&req)))
+                .join()
+                .unwrap()
+        });
+        assert!(
+            result.is_ok(),
+            "allowed restricted {mode:?} failed: {result:?}"
+        );
+        assert!(
+            alloc.peak <= unres_alloc.peak + 32 * 1024,
+            "allowed restricted {mode:?} spiked above unrestricted via readable_id (restricted_peak={}, unrestricted_peak={}, largest={})",
+            alloc.peak,
+            unres_alloc.peak,
+            alloc.largest
+        );
+    }
+
+    // Direct DemandInput check (excluding Dataset::query_reasoner JSON deserialization):
+    // denied long delta graph allocates < 64 KiB; allowed stays under two live 64 KiB copies.
+    let reasoner = ds.query_reasoner(None).unwrap();
+    let snap = ds.store().snapshot();
+    {
+        use sparkles::reasoning::reasoner::{
+            explain::{DemandInput, ExplainOptions, explain_demand},
+            whynot::{WhyNotOptions, why_not},
+        };
+        let denied_input = DemandInput {
+            reasoner: &reasoner,
+            snap: snap.clone(),
+            readable: only(&["default"]),
+        };
+        let (res, alloc) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    caller_allocations::measure(|| {
+                        explain_demand(
+                            &denied_input,
+                            &[z("s"), z("q"), z("o")],
+                            &ExplainOptions::default(),
+                        )
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(matches!(res, Ok(Explained::NotFound)));
+        assert!(
+            alloc.largest < 65_536 && alloc.peak < 65_536,
+            "direct denied demand decoded 64 KiB delta graph (peak={}, largest={})",
+            alloc.peak,
+            alloc.largest
+        );
+
+        let allowed_input = DemandInput {
+            reasoner: &reasoner,
+            snap: snap.clone(),
+            readable: only(&[&long_graph]),
+        };
+        let (res, alloc) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    caller_allocations::measure(|| {
+                        why_not(
+                            &allowed_input,
+                            &[z("s"), z("unrelated"), z("o")],
+                            &WhyNotOptions::default(),
+                        )
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(res.is_ok(), "direct allowed why_not failed: {res:?}");
+        assert!(
+            alloc.peak < 112 * 1024,
+            "direct allowed why_not spiked to two live 64 KiB copies (peak={}, largest={})",
+            alloc.peak,
+            alloc.largest
+        );
+    }
+
+    // Allowed long delta graph still derives the visible triple.
+    let mut visible_req = ExplainRequest::new([z("s"), z("q"), z("o")]);
+    visible_req.source = Some(ExplainSource::Demand);
+    visible_req.access = only(&[&long_graph]);
+    let visible_ans = ds.reasoning().explain(&visible_req).unwrap();
+    assert_eq!(found(visible_ans.explained).len(), 1);
+
+    // 2. RDFS on read with restricted access over an unrelated 64 KiB delta named graph
+    //    must borrow the delta key instead of allocating owned copies via Snapshot::term.
+    let (_dir_rdfs_delta, ds_rdfs_delta) = open();
+    let unrelated_delta = format!("http://x.org/u_{long}");
+    ds_rdfs_delta
+        .update(&format!(
+            "INSERT DATA {{ \
+                <http://z.org/s> <{RDF_TYPE}> <http://z.org/Sub> . \
+                GRAPH <{unrelated_delta}> {{ <http://z.org/a> <http://z.org/b> <http://z.org/c> }} \
+            }}"
+        ))
+        .unwrap();
+    ds_rdfs_delta
+        .reasoning()
+        .rdfs()
+        .set(NewSchema::Triples(vec![oxrdf::Triple::new(
+            NamedNode::new("http://z.org/Sub").unwrap(),
+            oxrdf::vocab::rdfs::SUB_CLASS_OF.into_owned(),
+            NamedNode::new("http://z.org/Super").unwrap(),
+        )]))
+        .unwrap();
+    let mut rdfs_delta_req = ExplainRequest::new([z("s"), ty(), z("Super")]);
+    rdfs_delta_req.access = Some(Arc::new(GraphAccess::graphs(
+        Graphs::All.without_pattern("http://x.org/*"),
+        Graphs::none(),
+    )));
+    let (result, alloc) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                caller_allocations::measure(|| ds_rdfs_delta.reasoning().explain(&rdfs_delta_req))
+            })
+            .join()
+            .unwrap()
+    });
+    let ans = result.expect("RDFS on read with excluded delta graph should succeed");
+    assert_eq!(ans.source, Some(ExplainSource::RdfsOnRead));
+    assert_eq!(found(ans.explained).len(), 1);
+    assert!(
+        alloc.largest < 65_536 && alloc.peak < 65_536,
+        "RDFS on read decoded excluded 64 KiB delta graph (peak={}, largest={})",
+        alloc.peak,
+        alloc.largest
+    );
+
+    // 3. RDFS on read with restricted access over a compacted FSST unrelated 64 KiB named graph.
+    let fc = sparkles_core::vocab::FC_BLOCK;
+    let dir_rdfs_fsst = tempfile::tempdir().unwrap();
+    let ds_rdfs_fsst = Dataset::open_with(
+        dir_rdfs_fsst.path().join("db"),
+        StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Fsst),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut fsst_data = String::from(
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         @prefix x: <http://x.org/> .\n\
+         @prefix z: <http://z.org/> .\n\
+         {\n  z:s rdf:type z:Sub, x:a",
+    );
+    for i in 0..(fc - 2) {
+        fsst_data.push_str(&format!(", <http://x.org/z{i:02}>"));
+    }
+    fsst_data.push_str(&format!(
+        " .\n}}\n<http://x.org/b{long}> {{ z:a z:b z:c . }}\n"
+    ));
+    ds_rdfs_fsst.load_str(&fsst_data, RdfFormat::TriG).unwrap();
+    ds_rdfs_fsst.store().compact().unwrap();
+    ds_rdfs_fsst
+        .reasoning()
+        .rdfs()
+        .set(NewSchema::Triples(vec![oxrdf::Triple::new(
+            NamedNode::new("http://z.org/Sub").unwrap(),
+            oxrdf::vocab::rdfs::SUB_CLASS_OF.into_owned(),
+            NamedNode::new("http://z.org/Super").unwrap(),
+        )]))
+        .unwrap();
+
+    // Wildcard policy: must check unrelated FSST graph with admission and live controls.
+    let wildcard_access = Some(Arc::new(GraphAccess::graphs(
+        Graphs::All.without_iri("http://x.org/hidden"),
+        Graphs::none(),
+    )));
+    let mut rdfs_budget_req = ExplainRequest::new([z("s"), ty(), z("Super")]);
+    rdfs_budget_req.access = wildcard_access.clone();
+    rdfs_budget_req.max_memory = Some(48 * 1024);
+    let (result, alloc) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                caller_allocations::measure(|| ds_rdfs_fsst.reasoning().explain(&rdfs_budget_req))
+            })
+            .join()
+            .unwrap()
+    });
+    assert!(
+        alloc.largest < 65_536,
+        "RDFS on read wildcard policy decoded 64 KiB FSST suffix (peak={}, largest={})",
+        alloc.peak,
+        alloc.largest
+    );
+    let err = result.map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "RDFS on read wildcard policy expected reasoning-budget, got {err:?}"
+    );
+
+    let mut rdfs_cancel_req = ExplainRequest::new([z("s"), ty(), z("Super")]);
+    rdfs_cancel_req.access = wildcard_access;
+    rdfs_cancel_req.cancel = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    let (result, alloc) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                caller_allocations::measure(|| ds_rdfs_fsst.reasoning().explain(&rdfs_cancel_req))
+            })
+            .join()
+            .unwrap()
+    });
+    assert!(
+        alloc.largest < 65_536,
+        "cancelled RDFS on read decoded 64 KiB FSST suffix (peak={}, largest={})",
+        alloc.peak,
+        alloc.largest
+    );
+    assert!(
+        matches!(result, Err(sparkles::Error::Cancelled)),
+        "cancelled RDFS on read expected Cancelled, got {result:?}"
+    );
+
+    // Exact-only policy ("default" only): must skip unrelated FSST graphs completely.
+    let mut rdfs_exact_req = ExplainRequest::new([z("s"), ty(), z("Super")]);
+    rdfs_exact_req.access = only(&["default"]);
+    rdfs_exact_req.max_memory = Some(48 * 1024);
+    let (result, alloc) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                caller_allocations::measure(|| ds_rdfs_fsst.reasoning().explain(&rdfs_exact_req))
+            })
+            .join()
+            .unwrap()
+    });
+    let ans = result.expect("exact-only RDFS on read should skip unrelated FSST graph");
+    assert_eq!(ans.source, Some(ExplainSource::RdfsOnRead));
+    assert_eq!(found(ans.explained).len(), 1);
+    assert!(
+        alloc.largest < 65_536,
+        "exact-only RDFS on read decoded unrelated 64 KiB FSST suffix (peak={}, largest={})",
+        alloc.peak,
+        alloc.largest
+    );
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
 fn demand_session_refuses_before_allocating_terms_table() {
     use sparkles::reasoning::{
         ReasonRequest,

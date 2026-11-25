@@ -204,17 +204,20 @@ pub(crate) fn input_graphs(
     program: &AnalysisProgram,
     options: &AnalysisOptions,
 ) -> Vec<crate::id::Id> {
-    let readable = |graph| {
-        options
-            .access
-            .as_ref()
-            .is_none_or(|access| access.bound(snapshot).readable_id(snapshot, graph))
+    let bound = options
+        .access
+        .as_ref()
+        .filter(|access| !access.reads_all())
+        .map(|access| access.bound(snapshot));
+    let Some(bound) = bound else {
+        return sparkles_reasoner::inputs::resolve(snapshot, &program.inputs).ids(snapshot);
     };
-    sparkles_reasoner::inputs::resolve_readable(snapshot, &program.inputs, &readable)
-        .ids(snapshot)
-        .into_iter()
-        .filter(|&graph| readable(graph))
-        .collect()
+    let readable = |graph: &sparkles_reasoner::inputs::GraphRef| match graph {
+        sparkles_reasoner::inputs::GraphRef::Default => bound.read.default_graph(),
+        sparkles_reasoner::inputs::GraphRef::Named(iri) => bound.read.allows_named_iri(iri),
+    };
+    sparkles_reasoner::inputs::resolve_readable_iri(snapshot, &program.inputs, &readable)
+        .readable_ids(snapshot, &readable)
 }
 
 pub(crate) type Facts = std::collections::BTreeMap<String, [oxrdf::Term; 3]>;

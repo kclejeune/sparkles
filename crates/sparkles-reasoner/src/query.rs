@@ -828,33 +828,19 @@ impl Session {
         };
         let closures = (!shared.closures).then_some(false);
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
-        let resolved = {
+        let graphs = {
             let mut check = session_check(&req.stop);
-            match &req.readable {
-                Some(readable) => inputs::resolve_readable_controlled(
-                    &snap,
-                    &shared.inputs,
-                    &|g| readable(g),
-                    &budget,
-                    &mut check,
-                ),
-                None => inputs::resolve_controlled(&snap, &shared.inputs, &budget, &mut check),
-            }
+            inputs::resolve_session_inputs_controlled(
+                &snap,
+                &shared.inputs,
+                req.readable.as_deref(),
+                &mut warnings,
+                &budget,
+                &mut check,
+            )
             .map_err(|e| session_compile_error(e, "input graphs"))?
         };
-        warnings
-            .extend_borrowed(&resolved.warnings)
-            .map_err(|e| memory_error(e, "input warnings"))?;
-        let mut graphs = {
-            let mut check = session_check(&req.stop);
-            resolved
-                .ids_controlled(&snap, &budget, &mut check)
-                .map_err(|e| session_compile_error(e, "input graphs"))?
-        };
         tracing::debug!(target: "sparkles_reasoner::demand", "session: rules compiled and inputs resolved in {:?}", t0.elapsed());
-        if let Some(readable) = &req.readable {
-            graphs.retain(|g| readable(*g));
-        }
         let absent = graphs.contains(&Id::DEFAULT_GRAPH);
         // The view without its commit names the anchor whose tables may answer this
         // commit too (spec F17 §6.2): the session then keys the cache by the anchor's view.
@@ -2205,11 +2191,7 @@ impl Session {
                 *by_pred.entry(t[1]).or_default() += 1;
             }
         }
-        let name = |x: u64| {
-            self.terms
-                .term(x)
-                .map_or_else(|| format!("#{x}"), |t| t.to_string())
-        };
+        let name = |x: u64| format!("#{x}");
         for (si, st) in program.stages.iter().enumerate() {
             for (k, m) in st.keys() {
                 if let Some(n) = by_magic.get(&m) {

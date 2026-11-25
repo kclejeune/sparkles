@@ -170,12 +170,38 @@ fn view_of(access: Option<&Arc<GraphAccess>>, snap: &Arc<Snapshot>) -> Result<Ar
     }
 }
 
-fn readable(access: Option<&Arc<GraphAccess>>, snap: &Arc<Snapshot>, g: Id) -> bool {
-    access.is_none_or(|a| a.bound(snap).readable_id(snap, g))
-}
-
+#[cfg(feature = "reasoning")]
 fn readable_iri(access: Option<&Arc<GraphAccess>>, snap: &Arc<Snapshot>, iri: &str) -> bool {
     access.is_none_or(|a| a.bound(snap).read.allows_iri(iri))
+}
+
+fn readable_id_controlled(
+    bound: &GraphAccess,
+    snap: &Snapshot,
+    g: Id,
+    max_memory: Option<usize>,
+    req: &ExplainRequest,
+    deadline: Option<Instant>,
+) -> Result<bool> {
+    let admit = |bytes: usize| -> Result<()> {
+        if let Some(limit) = max_memory
+            && bytes > limit
+        {
+            check_controls(req, deadline)?;
+            return Err(budget_error(format!(
+                "checking an explanation graph needs {bytes} bytes, over its memory limit of {limit}"
+            )));
+        }
+        Ok(())
+    };
+    let mut check = || check_controls(req, deadline);
+    bound.readable_id_controlled(
+        snap,
+        g,
+        |old, new| admit(old.saturating_add(new)),
+        |_| Ok(()),
+        &mut check,
+    )
 }
 
 /// Explain `req.triple` in `ds`.
@@ -233,14 +259,15 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
         return Ok(answer);
     }
     if let Some(on) = ds.reasoning().rdfs().get() {
+        let bound = access.map(|a| a.bound(&head));
         let leaves = match &on.source {
             SchemaSource::Fixed(_) => SchemaLeaves::Document,
             SchemaSource::Graph(g) => match g {
-                None if readable(access, &head, Id::DEFAULT_GRAPH) => {
+                None if bound.as_ref().is_none_or(|a| a.read.default_graph()) => {
                     SchemaLeaves::Graph(Id::DEFAULT_GRAPH)
                 }
                 None => SchemaLeaves::Hidden,
-                Some(iri) if readable_iri(access, &head, iri) => {
+                Some(iri) if bound.as_ref().is_none_or(|a| a.read.allows_named_iri(iri)) => {
                     match lookup_iri_controlled(&head, iri, req.max_memory, req, deadline)? {
                         Some(id) => SchemaLeaves::Graph(id),
                         None => SchemaLeaves::Hidden,
@@ -249,11 +276,7 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
                 Some(_) => SchemaLeaves::Hidden,
             },
         };
-        let view = view_of(access, &head)?;
-        let inferred =
-            lookup_iri_controlled(&head, super::INFERRED_GRAPH, req.max_memory, req, deadline)?;
-        let mut graphs = vec![Id::DEFAULT_GRAPH];
-        graphs.extend(head.graph_ids()?);
+        let view = view_of(bound.as_ref(), &head)?;
         let include_inferred = {
             #[cfg(feature = "reasoning")]
             {
@@ -264,7 +287,65 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
                 false
             }
         };
-        graphs.retain(|&g| (include_inferred || Some(g) != inferred) && readable(access, &head, g));
+        let inferred = if bound
+            .as_ref()
+            .is_none_or(|a| a.read.allows_named_iri(super::INFERRED_GRAPH))
+        {
+            lookup_iri_controlled(&head, super::INFERRED_GRAPH, req.max_memory, req, deadline)?
+        } else {
+            None
+        };
+        let graphs = match bound.as_deref().map(|a| &a.read) {
+            None | Some(crate::access::Graphs::All) => {
+                let mut graphs = vec![Id::DEFAULT_GRAPH];
+                graphs.extend(head.graph_ids()?);
+                if !include_inferred {
+                    graphs.retain(|&g| Some(g) != inferred);
+                }
+                graphs
+            }
+            Some(crate::access::Graphs::Only(rule))
+                if rule.patterns.is_empty() && !rule.blank_nodes =>
+            {
+                let bound_ref = bound.as_deref().expect("bound access");
+                let mut graphs = Vec::new();
+                if rule.default_graph {
+                    graphs.push(Id::DEFAULT_GRAPH);
+                }
+                for iri in &rule.iris {
+                    check_controls(req, deadline)?;
+                    if !bound_ref.read.allows_named_iri(iri) {
+                        continue;
+                    }
+                    if let Some(id) =
+                        lookup_iri_controlled(&head, iri, req.max_memory, req, deadline)?
+                        && (include_inferred || Some(id) != inferred)
+                        && !graphs.contains(&id)
+                        && head.count(crate::index::Perm::Gspo, &[id.0])? > 0
+                    {
+                        graphs.push(id);
+                    }
+                }
+                graphs
+            }
+            Some(crate::access::Graphs::Only(_)) => {
+                let bound_ref = bound.as_deref().expect("bound access");
+                let mut graphs = Vec::new();
+                if bound_ref.read.default_graph() {
+                    graphs.push(Id::DEFAULT_GRAPH);
+                }
+                for g in head.graph_ids()? {
+                    check_controls(req, deadline)?;
+                    if !include_inferred && Some(g) == inferred {
+                        continue;
+                    }
+                    if readable_id_controlled(bound_ref, &head, g, req.max_memory, req, deadline)? {
+                        graphs.push(g);
+                    }
+                }
+                graphs
+            }
+        };
         let read_at_head = std::cell::Cell::new(false);
         #[cfg(feature = "reasoning")]
         let resolver = |graph: Id,
@@ -662,13 +743,9 @@ fn demand_with_for(
     let req = query.req;
     let triple = query.triple;
     check_controls(req, deadline)?;
-    let view = view_of(req.access.as_ref(), &snap)?;
-    let readable = req.access.as_ref().map(|a| {
-        let a = a.clone();
-        let snap = snap.clone();
-        Arc::new(move |g| a.bound(&snap).readable_id(&snap, g))
-            as Arc<dyn Fn(Id) -> bool + Send + Sync>
-    });
+    let bound = req.access.as_ref().map(|a| a.bound(&snap));
+    let view = view_of(bound.as_ref(), &snap)?;
+    let readable = bound.filter(|a| !a.reads_all());
     let input = DemandInput {
         reasoner,
         snap: view,

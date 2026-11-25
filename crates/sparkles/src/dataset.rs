@@ -669,11 +669,11 @@ impl Dataset {
         }
         let reasoner = self.query_reasoner(None)?;
         let snap = self.snapshot();
-        let readable = opts.graphs.clone().filter(|a| !a.reads_all()).map(|a| {
-            let s = snap.clone();
-            Arc::new(move |g: crate::id::Id| a.readable_id(&s, g))
-                as Arc<dyn Fn(crate::id::Id) -> bool + Send + Sync>
-        });
+        let readable = opts
+            .graphs
+            .as_ref()
+            .filter(|a| !a.reads_all())
+            .map(|a| a.bound(&snap));
         let req = SessionRequest {
             snap,
             readable,
