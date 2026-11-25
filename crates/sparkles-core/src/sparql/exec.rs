@@ -6598,7 +6598,15 @@ fn key_rows_retained(
     bytes: &mut u64,
 ) -> Result<Vec<Option<Value>>> {
     with_key_evaluator(ctx, t, e, dec, |eval| {
-        let step = ctx.reservation_step();
+        let may_split = t.len() > PAR_THRESHOLD;
+        let parallel_key = (may_split || cfg!(feature = "geo")) && e.parallel_order_key();
+        let step = if cfg!(feature = "geo") && !parallel_key {
+            // A later key evaluation may need credit to serialize a geometry.
+            // Keep only the payload we already evaluated.
+            0
+        } else {
+            ctx.reservation_step()
+        };
         let eval_retained =
             |i: usize, charge: &mut Option<super::ctx::RetainedCharge>, bytes: &mut u64| {
                 if i.is_multiple_of(MAP_POLL_ROWS) {
@@ -6618,7 +6626,7 @@ fn key_rows_retained(
         // Resume offsets fit on the stack so the heap piece records can be
         // freed before the serial suffixes need their memory.
         const MAX_PIECES: usize = 64;
-        let piece_rows = if t.len() > PAR_THRESHOLD && e.parallel_order_key() {
+        let piece_rows = if may_split && parallel_key {
             t.len()
                 .div_ceil(rayon::current_num_threads().min(MAX_PIECES))
                 .max(PAR_MIN_LEN)
@@ -11842,7 +11850,7 @@ fn parallel_full_sort_hands_off_wide_string_keys() {
     use super::expr::Func;
     use spargebra::algebra::Function;
 
-    let (ctx, table) = parallel_full_sort_fixture();
+    let (ctx, table) = parallel_full_sort_fixture(2 * PAR_THRESHOLD);
     let var = table.vars[0];
     let expr = Expr::Call(
         Func::Builtin(Function::Concat),
@@ -11863,7 +11871,7 @@ fn parallel_full_sort_hands_off_wide_string_keys() {
 fn parallel_full_sort_releases_piece_metadata_before_finishing_keys() {
     use super::expr::{ArithOp, CmpOp};
 
-    let (ctx, table) = parallel_full_sort_fixture();
+    let (ctx, table) = parallel_full_sort_fixture(2 * PAR_THRESHOLD);
     let var = table.vars[0];
     let wide_rows = 32;
     let factor = Value::from_typed(&"9".repeat(1700), oxrdf::vocab::xsd::INTEGER.as_str());
@@ -11919,7 +11927,7 @@ fn assert_full_sort_with_wide_geometry_key(iri: String, extra_args: Vec<Expr>) {
         oxrdf::Literal::new_typed_literal(wkt, oxrdf::NamedNodeRef::new_unchecked(WKT_LITERAL));
 
     for threads in [1, 4] {
-        let (mut ctx, table) = parallel_full_sort_fixture();
+        let (mut ctx, table) = parallel_full_sort_fixture(2 * PAR_THRESHOLD);
         ctx.geo = GeoMemo::with_budget(0);
         let var = table.vars[0];
         let unbound = ctx.var("unbound");
@@ -11991,14 +11999,122 @@ fn assert_full_sort_with_wide_geometry_key(iri: String, extra_args: Vec<Expr>) {
     }
 }
 
+#[cfg(all(test, feature = "geo"))]
+#[test]
+fn parallel_full_sort_keeps_credit_for_later_geometry_keys() {
+    use super::expr::Func;
+    use crate::geo::{WKT_LITERAL, memo::GeoMemo};
+    use spargebra::algebra::Function;
+
+    const ROWS: usize = 8 * PAR_THRESHOLD;
+    const KEY_LEN: i64 = 20_000;
+    for threads in [1, 4] {
+        let (mut ctx, table) = parallel_full_sort_fixture(ROWS);
+        ctx.geo = GeoMemo::with_budget(0);
+        let var = table.vars[0];
+        let unbound = ctx.var("unbound");
+        let wkt_key = |points| {
+            let coordinates: Vec<_> = ["0 0", "1 1"].into_iter().cycle().take(points).collect();
+            let wkt = format!("LINESTRING({})", coordinates.join(", "));
+            let geometry = crate::geo::parse(&wkt, WKT_LITERAL).unwrap();
+            let bytes = crate::geo::to_wkt(&geometry).len() as u64 + 64;
+            let literal = oxrdf::Literal::new_typed_literal(
+                wkt,
+                oxrdf::NamedNodeRef::new_unchecked(WKT_LITERAL),
+            );
+            let id = ctx.intern_term(&oxrdf::Term::Literal(literal.clone()));
+            assert_ne!(id, Id::UNDEF);
+            let as_wkt = Expr::Call(
+                Func::Ext(format!("{}asWKT", crate::geo::vocab::GEOF)),
+                vec![Expr::Lit(id, Value::from_literal(&literal))],
+            );
+            (
+                Expr::Call(Func::Builtin(Function::Str), vec![as_wkt]),
+                bytes,
+            )
+        };
+        let (first_wkt, first_bytes) = wkt_key(6000);
+        let (second_wkt, second_bytes) = wkt_key(12000);
+        let first = table.cols[0][0];
+        let second = table.cols[0][1];
+        let is_row = |id| {
+            Box::new(Expr::SameTerm(
+                Box::new(Expr::Var(var)),
+                Box::new(Expr::Const(id)),
+            ))
+        };
+        let key = Expr::If(
+            is_row(first),
+            Box::new(Expr::Call(
+                Func::Builtin(Function::SubStr),
+                vec![
+                    first_wkt,
+                    Expr::Const(Id::from_i64(1).unwrap()),
+                    Expr::Const(Id::from_i64(KEY_LEN).unwrap()),
+                ],
+            )),
+            Box::new(Expr::If(
+                is_row(second),
+                Box::new(Expr::Call(
+                    Func::Builtin(Function::StrLen),
+                    vec![second_wkt],
+                )),
+                Box::new(Expr::Var(unbound)),
+            )),
+        );
+        let slots = (ROWS * size_of::<Option<Value>>()) as u64 + 128;
+        let sort = ROWS as u64 * 24 + 2 * table.mem_bytes() + 128 + 1024;
+        let evaluator = ctx.nvars() as u64 * 16 + 128;
+        let setup = ctx.live_bytes();
+        let geometry_bytes = first_bytes + second_bytes;
+        let key_bytes = KEY_LEN as u64 + 64;
+        // The first key can reserve a growth step, but its unused credit
+        // would leave too little for the second WKT serialization.
+        let headroom = 4 * (128 + super::bignum::AGG_SUM_PAYLOAD_BYTES);
+        ctx.mem_limit = setup + sort + evaluator + slots + geometry_bytes + key_bytes + headroom;
+        assert!(ctx.reservation_step() > headroom);
+        assert!(ctx.reservation_step() <= headroom + second_bytes);
+        let ctx = ctx.into_shared();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let sorted = pool
+            .install(|| {
+                order_by_rows(
+                    &ctx,
+                    table,
+                    &[(key, true)],
+                    None,
+                    &mut ExprReport::default(),
+                )
+            })
+            .unwrap();
+        let (unbound_rows, bound_rows) = sorted.cols[0].split_at(ROWS - 2);
+        assert_eq!(bound_rows, &[first, second], "{threads} threads");
+        assert!(
+            unbound_rows
+                .iter()
+                .map(|id| id.as_i64())
+                .eq((1..=ROWS as i64 - 2).rev()),
+            "{threads} threads"
+        );
+        assert_eq!(
+            ctx.live_bytes(),
+            setup + geometry_bytes,
+            "{threads} threads"
+        );
+    }
+}
+
 #[cfg(test)]
-fn parallel_full_sort_fixture() -> (Ctx, Table) {
+fn parallel_full_sort_fixture(rows: usize) -> (Ctx, Table) {
     let store = crate::store::Store::in_memory(Default::default());
     let mut ctx = Ctx::new(store.snapshot());
     ctx.opt.expr_cache = false;
     let var = ctx.var("v");
     let mut table = Table::new(vec![var]);
-    for i in (1..=2 * PAR_THRESHOLD as i64).rev() {
+    for i in (1..=rows as i64).rev() {
         table.push_row(&[Id::from_i64(i).unwrap()]);
     }
     (ctx, table)

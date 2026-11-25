@@ -445,8 +445,9 @@ impl Expr {
     }
 
     /// Geometry constructors charge the query even if the resulting key is
-    /// discarded, and worker scratch can make the constructor fail with a type
-    /// error. Evaluate keys that can call them in the serial loop.
+    /// discarded. Worker scratch or unused reservation credit can make the
+    /// constructor fail with a type error. Evaluate keys that can call them
+    /// serially and admit their retained payload exactly.
     pub(super) fn parallel_order_key(&self) -> bool {
         #[cfg(feature = "geo")]
         {
