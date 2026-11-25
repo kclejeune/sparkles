@@ -1,7 +1,7 @@
 //! Private query ownership. Payloads never enter this ledger or its locks.
 use super::pool::PoolGrant;
 use crate::error::{Budget, BudgetKind, Error, Result};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use sparkles_budget::{MemoryDomain, MemoryLease, ParentHandle, ParentRefused, Scope};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -17,6 +17,13 @@ pub(crate) struct QueryMemoryLedger {
     prefetch_bytes: AtomicU64,
     /// Number of active cursor prefetch scopes currently relying on the envelope.
     prefetch_active: AtomicUsize,
+    /// Number of detached optional-prefetch backing releases currently running
+    /// outside `state`. Updated only while holding `state`.
+    reclaim_in_flight: AtomicUsize,
+    /// Monotonic count of completed optional-prefetch reclamations (after any
+    /// backing return finishes). Updated only while holding `state`.
+    reclaim_epoch: AtomicU64,
+    reclaim_done: Condvar,
     state: Mutex<State>,
 }
 #[derive(Default)]
@@ -171,6 +178,58 @@ impl Release {
         drop(self.lease);
     }
 }
+
+thread_local! {
+    /// Ledger addresses currently executing an optional-prefetch backing release
+    /// (`Release::finish`) on this thread, preventing self- or mutual deadlock if a
+    /// grant waker or parent return callback re-enters the ledger.
+    static ACTIVE_PREFETCH_RELEASES: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Panic-safe guard for an optional-prefetch backing release executing outside
+/// `QueryMemoryLedger::state`. Publishes `reclaim_epoch` before decrementing
+/// `reclaim_in_flight` and wakes waiters on drop.
+struct InFlightPrefetchRelease<'a> {
+    ledger: &'a QueryMemoryLedger,
+}
+
+impl<'a> InFlightPrefetchRelease<'a> {
+    fn enter(ledger: &'a QueryMemoryLedger) -> Self {
+        let addr = ledger as *const QueryMemoryLedger as usize;
+        ACTIVE_PREFETCH_RELEASES.with(|active| active.borrow_mut().push(addr));
+        Self { ledger }
+    }
+
+    fn finish_with(self, release: Release) {
+        release.finish();
+    }
+}
+
+impl Drop for InFlightPrefetchRelease<'_> {
+    fn drop(&mut self) {
+        let addr = self.ledger as *const QueryMemoryLedger as usize;
+        ACTIVE_PREFETCH_RELEASES.with(|active| {
+            let mut active = active.borrow_mut();
+            let popped = active.pop();
+            debug_assert_eq!(popped, Some(addr));
+        });
+        let guard = self.ledger.lock();
+        let next_epoch = self.ledger.reclaim_epoch.load(Ordering::Relaxed) + 1;
+        // Publish the incremented epoch BEFORE decrementing `reclaim_in_flight` so a
+        // concurrent Acquire load of `reclaim_in_flight == 0` always observes it.
+        self.ledger
+            .reclaim_epoch
+            .store(next_epoch, Ordering::Release);
+        let prev = self.ledger.reclaim_in_flight.load(Ordering::Relaxed);
+        debug_assert!(prev > 0, "in-flight prefetch release");
+        self.ledger
+            .reclaim_in_flight
+            .store(prev - 1, Ordering::Release);
+        self.ledger.reclaim_done.notify_all();
+        drop(guard);
+    }
+}
 fn parent_error(error: ParentRefused) -> Error {
     match error {
         ParentRefused::Limit {
@@ -240,6 +299,9 @@ impl QueryMemoryLedger {
             envelope_reserved: AtomicU64::new(0),
             prefetch_bytes: AtomicU64::new(0),
             prefetch_active: AtomicUsize::new(0),
+            reclaim_in_flight: AtomicUsize::new(0),
+            reclaim_epoch: AtomicU64::new(0),
+            reclaim_done: Condvar::new(),
             state: Mutex::new(State {
                 owners: vec![Account {
                     exact: false,
@@ -399,12 +461,13 @@ impl QueryMemoryLedger {
         if bytes == 0 {
             return Ok(());
         }
-        match self.reserve_child_once(owner, limit, bytes) {
-            Ok(()) => Ok(()),
-            Err(ParentRefused::Limit { .. }) if self.reclaim_idle_prefetch() => {
-                self.reserve_child_once(owner, limit, bytes)
+        loop {
+            let epoch = self.reclaim_epoch.load(Ordering::Acquire);
+            match self.reserve_child_once(owner, limit, bytes) {
+                Ok(()) => return Ok(()),
+                Err(ParentRefused::Limit { .. }) if self.reclaim_idle_prefetch_since(epoch) => {}
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -576,22 +639,53 @@ impl QueryMemoryLedger {
         );
         Ok(())
     }
-    /// Reclaim any idle optional prefetch reservation across all accounts, returning
-    /// freed grant or parent-lease backing outside the ledger lock. Returns `true` if
-    /// any bytes were reclaimed.
-    fn reclaim_idle_prefetch(&self) -> bool {
-        if self.prefetch_bytes.load(Ordering::Acquire) == 0 {
-            return false;
+    fn in_active_prefetch_release(&self) -> bool {
+        let addr = self as *const Self as usize;
+        ACTIVE_PREFETCH_RELEASES.with(|active| active.borrow().contains(&addr))
+    }
+
+    fn wait_in_flight_prefetch_releases(&self, guard: &mut parking_lot::MutexGuard<'_, State>) {
+        if self.in_active_prefetch_release() {
+            return;
         }
-        let mut reclaimed = false;
+        while self.reclaim_in_flight.load(Ordering::Relaxed) != 0 {
+            self.reclaim_done.wait(guard);
+        }
+    }
+
+    /// Reclaim any idle optional prefetch reservation across all accounts, returning
+    /// freed grant or parent-lease backing outside the ledger lock, and wait for any
+    /// concurrent reclamation's backing return to complete. Returns `true` if idle
+    /// prefetch was reclaimed or another caller completed a reclamation since
+    /// `epoch_before`.
+    fn reclaim_idle_prefetch_since(&self, epoch_before: u64) -> bool {
+        // Read in reverse publication order:
+        //   with backing return: in_flight += 1 -> prefetch_bytes = ... ->
+        //                        [release.finish()] -> epoch += 1 -> in_flight -= 1
+        //   without backing:     epoch += 1 -> prefetch_bytes = ...
+        let prefetch = self.prefetch_bytes.load(Ordering::Acquire);
+        let in_flight = self.reclaim_in_flight.load(Ordering::Acquire);
+        let epoch = self.reclaim_epoch.load(Ordering::Acquire);
+        if prefetch == 0 && in_flight == 0 {
+            return epoch != epoch_before;
+        }
+        let mut progressed = epoch != epoch_before;
         loop {
-            let release = {
+            let step = {
                 let mut guard = self.lock();
                 let state = &mut *guard;
                 if state.prefetch_total == 0 {
+                    self.wait_in_flight_prefetch_releases(&mut guard);
+                    if self.reclaim_epoch.load(Ordering::Relaxed) != epoch_before {
+                        progressed = true;
+                    }
                     break;
                 }
                 if self.prefetch_active.load(Ordering::SeqCst) != 0 {
+                    self.wait_in_flight_prefetch_releases(&mut guard);
+                    if self.reclaim_epoch.load(Ordering::Relaxed) != epoch_before {
+                        progressed = true;
+                    }
                     break;
                 }
                 // Dekker handshake with `begin_prefetch` + `envelope_reserved`:
@@ -606,10 +700,18 @@ impl QueryMemoryLedger {
                         state.decode_total.saturating_add(state.prefetch_total),
                         Ordering::SeqCst,
                     );
+                    self.wait_in_flight_prefetch_releases(&mut guard);
+                    if self.reclaim_epoch.load(Ordering::Relaxed) != epoch_before {
+                        progressed = true;
+                    }
                     break;
                 }
                 let Some(account) = state.owners.iter_mut().find(|a| a.prefetch != 0) else {
                     debug_assert_eq!(state.prefetch_total, 0);
+                    self.wait_in_flight_prefetch_releases(&mut guard);
+                    if self.reclaim_epoch.load(Ordering::Relaxed) != epoch_before {
+                        progressed = true;
+                    }
                     break;
                 };
                 let bytes = account.prefetch;
@@ -628,15 +730,6 @@ impl QueryMemoryLedger {
                     .checked_sub(bytes)
                     .expect("query live bytes");
                 self.live.store(live, Ordering::Release);
-                self.prefetch_bytes
-                    .store(state.prefetch_total, Ordering::Release);
-                if state.prefetch_total != 0 {
-                    self.envelope_reserved.store(
-                        state.decode_total.saturating_add(state.prefetch_total),
-                        Ordering::SeqCst,
-                    );
-                }
-                reclaimed = true;
                 let returned = if state.cursor
                     && !account.exact
                     && (account.owner.grant.is_some() || account.lease.is_some())
@@ -648,11 +741,31 @@ impl QueryMemoryLedger {
                 } else {
                     0
                 };
-                account.retire(returned)
+                let release = if returned != 0 {
+                    let prev = self.reclaim_in_flight.load(Ordering::Relaxed);
+                    self.reclaim_in_flight.store(prev + 1, Ordering::Release);
+                    Some(account.retire(returned))
+                } else {
+                    let next_epoch = self.reclaim_epoch.load(Ordering::Relaxed) + 1;
+                    self.reclaim_epoch.store(next_epoch, Ordering::Release);
+                    None
+                };
+                self.prefetch_bytes
+                    .store(state.prefetch_total, Ordering::Release);
+                if state.prefetch_total != 0 {
+                    self.envelope_reserved.store(
+                        state.decode_total.saturating_add(state.prefetch_total),
+                        Ordering::SeqCst,
+                    );
+                }
+                progressed = true;
+                release
             };
-            release.finish();
+            if let Some(release) = step {
+                InFlightPrefetchRelease::enter(self).finish_with(release);
+            }
         }
-        reclaimed
+        progressed
     }
     fn admit(
         &self,
@@ -763,22 +876,17 @@ impl QueryMemoryLedger {
         if bytes == 0 {
             return Ok(());
         }
-        if decode {
-            match self.reserve_decode_once(owner, limit, bytes) {
-                Ok(()) => Ok(()),
-                Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch() => {
-                    self.reserve_decode_once(owner, limit, bytes)
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            let first = { self.admit(&mut self.lock(), owner, limit, bytes, false) };
-            match first {
-                Ok(()) => Ok(()),
-                Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch() => {
-                    self.admit(&mut self.lock(), owner, limit, bytes, false)
-                }
-                Err(error) => Err(error),
+        loop {
+            let epoch = self.reclaim_epoch.load(Ordering::Acquire);
+            let result = if decode {
+                self.reserve_decode_once(owner, limit, bytes)
+            } else {
+                self.admit(&mut self.lock(), owner, limit, bytes, false)
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch_since(epoch) => {}
+                Err(error) => return Err(error),
             }
         }
     }
@@ -791,12 +899,13 @@ impl QueryMemoryLedger {
         limit: u64,
         bytes: u64,
     ) -> Result<()> {
-        match self.reserve_receiving_once(owner, limit, bytes) {
-            Ok(()) => Ok(()),
-            Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch() => {
-                self.reserve_receiving_once(owner, limit, bytes)
+        loop {
+            let epoch = self.reclaim_epoch.load(Ordering::Acquire);
+            match self.reserve_receiving_once(owner, limit, bytes) {
+                Ok(()) => return Ok(()),
+                Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch_since(epoch) => {}
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -896,7 +1005,7 @@ impl QueryMemoryLedger {
         id: u64,
         decode_bytes: u64,
         prefetch_bytes: u64,
-    ) -> Release {
+    ) -> (Release, bool) {
         let cursor = state.cursor;
         let account = state
             .owners
@@ -929,12 +1038,6 @@ impl QueryMemoryLedger {
             .checked_sub(total)
             .expect("query live bytes");
         self.live.store(live, Ordering::Release);
-        self.prefetch_bytes
-            .store(state.prefetch_total, Ordering::Release);
-        self.envelope_reserved.store(
-            state.decode_total.saturating_add(state.prefetch_total),
-            Ordering::Release,
-        );
         let returned = if account.exact {
             account.eager = account
                 .eager
@@ -942,11 +1045,34 @@ impl QueryMemoryLedger {
                 .expect("owned exact child credit");
             total
         } else if cursor && (account.owner.grant.is_some() || account.lease.is_some()) {
-            account.shrink_live()
+            // Optional prefetch backing must not be stranded behind LIVE_SLACK once
+            // envelope teardown clears the prefetch record that later required charges
+            // would otherwise reclaim.
+            if prefetch_bytes != 0 && account.eager > account.live {
+                let excess = account.eager - account.live;
+                account.eager = account.live;
+                excess
+            } else {
+                account.shrink_live()
+            }
         } else {
             0
         };
-        account.retire(returned)
+        let track_in_flight = prefetch_bytes != 0 && returned != 0;
+        if track_in_flight {
+            let prev = self.reclaim_in_flight.load(Ordering::Relaxed);
+            self.reclaim_in_flight.store(prev + 1, Ordering::Release);
+        } else if prefetch_bytes != 0 {
+            let next_epoch = self.reclaim_epoch.load(Ordering::Relaxed) + 1;
+            self.reclaim_epoch.store(next_epoch, Ordering::Release);
+        }
+        self.prefetch_bytes
+            .store(state.prefetch_total, Ordering::Release);
+        self.envelope_reserved.store(
+            state.decode_total.saturating_add(state.prefetch_total),
+            Ordering::Release,
+        );
+        (account.retire(returned), track_in_flight)
     }
     pub(crate) fn release(&self, id: u64, bytes: u64) {
         let release = {
@@ -966,7 +1092,7 @@ impl QueryMemoryLedger {
     pub(crate) fn release_decode(&self) {
         // One original owner at a time; no allocation, grant wake or callback under lock.
         loop {
-            let release = {
+            let (release, track_in_flight) = {
                 let mut state = self.lock();
                 let Some((id, decode_bytes, prefetch_bytes)) = state
                     .owners
@@ -982,40 +1108,36 @@ impl QueryMemoryLedger {
                 };
                 self.release_envelope_locked(&mut state, id, decode_bytes, prefetch_bytes)
             };
-            release.finish();
+            if track_in_flight {
+                InFlightPrefetchRelease::enter(self).finish_with(release);
+            } else {
+                release.finish();
+            }
         }
     }
     pub(crate) fn check_output(&self, owner: &MemoryOwner, limit: u64, bytes: u64) -> Result<()> {
-        match self.check_output_once(owner, limit, bytes, true) {
-            Ok(()) => Ok(()),
-            Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch() => {
-                self.check_output_once(owner, limit, bytes, false)
-            }
-            Err(error) => {
-                if let Error::BudgetExceeded(budget) = &error {
-                    self.peak.fetch_max(budget.requested, Ordering::Relaxed);
+        loop {
+            let epoch = self.reclaim_epoch.load(Ordering::Acquire);
+            match self.check_output_once(owner, limit, bytes) {
+                Ok(()) => return Ok(()),
+                Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch_since(epoch) => {}
+                Err(error) => {
+                    if let Error::BudgetExceeded(budget) = &error {
+                        // Historical Ctx output peak is an attempted estimate, unlike
+                        // admitted ownership.
+                        self.peak.fetch_max(budget.requested, Ordering::Relaxed);
+                    }
+                    return Err(error);
                 }
-                Err(error)
             }
         }
     }
-    fn check_output_once(
-        &self,
-        owner: &MemoryOwner,
-        limit: u64,
-        bytes: u64,
-        may_reclaim: bool,
-    ) -> Result<()> {
+    fn check_output_once(&self, owner: &MemoryOwner, limit: u64, bytes: u64) -> Result<()> {
         let mut state = self.lock();
         let need = self.live.load(Ordering::Relaxed).saturating_add(bytes);
         if need > limit {
-            if !(may_reclaim && state.prefetch_total != 0) {
-                // Historical Ctx output peak is an attempted estimate, unlike admitted ownership.
-                self.peak.fetch_max(need, Ordering::Relaxed);
-            }
             return Err(memory(limit, need));
         }
-        self.peak.fetch_max(need, Ordering::Relaxed);
         let cursor = state.cursor;
         let account = state
             .owners
@@ -1042,6 +1164,7 @@ impl QueryMemoryLedger {
                 }
             }
         }
+        self.peak.fetch_max(need, Ordering::Relaxed);
         Ok(())
     }
     pub(crate) fn check_cursor_transition(&self) -> Result<()> {
@@ -1192,12 +1315,13 @@ impl QueryMemoryLedger {
         bytes: u64,
         frame: Option<&AtomicU64>,
     ) -> Result<()> {
-        match self.reserve_service_once(service, bytes, frame) {
-            Ok(()) => Ok(()),
-            Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch() => {
-                self.reserve_service_once(service, bytes, frame)
+        loop {
+            let epoch = self.reclaim_epoch.load(Ordering::Acquire);
+            match self.reserve_service_once(service, bytes, frame) {
+                Ok(()) => return Ok(()),
+                Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch_since(epoch) => {}
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
     }
     fn reserve_service_once(
@@ -1243,12 +1367,13 @@ impl QueryMemoryLedger {
         service: &crate::algo::ServiceMemory,
         bytes: u64,
     ) -> Result<()> {
-        match self.require_service_once(service, bytes) {
-            Ok(()) => Ok(()),
-            Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch() => {
-                self.require_service_once(service, bytes)
+        loop {
+            let epoch = self.reclaim_epoch.load(Ordering::Acquire);
+            match self.require_service_once(service, bytes) {
+                Ok(()) => return Ok(()),
+                Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch_since(epoch) => {}
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
     }
     fn require_service_once(&self, service: &crate::algo::ServiceMemory, bytes: u64) -> Result<()> {
@@ -2284,6 +2409,308 @@ mod tests {
         ledger.release_receiving(owner.id, limit);
         assert_eq!(ledger.live.load(Ordering::Relaxed), 0);
         assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn release_decode_returns_optional_prefetch_backing_under_capped_parent_and_grant() {
+        // 1. Capped upstream parent: admit full cap as optional prefetch, end prefetch,
+        // release_decode, then reserve_receiving(1) and reserve_receiving(limit - 1).
+        let used = Arc::new(AtomicU64::new(0));
+        let limit = 16_384u64;
+        let callback_ledger =
+            Arc::new(std::sync::OnceLock::<std::sync::Weak<QueryMemoryLedger>>::new());
+        let take = used.clone();
+        let give = used.clone();
+        let inspect = callback_ledger.clone();
+        let parent = MemoryDomain::unpooled().parent(
+            move |n| {
+                let mut cur = take.load(Ordering::Relaxed);
+                loop {
+                    let next = cur.checked_add(n).ok_or(ParentRefused::Overflow)?;
+                    if next > limit {
+                        return Err(ParentRefused::Limit {
+                            limit,
+                            requested: next,
+                            scope: Scope::Work,
+                        });
+                    }
+                    match take.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(actual) => cur = actual,
+                    }
+                }
+            },
+            move |n| {
+                if n != 0 {
+                    let ledger = inspect.get().unwrap().upgrade().unwrap();
+                    assert!(
+                        ledger.state.try_lock().is_some(),
+                        "teardown upstream return must run outside ledger lock"
+                    );
+                }
+                give.fetch_sub(n, Ordering::AcqRel);
+            },
+        );
+        let ledger = QueryMemoryLedger::nested(None, parent);
+        callback_ledger.set(Arc::downgrade(&ledger)).unwrap();
+        ledger.cursor_mode().unwrap();
+        let owner = ledger.owner(None).unwrap();
+
+        ledger.admit_prefetch(None, 1 << 20, limit).unwrap();
+        assert_eq!(ledger.live.load(Ordering::Relaxed), limit);
+        assert_eq!(used.load(Ordering::Relaxed), limit);
+        ledger.end_prefetch();
+
+        // Cursor teardown must return optional prefetch backing, not strand it behind
+        // LIVE_SLACK after clearing the prefetch accounting record.
+        ledger.release_decode();
+        assert_eq!(ledger.live.load(Ordering::Relaxed), 0);
+        assert_eq!(ledger.envelope_reserved(), 0);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+
+        ledger.reserve_receiving(&owner, 1 << 20, 1).unwrap();
+        ledger
+            .reserve_receiving(&owner, 1 << 20, limit - 1)
+            .unwrap();
+        assert_eq!(ledger.live.load(Ordering::Relaxed), limit);
+        assert_eq!(used.load(Ordering::Relaxed), limit);
+        ledger.release_receiving(owner.id, limit);
+        assert_eq!(ledger.live.load(Ordering::Relaxed), 0);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+
+        // Mixed decode + optional prefetch on the same account also returns all excess
+        // backing during teardown.
+        ledger.reserve(&owner, 1 << 20, 4096, true).unwrap();
+        ledger.admit_prefetch(None, 1 << 20, limit).unwrap();
+        ledger.end_prefetch();
+        ledger.release_decode();
+        assert_eq!(ledger.live.load(Ordering::Relaxed), 0);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+        ledger.reserve_receiving(&owner, 1 << 20, limit).unwrap();
+        ledger.release_receiving(owner.id, limit);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+
+        // 2. Grant-backed pool: optional prefetch admitted up to pool capacity is
+        // returned to the grant on release_decode so a subsequent exact receiving
+        // reservation succeeds.
+        let pool = QueryPool::new(limit);
+        let grant = Arc::new(pool.empty_grant());
+        let grant_ledger = QueryMemoryLedger::seeded(Some(grant.clone()), 0, 0, 0);
+        grant_ledger.cursor_mode().unwrap();
+        let grant_owner = grant_ledger.owner(Some(&grant)).unwrap();
+        grant_ledger
+            .admit_prefetch(Some(&grant), 1 << 20, limit)
+            .unwrap();
+        assert_eq!(grant.used(), limit);
+        grant_ledger.end_prefetch();
+        grant_ledger.release_decode();
+        assert_eq!(grant_ledger.live.load(Ordering::Relaxed), 0);
+        assert_eq!(grant.used(), 0);
+        grant_ledger
+            .reserve_receiving(&grant_owner, 1 << 20, 1)
+            .unwrap();
+        grant_ledger.release_receiving(grant_owner.id, 1);
+        assert_eq!(grant.used(), 0);
+    }
+
+    #[test]
+    fn concurrent_required_reservations_wait_for_in_flight_reclaim_and_retry_completed_reclaim() {
+        use std::sync::mpsc;
+
+        // Part 1: Deterministic two-caller coordination across the detached-backing
+        // window under a 16 KiB capped parent. Caller 1 reclaims idle prefetch and
+        // pauses inside the parent's return callback (outside the ledger lock, after
+        // `prefetch_bytes` is already 0, before parent `used` drops). Caller 2 runs
+        // `reserve_receiving(4096)`, fails its first attempt against the detached
+        // credit, unblocks caller 1, waits for the backing return, and succeeds.
+        let used = Arc::new(AtomicU64::new(0));
+        let limit = 16_384u64;
+        let callback_ledger =
+            Arc::new(std::sync::OnceLock::<std::sync::Weak<QueryMemoryLedger>>::new());
+        let (in_flight_tx, in_flight_rx) = mpsc::channel::<()>();
+        let (caller2_failed_tx, caller2_failed_rx) = mpsc::channel::<()>();
+        let in_flight_tx = Arc::new(Mutex::new(Some(in_flight_tx)));
+        let caller2_failed_tx = Arc::new(Mutex::new(Some(caller2_failed_tx)));
+        let caller2_failed_rx = Arc::new(Mutex::new(Some(caller2_failed_rx)));
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let take_used = used.clone();
+        let take_armed = armed.clone();
+        let take_failed_tx = caller2_failed_tx.clone();
+        let give_used = used.clone();
+        let give_inspect = callback_ledger.clone();
+        let give_armed = armed.clone();
+        let give_in_flight_tx = in_flight_tx.clone();
+        let give_failed_rx = caller2_failed_rx.clone();
+
+        let parent = MemoryDomain::unpooled().parent(
+            move |n| {
+                let mut cur = take_used.load(Ordering::Relaxed);
+                loop {
+                    let next = cur.checked_add(n).ok_or(ParentRefused::Overflow)?;
+                    if next > limit {
+                        if take_armed.load(Ordering::Acquire)
+                            && let Some(tx) = take_failed_tx.lock().take()
+                        {
+                            let _ = tx.send(());
+                        }
+                        return Err(ParentRefused::Limit {
+                            limit,
+                            requested: next,
+                            scope: Scope::Work,
+                        });
+                    }
+                    match take_used.compare_exchange_weak(
+                        cur,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(actual) => cur = actual,
+                    }
+                }
+            },
+            move |n| {
+                if n != 0 {
+                    let ledger = give_inspect.get().unwrap().upgrade().unwrap();
+                    assert!(
+                        ledger.state.try_lock().is_some(),
+                        "reclaim upstream return must run outside ledger lock"
+                    );
+                    if let Some(tx) = give_in_flight_tx.lock().take() {
+                        give_armed.store(true, Ordering::Release);
+                        tx.send(()).unwrap();
+                        let rx = give_failed_rx.lock().take().unwrap();
+                        rx.recv().unwrap();
+                    }
+                }
+                give_used.fetch_sub(n, Ordering::AcqRel);
+            },
+        );
+        let ledger = QueryMemoryLedger::nested(None, parent);
+        callback_ledger.set(Arc::downgrade(&ledger)).unwrap();
+        ledger.cursor_mode().unwrap();
+        let owner = ledger.owner(None).unwrap();
+
+        ledger.admit_prefetch(None, 1 << 20, limit).unwrap();
+        ledger.end_prefetch();
+
+        std::thread::scope(|scope| {
+            let l1 = &ledger;
+            let o1 = &owner;
+            let t1 = scope.spawn(move || l1.reserve_receiving(o1, 1 << 20, 4096));
+
+            // Wait until caller 1 has published prefetch_bytes == 0 and paused inside
+            // its upstream return callback with the 16 KiB backing still detached.
+            in_flight_rx.recv().unwrap();
+            assert_eq!(ledger.prefetch_bytes.load(Ordering::Acquire), 0);
+
+            let r2 = ledger.reserve_receiving(&owner, 1 << 20, 4096);
+            let r1 = t1.join().unwrap();
+            r1.expect("caller 1 must succeed after reclaiming idle prefetch");
+            r2.expect("caller 2 must wait for in-flight reclaim and succeed");
+        });
+        assert_eq!(ledger.live.load(Ordering::Relaxed), 8192);
+        assert_eq!(used.load(Ordering::Relaxed), 8192);
+        ledger.release_receiving(owner.id, 8192);
+        assert_eq!(ledger.live.load(Ordering::Relaxed), 0);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+
+        // Part 2: Local 16 KiB limit occupied solely by idle prefetch; two concurrent
+        // 4 KiB required reservations must both succeed even when one completes reclaim
+        // before the other reaches its reclaim check.
+        let local_limit = 16_384u64;
+        let local = QueryMemoryLedger::seeded(None, 0, 0, 0);
+        local.cursor_mode().unwrap();
+        let local_owner = local.owner(None).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        for _ in 0..128 {
+            local
+                .admit_prefetch(None, local_limit, local_limit)
+                .unwrap();
+            local.end_prefetch();
+            std::thread::scope(|scope| {
+                let l = &local;
+                let o = &local_owner;
+                let b = &barrier;
+                let t1 = scope.spawn(move || {
+                    b.wait();
+                    l.reserve(o, local_limit, 4096, false)
+                });
+                barrier.wait();
+                let r2 = local.reserve(&local_owner, local_limit, 4096, false);
+                let r1 = t1.join().unwrap();
+                r1.expect("concurrent local caller 1 must succeed");
+                r2.expect("concurrent local caller 2 must retry after reclaim and succeed");
+            });
+            assert_eq!(local.live.load(Ordering::Relaxed), 8192);
+            local.release(local_owner.id, 8192);
+            assert_eq!(local.live.load(Ordering::Relaxed), 0);
+        }
+
+        // Part 3: A parent return callback that re-enters the ledger with an
+        // unsatisfiable required charge must return BudgetExceeded without deadlocking
+        // on its own in-flight reclaim.
+        let re_used = Arc::new(AtomicU64::new(0));
+        let re_ledger_cell =
+            Arc::new(std::sync::OnceLock::<std::sync::Weak<QueryMemoryLedger>>::new());
+        let re_owner_cell = Arc::new(std::sync::OnceLock::<Arc<MemoryOwner>>::new());
+        let re_checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let re_take = re_used.clone();
+        let re_give = re_used.clone();
+        let re_inspect = re_ledger_cell.clone();
+        let re_owner_ref = re_owner_cell.clone();
+        let re_flag = re_checked.clone();
+        let re_parent = MemoryDomain::unpooled().parent(
+            move |n| {
+                let mut cur = re_take.load(Ordering::Relaxed);
+                loop {
+                    let next = cur.checked_add(n).ok_or(ParentRefused::Overflow)?;
+                    if next > limit {
+                        return Err(ParentRefused::Limit {
+                            limit,
+                            requested: next,
+                            scope: Scope::Work,
+                        });
+                    }
+                    match re_take.compare_exchange_weak(
+                        cur,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(actual) => cur = actual,
+                    }
+                }
+            },
+            move |n| {
+                re_give.fetch_sub(n, Ordering::AcqRel);
+                if n != 0 && !re_flag.swap(true, Ordering::AcqRel) {
+                    let ledger = re_inspect.get().unwrap().upgrade().unwrap();
+                    let owner = re_owner_ref.get().unwrap();
+                    assert!(matches!(
+                        ledger.reserve(owner, 1 << 20, limit * 2, false),
+                        Err(Error::BudgetExceeded(_))
+                    ));
+                }
+            },
+        );
+        let re_ledger = QueryMemoryLedger::nested(None, re_parent);
+        re_ledger_cell.set(Arc::downgrade(&re_ledger)).unwrap();
+        re_ledger.cursor_mode().unwrap();
+        let re_owner = re_ledger.owner(None).unwrap();
+        assert!(re_owner_cell.set(re_owner.clone()).is_ok());
+        re_ledger.admit_prefetch(None, 1 << 20, limit).unwrap();
+        re_ledger.end_prefetch();
+        re_ledger
+            .reserve_receiving(&re_owner, 1 << 20, limit)
+            .unwrap();
+        assert!(re_checked.load(Ordering::Acquire));
+        re_ledger.release_receiving(re_owner.id, limit);
+        assert_eq!(re_used.load(Ordering::Relaxed), 0);
     }
 }
 
