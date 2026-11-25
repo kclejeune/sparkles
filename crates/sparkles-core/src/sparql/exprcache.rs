@@ -162,6 +162,11 @@ pub fn impurity(e: &Expr) -> Option<&'static str> {
     impurity_with(e, false, &|_| Some("EXISTS"))
 }
 
+/// Whether evaluation on the same row can be retried after a handoff.
+pub(super) fn repeatable(e: &Expr) -> bool {
+    impurity_with(e, true, &|_| Some("EXISTS")).is_none()
+}
+
 /// Why the order or the grouping of the rows that `e` is evaluated on can be observed
 /// in a query on `ctx`, if it can. The query references a registered scalar, aggregate
 /// or property function anywhere, or `e` calls a function with side effects or one

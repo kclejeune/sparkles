@@ -6615,9 +6615,12 @@ fn key_rows_retained(
         // keep one transient result if its retained charge runs out of room.
         const TRANSIENT: u64 = super::bignum::AGG_SUM_PAYLOAD_BYTES;
         const PIECE_BYTES: u64 = 128;
+        // Resume offsets fit on the stack so the heap piece records can be
+        // freed before the serial suffixes need their memory.
+        const MAX_PIECES: usize = 64;
         let piece_rows = if t.len() > PAR_THRESHOLD && e.parallel() {
             t.len()
-                .div_ceil(rayon::current_num_threads())
+                .div_ceil(rayon::current_num_threads().min(MAX_PIECES))
                 .max(PAR_MIN_LEN)
         } else {
             t.len().max(1)
@@ -6663,6 +6666,13 @@ fn key_rows_retained(
                                         *slot = value;
                                         return Ok((offset + 1, key_bytes));
                                     }
+                                    // A wider result cannot stay in scratch.
+                                    // Retry this row only if evaluation is repeatable.
+                                    Err(Error::BudgetExceeded(_))
+                                        if super::exprcache::repeatable(e) =>
+                                    {
+                                        return Ok((offset, 0));
+                                    }
                                     Err(error) => return Err(error),
                                 }
                             }
@@ -6683,33 +6693,36 @@ fn key_rows_retained(
                 }
                 *bytes = bytes.saturating_add(*payload);
             }
-            // The workers returned their slack. Keep only the actual payload of
-            // their paused keys and the piece metadata, then finish any suffixes
-            // serially without evaluating a row twice.
-            if let Some(failed) = parts.iter().position(|(progress, _, _)| progress.is_err()) {
-                return Err(parts.swap_remove(failed).0.unwrap_err());
+            let mut resume = [0; MAX_PIECES];
+            let mut pending = 0;
+            let mut has_suffix = false;
+            for (((progress, _, _), slots), offset) in parts
+                .into_iter()
+                .zip(values.chunks(piece_rows))
+                .zip(&mut resume)
+            {
+                let (done, saved) = progress?;
+                *offset = done;
+                pending += saved;
+                has_suffix |= done < slots.len();
             }
-            let pending: u64 = parts
-                .iter()
-                .filter_map(|(progress, _, _)| progress.as_ref().ok().map(|&(_, pending)| pending))
-                .sum();
+            // The collection is gone. Release its charge and the unused
+            // transient allowance before admitting any more key payload.
+            scratch.resize(pending)?;
             if pending > 0 {
-                let kept = piece_bytes + pending;
-                scratch.resize(kept)?;
                 charge.as_mut().expect("retained pieces").absorb(scratch);
-                *bytes = bytes.saturating_add(kept);
-                for (piece, ((progress, _, _), slots)) in parts
-                    .into_iter()
-                    .zip(values.chunks_mut(piece_rows))
-                    .enumerate()
+                *bytes = bytes.saturating_add(pending);
+            }
+            if has_suffix {
+                ctx.check()?;
+                for (piece, (slots, &done)) in
+                    values.chunks_mut(piece_rows).zip(&resume).enumerate()
                 {
-                    let (done, _) = progress?;
                     let start = piece * piece_rows;
                     for (offset, slot) in slots.iter_mut().enumerate().skip(done) {
                         *slot = eval_retained(start + offset, charge, bytes)?;
                     }
                 }
-                *bytes -= piece_bytes;
                 charge.as_mut().expect("retained pieces").resize(*bytes)?;
             }
             return Ok(values);
@@ -6835,13 +6848,13 @@ fn order_by_rows(
         _ => idx.par_sort_by(cmp),
     }
     ctx.check()?;
-    ctx.check_output(idx.len(), t.width())?;
-    let sorted = t.take_rows(&idx);
-    // A large key column's decoded values are freed on the pool, not on this thread.
+    // Sorting has used the last key. Free the key columns on the pool before
+    // checking room for the output table.
     key_vals
         .into_iter()
         .for_each(super::exprcache::Column::drop_in_parallel);
-    Ok(sorted)
+    ctx.check_output(idx.len(), t.width())?;
+    Ok(t.take_rows(&idx))
 }
 
 /// The rows of `t` that DISTINCT keeps, each value's first, in input order.
@@ -11821,4 +11834,104 @@ fn parallel_full_sort_fits_without_a_second_key_column() {
     .unwrap();
     drop(keys);
     assert_eq!(tight.live_bytes(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_full_sort_hands_off_wide_string_keys() {
+    use super::expr::Func;
+    use spargebra::algebra::Function;
+
+    let (ctx, table) = parallel_full_sort_fixture();
+    let var = table.vars[0];
+    let expr = Expr::Call(
+        Func::Builtin(Function::Concat),
+        vec![
+            Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(var)]),
+            Expr::Lit(Id::UNDEF, Value::Str("#".repeat(4096).into())),
+        ],
+    );
+    // The final column fits with room for the old piece metadata, but a
+    // worker that runs out of room cannot stash its string in the transient.
+    let mut expected: Vec<_> = (1..=table.len() as i64).collect();
+    expected.sort_by_cached_key(i64::to_string);
+    assert_parallel_full_sort_at_budget(ctx, table, expr, 4 * 128, expected);
+}
+
+#[cfg(test)]
+#[test]
+fn parallel_full_sort_releases_piece_metadata_before_finishing_keys() {
+    use super::expr::{ArithOp, CmpOp};
+
+    let (ctx, table) = parallel_full_sort_fixture();
+    let var = table.vars[0];
+    let wide_rows = 32;
+    let factor = Value::from_typed(&"9".repeat(1700), oxrdf::vocab::xsd::INTEGER.as_str());
+    let expr = Expr::If(
+        Box::new(Expr::Cmp(
+            Box::new(Expr::Var(var)),
+            Box::new(Expr::Const(Id::from_i64(wide_rows).unwrap())),
+            CmpOp::Le,
+        )),
+        Box::new(Expr::Arith(
+            Box::new(Expr::Var(var)),
+            Box::new(Expr::Lit(Id::UNDEF, factor)),
+            ArithOp::Mul,
+        )),
+        Box::new(Expr::Var(var)),
+    );
+    // The sparse wide keys leave room to start the parallel evaluation, but
+    // finishing the suffix needs every byte remaining after the handoff.
+    let expected = (wide_rows + 1..=table.len() as i64).chain(1..=wide_rows);
+    assert_parallel_full_sort_at_budget(ctx, table, expr, 0, expected);
+}
+
+#[cfg(test)]
+fn parallel_full_sort_fixture() -> (Ctx, Table) {
+    let store = crate::store::Store::in_memory(Default::default());
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.opt.expr_cache = false;
+    let var = ctx.var("v");
+    let mut table = Table::new(vec![var]);
+    for i in (1..=2 * PAR_THRESHOLD as i64).rev() {
+        table.push_row(&[Id::from_i64(i).unwrap()]);
+    }
+    (ctx, table)
+}
+
+#[cfg(test)]
+fn assert_parallel_full_sort_at_budget(
+    mut ctx: Ctx,
+    table: Table,
+    expr: Expr,
+    headroom: u64,
+    expected: impl IntoIterator<Item = i64>,
+) {
+    let rows = table.len();
+    let payload = with_key_evaluator(&ctx, &table, &expr, None, |eval| {
+        (0..rows).try_fold(0, |bytes, i| Ok(bytes + key_payload(&eval(i)?)))
+    })
+    .unwrap();
+    let slots = (rows * size_of::<Option<Value>>()) as u64;
+    let sort = rows as u64 * 24 + 2 * table.mem_bytes() + 128 + 1024;
+    let evaluator = ctx.nvars() as u64 * 16 + 128;
+    ctx.mem_limit = sort + slots + 128 + evaluator + payload + headroom;
+    let ctx = ctx.into_shared();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let sorted = pool
+        .install(|| {
+            order_by_rows(
+                &ctx,
+                table,
+                &[(expr, true)],
+                None,
+                &mut ExprReport::default(),
+            )
+        })
+        .unwrap();
+    assert!(sorted.cols[0].iter().map(|id| id.as_i64()).eq(expected));
+    assert_eq!(ctx.live_bytes(), 0);
 }
