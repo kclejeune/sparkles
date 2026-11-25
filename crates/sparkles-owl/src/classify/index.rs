@@ -3571,6 +3571,134 @@ fn dt_comp(it: &Interner, run: &DtRun, e: Ex) -> Option<u32> {
 
 type RefireMap = FxHashMap<Ex, Vec<u32>>;
 
+/// Tracks targets whose refire component vector is currently sorted, deduplicated, and at
+/// high occupancy so duplicate-only tails resolve via `binary_search` without re-compacting
+/// or doubling retained capacity.
+enum SortedTargets {
+    Empty,
+    One(Ex),
+    // Keep inactive entries until the end of the scan. Erasing them can leave
+    // tombstones that lower capacity() without releasing the backing allocation.
+    Many(FxHashMap<Ex, bool>),
+}
+
+impl SortedTargets {
+    fn contains(&self, target: Ex) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::One(only) => *only == target,
+            Self::Many(map) => map.get(&target).copied().unwrap_or(false),
+        }
+    }
+
+    fn remove(&mut self, target: Ex) {
+        match self {
+            Self::Empty => {}
+            Self::One(only) => {
+                if *only == target {
+                    *self = Self::Empty;
+                }
+            }
+            Self::Many(map) => {
+                if let Some(active) = map.get_mut(&target) {
+                    *active = false;
+                }
+            }
+        }
+    }
+
+    fn insert(
+        &mut self,
+        target: Ex,
+        guard: &mut Option<super::numeric::ScratchGuard>,
+        halt_err: impl Fn(super::Error) -> Halt,
+    ) -> Result<(), Halt> {
+        use super::dtcheck::range::{map_backing_bytes, map_growth};
+        let insert_map = |map: &mut FxHashMap<Ex, bool>,
+                          key: Ex,
+                          guard: &mut Option<super::numeric::ScratchGuard>|
+         -> Result<(), Halt> {
+            if let Some(active) = map.get_mut(&key) {
+                *active = true;
+                return Ok(());
+            }
+            let growth = map_growth(map);
+            if let Some(g) = guard.as_mut() {
+                g.grow(growth).map_err(&halt_err)?;
+            }
+            map.insert(key, true);
+            let new_bytes = map_backing_bytes(map);
+            if let Some(g) = guard.as_mut() {
+                if g.bytes() > new_bytes {
+                    g.shrink(g.bytes() - new_bytes);
+                } else if new_bytes > g.bytes() {
+                    g.grow(new_bytes - g.bytes()).map_err(&halt_err)?;
+                }
+            }
+            Ok(())
+        };
+        match self {
+            Self::Empty => {
+                *self = Self::One(target);
+                Ok(())
+            }
+            Self::One(only) if *only == target => Ok(()),
+            Self::One(only) => {
+                let first = *only;
+                let mut map = FxHashMap::default();
+                insert_map(&mut map, first, guard)?;
+                insert_map(&mut map, target, guard)?;
+                *self = Self::Many(map);
+                Ok(())
+            }
+            Self::Many(map) => insert_map(map, target, guard),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn backing_bytes(&self) -> usize {
+        match self {
+            Self::Empty | Self::One(_) => 0,
+            Self::Many(map) => super::dtcheck::range::map_backing_bytes(map),
+        }
+    }
+}
+
+/// Doubles a refire component vector's capacity through `refire_guard`, admitting the full
+/// destination allocation while the old backing is still charged and releasing the old
+/// backing charge immediately afterward.
+fn dt_fires_grow_vec(
+    cs: &mut Vec<u32>,
+    refire_guard: &mut Option<super::numeric::ScratchGuard>,
+    map_charged: usize,
+    vec_charged: &mut usize,
+) -> Result<(), Halt> {
+    let halt_err = |e: super::Error| match e {
+        super::Error::Memory { used, .. } => Halt::Memory(used),
+        _ => Halt::Stopped,
+    };
+    let old_bytes = cs.capacity().saturating_mul(std::mem::size_of::<u32>());
+    let next_cap = cs.capacity().saturating_mul(2).max(4);
+    let next_bytes = next_cap.saturating_mul(std::mem::size_of::<u32>());
+    if let Some(g) = refire_guard.as_mut() {
+        g.grow(next_bytes).map_err(halt_err)?;
+    }
+    cs.reserve_exact(next_cap - cs.len());
+    let new_bytes = cs.capacity().saturating_mul(std::mem::size_of::<u32>());
+    *vec_charged = vec_charged
+        .saturating_sub(old_bytes)
+        .saturating_add(new_bytes);
+    if let Some(g) = refire_guard.as_mut() {
+        let target = map_charged.saturating_add(*vec_charged);
+        if g.bytes() > target {
+            g.shrink(g.bytes() - target);
+        } else if target > g.bytes() {
+            g.grow(target - g.bytes()).map_err(halt_err)?;
+        }
+    }
+    Ok(())
+}
+
 /// Tells each told subsumer of a body atom whose occurrences are all told its
 /// [`Node::DtFire`] marker, and gives for each subsumer the components it re-evaluates
 /// alongside the live scratch reservation covering the returned `refire` map.
@@ -3610,6 +3738,8 @@ fn dt_fires(
     eligible.sort_unstable_by_key(|&(e, _)| e);
     eligible.dedup();
     let mut refire_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    let mut sorted_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    let mut sorted = SortedTargets::Empty;
     let mut map_charged = 0usize;
     let mut vec_charged = 0usize;
     let mut refire: FxHashMap<Ex, Vec<u32>> = FxHashMap::default();
@@ -3642,42 +3772,50 @@ fn dt_fires(
         if cs.last() == Some(&comp) {
             continue;
         }
+        if sorted.contains(c) {
+            if cs.binary_search(&comp).is_ok() {
+                continue;
+            }
+            // A genuinely new component is arriving on a high-occupancy sorted list:
+            // double capacity to establish proportional headroom before leaving sorted mode.
+            dt_fires_grow_vec(cs, &mut refire_guard, map_charged, &mut vec_charged)?;
+            sorted.remove(c);
+            cs.push(comp);
+            continue;
+        }
         if cs.len() == cs.capacity() {
             if !cs.is_empty() {
                 #[cfg(test)]
                 dt_fires_record_compaction(cs.len());
                 cs.sort_unstable();
                 cs.dedup();
+                if cs.binary_search(&comp).is_ok() {
+                    if cs.len() == cs.capacity()
+                        || cs.len().saturating_mul(4) > cs.capacity().saturating_mul(3)
+                    {
+                        sorted.insert(c, &mut sorted_guard, halt_err)?;
+                    }
+                    continue;
+                }
             }
             if cs.len() == cs.capacity()
                 || cs.len().saturating_mul(4) > cs.capacity().saturating_mul(3)
             {
-                let old_bytes = cs.capacity().saturating_mul(std::mem::size_of::<u32>());
-                let next_cap = cs.capacity().saturating_mul(2).max(4);
-                let next_bytes = next_cap.saturating_mul(std::mem::size_of::<u32>());
-                if let Some(g) = refire_guard.as_mut() {
-                    g.grow(next_bytes).map_err(halt_err)?;
-                }
-                cs.reserve_exact(next_cap - cs.len());
-                let new_bytes = cs.capacity().saturating_mul(std::mem::size_of::<u32>());
-                vec_charged = vec_charged
-                    .saturating_sub(old_bytes)
-                    .saturating_add(new_bytes);
-                if let Some(g) = refire_guard.as_mut() {
-                    let target = map_charged.saturating_add(vec_charged);
-                    if g.bytes() > target {
-                        g.shrink(g.bytes() - target);
-                    } else if target > g.bytes() {
-                        g.grow(target - g.bytes()).map_err(halt_err)?;
-                    }
-                }
-            }
-            if !cs.is_empty() && cs.binary_search(&comp).is_ok() {
-                continue;
+                dt_fires_grow_vec(cs, &mut refire_guard, map_charged, &mut vec_charged)?;
             }
         }
         cs.push(comp);
     }
+    #[cfg(debug_assertions)]
+    if let Some(g) = sorted_guard.as_ref() {
+        debug_assert_eq!(
+            g.bytes(),
+            sorted.backing_bytes(),
+            "sorted_guard bytes must match live sorted-target backing"
+        );
+    }
+    drop(sorted);
+    drop(sorted_guard);
     drop(eligible);
     drop(eligible_guard);
     for cs in refire.values_mut() {
@@ -5263,5 +5401,286 @@ mod minimal_roles_tests {
             "expected Halt::Memory one byte below live overlap peak, got {:?}",
             err.err()
         );
+    }
+
+    #[test]
+    fn dt_fires_sorted_target_deactivation_preserves_backing_charge() {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+
+        use super::super::{Limits, numeric::Budget};
+        use super::{Ex, Halt, SortedTargets};
+
+        let budget = Budget::new(&Limits::default(), 0, None);
+        let mut guard = Some(budget.scratch_guard());
+        let mut sorted = SortedTargets::Empty;
+        let halt = |_| Halt::Stopped;
+        let hasher = BuildHasherDefault::<rustc_hash::FxHasher>::default();
+        // A full 32-bucket table with a cluster of colliding keys can leave
+        // tombstones on removal and report zero capacity while still allocated.
+        let keys: Vec<_> = (0..Ex::MAX)
+            .filter(|key| hasher.hash_one(key) & 31 == 0)
+            .take(28)
+            .collect();
+        for &key in &keys {
+            sorted.insert(key, &mut guard, halt).expect("insert target");
+        }
+        let bytes = guard.as_ref().expect("guard").bytes();
+        let peak = budget.peak();
+        for &key in &keys {
+            sorted.remove(key);
+            assert!(!sorted.contains(key));
+        }
+        let SortedTargets::Many(map) = &sorted else {
+            panic!("expected a backing map");
+        };
+        assert_eq!(super::super::dtcheck::range::map_backing_bytes(map), bytes);
+        for &key in &keys {
+            sorted
+                .insert(key, &mut guard, halt)
+                .expect("reactivate target");
+            assert!(sorted.contains(key));
+        }
+        assert_eq!(guard.as_ref().expect("guard").bytes(), bytes);
+        assert_eq!(budget.peak(), peak);
+    }
+
+    #[test]
+    fn dt_fires_full_duplicate_tail_does_not_grow_or_exceed_cap() {
+        use super::super::Limits;
+        use super::super::dtcheck::{
+            atoms::{DtKey, DtRun, Stop},
+            comp::Comps,
+            range::{Defs, Ranges as DtRanges, map_backing_bytes},
+        };
+        use super::super::numeric::Budget;
+        use super::{
+            Builder, Ex, Halt, Interner, Node, RoleName, dt_fires, dt_fires_compaction_stats,
+            reset_dt_fires_compaction_stats,
+        };
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty, DataRange, Datatype};
+        use crate::vocab;
+
+        // 1. Feed one target 1,024 distinct components in order (filling capacity 1,024),
+        //    followed by a 1,000-edge alternating duplicate tail starting with component 0.
+        //    The duplicate tail must not double capacity to 2,048, must not raise the
+        //    512 + 1,024 overlap peak, must fit under the live-overlap cap, and must avoid
+        //    quadratic re-compaction.
+        let k = 1024usize;
+        let tail = 1000usize;
+        let props: Vec<DataProperty> = (0..k)
+            .map(|i| DataProperty::new(format!("urn:dt:dup_p{i}")))
+            .collect();
+        let axioms: Vec<AxiomKind> = props
+            .iter()
+            .enumerate()
+            .map(|(i, dp)| {
+                AxiomKind::SubClassOf(
+                    ClassExpression::Class(Class::new(format!("urn:dt:DUP_A{i}"))),
+                    ClassExpression::DataAllValuesFrom(
+                        vec![dp.clone()],
+                        DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+                    ),
+                )
+            })
+            .collect();
+        let refs: Vec<&AxiomKind> = axioms.iter().collect();
+        let comps = Comps::of(&refs, &Defs::default(), &|| false).expect("1024 comps");
+        let mut it = Interner::new();
+        let mut role_comps: Vec<(Role, u32)> = props
+            .iter()
+            .map(|dp| {
+                let c = comps.component(dp).expect("checker comp");
+                (it.role(RoleName::Data(dp.clone())), c)
+            })
+            .collect();
+        role_comps.sort_unstable_by_key(|&(_, c)| c);
+        let target = it.class(&Class::new("urn:dt:DupTarget"));
+        let mut b = Builder::default();
+        let mut atoms = Vec::with_capacity(k);
+        let mut told_base: Vec<(Ex, Ex)> = Vec::with_capacity(k + tail);
+        for (idx, &(role, _)) in role_comps.iter().enumerate() {
+            let id = it.dt.id(DtKey {
+                role,
+                at_least: true,
+                n: (idx + 1) as u64,
+                range: DtRanges::FULL,
+            });
+            let e = it.node(Node::DtAtom(id));
+            b.dt_body.push(e);
+            atoms.push(e);
+            told_base.push((e, target));
+        }
+        for j in 0..tail {
+            told_base.push((atoms[j % 2], target));
+        }
+        let run = DtRun {
+            comps,
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: None,
+            stopped: None,
+        };
+        let expected: Vec<u32> = role_comps.iter().map(|&(_, c)| c).collect();
+        let eligible_bytes = k * std::mem::size_of::<(Ex, u32)>();
+
+        let uncap = Budget::new(&Limits::default(), 0, None);
+        it.ranges.begin(uncap.clone());
+        let mut told = told_base.clone();
+        reset_dt_fires_compaction_stats();
+        let (refire, guard) = dt_fires(&mut it, &run, &b, &mut told).expect("uncapped");
+        let (compactions, inspected) = dt_fires_compaction_stats();
+        let cs = refire.get(&target).expect("target refire");
+        assert_eq!(cs.as_slice(), expected.as_slice());
+        assert_eq!(
+            cs.capacity(),
+            k,
+            "duplicate-only tail on full vec must preserve capacity {k}, got {}",
+            cs.capacity()
+        );
+        let map_bytes = map_backing_bytes(&refire);
+        let final_refire_bytes = map_bytes + k * std::mem::size_of::<u32>();
+        assert_eq!(
+            guard.as_ref().expect("guard").bytes(),
+            final_refire_bytes,
+            "carried refire guard must match un-doubled live backing"
+        );
+        assert_eq!(uncap.retained_storage().1, final_refire_bytes);
+        let expected_live_peak =
+            eligible_bytes + map_bytes + (k / 2 + k) * std::mem::size_of::<u32>();
+        assert_eq!(
+            uncap.peak(),
+            expected_live_peak,
+            "duplicate tail must not trigger a 1024 + 2048 growth overlap peak"
+        );
+        assert!(
+            compactions <= 20,
+            "expected bounded compactions (<= 20), got {compactions}"
+        );
+        assert!(
+            inspected <= 4 * (k + tail),
+            "expected linear inspected entries (<= {}), got {inspected}",
+            4 * (k + tail)
+        );
+        drop((refire, guard));
+        it.ranges.end();
+        assert_eq!(uncap.retained_storage().1, 0);
+
+        // Must succeed at the exact 512 + 1,024 live-overlap cap (strictly below both
+        // cumulative historical charges and a spurious 1,024 + 2,048 duplicate-triggered growth).
+        let live_cap = Budget::new(
+            &Limits {
+                max_memory: Some(expected_live_peak),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it.ranges.begin(live_cap);
+        let mut told = told_base.clone();
+        let (refire_ok, guard_ok) =
+            dt_fires(&mut it, &run, &b, &mut told).expect("live-peak cap must succeed");
+        let cs_ok = refire_ok.get(&target).expect("target refire");
+        assert_eq!(cs_ok.capacity(), k);
+        assert_eq!(
+            guard_ok.as_ref().expect("guard").bytes(),
+            final_refire_bytes
+        );
+        drop((refire_ok, guard_ok));
+        it.ranges.end();
+
+        // One byte below the true 512 + 1,024 overlap peak must still refuse.
+        let under_cap = Budget::new(
+            &Limits {
+                max_memory: Some(expected_live_peak - 1),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it.ranges.begin(under_cap);
+        let mut told = told_base;
+        let err = dt_fires(&mut it, &run, &b, &mut told);
+        it.ranges.end();
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory one byte below live overlap peak, got {:?}",
+            err.err()
+        );
+
+        // 2. Multi-target high-occupancy sorted state (`SortedTargets::Many`) plus a genuinely
+        //    new component arriving afterward on one target must keep the duplicate-only target
+        //    at capacity M, grow the updated target to 2*M for proportional headroom, avoid
+        //    quadratic re-compaction across interleaved tails, and release sorted-state scratch.
+        let m = 128usize;
+        let mut it2 = Interner::new();
+        let t0 = it2.class(&Class::new("urn:dt:MultiDupT0"));
+        let t1 = it2.class(&Class::new("urn:dt:MultiDupT1"));
+        let mut b2 = Builder::default();
+        let mut atoms2 = Vec::with_capacity(m + 1);
+        for (idx, dp) in props.iter().take(m + 1).enumerate() {
+            let role = it2.role(RoleName::Data(dp.clone()));
+            let id = it2.dt.id(DtKey {
+                role,
+                at_least: true,
+                n: (idx + 1) as u64,
+                range: DtRanges::FULL,
+            });
+            let e = it2.node(Node::DtAtom(id));
+            b2.dt_body.push(e);
+            atoms2.push((e, run.comps.component(dp).expect("comp")));
+        }
+        atoms2.sort_unstable_by_key(|&(_, c)| c);
+        let mut told2 = Vec::new();
+        for &(e, _) in atoms2.iter().take(m) {
+            told2.push((e, t0));
+            told2.push((e, t1));
+        }
+        // Interleaved alternating duplicates across both full targets.
+        for j in 0..500usize {
+            let e = atoms2[j % 2].0;
+            told2.push((e, t0));
+            told2.push((e, t1));
+        }
+        // Genuinely new (m+1)-th component arrives for t0 only, followed by more duplicates.
+        told2.push((atoms2[m].0, t0));
+        for j in 0..500usize {
+            let e = atoms2[j % 2].0;
+            told2.push((e, t0));
+            told2.push((e, t1));
+        }
+        let uncap2 = Budget::new(&Limits::default(), 0, None);
+        it2.ranges.begin(uncap2.clone());
+        reset_dt_fires_compaction_stats();
+        let total_edges = told2.len();
+        let (refire2, guard2) = dt_fires(&mut it2, &run, &b2, &mut told2).expect("multi-target");
+        let (compactions2, inspected2) = dt_fires_compaction_stats();
+        let cs0 = refire2.get(&t0).expect("t0 refire");
+        let cs1 = refire2.get(&t1).expect("t1 refire");
+        let expected0: Vec<u32> = atoms2.iter().map(|&(_, c)| c).collect();
+        let expected1: Vec<u32> = atoms2.iter().take(m).map(|&(_, c)| c).collect();
+        assert_eq!(cs0.as_slice(), expected0.as_slice());
+        assert_eq!(cs1.as_slice(), expected1.as_slice());
+        assert_eq!(cs0.capacity(), 2 * m);
+        assert_eq!(cs1.capacity(), m);
+        let expected_refire2_bytes =
+            map_backing_bytes(&refire2) + (2 * m + m) * std::mem::size_of::<u32>();
+        assert_eq!(
+            guard2.as_ref().expect("guard2").bytes(),
+            expected_refire2_bytes,
+            "sorted-target scratch must be released and refire guard must match live backing"
+        );
+        assert_eq!(uncap2.retained_storage().1, expected_refire2_bytes);
+        assert!(
+            compactions2 <= 30,
+            "expected bounded multi-target compactions (<= 30), got {compactions2}"
+        );
+        assert!(
+            inspected2 <= 4 * total_edges,
+            "expected linear multi-target inspected entries (<= {}), got {inspected2}",
+            4 * total_edges
+        );
+        drop((refire2, guard2));
+        it2.ranges.end();
+        assert_eq!(uncap2.retained_storage().1, 0);
     }
 }
