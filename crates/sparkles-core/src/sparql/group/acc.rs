@@ -100,8 +100,15 @@ pub(crate) trait Accumulator: Send {
     fn init(&mut self, groups: usize);
 
     /// Fold row `i` of the batch into group `slots[i]`, for every row, in row order. A
-    /// row's slot is the number of its group among those `init` made.
-    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()>;
+    /// row's slot is the number of its group among those `init` made. `retain` admits any
+    /// retained state growth before allocation.
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        slots: &[u32],
+        retain: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()>;
 
     /// Whether [`Accumulator::merge`] gives what one accumulator over all the rows gives.
     fn mergeable(&self) -> bool {
@@ -112,7 +119,13 @@ pub(crate) trait Accumulator: Send {
     /// accumulator, into group `into[j]` of this one, for every group of `other`.
     /// `other` is of the same kind and aggregate. An accumulator that is not
     /// [`mergeable`](Accumulator::mergeable) leaves its groups as they are and fails.
-    fn merge(&mut self, _ctx: &Ctx, _other: &mut dyn Accumulator, _into: &[u32]) -> Result<()> {
+    fn merge(
+        &mut self,
+        _ctx: &Ctx,
+        _other: &mut dyn Accumulator,
+        _into: &[u32],
+        _retain: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         Err(crate::error::Error::unsupported(
             "this aggregate cannot be merged",
         ))
@@ -197,7 +210,13 @@ impl Accumulator for Running {
         }
     }
 
-    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()> {
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        slots: &[u32],
+        retain: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         let agg = &self.agg;
         match (&agg.func, batch.arg) {
             // running counts need no per-row dispatch
@@ -217,22 +236,30 @@ impl Accumulator for Running {
             }
             _ => {
                 let best = self.track && self.is_best();
+                let states = &mut self.states;
+                let payload = &mut self.payload;
+                let growth = &mut self.growth;
                 for (row, &slot) in slots.iter().enumerate() {
                     if row.is_multiple_of(1024) {
                         ctx.check()?;
                     }
                     let id = batch.value(row);
-                    if best && let Some(id) = id {
-                        // the best value stays decoded while its group lives
-                        let decoded = ctx.decoded_bytes(id)?;
-                        let held = &mut self.payload[slot as usize];
-                        if decoded > *held {
-                            self.growth += decoded - *held;
-                            *held = decoded;
+                    let slot_idx = slot as usize;
+                    let mut on_best = |new_bytes: u64| -> Result<()> {
+                        if best {
+                            let held = &mut payload[slot_idx];
+                            if new_bytes > *held {
+                                let delta = new_bytes - *held;
+                                retain(delta)?;
+                                *growth += delta;
+                                *held = new_bytes;
+                            }
                         }
-                    }
-                    self.states[slot as usize].add(ctx, agg, id);
+                        Ok(())
+                    };
+                    states[slot_idx].add(ctx, agg, id, &mut on_best)?;
                 }
+                ctx.check()?;
             }
         }
         Ok(())
@@ -248,11 +275,31 @@ impl Accumulator for Running {
         crate::sparql::exec::stat_aggregate(&self.agg.func).is_none()
     }
 
-    fn merge(&mut self, ctx: &Ctx, other: &mut dyn Accumulator, into: &[u32]) -> Result<()> {
+    fn merge(
+        &mut self,
+        ctx: &Ctx,
+        other: &mut dyn Accumulator,
+        into: &[u32],
+        retain: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         let other = other
             .as_any()
             .downcast_mut::<Running>()
             .expect("an accumulator of the same kind");
+        if self.is_best() {
+            for (from, &to) in other.payload.iter().zip(into) {
+                let held = &mut self.payload[to as usize];
+                if *from > *held {
+                    let delta = *from - *held;
+                    if self.track {
+                        retain(delta)?;
+                    }
+                    self.growth += delta;
+                    *held = *from;
+                }
+            }
+            other.payload.clear();
+        }
         for (state, &to) in std::mem::take(&mut other.states).into_iter().zip(into) {
             if !self.states[to as usize].merge(ctx, &self.agg, state) {
                 return Err(crate::error::Error::unsupported(
@@ -260,21 +307,14 @@ impl Accumulator for Running {
                 ));
             }
         }
-        if self.is_best() {
-            for (from, &to) in std::mem::take(&mut other.payload).iter().zip(into) {
-                let held = &mut self.payload[to as usize];
-                if *from > *held {
-                    self.growth += *from - *held;
-                    *held = *from;
-                }
-            }
-        }
         Ok(())
     }
 
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         let state = std::mem::replace(&mut self.states[group], AggState::Count(0));
-        Ok(state.finish(ctx, &self.agg))
+        let id = state.finish(ctx, &self.agg);
+        ctx.check()?;
+        Ok(id)
     }
 
     fn retractable(&self) -> bool {
@@ -353,7 +393,13 @@ impl Accumulator for Concat {
         }
     }
 
-    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()> {
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        slots: &[u32],
+        retain: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         for (row, &slot) in slots.iter().enumerate() {
             if row.is_multiple_of(1024) {
                 ctx.check()?;
@@ -367,7 +413,8 @@ impl Accumulator for Concat {
                 state.ok = false;
                 continue;
             }
-            let Some(value) = ctx.value(id) else {
+            let decode = ctx.charge(0)?;
+            let Some(value) = ctx.value_checked_into(id, &decode)? else {
                 continue;
             };
             // CONCAT takes only strings
@@ -379,15 +426,46 @@ impl Accumulator for Concat {
                 state.ok = false;
                 continue;
             };
-            let before = state.text.capacity();
+            let add_len =
+                lexical
+                    .len()
+                    .saturating_add(if state.empty { 0 } else { self.separator.len() });
+            if state.text.len().saturating_add(add_len) > state.text.capacity() {
+                let before = state.text.capacity();
+                let needed = state.text.len().saturating_add(add_len);
+                let next_cap = needed.max(before.saturating_mul(2));
+                // the string and its reallocation coexist while it grows
+                let delta = (next_cap.saturating_sub(before) as u64).saturating_mul(2);
+                if retain(delta).is_err() {
+                    let exact = (needed.saturating_sub(before) as u64).saturating_mul(2);
+                    retain(exact)?;
+                    state.text.reserve_exact(add_len);
+                    let actual =
+                        (state.text.capacity().saturating_sub(before) as u64).saturating_mul(2);
+                    if actual > exact {
+                        retain(actual - exact)?;
+                    }
+                    self.growth += actual.max(exact);
+                } else {
+                    state.text.reserve(next_cap - state.text.len());
+                    let actual =
+                        (state.text.capacity().saturating_sub(before) as u64).saturating_mul(2);
+                    if actual > delta {
+                        retain(actual - delta)?;
+                    }
+                    self.growth += actual.max(delta);
+                }
+            }
             if !state.empty {
                 state.text.push_str(&self.separator);
             }
             state.text.push_str(&lexical);
             state.empty = false;
-            // the string and its reallocation coexist while it grows
-            self.growth += (state.text.capacity().saturating_sub(before) as u64).saturating_mul(2);
+            drop(lexical);
+            drop(value);
+            drop(decode);
         }
+        ctx.check()?;
         Ok(())
     }
 
@@ -395,25 +473,66 @@ impl Accumulator for Concat {
         true
     }
 
-    fn merge(&mut self, _ctx: &Ctx, other: &mut dyn Accumulator, into: &[u32]) -> Result<()> {
+    fn merge(
+        &mut self,
+        ctx: &Ctx,
+        other: &mut dyn Accumulator,
+        into: &[u32],
+        retain: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         let other = other
             .as_any()
             .downcast_mut::<Concat>()
             .expect("an accumulator of the same kind");
-        for (from, &to) in std::mem::take(&mut other.groups).into_iter().zip(into) {
+        for (i, (from, &to)) in std::mem::take(&mut other.groups)
+            .into_iter()
+            .zip(into)
+            .enumerate()
+        {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
             let state = &mut self.groups[to as usize];
             state.ok &= from.ok;
             if !state.ok || from.empty {
                 continue;
             }
-            let before = state.text.capacity();
+            let add_len =
+                from.text
+                    .len()
+                    .saturating_add(if state.empty { 0 } else { self.separator.len() });
+            if state.text.len().saturating_add(add_len) > state.text.capacity() {
+                let before = state.text.capacity();
+                let needed = state.text.len().saturating_add(add_len);
+                let next_cap = needed.max(before.saturating_mul(2));
+                let delta = (next_cap.saturating_sub(before) as u64).saturating_mul(2);
+                if retain(delta).is_err() {
+                    let exact = (needed.saturating_sub(before) as u64).saturating_mul(2);
+                    retain(exact)?;
+                    state.text.reserve_exact(add_len);
+                    let actual =
+                        (state.text.capacity().saturating_sub(before) as u64).saturating_mul(2);
+                    if actual > exact {
+                        retain(actual - exact)?;
+                    }
+                    self.growth += actual.max(exact);
+                } else {
+                    state.text.reserve(next_cap - state.text.len());
+                    let actual =
+                        (state.text.capacity().saturating_sub(before) as u64).saturating_mul(2);
+                    if actual > delta {
+                        retain(actual - delta)?;
+                    }
+                    self.growth += actual.max(delta);
+                }
+            }
             if !state.empty {
                 state.text.push_str(&self.separator);
             }
             state.text.push_str(&from.text);
             state.empty = false;
-            self.growth += (state.text.capacity().saturating_sub(before) as u64).saturating_mul(2);
         }
+        ctx.check()?;
         Ok(())
     }
 
@@ -429,12 +548,14 @@ impl Accumulator for Concat {
         let nothing = state.empty
             && self.distinct
             && ctx.aggregate_errors.distinct_concat_of_nothing_unbound();
-        Ok(if state.ok && !nothing {
+        let id = if state.ok && !nothing {
             // SPARQL 1.1: the result is a simple literal
             ctx.intern_value(&Value::Str(state.text.into()))
         } else {
             Id::UNDEF
-        })
+        };
+        ctx.check()?;
+        Ok(id)
     }
 
     fn group_bytes(&self) -> u64 {
@@ -478,7 +599,13 @@ impl Accumulator for Distinct {
         self.inner.init(groups);
     }
 
-    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, slots: &[u32]) -> Result<()> {
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        slots: &[u32],
+        retain: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         // The slots and values of the rows that are new, which the aggregate underneath
         // reads, are charged until it has read them.
         let _scratch = ctx.charge(slots.len() as u64 * 12 + 64)?;
@@ -496,23 +623,28 @@ impl Accumulator for Distinct {
                     .iter()
                     .map(|c| c[batch.base + row])
                     .collect();
-                // the boxed row, the set's entry and room for its table to grow
-                let bytes = batch.table.cols.len() as u64 * 8 + 96;
-                let fresh = self.rows.insert((slot, key));
-                if fresh {
+                let entry = (slot, key);
+                if self.rows.contains(&entry) {
+                    false
+                } else {
+                    // the boxed row, the set's entry and room for its table to grow
+                    let bytes = batch.table.cols.len() as u64 * 8 + 96;
+                    retain(bytes)?;
                     self.growth += bytes;
+                    self.rows.insert(entry)
                 }
-                fresh
             } else {
                 match id {
                     // an error is never a duplicate
                     Some(id) if !id.is_undef() => {
-                        let fresh = self.values.insert((slot, id));
-                        if fresh {
+                        if self.values.contains(&(slot, id)) {
+                            false
+                        } else {
                             // the set's entry, with room for its table to grow
+                            retain(64)?;
                             self.growth += 64;
+                            self.values.insert((slot, id))
                         }
-                        fresh
                     }
                     _ => true,
                 }
@@ -533,7 +665,7 @@ impl Accumulator for Distinct {
             rows: None,
             base: batch.base,
         };
-        self.inner.add_batch(ctx, &inner, &keep)
+        self.inner.add_batch(ctx, &inner, &keep, retain)
     }
 
     fn group_bytes(&self) -> u64 {
@@ -576,7 +708,13 @@ impl Accumulator for Rows {
         self.results.extend(std::iter::repeat_n(Id::UNDEF, groups));
     }
 
-    fn add_batch(&mut self, ctx: &Ctx, batch: &Batch<'_>, _slots: &[u32]) -> Result<()> {
+    fn add_batch(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Batch<'_>,
+        _slots: &[u32],
+        _retain: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         let index = batch.rows.expect("a batch of whole groups");
         let map = batch.table.var_map(ctx.nvars());
         let arg = match batch.arg {
@@ -611,11 +749,17 @@ impl Accumulator for Rows {
                     descriptor,
                 )?
             } else {
-                crate::sparql::exec::aggregate(ctx, batch.table, &map, rows, &self.agg, arg, exists)
+                crate::sparql::exec::aggregate(
+                    ctx,
+                    batch.table,
+                    &map,
+                    rows,
+                    &self.agg,
+                    arg,
+                    exists,
+                )?
             };
-            if ctx.calls_extensions {
-                ctx.check()?;
-            }
+            ctx.check()?;
         }
         Ok(())
     }

@@ -128,6 +128,51 @@ const CHUNK_ROWS: usize = 65_536;
 /// The least step by which the retained charge of the group state grows.
 const RETAIN_STEP: u64 = 64 << 10;
 
+/// Retained memory charge and high-water byte tracking for a [`Grouping`].
+struct RetainState {
+    charge: Option<RetainedCharge>,
+    bytes: u64,
+    /// The bytes the charge holds, at least `bytes`.
+    reserved: u64,
+    /// The state's bytes before its first group.
+    base: u64,
+}
+
+impl RetainState {
+    /// Count `bytes` more of retained state. The charge grows ahead in steps of at
+    /// least 64 KiB, still before the state does, so that adding many small groups does
+    /// not update the memory ledger for each of them. It overstates the state by less
+    /// than one step.
+    fn retain(&mut self, bytes: u64) -> Result<()> {
+        let retained = self.bytes.saturating_add(bytes);
+        if retained > self.reserved {
+            let reserved = retained.saturating_add((retained / 8).max(RETAIN_STEP));
+            if let Some(charge) = &mut self.charge {
+                if charge.resize(reserved).is_err() {
+                    // Near the budget, reserve only what the state needs.
+                    charge.resize(retained)?;
+                    self.reserved = retained;
+                } else {
+                    self.reserved = reserved;
+                }
+            } else {
+                self.reserved = reserved;
+            }
+        }
+        self.bytes = retained;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.bytes = self.base;
+        self.reserved = self.base;
+        if let Some(charge) = &mut self.charge {
+            charge.resize(self.base)?;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct Grouping {
     keys: Vec<Option<usize>>,
     sources: Vec<Source>,
@@ -144,12 +189,7 @@ pub(crate) struct Grouping {
     at: usize,
     /// The bytes each new group takes in the index, the keys and the accumulators.
     per_group: u64,
-    charge: Option<RetainedCharge>,
-    bytes: u64,
-    /// The bytes the charge holds, at least `bytes`.
-    reserved: u64,
-    /// The state's bytes before its first group.
-    base: u64,
+    retain_state: RetainState,
     /// Whether the operator checks the output size of an eager grouping as it grows.
     eager: bool,
     /// Where rows of groups that do not fit go, when the query may spill.
@@ -240,10 +280,12 @@ impl Grouping {
             groups: 0,
             at: 0,
             per_group,
-            charge,
-            bytes,
-            reserved: bytes,
-            base: bytes,
+            retain_state: RetainState {
+                charge,
+                bytes,
+                reserved: bytes,
+                base: bytes,
+            },
             eager: false,
             query: None,
             threshold: 0,
@@ -304,28 +346,9 @@ impl Grouping {
         Ok(at)
     }
 
-    /// Count `bytes` more of retained state. The charge grows ahead in steps of at
-    /// least 64 KiB, still before the state does, so that adding many small groups does
-    /// not update the memory ledger for each of them. It overstates the state by less
-    /// than one step.
+    /// Count `bytes` more of retained state.
     fn retain(&mut self, bytes: u64) -> Result<()> {
-        let retained = self.bytes.saturating_add(bytes);
-        if retained > self.reserved {
-            let reserved = retained.saturating_add((retained / 8).max(RETAIN_STEP));
-            if let Some(charge) = &mut self.charge {
-                if charge.resize(reserved).is_err() {
-                    // Near the budget, reserve only what the state needs.
-                    charge.resize(retained)?;
-                    self.reserved = retained;
-                } else {
-                    self.reserved = reserved;
-                }
-            } else {
-                self.reserved = reserved;
-            }
-        }
-        self.bytes = retained;
-        Ok(())
+        self.retain_state.retain(bytes)
     }
 
     /// Add a group with these keys, or pass its rows on when the pass is full.
@@ -334,7 +357,7 @@ impl Grouping {
         // than a quarter of the room it had, so that the batches in flight still fit.
         if self.query.is_some()
             && self.groups > 0
-            && (self.bytes >= self.threshold || ctx.memory_room() < self.threshold / 2)
+            && (self.retain_state.bytes >= self.threshold || ctx.memory_room() < self.threshold / 2)
         {
             self.frozen = true;
         }
@@ -503,11 +526,11 @@ impl Grouping {
                     rows: index.as_ref(),
                     base,
                 };
-                self.accs[a].add_batch(ctx, &batch, &slots[base..end])?;
-                let growth = self.accs[a].take_growth();
-                if growth > 0 {
-                    self.retain(growth)?;
-                }
+                let retain_state = &mut self.retain_state;
+                let mut retain = |delta: u64| retain_state.retain(delta);
+                self.accs[a].add_batch(ctx, &batch, &slots[base..end], &mut retain)?;
+                ctx.check()?;
+                let _ = self.accs[a].take_growth();
                 base = end;
                 if base >= slots.len() {
                     break;
@@ -595,6 +618,7 @@ impl Grouping {
             ctx.check()?;
             for g in self.at..self.at + n {
                 let id = acc.finish(ctx, g)?;
+                ctx.check()?;
                 out.cols[nk + a].push(id);
             }
         }
@@ -611,15 +635,11 @@ impl Grouping {
         };
         self.index = Index::new(self.keys.len());
         self.order = Vec::new();
-        self.accs = accumulators(ctx, &self.aggs, self.charge.is_some());
+        self.accs = accumulators(ctx, &self.aggs, self.retain_state.charge.is_some());
         self.groups = 0;
         self.at = 0;
         self.frozen = false;
-        self.bytes = self.base;
-        self.reserved = self.base;
-        if let Some(charge) = &mut self.charge {
-            charge.resize(self.base)?;
-        }
+        self.retain_state.reset()?;
         self.depth = depth;
         self.passes += 1;
         Ok(Some(run.reader()?))

@@ -547,8 +547,7 @@ fn aggext_latches_memory_error_instead_of_silent_undef() {
         let _held = hold_all_but(&ctx, 64);
         let median_iri = format!("{}median", spargebra::algebra::ARQ_AGGREGATE_NAMESPACE);
         let out = super::aggext::aggregate(&ctx, &median_iri, &[Ok(id)]);
-        assert_eq!(out, Id::UNDEF);
-        assert_memory_budget_error(ctx.check(), "aggext::aggregate median latches memory error");
+        assert_memory_budget_error(out, "aggext::aggregate median propagates memory error");
     }
 
     // 2. StatAcc::add
@@ -558,8 +557,10 @@ fn aggext_latches_memory_error_instead_of_silent_undef() {
         let id = ctx.intern_term(&big_dec);
         let _held = hold_all_but(&ctx, 64);
         let mut acc = super::aggext::StatAcc::default();
-        acc.add(&ctx, Some(id));
-        assert_memory_budget_error(ctx.check(), "aggext::StatAcc::add latches memory error");
+        assert_memory_budget_error(
+            acc.add(&ctx, Some(id)),
+            "aggext::StatAcc::add propagates memory error",
+        );
     }
 }
 

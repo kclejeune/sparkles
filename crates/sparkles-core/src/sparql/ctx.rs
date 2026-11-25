@@ -4504,6 +4504,16 @@ impl OwnedCharge {
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
         self.lease.resize(self.ctx.mem_limit, bytes)
     }
+    pub(super) fn cover(&mut self, bytes: u64, step: u64) -> Result<()> {
+        if bytes <= self.lease.bytes {
+            return Ok(());
+        }
+        let target = bytes.max(self.lease.bytes.saturating_add(step));
+        if self.resize(target).is_err() {
+            self.resize(bytes)?;
+        }
+        Ok(())
+    }
     /// Adopt the actual predecoded payload guard; the existing cursor ledger is
     /// required and checked before the source is consumed.
     pub(super) fn adopt_charge(&mut self, source: &mut Option<Charge<'_>>) -> Result<()> {

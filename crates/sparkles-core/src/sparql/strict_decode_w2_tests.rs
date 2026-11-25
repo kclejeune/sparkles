@@ -847,3 +847,272 @@ fn service_describe_restrict_and_vector_strict_decode() {
         false,
     );
 }
+
+// =========================================================================
+// T6: External sort Head::load admits before decode & preserves drop order
+// =========================================================================
+
+#[test]
+fn extsort_head_load_admits_before_decode_and_preserves_drop_order() {
+    use crate::spill::{Spill, SpillOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let spill = Spill::open(&SpillOptions {
+        dir: dir.path().to_path_buf(),
+        max_bytes: 256 << 20,
+        query_bytes: 256 << 20,
+        min_free_bytes: 0,
+        encrypted: false,
+    })
+    .unwrap();
+
+    // Positive control: 3,000 short literals spill and merge cleanly under 384 KiB.
+    let mut ttl_ok = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..3_000 {
+        let k = (i * 7919) % 3_000;
+        ttl_ok.push_str(&format!("ex:s{i} ex:v \"v{k:05}\" .\n"));
+    }
+    let store_ok = store_with_turtle(&ttl_ok, true);
+
+    let cursor_opts = CursorOptions {
+        batch_rows: 256,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    for (label, q) in [
+        (
+            "extsort Key::Column control",
+            "PREFIX ex: <http://example.org/> SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?v",
+        ),
+        (
+            "extsort Key::Expr control",
+            "PREFIX ex: <http://example.org/> SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY LCASE(?v)",
+        ),
+    ] {
+        let mut cursor = super::select_cursor(
+            store_ok.snapshot(),
+            q,
+            &QueryOptions {
+                max_memory_bytes: Some(512 * 1024),
+                spill: Some(spill.clone()),
+                no_cache: true,
+                ..QueryOptions::default()
+            },
+            &cursor_opts,
+        )
+        .unwrap_or_else(|e| panic!("{label}: open failed: {e:?}"));
+        let mut count = 0usize;
+        while let Some(batch) = cursor
+            .next_batch()
+            .unwrap_or_else(|e| panic!("{label}: next_batch failed: {e:?}"))
+        {
+            count += batch.len();
+        }
+        assert_eq!(count, 3_000, "{label}: all sorted rows returned");
+    }
+
+    // Target: 600 rows with 4 KiB distinct literals (total raw strings ~2.4 MiB)
+    // under a tight 192 KiB budget with spill enabled. The external sort spills runs
+    // and then Head::load / run-build must refuse with BudgetKind::Memory (never
+    // producing SortKey::NULL corrupted output!).
+    let mut ttl_big = String::from("@prefix ex: <http://example.org/> .\n");
+    let pad = "x".repeat(4096);
+    for i in 0..600 {
+        let k = (i * 353) % 600;
+        ttl_big.push_str(&format!("ex:s{i} ex:v \"{k:04}-{pad}\" .\n"));
+    }
+    let store_big = store_with_turtle(&ttl_big, true);
+
+    for (label, q) in [
+        (
+            "extsort Key::Column tight",
+            "PREFIX ex: <http://example.org/> SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?v",
+        ),
+        (
+            "extsort Key::Expr tight",
+            "PREFIX ex: <http://example.org/> SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY LCASE(?v)",
+        ),
+    ] {
+        let res: Result<usize> = (|| {
+            let mut cursor = super::select_cursor(
+                store_big.snapshot(),
+                q,
+                &QueryOptions {
+                    max_memory_bytes: Some(192 * 1024),
+                    spill: Some(spill.clone()),
+                    no_cache: true,
+                    ..QueryOptions::default()
+                },
+                &cursor_opts,
+            )?;
+            let mut count = 0usize;
+            while let Some(batch) = cursor.next_batch()? {
+                count += batch.len();
+            }
+            Ok(count)
+        })();
+        assert_memory_budget_error(res, label);
+    }
+}
+
+// =========================================================================
+// T7: Group accumulators & per-group Rows aggregates strict decode
+// =========================================================================
+
+#[test]
+fn group_accumulators_and_rows_aggregates_strict_decode() {
+    let big_str = "g".repeat(32 * 1024);
+    let big_num_pad = "0".repeat(32 * 1024);
+    let ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+         ex:small ex:g \"1\" ; ex:s \"alpha\" ; ex:n \"1.5\"^^xsd:float .\n\
+         ex:small2 ex:g \"1\" ; ex:s \"beta\" ; ex:n \"2.5\"^^xsd:float .\n\
+         ex:big ex:g \"2\" ; ex:s \"{big_str}\" .\n\
+         ex:big2 ex:g \"2\" ; ex:s \"zzz\" ; ex:n \"2.5\"^^xsd:float .\n"
+    );
+    let store = store_with_turtle(&ttl, true);
+    // Load the oversized xsd:float into Tag::Delta (uncompacted) so it bypasses
+    // the compacted generation's typed numeric column and exercises strict decoding.
+    store
+        .load(&[Source::from_bytes(
+            format!(
+                "@prefix ex: <http://example.org/> .\n\
+                 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+                 ex:big ex:n \"{big_num_pad}1.5\"^^xsd:float .\n"
+            )
+            .into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let big_float_id = store
+        .snapshot()
+        .lookup_term(&Term::Literal(Literal::new_typed_literal(
+            format!("{big_num_pad}1.5"),
+            oxrdf::vocab::xsd::FLOAT,
+        )))
+        .expect("big xsd:float interned");
+    assert_eq!(
+        big_float_id.tag(),
+        Tag::Delta,
+        "oversized xsd:float must live in delta vocab"
+    );
+    let budget = 64 * 1024;
+
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "MIN(?v)",
+            "PREFIX ex: <http://example.org/> SELECT (MIN(?v) AS ?r) WHERE { ?x ex:g \"1\" ; ex:s ?v }",
+            "PREFIX ex: <http://example.org/> SELECT (MIN(?v) AS ?r) WHERE { ?x ex:g \"2\" ; ex:s ?v }",
+        ),
+        (
+            "MAX(?v)",
+            "PREFIX ex: <http://example.org/> SELECT (MAX(?v) AS ?r) WHERE { ?x ex:g \"1\" ; ex:s ?v }",
+            "PREFIX ex: <http://example.org/> SELECT (MAX(?v) AS ?r) WHERE { ?x ex:g \"2\" ; ex:s ?v }",
+        ),
+        (
+            "SUM(?n)",
+            "PREFIX ex: <http://example.org/> SELECT (SUM(?n) AS ?r) WHERE { ?x ex:g \"1\" ; ex:n ?n }",
+            "PREFIX ex: <http://example.org/> SELECT (SUM(?n) AS ?r) WHERE { ?x ex:g \"2\" ; ex:n ?n }",
+        ),
+        (
+            "AVG(?n)",
+            "PREFIX ex: <http://example.org/> SELECT (AVG(?n) AS ?r) WHERE { ?x ex:g \"1\" ; ex:n ?n }",
+            "PREFIX ex: <http://example.org/> SELECT (AVG(?n) AS ?r) WHERE { ?x ex:g \"2\" ; ex:n ?n }",
+        ),
+        (
+            "GROUP_CONCAT(?v)",
+            "PREFIX ex: <http://example.org/> SELECT (GROUP_CONCAT(?v; SEPARATOR=\",\") AS ?r) WHERE { ?x ex:g \"1\" ; ex:s ?v }",
+            "PREFIX ex: <http://example.org/> SELECT (GROUP_CONCAT(?v; SEPARATOR=\",\") AS ?r) WHERE { ?x ex:g \"2\" ; ex:s ?v }",
+        ),
+        (
+            "STDEV(?n)",
+            "PREFIX ex: <http://example.org/> SELECT (STDEV(?n) AS ?r) WHERE { ?x ex:g \"1\" ; ex:n ?n }",
+            "PREFIX ex: <http://example.org/> SELECT (STDEV(?n) AS ?r) WHERE { ?x ex:g \"2\" ; ex:n ?n }",
+        ),
+        (
+            "MEDIAN(?n)",
+            "PREFIX ex: <http://example.org/> SELECT (MEDIAN(?n) AS ?r) WHERE { ?x ex:g \"1\" ; ex:n ?n }",
+            "PREFIX ex: <http://example.org/> SELECT (MEDIAN(?n) AS ?r) WHERE { ?x ex:g \"2\" ; ex:n ?n }",
+        ),
+        (
+            "FOLD list",
+            "PREFIX ex: <http://example.org/> SELECT (FOLD(?v) AS ?r) WHERE { ?x ex:g \"1\" ; ex:s ?v }",
+            "PREFIX ex: <http://example.org/> SELECT (FOLD(?v) AS ?r) WHERE { ?x ex:g \"2\" ; ex:s ?v }",
+        ),
+        (
+            "FOLD map",
+            "PREFIX ex: <http://example.org/> SELECT (FOLD(?v, ?v) AS ?r) WHERE { ?x ex:g \"1\" ; ex:s ?v }",
+            "PREFIX ex: <http://example.org/> SELECT (FOLD(?v, ?v) AS ?r) WHERE { ?x ex:g \"2\" ; ex:s ?v }",
+        ),
+    ];
+
+    for (label, ctrl_q, tgt_q) in cases {
+        run_select_both_modes(&store, ctrl_q, budget, label, true);
+        run_select_both_modes(&store, tgt_q, budget, label, false);
+    }
+
+    // Also test the per-group Rows kernel (incremental_group = false) for MIN, SUM, GROUP_CONCAT.
+    for (label, ctrl_q, tgt_q) in &cases[..5] {
+        let mut opt = super::Optimizations::default();
+        opt.incremental_group = false;
+        let ctrl_res = super::query(
+            store.snapshot(),
+            ctrl_q,
+            &QueryOptions {
+                max_memory_bytes: Some(budget),
+                no_cache: true,
+                optimizations: Some(opt.clone()),
+                ..QueryOptions::default()
+            },
+        );
+        if let Err(err) = ctrl_res {
+            panic!("{label} (incremental_group=false control): expected Ok, got Err({err:?})");
+        }
+        let tgt_res = super::query(
+            store.snapshot(),
+            tgt_q,
+            &QueryOptions {
+                max_memory_bytes: Some(budget),
+                no_cache: true,
+                optimizations: Some(opt),
+                ..QueryOptions::default()
+            },
+        );
+        assert_memory_budget_error(
+            tgt_res,
+            &format!("{label} (incremental_group=false target)"),
+        );
+    }
+
+    // Mid-chunk GROUP_CONCAT growth test (< CHUNK_ROWS = 65,536):
+    // 400 rows x 512-byte strings = 200 KiB output, while each string fits 128 KiB easily.
+    // Control: 10 rows x 512 bytes (~5 KiB) passes under the same 128 KiB budget.
+    let mut ttl_mc = String::from("@prefix ex: <http://example.org/> .\n");
+    let chunk_val = "c".repeat(512);
+    for i in 0..400 {
+        ttl_mc.push_str(&format!("ex:r{i} ex:big \"{i:04}-{chunk_val}\" .\n"));
+    }
+    for i in 0..10 {
+        ttl_mc.push_str(&format!("ex:c{i} ex:small \"{i:04}-{chunk_val}\" .\n"));
+    }
+    let store_mc = store_with_turtle(&ttl_mc, true);
+    let mc_budget = 128 * 1024;
+    let mc_ctrl = "PREFIX ex: <http://example.org/> SELECT (GROUP_CONCAT(?v; SEPARATOR=\",\") AS ?r) WHERE { ?s ex:small ?v }";
+    let mc_tgt = "PREFIX ex: <http://example.org/> SELECT (GROUP_CONCAT(?v; SEPARATOR=\",\") AS ?r) WHERE { ?s ex:big ?v }";
+    run_select_both_modes(
+        &store_mc,
+        mc_ctrl,
+        mc_budget,
+        "GROUP_CONCAT mid-chunk",
+        true,
+    );
+    run_select_both_modes(
+        &store_mc,
+        mc_tgt,
+        mc_budget,
+        "GROUP_CONCAT mid-chunk",
+        false,
+    );
+}

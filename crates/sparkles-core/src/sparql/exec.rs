@@ -6506,12 +6506,6 @@ fn first_key_candidates(
     Ok((cand.len() < t.len()).then_some(cand))
 }
 
-/// The value of an ORDER BY key on each row of `t`, for a merge that compares rows
-/// read back from disk. Values the key computes are not interned.
-pub(super) fn key_values(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Option<Value>>> {
-    key_rows(ctx, t, e, None)
-}
-
 fn key_rows(
     ctx: &Ctx,
     t: &Table,
@@ -6841,7 +6835,7 @@ fn group_or_spill(
     report: &mut ExprReport,
     note: &mut Option<String>,
 ) -> Result<Table> {
-    let charged = ctx.spill.is_some();
+    let charged = ctx.spill.is_some() || ctx.mem_limit < u64::MAX || ctx.grant().is_some();
     match super::group::whole(ctx, &t, keys, aggs, charged, true, report) {
         Err(error) if hash::spills(ctx, &error) && super::group::hashable(ctx, aggs) => {
             let Some(shared) = ctx.shared() else {
@@ -6922,8 +6916,15 @@ impl AggState {
     }
 
     /// Add one row; `id` is the aggregated column's value (`None` for COUNT(*)).
+    /// `on_best` admits any retained `MIN`/`MAX` payload before replacing `best_v`.
     #[inline(always)]
-    pub(super) fn add(&mut self, ctx: &Ctx, agg: &Agg, id: Option<Id>) {
+    pub(super) fn add(
+        &mut self,
+        ctx: &Ctx,
+        agg: &Agg,
+        id: Option<Id>,
+        on_best: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         match self {
             AggState::Count(n) => *n += id.is_none_or(|id| !id.is_undef()) as u64,
             AggState::Sum {
@@ -6937,27 +6938,31 @@ impl AggState {
                 let id = id.unwrap_or(Id::UNDEF);
                 *errs += u64::from(id.is_undef());
                 if !*ok {
-                    return;
+                    return Ok(());
                 }
                 if generic.is_none()
                     && id.tag() == crate::id::Tag::Int
                     && let Some(s) = int.checked_add(id.as_i64().into())
                 {
                     *int = s;
-                    return;
+                    return Ok(());
                 }
-                let value = (!id.is_undef()).then(|| ctx.value(id)).flatten();
+                let value = if id.is_undef() {
+                    None
+                } else {
+                    ctx.value_checked(id)?
+                };
                 // An integer too large to be inlined joins the exact sum as well.
                 if generic.is_none()
                     && let Some(Value::Integer(i)) = &value
                     && let Some(s) = int.checked_add(i64::from(*i).into())
                 {
                     *int = s;
-                    return;
+                    return Ok(());
                 }
                 let Some(acc) = generic.take().or_else(|| super::value::exact_sum(*int)) else {
                     *ok = false;
-                    return;
+                    return Ok(());
                 };
                 match value {
                     Some(v) => match arith(NumOp::Add, &acc, &v) {
@@ -6970,9 +6975,10 @@ impl AggState {
             AggState::Best(best, best_v, errs) => {
                 let Some(id) = id.filter(|id| !id.is_undef()) else {
                     *errs += 1;
-                    return;
+                    return Ok(());
                 };
-                let v = ctx.value(id);
+                let decode = ctx.charge(0)?;
+                let v = ctx.value_checked_into(id, &decode)?;
                 let better = match best_v {
                     None => best.is_none(),
                     Some(b) => {
@@ -6985,17 +6991,20 @@ impl AggState {
                     }
                 };
                 if better {
+                    on_best(key_payload(&v))?;
                     *best = Some(id);
                     *best_v = v;
                 }
+                drop(decode);
             }
             AggState::Sample(x) => {
                 if x.is_none() {
                     *x = id.filter(|id| !id.is_undef());
                 }
             }
-            AggState::Stat(_, acc) => acc.add(ctx, id),
+            AggState::Stat(_, acc) => acc.add(ctx, id)?,
         }
+        Ok(())
     }
 
     /// Fold `other`, the state of the same aggregate over rows that come after this
@@ -7177,30 +7186,46 @@ pub(super) fn aggregate(
     agg: &Agg,
     arg: Option<&[Id]>,
     exists: Option<&super::exists::Answers<'_>>,
-) -> Id {
+) -> Result<Id> {
     if let (Some(spec), Some(e)) = (&agg.fold, &agg.expr) {
         return fold(ctx, t, map, rows, (e, spec, agg.distinct), exists);
     }
     let Some(e) = &agg.expr else {
         // COUNT(*)
         let n = if agg.distinct {
-            rows.iter()
-                .map(|&i| t.row(i as usize))
-                .collect::<FxHashSet<_>>()
-                .len()
+            let _seen_charge = ctx.charge(
+                (rows.len() as u64)
+                    .saturating_mul((t.cols.len() as u64).saturating_mul(8).saturating_add(64))
+                    .saturating_add(64),
+            )?;
+            let mut seen = FxHashSet::default();
+            for (idx, &i) in rows.iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                seen.insert(t.row(i as usize));
+            }
+            seen.len()
         } else {
             rows.len()
         };
-        return Id::from_i64(n as i64).unwrap_or(Id::UNDEF);
+        return Ok(Id::from_i64(n as i64).unwrap_or(Id::UNDEF));
     };
-    let mut vals: Vec<Result<Id, ()>> = rows
-        .iter()
-        .map(|&i| {
-            if let Some(a) = arg {
-                let id = a[i as usize];
-                return if id.is_undef() { Err(()) } else { Ok(id) };
-            }
-            eval(
+    let _vals_charge = ctx.charge(
+        (rows.len() as u64)
+            .saturating_mul(std::mem::size_of::<std::result::Result<Id, ()>>() as u64)
+            .saturating_add(64),
+    )?;
+    let mut vals: Vec<std::result::Result<Id, ()>> = Vec::with_capacity(rows.len());
+    for (idx, &i) in rows.iter().enumerate() {
+        if idx.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        let item = if let Some(a) = arg {
+            let id = a[i as usize];
+            if id.is_undef() { Err(()) } else { Ok(id) }
+        } else {
+            match eval(
                 e,
                 &Row {
                     table: t,
@@ -7210,45 +7235,62 @@ pub(super) fn aggregate(
                     exists,
                 },
                 ctx,
-            )
-            .map(|v| v.into_id(ctx))
-            .map_err(|_| ())
-        })
-        .collect();
+            ) {
+                Ok(v) => {
+                    let id = v.into_id(ctx);
+                    ctx.check()?;
+                    Ok(id)
+                }
+                Err(_) => {
+                    if ctx.has_memory_failure() {
+                        ctx.check()?;
+                    }
+                    Err(())
+                }
+            }
+        };
+        vals.push(item);
+    }
+    ctx.check()?;
     if agg.distinct {
+        let _seen_charge = ctx.charge((vals.len() as u64).saturating_mul(32).saturating_add(64))?;
         let mut seen = FxHashSet::default();
         vals.retain(|v| match v {
             Ok(id) => seen.insert(*id),
             Err(_) => true,
         });
     }
-    let values = || {
-        vals.iter()
-            .filter_map(|v| v.ok())
-            .filter_map(|id| ctx.value(id))
-    };
-    let result: Option<Value> = match &agg.func {
+    match &agg.func {
         AggregateFunction::Count => {
-            return Id::from_i64(vals.iter().filter(|v| v.is_ok()).count() as i64)
-                .unwrap_or(Id::UNDEF);
+            Ok(Id::from_i64(vals.iter().filter(|v| v.is_ok()).count() as i64).unwrap_or(Id::UNDEF))
         }
         // The running sum finds an integer sum in every order of the rows.
         AggregateFunction::Sum | AggregateFunction::Avg => {
             let mut state = AggState::new(agg);
-            for v in &vals {
-                state.add(ctx, agg, Some(v.unwrap_or(Id::UNDEF)));
+            for (idx, v) in vals.iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                state.add(ctx, agg, Some(v.unwrap_or(Id::UNDEF)), &mut |_| Ok(()))?;
             }
-            return state.finish(ctx, agg);
+            let id = state.finish(ctx, agg);
+            ctx.check()?;
+            Ok(id)
         }
         AggregateFunction::Min | AggregateFunction::Max => {
             let is_min = matches!(agg.func, AggregateFunction::Min);
             if vals.iter().any(|v| v.is_err()) && ctx.aggregate_errors.best_errs(is_min) {
-                return Id::UNDEF;
+                return Ok(Id::UNDEF);
             }
+            let mut best_credit = ctx.charge(0)?;
             let mut best: Option<Id> = None;
             let mut best_v: Option<Value> = None;
-            for id in vals.iter().filter_map(|v| v.ok()) {
-                let v = ctx.value(id);
+            for (idx, id) in vals.iter().filter_map(|v| v.ok()).enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let decode = ctx.charge(0)?;
+                let v = ctx.value_checked_into(id, &decode)?;
                 let better = match &best_v {
                     None => best.is_none(),
                     Some(b) => {
@@ -7262,41 +7304,82 @@ pub(super) fn aggregate(
                 };
                 if better {
                     best = Some(id);
+                    // Drop the old decoded value while its old credit is still live,
+                    // then swap in the new credit before storing the new value.
+                    drop(best_v.take());
+                    best_credit = decode;
                     best_v = v;
+                } else {
+                    drop(v);
+                    drop(decode);
                 }
             }
-            return best.unwrap_or(Id::UNDEF);
+            drop(best_v);
+            drop(best_credit);
+            Ok(best.unwrap_or(Id::UNDEF))
         }
-        AggregateFunction::Sample => return vals.iter().find_map(|v| v.ok()).unwrap_or(Id::UNDEF),
+        AggregateFunction::Sample => Ok(vals.iter().find_map(|v| v.ok()).unwrap_or(Id::UNDEF)),
         AggregateFunction::GroupConcat { separator } => {
             if agg.distinct
                 && rows.is_empty()
                 && ctx.aggregate_errors.distinct_concat_of_nothing_unbound()
             {
-                return Id::UNDEF;
-            }
-            let sep = separator.as_deref().unwrap_or(" ");
-            let mut parts = Vec::new();
-            let strings = ctx.aggregate_errors.concat_strings_only();
-            for v in values() {
-                // CONCAT takes only strings
-                if strings && !v.is_string() {
-                    return Id::UNDEF;
-                }
-                let Ok(s) = v.lexical() else { return Id::UNDEF };
-                parts.push(s.to_string());
+                return Ok(Id::UNDEF);
             }
             if vals.iter().any(|v| v.is_err()) {
-                return Id::UNDEF;
+                return Ok(Id::UNDEF);
+            }
+            let sep = separator.as_deref().unwrap_or(" ");
+            let strings = ctx.aggregate_errors.concat_strings_only();
+            let out_charge = ctx.charge(0)?;
+            let mut out = String::new();
+            let mut first = true;
+            for (idx, id) in vals.iter().filter_map(|v| v.ok()).enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let decode = ctx.charge(0)?;
+                let Some(v) = ctx.value_checked_into(id, &decode)? else {
+                    continue;
+                };
+                // CONCAT takes only strings
+                if strings && !v.is_string() {
+                    return Ok(Id::UNDEF);
+                }
+                let Ok(s) = v.lexical() else {
+                    return Ok(Id::UNDEF);
+                };
+                let add_len = s.len().saturating_add(if first { 0 } else { sep.len() });
+                if out.len().saturating_add(add_len) > out.capacity() {
+                    let before = out.capacity();
+                    let needed = out.len().saturating_add(add_len);
+                    let next_cap = needed.max(before.saturating_mul(2));
+                    let delta = (next_cap.saturating_sub(before) as u64).saturating_mul(2);
+                    if out_charge.add(delta).is_err() {
+                        let exact = (needed.saturating_sub(before) as u64).saturating_mul(2);
+                        out_charge.add(exact)?;
+                        out.reserve_exact(add_len);
+                    } else {
+                        out.reserve(next_cap - out.len());
+                    }
+                }
+                if !first {
+                    out.push_str(sep);
+                }
+                out.push_str(&s);
+                first = false;
+                drop(s);
+                drop(v);
+                drop(decode);
             }
             // SPARQL 1.1: the result is a simple literal (language tags are dropped)
-            Some(Value::Str(parts.join(sep).into()))
+            let id = ctx.intern_value(&Value::Str(out.into()));
+            drop(out_charge);
+            ctx.check()?;
+            Ok(id)
         }
-        AggregateFunction::Custom(iri) => {
-            return super::aggext::aggregate(ctx, iri.as_str(), &vals);
-        }
-    };
-    result.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
+        AggregateFunction::Custom(iri) => super::aggext::aggregate(ctx, iri.as_str(), &vals),
+    }
 }
 
 /// ARQ's `FOLD` of one group (`AggFoldList`, `AggFoldMap`): the values of `e` in the
@@ -7312,7 +7395,7 @@ fn fold(
     rows: &[u32],
     (e, fold, distinct): (&Expr, &super::plan::Fold, bool),
     exists: Option<&super::exists::Answers<'_>>,
-) -> Id {
+) -> Result<Id> {
     use super::cdt::{Elem, Map, map_put};
     let row = |i: u32| Row {
         table: t,
@@ -7321,17 +7404,40 @@ fn fold(
         dec: None,
         exists,
     };
+    let fold_charge = ctx.charge((rows.len() as u64).saturating_mul(4).saturating_add(64))?;
     let mut order: Vec<u32> = rows.to_vec();
     if !fold.order.is_empty() {
-        let keys: Vec<Vec<Option<Value>>> = rows
-            .iter()
-            .map(|&i| {
-                fold.order
-                    .iter()
-                    .map(|(k, _)| eval(k, &row(i), ctx).ok().and_then(|v| v.value(ctx).ok()))
-                    .collect()
-            })
-            .collect();
+        let key_slots = (rows.len() as u64)
+            .saturating_mul(fold.order.len() as u64)
+            .saturating_mul(std::mem::size_of::<Option<Value>>() as u64)
+            .saturating_add((rows.len() as u64).saturating_mul(8))
+            .saturating_add(64);
+        fold_charge.add(key_slots)?;
+        let mut keys: Vec<Vec<Option<Value>>> = Vec::with_capacity(rows.len());
+        for (r_idx, &i) in rows.iter().enumerate() {
+            if r_idx.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let mut row_keys = Vec::with_capacity(fold.order.len());
+            for (k, _) in &fold.order {
+                let val = match eval(k, &row(i), ctx) {
+                    Ok(Val::Id(id)) => ctx.value_checked_into(id, &fold_charge)?,
+                    Ok(Val::V(v) | Val::Dec(_, v)) => {
+                        let opt = Some(v);
+                        fold_charge.add(key_payload(&opt))?;
+                        opt
+                    }
+                    Err(_) => {
+                        if ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
+                        None
+                    }
+                };
+                row_keys.push(val);
+            }
+            keys.push(row_keys);
+        }
         let mut idx: Vec<usize> = (0..rows.len()).collect();
         idx.sort_by(|&a, &b| {
             for (k, (_, asc)) in fold.order.iter().enumerate() {
@@ -7343,28 +7449,56 @@ fn fold(
             }
             Ordering::Equal
         });
+        drop(keys);
         order = idx.into_iter().map(|j| rows[j]).collect();
     }
-    let term = |x: &Expr, i: u32| {
-        eval(x, &row(i), ctx)
-            .ok()
-            .and_then(|v| ctx.term(v.into_id(ctx)))
+    let eval_term = |x: &Expr, i: u32| -> Result<Option<oxrdf::Term>> {
+        match eval(x, &row(i), ctx) {
+            Ok(v) => {
+                let id = v.into_id(ctx);
+                ctx.check()?;
+                ctx.term_checked_into(id, &fold_charge)
+            }
+            Err(_) => {
+                if ctx.has_memory_failure() {
+                    ctx.check()?;
+                }
+                Ok(None)
+            }
+        }
     };
     let value = match &fold.value {
         None => {
+            fold_charge.add(
+                (order.len() as u64)
+                    .saturating_mul(std::mem::size_of::<Elem>() as u64)
+                    .saturating_add(64),
+            )?;
             let mut list = Vec::with_capacity(order.len());
             let mut seen = FxHashSet::default();
             let mut null = false;
-            for i in order {
+            for (idx, i) in order.into_iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
                 match eval(e, &row(i), ctx) {
                     Ok(v) => {
                         let id = v.into_id(ctx);
-                        if distinct && !seen.insert(id) {
-                            continue;
+                        ctx.check()?;
+                        if distinct {
+                            if seen.contains(&id) {
+                                continue;
+                            }
+                            fold_charge.add(32)?;
+                            seen.insert(id);
                         }
-                        list.push(ctx.term(id).map_or(Elem::Null, Elem::Term));
+                        let term = ctx.term_checked_into(id, &fold_charge)?;
+                        list.push(term.map_or(Elem::Null, Elem::Term));
                     }
                     Err(_) => {
+                        if ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
                         if distinct && null {
                             continue;
                         }
@@ -7377,17 +7511,29 @@ fn fold(
         }
         Some(v) => {
             let mut m = Map::new();
-            for i in order {
-                let Some(k @ (oxrdf::Term::NamedNode(_) | oxrdf::Term::Literal(_))) = term(e, i)
+            for (idx, i) in order.into_iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let Some(k @ (oxrdf::Term::NamedNode(_) | oxrdf::Term::Literal(_))) =
+                    eval_term(e, i)?
                 else {
                     continue;
                 };
-                map_put(&mut m, k, term(v, i).map_or(Elem::Null, Elem::Term));
+                let val_elem = eval_term(v, i)?.map_or(Elem::Null, Elem::Term);
+                fold_charge.add(64)?;
+                map_put(&mut m, k, val_elem);
             }
             super::cdt::map_value(&m)
         }
     };
-    ctx.intern_value(&value)
+    let opt = Some(value);
+    fold_charge.add(key_payload(&opt))?;
+    let id = ctx.intern_value(opt.as_ref().expect("folded value"));
+    drop(opt);
+    drop(fold_charge);
+    ctx.check()?;
+    Ok(id)
 }
 
 // ------------------------------------------------------------------ paths ------

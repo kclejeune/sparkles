@@ -365,51 +365,104 @@ struct Head {
 impl Head {
     /// Read the next frame, or return false at the end of the run.
     fn load(&mut self, ctx: &Arc<Ctx>, keys: &Keys) -> Result<bool> {
+        self.keys.clear();
+        self.columns.clear();
+        self.len = 0;
+        self.at = 0;
         self._charge = None;
-        let Some((columns, len)) = self.reader.next_frame()? else {
-            self.columns.clear();
-            self.keys.clear();
-            self.len = 0;
-            self.at = 0;
+        ctx.check()?;
+        let Some((frame_cols, len)) = self.reader.next_frame()? else {
             return Ok(false);
         };
-        let mut bytes = columns.len() as u64 * len as u64 * 8 + 256;
-        let (columns, decoded) = match keys {
-            Keys::Raw(_) => (columns, Vec::new()),
+        let mut bytes = frame_cols.len() as u64 * len as u64 * 8 + 256;
+        let mut charge = OwnedCharge::new(ctx, bytes)?;
+        let mut columns = Some(frame_cols);
+        let step = ctx.reservation_step();
+        let decoded = match keys {
+            Keys::Raw(_) => Vec::new(),
             Keys::Values { keys, vars } => {
                 let mut decoded = Vec::with_capacity(keys.len());
-                let mut columns = Some(columns);
                 for (key, _) in keys {
                     let column: Vec<SortKey> = match key {
-                        Key::Column(c) => columns.as_ref().expect("frame columns")[*c]
-                            .iter()
-                            .map(|&id| SortKey::new(ctx.value(id)))
-                            .collect(),
+                        Key::Column(c) => {
+                            let slots_bytes =
+                                (len as u64).saturating_mul(size_of::<SortKey>() as u64);
+                            bytes = bytes.saturating_add(slots_bytes);
+                            charge.cover(bytes, step)?;
+                            let mut col = Vec::with_capacity(len);
+                            let col_ids = &columns.as_ref().expect("frame columns")[*c];
+                            for (row, &id) in col_ids.iter().enumerate() {
+                                if row.is_multiple_of(1024) {
+                                    ctx.check()?;
+                                }
+                                match id.tag() {
+                                    crate::id::Tag::Vocab
+                                    | crate::id::Tag::Delta
+                                    | crate::id::Tag::Local => {
+                                        let decode = ctx.charge(0)?;
+                                        let val = ctx.value_checked_into(id, &decode)?;
+                                        let sk = SortKey::new(val);
+                                        bytes = bytes.saturating_add(sk.payload_bytes());
+                                        charge.cover(bytes, step)?;
+                                        col.push(sk);
+                                        drop(decode);
+                                    }
+                                    _ => {
+                                        let sk = SortKey::new(ctx.value(id));
+                                        bytes = bytes.saturating_add(sk.payload_bytes());
+                                        charge.cover(bytes, step)?;
+                                        col.push(sk);
+                                    }
+                                }
+                            }
+                            col
+                        }
                         Key::Expr(e) => {
                             let mut table = crate::sparql::table::Table::new(vars.clone());
                             table.cols = columns.take().expect("frame columns");
                             table.len = len;
-                            let values = exec::key_values(ctx, &table, e);
+                            let evaluated = exec::key_rows_charged(ctx, &table, e);
                             columns = Some(std::mem::take(&mut table.cols));
-                            values?.into_iter().map(SortKey::new).collect()
+                            let evaluated = evaluated?;
+                            let slots_bytes =
+                                (len as u64).saturating_mul(size_of::<SortKey>() as u64);
+                            bytes = bytes.saturating_add(slots_bytes);
+                            charge.cover(bytes, step)?;
+                            let mut col = Vec::with_capacity(len);
+                            let crate::sparql::exprcache::Column::Rows { vals, _charge } =
+                                evaluated
+                            else {
+                                unreachable!("key_rows_charged always returns Column::Rows");
+                            };
+                            let _eval_charge = _charge;
+                            let vals = vals;
+                            for (row, val) in vals.into_iter().enumerate() {
+                                if row.is_multiple_of(1024) {
+                                    ctx.check()?;
+                                }
+                                let sk = SortKey::new(val);
+                                bytes = bytes.saturating_add(sk.payload_bytes());
+                                charge.cover(bytes, step)?;
+                                col.push(sk);
+                            }
+                            drop(_eval_charge);
+                            col
                         }
                     };
-                    bytes = bytes.saturating_add(
-                        column
-                            .iter()
-                            .map(|k| k.payload_bytes() + size_of::<SortKey>() as u64)
-                            .sum::<u64>(),
-                    );
                     decoded.push(column);
                 }
-                (columns.expect("frame columns"), decoded)
+                decoded
             }
         };
-        self._charge = Some(OwnedCharge::new(ctx, bytes)?);
-        self.columns = columns;
+        ctx.check()?;
+        if charge.bytes() > bytes {
+            charge.resize(bytes)?;
+        }
+        self.columns = columns.expect("frame columns");
         self.keys = decoded;
         self.len = len;
         self.at = 0;
+        self._charge = Some(charge);
         Ok(true)
     }
 }

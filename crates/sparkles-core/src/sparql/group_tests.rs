@@ -38,7 +38,7 @@ fn fold(ctx: &Ctx, acc: &mut dyn Accumulator, values: &[Id], slots: &[u32]) {
         rows: None,
         base: 0,
     };
-    acc.add_batch(ctx, &batch, slots).unwrap();
+    acc.add_batch(ctx, &batch, slots, &mut |_| Ok(())).unwrap();
 }
 
 fn results(ctx: &Ctx, acc: &mut dyn Accumulator, groups: usize) -> Vec<String> {
@@ -79,7 +79,8 @@ fn merging_two_passes_gives_one_pass() {
             fold(&ctx, &mut left, &values[..split], &slots[..split]);
             fold(&ctx, &mut right, &values[split..], &slots[split..]);
             assert!(left.mergeable());
-            left.merge(&ctx, &mut right, &[0, 1, 2]).unwrap();
+            left.merge(&ctx, &mut right, &[0, 1, 2], &mut |_| Ok(()))
+                .unwrap();
             let mut again = Running::new(&agg, true);
             again.init(3);
             fold(&ctx, &mut again, &values, &slots);
@@ -106,7 +107,7 @@ fn a_merge_maps_the_groups_of_the_second_pass_onto_the_first() {
     fold(&ctx, &mut b, &[one, one, one], &[0, 0, 1]);
     // b's group 0 is a's group 1, and b's group 1 is a's new group 2
     a.init(1);
-    a.merge(&ctx, &mut b, &[1, 2]).unwrap();
+    a.merge(&ctx, &mut b, &[1, 2], &mut |_| Ok(())).unwrap();
     assert_eq!(results(&ctx, &mut a, 3), vec!["1", "3", "1"]);
 }
 
@@ -139,7 +140,7 @@ fn a_sum_that_became_generic_merges_in_row_order() {
     b.init(1);
     fold(&ctx, &mut a, &[int(&ctx, 2), half], &[0, 0]);
     fold(&ctx, &mut b, &[int(&ctx, 3)], &[0]);
-    a.merge(&ctx, &mut b, &[0]).unwrap();
+    a.merge(&ctx, &mut b, &[0], &mut |_| Ok(())).unwrap();
     let id = a.finish(&ctx, 0).unwrap();
     assert_eq!(&*ctx.value(id).unwrap().lexical().unwrap(), "5.5");
 }
@@ -164,7 +165,7 @@ fn group_concat_merges_in_row_order() {
     b.init(2);
     fold(&ctx, &mut a, &ids[..3], &slots[..3]);
     fold(&ctx, &mut b, &ids[3..], &slots[3..]);
-    a.merge(&ctx, &mut b, &[0, 1]).unwrap();
+    a.merge(&ctx, &mut b, &[0, 1], &mut |_| Ok(())).unwrap();
     assert_eq!(results(&ctx, &mut a, 2), results(&ctx, &mut whole, 2));
     assert_eq!(
         results(&ctx, &mut whole, 2)[0],
@@ -209,7 +210,9 @@ fn count_distinct_star_tells_rows_apart() {
         rows: None,
         base: 0,
     };
-    count.add_batch(&ctx, &batch, &[0, 0, 0, 0]).unwrap();
+    count
+        .add_batch(&ctx, &batch, &[0, 0, 0, 0], &mut |_| Ok(()))
+        .unwrap();
     assert_eq!(results(&ctx, &mut count, 1), vec!["3"]);
 }
 
