@@ -541,6 +541,36 @@ impl FloorMap<'_> {
         floor
     }
 
+    /// Record a floor already computed by [`Ctx::string_floor`] for a base-vocabulary simple
+    /// literal `id`. Preserves read-bit, eviction and test `computed` accounting identically
+    /// to [`FloorMap::floor`] without recomputing the floor.
+    #[inline]
+    pub(super) fn record_floor(&mut self, id: Id, floor: u64, computed: bool) {
+        let p = id.payload();
+        debug_assert!(id.tag() == Tag::Vocab && p < self.first_triple);
+        #[cfg(test)]
+        if computed {
+            self.computed += 1;
+        }
+        #[cfg(not(test))]
+        let _ = computed;
+        let Some(cur) = &self.cur else {
+            return;
+        };
+        let slot = cur.slot(p);
+        let word = slot.load(Ordering::Relaxed);
+        if cur.decode(p, word).is_some() {
+            if word & 1 == 0 {
+                slot.store(word | 1, Ordering::Relaxed);
+            }
+            return;
+        }
+        let evicts = usize::from(word & 1 == 1);
+        if cur.put(p, Some(floor), false) {
+            self.evicted += evicts;
+        }
+    }
+
     #[inline]
     fn compute(&mut self, id: Id) -> Option<u64> {
         #[cfg(test)]
