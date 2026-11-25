@@ -20,6 +20,7 @@ fn fact_bytes(literal: &Literal, datatype: &NamedNode) -> usize {
 struct CachedData {
     candidates: Vec<Candidate>,
     local_keys: FxHashMap<u64, Vec<u8>>,
+    datatypes: Option<Datatypes>,
     snap: Arc<Snapshot>,
     // Declared last so `candidates`, `local_keys`, and `snap` drop before credit returns
     // on both normal and early-error exits.
@@ -93,11 +94,13 @@ fn lookup_key_controlled_in_snap(
 const RDF_TYPE_KEY: &[u8] = b"<http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 type Candidate = (u64, u64);
+type Datatypes = FxHashMap<u64, Term>;
 
 fn visit_candidates(
     kept: &Kept,
     ty_id: Option<Id>,
     controls: &DiagnosticControls,
+    datatypes: Option<&Datatypes>,
     mut visit: impl FnMut(Candidate),
 ) -> anyhow::Result<()> {
     use crate::terms::Kind;
@@ -113,17 +116,60 @@ fn visit_candidates(
         } else {
             ty_id == Some(Id(predicate))
         };
-        if is_type && terms.kind(subject) == Kind::Literal && terms.kind(object) == Kind::Iri {
+        if is_type
+            && terms.kind(subject) == Kind::Literal
+            && terms.kind(object) == Kind::Iri
+            && datatypes.is_none_or(|datatypes| datatypes.contains_key(&object))
+        {
             visit((subject, object));
         }
     }
     Ok(())
 }
 
-fn local_keys(terms: &Terms, (subject, object): Candidate) -> impl Iterator<Item = (u64, &[u8])> {
-    [subject, object]
-        .into_iter()
+fn local_keys(
+    terms: &Terms,
+    (subject, object): Candidate,
+    include_objects: bool,
+) -> impl Iterator<Item = (u64, &[u8])> {
+    std::iter::once(subject)
+        .chain(include_objects.then_some(object))
         .filter_map(|id| terms.local_key(id).map(|key| (id, key)))
+}
+
+/// Copy each candidate datatype key once. Resolve store objects and validate ranges
+/// outside the lock before deciding which subjects to copy for the public reader.
+fn supported_datatypes(
+    cache: &Cache,
+    generation: u64,
+    snap: &Snapshot,
+    ty_id: Option<Id>,
+    controls: &DiagnosticControls,
+) -> anyhow::Result<Option<Datatypes>> {
+    let mut objects = FxHashMap::default();
+    {
+        let slot = cache.kept.lock();
+        let Some(kept) = slot.kept.as_ref().filter(|_| slot.generation == generation) else {
+            return Ok(None);
+        };
+        visit_candidates(kept, ty_id, controls, None, |(_, object)| {
+            objects
+                .entry(object)
+                .or_insert_with(|| kept.closure.terms.local_key(object).map(<[u8]>::to_vec));
+        })?;
+    }
+    let datatypes = objects
+        .into_iter()
+        .filter_map(|(object, key)| {
+            let term = match key {
+                Some(key) => sparkles_core::id::key_to_term(&key),
+                None => snap.term(Id(object))?,
+            };
+            matches!(&term, Term::NamedNode(n) if crate::diagnostics::decidable_range(n.as_str()))
+                .then_some((object, term))
+        })
+        .collect();
+    Ok(Some(datatypes))
 }
 
 #[derive(Default)]
@@ -149,14 +195,16 @@ impl KeySize {
 }
 
 /// Copy candidate ids and local keys from one cache generation. Vocabulary lookup and
-/// budget callbacks run outside the cache lock. The only allocations under the lock
-/// are copies of local keys whose exact total size has already been admitted.
+/// budget callbacks run outside the cache lock. The controlled reader admits all
+/// candidate storage before copying. The public reader resolves ranges before
+/// selecting literal subjects.
 fn snapshot_cached_typings(
     store: &Store,
     commit: u64,
     cache: &Cache,
     controls: &DiagnosticControls,
     budget: &Arc<Budget>,
+    supported_ranges_only: bool,
 ) -> anyhow::Result<CachedSnapshot> {
     let mut resolved = None;
     let matches_commit =
@@ -182,6 +230,16 @@ fn snapshot_cached_typings(
         }
         let ty_id = resolved.as_ref().and_then(|(_, id)| *id);
         let current = |slot: &CacheSlot| slot.generation == generation;
+        let datatypes = if supported_ranges_only {
+            let Some(datatypes) = supported_datatypes(cache, generation, &snap, ty_id, controls)?
+            else {
+                continue;
+            };
+            Some(datatypes)
+        } else {
+            None
+        };
+        let include_objects = datatypes.is_none();
         let mut candidate_count = 0usize;
         let mut key_size = KeySize::default();
         let mut seen = [0; 64];
@@ -193,9 +251,12 @@ fn snapshot_cached_typings(
             let Some(kept) = slot.kept.as_ref().filter(|_| current(&slot)) else {
                 continue;
             };
-            visit_candidates(kept, ty_id, controls, |candidate| {
+            if datatypes.as_ref().is_some_and(Datatypes::is_empty) {
+                return Ok(CachedSnapshot::Empty);
+            }
+            visit_candidates(kept, ty_id, controls, datatypes.as_ref(), |candidate| {
                 candidate_count += 1;
-                for (id, key) in local_keys(&kept.closure.terms, candidate) {
+                for (id, key) in local_keys(&kept.closure.terms, candidate, include_objects) {
                     local_refs += 1;
                     max_payload = max_payload.max(Id(id).payload() as usize);
                     if !overflowed && !seen[..key_size.count].contains(&id) {
@@ -225,8 +286,8 @@ fn snapshot_cached_typings(
                 let Some(kept) = slot.kept.as_ref().filter(|_| current(&slot)) else {
                     continue;
                 };
-                visit_candidates(kept, ty_id, controls, |candidate| {
-                    for (id, key) in local_keys(&kept.closure.terms, candidate) {
+                visit_candidates(kept, ty_id, controls, datatypes.as_ref(), |candidate| {
+                    for (id, key) in local_keys(&kept.closure.terms, candidate, include_objects) {
                         let payload = Id(id).payload() as usize;
                         let word = &mut seen[payload / u64::BITS as usize];
                         let mask = 1u64 << (payload % u64::BITS as usize);
@@ -244,8 +305,11 @@ fn snapshot_cached_typings(
                     let Some(kept) = slot.kept.as_ref().filter(|_| current(&slot)) else {
                         continue;
                     };
-                    visit_candidates(kept, ty_id, controls, |candidate| {
-                        ids.extend(local_keys(&kept.closure.terms, candidate).map(|(id, _)| id));
+                    visit_candidates(kept, ty_id, controls, datatypes.as_ref(), |candidate| {
+                        ids.extend(
+                            local_keys(&kept.closure.terms, candidate, include_objects)
+                                .map(|(id, _)| id),
+                        );
                     })?;
                 }
                 ids.sort_unstable();
@@ -272,6 +336,7 @@ fn snapshot_cached_typings(
         let mut data = CachedData {
             candidates: Vec::with_capacity(candidate_count),
             local_keys: FxHashMap::with_capacity_and_hasher(key_size.count, Default::default()),
+            datatypes,
             snap,
             _held: held,
         };
@@ -280,12 +345,18 @@ fn snapshot_cached_typings(
             let Some(kept) = slot.kept.as_ref().filter(|_| current(&slot)) else {
                 continue;
             };
-            visit_candidates(kept, ty_id, controls, |candidate| {
-                data.candidates.push(candidate);
-                for (id, key) in local_keys(&kept.closure.terms, candidate) {
-                    data.local_keys.entry(id).or_insert_with(|| key.to_vec());
-                }
-            })?;
+            visit_candidates(
+                kept,
+                ty_id,
+                controls,
+                data.datatypes.as_ref(),
+                |candidate| {
+                    data.candidates.push(candidate);
+                    for (id, key) in local_keys(&kept.closure.terms, candidate, include_objects) {
+                        data.local_keys.entry(id).or_insert_with(|| key.to_vec());
+                    }
+                },
+            )?;
         }
         return Ok(CachedSnapshot::Data(data));
     }
@@ -304,6 +375,7 @@ pub(super) fn literal_typings_cached(
         cache,
         &DiagnosticControls::default(),
         &Budget::unlimited(),
+        true,
     )? {
         CachedSnapshot::Missing => return Ok(None),
         CachedSnapshot::Empty => {
@@ -316,18 +388,18 @@ pub(super) fn literal_typings_cached(
     };
     let predicate = Term::NamedNode(rdf::TYPE.into_owned());
     let mut facts = Vec::new();
-    let mut datatypes: FxHashMap<u64, Option<Term>> = FxHashMap::default();
+    let datatypes = data
+        .datatypes
+        .as_ref()
+        .expect("public snapshot resolves ranges");
     data.candidates.sort_unstable();
     for &(subject, object) in &data.candidates {
-        let datatype = datatypes.entry(object).or_insert_with(|| {
-            data.term(object).filter(|term| {
-                matches!(term, Term::NamedNode(n) if crate::diagnostics::decidable_range(n.as_str()))
-            })
-        });
-        if let Some(datatype) = datatype
-            && let Some(subject) = data.term(subject)
-        {
-            facts.extend(LiteralTypings::violation(&subject, &predicate, datatype));
+        if let Some(subject) = data.term(subject) {
+            facts.extend(LiteralTypings::violation(
+                &subject,
+                &predicate,
+                &datatypes[&object],
+            ));
         }
     }
     Ok(Some(LiteralTypings { commit, facts }))
@@ -363,7 +435,7 @@ pub fn literal_typings_controlled_guarded(
         controls.memory_parent.clone(),
     );
     if let Some(cache) = cache {
-        match snapshot_cached_typings(store, commit, cache, controls, &budget)? {
+        match snapshot_cached_typings(store, commit, cache, controls, &budget, false)? {
             CachedSnapshot::Empty => {
                 return Ok(Some(GuardedLiteralTypings::new(
                     LiteralTypings {

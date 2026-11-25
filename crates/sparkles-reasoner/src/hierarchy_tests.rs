@@ -2502,3 +2502,49 @@ fn public_diagnostic_summary_reads_rule_local_terms() {
         "http://www.w3.org/2001/XMLSchema#integer"
     );
 }
+
+#[test]
+fn public_diagnostic_summary_skips_local_subjects_of_unsupported_ranges() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from(
+        "<urn:one> <urn:check> \"not-an\" .\n\
+         <urn:known> <urn:range> <http://www.w3.org/2001/XMLSchema#integer> .\n",
+    );
+    for i in 0..128 {
+        ttl.push_str(&format!("<urn:x{i}> <urn:seed> \"seed{i}\" .\n"));
+    }
+    load_turtle(&store, &ttl);
+    let suffix = "a".repeat(4 * 1024);
+    let profile = crate::Profile::Rules(format!(
+        "[unsupported: (?x <urn:seed> ?s) strConcat(?s, \"{suffix}\", ?l) \
+         -> (?l <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:ordinaryClass>)]\n\
+         [supported: (?x <urn:check> ?s) strConcat(?s, \"-int\", ?l) \
+         -> (?l <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#integer>)]"
+    ));
+    let cache = crate::Cache::default();
+    let report = crate::materialize_incremental(
+        &store,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions::default(),
+    )
+    .unwrap();
+    let commit = report.receipt.unwrap().commit.seq;
+    let (typings, peak) = crate::alloc_probe::peak_of(|| {
+        crate::literal_typings(&store, commit, Some(&cache))
+            .unwrap()
+            .unwrap()
+    });
+    assert_eq!(typings.commit, commit);
+    assert_eq!(typings.facts.len(), 1);
+    assert_eq!(typings.facts[0].0.value(), "not-an-int");
+    assert_eq!(
+        typings.facts[0].1.as_str(),
+        "http://www.w3.org/2001/XMLSchema#integer"
+    );
+    assert!(peak < 64 * 1024, "summary reader allocated {peak} bytes");
+}

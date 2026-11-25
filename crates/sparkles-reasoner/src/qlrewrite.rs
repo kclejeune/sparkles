@@ -1096,7 +1096,8 @@ impl Rendered {
 // The prefix plus the largest decimal usize on supported targets.
 const FRESH_NAME_BYTES: usize = "__ql".len() + 20;
 
-/// Size the temporary branch from its compact atoms and borrowed terms.
+/// Size the heap owned by a temporary branch and its group key, excluding the
+/// slots in the group vectors.
 fn estimate_rendered_bytes(
     q: &Cq,
     consts: &[Term],
@@ -1147,13 +1148,25 @@ fn estimate_rendered_bytes(
         .len()
         .saturating_mul(2)
         .saturating_add(q.binds.len())
-        .saturating_mul(std::mem::size_of::<u32>())
-        .saturating_add(std::mem::size_of::<(Vec<u32>, Vec<Rendered>)>());
+        .saturating_mul(size_of::<u32>());
     patterns
         .saturating_add(binds)
         .saturating_add(bind_names)
-        .saturating_add(64)
         .saturating_add(set_bytes)
+}
+
+/// Admit the new buffer alongside the old one before growing a group vector.
+fn reserve_group_slot<T>(vec: &mut Vec<T>, held: &mut crate::budget::Held) -> Result<()> {
+    let old = vec.capacity();
+    let elem = size_of::<T>();
+    let next = sparkles_budget::sizes::vec_grown(old, vec.len(), 1, elem);
+    if next > old {
+        held.try_grow(next.saturating_mul(elem))
+            .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+        vec.reserve_exact(next - vec.len());
+        held.shrink(old * elem);
+    }
+    Ok(())
 }
 
 /// Build the sorted, deduplicated list of bound variables of `q` into a pre-sized `Vec`
@@ -1393,7 +1406,7 @@ impl Rewriter<'_> {
             };
             bytes.saturating_add(size_of::<Variable>().saturating_add(len))
         });
-        let mut groups_held = crate::budget::Held::try_new(&self.budget, names_bytes)
+        let mut names_held = crate::budget::Held::try_new(&self.budget, names_bytes)
             .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
         let mut names = Vec::with_capacity(bgp.vars.len());
         let mut visible_len = 0;
@@ -1416,6 +1429,7 @@ impl Rewriter<'_> {
         // of them gives the same values to the ones it names.
         // `groups_held` is declared before `groups` so temporary rendered branches drop
         // before their credit returns.
+        let mut groups_held = crate::budget::Held::new(&self.budget);
         let mut groups: Vec<(Vec<u32>, Vec<Rendered>)> = Vec::new();
         for q in &branches {
             let est_bytes = estimate_rendered_bytes(q, &bgp.consts, &names, |s| iri(s).len());
@@ -1472,8 +1486,20 @@ impl Rewriter<'_> {
                 bind_names,
             };
             match groups.iter_mut().find(|(s, _)| *s == set) {
-                Some((_, g)) => g.push(b),
-                None => groups.push((set, vec![b])),
+                Some((_, g)) => {
+                    let key_bytes = set.capacity() * size_of::<u32>();
+                    drop(set);
+                    groups_held.shrink(key_bytes);
+                    reserve_group_slot(g, &mut groups_held)?;
+                    g.push(b);
+                }
+                None => {
+                    reserve_group_slot(&mut groups, &mut groups_held)?;
+                    groups_held
+                        .try_grow(size_of::<Rendered>())
+                        .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+                    groups.push((set, vec![b]));
+                }
             }
         }
         drop(branches);
@@ -1531,10 +1557,7 @@ impl Rewriter<'_> {
         // Admit both the first emitted copy of every branch and every wider-group
         // `NOT EXISTS` copy while `groups_held` stays charged for the overlapping
         // temporary `Rendered` state.
-        let mut bytes = names_bytes;
-        if visible_len < names.len() {
-            bytes = bytes.saturating_add(visible_bytes);
-        }
+        let mut bytes = 0usize;
         for (set, group) in &groups {
             bytes = bytes.saturating_add(group.iter().map(Rendered::bytes).sum::<usize>());
             for (s, g) in &groups {
@@ -1568,7 +1591,12 @@ impl Rewriter<'_> {
             });
         }
         drop(groups);
+        drop(groups_held);
         let union = union_of(parts).expect("the rewriting keeps the query it starts from");
+        self.emitted_held
+            .try_merge(&mut names_held)
+            .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
+        drop(names_held);
         // each solution of the pattern's variables and blank nodes once, as matching the
         // stored and derived facts gives it, with the blank nodes then left out
         let mut gp = GraphPattern::Distinct {
@@ -1578,6 +1606,9 @@ impl Rewriter<'_> {
             }),
         };
         if visible_len < bgp.vars.len() {
+            self.emitted_held
+                .try_grow(visible_bytes)
+                .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
             let mut visible = Vec::with_capacity(visible_len);
             visible.extend(bgp.vars.iter().filter_map(|(term, _)| match term {
                 TermPattern::Variable(v) => Some(v.clone()),
@@ -1588,7 +1619,6 @@ impl Rewriter<'_> {
                 variables: visible,
             };
         }
-        drop(groups_held);
         let mut counters = serde_json::Map::new();
         counters.insert("patterns".into(), patterns.len().into());
         counters.insert("branches".into(), n.into());
