@@ -308,7 +308,7 @@ fn shared_live_state_with_large_uncompacted_delta_resolves_within_allowance() {
 #[test]
 fn shared_cached_historical_state_resolves_while_private_replay_still_refuses() {
     // Commit 1 has 50,000 uncompacted delta quads; commit 2
-    //    advances head so commit 1 is historical.
+    // advances head so commit 1 is historical.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
     let c1 = insert_delta_quads(&store, 0, 50_000, false);

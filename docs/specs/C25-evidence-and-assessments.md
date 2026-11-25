@@ -859,10 +859,11 @@ compared byte for byte, including for references refused from their anchor alone
    even when the selected state was the store's shared live snapshot or an already-cached
    historical snapshot, so resolution under the 64 MiB allowance answered
    `incomplete-evidence` past about 32,700 uncompacted writes. Bounded history reads and
-   evidence resolution now charge a shared live or cached snapshot only for its retained
-   4 KiB handle and any non-live sealed generation metadata, while freshly materialized
-   private historical replays still pre-admit and retain the conservative 2 KiB per quad
-   delta charge before allocation. In a release diagnostic,
+   evidence resolution now charge a live snapshot or persistent history-cache hit only for
+   its retained 4 KiB handle and any non-live sealed generation metadata, while in-memory
+   historical snapshots and freshly materialized private historical replays still pre-admit
+   and retain the conservative 2 KiB per quad delta charge before allocation. In a release
+   diagnostic,
    `evidence_resolution_delta_charge_diagnostic`, run on the 8-vCPU, 16-GiB Linux Boat
    worker `bx_z8s55a5v` and not as a benchmark-host result, shared live and cached
    stored-fact resolution across 10,000, 50,000 and 100,000 uncompacted delta quads

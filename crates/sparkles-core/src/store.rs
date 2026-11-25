@@ -3155,8 +3155,9 @@ impl Store {
     }
 
     /// Resolve exactly the requested retained state within a per-read memory cap.
-    /// Index mappings and already-resident shared live or cached deltas remain shared;
-    /// per-request handle overhead and freshly materialized replay buffers consume this cap.
+    /// Live snapshots and persistent history-cache hits pay the 4 KiB handle charge (plus
+    /// any non-live sealed generation metadata), while in-memory historical snapshots and
+    /// freshly materialized private replays pay by delta size.
     pub fn snapshot_at_limited(
         &self,
         at: &crate::history::At,
