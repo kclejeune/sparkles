@@ -7908,15 +7908,15 @@ mod tests {
         };
         let out = Classifier::of(&doc.axioms).classify(&base).unwrap();
         assert!(out.stats.dl_rooted_declined);
-        // the pool refuses a grant of 256 MiB, and the scan's 512 MiB stay within the run's
-        // own budget of at least 1 GiB, so that only the pool stops it
+        // The scan needs 512 MiB. The first case stops at a 256 MiB run budget and
+        // the second stops when the pool refuses a grant of 256 MiB or more.
         let charge: Arc<dyn Fn(usize) -> bool + Send + Sync> = Arc::new(|b| b < 1 << 28);
         for (name, extra, limits) in [
             (
                 "budget",
-                1usize << 40,
+                1 << 29,
                 Limits {
-                    max_memory: Some(1 << 34),
+                    max_memory: Some(1 << 28),
                     ..base.clone()
                 },
             ),

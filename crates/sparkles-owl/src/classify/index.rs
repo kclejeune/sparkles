@@ -3563,24 +3563,36 @@ fn dt_comp(it: &Interner, run: &DtRun, e: Ex) -> Option<u32> {
     }
 }
 
-/// A flat table entry keeps the sorted flag in the padding after the target on 64-bit
-/// platforms. The flag records a sorted, deduplicated vector at high occupancy during
-/// the told-edge scan.
+/// The low bit records a sorted, deduplicated vector at high occupancy during the
+/// told-edge scan. A target indexes `Interner::nodes`, whose backing allocation is
+/// bounded by `isize::MAX` bytes, so even on 32-bit targets it fits in the upper bits.
 struct RefireEntry {
-    target: Ex,
-    sorted: bool,
+    target_and_sorted: usize,
     components: Vec<u32>,
 }
 
-#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<RefireEntry>() == std::mem::size_of::<(Ex, Vec<u32>)>());
+const _: () = assert!(std::mem::size_of::<Node>() > 0);
+
+impl RefireEntry {
+    fn target(&self) -> Ex {
+        (self.target_and_sorted >> 1) as Ex
+    }
+
+    fn sorted(&self) -> bool {
+        self.target_and_sorted & 1 != 0
+    }
+
+    fn set_sorted(&mut self, sorted: bool) {
+        self.target_and_sorted = (self.target_and_sorted & !1) | usize::from(sorted);
+    }
+}
 
 #[derive(Default)]
 pub(super) struct RefireMap {
     table: hashbrown::HashTable<RefireEntry>,
 }
 
-#[cfg(target_pointer_width = "64")]
 const _: () =
     assert!(std::mem::size_of::<RefireMap>() == std::mem::size_of::<FxHashMap<Ex, Vec<u32>>>());
 
@@ -3593,20 +3605,20 @@ impl RefireMap {
 
     pub(super) fn get(&self, target: &Ex) -> Option<&Vec<u32>> {
         self.table
-            .find(Self::hash(*target), |entry| entry.target == *target)
+            .find(Self::hash(*target), |entry| entry.target() == *target)
             .map(|entry| &entry.components)
     }
 
-    /// Inserts a target that is known to be absent.
+    /// Inserts an absent target that indexes the interner's node vector.
     pub(super) fn insert(&mut self, target: Ex, components: Vec<u32>) {
+        debug_assert!(target as usize <= usize::MAX >> 1);
         self.table.insert_unique(
             Self::hash(target),
             RefireEntry {
-                target,
-                sorted: false,
+                target_and_sorted: (target as usize) << 1,
                 components,
             },
-            |entry| Self::hash(entry.target),
+            |entry| Self::hash(entry.target()),
         );
     }
 
@@ -3655,15 +3667,11 @@ fn dt_fires_grow_vec(
     map_charged: usize,
     vec_charged: &mut usize,
 ) -> Result<(), Halt> {
-    let halt_err = |e: super::Error| match e {
-        super::Error::Memory { used, .. } => Halt::Memory(used),
-        _ => Halt::Stopped,
-    };
     let old_bytes = cs.capacity().saturating_mul(std::mem::size_of::<u32>());
     let next_cap = cs.capacity().saturating_mul(2).max(4);
     let next_bytes = next_cap.saturating_mul(std::mem::size_of::<u32>());
     if let Some(g) = refire_guard.as_mut() {
-        g.grow(next_bytes).map_err(halt_err)?;
+        g.grow(next_bytes).map_err(dt_fires_halt)?;
     }
     cs.reserve_exact(next_cap - cs.len());
     let new_bytes = cs.capacity().saturating_mul(std::mem::size_of::<u32>());
@@ -3675,10 +3683,15 @@ fn dt_fires_grow_vec(
         if g.bytes() > target {
             g.shrink(g.bytes() - target);
         } else if target > g.bytes() {
-            g.grow(target - g.bytes()).map_err(halt_err)?;
+            g.grow(target - g.bytes()).map_err(dt_fires_halt)?;
         }
     }
     Ok(())
+}
+
+enum RefireGrowth {
+    Deferred { skipped: bool },
+    Eager,
 }
 
 /// Tells each told subsumer of a body atom whose occurrences are all told its
@@ -3690,11 +3703,37 @@ fn dt_fires(
     b: &Builder,
     told: &mut Vec<(Ex, Ex)>,
 ) -> Result<(RefireMap, Option<super::numeric::ScratchGuard>), Halt> {
-    use super::dtcheck::range::table_growth;
-    let halt_err = |e: super::Error| match e {
+    let mut growth = RefireGrowth::Deferred { skipped: false };
+    let result = dt_fires_attempt(it, run, b, told, &mut growth);
+    if matches!(result, Err(Halt::Memory(_)))
+        && matches!(growth, RefireGrowth::Deferred { skipped: true })
+    {
+        // Deferring growth can change which old and new backings overlap across targets.
+        // The first attempt has released its allocations without publishing markers.
+        // Try the original growth order under the same budget and its already paid peak.
+        if let Some(budget) = &it.ranges.budget {
+            budget.poll().map_err(dt_fires_halt)?;
+        }
+        return dt_fires_attempt(it, run, b, told, &mut RefireGrowth::Eager);
+    }
+    result
+}
+
+fn dt_fires_halt(error: super::Error) -> Halt {
+    match error {
         super::Error::Memory { used, .. } => Halt::Memory(used),
         _ => Halt::Stopped,
-    };
+    }
+}
+
+fn dt_fires_attempt(
+    it: &mut Interner,
+    run: &DtRun,
+    b: &Builder,
+    told: &mut Vec<(Ex, Ex)>,
+    growth: &mut RefireGrowth,
+) -> Result<(RefireMap, Option<super::numeric::ScratchGuard>), Halt> {
+    use super::dtcheck::range::table_growth;
     let n_eligible = b
         .dt_body
         .iter()
@@ -3706,7 +3745,7 @@ fn dt_fires(
     let mut eligible_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
     if let Some(g) = eligible_guard.as_mut() {
         g.grow(n_eligible.saturating_mul(std::mem::size_of::<(Ex, u32)>()))
-            .map_err(halt_err)?;
+            .map_err(dt_fires_halt)?;
     }
     let mut eligible: Vec<(Ex, u32)> = Vec::with_capacity(n_eligible);
     for &e in &b.dt_body {
@@ -3732,11 +3771,12 @@ fn dt_fires(
         };
         let comp = eligible[pos].1;
         let hash = RefireMap::hash(c);
-        let matches_target = |entry: &RefireEntry| entry.target == c;
+        let matches_target = |entry: &RefireEntry| entry.target() == c;
         if refire.table.find(hash, matches_target).is_none() {
-            let growth = table_growth::<RefireEntry>(refire.table.len(), refire.table.capacity());
+            let table_growth =
+                table_growth::<RefireEntry>(refire.table.len(), refire.table.capacity());
             if let Some(g) = refire_guard.as_mut() {
-                g.grow(growth).map_err(halt_err)?;
+                g.grow(table_growth).map_err(dt_fires_halt)?;
             }
             refire.insert(c, Vec::new());
             let new_map_bytes = refire.table_bytes();
@@ -3745,7 +3785,7 @@ fn dt_fires(
                 if g.bytes() > target {
                     g.shrink(g.bytes() - target);
                 } else if target > g.bytes() {
-                    g.grow(target - g.bytes()).map_err(halt_err)?;
+                    g.grow(target - g.bytes()).map_err(dt_fires_halt)?;
                 }
             }
             map_charged = new_map_bytes;
@@ -3754,19 +3794,20 @@ fn dt_fires(
             .table
             .find_mut(hash, matches_target)
             .expect("inserted above");
+        let sorted = entry.sorted();
         let cs = &mut entry.components;
         if cs.last() == Some(&comp) {
             continue;
         }
-        if entry.sorted {
+        if sorted {
             if cs.binary_search(&comp).is_ok() {
                 continue;
             }
             // A genuinely new component is arriving on a high-occupancy sorted list:
             // double capacity to establish proportional headroom before leaving sorted mode.
             dt_fires_grow_vec(cs, &mut refire_guard, map_charged, &mut vec_charged)?;
-            entry.sorted = false;
             cs.push(comp);
+            entry.set_sorted(false);
             continue;
         }
         if cs.len() == cs.capacity() {
@@ -3775,19 +3816,23 @@ fn dt_fires(
                 dt_fires_record_compaction(cs.len());
                 cs.sort_unstable();
                 cs.dedup();
-                if cs.binary_search(&comp).is_ok() {
-                    if cs.len() == cs.capacity()
-                        || cs.len().saturating_mul(4) > cs.capacity().saturating_mul(3)
-                    {
-                        entry.sorted = true;
-                    }
-                    continue;
-                }
             }
-            if cs.len() == cs.capacity()
-                || cs.len().saturating_mul(4) > cs.capacity().saturating_mul(3)
+            let dense = cs.len() == cs.capacity()
+                || cs.len().saturating_mul(4) > cs.capacity().saturating_mul(3);
+            let duplicate = cs.binary_search(&comp).is_ok();
+            if dense
+                && duplicate
+                && let RefireGrowth::Deferred { skipped } = growth
             {
+                entry.set_sorted(true);
+                *skipped = true;
+                continue;
+            }
+            if dense {
                 dt_fires_grow_vec(cs, &mut refire_guard, map_charged, &mut vec_charged)?;
+            }
+            if duplicate {
+                continue;
             }
         }
         cs.push(comp);
@@ -3795,7 +3840,7 @@ fn dt_fires(
     drop(eligible);
     drop(eligible_guard);
     for entry in &mut refire.table {
-        if !entry.sorted {
+        if !entry.sorted() {
             entry.components.sort_unstable();
             entry.components.dedup();
         }
@@ -3803,10 +3848,10 @@ fn dt_fires(
     let mut ts_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
     if let Some(g) = ts_guard.as_mut() {
         g.grow(refire.table.len().saturating_mul(std::mem::size_of::<Ex>()))
-            .map_err(halt_err)?;
+            .map_err(dt_fires_halt)?;
     }
     let mut ts: Vec<Ex> = Vec::with_capacity(refire.table.len());
-    ts.extend(refire.table.iter().map(|entry| entry.target));
+    ts.extend(refire.table.iter().map(RefireEntry::target));
     ts.sort_unstable();
     for t in ts {
         let f = it.node(Node::DtFire(t));
@@ -5368,6 +5413,163 @@ mod minimal_roles_tests {
     }
 
     #[test]
+    fn dt_fires_single_target_fits_under_prior_peak() {
+        dt_fires_at_prior_peak(&[1], &[], 4, 4);
+    }
+
+    #[test]
+    fn dt_fires_reversed_growth_fits_under_prior_peak() {
+        // A and B used to grow on their duplicate edges, in that order. The fresh
+        // components come in the opposite order, which needs 512 slots if both
+        // growths are deferred. The prior growth order peaks at 448.
+        dt_fires_at_prior_peak(&[128, 64], &[(1, 64), (0, 128)], 448, 384);
+    }
+
+    fn dt_fires_at_prior_peak(
+        distinct: &[usize],
+        appends: &[(usize, usize)],
+        peak_slots: usize,
+        retained_slots: usize,
+    ) {
+        use super::super::Limits;
+        use super::super::dtcheck::{
+            atoms::{DtKey, DtRun, Stop},
+            comp::Comps,
+            range::{Defs, Ranges as DtRanges, map_buckets_for},
+        };
+        use super::super::numeric::Budget;
+        use super::{Builder, Ex, Halt, Interner, Node, RoleName, dt_fires};
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty, DataRange, Datatype};
+        use crate::vocab;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let n_props = distinct[0] + usize::from(!appends.is_empty());
+        let props: Vec<_> = (0..n_props)
+            .map(|i| DataProperty::new(format!("urn:dt:PriorCapP{i}")))
+            .collect();
+        let axioms: Vec<_> = props
+            .iter()
+            .map(|dp| {
+                AxiomKind::SubClassOf(
+                    ClassExpression::Class(Class::new("urn:dt:PriorCapBody")),
+                    ClassExpression::DataAllValuesFrom(
+                        vec![dp.clone()],
+                        DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+                    ),
+                )
+            })
+            .collect();
+        let refs: Vec<_> = axioms.iter().collect();
+        let run = DtRun {
+            comps: Comps::of(&refs, &Defs::default(), &|| false).expect("checker components"),
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: None,
+            stopped: None,
+        };
+        let mut it = Interner::new();
+        let targets: Vec<_> = (0..distinct.len())
+            .map(|i| it.class(&Class::new(format!("urn:dt:PriorCapT{i}"))))
+            .collect();
+        let mut b = Builder::default();
+        let mut atoms: Vec<_> = props
+            .iter()
+            .map(|dp| {
+                let role = it.role(RoleName::Data(dp.clone()));
+                let id = it.dt.id(DtKey {
+                    role,
+                    at_least: true,
+                    n: 1,
+                    range: DtRanges::FULL,
+                });
+                (
+                    run.comps.component(dp).expect("component"),
+                    role,
+                    it.node(Node::DtAtom(id)),
+                )
+            })
+            .collect();
+        atoms.sort_unstable();
+        b.dt_body.extend(atoms.iter().map(|&(_, _, atom)| atom));
+        let mut told = Vec::new();
+        for (&target, &n) in targets.iter().zip(distinct) {
+            told.extend(atoms[..n].iter().map(|&(_, _, atom)| (atom, target)));
+        }
+        if !appends.is_empty() {
+            let duplicate = it.dt.id(DtKey {
+                role: atoms[0].1,
+                at_least: true,
+                n: 2,
+                range: DtRanges::FULL,
+            });
+            let duplicate = it.node(Node::DtAtom(duplicate));
+            b.dt_body.push(duplicate);
+            told.extend(targets.iter().map(|&target| (duplicate, target)));
+            b.told
+                .extend(appends.iter().map(|&(t, c)| (atoms[c].2, targets[t])));
+        }
+        let eligible_bytes = b.dt_body.len() * std::mem::size_of::<(Ex, u32)>();
+        let map_bytes =
+            map_buckets_for(targets.len()) * (std::mem::size_of::<(Ex, Vec<u32>)>() + 1) + 16;
+        let cap = eligible_bytes + map_bytes + peak_slots * std::mem::size_of::<u32>();
+        let retained = map_bytes + retained_slots * std::mem::size_of::<u32>();
+        let n_told = told.len();
+        let pooled_bytes = Arc::new(AtomicUsize::new(0));
+        let pooled = pooled_bytes.clone();
+        let pool_limit = Limits {
+            charge: Some(Arc::new(move |more| {
+                pooled
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |paid| {
+                        paid.checked_add(more).filter(|&total| total <= cap)
+                    })
+                    .is_ok()
+            })),
+            ..Limits::default()
+        };
+        let capped = |limit| Limits {
+            max_memory: Some(limit),
+            ..Limits::default()
+        };
+        for limits in [capped(cap - 1), capped(cap), pool_limit] {
+            let n_nodes = it.nodes.len();
+            let budget = Budget::new(&limits, 0, None);
+            it.ranges.begin(budget.clone());
+            let result = dt_fires(&mut it, &run, &b, &mut told);
+            if limits.max_memory == Some(cap - 1) {
+                assert!(matches!(result, Err(Halt::Memory(_))));
+                assert_eq!(it.nodes.len(), n_nodes);
+                assert_eq!(told.len(), n_told);
+            } else {
+                let (refire, guard) = result.expect("prior peak must fit");
+                assert_eq!(budget.peak(), cap);
+                assert_eq!(budget.retained_storage().1, retained);
+                assert_eq!(guard.as_ref().expect("refire guard").bytes(), retained);
+                let markers = &told[n_told..];
+                assert_eq!(markers.len(), targets.len());
+                for ((&target, &n), &(from, to)) in targets.iter().zip(distinct).zip(markers) {
+                    let cs = refire.get(&target).expect("target refire");
+                    let len = n + usize::from(!appends.is_empty());
+                    assert!(
+                        cs.iter()
+                            .copied()
+                            .eq(atoms[..len].iter().map(|&(c, _, _)| c))
+                    );
+                    assert_eq!(cs.capacity(), (2 * n).max(4));
+                    assert_eq!(
+                        (from, it.nodes[to as usize]),
+                        (target, Node::DtFire(target))
+                    );
+                }
+            }
+            it.ranges.end();
+            assert_eq!(budget.retained_storage().1, 0);
+            told.truncate(n_told);
+        }
+        assert_eq!(pooled_bytes.load(Ordering::Relaxed), cap);
+    }
+
+    #[test]
     fn dt_fires_two_full_targets_fit_under_prior_peak() {
         use super::super::Limits;
         use super::super::dtcheck::{
@@ -5667,7 +5869,7 @@ mod minimal_roles_tests {
             told2.push((e, t1));
         }
         let eligible2_bytes = b2.dt_body.len() * std::mem::size_of::<(Ex, u32)>();
-        let map2_bytes = map_buckets_for(2) * (std::mem::size_of::<super::RefireEntry>() + 1) + 16;
+        let map2_bytes = map_buckets_for(2) * (std::mem::size_of::<(Ex, Vec<u32>)>() + 1) + 16;
         let peak2 = eligible2_bytes + map2_bytes + 5 * m * std::mem::size_of::<u32>();
         let cap2 = Budget::new(
             &Limits {

@@ -1686,24 +1686,28 @@ mod tests {
         }
         let mut body: Vec<Vec<Body>> = (0..256).map(|_| Vec::new()).collect();
         body[0].reserve(512);
+        let refire_bytes = map_buckets_for(897) * (std::mem::size_of::<(Ex, Vec<u32>)>() + 1)
+            + 16
+            + 897 * std::mem::size_of::<u32>();
         let expected_min = std::mem::size_of::<DtIx>()
             + map_backing_bytes(&roles)
             + body.capacity() * std::mem::size_of::<Vec<Body>>()
             + body[0].capacity() * std::mem::size_of::<Body>()
-            + map_buckets_for(897) * (std::mem::size_of::<(Ex, Vec<u32>)>() + 1)
-            + 16
-            + 897 * std::mem::size_of::<u32>()
+            + refire_bytes
             + 256; // sticky
         // Build `DtIx` with `body.len() == 256`; `sticky` has length `comps.len()`.
-        let dt = DtIx::new(
+        let mut dt = DtIx::new(
             Vec::new(),
             roles,
             body,
             Vec::new(),
             Ranges::new(),
             Comps::default(),
-            refire,
+            RefireMap::default(),
         );
+        let without_refire = dt.bytes();
+        dt.refire = refire;
+        assert_eq!(dt.bytes() - without_refire, refire_bytes);
         // Reserve 256 bytes in `sticky` to mirror 256 components.
         dt.sticky.lock().resize(256, FINE);
         assert!(
