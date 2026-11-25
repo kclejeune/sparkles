@@ -943,8 +943,10 @@ fn partial_memory_pool_and_taxonomy_refusals_preserve_tier_and_reuse() {
          SubClassOf(:B :D)\n\
          SubClassOf(:C :D)\n",
     );
-    for i in 0..160 {
-        tax_src.push_str(&format!("SubClassOf(:T{i} :T{})\n", i + 1));
+    for i in 0..250 {
+        tax_src.push_str(&format!(
+            "SubClassOf(:TaxonomyPaddingClass_{i:04}_RefusalCheck :TaxTop)\n"
+        ));
     }
     let tax_ax = axioms(&tax_src);
     let tax_cs = classes(&tax_ax);

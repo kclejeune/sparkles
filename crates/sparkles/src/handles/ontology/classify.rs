@@ -916,8 +916,8 @@ fn run(
             ..limits.clone()
         };
         let mut out = k.classify(axioms, changes, &limits)?;
-        let witness = out.cover(axioms, k.excluded(), dropped, &limits);
-        out.leave_out_unmapped(unmapped());
+        let witness = out.cover_admitted(axioms, k.excluded(), dropped, &limits)?;
+        out.leave_out_unmapped_admitted(unmapped(), &limits)?;
         Ok((out, witness))
     })
 }

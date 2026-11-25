@@ -71,12 +71,17 @@ fn table_layout_bytes(buckets: usize, entry_size: usize) -> Option<usize> {
 }
 
 /// Exact heap allocation size of a `FxHashMap`/`FxHashSet` with `capacity` slots of
+/// `entry_size` bytes, returning `None` on arithmetic overflow.
+#[inline]
+pub(super) fn checked_hash_table_bytes(capacity: usize, entry_size: usize) -> Option<usize> {
+    hash_buckets(capacity).and_then(|b| table_layout_bytes(b, entry_size))
+}
+
+/// Exact heap allocation size of a `FxHashMap`/`FxHashSet` with `capacity` slots of
 /// `entry_size` bytes.
 #[inline]
 pub(super) fn hash_table_bytes(capacity: usize, entry_size: usize) -> usize {
-    hash_buckets(capacity)
-        .and_then(|b| table_layout_bytes(b, entry_size))
-        .unwrap_or(usize::MAX)
+    checked_hash_table_bytes(capacity, entry_size).unwrap_or(usize::MAX)
 }
 
 /// Allocation size of the next hashbrown table when a table at `capacity` rehashes.

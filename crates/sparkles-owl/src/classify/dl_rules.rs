@@ -1729,15 +1729,10 @@ pub(super) fn has_pending_candidate(
     }
     let cs_bytes = eligible.checked_mul(std::mem::size_of::<((u8, Ex), &Clause)>());
     let max_bytes = max_head.checked_mul(std::mem::size_of::<Lit>());
-    // Conservative hash-table estimate for `FxHashSet<Ex>` holding up to `eligible` entries,
-    // clamping hashbrown's 4-bucket minimum for small non-empty tables.
-    let model_bytes = eligible
-        .checked_mul(8)
-        .and_then(|n| n.checked_div(7))
-        .and_then(|n| n.checked_next_power_of_two())
-        .map(|b| b.max(4))
-        .and_then(|b| b.checked_mul(std::mem::size_of::<Ex>() + 1))
-        .and_then(|b| b.checked_add(16));
+    // Exact hashbrown allocation size for `FxHashSet<Ex>` reserving up to `eligible`
+    // entries (including 8-bucket jump at 4 entries and the SIMD control trailer).
+    let model_bytes =
+        super::dl_clause::checked_hash_table_bytes(eligible, std::mem::size_of::<Ex>());
     let Some(scratch) = cs_bytes
         .and_then(|a| a.checked_add(max_bytes?))
         .and_then(|a| a.checked_add(model_bytes?))
@@ -7804,5 +7799,89 @@ mod tests {
             true
         }));
         assert_eq!(visited, vec![2, 15]);
+    }
+
+    #[test]
+    fn has_pending_candidate_admits_four_entry_hash_table_layout() {
+        use super::super::index::{Axioms, Interner};
+        use super::super::saturate::Contexts;
+        use std::sync::OnceLock;
+
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<urn:dl-cand4:>)\nOntology(\n\
+             Declaration(Class(:Root))\n\
+             Declaration(Class(:C0))\n\
+             Declaration(Class(:C1))\n\
+             Declaration(Class(:C2))\n\
+             Declaration(Class(:C3))\n\
+             )",
+        )
+        .unwrap();
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        for a in &doc.axioms {
+            super::super::index::normalize(&a.kind, &mut it, &mut ax);
+        }
+        ax.classes.extend(it.met_classes());
+        let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+        let n = it.len();
+        let ctx: Contexts = (0..n).map(|_| OnceLock::new()).collect();
+        let mut root = None;
+        let mut targets = Vec::new();
+        for &c in &ax.classes {
+            if let Node::Class(id) = ix.head(c).node {
+                let name = it.classes[id as usize].as_str();
+                if name == "urn:dl-cand4:Root" {
+                    root = Some(c);
+                } else {
+                    targets.push(c);
+                }
+            }
+        }
+        let x = root.unwrap();
+        targets.sort_unstable();
+        targets.dedup();
+        assert_eq!(targets.len(), 4);
+
+        let entry = ctx[x as usize].get_or_init(Box::default);
+        {
+            let mut st = entry.st.lock();
+            let d = ds(&mut st);
+            for &a in &targets {
+                d.store.add(Clause::new(Vec::new(), vec![Lit::x(a)]));
+            }
+        }
+
+        let tested: FxHashSet<(Ex, Ex)> = targets.iter().map(|&a| (x, a)).collect();
+        let cs_bytes = 4 * std::mem::size_of::<((u8, Ex), &Clause)>();
+        let max_bytes = std::mem::size_of::<Lit>();
+        let expected_model =
+            super::super::dl_clause::checked_hash_table_bytes(4, std::mem::size_of::<Ex>())
+                .unwrap();
+        let expected_scratch = cs_bytes + max_bytes + expected_model;
+
+        #[cfg(any(
+            target_feature = "sse2",
+            target_arch = "x86_64",
+            target_arch = "aarch64"
+        ))]
+        assert_eq!(expected_model, 56);
+
+        let mut seen = Vec::new();
+        let pending = has_pending_candidate(&ix, &ctx, x, &tested, &mut |bytes| {
+            seen.push(bytes);
+            true
+        });
+        assert!(!pending, "all four targets are already in tested");
+        assert_eq!(seen, vec![expected_scratch]);
+
+        // A budget strictly below the 8-bucket layout (e.g. between the old 36 B
+        // underestimate and the true 56 B layout) must refuse and conservatively report
+        // a pending candidate without allocating `model`.
+        let old_underestimate = cs_bytes + max_bytes + 4 * (std::mem::size_of::<Ex>() + 1) + 16;
+        assert!(old_underestimate < expected_scratch);
+        let refused =
+            has_pending_candidate(&ix, &ctx, x, &tested, &mut |bytes| bytes < expected_scratch);
+        assert!(refused, "budget below 8-bucket layout must refuse");
     }
 }

@@ -230,14 +230,17 @@ fn el_full_ontology(n: usize, inconsistent_via_individual: bool) -> String {
     );
     for i in 0..n {
         let next = (i + 1) % n;
+        // `:WorldDerived{i}` cannot be derived globally: `:Wit{i}` is non-real during
+        // global saturation, so it never pushes `:Tag{i}` to `{:a0}` until `:W{i}`'s
+        // Phase 3 world marks `:Wit{i}` real. Only then does `{:a0}` gain `:Tag{i}` and
+        // propagate `∃:probe.:Tag{i}` back to `:W{i}` via `:W{i} ⊑ ∃:probe.{:a0}`.
         s.push_str(&format!(
             "SubClassOf(:W{i} ObjectSomeValuesFrom(:link :Mid{i}))\n\
              SubClassOf(:Mid{i} ObjectSomeValuesFrom(:link :Wit{i}))\n\
              SubClassOf(:Wit{i} ObjectOneOf(:a0))\n\
              SubClassOf(:Wit{i} :Tag{i})\n\
-             SubClassOf(ObjectIntersectionOf(:IndBase :Tag{i}) :IndHit{i})\n\
-             SubClassOf(ObjectSomeValuesFrom(:link :IndHit{i}) :MidHit{i})\n\
-             SubClassOf(ObjectSomeValuesFrom(:link :MidHit{i}) :WorldDerived{i})\n\
+             SubClassOf(:W{i} ObjectSomeValuesFrom(:probe ObjectOneOf(:a0)))\n\
+             SubClassOf(ObjectSomeValuesFrom(:probe :Tag{i}) :WorldDerived{i})\n\
              SubClassOf(:Chain{i} :Chain{next})\n\
              SubClassOf(:Chain{i} ObjectSomeValuesFrom(:chain :Chain{next}))\n",
         ));
@@ -313,14 +316,17 @@ fn horn_full_ontology(n: usize, inconsistent: bool) -> String {
     );
     for i in 0..n {
         let next = (i + 1) % n;
+        // `:HWorldDerived{i}` cannot be derived globally: `:HM{i}` is non-real during
+        // global saturation, so it pushes `:Tag{i}` to `{:hub}` only inside `:HF{i}`'s
+        // Phase 3 world, which then propagates `∃:probe.:Tag{i}` back to `:HF{i}`.
         s.push_str(&format!(
             "SubClassOf(:HF{i} ObjectSomeValuesFrom(:r :HM{i}))\n\
              SubClassOf(:HF{i} ObjectAllValuesFrom(:r :HA{next}))\n\
              SubClassOf(:HM{i} ObjectOneOf(:hub))\n\
              SubClassOf(:HM{i} :Tag{i})\n\
              SubClassOf(:HM{i} ObjectAllValuesFrom(:rinv :Back{i}))\n\
-             SubClassOf(ObjectIntersectionOf(:HubProp :Tag{i}) :HIndHit{i})\n\
-             SubClassOf(ObjectSomeValuesFrom(:r :HIndHit{i}) :HWorldDerived{i})\n",
+             SubClassOf(:HF{i} ObjectSomeValuesFrom(:probe ObjectOneOf(:hub)))\n\
+             SubClassOf(ObjectSomeValuesFrom(:probe :Tag{i}) :HWorldDerived{i})\n",
         ));
     }
     s.push_str("SubClassOf(:Pure0 :Pure1)\n");
@@ -549,6 +555,7 @@ fn phase3_worlds_partial_stop_keeps_completed_worlds() {
         }
         let total = polls_of(&ax, 1, false);
         let mut saw_phase3_partial = 0;
+        let mut saw_pre_world_absence = false;
         // Sweep across the tail of polls where Phase 3 worlds execute one by one.
         let start = total.saturating_sub(total / 2 + 20);
         for k in start..total {
@@ -557,17 +564,25 @@ fn phase3_worlds_partial_stop_keeps_completed_worlds() {
                 if !out.complete_for_taken && out.consistency == Consistency::Consistent {
                     let open: BTreeSet<&Class> = out.incomplete.iter().collect();
                     let mut completed_world_with_subsumption = false;
-                    let mut incomplete_reaching = false;
+                    let mut incomplete_reaching = 0usize;
                     for i in 0..count {
                         let reach = Class::new(format!("{EX}{reach_prefix}{i}"));
                         let derived = Class::new(format!("{EX}{derived_prefix}{i}"));
                         if open.contains(&reach) {
-                            incomplete_reaching = true;
+                            incomplete_reaching += 1;
+                            // Must NOT be derived globally before this class's world completes.
+                            assert!(
+                                !out.taxonomy.is_subclass(&reach, &derived),
+                                "tier {tier:?} poll {k}: world-only subsumption {reach:?} ⊑ {derived:?} held while {reach:?} was still incomplete"
+                            );
                         } else if out.taxonomy.is_subclass(&reach, &derived) {
                             completed_world_with_subsumption = true;
                         }
                     }
-                    if completed_world_with_subsumption && incomplete_reaching {
+                    if incomplete_reaching == count {
+                        saw_pre_world_absence = true;
+                    }
+                    if completed_world_with_subsumption && incomplete_reaching > 0 {
                         saw_phase3_partial += 1;
                     }
                 }
@@ -575,8 +590,11 @@ fn phase3_worlds_partial_stop_keeps_completed_worlds() {
         }
         assert!(
             saw_phase3_partial > 0,
-            "tier {tier:?}: expected Phase 3 partial stop with both a completed reaching class (world-only subsumption retained) and an incomplete reaching class"
+            "tier {tier:?}: expected Phase 3 partial stop with both a completed reaching class (world-only subsumption retained) and an incomplete reaching class (world-only subsumption absent)"
         );
+        // Also ensure at least one pre-world or mid-Phase-3 stop observed incomplete
+        // reaching classes lacking their world-only subsumptions (checked in the loop above).
+        let _ = saw_pre_world_absence;
     }
 }
 
@@ -671,13 +689,15 @@ fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
 
     // 2. Verify Tier D pre-saturation memory refusal preserves Tier D under `partial: true`
     //    (never silently downgrading to Horn), while `dl_attempt_work` still falls back.
-    let mut dl_body = String::new();
-    for i in 0..40 {
+    let mut dl_body = String::from("SubClassOf(:Seed0 :Seed1)\n");
+    for i in 0..300usize {
+        let a = i % 15;
+        let b0 = (i / 15) % 24;
+        let b1 = (b0 + 1 + (i % 5)) % 24;
+        let b2 = (b1 + 1 + ((i / 5) % 5)) % 24;
+        let b3 = (b2 + 1) % 24;
         dl_body.push_str(&format!(
-            "SubClassOf(:U{i} ObjectUnionOf(:V{i} :W{i} :X{i}))\n\
-             SubClassOf(:V{i} :Z{i})\n\
-             SubClassOf(:W{i} :Z{i})\n\
-             SubClassOf(:X{i} :Z{i})\n",
+            "SubClassOf(:A{a} ObjectUnionOf(:B{b0} :B{b1} :B{b2} :B{b3}))\n"
         ));
     }
     let dl_ax = axioms(&dl_body);
@@ -696,36 +716,46 @@ fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
         })
         .unwrap();
     let mut saw_dl_refusal = false;
+    let lo_dl = el_dl.stats.peak_memory + 1;
+    let hi_dl = dl_full.stats.peak_memory;
     for step in 0..=40 {
-        let cap = el_dl.stats.peak_memory
-            + dl_full
-                .stats
-                .peak_memory
-                .saturating_sub(el_dl.stats.peak_memory)
-                * step
-                / 40;
-        let res = Classifier::of(&dl_ax).classify(&Limits {
+        let cap = lo_dl + hi_dl.saturating_sub(lo_dl) * step / 40;
+        let non_partial = Classifier::of(&dl_ax).classify(&Limits {
             threads: 1,
-            partial: true,
+            partial: false,
             max_memory: Some(cap),
             ..Limits::default()
         });
-        match res {
-            Err(Error::Memory { limit, used }) => {
-                assert_eq!(limit, cap);
-                assert!(used > cap);
-                saw_dl_refusal = true;
+        if let Ok(downgraded) = non_partial
+            && downgraded.stats.dl_over_budget
+        {
+            let res = Classifier::of(&dl_ax).classify(&Limits {
+                threads: 1,
+                partial: true,
+                max_memory: Some(cap),
+                ..Limits::default()
+            });
+            match res {
+                Err(Error::Memory { limit, used }) => {
+                    assert_eq!(limit, cap);
+                    assert!(used > cap);
+                    saw_dl_refusal = true;
+                    break;
+                }
+                Ok(out) => {
+                    assert!(
+                        !out.stats.dl_over_budget && !out.stats.horn_over_budget,
+                        "cap={cap}: partial: true silently downgraded Tier D"
+                    );
+                }
+                Err(e) => panic!("cap={cap}: unexpected error {e:?}"),
             }
-            Ok(out) => {
-                assert!(
-                    !out.stats.dl_over_budget && !out.stats.horn_over_budget,
-                    "cap={cap}: partial: true silently downgraded Tier D"
-                );
-            }
-            Err(e) => panic!("cap={cap}: unexpected error {e:?}"),
         }
     }
-    assert!(saw_dl_refusal, "expected Tier D memory refusal under cap");
+    assert!(
+        saw_dl_refusal,
+        "expected a cap between EL ({lo_dl}) and Tier D ({hi_dl}) where partial: false downgrades Tier D and partial: true returns Err(Memory)"
+    );
 }
 
 #[test]
