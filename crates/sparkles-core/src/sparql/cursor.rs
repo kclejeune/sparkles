@@ -630,7 +630,7 @@ impl QueryBatch {
 
     /// The terms of [`QueryBatch::decoded`] without the borrow of the batch, so that
     /// another thread can build them while the writer serializes the batch before it.
-    pub(super) fn term_cache(&self) -> Result<Option<TermCache>> {
+    pub(in crate::sparql) fn term_cache(&self) -> Result<Option<TermCache>> {
         match TermCache::new(self) {
             Ok(cache) => Ok(Some(cache)),
             Err(Error::BudgetExceeded(b)) if b.kind == crate::error::BudgetKind::Memory => Ok(None),
@@ -641,14 +641,14 @@ impl QueryBatch {
 
 /// The smallest step in which a decoded batch reserves memory for its terms.
 const TERM_RESERVE: u64 = 64 << 10;
-pub(super) struct DecodedBatch<'a> {
+pub(in crate::sparql) struct DecodedBatch<'a> {
     batch: &'a QueryBatch,
     cache: TermCache,
 }
 
 /// The decoded base-vocabulary terms of one batch, each decoded once in key order, and
 /// the term of each cell. It holds its reservation until it is dropped.
-pub(super) struct TermCache {
+pub(in crate::sparql) struct TermCache {
     terms: Vec<Term>,
     slots: Vec<u32>,
     _charge: OwnedCharge,
@@ -753,8 +753,13 @@ impl TermCache {
 
 impl<'a> DecodedBatch<'a> {
     /// A batch with the terms that [`QueryBatch::term_cache`] built for it.
-    pub(super) fn new(batch: &'a QueryBatch, cache: TermCache) -> Self {
+    pub(in crate::sparql) fn new(batch: &'a QueryBatch, cache: TermCache) -> Self {
         Self { batch, cache }
+    }
+
+    /// Recover the owned term cache so a paused batch can move to another thread.
+    pub(in crate::sparql) fn into_cache(self) -> TermCache {
+        self.cache
     }
 
     fn cached(&self, row: usize, column: usize) -> Option<&Term> {
@@ -2228,7 +2233,10 @@ impl QueryCursor {
         Ok(remaining)
     }
 
-    pub(super) fn next_batch_at_most(&mut self, rows: usize) -> Result<Option<QueryBatch>> {
+    pub(in crate::sparql) fn next_batch_at_most(
+        &mut self,
+        rows: usize,
+    ) -> Result<Option<QueryBatch>> {
         let previous_emitted = self.emitted;
         if self.shared && self.status == CursorStatus::Open {
             let began = Instant::now();

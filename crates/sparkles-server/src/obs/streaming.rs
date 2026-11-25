@@ -1,8 +1,8 @@
 //! Complete a cursor request once both its producer and response body terminate.
 
 use super::{Outcome, Pending, RequestReport};
-use axum::body::{Body, BodyDataStream, Bytes};
-use futures_util::Stream;
+use axum::body::{Body, Bytes};
+use http_body::{Body as _, Frame};
 use parking_lot::Mutex;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -86,8 +86,9 @@ impl DeferredReport {
     }
 
     pub(super) fn wrap(&self, body: Body) -> Body {
-        Body::from_stream(ObservedBody {
-            inner: body.into_data_stream(),
+        Body::new(ObservedBody {
+            remaining: body.size_hint().exact(),
+            inner: body,
             report: self.clone(),
             ended: false,
         })
@@ -95,20 +96,36 @@ impl DeferredReport {
 }
 
 struct ObservedBody {
-    inner: BodyDataStream,
+    inner: Body,
     report: DeferredReport,
+    /// The data bytes remaining when the inner body advertises an exact length.
+    remaining: Option<u64>,
     ended: bool,
 }
 
-impl Stream for ObservedBody {
-    type Item = Result<Bytes, axum::Error>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+impl http_body::Body for ObservedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
         if this.ended {
             return Poll::Ready(None);
         }
-        let result = Pin::new(&mut this.inner).poll_next(cx);
+        let result = Pin::new(&mut this.inner).poll_frame(cx);
         match &result {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let (Some(remaining), Some(data)) = (this.remaining, frame.data_ref()) {
+                    this.remaining = remaining.checked_sub(data.len() as u64);
+                }
+                if this.inner.is_end_stream() {
+                    this.ended = true;
+                    this.report.body_done(BodyEnd::Complete);
+                }
+            }
             Poll::Ready(None) => {
                 this.ended = true;
                 this.report.body_done(BodyEnd::Complete);
@@ -121,12 +138,27 @@ impl Stream for ObservedBody {
         }
         result
     }
+
+    fn is_end_stream(&self) -> bool {
+        self.ended || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 impl Drop for ObservedBody {
     fn drop(&mut self) {
         if !self.ended {
-            self.report.body_done(BodyEnd::Dropped);
+            // Hyper can skip polling an empty body or stop once it has taken all
+            // bytes advertised by a fixed-length body.
+            let end = if self.inner.is_end_stream() || self.remaining == Some(0) {
+                BodyEnd::Complete
+            } else {
+                BodyEnd::Dropped
+            };
+            self.report.body_done(end);
         }
     }
 }

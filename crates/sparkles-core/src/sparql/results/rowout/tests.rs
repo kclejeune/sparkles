@@ -183,21 +183,45 @@ fn late_marks_count_by_where_their_bytes_are() {
     assert_eq!(ledger.start(), 0);
     ledger.reserve_pending(2);
     // a mark not yet copied waits, one copied waits for the send, one sent counts at once
-    ledger.register(0, [(10, 1)].into_iter());
+    ledger.register(0, &[(10, 1)], None).unwrap();
     ledger.copied(20);
-    ledger.register(0, [(15, 2), (25, 1)].into_iter());
+    ledger.register(0, &[(15, 2), (25, 1)], None).unwrap();
     assert_eq!(ledger.delivered(), Some(0));
     ledger.handed_over(20);
     assert_eq!(ledger.delivered(), Some(3));
-    ledger.register(0, [(18, 4)].into_iter());
+    ledger.register(0, &[(18, 4)], None).unwrap();
     assert_eq!(ledger.delivered(), Some(7));
     // a copy that reaches a pending mark moves it to the buffer, and a lost buffer never
     // counts it
     ledger.copied(30);
-    ledger.register(0, std::iter::empty());
+    ledger.register(0, &[], None).unwrap();
     assert_eq!(ledger.delivered(), Some(7));
     ledger.handed_over(30);
     assert_eq!(ledger.delivered(), Some(8));
+}
+
+#[test]
+fn split_prefix_keeps_charged_marks_until_each_frame_enqueues() {
+    let result = small_answer();
+    let ctx = result.test_context();
+    let before = room(ctx);
+    let ledger = RowLedger::with_split_prefix(10);
+    assert_eq!(ledger.start(), 0);
+    ledger.reserve_pending(4);
+    ledger
+        .register(0, &[(10, 1), (15, 2), (25, 4), (35, 8)], Some(ctx))
+        .unwrap();
+    ledger.copied(30);
+    ledger.settle();
+    assert!(room(ctx) < before, "the copied suffix retains its charge");
+
+    ledger.handed_over(10);
+    assert_eq!(ledger.delivered(), Some(1));
+    ledger.handed_over(20);
+    assert_eq!(ledger.delivered(), Some(3));
+    ledger.handed_over(30);
+    assert_eq!(ledger.delivered(), Some(7));
+    assert_eq!(room(ctx), before);
 }
 
 #[test]

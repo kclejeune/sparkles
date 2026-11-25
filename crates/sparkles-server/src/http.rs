@@ -1510,6 +1510,15 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
     caller::request_options(st, ds, params)
 }
 
+#[cfg(test)]
+pub(super) fn query_options_for_test(st: &AppState, ds: &Dataset) -> (QueryOptions, CancelOnDrop) {
+    let params = Params(Vec::new());
+    let mut options = query_options(st, ds, &params);
+    let (cancel, guard) = cancel_on_drop();
+    options.cancel = Some(cancel);
+    (options, guard)
+}
+
 /// The reasoning mode a request's `reasoning` parameter names. An unknown value reads
 /// the dataset's materialized inferences, `false` reads the asserted data alone, and an
 /// absent value is the dataset's query-time default (spec F17 §2.2), which is
@@ -1997,46 +2006,65 @@ pub(crate) async fn run_query(
     let auto = auto
         && !trial
         && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
-    // the error body of the Sparkles format carries the plan as far as it ran
-    let failed_plan = sfmt == SolutionsFormat::Sparkles;
-    let run = {
-        let ds = ds.clone();
-        let claim = claim.clone();
-        move || {
-            let _claim = claim;
-            let t = std::time::Instant::now();
-            let t0 = crate::otel::start();
-            let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
-            let seq = snap.commit;
-            let automatic = |snap, opts: &sparkles::sparql::QueryOptions| {
-                sparkles::sparql::query_execution_with_plan(
-                    snap,
-                    &query,
-                    opts,
-                    &Default::default(),
-                    sparkles::sparql::ExecutionMode::Auto,
-                )
-                .map(|execution| match execution {
-                    sparkles::sparql::QueryExecution::Eager(r) => Ran::Eager(r.into_result()),
-                    cursor => Ran::Cursor(Box::new(cursor)),
-                })
-            };
-            let ran = if auto {
-                automatic(snap, &opts)
-            } else if trial {
-                // An eager trial that outgrows its memory budget runs again with automatic
-                // execution, as an eager run that automatic execution chose would, and its
-                // text is not tried eagerly again. The two runs count as one request: they
-                // share one deadline, one count of rows produced and one outbound budget.
-                let shared = one_request(&opts);
-                match sparkles::sparql::query_with_plan(snap.clone(), &query, &shared) {
-                    Err(f) if outgrew_memory(&f.error) => {
-                        QUICK.record_eager_failure(quick_key);
-                        automatic(snap, &shared)
-                    }
-                    ran => ran.map(Ran::Eager),
-                }
-            } else {
+    #[cfg(test)]
+    let force_pool = {
+        let probe = algo::probe::current();
+        probe.completion.is_some() || probe.after_write.is_some()
+    };
+    #[cfg(not(test))]
+    let force_pool = false;
+    let (r, seq, resolved, t0, _began, cancel_guard, prefixes) = if auto || trial {
+        let native_graph = params_wants_sparkles(&headers);
+        let auto_req = cursor::AutoRequest {
+            timeouts: stream_timeouts(&st),
+            query,
+            options: opts,
+            at,
+            params: &params,
+            uri: &uri,
+            guard: _cancel_on_drop,
+            limit,
+            format: sfmt,
+            thrift,
+            rdf_format: rfmt,
+            native_graph,
+            prefixes,
+            io: io.clone(),
+            quick_key,
+            auto,
+            trial,
+            claim: claim.clone(),
+        };
+        let outcome = if in_place && !force_pool {
+            inline::note_in_place(quick_key);
+            cursor::run_in_place(ds.clone(), auto_req).await?
+        } else {
+            cursor::run_auto_pool(ds.clone(), auto_req).await?
+        };
+        match outcome {
+            cursor::AutoOutcome::Responded(resp) => return Ok(resp),
+            cursor::AutoOutcome::Eager {
+                result,
+                seq,
+                resolved,
+                t0,
+                began,
+                guard,
+                prefixes,
+            } => (result, seq, resolved, t0, began, guard, prefixes),
+        }
+    } else {
+        // Eager execution (either explicit `execution=eager` or quick eager shortcut).
+        let failed_plan = sfmt == SolutionsFormat::Sparkles;
+        let run = {
+            let ds = ds.clone();
+            let claim = claim.clone();
+            move || {
+                let _claim = claim;
+                let t = std::time::Instant::now();
+                let t0 = crate::otel::start();
+                let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
+                let seq = snap.commit;
                 let ran = sparkles::sparql::query_with_plan(snap, &query, &opts);
                 if let Err(f) = &ran
                     && outgrew_memory(&f.error)
@@ -2044,69 +2072,39 @@ pub(crate) async fn run_query(
                     // a cursor that keeps to the budget stays the text's mode
                     QUICK.record_eager_failure(quick_key);
                 }
-                ran.map(Ran::Eager)
-            };
-            let r = match ran {
-                Ok(Ran::Cursor(cursor)) => return Ok((Ran::Cursor(cursor), seq, resolved, t0, t)),
-                Ok(Ran::Eager(r)) => r,
-                Err(f) => {
-                    let mut e: ApiError = f.error.into();
-                    if failed_plan && let (Some(plan), Some(body)) = (f.plan, e.1.as_object_mut()) {
-                        // writing the plan and dropping it recurse as deep as the plan
-                        let value = sparkles::sparql::depth::with_stack(plan.depth(), move || {
-                            serde_json::to_value(&plan).unwrap_or_default()
-                        });
-                        body.insert("plan".into(), value);
-                        body.insert("commit".into(), seq.into());
+                let r = match ran {
+                    Ok(r) => r,
+                    Err(f) => {
+                        let mut e: ApiError = f.error.into();
+                        if failed_plan
+                            && let (Some(plan), Some(body)) = (f.plan, e.1.as_object_mut())
+                        {
+                            let value =
+                                sparkles::sparql::depth::with_stack(plan.depth(), move || {
+                                    serde_json::to_value(&plan).unwrap_or_default()
+                                });
+                            body.insert("plan".into(), value);
+                            body.insert("commit".into(), seq.into());
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
-                }
-            };
-            tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
-            Ok((Ran::Eager(r), seq, resolved, t0, t))
+                };
+                tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
+                Ok((r, seq, resolved, t0, t))
+            }
+        };
+        let ran = if in_place {
+            inline::note_in_place(quick_key);
+            inline::run(run).and_then(|r| r)
+        } else {
+            blocking(run).await
+        };
+        if ran.is_err() {
+            // a query that failed (a timeout, say) is not known to be quick any more
+            QUICK.record(quick_key, f64::INFINITY);
         }
-    };
-    let ran = if in_place {
-        inline::note_in_place(quick_key);
-        inline::run(run).and_then(|r| r)
-    } else {
-        blocking(run).await
-    };
-    if ran.is_err() {
-        // a query that failed (a timeout, say) is not known to be quick any more
-        QUICK.record(quick_key, f64::INFINITY);
-    }
-    // `began` is when the run started on its thread, after any hop to the blocking pool,
-    // as the eager path's query and serialization times count
-    let (r, seq, resolved, t0, began) = ran.map_err(|e| with_timeout(e, timeout))?;
-    let r = match r {
-        Ran::Eager(r) => r,
-        Ran::Cursor(cursor) => {
-            return cursor::serve(
-                ds,
-                *cursor,
-                seq,
-                resolved,
-                cursor::Serve {
-                    timeouts: stream_timeouts(&st),
-                    params,
-                    uri,
-                    guard: _cancel_on_drop,
-                    limit,
-                    format: sfmt,
-                    thrift,
-                    rdf_format: rfmt,
-                    native_graph: params_wants_sparkles(&headers),
-                    prefixes,
-                    io,
-                    timeout,
-                    with_extra,
-                    t0,
-                    quick: Some((quick_key, began)),
-                },
-            )
-            .await;
-        }
+        let (r, seq, resolved, t0, began) = ran.map_err(|e| with_timeout(e, timeout))?;
+        (r, seq, resolved, t0, began, _cancel_on_drop, prefixes)
     };
     let algorithmic = r.uses_algorithms();
     let metadata = r.clone();
@@ -2174,7 +2172,6 @@ pub(crate) async fn run_query(
     // The retained answer decodes under the query's own cancel flag, so the request's
     // cancel guard must outlive the handler while a streamed body is written. The
     // response body holds it, so a client that leaves still cancels the writer.
-    let cancel_guard = _cancel_on_drop;
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let ts = std::time::Instant::now();
         let sent = results::RowCount::with_ledger(w.get_ref().ledger());

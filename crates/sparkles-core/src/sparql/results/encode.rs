@@ -5,10 +5,17 @@
 
 use super::rowout::Explicit;
 use super::source::RowView;
-use crate::sparql::ctx::{Charge, Ctx};
+use crate::sparql::ctx::{Charge, Ctx, OwnedCharge};
 use oxrdf::vocab::xsd;
 use oxrdf::{BaseDirection, TermRef};
-use std::io::Result;
+use std::io::{self, Result, Write};
+use std::sync::Arc;
+
+#[allow(dead_code)]
+enum KeyCharge<'a> {
+    Borrowed(Charge<'a>),
+    Owned(OwnedCharge),
+}
 
 /// The tabs between the cells of a TSV row, written a slice at a time.
 const TABS: &[u8; 32] = b"\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t";
@@ -37,11 +44,20 @@ impl Tsv {
     /// One row of `width` cells, an unbound cell empty. The row's start and end are the
     /// caller's to mark.
     pub(super) fn row(out: &mut Explicit<'_, '_>, row: RowView<'_>, width: usize) -> Result<()> {
+        Self::write_row(out, &row, width)
+    }
+
+    /// Check the exact row size without allocating or writing any of its output.
+    pub(super) fn row_fits(row: &RowView<'_>, width: usize, remaining: u64) -> bool {
+        Self::write_row(&mut SizeLimit::new(remaining), row, width).is_ok()
+    }
+
+    fn write_row(out: &mut impl Write, row: &RowView<'_>, width: usize) -> Result<()> {
         match row {
             RowView::Dense(terms) => {
                 for (c, term) in terms.iter().enumerate() {
                     if c > 0 {
-                        out.put(b"\t")?;
+                        out.write_all(b"\t")?;
                     }
                     if let Some(term) = term {
                         tsv_term(out, term.as_ref())?;
@@ -52,14 +68,14 @@ impl Tsv {
                 // the entries ascend by column, so the tabs before a cell are its column
                 // less the tabs already written
                 let mut tabs = 0;
-                for (c, term) in terms {
+                for (c, term) in *terms {
                     separators_to(out, TABS, &mut tabs, *c)?;
                     tsv_term(out, term.as_ref().as_ref())?;
                 }
                 separators_to(out, TABS, &mut tabs, width.saturating_sub(1))?;
             }
         }
-        out.put(b"\n")
+        out.write_all(b"\n")
     }
 }
 
@@ -84,11 +100,20 @@ impl Csv {
 
     /// One row of `width` cells, an unbound cell empty.
     pub(super) fn row(out: &mut Explicit<'_, '_>, row: RowView<'_>, width: usize) -> Result<()> {
+        Self::write_row(out, &row, width)
+    }
+
+    /// Check the exact row size without allocating or writing any of its output.
+    pub(super) fn row_fits(row: &RowView<'_>, width: usize, remaining: u64) -> bool {
+        Self::write_row(&mut SizeLimit::new(remaining), row, width).is_ok()
+    }
+
+    fn write_row(out: &mut impl Write, row: &RowView<'_>, width: usize) -> Result<()> {
         match row {
             RowView::Dense(terms) => {
                 for (c, term) in terms.iter().enumerate() {
                     if c > 0 {
-                        out.put(b",")?;
+                        out.write_all(b",")?;
                     }
                     if let Some(term) = term {
                         csv_term(out, term.as_ref())?;
@@ -97,14 +122,14 @@ impl Csv {
             }
             RowView::Sparse(terms) => {
                 let mut commas = 0;
-                for (c, term) in terms {
+                for (c, term) in *terms {
                     separators_to(out, COMMAS, &mut commas, *c)?;
                     csv_term(out, term.as_ref().as_ref())?;
                 }
                 separators_to(out, COMMAS, &mut commas, width.saturating_sub(1))?;
             }
         }
-        out.put(b"\r\n")
+        out.write_all(b"\r\n")
     }
 }
 
@@ -119,7 +144,7 @@ pub(super) struct Json<'a> {
     /// no row has been written, so the next one starts without a comma
     first: bool,
     /// the reservation for `keys`, declared after them so that they drop first
-    _charge: Option<Charge<'a>>,
+    _charge: Option<KeyCharge<'a>>,
 }
 
 impl<'a> Json<'a> {
@@ -127,8 +152,25 @@ impl<'a> Json<'a> {
     /// the table of keys are allocated once at their exact size and never grow.
     pub(super) fn new(ctx: Option<&'a Ctx>, variables: &[String]) -> crate::error::Result<Self> {
         let charge = ctx
-            .map(|ctx| ctx.charge(Self::charged(variables)))
+            .map(|ctx| {
+                ctx.charge(Self::charged(variables))
+                    .map(KeyCharge::Borrowed)
+            })
             .transpose()?;
+        Ok(Self::from_charge(charge, variables))
+    }
+
+    /// An owned encoder whose reservation is charged to `ctx`, so it can move across
+    /// threads between batches.
+    pub(super) fn new_owned(
+        ctx: &Arc<Ctx>,
+        variables: &[String],
+    ) -> crate::error::Result<Json<'static>> {
+        let charge = OwnedCharge::new(ctx, Self::charged(variables))?;
+        Ok(Json::from_charge(Some(KeyCharge::Owned(charge)), variables))
+    }
+
+    fn from_charge(charge: Option<KeyCharge<'a>>, variables: &[String]) -> Self {
         let keys = variables
             .iter()
             .map(|v| {
@@ -140,11 +182,11 @@ impl<'a> Json<'a> {
                 key.into_boxed_slice()
             })
             .collect();
-        Ok(Json {
+        Json {
             keys,
             first: true,
             _charge: charge,
-        })
+        }
     }
 
     /// The bytes [`Json::new`] charges for the keys of `variables`: each key's bytes and
@@ -176,11 +218,24 @@ impl<'a> Json<'a> {
         row: RowView<'_>,
         _width: usize,
     ) -> Result<()> {
-        out.put(if std::mem::take(&mut self.first) {
-            b"{"
-        } else {
-            b",{"
-        })?;
+        let first = std::mem::take(&mut self.first);
+        self.write_row(out, &row, first)
+    }
+
+    /// Check the exact row size without allocating or writing any of its output.
+    pub(super) fn row_fits(&self, row: &RowView<'_>, remaining: u64) -> bool {
+        self.write_row(&mut SizeLimit::new(remaining), row, self.first)
+            .is_ok()
+    }
+
+    /// The pre-escaped key bytes (`"name":`) for `column`.
+    #[inline]
+    pub(super) fn key_len(&self, column: usize) -> usize {
+        self.keys[column].len()
+    }
+
+    fn write_row(&self, out: &mut impl Write, row: &RowView<'_>, first: bool) -> Result<()> {
+        out.write_all(if first { b"{" } else { b",{" })?;
         let mut comma = false;
         match row {
             RowView::Dense(terms) => {
@@ -191,26 +246,26 @@ impl<'a> Json<'a> {
                 }
             }
             RowView::Sparse(terms) => {
-                for (c, term) in terms {
+                for (c, term) in *terms {
                     self.cell(out, &mut comma, *c, term.as_ref().as_ref())?;
                 }
             }
         }
-        out.put(b"}")
+        out.write_all(b"}")
     }
 
     #[inline]
     fn cell(
         &self,
-        out: &mut Explicit<'_, '_>,
+        out: &mut impl Write,
         comma: &mut bool,
         column: usize,
         term: TermRef<'_>,
     ) -> Result<()> {
         if std::mem::replace(comma, true) {
-            out.put(b",")?;
+            out.write_all(b",")?;
         }
-        out.put(&self.keys[column])?;
+        out.write_all(&self.keys[column])?;
         json_term(out, term)
     }
 
@@ -220,43 +275,43 @@ impl<'a> Json<'a> {
     }
 }
 
-fn json_term(out: &mut Explicit<'_, '_>, term: TermRef<'_>) -> Result<()> {
+fn json_term(out: &mut impl Write, term: TermRef<'_>) -> Result<()> {
     match term {
         TermRef::NamedNode(node) => {
-            out.put(b"{\"type\":\"uri\",\"value\":")?;
+            out.write_all(b"{\"type\":\"uri\",\"value\":")?;
             json_string(out, node.as_str())?;
-            out.put(b"}")
+            out.write_all(b"}")
         }
         TermRef::BlankNode(node) => {
-            out.put(b"{\"type\":\"bnode\",\"value\":")?;
+            out.write_all(b"{\"type\":\"bnode\",\"value\":")?;
             json_string(out, node.as_str())?;
-            out.put(b"}")
+            out.write_all(b"}")
         }
         TermRef::Literal(literal) => {
-            out.put(b"{\"type\":\"literal\",\"value\":")?;
+            out.write_all(b"{\"type\":\"literal\",\"value\":")?;
             json_string(out, literal.value())?;
             if let Some(language) = literal.language() {
-                out.put(b",\"xml:lang\":")?;
+                out.write_all(b",\"xml:lang\":")?;
                 json_string(out, language)?;
                 match literal.direction() {
-                    Some(BaseDirection::Ltr) => out.put(b",\"its:dir\":\"ltr\"")?,
-                    Some(BaseDirection::Rtl) => out.put(b",\"its:dir\":\"rtl\"")?,
+                    Some(BaseDirection::Ltr) => out.write_all(b",\"its:dir\":\"ltr\"")?,
+                    Some(BaseDirection::Rtl) => out.write_all(b",\"its:dir\":\"rtl\"")?,
                     None => {}
                 }
             } else if literal.datatype() != xsd::STRING {
-                out.put(b",\"datatype\":")?;
+                out.write_all(b",\"datatype\":")?;
                 json_string(out, literal.datatype().as_str())?;
             }
-            out.put(b"}")
+            out.write_all(b"}")
         }
         TermRef::Triple(triple) => {
-            out.put(b"{\"type\":\"triple\",\"value\":{\"subject\":")?;
+            out.write_all(b"{\"type\":\"triple\",\"value\":{\"subject\":")?;
             json_term(out, triple.subject.as_ref().into())?;
-            out.put(b",\"predicate\":")?;
+            out.write_all(b",\"predicate\":")?;
             json_term(out, triple.predicate.as_ref().into())?;
-            out.put(b",\"object\":")?;
+            out.write_all(b",\"object\":")?;
             json_term(out, triple.object.as_ref())?;
-            out.put(b"}}")
+            out.write_all(b"}}")
         }
     }
 }
@@ -284,31 +339,37 @@ fn json_escape(b: u8, long: &mut [u8; 6]) -> Option<&[u8]> {
     })
 }
 
+/// Encoded byte length of a single byte inside a JSON string.
+#[inline]
+pub(super) fn json_escape_len(b: u8) -> usize {
+    match b {
+        b'\\' | b'"' | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' => 2,
+        0..0x20 => 6,
+        _ => 1,
+    }
+}
+
 /// A string between double quotes, escaped, the runs between escapes copied whole. Only
 /// ASCII bytes are escaped, so a run never splits a character.
-fn json_string(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
-    out.put(b"\"")?;
+fn json_string(out: &mut impl Write, s: &str) -> Result<()> {
+    out.write_all(b"\"")?;
     let bytes = s.as_bytes();
     let mut long = *b"\\u0000";
     let mut start = 0;
     for (i, &b) in bytes.iter().enumerate() {
         if let Some(escaped) = json_escape(b, &mut long) {
-            out.put(&bytes[start..i])?;
-            out.put(escaped)?;
+            out.write_all(&bytes[start..i])?;
+            out.write_all(escaped)?;
             start = i + 1;
         }
     }
-    out.put(&bytes[start..])?;
-    out.put(b"\"")
+    out.write_all(&bytes[start..])?;
+    out.write_all(b"\"")
 }
 
 /// The length of `s` escaped and quoted by [`json_escaped`].
 fn json_escaped_len(s: &str) -> usize {
-    let mut long = *b"\\u0000";
-    2 + s
-        .bytes()
-        .map(|b| json_escape(b, &mut long).map_or(1, <[u8]>::len))
-        .sum::<usize>()
+    2 + s.bytes().map(json_escape_len).sum::<usize>()
 }
 
 /// [`json_string`] into a vector, for the keys escaped once per answer.
@@ -328,32 +389,32 @@ fn json_escaped(to: &mut Vec<u8>, s: &str) {
 /// as the column of the next cell.
 #[inline]
 fn separators_to(
-    out: &mut Explicit<'_, '_>,
+    out: &mut impl Write,
     run: &[u8; 32],
     written: &mut usize,
     to: usize,
 ) -> Result<()> {
     while *written < to {
         let n = (to - *written).min(run.len());
-        out.put(&run[..n])?;
+        out.write_all(&run[..n])?;
         *written += n;
     }
     Ok(())
 }
 
-fn csv_term(out: &mut Explicit<'_, '_>, term: TermRef<'_>) -> Result<()> {
+fn csv_term(out: &mut impl Write, term: TermRef<'_>) -> Result<()> {
     match term {
-        TermRef::NamedNode(node) => out.put(node.as_str().as_bytes()),
+        TermRef::NamedNode(node) => out.write_all(node.as_str().as_bytes()),
         TermRef::BlankNode(node) => {
-            out.put(b"_:")?;
-            out.put(node.as_str().as_bytes())
+            out.write_all(b"_:")?;
+            out.write_all(node.as_str().as_bytes())
         }
         TermRef::Literal(literal) => csv_string(out, literal.value()),
         TermRef::Triple(triple) => {
             csv_term(out, triple.subject.as_ref().into())?;
-            out.put(b" ")?;
+            out.write_all(b" ")?;
             csv_term(out, triple.predicate.as_ref().into())?;
-            out.put(b" ")?;
+            out.write_all(b" ")?;
             csv_term(out, triple.object.as_ref())
         }
     }
@@ -361,81 +422,83 @@ fn csv_term(out: &mut Explicit<'_, '_>, term: TermRef<'_>) -> Result<()> {
 
 /// A lexical form, between double quotes with each quote doubled when it holds a quote,
 /// comma, line feed or carriage return.
-fn csv_string(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
+fn csv_string(out: &mut impl Write, s: &str) -> Result<()> {
     let bytes = s.as_bytes();
     if !bytes
         .iter()
         .any(|&b| matches!(b, b'"' | b',' | b'\n' | b'\r'))
     {
-        return out.put(bytes);
+        return out.write_all(bytes);
     }
-    out.put(b"\"")?;
+    out.write_all(b"\"")?;
     let mut start = 0;
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'"' {
             // the quote ends this run, and the next run starts with it again
-            out.put(&bytes[start..=i])?;
+            out.write_all(&bytes[start..=i])?;
             start = i;
         }
     }
-    out.put(&bytes[start..])?;
-    out.put(b"\"")
+    out.write_all(&bytes[start..])?;
+    out.write_all(b"\"")
 }
 
-fn tsv_term(out: &mut Explicit<'_, '_>, term: TermRef<'_>) -> Result<()> {
+fn tsv_term(out: &mut impl Write, term: TermRef<'_>) -> Result<()> {
     match term {
         TermRef::NamedNode(node) => {
-            out.put(b"<")?;
-            out.put(node.as_str().as_bytes())?;
-            out.put(b">")
+            out.write_all(b"<")?;
+            out.write_all(node.as_str().as_bytes())?;
+            out.write_all(b">")
         }
         TermRef::BlankNode(node) => {
-            out.put(b"_:")?;
-            out.put(node.as_str().as_bytes())
+            out.write_all(b"_:")?;
+            out.write_all(node.as_str().as_bytes())
         }
         TermRef::Literal(literal) => {
             let value = literal.value();
             if let Some(language) = literal.language() {
                 tsv_quoted(out, value)?;
-                out.put(b"@")?;
-                out.put(language.as_bytes())?;
+                out.write_all(b"@")?;
+                out.write_all(language.as_bytes())?;
                 match literal.direction() {
-                    Some(BaseDirection::Ltr) => out.put(b"--ltr"),
-                    Some(BaseDirection::Rtl) => out.put(b"--rtl"),
+                    Some(BaseDirection::Ltr) => out.write_all(b"--ltr"),
+                    Some(BaseDirection::Rtl) => out.write_all(b"--rtl"),
                     None => Ok(()),
                 }
             } else {
                 match literal.datatype() {
-                    xsd::BOOLEAN if matches!(value, "true" | "false") => out.put(value.as_bytes()),
-                    xsd::INTEGER if is_turtle_integer(value) => out.put(value.as_bytes()),
-                    xsd::DECIMAL if is_turtle_decimal(value) => out.put(value.as_bytes()),
-                    xsd::DOUBLE if is_turtle_double(value) => out.put(value.as_bytes()),
+                    xsd::BOOLEAN if matches!(value, "true" | "false") => {
+                        out.write_all(value.as_bytes())
+                    }
+                    xsd::INTEGER if is_turtle_integer(value) => out.write_all(value.as_bytes()),
+                    xsd::DECIMAL if is_turtle_decimal(value) => out.write_all(value.as_bytes()),
+                    xsd::DOUBLE if is_turtle_double(value) => out.write_all(value.as_bytes()),
                     xsd::STRING => tsv_quoted(out, value),
                     datatype => {
                         tsv_quoted(out, value)?;
-                        out.put(b"^^<")?;
-                        out.put(datatype.as_str().as_bytes())?;
-                        out.put(b">")
+                        out.write_all(b"^^<")?;
+                        out.write_all(datatype.as_str().as_bytes())?;
+                        out.write_all(b">")
                     }
                 }
             }
         }
         TermRef::Triple(triple) => {
-            out.put(b"<<( ")?;
+            out.write_all(b"<<( ")?;
             tsv_term(out, triple.subject.as_ref().into())?;
-            out.put(b" ")?;
+            out.write_all(b" ")?;
             tsv_term(out, triple.predicate.as_ref().into())?;
-            out.put(b" ")?;
+            out.write_all(b" ")?;
             tsv_term(out, triple.object.as_ref())?;
-            out.put(b" )>>")
+            out.write_all(b" )>>")
         }
     }
 }
 
 /// A string between double quotes with tab, line feed, carriage return, quote and
 /// backslash escaped, the runs between them copied whole.
-fn tsv_quoted(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
-    out.put(b"\"")?;
+fn tsv_quoted(out: &mut impl Write, s: &str) -> Result<()> {
+    out.write_all(b"\"")?;
     let bytes = s.as_bytes();
     let mut start = 0;
     for (i, &b) in bytes.iter().enumerate() {
@@ -447,12 +510,12 @@ fn tsv_quoted(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
             b'\\' => b"\\\\",
             _ => continue,
         };
-        out.put(&bytes[start..i])?;
-        out.put(escaped)?;
+        out.write_all(&bytes[start..i])?;
+        out.write_all(escaped)?;
         start = i + 1;
     }
-    out.put(&bytes[start..])?;
-    out.put(b"\"")
+    out.write_all(&bytes[start..])?;
+    out.write_all(b"\"")
 }
 
 fn strip_sign(value: &[u8]) -> &[u8] {
@@ -509,7 +572,7 @@ pub(super) struct Xml<'a> {
     /// a cell copies its tag with one lookup
     tags: Box<[Box<[u8]>]>,
     /// the reservation for `tags`, declared after them so that they drop first
-    _charge: Option<Charge<'a>>,
+    _charge: Option<KeyCharge<'a>>,
 }
 
 const BINDING_OPEN: &[u8] = b"<binding name=\"";
@@ -520,8 +583,25 @@ impl<'a> Xml<'a> {
     /// tag and the table of tags are allocated once at their exact size and never grow.
     pub(super) fn new(ctx: Option<&'a Ctx>, variables: &[String]) -> crate::error::Result<Self> {
         let charge = ctx
-            .map(|ctx| ctx.charge(Self::charged(variables)))
+            .map(|ctx| {
+                ctx.charge(Self::charged(variables))
+                    .map(KeyCharge::Borrowed)
+            })
             .transpose()?;
+        Ok(Self::from_charge(charge, variables))
+    }
+
+    /// An owned encoder whose reservation is charged to `ctx`, so it can move across
+    /// threads between batches.
+    pub(super) fn new_owned(
+        ctx: &Arc<Ctx>,
+        variables: &[String],
+    ) -> crate::error::Result<Xml<'static>> {
+        let charge = OwnedCharge::new(ctx, Self::charged(variables))?;
+        Ok(Xml::from_charge(Some(KeyCharge::Owned(charge)), variables))
+    }
+
+    fn from_charge(charge: Option<KeyCharge<'a>>, variables: &[String]) -> Self {
         let tags = variables
             .iter()
             .map(|v| {
@@ -533,10 +613,10 @@ impl<'a> Xml<'a> {
                 tag.into_boxed_slice()
             })
             .collect();
-        Ok(Xml {
+        Xml {
             tags,
             _charge: charge,
-        })
+        }
     }
 
     fn tag_len(name: &str) -> usize {
@@ -565,12 +645,27 @@ impl<'a> Xml<'a> {
 
     /// One solution, the bound cells in column order.
     pub(super) fn row(
-        &mut self,
+        &self,
         out: &mut Explicit<'_, '_>,
         row: RowView<'_>,
         _width: usize,
     ) -> Result<()> {
-        out.put(b"<result>")?;
+        self.write_row(out, &row)
+    }
+
+    /// Check the exact row size without allocating or writing any of its output.
+    pub(super) fn row_fits(&self, row: &RowView<'_>, remaining: u64) -> bool {
+        self.write_row(&mut SizeLimit::new(remaining), row).is_ok()
+    }
+
+    /// The pre-escaped opening tag bytes (`<binding name="name">`) for `column`.
+    #[inline]
+    pub(super) fn tag_len_at(&self, column: usize) -> usize {
+        self.tags[column].len()
+    }
+
+    fn write_row(&self, out: &mut impl Write, row: &RowView<'_>) -> Result<()> {
+        out.write_all(b"<result>")?;
         match row {
             RowView::Dense(terms) => {
                 for (c, term) in terms.iter().enumerate() {
@@ -580,19 +675,19 @@ impl<'a> Xml<'a> {
                 }
             }
             RowView::Sparse(terms) => {
-                for (c, term) in terms {
+                for (c, term) in *terms {
                     self.cell(out, *c, term.as_ref().as_ref())?;
                 }
             }
         }
-        out.put(b"</result>")
+        out.write_all(b"</result>")
     }
 
     #[inline]
-    fn cell(&self, out: &mut Explicit<'_, '_>, column: usize, term: TermRef<'_>) -> Result<()> {
-        out.put(&self.tags[column])?;
+    fn cell(&self, out: &mut impl Write, column: usize, term: TermRef<'_>) -> Result<()> {
+        out.write_all(&self.tags[column])?;
         xml_term(out, term)?;
-        out.put(b"</binding>")
+        out.write_all(b"</binding>")
     }
 
     /// The end of the results element and of the document.
@@ -601,49 +696,85 @@ impl<'a> Xml<'a> {
     }
 }
 
-fn xml_term(out: &mut Explicit<'_, '_>, term: TermRef<'_>) -> Result<()> {
+fn xml_term(out: &mut impl Write, term: TermRef<'_>) -> Result<()> {
     match term {
         TermRef::NamedNode(node) => {
-            out.put(b"<uri>")?;
+            out.write_all(b"<uri>")?;
             xml_text(out, node.as_str())?;
-            out.put(b"</uri>")
+            out.write_all(b"</uri>")
         }
         TermRef::BlankNode(node) => {
-            out.put(b"<bnode>")?;
+            out.write_all(b"<bnode>")?;
             xml_text(out, node.as_str())?;
-            out.put(b"</bnode>")
+            out.write_all(b"</bnode>")
         }
         TermRef::Literal(literal) => {
-            out.put(b"<literal")?;
+            out.write_all(b"<literal")?;
             if let Some(language) = literal.language() {
-                out.put(b" xml:lang=\"")?;
+                out.write_all(b" xml:lang=\"")?;
                 xml_text(out, language)?;
-                out.put(b"\"")?;
+                out.write_all(b"\"")?;
                 if let Some(direction) = literal.direction() {
-                    out.put(match direction {
+                    out.write_all(match direction {
                         BaseDirection::Ltr => b" its:dir=\"ltr\"",
                         BaseDirection::Rtl => b" its:dir=\"rtl\"",
                     })?;
-                    out.put(b" xmlns:its=\"http://www.w3.org/2005/11/its\" its:version=\"2.0\"")?;
+                    out.write_all(
+                        b" xmlns:its=\"http://www.w3.org/2005/11/its\" its:version=\"2.0\"",
+                    )?;
                 }
             } else if literal.datatype() != xsd::STRING {
-                out.put(b" datatype=\"")?;
+                out.write_all(b" datatype=\"")?;
                 xml_text(out, literal.datatype().as_str())?;
-                out.put(b"\"")?;
+                out.write_all(b"\"")?;
             }
-            out.put(b">")?;
+            out.write_all(b">")?;
             xml_literal_value(out, literal.value())?;
-            out.put(b"</literal>")
+            out.write_all(b"</literal>")
         }
         TermRef::Triple(triple) => {
-            out.put(b"<triple><subject>")?;
+            out.write_all(b"<triple><subject>")?;
             xml_term(out, triple.subject.as_ref().into())?;
-            out.put(b"</subject><predicate>")?;
+            out.write_all(b"</subject><predicate>")?;
             xml_term(out, triple.predicate.as_ref().into())?;
-            out.put(b"</predicate><object>")?;
+            out.write_all(b"</predicate><object>")?;
             xml_term(out, triple.object.as_ref())?;
-            out.put(b"</object></triple>")
+            out.write_all(b"</object></triple>")
         }
+    }
+}
+
+/// Bounded counting `Write` sink used by exact pre-encode size probes.
+pub(super) struct SizeLimit {
+    remaining: u64,
+}
+
+impl SizeLimit {
+    #[inline]
+    pub(super) fn new(remaining: u64) -> Self {
+        Self { remaining }
+    }
+}
+
+impl Write for SizeLimit {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) -> Result<usize> {
+        self.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len() as u64)
+            .ok_or(io::ErrorKind::WriteZero)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -662,17 +793,17 @@ fn xml_escape(b: u8) -> Option<&'static [u8]> {
 
 /// Text or an attribute value, escaped, the runs between escapes copied whole. Only ASCII
 /// bytes are escaped, so a run never splits a character.
-fn xml_text(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
+fn xml_text(out: &mut impl Write, s: &str) -> Result<()> {
     let bytes = s.as_bytes();
     let mut start = 0;
     for (i, &b) in bytes.iter().enumerate() {
         if let Some(escaped) = xml_escape(b) {
-            out.put(&bytes[start..i])?;
-            out.put(escaped)?;
+            out.write_all(&bytes[start..i])?;
+            out.write_all(escaped)?;
             start = i + 1;
         }
     }
-    out.put(&bytes[start..])
+    out.write_all(&bytes[start..])
 }
 
 /// The character reference sparesults writes for a tab, line feed, carriage return or
@@ -691,7 +822,7 @@ fn xml_bound_space(b: u8) -> Option<&'static [u8]> {
 /// A literal's value, its leading and trailing whitespace as character references so that
 /// a reader keeps it, and the rest escaped as text. A value of only whitespace is all
 /// references.
-fn xml_literal_value(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
+fn xml_literal_value(out: &mut impl Write, s: &str) -> Result<()> {
     let bytes = s.as_bytes();
     let start = bytes
         .iter()
@@ -702,12 +833,12 @@ fn xml_literal_value(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
         .rposition(|&b| xml_bound_space(b).is_none())
         .map_or(start, |i| i + 1);
     for &b in &bytes[..start] {
-        out.put(xml_bound_space(b).unwrap_or_default())?;
+        out.write_all(xml_bound_space(b).unwrap_or_default())?;
     }
     // both ends are ASCII bytes or the ends of the value, so the middle is a whole str
     xml_text(out, &s[start..end])?;
     for &b in &bytes[end..] {
-        out.put(xml_bound_space(b).unwrap_or_default())?;
+        out.write_all(xml_bound_space(b).unwrap_or_default())?;
     }
     Ok(())
 }

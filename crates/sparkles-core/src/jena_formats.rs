@@ -1388,13 +1388,20 @@ mod rdf_json {
 /// Writes Thrift compact-protocol values.
 struct TOut<W> {
     w: W,
-    /// the last field id of each open struct
-    last: Vec<i16>,
+    /// the last field id of each open struct (inline for normal nesting depth)
+    inline: [i16; 8],
+    depth: usize,
+    overflow: Vec<i16>,
 }
 
 impl<W: Write> TOut<W> {
     fn new(w: W) -> Self {
-        TOut { w, last: vec![0] }
+        TOut {
+            w,
+            inline: [0; 8],
+            depth: 1,
+            overflow: Vec::new(),
+        }
     }
 
     fn varint(&mut self, mut v: u64) -> io::Result<()> {
@@ -1419,7 +1426,11 @@ impl<W: Write> TOut<W> {
     }
 
     fn field(&mut self, id: i16, ty: u8) -> io::Result<()> {
-        let last = self.last.last_mut().expect("an open struct");
+        let last = if self.depth <= self.inline.len() {
+            &mut self.inline[self.depth - 1]
+        } else {
+            self.overflow.last_mut().expect("an open struct")
+        };
         let delta = id - *last;
         *last = id;
         if (1..=15).contains(&delta) {
@@ -1431,11 +1442,20 @@ impl<W: Write> TOut<W> {
     }
 
     fn begin(&mut self) {
-        self.last.push(0);
+        if self.depth < self.inline.len() {
+            self.inline[self.depth] = 0;
+        } else {
+            self.overflow.push(0);
+        }
+        self.depth += 1;
     }
 
     fn end(&mut self) -> io::Result<()> {
-        self.last.pop();
+        debug_assert!(self.depth > 0, "closing without an open struct");
+        self.depth -= 1;
+        if self.depth >= self.inline.len() {
+            self.overflow.pop();
+        }
         self.w.write_all(&[0])
     }
 
@@ -1748,6 +1768,12 @@ impl<W: Write> ThriftResults<W> {
         }
         out.end()?;
         Ok(ThriftResults { out })
+    }
+
+    /// Resume writing `RDF_DataTuple` rows to `w` after the `RDF_VarTuple` header has
+    /// already been emitted.
+    pub(crate) fn resume(w: W) -> Self {
+        ThriftResults { out: TOut::new(w) }
     }
 
     pub fn row(&mut self, row: &[Option<Term>]) -> io::Result<()> {
@@ -2074,7 +2100,9 @@ mod tests {
         o.end().unwrap();
         // triple ex:s ex:p 42 (valInteger), then ex:s ex:p 1.50 (valDecimal), 2.5 (valDouble)
         for value in 0..3 {
-            o.last = vec![0];
+            o.inline[0] = 0;
+            o.depth = 1;
+            o.overflow.clear();
             o.field(2, ttype::STRUCT).unwrap();
             o.begin();
             for (fid, local) in [(1, "s"), (2, "p")] {

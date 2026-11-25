@@ -394,7 +394,7 @@ pub(super) struct CursorSolutions<'c> {
     pub(super) cursor: &'c mut crate::sparql::QueryCursor,
 }
 
-struct CursorRows<'b> {
+pub(super) struct CursorRows<'b> {
     // Rust drops fields in declaration order: the row's owned fallbacks go before the
     // reservation of their slots.
     terms: Vec<(usize, Cow<'b, Term>)>,
@@ -404,6 +404,29 @@ struct CursorRows<'b> {
     decoded: Option<&'b crate::sparql::cursor::DecodedBatch<'b>>,
     charge: &'b mut RowCharge,
     len: usize,
+}
+
+impl<'b> CursorRows<'b> {
+    pub(super) fn new(
+        cursor: &'b crate::sparql::QueryCursor,
+        batch: &'b crate::sparql::QueryBatch,
+        decoded: Option<&'b crate::sparql::cursor::DecodedBatch<'b>>,
+        charge: &'b mut RowCharge,
+        len: usize,
+    ) -> Result<Self> {
+        let row_storage = cursor.charge(
+            batch.width() as u64 * std::mem::size_of::<(usize, Cow<'_, Term>)>() as u64 + 128,
+        )?;
+        Ok(Self {
+            terms: Vec::with_capacity(batch.width()),
+            _row_storage: row_storage,
+            cursor,
+            batch,
+            decoded,
+            charge,
+            len,
+        })
+    }
 }
 
 impl RowBatch for CursorRows<'_> {
@@ -459,20 +482,8 @@ impl SolutionSource for CursorSolutions<'_> {
             .cursor
             .for_each_decoded(send, |cursor, batch, decoded| {
                 // the slots of one row's bound cells, held for the batch
-                let row_storage = cursor.charge(
-                    batch.width() as u64 * std::mem::size_of::<(usize, Cow<'_, Term>)>() as u64
-                        + 128,
-                )?;
                 let len = batch.len().min(left);
-                let mut rows = CursorRows {
-                    terms: Vec::with_capacity(batch.width()),
-                    _row_storage: row_storage,
-                    cursor,
-                    batch,
-                    decoded,
-                    charge: &mut row_charge,
-                    len,
-                };
+                let mut rows = CursorRows::new(cursor, batch, decoded, &mut row_charge, len)?;
                 visitor.batch(&mut rows)?;
                 left -= len;
                 Ok(())
@@ -496,53 +507,14 @@ impl SolutionSource for CursorSolutions<'_> {
         started: Instant,
         initial_exec: f64,
     ) -> Result<()> {
-        let sent = sent.unwrap_or(0);
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Meta<'a> {
-            total_rows: Option<u64>,
-            sent_rows: u64,
-            status: crate::sparql::CursorStatus,
-            timing: &'a crate::sparql::Timing,
-            plan: &'a crate::sparql::CursorPlan,
-            memory: NativeMemory,
-            rows_produced: u64,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            commit: Option<u64>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            dataset_id: Option<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            io: Option<crate::ioacct::IoReport>,
-        }
-        let cursor = &*self.cursor;
-        let stats = cursor.stats();
-        let mut timing = stats.timing.clone();
-        timing.serialize_ms =
-            (started.elapsed().as_secs_f64() * 1000.0 - (timing.exec_ms - initial_exec)).max(0.0);
-        out.write_all(b",\"meta\":")?;
-        crate::sparql::depth::with_stack(cursor.stack_depth(), || {
-            json(
-                &mut *out,
-                &Meta {
-                    total_rows: (stats.status == crate::sparql::CursorStatus::Complete)
-                        .then_some(sent),
-                    sent_rows: sent,
-                    status: stats.status,
-                    timing: &timing,
-                    plan: cursor.plan(),
-                    memory: NativeMemory {
-                        peak_bytes: stats.mem_peak_bytes,
-                        granted_bytes: stats.granted_bytes,
-                    },
-                    rows_produced: stats.rows_produced,
-                    commit: metadata.as_ref().map(|m| m.commit),
-                    dataset_id: metadata.as_ref().map(|m| m.dataset_id),
-                    io: metadata.as_ref().and_then(|m| m.io).map(|p| p.report()),
-                },
-            )
-        })?;
-        out.write_all(b"}")?;
-        Ok(())
+        write_select_cursor_native_trailer(
+            self.cursor,
+            out,
+            sent.unwrap_or(0),
+            metadata,
+            started,
+            initial_exec,
+        )
     }
 
     fn stats(&self) -> Option<CursorStats> {
@@ -552,6 +524,60 @@ impl SolutionSource for CursorSolutions<'_> {
     fn fail_output(&mut self, error: &Error) {
         self.cursor.fail_output(error);
     }
+}
+
+pub(super) fn write_select_cursor_native_trailer(
+    cursor: &crate::sparql::QueryCursor,
+    out: &mut RowOut<'_>,
+    sent: u64,
+    metadata: Option<NativeJsonMetadata<'_>>,
+    started: Instant,
+    initial_exec: f64,
+) -> Result<()> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Meta<'a> {
+        total_rows: Option<u64>,
+        sent_rows: u64,
+        status: crate::sparql::CursorStatus,
+        timing: &'a crate::sparql::Timing,
+        plan: &'a crate::sparql::CursorPlan,
+        memory: NativeMemory,
+        rows_produced: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        commit: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dataset_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        io: Option<crate::ioacct::IoReport>,
+    }
+    let stats = cursor.stats();
+    let mut timing = stats.timing.clone();
+    timing.serialize_ms =
+        (started.elapsed().as_secs_f64() * 1000.0 - (timing.exec_ms - initial_exec)).max(0.0);
+    out.write_all(b",\"meta\":")?;
+    crate::sparql::depth::with_stack(cursor.stack_depth(), || {
+        json(
+            &mut *out,
+            &Meta {
+                total_rows: (stats.status == crate::sparql::CursorStatus::Complete).then_some(sent),
+                sent_rows: sent,
+                status: stats.status,
+                timing: &timing,
+                plan: cursor.plan(),
+                memory: NativeMemory {
+                    peak_bytes: stats.mem_peak_bytes,
+                    granted_bytes: stats.granted_bytes,
+                },
+                rows_produced: stats.rows_produced,
+                commit: metadata.as_ref().map(|m| m.commit),
+                dataset_id: metadata.as_ref().map(|m| m.dataset_id),
+                io: metadata.as_ref().and_then(|m| m.io).map(|p| p.report()),
+            },
+        )
+    })?;
+    out.write_all(b"}")?;
+    Ok(())
 }
 
 /// One statement of a graph result, a triple or a quad as its source produced it. The
@@ -716,8 +742,8 @@ impl GraphSource for EagerGraph<'_> {
 
 /// A cursor writer's charge and the bytes it covers.
 pub(super) struct CursorCharge {
-    charge: crate::sparql::ctx::OwnedCharge,
-    bytes: u64,
+    pub(super) charge: crate::sparql::ctx::OwnedCharge,
+    pub(super) bytes: u64,
 }
 
 /// A CONSTRUCT or DESCRIBE cursor. Its statements are quads in production order, with
@@ -819,43 +845,7 @@ impl GraphSource for CursorGraph<'_> {
         metadata: Option<NativeJsonMetadata<'_>>,
         _started: Instant,
     ) -> Result<()> {
-        let cursor = &*self.cursor;
-        let stats = cursor.stats();
-        out.write_all(b",\"meta\":{")?;
-        write!(
-            out,
-            "\"totalRows\":{},\"sentRows\":{sent},\"status\":",
-            if stats.status == crate::sparql::CursorStatus::Complete {
-                sent.to_string()
-            } else {
-                "null".into()
-            }
-        )?;
-        json(&mut *out, &stats.status)?;
-        out.write_all(b",\"timing\":")?;
-        json(&mut *out, &stats.timing)?;
-        out.write_all(b",\"plan\":")?;
-        json(&mut *out, cursor.plan())?;
-        let granted = stats
-            .granted_bytes
-            .map_or(String::new(), |g| format!(",\"grantedBytes\":{g}"));
-        write!(
-            out,
-            ",\"memory\":{{\"peakBytes\":{}{granted}}},\"rowsProduced\":{},\"describeTruncated\":{}",
-            stats.mem_peak_bytes,
-            stats.rows_produced,
-            cursor.describe_truncated()
-        )?;
-        if let Some(meta) = metadata {
-            write!(out, ",\"commit\":{},\"datasetId\":", meta.commit)?;
-            json(&mut *out, &meta.dataset_id)?;
-            if let Some(p) = meta.io {
-                out.write_all(b",\"io\":")?;
-                json(&mut *out, &p.report())?;
-            }
-        }
-        out.write_all(b"}}")?;
-        Ok(())
+        write_graph_cursor_native_trailer(self.cursor, out, sent, metadata)
     }
 
     fn stats(&self) -> Option<CursorStats> {
@@ -865,4 +855,48 @@ impl GraphSource for CursorGraph<'_> {
     fn fail_output(&mut self, error: &Error) {
         self.cursor.fail_output(error);
     }
+}
+
+pub(super) fn write_graph_cursor_native_trailer(
+    cursor: &crate::sparql::GraphCursor,
+    out: &mut RowOut<'_>,
+    sent: u64,
+    metadata: Option<NativeJsonMetadata<'_>>,
+) -> Result<()> {
+    let stats = cursor.stats();
+    out.write_all(b",\"meta\":{")?;
+    write!(
+        out,
+        "\"totalRows\":{},\"sentRows\":{sent},\"status\":",
+        if stats.status == crate::sparql::CursorStatus::Complete {
+            sent.to_string()
+        } else {
+            "null".into()
+        }
+    )?;
+    json(&mut *out, &stats.status)?;
+    out.write_all(b",\"timing\":")?;
+    json(&mut *out, &stats.timing)?;
+    out.write_all(b",\"plan\":")?;
+    json(&mut *out, cursor.plan())?;
+    let granted = stats
+        .granted_bytes
+        .map_or(String::new(), |g| format!(",\"grantedBytes\":{g}"));
+    write!(
+        out,
+        ",\"memory\":{{\"peakBytes\":{}{granted}}},\"rowsProduced\":{},\"describeTruncated\":{}",
+        stats.mem_peak_bytes,
+        stats.rows_produced,
+        cursor.describe_truncated()
+    )?;
+    if let Some(meta) = metadata {
+        write!(out, ",\"commit\":{},\"datasetId\":", meta.commit)?;
+        json(&mut *out, &meta.dataset_id)?;
+        if let Some(p) = meta.io {
+            out.write_all(b",\"io\":")?;
+            json(&mut *out, &p.report())?;
+        }
+    }
+    out.write_all(b"}}")?;
+    Ok(())
 }
