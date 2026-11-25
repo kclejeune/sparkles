@@ -1990,12 +1990,9 @@ impl Ctx {
         self.owner.lock().upgrade()
     }
 
-    /// Charge `bytes` of state that outlives the call that builds it, such as a cache
-    /// that belongs to the plan, in both accounting modes. The charge holds a weak owner,
-    /// which avoids a plan and context reference cycle. A context that was never shared
-    /// has no owner to release through, so an eager one keeps such state uncharged, as
-    /// `None` says, while a cursor always has one.
-    pub(super) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
+    /// Weak owner for retained state, or `Ok(None)` when an unattached eager context
+    /// keeps retained state uncharged.
+    fn retained_owner(&self) -> Result<Option<Weak<Ctx>>> {
         let owner = self.owner.lock().clone();
         if owner.strong_count() == 0 {
             if !self.streams {
@@ -2003,6 +2000,18 @@ impl Ctx {
             }
             return Err(Error::invalid("cursor context owner has not been attached"));
         }
+        Ok(Some(owner))
+    }
+
+    /// Charge `bytes` of state that outlives the call that builds it, such as a cache
+    /// that belongs to the plan, in both accounting modes. The charge holds a weak owner,
+    /// which avoids a plan and context reference cycle. A context that was never shared
+    /// has no owner to release through, so an eager one keeps such state uncharged, as
+    /// `None` says, while a cursor always has one.
+    pub(super) fn retained_charge(&self, bytes: u64) -> Result<Option<RetainedCharge>> {
+        let Some(owner) = self.retained_owner()? else {
+            return Ok(None);
+        };
         let charge = self.charge(bytes)?;
         let id = charge.disarm();
         Ok(Some(RetainedCharge { owner, id, bytes }))
@@ -2021,13 +2030,9 @@ impl Ctx {
                 "admission lease belongs to another query account",
             ));
         }
-        let owner = self.owner.lock().clone();
-        if owner.strong_count() == 0 {
-            if !self.streams {
-                return Ok(None);
-            }
-            return Err(Error::invalid("cursor context owner has not been attached"));
-        }
+        let Some(owner) = self.retained_owner()? else {
+            return Ok(None);
+        };
         if bytes == 0 {
             return Ok(Some(RetainedCharge {
                 owner,
@@ -3244,8 +3249,8 @@ impl Ctx {
         mut cover: impl FnMut(u64) -> Result<()>,
     ) -> Result<Option<Term>> {
         let mut decode = |key: &[u8]| -> Result<Option<Term>> {
-            cover((key.len() as u64).saturating_mul(8).saturating_add(128))?;
-            Ok(Some(id::key_to_term(key)))
+            cover(self.batch_key_decode_bytes(key)?)?;
+            Ok(Some(copied_output_key(key)))
         };
         match id.tag() {
             Tag::Local => self.local.read().get(id.payload()).map_or(Ok(None), decode),
@@ -3265,20 +3270,29 @@ impl Ctx {
         }
     }
 
+    fn batch_key_decode_bytes(&self, key: &[u8]) -> Result<u64> {
+        if id::is_key_triple(key) {
+            // Compact triple keys can hide a component vector and boxed triple
+            // at each level, even when there is very little lexical text.
+            output_key_bytes(self, key, 0)
+        } else {
+            Ok((key.len() as u64).saturating_mul(8).saturating_add(128))
+        }
+    }
+
     pub(super) fn decoded_bytes(&self, id: Id) -> Result<u64> {
-        let size = match id.tag() {
-            Tag::Local => self.local.read().get(id.payload()).map_or(0, <[u8]>::len),
-            Tag::Vocab => self
-                .with_cursor_vocab_key(id.payload(), <[u8]>::len)?
-                .unwrap_or(0),
+        let size = |key: &[u8]| self.batch_key_decode_bytes(key);
+        let bytes = match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).map(size),
+            Tag::Vocab => self.with_cursor_vocab_key(id.payload(), size)?,
             Tag::Delta => self
                 .snap
                 .generation
                 .dvocab
-                .with(|v| v.get(id.payload()).map_or(0, <[u8]>::len)),
-            _ => 0,
+                .with(|v| v.get(id.payload()).map(size)),
+            _ => None,
         };
-        Ok((size as u64).saturating_mul(8).saturating_add(128))
+        bytes.unwrap_or(Ok(128))
     }
 
     /// The value of a base vocabulary id from the numeric column, when it holds one.
@@ -3925,13 +3939,9 @@ impl Charge<'_> {
         bytes: u64,
     ) -> Result<Option<RetainedCharge>> {
         let held = source.as_ref().expect("live charge to transfer");
-        let owner = held.ctx.owner.lock().clone();
-        if owner.strong_count() == 0 {
-            if !held.ctx.streams {
-                return Ok(None);
-            }
-            return Err(Error::invalid("cursor context owner has not been attached"));
-        }
+        let Some(owner) = held.ctx.retained_owner()? else {
+            return Ok(None);
+        };
         held.resize(bytes)?;
         let id = source.take().expect("admitted live charge").disarm();
         Ok(Some(RetainedCharge {

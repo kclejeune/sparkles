@@ -481,6 +481,21 @@ fn shallow_plan_estimate(spec: &ExistsSpec) -> u64 {
         .saturating_add(2048)
 }
 
+/// Plan the unsubstituted pattern for execution, with ordinary filter sampling.
+pub(super) fn unsubstituted_plan(ctx: &Ctx, spec: &ExistsSpec) -> Result<Arc<Node>> {
+    cache_unsubstituted_plan(ctx, spec, None, true)
+}
+
+/// Plan for cursor eligibility. Probes can discard their plans, so use existing
+/// filter selectivities without evaluating or recording new samples.
+pub(super) fn speculative_plan(
+    ctx: &Ctx,
+    spec: &ExistsSpec,
+    admission: Option<&Charge<'_>>,
+) -> Result<Arc<Node>> {
+    cache_unsubstituted_plan(ctx, spec, admission, false)
+}
+
 /// Plan `(spec.pattern(), spec.graph)` unsubstituted at most once per [`ExistsSpec`],
 /// returning a shared `Arc<Node>` cached in [`ExistsSpec::plan_cache`].
 ///
@@ -491,14 +506,11 @@ fn shallow_plan_estimate(spec: &ExistsSpec) -> u64 {
 /// is resized and converted directly into a [`RetainedCharge`] with no release gap;
 /// before attachment (during automatic admission), it is adopted into `admission` and
 /// carried across `enable_cursor_accounting` via a [`super::query_memory::QueryMemoryLease`].
-pub(super) fn unsubstituted_plan(ctx: &Ctx, spec: &ExistsSpec) -> Result<Arc<Node>> {
-    unsubstituted_plan_with_admission(ctx, spec, None)
-}
-
-pub(super) fn unsubstituted_plan_with_admission(
+fn cache_unsubstituted_plan(
     ctx: &Ctx,
     spec: &ExistsSpec,
     admission: Option<&Charge<'_>>,
+    sample_filters: bool,
 ) -> Result<Arc<Node>> {
     ctx.check()?;
     {
@@ -526,9 +538,7 @@ pub(super) fn unsubstituted_plan_with_admission(
         next
     });
     let mut planner = Planner::for_exists_with_charge(ctx, spec, Some(&plan_guard));
-    // A discarded plan must leave no sample text or credit in the query context.
-    // Sampling also evaluates expressions, so leave it to non-speculative planning.
-    planner.sample_filters &= admission.is_none();
+    planner.sample_filters &= sample_filters;
     let node = planner.plan(spec.pattern(), &spec.graph, Vec::new())?;
     super::depth::check_plan(node.depth())?;
     let bytes = super::cursor::plan_bytes(&node);
@@ -723,7 +733,7 @@ pub(super) fn keyed_plan(
     if !meta.keys.iter().any(|v| constant(v) || vars.contains(v)) {
         return Ok(None);
     }
-    let node = match unsubstituted_plan_with_admission(ctx, spec, admission) {
+    let node = match speculative_plan(ctx, spec, admission) {
         Ok(node) => node,
         Err(e @ (Error::Cancelled | Error::Timeout | Error::Io(_) | Error::Corrupt(_))) => {
             return Err(e);

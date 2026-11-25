@@ -1874,18 +1874,17 @@ fn streams_natively_with_admission(
                 }
                 continue;
             }
-            let planned =
-                match super::exists::unsubstituted_plan_with_admission(ctx, spec, admission) {
-                    Ok(planned) => planned,
-                    Err(
-                        e @ (Error::Cancelled | Error::Timeout | Error::Io(_) | Error::Corrupt(_)),
-                    ) => return Err(e),
-                    Err(Error::BudgetExceeded(_)) => return Ok(None),
-                    Err(_) => {
-                        spec.plan_cache.set_native(false);
-                        return Ok(Some(false));
-                    }
-                };
+            let planned = match super::exists::speculative_plan(ctx, spec, admission) {
+                Ok(planned) => planned,
+                Err(e @ (Error::Cancelled | Error::Timeout | Error::Io(_) | Error::Corrupt(_))) => {
+                    return Err(e);
+                }
+                Err(Error::BudgetExceeded(_)) => return Ok(None),
+                Err(_) => {
+                    spec.plan_cache.set_native(false);
+                    return Ok(Some(false));
+                }
+            };
             match super::depth::guard_exists(|| at(ctx, &planned, admission))? {
                 Some(ok) => {
                     spec.plan_cache.set_native(ok);
@@ -10156,6 +10155,64 @@ mod retained_variable_tests {
     }
 
     #[test]
+    fn deep_exists_filter_preflight_refuses_compact_triple_before_decoding() {
+        use crate::id::{Tag, term_key};
+        use crate::store::{Store, StoreOptions};
+        use oxrdf::{NamedNode, Term, Triple};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let levels = 32;
+        let mut term = Term::NamedNode(NamedNode::new_unchecked("x:o"));
+        for _ in 0..levels {
+            term = Triple::new(
+                NamedNode::new_unchecked("x:s"),
+                NamedNode::new_unchecked("x:p"),
+                term,
+            )
+            .into();
+        }
+        let mut txn = store.write();
+        let id = txn.intern(&term).unwrap();
+        let s = txn.intern(&NamedNode::new_unchecked("x:s").into()).unwrap();
+        let p = txn.intern(&NamedNode::new_unchecked("x:p").into()).unwrap();
+        assert!(txn.insert([s, p, id, Id::DEFAULT_GRAPH]).unwrap());
+        txn.commit().unwrap();
+        assert_eq!(id.tag(), Tag::Delta);
+
+        let limit = 64 << 10;
+        let opts = QueryOptions {
+            max_memory_bytes: Some(limit),
+            ..Default::default()
+        };
+        let parsed = super::super::parse_query("SELECT ?o { <x:s> <x:p> ?o }", None, &[]).unwrap();
+        let prepared =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let ctx = &prepared.ctx;
+        let component_vec = (3 * std::mem::size_of::<Term>()) as u64;
+        let old_decode = (term_key(&term).len() as u64) * 8 + 128;
+        let live_vectors = levels * component_vec;
+        assert!(old_decode < live_vectors);
+        let room = (old_decode + live_vectors) / 2;
+        let held = ctx.charge(ctx.memory_remaining() - room).unwrap();
+        let expr = Expr::Const(id);
+        let mut sized = Ok(0);
+        let largest = crate::test_alloc::record_largest(|| {
+            sized = expr.description_bytes(ctx);
+        });
+        assert!(
+            (largest as u64) < component_vec,
+            "description sizing allocated {largest} bytes with only {room} bytes left"
+        );
+        assert!(matches!(sized, Err(Error::BudgetExceeded(_))), "{sized:?}");
+        assert!(ctx.mem_peak() <= limit);
+        drop(held);
+        assert_eq!(
+            expr.description_bytes(ctx).unwrap(),
+            expr.display(ctx).len()
+        );
+    }
+
+    #[test]
     fn deep_exists_auto_ask_open_skips_specs_after_strict_refusal() {
         use super::super::exists::EXISTS_PLANS_BUILT;
         use crate::io::Source;
@@ -10268,6 +10325,59 @@ mod retained_variable_tests {
         assert!(!spec(&prepared.node).plan_cache.has_cached_plan());
         assert_eq!(prepared.ctx.live_bytes(), baseline);
         assert!(!prepared.ctx.has_sampled());
+    }
+
+    #[test]
+    fn deep_exists_memory_retry_refusal_does_not_sample() {
+        use super::super::exists::EXISTS_PLANS_BUILT;
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s> <urn:p> <urn:o> .\n<urn:o> <urn:q> 7 .".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snapshot = store.snapshot();
+        assert!(snapshot.delta.is_empty());
+        let query = "SELECT ?s { ?s <urn:p> ?o
+            FILTER EXISTS { ?o <urn:q> ?y FILTER(isLITERAL(?y)) } }";
+        let padded = format!("{query}\n#{}", "padding".repeat(32_000));
+        let parsed = super::super::parse_query(&padded, None, &[]).unwrap();
+        let limit = 2 << 20;
+        assert!(padded.len() as u64 * 16 > limit);
+        let opts = QueryOptions {
+            max_memory_bytes: Some(limit),
+            ..Default::default()
+        };
+        let cursor = CursorOptions::default();
+        assert!(!snapshot.counts.has_samples());
+        EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        assert!(
+            !fits_without_spill(&snapshot, &parsed, &padded, &opts, &cursor, Instant::now())
+                .unwrap()
+        );
+        assert_eq!(EXISTS_PLANS_BUILT.with(|n| n.get()), 1);
+        assert!(
+            !snapshot.counts.has_samples(),
+            "the refused retry populated the snapshot's sample cache"
+        );
+
+        query_execution_with_plan(
+            snapshot.clone(),
+            query,
+            &opts,
+            &cursor,
+            ExecutionMode::Streaming,
+        )
+        .unwrap_or_else(|err| panic!("{}", err.error));
+        assert!(
+            snapshot.counts.has_samples(),
+            "the filter must be sampleable"
+        );
     }
 
     #[test]

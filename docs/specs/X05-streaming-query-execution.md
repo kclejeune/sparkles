@@ -1992,6 +1992,7 @@ metadata, and retained charges. When automatic admission keeps a query eager or 
 error, `clear_cached_plans` drops all cached plans and structural admission metadata
 before the admission reservation releases. Speculative EXISTS planning uses selectivities
 already recorded in the query context and the standard estimates for the remaining filters.
+This also applies when Auto SELECT checks whether a memory failure can retry without spill.
 Ordinary planning can evaluate and record new samples.
 
 Automatic ASK checks the fixed opening costs before attempting to build a cursor. The

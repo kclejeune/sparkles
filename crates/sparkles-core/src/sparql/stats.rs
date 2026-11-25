@@ -164,6 +164,11 @@ impl CountCache {
         self.sampled.lock().get(k).copied()
     }
 
+    #[cfg(test)]
+    pub(super) fn has_samples(&self) -> bool {
+        !self.sampled.lock().is_empty()
+    }
+
     pub(super) fn set_sampled(&self, k: String, s: super::sample::Sampled) {
         let mut m = self.sampled.lock();
         if m.len() >= Self::ENTRIES {
