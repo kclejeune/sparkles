@@ -668,9 +668,9 @@ that it agrees with the engine on every W3C query test and on the seeded queries
 `tests/query_cursor.rs` at both modes.
 
 The evaluator has landed and passed this gate, apart from the disagreements that items
-1064, 1065 and 1071 hold. While those items are open, the tests compare the aggregates
-over errors and non-strings and the string functions over directional strings under the
-engine's reading, and leave out the queries that read longer numbers. The [spec's Outcome](SPEC.md#outcome) describes it.
+1064, 1065 and 1071 held. Items 1064 and 1071 have shipped; the tests compare the
+aggregates over errors and non-strings under the engine's default Jena reading and leave
+out the queries that read longer numbers under item 1065. The [spec's Outcome](SPEC.md#outcome) describes it.
 
 ### The merge
 

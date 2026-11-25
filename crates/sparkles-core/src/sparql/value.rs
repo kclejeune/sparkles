@@ -37,6 +37,9 @@ pub enum Value {
     },
 }
 
+/// Language tag and optional RDF 1.2 base direction of a string literal argument.
+pub(crate) type StringLang<'a> = Option<(&'a str, Option<oxrdf::BaseDirection>)>;
+
 /// A SPARQL expression type error (evaluation → unbound / filter false).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeError;
@@ -230,11 +233,13 @@ impl Value {
             _ => None,
         }
     }
-    /// "string literal" argument per SPARQL 17.4.3 (simple, xsd:string or lang-tagged)
-    pub fn string_arg(&self) -> EvalResult<(&str, Option<&str>)> {
+    /// "string literal" argument per SPARQL 17.4.3 (simple, `xsd:string` or
+    /// language-tagged, with optional RDF 1.2 base direction).
+    pub fn string_arg(&self) -> EvalResult<(&str, StringLang<'_>)> {
         match self {
             Value::Str(s) => Ok((s, None)),
-            Value::Lang(s, l) | Value::LangDir(s, l, _) => Ok((s, Some(l))),
+            Value::Lang(s, l) => Ok((s, Some((l, None)))),
+            Value::LangDir(s, l, d) => Ok((s, Some((l, Some(*d))))),
             _ => Err(TypeError),
         }
     }

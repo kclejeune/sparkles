@@ -396,14 +396,15 @@ engine passes over an error in MIN and MAX, where the specification's order make
 error and Jena makes both an error, and it follows Jena in making AVG over errors only an
 error and in letting GROUP_CONCAT read IRIs and numbers. It does not read an
 `xsd:integer` or `xsd:decimal` beyond the range of its decimal type as a number, which
-XSD permits and Jena does not do. Its string functions take a directional string and a
+XSD permits and Jena does not do. Its string functions once took a directional string and a
 language-tagged string of the same language as compatible arguments, which SPARQL 1.2
-and Jena do not. The evaluator evaluates the aggregates of item 1064 under the
-specification's, Jena's or the engine's reading, answers the W3C suites under the
-specification's, and compares the engine under the engine's current reading until the
-setting of item 1064 lands with Jena's as its default. The evaluator notes where a query
-meets item 1064 or 1071, and the tests compare such a query exactly under the engine's
-reading. Item 1077 holds three
+and Jena do not; item 1071 has shipped, so `STRSTARTS`, `STRENDS`, `CONTAINS`, `STRBEFORE`,
+`STRAFTER` and the vocabulary-key filters now compare both language tag and base direction,
+matching string-returning functions preserve the base direction, and the reference evaluator
+no longer carries a compatibility workaround for them. The evaluator evaluates the
+aggregates of item 1064 under the specification's, Jena's or the engine's reading, answers
+the W3C suites under the specification's, and compares the engine under the engine's
+reading of item 1064's setting, whose default is Jena's. Item 1077 holds three
 XSD and XPath readings in which the engine differs from both the specification and
 Jena, `isNumeric("inf"^^xsd:double)`, the canonical form of a double cast to a string and
 `.` in REGEX, which matches a carriage return. The

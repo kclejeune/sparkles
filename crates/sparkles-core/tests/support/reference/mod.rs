@@ -151,7 +151,6 @@ pub struct Reference {
     quads: Vec<Quad>,
     union_default: bool,
     aggregate_errors: Cell<AggregateErrors>,
-    ignore_direction_in_compatibility: Cell<bool>,
     spec_readings: Cell<bool>,
     sparql11_ebv: Cell<bool>,
     /// The start of the labels of the blank nodes that the evaluation makes, which no
@@ -190,7 +189,6 @@ impl Reference {
             quads,
             union_default: false,
             aggregate_errors: Cell::new(AggregateErrors::Spec),
-            ignore_direction_in_compatibility: Cell::new(false),
             spec_readings: Cell::new(false),
             sparql11_ebv: Cell::new(false),
             fresh_prefix,
@@ -219,13 +217,6 @@ impl Reference {
     /// evaluator kept across queries.
     pub fn set_aggregate_errors(&self, reading: AggregateErrors) {
         self.aggregate_errors.set(reading);
-    }
-
-    /// Set whether later evaluations take two language-tagged string arguments of the same
-    /// language and different base directions as compatible, a reading other than SPARQL
-    /// 1.2's, which [`Notes::direction_in_compatibility`] describes.
-    pub fn set_ignoring_direction_in_compatibility(&self, ignore: bool) {
-        self.ignore_direction_in_compatibility.set(ignore);
     }
 
     /// Evaluate the questions where Jena's reading differs from the specification's text
@@ -486,11 +477,6 @@ pub struct Notes {
     /// supports 16, so the evaluator's answer, which reads them exactly up to 38 digits,
     /// is one of those it allows.
     pub beyond_minimum_precision: bool,
-    /// A string function had two language-tagged arguments of the same language whose
-    /// base directions differ, which SPARQL 1.2 and Jena make incompatible arguments and
-    /// an error. A test may compare with the reading that ignores the direction where the
-    /// difference is tracked as an open defect.
-    pub direction_in_compatibility: bool,
     /// AVG read only errors, where the readings of [`AggregateErrors`] differ.
     pub avg_of_errors: bool,
     /// GROUP_CONCAT read a value that is not a string, such as an IRI or a number, where
