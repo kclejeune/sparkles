@@ -304,8 +304,16 @@ fn swap(
     match st.reattach_expected(name, restored_id) {
         Ok(ds) => {
             let cleanup = if keep_replaced {
-                let kept = databases.join(format!("{KEPT_PREFIX}{name}-{task}"));
+                let kept_name = format!("{KEPT_PREFIX}{name}-{task}");
+                let kept = databases.join(&kept_name);
+                let marker = replaced.join(super::delete::KEEP_REPLACED_MARKER);
+                let marked = super::write_file_atomic(&marker, kept_name.as_bytes());
+                if let Err(error) = marked {
+                    tracing::warn!(target: "sparkles::backup", path = %marker.display(), %error,
+                        "could not mark the intentionally retained restore copy");
+                }
                 std::fs::rename(&replaced, &kept)
+                    .and_then(|()| sparkles_core::fsutil::sync_dir(&databases))
             } else {
                 std::fs::remove_dir_all(&replaced)
             };

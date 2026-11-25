@@ -550,17 +550,19 @@ closed links. Recovery checks a known original UUID before and under process exc
 and cannot create a missing root or empty generation. A failed delete move is synchronized
 back before reopen, or remains unavailable with its original bytes and reported path.
 Uncertain moved data uses the existing retained `.kept-<name>-<token>` convention.
-Managed persistent deletes persist a versioned `delete.json` intent, format 1 in
-`formats::SETTINGS`, before updating `config.json` and moving the root aside, and clear it
-once the move into disposable trash is synchronized, the directory is removed or rollback
-completes. On catalog startup, recovery refuses unknown or malformed `delete.json` versions
-before touching files, removes interrupted `.kept-<name>-<token>` directories and
-unmoved roots backed by a matching intent UUID when the dataset is absent from
-`config.json` or replaced by another UUID, never follows symlinks, leaves live datasets
-and `keepReplaced` copies untouched, and logs a structured warning with the path and
-retained bytes for any unremovable or unrecognized `.kept-*` entry without failing startup.
-Catalog startup refuses only a registered root that lacks its directory or CURRENT,
-names the expected path and serves the other datasets. Restore publication
+Managed persistent deletes record a versioned `delete.json` intent before updating
+`config.json`. Format 2 records rollback before the directory can be moved back or
+reopened. The reader also accepts format 1 forward intents. Startup validates the journal
+before running any recovery. Forward recovery verifies identity and takes the store
+process lock before staging and reclaiming a directory. It synchronizes the database
+namespace before retiring the intent. Rollback recovery preserves the original bytes and
+restores a missing registry entry when it can verify the original UUID. It leaves a
+retained copy at its existing path if the original move back failed. Startup preserves
+unknown kept copies and reports retained paths, byte counts and incomplete counts.
+Restores mark intentional `keepReplaced` copies so their warnings do not depend on the
+active name.
+A registered root with a missing directory or CURRENT stays closed. Startup names the
+expected path and serves the other datasets. Restore publication
 checks the restored identity separately from original-identity rollback. Existing roots
 without a known expected UUID retain the supported legacy metadata upgrade only when
 CURRENT already exists.

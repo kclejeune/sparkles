@@ -17,6 +17,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 mod delete;
+mod delete_fs;
 mod gate;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -306,15 +307,15 @@ impl Catalog {
         let dir = std::path::absolute(dir)?;
         std::fs::create_dir_all(&dir)?;
         let lock = lock_dir(&dir)?;
-        std::fs::create_dir_all(dir.join("databases"))?;
+        let intents = delete::read_intents(&dir)?;
+        let databases = delete::open_databases(&dir)?;
         rename::recover(&dir)?;
         #[cfg(feature = "backup")]
         restore::recover(&dir).map_err(component)?;
-        delete::recover(&dir)?;
-        for e in std::fs::read_dir(dir.join("databases"))? {
+        delete::recover(&dir, &databases, intents)?;
+        for e in std::fs::read_dir(databases.path())? {
             let e = e?;
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with(".clone-") || name.starts_with(TRASH_PREFIX) {
+            if e.file_name().to_string_lossy().starts_with(".clone-") {
                 std::fs::remove_dir_all(e.path())?;
             }
         }
@@ -936,6 +937,8 @@ impl Catalog {
                     name: name.into(),
                     id,
                     token,
+                    state: delete::IntentState::Deleting,
+                    reasoning: reasoning.clone(),
                 });
                 if let Some(intent) = &intent {
                     let recorded = {
@@ -943,21 +946,63 @@ impl Catalog {
                         delete::record(dir, intent)
                     };
                     if let Err(error) = recorded {
-                        return Err(self.reopen_closed_locked(name, id, reasoning, error));
+                        return Err(self.reopen_closed_locked(name, id, reasoning, error).error);
                     }
                     delete::crash_point(delete::CRASH_AFTER_INTENT)?;
                 }
-                if let Err(error) = self.save_locked() {
+                if let Err(error) = self.save_locked_for_delete() {
+                    let mut revoked = true;
                     if let Some(intent) = &intent {
-                        let _intent_lock = self.inner.delete_intents.lock();
-                        let _ = delete::clear(dir, intent.token);
+                        let marked = {
+                            let _intent_lock = self.inner.delete_intents.lock();
+                            delete::mark_rolling_back(dir, intent.token)
+                        };
+                        if let Err(mark_error) = marked {
+                            revoked = false;
+                            tracing::warn!(
+                                target: "sparkles::catalog",
+                                path = %dir.join(delete::INTENT_FILE).display(),
+                                error = %mark_error,
+                                "could not mark delete intent as rolling back after registry save failure"
+                            );
+                        }
+                        #[cfg(test)]
+                        delete::crash_point(delete::CRASH_AFTER_SAVE_ROLLBACK_MARK)?;
                     }
-                    return Err(self.reopen_closed_locked(name, id, reasoning, error));
+                    // Only reopen into live serving state when rollback is durably
+                    // recorded or config.json on disk still registers this dataset.
+                    let can_reopen = revoked
+                        || read_registry(dir).is_ok_and(|reg| {
+                            reg.datasets
+                                .iter()
+                                .any(|e| e.name == name && e.kind == DatasetKind::Persistent)
+                        });
+                    let outcome = if can_reopen {
+                        self.reopen_closed_locked(name, id, reasoning, error)
+                    } else {
+                        self.keep_closed_locked(name, id, reasoning, error)
+                    };
+                    if outcome.registry_saved
+                        && let Some(intent) = &intent
+                    {
+                        self.retire_delete_rollback(dir, intent.token);
+                    }
+                    return Err(outcome.error);
                 }
                 if intent.is_some() {
                     delete::crash_point(delete::CRASH_AFTER_SAVE)?;
                 }
-                match root.map(|root| move_to_trash(&root, token)).transpose() {
+                let mut mark_rollback = || -> Result<()> {
+                    if let Some(intent) = &intent {
+                        let _intent_lock = self.inner.delete_intents.lock();
+                        delete::mark_rolling_back(dir, intent.token)?;
+                    }
+                    Ok(())
+                };
+                match root
+                    .map(|root| move_to_trash(&root, token, &mut mark_rollback))
+                    .transpose()
+                {
                     Ok(Some(moved)) => {
                         if moved.synchronized_as_trash
                             && let Some(intent) = &intent
@@ -982,26 +1027,17 @@ impl Catalog {
                     #[cfg(test)]
                     Err(MoveError::Crash(error)) => return Err(error),
                     Err(MoveError::Rollback(failure)) => {
-                        let err = if failure.reopen {
+                        let outcome = if failure.reopen {
                             self.reopen_closed_locked(name, id, reasoning, failure.error)
                         } else {
                             self.keep_closed_locked(name, id, reasoning, failure.error)
                         };
-                        if let Some(intent) = &intent {
-                            let cleared = {
-                                let _intent_lock = self.inner.delete_intents.lock();
-                                delete::clear(dir, intent.token)
-                            };
-                            if let Err(error) = cleared {
-                                tracing::warn!(
-                                    target: "sparkles::catalog",
-                                    path = %dir.join(delete::INTENT_FILE).display(),
-                                    %error,
-                                    "could not clear delete intent after delete rollback"
-                                );
-                            }
+                        if outcome.registry_saved
+                            && let Some(intent) = &intent
+                        {
+                            self.retire_delete_rollback(dir, intent.token);
                         }
-                        return Err(err);
+                        return Err(outcome.error);
                     }
                 }
             } else {
@@ -1071,6 +1107,20 @@ impl Catalog {
         );
     }
 
+    fn retire_delete_rollback(&self, dir: &Path, token: Uuid) {
+        let _intent_lock = self.inner.delete_intents.lock();
+        if let Err(error) =
+            sync_dir(&dir.join("databases")).and_then(|()| delete::clear(dir, token))
+        {
+            tracing::warn!(
+                target: "sparkles::catalog",
+                path = %dir.join(delete::INTENT_FILE).display(),
+                %error,
+                "could not clear delete intent after delete rollback"
+            );
+        }
+    }
+
     /// An irrevocably closed state is never revived on later I/O refusal.
     fn reopen_closed_locked(
         &self,
@@ -1078,7 +1128,7 @@ impl Catalog {
         id: Uuid,
         reasoning: Option<crate::reasoning::ReasoningRecord>,
         error: Error,
-    ) -> Error {
+    ) -> RollbackOutcome {
         let retained_reasoning = reasoning.clone();
         self.inner.detached.lock().insert(
             name.into(),
@@ -1088,11 +1138,17 @@ impl Catalog {
             },
         );
         match self.reattach_locked(name, Some(id)) {
-            Ok(()) => match self.save_locked() {
-                Ok(()) => error,
-                Err(save) => Error::Corrupt(format!(
-                    "{error}; reopening /{name} succeeded but restoring its registry failed: {save}"
-                )),
+            Ok(()) => match self.save_rollback_registry_locked() {
+                Ok(()) => RollbackOutcome {
+                    error,
+                    registry_saved: true,
+                },
+                Err(save) => RollbackOutcome {
+                    error: Error::Corrupt(format!(
+                        "{error}; reopening /{name} succeeded but restoring its registry failed: {save}"
+                    )),
+                    registry_saved: false,
+                },
             },
             Err(reopen) => self.keep_closed_locked(
                 name,
@@ -1113,7 +1169,7 @@ impl Catalog {
         id: Uuid,
         reasoning: Option<crate::reasoning::ReasoningRecord>,
         error: Error,
-    ) -> Error {
+    ) -> RollbackOutcome {
         let message =
             format!("{error}; original dataset {id} remains closed and requires recovery");
         self.inner.detached.lock().insert(
@@ -1130,11 +1186,17 @@ impl Catalog {
                 kind: "recovery",
             },
         );
-        match self.save_locked() {
-            Ok(()) => Error::Corrupt(message),
-            Err(save) => Error::Corrupt(format!(
-                "{message}; retaining its registry entry also failed: {save}"
-            )),
+        match self.save_rollback_registry_locked() {
+            Ok(()) => RollbackOutcome {
+                error: Error::Corrupt(message),
+                registry_saved: true,
+            },
+            Err(save) => RollbackOutcome {
+                error: Error::Corrupt(format!(
+                    "{message}; retaining its registry entry also failed: {save}"
+                )),
+                registry_saved: false,
+            },
         }
     }
 
@@ -1545,8 +1607,7 @@ impl Catalog {
         let _g = self.manage()?;
         self.save_locked()
     }
-    fn save_locked(&self) -> Result<()> {
-        let Some(dir) = self.dir() else { return Ok(()) };
+    fn serialize_registry_locked(&self) -> Result<Vec<u8>> {
         let mut datasets: Vec<RegistryEntry> = self
             .inner
             .entries
@@ -1571,10 +1632,29 @@ impl Catalog {
         }
         datasets.sort_by(|a, b| a.name.cmp(&b.name));
         let reg = Registry { datasets };
-        write_file_atomic(
-            &dir.join(CONFIG_FILE),
-            &sparkles_core::formats::settings_to_vec(CONFIG_FILE, &reg)?,
-        )
+        sparkles_core::formats::settings_to_vec(CONFIG_FILE, &reg)
+    }
+    fn save_locked(&self) -> Result<()> {
+        let Some(dir) = self.dir() else { return Ok(()) };
+        let bytes = self.serialize_registry_locked()?;
+        write_file_atomic(&dir.join(CONFIG_FILE), &bytes)
+    }
+    fn save_locked_for_delete(&self) -> Result<()> {
+        let Some(dir) = self.dir() else { return Ok(()) };
+        let bytes = self.serialize_registry_locked()?;
+        let path = dir.join(CONFIG_FILE);
+        #[cfg(test)]
+        if DELETE_FAIL.get() & (1 << DELETE_SAVE_SYNC) != 0 {
+            let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+            sparkles_core::fsutil::write_synced(&tmp, &bytes)?;
+            std::fs::rename(&tmp, &path)?;
+            return Err(std::io::Error::other("injected config.json parent sync failure").into());
+        }
+        write_file_atomic(&path, &bytes)
+    }
+    fn save_rollback_registry_locked(&self) -> Result<()> {
+        delete_fail_point(DELETE_ROLLBACK_REGISTRY_SAVE)?;
+        self.save_locked()
     }
     /// Take a managed persistent dataset out of the lookup map for an in-place
     /// restore. It stays registered in what [`save`](Self::save) writes until it is
@@ -1737,6 +1817,11 @@ pub(crate) fn lock_dir(dir: &Path) -> Result<ProcessLock> {
 const TRASH_PREFIX: &str = ".deleted-";
 // Existing retained-restore convention: unresolved moves are never trash.
 pub(super) const KEPT_PREFIX: &str = ".kept-";
+struct RollbackOutcome {
+    error: Error,
+    registry_saved: bool,
+}
+
 struct DeleteMoveError {
     error: Error,
     reopen: bool,
@@ -1762,12 +1847,15 @@ const DELETE_ROLLBACK_SYNC: u8 = 4;
 const DELETE_TRASH_RENAME: u8 = 5;
 const DELETE_TRASH_SYNC: u8 = 6;
 #[cfg(test)]
+const DELETE_SAVE_SYNC: u8 = 7;
+const DELETE_ROLLBACK_REGISTRY_SAVE: u8 = 8;
+#[cfg(test)]
 thread_local! {
-    static DELETE_FAIL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static DELETE_FAIL: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
 }
 fn delete_fail_point(point: u8) -> Result<()> {
     #[cfg(test)]
-    if DELETE_FAIL.get() & (1 << point) != 0 {
+    if DELETE_FAIL.get() & (1u16 << point) != 0 {
         return Err(std::io::Error::other(format!("injected delete stage {point}")).into());
     }
     #[cfg(not(test))]
@@ -1777,7 +1865,11 @@ fn delete_fail_point(point: u8) -> Result<()> {
 
 /// Keep the actual moved source across uncertain directory synchronization.
 /// Only synchronized original-name removal may become disposable trash.
-fn move_to_trash(root: &Path, token: Uuid) -> std::result::Result<MovedToTrash, MoveError> {
+fn move_to_trash(
+    root: &Path,
+    token: Uuid,
+    on_rollback: &mut dyn FnMut() -> Result<()>,
+) -> std::result::Result<MovedToTrash, MoveError> {
     let parent = root.parent().expect("database parent");
     // The dataset name lets an operator match retained bytes to a refused entry.
     let name = root
@@ -1785,23 +1877,47 @@ fn move_to_trash(root: &Path, token: Uuid) -> std::result::Result<MovedToTrash, 
         .expect("dataset directory")
         .to_string_lossy();
     let kept = parent.join(format!("{KEPT_PREFIX}{name}-{token}"));
-    delete_fail_point(DELETE_BEFORE_MOVE).map_err(|error| {
-        MoveError::Rollback(DeleteMoveError {
-            error,
-            reopen: true,
-        })
-    })?;
-    std::fs::rename(root, &kept).map_err(|error| {
-        MoveError::Rollback(DeleteMoveError {
-            error: error.into(),
-            reopen: true,
-        })
-    })?;
+    let forward = delete_fail_point(DELETE_BEFORE_MOVE)
+        .and_then(|()| std::fs::rename(root, &kept).map_err(Error::from));
+    if let Err(error) = forward {
+        let marked = on_rollback();
+        #[cfg(test)]
+        if let Err(crash) = delete::crash_point(delete::CRASH_AFTER_FAILED_FORWARD_MOVE) {
+            return Err(MoveError::Crash(crash));
+        }
+        return match marked {
+            Ok(()) => Err(MoveError::Rollback(DeleteMoveError {
+                error,
+                reopen: true,
+            })),
+            Err(mark_err) => Err(MoveError::Rollback(DeleteMoveError {
+                error: Error::Corrupt(format!(
+                    "{error}; could not mark delete intent as rolling back: {mark_err}"
+                )),
+                reopen: false,
+            })),
+        };
+    }
     let synchronized = delete_fail_point(DELETE_STAGE_SYNC).and_then(|()| sync_dir(parent));
     if let Err(error) = synchronized {
+        // Durably revoke the forward delete intent BEFORE putting the directory back
+        // so a crash during rollback can never delete original dataset bytes.
+        if let Err(mark_err) = on_rollback() {
+            return Err(MoveError::Rollback(DeleteMoveError {
+                error: Error::Corrupt(format!(
+                    "deletion could not synchronize: {error}; could not mark delete intent as rolling back: {mark_err}; original bytes remain at {}",
+                    kept.display()
+                )),
+                reopen: false,
+            }));
+        }
         let restored = delete_fail_point(DELETE_ROLLBACK_MOVE)
             .and_then(|()| std::fs::rename(&kept, root).map_err(Error::from));
         if let Err(rollback) = restored {
+            #[cfg(test)]
+            if let Err(crash) = delete::crash_point(delete::CRASH_AFTER_FAILED_ROLLBACK_MOVE) {
+                return Err(MoveError::Crash(crash));
+            }
             return Err(MoveError::Rollback(DeleteMoveError {
                 error: Error::Corrupt(format!(
                     "deletion could not synchronize: {error}; restoring {} failed: {rollback}; original bytes remain at {}",
@@ -1814,6 +1930,10 @@ fn move_to_trash(root: &Path, token: Uuid) -> std::result::Result<MovedToTrash, 
         if let Err(rollback) =
             delete_fail_point(DELETE_ROLLBACK_SYNC).and_then(|()| sync_dir(parent))
         {
+            #[cfg(test)]
+            if let Err(crash) = delete::crash_point(delete::CRASH_AFTER_FAILED_ROLLBACK_SYNC) {
+                return Err(MoveError::Crash(crash));
+            }
             return Err(MoveError::Rollback(DeleteMoveError {
                 error: Error::Corrupt(format!(
                     "deletion could not synchronize: {error}; original bytes returned to {} but rollback sync failed: {rollback}",
@@ -1821,6 +1941,10 @@ fn move_to_trash(root: &Path, token: Uuid) -> std::result::Result<MovedToTrash, 
                 )),
                 reopen: false,
             }));
+        }
+        #[cfg(test)]
+        if let Err(crash) = delete::crash_point(delete::CRASH_AFTER_ROLLBACK_MOVE_SYNC) {
+            return Err(MoveError::Crash(crash));
         }
         return Err(MoveError::Rollback(DeleteMoveError {
             error,
@@ -1882,10 +2006,34 @@ pub(crate) fn component(e: anyhow::Error) -> Error {
 }
 pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    Ok(sparkles_core::fsutil::write_atomic_via(path, &tmp, bytes)?)
+    sparkles_core::fsutil::write_atomic_via(path, &tmp, bytes)?;
+    #[cfg(test)]
+    record_dir_sync(path.parent().unwrap_or(Path::new(".")));
+    Ok(())
 }
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
-    Ok(sparkles_core::fsutil::sync_dir(dir)?)
+    sparkles_core::fsutil::sync_dir(dir)?;
+    #[cfg(test)]
+    record_dir_sync(dir);
+    Ok(())
+}
+#[cfg(test)]
+thread_local! {
+    static CATALOG_DIR_SYNCS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+pub(super) fn record_dir_sync(dir: &Path) {
+    CATALOG_DIR_SYNCS.with(|s| s.borrow_mut().push(dir.to_path_buf()));
+}
+#[cfg(test)]
+pub(super) fn take_catalog_dir_syncs() -> Vec<PathBuf> {
+    CATALOG_DIR_SYNCS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+fn write_registry(dir: &Path, reg: &Registry) -> Result<()> {
+    write_file_atomic(
+        &dir.join(CONFIG_FILE),
+        &sparkles_core::formats::settings_to_vec(CONFIG_FILE, reg)?,
+    )
 }
 
 #[cfg(test)]

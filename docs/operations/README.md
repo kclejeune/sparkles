@@ -57,6 +57,26 @@ Sparkles runs as a single binary packaged for NixOS, Home Manager, Docker, and K
 * **Parallel startup and health probes.** The server opens its listening socket first and opens datasets in parallel ([API.md](../API.md#startup)). `/$/ready` reports each dataset as `open`, `opening` (returning `503` with `Retry-After` on access), or `failed`. Failed datasets stay closed while others serve, marking the server `degraded` and unready unless `--ready-ignore-failed` is set (`--require-all-datasets` exits instead). Use `/$/ping` for startup and liveness probes and `/$/ready` (or `/$/ready/{ds}`) for readiness checks ([USAGE.md](../USAGE.md#endpoints-and-operations)). Degraded derived-index reporting and WAL replay progress remain planned (roadmap [item 402](../ROADMAP.md)).
 * **Graceful shutdown.** On `SIGTERM` or `SIGINT`, the server stops accepting new connections, allows in-flight requests up to `--shutdown-grace` seconds to finish, and cancels remaining work without committing aborted writes.
 
+### Interrupted dataset deletes
+
+Managed persistent deletes use the catalog's `delete.json` journal. Startup checks the
+journal before recovering any pending rename, restore or delete. An unsupported version,
+invalid journal, or symlink in place of the journal or `databases` directory prevents
+the catalog from opening.
+
+During recovery, the catalog checks the dataset UUID and takes the store's process lock
+before removing a directory. An unregistered dataset at its original path moves to
+`databases/.kept-<name>-<token>` before cleanup begins. A failed cleanup or a busy store
+leaves its journal entry for the next startup. A delete that was rolling back preserves
+the original data. If the original root could not be restored, its registered name stays
+closed and the warning names the retained path.
+
+Warnings report `path`, `retained_bytes`, and whether the byte count is complete.
+Startup leaves unrecognized kept entries in place. Copies marked by a `keepReplaced`
+restore are recognized even after the active dataset is renamed or deleted. Older copies
+without a marker may appear in the warnings. Stop the catalog and all standalone users
+of a dataset before moving or editing files inside the managed catalog directory.
+
 ### API compatibility
 
 The [API compatibility policy](../DEVELOPMENT.md#api-compatibility) covers HTTP routes, CLI commands, and public library APIs. HTTP OpenAPI descriptions and standard CLI command trees are checked against a development commit baseline rather than a published release. Library and binding compatibility checks, CLI JSON/exit-code checks, MCP and metrics guards, deprecation signals, and released-artifact verification remain planned (roadmap [item 60](../ROADMAP.md)). On-disk reader compatibility windows are managed separately.
