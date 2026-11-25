@@ -7414,18 +7414,29 @@ fn split_leaf_export_overlap_allocation_sites_nested_forks_and_parallel_inconsis
         );
     }
 
-    // 3. Leaf-export overlap refusal + nested forks & forced merges (`shoi-042` with
-    //    `rooted_merge = true`, which executes 2 nested forks and 2 forced `STOP_MERGE`s
-    //    with live sibling frames + `Arc<CanonMap>`s on `stack`):
-    //    verify:
-    //    (a) a cap/pool refusing right above leaf saturation peak but below `leaf + export`
-    //        refuses cleanly (recording combined peak, clearing `split_answer`) and recovers;
-    //    (b) refusing pool across nested forks / forced merges refuses cleanly and recovers.
+    // 3. Nested-frame pool refusal (Sol r2 P2 #2):
+    //    Two independent binary splits over 8 KiB individual IRIs with `probe = 0`:
+    //    depth-2 saturation carries two live sibling frames (`B_ne_1`, `B_ne_2`) and two
+    //    distinct `Arc<CanonMap>`s in `outer_held` alongside the branch's own index/contexts,
+    //    so its watermark strictly exceeds depth-0 and depth-1. Arm pool refusal strictly
+    //    AFTER `SplitFork { splits >= 2, depth >= 2 }` and verify clean refusal + recovery.
     {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
-        let doc =
-            crate::ofn_read::parse(&std::fs::read_to_string(dir.join("shoi-042.ofn")).unwrap())
-                .unwrap();
+        use super::admission_test::{MergePhase, with_merge_probe};
+        let pad = "p".repeat(8192);
+        let ofn = format!(
+            "Prefix(:=<http://example.org/nest#>)\n\
+             Ontology(<http://example.org/nest>\n\
+               ClassAssertion(ObjectOneOf(:b_{pad} :c_{pad}) :a_{pad})\n\
+               ClassAssertion(ObjectOneOf(:e_{pad} :f_{pad}) :d_{pad})\n\
+               ClassAssertion(:P :b_{pad})\n\
+               ClassAssertion(:P :c_{pad})\n\
+               ClassAssertion(:Q :e_{pad})\n\
+               ClassAssertion(:Q :f_{pad})\n\
+               SubClassOf(:A ObjectOneOf(:a_{pad}))\n\
+               SubClassOf(:D ObjectOneOf(:d_{pad}))\n\
+             )"
+        );
+        let doc = crate::ofn_read::parse(&ofn).unwrap();
         let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
         let lim_base = Limits {
             threads: 1,
@@ -7434,184 +7445,203 @@ fn split_leaf_export_overlap_allocation_sites_nested_forks_and_parallel_inconsis
             rooted_eq_split: true,
             ..Limits::default()
         };
-        // Measure exact pool charge increments across a full nested-fork + forced-merge run.
-        let total_charged = Arc::new(AtomicUsize::new(0));
-        let max_step_at = Arc::new(AtomicUsize::new(0));
-        let steps = Arc::new(parking_lot::Mutex::new(Vec::<usize>::new()));
-        let tc = total_charged.clone();
-        let stp = steps.clone();
         let mut sat = Saturation::new();
-        let ok = sat
-            .classify(
-                &refs,
-                None,
-                &Limits {
-                    charge: Some(Arc::new(move |more: usize| {
-                        let cur = tc.fetch_add(more, Ordering::Relaxed) + more;
-                        stp.lock().push(cur);
-                        true
-                    })),
-                    ..lim_base.clone()
-                },
-            )
-            .unwrap();
-        assert!(ok.complete && ok.stats.dl_rooted_splits >= 2 && ok.stats.dl_rooted_restarts >= 1);
-        let full_peak = ok.stats.peak_memory;
-        let recorded = steps.lock().clone();
-        assert!(
-            recorded.len() >= 2,
-            "nested fork + merge + export must record multiple pool charge milestones"
-        );
-        // Set a refusing pool threshold strictly below `full_peak` (at the second-to-last
-        // milestone, or 98% of full peak) so saturation/early forks succeed and the overlap
-        // export/finalization step is refused by the pool!
-        let cutoff = recorded
-            .iter()
-            .rev()
-            .find(|&&v| v < full_peak)
-            .copied()
-            .unwrap_or(full_peak.saturating_sub(64));
-        max_step_at.store(cutoff, Ordering::Relaxed);
+        let ok = super::with_split_knobs(Some(0), Some(true), Some(4), Some(16), || {
+            sat.classify(&refs, None, &lim_base).unwrap()
+        });
+        assert!(ok.complete && ok.stats.dl_rooted_splits >= 2 && ok.stats.dl_rooted_leaves >= 3);
 
-        let pool_used = Arc::new(AtomicUsize::new(0));
+        let saw_nested_fork = Arc::new(AtomicBool::new(false));
+        let armed = Arc::new(AtomicBool::new(false));
         let pool_refused = Arc::new(AtomicBool::new(false));
-        let pu = pool_used.clone();
+        let armed_cb = armed.clone();
         let pr = pool_refused.clone();
         let lim_pool = Limits {
-            charge: Some(Arc::new(move |more: usize| {
-                let prev = pu.load(Ordering::Relaxed);
-                let next = prev.saturating_add(more);
-                if next > cutoff {
-                    pr.store(true, Ordering::Relaxed);
+            charge: Some(Arc::new(move |_more: usize| {
+                if armed_cb.load(Ordering::Acquire) {
+                    pr.store(true, Ordering::Release);
                     return false;
                 }
-                pu.store(next, Ordering::Relaxed);
                 true
             })),
             ..lim_base.clone()
         };
         let mut sat_pool = Saturation::new();
-        let pool_out = sat_pool.classify(&refs, None, &lim_pool);
+        let sf = saw_nested_fork.clone();
+        let arm_probe = armed.clone();
+        let pool_out = with_merge_probe(
+            move |phase| {
+                if let MergePhase::SplitFork { splits, depth, .. } = phase
+                    && splits >= 2
+                    && depth >= 2
+                {
+                    sf.store(true, Ordering::Release);
+                    arm_probe.store(true, Ordering::Release);
+                }
+            },
+            || {
+                super::with_split_knobs(Some(0), Some(true), Some(4), Some(16), || {
+                    sat_pool.classify(&refs, None, &lim_pool)
+                })
+            },
+        );
         assert!(
-            pool_refused.load(Ordering::Relaxed),
-            "pool cutoff {cutoff} (full_peak={full_peak}) must trigger a pool refusal"
+            saw_nested_fork.load(Ordering::Acquire),
+            "nested-frame fixture must reach splits>=2, depth>=2 before refusing"
+        );
+        assert!(
+            pool_refused.load(Ordering::Acquire),
+            "armed nested-frame pool callback must have refused"
         );
         match pool_out {
             Ok(fb) => {
                 assert!(!fb.complete && fb.stats.dl_over_budget);
                 assert!(sat_pool.split_answer.is_none());
             }
-            Err(Error::Memory { used, .. }) => {
-                assert!(used > cutoff);
+            Err(Error::Memory { .. }) => {
                 assert!(sat_pool.split_answer.is_none());
             }
-            Err(other) => panic!("unexpected error on pool refusal: {other:?}"),
+            Err(other) => panic!("unexpected error on nested-frame pool refusal: {other:?}"),
         }
-        // Hard-cap overlap refusal right below `full_peak` also refuses cleanly and recovers!
-        let mut sat_cap = Saturation::new();
-        let cap_out = sat_cap.classify(
-            &refs,
-            None,
-            &Limits {
-                max_memory: Some(cutoff),
-                ..lim_base.clone()
-            },
-        );
-        match cap_out {
-            Ok(fb) => {
-                assert!(!fb.complete && fb.stats.dl_over_budget);
-                assert!(sat_cap.split_answer.is_none());
-            }
-            Err(Error::Memory { used, .. }) => {
-                assert!(used > cutoff);
-                assert!(sat_cap.split_answer.is_none());
-            }
-            Err(other) => panic!("unexpected error on hard-cap overlap refusal: {other:?}"),
-        }
-        let rec = sat_cap.classify(&refs, None, &lim_base).unwrap();
+        let rec = super::with_split_knobs(Some(0), Some(true), Some(4), Some(16), || {
+            sat_pool.classify(&refs, None, &lim_base).unwrap()
+        });
         assert_eq!(rec.taxonomy, ok.taxonomy);
     }
 
-    // 4. Dedicated leaf-export overlap refusal test (Sol r1 #1):
-    //    Build a 200-class chain beside `a = b ∨ a = c` (`probe = 0` forces an immediate
-    //    fork!). Measure (a) standalone saturated leaf footprint on the exact `a = b` leaf
-    //    theory (`saturate()` peak) and (b) combined split-run peak (`leaf_live + export_scratch`).
-    //    Verify the combined peak strictly exceeds the standalone leaf peak, and a cap
-    //    strictly between them allows leaf saturation to finish while refusing inside
-    //    `export_split_leaf`!
+    // 4. Dedicated leaf-export overlap refusal test (Sol r1 #1, anchored per Sol r2 P2 #2):
+    //    Build 200 named aliases `i000..i199` all asserted `SameIndividual` with `:rep` plus
+    //    200 classes `C000..C199` (`SubClassOf(:Root :Ck)`, `ClassAssertion(:Root :rep)`)
+    //    beside `a = b ∨ a = c` (`probe = 0` forces an immediate fork). During saturation,
+    //    canonicalization collapses all 200 aliases to `:rep` so saturation is tiny, while
+    //    `export_split_leaf` projects back to the full 200-individual × 200-class original
+    //    signature (`leaf_insts` > 160 KiB) while `leaf_live` is still held! Inside the SAME
+    //    split run, record the exact pool watermark at `SplitLeafExportStart` and
+    //    `SplitLeafExportDone`, set `overlap_cap` strictly between them, and assert
+    //    `SplitFork`, `SplitLeafExportStart`, AND `SplitLeafExportRefused` all fire.
     {
-        let n_chain = 200usize;
-        let mut ax = Vec::with_capacity(n_chain + 4);
+        use super::admission_test::{MergePhase, with_merge_probe};
+        let n_classes = 200usize;
+        let n_aliases = 200usize;
+        let mut ax = Vec::with_capacity(n_classes + n_aliases + 8);
         let a = crate::model::Individual::named("http://example.org/ov#a");
         let b = crate::model::Individual::named("http://example.org/ov#b");
         let c_ind = crate::model::Individual::named("http://example.org/ov#c");
+        let rep = crate::model::Individual::named("http://example.org/ov#rep");
+        let root_cls = Class::new("http://example.org/ov#Root");
         ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
             crate::model::ClassExpression::ObjectOneOf(std::collections::BTreeSet::from([
-                b.clone(),
-                c_ind,
+                b, c_ind,
             ])),
-            a.clone(),
+            a,
         )));
-        for i in 0..n_chain {
+        ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
+            crate::model::ClassExpression::Class(root_cls.clone()),
+            rep.clone(),
+        )));
+        for i in 0..n_classes {
             let ci = Class::new(format!("http://example.org/ov#C{i:03}"));
-            if i + 1 < n_chain {
-                let cj = Class::new(format!("http://example.org/ov#C{:03}", i + 1));
-                ax.push(crate::model::Axiom::sub_class_of(ci, cj));
-            }
+            ax.push(crate::model::Axiom::sub_class_of(root_cls.clone(), ci));
         }
-        let mut ax_leaf = ax.clone();
-        ax_leaf.push(crate::model::Axiom::new(AxiomKind::SameIndividual(
-            std::collections::BTreeSet::from([a, b]),
-        )));
+        for i in 0..n_aliases {
+            let alias = crate::model::Individual::named(format!("http://example.org/ov#i{i:03}"));
+            ax.push(crate::model::Axiom::new(AxiomKind::SameIndividual(
+                std::collections::BTreeSet::from([rep.clone(), alias]),
+            )));
+        }
         let refs: Vec<&AxiomKind> = ax.iter().map(|x| &x.kind).collect();
-        let leaf_refs: Vec<&AxiomKind> = ax_leaf.iter().map(|x| &x.kind).collect();
-        let lim_sat = Limits {
+        let lim_fork = Limits {
             threads: 1,
             rooted: true,
             rooted_merge: true,
-            rooted_eq_split: false,
+            rooted_eq_split: true,
             ..Limits::default()
         };
-        let mut sat_only = Saturation::new();
-        let sat_res = sat_only.saturate(&leaf_refs, None, &lim_sat).unwrap();
-        let leaf_alone_peak = sat_res.stats.peak_memory;
 
-        let lim_fork = Limits {
-            rooted_eq_split: true,
-            ..lim_sat.clone()
-        };
+        let charged = Arc::new(AtomicUsize::new(0));
+        let pre_export_wm = Arc::new(AtomicUsize::new(0));
+        let post_export_wm = Arc::new(AtomicUsize::new(0));
+        let ch_cb = charged.clone();
+        let ch_probe = charged.clone();
+        let pre_p = pre_export_wm.clone();
+        let post_p = post_export_wm.clone();
         let mut sat_fork = Saturation::new();
-        let fork_res = super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
-            sat_fork.classify(&refs, None, &lim_fork).unwrap()
-        });
-        assert!(fork_res.complete && fork_res.stats.dl_rooted_splits >= 1);
-        let combined_peak = fork_res.stats.peak_memory;
-        assert!(
-            combined_peak > leaf_alone_peak + 1024,
-            "combined leaf+export peak ({combined_peak}) must strictly exceed leaf-only peak ({leaf_alone_peak})"
+        let fork_res = with_merge_probe(
+            move |phase| match phase {
+                MergePhase::SplitLeafExportStart { leaves: 0 } => {
+                    pre_p.store(ch_probe.load(Ordering::Acquire), Ordering::Release);
+                }
+                MergePhase::SplitLeafExportDone { leaves: 0 } => {
+                    post_p.store(ch_probe.load(Ordering::Acquire), Ordering::Release);
+                }
+                _ => {}
+            },
+            || {
+                super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
+                    sat_fork
+                        .classify(
+                            &refs,
+                            None,
+                            &Limits {
+                                charge: Some(Arc::new(move |more: usize| {
+                                    ch_cb.fetch_add(more, Ordering::AcqRel);
+                                    true
+                                })),
+                                ..lim_fork.clone()
+                            },
+                        )
+                        .unwrap()
+                })
+            },
         );
-        // Set cap strictly above `leaf_alone_peak` and strictly below `combined_peak` so
-        // leaf saturation fits while leaf + export_scratch overlap is refused!
-        let overlap_cap = leaf_alone_peak + (combined_peak - leaf_alone_peak) / 2;
+        assert!(fork_res.complete && fork_res.stats.dl_rooted_splits >= 1);
+        let pre_wm = pre_export_wm.load(Ordering::Acquire);
+        let post_wm = post_export_wm.load(Ordering::Acquire);
+        assert!(
+            post_wm > pre_wm + 1024,
+            "first leaf export watermark ({post_wm}) must strictly exceed pre-export leaf watermark ({pre_wm})"
+        );
+
+        let overlap_cap = pre_wm + (post_wm - pre_wm) / 2;
+        let saw_fork = Arc::new(AtomicBool::new(false));
+        let saw_export_start = Arc::new(AtomicBool::new(false));
+        let saw_export_refused = Arc::new(AtomicBool::new(false));
+        let sf = saw_fork.clone();
+        let ses = saw_export_start.clone();
+        let ser = saw_export_refused.clone();
         let mut sat_ov = Saturation::new();
-        let ov_res = super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
-            sat_ov.classify(
-                &refs,
-                None,
-                &Limits {
-                    max_memory: Some(overlap_cap),
-                    ..lim_fork.clone()
-                },
-            )
-        });
+        let ov_res = with_merge_probe(
+            move |phase| match phase {
+                MergePhase::SplitFork { .. } => sf.store(true, Ordering::Release),
+                MergePhase::SplitLeafExportStart { .. } => ses.store(true, Ordering::Release),
+                MergePhase::SplitLeafExportRefused => ser.store(true, Ordering::Release),
+                _ => {}
+            },
+            || {
+                super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
+                    sat_ov.classify(
+                        &refs,
+                        None,
+                        &Limits {
+                            max_memory: Some(overlap_cap),
+                            ..lim_fork.clone()
+                        },
+                    )
+                })
+            },
+        );
+        assert!(saw_fork.load(Ordering::Acquire), "must fork before export");
+        assert!(
+            saw_export_start.load(Ordering::Acquire),
+            "leaf saturation must succeed under overlap_cap={overlap_cap} (pre_wm={pre_wm})"
+        );
+        assert!(
+            saw_export_refused.load(Ordering::Acquire),
+            "refusal must occur specifically inside export_split_leaf under overlap_cap={overlap_cap} (post_wm={post_wm})"
+        );
         match ov_res {
             Ok(fb) => {
-                assert!(
-                    !fb.complete && fb.stats.dl_over_budget,
-                    "overlap cap {overlap_cap} must refuse split export (got complete={}, over={})",
-                    fb.complete,
-                    fb.stats.dl_over_budget
-                );
+                assert!(!fb.complete && fb.stats.dl_over_budget);
                 assert!(sat_ov.split_answer.is_none());
             }
             Err(Error::Memory { used, .. }) => {
@@ -7620,5 +7650,391 @@ fn split_leaf_export_overlap_allocation_sites_nested_forks_and_parallel_inconsis
             }
             Err(other) => panic!("unexpected error on leaf-export overlap refusal: {other:?}"),
         }
+    }
+}
+
+/// Round-2 regression suite covering Neon B1 (no stale-`paid` pool double-charge / regression),
+/// Sol P1 #1 (live entry baseline for asserted `SameIndividual` and reused `Saturation`),
+/// Sol P1 #2 (post-leaf `canon_want` and `leaf_individuals` cleanup), and Sol P1 #3
+/// (DFS `stack`, synthetic `BTreeSet`, and moved `leaf_individuals` pre-admission).
+#[test]
+fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
+    use super::admission_test::{MergePhase, with_merge_probe};
+
+    // 1. Neon B1: cumulative pool charges across nested `STOP_SPLIT` + `STOP_MERGE` with
+    //    active `neq` pairs (`shoi-042` with `rooted_merge = true`) must NEVER exceed
+    //    `stats.peak_memory`, and a pool capped at exact `stats.peak_memory` must SUCCEED
+    //    with zero spurious double-charge refusal!
+    {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
+        let doc =
+            crate::ofn_read::parse(&std::fs::read_to_string(dir.join("shoi-042.ofn")).unwrap())
+                .unwrap();
+        let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let total_charged = Arc::new(AtomicUsize::new(0));
+        let tc = total_charged.clone();
+        let mut sat = Saturation::new();
+        let out = sat
+            .classify(
+                &refs,
+                None,
+                &Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    rooted_eq_split: true,
+                    charge: Some(Arc::new(move |more: usize| {
+                        tc.fetch_add(more, Ordering::AcqRel);
+                        true
+                    })),
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            out.complete && out.stats.dl_rooted_splits >= 2 && out.stats.dl_rooted_restarts >= 1
+        );
+        let charged = total_charged.load(Ordering::Acquire);
+        assert!(
+            charged <= out.stats.peak_memory,
+            "cumulative pool charges ({charged}) must never exceed peak_memory ({}) via stale-paid double-charging",
+            out.stats.peak_memory
+        );
+        // Exact-peak pool budget must complete without spurious refusal.
+        let exact_cap = out.stats.peak_memory;
+        let pool_used = Arc::new(AtomicUsize::new(0));
+        let pu = pool_used.clone();
+        let mut sat_exact = Saturation::new();
+        let exact_out = sat_exact
+            .classify(
+                &refs,
+                None,
+                &Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    rooted_eq_split: true,
+                    charge: Some(Arc::new(move |more: usize| {
+                        let next = pu.fetch_add(more, Ordering::AcqRel) + more;
+                        next <= exact_cap
+                    })),
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            exact_out.complete,
+            "pool capped at exact peak_memory ({exact_cap}) must succeed without double-charge refusal"
+        );
+        assert_eq!(exact_out.taxonomy, out.taxonomy);
+    }
+
+    // 2. Sol P1 #1a: Asserted `SameIndividual` UF + signature overlap refusal.
+    //    Large asserted `SameIndividual` partition leaves a substantial `self.merge` UF live
+    //    at entry to `run_splitting`. Under a cap/pool strictly above the UF+canon prepass
+    //    alone and strictly above the signature alone, but below `UF + canon + signature`,
+    //    signature admission MUST refuse!
+    {
+        let mut ax = Vec::new();
+        let pad = "x".repeat(256);
+        for i in 0..80usize {
+            let u = crate::model::Individual::named(format!("http://example.org/sa#u{i:03}_{pad}"));
+            let v = crate::model::Individual::named(format!("http://example.org/sa#v{i:03}_{pad}"));
+            ax.push(crate::model::Axiom::new(AxiomKind::SameIndividual(
+                std::collections::BTreeSet::from([u, v]),
+            )));
+        }
+        let refs: Vec<&AxiomKind> = ax.iter().map(|x| &x.kind).collect();
+        // Measure prepass UF + canon bytes via `collect_same` on a fresh `Saturation`.
+        let mut sat_probe = Saturation::new();
+        let admitted_probe = Arc::new(AtomicUsize::new(0));
+        let mut peak_probe = 0usize;
+        let lim_unlim = Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            rooted_eq_split: true,
+            ..Limits::default()
+        };
+        sat_probe
+            .collect_same(&refs, 0, &lim_unlim, &admitted_probe, &mut peak_probe)
+            .unwrap();
+        let prepass_live = sat_probe
+            .merge
+            .uf_bytes()
+            .saturating_add(sat_probe.canon_live_bytes());
+        assert!(
+            prepass_live > 32 * 1024,
+            "expected substantial prepass UF+canon: {prepass_live}"
+        );
+
+        // Measure signature-only cost (with `rooted_merge = false` so UF is empty at entry).
+        let cap_overlap = prepass_live.saturating_add(2048);
+        let mut sat_cap = Saturation::new();
+        let admitted_cap = Arc::new(AtomicUsize::new(0));
+        let mut peak_cap = 0usize;
+        sat_cap
+            .collect_same(&refs, 0, &lim_unlim, &admitted_cap, &mut peak_cap)
+            .unwrap();
+        let lim_cap = Limits {
+            max_memory: Some(cap_overlap),
+            ..lim_unlim.clone()
+        };
+        let err_cap = sat_cap
+            .run_splitting(&refs, None, 0, &lim_cap, &admitted_cap, &mut peak_cap, true)
+            .unwrap_err();
+        assert!(
+            matches!(err_cap, Error::Memory { used, .. } if used > cap_overlap),
+            "signature admission must include live asserted-SameIndividual UF+canon ({prepass_live}) against cap {cap_overlap}, got {err_cap:?}"
+        );
+
+        // Same overlap refusal through a `Limits::charge` pool!
+        let mut sat_pool = Saturation::new();
+        let admitted_pool = Arc::new(AtomicUsize::new(0));
+        let mut peak_pool = 0usize;
+        sat_pool
+            .collect_same(&refs, 0, &lim_unlim, &admitted_pool, &mut peak_pool)
+            .unwrap();
+        // Reset admitted watermark to `prepass_live` as if the pool granted the prepass, and
+        // allow only 2048 additional bytes beyond `prepass_live`.
+        admitted_pool.store(prepass_live, Ordering::Relaxed);
+        let pool_rem = Arc::new(AtomicUsize::new(2048));
+        let pr = pool_rem.clone();
+        let lim_pool = Limits {
+            charge: Some(Arc::new(move |more: usize| {
+                let cur = pr.load(Ordering::Acquire);
+                if more > cur {
+                    return false;
+                }
+                pr.fetch_sub(more, Ordering::AcqRel);
+                true
+            })),
+            ..lim_unlim
+        };
+        let err_pool = sat_pool
+            .run_splitting(
+                &refs,
+                None,
+                0,
+                &lim_pool,
+                &admitted_pool,
+                &mut peak_pool,
+                true,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err_pool, Error::Memory { used, .. } if used > cap_overlap),
+            "pool signature admission must include live prepass UF+canon, got {err_pool:?}"
+        );
+    }
+
+    // 3. Sol P1 #1b: Reused `Saturation` (`index` + `ctx` live, NO asserted `SameIndividual`
+    //    so `collect_same` returns early without resetting) + signature overlap refusal.
+    {
+        let mut big_ax = Vec::new();
+        for i in 0..300usize {
+            let ci = Class::new(format!("http://example.org/reuse#BigC{i:03}"));
+            if i + 1 < 300 {
+                let cj = Class::new(format!("http://example.org/reuse#BigC{:03}", i + 1));
+                big_ax.push(crate::model::Axiom::sub_class_of(ci, cj));
+            }
+        }
+        let big_refs: Vec<&AxiomKind> = big_ax.iter().map(|x| &x.kind).collect();
+        let mut sat = Saturation::new();
+        let first = sat
+            .classify(
+                &big_refs,
+                None,
+                &Limits {
+                    threads: 1,
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        assert!(first.complete && sat.index.is_some());
+        let entry_live = sat.leaf_live_bytes_without_canon_and_merge();
+        assert!(
+            entry_live > 16 * 1024,
+            "expected substantial retained entry state: {entry_live}"
+        );
+
+        // Second ontology has NO `SameIndividual` (so `collect_same` returns early without
+        // resetting `sat`), and a modest signature (~4 KiB) that fits easily on a fresh `sat`
+        // under `cap_reuse`, but exceeds `cap_reuse` alongside `entry_live`.
+        let mut small_ax = Vec::new();
+        let a = crate::model::Individual::named("http://example.org/reuse2#a");
+        let b = crate::model::Individual::named("http://example.org/reuse2#b");
+        small_ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
+            crate::model::ClassExpression::ObjectOneOf(std::collections::BTreeSet::from([
+                a.clone(),
+                b,
+            ])),
+            a,
+        )));
+        for i in 0..40usize {
+            small_ax.push(crate::model::Axiom::new(AxiomKind::Declaration(
+                crate::model::Entity::Class(Class::new(format!(
+                    "http://example.org/reuse2#S{i:02}_{}",
+                    "y".repeat(64)
+                ))),
+            )));
+        }
+        let small_refs: Vec<&AxiomKind> = small_ax.iter().map(|x| &x.kind).collect();
+        let cap_reuse = entry_live.saturating_add(512);
+        let lim_reuse = Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            rooted_eq_split: true,
+            max_memory: Some(cap_reuse),
+            ..Limits::default()
+        };
+        let mut sat_fresh = Saturation::new();
+        let fresh_ok = sat_fresh.classify(&small_refs, None, &lim_reuse).unwrap();
+        assert!(
+            fresh_ok.complete,
+            "fresh saturation must fit easily under cap_reuse={cap_reuse}"
+        );
+
+        let reuse_err = sat.classify(&small_refs, None, &lim_reuse).unwrap_err();
+        assert!(
+            matches!(reuse_err, Error::Memory { used, .. } if used > cap_reuse),
+            "reused saturation signature admission must count live entry state ({entry_live}) against cap {cap_reuse}, got {reuse_err:?}"
+        );
+    }
+
+    // 4. Sol P1 #2: Leaf cleanup drops `canon_want` and frees `leaf_individuals` capacity
+    //    immediately after `reset()` (before unequal sibling synthetic axioms and before
+    //    final taxonomy/answer construction) and after `SplitAnswer` publication.
+    {
+        let ofn = "Prefix(:=<http://example.org/lc#>)\nOntology(<http://example.org/lc>\n  ClassAssertion(ObjectOneOf(:b :c) :a)\n  ClassAssertion(:P :b)\n  ClassAssertion(:P :c)\n  SubClassOf(:A ObjectOneOf(:a))\n  Declaration(NamedIndividual(:d1))\n  Declaration(NamedIndividual(:d2))\n  Declaration(NamedIndividual(:d3))\n  Declaration(NamedIndividual(:d4))\n)";
+        let doc = crate::ofn_read::parse(ofn).unwrap();
+        let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let resets = Arc::new(parking_lot::Mutex::new(Vec::<(bool, usize)>::new()));
+        let r_cb = resets.clone();
+        let mut sat = Saturation::new();
+        let out = with_merge_probe(
+            move |phase| {
+                if let MergePhase::SplitPostLeafReset {
+                    canon_want_none,
+                    leaf_inds_cap,
+                } = phase
+                {
+                    r_cb.lock().push((canon_want_none, leaf_inds_cap));
+                }
+            },
+            || {
+                super::with_split_knobs(Some(0), Some(true), Some(4), Some(8), || {
+                    sat.classify(
+                        &refs,
+                        None,
+                        &Limits {
+                            threads: 1,
+                            rooted: true,
+                            rooted_merge: true,
+                            rooted_eq_split: true,
+                            ..Limits::default()
+                        },
+                    )
+                    .unwrap()
+                })
+            },
+        );
+        assert!(out.complete && out.stats.dl_rooted_splits >= 1 && out.stats.dl_rooted_leaves >= 2);
+        let observed = resets.lock();
+        assert!(
+            observed.len() >= 2,
+            "expected post-leaf reset events for both forked leaves, got {observed:?}"
+        );
+        for &(canon_none, inds_cap) in observed.iter() {
+            assert!(
+                canon_none,
+                "canon_want must be cleared immediately on leaf reset"
+            );
+            assert_eq!(
+                inds_cap, 0,
+                "leaf_individuals capacity must be freed on leaf reset"
+            );
+        }
+        assert!(
+            sat.canon_want.is_none(),
+            "canon_want must be None after SplitAnswer publication"
+        );
+        assert_eq!(
+            sat.leaf_individuals.capacity(),
+            0,
+            "leaf_individuals capacity must be 0 after SplitAnswer publication"
+        );
+    }
+
+    // 5. Sol P1 #3: Root DFS stack pre-admission refusal & synthetic BTreeSet admission.
+    //    Choose a cap strictly above `orig_sig_bytes` (so signature collection succeeds) and
+    //    strictly below `orig_sig_bytes + size_of::<SplitFrame>()` (so root `stack` allocation
+    //    refuses cleanly before pushing the root frame!).
+    {
+        let ofn = "Prefix(:=<http://example.org/st#>)\nOntology(<http://example.org/st>\n  ClassAssertion(ObjectOneOf(:b :c) :a)\n  SubClassOf(:A :B)\n)";
+        let doc = crate::ofn_read::parse(ofn).unwrap();
+        let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        // Record pool charge increments during entry of `run_splitting`:
+        // charge 1 = raw_classes, charge 2 = raw_inds, charge 3 = orig_sig_bytes,
+        // charge 4 = root DFS stack buffer (`ensure_stack_cap`).
+        let milestones = Arc::new(parking_lot::Mutex::new(Vec::<usize>::new()));
+        let ms = milestones.clone();
+        let total = Arc::new(AtomicUsize::new(0));
+        let tt = total.clone();
+        let mut sat_meas = Saturation::new();
+        let _ = sat_meas
+            .classify(
+                &refs,
+                None,
+                &Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    rooted_eq_split: true,
+                    charge: Some(Arc::new(move |more: usize| {
+                        let cur = tt.fetch_add(more, Ordering::AcqRel) + more;
+                        ms.lock().push(cur);
+                        true
+                    })),
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        let recorded = milestones.lock().clone();
+        assert!(
+            recorded.len() >= 4,
+            "expected >=4 entry milestones, got {recorded:?}"
+        );
+        // Refusing the 4th charge (root DFS stack allocation) must abort `run_splitting`
+        // with `Error::Memory` before entering saturation (`dl_tried == false`).
+        let mut sat_ref = Saturation::new();
+        let charges_seen = Arc::new(AtomicUsize::new(0));
+        let cs = charges_seen.clone();
+        let err = sat_ref
+            .classify(
+                &refs,
+                None,
+                &Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    rooted_eq_split: true,
+                    charge: Some(Arc::new(move |_more: usize| {
+                        let n = cs.fetch_add(1, Ordering::AcqRel) + 1;
+                        n < 4
+                    })),
+                    ..Limits::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Memory { .. }),
+            "refusing root DFS stack allocation must return Error::Memory, got {err:?}"
+        );
+        assert!(
+            !sat_ref.dl_tried,
+            "root DFS stack refusal must occur before branch saturation starts"
+        );
     }
 }

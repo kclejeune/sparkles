@@ -620,7 +620,7 @@ fn dec_len(mut n: usize) -> usize {
 /// removing one leaves 5 + 1 + 5 keys across 2 leaves and 1 internal root, a 3-node shape
 /// preserved by `clone()`. Only `len <= 10` is guaranteed to fit in a single leaf.
 #[inline]
-fn btree_set_bytes<T>(len: usize) -> usize {
+pub(super) fn btree_set_bytes<T>(len: usize) -> usize {
     if len == 0 {
         return 0;
     }

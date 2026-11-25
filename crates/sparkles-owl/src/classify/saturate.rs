@@ -3171,6 +3171,12 @@ impl<'a> Run<'a> {
                     .get(c.clause_id as usize)
                     .is_some_and(|s| !s.dead)
             {
+                if dl.work() < dl.split_probe()
+                    && !(dl.split_mode() == super::dl_rules::SplitMode::EagerPureThenProbe
+                        && c.prio >= 2)
+                {
+                    return;
+                }
                 #[cfg(test)]
                 invoke_probe_publish_hook();
                 slot.winner = Some(c);
@@ -8217,7 +8223,6 @@ mod horn_accounting_tests {
         use super::super::dl_root::rescan_split_cand;
         use super::super::dl_rules::{DlRun, DlSt, SplitCand, SplitMode};
         use crate::classify::{Limits, Saturation};
-        use std::sync::{Arc, Barrier};
 
         // Build a minimal rooted Index so `ix.dl.root` is `Some(root_ex)`.
         let ofn = "Prefix(:=<http://example.org/p#>)\nOntology(<http://example.org/p>\n  ClassAssertion(ObjectOneOf(:a :b) :a)\n  SubClassOf(:A ObjectUnionOf(:B :C))\n)";
@@ -8290,35 +8295,58 @@ mod horn_accounting_tests {
                 steps: false,
             };
             let run_obj = run(ix, &ctx, &b);
-            let bar_in = Arc::new(Barrier::new(2));
-            let bar_go = Arc::new(Barrier::new(2));
+            let (tx_in, rx_in) = std::sync::mpsc::channel::<()>();
+            let (tx_go, rx_go) = std::sync::mpsc::channel::<()>();
+            struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+            impl ReleaseOnDrop {
+                fn release(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            impl Drop for ReleaseOnDrop {
+                fn drop(&mut self) {
+                    self.release();
+                }
+            }
             std::thread::scope(|s| {
                 let run_ref = &run_obj;
-                let b_in = bar_in.clone();
-                let b_go = bar_go.clone();
                 let worker_a = s.spawn(move || {
                     super::with_probe_publish_hook(
                         move || {
-                            b_in.wait();
-                            b_go.wait();
+                            let _ = tx_in.send(());
+                            let _ = rx_go.recv_timeout(std::time::Duration::from_secs(5));
                         },
                         || run_ref.try_probe_split(),
                     );
                 });
 
-                // Wait until Worker A is inside `root_st -> split_slot`, before CAS.
-                bar_in.wait();
+                // Always release Worker A before asserting so a regression panic can never
+                // deadlock `std::thread::scope`'s join.
+                let mut release_a = ReleaseOnDrop(Some(tx_go));
+                let entered = rx_in
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok();
                 let root_ctx = ctx[root_ex as usize].get().unwrap();
+                let lock_held_in_hook = root_ctx.st.try_lock().is_none();
+                let stopped_before_cas = run_obj.stopped();
+                // Release Worker A to commit winner + publish_split_stop and drop root_st.
+                release_a.release();
+                worker_a.join().unwrap();
+
                 assert!(
-                    root_ctx.st.try_lock().is_none(),
+                    entered,
+                    "try_probe_split did not enter publish hook in time"
+                );
+                assert!(
+                    lock_held_in_hook,
                     "try_probe_split must hold root_st across liveness check and publication"
                 );
                 assert!(
-                    !run_obj.stopped(),
+                    !stopped_before_cas,
                     "STOP_SPLIT must not be published before critical-section CAS"
                 );
-                // Release Worker A to commit winner + publish_split_stop and drop root_st.
-                bar_go.wait();
                 // Mutator enters `root_st` immediately after Worker A releases it.
                 let mut st = root_ctx.st.lock();
                 assert_eq!(
@@ -8337,7 +8365,6 @@ mod horn_accounting_tests {
                     assert_eq!(slot.winner, Some(cand));
                 }
                 drop(st);
-                worker_a.join().unwrap();
             });
             assert_eq!(dl.take_winning_split(), Some(cand));
         }
@@ -8413,6 +8440,82 @@ mod horn_accounting_tests {
                 "downgraded prio-1 rescan below probe threshold must not publish STOP_SPLIT"
             );
             assert_eq!(dl.best_split_prio.load(Ordering::Acquire), 1);
+            let slot = dl.split_slot.lock();
+            assert_eq!(slot.best.map(|c| c.prio), Some(1));
+            assert!(slot.winner.is_none());
+        }
+
+        // 3. Fast-path stale-priority probe race (Sol r2 P2 #1 / Neon r2 NB1):
+        //    Worker A passes `split_probe_reached()` on a stale prio-2 hint while
+        //    `work < split_probe`, waits for `root_st`, and sees a live prio-1 `slot.best`
+        //    after Worker B downgraded it. Fast path must check the threshold on the locked
+        //    candidate and NOT publish `STOP_SPLIT`.
+        {
+            let ctx: Contexts = (0..n_ctx).map(|_| OnceLock::new()).collect();
+            let mut dl = DlRun::new(false, Default::default());
+            dl.configure_split(
+                SplitMode::EagerPureThenProbe,
+                1000,
+                11,
+                vec![0, 1].into_boxed_slice(),
+                Vec::new().into_boxed_slice(),
+            );
+            dl.count(10); // strictly below probe=1000
+            let mk = |xl: XLit| match dl.lits.lit(xl, |_| None) {
+                Made::Lit(l) => l,
+                other => panic!("expected literal, got {other:?}"),
+            };
+            let eq01 = mk(XLit::Eq(RTerm::C(0), RTerm::C(1)));
+            let atom = mk(XLit::Atom(10, RTerm::C(0)));
+            let mut dl_st = DlSt::default();
+            let _ = dl_st.store.add(Clause::new(Vec::new(), vec![eq01, atom]));
+            // Put a live prio-1 candidate in `slot.best` while the lock-free hint still
+            // reports prio 2 (simulating Worker A entering before Worker B's downgrade).
+            dl.record_split_cand(SplitCand {
+                epoch: 11,
+                prio: 1,
+                head_len: 2,
+                rank_lo: 0,
+                rank_hi: 1,
+                u_id: 0,
+                v_id: 1,
+                clause_id: 0,
+            });
+            dl.best_split_prio.store(2, Ordering::Release);
+            assert!(
+                dl.split_probe_reached(),
+                "stale prio-2 hint lets Worker A enter try_probe_split below split_probe"
+            );
+            let root_box = Box::new(Ctx::default());
+            {
+                let mut st = root_box.st.lock();
+                st.extra = Some(Box::new(Extra {
+                    dl: Some(Box::new(dl_st)),
+                    ..Extra::default()
+                }));
+            }
+            let _ = ctx[root_ex as usize].set(root_box);
+            let b = Bounds {
+                threads: 1,
+                deadline: None,
+                max_memory: None,
+                cancelled: None,
+                charge: None,
+                base_memory: 0,
+                base_queued: 0,
+                peak_memory: 0,
+                paid_memory: 0,
+                dynamic: None,
+                dl: Some(&dl),
+                partial: false,
+                steps: false,
+            };
+            let run_obj = run(ix, &ctx, &b);
+            run_obj.try_probe_split();
+            assert!(
+                !run_obj.stopped(),
+                "fast path must not publish STOP_SPLIT for live prio-1 candidate below split_probe"
+            );
             let slot = dl.split_slot.lock();
             assert_eq!(slot.best.map(|c| c.prio), Some(1));
             assert!(slot.winner.is_none());

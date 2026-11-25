@@ -401,20 +401,73 @@ pub(super) enum PlanKind {
 /// so regression tests can verify exact phases, stop winners, and helper participation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MergePhase {
-    PlanStart { restarts: usize },
-    PlanBlockedScan { restarts: usize },
-    PlanBlockedScanDone { restarts: usize },
-    PlanHornCheck { restarts: usize },
-    PlanHornCheckDone { restarts: usize },
-    PlanIndsDrain { restarts: usize },
-    PlanIndsDrainDone { restarts: usize },
-    PlanRetarget { restarts: usize },
-    PlanRetargetDone { restarts: usize },
-    PlanKeyBody { restarts: usize },
-    PlanKeyBodyDone { restarts: usize },
-    PlanDone { restarts: usize, outcome: PlanKind },
-    SatStop { stop: u8, helper_ran: bool },
-    MergeRestart { restarts: usize },
+    PlanStart {
+        restarts: usize,
+    },
+    PlanBlockedScan {
+        restarts: usize,
+    },
+    PlanBlockedScanDone {
+        restarts: usize,
+    },
+    PlanHornCheck {
+        restarts: usize,
+    },
+    PlanHornCheckDone {
+        restarts: usize,
+    },
+    PlanIndsDrain {
+        restarts: usize,
+    },
+    PlanIndsDrainDone {
+        restarts: usize,
+    },
+    PlanRetarget {
+        restarts: usize,
+    },
+    PlanRetargetDone {
+        restarts: usize,
+    },
+    PlanKeyBody {
+        restarts: usize,
+    },
+    PlanKeyBodyDone {
+        restarts: usize,
+    },
+    PlanDone {
+        restarts: usize,
+        outcome: PlanKind,
+    },
+    SatStop {
+        stop: u8,
+        helper_ran: bool,
+    },
+    MergeRestart {
+        restarts: usize,
+    },
+    BetweenRoundsTestStart,
+    BetweenRoundsTestRefused,
+    SplitFork {
+        splits: usize,
+        depth: usize,
+        prio: u8,
+    },
+    SplitLeafExportStart {
+        leaves: usize,
+    },
+    SplitLeafExportRefused,
+    SplitLeafExportDone {
+        leaves: usize,
+    },
+    SplitExcludedAbort {
+        spent: usize,
+        bound: usize,
+        remaining: usize,
+    },
+    SplitPostLeafReset {
+        canon_want_none: bool,
+        leaf_inds_cap: usize,
+    },
 }
 
 type MergeProbe = Box<dyn FnMut(MergePhase)>;
