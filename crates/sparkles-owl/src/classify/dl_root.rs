@@ -56,10 +56,10 @@ use super::dl_clause::{
 use super::dl_rules::drain_admitted;
 use super::dl_rules::{
     DlIx, DlSt, Found, MREPAIR_CF, MREPAIR_HOLDER, MREPAIR_NO_REPLAY, MREPAIR_NO_RETURN,
-    MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, RECORD_SLACK, RootDerive, Side, WORK_READS, dix, dl,
-    drain, drain_with, drain_with_admitted, ds, ds_admit, for_each_all, ground_restrict,
-    mark_interrupted, merge_parts, no_xy, pred_id, restricted, side, side_exact_bytes,
-    side_parts_bytes, unit,
+    MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, PRUNE_SCRATCH_ELEM, RECORD_SLACK, RootDerive, Side,
+    WORK_READS, dix, dl, drain, drain_with, drain_with_admitted, ds, ds_admit, for_each_all,
+    ground_restrict, mark_interrupted, merge_parts, no_xy, pred_id, restricted, side,
+    side_exact_bytes, side_parts_bytes, unit,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, CreditGuard, DlGuard, Guard, Sink, State};
@@ -247,12 +247,14 @@ fn inv_of<'a>(ix: &'a Index, dx: &'a DlIx) -> impl Fn(Role) -> Option<Role> + Co
 
 /// The literal of `l`, which in the root is never true or false but for an equality or
 /// inequality of a term with itself.
+#[cfg(test)]
 #[inline]
 fn lit<S: Sink>(ix: &Index, out: &S, l: XLit) -> Made {
     out.dl().lits.lit(l, inv_of(ix, dix(ix)))
 }
 
 /// The literal of a ground atom `a(u)`.
+#[cfg(test)]
 #[inline]
 fn atom<S: Sink>(ix: &Index, out: &S, a: Ex, u: u32) -> Lit {
     match lit(ix, out, XLit::Atom(a, RTerm::C(u))) {
@@ -712,8 +714,11 @@ fn at_consts<S: Sink>(
         }
         if let Some(cids) = dl(st).and_then(|x| x.pred_in.get(&w)) {
             for &cid in cids {
-                let c = out.dl().table.get(cid);
-                root_pred(ix, st, e, u, c, Some((l, prem)), found, &out.dl().lits);
+                let c = out.dl().table.get(cid).clone();
+                if !root_pred(ix, st, e, u, &c, Some((l, prem)), found, out) {
+                    mark_interrupted(st);
+                    return false;
+                }
             }
         }
     }
@@ -885,13 +890,8 @@ pub(super) fn univ_from_x<S: Sink>(
     true
 }
 
-/// The premises of a ground inference whose maximal literal is `l`, the selected clauses
-/// and the markers left out.
-fn partners(st: &State, l: Lit) -> Vec<Side> {
-    partners_of(st, l, false)
-}
-
-/// [`partners`], with the selected clauses too when `sel` is set.
+/// The premises of a ground inference whose maximal literal is `l`, with the selected
+/// clauses too when `sel` is set.
 fn partners_of(st: &State, l: Lit, sel: bool) -> Vec<Side> {
     let Some(d) = dl(st) else {
         return Vec::new();
@@ -907,15 +907,6 @@ fn partners_of(st: &State, l: Lit, sel: bool) -> Vec<Side> {
         })
         .map(|&i| side(&d.store.clauses[i as usize].c, l))
         .collect()
-}
-
-/// The premises of `a(u)`: the unit for `owl:Thing`, which holds of every constant, and the
-/// root's clauses otherwise.
-fn partners_at<S: Sink>(ix: &Index, st: &State, out: &S, a: Ex, u: u32) -> Vec<Side> {
-    if a == TOP {
-        return vec![unit()];
-    }
-    partners(st, atom(ix, out, a, u))
 }
 
 /// Visits each live, unselected premise of `a(u)` directly from the borrowed store in
@@ -1034,8 +1025,76 @@ pub(super) fn routable_unit_parts(
     true
 }
 
+/// Streams a D1-suppressed conclusion directly into `w` from borrowed literal slices
+/// without allocating intermediate `Side`, `Vec`, or `String` buffers.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn write_shared_parts(
+    mut w: impl std::io::Write,
+    ix: &Index,
+    st: &State,
+    lits: &super::dl_clause::Lits,
+    rule: &'static str,
+    prem_body: &[Lit],
+    part_body: &[Lit],
+    prem_head: &[Lit],
+    part_head: &[Lit],
+    without: Option<Lit>,
+    add: Option<Lit>,
+) -> std::io::Result<()> {
+    struct Body<'a>(&'a Index, &'a super::dl_clause::Lits, &'a [Lit], &'a [Lit]);
+    impl std::fmt::Display for Body<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("[")?;
+            let mut first = true;
+            for l in self.2.iter().copied().chain(self.3.iter().copied()) {
+                if !first {
+                    f.write_str(", ")?;
+                }
+                first = false;
+                super::dl_rules::write_lit(f, self.0, self.1, l)?;
+            }
+            f.write_str("]")
+        }
+    }
+    struct Head<'a>(
+        &'a Index,
+        &'a super::dl_clause::Lits,
+        &'a [Lit],
+        &'a [Lit],
+        Option<Lit>,
+        Option<Lit>,
+    );
+    impl std::fmt::Display for Head<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("[")?;
+            let mut first = true;
+            for l in self
+                .2
+                .iter()
+                .copied()
+                .chain(self.3.iter().copied().filter(|&l| Some(l) != self.4))
+                .chain(self.5)
+            {
+                if !first {
+                    f.write_str(", ")?;
+                }
+                first = false;
+                super::dl_rules::write_lit(f, self.0, self.1, l)?;
+            }
+            f.write_str("]")
+        }
+    }
+    writeln!(
+        w,
+        "TR S {} {rule} {} -> {}",
+        super::dl_rules::fmt_ctx(st, false),
+        Body(ix, lits, prem_body, part_body),
+        Head(ix, lits, prem_head, part_head, without, add),
+    )
+}
+
 /// Logs a D1-suppressed conclusion lazily when `DLTRACE` is enabled without allocating
-/// an intermediate `Side`.
+/// an intermediate `Side` or formatting scratch buffers.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn trace_shared_parts(
     ix: &Index,
@@ -1049,36 +1108,35 @@ pub(super) fn trace_shared_parts(
     without: Option<Lit>,
     add: Option<Lit>,
 ) {
-    let mut body = String::from("[");
-    let mut first = true;
-    for l in prem_body.iter().copied().chain(part_body.iter().copied()) {
-        if !first {
-            body.push_str(", ");
-        }
-        first = false;
-        let s = super::dl_rules::tr(ix, lits, &[l]);
-        body.push_str(&s[1..s.len() - 1]);
+    #[cfg(test)]
+    if super::dl_rules::test_trace_active() {
+        let _ = write_shared_parts(
+            std::io::sink(),
+            ix,
+            st,
+            lits,
+            rule,
+            prem_body,
+            part_body,
+            prem_head,
+            part_head,
+            without,
+            add,
+        );
+        return;
     }
-    body.push(']');
-    let mut head = String::from("[");
-    first = true;
-    for l in prem_head
-        .iter()
-        .copied()
-        .chain(part_head.iter().copied().filter(|&l| Some(l) != without))
-        .chain(add)
-    {
-        if !first {
-            head.push_str(", ");
-        }
-        first = false;
-        let s = super::dl_rules::tr(ix, lits, &[l]);
-        head.push_str(&s[1..s.len() - 1]);
-    }
-    head.push(']');
-    eprintln!(
-        "TR S {} {rule} {body} -> {head}",
-        super::dl_rules::tr_ctx(st, false),
+    let _ = write_shared_parts(
+        std::io::stderr().lock(),
+        ix,
+        st,
+        lits,
+        rule,
+        prem_body,
+        part_body,
+        prem_head,
+        part_head,
+        without,
+        add,
     );
 }
 
@@ -1087,7 +1145,7 @@ pub(super) fn trace_shared_parts(
 /// emitted `Side` buffer through `out` before allocation. Returns `false` on memory refusal
 /// or overflow (marking `st` interrupted).
 #[allow(clippy::too_many_arguments)]
-fn push_partners_admitted<S: Sink>(
+pub(super) fn push_partners_admitted<S: Sink>(
     ix: &Index,
     st: &mut State,
     out: &mut Guard<'_, S>,
@@ -1263,7 +1321,7 @@ pub(super) fn shared(
     partner_fact && dl(st).is_some_and(|x| x.given_fact) && routable_unit(ix, st, lits, c)
 }
 
-/// Logs a D1-suppressed conclusion lazily when `DLTRACE` is enabled.
+/// Logs a D1-suppressed conclusion lazily when `DLTRACE` is enabled without heap scratch.
 pub(super) fn trace_shared(
     ix: &Index,
     st: &State,
@@ -1271,12 +1329,7 @@ pub(super) fn trace_shared(
     rule: &'static str,
     c: &Side,
 ) {
-    eprintln!(
-        "TR S {} {rule} {} -> {}",
-        super::dl_rules::tr_ctx(st, false),
-        super::dl_rules::tr(ix, lits, &c.0),
-        super::dl_rules::tr(ix, lits, &c.1),
-    );
+    trace_shared_parts(ix, st, lits, rule, &c.0, &[], &c.1, &[], None, None);
 }
 
 /// Pre-admits and pushes the conclusion formed by `(prem, pb, ph, without, add)` into
@@ -1570,26 +1623,121 @@ fn hyper_at<S: Sink>(
                 }
                 continue;
             }
-            let lists: Vec<Vec<Side>> = body
-                .iter()
-                .map(|&a| {
-                    if a == d {
-                        vec![prem.clone()]
-                    } else {
-                        partners_at(ix, st, out, a, u)
+            let Some(mut lists_bytes) = body.len().checked_mul(std::mem::size_of::<Vec<Side>>())
+            else {
+                out.data_overflow();
+                mark_interrupted(st);
+                return false;
+            };
+            let mut empty_pos = false;
+            let mut max_list_len = 0usize;
+            let mut overflow = false;
+            for &a in body.iter() {
+                let mut count = 0usize;
+                let mut sides_bytes = 0usize;
+                if a == d {
+                    count = 1;
+                    let Some(b) = side_exact_bytes(prem.0.len(), prem.1.len()) else {
+                        overflow = true;
+                        break;
+                    };
+                    sides_bytes = b;
+                } else {
+                    for_each_partner_at(ix, st, out, a, u, |pb, ph, without, _| {
+                        if overflow {
+                            return;
+                        }
+                        let Some(sb) = side_parts_bytes(&empty_side, pb, ph, without, None)
+                            .and_then(|b| sides_bytes.checked_add(b))
+                        else {
+                            overflow = true;
+                            return;
+                        };
+                        let Some(nc) = count.checked_add(1) else {
+                            overflow = true;
+                            return;
+                        };
+                        count = nc;
+                        sides_bytes = sb;
+                    });
+                    if overflow {
+                        break;
                     }
-                })
-                .collect();
+                }
+                if count == 0 {
+                    empty_pos = true;
+                    break;
+                }
+                max_list_len = max_list_len.max(count);
+                let Some(pos_bytes) = count
+                    .checked_mul(std::mem::size_of::<Side>())
+                    .and_then(|b| b.checked_add(sides_bytes))
+                    .and_then(|b| lists_bytes.checked_add(b))
+                else {
+                    overflow = true;
+                    break;
+                };
+                lists_bytes = pos_bytes;
+            }
+            if overflow {
+                out.data_overflow();
+                mark_interrupted(st);
+                return false;
+            }
+            if empty_pos {
+                continue;
+            }
+            let Some(base_bytes) = side_exact_bytes(0, head.len()) else {
+                out.data_overflow();
+                mark_interrupted(st);
+                return false;
+            };
+            let Some(prod_bytes) = lists_bytes.checked_add(base_bytes) else {
+                out.data_overflow();
+                mark_interrupted(st);
+                return false;
+            };
+            let prune_scratch = if max_list_len < 2 {
+                0
+            } else {
+                let Some(ps) = max_list_len.checked_mul(PRUNE_SCRATCH_ELEM) else {
+                    out.data_overflow();
+                    mark_interrupted(st);
+                    return false;
+                };
+                ps
+            };
+            if !found.reserve_prod_admitted(prod_bytes, prune_scratch, out) {
+                mark_interrupted(st);
+                return false;
+            }
             let mut h_lits = Vec::with_capacity(head.len());
             for &a in head.iter() {
                 let Some(la) = atom_admitted(ix, out, a, u) else {
+                    drop(h_lits);
+                    out.release_to(found.held_bytes());
                     mark_interrupted(st);
                     return false;
                 };
                 h_lits.push(la);
             }
+            let mut lists = Vec::with_capacity(body.len());
+            for &a in body.iter() {
+                if a == d {
+                    lists.push(vec![(prem.0.clone(), prem.1.clone())]);
+                } else {
+                    let mut count = 0usize;
+                    for_each_partner_at(ix, st, out, a, u, |_, _, _, _| count += 1);
+                    let mut v = Vec::with_capacity(count);
+                    for_each_partner_at(ix, st, out, a, u, |pb, ph, without, _| {
+                        v.push(merge_parts(&empty_side, pb, ph, without, None));
+                    });
+                    lists.push(v);
+                }
+            }
             let base: Side = (Vec::new(), h_lits);
             found.ground_products(lists, base);
+            out.release_to(found.held_bytes());
         }
     }
     hyper_roles(ix, st, out, d, u, prem, found, sel)
@@ -2606,7 +2754,11 @@ fn succ_at<S: Sink>(
             if share && super::dl_rules::constants_only(ix, dx, &out.dl().lits, c) {
                 continue;
             }
-            root_pred(ix, st, e, u, c, None, found, &out.dl().lits);
+            let c = c.clone();
+            if !root_pred(ix, st, e, u, &c, None, found, out) {
+                mark_interrupted(st);
+                return w;
+            }
         }
     }
     w
@@ -2619,7 +2771,7 @@ fn succ_at<S: Sink>(
 /// premise that a new clause gives for one of these literals. The successor's core is
 /// empty, so no core atom is resolved.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn root_pred(
+pub(super) fn root_pred<S: Sink>(
     ix: &Index,
     st: &State,
     e: Ex,
@@ -2627,9 +2779,9 @@ pub(super) fn root_pred(
     c: &Clause,
     fixed: Option<(Lit, &Side)>,
     found: &mut Found,
-    lits: &super::dl_clause::Lits,
-) {
-    root_pred_of(
+    guard: &mut Guard<'_, S>,
+) -> bool {
+    root_pred_of_admitted(
         ix,
         st,
         e,
@@ -2637,13 +2789,15 @@ pub(super) fn root_pred(
         c,
         fixed,
         found,
-        lits,
+        Some(guard),
+        None,
         super::dl_rules::sel_partners_x(),
-    );
+    )
 }
 
 /// [`root_pred`], whose premises over `f_e(u)` include the selected clauses when `sel` is
 /// set, as Hyper over x has them under [`super::dl_rules::sel_partners_x`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn root_pred_of(
     ix: &Index,
@@ -2656,6 +2810,30 @@ fn root_pred_of(
     lits: &super::dl_clause::Lits,
     sel: bool,
 ) {
+    struct NoSink;
+    impl Sink for NoSink {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &super::dl_rules::DlRun {
+            unreachable!()
+        }
+    }
+    let _ = root_pred_of_admitted::<NoSink>(ix, st, e, u, c, fixed, found, None, Some(lits), sel);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn root_pred_of_admitted<S: Sink>(
+    ix: &Index,
+    st: &State,
+    e: Ex,
+    u: u32,
+    c: &Clause,
+    fixed: Option<(Lit, &Side)>,
+    found: &mut Found,
+    mut guard: Option<&mut Guard<'_, S>>,
+    lits_fallback: Option<&super::dl_clause::Lits>,
+    sel: bool,
+) -> bool {
     found.rule = "rpredc";
     use super::dl_clause::{RY, X as KX};
     let dx = dix(ix);
@@ -2675,82 +2853,109 @@ fn root_pred_of(
     }
     let mut need = Vec::new();
     let mut ground = Vec::new();
-    for &l in c.body() {
-        match l.kind() {
-            KX => match lits.lit(XLit::Atom(l.atom(), f), inv) {
-                Made::Lit(k) => need.push(Need::Atom(k)),
-                _ => return,
-            },
-            RY => need.push(Need::Role(l.atom())),
-            XL if lits.view(l, inv).is_ground() => ground.push(l),
-            _ => return,
-        }
-    }
-    let role_of = |p: Lit| match lits.view(p, inv) {
-        XLit::Role(t, a, b) if a == at && b == f => Some(t),
-        XLit::Role(t, a, b) if a == f && b == at => dx.inv(ix, t),
-        _ => None,
-    };
-    let fits = |n: &Need, p: Lit| match n {
-        Need::Atom(k) => *k == p,
-        Need::Role(s) => role_of(p).is_some_and(|t| dx.sub(ix, t, *s)),
-    };
-    if let Some((p, _)) = fixed
-        && !need.iter().any(|n| fits(n, p))
-    {
-        return;
-    }
     let mut head = Vec::with_capacity(c.head().len());
-    for &l in c.head() {
-        let w = match lits.view(l, inv) {
-            XLit::Atom(a, b) => map(b).map(|b| XLit::Atom(a, b)),
-            XLit::Role(r, a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Role(r, a, b)),
-            XLit::Eq(a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Eq(a, b)),
-            XLit::Ne(a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Ne(a, b)),
+    let (free, base, matches) = {
+        let lits = match (&guard, lits_fallback) {
+            (Some(g), _) => &g.dl().lits,
+            (None, Some(l)) => l,
+            (None, None) => unreachable!(),
         };
-        match w.map(|w| lits.lit(w, inv)) {
-            Some(Made::Lit(m)) => head.push(m),
-            Some(Made::False) => {}
-            Some(Made::True) | None => return,
-        }
-    }
-    let roles = |s: Role| -> Vec<Side> {
-        let Some(x) = dl(st) else { return Vec::new() };
-        let Some(t) = x.store.terms.as_deref() else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for &i in t.any.get(&f).into_iter().flatten() {
-            let sc = &x.store.clauses[i as usize];
-            if sc.dead {
-                continue;
+        for &l in c.body() {
+            match l.kind() {
+                KX => match lits.lit(XLit::Atom(l.atom(), f), inv) {
+                    Made::Lit(k) => need.push(Need::Atom(k)),
+                    _ => return true,
+                },
+                RY => need.push(Need::Role(l.atom())),
+                XL if lits.view(l, inv).is_ground() => ground.push(l),
+                _ => return true,
             }
-            for &m in x.store.maxima(i) {
-                if role_of(m).is_some_and(|t| dx.sub(ix, t, s)) {
-                    out.push(side(&sc.c, m));
+        }
+        let role_of = |p: Lit| match lits.view(p, inv) {
+            XLit::Role(t, a, b) if a == at && b == f => Some(t),
+            XLit::Role(t, a, b) if a == f && b == at => dx.inv(ix, t),
+            _ => None,
+        };
+        let fits = |n: &Need, p: Lit| match n {
+            Need::Atom(k) => *k == p,
+            Need::Role(s) => role_of(p).is_some_and(|t| dx.sub(ix, t, *s)),
+        };
+        let matches: Vec<usize> = match fixed {
+            Some((p, _)) => {
+                let m: Vec<usize> = need
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| fits(n, p))
+                    .map(|(k, _)| k)
+                    .collect();
+                if m.is_empty() {
+                    return true;
+                }
+                m
+            }
+            None => Vec::new(),
+        };
+        for &l in c.head() {
+            let w = match lits.view(l, inv) {
+                XLit::Atom(a, b) => map(b).map(|b| XLit::Atom(a, b)),
+                XLit::Role(r, a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Role(r, a, b)),
+                XLit::Eq(a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Eq(a, b)),
+                XLit::Ne(a, b) => map(a).zip(map(b)).map(|(a, b)| XLit::Ne(a, b)),
+            };
+            match w.map(|w| lits.lit(w, inv)) {
+                Some(Made::Lit(m)) => head.push(m),
+                Some(Made::False) => {}
+                Some(Made::True) | None => return true,
+            }
+        }
+        let roles = |s: Role| -> Vec<Side> {
+            let Some(x) = dl(st) else { return Vec::new() };
+            let Some(t) = x.store.terms.as_deref() else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            for &i in t.any.get(&f).into_iter().flatten() {
+                let sc = &x.store.clauses[i as usize];
+                if sc.dead {
+                    continue;
+                }
+                for &m in x.store.maxima(i) {
+                    if role_of(m).is_some_and(|t| dx.sub(ix, t, s)) {
+                        out.push(side(&sc.c, m));
+                    }
                 }
             }
-        }
-        out
+            out
+        };
+        let free: Vec<Vec<Side>> = need
+            .iter()
+            .map(|n| match n {
+                Need::Atom(k) => partners_of(st, *k, sel),
+                Need::Role(s) => roles(*s),
+            })
+            .collect();
+        (free, (ground, head), matches)
     };
-    let free: Vec<Vec<Side>> = need
-        .iter()
-        .map(|n| match n {
-            Need::Atom(k) => partners_of(st, *k, sel),
-            Need::Role(s) => roles(*s),
-        })
-        .collect();
-    let base: Side = (ground, head);
+    let mut push_prod = |lists: Vec<Vec<Side>>, b: Side| -> bool {
+        match guard.as_deref_mut() {
+            Some(g) => found.push_product_admitted(lists, b, false, g),
+            None => {
+                found.products(lists, b);
+                true
+            }
+        }
+    };
     match fixed {
-        None => found.products(free, base),
-        Some((p, prem)) => {
-            for (k, n) in need.iter().enumerate() {
-                if fits(n, p) {
-                    let mut lists = free.clone();
-                    lists[k] = vec![prem.clone()];
-                    found.products(lists, base.clone());
+        None => push_prod(free, base),
+        Some((_, prem)) => {
+            for k in matches {
+                let mut lists = free.clone();
+                lists[k] = vec![prem.clone()];
+                if !push_prod(lists, base.clone()) {
+                    return false;
                 }
             }
+            true
         }
     }
 }

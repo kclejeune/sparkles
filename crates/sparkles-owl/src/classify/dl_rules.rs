@@ -1086,16 +1086,41 @@ fn role_of(ix: &Index, e: Ex) -> Option<Role> {
 pub(super) type Side = (Vec<Lit>, Vec<Lit>);
 
 pub(super) fn side(c: &Clause, without: Lit) -> Side {
-    (
-        c.body().to_vec(),
-        c.head().iter().copied().filter(|&l| l != without).collect(),
-    )
+    let h_len = c.head().iter().filter(|&&l| l != without).count();
+    let mut head = Vec::with_capacity(h_len);
+    head.extend(c.head().iter().copied().filter(|&l| l != without));
+    (c.body().to_vec(), head)
 }
 
 /// The premise of a unit.
 #[inline]
 pub(super) fn unit() -> Side {
     (Vec::new(), Vec::new())
+}
+
+/// Visits each live premise whose maximal literal is `a(x)` directly from the borrowed
+/// store without allocating an intermediate `Vec<Side>`, stopping early when `f` returns
+/// `false`. Passes `(body, head, without)`.
+fn for_each_partner_x(
+    st: &State,
+    a: Ex,
+    mut f: impl FnMut(&[Lit], &[Lit], Option<Lit>) -> bool,
+) -> bool {
+    if a == TOP || st.subs.contains(&a) {
+        return f(&[], &[], None);
+    }
+    let Some(d) = dl(st) else {
+        return true;
+    };
+    let lit = Lit::x(a);
+    let allow_sel = sel_partners_x();
+    for i in d.store.with_x(a) {
+        let s = &d.store.clauses[i as usize];
+        if (allow_sel || !s.sel) && !f(s.c.body(), s.c.head(), Some(lit)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The premises whose maximal literal is `X(a)`: the unit, or the stored clauses.
@@ -1623,7 +1648,10 @@ pub(super) fn late<S: Sink>(
                         continue;
                     }
                     let c = c.clone();
-                    pred(ix, st, e, &c, None, found, &out.dl().lits);
+                    if !pred(ix, st, e, &c, None, found, out) {
+                        mark_interrupted(st);
+                        return false;
+                    }
                 }
             }
             true
@@ -1749,6 +1777,11 @@ pub(super) fn local(v: super::dl_clause::XLit) -> bool {
             && ts.iter().any(|t| matches!(t, RTerm::X | RTerm::Y))
             && ts.iter().any(|t| matches!(t, RTerm::C(_) | RTerm::Fc(..)))
 }
+
+/// Scratch bytes per element needed by [`prune`] on a product premise list with length >= 2:
+/// covers both `sort_by_key` scratch (`size_of::<Side>()`) and `keep`
+/// (`size_of::<(Side, u64, u64, bool)>()`).
+pub(super) const PRUNE_SCRATCH_ELEM: usize = std::mem::size_of::<(Side, u64, u64, bool)>();
 
 #[inline]
 fn side_cap_bytes(s: &Side) -> usize {
@@ -1935,7 +1968,96 @@ impl Found {
             return false;
         }
         let s = make();
+        debug_assert_eq!(side_cap_bytes(&s), side_bytes);
         self.push(s);
+        guard.release_to(self.held_bytes());
+        true
+    }
+    /// Pre-admits `Found::prods` geometric growth (including realloc overlap) plus
+    /// `prod_bytes` (the forthcoming `lists` and `base` payloads) plus `prune_scratch`
+    /// through `guard`, then reserves capacity in `self.prods`. Returns `false` (leaving
+    /// `self.prods` untouched) on overflow or refusal.
+    pub(super) fn reserve_prod_admitted<S: Sink>(
+        &mut self,
+        prod_bytes: usize,
+        prune_scratch: usize,
+        guard: &mut Guard<'_, S>,
+    ) -> bool {
+        let Some(need_len) = self.prods.len().checked_add(1) else {
+            guard.data_overflow();
+            return false;
+        };
+        let elem = std::mem::size_of::<(Vec<Vec<Side>>, Side, bool, &'static str)>();
+        let cap = self.prods.capacity();
+        let held = self.held_bytes();
+        let Some(total_new) = prod_bytes.checked_add(prune_scratch) else {
+            guard.data_overflow();
+            return false;
+        };
+        if need_len > cap {
+            let target_cap = match cap.checked_mul(2) {
+                Some(d) => need_len.max(d.max(4)),
+                None => need_len,
+            };
+            let Some(new_cap_bytes) = target_cap.checked_mul(elem) else {
+                guard.data_overflow();
+                return false;
+            };
+            let old_cap_bytes = cap * elem;
+            let Some(realloc_peak) = held.checked_add(new_cap_bytes) else {
+                guard.data_overflow();
+                return false;
+            };
+            let Some(post_peak) = (held - old_cap_bytes)
+                .checked_add(new_cap_bytes)
+                .and_then(|b| b.checked_add(total_new))
+            else {
+                guard.data_overflow();
+                return false;
+            };
+            if !guard.ensure_admitted(realloc_peak.max(post_peak)) {
+                return false;
+            }
+            self.prods.reserve_exact(target_cap - self.prods.len());
+        } else {
+            let Some(peak) = held.checked_add(total_new) else {
+                guard.data_overflow();
+                return false;
+            };
+            if !guard.ensure_admitted(peak) {
+                return false;
+            }
+        }
+        true
+    }
+    /// Pre-admits `Found::prods` growth plus `lists`/`base` payload and `prune` scratch
+    /// through `guard`, pushes the pruned product into `self.prods`, and releases temporary
+    /// scratch/realloc overlap while keeping `held_bytes()` admitted.
+    pub(super) fn push_product_admitted<S: Sink>(
+        &mut self,
+        lists: Vec<Vec<Side>>,
+        base: Side,
+        ground: bool,
+        guard: &mut Guard<'_, S>,
+    ) -> bool {
+        if lists.iter().any(|l| l.is_empty()) {
+            return true;
+        }
+        let prod_bytes = prod_inner_bytes(lists.capacity(), &lists, &base);
+        let max_len = lists.iter().map(Vec::len).max().unwrap_or(0);
+        let prune_scratch = if max_len < 2 {
+            0
+        } else {
+            let Some(ps) = max_len.checked_mul(PRUNE_SCRATCH_ELEM) else {
+                guard.data_overflow();
+                return false;
+            };
+            ps
+        };
+        if !self.reserve_prod_admitted(prod_bytes, prune_scratch, guard) {
+            return false;
+        }
+        self.products_of(lists, base, ground);
         guard.release_to(self.held_bytes());
         true
     }
@@ -1987,6 +2109,34 @@ impl Found {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) struct TestTraceGuard(bool);
+
+#[cfg(test)]
+impl Drop for TestTraceGuard {
+    fn drop(&mut self) {
+        TEST_TRACE.with(|c| c.set(self.0));
+    }
+}
+
+/// Forces [`tracing`] on and redirects `trace_shared_parts` to `std::io::sink()` on the
+/// current thread for zero-allocation tracing tests.
+#[cfg(test)]
+pub(super) fn force_test_trace() -> TestTraceGuard {
+    let prev = TEST_TRACE.with(|c| c.replace(true));
+    TestTraceGuard(prev)
+}
+
+#[cfg(test)]
+pub(super) fn test_trace_active() -> bool {
+    TEST_TRACE.with(|c| c.get())
+}
+
 /// Whether the derivation trace is on, which `DLTRACE` in the environment turns on: each
 /// conclusion a context derives, before normalization, goes to standard error as
 /// `TR <context> <rule> [body] -> [head]`, the root as `R` and another context by the
@@ -1994,17 +2144,35 @@ impl Found {
 /// clause processed, so that the conclusions between two such lines are the inferences
 /// on the processed clause.
 pub(super) fn tracing() -> bool {
+    #[cfg(test)]
+    if test_trace_active() {
+        return true;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("DLTRACE").is_some())
 }
 
+/// Zero-allocation formatter for a context's name in the derivation trace.
+pub(super) struct FmtCtx(usize, bool);
+
+impl std::fmt::Display for FmtCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.1 {
+            f.write_str("R")
+        } else {
+            write!(f, "C{:x}", self.0 & 0xffffff)
+        }
+    }
+}
+
+#[inline]
+pub(super) fn fmt_ctx(st: &State, root: bool) -> FmtCtx {
+    FmtCtx(st as *const State as usize, root)
+}
+
 /// The context's name in the derivation trace.
 pub(super) fn tr_ctx(st: &State, root: bool) -> String {
-    if root {
-        "R".into()
-    } else {
-        format!("C{:x}", st as *const State as usize & 0xffffff)
-    }
+    fmt_ctx(st, root).to_string()
 }
 
 /// Drops from a product's list each premise whose side has every literal of another's: a
@@ -2845,26 +3013,58 @@ fn drain_with_covered<S: Sink, D: Deriver>(
     }
 }
 
-/// The literals `ls` for the derivation trace, with each atom's node in place of its id.
-pub(super) fn tr(ix: &Index, lits: &Lits, ls: &[Lit]) -> String {
+struct FmtTerm(RTerm);
+
+impl std::fmt::Display for FmtTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            RTerm::Fx(e) => write!(f, "f{e}(x)"),
+            RTerm::Fc(e, u) => write!(f, "f{e}({u})"),
+            RTerm::C(u) => write!(f, "{u}"),
+            RTerm::X => f.write_str("x"),
+            RTerm::Y => f.write_str("y"),
+        }
+    }
+}
+
+/// Formats one literal directly into `f` without heap allocation, matching [`tr`].
+pub(super) fn write_lit(
+    f: &mut std::fmt::Formatter<'_>,
+    ix: &Index,
+    lits: &Lits,
+    l: Lit,
+) -> std::fmt::Result {
     use super::dl_clause::XLit;
     let dx = dix(ix);
     let inv = |r| dx.inv(ix, r);
-    let t = |t: RTerm| match t {
-        RTerm::Fx(e) => format!("f{e}(x)"),
-        RTerm::Fc(e, u) => format!("f{e}({u})"),
-        RTerm::C(u) => format!("{u}"),
-        RTerm::X => "x".into(),
-        RTerm::Y => "y".into(),
-    };
-    let one = |l: Lit| match lits.view(l, inv) {
-        XLit::Atom(a, b) => format!("{:?}#{a}({})", ix.head(a).node, t(b)),
-        XLit::Role(r, a, b) => format!("r{r}({}, {})", t(a), t(b)),
-        XLit::Eq(a, b) => format!("{} = {}", t(a), t(b)),
-        XLit::Ne(a, b) => format!("{} != {}", t(a), t(b)),
-    };
-    let v: Vec<String> = ls.iter().map(|&l| one(l)).collect();
-    format!("[{}]", v.join(", "))
+    match lits.view(l, inv) {
+        XLit::Atom(a, b) => write!(f, "{:?}#{a}({})", ix.head(a).node, FmtTerm(b)),
+        XLit::Role(r, a, b) => write!(f, "r{r}({}, {})", FmtTerm(a), FmtTerm(b)),
+        XLit::Eq(a, b) => write!(f, "{} = {}", FmtTerm(a), FmtTerm(b)),
+        XLit::Ne(a, b) => write!(f, "{} != {}", FmtTerm(a), FmtTerm(b)),
+    }
+}
+
+struct FmtOneLit<'a>(&'a Index, &'a Lits, Lit);
+
+impl std::fmt::Display for FmtOneLit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_lit(f, self.0, self.1, self.2)
+    }
+}
+
+/// The literals `ls` for the derivation trace, with each atom's node in place of its id.
+pub(super) fn tr(ix: &Index, lits: &Lits, ls: &[Lit]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("[");
+    for (i, &l) in ls.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{}", FmtOneLit(ix, lits, l));
+    }
+    out.push(']');
+    out
 }
 
 /// Visits each universal restriction `(t, c)` that `d` stands for (`d ⊑ ∀t.c`) without
@@ -3237,22 +3437,119 @@ fn disjoint(ix: &Index, a: &[(Ex, u32)], b: &[(Ex, u32)]) -> Option<(u32, u32)> 
 }
 
 /// Hyper with a clause of case analysis, `id`, with `prem` as the premise of its body atom
-/// `d`: the other atoms' premises, and the head as literals over x.
-fn hyper_clause(ix: &Index, st: &State, id: u32, d: Ex, prem: &Side, found: &mut Found) {
+/// `d`: the other atoms' premises, and the head as literals over x. Pre-admits `Found::prods`
+/// growth, `lists`/`base` payloads, and `prune` scratch before constructing any partner list.
+fn hyper_clause<S: Sink>(
+    ix: &Index,
+    st: &State,
+    id: u32,
+    d: Ex,
+    prem: &Side,
+    found: &mut Found,
+    guard: &mut Guard<'_, S>,
+) -> bool {
     found.rule = "hyper";
     let (body, head) = &dix(ix).clauses[id as usize];
-    let lists: Vec<Vec<Side>> = body
-        .iter()
-        .map(|&a| {
-            if a == d {
-                vec![prem.clone()]
-            } else {
-                partners_x(st, a)
+    let empty_side = unit();
+    let Some(mut lists_bytes) = body.len().checked_mul(std::mem::size_of::<Vec<Side>>()) else {
+        guard.data_overflow();
+        return false;
+    };
+    let mut max_list_len = 0usize;
+    let mut overflow = false;
+    for &a in body.iter() {
+        let mut count = 0usize;
+        let mut sides_bytes = 0usize;
+        if a == d {
+            count = 1;
+            let Some(b) = side_exact_bytes(prem.0.len(), prem.1.len()) else {
+                overflow = true;
+                break;
+            };
+            sides_bytes = b;
+        } else {
+            for_each_partner_x(st, a, |pb, ph, without| {
+                let Some(sb) = side_parts_bytes(&empty_side, pb, ph, without, None)
+                    .and_then(|b| sides_bytes.checked_add(b))
+                else {
+                    overflow = true;
+                    return false;
+                };
+                let Some(nc) = count.checked_add(1) else {
+                    overflow = true;
+                    return false;
+                };
+                count = nc;
+                sides_bytes = sb;
+                true
+            });
+            if overflow {
+                break;
             }
-        })
-        .collect();
-    let base: Side = (Vec::new(), head.iter().map(|&h| Lit::x(h)).collect());
-    found.products(lists, base);
+        }
+        if count == 0 {
+            return true;
+        }
+        max_list_len = max_list_len.max(count);
+        let Some(pos_bytes) = count
+            .checked_mul(std::mem::size_of::<Side>())
+            .and_then(|b| b.checked_add(sides_bytes))
+            .and_then(|b| lists_bytes.checked_add(b))
+        else {
+            overflow = true;
+            break;
+        };
+        lists_bytes = pos_bytes;
+    }
+    if overflow {
+        guard.data_overflow();
+        return false;
+    }
+    let Some(base_bytes) = side_exact_bytes(0, head.len()) else {
+        guard.data_overflow();
+        return false;
+    };
+    let Some(prod_bytes) = lists_bytes.checked_add(base_bytes) else {
+        guard.data_overflow();
+        return false;
+    };
+    let prune_scratch = if max_list_len < 2 {
+        0
+    } else {
+        let Some(ps) = max_list_len.checked_mul(PRUNE_SCRATCH_ELEM) else {
+            guard.data_overflow();
+            return false;
+        };
+        ps
+    };
+    if !found.reserve_prod_admitted(prod_bytes, prune_scratch, guard) {
+        return false;
+    }
+    let mut lists = Vec::with_capacity(body.len());
+    for &a in body.iter() {
+        if a == d {
+            lists.push(vec![(prem.0.clone(), prem.1.clone())]);
+        } else {
+            let mut count = 0usize;
+            for_each_partner_x(st, a, |_, _, _| {
+                count += 1;
+                true
+            });
+            let mut v = Vec::with_capacity(count);
+            for_each_partner_x(st, a, |pb, ph, without| {
+                v.push(merge_parts(&empty_side, pb, ph, without, None));
+                true
+            });
+            lists.push(v);
+        }
+    }
+    let mut h_lits = Vec::with_capacity(head.len());
+    for &h in head.iter() {
+        h_lits.push(Lit::x(h));
+    }
+    found.products(lists, (Vec::new(), h_lits));
+    guard.release_to(found.held_bytes());
+    true
 }
 
 /// The universals of the holders over the successor term f, which x reaches by r: the
@@ -3328,7 +3625,7 @@ fn univ_over<S: Sink>(
 /// The predecessor is a neighbour through the body atom `q(x, y)`. `fixed` is a new premise
 /// of one successor term, which the inference must use, and `holder` the holder's premises.
 #[allow(clippy::too_many_arguments)]
-fn at_most(
+fn at_most<S: Sink>(
     ix: &Index,
     st: &State,
     n: u32,
@@ -3337,11 +3634,12 @@ fn at_most(
     fixed: Option<(Ex, &Side)>,
     extra: &[Ex],
     found: &mut Found,
-) {
+    guard: &mut Guard<'_, S>,
+) -> bool {
     found.rule = if extra.is_empty() { "atmost" } else { "lazy" };
     let dx = dix(ix);
     if holder.is_empty() {
-        return;
+        return true;
     }
     let mut cands: Vec<(Term, Vec<Side>)> = Vec::new();
     if let Some(i) = dx.inv(ix, q)
@@ -3367,7 +3665,7 @@ fn at_most(
     }
     let k = n as usize + 1;
     if cands.len() < k {
-        return;
+        return true;
     }
     // the subsets, with the fixed candidate when there is one, made one product each
     let subsets = match must {
@@ -3385,30 +3683,87 @@ fn at_most(
             );
         }
         found.over = true;
-        return;
+        return true;
+    }
+    let list_exact_bytes = |v: &[Side]| -> Option<usize> {
+        let mut total = v.len().checked_mul(std::mem::size_of::<Side>())?;
+        for s in v {
+            total = total.checked_add(side_exact_bytes(s.0.len(), s.1.len())?)?;
+        }
+        Some(total)
+    };
+    let Some(holder_bytes) = list_exact_bytes(&holder) else {
+        guard.data_overflow();
+        return false;
+    };
+    let mut cand_bytes = Vec::with_capacity(cands.len());
+    for (_, ps) in &cands {
+        let Some(b) = list_exact_bytes(ps) else {
+            guard.data_overflow();
+            return false;
+        };
+        cand_bytes.push(b);
     }
     // each subset of k candidates, with the fixed one when there is one
     let mut pick: Vec<usize> = (0..k).collect();
     loop {
         if must.is_none_or(|m| pick.contains(&m)) {
-            let mut lists: Vec<Vec<Side>> = vec![holder.clone()];
-            let mut eqs: Vec<Lit> = extra.iter().map(|&a| Lit::x(a)).collect();
-            for (a, &i) in pick.iter().enumerate() {
-                lists.push(cands[i].1.clone());
-                for &j in &pick[a + 1..] {
-                    if let Made::Lit(l) = Lit::eq(cands[i].0, cands[j].0) {
-                        eqs.push(l);
+            let empty_cand = pick.iter().any(|&i| cands[i].1.is_empty());
+            if !empty_cand {
+                let mut eqs_len = extra.len();
+                let mut max_len = holder.len();
+                let mut prod_bytes = (1 + k)
+                    .checked_mul(std::mem::size_of::<Vec<Side>>())
+                    .and_then(|b| b.checked_add(holder_bytes));
+                for (a, &i) in pick.iter().enumerate() {
+                    max_len = max_len.max(cands[i].1.len());
+                    prod_bytes = prod_bytes.and_then(|b| b.checked_add(cand_bytes[i]));
+                    for &j in &pick[a + 1..] {
+                        if let Made::Lit(_) = Lit::eq(cands[i].0, cands[j].0) {
+                            eqs_len += 1;
+                        }
                     }
                 }
+                let Some(prod_bytes) =
+                    prod_bytes.and_then(|b| b.checked_add(side_exact_bytes(0, eqs_len)?))
+                else {
+                    guard.data_overflow();
+                    return false;
+                };
+                let prune_scratch = if max_len < 2 {
+                    0
+                } else {
+                    let Some(ps) = max_len.checked_mul(PRUNE_SCRATCH_ELEM) else {
+                        guard.data_overflow();
+                        return false;
+                    };
+                    ps
+                };
+                if !found.reserve_prod_admitted(prod_bytes, prune_scratch, guard) {
+                    return false;
+                }
+                let mut lists: Vec<Vec<Side>> = Vec::with_capacity(1 + k);
+                lists.push(holder.clone());
+                let mut eqs: Vec<Lit> = Vec::with_capacity(eqs_len);
+                eqs.extend(extra.iter().map(|&a| Lit::x(a)));
+                for (a, &i) in pick.iter().enumerate() {
+                    lists.push(cands[i].1.clone());
+                    for &j in &pick[a + 1..] {
+                        if let Made::Lit(l) = Lit::eq(cands[i].0, cands[j].0) {
+                            eqs.push(l);
+                        }
+                    }
+                }
+                found.products(lists, (Vec::new(), eqs));
+                guard.release_to(found.held_bytes());
             }
-            found.products(lists, (Vec::new(), eqs));
         }
         // the next subset in lexicographic order
         let m = cands.len();
         let mut i = k;
         loop {
             if i == 0 {
-                return;
+                return true;
             }
             i -= 1;
             if pick[i] < m - k + i {
@@ -3472,14 +3827,38 @@ fn on_rl<S: Sink>(
         return true;
     }
     for &(m, n, q) in &dx.atmosts {
-        if dx.sub(ix, s, q) {
-            at_most(ix, st, n, q, partners_x(st, m), Some((f, prem)), &[], found);
+        if dx.sub(ix, s, q)
+            && !at_most(
+                ix,
+                st,
+                n,
+                q,
+                partners_x(st, m),
+                Some((f, prem)),
+                &[],
+                found,
+                guard,
+            )
+        {
+            return false;
         }
     }
     // item 728's clauses, with the new premise fixed in the product
     for (n, q, head) in &dx.lazy {
-        if dx.sub(ix, s, *q) {
-            at_most(ix, st, *n, *q, vec![unit()], Some((f, prem)), head, found);
+        if dx.sub(ix, s, *q)
+            && !at_most(
+                ix,
+                st,
+                *n,
+                *q,
+                vec![unit()],
+                Some((f, prem)),
+                head,
+                found,
+                guard,
+            )
+        {
+            return false;
         }
     }
     found.rule = "qual";
@@ -3487,17 +3866,16 @@ fn on_rl<S: Sink>(
         let q = dx.base + 2 * k as Role;
         if let Some(i) = dx.inv(ix, r)
             && dx.sub(ix, s, i)
-        {
-            for p in partners_x(st, b) {
-                let add = Lit::rl(f, q ^ 1);
-                let Some(bytes) = side_parts_bytes(prem, &p.0, &p.1, None, Some(add)) else {
+            && !for_each_partner_x(st, b, |pb, ph, without| {
+                let add = Some(Lit::rl(f, q ^ 1));
+                let Some(bytes) = side_parts_bytes(prem, pb, ph, without, add) else {
                     guard.data_overflow();
                     return false;
                 };
-                if !found.push_admitted(bytes, || merge_with_exact(prem, &p, add), guard) {
-                    return false;
-                }
-            }
+                found.push_admitted(bytes, || merge_parts(prem, pb, ph, without, add), guard)
+            })
+        {
+            return false;
         }
     }
     found.rule = "rdis";
@@ -3755,41 +4133,52 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
     let unit = unit();
     if let Some(ids) = dx.by_body.get(&d) {
         for &id in ids {
-            hyper_clause(ix, st, id, d, &unit, &mut found);
+            if !hyper_clause(ix, st, id, d, &unit, &mut found, &mut found_guard) {
+                mark_interrupted(st);
+                return;
+            }
         }
     }
     let h = ix.head(d);
     if dl(st).is_some() {
         // the stored clauses meet d in conjunctions and disjointness
         for &(p, k) in ix.conj_of(h) {
-            if !st.subs.contains(&p) {
-                for p in partners_x(st, p) {
-                    let Some(bytes) = side_parts_bytes(&p, &[], &[], None, Some(Lit::x(k))) else {
+            if !st.subs.contains(&p)
+                && !for_each_partner_x(st, p, |pb, ph, without| {
+                    let add = Some(Lit::x(k));
+                    let Some(bytes) = side_parts_bytes(&unit, pb, ph, without, add) else {
                         found_guard.data_overflow();
-                        mark_interrupted(st);
-                        return;
+                        return false;
                     };
-                    if !found.push_admitted(bytes, || with_exact(&p, Lit::x(k)), &mut found_guard) {
-                        mark_interrupted(st);
-                        return;
-                    }
-                }
+                    found.push_admitted(
+                        bytes,
+                        || merge_parts(&unit, pb, ph, without, add),
+                        &mut found_guard,
+                    )
+                })
+            {
+                mark_interrupted(st);
+                return;
             }
         }
         for &set in ix.disjoint_of(h) {
             for &m in &dx.sets[set as usize] {
-                if m != d && !st.subs.contains(&m) {
-                    for q in partners_x(st, m) {
-                        let Some(bytes) = side_exact_bytes(q.0.len(), q.1.len()) else {
+                if m != d
+                    && !st.subs.contains(&m)
+                    && !for_each_partner_x(st, m, |pb, ph, without| {
+                        let Some(bytes) = side_parts_bytes(&unit, pb, ph, without, None) else {
                             found_guard.data_overflow();
-                            mark_interrupted(st);
-                            return;
+                            return false;
                         };
-                        if !found.push_admitted(bytes, || q, &mut found_guard) {
-                            mark_interrupted(st);
-                            return;
-                        }
-                    }
+                        found.push_admitted(
+                            bytes,
+                            || merge_parts(&unit, pb, ph, without, None),
+                            &mut found_guard,
+                        )
+                    })
+                {
+                    mark_interrupted(st);
+                    return;
                 }
             }
         }
@@ -3851,8 +4240,21 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
         }
     }
     if dx.counting {
-        if let Some(&(n, q)) = dx.atmost.get(&d) {
-            at_most(ix, st, n, q, vec![unit.clone()], None, &[], &mut found);
+        if let Some(&(n, q)) = dx.atmost.get(&d)
+            && !at_most(
+                ix,
+                st,
+                n,
+                q,
+                vec![unit.clone()],
+                None,
+                &[],
+                &mut found,
+                &mut found_guard,
+            )
+        {
+            mark_interrupted(st);
+            return;
         }
         if !on_filler(ix, st, d, &unit, &mut found, &mut found_guard) {
             mark_interrupted(st);
@@ -4416,6 +4818,7 @@ pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out:
         .as_deref()
         .map_or(Vec::new(), |r| r.edges_to(v).to_vec());
     let c = out.dl().table.get(cid).clone();
+    let mut found_guard = Guard::new(out);
     let mut found = Found {
         root,
         ..Found::default()
@@ -4423,7 +4826,19 @@ pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out:
     if is_const_shared {
         if has_edge && !is_mark {
             found.rule = "predg";
-            found.push((c.body().to_vec(), c.head().to_vec()));
+            let Some(bytes) = side_exact_bytes(c.body().len(), c.head().len()) else {
+                found_guard.data_overflow();
+                mark_interrupted(st);
+                return true;
+            };
+            if !found.push_admitted(
+                bytes,
+                || (c.body().to_vec(), c.head().to_vec()),
+                &mut found_guard,
+            ) {
+                mark_interrupted(st);
+                return true;
+            }
         }
     } else {
         if !root {
@@ -4433,17 +4848,23 @@ pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out:
                 if into_nominal(ix, e).is_some() {
                     continue;
                 }
-                pred(ix, st, e, &c, None, &mut found, &out.dl().lits);
+                if !pred(ix, st, e, &c, None, &mut found, &mut found_guard) {
+                    mark_interrupted(st);
+                    return true;
+                }
             }
         }
         for (e, u) in pairs {
-            super::dl_root::root_pred(ix, st, e, u, &c, None, &mut found, &out.dl().lits);
+            if !super::dl_root::root_pred(ix, st, e, u, &c, None, &mut found, &mut found_guard) {
+                mark_interrupted(st);
+                return true;
+            }
         }
     }
     if root {
-        drain_with(ix, st, found, out, &RootDerive);
+        drain_with_admitted(ix, st, found, &mut found_guard, &RootDerive);
     } else {
-        drain(ix, st, found, out);
+        drain_admitted(ix, st, found, &mut found_guard);
     }
     true
 }
@@ -4453,16 +4874,17 @@ pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out:
 /// maximal literal is a role below s over f(x), and the head's literals over y become
 /// literals over x and f(x). `fixed` is the premise that a new clause gives for one of
 /// these literals, which the inference must use at one of the places it fits.
-fn pred(
+fn pred<S: Sink>(
     ix: &Index,
     st: &State,
     f: Ex,
     c: &Clause,
     fixed: Option<(Lit, &Side)>,
     found: &mut Found,
-    lits: &Lits,
-) {
+    guard: &mut Guard<'_, S>,
+) -> bool {
     found.rule = "pred";
+    let lits = &guard.dl().lits;
     let dx = dix(ix);
     // a rooted run's ground body literals stay in the body, and its head literals over y,
     // x and constants are read over x, f(x) and the constants
@@ -4474,7 +4896,7 @@ fn pred(
         for &l in c.body() {
             if l.kind() == XL {
                 if !is_ground(lits.view(l, inv)) {
-                    return;
+                    return true;
                 }
                 ground.push(l);
             }
@@ -4492,7 +4914,7 @@ fn pred(
             if let XLit::Role(_, a, b) = v
                 && matches!((a, b), (RTerm::X, RTerm::C(_)) | (RTerm::C(_), RTerm::X))
             {
-                return;
+                return true;
             }
             let t = |t: RTerm| match t {
                 RTerm::Y => Some(RTerm::X),
@@ -4509,7 +4931,7 @@ fn pred(
             match w.map(|w| lits.lit(w, inv)) {
                 Some(Made::Lit(m)) => up.push(m),
                 Some(Made::False) => {}
-                Some(Made::True) | None => return,
+                Some(Made::True) | None => return true,
             }
         }
     }
@@ -4530,9 +4952,9 @@ fn pred(
                 .map(|l| Lit::rl(f, l.atom())),
         );
     } else if c.body().iter().any(|l| l.kind() == RY) {
-        let Some(r) = role_of(ix, f) else { return };
+        let Some(r) = role_of(ix, f) else { return true };
         if !meets(ix, c, r) {
-            return;
+            return true;
         }
         need.push(Lit::rl(f, r));
     }
@@ -4544,7 +4966,7 @@ fn pred(
     if let Some((p, _)) = fixed
         && !need.iter().any(|&n| fits(n, p))
     {
-        return;
+        return true;
     }
     let mut head: Vec<Lit> = Vec::with_capacity(c.head().len());
     for l in c.head() {
@@ -4552,7 +4974,7 @@ fn pred(
             Y => head.push(Lit::x(l.atom())),
             RY => head.push(Lit::rl(f, l.atom())),
             XL if dx.root.is_some() => {}
-            _ => return,
+            _ => return true,
         }
     }
     head.extend(up);
@@ -4565,7 +4987,7 @@ fn pred(
         })
         .collect();
     match fixed {
-        None => found.products(lists_free, base),
+        None => found.push_product_admitted(lists_free, base, false, guard),
         Some((p, side)) => {
             // without counting the premise fits one place
             let places: Vec<usize> = need
@@ -4590,8 +5012,11 @@ fn pred(
                     )
                 };
                 lists[k] = vec![side.clone()];
-                found.products(lists, b);
+                if !found.push_product_admitted(lists, b, false, guard) {
+                    return false;
+                }
             }
+            true
         }
     }
 }
@@ -4994,50 +5419,50 @@ fn process<S: Sink>(
                 }
                 found.rule = "conj";
                 for &(p, k) in ix.conj_of(h) {
-                    for q in partners_x(st, p) {
-                        let add = Lit::x(k);
-                        let Some(bytes) = side_parts_bytes(&prem, &q.0, &q.1, None, Some(add))
-                        else {
+                    if !for_each_partner_x(st, p, |pb, ph, without| {
+                        let add = Some(Lit::x(k));
+                        let Some(bytes) = side_parts_bytes(&prem, pb, ph, without, add) else {
                             found_guard.data_overflow();
-                            mark_interrupted(st);
-                            return;
+                            return false;
                         };
-                        if !found.push_admitted(
+                        found.push_admitted(
                             bytes,
-                            || merge_with_exact(&prem, &q, add),
+                            || merge_parts(&prem, pb, ph, without, add),
                             &mut found_guard,
-                        ) {
-                            mark_interrupted(st);
-                            return;
-                        }
+                        )
+                    }) {
+                        mark_interrupted(st);
+                        return;
                     }
                 }
                 found.rule = "disj";
                 for &set in ix.disjoint_of(h) {
                     for &m in &dx.sets[set as usize] {
-                        if m != d {
-                            for q in partners_x(st, m) {
-                                let Some(bytes) = side_parts_bytes(&prem, &q.0, &q.1, None, None)
+                        if m != d
+                            && !for_each_partner_x(st, m, |pb, ph, without| {
+                                let Some(bytes) = side_parts_bytes(&prem, pb, ph, without, None)
                                 else {
                                     found_guard.data_overflow();
-                                    mark_interrupted(st);
-                                    return;
+                                    return false;
                                 };
-                                if !found.push_admitted(
+                                found.push_admitted(
                                     bytes,
-                                    || merge_exact(&prem, &q),
+                                    || merge_parts(&prem, pb, ph, without, None),
                                     &mut found_guard,
-                                ) {
-                                    mark_interrupted(st);
-                                    return;
-                                }
-                            }
+                                )
+                            })
+                        {
+                            mark_interrupted(st);
+                            return;
                         }
                     }
                 }
                 if let Some(ids) = dx.by_body.get(&d) {
                     for &cl in ids {
-                        hyper_clause(ix, st, cl, d, &prem, &mut found);
+                        if !hyper_clause(ix, st, cl, d, &prem, &mut found, &mut found_guard) {
+                            mark_interrupted(st);
+                            return;
+                        }
                     }
                 }
                 // the universals d stands for, over the predecessor and the successors
@@ -5091,8 +5516,21 @@ fn process<S: Sink>(
                     }
                 }
                 if dx.counting {
-                    if let Some(&(n, q)) = dx.atmost.get(&d) {
-                        at_most(ix, st, n, q, vec![prem.clone()], None, &[], &mut found);
+                    if let Some(&(n, q)) = dx.atmost.get(&d)
+                        && !at_most(
+                            ix,
+                            st,
+                            n,
+                            q,
+                            vec![prem.clone()],
+                            None,
+                            &[],
+                            &mut found,
+                            &mut found_guard,
+                        )
+                    {
+                        mark_interrupted(st);
+                        return;
                     }
                     if !on_filler(ix, st, d, &prem, &mut found, &mut found_guard) {
                         mark_interrupted(st);
@@ -5159,7 +5597,6 @@ fn process<S: Sink>(
                 if st.subs.contains(&e) && !es.contains(&ix.head(e).succ) {
                     es.push(ix.head(e).succ);
                 }
-                let table = &found_guard.dl().table;
                 for &v in &es {
                     if replayed && v == edge_v {
                         continue;
@@ -5168,15 +5605,19 @@ fn process<S: Sink>(
                         .and_then(|x| x.pred_in.get(&v))
                         .map_or(&[][..], |v| v.as_slice());
                     for &cid in cids {
-                        pred(
+                        let pc = found_guard.dl().table.get(cid).clone();
+                        if !pred(
                             ix,
                             st,
                             e,
-                            table.get(cid),
+                            &pc,
                             Some((l, &prem)),
                             &mut found,
-                            &found_guard.dl().lits,
-                        );
+                            &mut found_guard,
+                        ) {
+                            mark_interrupted(st);
+                            return;
+                        }
                     }
                 }
             }
