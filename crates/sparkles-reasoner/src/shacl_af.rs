@@ -228,12 +228,10 @@ pub(crate) fn derive(
         s.dvocab_len = u64::MAX;
         Arc::new(s)
     };
-    let budget = Budget::new(opts.max_memory);
+    let budget = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
     let base = Arc::new(facts::Base::new(snap.clone(), graphs)?);
-    let mut g = graph::Graph::with_base(base.clone());
-    g.set_budget(&budget)?;
-    let terms = Terms::new(snap.clone());
-    terms.set_budget(&budget)?;
+    let mut g = graph::Graph::with_base_in(base.clone(), &budget)?;
+    let terms = Terms::new_in(snap.clone(), &budget)?;
     let warnings = WorkingWarnings::new(&budget);
     let Some(&first) = graphs.first() else {
         bail!("the shacl-af profile has no input graph to read");

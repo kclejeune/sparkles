@@ -3,7 +3,8 @@
 //! These controls are opt-in. Ordinary materializations keep their allocation and
 //! caching policy. An analysis reserves one unused blank range in its private copies.
 
-use crate::budget::{Budget, BudgetFailure};
+use crate::ParentHandle;
+use crate::budget::{Budget, BudgetFailure, Held};
 use crate::diagnostics::LiteralTypings;
 use crate::terms::Terms;
 use oxrdf::{Literal, Term};
@@ -18,6 +19,8 @@ struct Witnesses {
     keys: BTreeMap<(Arc<str>, Vec<String>), u64>,
     programs: BTreeSet<Arc<str>>,
     next: u64,
+    /// Declared last so `keys` and `programs` drop before returning witness credit.
+    held: Held,
 }
 
 /// The bounded witness namespace shared by every state of one analysis request.
@@ -25,10 +28,11 @@ struct Witnesses {
 pub struct WitnessMap {
     ordinal: u16,
     state: Mutex<Witnesses>,
-    budget: Arc<Budget>,
     now: Term,
     cancel: Arc<AtomicBool>,
     deadline: Option<Instant>,
+    /// Declared last so `state` and its `Held` drop before parent credit returns.
+    budget: Arc<Budget>,
 }
 
 impl WitnessMap {
@@ -38,14 +42,26 @@ impl WitnessMap {
         cancel: Arc<AtomicBool>,
         deadline: Option<Instant>,
     ) -> Arc<Self> {
+        Self::with_memory_parent(ordinal, max_memory, None, cancel, deadline)
+    }
+
+    pub fn with_memory_parent(
+        ordinal: u16,
+        max_memory: Option<usize>,
+        memory_parent: Option<ParentHandle>,
+        cancel: Arc<AtomicBool>,
+        deadline: Option<Instant>,
+    ) -> Arc<Self> {
+        let budget = Budget::with_parent(max_memory, memory_parent);
+        let held = Held::new(&budget);
         Arc::new(Self {
             ordinal,
             state: Mutex::new(Witnesses {
                 keys: BTreeMap::new(),
                 programs: BTreeSet::new(),
                 next: sparkles_core::branch::bnode_range_start(ordinal),
+                held,
             }),
-            budget: Budget::new(max_memory),
             now: Literal::new_typed_literal(
                 oxsdatatypes::DateTime::now().to_string(),
                 oxrdf::vocab::xsd::DATE_TIME,
@@ -53,6 +69,7 @@ impl WitnessMap {
             .into(),
             cancel,
             deadline,
+            budget,
         })
     }
 
@@ -67,7 +84,8 @@ pub struct AnalysisContext {
     witnesses: Arc<WitnessMap>,
     pub(crate) now: Term,
     program: Arc<str>,
-    typings: Mutex<Option<LiteralTypings>>,
+    typings: Mutex<Option<(LiteralTypings, Held)>>,
+    /// Declared last so `typings` and its `Held` drop before parent credit returns.
     typing_budget: Arc<Budget>,
 }
 
@@ -82,18 +100,19 @@ impl AnalysisContext {
             if let Some(program) = state.programs.get(program.as_str()) {
                 program.clone()
             } else {
-                witnesses.budget.try_charge(128 + program.capacity())?;
+                state.held.try_grow(128 + program.capacity())?;
                 let program: Arc<str> = program.into();
                 state.programs.insert(program.clone());
                 program
             }
         };
+        let typing_budget = Budget::with_parent(max_typing_memory, witnesses.budget.parent());
         Ok(Arc::new(Self {
             now: witnesses.now.clone(),
             program,
             witnesses,
             typings: Mutex::new(None),
-            typing_budget: Budget::new(max_typing_memory),
+            typing_budget,
         }))
     }
 
@@ -134,13 +153,13 @@ impl AnalysisContext {
         if let Some(id) = state.keys.get(&key) {
             return Ok(*id);
         }
-        let bytes = 192
-            + key.1.capacity() * std::mem::size_of::<String>()
-            + key.1.iter().map(String::capacity).sum::<usize>();
-        self.witnesses.budget.try_charge(bytes)?;
         if sparkles_core::branch::bnode_ordinal(state.next) != self.witnesses.ordinal as u64 {
             return Err(fail("exhausting the analysis witness range"));
         }
+        let bytes = 192
+            + key.1.capacity() * std::mem::size_of::<String>()
+            + key.1.iter().map(String::capacity).sum::<usize>();
+        state.held.try_grow(bytes)?;
         let id = Id::bnode(state.next).0;
         state.next += 1;
         state.keys.insert(key, id);
@@ -152,6 +171,7 @@ impl AnalysisContext {
         terms: &Terms,
         facts: &rustc_hash::FxHashSet<[u64; 3]>,
     ) -> Result<(), BudgetFailure> {
+        let mut held = Held::new(&self.typing_budget);
         let mut found = Vec::new();
         for triple in facts {
             if self.witnesses.cancel.load(Ordering::Relaxed)
@@ -172,22 +192,25 @@ impl AnalysisContext {
             ) && let Some((literal, datatype)) =
                 LiteralTypings::violation(&subject, &predicate, &object)
             {
-                self.typing_budget.try_charge(
-                    128 + literal.to_string().len() * 2 + datatype.as_str().len() * 2,
-                )?;
+                held.try_grow(128 + literal.to_string().len() * 2 + datatype.as_str().len() * 2)?;
                 found.push((literal, datatype));
             }
         }
-        *self.typings.lock().unwrap() = Some(LiteralTypings {
-            commit: 0,
-            facts: found,
-        });
+        let previous = self.typings.lock().unwrap().replace((
+            LiteralTypings {
+                commit: 0,
+                facts: found,
+            },
+            held,
+        ));
+        drop(previous);
         Ok(())
     }
 
     /// Consume the summary independently of optional closure caching.
     pub fn take_literal_typings(&self, commit: u64) -> Option<LiteralTypings> {
-        self.typings.lock().unwrap().take().map(|mut typings| {
+        let taken = self.typings.lock().unwrap().take();
+        taken.map(|(mut typings, _held)| {
             typings.commit = commit;
             typings
         })

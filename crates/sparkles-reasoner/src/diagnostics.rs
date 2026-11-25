@@ -684,6 +684,8 @@ pub struct DiagnosticControls {
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Each query and the decoded rows it retains are held to this estimate.
     pub max_memory: Option<u64>,
+    /// Parent memory handle that controlled diagnostic reads reserve from (`None`: unpooled).
+    pub memory_parent: Option<crate::ParentHandle>,
 }
 
 pub(crate) fn check_control(
@@ -732,6 +734,11 @@ pub fn diagnose_for_gate(
         deadline: query.deadline.into_iter().chain(timeout).min(),
         cancel: query.cancel.clone(),
         max_memory: query.max_memory_bytes,
+        memory_parent: query
+            .grant
+            .as_ref()
+            .map(|g| g.memory_parent())
+            .or_else(|| query.pool.as_ref().map(|p| p.work_parent())),
     };
     let gate = Gate {
         query,
@@ -848,6 +855,14 @@ fn diagnose_impl(
                 findings.extend(found);
             }
             Err(Error::Timeout) => out.status = CheckStatus::Timeout,
+            Err(
+                error @ Error::BudgetExceeded(sparkles_core::Budget {
+                    kind: sparkles_core::BudgetKind::ServerMemory,
+                    ..
+                }),
+            ) => {
+                return Err(error.into());
+            }
             Err(error @ (Error::BudgetExceeded(_) | Error::Cancelled)) if gate.is_some() => {
                 return Err(error.into());
             }

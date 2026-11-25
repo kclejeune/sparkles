@@ -310,7 +310,11 @@ impl Closure {
             if Arc::ptr_eq(source, budget) {
                 return Ok(0);
             }
-            if bytes != 0 && source.domain() != budget.domain() {
+            if bytes != 0
+                && source.parent().is_some()
+                && budget.parent().is_some()
+                && source.domain() != budget.domain()
+            {
                 return Err(BudgetFailure::parent(
                     sparkles_budget::ParentRefused::ForeignDomain,
                 ));

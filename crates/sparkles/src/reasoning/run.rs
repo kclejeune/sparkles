@@ -127,6 +127,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
         inputs: req.inputs.clone(),
         threads: req.threads,
         max_memory: req.max_memory,
+        memory_parent: state.pool.as_ref().map(|p| p.work_parent()),
         max_inferred: req
             .max_inferred
             .unwrap_or(sparkles_reasoner::DEFAULT_MAX_INFERRED),
@@ -442,14 +443,11 @@ pub fn diagnose_with(
     cache: Option<&sparkles_reasoner::Cache>,
     opts: &DiagnoseOptions,
 ) -> Result<Diagnostics> {
-    diagnose_snapshot_with(
-        store,
-        record,
-        cache,
-        opts,
-        store.snapshot(),
-        &Default::default(),
-    )
+    let controls = sparkles_reasoner::diagnostics::DiagnosticControls {
+        memory_parent: opts.grant.as_ref().map(|g| g.memory_parent()),
+        ..Default::default()
+    };
+    diagnose_snapshot_with(store, record, cache, opts, store.snapshot(), &controls)
 }
 
 /// Diagnose an already retained view under a parent request's controls.
@@ -470,15 +468,37 @@ pub(crate) fn diagnose_snapshot_with(
             .any(|c| c == sparkles_reasoner::diagnostics::LITERAL_NOT_IN_DATATYPE);
     let typings = match record {
         Some(r) if checked && opts.inferences && SOUND_PROFILES.contains(&r.profile.as_str()) => {
-            r.commit.and_then(
-                |c| match sparkles_reasoner::literal_typings(store, c, cache) {
+            let mut typing_controls = controls.clone();
+            if typing_controls.memory_parent.is_none() {
+                typing_controls.memory_parent = opts.grant.as_ref().map(|g| g.memory_parent());
+            }
+            match r.commit {
+                Some(c) => match sparkles_reasoner::literal_typings_controlled(
+                    store,
+                    c,
+                    cache,
+                    &typing_controls,
+                ) {
                     Ok(t) => t,
                     Err(e) => {
+                        if let Some(core) = e.downcast_ref::<Error>()
+                            && matches!(
+                                core,
+                                Error::Cancelled
+                                    | Error::BudgetExceeded(crate::Budget {
+                                        kind: crate::BudgetKind::ServerMemory,
+                                        ..
+                                    })
+                            )
+                        {
+                            return Err(from_anyhow(e));
+                        }
                         tracing::warn!("reading the literal typings of the inferences: {e:#}");
                         None
                     }
                 },
-            )
+                None => None,
+            }
         }
         _ => None,
     };

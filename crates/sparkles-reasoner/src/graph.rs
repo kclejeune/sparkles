@@ -160,6 +160,7 @@ impl Graph {
     }
 
     /// Charge the graph's heap to `budget` from now on, or fail when it does not fit.
+    #[cfg(test)]
     pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
         self.held = Held::try_new(budget, self.heap_bytes())?;
         Ok(())
@@ -252,12 +253,47 @@ impl Graph {
 
     /// A graph whose ids `[0, base.len)` are the base tier (at least one id, so that
     /// a base tier that grows later, see [`set_base`](Self::set_base), is still read).
+    #[cfg(test)]
     pub fn with_base(base: Arc<Base>) -> Graph {
         Graph {
             tier: Tier::new(base.len().max(1)),
             base: Some(base),
             ..Graph::default()
         }
+    }
+
+    /// [`with_base`](Self::with_base), charging the shard vectors to `budget` before
+    /// constructing the graph.
+    pub(crate) fn with_base_in(
+        base: Arc<Base>,
+        budget: &Arc<Budget>,
+    ) -> Result<Graph, BudgetFailure> {
+        let held = Held::try_new(budget, Self::fixed_heap_bytes())?;
+        Ok(Graph {
+            tier: Tier::new(base.len().max(1)),
+            base: Some(base),
+            index: shards(),
+            in_base: shards(),
+            live: 0,
+            pending: None,
+            hidden: None,
+            relations: false,
+            hides: false,
+            held,
+        })
+    }
+
+    /// [`with_base_in`](Self::with_base_in) with pre-admitted capacity for `n` derived facts.
+    pub(crate) fn try_with_base_capacity(
+        base: Arc<Base>,
+        n: usize,
+        budget: &Arc<Budget>,
+    ) -> Result<Graph, BudgetFailure> {
+        let offset = base.len().max(1);
+        let mut g = Graph::try_with_capacity(n, budget)?;
+        g.tier.set_offset(offset);
+        g.base = Some(base);
+        Ok(g)
     }
 
     /// A graph over the same base tier and id numbers as this one, with room for `n`

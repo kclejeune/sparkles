@@ -650,8 +650,12 @@ impl Dataset {
                 None => Default::default(),
             },
         };
-        sparkles_reasoner::query::QueryReasoner::new(profile, &extras, inputs)
-            .map_err(crate::handles::from_anyhow)
+        let mut reasoner = sparkles_reasoner::query::QueryReasoner::new(profile, &extras, inputs)
+            .map_err(crate::handles::from_anyhow)?;
+        if let Some(pool) = &self.inner.pool {
+            reasoner = reasoner.with_pool(pool.clone());
+        }
+        Ok(reasoner)
     }
 
     /// Under the `owl-ql` query-time profile (spec F17 §7), what the rewriting reads of
@@ -674,11 +678,17 @@ impl Dataset {
             .as_ref()
             .filter(|a| !a.reads_all())
             .map(|a| a.bound(&snap));
+        let memory_parent = opts
+            .grant
+            .as_ref()
+            .map(|g| g.memory_parent())
+            .or_else(|| self.inner.pool.as_ref().map(|p| p.work_parent()));
         let req = SessionRequest {
             snap,
             readable,
             stop: Arc::new(|| Ok(())),
             max_memory: opts.max_memory_bytes,
+            memory_parent,
             no_cache: false,
         };
         let Some(t) = reasoner.owl_ql_tbox(&req)? else {
@@ -702,6 +712,11 @@ impl Dataset {
     /// Current read snapshot.
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner.store.snapshot()
+    }
+
+    /// The shared query memory pool attached to this dataset, if any.
+    pub fn pool(&self) -> Option<&Arc<crate::sparql::pool::QueryPool>> {
+        self.inner.pool.as_ref()
     }
 
     // ------------------------------------------------------------------ loading ------

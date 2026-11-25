@@ -25,10 +25,11 @@ pub fn literal_typings_controlled(
     controls: &DiagnosticControls,
 ) -> anyhow::Result<Option<LiteralTypings>> {
     check(controls)?;
-    let budget = Budget::new(
+    let budget = Budget::with_parent(
         controls
             .max_memory
             .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX)),
+        controls.memory_parent.clone(),
     );
     if let Some(cache) = cache
         && let Some(kept) = cache.kept.try_lock()
@@ -36,6 +37,7 @@ pub fn literal_typings_controlled(
             .as_ref()
             .filter(|kept| kept.dataset_id == store.dataset_id() && kept.commit == commit)
     {
+        let mut found_held = Held::new(&budget);
         let mut found = Vec::new();
         let terms = &kept.closure.terms;
         let predicate = Term::NamedNode(rdf::TYPE.into_owned());
@@ -52,7 +54,7 @@ pub fn literal_typings_controlled(
                 && let Some((literal, datatype)) =
                     LiteralTypings::violation(&subject, &predicate, &object)
             {
-                budget.try_charge(fact_bytes(&literal, &datatype))?;
+                found_held.try_grow(fact_bytes(&literal, &datatype))?;
                 found.push((literal, datatype));
             }
         }
@@ -79,16 +81,14 @@ pub fn literal_typings_controlled(
         return Ok(None);
     };
     // Two bounded file buffers and map bookkeeping overlap while replaying the log.
-    budget.try_charge(32 * 1024)?;
+    let _buf_held = Held::try_new(&budget, 32 * 1024)?;
     let ty_key = sparkles_core::id::iri_key(rdf::TYPE.as_str());
     let ty_term = Term::NamedNode(rdf::TYPE.into_owned());
-    let mut found: FxHashMap<Keys, ((Literal, NamedNode), usize)> = FxHashMap::default();
-    let consistent = scan_controlled(root, &meta, controls, &budget, |added, keys, held| {
+    let mut found: FxHashMap<Keys, ((Literal, NamedNode), Held)> = FxHashMap::default();
+    let consistent = scan_controlled(root, &meta, controls, &budget, |added, keys, mut held| {
         check(controls)?;
         if !added {
-            if let Some((_, bytes)) = found.remove(&keys) {
-                budget.release(bytes);
-            }
+            found.remove(&keys);
         } else if keys[1] == ty_key && keys[0].first() == Some(&b'"') {
             let _scratch = Held::try_new(
                 &budget,
@@ -104,14 +104,11 @@ pub fn literal_typings_controlled(
                 LiteralTypings::violation(&subject, &ty_term, &object)
             {
                 let extra = fact_bytes(&literal, &datatype);
-                budget.try_charge(extra)?;
-                if let Some((_, bytes)) = found.insert(keys, ((literal, datatype), extra + held)) {
-                    budget.release(bytes);
-                }
+                held.try_grow(extra)?;
+                found.insert(keys, ((literal, datatype), held));
                 return Ok(());
             }
         }
-        budget.release(held);
         Ok(())
     })?;
     Ok(consistent.then(|| LiteralTypings {
@@ -125,9 +122,9 @@ fn keys<R: std::io::Read>(
     end: u64,
     controls: &DiagnosticControls,
     budget: &Arc<Budget>,
-) -> anyhow::Result<Option<(Keys, usize)>> {
+) -> anyhow::Result<Option<(Keys, Held)>> {
+    let mut held = Held::new(budget);
     let mut triple: Keys = Default::default();
-    let mut held = 0;
     for key in &mut triple {
         check(controls)?;
         let mut length = [0u8; 4];
@@ -140,8 +137,7 @@ fn keys<R: std::io::Read>(
         }
         let length = length as usize;
         let charge = length.max(8);
-        budget.try_charge(charge)?;
-        held += charge;
+        held.try_grow(charge)?;
         key.resize(length, 0);
         if reader.read_exact(key).is_err() {
             return Ok(None);
@@ -155,7 +151,7 @@ fn scan_controlled(
     meta: &SavedMeta,
     controls: &DiagnosticControls,
     budget: &Arc<Budget>,
-    mut visit: impl FnMut(bool, Keys, usize) -> anyhow::Result<()>,
+    mut visit: impl FnMut(bool, Keys, Held) -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
     let Ok(file) = std::fs::File::open(root.join(SAVED_BIN)) else {
         return Ok(false);

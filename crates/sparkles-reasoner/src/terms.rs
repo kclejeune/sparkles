@@ -193,6 +193,7 @@ impl Drop for TermCredit {
 }
 
 impl Terms {
+    #[cfg(test)]
     pub fn new(snap: Arc<Snapshot>) -> Terms {
         Self::new_in(snap, &Budget::unlimited()).expect("unpooled initial terms")
     }
@@ -377,6 +378,7 @@ impl Terms {
     }
 
     /// Charge the local terms to `budget` from now on, or fail when they do not fit.
+    #[cfg(test)]
     pub fn set_budget(&self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
         loop {
             let (old, bytes) = {

@@ -46,6 +46,7 @@ fn request(snap: &Arc<Snapshot>) -> SessionRequest {
         readable: None,
         stop: Arc::new(|| Ok(())),
         max_memory: None,
+        memory_parent: None,
         no_cache: true,
     }
 }

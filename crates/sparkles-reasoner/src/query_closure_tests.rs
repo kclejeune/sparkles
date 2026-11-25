@@ -41,6 +41,7 @@ fn session(store: &Store, profile: &Profile, on: bool) -> Session {
             readable: None,
             stop: Arc::new(|| Ok(())),
             max_memory: None,
+            memory_parent: None,
             no_cache: true,
         },
     )

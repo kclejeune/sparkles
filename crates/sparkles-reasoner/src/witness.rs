@@ -826,8 +826,21 @@ impl Witnesses {
 
     /// Charge the witnesses to `budget`, as the closure they belong to is.
     pub(crate) fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
+        let source = self.held.budget();
+        if Arc::ptr_eq(source, budget) {
+            return Ok(());
+        }
         let n = self.held.bytes();
-        let mut h = Held::try_new(budget, n)?;
+        if n != 0
+            && source.parent().is_some()
+            && budget.parent().is_some()
+            && source.domain() != budget.domain()
+        {
+            return Err(BudgetFailure::parent(
+                sparkles_budget::ParentRefused::ForeignDomain,
+            ));
+        }
+        let mut h = Held::try_new_exact(budget, n)?;
         std::mem::swap(&mut self.held, &mut h);
         drop(h);
         Ok(())

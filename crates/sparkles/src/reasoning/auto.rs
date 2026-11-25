@@ -132,6 +132,10 @@ impl ReasoningProvider for AutoReasoner {
         .then_some(m)
     }
 
+    fn rewrites(&self) -> bool {
+        self.inner.rewrites()
+    }
+
     fn rewrite(
         &self,
         query: &spargebra::Query,
@@ -242,6 +246,10 @@ impl ReasoningProvider for Limited {
         self.inner.reads_all(req)
     }
 
+    fn rewrites(&self) -> bool {
+        self.inner.rewrites()
+    }
+
     fn rewrite(
         &self,
         query: &spargebra::Query,
@@ -255,6 +263,7 @@ impl ReasoningProvider for Limited {
             readable: req.readable.clone(),
             stop: self.limit(req.stop.clone()),
             max_memory: req.max_memory,
+            memory_parent: req.memory_parent.clone(),
             no_cache: req.no_cache,
         };
         let rewritten = self.inner.rewrite(query, bound, &req)?;

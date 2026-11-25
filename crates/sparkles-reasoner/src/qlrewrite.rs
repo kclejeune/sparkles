@@ -428,8 +428,10 @@ impl Tbox {
         snap: &Snapshot,
         graphs: &[Id],
         stop: &dyn Fn() -> Result<()>,
-        budget: &crate::budget::Budget,
+        budget: &Arc<crate::budget::Budget>,
     ) -> Result<Tbox> {
+        // Declared before `triples` so payload drops before held credit returns.
+        let mut held = crate::budget::Held::new(budget);
         let mut triples = Vec::new();
         let (mut visited, mut kept) = (0usize, 0usize);
         // each key as the scan visits it: the stop function and the budget are checked
@@ -444,8 +446,7 @@ impl Tbox {
                 return Ok(());
             }
             if kept.is_multiple_of(1024) {
-                budget
-                    .try_charge(1024 * TRIPLE_BYTES)
+                held.try_grow(1024 * TRIPLE_BYTES)
                     .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL axioms"))?;
             }
             kept += 1;
@@ -557,7 +558,11 @@ pub fn clear() {
 
 /// The TBox of the input graphs of `inputs` that the caller of `req` reads, from the
 /// TBoxes kept for the same generation, commit and view, or read from the snapshot.
-pub(crate) fn tbox(req: &SessionRequest, inputs: &Inputs) -> Result<Arc<Tbox>> {
+pub(crate) fn tbox(
+    req: &SessionRequest,
+    inputs: &Inputs,
+    parent: Option<crate::ParentHandle>,
+) -> Result<Arc<Tbox>> {
     let snap = &req.snap;
     let resolved = match &req.readable {
         Some(access) if !access.reads_all() => {
@@ -595,11 +600,12 @@ pub(crate) fn tbox(req: &SessionRequest, inputs: &Inputs) -> Result<Arc<Tbox>> {
     }
     // the TBox and the triples it is read from live while the query plans, so the
     // query's memory budget bounds them
-    let budget =
-        crate::budget::Budget::new(req.max_memory.map(|m| m.min(usize::MAX as u64) as usize));
+    let budget = crate::budget::Budget::with_parent(
+        req.max_memory.map(|m| m.min(usize::MAX as u64) as usize),
+        parent.or_else(|| req.memory_parent.clone()),
+    );
     let t = Arc::new(Tbox::read(snap, &graphs, &*req.stop, &budget)?);
-    budget
-        .try_charge(t.approx_bytes())
+    let _held = crate::budget::Held::try_new(&budget, t.approx_bytes())
         .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL axioms"))?;
     if let Some(k) = key {
         let mut kept = TBOXES.lock();
@@ -1088,8 +1094,6 @@ struct Rewriter<'a> {
     tbox: &'a Tbox,
     max_union: usize,
     stop: &'a dyn Fn() -> Result<()>,
-    /// the query's memory budget, which the queries of the rewriting are charged to
-    budget: Arc<crate::budget::Budget>,
     /// the values of the query's initial bindings, by variable name
     bound: FxHashMap<String, Term>,
     /// the occurrences of each name in the whole query
@@ -1102,6 +1106,10 @@ struct Rewriter<'a> {
     derive: Vec<Vec<TriplePattern>>,
     nodes: Vec<PlanInfo>,
     warnings: Vec<String>,
+    /// charge for copied branches in wider-group filters; drops before `budget`
+    copies_held: crate::budget::Held,
+    /// the query's memory budget, declared last so buffers and `Held` drop before parent credit returns
+    budget: Arc<crate::budget::Budget>,
 }
 
 impl Rewriter<'_> {
@@ -1405,8 +1413,8 @@ impl Rewriter<'_> {
                 }
             }
         }
-        self.budget
-            .try_charge(bytes)
+        self.copies_held
+            .try_grow(bytes)
             .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
         let mut parts = Vec::with_capacity(groups.len());
         for (set, group) in &groups {
@@ -1696,6 +1704,19 @@ pub fn rewrite_query(
     max_memory: Option<u64>,
     stop: &dyn Fn() -> Result<()>,
 ) -> Result<Option<Rewritten>> {
+    rewrite_query_with_parent(query, bound, tbox, max_union, max_memory, None, stop)
+}
+
+/// [`rewrite_query`], reserving from `memory_parent` when present.
+pub fn rewrite_query_with_parent(
+    query: &Query,
+    bound: &[(String, Term)],
+    tbox: &Tbox,
+    max_union: usize,
+    max_memory: Option<u64>,
+    memory_parent: Option<crate::ParentHandle>,
+    stop: &dyn Fn() -> Result<()>,
+) -> Result<Option<Rewritten>> {
     // the projection that ASK wraps its pattern in names every variable, and none of them
     // is an answer, so it does not count
     let sse = match query {
@@ -1717,11 +1738,15 @@ pub fn rewrite_query(
     for (name, _) in bound {
         *counts.entry(format!("?{name}")).or_default() += 1;
     }
+    let budget = crate::budget::Budget::with_parent(
+        max_memory.map(|m| m.min(usize::MAX as u64) as usize),
+        memory_parent,
+    );
+    let copies_held = crate::budget::Held::new(&budget);
     let mut rw = Rewriter {
         tbox,
         max_union,
         stop,
-        budget: crate::budget::Budget::new(max_memory.map(|m| m.min(usize::MAX as u64) as usize)),
         bound: bound.iter().cloned().collect(),
         counts,
         all_distinguished: sse.contains("(count)") || sse.contains("(count distinct)"),
@@ -1730,6 +1755,8 @@ pub fn rewrite_query(
         derive: Vec::new(),
         nodes: Vec::new(),
         warnings: tbox.warnings(),
+        copies_held,
+        budget,
     };
     let rewrite = |p: &GraphPattern, rw: &mut Rewriter| rw.pattern(p);
     let query = match query {

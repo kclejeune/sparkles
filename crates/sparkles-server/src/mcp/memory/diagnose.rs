@@ -590,6 +590,12 @@ impl Tools<'_> {
                             .limits
                             .query_memory_bytes
                             .map(|m| m as usize),
+                        memory_parent: reader
+                            .opts
+                            .grant
+                            .as_ref()
+                            .map(|g| g.memory_parent())
+                            .or_else(|| ds.dataset.pool().map(|p| p.work_parent())),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -627,10 +633,15 @@ impl Tools<'_> {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        if e.chain()
-                            .any(|c| matches!(c.downcast_ref::<Error>(), Some(Error::Cancelled)))
-                        {
-                            return Err(ctx.engine(Error::Cancelled));
+                        if let Some(core) = e.chain().find_map(|c| c.downcast_ref::<Error>()) {
+                            if matches!(core, Error::Cancelled) {
+                                return Err(ctx.engine(Error::Cancelled));
+                            }
+                            if let Error::BudgetExceeded(b) = core
+                                && b.kind == sparkles::BudgetKind::ServerMemory
+                            {
+                                return Err(ctx.engine(Error::BudgetExceeded(*b)));
+                            }
                         }
                         f["whyNotError"] = e.to_string().into();
                     }

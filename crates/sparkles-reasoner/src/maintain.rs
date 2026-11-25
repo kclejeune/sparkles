@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct Cache {
     kept: Mutex<Option<Kept>>,
     max_triples: AtomicUsize,
+    retained_parent: Option<crate::ParentHandle>,
 }
 
 /// Default of [`Cache::new`]'s limit.
@@ -81,7 +82,18 @@ impl Cache {
         Cache {
             kept: Mutex::new(None),
             max_triples: AtomicUsize::new(max_triples),
+            retained_parent: None,
         }
+    }
+
+    /// Charge closures kept in this cache to `parent` instead of holding no retained pool credit.
+    pub fn with_retained_parent(mut self, parent: Option<crate::ParentHandle>) -> Cache {
+        self.retained_parent = parent;
+        self
+    }
+
+    pub(crate) fn retained_parent(&self) -> Option<crate::ParentHandle> {
+        self.retained_parent.clone()
     }
 
     /// Change the limit (a kept closure over it is dropped at the next run).
@@ -96,7 +108,8 @@ impl Cache {
 
     /// Drop the kept closure.
     pub fn clear(&self) {
-        *self.kept.lock() = None;
+        let old = self.kept.lock().take();
+        drop(old);
     }
 
     /// The witnesses of `t` in the kept closure: `None` when no closure with witnesses
@@ -172,63 +185,85 @@ impl Cache {
     /// can use is taken only when its heap fits `budget`, and is charged there; one that
     /// does not fit stays for a later run, and the result is the error.
     fn take_for(&self, budget: &Arc<Budget>, want: &Want<'_>) -> Taken {
-        let mut k = self.kept.lock();
-        let Some(kept) = k.as_ref() else {
+        let (mut kept, mismatch) = {
+            let mut k = self.kept.lock();
+            let Some(kept) = k.as_ref() else {
+                return Taken::None;
+            };
+            if kept.dataset_id != want.dataset_id
+                || kept.commit != want.since
+                || !Arc::ptr_eq(&kept.snap.generation, want.generation)
+            {
+                (k.take(), Some(Taken::None))
+            } else if kept.digest != want.digest {
+                (k.take(), Some(Taken::RulesChanged))
+            } else if kept.inputs != want.inputs {
+                (k.take(), Some(Taken::InputsChanged))
+            } else {
+                (k.take(), None)
+            }
+        };
+        if let Some(outcome) = mismatch {
+            drop(kept);
+            return outcome;
+        }
+        let Some(mut kept) = kept.take() else {
             return Taken::None;
         };
-        if kept.dataset_id != want.dataset_id
-            || kept.commit != want.since
-            || !Arc::ptr_eq(&kept.snap.generation, want.generation)
-        {
-            *k = None;
-            return Taken::None;
-        }
-        if kept.digest != want.digest {
-            *k = None;
-            return Taken::RulesChanged;
-        }
-        if kept.inputs != want.inputs {
-            *k = None;
-            return Taken::InputsChanged;
-        }
         // witnesses the run will not update are dropped before the closure is charged, so
         // that a run without them, or with another bound, is not refused for their memory
-        if kept.witnesses.as_ref().map(Witnesses::max) != want.witnesses
-            && let Some(kept) = k.as_mut()
-        {
+        if kept.witnesses.as_ref().map(Witnesses::max) != want.witnesses {
             kept.witnesses = None;
         }
-        let Some(kept) = k.as_ref() else {
-            return Taken::None;
+        let restore = |this: &Self, kept: Kept| {
+            let displaced = {
+                let mut slot = this.kept.lock();
+                if slot.is_none() {
+                    *slot = Some(kept);
+                    None
+                } else {
+                    Some(kept)
+                }
+            };
+            drop(displaced);
         };
         let need = kept.heap_bytes();
-        if let Err(e) = budget.try_charge(need) {
-            return Taken::Refused(
-                e.with_context(" (taking the closure kept in memory)".into())
-                    .into(),
-            );
-        }
-        budget.release(need);
-        let Some(mut kept) = k.take() else {
-            return Taken::None;
+        let probe = match Held::try_new_exact(budget, need) {
+            Ok(probe) => probe,
+            Err(e) => {
+                restore(self, kept);
+                return Taken::Refused(
+                    e.with_context(" (taking the closure kept in memory)".into())
+                        .into(),
+                );
+            }
         };
+        drop(probe);
+        let prev_budget = kept.closure.graph.budget().clone();
         if let Err(e) = kept.closure.set_budget(budget) {
-            *k = Some(kept);
+            restore(self, kept);
             return Taken::Refused(e.into());
         }
         if let Some(w) = kept.witnesses.as_mut()
             && let Err(e) = w.set_budget(budget)
         {
-            *k = Some(kept);
+            if kept.closure.set_budget(&prev_budget).is_ok() {
+                restore(self, kept);
+            } else {
+                drop(kept);
+            }
             return Taken::Refused(e.into());
         }
         Taken::Kept(Box::new(kept))
     }
 
     fn put(&self, k: Kept) {
-        if k.closure.graph.live() <= self.max_triples.load(Ordering::Relaxed) {
-            *self.kept.lock() = Some(k);
-        }
+        let old = if k.closure.graph.live() <= self.max_triples.load(Ordering::Relaxed) {
+            self.kept.lock().replace(k)
+        } else {
+            Some(k)
+        };
+        drop(old);
     }
 }
 
@@ -272,6 +307,8 @@ pub(crate) struct Kept {
     generalized: FxHashSet<Triple>,
     /// the generalized facts as saved with the dataset for `commit`
     saved: Option<SavedMeta>,
+    /// retained charge for `generalized`, declared after it so payload drops first
+    _generalized_held: Held,
 }
 
 /// The changes of the union of the input graphs and of the inferred graph between two
@@ -417,11 +454,13 @@ pub(crate) fn previous(
             mut witnesses,
             mut generalized,
             saved,
+            _generalized_held,
             ..
         } = k;
         let raw = raw.map_err(Fallback)?;
         let mut held = Held::new(budget);
         held.grow(set_bytes(&generalized))?;
+        drop(_generalized_held);
         let moved = closure.terms.rebase(snap.clone())?;
         closure.remap(&moved)?;
         if let Some(w) = witnesses.as_mut() {
@@ -479,8 +518,7 @@ pub(crate) fn previous(
         }
     };
     let raw = raw.map_err(Fallback)?;
-    let terms = Terms::new(snap.clone());
-    terms.set_budget(budget)?;
+    let terms = Terms::new_in(snap.clone(), budget)?;
     let changes = raw.resolve(&terms, snap, &ids)?;
     let mut held = Held::new(budget);
     held.grow(changes.heap_bytes())?;
@@ -595,8 +633,7 @@ fn reconstruct(
         !then
     });
     drop((now, added, removed));
-    let mut graph =
-        Graph::with_base(base).try_like(derived.len() + generalized.len(), budget, true)?;
+    let mut graph = Graph::try_with_base_capacity(base, derived.len() + generalized.len(), budget)?;
     graph.try_add_batch(derived)?;
     graph.try_add_batch(generalized.iter().copied())?;
     drop(held);
@@ -949,6 +986,27 @@ pub(crate) fn keep(
         .graph
         .try_reserve_rows((live / 64).max(1024), (live / 16).max(4096))?;
     budget.check_peak()?;
+    // Migrate off the run's transient work budget onto the cache's retained budget so
+    // finishing a materialization returns work-pool credit to exact 0 and the next
+    // incremental run does not double-charge the closure across two work budgets.
+    let kept_budget = Budget::with_parent(None, cache.retained_parent());
+    let generalized_held = match Held::try_new_exact(&kept_budget, set_bytes(&generalized)) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("kept closure generalized facts did not fit retained budget: {e}");
+            return Ok(false);
+        }
+    };
+    if let Err(e) = closure.set_budget(&kept_budget) {
+        tracing::warn!("kept closure did not fit retained budget: {e}");
+        return Ok(false);
+    }
+    if let Some(w) = witnesses.as_mut()
+        && let Err(e) = w.set_budget(&kept_budget)
+    {
+        tracing::warn!("kept closure witnesses did not fit retained budget: {e}");
+        return Ok(false);
+    }
     cache.put(Kept {
         dataset_id: store.dataset_id(),
         commit: receipt.commit.seq,
@@ -959,6 +1017,7 @@ pub(crate) fn keep(
         witnesses,
         generalized,
         saved,
+        _generalized_held: generalized_held,
     });
     Ok(true)
 }

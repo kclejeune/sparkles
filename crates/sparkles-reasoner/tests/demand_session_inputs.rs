@@ -147,6 +147,7 @@ fn a_proof_of_a_session_prepared_again_is_not_reused() {
             readable: None,
             stop: Arc::new(|| Ok(())),
             max_memory: None,
+            memory_parent: None,
             no_cache: true,
         })
         .unwrap();
