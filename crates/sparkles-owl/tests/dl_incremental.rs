@@ -1734,6 +1734,95 @@ fn deleting_data_axiom_with_mixed_zero_min_disjunction_restarts_into_tier_d() {
     assert!(!out.stats.incremental);
     assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
     assert!(k.excluded().is_empty());
+
+    // DisjointClasses with 1 unique data operand and a repeated disjunctive non-data
+    // operand is accepted by Tier D because Norm::axiom skips unique operands when
+    // unique.len() < 2 while forcing every repeated operand empty.
+    let disj_horn_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        SubClassOf(:P ObjectAllValuesFrom(:r :Q))
+        DisjointClasses(
+            DataSomeValuesFrom(:z xsd:integer)
+            ObjectComplementOf(ObjectUnionOf(:B :C))
+            ObjectComplementOf(ObjectUnionOf(:B :C)))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(disj_horn_base, 1);
+    assert!(
+        !k.classify(&limits(1))
+            .unwrap()
+            .taxonomy
+            .is_subclass(&Class::thing(), &c("G"))
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed DisjointClasses (Horn)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // Same DisjointClasses transition from KeptTier::El.
+    let disj_el_base = "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+        DisjointClasses(
+            DataSomeValuesFrom(:z xsd:integer)
+            ObjectComplementOf(ObjectUnionOf(:B :C))
+            ObjectComplementOf(ObjectUnionOf(:B :C)))
+        SubClassOf(:B :G)
+        SubClassOf(:C :G)";
+    let (mut k, mut held) = data_started(disj_el_base, 1);
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting blocking EL data axiom with mixed DisjointClasses (EL)",
+    );
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("G")));
+    assert!(k.excluded().is_empty());
+
+    // And when the mixed DisjointClasses is added after an earlier data deletion.
+    let (mut k, mut held) = data_started(
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))
+         SubClassOf(:B :G)
+         SubClassOf(:C :G)",
+        1,
+    );
+    data_remove(
+        &mut k,
+        &mut held,
+        "SubClassOf(:X DataSomeValuesFrom(:d xsd:integer))",
+    );
+    let out = same_as_fresh(
+        &mut k,
+        &held,
+        1,
+        "after deleting data axiom before DisjointClasses",
+    );
+    assert!(out.stats.incremental);
+    data_add(
+        &mut k,
+        &mut held,
+        "DisjointClasses(
+            DataSomeValuesFrom(:z xsd:integer)
+            ObjectComplementOf(ObjectUnionOf(:B :C))
+            ObjectComplementOf(ObjectUnionOf(:B :C)))",
+    );
+    let out = same_as_fresh(&mut k, &held, 1, "after adding mixed DisjointClasses");
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("G")));
+    assert!(k.excluded().is_empty());
 }
 
 #[test]

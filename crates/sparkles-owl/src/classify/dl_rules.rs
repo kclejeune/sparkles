@@ -1545,11 +1545,27 @@ impl DlSt {
             })
     }
 
-    /// Removes the contexts for which `gone` answers true from the predecessors that
-    /// registered, which register again when a run saturates them again (roadmap item
-    /// 753).
-    pub fn drop_predecessors(&mut self, gone: impl Fn(Ex) -> bool) {
-        self.dpreds.retain(|&(u, _)| !gone(u));
+    /// Cooperative polling removal of the contexts for which `gone` answers true from the
+    /// predecessors that registered, which register again when a run saturates them again
+    /// (roadmap item 753). On `Err`, the caller's dirty flag discards the kept state.
+    pub fn drop_predecessors_poll<E>(
+        &mut self,
+        gone: impl Fn(Ex) -> bool,
+        tick: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut write = 0usize;
+        for read in 0..self.dpreds.len() {
+            tick()?;
+            let item = self.dpreds[read];
+            if !gone(item.0) {
+                if write != read {
+                    self.dpreds[write] = item;
+                }
+                write += 1;
+            }
+        }
+        self.dpreds.truncate(write);
+        Ok(())
     }
 
     /// Adds `delta` to every context id from `from` upward that the state names, as

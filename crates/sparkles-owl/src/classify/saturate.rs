@@ -173,11 +173,29 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
         }
     }
 
-    pub fn retain(&mut self, keep: impl Fn(&T) -> bool) {
-        self.list.retain(|x| keep(x));
-        if let Some(set) = &mut self.set {
-            set.retain(|x| keep(x));
+    /// Cooperative polling removal that drops elements from the backing hash set inline
+    /// during the single list compaction pass. On `Err`, the caller's dirty flag discards
+    /// the kept state.
+    pub fn retain_poll<E>(
+        &mut self,
+        keep: impl Fn(&T) -> bool,
+        tick: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut write = 0usize;
+        for read in 0..self.list.len() {
+            tick()?;
+            let x = self.list[read];
+            if keep(&x) {
+                if write != read {
+                    self.list[write] = x;
+                }
+                write += 1;
+            } else if let Some(set) = &mut self.set {
+                set.remove(&x);
+            }
         }
+        self.list.truncate(write);
+        Ok(())
     }
 
     /// Replaces each member by `f` of it, which must keep distinct members distinct.
@@ -507,52 +525,83 @@ impl State {
 
     /// Removes the backward links whose source `gone` answers true for.
     pub fn drop_links_where(&mut self, gone: impl Fn(Ex) -> bool) {
-        let mut emptied = false;
-        for (_, srcs) in &mut self.back {
-            if srcs.list.iter().any(|&e| gone(e)) {
-                srcs.retain(|&e| !gone(e));
-                emptied |= srcs.list.is_empty();
+        let _ = self.drop_links_where_poll(gone, &mut || Ok::<(), ()>(()));
+    }
+
+    /// Cooperative polling variant of [`State::drop_links_where`]. On `Err`, the caller's
+    /// dirty flag discards the kept state.
+    pub fn drop_links_where_poll<E>(
+        &mut self,
+        gone: impl Fn(Ex) -> bool,
+        tick: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut write = 0usize;
+        for read in 0..self.back.len() {
+            tick()?;
+            self.back[read].1.retain_poll(|&e| !gone(e), tick)?;
+            if !self.back[read].1.list.is_empty() {
+                if write != read {
+                    self.back.swap(write, read);
+                }
+                write += 1;
             }
         }
-        if emptied {
-            self.back.retain(|(_, v)| !v.list.is_empty());
-        }
+        self.back.truncate(write);
+        Ok(())
     }
 
     /// Removes what the state keeps of every predecessor context for which `gone`
     /// answers true, which a run that clears them does before they register again
     /// (roadmap item 753): their backward links and what the Horn and Tier D rules were
     /// told of them.
+    #[allow(dead_code)]
     pub fn drop_predecessors_where(&mut self, gone: impl Fn(Ex) -> bool) {
-        self.drop_links_where(&gone);
+        let _ = self.drop_predecessors_where_poll(gone, &mut || Ok::<(), ()>(()));
+    }
+
+    /// Cooperative polling variant of [`State::drop_predecessors_where`]. On `Err`, the
+    /// caller's dirty flag discards the kept state.
+    pub fn drop_predecessors_where_poll<E>(
+        &mut self,
+        gone: impl Fn(Ex) -> bool,
+        tick: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.drop_links_where_poll(&gone, tick)?;
         if let Some(x) = self.extra.as_mut() {
             let h = &mut x.horn;
-            if h.pred_in.list.iter().any(|&(m, _)| gone(m)) {
-                h.pred_in.retain(|&(m, _)| !gone(m));
-            }
-            if h.told.list.iter().any(|&(m, _)| gone(m)) {
-                h.told.retain(|&(m, _)| !gone(m));
-            }
+            h.pred_in.retain_poll(|&(m, _)| !gone(m), tick)?;
+            h.told.retain_poll(|&(m, _)| !gone(m), tick)?;
             for set in [&mut h.real_preds, &mut h.same, &mut h.told_singular] {
-                if set.list.iter().any(|&m| gone(m)) {
-                    set.retain(|&m| !gone(m));
-                }
+                set.retain_poll(|&m| !gone(m), tick)?;
             }
             if let Some(d) = x.dl.as_deref_mut() {
-                d.drop_predecessors(&gone);
+                d.drop_predecessors_poll(&gone, tick)?;
             }
         }
+        Ok(())
     }
 
     /// Remaps each checker component id held by a kept context to its id in the new
     /// index, preserving its held atoms and last evaluation (roadmap item 753).
+    #[allow(dead_code)]
     pub fn reindex_dt(&mut self, comp_map: &[Option<u32>]) {
+        let _ = self.reindex_dt_poll(comp_map, &mut || Ok::<(), ()>(()));
+    }
+
+    /// Cooperative polling variant of [`State::reindex_dt`].
+    pub fn reindex_dt_poll<E>(
+        &mut self,
+        comp_map: &[Option<u32>],
+        tick: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
         if let Some(x) = self.extra.as_mut() {
             for s in &mut x.dt {
+                tick()?;
                 s.comp = comp_map[s.comp as usize]
                     .expect("kept context holds only unchanged checker components");
             }
         }
+        Ok(())
     }
 
     /// Adds `delta` to every context id from `from` upward that the state names, the

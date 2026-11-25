@@ -2378,18 +2378,206 @@ fn push_bounded_never_exceeds_cap_limit() {
 }
 
 #[test]
+fn neg_data_897_role_deletion_fits_changed_scratch_without_rehash() {
+    let n = 897usize;
+    let mut doc = String::with_capacity(n * 64 + 64);
+    doc.push_str("SubClassOf(:A :B)\n");
+    for i in 0..n {
+        doc.push_str(&format!(
+            "SubClassOf(DataSomeValuesFrom(:d{i} xsd:integer) :Q)\n"
+        ));
+    }
+    let ax1 = axioms(&doc);
+    let refs1: Vec<&AxiomKind> = ax1.iter().collect();
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat_old = Saturation::new();
+    sat_old.classify(&refs1, None, &limits).unwrap();
+    let old_ix = sat_old.index.as_ref().unwrap();
+    assert_eq!(old_ix.neg_data.len(), n);
+
+    let mut sat = Saturation::new();
+    let first = sat.classify(&refs1, None, &limits).unwrap();
+    assert!(!first.stats.incremental);
+
+    let kept = axioms("SubClassOf(:A :B)");
+    let kept_refs: Vec<&AxiomKind> = kept.iter().collect();
+    let removed_refs: Vec<&AxiomKind> = ax1[1..].iter().collect();
+    let second = sat
+        .classify(
+            &kept_refs,
+            Some(Changes {
+                added: &[],
+                removed: &removed_refs,
+            }),
+            &limits,
+        )
+        .unwrap();
+    assert!(second.stats.incremental);
+    let new_ix = sat.index.as_ref().unwrap();
+    assert!(new_ix.neg_data.is_empty());
+
+    // Both `seen_roles` and `changed_neg_roles` are pre-sized to `max_roles = 897` with
+    // zero rehashes; their combined bucket backing fits strictly inside `changed_scratch`.
+    let buckets = dtcheck::range::map_buckets_for(n);
+    let two_tables = buckets * (std::mem::size_of::<index::Role>() + 1) * 2 + 32;
+    let scratch = new_ix.changed_scratch(old_ix);
+    assert!(
+        scratch >= old_ix.head_count() + two_tables,
+        "changed_scratch {scratch} must cover expression marks + two pre-sized {n}-role sets ({two_tables})"
+    );
+    let mut fresh = Saturation::new();
+    let fresh_out = fresh.classify(&kept_refs, None, &limits).unwrap();
+    assert_eq!(second.taxonomy, fresh_out.taxonomy);
+}
+
+#[test]
+fn same_tables_with_stop_polls_dense_role_closure_and_data_tables() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 1. Pure EL ontology (no checker) with 100 roles in a linear chain -> 5,050 `sup`
+    //    entries (> POLL_CHANGED = 4096) with only ~100 roles, so per-role ticks alone
+    //    cannot trigger a poll without inner `sup` slice polling.
+    let mut chain = String::new();
+    for i in 0..99 {
+        chain.push_str(&format!("SubObjectPropertyOf(:r{i} :r{})\n", i + 1));
+    }
+    chain.push_str("SubClassOf(:A :B)\n");
+    let ax = axioms(&chain);
+    let refs: Vec<&AxiomKind> = ax.iter().collect();
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    sat.classify(&refs, None, &limits).unwrap();
+    let ix = sat.index.as_ref().unwrap();
+    assert!(ix.dt.is_none());
+    let total_sup: usize = ix.roles.sup.iter().map(Vec::len).sum();
+    assert!(
+        total_sup > index::POLL_CHANGED,
+        "expected dense closure > POLL_CHANGED, got {total_sup}"
+    );
+    let polls = AtomicUsize::new(0);
+    assert_eq!(
+        ix.same_tables_with_stop(ix, &|| {
+            polls.fetch_add(1, Ordering::Relaxed);
+            false
+        }),
+        Some(true)
+    );
+    assert!(
+        polls.load(Ordering::Relaxed) >= 1,
+        "same_tables_with_stop must poll inside dense role closure without a checker"
+    );
+    assert_eq!(
+        ix.same_tables_with_stop(ix, &|| true),
+        None,
+        "same_tables_with_stop must stop on first poll"
+    );
+
+    // 2. Pure EL ontology with 4,200 data properties having ranges and functionality
+    //    (each > POLL_CHANGED), asserting polls across `sup`, `data_range`, and `functional`.
+    let n = 4200usize;
+    let mut data_doc = String::with_capacity(n * 80);
+    for i in 0..n {
+        data_doc.push_str(&format!(
+            "DataPropertyRange(:d{i} xsd:integer)\nFunctionalDataProperty(:d{i})\n"
+        ));
+    }
+    let ax2 = axioms(&data_doc);
+    let refs2: Vec<&AxiomKind> = ax2.iter().collect();
+    let mut sat2 = Saturation::new();
+    sat2.classify(&refs2, None, &limits).unwrap();
+    let ix2 = sat2.index.as_ref().unwrap();
+    assert!(ix2.dt.is_none());
+    let polls2 = AtomicUsize::new(0);
+    assert_eq!(
+        ix2.same_tables_with_stop(ix2, &|| {
+            polls2.fetch_add(1, Ordering::Relaxed);
+            false
+        }),
+        Some(true)
+    );
+    assert!(
+        polls2.load(Ordering::Relaxed) >= 4,
+        "expected polls across sup, data_range, functional, and flags; got {}",
+        polls2.load(Ordering::Relaxed)
+    );
+}
+
+#[test]
+fn dtix_align_polls_inside_large_body_told_slice() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Single checker property with 1 body atom whose `told` slice has 4,200 named
+    // subsumers (> POLL_ALIGN = 4096). Without inner polling on `a.told == b.told`,
+    // `DtIx::align` would only poll once at its final stop check.
+    let n = 4200usize;
+    let mut doc = String::with_capacity(n * 64 + 64);
+    doc.push_str("SubClassOf(:A DataAllValuesFrom(:p xsd:integer))\n");
+    for i in 0..n {
+        doc.push_str(&format!(
+            "SubClassOf(DataSomeValuesFrom(:p xsd:integer) :T{i})\n"
+        ));
+    }
+    let ax = axioms(&doc);
+    let refs: Vec<&AxiomKind> = ax.iter().collect();
+    let mut sat = Saturation::new();
+    sat.classify(
+        &refs,
+        None,
+        &Limits {
+            threads: 1,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    let ix = sat.index.as_ref().unwrap();
+    let dt = ix.dt.as_ref().unwrap();
+    assert_eq!(dt.roles.len(), 1);
+    assert_eq!(dt.body.len(), 1);
+    assert_eq!(dt.body[0].len(), 1);
+    assert_eq!(
+        dt.body[0][0].told.as_deref().map(<[index::Ex]>::len),
+        Some(n)
+    );
+
+    let polls = AtomicUsize::new(0);
+    let outcome = dt.align(dt, ix.roles.sup.len(), &|| {
+        polls.fetch_add(1, Ordering::Relaxed);
+        false
+    });
+    assert!(matches!(outcome, dt_sat::DtAlignOutcome::Aligned(_)));
+    assert!(
+        polls.load(Ordering::Relaxed) >= 2,
+        "DtIx::align must poll inside large body `told` slice before final stop check, got {}",
+        polls.load(Ordering::Relaxed)
+    );
+    let stop_polls = AtomicUsize::new(0);
+    let stopped = dt.align(dt, ix.roles.sup.len(), &|| {
+        stop_polls.fetch_add(1, Ordering::Relaxed) == 0
+    });
+    assert!(matches!(stopped, dt_sat::DtAlignOutcome::Stopped));
+    assert_eq!(stop_polls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn high_fanout_refire_and_modes_compatible_poll_within_bound() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // 4,200 independent checker properties all telling the same class :Shared creates a
-    // single DtFire(:Shared) head with 4,200 refire components (> POLL_CHANGED = 4096)
-    // and 4,200 checker roles (> POLL_ALIGN = 4096).
+    // 4,200 independent checker properties all telling two shared classes :Shared0 and
+    // :Shared1 creates 8,400 refire membership entries (> 2 * POLL_CHANGED) and 4,200
+    // checker roles (> POLL_ALIGN).
     let n = 4200usize;
-    let mut doc = String::with_capacity(n * 110);
+    let mut doc = String::with_capacity(n * 170);
     for i in 0..n {
         doc.push_str(&format!(
             "SubClassOf(:A{i} DataAllValuesFrom(:p{i} xsd:integer))\n\
-             SubClassOf(DataSomeValuesFrom(:p{i} xsd:integer) :Shared)\n"
+             SubClassOf(DataSomeValuesFrom(:p{i} xsd:integer) :Shared0)\n\
+             SubClassOf(DataSomeValuesFrom(:p{i} xsd:integer) :Shared1)\n"
         ));
     }
     let ax1 = axioms(&doc);
@@ -2404,23 +2592,23 @@ fn high_fanout_refire_and_modes_compatible_poll_within_bound() {
 
     let old_ix = sat.index.as_ref().unwrap();
     let old_dt = old_ix.dt.as_ref().unwrap();
-    let shared_ex = sat
+    let shared0 = sat
         .interner
         .get(&index::Node::Class(
             sat.interner
                 .classes
                 .iter()
-                .position(|c| c.as_str() == "urn:dt:Shared")
+                .position(|c| c.as_str() == "urn:dt:Shared0")
                 .unwrap() as u32,
         ))
         .unwrap();
     assert_eq!(
-        old_dt.refire_of(shared_ex).map(<[u32]>::len),
+        old_dt.refire_of(shared0).map(<[u32]>::len),
         Some(n),
-        "expected a single high-fanout DtFire target with {n} components"
+        "expected a high-fanout DtFire target with {n} components"
     );
 
-    // 1. modes_compatible_with_stop must poll within POLL_ALIGN roles and stop cleanly.
+    // 1. Direct modes_compatible_with_stop polling check.
     let polls = AtomicUsize::new(0);
     let res = old_dt.modes_compatible_with_stop(old_dt, old_ix.roles.sup.len(), &|| {
         polls.fetch_add(1, Ordering::Relaxed) >= 1
@@ -2431,32 +2619,84 @@ fn high_fanout_refire_and_modes_compatible_poll_within_bound() {
     );
     assert!(polls.load(Ordering::Relaxed) >= 2);
 
-    // 2. changed_with_dt must compare the 4,200-component DtFire in near-linear time
-    //    and poll inside the refire scan.
+    // 2. Differential poll count isolating the inner refire membership loop:
+    //    `without_dt_polls` covers the per-expression scan + final stop; the extra polls
+    //    with `Some(&aligned)` must strictly exceed the outer `for e in 0..n` tick bound
+    //    `heads.len() / POLL_CHANGED`.
     let aligned = match old_dt.align(old_dt, old_ix.roles.sup.len(), &|| false) {
         dt_sat::DtAlignOutcome::Aligned(a) => a,
         _ => panic!("self-alignment must succeed"),
     };
-    let total_polls = AtomicUsize::new(0);
-    let changed = old_ix.changed_with_dt(old_ix, Some(&aligned), &|| {
-        total_polls.fetch_add(1, Ordering::Relaxed);
-        false
-    });
-    assert!(changed.is_some());
-    let seen = total_polls.load(Ordering::Relaxed);
+    let without_dt = AtomicUsize::new(0);
     assert!(
-        seen >= 2,
-        "expected multiple polls across expressions and refire scan, got {seen}"
+        old_ix
+            .changed_with_dt(old_ix, None, &|| {
+                without_dt.fetch_add(1, Ordering::Relaxed);
+                false
+            })
+            .is_some()
     );
-    // Cancelling on the last poll observed must abort changed_with_dt cleanly.
-    let cancel_at = seen - 1;
+    let with_dt = AtomicUsize::new(0);
+    assert!(
+        old_ix
+            .changed_with_dt(old_ix, Some(&aligned), &|| {
+                with_dt.fetch_add(1, Ordering::Relaxed);
+                false
+            })
+            .is_some()
+    );
+    let base_polls = without_dt.load(Ordering::Relaxed);
+    let total_polls = with_dt.load(Ordering::Relaxed);
+    let refire_polls = total_polls - base_polls;
+    let outer_only_max = old_ix.head_count() / index::POLL_CHANGED;
+    assert!(
+        refire_polls > outer_only_max,
+        "inner refire scan must add polls beyond outer expression ticks: refire_polls={refire_polls}, outer_only_max={outer_only_max}"
+    );
+    // Cancelling strictly before the final `if stop()` must abort inside the refire scan.
+    let cancel_at = base_polls + outer_only_max;
+    assert!(cancel_at < total_polls - 1);
     let cpolls = AtomicUsize::new(0);
     let stopped = old_ix.changed_with_dt(old_ix, Some(&aligned), &|| {
         cpolls.fetch_add(1, Ordering::Relaxed) >= cancel_at
     });
     assert!(
         stopped.is_none(),
-        "changed_with_dt must stop on late cooperative poll"
+        "changed_with_dt must abort inside inner refire loop"
+    );
+    assert_eq!(cpolls.load(Ordering::Relaxed), cancel_at + 1);
+
+    // 3. Single-role high-fanout `neg_data` comparison must poll inside the per-role scan.
+    //    Use pure EL `DataHasValue` literals so `:d` stays on the EL data lattice (`neg_data`).
+    let mut neg_doc = String::with_capacity(n * 64);
+    for i in 0..n {
+        neg_doc.push_str(&format!(
+            "SubClassOf(DataHasValue(:d \"v{i}\"^^xsd:string) :C)\n"
+        ));
+    }
+    let neg_ax = axioms(&neg_doc);
+    let neg_refs: Vec<&AxiomKind> = neg_ax.iter().collect();
+    let mut neg_sat = Saturation::new();
+    neg_sat.classify(&neg_refs, None, &limits).unwrap();
+    let neg_ix = neg_sat.index.as_ref().unwrap();
+    assert_eq!(neg_ix.neg_data.len(), 1);
+    assert_eq!(neg_ix.neg_data.values().next().map(Vec::len), Some(n));
+    let neg_polls = AtomicUsize::new(0);
+    assert!(
+        neg_ix
+            .changed_with_dt(neg_ix, None, &|| {
+                neg_polls.fetch_add(1, Ordering::Relaxed);
+                false
+            })
+            .is_some()
+    );
+    // Expression loop polls `1 + (heads.len() - 1) / POLL_CHANGED` times, plus 1 final
+    // stop check; the inner single-role `neg_data` scan must add at least 1 poll.
+    let expr_and_final = 1 + (neg_ix.head_count() - 1) / index::POLL_CHANGED + 1;
+    assert!(
+        neg_polls.load(Ordering::Relaxed) > expr_and_final,
+        "expected inner neg_data poll beyond expression+final ({expr_and_final}), got {}",
+        neg_polls.load(Ordering::Relaxed)
     );
 }
 
@@ -2465,39 +2705,70 @@ fn high_fanout_invalidation_and_orphan_prune_poll_within_bound() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // 4,200 sources all link into a single hub :Hub via :r so :Hub's `st.back` holds
-    // > POLL_INVALIDATE (4096) incoming edges, and a checker property :d exercises
-    // both `invalidate_changed` and `orphan_prune`.
-    let n = 4200usize;
-    let mut doc = String::with_capacity(n * 64 + 256);
+    // 1. Direct `invalidate_changed` + `orphan_prune` predecessor-cleanup test:
+    //    200 sources x 50 object roles all link into one `:Hub` -> 10,000 incoming links
+    //    in `:Hub`'s `st.back` while `total_slots` is only ~253 (`Exist(:r{j}, :Hub)` is
+    //    shared across all 200 sources).
+    let sources = 200usize;
+    let roles = 50usize;
+    let mut doc = String::with_capacity(sources * roles * 56 + 128);
     doc.push_str(
         "SubClassOf(:Hub DataAllValuesFrom(:d xsd:integer))\n\
          SubClassOf(:Hub DataSomeValuesFrom(:d xsd:integer))\n",
     );
-    for i in 0..n {
-        doc.push_str(&format!(
-            "SubClassOf(:S{i} ObjectSomeValuesFrom(:r :Hub))\n"
-        ));
+    for i in 0..sources {
+        for j in 0..roles {
+            doc.push_str(&format!(
+                "SubClassOf(:S{i} ObjectSomeValuesFrom(:r{j} :Hub))\n"
+            ));
+        }
     }
-    let ax1 = axioms(&doc);
-    let refs1: Vec<&AxiomKind> = ax1.iter().collect();
+    let ax = axioms(&doc);
+    let refs: Vec<&AxiomKind> = ax.iter().collect();
     let base_limits = Limits {
         threads: 1,
         ..Limits::default()
     };
-    let mut sat = Saturation::new();
-    let first = sat.classify(&refs1, None, &base_limits).unwrap();
-    assert!(!first.stats.incremental);
 
-    let added = axioms("SubClassOf(:Hub DataSomeValuesFrom(:d xsd:int))");
-    let mut ax2 = ax1.clone();
-    ax2.extend(added.iter().cloned());
-    let refs2: Vec<&AxiomKind> = ax2.iter().collect();
-    let add_refs: Vec<&AxiomKind> = added.iter().collect();
+    let build_hub_sat = || {
+        let mut sat = Saturation::new();
+        let out = sat.classify(&refs, None, &base_limits).unwrap();
+        assert!(!out.stats.incremental);
+        let hub = sat
+            .interner
+            .get(&index::Node::Class(
+                sat.interner
+                    .classes
+                    .iter()
+                    .position(|c| c.as_str() == "urn:dt:Hub")
+                    .unwrap() as u32,
+            ))
+            .unwrap();
+        let s0 = sat
+            .interner
+            .get(&index::Node::Class(
+                sat.interner
+                    .classes
+                    .iter()
+                    .position(|c| c.as_str() == "urn:dt:S0")
+                    .unwrap() as u32,
+            ))
+            .unwrap();
+        (sat, hub, s0)
+    };
 
-    // First run without cancellation while counting total polls across the incremental edit.
-    let polls = Arc::new(AtomicUsize::new(0));
-    let p = polls.clone();
+    // 1a. `invalidate_changed` with ONLY `:Hub` changed -> BFS walks `:Hub`'s 10,000
+    //     `st.back` edges. Without inner edge polling, total ticks stay under 3 * POLL.
+    let (sat_ref, hub, s0) = build_hub_sat();
+    let ix = sat_ref.index.as_ref().unwrap();
+    let roots = sat_ref.last_roots.clone();
+    let (mut sat_bfs, _, _) = build_hub_sat();
+    let total_slots = sat_bfs.ctx.len();
+    assert!(total_slots < 500, "compact slot count, got {total_slots}");
+    let mut changed_hub = vec![false; ix.head_count()];
+    changed_hub[hub as usize] = true;
+    let bfs_polls = Arc::new(AtomicUsize::new(0));
+    let p = bfs_polls.clone();
     let counting = Limits {
         cancelled: Some(Arc::new(move || {
             p.fetch_add(1, Ordering::Relaxed);
@@ -2505,48 +2776,265 @@ fn high_fanout_invalidation_and_orphan_prune_poll_within_bound() {
         })),
         ..base_limits.clone()
     };
-    let second = sat
-        .classify(
-            &refs2,
-            Some(Changes {
-                added: &add_refs,
-                removed: &[],
-            }),
+    let mut peak = 0usize;
+    let cleared = sat_bfs
+        .invalidate_changed(
+            &changed_hub,
+            ix,
+            None,
+            None,
+            &roots,
+            &roots,
+            false,
             &counting,
+            0,
+            &mut peak,
         )
         .unwrap();
-    assert!(second.stats.incremental);
+    assert!(cleared > sources);
+    let bfs_total = bfs_polls.load(Ordering::Relaxed);
     assert!(
-        polls.load(Ordering::Relaxed) >= 4,
-        "expected multiple polls across high-fanout invalidation and orphan_prune, got {}",
-        polls.load(Ordering::Relaxed)
+        bfs_total >= 4,
+        "invalidate_changed BFS must poll inside :Hub's 10,000 incoming edges, got {bfs_total}"
     );
-
-    // Re-run on a fresh kept state and cancel near the end of invalidation/orphan_prune,
-    // then verify clean recovery on the next run.
-    let mut sat2 = Saturation::new();
-    sat2.classify(&refs1, None, &base_limits).unwrap();
-    let stop_at = polls.load(Ordering::Relaxed) / 2;
+    // Cancel inside the BFS edge walk (last poll) and verify Error::Cancelled.
+    let (mut sat_bfs_cancel, _, _) = build_hub_sat();
     let seen = Arc::new(AtomicUsize::new(0));
     let s = seen.clone();
-    let cancelled = Limits {
+    let cancel_at = bfs_total - 1;
+    let cancel_lim = Limits {
         cancelled: Some(Arc::new(move || {
-            s.fetch_add(1, Ordering::Relaxed) >= stop_at
+            s.fetch_add(1, Ordering::Relaxed) >= cancel_at
         })),
         ..base_limits.clone()
     };
-    let err = sat2.classify(
-        &refs2,
-        Some(Changes {
-            added: &add_refs,
-            removed: &[],
-        }),
-        &cancelled,
+    let mut peak = 0usize;
+    let err = sat_bfs_cancel.invalidate_changed(
+        &changed_hub,
+        ix,
+        None,
+        None,
+        &roots,
+        &roots,
+        false,
+        &cancel_lim,
+        0,
+        &mut peak,
     );
+    assert!(matches!(err, Err(Error::Cancelled)));
+
+    // 1b. `invalidate_changed` with ONLY `:S0` changed -> `:Hub` stays initialized and
+    //     calls `drop_predecessors_where_poll` scanning all 10,000 incoming links.
+    let (mut sat_clean, _, _) = build_hub_sat();
+    let mut changed_s0 = vec![false; ix.head_count()];
+    changed_s0[s0 as usize] = true;
+    let clean_polls = Arc::new(AtomicUsize::new(0));
+    let p = clean_polls.clone();
+    let counting = Limits {
+        cancelled: Some(Arc::new(move || {
+            p.fetch_add(1, Ordering::Relaxed);
+            false
+        })),
+        ..base_limits.clone()
+    };
+    let mut peak = 0usize;
+    let cleared = sat_clean
+        .invalidate_changed(
+            &changed_s0,
+            ix,
+            None,
+            None,
+            &roots,
+            &roots,
+            false,
+            &counting,
+            0,
+            &mut peak,
+        )
+        .unwrap();
+    assert_eq!(cleared, 1);
+    let clean_total = clean_polls.load(Ordering::Relaxed);
+    // Initial scan over ~253 contexts + 10,000 subs contributes 2 polls; without inner
+    // polling in `drop_predecessors_where_poll`, cleanup adds only 253 ticks (0 polls).
     assert!(
-        err.is_err(),
-        "expected cancellation stop on high-fanout edit"
+        clean_total >= 4,
+        "invalidate_changed cleanup must poll inside drop_predecessors_where_poll, got {clean_total}"
     );
-    let recovered = sat2.classify(&refs2, None, &base_limits).unwrap();
-    assert_eq!(recovered.taxonomy, second.taxonomy);
+    let (mut sat_clean_cancel, _, _) = build_hub_sat();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let s = seen.clone();
+    let cancel_at = clean_total - 1;
+    let cancel_lim = Limits {
+        cancelled: Some(Arc::new(move || {
+            s.fetch_add(1, Ordering::Relaxed) >= cancel_at
+        })),
+        ..base_limits.clone()
+    };
+    let mut peak = 0usize;
+    let err = sat_clean_cancel.invalidate_changed(
+        &changed_s0,
+        ix,
+        None,
+        None,
+        &roots,
+        &roots,
+        false,
+        &cancel_lim,
+        0,
+        &mut peak,
+    );
+    assert!(matches!(err, Err(Error::Cancelled)));
+
+    // 1c. Direct `orphan_prune` predecessor-cleanup differential test on `:Hub`:
+    //     omitting `:S0` from `roots` prunes `:S0` and forces `:Hub` to run
+    //     `drop_predecessors_where_poll` over 10,000 incoming links, adding >= 2 polls
+    //     compared to keeping all roots (where cleanup is skipped).
+    let (sat_no_prune, _, _) = build_hub_sat();
+    let no_prune_polls = Arc::new(AtomicUsize::new(0));
+    let p = no_prune_polls.clone();
+    let counting = Limits {
+        cancelled: Some(Arc::new(move || {
+            p.fetch_add(1, Ordering::Relaxed);
+            false
+        })),
+        ..base_limits.clone()
+    };
+    let mut totals = saturate::Totals::default();
+    sat_no_prune
+        .orphan_prune(ix, None, &roots, &counting, None, None, 0, &mut totals)
+        .unwrap();
+    let unpruned_total = no_prune_polls.load(Ordering::Relaxed);
+
+    let roots_without_s0: Vec<index::Ex> = roots.iter().copied().filter(|&r| r != s0).collect();
+    let (sat_prune, _, _) = build_hub_sat();
+    let prune_polls = Arc::new(AtomicUsize::new(0));
+    let p = prune_polls.clone();
+    let counting = Limits {
+        cancelled: Some(Arc::new(move || {
+            p.fetch_add(1, Ordering::Relaxed);
+            false
+        })),
+        ..base_limits.clone()
+    };
+    let mut totals = saturate::Totals::default();
+    sat_prune
+        .orphan_prune(
+            ix,
+            None,
+            &roots_without_s0,
+            &counting,
+            None,
+            None,
+            0,
+            &mut totals,
+        )
+        .unwrap();
+    let pruned_total = prune_polls.load(Ordering::Relaxed);
+    assert!(
+        pruned_total >= unpruned_total + 2,
+        "orphan_prune cleanup must poll inside drop_predecessors_where_poll: pruned={pruned_total}, unpruned={unpruned_total}"
+    );
+    let (sat_prune_cancel, _, _) = build_hub_sat();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let s = seen.clone();
+    let cancel_at = unpruned_total + 1;
+    let cancel_lim = Limits {
+        cancelled: Some(Arc::new(move || {
+            s.fetch_add(1, Ordering::Relaxed) >= cancel_at
+        })),
+        ..base_limits.clone()
+    };
+    let mut totals = saturate::Totals::default();
+    let err = sat_prune_cancel.orphan_prune(
+        ix,
+        None,
+        &roots_without_s0,
+        &cancel_lim,
+        None,
+        None,
+        0,
+        &mut totals,
+    );
+    assert!(matches!(err, Err(Error::Cancelled)));
+
+    // 2. Direct `orphan_prune` wide outgoing traversal test:
+    //    `:Root` has 5,000 outgoing `Exist` links (50 roles x 100 targets) and chains so
+    //    both `st.subs` and `st.fwd.list` hold 5,000 entries. Without inner outgoing-edge
+    //    polls, BFS + prune over `total_slots ~ 5,105` would poll only once.
+    let targets = 100usize;
+    let out_roles = 50usize;
+    let mut out_doc = String::with_capacity(targets * out_roles * 64 + 2048);
+    for j in 0..out_roles {
+        out_doc.push_str(&format!(
+            "SubObjectPropertyOf(ObjectPropertyChain(:p{j} :q) :u)\n"
+        ));
+    }
+    for j in 0..out_roles {
+        for i in 0..targets {
+            out_doc.push_str(&format!(
+                "SubClassOf(:Root ObjectSomeValuesFrom(:p{j} :T{i}))\n"
+            ));
+        }
+    }
+    let out_ax = axioms(&out_doc);
+    let out_refs: Vec<&AxiomKind> = out_ax.iter().collect();
+    let mut out_sat = Saturation::new();
+    out_sat.classify(&out_refs, None, &base_limits).unwrap();
+    let out_ix = out_sat.index.as_ref().unwrap();
+    let root_ex = out_sat
+        .interner
+        .get(&index::Node::Class(
+            out_sat
+                .interner
+                .classes
+                .iter()
+                .position(|c| c.as_str() == "urn:dt:Root")
+                .unwrap() as u32,
+        ))
+        .unwrap();
+    let out_polls = Arc::new(AtomicUsize::new(0));
+    let p = out_polls.clone();
+    let counting = Limits {
+        cancelled: Some(Arc::new(move || {
+            p.fetch_add(1, Ordering::Relaxed);
+            false
+        })),
+        ..base_limits.clone()
+    };
+    let mut totals = saturate::Totals::default();
+    out_sat
+        .orphan_prune(
+            out_ix,
+            None,
+            &[root_ex],
+            &counting,
+            None,
+            None,
+            0,
+            &mut totals,
+        )
+        .unwrap();
+    let out_total = out_polls.load(Ordering::Relaxed);
+    assert!(
+        out_total >= 3,
+        "orphan_prune must poll across :Root's 5,000 outgoing subs/fwd edges, got {out_total}"
+    );
+    let seen = Arc::new(AtomicUsize::new(0));
+    let s = seen.clone();
+    let cancel_lim = Limits {
+        cancelled: Some(Arc::new(move || s.fetch_add(1, Ordering::Relaxed) >= 1)),
+        ..base_limits.clone()
+    };
+    let mut totals = saturate::Totals::default();
+    let err = out_sat.orphan_prune(
+        out_ix,
+        None,
+        &[root_ex],
+        &cancel_lim,
+        None,
+        None,
+        0,
+        &mut totals,
+    );
+    assert!(matches!(err, Err(Error::Cancelled)));
 }

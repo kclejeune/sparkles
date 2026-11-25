@@ -5637,12 +5637,12 @@ impl Saturation {
             } else {
                 let mut st = c.st.lock();
                 if st.init {
-                    st.drop_predecessors_where(|p| affected.has(p));
+                    st.drop_predecessors_where_poll(|p| affected.has(p), &mut tick)?;
                     if renumbered {
                         st.reindex_disjoint(ix);
                     }
                     if let Some(align) = dt_align {
-                        st.reindex_dt(&align.comp_map);
+                        st.reindex_dt_poll(&align.comp_map, &mut tick)?;
                     }
                 }
             }
@@ -5758,7 +5758,7 @@ impl Saturation {
                 {
                     let mut st = c.st.lock();
                     if st.init {
-                        st.drop_predecessors_where(|p| !reachable.has(p));
+                        st.drop_predecessors_where_poll(|p| !reachable.has(p), &mut tick)?;
                     }
                 }
             }

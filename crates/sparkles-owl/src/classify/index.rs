@@ -349,7 +349,46 @@ pub enum Scope {
 const SCOPE_BYTES: usize = 48;
 
 /// The expressions that [`Index::changed`] compares between two polls of its stop.
-const POLL_CHANGED: usize = 4096;
+pub(super) const POLL_CHANGED: usize = 4096;
+
+#[inline]
+fn tick_changed(ticks: &mut usize, stop: &dyn Fn() -> bool) -> bool {
+    *ticks += 1;
+    if *ticks >= POLL_CHANGED {
+        *ticks = 0;
+        stop()
+    } else {
+        false
+    }
+}
+
+fn slice_eq_poll<T: PartialEq>(
+    a: &[T],
+    b: &[T],
+    ticks: &mut usize,
+    stop: &dyn Fn() -> bool,
+) -> Option<bool> {
+    if a.len() != b.len() {
+        return Some(false);
+    }
+    let mut i = 0;
+    while i < a.len() {
+        let step = POLL_CHANGED.saturating_sub(*ticks).max(1);
+        let end = (i + step).min(a.len());
+        if a[i..end] != b[i..end] {
+            return Some(false);
+        }
+        *ticks += end - i;
+        i = end;
+        if *ticks >= POLL_CHANGED {
+            *ticks = 0;
+            if stop() {
+                return None;
+            }
+        }
+    }
+    Some(true)
+}
 
 struct ValueInsertionPlan {
     vector_capacity: usize,
@@ -2266,6 +2305,10 @@ impl Index {
 
 #[cfg(test)]
 impl Index {
+    pub(super) fn head_count(&self) -> usize {
+        self.heads.len()
+    }
+
     /// The fixture may replace only key records after a production index build.
     pub(super) fn assert_key_fixture_equivalent(&self, expected: &Index) {
         let Index {
@@ -2569,73 +2612,105 @@ impl Index {
     pub fn same_tables_with_stop(&self, old: &Index, stop: &dyn Fn() -> bool) -> Option<bool> {
         let (a, b) = (&old.roles, &self.roles);
         let n = a.sup.len();
-        let prefix = |x: &[bool], y: &[bool]| y.len() >= x.len() && y[..x.len()] == *x;
-        let sorted = |v: &[(Role, Ex)]| {
-            let mut v = v.to_vec();
-            v.sort_unstable();
-            v
-        };
-        let comp_within = |x: &FxHashMap<(Role, Role), Vec<Role>>,
-                           y: &FxHashMap<(Role, Role), Vec<Role>>| {
-            x.iter()
-                .filter(|(k, _)| (k.0 as usize) < n && (k.1 as usize) < n)
-                .all(|(k, v)| y.get(k) == Some(v))
-        };
-        let data_ranges_same = b.data_range.len() >= a.data_range.len()
-            && a.data_range
-                .iter()
-                .zip(&b.data_range)
-                .all(|(va, vb)| match (va, vb) {
-                    (None, None) => true,
-                    (Some(va), Some(vb)) => {
-                        old.vals.get(*va as usize) == self.vals.get(*vb as usize)
+        if b.sup.len() < n
+            || b.right.len() < a.right.len()
+            || b.left.len() < a.left.len()
+            || a.reflexive.len() != b.reflexive.len()
+            || b.range.len() < a.range.len()
+            || b.data_range.len() < a.data_range.len()
+            || b.functional.len() < a.functional.len()
+            || b.empty.len() < a.empty.len()
+            || b.linear.len() < a.linear.len()
+            || b.inv.len() < a.inv.len()
+            || a.clash.len() != b.clash.len()
+            || old.selfs.len() != self.selfs.len()
+            || super::saturate::plain(old) != super::saturate::plain(self)
+            || !old.universal.is_empty()
+            || !self.universal.is_empty()
+            || !old.keys.is_empty()
+            || !self.keys.is_empty()
+            || !old.nominals.is_empty()
+            || !self.nominals.is_empty()
+            || old.nominal_selfs
+            || self.nominal_selfs
+            || old.tops != self.tops
+            || self.tops[1].is_some()
+            || old.horn.as_ref().map(|h| h.dominate) != self.horn.as_ref().map(|h| h.dominate)
+            || old.dt.is_some() != self.dt.is_some()
+        {
+            return Some(false);
+        }
+        match (&old.dl, &self.dl) {
+            (None, None) => {}
+            (Some(da), Some(db)) if da.keyed_by_expressions() && db.keyed_by_expressions() => {}
+            _ => return Some(false),
+        }
+        let mut ticks = 0usize;
+        for (sa, sb) in a.sup.iter().zip(&b.sup[..n]) {
+            if tick_changed(&mut ticks, stop) {
+                return None;
+            }
+            if !slice_eq_poll(sa, sb, &mut ticks, stop)? {
+                return Some(false);
+            }
+        }
+        for (x, y) in [(&a.comp, &b.comp), (&b.comp, &a.comp)] {
+            for (k, v) in x {
+                if tick_changed(&mut ticks, stop) {
+                    return None;
+                }
+                if (k.0 as usize) < n && (k.1 as usize) < n {
+                    let Some(yv) = y.get(k) else {
+                        return Some(false);
+                    };
+                    if !slice_eq_poll(v, yv, &mut ticks, stop)? {
+                        return Some(false);
                     }
-                    _ => false,
-                });
-        let functional_same = b.functional.len() >= a.functional.len()
-            && b.functional[..a.functional.len()] == a.functional[..];
-        let dt_same = match (&old.dt, &self.dt) {
-            (None, None) => true,
-            (Some(a_dt), Some(b_dt)) => b_dt.modes_compatible_with_stop(a_dt, n, stop)?,
-            _ => false,
-        };
-        Some(
-            b.sup.len() >= n
-                && b.sup[..n] == a.sup[..]
-                && comp_within(&a.comp, &b.comp)
-                && comp_within(&b.comp, &a.comp)
-                && prefix(&a.right, &b.right)
-                && prefix(&a.left, &b.left)
-                && a.reflexive == b.reflexive
-                && b.range.len() >= a.range.len()
-                && b.range[..a.range.len()] == a.range[..]
-                && data_ranges_same
-                && functional_same
-                && super::saturate::plain(old) == super::saturate::plain(self)
-                && prefix(&a.empty, &b.empty)
-                && prefix(&a.linear, &b.linear)
-                && b.inv.len() >= a.inv.len()
-                && b.inv[..a.inv.len()] == a.inv[..]
-                && a.clash == b.clash
-                && sorted(&old.selfs) == sorted(&self.selfs)
-                && dt_same
-                && old.universal.is_empty()
-                && self.universal.is_empty()
-                && old.keys.is_empty()
-                && self.keys.is_empty()
-                && old.nominals.is_empty()
-                && self.nominals.is_empty()
-                && !old.nominal_selfs
-                && !self.nominal_selfs
-                && old.tops == self.tops
-                && self.tops[1].is_none()
-                && old.horn.as_ref().map(|h| h.dominate) == self.horn.as_ref().map(|h| h.dominate)
-                && match (&old.dl, &self.dl) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => a.keyed_by_expressions() && b.keyed_by_expressions(),
-                    _ => false,
-                },
-        )
+                }
+            }
+        }
+        if !slice_eq_poll(&a.right, &b.right[..a.right.len()], &mut ticks, stop)?
+            || !slice_eq_poll(&a.left, &b.left[..a.left.len()], &mut ticks, stop)?
+            || !slice_eq_poll(&a.reflexive, &b.reflexive, &mut ticks, stop)?
+            || !slice_eq_poll(&a.range, &b.range[..a.range.len()], &mut ticks, stop)?
+        {
+            return Some(false);
+        }
+        for (va, vb) in a.data_range.iter().zip(&b.data_range[..a.data_range.len()]) {
+            if tick_changed(&mut ticks, stop) {
+                return None;
+            }
+            let same = match (va, vb) {
+                (None, None) => true,
+                (Some(va), Some(vb)) => old.vals.get(*va as usize) == self.vals.get(*vb as usize),
+                _ => false,
+            };
+            if !same {
+                return Some(false);
+            }
+        }
+        for (fa, fb) in a.functional.iter().zip(&b.functional[..a.functional.len()]) {
+            if tick_changed(&mut ticks, stop) {
+                return None;
+            }
+            if !slice_eq_poll(fa, fb, &mut ticks, stop)? {
+                return Some(false);
+            }
+        }
+        if !slice_eq_poll(&a.empty, &b.empty[..a.empty.len()], &mut ticks, stop)?
+            || !slice_eq_poll(&a.linear, &b.linear[..a.linear.len()], &mut ticks, stop)?
+            || !slice_eq_poll(&a.inv, &b.inv[..a.inv.len()], &mut ticks, stop)?
+            || !slice_eq_poll(&a.clash, &b.clash, &mut ticks, stop)?
+            || !slice_eq_poll(&old.selfs, &self.selfs, &mut ticks, stop)?
+        {
+            return Some(false);
+        }
+        if let (Some(a_dt), Some(b_dt)) = (&old.dt, &self.dt)
+            && !b_dt.modes_compatible_with_stop(a_dt, n, stop)?
+        {
+            return Some(false);
+        }
+        Some(true)
     }
 
     /// For each expression of `old`, whether a context that holds it reads other rules
@@ -2709,42 +2784,39 @@ impl Index {
         // Data roles of `old` whose negative data restrictions changed (as sets of
         // `(DataVal, Ex)` pairs). Any `DataSome(r, _)` with a superrole in this set
         // must be marked changed so functional data groups re-run `data_matches`.
+        // Each `neg_data` list is canonicalized during `Index::build`, so comparison
+        // is a zero-allocation linear scan with cooperative stop polling, and both
+        // role sets are pre-sized to avoid transient rehash memory.
         let mut changed_neg_roles: FxHashSet<Role> = FxHashSet::default();
         if !old.neg_data.is_empty() || !self.neg_data.is_empty() {
             let old_roles = old.roles.sup.len();
-            let old_neg_max = old.neg_data.values().map(Vec::len).max().unwrap_or(0);
-            let new_neg_max = self.neg_data.values().map(Vec::len).max().unwrap_or(0);
-            let mut neg_a: Vec<(&DataVal, Ex)> = Vec::with_capacity(old_neg_max);
-            let mut neg_b: Vec<(&DataVal, Ex)> = Vec::with_capacity(new_neg_max);
-            let mut seen_roles: FxHashSet<Role> = FxHashSet::with_capacity_and_hasher(
-                (old.neg_data.len() + self.neg_data.len()).min(old_roles),
-                Default::default(),
-            );
+            let max_roles = (old.neg_data.len() + self.neg_data.len()).min(old_roles);
+            let mut seen_roles: FxHashSet<Role> =
+                FxHashSet::with_capacity_and_hasher(max_roles, Default::default());
+            changed_neg_roles = FxHashSet::with_capacity_and_hasher(max_roles, Default::default());
             let mut ticks = 0usize;
             for &r in old.neg_data.keys().chain(self.neg_data.keys()) {
                 if (r as usize) >= old_roles || !seen_roles.insert(r) {
                     continue;
                 }
-                ticks += 1;
-                if ticks >= POLL_CHANGED {
-                    ticks = 0;
-                    if stop() {
-                        return None;
+                if tick_changed(&mut ticks, stop) {
+                    return None;
+                }
+                let old_v = old.neg_data.get(&r).map_or(&[][..], Vec::as_slice);
+                let new_v = self.neg_data.get(&r).map_or(&[][..], Vec::as_slice);
+                let mut same_neg = old_v.len() == new_v.len();
+                if same_neg {
+                    for (&(wa, xa), &(wb, xb)) in old_v.iter().zip(new_v) {
+                        if tick_changed(&mut ticks, stop) {
+                            return None;
+                        }
+                        if xa != xb || old.vals[wa as usize] != self.vals[wb as usize] {
+                            same_neg = false;
+                            break;
+                        }
                     }
                 }
-                neg_a.clear();
-                if let Some(v) = old.neg_data.get(&r) {
-                    neg_a.extend(v.iter().map(|&(w, x)| (&old.vals[w as usize], x)));
-                    neg_a.sort_unstable();
-                    neg_a.dedup();
-                }
-                neg_b.clear();
-                if let Some(v) = self.neg_data.get(&r) {
-                    neg_b.extend(v.iter().map(|&(w, x)| (&self.vals[w as usize], x)));
-                    neg_b.sort_unstable();
-                    neg_b.dedup();
-                }
-                if neg_a != neg_b {
+                if !same_neg {
                     changed_neg_roles.insert(r);
                 }
             }
@@ -2864,14 +2936,7 @@ impl Index {
     /// 48 bytes a member, the negative-data role comparison tables, the datatype-checker
     /// component alignment tables, and the keys of the clauses of Tier D.
     pub fn changed_scratch(&self, old: &Index) -> usize {
-        let neg_roles = old.neg_data.len() + self.neg_data.len();
-        let neg_max = old
-            .neg_data
-            .values()
-            .chain(self.neg_data.values())
-            .map(Vec::len)
-            .max()
-            .unwrap_or(0);
+        let neg_roles = (old.neg_data.len() + self.neg_data.len()).min(old.roles.sup.len());
         let neg_tables = if neg_roles > 0 {
             super::dtcheck::range::map_buckets_for(neg_roles)
                 .saturating_mul((std::mem::size_of::<Role>() + 1) * 2)
@@ -2879,8 +2944,6 @@ impl Index {
         } else {
             0
         };
-        let neg_scratch = neg_tables
-            .saturating_add(neg_max.saturating_mul(std::mem::size_of::<(&DataVal, Ex)>() * 2));
         let dt_scratch = match (&old.dt, &self.dt) {
             (Some(a), Some(b)) => b.align_scratch(a),
             _ => 0,
@@ -2888,7 +2951,7 @@ impl Index {
         old.heads
             .len()
             .saturating_add((old.disjoint.len() + self.disjoint.len()).saturating_mul(48))
-            .saturating_add(neg_scratch)
+            .saturating_add(neg_tables)
             .saturating_add(dt_scratch)
             .saturating_add(match (&old.dl, &self.dl) {
                 (Some(a), Some(b)) => b.changed_scratch(a),
@@ -2999,6 +3062,16 @@ impl Index {
             ix.neg_data.entry(r).or_default().push((w, x));
         }
         ix.vals = it.copy_values()?;
+        for ns in ix.neg_data.values_mut() {
+            ns.sort_unstable_by(|&(w1, x1), &(w2, x2)| {
+                ix.vals[w1 as usize]
+                    .cmp(&ix.vals[w2 as usize])
+                    .then_with(|| x1.cmp(&x2))
+            });
+            ns.dedup_by(|(w1, x1), (w2, x2)| {
+                *x1 == *x2 && ix.vals[*w1 as usize] == ix.vals[*w2 as usize]
+            });
+        }
         ix.numeric_ledger = it.ranges.ledger.clone();
         // An individual has an instance in every model, so a told `{a} ⊑ ∃r.{b}`, which
         // a property assertion `r(a, b)` is, puts `b` in the range of `r`. The index
@@ -3143,7 +3216,13 @@ impl Index {
         // the ids above every expression
         let run = it.dt_run.take();
         let refire = match run.as_deref() {
-            Some(run) => dt_fires(it, run, &b, &mut told),
+            Some(r) => match dt_fires(it, r, &b, &mut told) {
+                Ok(refire) => refire,
+                Err(e) => {
+                    it.dt_run = run;
+                    return Err(e);
+                }
+            },
             None => FxHashMap::default(),
         };
         it.dt_run = run;
@@ -3186,6 +3265,7 @@ impl Index {
         ix.disjoint = group(&disj, |h| &mut h.disj, &mut ix.heads);
         ix.nominal_selfs = !b.selfs.is_empty() && !it.individuals.is_empty();
         ix.selfs = std::mem::take(&mut b.selfs);
+        ix.selfs.sort_unstable();
         ix.keys = ax.keys.clone();
         ix.nominals = it.nominals().collect();
         ix.anonymous = it.anonymous_nominals();
@@ -3471,14 +3551,27 @@ fn dt_fires(
     run: &DtRun,
     b: &Builder,
     told: &mut Vec<(Ex, Ex)>,
-) -> FxHashMap<Ex, Vec<u32>> {
+) -> Result<FxHashMap<Ex, Vec<u32>>, Halt> {
     let mut by: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
     for &(a, c) in told.iter().chain(&b.told) {
         if c != TOP && matches!(it.nodes[a as usize], Node::DtAtom(_)) {
             by.entry(a).or_default().push(c);
         }
     }
-    let mut items: Vec<(u32, Ex)> = Vec::new();
+    let n_items = b
+        .dt_body
+        .iter()
+        .filter(|&&e| !b.dt_other.contains(&e) && dt_comp(it, run, e).is_some())
+        .count();
+    let mut items_guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    if let Some(g) = items_guard.as_mut() {
+        g.grow(n_items.saturating_mul(std::mem::size_of::<(u32, Ex)>()))
+            .map_err(|e| match e {
+                super::Error::Memory { used, .. } => Halt::Memory(used),
+                _ => Halt::Stopped,
+            })?;
+    }
+    let mut items: Vec<(u32, Ex)> = Vec::with_capacity(n_items);
     for &e in &b.dt_body {
         if b.dt_other.contains(&e) {
             continue;
@@ -3497,13 +3590,14 @@ fn dt_fires(
             }
         }
     }
+    drop(items_guard);
     let mut ts: Vec<Ex> = refire.keys().copied().collect();
     ts.sort_unstable();
     for t in ts {
         let f = it.node(Node::DtFire(t));
         told.push((t, f));
     }
-    refire
+    Ok(refire)
 }
 
 /// The index of the Horn rules, built after the occurrences of the normalized axioms:
@@ -4553,5 +4647,91 @@ mod minimal_roles_tests {
         );
         assert_eq!(r, Err(()));
         assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn dt_fires_reserves_sort_vector_through_build_budget() {
+        use super::super::Limits;
+        use super::super::dtcheck::{
+            atoms::{DtKey, DtRun, Stop},
+            comp::Comps,
+            range::{Defs, Ranges as DtRanges},
+        };
+        use super::super::numeric::Budget;
+        use super::{Builder, Ex, Halt, Interner, Node, RoleName, dt_fires};
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty, DataRange, Datatype};
+        use crate::vocab;
+
+        let n_atoms = 4000usize;
+        let dp = DataProperty::new("urn:dt:p");
+        let target_cls = Class::new("urn:dt:Target");
+        let ax = AxiomKind::SubClassOf(
+            ClassExpression::Class(target_cls.clone()),
+            ClassExpression::DataAllValuesFrom(
+                vec![dp.clone()],
+                DataRange::Datatype(Datatype::new(vocab::XSD_INTEGER)),
+            ),
+        );
+        let comps = Comps::of(&[&ax], &Defs::default(), &|| false).expect("checker comp");
+        assert!(comps.checker(&dp));
+        let mut it = Interner::new();
+        let role = it.role(RoleName::Data(dp));
+        let target = it.class(&target_cls);
+        let mut b = Builder::default();
+        let mut told_base: Vec<(Ex, Ex)> = Vec::with_capacity(n_atoms);
+        for i in 0..n_atoms {
+            let id = it.dt.id(DtKey {
+                role,
+                at_least: true,
+                n: (i + 1) as u64,
+                range: DtRanges::FULL,
+            });
+            let e = it.node(Node::DtAtom(id));
+            b.dt_body.push(e);
+            told_base.push((e, target));
+        }
+        let run = DtRun {
+            comps,
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: None,
+            stopped: None,
+        };
+        let expected_items_bytes = n_atoms * std::mem::size_of::<(u32, Ex)>();
+
+        // Uncapped run must charge the sort vector against `it.ranges.budget` and release
+        // the scratch reservation once `items` is consumed.
+        let uncap = Budget::new(&Limits::default(), 0, None);
+        it.ranges.begin(uncap.clone());
+        let mut told = told_base.clone();
+        let refire = dt_fires(&mut it, &run, &b, &mut told).expect("uncapped dt_fires");
+        it.ranges.end();
+        assert_eq!(refire.len(), 1);
+        assert_eq!(refire.get(&target).map(Vec::len), Some(1));
+        assert!(
+            uncap.peak() >= expected_items_bytes,
+            "expected dt_fires peak {} >= items bytes {expected_items_bytes}",
+            uncap.peak()
+        );
+        assert_eq!(uncap.retained_storage().1, 0, "scratch must be released");
+
+        // Tight cap below the sort vector size must refuse before allocating `items`,
+        // even though the resulting `refire` map has only a single 1-element entry.
+        let tight = Budget::new(
+            &Limits {
+                max_memory: Some(expected_items_bytes - 1),
+                ..Limits::default()
+            },
+            0,
+            None,
+        );
+        it.ranges.begin(tight);
+        let mut told = told_base;
+        let err = dt_fires(&mut it, &run, &b, &mut told);
+        it.ranges.end();
+        assert!(
+            matches!(err, Err(Halt::Memory(_))),
+            "expected Halt::Memory under tight cap, got {err:?}"
+        );
     }
 }

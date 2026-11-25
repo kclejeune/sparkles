@@ -110,17 +110,60 @@ pub enum DtAlignOutcome {
 /// Items processed between cooperative stop polls inside [`DtIx::align`].
 const POLL_ALIGN: usize = 4096;
 
+#[inline]
+fn tick_align(ticks: &mut usize, n: usize, stop: &dyn Fn() -> bool) -> bool {
+    *ticks += n;
+    if *ticks >= POLL_ALIGN {
+        *ticks = 0;
+        stop()
+    } else {
+        false
+    }
+}
+
+fn slice_eq_poll<T: PartialEq>(
+    a: &[T],
+    b: &[T],
+    ticks: &mut usize,
+    stop: &dyn Fn() -> bool,
+) -> Option<bool> {
+    if a.len() != b.len() {
+        return Some(false);
+    }
+    let mut i = 0;
+    while i < a.len() {
+        let step = POLL_ALIGN.saturating_sub(*ticks).max(1);
+        let end = (i + step).min(a.len());
+        if a[i..end] != b[i..end] {
+            return Some(false);
+        }
+        *ticks += end - i;
+        i = end;
+        if *ticks >= POLL_ALIGN {
+            *ticks = 0;
+            if stop() {
+                return None;
+            }
+        }
+    }
+    Some(true)
+}
+
 impl DtIx {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         keys: Vec<DtKey>,
-        roles: FxHashMap<Role, RoleIx>,
+        mut roles: FxHashMap<Role, RoleIx>,
         body: Vec<Vec<Body>>,
         disjoint: Vec<(Role, Role)>,
         ranges: Ranges,
         comps: Comps,
         refire: FxHashMap<Ex, Vec<u32>>,
     ) -> DtIx {
+        for ri in roles.values_mut() {
+            ri.ranges.sort_unstable();
+            ri.ranges.dedup();
+        }
         let n = comps.len();
         DtIx {
             comps,
@@ -379,19 +422,10 @@ impl DtIx {
                     .saturating_mul(std::mem::size_of::<(Role, Role)>() * 8),
             );
         let out = old_comps.saturating_mul(std::mem::size_of::<Option<u32>>() + 1);
-        let max_ranges = old
-            .roles
-            .values()
-            .chain(self.roles.values())
-            .map(|r| r.ranges.len())
-            .max()
-            .unwrap_or(0);
-        let ranges = max_ranges.saturating_mul(std::mem::size_of::<Rid>() * 2);
         groups
             .saturating_add(by_roles)
             .saturating_add(disj)
             .saturating_add(out)
-            .saturating_add(ranges)
             .saturating_add(64)
     }
 
@@ -412,27 +446,16 @@ impl DtIx {
             None => return DtAlignOutcome::Stopped,
         }
         let mut ticks = 0usize;
-        let mut poll = || -> bool {
-            ticks += 1;
-            if ticks >= POLL_ALIGN {
-                ticks = 0;
-                stop()
-            } else {
-                false
-            }
-        };
 
-        let mut max_ranges = 0usize;
         let mut old_groups: Vec<Vec<Role>> = vec![Vec::new(); old.body.len()];
         for (&r, ri) in &old.roles {
-            if poll() {
+            if tick_align(&mut ticks, 1, stop) {
                 return DtAlignOutcome::Stopped;
             }
-            max_ranges = max_ranges.max(ri.ranges.len());
             old_groups[ri.comp as usize].push(r);
         }
         for g in &mut old_groups {
-            if poll() {
+            if tick_align(&mut ticks, g.len().max(1), stop) {
                 return DtAlignOutcome::Stopped;
             }
             g.sort_unstable();
@@ -440,14 +463,13 @@ impl DtIx {
 
         let mut new_groups: Vec<Vec<Role>> = vec![Vec::new(); self.body.len()];
         for (&r, ri) in &self.roles {
-            if poll() {
+            if tick_align(&mut ticks, 1, stop) {
                 return DtAlignOutcome::Stopped;
             }
-            max_ranges = max_ranges.max(ri.ranges.len());
             new_groups[ri.comp as usize].push(r);
         }
         for g in &mut new_groups {
-            if poll() {
+            if tick_align(&mut ticks, g.len().max(1), stop) {
                 return DtAlignOutcome::Stopped;
             }
             g.sort_unstable();
@@ -456,7 +478,7 @@ impl DtIx {
         let mut new_by_roles: FxHashMap<&[Role], u32> =
             FxHashMap::with_capacity_and_hasher(self.body.len(), Default::default());
         for (c, g) in new_groups.iter().enumerate() {
-            if poll() {
+            if tick_align(&mut ticks, g.len().max(1), stop) {
                 return DtAlignOutcome::Stopped;
             }
             if !g.is_empty() {
@@ -466,7 +488,7 @@ impl DtIx {
 
         let mut old_disj: Vec<Vec<(Role, Role)>> = vec![Vec::new(); old.body.len()];
         for &(a, b) in &old.disjoint {
-            if poll() {
+            if tick_align(&mut ticks, 1, stop) {
                 return DtAlignOutcome::Stopped;
             }
             if let Some(ca) = old.roles.get(&a).map(|r| r.comp) {
@@ -480,7 +502,7 @@ impl DtIx {
         }
         let mut new_disj: Vec<Vec<(Role, Role)>> = vec![Vec::new(); self.body.len()];
         for &(a, b) in &self.disjoint {
-            if poll() {
+            if tick_align(&mut ticks, 1, stop) {
                 return DtAlignOutcome::Stopped;
             }
             if let Some(ca) = self.roles.get(&a).map(|r| r.comp) {
@@ -495,21 +517,29 @@ impl DtIx {
 
         let mut comp_map = vec![None; old.body.len()];
         let mut changed_comps = vec![true; old.body.len()];
-        let mut ra: Vec<Rid> = Vec::new();
-        let mut rb: Vec<Rid> = Vec::new();
         for old_c in 0..old.body.len() {
-            if poll() {
+            if tick_align(&mut ticks, 1, stop) {
                 return DtAlignOutcome::Stopped;
             }
             let roles = &old_groups[old_c];
             if roles.is_empty() {
                 continue;
             }
+            if tick_align(&mut ticks, roles.len(), stop) {
+                return DtAlignOutcome::Stopped;
+            }
             let Some(&new_c) = new_by_roles.get(roles.as_slice()) else {
                 continue;
             };
-            if old_disj[old_c] != new_disj[new_c as usize] {
-                continue;
+            match slice_eq_poll(
+                &old_disj[old_c],
+                &new_disj[new_c as usize],
+                &mut ticks,
+                stop,
+            ) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => return DtAlignOutcome::Stopped,
             }
             let old_body = &old.body[old_c];
             let new_body = &self.body[new_c as usize];
@@ -518,10 +548,22 @@ impl DtIx {
             }
             let mut body_same = true;
             for (a, b) in old_body.iter().zip(new_body) {
-                if poll() {
+                if tick_align(&mut ticks, 1, stop) {
                     return DtAlignOutcome::Stopped;
                 }
-                if a.e != b.e || a.told != b.told {
+                if a.e != b.e {
+                    body_same = false;
+                    break;
+                }
+                let told_same = match (a.told.as_deref(), b.told.as_deref()) {
+                    (None, None) => true,
+                    (Some(ta), Some(tb)) => match slice_eq_poll(ta, tb, &mut ticks, stop) {
+                        Some(eq) => eq,
+                        None => return DtAlignOutcome::Stopped,
+                    },
+                    _ => false,
+                };
+                if !told_same {
                     body_same = false;
                     break;
                 }
@@ -531,32 +573,30 @@ impl DtIx {
             }
             let mut roles_same = true;
             for &r in roles {
-                if poll() {
+                if tick_align(&mut ticks, 1, stop) {
                     return DtAlignOutcome::Stopped;
                 }
                 let old_ri = &old.roles[&r];
                 let new_ri = &self.roles[&r];
-                if old_ri.functional != new_ri.functional || old_ri.supers != new_ri.supers {
+                if old_ri.functional != new_ri.functional {
                     roles_same = false;
                     break;
                 }
-                if old_ri.ranges != new_ri.ranges {
-                    if ra.capacity() == 0 && max_ranges > 0 {
-                        ra.reserve_exact(max_ranges);
-                        rb.reserve_exact(max_ranges);
-                    }
-                    ra.clear();
-                    ra.extend_from_slice(&old_ri.ranges);
-                    ra.sort_unstable();
-                    ra.dedup();
-                    rb.clear();
-                    rb.extend_from_slice(&new_ri.ranges);
-                    rb.sort_unstable();
-                    rb.dedup();
-                    if ra != rb {
+                match slice_eq_poll(&old_ri.supers, &new_ri.supers, &mut ticks, stop) {
+                    Some(true) => {}
+                    Some(false) => {
                         roles_same = false;
                         break;
                     }
+                    None => return DtAlignOutcome::Stopped,
+                }
+                match slice_eq_poll(&old_ri.ranges, &new_ri.ranges, &mut ticks, stop) {
+                    Some(true) => {}
+                    Some(false) => {
+                        roles_same = false;
+                        break;
+                    }
+                    None => return DtAlignOutcome::Stopped,
                 }
             }
             if roles_same {
