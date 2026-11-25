@@ -599,6 +599,77 @@ class OntologyTest {
         }
     }
 
+    /** Item 603 phase 7: cancelling a classification mid-run with `partial = true` returns a sound partial answer. */
+    @Test fun the_native_handle_answers_a_classification_in_part_when_cancelled() {
+        val body = cases(300, false)
+        val query = ClassifyQuery(partial = true, threads = 1, limit = 10000)
+        val (full, took) = SparklesDatasets.memory().use { ds ->
+            UpdateAction.parseExecute(body, ds)
+            val start = System.nanoTime()
+            val r = ds.ontology().classify(OntologyRead(), query)
+            r to (System.nanoTime() - start) / 1_000_000.0
+        }
+        assertTrue(full.getBoolean("complete"))
+        var partialCount = 0
+        var answered = 0
+        fun answers(ms: Long): Boolean {
+            return SparklesDatasets.memory().use { ds ->
+                UpdateAction.parseExecute(body, ds)
+                SparklesOperation().use { op ->
+                    val canceller = Thread {
+                        try {
+                            Thread.sleep(ms)
+                            op.cancel()
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    canceller.isDaemon = true
+                    canceller.start()
+                    val r = try {
+                        ds.ontology().classify(OntologyRead(), query, op)
+                    } catch (_: org.apache.jena.query.QueryCancelledException) {
+                        return@use false
+                    } finally {
+                        canceller.interrupt()
+                    }
+                    answered++
+                    assertEquals(full.getNumber("classes"), r.getNumber("classes"))
+                    if (!r.getBoolean("partial")) {
+                        assertTrue(r.getBoolean("complete"))
+                        assertEquals("consistent", r.getString("consistency"))
+                        return@use true
+                    }
+                    assertFalse(r.getBoolean("complete"), "a partial answer is presented as complete")
+                    val open = r.get("incomplete").asArray
+                    assertEquals(open.size, r.getNumber("incompleteCount").toInt())
+                    val c = r.getString("consistency")
+                    assertTrue(c == "consistent" || c == "unknown", c)
+                    if (c == "unknown") assertTrue(open.size + 2 >= r.getNumber("classes").toInt())
+                    partialCount++
+                    return@use true
+                }
+            }
+        }
+        fun after(ms: Long) = ms + maxOf(1L, Math.round(0.08 * ms))
+        val limit = maxOf(2000L, (20 * took).toLong())
+        var lo = 0L
+        var ms = 2L
+        while (ms < limit && !answers(ms)) {
+            lo = ms
+            ms = after(ms)
+        }
+        var hi = ms
+        while (hi - lo > 1) {
+            val mid = (lo + hi) / 2
+            if (answers(mid)) hi = mid else lo = mid
+        }
+        while (answered < 20 && ms < limit) {
+            ms = after(ms)
+            answers(ms)
+        }
+        assertTrue(partialCount > 0, "no cancellation gave a partial answer")
+    }
+
     /** Items 608 and 457: Manchester text read against the graph, and a DL query of it. */
     @Test fun the_native_handle_reads_manchester_and_answers_dl_queries() {
         SparklesDatasets.memory().use { ds ->

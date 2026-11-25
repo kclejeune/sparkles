@@ -175,7 +175,12 @@ export class ClassificationFrame {
         reason: null,
         result: frame.result,
         outcome: frame.outcome,
-        entity: { iri: view.iri, present: true, unsatisfiable: frame.unsatisfiable },
+        entity: {
+          iri: view.iri,
+          present: true,
+          unsatisfiable: frame.unsatisfiable,
+          incomplete: frame.incomplete,
+        },
         activity: null,
         page: null,
         staleCommit: null,

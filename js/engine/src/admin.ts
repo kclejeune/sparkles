@@ -676,6 +676,7 @@ export interface OntologyFrameClassification {
     result: ClassificationResult;
     outcome: ClassificationOutcome;
     unsatisfiable: boolean;
+    incomplete: boolean;
     parents: {
       total: number;
       limit: number;
@@ -743,6 +744,7 @@ export interface OntologyClassification extends OntologyState {
   class?: OntologyTaxonomyNode & {
     iri: string;
     unsatisfiable: boolean;
+    incomplete?: boolean;
     childClasses: string[];
     superClasses: string[];
   };
