@@ -2394,3 +2394,23 @@ async fn a_head_that_keeps_moving_refuses_and_writes_nothing_of_the_run() {
     );
     assert_eq!(m.requests().len(), 1, "the extraction ran once");
 }
+
+#[tokio::test]
+async fn declared_drift_refuses_claims_ingestion_before_model_calls() {
+    use crate::settings::{Declared, Providers};
+    let m = proposals_mock();
+    let (st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    evidence(&app).await;
+    let before = head(&st);
+    let declared = Declared::parse(
+        r#"{"datasets":{"org":{"evidence":{"enabled":true,"sourceRecords":["urn:ev:changed"],"proposals":["urn:ev:claims"]}}}}"#,
+        Providers::Unchecked,
+    ).unwrap();
+    st.settings.replace_declared_for_test(Arc::new(declared));
+
+    let error = run_direct(&st, claims_request(NOTES)).unwrap_err();
+    assert_eq!(error["code"], "evidence-settings-drift", "{error}");
+    assert!(m.requests().is_empty());
+    assert_eq!(head(&st), before);
+}

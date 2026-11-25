@@ -1318,6 +1318,11 @@ each evaluation child.
 
 ### Compatibility
 
+- Layered dataset settings responses can return `evidence` as the `kind`.
+  Clients that exhaustively handle the former kinds can regenerate their types
+  from the updated OpenAPI document. Dataset administrators can declare and lock
+  evidence settings and reconcile drift through the layered routes (item 508).
+
 The unreleased Rust snapshot, mask and access-control surface changed under roadmap item
 1307; HTTP and CLI wire contracts are unchanged:
 

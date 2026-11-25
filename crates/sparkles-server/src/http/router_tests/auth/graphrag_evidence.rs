@@ -1474,3 +1474,27 @@ async fn pooled_server_evidence_build_succeeds_and_returns_pool_credit() {
     assert_eq!(big_pool.granted(), 0);
     assert_eq!(st.catalog.pool().unwrap().granted(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_drift_refuses_policy_build_and_refresh_before_model_calls() {
+    use crate::settings::{Declared, Providers};
+    let e = Arc::new(env(true));
+    let declared = Declared::parse(
+        r#"{"datasets":{"ev":{"evidence":{"enabled":true,"sourceRecords":["urn:ev:changed"],"proposals":["urn:ev:claims"]}}}}"#,
+        Providers::Unchecked,
+    ).unwrap();
+    e.s.state
+        .settings
+        .replace_declared_for_test(Arc::new(declared));
+
+    let runner = e.clone();
+    tokio::task::spawn_blocking(move || {
+        for mode in [Mode::Build, Mode::Refresh] {
+            let message = refused(runner.run(settings(serde_json::json!({})), mode));
+            assert!(message.starts_with("evidence-settings-drift"), "{message}");
+        }
+    })
+    .await
+    .unwrap();
+    assert!(e.mock.requests().is_empty());
+}

@@ -2825,7 +2825,7 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                 ],
                 json!({
                     "dataset": string(),
-                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes", "graphrag", "paths", "forms"]),
+                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes", "graphrag", "paths", "forms", "evidence"]),
                     "effective": any_object("The effective object: the built-in defaults, the declared values and the runtime layer merged, with the locked fields from the settings file."),
                     "declared": any_object("The settings file's `defaults` and dataset entry for this kind, merged."),
                     "runtime": any_object("The runtime layer: the fields changed through the API. `null` removes a declared member."),
@@ -2836,10 +2836,31 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                     "status": closed(&["valid"], json!({ "valid": boolean(), "error": string() })),
                     "etag": with_desc(string(), "The entity tag of the runtime layer, as in the `ETag` header."),
                     "warnings": with_desc(array(sref("PrefixWarning")), "The `prefixes` kind only: the prefixes that shadow a well-known prefix with another IRI."),
+                    "recorded": with_desc(sref("EvidenceRecordedStatus"), "The `evidence` kind only: the recorded evidence settings, protection state and whether they differ from the effective settings."),
                 }),
             ),
             "One settings kind of a dataset with its layers and sources.",
             "settings",
+        ),
+    );
+    put(
+        "EvidenceRecordedStatus",
+        doc(
+            closed(
+                &[
+                    "settings", "digest", "revision", "managed", "detached", "drift",
+                ],
+                json!({
+                    "settings": sref("EvidenceSettings"),
+                    "digest": with_desc(or_null(string()), "The SHA-256 digest of `evidence.json`, `null` before the first configuration."),
+                    "revision": with_desc(int(), "The revision of the managed-graph registry, 0 when there is none."),
+                    "managed": with_desc(strings(), "Role graphs that ordinary writes cannot change."),
+                    "detached": with_desc(strings(), "Role graphs that an administrator detached."),
+                    "drift": with_desc(boolean(), "Whether the effective settings differ from the recorded ones, refusing typed evidence operations until reconciled."),
+                }),
+            ),
+            "Recorded evidence settings, protection state and drift status.",
+            "evidence-settings",
         ),
     );
     put(

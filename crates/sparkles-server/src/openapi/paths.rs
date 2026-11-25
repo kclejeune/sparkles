@@ -3731,10 +3731,10 @@ fn assist(p: &mut Paths) {
         "/{ds}/recall",
         "recallFacts",
         "Recall facts",
-        "The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact.",
+        "The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact. A request using a review or matching policy returns `409 evidence-settings-drift` while the evidence settings need reconciliation.",
         "RecallRequest",
         "RecallResult",
-    ));
+    ).errors(&[409, 503]));
     p.add(
         op(POST, "/{ds}/facts", "assertFacts", "SPARQL", "Write facts with provenance")
             .doc("The MCP tool `assert_facts` as the caller, with its checks. Needs `write` on the graphs written and counts as an update. `sparkles memory import` and `assert` call it.")
@@ -3745,15 +3745,15 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/claims/resolve", "resolveEvidence", "SPARQL", "Verify evidence references")
-            .doc("Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field.")
+            .doc("Needs `read` on the dataset through the query endpoint, and counts as a query. Verifies each reference in order: a stored fact at the exact commit of the branch its identities name, read through the caller's view of that dataset and branch, and a record as an authenticated record of the dataset's protected evidence graphs at the request branch's current state. The first reference that does not verify is answered with its `code` and `reference` key: `422 evidence-unavailable` for a missing, unretained or unreadable reference alike, `422 incomplete-evidence` when the 64 MiB resolution limit or the caller's access policy stops verification, `422 unanchored-evidence`, `422 span-mismatch`, `422 origin-not-reproduced` and `409 immutable-record-conflict`. A malformed reference is a `400` that names its field. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-resolution")
             .json_body(true, "EvidenceResolveRequest")
             .json("200", "Every reference, verified.", "EvidenceResolveResult")
-            .errors(&[400, 403, 404, 408, 409, 413, 422]),
+            .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
     );
     p.add(
         op(POST, "/{ds}/claims", "proposeClaims", "SPARQL", "Propose claims with their evidence")
-            .doc("Needs `write` on the dataset or branch through the update endpoint, update grants on every graph the batch writes, and read access to every record and stored fact it references, decided as `POST /{ds}/claims/resolve` decides it. Counts as an update. Publishes the batch's source revisions, renditions and passages in the evidence settings' source-record graph and its references, claims, links and assessments in the proposal graph, as one commit of the evidence owner. Claims describe their propositions and never assert them. The server sets each record's receipt, creation activity and record digest, a source revision's `firstAvailableAt` and the operation that the authenticated caller is the agent of. A repeated `idempotencyKey` with the same payload answers the first receipt with `replayed` and writes nothing. Refusals write nothing: `400` for a malformed or inconsistent batch, naming its field, `403` for a written graph the caller may not update, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict` for a record identity that holds other content or no authenticated record, `409 unsupported-profile`, the reference outcomes of `POST /{ds}/claims/resolve`, and `503 authority-changed` when the caller's credential was revoked or the access policy changed before publication.")
+            .doc("Needs `write` on the dataset or branch through the update endpoint, update grants on every graph the batch writes, and read access to every record and stored fact it references, decided as `POST /{ds}/claims/resolve` decides it. Counts as an update. Publishes the batch's source revisions, renditions and passages in the evidence settings' source-record graph and its references, claims, links and assessments in the proposal graph, as one commit of the evidence owner. Claims describe their propositions and never assert them. The server sets each record's receipt, creation activity and record digest, a source revision's `firstAvailableAt` and the operation that the authenticated caller is the agent of. A repeated `idempotencyKey` with the same payload answers the first receipt with `replayed` and writes nothing. Refusals write nothing: `400` for a malformed or inconsistent batch, naming its field, `403` for a written graph the caller may not update, `409 head-changed`, `409 idempotency-conflict`, `409 immutable-record-conflict` for a record identity that holds other content or no authenticated record, `409 unsupported-profile`, the reference outcomes of `POST /{ds}/claims/resolve`, and `503 authority-changed` when the caller's credential was revoked or the access policy changed before publication. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-proposals")
             .json_body(true, "EvidenceProposal")
             .json("200", "The operation and its records, published, replayed or previewed.", "EvidenceProposalResult")
@@ -3761,7 +3761,7 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/claims/review", "reviewClaims", "SPARQL", "Review claims under a policy")
-            .doc("Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Under a matching policy the targets are identity proposals and the policy's resolution map follows the decisions: an operation that changes which accepted decisions it follows writes one immutable map revision in the policy's maps graph and rewrites the clusters it changed in the output graph, and needs update and read grants on the decisions, maps and output graphs and read access to every effective proposal of those clusters. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 identity-conflict` when an accepted separation would share a cluster, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`.")
+            .doc("Needs `write` on the dataset or branch through the update endpoint, update and read grants on the policy's decisions, supports and output graphs, and read access to each target and, for an acceptance, to every evidence link of the target with its reference and what that names and to every negative claim of the same proposition in the policy's evidence boundary. Such a record the caller cannot read answers exactly as an unreadable target, `422 evidence-unavailable`. Counts as an update. Appends one immutable decision per target in the policy's decisions graph as one commit of the evidence owner, with the caller as the reviewer. An acceptance of a positive claim of an admitted kind with the required scope records an acceptance support and projects the claim's proposition into the policy's output graph. A projected triple stays while one live support owns it, and a decision that supersedes an acceptance ends its support. Every read is made at `ifHead`. Under a matching policy the targets are identity proposals and the policy's resolution map follows the decisions: an operation that changes which accepted decisions it follows writes one immutable map revision in the policy's maps graph and rewrites the clusters it changed in the output graph, and needs update and read grants on the decisions, maps and output graphs and read access to every effective proposal of those clusters. Refusals write nothing: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not update or read, `409 policy-changed`, `409 head-changed`, `409 target-changed`, `409 decision-superseded`, `409 target-withdrawn`, `409 evidence-conflict` for contrary evidence under a policy that refuses conflicts, `409 identity-conflict` when an accepted separation would share a cluster, `409 idempotency-conflict`, `422 evidence-unavailable`, `422 incomplete-evidence`, `503 projection-unavailable` when a graph of the policy's projection was detached and protected again, and `503 authority-changed`. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-reviews")
             .json_body(true, "EvidenceReview")
             .json("200", "The operation and its decisions, published, replayed or previewed.", "EvidenceReviewResult")
@@ -3769,7 +3769,7 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/claims/withdraw", "withdrawClaims", "SPARQL", "Withdraw claim occurrences")
-            .doc("Needs `write` on the dataset or branch through the update endpoint, update grants on each claim's graph, and update and read grants on the output graph and read grants on the decisions and supports graphs of every review policy. Counts as an update. Records a withdrawal with `prov:invalidatedAtTime` in each claim's graph as one commit of the evidence owner, without making a contrary claim. The claims' supports stop being live, and each projected triple left without a live support leaves its output graph. A claim that is already withdrawn is answered as `existing`. Refusals write nothing: `400`, `403`, `409 head-changed`, `409 target-changed`, `409 idempotency-conflict`, `422 evidence-unavailable`, `503 projection-unavailable` and `503 authority-changed`.")
+            .doc("Needs `write` on the dataset or branch through the update endpoint, update grants on each claim's graph, and update and read grants on the output graph and read grants on the decisions and supports graphs of every review policy. Counts as an update. Records a withdrawal with `prov:invalidatedAtTime` in each claim's graph as one commit of the evidence owner, without making a contrary claim. The claims' supports stop being live, and each projected triple left without a live support leaves its output graph. A claim that is already withdrawn is answered as `existing`. Refusals write nothing: `400`, `403`, `409 head-changed`, `409 target-changed`, `409 idempotency-conflict`, `422 evidence-unavailable`, `503 projection-unavailable` and `503 authority-changed`. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-reviews")
             .json_body(true, "EvidenceWithdrawal")
             .json("200", "The operation and its withdrawals, published, replayed or previewed.", "EvidenceWithdrawalResult")
@@ -3777,19 +3777,19 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/claims/identities", "resolveIdentities", "SPARQL", "Resolve entities through a resolution map")
-            .doc("Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again or an identity graph the map was built from left the boundary.")
+            .doc("Needs `read` on the dataset or branch through the query endpoint, and read grants on the matching policy's decisions, maps and output graphs and on the identity graphs of its boundary. Counts as a query. Answers what the policy's current resolution map selects for each entity: its representative, the members of its cluster and the current accepted decisions that join it. An entity the map does not name resolves to itself. The map is ordinary RDF in the policy's output graph, `<member> ev:resolvesTo <representative>`, which queries join explicitly. Refusals: `400` for a malformed request or an unknown policy, `403` for a graph the caller may not read, `422 incomplete-evidence` when a cluster's records exceed 10,000, and `503 projection-unavailable` when a graph of the policy was detached and protected again or an identity graph the map was built from left the boundary. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-identities")
             .json_body(true, "EvidenceIdentities")
             .json("200", "The map's revision and each entity's resolution.", "EvidenceIdentitiesResult")
-            .errors(&[400, 403, 404, 408, 413, 422, 503]),
+            .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
     );
     p.add(
         op(POST, "/{ds}/claims/dependents", "listEvidenceDependents", "SPARQL", "Find the assessments that depend on changed records")
-            .doc("Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read.")
+            .doc("Needs `read` on the dataset or branch through the query endpoint, and counts as a query. Answers the authenticated assessments in the proposal graphs the caller can read whose `ev:target` or `prov:used` names one of the changed record identities, and with `transitive` the assessments that depend on those, each once at its smallest depth. A graph the caller cannot read is not searched, and an assessment any of whose triples the caller's view hides is neither reported nor followed, so the answer discloses nothing hidden. A review or withdrawal names its changed identities in `changed`, its decisions and its withdrawals. Refusals: `400` for a malformed request and `422 incomplete-evidence` when more than 10,000 candidate records would be read. Returns `409 evidence-settings-drift` while the effective and recorded evidence settings differ.")
             .see("evidence-dependents")
             .json_body(true, "EvidenceDependents")
             .json("200", "The dependent assessments.", "EvidenceDependentsResult")
-            .errors(&[400, 403, 404, 408, 413, 422]),
+            .errors(&[400, 403, 404, 408, 409, 413, 422, 503]),
     );
     p.add(
         op(POST, "/{ds}/sources", "registerSource", "SPARQL", "Register a source document")
@@ -3865,7 +3865,7 @@ fn assist(p: &mut Paths) {
             "Datasets",
             "Set the evidence settings",
         )
-        .doc("Needs `admin` on the dataset. Records complete settings and protects every graph of their roles. A configuration that would stop protecting a graph, or that races with another change, is a `409` that writes nothing.")
+        .doc("Needs `admin` on the dataset. Records complete settings and protects every graph of their roles. A configuration that would stop protecting a graph, change a field locked by `serve --settings` (`locked-by-config`), or race with another change is a `409` that writes nothing.")
         .see("evidence-settings")
         .json_body(true, "EvidenceSettings")
         .json("200", "The settings and their protection.", "EvidenceSettingsStatus")
@@ -3879,7 +3879,7 @@ fn assist(p: &mut Paths) {
             "Datasets",
             "Stop protecting an evidence graph",
         )
-        .doc("Needs `admin` on the dataset. Ordinary writes can change the graph until the settings are recorded again.")
+        .doc("Needs `admin` on the dataset. Ordinary writes can change the graph until the settings are recorded again. Refused with `409 locked-by-config` when `serve --settings` locks evidence enabled and locks a role or policy requiring the graph.")
         .see("evidence-settings")
         .json_body(true, "EvidenceDetach")
         .json("200", "The settings and their protection.", "EvidenceSettingsStatus")
@@ -4501,15 +4501,16 @@ fn assist(p: &mut Paths) {
             "Datasets",
             "Get every settings kind",
         )
-        .doc("Each kind's effective object with its layers, sources and locks.")
+        .doc("Each kind's effective object with its layers, sources and locks. The `evidence` kind is included only for callers with `admin` on the dataset.")
         .see("settings")
-        .json("200", "The kinds.", "DatasetSettings"),
+        .json("200", "The kinds.", "DatasetSettings")
+        .errors(&[503]),
     );
     let kind_body = |o: super::Op| {
         o.body(
             true,
-            "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, or for `prefixes` a map from prefix names to IRIs.",
-            json!({ "application/json": { "schema": { "type": "object" } } }),
+            "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs.",
+            json!({ "application/json": { "schema": { "type": "object", "additionalProperties": true } } }),
         )
         .header(
             "If-Match",
@@ -4517,14 +4518,14 @@ fn assist(p: &mut Paths) {
             "The `etag` of the runtime layer the change is based on.",
         )
         .json("200", "The kind after the change.", "SettingsKind")
-        .errors(&[400, 409, 412])
+        .errors(&[400, 409, 412, 503])
     };
     p.add(
         op(GET, "/$/settings/{ds}/{kind}", "getSettings", "Datasets", "Get a settings kind")
-            .doc("The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer.")
+            .doc("The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer. The `evidence` kind needs `admin` on the dataset and includes `recorded`.")
             .see("settings")
             .json("200", "The kind.", "SettingsKind")
-            .errors(&[404]),
+            .errors(&[401, 403, 404, 503]),
     );
     p.add(kind_body(
         op(PATCH, "/$/settings/{ds}/{kind}", "patchSettings", "Datasets", "Change settings fields")
@@ -4543,7 +4544,7 @@ fn assist(p: &mut Paths) {
             .query("field", json!({ "type": "string" }), "A dotted field such as `historyDays` or `budget.perRequest`.")
             .header("If-Match", json!({ "type": "string" }), "The `etag` of the runtime layer the change is based on.")
             .json("200", "The kind after the change.", "SettingsKind")
-            .errors(&[400, 409, 412]),
+            .errors(&[400, 409, 412, 503]),
     );
     let server_body = |o: super::Op| {
         o.body(

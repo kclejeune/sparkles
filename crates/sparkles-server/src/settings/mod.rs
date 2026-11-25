@@ -17,6 +17,9 @@
 //! ([`secrets`]).
 
 pub mod connections;
+pub mod evidence;
+#[cfg(test)]
+mod evidence_tests;
 pub mod forms;
 pub mod http;
 pub mod merge;
@@ -31,6 +34,7 @@ mod server_tests;
 #[cfg(test)]
 mod tests;
 
+pub use evidence::EVIDENCE;
 pub use prefixes::PREFIXES;
 pub use server::MODELS;
 
@@ -39,7 +43,7 @@ use crate::state::{AppState, Dataset};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use merge::{at, forbidden_member, leaves, merged, parse_path, path_string, starts_with};
-use parking_lot::Mutex;
+use parking_lot::{ArcRwLockReadGuard, Mutex, RawRwLock, RwLock};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -206,8 +210,8 @@ pub static FORMS: Kind = Kind {
 };
 
 /// Every dataset-wide kind, in the order the answers list them.
-pub static KINDS: [&Kind; 7] = [
-    &ASSISTANT, &MEMORY, &INGEST, &PREFIXES, &GRAPHRAG, &PATHS, &FORMS,
+pub static KINDS: [&Kind; 8] = [
+    &ASSISTANT, &MEMORY, &INGEST, &PREFIXES, &GRAPHRAG, &PATHS, &FORMS, &EVIDENCE,
 ];
 
 /// The server-wide `notifications` kind (spec C21 §5): channels, routes and delivery,
@@ -580,9 +584,13 @@ fn parse_server(v: &Value) -> Result<ServerEntry, String> {
 fn parse_lock(s: &str) -> Result<(&'static str, Vec<String>), String> {
     let bad = || format!("locked: {s:?} is not a field such as \"assistant.send\"");
     let mut p = parse_path(s).ok_or_else(bad)?;
-    // `prefixes` locks every prefix, and `prefixes.NAME` one (spec C20 §3.3)
+    // `prefixes` locks every prefix, and `prefixes.NAME` one (spec C20 §3.3).
+    // `evidence` locks every evidence setting, and `evidence.FIELD` one (spec C25).
     if p.len() == 1 && p[0] == prefixes::NAME {
         return Ok((PREFIXES.name, Vec::new()));
+    }
+    if p.len() == 1 && p[0] == evidence::NAME {
+        return Ok((EVIDENCE.name, Vec::new()));
     }
     if p.len() < 2 {
         return Err(bad());
@@ -599,6 +607,8 @@ fn parse_lock(s: &str) -> Result<(&'static str, Vec<String>), String> {
                 "locked: {s:?} is not a prefix such as \"prefixes.ex\""
             ));
         }
+    } else if evidence::is(k) {
+        evidence::check_lock_path(&p[1..])?;
     } else if !k.members.contains(&p[1].as_str()) {
         return Err(format!("locked: {} has no member {:?}", k.name, p[1]));
     }
@@ -895,6 +905,8 @@ pub struct Settings {
     /// shared with the stores' prefix filters ([`prefixes::filter`]), so a start keeps
     /// the handle and a reload swaps what it holds
     declared: Arc<ArcSwap<Declared>>,
+    // Order declared settings reloads with evidence administration and publication.
+    evidence_declarations: Arc<RwLock<()>>,
     status: Mutex<FileStatus>,
     /// `--model-config` and its reads (§7)
     models_file: Option<PathBuf>,
@@ -953,6 +965,22 @@ impl Settings {
         self.declared.load_full()
     }
 
+    pub(crate) fn hold_evidence_declarations(&self) -> ArcRwLockReadGuard<RawRwLock, ()> {
+        // Evidence administration can hold a read guard while waiting on the store
+        // lock. A publisher already holding that lock must still be able to enter.
+        self.evidence_declarations.read_arc_recursive()
+    }
+
+    fn replace_declared(&self, d: Arc<Declared>) {
+        let _guard = self.evidence_declarations.write();
+        self.declared.store(d);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_declared_for_test(&self, d: Arc<Declared>) {
+        self.replace_declared(d);
+    }
+
     /// The store's filter for the prefixes that loaded data brings to the dataset
     /// `name` (spec C20 §3.4).
     pub fn prefix_filter(&self, name: &str) -> sparkles::store::PrefixFilter {
@@ -969,7 +997,7 @@ impl Settings {
         };
         match read_file(path, Providers::Checked(models)) {
             Ok(d) => {
-                self.declared.store(Arc::new(d));
+                self.replace_declared(Arc::new(d));
                 let mut s = self.status.lock();
                 s.read_at = Some(now());
                 s.error = None;
@@ -1055,6 +1083,9 @@ pub fn runtime(st: &AppState, ds: &Dataset, kind: &Kind) -> anyhow::Result<Value
     let ds = main.as_deref().unwrap_or(ds);
     if prefixes::is(kind) {
         return Ok(prefixes::runtime_layer(ds));
+    }
+    if evidence::is(kind) {
+        return evidence::runtime_layer(st, ds);
     }
     let v = crate::assist::read_file(st, ds, kind.file)?;
     Ok(match v {
@@ -1147,13 +1178,22 @@ pub fn effective_at<T: Typed>(dir: &Path, kind: &'static Kind) -> anyhow::Result
     )?))
 }
 
-/// After a reload, log the effective objects that are no longer valid (§4.3).
+/// After a reload, log the effective objects that are no longer valid (§4.3) and any
+/// datasets whose declared and recorded evidence settings now differ.
 pub fn log_invalid(st: &AppState) {
     for ds in st.datasets().values() {
         for k in KINDS {
             if let Err(e) = resolved(st, ds, k).status {
                 tracing::warn!(dataset = %ds.name, kind = k.name, "settings are not valid: {e}");
             }
+        }
+        if let Ok(state) = evidence::inspect(st, ds)
+            && state.drift
+        {
+            tracing::warn!(
+                dataset = %ds.name,
+                "declared and recorded evidence settings differ; typed evidence operations are refused until reconciled"
+            );
         }
     }
 }

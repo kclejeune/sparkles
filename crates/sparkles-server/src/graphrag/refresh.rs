@@ -461,18 +461,22 @@ pub(crate) fn due_reason(
     // the policy the reports read under: enabling, switching or removing it, or a new
     // version, rewrites every report (spec C25, "Reports on accepted evidence")
     let evidence = match &settings.review_policy {
-        Some(name) => Some(
-            super::evidence::Evidence::admit(
-                ds,
-                Some(name),
-                None,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Default::default(),
-                &ds.dataset.query_options(),
+        Some(name) => {
+            crate::settings::evidence::require_reconciled(st, ds)
+                .map_err(|e| super::evidence::engine(e).to_string())?;
+            Some(
+                super::evidence::Evidence::admit(
+                    ds,
+                    Some(name),
+                    None,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    Default::default(),
+                    &ds.dataset.query_options(),
+                )
+                .map_err(|e| e.to_string())?
+                .expect("a named policy"),
             )
-            .map_err(|e| e.to_string())?
-            .expect("a named policy"),
-        ),
+        }
         None => None,
     };
     if let Some(e) = &evidence {

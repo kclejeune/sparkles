@@ -179,6 +179,7 @@ struct Prepared {
     logical: Arc<crate::state::Dataset>,
     options: ReviewOptions,
     control: Control,
+    fence: Arc<CallerFence>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -211,15 +212,19 @@ fn prepare(
     options.message = message.map(Arc::from);
     options.author = crate::http::author(p);
     options.write = opts.graphs.clone();
-    options.authority = Some(Arc::new(CallerFence {
+    let drift = crate::settings::evidence::DriftFence::capture(st, &main)?;
+    let fence = Arc::new(CallerFence {
         st: st.clone(),
         p: p.clone(),
-    }));
+        drift,
+    });
+    options.authority = Some(fence.clone());
     Ok(Prepared {
         main,
         logical,
         options,
         control,
+        fence,
     })
 }
 
@@ -310,6 +315,7 @@ pub(super) fn review_now(
         "mapRevision": reviewed.map_revision.as_ref().map(|m| m.as_str()),
     });
     preview_json(&mut out, reviewed.preview.as_deref());
+    prepared.fence.check_uncommitted(reviewed.committed)?;
     Ok(out)
 }
 
@@ -373,6 +379,7 @@ pub(super) fn withdraw_now(
         "changed": changed_json(&withdrawn.changed),
     });
     preview_json(&mut out, withdrawn.preview.as_deref());
+    prepared.fence.check_uncommitted(withdrawn.committed)?;
     Ok(out)
 }
 

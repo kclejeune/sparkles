@@ -2242,6 +2242,8 @@ impl Tools<'_> {
                 .ok_or_else(|| ToolError::new("unknown-dataset", 404, "the dataset is gone"))?,
             None => ds.clone(),
         };
+        let drift = crate::settings::evidence::DriftFence::capture(&self.server.state, &main)
+            .map_err(|e| ctx.engine(e))?;
         let control = sparkles::task::Control {
             deadline: Some(deadline),
             ..sparkles::task::Control::with_cancel(self.call.cancel.clone())
@@ -2259,7 +2261,7 @@ impl Tools<'_> {
         }
         .and_then(|prep| prep.with_selection_limit(VIEW_BYTES))
         .map_err(|e| ctx.engine(e))?;
-        main.dataset
+        let view = main.dataset
             .store()
             .evidence_view_with_branch(ds.dataset.store(), &sel, &preparation)
             .map_err(|e| match &e {
@@ -2269,7 +2271,10 @@ impl Tools<'_> {
                     )
                 }
                 _ => ctx.engine(e),
-            })
+            });
+        let _declared = self.server.state.settings.hold_evidence_declarations();
+        drift.check(&self.server.state).map_err(|e| ctx.engine(e))?;
+        view
     }
 }
 

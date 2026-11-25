@@ -105,6 +105,7 @@ fn target(r: &Run, req: &Request) -> Result<Target, Failed> {
             ),
         ));
     }
+    crate::settings::evidence::require_reconciled(st, &main).map_err(|e| api(e.into()))?;
     let status = sparkles::evidence::settings(&main.dataset).map_err(|e| api(e.into()))?;
     let settings = status.settings;
     if !settings.enabled {
@@ -784,7 +785,10 @@ fn publish(
         options.message = Some(Arc::from(message.as_str()));
         options.author = crate::http::author(&p);
         options.write = write_view(r, &t.main, &t.logical, &t.branch);
-        options.authority = Some(crate::evidence::caller_fence(st.clone(), p.clone()));
+        options.authority = Some(
+            crate::evidence::caller_fence(st.clone(), &t.main, p.clone())
+                .map_err(|e| api(e.into()))?,
+        );
         if let Some(pl) = &planned {
             options.if_head = Some(pl.head);
             options.ordinary = Some(pl.changes.clone());

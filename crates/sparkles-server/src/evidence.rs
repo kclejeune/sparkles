@@ -73,8 +73,8 @@ async fn get_settings(State(st): St, Path(name): Path<String>) -> ApiResult<Json
 }
 
 /// `PUT /$/evidence/{ds}/settings`: record complete settings. A configuration that
-/// would stop protecting a graph, or that races with another registry change, is a
-/// `409` that writes nothing.
+/// would stop protecting a graph, change a field locked by `serve --settings`, or race
+/// with another registry change is a `409` that writes nothing.
 async fn put_settings(
     State(st): St,
     Path(name): Path<String>,
@@ -87,10 +87,11 @@ async fn put_settings(
     blocking(move || {
         let control = Control::none();
         let settings = sparkles::evidence::parse_settings(&bytes, &control)?;
-        body(sparkles::evidence::configure(
-            &ds.dataset,
-            &settings,
-            &control,
+        let lock = st.settings.write_lock(&ds.name, &crate::settings::EVIDENCE);
+        let _g = lock.lock();
+        let _declared = st.settings.hold_evidence_declarations();
+        body(crate::settings::evidence::configure_complete(
+            &st, &ds, &settings, &control,
         )?)
     })
     .await
@@ -103,7 +104,8 @@ struct Detach {
 }
 
 /// `POST /$/evidence/{ds}/detach` with `{"graph": IRI}`: ordinary writes can change the
-/// graph until the settings are recorded again.
+/// graph until the settings are recorded again. Refused with `409 locked-by-config` when
+/// `serve --settings` locks evidence enabled and locks a role or policy requiring `graph`.
 async fn detach(
     State(st): St,
     Path(name): Path<String>,
@@ -119,7 +121,14 @@ async fn detach(
         )
     })?;
     let ds = dataset(&st, &name)?;
-    blocking(move || body(sparkles::evidence::detach(&ds.dataset, &request.graph)?)).await
+    blocking(move || {
+        let lock = st.settings.write_lock(&ds.name, &crate::settings::EVIDENCE);
+        let _g = lock.lock();
+        let _declared = st.settings.hold_evidence_declarations();
+        crate::settings::evidence::check_detach_locks(&st, &ds, &request.graph)?;
+        body(sparkles::evidence::detach(&ds.dataset, &request.graph)?)
+    })
+    .await
 }
 
 // ------------------------------------------------------------------ holds ------
@@ -744,6 +753,8 @@ impl Execution {
 
 /// One typed operation shared by HTTP and MCP. Both transports perform their endpoint
 /// check; record access and protected writes are checked here by the existing writer.
+/// Refuses with `409 evidence-settings-drift` while the declared and recorded evidence
+/// settings differ.
 pub(crate) fn execute(
     operation: &str,
     st: Arc<AppState>,
@@ -754,15 +765,29 @@ pub(crate) fn execute(
 ) -> ApiResult<J> {
     // Keep admission ownership even when the caller drops its transport future.
     let _grant = execution.grant.clone();
-    match operation {
-        "propose" => claims::propose_now(st, name, principal, bytes, execution),
-        "review" => review::review_now(st, name, principal, bytes, execution),
-        "withdraw" => review::withdraw_now(st, name, principal, bytes, execution),
-        "resolve" => resolve_now(st, name, principal, bytes, execution),
-        "identities" => review::identities_now(st, name, principal, bytes, execution),
-        "dependents" => review::dependents_now(st, name, principal, bytes, execution),
-        _ => unreachable!("unregistered evidence operation"),
+    if st.read_only && matches!(operation, "propose" | "review" | "withdraw") {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
+    let main = crate::http::main_dataset(&st, &name)?;
+    if matches!(operation, "propose" | "review" | "withdraw") {
+        crate::settings::evidence::require_reconciled(&st, &main)?;
+        return match operation {
+            "propose" => claims::propose_now(st, name, principal, bytes, execution),
+            "review" => review::review_now(st, name, principal, bytes, execution),
+            "withdraw" => review::withdraw_now(st, name, principal, bytes, execution),
+            _ => unreachable!("unregistered evidence write"),
+        };
+    }
+    let fence = crate::settings::evidence::DriftFence::capture(&st, &main)?;
+    let result = match operation {
+        "resolve" => resolve_now(st.clone(), name, principal, bytes, execution),
+        "identities" => review::identities_now(st.clone(), name, principal, bytes, execution),
+        "dependents" => review::dependents_now(st.clone(), name, principal, bytes, execution),
+        _ => unreachable!("unregistered evidence read"),
+    };
+    let _declared = st.settings.hold_evidence_declarations();
+    fence.check(&st)?;
+    result
 }
 
 async fn run_http(

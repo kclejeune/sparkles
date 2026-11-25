@@ -13405,6 +13405,31 @@ profile does not protect is a `404`. A detach refuses with `503 managed-unavaila
 and changes nothing when this build cannot read the recorded settings. A registry that this build cannot enforce answers
 `503 managed-unavailable` on all three routes.
 
+With [`serve --settings`](#settings), put `evidence` under `defaults` or a named
+dataset. Lock the entire kind with `evidence`, a field such as `evidence.sourceRecords`,
+a policy such as `evidence.policies.advisories`, or a field such as
+`evidence.matchingPolicies.people.output`. `GET /$/settings/{ds}/evidence` needs
+`admin` and returns the layers alongside `recorded`, which includes the canonical
+settings, digest, revision, managed and detached graphs, and the `drift` flag.
+The dataset-wide settings listing includes this kind only for dataset administrators.
+
+Startup and SIGHUP resolve the declarations without changing the recorded settings or
+graph protection. Typed evidence operations, including recall and ask with a review
+or matching policy, answer `409 evidence-settings-drift` while the effective and
+recorded values disagree. Claims-mode ingestion and GraphRAG builds and refreshes
+with a review policy also refuse drift in their task results. A valid disabled
+declaration for a dataset that never configured evidence supplies defaults for
+future enablement and reports no drift.
+Record the effective settings with `DELETE /$/settings/{ds}/evidence` to clear runtime
+overrides and apply the declared values, or use `PUT` or `PATCH` on the layered route
+to reconcile while setting permitted overrides. A `PATCH` with a named policy set to
+`null` clears its runtime override and reveals any declared policy. The complete settings endpoint also reconciles and
+records any differences from the declared values as runtime overrides. Both routes
+refuse changes that violate the locks or remove a protected graph. Detaching a graph
+returns `409 locked-by-config` when the declaration locks evidence enabled and
+locks a role or policy that requires that graph. Dataset backups keep the runtime
+overrides for use when the restored dataset has the same declarations.
+
 ### Evidence holds
 
 An evidence reference names a commit of a dataset branch by the branch's identity. A
@@ -14564,8 +14589,8 @@ figures of the runs and reviews since the server started.
 
 ### Settings
 
-A dataset's `assistant`, `memory`, `ingest`, `prefixes`, `graphrag`, `paths` and `forms`
-settings are settings kinds. The effective value of a kind is computed from four layers, and a
+A dataset's `assistant`, `memory`, `ingest`, `prefixes`, `graphrag`, `paths`, `forms`
+and [`evidence`](#evidence-settings) settings are settings kinds. The effective value of a kind is computed from four layers, and a
 later layer overrides an earlier one.
 
 1. The built-in defaults of the kind.
@@ -14621,7 +14646,7 @@ not define or a secret that no provider uses. The other subcommands of `sparkles
 |---|---|---|---|
 | GET | `/$/settings` | `server-admin` | The settings file's `path`, `readAt`, the last reload `error` and `errorAt`, the `declared` dataset names, the `unmatched` names that match no dataset, the dataset-wide `kinds`, the `serverKinds`, and the same report for the model configuration under `models`. |
 | GET | `/$/settings/{ds}` | `read` | `{dataset, kinds}`, with each kind as below. |
-| GET | `/$/settings/{ds}/{kind}` | `read` | The kind, with an `ETag` of its runtime layer. |
+| GET | `/$/settings/{ds}/{kind}` | `read` or `admin` for `evidence` | The kind, with an `ETag` of its runtime layer. |
 | PATCH | `/$/settings/{ds}/{kind}` | `admin` | Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. |
 | PUT | `/$/settings/{ds}/{kind}` | `admin` | Makes the effective object equal to the body. A member the body leaves out takes its built-in default, and a locked field it leaves out keeps its value. The runtime layer keeps the fields where the body differs from the declared values and the defaults, with `null` for a declared member the body removes. |
 | DELETE | `/$/settings/{ds}/{kind}[?field=PATH]` | `admin` | Clears the runtime layer, or one field of it. |

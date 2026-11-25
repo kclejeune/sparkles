@@ -705,3 +705,135 @@ graphs = ["http://ex.org/src/*"]
     assert!(!m.requests().is_empty());
     assert_eq!(head("wiki"), at + 1);
 }
+
+#[tokio::test]
+async fn evidence_settings_require_admin_and_drift_does_not_disclose() {
+    let s = proposal_server();
+    // Replace declared settings on `s.state` with a settings file that drifts from
+    // what `proposal_server()` recorded (adds a second source graph).
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    std::fs::write(
+        &f,
+        serde_json::json!({
+            "datasets": {
+                "ev": {
+                    "evidence": {
+                        "enabled": true,
+                        "sourceRecords": ["urn:ev:sources", "urn:ev:secret-sources"],
+                        "proposals": ["urn:ev:claims"]
+                    },
+                    "locked": ["evidence.sourceRecords"]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let settings = crate::settings::Settings::load(&f, None).unwrap();
+    let d = settings.declared();
+    // Swap the declared settings directly onto the existing server state.
+    s.state.settings.replace_declared_for_test(d);
+
+    let evw = basic("evw", "evw-pw");
+    let alice = b("alice");
+
+    // Non-admin writer cannot read GET /$/settings/ev/evidence (C25 decision 7).
+    let r = call(
+        &s.app,
+        "GET",
+        "/$/settings/ev/evidence",
+        &[("authorization", &evw)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+
+    // Non-admin GET /$/settings/ev omits the evidence kind.
+    let r = call(
+        &s.app,
+        "GET",
+        "/$/settings/ev",
+        &[("authorization", &evw)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.json()["kinds"].get("evidence").is_none(), "{}", r.text());
+
+    // Admin alice reads GET /$/settings/ev/evidence and sees drift: true.
+    let r = call(
+        &s.app,
+        "GET",
+        "/$/settings/ev/evidence",
+        &[("authorization", &alice)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["recorded"]["drift"], true);
+
+    // Admin GET /$/settings/ev includes evidence.
+    let r = call(
+        &s.app,
+        "GET",
+        "/$/settings/ev",
+        &[("authorization", &alice)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.json()["kinds"].get("evidence").is_some(), "{}", r.text());
+
+    // Writer evw gets 409 evidence-settings-drift without leaking secret graph IRIs.
+    let r = propose(&s, &evw, &revision_and_claim("occ-drift")).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["code"], "evidence-settings-drift");
+    assert!(!r.text().contains("urn:ev:secret-sources"), "{}", r.text());
+    assert!(!r.text().contains("urn:ev:sources"), "{}", r.text());
+
+    // Unauthorized user bob still gets 403/404, not evidence-settings-drift.
+    let r = propose(&s, &b("bob"), &revision_and_claim("occ-unauth")).await;
+    assert!(
+        matches!(r.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+        "{}: {}",
+        r.status,
+        r.text()
+    );
+
+    // Keep tempdir alive until end of test.
+    drop(dir);
+}
+
+#[tokio::test]
+async fn evidence_settings_reads_use_admin_middleware() {
+    let s = build(super::reader_fixture());
+    let admin = b("alice");
+    let reader = bearer(&tok('R'));
+    for path in [
+        "/$/settings/public/evidence",
+        "/$/settings/public/%65vidence",
+    ] {
+        for method in ["GET", "HEAD"] {
+            let r = call(&s.app, method, path, &[], "").await;
+            assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+            assert!(!r.all("www-authenticate").is_empty());
+            let r = call(&s.app, method, path, &[("authorization", &reader)], "").await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+            assert!(
+                r.all("www-authenticate")
+                    .iter()
+                    .any(|h| h.contains("insufficient_scope"))
+            );
+            let r = call(
+                &s.app,
+                method,
+                path,
+                &[("authorization", &admin), ("sec-fetch-site", "cross-site")],
+                "",
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+        }
+    }
+}
