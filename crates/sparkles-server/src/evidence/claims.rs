@@ -859,6 +859,23 @@ pub(super) struct CallerFence {
 }
 
 impl sparkles::evidence::AuthorityFence for CallerFence {
+    fn enter_source_holds(
+        &self,
+        targets: &[&sparkles::Dataset],
+    ) -> sparkles::Result<Box<dyn std::any::Any>> {
+        let guard = self.enter()?;
+        if targets
+            .iter()
+            .any(|ds| !ds.name().is_some_and(|name| self.p.admin_everywhere(name)))
+        {
+            return Err(sparkles::Error::NotPermitted(
+                "foreign source holds need admin on every branch and graph of the referenced dataset"
+                    .into(),
+            ));
+        }
+        Ok(guard)
+    }
+
     fn enter(&self) -> sparkles::Result<Box<dyn std::any::Any>> {
         #[cfg(feature = "auth")]
         if let (Some(auth), Some(epoch)) = (&self.st.auth, self.p.access_epoch()) {

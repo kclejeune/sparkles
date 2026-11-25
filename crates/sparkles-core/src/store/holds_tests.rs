@@ -667,10 +667,9 @@ fn a_cross_dataset_hold_writes_format_2_reopens_and_checks_origin_conflicts() {
     let origin = id(99);
     let other_origin = id(100);
     // self dataset id is normalized to None and stays format 1
-    let local = s
-        .acquire_hold_for(EV, id(1), &[at(&s, 1)], Some(s.dataset_id()))
+    s.acquire_hold_for(EV, id(1), &[at(&s, 1)], Some(s.dataset_id()))
         .unwrap();
-    assert_eq!(local.hold.for_dataset, None);
+    assert_eq!(s.source_hold_details().unwrap()[0].for_dataset, None);
     let v: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join(crate::holds::FILE)).unwrap()).unwrap();
     assert_eq!(v["format"], 1);
@@ -679,7 +678,10 @@ fn a_cross_dataset_hold_writes_format_2_reopens_and_checks_origin_conflicts() {
         .acquire_hold_for(EV, id(2), &[at(&s, 2)], Some(origin))
         .unwrap();
     assert!(foreign.created);
-    assert_eq!(foreign.hold.for_dataset, Some(origin));
+    assert_eq!(
+        s.source_hold_details().unwrap()[1].for_dataset,
+        Some(origin)
+    );
     let v: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join(crate::holds::FILE)).unwrap()).unwrap();
     assert_eq!(v["format"], 2);
@@ -714,7 +716,7 @@ fn a_cross_dataset_hold_writes_format_2_reopens_and_checks_origin_conflicts() {
     s.compact().unwrap();
     drop(s);
     let s = Store::open(&root, StoreOptions::default()).unwrap();
-    let holds = s.source_holds().unwrap();
+    let holds = s.source_hold_details().unwrap();
     assert_eq!(holds.len(), 2);
     assert_eq!(holds[0].for_dataset, None);
     assert_eq!(holds[1].for_dataset, Some(origin));

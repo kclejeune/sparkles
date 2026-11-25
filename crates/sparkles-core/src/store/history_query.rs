@@ -368,6 +368,18 @@ impl Store {
         log.query(&q, head.seq)
     }
 
+    /// Read commit or time bounds through the published head without taking the
+    /// writer. Any staged or unpublished changes are beyond the log's requested bound.
+    #[doc(hidden)]
+    pub fn published_history_changes(&self, q: &HistoryQuery) -> Result<HistoryResult> {
+        let Some(log) = &self.changelog else {
+            return Err(Error::HistoryUnsupported(
+                "this store has no change log".into(),
+            ));
+        };
+        log.query(q, self.snapshot().commit)
+    }
+
     /// The commit a selector names, without asking that its state be readable.
     fn resolve_seq(&self, a: &crate::history::At, head: CommitInfo) -> Result<u64> {
         use crate::history::At;

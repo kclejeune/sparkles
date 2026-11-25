@@ -74,13 +74,14 @@ pub struct SourceHold {
     pub created_ms: i64,
     /// The held commits as the owner named them, sorted and distinct.
     pub commits: Vec<CommitRef>,
-    /// The dataset whose operation acquired this hold, when it differs from this
-    /// dataset. `None` for holds of this dataset itself.
-    #[serde(
-        rename = "forDatasetId",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+}
+
+/// A source hold with the identity of its originating dataset when it is foreign.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SourceHoldInfo {
+    #[serde(flatten)]
+    pub hold: SourceHold,
+    #[serde(rename = "forDatasetId", skip_serializing_if = "Option::is_none")]
     pub for_dataset: Option<uuid::Uuid>,
 }
 
@@ -88,6 +89,7 @@ pub struct SourceHold {
 #[derive(Clone, Debug)]
 pub(crate) struct Record {
     pub hold: SourceHold,
+    pub for_dataset: Option<uuid::Uuid>,
     pub stores: Vec<uuid::Uuid>,
     /// Raised by every acquisition of the hold, the repeated ones too, so that a
     /// reconciliation releases only a hold nobody acquired since it looked. In memory
@@ -310,7 +312,7 @@ struct CommitFile {
 pub(crate) fn encode(dataset_id: uuid::Uuid, records: &BTreeMap<uuid::Uuid, Record>) -> Vec<u8> {
     let has_foreign = records
         .values()
-        .any(|r| r.hold.for_dataset.is_some_and(|d| d != dataset_id));
+        .any(|r| r.for_dataset.is_some_and(|d| d != dataset_id));
     let f = File {
         format: if has_foreign { FORMAT } else { 1 },
         dataset_id,
@@ -320,7 +322,7 @@ pub(crate) fn encode(dataset_id: uuid::Uuid, records: &BTreeMap<uuid::Uuid, Reco
                 id: r.hold.id,
                 owner: r.hold.owner.as_str().to_string(),
                 created: crate::commit::rfc3339_ms(r.hold.created_ms),
-                for_dataset_id: r.hold.for_dataset.filter(|&d| d != dataset_id),
+                for_dataset_id: r.for_dataset.filter(|&d| d != dataset_id),
                 commits: r
                     .hold
                     .commits
@@ -404,8 +406,8 @@ pub(crate) fn decode(bytes: &[u8], dataset_id: uuid::Uuid) -> Result<BTreeMap<uu
                 owner,
                 created_ms,
                 commits,
-                for_dataset: h.for_dataset_id,
             },
+            for_dataset: h.for_dataset_id,
             stores,
             touch: 0,
             acquired_ms: created_ms,
@@ -479,8 +481,8 @@ mod tests {
                         seq: *s,
                     })
                     .collect(),
-                for_dataset: for_dataset.map(uuid::Uuid::from_u128),
             },
+            for_dataset: for_dataset.map(uuid::Uuid::from_u128),
             stores: commits
                 .iter()
                 .map(|(_, _, s)| uuid::Uuid::from_u128(*s))
@@ -528,11 +530,8 @@ mod tests {
         assert!(v2["holds"][0].get("forDatasetId").is_none());
         assert_eq!(v2["holds"][1]["forDatasetId"], other.to_string());
         let back2 = decode(&bytes2, ds).unwrap();
-        assert_eq!(
-            back2[&uuid::Uuid::from_u128(2)].hold.for_dataset,
-            Some(other)
-        );
-        assert_eq!(back2[&uuid::Uuid::from_u128(1)].hold.for_dataset, None);
+        assert_eq!(back2[&uuid::Uuid::from_u128(2)].for_dataset, Some(other));
+        assert_eq!(back2[&uuid::Uuid::from_u128(1)].for_dataset, None);
     }
 
     #[test]

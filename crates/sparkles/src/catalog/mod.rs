@@ -214,7 +214,7 @@ pub(crate) struct Inner {
     caches: Option<SharedCaches>,
     /// the pool its datasets' queries take grants from
     pool: Option<Arc<crate::sparql::pool::QueryPool>>,
-    entries: RwLock<BTreeMap<String, Entry>>,
+    entries: Arc<RwLock<BTreeMap<String, Entry>>>,
     reservations: Mutex<BTreeMap<String, (ReservationKind, String)>>,
     /// Persistent datasets taken out of `entries` for an in-place restore, or left
     /// closed by a rename whose rollback could not reopen them.
@@ -241,6 +241,17 @@ pub(crate) struct Inner {
 #[derive(Clone)]
 pub struct Catalog {
     pub(crate) inner: Arc<Inner>,
+}
+
+pub(crate) struct CatalogIdentities(
+    parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, BTreeMap<String, Entry>>,
+);
+
+impl CatalogIdentities {
+    pub(crate) fn matches(&self, dataset: &Dataset) -> bool {
+        Catalog::unique_entry(&self.0, dataset.dataset_id())
+            .is_some_and(|entry| std::ptr::eq(dataset.store(), entry.dataset.store()))
+    }
 }
 
 /// A reservation releases its name on drop, including cancellation or failure.
@@ -322,7 +333,7 @@ impl Catalog {
                     .pool_bytes
                     .map(crate::sparql::pool::QueryPool::new),
                 options: RwLock::new(options),
-                entries: RwLock::new(BTreeMap::new()),
+                entries: Arc::new(RwLock::new(BTreeMap::new())),
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
                 refused: Mutex::new(BTreeMap::new()),
@@ -511,7 +522,7 @@ impl Catalog {
                     .pool_bytes
                     .map(crate::sparql::pool::QueryPool::new),
                 options: RwLock::new(options),
-                entries: RwLock::new(BTreeMap::new()),
+                entries: Arc::new(RwLock::new(BTreeMap::new())),
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
                 refused: Mutex::new(BTreeMap::new()),
@@ -674,18 +685,34 @@ impl Catalog {
         Self::unique_entry(&self.inner.entries.read(), id).map(|entry| entry.dataset.clone())
     }
 
-    /// Check that each dataset is the sole open instance of its identity. Returns false
-    /// if the registry is busy, so callers under a publication lock never wait for it.
-    pub(crate) fn matches_unique_datasets<'a>(
+    /// Pin the exact registered handles until the caller finishes publication.
+    /// A busy registry is retryable, unlike an absent or ambiguous identity.
+    pub(crate) fn pin_dataset_identities<'a>(
         &self,
         datasets: impl IntoIterator<Item = &'a Dataset>,
-    ) -> bool {
-        self.inner.entries.try_read().is_some_and(|entries| {
-            datasets.into_iter().all(|ds| {
-                Self::unique_entry(&entries, ds.dataset_id())
-                    .is_some_and(|entry| std::ptr::eq(ds.store(), entry.dataset.store()))
-            })
-        })
+        control: &crate::task::Control,
+        no_wait: bool,
+    ) -> Result<Option<CatalogIdentities>> {
+        let entries = loop {
+            control.check()?;
+            let entries = if no_wait {
+                self.inner.entries.try_read_arc()
+            } else {
+                self.inner
+                    .entries
+                    .try_read_arc_for(std::time::Duration::from_millis(10))
+            };
+            if let Some(entries) = entries {
+                break CatalogIdentities(entries);
+            }
+            if no_wait {
+                return Err(Error::WriterBusy);
+            }
+        };
+        Ok(datasets
+            .into_iter()
+            .all(|ds| entries.matches(ds))
+            .then_some(entries))
     }
 
     fn unique_entry(entries: &BTreeMap<String, Entry>, id: Uuid) -> Option<&Entry> {
@@ -696,7 +723,7 @@ impl Catalog {
         matches.next().is_none().then_some(entry)
     }
 
-    /// Clone an already registered dataset by exact identity with controlled waiting.
+    /// Clone the unique registered dataset by exact identity with controlled waiting.
     /// This never opens a dataset and grants no permission to read it.
     pub fn try_get_by_id(
         &self,
@@ -718,8 +745,10 @@ impl Catalog {
                 for entry in entries.values() {
                     options.check()?;
                     if entry.dataset.dataset_id() == id {
+                        if dataset.is_some() {
+                            return Ok(None);
+                        }
                         dataset = Some(entry.dataset.clone());
-                        break;
                     }
                 }
                 options.check()?;

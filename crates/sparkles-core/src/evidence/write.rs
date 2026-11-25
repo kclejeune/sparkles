@@ -171,9 +171,15 @@ pub struct PlannedRecord {
 /// A stored fact commit that the operation keeps readable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HeldCommit {
-    pub dataset: Uuid,
     pub branch: Uuid,
     pub commit: u64,
+}
+
+/// A planned source hold commit and the dataset that serves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DatasetHeldCommit {
+    pub dataset: Uuid,
+    pub commit: HeldCommit,
 }
 
 /// A proposal's records with their identities and immutable content.
@@ -187,9 +193,9 @@ pub struct Plan {
     pub records: Vec<PlannedRecord>,
     /// The distinct graphs the operation writes, sorted.
     pub graphs: Vec<NamedNode>,
-    /// The stored facts that the operation's references name, sorted by dataset, branch
-    /// and commit.
+    /// The local stored facts the operation holds, sorted by branch and commit.
     pub held: Vec<HeldCommit>,
+    held_in: Vec<DatasetHeldCommit>,
     principal: NamedNode,
     idempotency_key: Option<String>,
     /// `<source> a ev:Source` in the source-record graph.
@@ -670,10 +676,12 @@ pub fn plan<'i>(
         control.check()?;
         let (scope, mut r_fields): (String, Vec<(NamedNode, Term)>) = match &reference.target {
             EvidenceRefTarget::StoredFact(fact) => {
-                held.push(HeldCommit {
+                held.push(DatasetHeldCommit {
                     dataset: fact.dataset,
-                    branch: fact.branch,
-                    commit: fact.commit,
+                    commit: HeldCommit {
+                        branch: fact.branch,
+                        commit: fact.commit,
+                    },
                 });
                 let mut fields = vec![
                     (ev("datasetId"), string(&fact.dataset.to_string())),
@@ -958,7 +966,12 @@ pub fn plan<'i>(
         payload_digest,
         records,
         graphs,
-        held,
+        held: held
+            .iter()
+            .filter(|c| c.dataset == dataset)
+            .map(|c| c.commit)
+            .collect(),
+        held_in: held,
         principal: options.principal.clone(),
         idempotency_key: options.idempotency_key.map(str::to_owned),
         sources,
@@ -974,7 +987,29 @@ fn base64_literal(bytes: &[u8]) -> Term {
     .into()
 }
 
+/// Changes to these predicates can alter an operation's hold account.
+pub fn operation_hold_predicates() -> [NamedNode; 2] {
+    [rdf_type(), ev("sourceHoldSets")]
+}
+
+fn hold_set_digest(dataset: Uuid, commits: impl IntoIterator<Item = HeldCommit>) -> String {
+    use sha2::Sha256;
+    let mut hash = Sha256::new();
+    hash.update(b"sparkles-evidence-hold-set-v1\0");
+    hash.update(dataset.as_bytes());
+    for commit in commits {
+        hash.update(commit.branch.as_bytes());
+        hash.update(commit.commit.to_be_bytes());
+    }
+    Sha256Digest(hash.finalize().into()).to_string()
+}
+
 impl Plan {
+    /// Every held commit, sorted by dataset, branch and commit.
+    pub fn held_in(&self) -> &[DatasetHeldCommit] {
+        &self.held_in
+    }
+
     /// Every quad the operation publishes, given the commit's `stamp`, the protection
     /// nonce of each graph it writes, and the hold it acquired. `skip[i]` leaves out the
     /// record `records[i]`, which an earlier operation already published with equal
@@ -1002,6 +1037,23 @@ impl Plan {
             &protection,
             skip,
         )?;
+        let hold_sets = if hold.is_some() {
+            self.held_in
+                .chunk_by(|a, b| a.dataset == b.dataset)
+                .map(|set| hold_set_digest(set[0].dataset, set.iter().map(|c| c.commit)))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            String::new()
+        };
+        for graph in &self.graphs {
+            out.push(Quad::new(
+                self.operation_iri.clone(),
+                ev("sourceHoldSets"),
+                string(&hold_sets),
+                GraphName::NamedNode(graph.clone()),
+            ));
+        }
         if let Some(g) = &self.source_graph {
             for s in &self.sources {
                 out.push(Quad::new(
@@ -1150,10 +1202,14 @@ pub struct RecordedOperation {
     pub payload_digest: Option<Sha256Digest>,
     pub branch: Option<Uuid>,
     pub commit: Option<u64>,
-    /// The source hold recorded on the operation, when it has one.
-    pub source_hold: Option<Uuid>,
     /// When the operation published, as recorded.
     pub ended_at: Option<Literal>,
+}
+
+/// A recorded operation and the hold ID reported in its original receipt.
+pub struct RecordedOperationDetails {
+    pub operation: RecordedOperation,
+    pub source_hold: Option<Uuid>,
 }
 
 /// A record identity found in a snapshot.
@@ -1600,13 +1656,89 @@ impl<'a> Reads<'a> {
         Ok(found)
     }
 
+    /// Whether any description of the operation can account for this hold. Older
+    /// receipts have no hold set metadata and are kept conservatively.
+    pub fn describes_hold(
+        &mut self,
+        op: &NamedNode,
+        dataset: Uuid,
+        commits: &[crate::branch::CommitRef],
+    ) -> Result<bool> {
+        let (Some(s), Some(p), Some(o)) = (
+            self.id(op.as_str())?,
+            self.id(RDF_TYPE)?,
+            self.id(&format!("{EV}Operation"))?,
+        ) else {
+            return Ok(false);
+        };
+        let marker = self.id(&format!("{EV}sourceHoldSets"))?;
+        let digest = hold_set_digest(
+            dataset,
+            commits.iter().map(|c| HeldCommit {
+                branch: c.branch_id,
+                commit: c.seq,
+            }),
+        );
+        let mut keep = false;
+        self.preparation
+            .scan(self.snap, Perm::Spo, &[s.0, p.0, o.0], |q| {
+                let Some(marker) = marker else {
+                    keep = true;
+                    return Ok(false);
+                };
+                let mut sets = None;
+                let mut multiple = false;
+                self.preparation.scan(
+                    self.snap,
+                    Perm::Gspo,
+                    &[q[crate::index::G].0, s.0, marker.0],
+                    |q| {
+                        multiple = sets.replace(q[2]).is_some();
+                        Ok(!multiple)
+                    },
+                )?;
+                keep = match sets {
+                    Some(sets) if !multiple => {
+                        self.preparation.with_term(self.snap, sets, |term| {
+                            Ok(match term {
+                                Some(Term::Literal(value))
+                                    if value.datatype() == oxrdf::vocab::xsd::STRING =>
+                                {
+                                    let value = value.value();
+                                    !value.is_empty()
+                                        && value.split(',').any(|set| {
+                                            set == digest || set.parse::<Sha256Digest>().is_err()
+                                        })
+                                }
+                                _ => true,
+                            })
+                        })?
+                    }
+                    _ => true,
+                };
+                Ok(!keep)
+            })?;
+        Ok(keep)
+    }
+
     /// The operation `op` as `graphs` describe it, `None` when none does.
     pub fn operation(
         &mut self,
         op: &NamedNode,
         graphs: &[ProtectedGraph],
     ) -> Result<Option<RecordedOperation>> {
-        let mut found: Option<RecordedOperation> = None;
+        Ok(self
+            .operation_details(op, graphs)?
+            .map(|read| read.operation))
+    }
+
+    /// The recorded operation and original source hold, if any.
+    pub fn operation_details(
+        &mut self,
+        op: &NamedNode,
+        graphs: &[ProtectedGraph],
+    ) -> Result<Option<RecordedOperationDetails>> {
+        let mut found: Option<RecordedOperationDetails> = None;
         for (g, nonce) in graphs {
             self.preparation.check()?;
             if !self.is_operation(op.as_str(), g.as_str())? {
@@ -1637,20 +1769,25 @@ impl<'a> Reads<'a> {
                 payload_digest,
                 branch,
                 commit,
-                source_hold,
                 ended_at,
             };
             found = Some(match found {
-                None => this,
-                Some(prev) => RecordedOperation {
-                    authenticated: prev.authenticated && this.authenticated,
-                    payload_digest: prev
-                        .payload_digest
-                        .filter(|d| Some(*d) == this.payload_digest),
-                    branch: prev.branch.filter(|b| Some(*b) == this.branch),
-                    commit: prev.commit.filter(|c| Some(*c) == this.commit),
-                    source_hold: prev.source_hold.filter(|h| Some(*h) == this.source_hold),
-                    ended_at: prev.ended_at,
+                None => RecordedOperationDetails {
+                    operation: this,
+                    source_hold,
+                },
+                Some(prev) => RecordedOperationDetails {
+                    source_hold: prev.source_hold.filter(|h| Some(*h) == source_hold),
+                    operation: RecordedOperation {
+                        authenticated: prev.operation.authenticated && this.authenticated,
+                        payload_digest: prev
+                            .operation
+                            .payload_digest
+                            .filter(|d| Some(*d) == this.payload_digest),
+                        branch: prev.operation.branch.filter(|b| Some(*b) == this.branch),
+                        commit: prev.operation.commit.filter(|c| Some(*c) == this.commit),
+                        ended_at: prev.operation.ended_at,
+                    },
                 },
             });
         }

@@ -588,7 +588,10 @@ pub struct BranchSet {
     opts: StoreOptions,
     cache: Arc<BlockCache>,
     quota: Arc<quota::Quota>,
-    table: Mutex<TableFile>,
+    table: Arc<Mutex<TableFile>>,
+    // A fork may have captured a base that retention no longer lists. Reconciliation
+    // excludes in-flight captures while releasing holds based on retained history.
+    forks: Arc<parking_lot::RwLock<()>>,
     /// open branch stores (not `main`)
     pub(super) stores: Mutex<HashMap<uuid::Uuid, Arc<Store>>>,
     pub(super) openings: Mutex<HashMap<usize, Opening>>,
@@ -690,7 +693,8 @@ impl BranchSet {
             opts: opts.clone(),
             cache,
             quota,
-            table: Mutex::new(TableFile::new(dataset_id)),
+            table: Arc::new(Mutex::new(TableFile::new(dataset_id))),
+            forks: Arc::default(),
             stores: Default::default(),
             openings: Default::default(),
             opening: Mutex::new(()),
@@ -794,7 +798,8 @@ impl BranchSet {
             opts: opts.clone(),
             cache,
             quota,
-            table: Mutex::new(table),
+            table: Arc::new(Mutex::new(table)),
+            forks: Arc::default(),
             stores: Default::default(),
             openings: Default::default(),
             opening: Mutex::new(()),
@@ -1447,6 +1452,12 @@ impl BranchStore<'_> {
     }
 }
 
+/// Keeps the listed branch identities stable during operation-hold reconciliation.
+pub struct ListedBranches {
+    _table: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, TableFile>>,
+    _forks: Option<parking_lot::ArcRwLockWriteGuard<parking_lot::RawRwLock, ()>>,
+}
+
 impl Store {
     /// The name of this store's branch (`main` for a dataset's own store).
     pub fn branch_name(&self) -> String {
@@ -1468,6 +1479,12 @@ impl Store {
             .ident
             .as_ref()
             .map_or(self.dataset_id, |i| i.dataset_id)
+    }
+
+    /// Whether both handles belong to the same open dataset family. A separately
+    /// opened copy can have the same persisted UUID without sharing the family.
+    pub fn shares_family_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.family, &other.family)
     }
 
     /// Whether this is a branch store (not a dataset's own store).
@@ -1640,6 +1657,12 @@ impl Store {
         Ok(BranchStore::Other(set.open_store(id)?))
     }
 
+    /// Open an upstream store whose history can still be selected through a listed
+    /// branch, including an upstream that was retired when its name was removed.
+    pub fn upstream_store(&self, id: uuid::Uuid) -> Result<BranchStore<'_>> {
+        self.branch_by_id(id)
+    }
+
     /// The id of branch `name`.
     pub fn branch_id_of(&self, name: &str) -> Result<uuid::Uuid> {
         if name == MAIN {
@@ -1671,6 +1694,28 @@ impl Store {
                 .map(|branch| branch.id)
                 .eq(ids.iter().copied())
         })
+    }
+
+    /// Keep the previously enumerated branches listed during a durable hold release.
+    /// A busy branch table or a different list leaves the release unconfirmed.
+    pub fn pin_listed_branch_ids(&self, ids: &[uuid::Uuid]) -> Option<ListedBranches> {
+        let SetRef::Owner(set) = &self.branching.set else {
+            return ids.is_empty().then_some(ListedBranches {
+                _table: None,
+                _forks: None,
+            });
+        };
+        let forks = set.forks.try_write_arc()?;
+        let table = set.table.try_lock_arc()?;
+        table
+            .branches
+            .iter()
+            .map(|branch| branch.id)
+            .eq(ids.iter().copied())
+            .then_some(ListedBranches {
+                _table: Some(table),
+                _forks: Some(forks),
+            })
     }
 
     /// The current name of the listed branch whose identity is `id`, `main` for the
@@ -2124,6 +2169,7 @@ impl Store {
             return Err(branch::invalid_branch("the note is longer than 1024 bytes"));
         }
         let set = self.owned_set()?.clone();
+        let _fork = set.forks.read();
         if set.memory {
             return self.create_memory_branch(name, o, &set);
         }

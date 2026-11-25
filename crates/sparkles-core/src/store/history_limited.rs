@@ -9,6 +9,68 @@ enum PinnedSource<'a> {
 }
 
 impl Store {
+    /// The retained ranges at a published head, without draining or waiting for the
+    /// writer. The ranges can shrink after this call.
+    #[doc(hidden)]
+    pub fn published_history_ranges(
+        &self,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<Vec<(u64, u64)>> {
+        let limit = ReadLimit {
+            options,
+            memory: Some(max_memory_bytes),
+            held: crate::history::READ_METADATA_BYTES,
+        };
+        if let Some(history) = &self.history {
+            let history = limit.lock(history)?;
+            let live = self.snapshot();
+            let current = commit::generation_number(&live.generation.name);
+            if !history.gens.contains_key(&current) {
+                return Err(Error::WriterBusy);
+            }
+            return history.reconstructable_with(current, live.commit, &limit);
+        }
+        if let Some(memory) = &self.mem_history {
+            let history = limit.lock(memory)?;
+            return history.reconstructable_with(self.snapshot().commit, &limit);
+        }
+        let head = self.snapshot().commit;
+        Ok(vec![(head, head)])
+    }
+
+    /// A bounded snapshot at a commit at or below the published head. It reads
+    /// commit metadata without entering the writer, for orphan reconciliation.
+    #[doc(hidden)]
+    pub fn snapshot_at_published(
+        &self,
+        seq: u64,
+        options: &HistoryOptions,
+        max_memory_bytes: u64,
+    ) -> Result<Arc<Snapshot>> {
+        let capacity = self
+            .opts
+            .shared
+            .as_ref()
+            .map_or(self.opts.history_cache_bytes, |scope| {
+                scope.caches.history().capacity()
+            });
+        let limit = ReadLimit {
+            options,
+            memory: Some(max_memory_bytes.min(capacity)),
+            held: crate::history::READ_METADATA_BYTES,
+        };
+        let live = self.snapshot();
+        let head = limit
+            .lock(&self.catalog)?
+            .get(live.commit)
+            .ok_or(Error::WriterBusy)?;
+        let at = At::Commit(seq);
+        let resolved = self.resolve_in(&at, head, &limit)?;
+        self.snapshot_at_resolved(&at, limit, resolved, live)
+            .map(|(snapshot, _)| snapshot)
+    }
+
     /// An unresolved time has no honest commit number after catalog pruning.
     pub(super) fn unresolved_time_limited(&self, ms: i64, limit: &ReadLimit<'_>) -> Result<Error> {
         let writer = limit.lock(&self.writer)?;

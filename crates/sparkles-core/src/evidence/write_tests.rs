@@ -449,23 +449,31 @@ fn plan_held_collects_local_and_cross_dataset_stored_facts_sorted_by_dataset() {
         },
     ];
     let p = plan_of(&batch, &settings(&["urn:s"], &["urn:c"]), None).unwrap();
-    let mut expected = vec![
-        HeldCommit {
+    let local = HeldCommit {
+        branch: DATASET,
+        commit: 3,
+    };
+    let mut expected = [
+        DatasetHeldCommit {
             dataset: ds_a,
-            branch: ds_a,
-            commit: 5,
+            commit: HeldCommit {
+                branch: ds_a,
+                commit: 5,
+            },
         },
-        HeldCommit {
+        DatasetHeldCommit {
             dataset: ds_b,
-            branch: branch_b,
-            commit: 9,
+            commit: HeldCommit {
+                branch: branch_b,
+                commit: 9,
+            },
         },
-        HeldCommit {
+        DatasetHeldCommit {
             dataset: DATASET,
-            branch: DATASET,
-            commit: 3,
+            commit: local,
         },
     ];
     expected.sort();
-    assert_eq!(p.held, expected);
+    assert_eq!(p.held_in(), expected);
+    assert_eq!(p.held, [local]);
 }

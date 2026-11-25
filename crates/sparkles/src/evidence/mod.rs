@@ -336,7 +336,7 @@ pub fn detach(dataset: &Dataset, graph: &str) -> Result<SettingsStatus> {
 // --------------------------------------------------------------- holds ------------
 
 pub use sparkles_core::branch::CommitRef;
-pub use sparkles_core::holds::{DEFAULT_GRACE_MS, MAX_COMMITS, SourceHold};
+pub use sparkles_core::holds::{DEFAULT_GRACE_MS, MAX_COMMITS, SourceHold, SourceHoldInfo};
 pub use sparkles_core::store::Acquired;
 
 /// The durable source holds of the evidence profile in `dataset` and its branches, by
@@ -348,6 +348,13 @@ pub fn holds(dataset: &Dataset) -> Result<Vec<SourceHold>> {
         .into_iter()
         .filter(|h| h.owner == OwnerKind::Evidence)
         .collect())
+}
+
+/// The evidence holds with their originating dataset IDs when foreign.
+pub fn hold_details(dataset: &Dataset) -> Result<Vec<SourceHoldInfo>> {
+    let mut holds = dataset.store().source_hold_details()?;
+    holds.retain(|h| h.hold.owner == OwnerKind::Evidence);
+    Ok(holds)
 }
 
 /// Keep `commits` readable for the evidence profile under the hold `id`. Each commit

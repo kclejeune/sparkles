@@ -117,7 +117,8 @@ pub use backup::{
 pub(crate) use branching::BRANCH_FILE as BRANCH_FILE_NAME;
 pub(crate) use branching::write_initial_table;
 pub use branching::{
-    BRANCHES_DIR, BRANCHES_FILE, BranchCommit, BranchSet, BranchStore, read_branch_table,
+    BRANCHES_DIR, BRANCHES_FILE, BranchCommit, BranchSet, BranchStore, ListedBranches,
+    read_branch_table,
 };
 pub use changelog::{
     CHANGE_LOG_FILE, CHANGES_DIR, ChangeCommit, ChangeLog, ChangeLogSettings, ChangeLogStatus,
@@ -3211,6 +3212,17 @@ impl Store {
             self.resolve(at)?
         };
         let live = self.snapshot();
+        self.snapshot_at_resolved(at, limit, r, live)
+    }
+
+    /// Materialize a resolved commit against a published snapshot's generation.
+    fn snapshot_at_resolved<C: HistoryRead>(
+        &self,
+        at: &crate::history::At,
+        limit: C,
+        r: crate::history::Resolved,
+        live: Arc<Snapshot>,
+    ) -> Result<(Arc<Snapshot>, crate::history::Resolved)> {
         if r.commit.seq == live.commit {
             limit.check(history_limited::preparation_delta_bytes(&live.delta))?;
             return Ok((

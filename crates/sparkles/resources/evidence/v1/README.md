@@ -105,7 +105,7 @@ the commit and triple under the caller's view.
 `ev:availabilityReceipt`, `prov:wasGeneratedBy`, `ev:graphProtection`, `ev:recordDigest` and each source
 revision's `ev:firstAvailableAt`, and describes the operation as an `ev:Operation` in
 every written graph with its `ev:payloadDigest`, optional `ev:idempotencyKey` and
-`ev:sourceHold` and the graph's `ev:graphProtection` nonce. The typed input has no field for
+`ev:sourceHold`, `ev:sourceHoldSets` and the graph's `ev:graphProtection` nonce. The typed input has no field for
 these terms. A record digest covers the immutable content of a record. It counts
 `ev:retainedBytes` and `ev:normalizedText` by their presence only and leaves out the
 server-owned terms.

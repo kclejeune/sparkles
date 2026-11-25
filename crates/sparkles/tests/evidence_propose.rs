@@ -813,12 +813,23 @@ impl AuthorityFence for ReleaseDuringPublication {
     fn enter(&self) -> sparkles::Result<Box<dyn std::any::Any>> {
         let id = evidence::holds(&self.ds).unwrap()[0].id;
         let ds = self.ds.clone();
+        let (started, waiting) = std::sync::mpsc::channel();
+        ds.store().set_failpoint(
+            "holds-release-waiting",
+            Some(Arc::new(move |_| {
+                started.send(()).unwrap();
+            })),
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             let r = evidence::release_hold(&ds, id).unwrap();
+            ds.store().set_failpoint("holds-release-waiting", None);
             let _ = tx.send(());
             r
         });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
         if rx
             .recv_timeout(std::time::Duration::from_millis(300))
             .is_ok()
@@ -1161,10 +1172,10 @@ mod crashes {
         let cat = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
         let a = cat.get("a").unwrap();
         let b = cat.get("b").unwrap();
-        let holds = evidence::holds(&b).unwrap();
+        let holds = evidence::hold_details(&b).unwrap();
         assert_eq!(holds.len(), 1);
         assert_eq!(holds[0].for_dataset, Some(a_id));
-        assert!(!evidence::operation_recorded(&a, holds[0].id, &Control::none()).unwrap());
+        assert!(!evidence::operation_recorded(&a, holds[0].hold.id, &Control::none()).unwrap());
         // standalone reconciliation (without a catalog) keeps cross-dataset holds
         assert!(
             evidence::reconcile_operation_holds(&b, 0)
@@ -1181,7 +1192,7 @@ mod crashes {
         // past grace period, catalog reconciliation finds it absent in a and releases it
         assert_eq!(
             evidence::reconcile_operation_holds_in(Some(&cat), &b, 0).unwrap(),
-            vec![holds[0].id]
+            vec![holds[0].hold.id]
         );
         assert!(evidence::holds(&b).unwrap().is_empty());
         // retry after a crash reuses the durable foreign hold and publishes cleanly
@@ -1295,12 +1306,12 @@ mod crashes {
         );
         a.store().set_failpoint("evidence-held", None);
         assert_eq!(a.store().head_commit().seq, head);
-        let holds = evidence::holds(&b).unwrap();
+        let holds = evidence::hold_details(&b).unwrap();
         assert_eq!(holds.len(), 1);
         assert_eq!(holds[0].for_dataset, Some(a.dataset_id()));
         assert_eq!(
             evidence::reconcile_operation_holds_in(Some(&cat), &b, 0).unwrap(),
-            vec![holds[0].id]
+            vec![holds[0].hold.id]
         );
         assert!(evidence::holds(&b).unwrap().is_empty());
     }
@@ -1443,12 +1454,12 @@ fn cross_dataset_stored_fact_is_held_and_protected_from_retention() {
     assert!(p.committed);
     let hold_id = p.hold.expect("operation hold");
     assert!(evidence::holds(&a).unwrap().is_empty());
-    let b_holds = evidence::holds(&b).unwrap();
+    let b_holds = evidence::hold_details(&b).unwrap();
     assert_eq!(b_holds.len(), 1);
-    assert_eq!(b_holds[0].id, hold_id);
+    assert_eq!(b_holds[0].hold.id, hold_id);
     assert_eq!(b_holds[0].for_dataset, Some(a.dataset_id()));
     assert_eq!(
-        b_holds[0].commits,
+        b_holds[0].hold.commits,
         vec![evidence::CommitRef {
             branch_id: b.dataset_id(),
             seq: fact_b,
@@ -1651,15 +1662,15 @@ fn cross_dataset_holds_span_multiple_datasets_and_branches() {
     .unwrap();
     let id = p.hold.unwrap();
     assert_eq!(evidence::holds(&a).unwrap()[0].id, id);
-    assert_eq!(evidence::holds(&a).unwrap()[0].for_dataset, None);
+    assert_eq!(evidence::hold_details(&a).unwrap()[0].for_dataset, None);
     assert_eq!(evidence::holds(&b).unwrap()[0].id, id);
     assert_eq!(
-        evidence::holds(&b).unwrap()[0].for_dataset,
+        evidence::hold_details(&b).unwrap()[0].for_dataset,
         Some(a.dataset_id())
     );
     assert_eq!(evidence::holds(&c).unwrap()[0].id, id);
     assert_eq!(
-        evidence::holds(&c).unwrap()[0].for_dataset,
+        evidence::hold_details(&c).unwrap()[0].for_dataset,
         Some(a.dataset_id())
     );
     // deleting the held branch in b is refused without release_holds
@@ -1863,4 +1874,561 @@ fn foreign_release_waits_for_publication_and_reconcile_does_not_block_on_writer(
         assert_eq!(released, vec![orphan]);
         drop(t);
     });
+}
+
+fn copy_dataset(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::create_dir(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let to = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dataset(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), to).unwrap();
+        }
+    }
+}
+
+#[test]
+fn proposal_rejects_copied_main_and_branch_handles() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let origin = catalog.create("origin", &Default::default()).unwrap();
+    let target = catalog.create("target", &Default::default()).unwrap();
+    configured(&origin);
+    let fact = with_fact(&target);
+    let copied_root = dir.path().join("copy");
+    copy_dataset(origin.store().root().unwrap(), &copied_root);
+    let copy = Dataset::open(copied_root).unwrap();
+    assert_eq!(copy.dataset_id(), origin.dataset_id());
+    copy.create_branch("work", &Default::default()).unwrap();
+
+    let input = batch_for_fact(&target, target.dataset_id(), fact);
+    for logical in [&copy, &copy.branch("work").unwrap()] {
+        let head = logical.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::propose(
+                Some(&catalog),
+                &origin,
+                logical,
+                &input,
+                &options(),
+                &mut |_, _| all(),
+                &Control::none(),
+            )),
+            "invalid"
+        );
+        assert_eq!(logical.store().head_commit().seq, head);
+    }
+    assert!(evidence::holds(&target).unwrap().is_empty());
+}
+
+#[test]
+fn duplicate_catalog_identities_refuse_proposals_and_keep_ambiguous_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let origin = catalog.create("origin", &Default::default()).unwrap();
+    let target = catalog.create("target", &Default::default()).unwrap();
+    configured(&origin);
+    let fact = with_fact(&target);
+    let input = batch_for_fact(&target, target.dataset_id(), fact);
+    let copied_target = dir.path().join("target-copy");
+    copy_dataset(target.store().root().unwrap(), &copied_target);
+    let duplicate = catalog
+        .attach(
+            "a-copy",
+            sparkles::catalog::Attach::Directory(copied_target),
+        )
+        .unwrap();
+    assert_eq!(target.dataset_id(), duplicate.dataset_id());
+    assert_eq!(
+        code(evidence::propose(
+            Some(&catalog),
+            &origin,
+            &origin,
+            &input,
+            &options(),
+            &mut |_, _| all(),
+            &Control::none(),
+        )),
+        "evidence-unavailable"
+    );
+    assert!(evidence::holds(&target).unwrap().is_empty());
+    assert!(evidence::holds(&duplicate).unwrap().is_empty());
+    assert!(catalog.delete("a-copy").unwrap());
+    drop(duplicate);
+
+    let copied_origin = dir.path().join("origin-copy");
+    copy_dataset(origin.store().root().unwrap(), &copied_origin);
+    let duplicate = catalog
+        .attach(
+            "a-copy",
+            sparkles::catalog::Attach::Directory(copied_origin),
+        )
+        .unwrap();
+    assert_eq!(origin.dataset_id(), duplicate.dataset_id());
+    let id = uuid::Uuid::new_v4();
+    evidence::acquire_hold_for(
+        &target,
+        id,
+        &[evidence::CommitRef {
+            branch_id: target.dataset_id(),
+            seq: fact,
+        }],
+        Some(origin.dataset_id()),
+    )
+    .unwrap();
+    assert!(
+        evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(evidence::holds(&target).unwrap()[0].id, id);
+    assert!(catalog.delete("a-copy").unwrap());
+    assert_eq!(
+        evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0).unwrap(),
+        [id]
+    );
+}
+
+#[test]
+fn mixed_persistence_refuses_before_any_hold_or_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+        let persistent = catalog.create("disk", &Default::default()).unwrap();
+        let memory = catalog
+            .create(
+                "memory",
+                &sparkles::catalog::CreateDataset {
+                    kind: sparkles::catalog::DatasetKind::Memory,
+                    geo: None,
+                },
+            )
+            .unwrap();
+        configured(&persistent);
+        configured(&memory);
+        for (origin, target) in [(&persistent, &memory), (&memory, &persistent)] {
+            target.update("INSERT DATA { GRAPH <urn:facts> { <urn:release> <urn:affectedBy> <urn:cve> } }").unwrap();
+            let fact = target.store().head_commit().seq;
+            let input = batch_for_fact(target, target.dataset_id(), fact);
+            let head = origin.store().head_commit().seq;
+            let mut opts = options();
+            opts.idempotency_key = Some("mixed".into());
+            assert_eq!(
+                code(evidence::propose(
+                    Some(&catalog),
+                    origin,
+                    origin,
+                    &input,
+                    &opts,
+                    &mut |_, _| all(),
+                    &Control::none(),
+                )),
+                "evidence-unavailable"
+            );
+            assert_eq!(origin.store().head_commit().seq, head);
+            assert!(evidence::holds(target).unwrap().is_empty());
+        }
+    }
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let persistent = catalog.get("disk").unwrap();
+    assert!(evidence::holds(&persistent).unwrap().is_empty());
+    let op = evidence::operation_id(persistent.dataset_id(), &options().principal, "mixed");
+    assert!(!evidence::operation_recorded(&persistent, op, &Control::none()).unwrap());
+}
+
+#[test]
+fn public_hold_types_still_support_struct_literals_and_patterns() {
+    let id = uuid::Uuid::nil();
+    let evidence::SourceHold {
+        id,
+        owner,
+        created_ms,
+        commits,
+    } = evidence::SourceHold {
+        id,
+        owner: OwnerKind::Evidence,
+        created_ms: 0,
+        commits: vec![evidence::CommitRef {
+            branch_id: id,
+            seq: 1,
+        }],
+    };
+    use evidence::propose::HeldCommit;
+    let HeldCommit { branch, commit } = HeldCommit {
+        branch: id,
+        commit: 1,
+    };
+    use sparkles_core::evidence::write::RecordedOperation;
+    let RecordedOperation {
+        authenticated,
+        payload_digest,
+        branch: recorded_branch,
+        commit: recorded_commit,
+        ended_at,
+    } = RecordedOperation {
+        authenticated: true,
+        payload_digest: None,
+        branch: Some(branch),
+        commit: Some(commit),
+        ended_at: None,
+    };
+    assert!(authenticated);
+    assert_eq!(owner, OwnerKind::Evidence);
+    assert_eq!(created_ms, 0);
+    assert_eq!(branch, id);
+    assert_eq!(recorded_branch, Some(branch));
+    assert_eq!(recorded_commit, Some(commits[0].seq));
+    assert!(payload_digest.is_none() && ended_at.is_none());
+}
+
+#[test]
+fn publication_rechecks_foreign_registration_after_acquisition() {
+    for duplicate in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+        let origin = catalog.create("origin", &Default::default()).unwrap();
+        let target = catalog
+            .attach(
+                "target",
+                sparkles::catalog::Attach::Directory(dir.path().join("target")),
+            )
+            .unwrap();
+        configured(&origin);
+        let fact = with_fact(&target);
+        let copied_root = dir.path().join("copy");
+        copy_dataset(target.store().root().unwrap(), &copied_root);
+        let change = catalog.clone();
+        origin.store().set_failpoint(
+            "evidence-held",
+            Some(Arc::new(move |_| {
+                if duplicate {
+                    change
+                        .attach(
+                            "a-copy",
+                            sparkles::catalog::Attach::Directory(copied_root.clone()),
+                        )
+                        .unwrap();
+                } else {
+                    assert!(change.delete("target").unwrap());
+                }
+            })),
+        );
+        let head = origin.store().head_commit().seq;
+        assert_eq!(
+            code(evidence::propose(
+                Some(&catalog),
+                &origin,
+                &origin,
+                &batch_for_fact(&target, target.dataset_id(), fact),
+                &options(),
+                &mut |_, _| all(),
+                &Control::none(),
+            )),
+            "evidence-unavailable"
+        );
+        origin.store().set_failpoint("evidence-held", None);
+        assert_eq!(origin.store().head_commit().seq, head);
+        assert_eq!(evidence::holds(&target).unwrap().len(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn uncertain_release_refuses_a_foreign_receipt_and_reopens_without_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options();
+    opts.idempotency_key = Some("uncertain-release".into());
+    {
+        let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+        let origin = catalog.create("origin", &Default::default()).unwrap();
+        let target = catalog.create("target", &Default::default()).unwrap();
+        configured(&origin);
+        let fact = with_fact(&target);
+        let root = target.store().root().unwrap().to_owned();
+        let aside = dir.path().join("aside");
+        let root_for_sync = root.clone();
+        let aside_for_sync = aside.clone();
+        target.store().set_failpoint(
+            "holds-replaced",
+            Some(Arc::new(move |_| {
+                std::fs::rename(&root_for_sync, &aside_for_sync).unwrap();
+            })),
+        );
+        let release = target.clone();
+        origin.store().set_failpoint(
+            "evidence-held",
+            Some(Arc::new(move |_| {
+                let id = evidence::holds(&release).unwrap()[0].id;
+                let error = evidence::release_hold(&release, id).unwrap_err();
+                assert!(matches!(error, sparkles::Error::Io(_)));
+                std::fs::rename(&aside, &root).unwrap();
+            })),
+        );
+        let error = evidence::propose(
+            Some(&catalog),
+            &origin,
+            &origin,
+            &batch_for_fact(&target, target.dataset_id(), fact),
+            &opts,
+            &mut |_, _| all(),
+            &Control::none(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "holds-unavailable");
+        assert_eq!(
+            error.to_string(),
+            "a referenced dataset's holds are unavailable"
+        );
+        origin.store().set_failpoint("evidence-held", None);
+        target.store().set_failpoint("holds-replaced", None);
+    }
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let origin = catalog.get("origin").unwrap();
+    let target = catalog.get("target").unwrap();
+    let id = evidence::operation_id(origin.dataset_id(), &opts.principal, "uncertain-release");
+    assert!(!evidence::operation_recorded(&origin, id, &Control::none()).unwrap());
+    assert!(evidence::holds(&target).unwrap().is_empty());
+}
+
+#[test]
+fn reconciliation_releases_only_the_losing_payloads_disjoint_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let winning_name;
+    let id;
+    {
+        let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+        let origin = catalog.create("origin", &Default::default()).unwrap();
+        let b = catalog.create("b", &Default::default()).unwrap();
+        let c = catalog.create("c", &Default::default()).unwrap();
+        configured(&origin);
+        let inputs = [
+            batch_for_fact(&b, b.dataset_id(), with_fact(&b)),
+            batch_for_fact(&c, c.dataset_id(), with_fact(&c)),
+        ];
+        let both_acquired = Arc::new(std::sync::Barrier::new(2));
+        origin.store().set_failpoint(
+            "evidence-held",
+            Some(Arc::new(move |_| {
+                both_acquired.wait();
+            })),
+        );
+        let mut opts = options();
+        opts.idempotency_key = Some("race".into());
+        let attempt = |input: &EvidenceInput| {
+            evidence::propose(
+                Some(&catalog),
+                &origin,
+                &origin,
+                input,
+                &opts,
+                &mut |_, _| all(),
+                &Control::none(),
+            )
+        };
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| attempt(&inputs[0]));
+            let second = attempt(&inputs[1]);
+            (first.join().unwrap(), second)
+        });
+        origin.store().set_failpoint("evidence-held", None);
+        winning_name = if first.is_ok() { "b" } else { "c" };
+        let (winner, loser) = if first.is_ok() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let winning = winner.unwrap();
+        assert!(winning.committed);
+        id = winning.hold.unwrap();
+        assert_eq!(code(loser), "idempotency-conflict");
+        for ds in [&b, &c] {
+            assert_eq!(
+                evidence::holds(ds).unwrap()[0].id,
+                id,
+                "both acquisitions completed"
+            );
+        }
+    }
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    for name in ["b", "c"] {
+        let target = catalog.get(name).unwrap();
+        let released = evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0).unwrap();
+        if name == winning_name {
+            assert!(released.is_empty());
+            assert_eq!(evidence::holds(&target).unwrap()[0].id, id);
+        } else {
+            assert_eq!(released, [id]);
+            assert!(evidence::holds(&target).unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn reconciliation_preserves_a_hold_that_a_historical_fork_inherits() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = sparkles::Catalog::open(dir.path(), Default::default()).unwrap();
+    let origin = catalog.create("origin", &Default::default()).unwrap();
+    let target = catalog.create("target", &Default::default()).unwrap();
+    configured(&origin);
+    let fact = with_fact(&target);
+    let proposed = evidence::propose(
+        Some(&catalog),
+        &origin,
+        &origin,
+        &batch_for_fact(&target, target.dataset_id(), fact),
+        &options(),
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let id = proposed.hold.unwrap();
+    for graph in [SOURCES, CLAIMS] {
+        evidence::detach(&origin, graph).unwrap();
+        origin.update(&format!("DROP GRAPH <{graph}>")).unwrap();
+    }
+    assert!(!evidence::operation_recorded(&origin, id, &Control::none()).unwrap());
+    let orphan = uuid::Uuid::new_v4();
+    evidence::acquire_hold_for(
+        &target,
+        orphan,
+        &[evidence::CommitRef {
+            branch_id: target.dataset_id(),
+            seq: fact,
+        }],
+        Some(origin.dataset_id()),
+    )
+    .unwrap();
+    let (forking, wait_for_fork) = std::sync::mpsc::channel();
+    let confirmed = Arc::new(AtomicBool::new(false));
+    let did_confirm = confirmed.clone();
+    let checked_origin = origin.clone();
+    target.store().set_failpoint(
+        "holds-reconcile-confirmed",
+        Some(Arc::new(move |_| {
+            assert!(checked_origin.store().pin_listed_branch_ids(&[]).is_none());
+            did_confirm.store(true, Ordering::SeqCst);
+            forking.send(()).unwrap();
+        })),
+    );
+    std::thread::scope(|scope| {
+        let fork = scope.spawn(move || {
+            wait_for_fork
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            origin
+                .create_branch(
+                    "fork",
+                    &sparkles::branch::BranchOptions {
+                        at: sparkles::history::At::Commit(proposed.commit),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            origin
+        });
+        assert_eq!(
+            evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0).unwrap(),
+            [orphan]
+        );
+        let origin = fork.join().unwrap();
+        assert!(evidence::operation_recorded(&origin, id, &Control::none()).unwrap());
+    });
+    target
+        .store()
+        .set_failpoint("holds-reconcile-confirmed", None);
+    assert!(confirmed.load(Ordering::SeqCst));
+    assert_eq!(evidence::holds(&target).unwrap()[0].id, id);
+}
+
+#[test]
+fn reconciliation_keeps_a_hold_while_a_memory_fork_has_an_unlisted_base() {
+    let catalog = sparkles::Catalog::memory(Default::default());
+    let origin = catalog
+        .attach("origin", sparkles::catalog::Attach::Memory)
+        .unwrap();
+    let target = catalog
+        .attach("target", sparkles::catalog::Attach::Memory)
+        .unwrap();
+    configured(&origin);
+    target
+        .update("INSERT DATA { GRAPH <urn:facts> { <urn:release> <urn:affectedBy> <urn:cve> } }")
+        .unwrap();
+    let fact = target.store().head_commit().seq;
+    let proposed = evidence::propose(
+        Some(&catalog),
+        &origin,
+        &origin,
+        &batch_for_fact(&target, target.dataset_id(), fact),
+        &options(),
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    let id = proposed.hold.unwrap();
+    origin
+        .store()
+        .set_retention(sparkles::history::Retention {
+            keep_commits: Some(32),
+            keep_age_ms: None,
+            max_bytes: None,
+        })
+        .unwrap();
+    for graph in [SOURCES, CLAIMS] {
+        evidence::detach(&origin, graph).unwrap();
+        origin.update(&format!("DROP GRAPH <{graph}>")).unwrap();
+    }
+    let (captured, capture) = std::sync::mpsc::sync_channel(0);
+    let (finish, done) = std::sync::mpsc::channel();
+    let done = std::sync::Mutex::new(done);
+    origin.store().set_failpoint(
+        "memory-ordinal-reserved",
+        Some(Arc::new(move |_| {
+            captured.send(()).unwrap();
+            done.lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+        })),
+    );
+    std::thread::scope(|scope| {
+        let fork = scope.spawn(|| {
+            origin
+                .create_branch(
+                    "fork",
+                    &sparkles::branch::BranchOptions {
+                        at: sparkles::history::At::Commit(proposed.commit),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        });
+        capture
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let retained = origin
+            .store()
+            .set_retention(sparkles::history::Retention {
+                keep_commits: Some(1),
+                keep_age_ms: None,
+                max_bytes: None,
+            })
+            .unwrap();
+        assert!(
+            !retained
+                .reconstructable
+                .iter()
+                .any(|(lo, hi)| (*lo..=*hi).contains(&proposed.commit))
+        );
+        let released = evidence::reconcile_operation_holds_in(Some(&catalog), &target, 0).unwrap();
+        finish.send(()).unwrap();
+        fork.join().unwrap();
+        assert!(released.is_empty());
+    });
+    origin
+        .store()
+        .set_failpoint("memory-ordinal-reserved", None);
+    assert!(evidence::operation_recorded(&origin, id, &Control::none()).unwrap());
+    assert_eq!(evidence::holds(&target).unwrap()[0].id, id);
 }

@@ -210,7 +210,7 @@ instruction counts, and the limits of attributing them to layout.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Shared evidence and review records](ai/README.md#evidence-profile) | Partial | Evidence proposals, reviews, withdrawals, identity maps and dependent lookups span Rust, HTTP and MCP, integrated with Ask, ingestion and reports. Proposals hold referenced commits across catalog datasets. Binding handles, proposition indexing, support-aware visibility and maintained analyses remain under items 81 and 340. |
+| [Shared evidence and review records](ai/README.md#evidence-profile) | Partial | Rust, HTTP and MCP expose evidence proposals, reviews, withdrawals, identity maps and dependent lookups. Proposals hold referenced commits across catalog datasets. Bindings and maintained analyses remain under items 81 and 340. |
 | [Shared entity representation](ai/README.md#shared-entity-representation) | Early | Versioned profile resources, acceptance fixtures and a bounded offline resolver are available. Managed integration with the evidence, temporal and analysis runtimes remains under item 396. |
 | [Durable jobs and delivery](ai/README.md#durable-jobs) | Early (Phase 1) | Idempotent submission, fenced leases, atomic `quads` publication and crash recovery are available over Rust and HTTP. The transactional outbox, recurring jobs, maintenance jobs, bindings and UI controls remain under item 339. |
 | [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |

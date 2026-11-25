@@ -1281,6 +1281,49 @@ async fn cross_dataset_claims_proposal_holds_referenced_dataset_over_http() {
         "links": [{"key": "l", "occurrenceKey": "l1", "target": {"key": "c"},
                    "evidence": {"key": "ref"}, "relation": "supports", "author": "urn:a"}],
     });
+    use crate::auth::{Access, Endpoint, Grants, Kind, Level, Principal, Restricted, Scheme};
+    let principal = Principal::new(
+        Kind::User,
+        "proposer",
+        Scheme::Basic,
+        Access::of(Grants {
+            datasets: vec![("ev".into(), Level::Write)],
+            restricted: vec![Restricted {
+                dataset: "inv".into(),
+                level: Level::Read,
+                endpoints: Some(vec![Endpoint::Query]),
+                graphs: None,
+                lifts: Vec::new(),
+                branches: None,
+                server_models: false,
+            }],
+            ..Default::default()
+        }),
+    );
+    let inv_root = inv.store.root().unwrap();
+    let metadata = std::fs::read(inv_root.join("dataset.json")).unwrap();
+    let origin_head = ev.store.head_commit().seq;
+    let denied = crate::evidence::execute(
+        "propose",
+        state.clone(),
+        "ev".into(),
+        principal,
+        body.to_string().into(),
+        crate::evidence::Execution {
+            branch: sparkles::branch::MAIN.into(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deadline: None,
+            grant: None,
+        },
+    )
+    .expect_err("query read does not grant authority to create a foreign hold");
+    assert_eq!(denied.into_parts().0, StatusCode::FORBIDDEN);
+    assert_eq!(ev.store.head_commit().seq, origin_head);
+    assert_eq!(
+        std::fs::read(inv_root.join("dataset.json")).unwrap(),
+        metadata
+    );
+    assert!(!inv_root.join(sparkles::holds::FILE).exists());
     let (status, proposed) = call(
         &app,
         "POST",
