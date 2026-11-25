@@ -4372,6 +4372,77 @@ mod tests {
         assert_eq!(s.snapshot().len(), s.snapshot().commit);
     }
 
+    /// X16 Phase 6: a group of one (direct or buffered) carries `WAL_FLAG_ANNOTATED` when
+    /// it carries an annotation, so a crash that leaves its log record on disk without its
+    /// annotation record is truncated as a torn tail on reopen and accepts the next commit.
+    #[test]
+    fn a_group_of_one_without_its_annotation_is_a_torn_tail_for_direct_and_buffered() {
+        for direct in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join(if direct { "direct" } else { "buffered" });
+            {
+                let opts = StoreOptions {
+                    wal_direct_writes: direct,
+                    ..options()
+                };
+                let s = Store::open(&root, opts).unwrap();
+                for name in ["m1", "m2"] {
+                    let r = kind_insert(
+                        &s,
+                        CommitKind::Update,
+                        message_options(name),
+                        in_graph(name, "urn:g"),
+                    )
+                    .unwrap();
+                    assert!(r.committed, "direct={direct}");
+                    assert_eq!(r.annotation.message.as_deref(), Some(name));
+                }
+                assert_eq!(
+                    s.group.as_ref().unwrap().fences.load(Ordering::Relaxed),
+                    2,
+                    "direct={direct}"
+                );
+            }
+            // drop the last commit's annotation record while keeping commit 1's (17 bytes each)
+            let path = root.join(crate::annotations::FILE);
+            let end = crate::annotations::records_end(&std::fs::read(&path).unwrap()).unwrap();
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(end as u64 - 17)
+                .unwrap();
+            assert_eq!(
+                wal_check(&root),
+                crate::check::Status::Warning,
+                "direct={direct}: missing tail annotation must be reported as a torn tail"
+            );
+            let s = Store::open(&root, Default::default()).unwrap();
+            let snap = s.snapshot();
+            assert_eq!(snap.commit, 1, "direct={direct}");
+            assert_eq!(snap.len(), 1, "direct={direct}");
+            assert_eq!(s.annotation(1).unwrap().message.as_deref(), Some("m1"));
+            assert!(s.annotation(2).is_none());
+            // the reopened store continues cleanly at sequence 2
+            let next = kind_insert(
+                &s,
+                CommitKind::Update,
+                message_options("m2-retry"),
+                in_graph("m2-retry", "urn:g"),
+            )
+            .unwrap();
+            assert_eq!(next.commit.seq, 2, "direct={direct}");
+            assert_eq!(next.annotation.message.as_deref(), Some("m2-retry"));
+            drop(s);
+            let reopened = Store::open(&root, Default::default()).unwrap();
+            assert_eq!(reopened.snapshot().commit, 2, "direct={direct}");
+            assert_eq!(
+                reopened.annotation(2).unwrap().message.as_deref(),
+                Some("m2-retry")
+            );
+        }
+    }
+
     /// Rejects every state that holds `urn:bad`.
     struct Strict {
         speculative: bool,

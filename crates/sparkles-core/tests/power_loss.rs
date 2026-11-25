@@ -1682,6 +1682,26 @@ fn crash_images_keep_every_acknowledged_commit() {
             },
         ),
         (
+            "group-of-one-direct",
+            Config {
+                group: true,
+                direct: true,
+                idle_direct: false,
+                threads: 1,
+                commits: 25,
+            },
+        ),
+        (
+            "group-of-one-buffered",
+            Config {
+                group: true,
+                direct: false,
+                idle_direct: false,
+                threads: 1,
+                commits: 25,
+            },
+        ),
+        (
             "ordinary-direct",
             Config {
                 group: false,
