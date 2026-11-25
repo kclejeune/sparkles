@@ -6813,9 +6813,9 @@ fn eleven_element_three_node_btree_set_is_not_undercounted_when_cloned() {
     assert!(inds.remove(&first));
     assert_eq!(inds.len(), 11);
 
-    // 1. Retained exclusion cloning (`DifferentIndividuals` with 11-member 3-node set).
+    // 1. Retained exclusion cloning (`SameIndividual` with an 11-member 3-node set).
     let excl_template = vec![Excluded {
-        axiom: AxiomKind::DifferentIndividuals(inds.clone().into()),
+        axiom: AxiomKind::SameIndividual(inds.clone()),
         gap: index::Gap::Partial("eleven-3node"),
     }];
     let (excl_cloned, excl_clone_sample) = measure(|| excl_template.clone());

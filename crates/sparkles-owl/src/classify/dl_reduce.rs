@@ -327,14 +327,17 @@ fn exact_m_class(k: usize, j: usize, a: usize, b: usize, len: usize) -> Class {
     Class::new(s)
 }
 
-struct Poller<'a, E, F: FnMut() -> Result<(), E>> {
+struct Poller<'a, E, F: FnMut() -> Result<(), E>, const REDUCTION: bool = true> {
     steps: usize,
     poll: &'a mut F,
 }
 
-impl<E, F: FnMut() -> Result<(), E>> Poller<'_, E, F> {
+impl<E, F: FnMut() -> Result<(), E>, const REDUCTION: bool> Poller<'_, E, F, REDUCTION> {
     #[inline]
     fn tick(&mut self) -> Result<(), E> {
+        if !REDUCTION {
+            return (self.poll)();
+        }
         let s = self.steps;
         self.steps = self.steps.wrapping_add(1);
         if s.is_multiple_of(POLL_WORK) {
@@ -1524,10 +1527,10 @@ fn hash_ce_polled<E, F: FnMut() -> Result<(), E>>(
 }
 
 /// Allocation-free, cooperatively polled structural equality of `DataRange`.
-fn eq_dr_polled<E, F: FnMut() -> Result<(), E>>(
+fn eq_dr_polled<E, F: FnMut() -> Result<(), E>, const REDUCTION: bool>(
     a: &DataRange,
     b: &DataRange,
-    poller: &mut Poller<'_, E, F>,
+    poller: &mut Poller<'_, E, F, REDUCTION>,
 ) -> Result<bool, E> {
     poller.tick()?;
     match (a, b) {
@@ -1574,10 +1577,10 @@ fn eq_dr_polled<E, F: FnMut() -> Result<(), E>>(
 }
 
 /// Allocation-free, cooperatively polled structural equality of `ClassExpression`.
-fn eq_ce_polled<E, F: FnMut() -> Result<(), E>>(
+fn eq_ce_polled<E, F: FnMut() -> Result<(), E>, const REDUCTION: bool>(
     a: &ClassExpression,
     b: &ClassExpression,
-    poller: &mut Poller<'_, E, F>,
+    poller: &mut Poller<'_, E, F, REDUCTION>,
 ) -> Result<bool, E> {
     use ClassExpression as C;
     poller.tick()?;
@@ -1605,7 +1608,7 @@ fn eq_ce_polled<E, F: FnMut() -> Result<(), E>>(
             let mut all_eq = true;
             for (compared, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {
                 #[cfg(test)]
-                if compared == 16 {
+                if REDUCTION && compared == 16 {
                     super::admission_test::merge_phase_disjoint_dedup();
                     probed = true;
                 }
@@ -1672,6 +1675,19 @@ fn eq_ce_polled<E, F: FnMut() -> Result<(), E>>(
         }
         _ => Ok(false),
     }
+}
+
+/// Structural equality for the Horn checker, which keeps its own polling cadence.
+pub(super) fn class_eq_polled<E>(
+    a: &ClassExpression,
+    b: &ClassExpression,
+    tick: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    let mut poller = Poller::<_, _, false> {
+        steps: 0,
+        poll: tick,
+    };
+    eq_ce_polled(a, b, &mut poller)
 }
 
 struct DisjointImage {
@@ -2874,7 +2890,7 @@ mod tests {
             polls2 += 1;
             if polls2 >= 2 { Err("stop") } else { Ok(()) }
         };
-        let mut poller2 = Poller {
+        let mut poller2 = Poller::<_, _> {
             steps: 0,
             poll: &mut err_after_two_eq,
         };

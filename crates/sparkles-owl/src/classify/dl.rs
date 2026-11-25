@@ -502,8 +502,11 @@ fn disjoint_counts<E>(
     while let Some(part) = parts.next() {
         let counts = class(part, state)?;
         let mut duplicate = false;
-        while parts.next_if(|other| *other == part).is_some() {
-            state.tick()?;
+        while let Some(&other) = parts.peek() {
+            if !super::dl_reduce::class_eq_polled(part, other, &mut || state.tick())? {
+                break;
+            }
+            parts.next();
             duplicate = true;
         }
         if duplicate {
@@ -922,6 +925,39 @@ mod tests {
                 global: false
             }
         );
+    }
+
+    #[test]
+    fn disjoint_operand_comparison_polls_before_finishing() {
+        fn operand(last: &str) -> ClassExpression {
+            let individuals = (0..64)
+                .map(|i| Individual::named(format!("urn:disjoint:i{i:02}")))
+                .chain(std::iter::once(Individual::named(last)))
+                .collect();
+            ClassExpression::ObjectIntersectionOf(
+                [ClassExpression::ObjectOneOf(individuals)].into(),
+            )
+        }
+
+        for (last, horn) in [("urn:disjoint:z0", true), ("urn:disjoint:z1", false)] {
+            let parts = [operand("urn:disjoint:z0"), operand(last)].into();
+            let axiom = AxiomKind::DisjointUnion(Class::new("urn:disjoint:Union"), parts);
+            assert_eq!(is_horn_polled(&axiom, &mut || Ok::<(), ()>(())), Ok(horn));
+
+            // The polarity count sees only the intersection and enumeration nodes in
+            // each operand. Reaching ten polls requires visiting individuals in equality.
+            let mut ticks = 0;
+            let result = is_horn_polled(&axiom, &mut || {
+                ticks += 1;
+                if ticks == 10 {
+                    Err("cancelled")
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result, Err("cancelled"), "{last}");
+            assert_eq!(ticks, 10);
+        }
     }
 
     #[test]
