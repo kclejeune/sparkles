@@ -3598,27 +3598,29 @@ fn ordered_lexical_check_refuses_oversized_probe_after_candidate_decode() {
         range_filter: Vec::new(),
         tie_order: vec![0],
     };
-    let run = |last: Id| TopKRun {
-        lo: last.0 + 1,
-        hi: candidate.0,
-        exact: true,
-        best_high: false,
-        kept: Table::new(vec![0]),
-        want: 1,
-        done: false,
-        lexical: true,
-        extra: Vec::new(),
-        hold: false,
-    };
+    fn make_run<'ctx>(ctx: &'ctx Ctx, last: Id, candidate: Id) -> TopKRun<'ctx> {
+        TopKRun {
+            lo: last.0 + 1,
+            hi: candidate.0,
+            exact: true,
+            best_high: false,
+            kept: Materialized::empty_fast(ctx, &[0], &[]).unwrap(),
+            want: 1,
+            done: false,
+            lexical: true,
+            extra: Vec::new(),
+            hold: false,
+        }
+    }
 
     let control = Ctx::new(snap.clone());
     let kth = control.value(candidate).expect("short candidate decodes");
     assert!(matches!(
-        lexical_check(&control, &spec, &run(short), Some(&kth)).unwrap(),
+        lexical_check(&control, &spec, &make_run(&control, short, candidate), Some(&kth)).unwrap(),
         Lexical::Read(ids) if ids == [candidate.0]
     ));
     assert!(matches!(
-        lexical_check(&control, &spec, &run(long), Some(&kth)).unwrap(),
+        lexical_check(&control, &spec, &make_run(&control, long, candidate), Some(&kth)).unwrap(),
         Lexical::Read(ids) if ids == [candidate.0]
     ));
 
@@ -3629,7 +3631,7 @@ fn ordered_lexical_check_refuses_oversized_probe_after_candidate_decode() {
         .expect("candidate fits tight budget");
     target.check().unwrap();
     assert!(matches!(
-        lexical_check(&target, &spec, &run(long), Some(&kth)),
+        lexical_check(&target, &spec, &make_run(&target, long, candidate), Some(&kth)),
         Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
     ));
 }
@@ -3906,10 +3908,8 @@ fn topk_rest<'ctx>(
         None => {
             if rest.table.len() > PAR_THRESHOLD / 4 {
                 let not_total = std::sync::atomic::AtomicBool::new(false);
-                rest.table.cols[0]
-                    .par_iter()
-                    .enumerate()
-                    .try_for_each(|(i, &id)| -> Result<()> {
+                rest.table.cols[0].par_iter().enumerate().try_for_each(
+                    |(i, &id)| -> Result<()> {
                         if not_total.load(std::sync::atomic::Ordering::Relaxed) {
                             return Ok(());
                         }
@@ -3920,7 +3920,8 @@ fn topk_rest<'ctx>(
                             not_total.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         Ok(())
-                    })?;
+                    },
+                )?;
                 ctx.check()?;
                 !not_total.load(std::sync::atomic::Ordering::Relaxed)
             } else {

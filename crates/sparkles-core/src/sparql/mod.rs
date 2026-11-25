@@ -1596,8 +1596,9 @@ pub(crate) fn execute_query_with_parent(
     let depth = depth::check_query(parsed)?;
     depth::with_stack(depth, || {
         let t1 = Instant::now();
-        let prepared =
-            prepare_query_input_policy(snap, parsed, opts, None, None, None, None, parent, None)?;
+        let prepared = prepare_query_input_policy(
+            snap, parsed, opts, None, None, None, None, parent, None, None,
+        )?;
         let plan_ms = t1.elapsed().as_secs_f64() * 1000.0;
         depth::with_stack(prepared.plan_depth, || {
             execute_prepared(parsed, opts, parse_ms, plan_ms, prepared)

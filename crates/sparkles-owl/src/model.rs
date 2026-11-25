@@ -1404,7 +1404,12 @@ impl Signature {
                 visit_ce(a, on_class, on_ind);
                 visit_ce(b, on_class, on_ind);
             }
-            K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
+            K::EquivalentClasses(cs) => {
+                for c in cs {
+                    visit_ce(c, on_class, on_ind);
+                }
+            }
+            K::DisjointClasses(cs) => {
                 for c in cs {
                     visit_ce(c, on_class, on_ind);
                 }
@@ -1419,7 +1424,12 @@ impl Signature {
             | K::ObjectPropertyRange(_, c)
             | K::DataPropertyDomain(_, c)
             | K::HasKey(c, _, _) => visit_ce(c, on_class, on_ind),
-            K::SameIndividual(is) | K::DifferentIndividuals(is) => {
+            K::SameIndividual(is) => {
+                for i in is {
+                    visit_ind(i, on_ind);
+                }
+            }
+            K::DifferentIndividuals(is) => {
                 for i in is {
                     visit_ind(i, on_ind);
                 }

@@ -601,8 +601,8 @@ impl Runtime {
                     if let Some(c) = e.cell.take() {
                         if c.release_view(&n) == 0 {
                             let info = c.info.lock();
-                            state =
-                                state.saturating_sub(info.bytes.saturating_sub(info.published_bytes));
+                            state = state
+                                .saturating_sub(info.bytes.saturating_sub(info.published_bytes));
                         }
                         detached.push(c);
                     }

@@ -100,17 +100,11 @@ impl<'a> Rechecked<'a> {
         if let Some(cached) = self.memo.get(&o) {
             return Ok(cached.clone());
         }
-        let parse_charge = self.ctx.charge(0)?;
-        let slot = classify_controlled(self.ctx, Id(o), &self.cfg, true, &parse_charge)?;
-        let entry = match slot {
-            Slot::Geom(e) => Some(e),
-            _ => None,
-        };
+        let entry = recheck_controlled(self.ctx, Id(o), &self.cfg)?;
         let next = self.bytes.saturating_add(64);
         self._charge.cover(next, self.step)?;
         self.bytes = next;
         self.memo.insert(o, entry.clone());
-        drop(parse_charge);
         Ok(entry)
     }
 
@@ -127,6 +121,17 @@ impl<'a> Rechecked<'a> {
         next_cap(self.memo.len(), self.memo.capacity(), 1) as u64
             * (size_of::<u64>() + size_of::<Option<Arc<ColumnEntry>>>() + 1) as u64
     }
+}
+
+#[inline]
+fn recheck_controlled(ctx: &Ctx, id: Id, cfg: &GeoConfig) -> Result<Option<Arc<ColumnEntry>>> {
+    let parse_charge = ctx.charge(0)?;
+    let slot = classify_controlled(ctx, id, cfg, true, &parse_charge)?;
+    drop(parse_charge);
+    Ok(match slot {
+        Slot::Geom(e) => Some(e),
+        _ => None,
+    })
 }
 
 #[inline]
@@ -1706,12 +1711,13 @@ impl WindowIter {
                                             next_cap(rechecked.len(), rechecked.capacity(), 1),
                                         ))?;
                                     }
-                                    let entry = rechecked
-                                        .entry(r.o)
-                                        .or_insert_with(|| {
-                                            recheck(&snap.key(Id(r.o))?, &view.config)
-                                        })
-                                        .clone();
+                                    let entry = if let Some(cached) = rechecked.get(&r.o) {
+                                        cached.clone()
+                                    } else {
+                                        let e = recheck_controlled(ctx, Id(r.o), &view.config)?;
+                                        rechecked.insert(r.o, e.clone());
+                                        e
+                                    };
                                     if let Some(e) = entry {
                                         self.st.rechecked += 1;
                                         if pending.len() == pending.capacity() {
@@ -1769,12 +1775,13 @@ impl WindowIter {
                                             next_cap(rechecked.len(), rechecked.capacity(), 1),
                                         ))?;
                                     }
-                                    let entry = rechecked
-                                        .entry(r.o)
-                                        .or_insert_with(|| {
-                                            recheck(&snap.key(Id(r.o))?, &view.config)
-                                        })
-                                        .clone();
+                                    let entry = if let Some(cached) = rechecked.get(&r.o) {
+                                        cached.clone()
+                                    } else {
+                                        let e = recheck_controlled(ctx, Id(r.o), &view.config)?;
+                                        rechecked.insert(r.o, e.clone());
+                                        e
+                                    };
                                     if let Some(e) = entry {
                                         self.st.rechecked += 1;
                                         if pending.len() == pending.capacity() {
@@ -1832,12 +1839,13 @@ impl WindowIter {
                                             next_cap(rechecked.len(), rechecked.capacity(), 1),
                                         ))?;
                                     }
-                                    let entry = rechecked
-                                        .entry(r.o)
-                                        .or_insert_with(|| {
-                                            recheck(&snap.key(Id(r.o))?, &view.config)
-                                        })
-                                        .clone();
+                                    let entry = if let Some(cached) = rechecked.get(&r.o) {
+                                        cached.clone()
+                                    } else {
+                                        let e = recheck_controlled(ctx, Id(r.o), &view.config)?;
+                                        rechecked.insert(r.o, e.clone());
+                                        e
+                                    };
                                     if let Some(e) = entry {
                                         self.st.rechecked += 1;
                                         if pending.len() == pending.capacity() {
@@ -2059,10 +2067,15 @@ impl WindowIter {
                                             .saturating_add(extra),
                                         )?;
                                     }
-                                    let s = match snap.key(Id(r.o)) {
-                                        Some(k) => classify(&k, cfg),
-                                        None => Slot::Other,
-                                    };
+                                    let parse_charge = ctx.charge(0)?;
+                                    let s = classify_controlled(
+                                        ctx,
+                                        Id(r.o),
+                                        cfg,
+                                        false,
+                                        &parse_charge,
+                                    )?;
+                                    drop(parse_charge);
                                     memo.insert(r.o, s.clone());
                                     s
                                 }
@@ -2085,11 +2098,14 @@ impl WindowIter {
                                             .saturating_add(extra),
                                     )?;
                                 }
-                                rechecked
-                                    .entry(r.o)
-                                    .or_insert_with(|| recheck(&snap.key(Id(r.o))?, cfg))
-                                    .clone()
-                                    .map(|e| (e, true))
+                                let entry = if let Some(cached) = rechecked.get(&r.o) {
+                                    cached.clone()
+                                } else {
+                                    let e = recheck_controlled(ctx, Id(r.o), cfg)?;
+                                    rechecked.insert(r.o, e.clone());
+                                    e
+                                };
+                                entry.map(|e| (e, true))
                             }
                             _ => None,
                         };
@@ -2289,7 +2305,7 @@ impl NearestIter {
                 push_heap(&mut heap, e, 0, admit)?;
             }
             let f = Filter::new(&snap, &preds, &graph, dedup);
-            let mut re = Rechecked::new(&snap);
+            let mut re = Rechecked::new(ctx)?;
             for (idx, r) in base.skipped.iter().enumerate() {
                 if idx.is_multiple_of(CHUNK) {
                     ctx.check()?;
@@ -2299,7 +2315,7 @@ impl NearestIter {
                         let heap_bytes = heap.capacity() as u64 * size_of::<Entry>() as u64;
                         admit(heap_bytes.saturating_add(re.projected_bytes_after_insert()))?;
                     }
-                    if let Some(en) = re.entry(r.o) {
+                    if let Some(en) = re.entry(r.o)? {
                         st.rechecked += 1;
                         push_heap(
                             &mut heap,
@@ -2324,7 +2340,7 @@ impl NearestIter {
                     let heap_bytes = heap.capacity() as u64 * size_of::<Entry>() as u64;
                     admit(heap_bytes.saturating_add(re.projected_bytes_after_insert()))?;
                 }
-                if let Some(en) = re.entry(r.o) {
+                if let Some(en) = re.entry(r.o)? {
                     st.rechecked += 1;
                     let mut e = Entry::row(&lb, r, en);
                     e.from_tail = true;

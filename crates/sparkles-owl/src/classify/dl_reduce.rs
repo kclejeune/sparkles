@@ -37,7 +37,7 @@ use super::index::Gap;
 use super::{Error, Excluded, ScratchBudget};
 use crate::model::*;
 use crate::vocab;
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxHashSet, FxHasher};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 

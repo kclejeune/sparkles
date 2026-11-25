@@ -551,16 +551,6 @@ impl State {
         }
     }
 
-    /// Removes the backward links whose source is in `gone`, polling `tick` across roles
-    /// and source lists.
-    pub fn drop_links_from_poll(
-        &mut self,
-        gone: &FxHashSet<Ex>,
-        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
-    ) -> Result<(), super::Error> {
-        self.drop_links_where_poll(|e| gone.contains(&e), &mut |w| tick(w))
-    }
-
     /// Removes the backward links whose source `gone` answers true for.
     pub fn drop_links_where(&mut self, gone: impl Fn(Ex) -> bool) {
         let _ = self.drop_links_where_poll(gone, &mut |_| Ok::<(), ()>(()));
@@ -3859,7 +3849,7 @@ impl<'a> Run<'a> {
                 }
                 if self.stopped() {
                     if self.bounds.partial {
-                        self.deliver(&mut outbox, &mut mine);
+                        self.deliver(outbox, &mut mine);
                     }
                     return;
                 }
@@ -5824,6 +5814,8 @@ mod horn_accounting_tests {
                 sent: 0,
                 work: 0,
                 kept: 0,
+                wake_split: false,
+                already_panicking: false,
             };
             assert!(out.top_chain_sub(tail, domain, Some(&probe)));
             assert_eq!(out.sent, 0);
@@ -5887,7 +5879,7 @@ mod horn_accounting_tests {
             grant.calls(),
             [(baseline, true), (MESSAGE, true), (MESSAGE, false)]
         );
-        let paid = *run.paid.lock();
+        let paid = run.admission.lock().paid;
         let peak = run.peak.load(Ordering::Relaxed);
         assert_eq!(paid, grant.accepted());
         assert_eq!(paid, baseline + MESSAGE);
@@ -6131,6 +6123,8 @@ mod horn_accounting_tests {
                     sent: 0,
                     work: 0,
                     kept: 0,
+                    wake_split: false,
+                    already_panicking: false,
                 };
                 assert!(out.top_chain_sub(source, domain, Some(&probe)));
                 assert_eq!(out.sent, 0);
@@ -6176,7 +6170,7 @@ mod horn_accounting_tests {
                 BASE + usize::from(!duplicate) * MESSAGE
             );
             let paid = BASE + MESSAGE + QUEUE_BYTES;
-            assert_eq!(*run.paid.lock(), paid);
+            assert_eq!(run.admission.lock().paid, paid);
             assert_eq!(run.peak.load(Ordering::Relaxed), paid);
             assert_eq!(
                 grant.calls(),
@@ -8295,6 +8289,8 @@ mod horn_accounting_tests {
             sent: 0,
             work: 0,
             kept: 0,
+            wake_split: false,
+            already_panicking: false,
         };
         let queued_before = run.queued.load(Ordering::Relaxed);
         let flushed = run.flush_links(&st, &mut out, &mut tally);

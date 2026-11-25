@@ -289,12 +289,19 @@ pub(crate) fn rows_without_distance(
     #[cfg(test)] observe: impl Fn(&Geom),
 ) -> Result<(Vec<[Id; 3]>, FxHashSet<Id>)> {
     let mut held = ctx.retained_charge(0)?;
-    rows_without_distance_charged(ctx, spec, subj, &mut |bytes| {
-        if let Some(h) = &mut held {
-            h.resize(bytes)?;
-        }
-        Ok(())
-    })
+    rows_without_distance_inner(
+        ctx,
+        spec,
+        subj,
+        &mut |bytes| {
+            if let Some(h) = &mut held {
+                h.resize(bytes)?;
+            }
+            Ok(())
+        },
+        #[cfg(test)]
+        observe,
+    )
 }
 
 /// [`rows_without_distance`] with pre-admission of `memo`, `rechecked`, output rows, and
@@ -304,6 +311,23 @@ pub(crate) fn rows_without_distance_charged(
     spec: &SpatialKnnSpec,
     subj: Option<Id>,
     admit: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<(Vec<[Id; 3]>, FxHashSet<Id>)> {
+    rows_without_distance_inner(
+        ctx,
+        spec,
+        subj,
+        admit,
+        #[cfg(test)]
+        |_| {},
+    )
+}
+
+fn rows_without_distance_inner(
+    ctx: &Ctx,
+    spec: &SpatialKnnSpec,
+    subj: Option<Id>,
+    admit: &mut dyn FnMut(u64) -> Result<()>,
+    #[cfg(test)] observe: impl Fn(&Geom),
 ) -> Result<(Vec<[Id; 3]>, FxHashSet<Id>)> {
     fn next_cap(len: usize, cap: usize, extra: usize) -> usize {
         if len.saturating_add(extra) <= cap {

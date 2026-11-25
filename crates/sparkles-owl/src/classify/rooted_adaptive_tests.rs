@@ -1443,6 +1443,7 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
                 .run_once(
                     &kinds,
                     None,
+                    None,
                     0,
                     &baseline_limits,
                     true,
@@ -1463,6 +1464,7 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
         let _ = s
             .run_once(
                 &kinds,
+                None,
                 None,
                 0,
                 &baseline_limits,
@@ -1498,6 +1500,7 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
             let mut s = Saturation::new();
             let r = s.run_once(
                 &kinds,
+                None,
                 None,
                 0,
                 &cap_at_base,
@@ -1569,6 +1572,7 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
             let mut s = Saturation::new();
             let r = s.run_once(
                 &kinds,
+                None,
                 None,
                 0,
                 &pool_at_base,
@@ -1669,6 +1673,7 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
                     let mut s = Saturation::new();
                     let r = s.run_once(
                         &kinds,
+                        None,
                         None,
                         0,
                         &pool_exact_presat,

@@ -722,7 +722,8 @@ mod drop_order_tests {
         let mut view_limits = FxHashMap::default();
         view_limits.insert("v".to_string(), 1 << 20);
         let mut slot = Slot {
-            query: q,
+            query: Arc::new(q),
+            query_text_bytes: 0,
             whole: None,
             vars,
             history,

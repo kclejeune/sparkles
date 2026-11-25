@@ -8788,7 +8788,16 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             },
             || {
                 sat_cap
-                    .run_splitting(&refs, None, 0, &lim_cap, &admitted_cap, &mut peak_cap, true)
+                    .run_splitting(
+                        &refs,
+                        None,
+                        0,
+                        &lim_cap,
+                        &admitted_cap,
+                        &mut peak_cap,
+                        true,
+                        AttemptProvenance::Ineligible,
+                    )
                     .unwrap_err()
             },
         );
@@ -8846,6 +8855,7 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
                         &admitted_pool,
                         &mut peak_pool,
                         true,
+                        AttemptProvenance::Ineligible,
                     )
                     .unwrap_err()
             },
@@ -10033,6 +10043,7 @@ fn split_round4_declined_forked_plan_leaves_empty_interner() {
                 &Arc::new(AtomicUsize::new(0)),
                 &mut 0,
                 false,
+                AttemptProvenance::Ineligible,
             )
         },
     );
@@ -10107,6 +10118,7 @@ fn split_round6_reduced_merge_does_not_copy_unchanged_exclusions() {
                     &Arc::new(AtomicUsize::new(0)),
                     &mut 0,
                     true,
+                    AttemptProvenance::Ineligible,
                 )
             })
             .0
@@ -10187,6 +10199,7 @@ fn reduced_exclusion_restore_accounts_for_taken_profile_diagnostics() {
                 threads: 1,
                 ..Limits::default()
             },
+            AttemptProvenance::Ineligible,
         );
         (sat, result)
     };

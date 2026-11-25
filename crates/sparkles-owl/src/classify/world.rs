@@ -900,7 +900,7 @@ impl Sink for WorldSink<'_> {
         if add > 0 {
             super::admission_test::hit(super::admission_test::Point::WorldDataReserve);
         }
-        let ok = match self.reporter {
+        match self.reporter {
             Reporter::Callback(bound) => {
                 let mut in_flight = WorldDeltaGuard { bound, delta: add };
                 let ok = bound(add);
@@ -921,8 +921,7 @@ impl Sink for WorldSink<'_> {
                 }
                 ok
             }
-        };
-        ok
+        }
     }
     fn speculative_overflow(&mut self) {
         self.halted.set(true);
@@ -977,7 +976,7 @@ impl Sink for WorldSink<'_> {
             self.charged.get().checked_add(bytes),
             self.grown.get().checked_add(1),
         ) else {
-            self.data_overflow();
+            self.retained_overflow();
             return false;
         };
         #[cfg(test)]
@@ -3198,14 +3197,14 @@ mod numeric_resource_tests {
         let caught = catch_unwind(AssertUnwindSafe(|| {
             let _guard = ActivationFlushGuard {
                 held: &world.held,
-                reported: &world.reported,
+                reported: &world.debit.reported,
                 bound: &bound,
                 data_growth: &data_growth,
                 charged: &charged,
             };
             arm_panic.store(true, Ordering::SeqCst);
             // Normal scope exit drops `_guard`, which MUST transfer `data_growth` (96)
-            // into `world.{held, reported}` BEFORE calling `(bound)(-48)` which panics
+            // into `world.{held, debit.reported}` BEFORE calling `(bound)(-48)` which panics
             // in `WorldBudget::tell`'s cancellation poll (after already subtracting 48
             // from `budget.held`!).
         }))
@@ -3217,10 +3216,10 @@ mod numeric_resource_tests {
         );
         // Disarm so drop check verifies clean release (and even armed, unwind skips poll).
         arm_panic.store(false, Ordering::SeqCst);
-        // `data_growth` (96) must already be in `world.{held, reported}`, while `-48`
+        // `data_growth` (96) must already be in `world.{held, debit.reported}`, while `-48`
         // already retired from `budget.held` before the panic!
         assert_eq!(world.held.get(), 96);
-        assert_eq!(world.reported.get(), 96);
+        assert_eq!(world.debit.reported.get(), 96);
         assert_eq!(budget.held.load(Ordering::Relaxed), 64 + 96);
 
         drop(world);
@@ -3288,7 +3287,7 @@ mod numeric_resource_tests {
                 me: 0,
                 local: &mut Vec::new(),
                 out: &mut Vec::new(),
-                bound: &bound,
+                reporter: Reporter::Callback(&bound),
                 data_growth: &growth,
                 halted: &halted,
                 overflow: &overflow,
@@ -3333,7 +3332,7 @@ mod numeric_resource_tests {
             );
             assert!(bound(64));
             world.held.set(64);
-            world.reported.set(64);
+            world.debit.reported.set(64);
             assert_eq!(budget.held.load(Ordering::Relaxed), 64);
 
             let growth = Cell::new(0);
@@ -3343,7 +3342,7 @@ mod numeric_resource_tests {
                 me: 0,
                 local: &mut Vec::new(),
                 out: &mut Vec::new(),
-                bound: &bound,
+                reporter: Reporter::Callback(&bound),
                 data_growth: &growth,
                 halted: &halted,
                 overflow: &overflow,
@@ -3383,7 +3382,7 @@ mod numeric_resource_tests {
             };
             let budget = WorldBudget::start(&limits, None, 4096, &mut totals).unwrap();
             let bound = |d: isize| budget.tell(d);
-            let world = World::new(
+            let mut world = World::new(
                 sat.index.as_ref().unwrap(),
                 &sat.ctx,
                 None,
@@ -3398,7 +3397,7 @@ mod numeric_resource_tests {
             let id = {
                 let _flush = ActivationFlushGuard {
                     held: &world.held,
-                    reported: &world.reported,
+                    reported: &world.debit.reported,
                     bound: &bound,
                     data_growth: &growth,
                     charged: &charged,
@@ -3407,7 +3406,7 @@ mod numeric_resource_tests {
                     me: 0,
                     local: &mut Vec::new(),
                     out: &mut Vec::new(),
-                    bound: &bound,
+                    reporter: Reporter::Callback(&bound),
                     data_growth: &growth,
                     halted: &halted,
                     overflow: &overflow,
@@ -3424,15 +3423,8 @@ mod numeric_resource_tests {
             assert!(exact_bytes > 0);
             assert_eq!(world.local.unadmitted_bytes(), 0);
             assert_eq!(budget.held.load(Ordering::Relaxed), exact_bytes as isize);
-            assert!(World::checkpoint_fields(
-                &world.held,
-                &world.reported,
-                &world.local,
-                0,
-                0,
-                0,
-                &bound
-            ));
+            world.checkpoint(0);
+            assert!(!world.halted);
             assert_eq!(
                 budget.held.load(Ordering::Relaxed),
                 exact_bytes as isize,
@@ -3495,7 +3487,7 @@ mod numeric_resource_tests {
             let caught = catch_unwind(AssertUnwindSafe(|| {
                 let _flush = ActivationFlushGuard {
                     held: &world.held,
-                    reported: &world.reported,
+                    reported: &world.debit.reported,
                     bound: &bound,
                     data_growth: &growth,
                     charged: &charged,
@@ -3504,7 +3496,7 @@ mod numeric_resource_tests {
                     me: 0,
                     local: &mut Vec::new(),
                     out: &mut Vec::new(),
-                    bound: &bound,
+                    reporter: Reporter::Callback(&bound),
                     data_growth: &growth,
                     halted: &halted,
                     overflow: &overflow,
@@ -3564,7 +3556,7 @@ mod numeric_resource_tests {
                     me: 0,
                     local: &mut Vec::new(),
                     out: &mut Vec::new(),
-                    bound: &bound,
+                    reporter: Reporter::Callback(&bound),
                     data_growth: &Cell::new(0),
                     halted: &halted,
                     overflow: &overflow,

@@ -3215,14 +3215,14 @@ impl Index {
             .saturating_add(max_span.saturating_mul(2 * std::mem::size_of::<u32>()))
             .saturating_add(neg_tables)
             .saturating_add(dt_scratch);
-        let dl_phase = old
-            .heads
-            .len()
-            .saturating_add(dt_scratch)
-            .saturating_add(match (&old.dl, &self.dl) {
-                (Some(a), Some(b)) => b.changed_scratch(a, poll)?,
-                _ => 0,
-            });
+        let dl_phase =
+            old.heads
+                .len()
+                .saturating_add(dt_scratch)
+                .saturating_add(match (&old.dl, &self.dl) {
+                    (Some(a), Some(b)) => b.changed_scratch(a, poll)?,
+                    _ => 0,
+                });
         poll()?;
         Ok(disj_phase.max(scan_phase).max(dl_phase))
     }

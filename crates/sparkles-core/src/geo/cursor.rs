@@ -428,7 +428,7 @@ impl SpatialPfReader {
                                 ctx.check()?;
                             }
                             let g = k2[3];
-                            if !spec.graph.accepts(g) || !scope.contains(ctx, g) {
+                            if !spec.graph.accepts(g) || !scope.contains(ctx, g)? {
                                 return Ok(());
                             }
                             if spec.graph_var.is_some() && g1 != g {
@@ -505,7 +505,7 @@ impl SpatialPfReader {
                         ctx.check()?;
                     }
                     let (lat_o, g) = (k[2], k[3]);
-                    if !spec.graph.accepts(g) || !scope.contains(ctx, g) {
+                    if !spec.graph.accepts(g) || !scope.contains(ctx, g)? {
                         return Ok(());
                     }
                     let Some(y) = super::wgs84::number(&ctx.snap, Id(lat_o)) else {
@@ -1455,15 +1455,21 @@ impl SpatialRelateReader {
         self.charge.resize(self.retained_bytes())
     }
 
-    fn in_scope(&mut self, ctx: &Ctx, g: u64) -> bool {
-        let cfg = &self.cfg;
-        *self.scope.entry(g).or_insert_with(|| {
-            super::exec::graph_iri(ctx, Id(g)).is_some_and(|i| cfg.graph_in_scope(&i))
-        })
+    fn in_scope(&mut self, ctx: &Ctx, g: u64) -> Result<bool> {
+        if let Some(&ok) = self.scope.get(&g) {
+            return Ok(ok);
+        }
+        let ok = super::exec::graph_iri_checked(ctx, Id(g))?
+            .is_some_and(|i| self.cfg.graph_in_scope(&i));
+        self.scope.insert(g, ok);
+        Ok(ok)
     }
 
-    fn ser_graph(&mut self, ctx: &Ctx, g: u64) -> bool {
-        self.spec.graph.accepts(g) && self.in_scope(ctx, g)
+    fn ser_graph(&mut self, ctx: &Ctx, g: u64) -> Result<bool> {
+        if !self.spec.graph.accepts(g) {
+            return Ok(false);
+        }
+        self.in_scope(ctx, g)
     }
 
     fn geom_charged(&mut self, ctx: &Ctx, lit: Id, extra_bytes: u64) -> Result<Option<GeomRef>> {
@@ -1526,7 +1532,7 @@ impl SpatialRelateReader {
                         )?;
                     }
                 }
-                if self.in_scope(ctx, k[3]) {
+                if self.in_scope(ctx, k[3])? {
                     if out.len() == out.capacity() {
                         let elem = size_of::<ConstLit>();
                         let next = vec_grown(out.capacity(), out.len(), 1, elem);
@@ -1806,7 +1812,7 @@ impl SpatialRelateReader {
                         })?;
                         let raw_bytes = raw.capacity() as u64 * size_of::<[u64; 4]>() as u64;
                         for &k in &raw {
-                            if self.ser_graph(ctx, k[3]) {
+                            if self.ser_graph(ctx, k[3])? {
                                 if rows.len() == rows.capacity() {
                                     let cur_rows = rows.capacity() as u64 * size_of::<Ser>() as u64;
                                     let next_rows = next_cap(rows.len(), rows.capacity(), 1) as u64
@@ -2493,7 +2499,7 @@ impl SpatialRelateReader {
                                         raw.capacity() as u64 * size_of::<[u64; 4]>() as u64;
                                     let win = *window;
                                     for k in raw {
-                                        if !self.ser_graph(ctx, k[3]) {
+                                        if !self.ser_graph(ctx, k[3])? {
                                             continue;
                                         }
                                         let ser = Ser {

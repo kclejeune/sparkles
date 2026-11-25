@@ -2434,7 +2434,9 @@ fn neg_data_897_role_deletion_fits_changed_scratch_without_rehash() {
     // zero rehashes; their combined bucket backing fits strictly inside `changed_scratch`.
     let buckets = dtcheck::range::map_buckets_for(n);
     let two_tables = buckets * (std::mem::size_of::<index::Role>() + 1) * 2 + 32;
-    let scratch = new_ix.changed_scratch(old_ix);
+    let scratch = new_ix
+        .changed_scratch(old_ix, &|| Ok::<(), std::convert::Infallible>(()))
+        .unwrap();
     assert!(
         scratch >= old_ix.head_count() + two_tables,
         "changed_scratch {scratch} must cover expression marks + two pre-sized {n}-role sets ({two_tables})"
@@ -2745,20 +2747,20 @@ fn high_fanout_refire_and_modes_compatible_poll_within_bound() {
     let without_dt = AtomicUsize::new(0);
     assert!(
         old_ix
-            .changed_with_dt(old_ix, None, &|| {
+            .changed_with_dt(old_ix, None, &|| -> Result<(), ()> {
                 without_dt.fetch_add(1, Ordering::Relaxed);
-                false
+                Ok(())
             })
-            .is_some()
+            .is_ok()
     );
     let with_dt = AtomicUsize::new(0);
     assert!(
         old_ix
-            .changed_with_dt(old_ix, Some(&aligned), &|| {
+            .changed_with_dt(old_ix, Some(&aligned), &|| -> Result<(), ()> {
                 with_dt.fetch_add(1, Ordering::Relaxed);
-                false
+                Ok(())
             })
-            .is_some()
+            .is_ok()
     );
     let base_polls = without_dt.load(Ordering::Relaxed);
     let total_polls = with_dt.load(Ordering::Relaxed);
@@ -2773,10 +2775,14 @@ fn high_fanout_refire_and_modes_compatible_poll_within_bound() {
     assert!(cancel_at < total_polls - 1);
     let cpolls = AtomicUsize::new(0);
     let stopped = old_ix.changed_with_dt(old_ix, Some(&aligned), &|| {
-        cpolls.fetch_add(1, Ordering::Relaxed) >= cancel_at
+        if cpolls.fetch_add(1, Ordering::Relaxed) >= cancel_at {
+            Err(())
+        } else {
+            Ok(())
+        }
     });
     assert!(
-        stopped.is_none(),
+        stopped.is_err(),
         "changed_with_dt must abort inside inner refire loop"
     );
     assert_eq!(cpolls.load(Ordering::Relaxed), cancel_at + 1);
@@ -2799,11 +2805,11 @@ fn high_fanout_refire_and_modes_compatible_poll_within_bound() {
     let neg_polls = AtomicUsize::new(0);
     assert!(
         neg_ix
-            .changed_with_dt(neg_ix, None, &|| {
+            .changed_with_dt(neg_ix, None, &|| -> Result<(), ()> {
                 neg_polls.fetch_add(1, Ordering::Relaxed);
-                false
+                Ok(())
             })
-            .is_some()
+            .is_ok()
     );
     // Expression loop polls `1 + (heads.len() - 1) / POLL_CHANGED` times, plus 1 final
     // stop check; the inner single-role `neg_data` scan must add at least 1 poll.
@@ -2894,7 +2900,7 @@ fn high_fanout_invalidation_and_orphan_prune_poll_within_bound() {
     let mut peak = 0usize;
     let cleared = sat_bfs
         .invalidate_changed(
-            &changed_hub,
+            changed_hub.clone(),
             ix,
             None,
             None,
@@ -2925,7 +2931,7 @@ fn high_fanout_invalidation_and_orphan_prune_poll_within_bound() {
     };
     let mut peak = 0usize;
     let err = sat_bfs_cancel.invalidate_changed(
-        &changed_hub,
+        changed_hub,
         ix,
         None,
         None,
@@ -2955,7 +2961,7 @@ fn high_fanout_invalidation_and_orphan_prune_poll_within_bound() {
     let mut peak = 0usize;
     let cleared = sat_clean
         .invalidate_changed(
-            &changed_s0,
+            changed_s0.clone(),
             ix,
             None,
             None,
@@ -2987,7 +2993,7 @@ fn high_fanout_invalidation_and_orphan_prune_poll_within_bound() {
     };
     let mut peak = 0usize;
     let err = sat_clean_cancel.invalidate_changed(
-        &changed_s0,
+        changed_s0,
         ix,
         None,
         None,
@@ -3210,11 +3216,11 @@ fn changed_with_dt_polls_skipped_new_neg_data_roles() {
     let polls = AtomicUsize::new(0);
     assert!(
         new_ix
-            .changed_with_dt(old_ix, None, &|| {
+            .changed_with_dt(old_ix, None, &|| -> Result<(), ()> {
                 polls.fetch_add(1, Ordering::Relaxed);
-                false
+                Ok(())
             })
-            .is_some()
+            .is_ok()
     );
     // Expression loop polls once (old_ix has < POLL_CHANGED heads) + 1 final stop check.
     let expr_and_final = 1 + (old_ix.head_count() - 1) / index::POLL_CHANGED + 1;
@@ -3229,9 +3235,13 @@ fn changed_with_dt_polls_skipped_new_neg_data_roles() {
     assert!(
         new_ix
             .changed_with_dt(old_ix, None, &|| {
-                stop_polls.fetch_add(1, Ordering::Relaxed) == 0
+                if stop_polls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(())
+                } else {
+                    Ok(())
+                }
             })
-            .is_none()
+            .is_err()
     );
     assert_eq!(stop_polls.load(Ordering::Relaxed), 1);
 }

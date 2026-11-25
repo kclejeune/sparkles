@@ -326,6 +326,7 @@ pub(crate) enum WinningStop {
     Timeout,
     Cancelled,
     Merge,
+    Split,
 }
 
 impl WinningStop {
@@ -337,6 +338,7 @@ impl WinningStop {
             Some(Stop::Timeout) => Self::Timeout,
             Some(Stop::Cancelled) => Self::Cancelled,
             Some(Stop::Merge { .. }) => Self::Merge,
+            Some(Stop::Split { .. }) => Self::Split,
         }
     }
 
@@ -355,6 +357,7 @@ impl WinningStop {
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
             Self::Merge => "merge",
+            Self::Split => "split",
         }
     }
 }
@@ -1919,9 +1922,6 @@ pub struct Saturation {
     adaptive_run_id: u64,
     /// number of tracked rooted attempts executed in the current top-level `run_with_all`
     adaptive_attempts: u32,
-    /// the high-water mark that the last completed [`Saturation::run_once`] paid to the
-    /// memory pool, used to offset post-run original-axiom accounting on kept rewrites
-    last_paid: usize,
     /// item 1061 phase 2 dense union-find and cached canonical map for rooted constant
     /// merging; cleared at the end of every `run_with_all`
     merge: Merge,
@@ -2978,6 +2978,7 @@ const POLL_INVALIDATE: usize = 4096;
 
 /// Pushes `e` onto `queue`, growing geometrically via `reserve_exact` without exceeding
 /// `cap_limit` elements so worklist capacity never outgrows pre-admitted scratch.
+#[cfg(test)]
 fn push_bounded(queue: &mut Vec<Ex>, e: Ex, cap_limit: usize) {
     if queue.len() == queue.capacity() {
         let remaining = cap_limit.saturating_sub(queue.len());
@@ -4744,6 +4745,7 @@ impl Saturation {
                     admitted,
                     &mut branch_peak,
                     !forked,
+                    attempt,
                 );
                 ledger.note_peak(branch_peak);
                 self.split_cfg = None;
@@ -7594,13 +7596,7 @@ impl Saturation {
         self.interner.ensure_top_bottom();
         self.interner.ranges.begin(budget.clone());
         let result = self.build_inner(
-            axioms,
-            outside,
-            reduction,
-            threads,
-            held_bytes,
-            limits,
-            attempt,
+            axioms, outside, reduction, threads, held_bytes, limits, attempt,
         );
         // the run's components and definitions end with its normalization, on every exit
         self.interner.dt_run = None;
@@ -7617,6 +7613,7 @@ impl Saturation {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_inner(
         &mut self,
         axioms: &[&AxiomKind],
@@ -8634,6 +8631,7 @@ impl Saturation {
     }
 
     /// [`Saturation::run`], with a reason when a run with changes must start again.
+    #[allow(clippy::too_many_arguments)]
     fn run_once(
         &mut self,
         axioms: &[&AxiomKind],
@@ -13347,10 +13345,6 @@ pub(super) fn check_chain_ranges<'a>(
 /// The axioms normalized between two polls of the run's deadline and cancellation.
 const POLL_AXIOMS: usize = 65_536;
 
-/// The contexts or edges scanned between two polls of the run's deadline and cancellation
-/// during index-diff invalidation and dynamic context rebasing.
-const POLL_INVALIDATE: usize = 4096;
-
 /// The run's deadline and cancellation, as an error when either has come.
 /// Why the worlds stopped.
 const WORLD_MEMORY: u8 = 1;
@@ -16885,7 +16879,8 @@ mod tests {
         let (_, _, peak_no, _, _) = Saturation::new()
             .build(
                 &kinds_no,
-                &[],
+                &Vec::new(),
+                None,
                 1,
                 0,
                 0,
@@ -16896,7 +16891,8 @@ mod tests {
         let (_, _, peak_with, _, _) = Saturation::new()
             .build(
                 &kinds_with,
-                &[],
+                &Vec::new(),
+                None,
                 1,
                 0,
                 0,
@@ -16921,7 +16917,8 @@ mod tests {
                 Saturation::new()
                     .build(
                         &kinds_with,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -16974,7 +16971,8 @@ mod tests {
                 sat_miss
                     .build(
                         &kinds_miss,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -17016,7 +17014,8 @@ mod tests {
                 Saturation::new()
                     .build(
                         &kinds_miss,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -17069,7 +17068,8 @@ mod tests {
                 sat_par
                     .build(
                         &kinds_par,
-                        &[],
+                        &Vec::new(),
+                        None,
                         2,
                         0,
                         0,
@@ -17092,7 +17092,8 @@ mod tests {
                 sat_par_ser
                     .build(
                         &kinds_par,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -17773,7 +17774,8 @@ mod tests {
             Saturation::new()
                 .build(
                     &kinds_no,
-                    &[],
+                    &Vec::new(),
+                    None,
                     1,
                     0,
                     0,
@@ -17794,7 +17796,8 @@ mod tests {
                 Saturation::new()
                     .build(
                         &kinds_with,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -17823,7 +17826,8 @@ mod tests {
                     Saturation::new()
                         .build(
                             &kinds_with,
-                            &[],
+                            &Vec::new(),
+                            None,
                             1,
                             0,
                             0,
@@ -17879,7 +17883,8 @@ mod tests {
             Saturation::new()
                 .build(
                     &kinds_wide_no,
-                    &[],
+                    &Vec::new(),
+                    None,
                     1,
                     0,
                     0,
@@ -17900,7 +17905,8 @@ mod tests {
                 Saturation::new()
                     .build(
                         &kinds_wide_with,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -17933,7 +17939,8 @@ mod tests {
                     Saturation::new()
                         .build(
                             &kinds_wide_with,
-                            &[],
+                            &Vec::new(),
+                            None,
                             1,
                             0,
                             0,
@@ -17992,7 +17999,8 @@ mod tests {
             Saturation::new()
                 .build(
                     &kinds_accepted_no,
-                    &[],
+                    &Vec::new(),
+                    None,
                     1,
                     0,
                     0,
@@ -18028,7 +18036,8 @@ mod tests {
                 Saturation::new()
                     .build(
                         &kinds_accepted_with,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -18082,7 +18091,8 @@ mod tests {
                     Saturation::new()
                         .build(
                             &kinds_accepted_with,
-                            &[],
+                            &Vec::new(),
+                            None,
                             1,
                             0,
                             0,
@@ -18143,7 +18153,8 @@ mod tests {
                 Saturation::new()
                     .build(
                         &kinds_one_chain,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -18180,7 +18191,8 @@ mod tests {
                 sat_chains
                     .build(
                         &kinds_chains,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -18317,7 +18329,8 @@ mod tests {
                 Saturation::new()
                     .build(
                         &kinds,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -18365,7 +18378,8 @@ mod tests {
                 Saturation::new()
                     .build(
                         &kinds,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -18408,7 +18422,8 @@ mod tests {
                 Saturation::new()
                     .build(
                         &kinds,
-                        &[],
+                        &Vec::new(),
+                        None,
                         1,
                         0,
                         0,
@@ -19650,6 +19665,7 @@ mod tests {
                     .build(
                         &kinds,
                         &outside,
+                        None,
                         1,
                         0,
                         0,
@@ -20899,6 +20915,7 @@ mod tests {
             .build(
                 &axiom_kinds,
                 &outside,
+                None,
                 1,
                 0,
                 0,
@@ -22047,6 +22064,7 @@ mod tests {
             let build_res = probe.build(
                 &horn_kinds,
                 &horn_outside,
+                None,
                 1,
                 0,
                 0,
@@ -22158,6 +22176,7 @@ mod tests {
             let build_res = probe.build(
                 &dl_kinds,
                 &dl_outside,
+                None,
                 1,
                 0,
                 0,
@@ -22616,7 +22635,17 @@ mod tests {
                     }
                     _ => {}
                 },
-                || sat.run_once(&refs, None, None, 0, &lim, true),
+                || {
+                    sat.run_once(
+                        &refs,
+                        None,
+                        None,
+                        0,
+                        &lim,
+                        true,
+                        AttemptProvenance::Ineligible,
+                    )
+                },
             );
             (
                 sat,
@@ -22660,6 +22689,7 @@ mod tests {
         );
         let (_, tax_opt, stats) = res_part
             .expect("partial=true must not error on between-rounds test_admitted refusal")
+            .continue_value()
             .expect("partial=true must return a partial classification");
         assert!(tax_opt.is_some());
         assert_eq!(

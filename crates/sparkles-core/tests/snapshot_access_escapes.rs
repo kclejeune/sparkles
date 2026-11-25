@@ -737,12 +737,10 @@ fn prepared_txn_view_refuses_reasoning_and_view_providers_that_could_retain_snap
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    type ReadableFn = Arc<dyn Fn(sparkles_core::id::Id) -> bool + Send + Sync>;
-
     struct CapturingReasoner {
         calls: AtomicUsize,
         snaps: Mutex<Vec<Arc<Snapshot>>>,
-        readables: Mutex<Vec<ReadableFn>>,
+        readables: Mutex<Vec<Arc<GraphAccess>>>,
     }
 
     impl CapturingReasoner {
