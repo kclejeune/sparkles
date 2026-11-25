@@ -2343,6 +2343,10 @@ impl Saturation {
         if let Err(Error::Memory { .. }) = r
             && self.reused
         {
+            #[cfg(test)]
+            admission_test::hit(admission_test::Point::KeptRetry {
+                dl_worked: self.dl_worked.load(Ordering::Relaxed),
+            });
             // A run that kept contexts passed its budget, which a run that starts again
             // may not: what it keeps of the contexts that nothing reaches any more, and
             // for a run with the Horn rules or Tier D the last index, which it holds
@@ -3692,8 +3696,10 @@ impl Saturation {
             Some(k) if k.tier != KeptTier::El => self.index.take(),
             _ => None,
         };
-        let old_bytes = old_ix.as_ref().map_or(0, |ix| ix.bytes())
-            + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes())
+        let old_ix_bytes = old_ix.as_ref().map_or(0, |ix| ix.bytes());
+        let dyn_retained_bytes = self.dynamic.as_ref().map_or(0, |d| d.retained_bytes());
+        let old_bytes = old_ix_bytes
+            + dyn_retained_bytes
             + self
                 .dl_run
                 .as_ref()
@@ -3873,6 +3879,8 @@ impl Saturation {
                     };
                     // Bound and pre-admit the peak single-table overlap during `shift_contexts`
                     // before allocating any replacement table.
+                    #[cfg(test)]
+                    admission_test::hit(admission_test::Point::RebaseScratchStart);
                     let mut rebase_scratch = 0usize;
                     for slot in &self.ctx {
                         tick(1)?;
@@ -3888,17 +3896,29 @@ impl Saturation {
                             rebase_scratch = rebase_scratch.max(s);
                         }
                     }
+                    // Reuse retained static, dynamic, and old-index byte sizes measured
+                    // before normalization (adjusting for any `self.ctx` slot growth from
+                    // `resize_with`) to avoid an unpolled rescan of the context tables.
+                    let slot = std::mem::size_of::<OnceLock<Box<saturate::Ctx>>>();
+                    let rebase_ctx_bytes =
+                        kept_bytes + self.ctx.capacity().saturating_sub(kept_capacity) * slot;
                     let rebase_live = self.index_bytes(&ix)
                         + held_bytes
                         + ax.bytes()
-                        + self.context_bytes()
-                        + d.retained_bytes()
+                        + rebase_ctx_bytes
+                        + dyn_retained_bytes
                         + dl_run.as_ref().map_or(0, |r| r.bytes())
-                        + old_ix.as_ref().map_or(0, |o| o.bytes());
+                        + old_ix_bytes;
+                    // Check for a stop after the scratch scan and before admission or mutation.
+                    poll(limits)?;
                     let rebase_held = rebase_live.saturating_add(rebase_scratch);
                     let more = rebase_held.saturating_sub(normalized_peak);
                     #[cfg(test)]
-                    admission_test::hit(admission_test::Point::RebaseAdmit);
+                    admission_test::hit(admission_test::Point::RebaseAdmit {
+                        live: rebase_live,
+                        scratch: rebase_scratch,
+                        paid: normalized_peak,
+                    });
                     if limits.max_memory.is_some_and(|m| rebase_held > m)
                         || limits
                             .charge
@@ -3925,7 +3945,11 @@ impl Saturation {
                             c.st.lock().shift_contexts(from, delta, &mut tick)?;
                         }
                     }
+                    #[cfg(test)]
+                    admission_test::hit(admission_test::Point::RebaseDynamicStart);
                     d.rebase(n as Ex, &mut tick)?;
+                    #[cfg(test)]
+                    admission_test::hit(admission_test::Point::RebaseDynamicEnd);
                 }
                 Some(d)
             }
@@ -5404,6 +5428,8 @@ impl Saturation {
         };
         let all = (0..ctx.len() as Ex).chain((0..count).map(|i| base + i));
         let mut affected: FxHashSet<Ex> = FxHashSet::default();
+        #[cfg(test)]
+        admission_test::hit(admission_test::Point::InvalidateInitialStart);
         for e in all.clone() {
             tick(1)?;
             let Some(c) = ctx_of(e) else { continue };
@@ -5421,8 +5447,16 @@ impl Saturation {
             }
             if !hit && e >= base {
                 let core = dynamic.core(e);
-                tick(core.len())?;
-                if dl_rules::core_changed(core, &changed) {
+                #[cfg(test)]
+                if core.len() > POLL_INVALIDATE {
+                    admission_test::hit(admission_test::Point::InvalidateLargeCoreStart);
+                }
+                let core_hit = dl_rules::core_changed_poll(core, &changed, &mut tick)?;
+                #[cfg(test)]
+                if core.len() > POLL_INVALIDATE {
+                    admission_test::hit(admission_test::Point::InvalidateLargeCoreEnd);
+                }
+                if core_hit {
                     hit = true;
                 }
             }
@@ -5436,6 +5470,8 @@ impl Saturation {
                 affected.insert(e);
             }
         }
+        #[cfg(test)]
+        admission_test::hit(admission_test::Point::InvalidateInitialEnd);
         // `changed` is never read past the initial scan; free it before the BFS and any
         // `renumbered` disjoint-map growth check so `live_without_old` stays exact.
         drop(changed);
@@ -5444,6 +5480,8 @@ impl Saturation {
         // over the predecessor, and the class whose subsumer a test that held gave
         let tests = ix.dl.is_some();
         let mut queue: Vec<Ex> = affected.iter().copied().collect();
+        #[cfg(test)]
+        admission_test::hit(admission_test::Point::InvalidateClosureStart);
         while let Some(e) = queue.pop() {
             tick(1)?;
             let Some(c) = ctx_of(e) else { continue };
@@ -5467,12 +5505,14 @@ impl Saturation {
             if tests
                 && e >= base
                 && st.bottom
-                && let Some(x) = dl_rules::tested_class(dynamic.core(e))
+                && let Some(x) = dl_rules::tested_class_poll(dynamic.core(e), &mut tick)?
                 && affected.insert(x)
             {
                 queue.push(x);
             }
         }
+        #[cfg(test)]
+        admission_test::hit(admission_test::Point::InvalidateClosureEnd);
         if renumbered {
             let mut maps = 0usize;
             for e in all.clone() {
@@ -5483,13 +5523,18 @@ impl Saturation {
                 let Some(c) = ctx_of(e) else { continue };
                 let st = c.st.lock();
                 if st.init && !st.disj.is_empty() {
-                    tick(st.subs.len())?;
-                    maps = maps.saturating_add(st.disjoint_growth(ix));
+                    maps = maps.saturating_add(st.disjoint_growth_poll(ix, &mut tick)?);
                 }
             }
             if maps > 0 {
                 let used = live_without_old.saturating_add(maps);
                 let more = used.saturating_sub(*normalized_peak);
+                #[cfg(test)]
+                admission_test::hit(admission_test::Point::DisjointGrowthAdmit {
+                    live: live_without_old,
+                    growth: maps,
+                    paid: *normalized_peak,
+                });
                 if limits.max_memory.is_some_and(|m| used > m)
                     || limits
                         .charge
@@ -5504,6 +5549,8 @@ impl Saturation {
                 *normalized_peak = (*normalized_peak).max(used);
             }
         }
+        #[cfg(test)]
+        admission_test::hit(admission_test::Point::InvalidateFinalStart);
         let mut cleared = 0;
         for e in all {
             tick(1)?;
@@ -5516,21 +5563,19 @@ impl Saturation {
             } else {
                 let mut st = c.st.lock();
                 if st.init {
-                    let pred_work = st
-                        .back
-                        .iter()
-                        .map(|(_, s)| s.list.len())
-                        .sum::<usize>()
-                        .saturating_add(dl_rules::dl(&st).map_or(0, |d| d.dpreds.len()));
-                    st.drop_predecessors(&affected);
+                    st.drop_predecessors_poll(&affected, &mut tick)?;
                     if renumbered && !st.disj.is_empty() {
-                        st.reindex_disjoint(ix);
+                        #[cfg(test)]
+                        admission_test::hit(admission_test::Point::DisjointReindex);
+                        st.reindex_disjoint_poll(ix, &mut tick)?;
+                        #[cfg(test)]
+                        admission_test::hit(admission_test::Point::DisjointReindexEnd);
                     }
-                    drop(st);
-                    tick(pred_work)?;
                 }
             }
         }
+        #[cfg(test)]
+        admission_test::hit(admission_test::Point::InvalidateFinalEnd);
         Ok(cleared)
     }
 
@@ -9275,72 +9320,182 @@ mod tests {
         held.extend(edit_doc.axioms.clone());
         let want = Classifier::of(&held).classify(&eager).unwrap();
 
-        // Refuse the grant at `RebaseAdmit` and assert `RebaseShift` is never reached before
-        // the fresh retry succeeds under the same limits.
+        // 1. Observe the exact `(live, scratch, paid)` values at `RebaseAdmit` and assert
+        // that `scratch == max_scratch > 0` and that `live + scratch` strictly exceeds
+        // `live.max(paid)`. Choosing `cap` strictly between `live.max(paid)` and
+        // `live + scratch` isolates the scratch contribution: omitting `+ rebase_scratch`
+        // would allow admission and reach `RebaseShift`.
+        let observed = Arc::new(parking_lot::Mutex::new(None::<(usize, usize, usize)>));
+        let obs_hook = observed.clone();
+        let mut k_probe = Classifier::of(&base_doc.axioms);
+        k_probe.classify(&eager).unwrap();
+        k_probe.add(&edit_doc.axioms);
+        let probe_out = admission_test::with_hook(
+            move |pt| {
+                if let admission_test::Point::RebaseAdmit {
+                    live,
+                    scratch,
+                    paid,
+                } = pt
+                {
+                    *obs_hook.lock() = Some((live, scratch, paid));
+                }
+            },
+            || k_probe.classify(&eager).unwrap(),
+        );
+        assert!(probe_out.stats.incremental);
+        let (live, scratch, paid) = observed
+            .lock()
+            .expect("RebaseAdmit was not reached on probe run");
+        assert_eq!(scratch, max_scratch);
+        let baseline = live.max(paid);
+        assert!(
+            live + scratch > baseline,
+            "rebase_held ({live} + {scratch}) did not exceed baseline ({baseline})"
+        );
+        let cap = baseline + (live + scratch - baseline) / 2;
+        assert!(cap >= baseline && cap < live + scratch);
+
+        // 2. `max_memory: Some(cap)` passes normalization (`paid <= cap`) and reaches
+        // `RebaseAdmit`, refuses specifically because of `rebase_scratch`, skips
+        // `RebaseShift`, and retries fresh under the same cap with identical results.
         let saw_admit = Arc::new(AtomicBool::new(false));
         let saw_shift = Arc::new(AtomicBool::new(false));
-        let refuse_at_rebase = Arc::new(AtomicBool::new(false));
-        let refused = Arc::new(AtomicUsize::new(0));
         let sa = saw_admit.clone();
         let ss = saw_shift.clone();
-        let rr = refuse_at_rebase.clone();
-        let rf = refused.clone();
-        let r_charge = refuse_at_rebase.clone();
-
         k.add(&edit_doc.axioms);
-        let out = admission_test::with_hook(
+        let out_max = admission_test::with_hook(
             move |pt| match pt {
-                admission_test::Point::RebaseAdmit => {
-                    sa.store(true, Ordering::SeqCst);
-                    rr.store(true, Ordering::SeqCst);
-                }
-                admission_test::Point::RebaseShift => {
-                    ss.store(true, Ordering::SeqCst);
-                }
+                admission_test::Point::RebaseAdmit { .. } => sa.store(true, Ordering::SeqCst),
+                admission_test::Point::RebaseShift => ss.store(true, Ordering::SeqCst),
                 _ => {}
             },
             || {
                 k.classify(&Limits {
-                    charge: Some(Arc::new(move |bytes| {
-                        if r_charge.swap(false, Ordering::SeqCst) {
-                            assert!(bytes > 0);
-                            rf.fetch_add(1, Ordering::SeqCst);
-                            false
-                        } else {
-                            true
-                        }
-                    })),
+                    max_memory: Some(cap),
                     ..eager.clone()
                 })
                 .unwrap()
             },
         );
-        assert!(
-            saw_admit.load(Ordering::SeqCst),
-            "RebaseAdmit was not reached"
-        );
-        assert!(
-            refused.load(Ordering::SeqCst) > 0,
-            "charge did not refuse at RebaseAdmit (rebase_held did not exceed normalized_peak)"
-        );
+        assert!(saw_admit.load(Ordering::SeqCst), "RebaseAdmit not reached");
         assert!(
             !saw_shift.load(Ordering::SeqCst),
-            "RebaseShift ran despite grant refusal at RebaseAdmit"
+            "RebaseShift ran despite max_memory cap below live + scratch"
         );
-        assert!(
-            !out.stats.incremental,
-            "refused kept run did not retry fresh"
-        );
-        assert_eq!(out.taxonomy, want.taxonomy);
-        assert_eq!(out.consistency, want.consistency);
-        assert_eq!(out.complete, want.complete);
+        assert!(!out_max.stats.incremental);
+        assert_eq!(out_max.taxonomy, want.taxonomy);
+        assert_eq!(out_max.consistency, want.consistency);
+        assert_eq!(out_max.complete, want.complete);
         assert!(k.excluded().is_empty());
+
+        // 3. Pool `charge` capped at `cap` also admits everything through `paid <= cap`,
+        // refuses the `RebaseAdmit` scratch delta, skips `RebaseShift`, and retries fresh.
+        let mut k_charge = Classifier::of(&base_doc.axioms);
+        k_charge.classify(&eager).unwrap();
+        k_charge.add(&edit_doc.axioms);
+        let saw_admit = Arc::new(AtomicBool::new(false));
+        let saw_shift = Arc::new(AtomicBool::new(false));
+        let charged = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let sa = saw_admit.clone();
+        let ss = saw_shift.clone();
+        let ch = charged.clone();
+        let rf = refused.clone();
+        let out_charge = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::RebaseAdmit { .. } => sa.store(true, Ordering::SeqCst),
+                admission_test::Point::RebaseShift => ss.store(true, Ordering::SeqCst),
+                _ => {}
+            },
+            || {
+                k_charge
+                    .classify(&Limits {
+                        charge: Some(Arc::new(move |bytes| {
+                            let prev = ch.fetch_add(bytes, Ordering::SeqCst);
+                            if prev + bytes > cap {
+                                ch.fetch_sub(bytes, Ordering::SeqCst);
+                                rf.fetch_add(1, Ordering::SeqCst);
+                                false
+                            } else {
+                                true
+                            }
+                        })),
+                        ..eager.clone()
+                    })
+                    .unwrap()
+            },
+        );
+        assert!(saw_admit.load(Ordering::SeqCst), "RebaseAdmit not reached");
+        assert!(refused.load(Ordering::SeqCst) > 0, "charge did not refuse");
+        assert!(
+            !saw_shift.load(Ordering::SeqCst),
+            "RebaseShift ran despite charge cap below live + scratch"
+        );
+        assert!(!out_charge.stats.incremental);
+        assert!(charged.load(Ordering::SeqCst) <= cap);
+        assert_eq!(out_charge.taxonomy, want.taxonomy);
+        assert_eq!(out_charge.consistency, want.consistency);
+        assert!(k_charge.excluded().is_empty());
+
+        // 4. Cancellation arriving during the rebase scratch scan stops before
+        // `RebaseAdmit`, `charge`, and `RebaseShift` run.
+        let mut k_stop = Classifier::of(&base_doc.axioms);
+        k_stop.classify(&eager).unwrap();
+        k_stop.add(&edit_doc.axioms);
+        let cancel_armed = Arc::new(AtomicBool::new(false));
+        let saw_admit = Arc::new(AtomicBool::new(false));
+        let saw_shift = Arc::new(AtomicBool::new(false));
+        let charge_after_arm = Arc::new(AtomicUsize::new(0));
+        let ca_hook = cancel_armed.clone();
+        let ca_poll = cancel_armed.clone();
+        let ca_charge = cancel_armed.clone();
+        let sa = saw_admit.clone();
+        let ss = saw_shift.clone();
+        let caa = charge_after_arm.clone();
+        let err = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::RebaseScratchStart => {
+                    ca_hook.store(true, Ordering::SeqCst);
+                }
+                admission_test::Point::RebaseAdmit { .. } => sa.store(true, Ordering::SeqCst),
+                admission_test::Point::RebaseShift => ss.store(true, Ordering::SeqCst),
+                _ => {}
+            },
+            || {
+                k_stop.classify(&Limits {
+                    cancelled: Some(Arc::new(move || ca_poll.load(Ordering::SeqCst))),
+                    charge: Some(Arc::new(move |_| {
+                        if ca_charge.load(Ordering::SeqCst) {
+                            caa.fetch_add(1, Ordering::SeqCst);
+                        }
+                        true
+                    })),
+                    ..eager.clone()
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(
+            !saw_admit.load(Ordering::SeqCst),
+            "RebaseAdmit ran after cancellation during scratch scan"
+        );
+        assert_eq!(
+            charge_after_arm.load(Ordering::SeqCst),
+            0,
+            "charge callback ran after cancellation during scratch scan"
+        );
+        assert!(!saw_shift.load(Ordering::SeqCst));
+        let recovered = k_stop.classify(&eager).unwrap();
+        assert!(!recovered.stats.incremental);
+        assert_eq!(recovered.taxonomy, want.taxonomy);
     }
 
     /// Cooperative polling in `invalidate_changed` (Item 753 Phase 1): both a reverse-dependency
-    /// chain with 1 edge per context (`edges == 1`, > 4096 nodes, which skipped the old
-    /// `visited.is_multiple_of(4096)` check) and a single high-fan-in successor (> 4096
-    /// predecessors) poll cooperatively, cancel deterministically mid-BFS, and recover cleanly.
+    /// chain with 1 edge per context (`edges == 1`, > 4096 nodes) and a single high-fan-in
+    /// successor (> 4096 predecessors) poll inside the BFS closure itself, cancel before
+    /// `InvalidateClosureEnd`, and recover cleanly.
     #[test]
     fn invalidate_changed_polls_chain_and_high_fan_in_and_recovers() {
         let eager = Limits {
@@ -9352,6 +9507,76 @@ mod tests {
             crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
                 .unwrap()
                 .axioms
+        };
+
+        let assert_closure_cancels = |base: &[Axiom], edit: &[Axiom], label: &str| {
+            let mut k_ok = Classifier::of(base);
+            let base_out = k_ok.classify(&eager).unwrap();
+            assert_eq!(base_out.stats.tier, Tier::Disjunctive);
+            k_ok.add(edit);
+            let ok = k_ok.classify(&eager).unwrap();
+            assert!(ok.stats.incremental, "{label}: expected incremental run");
+            assert!(
+                ok.stats.cleared >= 4500,
+                "{label}: cleared={}",
+                ok.stats.cleared
+            );
+
+            let mut k = Classifier::of(base);
+            k.classify(&eager).unwrap();
+            k.add(edit);
+            let in_closure = Arc::new(AtomicBool::new(false));
+            let saw_start = Arc::new(AtomicBool::new(false));
+            let saw_end = Arc::new(AtomicBool::new(false));
+            let closure_polls = Arc::new(AtomicUsize::new(0));
+            let ic_hook = in_closure.clone();
+            let ic_poll = in_closure.clone();
+            let ss = saw_start.clone();
+            let se = saw_end.clone();
+            let cp = closure_polls.clone();
+            let err = admission_test::with_hook(
+                move |pt| match pt {
+                    admission_test::Point::InvalidateClosureStart => {
+                        ss.store(true, Ordering::SeqCst);
+                        ic_hook.store(true, Ordering::SeqCst);
+                    }
+                    admission_test::Point::InvalidateClosureEnd => {
+                        ic_hook.store(false, Ordering::SeqCst);
+                        se.store(true, Ordering::SeqCst);
+                    }
+                    _ => {}
+                },
+                || {
+                    k.classify(&Limits {
+                        cancelled: Some(Arc::new(move || {
+                            if ic_poll.load(Ordering::SeqCst) {
+                                cp.fetch_add(1, Ordering::SeqCst);
+                                true
+                            } else {
+                                false
+                            }
+                        })),
+                        ..eager.clone()
+                    })
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Cancelled), "{label}: {err:?}");
+            assert!(
+                saw_start.load(Ordering::SeqCst),
+                "{label}: InvalidateClosureStart was not reached"
+            );
+            assert!(
+                closure_polls.load(Ordering::SeqCst) > 0,
+                "{label}: no cooperative poll ran inside BFS closure"
+            );
+            assert!(
+                !saw_end.load(Ordering::SeqCst),
+                "{label}: BFS closure finished without stopping on cancellation"
+            );
+            let recovered = k.classify(&eager).unwrap();
+            assert!(!recovered.stats.incremental);
+            assert_eq!(recovered.taxonomy, ok.taxonomy);
         };
 
         // Case 1: 4500-node reverse-dependency chain with 1 backward edge per context.
@@ -9366,50 +9591,7 @@ mod tests {
         }
         let chain_base = parse(&chain_body);
         let chain_edit = parse("SubClassOf(:C4500 :Target)");
-
-        let mut kc = Classifier::of(&chain_base);
-        let base_out = kc.classify(&eager).unwrap();
-        assert_eq!(base_out.stats.tier, Tier::Disjunctive);
-        kc.add(&chain_edit);
-        let total_polls = Arc::new(AtomicUsize::new(0));
-        let tp = total_polls.clone();
-        let ok = kc
-            .classify(&Limits {
-                cancelled: Some(Arc::new(move || {
-                    tp.fetch_add(1, Ordering::Relaxed);
-                    false
-                })),
-                ..eager.clone()
-            })
-            .unwrap();
-        assert!(ok.stats.incremental);
-        assert!(ok.stats.cleared >= 4500, "cleared={}", ok.stats.cleared);
-        let polls_seen = total_polls.load(Ordering::Relaxed);
-        assert!(
-            polls_seen >= 8,
-            "expected multiple cooperative polls across 4500-node chain, got {polls_seen}"
-        );
-
-        // Cancel deterministically inside the BFS closure (near the middle of the poll stream),
-        // then verify clean recovery on the next classification.
-        let mut kc2 = Classifier::of(&chain_base);
-        kc2.classify(&eager).unwrap();
-        kc2.add(&chain_edit);
-        let stop_at = polls_seen / 2;
-        let seen = Arc::new(AtomicUsize::new(0));
-        let s = seen.clone();
-        let err = kc2
-            .classify(&Limits {
-                cancelled: Some(Arc::new(move || {
-                    s.fetch_add(1, Ordering::Relaxed) >= stop_at
-                })),
-                ..eager.clone()
-            })
-            .unwrap_err();
-        assert!(matches!(err, Error::Cancelled), "{err:?}");
-        let recovered = kc2.classify(&eager).unwrap();
-        assert!(!recovered.stats.incremental);
-        assert_eq!(recovered.taxonomy, ok.taxonomy);
+        assert_closure_cancels(&chain_base, &chain_edit, "4500-node chain");
 
         // Case 2: Single high-fan-in successor `:Hub` with 4500 predecessors in `st.back`.
         let mut fan_body = String::from(
@@ -9422,97 +9604,181 @@ mod tests {
         }
         let fan_base = parse(&fan_body);
         let fan_edit = parse("SubClassOf(:Hub :Target)");
-
-        let mut kf = Classifier::of(&fan_base);
-        kf.classify(&eager).unwrap();
-        kf.add(&fan_edit);
-        let fan_polls = Arc::new(AtomicUsize::new(0));
-        let fp = fan_polls.clone();
-        let ok_fan = kf
-            .classify(&Limits {
-                cancelled: Some(Arc::new(move || {
-                    fp.fetch_add(1, Ordering::Relaxed);
-                    false
-                })),
-                ..eager.clone()
-            })
-            .unwrap();
-        assert!(ok_fan.stats.incremental);
-        assert!(
-            ok_fan.stats.cleared >= 4500,
-            "cleared={}",
-            ok_fan.stats.cleared
-        );
-        let fan_polls_seen = fan_polls.load(Ordering::Relaxed);
-        assert!(
-            fan_polls_seen >= 6,
-            "expected cooperative polls inside 4500-predecessor fan-in, got {fan_polls_seen}"
-        );
-
-        let mut kf2 = Classifier::of(&fan_base);
-        kf2.classify(&eager).unwrap();
-        kf2.add(&fan_edit);
-        let stop_at = fan_polls_seen / 2;
-        let seen = Arc::new(AtomicUsize::new(0));
-        let s = seen.clone();
-        let err = kf2
-            .classify(&Limits {
-                cancelled: Some(Arc::new(move || {
-                    s.fetch_add(1, Ordering::Relaxed) >= stop_at
-                })),
-                ..eager.clone()
-            })
-            .unwrap_err();
-        assert!(matches!(err, Error::Cancelled), "{err:?}");
-        let recovered = kf2.classify(&eager).unwrap();
-        assert!(!recovered.stats.incremental);
-        assert_eq!(recovered.taxonomy, ok_fan.taxonomy);
+        assert_closure_cancels(&fan_base, &fan_edit, "4500-predecessor fan-in");
     }
 
-    /// Cooperative polling during rebase (Item 753 Phase 1): adding a fresh name after
-    /// saturating > 4500 contexts with dynamic entries polls inside rebase and recovers
-    /// cleanly when cancelled mid-rebase.
+    /// Cooperative polling inside `invalidate_changed` for large dynamic cores and large
+    /// disjointness membership rebuilds (Item 753 Phase 1): both a >4096-element core scan
+    /// and a >4096-membership `reindex_disjoint_poll` inside the final pass cancel mid-walk
+    /// and recover cleanly on the next classification.
     #[test]
-    fn rebase_polls_inside_dynamic_walk_and_recovers() {
+    fn invalidate_changed_polls_large_core_and_disjoint_rebuild_and_recovers() {
         let eager = Limits {
             threads: 1,
             expansion: Expansion::Eager,
             ..Limits::default()
         };
-        let mut body = String::from(
-            "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\nSubClassOf(:Q :R)\n",
-        );
-        for i in 0..4500usize {
-            body.push_str(&format!("Declaration(Class(:Pad{i}))\n"));
-        }
-        let base =
+        let parse = |body: &str| {
             crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
                 .unwrap()
-                .axioms;
-        let edit = crate::ofn_read::parse(
-            "Prefix(:=<http://ex.org/>)\nOntology(\nSubClassOf(:FreshRebase :P)\n)",
-        )
-        .unwrap()
-        .axioms;
+                .axioms
+        };
 
-        let mut k = Classifier::of(&base);
-        k.classify(&eager).unwrap();
-        k.add(&edit);
-        let in_rebase = Arc::new(AtomicBool::new(false));
-        let rebase_polls = Arc::new(AtomicUsize::new(0));
-        let ir_hook = in_rebase.clone();
-        let ir_cancel = in_rebase.clone();
-        let rp = rebase_polls.clone();
+        // Direct unit check on `core_changed_poll` and `tested_class_poll` with > 4096 core entries.
+        let large_core: Vec<Ex> = (1..=4500u32).collect();
+        let mut ticks = 0usize;
+        let err = dl_rules::core_changed_poll(&large_core, &vec![false; 5000], &mut |w| {
+            ticks += w;
+            if ticks >= POLL_INVALIDATE {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled));
+        assert_eq!(ticks, POLL_INVALIDATE);
+
+        let mut test_core: Vec<Ex> = (1..=4500u32).map(|x| x | (1 << 31)).collect();
+        test_core.push(7);
+        let mut ticks = 0usize;
+        let err = dl_rules::tested_class_poll(&test_core, &mut |w| {
+            ticks += w;
+            if ticks >= POLL_INVALIDATE {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled));
+        assert_eq!(ticks, POLL_INVALIDATE);
+
+        // End-to-end large dynamic test core (> 4096 grouped subsumption candidates for `:A`)
+        // cancels inside `core_changed_poll` itself and recovers cleanly.
+        let mut core_body = String::from(
+            "SubClassOf(:A ObjectUnionOf(:P :Q))\n\
+             SubClassOf(:P :MidP)\n\
+             SubClassOf(:Q :MidQ)\n",
+        );
+        for i in 0..4200usize {
+            core_body.push_str(&format!(
+                "SubClassOf(:MidP :CP{i})\nSubClassOf(:MidQ :CQ{i})\n"
+            ));
+        }
+        let core_base = parse(&core_body);
+        let core_edit = parse("SubClassOf(:Unrelated :P)");
+        let mut kc = Classifier::of(&core_base);
+        let base_out = kc.classify(&eager).unwrap();
+        assert_eq!(base_out.stats.tier, Tier::Disjunctive);
+        let dyn_ref = kc.sat.dynamic.as_ref().expect("dynamic table");
+        let max_core = (0..dyn_ref.len() as Ex)
+            .map(|i| dyn_ref.core(dyn_ref.base() + i).len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_core > POLL_INVALIDATE,
+            "expected dynamic core len > {POLL_INVALIDATE}, got {max_core}"
+        );
+        kc.add(&core_edit);
+        let in_core = Arc::new(AtomicBool::new(false));
+        let saw_core_start = Arc::new(AtomicBool::new(false));
+        let saw_core_end = Arc::new(AtomicBool::new(false));
+        let core_polls = Arc::new(AtomicUsize::new(0));
+        let ic_hook = in_core.clone();
+        let ic_poll = in_core.clone();
+        let scs = saw_core_start.clone();
+        let sce = saw_core_end.clone();
+        let cp = core_polls.clone();
         let err = admission_test::with_hook(
-            move |pt| {
-                if pt == admission_test::Point::RebaseShift {
-                    ir_hook.store(true, Ordering::SeqCst);
+            move |pt| match pt {
+                admission_test::Point::InvalidateLargeCoreStart => {
+                    scs.store(true, Ordering::SeqCst);
+                    ic_hook.store(true, Ordering::SeqCst);
                 }
+                admission_test::Point::InvalidateLargeCoreEnd => {
+                    ic_hook.store(false, Ordering::SeqCst);
+                    sce.store(true, Ordering::SeqCst);
+                }
+                _ => {}
             },
             || {
-                k.classify(&Limits {
+                kc.classify(&Limits {
                     cancelled: Some(Arc::new(move || {
-                        if ir_cancel.load(Ordering::SeqCst) {
+                        if ic_poll.load(Ordering::SeqCst) {
+                            cp.fetch_add(1, Ordering::SeqCst);
+                            true
+                        } else {
+                            false
+                        }
+                    })),
+                    ..eager.clone()
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(
+            saw_core_start.load(Ordering::SeqCst),
+            "InvalidateLargeCoreStart was not reached"
+        );
+        assert!(
+            core_polls.load(Ordering::SeqCst) > 0,
+            "no cooperative poll ran inside core_changed_poll over >4096-entry dynamic core"
+        );
+        assert!(
+            !saw_core_end.load(Ordering::SeqCst),
+            "core_changed_poll completed without stopping on cancellation"
+        );
+        let mut core_held = core_base.clone();
+        core_held.extend(core_edit);
+        let core_want = Classifier::of(&core_held).classify(&eager).unwrap();
+        let recovered = kc.classify(&eager).unwrap();
+        assert!(!recovered.stats.incremental);
+        assert_eq!(recovered.taxonomy, core_want.taxonomy);
+
+        // End-to-end kept context whose subsumer `:M` belongs to 4500 unchanged disjoint sets:
+        // an unrelated `DisjointClasses(:Z0 :Z1)` renumbers sets and triggers `reindex_disjoint_poll`,
+        // which cancels strictly inside `DisjointReindex..DisjointReindexEnd` and recovers.
+        let mut disj_body = String::from(
+            "SubClassOf(:U ObjectUnionOf(:P :Q))\n\
+             SubClassOf(:P :R)\nSubClassOf(:Q :R)\n\
+             SubClassOf(:Keep :M)\n",
+        );
+        for i in 0..4500usize {
+            disj_body.push_str(&format!("DisjointClasses(:M :D{i})\n"));
+        }
+        let disj_base = parse(&disj_body);
+        let disj_edit = parse("DisjointClasses(:Z0 :Z1)");
+        let mut kd = Classifier::of(&disj_base);
+        let base_out = kd.classify(&eager).unwrap();
+        assert_eq!(base_out.stats.tier, Tier::Disjunctive);
+        kd.add(&disj_edit);
+        let in_reindex = Arc::new(AtomicBool::new(false));
+        let reindex_starts = Arc::new(AtomicUsize::new(0));
+        let reindex_ends = Arc::new(AtomicUsize::new(0));
+        let reindex_polls = Arc::new(AtomicUsize::new(0));
+        let ir_hook = in_reindex.clone();
+        let ir_poll = in_reindex.clone();
+        let rs = reindex_starts.clone();
+        let re = reindex_ends.clone();
+        let rp = reindex_polls.clone();
+        let err = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::DisjointReindex => {
+                    rs.fetch_add(1, Ordering::SeqCst);
+                    ir_hook.store(true, Ordering::SeqCst);
+                }
+                admission_test::Point::DisjointReindexEnd => {
+                    ir_hook.store(false, Ordering::SeqCst);
+                    re.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            },
+            || {
+                kd.classify(&Limits {
+                    cancelled: Some(Arc::new(move || {
+                        if ir_poll.load(Ordering::SeqCst) {
                             rp.fetch_add(1, Ordering::SeqCst);
                             true
                         } else {
@@ -9526,8 +9792,117 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Cancelled), "{err:?}");
         assert!(
-            rebase_polls.load(Ordering::SeqCst) > 0,
-            "expected cooperative poll during RebaseShift over >4500 slots"
+            reindex_starts.load(Ordering::SeqCst) > 0,
+            "DisjointReindex was not reached"
+        );
+        assert!(
+            reindex_polls.load(Ordering::SeqCst) > 0,
+            "no cooperative poll ran inside reindex_disjoint_poll over 4500 memberships"
+        );
+        assert!(
+            in_reindex.load(Ordering::SeqCst),
+            "cancellation did not terminate an active reindex_disjoint_poll before DisjointReindexEnd"
+        );
+        assert_eq!(
+            reindex_starts.load(Ordering::SeqCst),
+            reindex_ends.load(Ordering::SeqCst) + 1,
+            "expected active reindex_disjoint_poll to stop before DisjointReindexEnd"
+        );
+        let mut disj_held = disj_base.clone();
+        disj_held.extend(disj_edit);
+        let disj_want = Classifier::of(&disj_held).classify(&eager).unwrap();
+        let recovered = kd.classify(&eager).unwrap();
+        assert!(!recovered.stats.incremental);
+        assert_eq!(recovered.taxonomy, disj_want.taxonomy);
+    }
+
+    /// Cooperative polling during `Dynamic::rebase` (Item 753 Phase 1): saturating > 4096
+    /// dynamic conjunction contexts under `Expansion::Eager` and adding a fresh name polls
+    /// inside `Dynamic::rebase`'s shard walk, cancels before `RebaseDynamicEnd`, and recovers
+    /// cleanly.
+    #[test]
+    fn rebase_polls_inside_dynamic_walk_and_recovers() {
+        let eager = Limits {
+            threads: 1,
+            expansion: Expansion::Eager,
+            ..Limits::default()
+        };
+        let mut body = String::from(
+            "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\nSubClassOf(:Q :R)\n",
+        );
+        for i in 0..4200usize {
+            body.push_str(&format!(
+                "SubClassOf(:X{i} ObjectSomeValuesFrom(:r :A{i}))\n\
+                 SubClassOf(:X{i} ObjectAllValuesFrom(:r :B))\n"
+            ));
+        }
+        let base =
+            crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
+                .unwrap()
+                .axioms;
+        let edit = crate::ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)\nOntology(\nSubClassOf(:FreshRebase :P)\n)",
+        )
+        .unwrap()
+        .axioms;
+
+        let mut k = Classifier::of(&base);
+        let first = k.classify(&eager).unwrap();
+        assert_eq!(first.stats.tier, Tier::Disjunctive);
+        let dyn_len = k.sat.dynamic.as_ref().expect("dynamic table").len();
+        assert!(
+            dyn_len > POLL_INVALIDATE,
+            "fixture must create > {POLL_INVALIDATE} dynamic entries, got {dyn_len}"
+        );
+        k.add(&edit);
+        let in_dynamic = Arc::new(AtomicBool::new(false));
+        let saw_start = Arc::new(AtomicBool::new(false));
+        let saw_end = Arc::new(AtomicBool::new(false));
+        let dynamic_polls = Arc::new(AtomicUsize::new(0));
+        let id_hook = in_dynamic.clone();
+        let id_cancel = in_dynamic.clone();
+        let ss = saw_start.clone();
+        let se = saw_end.clone();
+        let dp = dynamic_polls.clone();
+        let err = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::RebaseDynamicStart => {
+                    ss.store(true, Ordering::SeqCst);
+                    id_hook.store(true, Ordering::SeqCst);
+                }
+                admission_test::Point::RebaseDynamicEnd => {
+                    id_hook.store(false, Ordering::SeqCst);
+                    se.store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            },
+            || {
+                k.classify(&Limits {
+                    cancelled: Some(Arc::new(move || {
+                        if id_cancel.load(Ordering::SeqCst) {
+                            dp.fetch_add(1, Ordering::SeqCst);
+                            true
+                        } else {
+                            false
+                        }
+                    })),
+                    ..eager.clone()
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(
+            saw_start.load(Ordering::SeqCst),
+            "RebaseDynamicStart was not reached"
+        );
+        assert!(
+            dynamic_polls.load(Ordering::SeqCst) > 0,
+            "expected cooperative poll inside Dynamic::rebase over {dyn_len} entries"
+        );
+        assert!(
+            !saw_end.load(Ordering::SeqCst),
+            "Dynamic::rebase finished without stopping on cancellation"
         );
         let mut held = base.clone();
         held.extend(edit);
@@ -9538,8 +9913,10 @@ mod tests {
     }
 
     /// Renumbered `DisjointClasses` pre-admission under `Expansion::Eager` (Item 753 Phase 1):
-    /// covers both incremental `reindex_disjoint` parity and tight budget refusal on
-    /// `live_without_old + maps` falling back to a fresh run.
+    /// covers both incremental `reindex_disjoint` parity and an isolated `disjoint_growth`
+    /// refusal whose cap lies strictly between `paid` (after two-index comparison) and
+    /// `live_without_old + growth`, proving refusal occurs at `DisjointGrowthAdmit` before
+    /// `DisjointReindex` and recovers via fresh retry.
     #[test]
     fn eager_renumbered_disjoint_growth_preadmission_and_parity() {
         let eager = Limits {
@@ -9550,40 +9927,47 @@ mod tests {
         let mut body = String::from(
             "SubClassOf(:U ObjectUnionOf(:P :Q))\n\
              SubClassOf(:P :R)\n\
-             SubClassOf(:Q :R)\n\
-             SubClassOf(:Base :A0)\n",
+             SubClassOf(:Q :R)\n",
         );
-        for i in 0..32usize {
+        for i in 0..64usize {
             body.push_str(&format!(
-                "SubClassOf(:Base :A{i})\nDisjointClasses(:A{i} :B{i})\n"
+                "SubClassOf(:Hub :A{i})\nDisjointClasses(:A{i} :B{i})\n"
             ));
+        }
+        for j in 0..128usize {
+            body.push_str(&format!("SubClassOf(:Base{j} :Hub)\n"));
+        }
+        let mut drop_body = String::new();
+        for g in 0..256usize {
+            drop_body.push_str(&format!("SubClassOf(:Gone{g} :Hub)\n"));
         }
         let base_ax =
             crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
                 .unwrap()
                 .axioms;
-        // Adding a disjoint pair over fresh classes inserts a new disjointness set and
-        // shifts existing disjointness set numbering (`renumbered == true`) while keeping
-        // `:Base` intact, and adding extra disjoint sets for `:A0` forces `disjoint_growth > 0`
-        // on kept contexts if any kept context grows its map.
-        let mut extra = String::from("DisjointClasses(:Z0 :Z1)\n");
-        for i in 0..32usize {
-            extra.push_str(&format!("DisjointClasses(:Z0 :Z{})\n", i + 2));
-        }
-        let edit_ax = crate::ofn_read::parse(&format!(
-            "Prefix(:=<http://ex.org/>)\nOntology(\n{extra}\n)"
+        let drop_ax = crate::ofn_read::parse(&format!(
+            "Prefix(:=<http://ex.org/>)\nOntology(\n{drop_body}\n)"
         ))
         .unwrap()
         .axioms;
+        let edit_ax = crate::ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)\nOntology(\nDisjointClasses(:Z0 :Z1)\n)",
+        )
+        .unwrap()
+        .axioms;
+
+        let mut initial_ax = base_ax.clone();
+        initial_ax.extend(drop_ax.clone());
 
         let mut held = base_ax.clone();
         held.extend(edit_ax.clone());
         let want = Classifier::of(&held).classify(&eager).unwrap();
 
         // 1. Uncapped kept run reindexes disjointness sets incrementally with exact parity.
-        let mut k = Classifier::of(&base_ax);
+        let mut k = Classifier::of(&initial_ax);
         let first = k.classify(&eager).unwrap();
         assert_eq!(first.stats.tier, Tier::Disjunctive);
+        k.remove(&drop_ax);
         k.add(&edit_ax);
         let out = k.classify(&eager).unwrap();
         assert!(
@@ -9594,73 +9978,301 @@ mod tests {
         assert_eq!(out.consistency, want.consistency);
         assert!(k.excluded().is_empty());
 
-        // 2. Direct `disjoint_growth > 0` pre-admission refusal triggers fresh retry.
-        // Grow `st.disj` on kept contexts by having `:Keep` subsume `:A0..:A31` and
-        // adding 64 new disjointness sets naming `:A0` (leaving `:Keep`'s map needing
-        // > its previous capacity when renumbered). Actually, adding `DisjointClasses(:A0 :Extra_j)`
-        // marks `:A0` changed; instead, make `:Keep` hold `:A0..:A31` with `st.disj`
-        // initially empty-capacity after clearing/shrinking or use a tighter `max_memory`
-        // budget over renumbered kept sets and verify refusal + fresh recovery!
-        let mut k_refuse = Classifier::of(&base_ax);
-        k_refuse.classify(&eager).unwrap();
-        // Force `:Base` to have `disjoint_growth(&new_ix) > 0` by shrinking its `disj`
-        // capacity to 0 (valid since we'll immediately add `edit_ax` which sets
-        // `renumbered == true` and runs `invalidate_changed`!).
-        let base_id = k_refuse
-            .sat
-            .interner
-            .get(&Node::Class(
-                k_refuse
+        // Helper that prepares a classified kept state whose 128 `:Base{j}` contexts have
+        // single-entry `st.disj` capacity (< 64 memberships), while the 256 removed `:Gone{g}`
+        // contexts remain in the kept state until invalidation clears them. That ensures both
+        // `live_without_old + growth > paid` and `want.stats.peak_memory < paid`, so a cap
+        // between `paid` and `live_without_old + growth` refuses specifically at
+        // `DisjointGrowthAdmit` and succeeds on the fresh retry.
+        let make_shrunk = || {
+            let mut kr = Classifier::of(&initial_ax);
+            kr.classify(&eager).unwrap();
+            for j in 0..128usize {
+                let iri = format!("http://ex.org/Base{j}");
+                let id = kr
                     .sat
                     .interner
-                    .classes
-                    .iter()
-                    .position(|c| c.as_str() == "http://ex.org/Base")
-                    .unwrap() as u32,
-            ))
-            .unwrap();
-        {
-            let ctx = k_refuse.sat.ctx[base_id as usize].get().unwrap();
-            let mut st = ctx.st.lock();
-            // Keep one entry so `!st.disj.is_empty()` holds while capacity is small
-            // (< 32 memberships), forcing `st.disjoint_growth(ix) > 0`.
-            let first_entry = *st.disj.iter().next().unwrap().0;
-            let first_val = st.disj[&first_entry];
-            st.disj = FxHashMap::default();
-            st.disj.insert(first_entry, first_val);
-            assert!(st.disj.capacity() < 32);
-        }
-        k_refuse.add(&edit_ax);
-        // Find the minimal budget where a fresh run succeeds, then verify a tight budget
-        // refuses the kept run during renumbered pre-admission and recovers via fresh retry.
-        let fresh_ok = |limit: usize| {
-            let mut f = Classifier::of(&held);
-            f.classify(&Limits {
-                max_memory: Some(limit),
-                ..eager.clone()
-            })
-            .ok()
-            .filter(|_| f.excluded().is_empty())
-        };
-        let (mut lo, mut hi) = (0usize, 1usize << 26);
-        assert!(fresh_ok(hi).is_some());
-        while hi - lo > 64 {
-            let mid = lo + (hi - lo) / 2;
-            if fresh_ok(mid).is_some() {
-                hi = mid;
-            } else {
-                lo = mid;
+                    .get(&Node::Class(
+                        kr.sat
+                            .interner
+                            .classes
+                            .iter()
+                            .position(|c| c.as_str() == iri)
+                            .unwrap() as u32,
+                    ))
+                    .unwrap();
+                let ctx = kr.sat.ctx[id as usize].get().unwrap();
+                let mut st = ctx.st.lock();
+                let (&first_entry, &first_val) = st.disj.iter().next().unwrap();
+                st.disj = FxHashMap::default();
+                st.disj.insert(first_entry, first_val);
+                assert!(st.disj.capacity() < 64);
             }
-        }
-        let out_tight = k_refuse
-            .classify(&Limits {
-                max_memory: Some(hi),
-                ..eager.clone()
-            })
-            .unwrap();
-        assert!(!out_tight.stats.incremental);
-        assert_eq!(out_tight.taxonomy, want.taxonomy);
-        assert!(k_refuse.excluded().is_empty());
+            kr.remove(&drop_ax);
+            kr.add(&edit_ax);
+            kr
+        };
+
+        // 2. Observe `(live, growth, paid)` at `DisjointGrowthAdmit` on an uncapped run and
+        // choose `cap` strictly between `paid` and `live + growth`.
+        let observed = Arc::new(parking_lot::Mutex::new(None::<(usize, usize, usize)>));
+        let obs_hook = observed.clone();
+        let mut k_probe = make_shrunk();
+        let probe_out = admission_test::with_hook(
+            move |pt| {
+                if let admission_test::Point::DisjointGrowthAdmit { live, growth, paid } = pt {
+                    *obs_hook.lock() = Some((live, growth, paid));
+                }
+            },
+            || k_probe.classify(&eager).unwrap(),
+        );
+        assert!(probe_out.stats.incremental);
+        let (live, growth, paid) = observed
+            .lock()
+            .expect("DisjointGrowthAdmit was not reached on probe run");
+        assert!(growth > 0, "expected disjoint_growth > 0");
+        assert!(
+            live + growth > paid,
+            "live_without_old + growth ({live} + {growth}) must exceed two-index peak ({paid})"
+        );
+        let cap = paid + (live + growth - paid) / 2;
+        assert!(cap >= paid && cap < live + growth);
+
+        // 3. `max_memory: Some(cap)` passes normalization, rebase, and two-index comparison
+        // (`paid <= cap`), refuses at `DisjointGrowthAdmit`, skips `DisjointReindex`, and
+        // retries fresh under the same cap with full parity.
+        let mut k_max = make_shrunk();
+        let saw_admit = Arc::new(AtomicBool::new(false));
+        let saw_reindex = Arc::new(AtomicBool::new(false));
+        let sa = saw_admit.clone();
+        let sr = saw_reindex.clone();
+        let out_max = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::DisjointGrowthAdmit { .. } => {
+                    sa.store(true, Ordering::SeqCst);
+                }
+                admission_test::Point::DisjointReindex => {
+                    sr.store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            },
+            || {
+                k_max
+                    .classify(&Limits {
+                        max_memory: Some(cap),
+                        ..eager.clone()
+                    })
+                    .unwrap()
+            },
+        );
+        assert!(
+            saw_admit.load(Ordering::SeqCst),
+            "DisjointGrowthAdmit was not reached under max_memory={cap}"
+        );
+        assert!(
+            !saw_reindex.load(Ordering::SeqCst),
+            "DisjointReindex ran despite refusal at DisjointGrowthAdmit"
+        );
+        assert!(!out_max.stats.incremental);
+        assert_eq!(out_max.taxonomy, want.taxonomy);
+        assert_eq!(out_max.consistency, want.consistency);
+        assert!(k_max.excluded().is_empty());
+
+        // 4. Pool `charge` capped at `cap` likewise reaches `DisjointGrowthAdmit`, refuses
+        // the growth delta, skips `DisjointReindex`, and retries fresh with full parity.
+        let mut k_charge = make_shrunk();
+        let saw_admit = Arc::new(AtomicBool::new(false));
+        let saw_reindex = Arc::new(AtomicBool::new(false));
+        let charged = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let sa = saw_admit.clone();
+        let sr = saw_reindex.clone();
+        let ch = charged.clone();
+        let rf = refused.clone();
+        let out_charge = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::DisjointGrowthAdmit { .. } => {
+                    sa.store(true, Ordering::SeqCst);
+                }
+                admission_test::Point::DisjointReindex => {
+                    sr.store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            },
+            || {
+                k_charge
+                    .classify(&Limits {
+                        charge: Some(Arc::new(move |bytes| {
+                            let prev = ch.fetch_add(bytes, Ordering::SeqCst);
+                            if prev + bytes > cap {
+                                ch.fetch_sub(bytes, Ordering::SeqCst);
+                                rf.fetch_add(1, Ordering::SeqCst);
+                                false
+                            } else {
+                                true
+                            }
+                        })),
+                        ..eager.clone()
+                    })
+                    .unwrap()
+            },
+        );
+        assert!(saw_admit.load(Ordering::SeqCst));
+        assert!(refused.load(Ordering::SeqCst) > 0);
+        assert!(!saw_reindex.load(Ordering::SeqCst));
+        assert!(!out_charge.stats.incremental);
+        assert!(charged.load(Ordering::SeqCst) <= cap);
+        assert_eq!(out_charge.taxonomy, want.taxonomy);
+        assert_eq!(out_charge.consistency, want.consistency);
+        assert!(k_charge.excluded().is_empty());
+    }
+
+    /// Post-counting fallback under `Expansion::Eager` (`dl_counting_over == true`, where
+    /// the fallback runs Tier D with `self.no_counting = true`) must not retain `self.kept`
+    /// state (verified directly on `k.sat.kept` so a `RuleKey` mismatch cannot mask a bug).
+    #[test]
+    fn eager_post_counting_fallback_does_not_retain_kept_state() {
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)
+             Ontology(
+                 SubClassOf(:A ObjectUnionOf(:B :C))
+                 SubClassOf(:B :D)
+                 SubClassOf(:C :D)
+                 SubClassOf(:A ObjectMaxCardinality(2 :r :B))
+             )",
+        )
+        .unwrap();
+        let lim = Limits {
+            threads: 1,
+            counting: true,
+            dl_work: Some(1),
+            expansion: Expansion::Eager,
+            ..Limits::default()
+        };
+        let mut k = Classifier::of(&doc.axioms);
+        let out = k.classify(&lim).unwrap();
+        assert!(
+            out.stats.dl_counting_over,
+            "expected post-counting fallback under dl_work=1"
+        );
+        assert!(out.stats.dl_over_budget);
+        assert_eq!(
+            out.stats.tier,
+            Tier::Disjunctive,
+            "expected post-counting fallback to complete in Tier D, not fall back to Horn"
+        );
+        assert!(
+            k.sat.kept.is_none(),
+            "post-counting Tier D fallback unexpectedly retained kept contexts"
+        );
+    }
+
+    /// Kept-run width-stop observation under `Expansion::Eager` (Item 753 Phase 1): using pure
+    /// class axioms whose 2x2 product triggers the width limit at 3 (and stays incremental at 4),
+    /// directly verify that `DlWidthStop` fires during the kept run *before* `KeptRetry` with
+    /// `dl_worked == true`, followed by the fresh retry's `DlWidthStop` and exact parity.
+    #[test]
+    fn eager_kept_width_stop_fires_before_fresh_retry() {
+        let parse = |body: &str| {
+            crate::ofn_read::parse(&format!(
+                "Prefix(:=<http://ex.org/>)\n\
+                 Prefix(owl:=<http://www.w3.org/2002/07/owl#>)\n\
+                 Ontology(\n{body}\n)"
+            ))
+            .unwrap()
+            .axioms
+        };
+        let base = parse(
+            "SubClassOf(:A ObjectUnionOf(:B :C))
+             SubClassOf(:B :D)
+             SubClassOf(:C :D)",
+        );
+        let wide = parse(
+            "SubClassOf(:W ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:W ObjectUnionOf(:Q1 ObjectAllValuesFrom(:r :P1)))
+             SubClassOf(:W ObjectUnionOf(:Q2 ObjectAllValuesFrom(:r :P1)))
+             SubClassOf(:W ObjectUnionOf(:R1 ObjectAllValuesFrom(:r :P2)))
+             SubClassOf(:W ObjectUnionOf(:R2 ObjectAllValuesFrom(:r :P2)))
+             SubClassOf(ObjectIntersectionOf(:P1 :P2) owl:Nothing)",
+        );
+        let eager = |width: usize| Limits {
+            threads: 1,
+            expansion: Expansion::Eager,
+            dl_attempt_width: Some(width),
+            ..Limits::default()
+        };
+
+        // At width limit 4, adding `wide` stays incremental with no width stop or kept retry.
+        let events_4 = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let ev4 = events_4.clone();
+        let mut k4 = Classifier::of(&base);
+        k4.classify(&eager(4)).unwrap();
+        k4.add(&wide);
+        let out4 = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::DlWidthStop | admission_test::Point::KeptRetry { .. } => {
+                    ev4.lock().push(pt);
+                }
+                _ => {}
+            },
+            || k4.classify(&eager(4)).unwrap(),
+        );
+        assert!(out4.stats.incremental);
+        assert!(!out4.stats.dl_attempt_over && !out4.stats.dl_over_budget);
+        assert!(events_4.lock().is_empty(), "{:?}", events_4.lock());
+
+        // At width limit 3, the kept run itself hits `DlWidthStop`, triggers
+        // `KeptRetry { dl_worked: true }`, and then the fresh retry hits `DlWidthStop` again.
+        let events_3 = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let ev3 = events_3.clone();
+        let mut k3 = Classifier::of(&base);
+        k3.classify(&eager(3)).unwrap();
+        assert!(k3.sat.kept.is_some());
+        k3.add(&wide);
+        let out3 = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::DlWidthStop | admission_test::Point::KeptRetry { .. } => {
+                    ev3.lock().push(pt);
+                }
+                _ => {}
+            },
+            || k3.classify(&eager(3)).unwrap(),
+        );
+        let seq = events_3.lock().clone();
+        let retry_pos = seq
+            .iter()
+            .position(|pt| matches!(pt, admission_test::Point::KeptRetry { dl_worked: true }))
+            .unwrap_or_else(|| panic!("expected KeptRetry {{ dl_worked: true }}, got {seq:?}"));
+        assert!(
+            seq[..retry_pos]
+                .iter()
+                .any(|pt| matches!(pt, admission_test::Point::DlWidthStop)),
+            "kept run did not hit DlWidthStop before KeptRetry: {seq:?}"
+        );
+        assert!(
+            seq[retry_pos + 1..]
+                .iter()
+                .any(|pt| matches!(pt, admission_test::Point::DlWidthStop)),
+            "fresh retry did not hit DlWidthStop after KeptRetry: {seq:?}"
+        );
+        assert!(!out3.stats.incremental);
+        assert!(out3.stats.dl_attempt_over && out3.stats.dl_over_budget);
+
+        let mut held = base.clone();
+        held.extend(wide.clone());
+        let want = Classifier::of(&held).classify(&eager(3)).unwrap();
+        assert_eq!(out3.taxonomy, want.taxonomy);
+        assert_eq!(out3.consistency, want.consistency);
+        assert_eq!(out3.complete, want.complete);
+
+        // Removing the wide axioms recovers cleanly without width fallback.
+        k3.remove(&wide);
+        let rec = k3.classify(&eager(3)).unwrap();
+        assert!(!rec.stats.dl_attempt_over && !rec.stats.dl_over_budget);
+        assert!(rec.taxonomy.is_subclass(
+            &Class::new("http://ex.org/A"),
+            &Class::new("http://ex.org/D")
+        ));
     }
 }
 

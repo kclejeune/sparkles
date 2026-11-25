@@ -180,6 +180,41 @@ impl<T: Copy + Eq + std::hash::Hash> Small<T> {
         }
     }
 
+    /// Retains members matching `keep`, polling `tick` across the scan and compaction.
+    pub fn retain_poll(
+        &mut self,
+        keep: impl Fn(&T) -> bool,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
+        let mut first_drop = None;
+        for (i, x) in self.list.iter().enumerate() {
+            tick(1)?;
+            if !keep(x) {
+                first_drop = Some(i);
+                break;
+            }
+        }
+        let Some(start) = first_drop else {
+            return Ok(());
+        };
+        if let Some(set) = &mut self.set {
+            set.remove(&self.list[start]);
+        }
+        let mut write = start;
+        for read in (start + 1)..self.list.len() {
+            tick(1)?;
+            let x = self.list[read];
+            if keep(&x) {
+                self.list[write] = x;
+                write += 1;
+            } else if let Some(set) = &mut self.set {
+                set.remove(&x);
+            }
+        }
+        self.list.truncate(write);
+        Ok(())
+    }
+
     /// Replaces each member by `f` of it, which must keep distinct members distinct,
     /// dropping any old hash set before allocating the replacement from `self.list` so peak
     /// memory never overlaps two tables, and polling `tick` across both passes.
@@ -519,9 +554,33 @@ impl State {
         }
     }
 
-    /// Removes the backward links whose source is in `gone`.
-    pub fn drop_links_from(&mut self, gone: &FxHashSet<Ex>) {
-        self.drop_links_where(|e| gone.contains(&e));
+    /// Removes the backward links whose source is in `gone`, polling `tick` across roles
+    /// and source lists.
+    pub fn drop_links_from_poll(
+        &mut self,
+        gone: &FxHashSet<Ex>,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
+        let mut emptied = false;
+        for (_, srcs) in &mut self.back {
+            tick(1)?;
+            srcs.retain_poll(|&e| !gone.contains(&e), tick)?;
+            emptied |= srcs.list.is_empty();
+        }
+        if emptied {
+            let mut write = 0;
+            for read in 0..self.back.len() {
+                tick(1)?;
+                if !self.back[read].1.list.is_empty() {
+                    if write != read {
+                        self.back.swap(write, read);
+                    }
+                    write += 1;
+                }
+            }
+            self.back.truncate(write);
+        }
+        Ok(())
     }
 
     /// Removes the backward links whose source `gone` answers true for.
@@ -540,26 +599,26 @@ impl State {
 
     /// Removes what the state keeps of the contexts in `gone` as its predecessors,
     /// which a run that clears them does before they register again (roadmap item
-    /// 753): their backward links and what the Horn rules were told of them.
-    pub fn drop_predecessors(&mut self, gone: &FxHashSet<Ex>) {
-        self.drop_links_from(gone);
+    /// 753): their backward links, what the Horn rules were told of them, and DL
+    /// predecessor registrations, polling `tick` across every list.
+    pub fn drop_predecessors_poll(
+        &mut self,
+        gone: &FxHashSet<Ex>,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
+        self.drop_links_from_poll(gone, tick)?;
         if let Some(x) = self.extra.as_mut() {
             let h = &mut x.horn;
-            if h.pred_in.list.iter().any(|(m, _)| gone.contains(m)) {
-                h.pred_in.retain(|(m, _)| !gone.contains(m));
-            }
-            if h.told.list.iter().any(|(m, _)| gone.contains(m)) {
-                h.told.retain(|(m, _)| !gone.contains(m));
-            }
+            h.pred_in.retain_poll(|(m, _)| !gone.contains(m), tick)?;
+            h.told.retain_poll(|(m, _)| !gone.contains(m), tick)?;
             for set in [&mut h.real_preds, &mut h.same, &mut h.told_singular] {
-                if set.list.iter().any(|m| gone.contains(m)) {
-                    set.retain(|m| !gone.contains(m));
-                }
+                set.retain_poll(|m| !gone.contains(m), tick)?;
             }
             if let Some(d) = x.dl.as_deref_mut() {
-                d.drop_predecessors(gone);
+                d.drop_predecessors_poll(gone, tick)?;
             }
         }
+        Ok(())
     }
 
     /// Peak temporary scratch bytes needed by [`State::shift_contexts`] for this state when
@@ -645,41 +704,77 @@ impl State {
     /// subsumer that gave it, whose memberships the saturation never recorded. The map
     /// grows only past [`State::disjoint_growth`], which the caller admits first.
     pub fn reindex_disjoint(&mut self, ix: &Index) {
+        let mut noop = |_| Ok(());
+        self.reindex_disjoint_poll(ix, &mut noop)
+            .expect("noop poll never fails");
+    }
+
+    /// Like [`State::reindex_disjoint`], polling `tick` across subsumers and disjointness
+    /// memberships so large maps remain cooperatively interruptible.
+    pub fn reindex_disjoint_poll(
+        &mut self,
+        ix: &Index,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
         self.disj.clear();
         if self.bottom {
-            return;
+            return Ok(());
         }
-        let n = self.disjoint_members(ix);
+        let n = self.disjoint_members_poll(ix, tick)?;
         if n > self.disj.capacity() {
             // drop the old table before the new one is allocated
             self.disj = FxHashMap::default();
             self.disj.reserve(n);
         }
         for &d in &self.subs {
+            tick(1)?;
             for &s in ix.disjoint(d) {
+                tick(1)?;
                 self.disj.entry(s).or_insert(d);
             }
         }
+        Ok(())
     }
 
     /// The memberships of the subsumers in the index's disjointness sets, a bound on the
-    /// entries of the map that [`State::reindex_disjoint`] builds.
-    fn disjoint_members(&self, ix: &Index) -> usize {
-        self.subs.iter().map(|&d| ix.disjoint(d).len()).sum()
+    /// entries of the map that [`State::reindex_disjoint`] builds, polling `tick` per
+    /// subsumer.
+    fn disjoint_members_poll(
+        &self,
+        ix: &Index,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<usize, super::Error> {
+        let mut total = 0usize;
+        for &d in &self.subs {
+            tick(1)?;
+            total = total.saturating_add(ix.disjoint(d).len());
+        }
+        Ok(total)
     }
 
     /// The bytes of the table that [`State::reindex_disjoint`] allocates over `ix`, none
     /// when the map it has holds the memberships. A table reserved for `n` entries has
     /// at most `2n + 8` of capacity.
     pub fn disjoint_growth(&self, ix: &Index) -> usize {
+        let mut noop = |_| Ok(());
+        self.disjoint_growth_poll(ix, &mut noop)
+            .expect("noop poll never fails")
+    }
+
+    /// Like [`State::disjoint_growth`], polling `tick` across the subsumer scan.
+    pub fn disjoint_growth_poll(
+        &self,
+        ix: &Index,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<usize, super::Error> {
         if self.bottom {
-            return 0;
+            return Ok(0);
         }
-        let n = self.disjoint_members(ix);
+        let n = self.disjoint_members_poll(ix, tick)?;
         if n <= self.disj.capacity() {
-            0
+            Ok(0)
         } else {
-            table_bytes(2 * n + 8, 8)
+            Ok(table_bytes(2 * n + 8, 8))
         }
     }
 

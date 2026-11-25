@@ -1526,14 +1526,7 @@ impl DlSt {
         }
     }
 
-    /// Whether a marker, a denied test class, a registered existential restriction, or a
-    /// stored clause of the context, dead or not, names an expression that `changed` marks,
-    /// or one it does not cover (roadmap item 753). Every rule reads the index by the atoms
-    /// and the successor terms of its premises, and a premise is a unit of the context, a
-    /// marker or a clause its store took, so a context that names no marked expression here
-    /// or among its units made no inference that the changed rules give or take. A clause
-    /// the store subsumed on arrival was a premise of none. The equalities and the interned
-    /// literals of runs that count or have a root are not read, and count as marked.
+    /// Test wrapper around [`DlSt::names_changed_poll`] with a no-op poll callback.
     #[cfg(test)]
     pub fn names_changed(&self, changed: &[bool]) -> bool {
         let mut noop = |_| Ok(());
@@ -1541,7 +1534,15 @@ impl DlSt {
             .expect("noop poll never fails")
     }
 
-    /// Like [`DlSt::names_changed`], polling `tick` across markers, edges, and stored clauses.
+    /// Whether a marker, a denied test class, a registered existential restriction, or a
+    /// stored clause of the context, dead or not, names an expression that `changed` marks,
+    /// or one it does not cover (roadmap item 753), polling `tick` across markers, edges,
+    /// and stored clauses. Every rule reads the index by the atoms and the successor terms
+    /// of its premises, and a premise is a unit of the context, a marker or a clause its
+    /// store took, so a context that names no marked expression here or among its units made
+    /// no inference that the changed rules give or take. A clause the store subsumed on
+    /// arrival was a premise of none. The equalities and the interned literals of runs that
+    /// count or have a root are not read, and count as marked.
     pub(super) fn names_changed_poll(
         &self,
         changed: &[bool],
@@ -1586,9 +1587,24 @@ impl DlSt {
     }
 
     /// Removes the contexts in `gone` from the predecessors that registered, which
-    /// register again when a run saturates them again (roadmap item 753).
-    pub fn drop_predecessors(&mut self, gone: &FxHashSet<Ex>) {
-        self.dpreds.retain(|(u, _)| !gone.contains(u));
+    /// register again when a run saturates them again (roadmap item 753), polling `tick`
+    /// across the predecessor list.
+    pub fn drop_predecessors_poll(
+        &mut self,
+        gone: &FxHashSet<Ex>,
+        tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+    ) -> Result<(), super::Error> {
+        let mut write = 0;
+        for read in 0..self.dpreds.len() {
+            tick(1)?;
+            let item = self.dpreds[read];
+            if !gone.contains(&item.0) {
+                self.dpreds[write] = item;
+                write += 1;
+            }
+        }
+        self.dpreds.truncate(write);
+        Ok(())
     }
 
     /// Peak temporary scratch bytes needed by [`DlSt::shift_contexts`] when shifting dynamic
@@ -1778,19 +1794,56 @@ pub fn has_test(d: &super::saturate::Dynamic, x: Ex, bs: &[Ex]) -> bool {
 
 /// The class that a test context with the core `core` tests, or `None` when `core` has no
 /// denied class (such as an eager conjunction context whose core holds only positive
-/// expressions).
+/// expressions), polling `tick` across the core entries.
+pub(super) fn tested_class_poll(
+    core: &[Ex],
+    tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+) -> Result<Option<Ex>, super::Error> {
+    let mut has_neg = false;
+    let mut first_pos = None;
+    for &m in core {
+        tick(1)?;
+        if m & NEG != 0 {
+            has_neg = true;
+        } else if first_pos.is_none() {
+            first_pos = Some(m);
+        }
+        if has_neg && first_pos.is_some() {
+            return Ok(first_pos);
+        }
+    }
+    Ok(if has_neg { first_pos } else { None })
+}
+
+/// Test wrapper around [`tested_class_poll`] with a no-op poll callback.
+#[cfg(test)]
 pub fn tested_class(core: &[Ex]) -> Option<Ex> {
-    core.iter()
-        .any(|&m| m & NEG != 0)
-        .then(|| core.iter().copied().find(|&m| m & NEG == 0))
-        .flatten()
+    let mut noop = |_| Ok(());
+    tested_class_poll(core, &mut noop).expect("noop poll never fails")
 }
 
 /// Whether any expression named by a dynamic context's `core` (positive or denied) is
-/// marked in `changed`, or lies outside `changed` (roadmap item 753).
+/// marked in `changed`, or lies outside `changed` (roadmap item 753), polling `tick`
+/// across the core entries.
+pub(super) fn core_changed_poll(
+    core: &[Ex],
+    changed: &[bool],
+    tick: &mut dyn FnMut(usize) -> Result<(), super::Error>,
+) -> Result<bool, super::Error> {
+    for &m in core {
+        tick(1)?;
+        if changed.get((m & !NEG) as usize).copied().unwrap_or(true) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Test wrapper around [`core_changed_poll`] with a no-op poll callback.
+#[cfg(test)]
 pub(super) fn core_changed(core: &[Ex], changed: &[bool]) -> bool {
-    core.iter()
-        .any(|&m| changed.get((m & !NEG) as usize).copied().unwrap_or(true))
+    let mut noop = |_| Ok(());
+    core_changed_poll(core, changed, &mut noop).expect("noop poll never fails")
 }
 
 /// Starts a test context: its core, `owl:Thing` and the class it denies.
@@ -3771,6 +3824,8 @@ fn drain_with_covered<S: Sink, D: Deriver>(
         // a product past the run's limit on choices ends the run as its bound does, before
         // the product spends its work (roadmap item 1011)
         if held_guard.dl().too_wide(&lists) {
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::DlWidthStop);
             held_guard.dl().exhaust_with(WorkStopGuard::WidthExhausted);
             mark_interrupted(st);
             return;
