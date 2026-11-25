@@ -89,6 +89,8 @@ impl SortKey {
                 (s.len() + lang.len()) as u64 + 128
             }
             Some(Value::Other { lex, dt }) => (lex.len() + dt.len()) as u64 + 128,
+            Some(Value::BigInteger(i)) => i.heap_bytes() + 32,
+            Some(Value::BigDecimal(d)) => d.heap_bytes() + 32,
             Some(Value::Triple(triple)) => super::graph_triple_bytes(triple),
             _ => 0,
         }
@@ -121,6 +123,7 @@ fn classify(v: &Value) -> (u8, Prim) {
             LITERAL + 2,
             Prim::Exact(i128::from_be_bytes(d.to_be_bytes()), true),
         ),
+        Value::BigInteger(_) | Value::BigDecimal(_) => (LITERAL + 2, Prim::Plain),
         Value::Float(f) => (LITERAL + 2, Prim::Approx(f64::from(f32::from(*f)), true)),
         Value::Double(d) => (LITERAL + 2, Prim::Approx(f64::from(*d), false)),
         Value::Bool(b) => (LITERAL + 3, Prim::Bool(*b)),
@@ -184,7 +187,9 @@ pub fn totally_ordered(v: Option<&Value>) -> bool {
             | Value::Str(_)
             | Value::Lang(..)
             | Value::Integer(_)
+            | Value::BigInteger(_)
             | Value::Decimal(_)
+            | Value::BigDecimal(_)
             | Value::Bool(_),
         ) => true,
         Some(Value::Float(f)) => !f32::from(*f).is_nan(),

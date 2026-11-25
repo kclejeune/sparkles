@@ -5,6 +5,7 @@ pub mod aggext;
 pub mod algorun;
 pub mod algosvc;
 pub mod arqpf;
+pub mod bignum;
 pub mod cache;
 pub mod catalog;
 pub mod cdt;

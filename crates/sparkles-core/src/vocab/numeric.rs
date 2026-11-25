@@ -39,7 +39,7 @@
 //! Layout, little-endian:
 //!
 //! ```text
-//! magic "SPKVNUM2" | vocabulary length u64 | covered u64 | values u64
+//! magic "SPKVNUM3" | vocabulary length u64 | covered u64 | values u64
 //!   | positions u64 | segments u64
 //! kinds: ceil(positions / 16) u64 words, position p in bits 4·(p % 16) of word p / 16
 //! rank: ceil(positions / 128) u32, the values before each group of 128 positions,
@@ -61,7 +61,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The column's file name in a generation directory.
 pub const FILE: &str = "vocab.num";
-const MAGIC: &[u8; 8] = b"SPKVNUM2";
+const MAGIC: &[u8; 8] = b"SPKVNUM3";
 const HEADER: usize = 48;
 /// The kinds and the rank are kept in memory up to this size. DBpedia's take 4.3 MB.
 const RESIDENT: usize = 64 << 20;
@@ -182,6 +182,7 @@ pub fn classify(key: &[u8]) -> (u8, u64) {
             Some(p) => (DECIMAL, p),
             None => (UNKNOWN, 0),
         },
+        Value::BigInteger(_) | Value::BigDecimal(_) => (UNKNOWN, 0),
         Value::Float(f) => (FLOAT, f32::from(f).to_bits() as u64),
         Value::Double(d) => (DOUBLE, f64::from(d).to_bits()),
         _ => (NOT_NUMERIC, 0),
@@ -872,7 +873,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     fn numeric_expected_page(at: usize, len: usize) -> std::collections::BTreeSet<usize> {
-        // Independent SPKVNUM2 byte layout and system page size, not locate().
+        // Independent SPKVNUM3 byte layout and system page size, not locate().
         // SAFETY: sysconf has no pointer arguments or other preconditions.
         let ps = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
         (at / ps..(at + len).div_ceil(ps)).collect()
@@ -1085,7 +1086,7 @@ pub(crate) mod tests {
             i if i == tail => Numeric::Integer(777),
             _ => Numeric::NotNumeric,
         };
-        // Derive load ranges from the fixture's documented two segments and SPKVNUM2
+        // Derive load ranges from the fixture's documented two segments and SPKVNUM3
         // layout, without calling locate(), kind_word(), rank_at() or layout().
         let expected_pages = |ids: &[u64], mapped: bool| {
             let positions = PROFILE_NUMBERS + 1;
@@ -1279,7 +1280,9 @@ pub(crate) mod tests {
     fn same(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Integer(x), Value::Integer(y)) => x == y,
+            (Value::BigInteger(x), Value::BigInteger(y)) => x == y,
             (Value::Decimal(x), Value::Decimal(y)) => x == y,
+            (Value::BigDecimal(x), Value::BigDecimal(y)) => x == y,
             (Value::Float(x), Value::Float(y)) => {
                 f32::from(*x).to_bits() == f32::from(*y).to_bits()
             }

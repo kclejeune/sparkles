@@ -833,8 +833,14 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         Expr::Neg(a) => {
             let x = eval(a, row, ctx)?.value(ctx)?;
             Ok(Val::V(match Num::of(&x)? {
-                Num::Integer(i) => Value::Integer(i.checked_neg().ok_or(TypeError)?),
-                Num::Decimal(d) => Value::Decimal(d.checked_neg().ok_or(TypeError)?),
+                Num::Integer(i) => i.checked_neg().map(Value::Integer).unwrap_or_else(|| {
+                    Value::from_bigint(super::bignum::BigInt::from_i64(i64::from(i)).negated())
+                }),
+                Num::BigInteger(i) => Value::from_bigint(i.negated()),
+                Num::Decimal(d) => d.checked_neg().map(Value::Decimal).unwrap_or_else(|| {
+                    Value::from_bigdec(super::bignum::BigDec::from_oxs_decimal(d).negated())
+                }),
+                Num::BigDecimal(d) => Value::from_bigdec(d.negated()),
                 Num::Float(f) => Value::Float(-f),
                 Num::Double(d) => Value::Double(-d),
             }))
@@ -1279,26 +1285,59 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         F::Rand => Val::V(Value::Double(rand::random::<f64>().into())),
         F::Abs => Val::V(match Num::of(&*a0()?)? {
-            Num::Integer(i) => Value::Integer(i.checked_abs().ok_or(TypeError)?),
-            Num::Decimal(d) => Value::Decimal(d.checked_abs().ok_or(TypeError)?),
+            Num::Integer(i) => i.checked_abs().map(Value::Integer).unwrap_or_else(|| {
+                Value::from_bigint(super::bignum::BigInt::from_i64(i64::from(i)).abs())
+            }),
+            Num::BigInteger(i) => Value::from_bigint(i.abs()),
+            Num::Decimal(d) => d.checked_abs().map(Value::Decimal).unwrap_or_else(|| {
+                Value::from_bigdec(super::bignum::BigDec::from_oxs_decimal(d).abs())
+            }),
+            Num::BigDecimal(d) => Value::from_bigdec(d.abs()),
             Num::Float(f) => Value::Float(f.abs()),
             Num::Double(d) => Value::Double(d.abs()),
         }),
         F::Ceil => Val::V(match Num::of(&*a0()?)? {
             Num::Integer(i) => Value::Integer(i),
-            Num::Decimal(d) => Value::Decimal(d.checked_ceil().ok_or(TypeError)?),
+            Num::BigInteger(i) => Value::from_bigint(i.clone()),
+            Num::Decimal(d) => match d.checked_ceil() {
+                Some(v) => Value::Decimal(v),
+                None => Value::from_bigdec(
+                    super::bignum::BigDec::from_oxs_decimal(d)
+                        .ceil()
+                        .ok_or(TypeError)?,
+                ),
+            },
+            Num::BigDecimal(d) => Value::from_bigdec(d.ceil().ok_or(TypeError)?),
             Num::Float(f) => Value::Float(f.ceil()),
             Num::Double(d) => Value::Double(d.ceil()),
         }),
         F::Floor => Val::V(match Num::of(&*a0()?)? {
             Num::Integer(i) => Value::Integer(i),
-            Num::Decimal(d) => Value::Decimal(d.checked_floor().ok_or(TypeError)?),
+            Num::BigInteger(i) => Value::from_bigint(i.clone()),
+            Num::Decimal(d) => match d.checked_floor() {
+                Some(v) => Value::Decimal(v),
+                None => Value::from_bigdec(
+                    super::bignum::BigDec::from_oxs_decimal(d)
+                        .floor()
+                        .ok_or(TypeError)?,
+                ),
+            },
+            Num::BigDecimal(d) => Value::from_bigdec(d.floor().ok_or(TypeError)?),
             Num::Float(f) => Value::Float(f.floor()),
             Num::Double(d) => Value::Double(d.floor()),
         }),
         F::Round => Val::V(match Num::of(&*a0()?)? {
             Num::Integer(i) => Value::Integer(i),
-            Num::Decimal(d) => Value::Decimal(d.checked_round().ok_or(TypeError)?),
+            Num::BigInteger(i) => Value::from_bigint(i.clone()),
+            Num::Decimal(d) => match d.checked_round() {
+                Some(v) => Value::Decimal(v),
+                None => Value::from_bigdec(
+                    super::bignum::BigDec::from_oxs_decimal(d)
+                        .round()
+                        .ok_or(TypeError)?,
+                ),
+            },
+            Num::BigDecimal(d) => Value::from_bigdec(d.round().ok_or(TypeError)?),
             Num::Float(f) => Value::Float((round_half_up_double(f64::from(f)) as f32).into()),
             Num::Double(d) => Value::Double(round_half_up_double(d.into()).into()),
         }),
@@ -1760,7 +1799,7 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
         "string" => s(lex),
         "boolean" => match (&v, num) {
             (Value::Bool(x), _) => b(*x),
-            (_, Some(n)) => b(Value::Double(n.to_double()).ebv().unwrap_or(false)),
+            (_, Some(_)) => b(v.ebv().unwrap_or(false)),
             _ if from_str => return parsed(xsd::BOOLEAN),
             _ => return Err(TypeError),
         },
@@ -1770,34 +1809,51 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
             let r = match (&v, num) {
                 (Value::Bool(x), _) => Value::Integer((*x as i64).into()),
                 (_, Some(Num::Integer(i))) => Value::Integer(i),
-                (_, Some(Num::Decimal(d))) => {
-                    Value::Integer(Integer::try_from(d).map_err(|_| TypeError)?)
-                }
-                (_, Some(Num::Float(f))) => {
-                    Value::Integer(Integer::try_from(f).map_err(|_| TypeError)?)
-                }
-                (_, Some(Num::Double(d))) => {
-                    Value::Integer(Integer::try_from(d).map_err(|_| TypeError)?)
-                }
+                (_, Some(Num::BigInteger(i))) => Value::from_bigint(i.clone()),
+                (_, Some(Num::Decimal(d))) => Integer::try_from(d)
+                    .map(Value::Integer)
+                    .unwrap_or_else(|_| {
+                        Value::from_bigint(
+                            super::bignum::BigDec::from_oxs_decimal(d).trunc_to_bigint(),
+                        )
+                    }),
+                (_, Some(Num::BigDecimal(d))) => Value::from_bigint(d.trunc_to_bigint()),
+                (_, Some(Num::Float(f))) => match Integer::try_from(f) {
+                    Ok(i) => Value::Integer(i),
+                    Err(_) => Value::from_bigint(
+                        super::bignum::BigInt::from_f64_trunc(f64::from(f32::from(f)))
+                            .ok_or(TypeError)?,
+                    ),
+                },
+                (_, Some(Num::Double(d))) => match Integer::try_from(d) {
+                    Ok(i) => Value::Integer(i),
+                    Err(_) => Value::from_bigint(
+                        super::bignum::BigInt::from_f64_trunc(f64::from(d)).ok_or(TypeError)?,
+                    ),
+                },
                 _ if from_str => match parsed(xsd::INTEGER)? {
                     Val::V(v) => v,
                     _ => return Err(TypeError),
                 },
                 _ => return Err(TypeError),
             };
-            match integer_range(local) {
-                None => Val::V(r),
-                Some((lo, hi)) => {
-                    // the derived type's range, and the literal keeps its datatype
-                    let Value::Integer(i) = r else {
-                        return Err(TypeError);
-                    };
-                    if !(lo..=hi).contains(&i128::from(i64::from(i))) {
-                        return Err(TypeError);
-                    }
-                    let lit = Literal::new_typed_literal(i.to_string(), dt.clone());
-                    Val::Dec(ctx.intern_term(&Term::Literal(lit)), r)
+            if local == "integer" {
+                Val::V(r)
+            } else {
+                // the derived type's range, and the literal keeps its datatype
+                let in_range = match &r {
+                    Value::Integer(i) => match integer_range(local) {
+                        Some((lo, hi)) => (lo..=hi).contains(&i128::from(i64::from(*i))),
+                        None => false,
+                    },
+                    Value::BigInteger(i) => super::value::integer_in_derived_range(i, dt.as_str()),
+                    _ => return Err(TypeError),
+                };
+                if !in_range {
+                    return Err(TypeError);
                 }
+                let lit = Literal::new_typed_literal(r.lexical()?.as_ref(), dt.clone());
+                Val::Dec(ctx.intern_term(&Term::Literal(lit)), r)
             }
         }
         "anyURI" => match &v {
@@ -1819,18 +1875,28 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
         "decimal" => match (&v, num) {
             (Value::Bool(x), _) => Val::V(Value::Decimal((*x as i64).into())),
             (_, Some(Num::Integer(i))) => Val::V(Value::Decimal(i.into())),
+            (_, Some(Num::BigInteger(i))) => Val::V(Value::from_bigdec(
+                super::bignum::BigDec::from_bigint(i.clone()),
+            )),
             (_, Some(Num::Decimal(d))) => Val::V(Value::Decimal(d)),
+            (_, Some(Num::BigDecimal(d))) => Val::V(Value::from_bigdec(d.clone())),
             (_, Some(Num::Float(f))) => {
-                Val::V(Value::Decimal(Decimal::try_from(f).map_err(|_| TypeError)?))
+                let x = f32::from(f);
+                let dec = super::bignum::BigDec::from_f32(x).ok_or(TypeError)?;
+                Val::V(Value::from_bigdec(dec))
             }
             (_, Some(Num::Double(d))) => {
-                Val::V(Value::Decimal(Decimal::try_from(d).map_err(|_| TypeError)?))
+                let x = f64::from(d);
+                let dec = super::bignum::BigDec::from_f64(x).ok_or(TypeError)?;
+                Val::V(Value::from_bigdec(dec))
             }
             _ if from_str => return parsed(xsd::DECIMAL),
             _ => return Err(TypeError),
         },
         "float" => match (&v, num) {
             (Value::Bool(x), _) => Val::V(Value::Float(if *x { 1.0f32 } else { 0.0 }.into())),
+            (_, Some(Num::BigInteger(i))) => Val::V(Value::Float(Float::from(i.to_f32()))),
+            (_, Some(Num::BigDecimal(d))) => Val::V(Value::Float(Float::from(d.to_f32()))),
             (_, Some(n)) => Val::V(Value::Float(Float::from(n.to_double()))),
             _ if from_str => return parsed(xsd::FLOAT),
             _ => return Err(TypeError),
@@ -2048,6 +2114,10 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
                 }
                 let value = match Num::of(&*a(0)?)? {
                     Num::Integer(i) => super::fnformat::FormatValue::Integer(i64::from(i).into()),
+                    Num::BigInteger(i) => match i.to_i128() {
+                        Some(v) => super::fnformat::FormatValue::Integer(v),
+                        None => super::fnformat::FormatValue::Double(i.to_f64()),
+                    },
                     n => super::fnformat::FormatValue::Double(f64::from(n.to_double())),
                 };
                 let picture = a(1)?;
@@ -2123,6 +2193,7 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
             "struuid" => fb(Function::StrUuid),
             "evenInteger" => match Num::of(&*a(0)?)? {
                 Num::Integer(n) => Ok(b(i64::from(n) % 2 == 0)),
+                Num::BigInteger(n) => Ok(b(n.is_even())),
                 _ => Err(TypeError),
             },
             "langeq" => {
@@ -2270,7 +2341,12 @@ fn sprintf_arg(v: &Value) -> super::fnformat::Arg {
     use super::fnformat::Arg;
     match v {
         Value::Integer(i) => Arg::Integer(i64::from(*i).into()),
+        Value::BigInteger(i) => match i.to_i128() {
+            Some(v) => Arg::Integer(v),
+            None => Arg::Double(i.to_f64()),
+        },
         Value::Decimal(d) => Arg::Decimal(*d),
+        Value::BigDecimal(d) => Arg::Double(d.to_f64()),
         Value::Double(d) => Arg::Double(f64::from(*d)),
         Value::Float(f) => Arg::Float(f32::from(*f)),
         Value::DateTime(d) => Arg::Date(*d),

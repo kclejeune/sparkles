@@ -70,7 +70,7 @@ pub(super) fn has_desc(p: &PlanInfo, needle: &str) -> bool {
 /// allows. The reference reads no text, spatial or extension indexes, so a query that
 /// uses them is one it does not evaluate, and neither is a query whose nested loops pass
 /// the work limit. A query that reads a number of more than 16 digits is not compared,
-/// since XSD lets the engine limit those (roadmap item 1065). Where the query meets a
+/// since the test-only reference evaluator uses fixed-width `i128` and `Decimal`. Where the query meets a
 /// question that the engine reads otherwise than the specification's text, such as an
 /// error in MIN or MAX under the default of item 1064's setting or string arguments that
 /// differ only in base direction (item 1071), it is compared exactly under the engine's

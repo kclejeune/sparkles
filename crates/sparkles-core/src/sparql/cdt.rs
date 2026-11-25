@@ -795,8 +795,8 @@ pub fn same_value(a: &Term, b: &Term) -> EvalResult<bool> {
     };
     let (x, y) = (val(a), val(b));
     if let (Ok(p), Ok(q)) = (Num::of(&x), Num::of(&y)) {
-        let family = |n: &Num| match n {
-            Num::Integer(_) | Num::Decimal(_) => 0,
+        let family = |n: &Num<'_>| match n {
+            Num::Integer(_) | Num::BigInteger(_) | Num::Decimal(_) | Num::BigDecimal(_) => 0,
             Num::Float(_) => 1,
             Num::Double(_) => 2,
         };

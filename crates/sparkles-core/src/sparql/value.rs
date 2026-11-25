@@ -1,6 +1,7 @@
 //! SPARQL value space (ARQ `NodeValue` equivalent): typed values, promotion,
 //! comparison, effective boolean value and ordering.
 
+use super::bignum::{BigDec, BigInt};
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{Literal, NamedNode, Term};
 use oxsdatatypes::*;
@@ -21,7 +22,11 @@ pub enum Value {
     Triple(Arc<oxrdf::Triple>),
     Bool(bool),
     Integer(Integer),
+    /// `xsd:integer` (or derived integer) outside the `i64` range
+    BigInteger(Arc<BigInt>),
     Decimal(Decimal),
+    /// `xsd:decimal` outside `oxsdatatypes::Decimal`
+    BigDecimal(Arc<BigDec>),
     Float(Float),
     Double(Double),
     DateTime(DateTime),
@@ -67,8 +72,82 @@ pub(crate) fn numeric_datatype(dt: &str) -> bool {
         || INTEGER_DERIVED.contains(&dt)
 }
 
+/// Whether a signed `i64` satisfies the XSD bounds of a derived integer datatype.
+#[inline]
+fn derived_i64_in_range(v: i64, dt: &str) -> bool {
+    match dt.rsplit('#').next().unwrap_or("") {
+        "long" => true,
+        "int" => i32::try_from(v).is_ok(),
+        "short" => i16::try_from(v).is_ok(),
+        "byte" => i8::try_from(v).is_ok(),
+        "nonNegativeInteger" | "unsignedLong" => v >= 0,
+        "positiveInteger" => v >= 1,
+        "nonPositiveInteger" => v <= 0,
+        "negativeInteger" => v <= -1,
+        "unsignedInt" => u32::try_from(v).is_ok(),
+        "unsignedShort" => u16::try_from(v).is_ok(),
+        "unsignedByte" => u8::try_from(v).is_ok(),
+        _ => false,
+    }
+}
+
+/// Whether `v` satisfies the XSD value-space bounds of `xsd:integer` or a derived integer
+/// datatype.
+pub(crate) fn integer_in_derived_range(v: &BigInt, dt: &str) -> bool {
+    match dt.rsplit('#').next().unwrap_or("") {
+        "integer" => true,
+        "long" => v.to_i64().is_some(),
+        "int" => v.to_i64().is_some_and(|n| i32::try_from(n).is_ok()),
+        "short" => v.to_i64().is_some_and(|n| i16::try_from(n).is_ok()),
+        "byte" => v.to_i64().is_some_and(|n| i8::try_from(n).is_ok()),
+        "nonNegativeInteger" => !v.is_negative(),
+        "positiveInteger" => v.is_positive(),
+        "nonPositiveInteger" => !v.is_positive(),
+        "negativeInteger" => v.is_negative(),
+        "unsignedLong" => v.to_u64().is_some(),
+        "unsignedInt" => v.to_i64().is_some_and(|n| u32::try_from(n).is_ok()),
+        "unsignedShort" => v.to_i64().is_some_and(|n| u16::try_from(n).is_ok()),
+        "unsignedByte" => v.to_i64().is_some_and(|n| u8::try_from(n).is_ok()),
+        _ => false,
+    }
+}
+
+#[cold]
+fn parse_big_integer_or_other(lex: &str, dt: &str) -> Value {
+    if let Some(bi) = BigInt::parse(lex)
+        && integer_in_derived_range(&bi, dt)
+    {
+        return Value::from_bigint(bi);
+    }
+    Value::Other {
+        lex: lex.into(),
+        dt: dt.into(),
+    }
+}
+
+#[cold]
+fn parse_big_decimal_or_other(lex: &str, dt: &str) -> Value {
+    if let Some(bd) = BigDec::parse(lex) {
+        return Value::from_bigdec(bd);
+    }
+    Value::Other {
+        lex: lex.into(),
+        dt: dt.into(),
+    }
+}
+
+#[cold]
+fn numeric_key_big(lex: &str, dt: &str) -> Option<f64> {
+    if dt == xsd::DECIMAL.as_str() {
+        return BigDec::parse(lex).map(|d| d.to_f64());
+    }
+    let bi = BigInt::parse(lex)?;
+    integer_in_derived_range(&bi, dt).then(|| bi.to_f64())
+}
+
 /// Numeric subset of from_key without allocating Other/lexical Arc values.
-/// The pinned four parsers and approx_f64 use fixed scalar/stack storage.
+/// Ordinary fixed-width numbers stay on fixed scalar/stack storage; out-of-range
+/// integers and decimals fall back to the cold arbitrary-precision parser.
 pub(crate) fn numeric_key(key: &[u8]) -> Option<f64> {
     if key.first() != Some(&b'"') {
         return None;
@@ -83,16 +162,32 @@ pub(crate) fn numeric_key(key: &[u8]) -> Option<f64> {
     if !numeric_datatype(dt) {
         return None;
     }
-    let value = if dt == xsd::DECIMAL.as_str() {
-        Value::Decimal(lex.parse().ok()?)
-    } else if dt == xsd::FLOAT.as_str() {
-        Value::Float(lex.parse().ok()?)
-    } else if dt == xsd::DOUBLE.as_str() {
-        Value::Double(lex.parse().ok()?)
-    } else {
-        Value::Integer(lex.parse().ok()?)
-    };
-    approx_f64(&value)
+    if dt == xsd::DECIMAL.as_str() {
+        return match lex.parse::<Decimal>() {
+            Ok(d) => Some(decimal_f64(d)),
+            Err(_) => numeric_key_big(lex, dt),
+        };
+    }
+    if dt == xsd::FLOAT.as_str() {
+        let f: Float = lex.parse().ok()?;
+        let d = f64::from(f32::from(f));
+        return (!d.is_nan()).then_some(d);
+    }
+    if dt == xsd::DOUBLE.as_str() {
+        let d: Double = lex.parse().ok()?;
+        let d = f64::from(d);
+        return (!d.is_nan()).then_some(d);
+    }
+    match lex.parse::<Integer>() {
+        Ok(i) => {
+            if dt == xsd::INTEGER.as_str() || derived_i64_in_range(i64::from(i), dt) {
+                Some(i64::from(i) as f64)
+            } else {
+                None
+            }
+        }
+        Err(_) => numeric_key_big(lex, dt),
+    }
 }
 
 impl Value {
@@ -169,8 +264,14 @@ impl Value {
                 "false" | "0" => Value::Bool(false),
                 _ => other(),
             },
-            s if s == xsd::INTEGER.as_str() => parse!(Integer),
-            s if s == xsd::DECIMAL.as_str() => parse!(Decimal),
+            s if s == xsd::INTEGER.as_str() => match lex.parse() {
+                Ok(i) => Value::Integer(i),
+                Err(_) => parse_big_integer_or_other(lex, dt),
+            },
+            s if s == xsd::DECIMAL.as_str() => match lex.parse() {
+                Ok(d) => Value::Decimal(d),
+                Err(_) => parse_big_decimal_or_other(lex, dt),
+            },
             s if s == xsd::DOUBLE.as_str() => parse!(Double),
             s if s == xsd::FLOAT.as_str() => parse!(Float),
             s if s == xsd::DATE_TIME.as_str() || s == xsd::DATE_TIME_STAMP.as_str() => {
@@ -181,8 +282,26 @@ impl Value {
             s if s == xsd::DURATION.as_str() => parse!(Duration),
             s if s == xsd::YEAR_MONTH_DURATION.as_str() => parse!(YearMonth),
             s if s == xsd::DAY_TIME_DURATION.as_str() => parse!(DayTime),
-            s if INTEGER_DERIVED.contains(&s) => parse!(Integer),
+            s if INTEGER_DERIVED.contains(&s) => match lex.parse::<Integer>() {
+                Ok(i) if derived_i64_in_range(i64::from(i), dt) => Value::Integer(i),
+                Ok(_) => other(),
+                Err(_) => parse_big_integer_or_other(lex, dt),
+            },
             _ => other(),
+        }
+    }
+
+    pub fn from_bigint(i: BigInt) -> Value {
+        match i.to_i64() {
+            Some(n) => Value::Integer(n.into()),
+            None => Value::BigInteger(Arc::new(i)),
+        }
+    }
+
+    pub fn from_bigdec(d: BigDec) -> Value {
+        match d.to_oxs_decimal() {
+            Some(dec) => Value::Decimal(dec),
+            None => Value::BigDecimal(Arc::new(d)),
         }
     }
 
@@ -201,7 +320,9 @@ impl Value {
             }
             Value::Bool(b) => typed(b.to_string(), xsd::BOOLEAN.into()),
             Value::Integer(i) => typed(i.to_string(), xsd::INTEGER.into()),
+            Value::BigInteger(i) => typed(i.to_string(), xsd::INTEGER.into()),
             Value::Decimal(d) => typed(d.to_string(), xsd::DECIMAL.into()),
+            Value::BigDecimal(d) => typed(d.to_string(), xsd::DECIMAL.into()),
             Value::Float(f) => typed(f.to_string(), xsd::FLOAT.into()),
             Value::Double(d) => typed(d.to_string(), xsd::DOUBLE.into()),
             Value::DateTime(d) => typed(d.to_string(), xsd::DATE_TIME.into()),
@@ -220,7 +341,12 @@ impl Value {
     pub fn is_numeric(&self) -> bool {
         matches!(
             self,
-            Value::Integer(_) | Value::Decimal(_) | Value::Float(_) | Value::Double(_)
+            Value::Integer(_)
+                | Value::BigInteger(_)
+                | Value::Decimal(_)
+                | Value::BigDecimal(_)
+                | Value::Float(_)
+                | Value::Double(_)
         )
     }
     /// simple literal or xsd:string
@@ -280,7 +406,9 @@ impl Value {
             Value::Bool(b) => Ok(*b),
             Value::Str(s) => Ok(!s.is_empty()),
             Value::Integer(i) => Ok(i64::from(*i) != 0),
+            Value::BigInteger(i) => Ok(!i.is_zero()),
             Value::Decimal(d) => Ok(*d != Decimal::from(0)),
+            Value::BigDecimal(d) => Ok(!d.is_zero()),
             Value::Float(f) => Ok(!(f32::from(*f) == 0.0 || f.is_nan())),
             Value::Double(d) => Ok(!(f64::from(*d) == 0.0 || d.is_nan())),
             // SPARQL 1.2 (§17.2.2): ill-typed boolean / numeric literals have no
@@ -293,18 +421,22 @@ impl Value {
 // ------------------------------------------------------------------ numerics ----
 
 #[derive(Clone, Copy, Debug)]
-pub enum Num {
+pub enum Num<'a> {
     Integer(Integer),
+    BigInteger(&'a BigInt),
     Decimal(Decimal),
+    BigDecimal(&'a BigDec),
     Float(Float),
     Double(Double),
 }
 
-impl Num {
-    pub fn of(v: &Value) -> EvalResult<Num> {
+impl<'a> Num<'a> {
+    pub fn of(v: &'a Value) -> EvalResult<Num<'a>> {
         Ok(match v {
             Value::Integer(i) => Num::Integer(*i),
+            Value::BigInteger(i) => Num::BigInteger(i),
             Value::Decimal(d) => Num::Decimal(*d),
+            Value::BigDecimal(d) => Num::BigDecimal(d),
             Value::Float(f) => Num::Float(*f),
             Value::Double(d) => Num::Double(*d),
             _ => return Err(TypeError),
@@ -312,8 +444,8 @@ impl Num {
     }
     pub(crate) fn rank(self) -> u8 {
         match self {
-            Num::Integer(_) => 0,
-            Num::Decimal(_) => 1,
+            Num::Integer(_) | Num::BigInteger(_) => 0,
+            Num::Decimal(_) | Num::BigDecimal(_) => 1,
             Num::Float(_) => 2,
             Num::Double(_) => 3,
         }
@@ -325,10 +457,28 @@ impl Num {
             _ => None,
         }
     }
+    pub(crate) fn to_big_int(self) -> Option<BigInt> {
+        match self {
+            Num::Integer(i) => Some(BigInt::from_i64(i64::from(i))),
+            Num::BigInteger(i) => Some(i.clone()),
+            _ => None,
+        }
+    }
+    pub(crate) fn to_big_dec(self) -> Option<BigDec> {
+        match self {
+            Num::Integer(i) => Some(BigDec::from_i64(i64::from(i))),
+            Num::BigInteger(i) => Some(BigDec::from_bigint(i.clone())),
+            Num::Decimal(d) => Some(BigDec::from_oxs_decimal(d)),
+            Num::BigDecimal(d) => Some(d.clone()),
+            _ => None,
+        }
+    }
     pub(crate) fn to_float(self) -> Float {
         match self {
             Num::Integer(i) => i.into(),
+            Num::BigInteger(i) => Float::from(i.to_f32()),
             Num::Decimal(d) => d.into(),
+            Num::BigDecimal(d) => Float::from(d.to_f32()),
             Num::Float(f) => f,
             Num::Double(d) => d.into(),
         }
@@ -336,7 +486,9 @@ impl Num {
     pub fn to_double(self) -> Double {
         match self {
             Num::Integer(i) => i.into(),
+            Num::BigInteger(i) => Double::from(i.to_f64()),
             Num::Decimal(d) => d.into(),
+            Num::BigDecimal(d) => Double::from(d.to_f64()),
             Num::Float(f) => f.into(),
             Num::Double(d) => d,
         }
@@ -344,7 +496,9 @@ impl Num {
     pub fn into_value(self) -> Value {
         match self {
             Num::Integer(i) => Value::Integer(i),
+            Num::BigInteger(i) => Value::from_bigint(i.clone()),
             Num::Decimal(d) => Value::Decimal(d),
+            Num::BigDecimal(d) => Value::from_bigdec(d.clone()),
             Num::Float(f) => Value::Float(f),
             Num::Double(d) => Value::Double(d),
         }
@@ -358,6 +512,30 @@ pub enum NumOp {
     Div,
 }
 
+#[cold]
+fn arith_big(op: NumOp, rank: u8, a: Num<'_>, b: Num<'_>) -> EvalResult<Value> {
+    if rank == 0 && !matches!(op, NumOp::Div) {
+        let x = a.to_big_int().ok_or(TypeError)?;
+        let y = b.to_big_int().ok_or(TypeError)?;
+        let r = match op {
+            NumOp::Add => x.checked_add(&y),
+            NumOp::Sub => x.checked_sub(&y),
+            NumOp::Mul => x.checked_mul(&y),
+            NumOp::Div => unreachable!(),
+        };
+        return r.map(Value::from_bigint).ok_or(TypeError);
+    }
+    let x = a.to_big_dec().ok_or(TypeError)?;
+    let y = b.to_big_dec().ok_or(TypeError)?;
+    let r = match op {
+        NumOp::Add => x.checked_add(&y),
+        NumOp::Sub => x.checked_sub(&y),
+        NumOp::Mul => x.checked_mul(&y),
+        NumOp::Div => x.checked_div(&y),
+    };
+    r.map(Value::from_bigdec).ok_or(TypeError)
+}
+
 pub fn arith(op: NumOp, a: &Value, b: &Value) -> EvalResult<Value> {
     let (a, b) = (Num::of(a), Num::of(b));
     let (a, b) = match (a, b) {
@@ -368,34 +546,42 @@ pub fn arith(op: NumOp, a: &Value, b: &Value) -> EvalResult<Value> {
     Ok(match rank {
         0 | 1 => {
             if rank == 0 && !matches!(op, NumOp::Div) {
-                let (Num::Integer(x), Num::Integer(y)) = (a, b) else {
-                    unreachable!()
-                };
+                if let (Num::Integer(x), Num::Integer(y)) = (a, b) {
+                    let r = match op {
+                        NumOp::Add => x.checked_add(y),
+                        NumOp::Sub => x.checked_sub(y),
+                        NumOp::Mul => x.checked_mul(y),
+                        NumOp::Div => unreachable!(),
+                    };
+                    if let Some(v) = r {
+                        return Ok(Value::Integer(v));
+                    }
+                }
+                return arith_big(op, 0, a, b);
+            }
+            if let Some(r) = exact_decimal(&op, a, b) {
+                if let Some(v) = r {
+                    return Ok(Value::Decimal(v));
+                }
+                return arith_big(op, 1, a, b);
+            }
+            if let (Some(x), Some(y)) = (a.to_decimal(), b.to_decimal()) {
                 let r = match op {
                     NumOp::Add => x.checked_add(y),
                     NumOp::Sub => x.checked_sub(y),
                     NumOp::Mul => x.checked_mul(y),
-                    NumOp::Div => unreachable!(),
-                };
-                return r.map(Value::Integer).ok_or(TypeError);
-            }
-            if let Some(r) = exact_decimal(&op, a, b) {
-                return r.map(Value::Decimal).ok_or(TypeError);
-            }
-            let x = a.to_decimal().ok_or(TypeError)?;
-            let y = b.to_decimal().ok_or(TypeError)?;
-            let r = match op {
-                NumOp::Add => x.checked_add(y),
-                NumOp::Sub => x.checked_sub(y),
-                NumOp::Mul => x.checked_mul(y),
-                NumOp::Div => {
-                    if y == Decimal::from(0) {
-                        return Err(TypeError);
+                    NumOp::Div => {
+                        if y == Decimal::from(0) {
+                            return Err(TypeError);
+                        }
+                        x.checked_div(y)
                     }
-                    x.checked_div(y)
+                };
+                if let Some(v) = r {
+                    return Ok(Value::Decimal(v));
                 }
-            };
-            Value::Decimal(r.ok_or(TypeError)?)
+            }
+            return arith_big(op, 1, a, b);
         }
         2 => {
             let (x, y) = (a.to_float(), b.to_float());
@@ -421,16 +607,12 @@ pub fn arith(op: NumOp, a: &Value, b: &Value) -> EvalResult<Value> {
 /// The scale of oxsdatatypes' decimals, which hold `value × 10^-18` in an `i128`.
 const DECIMAL_SCALE: i128 = 1_000_000_000_000_000_000;
 
-/// An exact integer sum as a value to add further numbers to. It is an `xsd:integer` when
-/// it fits one and otherwise an `xsd:decimal`, so that adding a decimal or a double to a
-/// sum of integers past the `xsd:integer` range does not fail in one row order and not
-/// in another. `None` when the sum fits neither.
-pub(crate) fn exact_sum(sum: i128) -> Option<Value> {
+/// An exact integer sum as a value to add further numbers to. It is an `xsd:integer`
+/// (`Value::Integer` when it fits `i64`, `Value::BigInteger` otherwise).
+pub(crate) fn exact_sum(sum: i128) -> Value {
     match i64::try_from(sum) {
-        Ok(sum) => Some(Value::Integer(sum.into())),
-        Err(_) => sum
-            .checked_mul(DECIMAL_SCALE)
-            .map(|v| Value::Decimal(Decimal::from_be_bytes(v.to_be_bytes()))),
+        Ok(sum) => Value::Integer(sum.into()),
+        Err(_) => Value::BigInteger(Arc::new(BigInt::from_i128(sum))),
     }
 }
 
@@ -445,7 +627,7 @@ pub(crate) fn exact_sum(sum: i128) -> Option<Value> {
 /// The quotient of two integers `i / j` with `j` nonzero is `i × 10^18 / j`
 /// truncated toward zero. oxsdatatypes truncates twice, which gives the same result,
 /// and its shifts stay below 10^39 for 64-bit integers, so it never fails there.
-fn exact_decimal(op: &NumOp, a: Num, b: Num) -> Option<Option<Decimal>> {
+fn exact_decimal(op: &NumOp, a: Num<'_>, b: Num<'_>) -> Option<Option<Decimal>> {
     let raw = |d: Decimal| i128::from_be_bytes(d.to_be_bytes());
     let decimal = |v: i128| Decimal::from_be_bytes(v.to_be_bytes());
     match (op, a, b) {
@@ -460,11 +642,34 @@ fn exact_decimal(op: &NumOp, a: Num, b: Num) -> Option<Option<Decimal>> {
     }
 }
 
+#[derive(Clone, Debug)]
+enum NumOwned {
+    Integer(Integer),
+    BigInteger(Arc<BigInt>),
+    Decimal(Decimal),
+    BigDecimal(Arc<BigDec>),
+    Float(Float),
+    Double(Double),
+}
+
+impl NumOwned {
+    fn as_num(&self) -> Num<'_> {
+        match self {
+            NumOwned::Integer(i) => Num::Integer(*i),
+            NumOwned::BigInteger(i) => Num::BigInteger(i),
+            NumOwned::Decimal(d) => Num::Decimal(*d),
+            NumOwned::BigDecimal(d) => Num::BigDecimal(d),
+            NumOwned::Float(f) => Num::Float(*f),
+            NumOwned::Double(d) => Num::Double(*d),
+        }
+    }
+}
+
 /// A numeric constant prepared for many comparisons: its value in each type that
-/// [`num_cmp`] promotes it to, converted once. [`NumConst::cmp`] gives `num_cmp(x, c)`.
-#[derive(Clone, Copy, Debug)]
+/// [`num_cmp`] promotes it to, converted once. [`NumConst::order`] gives `num_cmp(x, c)`.
+#[derive(Clone, Debug)]
 pub struct NumConst {
-    c: Num,
+    c: NumOwned,
     rank: u8,
     decimal: Option<Decimal>,
     float: Float,
@@ -472,9 +677,17 @@ pub struct NumConst {
 }
 
 impl NumConst {
-    pub fn new(c: Num) -> NumConst {
+    pub fn new(c: Num<'_>) -> NumConst {
+        let owned = match c {
+            Num::Integer(i) => NumOwned::Integer(i),
+            Num::BigInteger(i) => NumOwned::BigInteger(Arc::new(i.clone())),
+            Num::Decimal(d) => NumOwned::Decimal(d),
+            Num::BigDecimal(d) => NumOwned::BigDecimal(Arc::new(d.clone())),
+            Num::Float(f) => NumOwned::Float(f),
+            Num::Double(d) => NumOwned::Double(d),
+        };
         NumConst {
-            c,
+            c: owned,
             rank: c.rank(),
             decimal: c.to_decimal(),
             float: c.to_float(),
@@ -484,26 +697,51 @@ impl NumConst {
 
     /// `num_cmp(x, c)`.
     #[inline]
-    pub fn order(&self, x: Num) -> Option<Ordering> {
+    pub fn order(&self, x: Num<'_>) -> Option<Ordering> {
         match x.rank().max(self.rank) {
-            0 => match (x, self.c) {
-                (Num::Integer(x), Num::Integer(y)) => x.partial_cmp(&y),
-                _ => None,
+            0 => match (x, &self.c) {
+                (Num::Integer(x), NumOwned::Integer(y)) => x.partial_cmp(y),
+                _ => num_cmp_big(x, self.c.as_num()),
             },
-            1 => x.to_decimal()?.partial_cmp(&self.decimal?),
+            1 => match (x.to_decimal(), self.decimal) {
+                (Some(a), Some(b)) => a.partial_cmp(&b),
+                _ => num_cmp_big(x, self.c.as_num()),
+            },
             2 => x.to_float().partial_cmp(&self.float),
             _ => x.to_double().partial_cmp(&self.double),
         }
     }
 }
 
-fn num_cmp(a: Num, b: Num) -> Option<Ordering> {
+#[cold]
+fn num_cmp_big(a: Num<'_>, b: Num<'_>) -> Option<Ordering> {
+    match (a, b) {
+        (Num::BigInteger(x), Num::BigInteger(y)) => Some(x.cmp(y)),
+        (Num::BigInteger(x), Num::Integer(y)) => Some(x.cmp(&BigInt::from_i64(i64::from(y)))),
+        (Num::Integer(x), Num::BigInteger(y)) => Some(BigInt::from_i64(i64::from(x)).cmp(y)),
+        (Num::BigDecimal(x), Num::BigDecimal(y)) => Some(x.cmp(y)),
+        (Num::BigDecimal(x), Num::BigInteger(y)) => Some(x.cmp_bigint(y)),
+        (Num::BigInteger(x), Num::BigDecimal(y)) => Some(y.cmp_bigint(x).reverse()),
+        (Num::BigDecimal(x), Num::Integer(y)) => {
+            Some(x.cmp_bigint(&BigInt::from_i64(i64::from(y))))
+        }
+        (Num::Integer(x), Num::BigDecimal(y)) => {
+            Some(y.cmp_bigint(&BigInt::from_i64(i64::from(x))).reverse())
+        }
+        _ => Some(a.to_big_dec()?.cmp(&b.to_big_dec()?)),
+    }
+}
+
+fn num_cmp(a: Num<'_>, b: Num<'_>) -> Option<Ordering> {
     match a.rank().max(b.rank()) {
         0 => match (a, b) {
             (Num::Integer(x), Num::Integer(y)) => x.partial_cmp(&y),
-            _ => None,
+            _ => num_cmp_big(a, b),
         },
-        1 => a.to_decimal()?.partial_cmp(&b.to_decimal()?),
+        1 => match (a.to_decimal(), b.to_decimal()) {
+            (Some(x), Some(y)) => x.partial_cmp(&y),
+            _ => num_cmp_big(a, b),
+        },
         2 => a.to_float().partial_cmp(&b.to_float()),
         _ => a.to_double().partial_cmp(&b.to_double()),
     }
@@ -713,7 +951,12 @@ pub fn order_cmp(a: Option<&Value>, b: Option<&Value>) -> Ordering {
         match v {
             Value::Str(_) => 0,
             Value::Lang(..) => 1,
-            Value::Integer(_) | Value::Decimal(_) | Value::Float(_) | Value::Double(_) => 2,
+            Value::Integer(_)
+            | Value::BigInteger(_)
+            | Value::Decimal(_)
+            | Value::BigDecimal(_)
+            | Value::Float(_)
+            | Value::Double(_) => 2,
             Value::Bool(_) => 3,
             Value::DateTime(_) => 4,
             Value::Date(_) => 5,
@@ -848,12 +1091,16 @@ mod tests {
                     assert_eq!(fast, reference(&op, a, b), "{a:?} {b:?}");
                 }
                 let want = reference(&op, a, b);
-                let got = match arith(op, &a.into_value(), &b.into_value()) {
-                    Ok(Value::Decimal(d)) => Some(d),
-                    Err(_) => None,
-                    Ok(other) => panic!("{other:?}"),
-                };
-                assert_eq!(got, want, "{a:?} {b:?}");
+                let div_by_zero =
+                    matches!(op, NumOp::Div) && b.to_decimal() == Some(Decimal::from(0));
+                match (want, arith(op, &a.into_value(), &b.into_value())) {
+                    (Some(d), Ok(Value::Decimal(got))) => assert_eq!(got, d, "{a:?} {b:?}"),
+                    (None, Err(_)) if div_by_zero => {}
+                    // Overflows, >18-fractional-digit results, and intermediate i128
+                    // overflows (such as Decimal::MIN / -10) fall back to BigDec (item 1065).
+                    (None, Ok(Value::Decimal(_) | Value::BigDecimal(_))) if !div_by_zero => {}
+                    (want, got) => panic!("{a:?} {b:?}: want {want:?}, got {got:?}"),
+                }
             }
         }
         assert!(checked > 500_000, "the fast paths are exercised: {checked}");
@@ -863,9 +1110,10 @@ mod tests {
             exact_decimal(&NumOp::Mul, tiny, Num::Integer(0.into())),
             Some(Some(Decimal::from(0)))
         );
-        // Fractional quotients still use the general path and its precision limits.
+        // Fractional quotients beyond 18 digits fall back to BigDecimal.
         assert!(exact_decimal(&NumOp::Div, tiny, Num::Integer(10.into())).is_none());
-        assert!(arith(NumOp::Div, &tiny.into_value(), &Value::Integer(10.into())).is_err());
+        let q = arith(NumOp::Div, &tiny.into_value(), &Value::Integer(10.into())).unwrap();
+        assert_eq!(q.lexical().unwrap().as_ref(), "0.0000000000000000001");
         assert!(
             arith(
                 NumOp::Div,

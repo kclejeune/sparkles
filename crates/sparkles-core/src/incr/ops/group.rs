@@ -122,6 +122,9 @@ struct SumState {
     undef: i64,
     /// the integer sum, in wrapping arithmetic so that removals stay exact
     int: i128,
+    /// arbitrary-precision integers and decimals as counts, allocated only when seen
+    big_ints: Option<Box<FxHashMap<crate::sparql::bignum::BigInt, i64>>>,
+    big_decs: Option<Box<FxHashMap<crate::sparql::bignum::BigDec, i64>>>,
     /// the decimal values as counts by their 128-bit encoding
     decs: FxHashMap<i128, i64>,
     floats: FxHashMap<u32, i64>,
@@ -138,12 +141,28 @@ impl SumState {
                     .int
                     .wrapping_add((i64::from(*i) as i128).wrapping_mul(w as i128))
             }
+            Some(Value::BigInteger(i)) => {
+                let map = self.big_ints.get_or_insert_with(Default::default);
+                let n = map.entry((**i).clone()).or_insert(0);
+                *n += w;
+                if *n == 0 {
+                    map.remove(i.as_ref());
+                }
+            }
             Some(Value::Decimal(d)) => {
                 let k = i128::from_be_bytes(d.to_be_bytes());
                 let n = self.decs.entry(k).or_insert(0);
                 *n += w;
                 if *n == 0 {
                     self.decs.remove(&k);
+                }
+            }
+            Some(Value::BigDecimal(d)) => {
+                let map = self.big_decs.get_or_insert_with(Default::default);
+                let n = map.entry((**d).clone()).or_insert(0);
+                *n += w;
+                if *n == 0 {
+                    map.remove(d.as_ref());
                 }
             }
             Some(Value::Float(f)) => *self.floats.entry(f32::from(*f).to_bits()).or_insert(0) += w,
@@ -160,7 +179,30 @@ impl SumState {
         if self.errs != 0 {
             return None;
         }
-        let mut acc = if !self.decs.is_empty() {
+        let has_big_int = self.big_ints.as_ref().is_some_and(|m| !m.is_empty());
+        let has_big_dec = self.big_decs.as_ref().is_some_and(|m| !m.is_empty());
+        let mut acc = if has_big_dec || (has_big_int && !self.decs.is_empty()) {
+            use crate::sparql::bignum::{BigDec, BigInt};
+            let mut total = BigDec::from_bigint(BigInt::from_i128(self.int));
+            if let Some(map) = &self.big_ints {
+                for (bi, &n) in map.iter() {
+                    let term = bi.checked_mul(&BigInt::from_i64(n))?;
+                    total = total.checked_add(&BigDec::from_bigint(term))?;
+                }
+            }
+            for (&k, &n) in &self.decs {
+                let d = BigDec::from_oxs_decimal(Decimal::from_be_bytes(k.to_be_bytes()));
+                let term = d.checked_mul(&BigDec::from_i64(n))?;
+                total = total.checked_add(&term)?;
+            }
+            if let Some(map) = &self.big_decs {
+                for (bd, &n) in map.iter() {
+                    let term = bd.checked_mul(&BigDec::from_i64(n))?;
+                    total = total.checked_add(&term)?;
+                }
+            }
+            Value::from_bigdec(total)
+        } else if !self.decs.is_empty() {
             // summed exactly in 256 bits, so that values which cancel out do not
             // overflow on the way; the integers join the decimals, as a one-off
             // evaluation promotes them
@@ -169,9 +211,29 @@ impl SumState {
                 acc.add_product(*k, *n);
             }
             acc.add_product(self.int, 1_000_000_000_000_000_000);
-            Value::Decimal(Decimal::from_be_bytes(acc.to_i128()?.to_be_bytes()))
+            if let Some(raw) = acc.to_i128() {
+                Value::Decimal(Decimal::from_be_bytes(raw.to_be_bytes()))
+            } else {
+                use crate::sparql::bignum::{BigDec, BigInt};
+                let mut total = BigDec::from_bigint(BigInt::from_i128(self.int));
+                for (&k, &n) in &self.decs {
+                    let d = BigDec::from_oxs_decimal(Decimal::from_be_bytes(k.to_be_bytes()));
+                    total = total.checked_add(&d.checked_mul(&BigDec::from_i64(n))?)?;
+                }
+                Value::from_bigdec(total)
+            }
+        } else if has_big_int {
+            use crate::sparql::bignum::BigInt;
+            let mut total = BigInt::from_i128(self.int);
+            if let Some(map) = &self.big_ints {
+                for (bi, &n) in map.iter() {
+                    let term = bi.checked_mul(&BigInt::from_i64(n))?;
+                    total = total.checked_add(&term)?;
+                }
+            }
+            Value::from_bigint(total)
         } else {
-            Value::Integer(i64::try_from(self.int).ok()?.into())
+            crate::sparql::value::exact_sum(self.int)
         };
         let mut floats: Vec<(f32, i64)> = self
             .floats
@@ -784,8 +846,14 @@ impl Group {
                             AState::Rows(m) => m.len() as u64 * row_bytes(self.inner.schema.len()),
                             AState::Values { vals, .. } => vals.len() as u64 * 24 + 96,
                             AState::Sum(s) => {
+                                let big = s.big_ints.as_ref().map_or(0, |m| {
+                                    m.keys().map(|k| k.heap_bytes() + 24).sum::<u64>()
+                                }) + s.big_decs.as_ref().map_or(0, |m| {
+                                    m.keys().map(|k| k.heap_bytes() + 24).sum::<u64>()
+                                });
                                 96 + (s.floats.len() + s.doubles.len()) as u64 * 24
                                     + s.decs.len() as u64 * 40
+                                    + big
                             }
                             AState::Multi(m) => 40 + m.vals.len() as u64 * 16,
                         })
@@ -799,7 +867,14 @@ impl Group {
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {
-        fn sum(w: &mut Writer, s: &SumState) {
+        fn sum(w: &mut Writer, s: &SumState) -> Result<()> {
+            if s.big_ints.as_ref().is_some_and(|m| !m.is_empty())
+                || s.big_decs.as_ref().is_some_and(|m| !m.is_empty())
+            {
+                return Err(crate::error::Error::unsupported(
+                    "view checkpoints do not encode arbitrary-precision SUM/AVG state",
+                ));
+            }
             w.i64(s.rows);
             w.i64(s.errs);
             w.i64(s.undef);
@@ -819,6 +894,7 @@ impl Group {
                 w.u64(*b);
                 w.i64(*n);
             }
+            Ok(())
         }
         w.u64(self.groups.len() as u64);
         for (k, g) in &self.groups {
@@ -848,9 +924,9 @@ impl Group {
                             w.i64(*n);
                         }
                         w.i64(*errs);
-                        sum(w, s);
+                        sum(w, s)?;
                     }
-                    AState::Sum(s) => sum(w, s),
+                    AState::Sum(s) => sum(w, s)?,
                     AState::Multi(m) => {
                         w.u64(m.vals.len() as u64);
                         for (v, n) in &m.vals {

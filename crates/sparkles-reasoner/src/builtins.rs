@@ -281,7 +281,29 @@ fn arith_value(t: &Terms, kind: BuiltinKind, a: u64, b: u64) -> Option<Value> {
     let (x, y) = (num(t, a)?, num(t, b)?);
     let r = match (kind, &x, &y) {
         // Jena: long division for integers
-        (Quotient, Value::Integer(i), Value::Integer(j)) => Value::Integer(i.checked_div(*j)?),
+        (Quotient, Value::Integer(i), Value::Integer(j)) => {
+            i.checked_div(*j).map(Value::Integer).or_else(|| {
+                if i64::from(*j) == 0 {
+                    return None;
+                }
+                let a = sparkles_core::sparql::bignum::BigInt::from_i64(i64::from(*i));
+                let b = sparkles_core::sparql::bignum::BigInt::from_i64(i64::from(*j));
+                a.checked_div_rem(&b).map(|(q, _)| Value::from_bigint(q))
+            })?
+        }
+        (
+            Quotient,
+            Value::Integer(_) | Value::BigInteger(_),
+            Value::Integer(_) | Value::BigInteger(_),
+        ) => {
+            let to_bi = |v: &Value| match v {
+                Value::Integer(i) => sparkles_core::sparql::bignum::BigInt::from_i64(i64::from(*i)),
+                Value::BigInteger(i) => (**i).clone(),
+                _ => unreachable!(),
+            };
+            let (q, _) = to_bi(&x).checked_div_rem(&to_bi(&y))?;
+            Value::from_bigint(q)
+        }
         _ => {
             let op = match kind {
                 Sum => NumOp::Add,
@@ -323,10 +345,13 @@ fn is_dtype(t: &Terms, v: u64, dt: u64) -> bool {
         NamedNode::new_unchecked(d),
     ));
     match (&src, &target) {
-        (Value::Integer(_), Value::Integer(_)) | (Value::Integer(_), Value::Decimal(_)) => {
+        (Value::Integer(_) | Value::BigInteger(_), Value::Integer(_) | Value::BigInteger(_))
+        | (Value::Integer(_) | Value::BigInteger(_), Value::Decimal(_) | Value::BigDecimal(_)) => {
             integer_in_range(l.value(), d)
         }
-        (Value::Decimal(_), Value::Decimal(_)) => true,
+        (Value::Decimal(_) | Value::BigDecimal(_), Value::Decimal(_) | Value::BigDecimal(_)) => {
+            true
+        }
         _ => false,
     }
 }

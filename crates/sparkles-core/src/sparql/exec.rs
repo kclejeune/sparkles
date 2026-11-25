@@ -3180,7 +3180,7 @@ impl NumAtom {
     /// generic evaluator answers it. For two numbers, `compare` and `equals` are
     /// `num_cmp`, and an incomparable pair (NaN) is false.
     #[inline]
-    fn holds(&self, x: Id, v: super::value::Num) -> bool {
+    fn holds(&self, x: Id, v: super::value::Num<'_>) -> bool {
         use super::plan::RangeOp;
         use Ordering::*;
         if self.op == RangeOp::Eq && self.id == Some(x) {
@@ -3255,8 +3255,7 @@ pub(super) fn apply_range_filter(
             },
             (Tag::Int | Tag::Double | Tag::Decimal, _) => ctx
                 .value(x)
-                .and_then(|v| Num::of(&v).ok())
-                .map(|v| test(x, v)),
+                .and_then(|v| Num::of(&v).ok().map(|n| test(x, n))),
             _ => None,
         }
     };
@@ -6942,10 +6941,9 @@ impl AggState {
                     *int = s;
                     return;
                 }
-                let Some(acc) = generic.take().or_else(|| super::value::exact_sum(*int)) else {
-                    *ok = false;
-                    return;
-                };
+                let acc = generic
+                    .take()
+                    .unwrap_or_else(|| super::value::exact_sum(*int));
                 match value {
                     Some(v) => match arith(NumOp::Add, &acc, &v) {
                         Ok(v) => *generic = Some(v),
@@ -7025,14 +7023,13 @@ impl AggState {
                     *int = s;
                     return true;
                 }
-                let left = generic.take().or_else(|| super::value::exact_sum(*int));
-                let right = ogeneric.or_else(|| super::value::exact_sum(oint));
-                match (left, right) {
-                    (Some(l), Some(r)) => match arith(NumOp::Add, &l, &r) {
-                        Ok(v) => *generic = Some(v),
-                        Err(_) => *ok = false,
-                    },
-                    _ => *ok = false,
+                let left = generic
+                    .take()
+                    .unwrap_or_else(|| super::value::exact_sum(*int));
+                let right = ogeneric.unwrap_or_else(|| super::value::exact_sum(oint));
+                match arith(NumOp::Add, &left, &right) {
+                    Ok(v) => *generic = Some(v),
+                    Err(_) => *ok = false,
                 }
             }
             (AggState::Best(best, best_v, errs), AggState::Best(Some(id), v, oerrs)) => {
@@ -7122,13 +7119,7 @@ impl AggState {
                 if !ok {
                     return Id::UNDEF;
                 }
-                let sum = match generic {
-                    Some(sum) => sum,
-                    None => match i64::try_from(int) {
-                        Ok(int) => Value::Integer(int.into()),
-                        Err(_) => return Id::UNDEF,
-                    },
-                };
+                let sum = generic.unwrap_or_else(|| super::value::exact_sum(int));
                 let v = if matches!(agg.func, AggregateFunction::Avg) {
                     if rows == 0 {
                         Some(Value::Integer(0.into()))

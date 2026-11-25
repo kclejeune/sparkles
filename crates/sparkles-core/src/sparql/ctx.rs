@@ -188,6 +188,8 @@ impl ValueCache {
             Value::Iri(a) | Value::BNode(a) | Value::Str(a) => text(a),
             Value::Lang(a, b) | Value::LangDir(a, b, _) => text(a) + text(b),
             Value::Other { lex, dt } => text(lex) + text(dt),
+            Value::BigInteger(i) => i.heap_bytes() + 16,
+            Value::BigDecimal(d) => d.heap_bytes() + 16,
             Value::Triple(t) => 64 + t.to_string().len() as u64,
             _ => 0,
         };
