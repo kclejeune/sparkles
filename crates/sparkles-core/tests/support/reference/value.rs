@@ -604,6 +604,11 @@ fn class(t: Option<&Term>) -> u8 {
     }
 }
 
+/// The ORDER BY term class of a bound RDF term.
+pub(crate) fn term_class(t: &Term) -> u8 {
+    class(Some(t))
+}
+
 /// The order of two decimal numerals, such as `-12.50`, by their values.
 fn exact_decimal_cmp(a: &str, b: &str) -> Ordering {
     // the sign, the integer digits without leading zeros and the fraction digits

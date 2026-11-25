@@ -369,11 +369,14 @@ An ordered or sliced answer must follow an order that ORDER BY allows. The compa
 uses the engine's spelling for a key it can recover from the returned bindings.
 A key stops before the first open value or spelling it cannot recover. This includes
 a hidden aggregate key whose inputs, selection or distinct solution count depend on
-spelling, or a variable whose BIND may be unbound under a different spelling.
-Metadata reads such as LANG and DATATYPE keep their place when the input can change
-only lexically, as with UCASE on a computed string or a selection aggregate whose
-candidates share their RDF metadata. Earlier conditions can still rule out an order
-or slice.
+spelling, or a variable whose BIND may be unbound under a different spelling. A
+distinct solution count stays fixed when fixed bindings, fixed presence or distinct
+fixed metadata already separate every spelling-dependent pair. In MIN and MAX, a
+guaranteed candidate in a strictly better RDF term class rules out lexical-only
+candidates in worse classes. Metadata reads such as LANG and DATATYPE keep their
+place when the remaining input can change only lexically, as with UCASE on a computed
+string or a selection aggregate whose winning-class candidates share their RDF
+metadata. Earlier conditions can still rule out an order or slice.
 
 When several reference rows match a returned row, the comparison uses the observed
 keys of those candidates to check for inversions. A slice must have room on either side

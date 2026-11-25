@@ -7658,6 +7658,128 @@ fn reference_str_1093_r4_tracks_count_distinct_star_dependencies() {
     );
 }
 
+#[test]
+fn reference_str_1093_r5_keeps_count_distinct_star_fixed_with_discriminator() {
+    use reference::check::Outcome;
+    let two = &["2"][..];
+    let ten = &["10"][..];
+
+    let fixed_tag = r#"SELECT ?n WHERE {
+        VALUES (?n ?tag) { (2 "a") (10 "a") (10 "b") }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(fixed_tag, &[ten]).is_err());
+    assert_eq!(check_str_1093(fixed_tag, &[two]), Ok(Outcome::Compared));
+
+    let fixed_presence = r#"SELECT ?n WHERE {
+        VALUES (?n ?tag) { (2 "a") (10 "a") (10 UNDEF) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(fixed_presence, &[ten]).is_err());
+    assert_eq!(
+        check_str_1093(fixed_presence, &[two]),
+        Ok(Outcome::Compared)
+    );
+
+    let fixed_metadata = r#"SELECT ?n WHERE {
+        { VALUES ?n { 2 10 } BIND(STR(?n + 0) AS ?s) }
+        UNION { VALUES ?n { 10 } BIND(STRLANG(STR(?n + 0), "en") AS ?s) }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(fixed_metadata, &[ten]).is_err());
+    assert_eq!(
+        check_str_1093(fixed_metadata, &[two]),
+        Ok(Outcome::Compared)
+    );
+
+    let unbound_with_tag = r#"SELECT ?n WHERE {
+        { VALUES (?n ?tag ?k) { (2 "a" 1) (10 "a" 1) } }
+        UNION {
+            SELECT ?n ?tag ?k {
+                BIND(10 AS ?n)
+                BIND("b" AS ?tag)
+                BIND(STR(10 + 0) AS ?s)
+                BIND(IF(?s = "10", 1 / 0, 1) AS ?k)
+            }
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(check_str_1093(unbound_with_tag, &[ten]).is_err());
+    assert_eq!(
+        check_str_1093(unbound_with_tag, &[two]),
+        Ok(Outcome::Compared)
+    );
+
+    let colliding_lexical = r#"SELECT ?n WHERE {
+        { VALUES (?n ?tag ?s) { (2 "a" "2") (10 "a" "010") } }
+        UNION { VALUES (?n ?tag) { (10 "a") } BIND(STR(?n + 0) AS ?s) }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(matches!(
+        check_str_1093(colliding_lexical, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    let colliding_unbound = r#"SELECT ?n WHERE {
+        { VALUES (?n ?k) { (2 1) (10 1) } }
+        UNION {
+            SELECT ?n ?k {
+                BIND(10 AS ?n)
+                BIND(STR(10 + 0) AS ?s)
+                BIND(IF(?s = "10", 1 / 0, 1) AS ?k)
+            }
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) LIMIT 1"#;
+    assert!(matches!(
+        check_str_1093(colliding_unbound, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_r5_keeps_min_max_fixed_across_strict_term_classes() {
+    use reference::check::Outcome;
+    let two = &["2"][..];
+    let ten = &["10"][..];
+    let base = r#"SELECT ?n WHERE {
+        VALUES (?n ?copy) { (2 true) (2 false) (10 true) (10 false) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n"#;
+
+    let min_iri = format!("{base} ORDER BY MIN(IF(?copy, <urn:fixed>, ?s)) ?n LIMIT 1");
+    assert!(check_str_1093(&min_iri, &[ten]).is_err());
+    assert_eq!(check_str_1093(&min_iri, &[two]), Ok(Outcome::Compared));
+
+    let max_triple =
+        format!("{base} ORDER BY MAX(IF(?copy, <<( <urn:s> <urn:p> <urn:o> )>>, ?s)) ?n LIMIT 1");
+    assert!(check_str_1093(&max_triple, &[ten]).is_err());
+    assert_eq!(check_str_1093(&max_triple, &[two]), Ok(Outcome::Compared));
+
+    let max_datatype =
+        format!("{base} ORDER BY DATATYPE(MAX(IF(?copy, <urn:fixed>, ?s))) ?n LIMIT 1");
+    assert!(check_str_1093(&max_datatype, &[ten]).is_err());
+    assert_eq!(check_str_1093(&max_datatype, &[two]), Ok(Outcome::Compared));
+
+    let max_literal_wins = format!("{base} ORDER BY MAX(IF(?copy, <urn:fixed>, ?s)) ?n LIMIT 1");
+    assert!(matches!(
+        check_str_1093(&max_literal_wins, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    let min_class_can_change = format!(
+        r#"{base} ORDER BY MIN(IF(?copy, <urn:fixed>, IF(?s != "010", "a", <urn:a>))) ?n LIMIT 1"#
+    );
+    assert!(matches!(
+        check_str_1093(&min_class_can_change, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+
+    let min_error_can_appear = format!(
+        r#"{base} ORDER BY MIN(IF(?copy, <urn:fixed>, IF(?s = "010", 1 / 0, "a"))) ?n LIMIT 1"#
+    );
+    assert!(matches!(
+        check_str_1093(&min_error_can_appear, &[ten]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
 /// The reference evaluator's own cases: the choices that it notes, the scope of the
 /// solution that LATERAL substitutes, BNODE across a join and its sort order.
 #[test]

@@ -180,6 +180,37 @@ impl Solution {
                 .iter()
                 .any(|(v, &s)| !is_hidden(v) && s != SpellingDependency::None)
     }
+
+    fn var_spelling(&self, v: &Variable) -> SpellingDependency {
+        let spelling = self.spelling(v);
+        if matches!(self.origin(v), Origin::NumericLexical(_)) {
+            spelling.max(SpellingDependency::Lexical)
+        } else {
+            spelling
+        }
+    }
+
+    fn visible_binding(&self, v: &Variable) -> VisibleBinding<'_> {
+        match self.get(v) {
+            Some(term) => match self.var_spelling(v) {
+                SpellingDependency::None => VisibleBinding::FixedBound(term),
+                SpellingDependency::Lexical => VisibleBinding::LexicalBound(term),
+                SpellingDependency::Term => VisibleBinding::Unstable,
+            },
+            None => match self.spelling(v) {
+                SpellingDependency::None => VisibleBinding::FixedUnbound,
+                SpellingDependency::Lexical | SpellingDependency::Term => VisibleBinding::Unstable,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum VisibleBinding<'a> {
+    FixedBound(&'a Term),
+    FixedUnbound,
+    LexicalBound(&'a Term),
+    Unstable,
 }
 
 /// Why a query got no answer.
@@ -776,18 +807,123 @@ fn visible(s: &Solution) -> BTreeMap<Variable, Term> {
         .collect()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum TermMetadata<'a> {
+    NamedNode,
+    BlankNode,
+    Triple,
+    Literal(&'a str, Option<&'a str>, Option<u8>),
+}
+
+fn term_metadata(t: &Term) -> TermMetadata<'_> {
+    match t {
+        Term::NamedNode(_) => TermMetadata::NamedNode,
+        Term::BlankNode(_) => TermMetadata::BlankNode,
+        Term::Triple(_) => TermMetadata::Triple,
+        Term::Literal(l) => TermMetadata::Literal(
+            l.datatype().as_str(),
+            l.language(),
+            l.direction().map(|d| match d {
+                oxrdf::BaseDirection::Ltr => 0,
+                oxrdf::BaseDirection::Rtl => 1,
+            }),
+        ),
+    }
+}
+
 fn same_metadata(a: &Term, b: &Term) -> bool {
-    match (a, b) {
-        (Term::NamedNode(_), Term::NamedNode(_))
-        | (Term::BlankNode(_), Term::BlankNode(_))
-        | (Term::Triple(_), Term::Triple(_)) => true,
-        (Term::Literal(x), Term::Literal(y)) => {
-            x.datatype() == y.datatype()
-                && x.language() == y.language()
-                && x.direction() == y.direction()
+    term_metadata(a) == term_metadata(b)
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum FixedBucketValue<'a> {
+    Term(&'a Term),
+    Metadata(TermMetadata<'a>),
+}
+
+fn always_distinct_on(a: &Solution, b: &Solution, v: &Variable) -> bool {
+    match (a.visible_binding(v), b.visible_binding(v)) {
+        (VisibleBinding::FixedBound(x), VisibleBinding::FixedBound(y)) => x != y,
+        (VisibleBinding::FixedBound(_), VisibleBinding::FixedUnbound)
+        | (VisibleBinding::FixedUnbound, VisibleBinding::FixedBound(_))
+        | (VisibleBinding::LexicalBound(_), VisibleBinding::FixedUnbound)
+        | (VisibleBinding::FixedUnbound, VisibleBinding::LexicalBound(_)) => true,
+        (VisibleBinding::LexicalBound(x), VisibleBinding::FixedBound(y))
+        | (VisibleBinding::FixedBound(x), VisibleBinding::LexicalBound(y))
+        | (VisibleBinding::LexicalBound(x), VisibleBinding::LexicalBound(y)) => {
+            !same_metadata(x, y)
         }
         _ => false,
     }
+}
+
+fn always_distinct(a: &Solution, b: &Solution) -> bool {
+    a.terms
+        .keys()
+        .filter(|v| !is_hidden(v))
+        .any(|v| always_distinct_on(a, b, v))
+        || b.terms
+            .keys()
+            .filter(|v| !is_hidden(v) && !a.terms.contains_key(*v))
+            .any(|v| always_distinct_on(a, b, v))
+}
+
+fn distinct_count_depends_on_spelling(members: &[Solution]) -> bool {
+    if members.len() <= 1 || !members.iter().any(Solution::has_visible_spelling) {
+        return false;
+    }
+    let refs: Vec<&Solution> = members.iter().collect();
+    distinct_count_bucket_depends_on_spelling(&refs)
+}
+
+fn distinct_count_bucket_depends_on_spelling(members: &[&Solution]) -> bool {
+    use SpellingDependency as Spelling;
+    if members.len() <= 1 || !members.iter().any(|s| s.has_visible_spelling()) {
+        return false;
+    }
+    let mut stability: HashMap<&Variable, Spelling> = HashMap::new();
+    for s in members {
+        for v in s.terms.keys().filter(|v| !is_hidden(v)) {
+            let entry = stability.entry(v).or_default();
+            *entry = (*entry).max(s.var_spelling(v));
+        }
+        for (v, &sp) in &s.spelling {
+            if !is_hidden(v) && !s.terms.contains_key(v) && sp != Spelling::None {
+                stability.insert(v, Spelling::Term);
+            }
+        }
+    }
+    let mut buckets: HashMap<Vec<(&Variable, FixedBucketValue<'_>)>, Vec<&Solution>> =
+        HashMap::new();
+    for &s in members {
+        let key = s
+            .terms
+            .iter()
+            .filter(|(v, _)| !is_hidden(v))
+            .filter_map(
+                |(v, term)| match stability.get(v).copied().unwrap_or_default() {
+                    Spelling::None => Some((v, FixedBucketValue::Term(term))),
+                    Spelling::Lexical => Some((v, FixedBucketValue::Metadata(term_metadata(term)))),
+                    Spelling::Term => None,
+                },
+            )
+            .collect();
+        buckets.entry(key).or_default().push(s);
+    }
+    if buckets.len() > 1 {
+        return buckets
+            .into_values()
+            .any(|group| distinct_count_bucket_depends_on_spelling(&group));
+    }
+    for (i, &a) in members.iter().enumerate() {
+        let a_dep = a.has_visible_spelling();
+        for &b in &members[i + 1..] {
+            if (a_dep || b.has_visible_spelling()) && !always_distinct(a, b) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The solutions of `right` that can be compatible with a solution of `left`, found by
@@ -1944,7 +2080,7 @@ impl<'a> Evaluator<'a> {
                     }
                     let n = members.iter().map(visible).collect::<HashSet<_>>().len();
                     let mut binding = Binding::number(int_term(n as i128));
-                    if members.len() > 1 && members.iter().any(Solution::has_visible_spelling) {
+                    if distinct_count_depends_on_spelling(members) {
                         binding.spelling = Spelling::Lexical;
                     }
                     binding
@@ -2177,7 +2313,44 @@ impl<'a> Evaluator<'a> {
                     Spelling::Lexical
                 }
                 AggregateFunction::Sum | AggregateFunction::Avg if reads_spelling => Spelling::Term,
-                AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::Sample => {
+                AggregateFunction::Min | AggregateFunction::Max => {
+                    if spelling_error || inputs == Spelling::Term {
+                        Spelling::Term
+                    } else if inputs == Spelling::Lexical {
+                        let classes = values.iter().flatten().map(|b| value::term_class(&b.term));
+                        let best_class = if matches!(name, AggregateFunction::Min) {
+                            classes.min()
+                        } else {
+                            classes.max()
+                        };
+                        let mut contenders = values
+                            .iter()
+                            .flatten()
+                            .filter(|b| Some(value::term_class(&b.term)) == best_class);
+                        if let Some(first) = contenders.next() {
+                            let mut dep = first.spelling();
+                            let mut mixed_metadata = false;
+                            for b in contenders {
+                                dep = dep.max(b.spelling());
+                                if !same_metadata(&first.term, &b.term) {
+                                    mixed_metadata = true;
+                                }
+                            }
+                            if dep == Spelling::None {
+                                Spelling::None
+                            } else if mixed_metadata {
+                                Spelling::Term
+                            } else {
+                                Spelling::Lexical
+                            }
+                        } else {
+                            Spelling::None
+                        }
+                    } else {
+                        Spelling::None
+                    }
+                }
+                AggregateFunction::Sample => {
                     if spelling_error || inputs == Spelling::Term {
                         Spelling::Term
                     } else if inputs == Spelling::Lexical {
