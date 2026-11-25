@@ -1847,6 +1847,41 @@ impl Vocab {
         }
     }
 
+    /// Whether [`Vocab::prefetch_value_pages_checked`] has any memory-mapped vocabulary
+    /// block not yet hinted or any memory-mapped numeric-column segment covering `ids`.
+    /// Callers that already checked [`crate::index::io_hints`] use this to skip scratch
+    /// admission, allocation and sorting for in-memory vocabularies and warm blocks.
+    pub(crate) fn has_unhinted_value_pages(&self, ids: impl Iterator<Item = u64>) -> bool {
+        let vocab_mapped = matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)));
+        let num = self.num.as_ref().filter(|n| n.is_mapped());
+        if !vocab_mapped && num.is_none() {
+            return false;
+        }
+        let mut last = usize::MAX;
+        for id in ids {
+            if id >= self.len {
+                continue;
+            }
+            if num.is_some_and(|n| n.may_hold(id)) {
+                return true;
+            }
+            if vocab_mapped {
+                let b = id as usize / FC_BLOCK;
+                if b != last {
+                    last = b;
+                    let asked = self
+                        .prefetched
+                        .get(b / 64)
+                        .map_or(0, |w| w.load(AtomicOrdering::Relaxed));
+                    if asked & (1u64 << (b % 64)) == 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Checked version of [`Vocab::prefetch_value_pages`] that admits the sorted block-index
     /// vector through `reserve` before allocating it.
     pub(crate) fn prefetch_value_pages_checked(

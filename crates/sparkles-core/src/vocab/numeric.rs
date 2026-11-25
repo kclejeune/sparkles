@@ -380,6 +380,12 @@ impl NumColumn {
         self.segments.len()
     }
 
+    /// Whether this numeric column is backed by a memory-mapped file.
+    #[inline]
+    pub(crate) fn is_mapped(&self) -> bool {
+        matches!(self.bytes, Bytes::Map(_))
+    }
+
     /// Whether base id `id` may be a number. The answer costs no read: an id outside
     /// every segment is not one.
     #[inline]

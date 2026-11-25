@@ -5848,9 +5848,24 @@ thread_local! {
 }
 
 /// Ask for the vocabulary pages of the terms in the columns of `vars` of a small table
-/// (see [`decode_for`]). The optional scratch vector is admitted first and skipped if
-/// the remaining memory budget cannot hold it.
+/// (see [`decode_for`]). Skips without charging or allocating when neither the base
+/// vocabulary nor its numeric column has unhinted mapped pages for these ids. In cursor
+/// mode, transient prefetch scratch is admitted through the context's decoding envelope
+/// so repeated batches take no per-batch ledger locks; in eager mode, it is charged and
+/// released directly on the fast account. If the remaining budget cannot hold the scratch,
+/// prefetching is skipped cleanly.
 fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
+    let vocab = &ctx.snap.generation.vocab;
+    let ids_iter = || {
+        vars.iter()
+            .filter_map(|&v| t.col_of(v))
+            .flat_map(|c| t.cols[c].iter())
+            .filter(|id| id.tag() == crate::id::Tag::Vocab)
+            .map(|id| id.payload())
+    };
+    if !vocab.has_unhinted_value_pages(ids_iter()) {
+        return;
+    }
     let count: usize = vars
         .iter()
         .filter_map(|&v| t.col_of(v))
@@ -5870,32 +5885,49 @@ fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
     else {
         return;
     };
+    if ctx.streams() {
+        let max_blocks = count
+            .checked_mul(size_of::<usize>())
+            .and_then(|b| u64::try_from(b).ok())
+            .unwrap_or(0);
+        let eager_total = ids_bytes.saturating_add(max_blocks);
+        if ctx.reserve_decode_scratch(eager_total).is_err()
+            && ctx.reserve_decode_scratch(ids_bytes).is_err()
+        {
+            return;
+        }
+        #[cfg(test)]
+        PREFETCH_COLUMN_TERMS_ALLOCATED.with(|n| n.set(n.get() + 1));
+        let mut ids = Vec::with_capacity(count);
+        ids.extend(ids_iter());
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() >= 2 {
+            let _ = vocab.prefetch_value_pages_checked(&ids, |block_bytes| {
+                ctx.reserve_decode_scratch(ids_bytes.saturating_add(block_bytes as u64))?;
+                #[cfg(test)]
+                PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED.with(|n| n.set(n.get() + 1));
+                Ok(())
+            });
+        }
+        return;
+    }
     let Ok(scratch) = ctx.charge(ids_bytes) else {
         return;
     };
     #[cfg(test)]
     PREFETCH_COLUMN_TERMS_ALLOCATED.with(|n| n.set(n.get() + 1));
     let mut ids = Vec::with_capacity(count);
-    ids.extend(
-        vars.iter()
-            .filter_map(|&v| t.col_of(v))
-            .flat_map(|c| t.cols[c].iter())
-            .filter(|id| id.tag() == crate::id::Tag::Vocab)
-            .map(|id| id.payload()),
-    );
+    ids.extend(ids_iter());
     ids.sort_unstable();
     ids.dedup();
     if ids.len() >= 2 {
-        let _ = ctx
-            .snap
-            .generation
-            .vocab
-            .prefetch_value_pages_checked(&ids, |block_bytes| {
-                scratch.resize(ids_bytes.saturating_add(block_bytes as u64))?;
-                #[cfg(test)]
-                PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED.with(|n| n.set(n.get() + 1));
-                Ok(())
-            });
+        let _ = vocab.prefetch_value_pages_checked(&ids, |block_bytes| {
+            scratch.resize(ids_bytes.saturating_add(block_bytes as u64))?;
+            #[cfg(test)]
+            PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED.with(|n| n.set(n.get() + 1));
+            Ok(())
+        });
     }
     drop(ids);
     drop(scratch);
@@ -11203,6 +11235,99 @@ mod paid_eager_producer_tests {
         let before_drop = ok_topk.live_bytes();
         drop(filtered);
         assert_eq!(before_drop - ok_topk.live_bytes(), raw_bytes);
+    }
+
+    #[test]
+    fn prefetch_column_terms_bounds_cursor_ledger_ops_and_skips_warm_batches() {
+        use crate::io::Source;
+        use oxrdfio::RdfFormat;
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..256 {
+            data.push_str(&format!("ex:s{i} ex:p \"word {i:04}\" .\n"));
+        }
+        disk.load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        let snap = disk.snapshot();
+        let make_batch = |range: std::ops::Range<usize>| {
+            let mut tbl = Table::new(vec![0]);
+            for i in range {
+                let id = snap
+                    .lookup_term(&oxrdf::Literal::new_simple_literal(format!("word {i:04}")).into())
+                    .unwrap();
+                tbl.push_row(&[id]);
+            }
+            tbl
+        };
+        let batch1 = make_batch(0..64);
+        let batch2 = make_batch(64..128);
+        let ids_bytes = (64 * size_of::<u64>()) as u64;
+
+        // Under a tight cursor budget below `ids_bytes`, prefetch skips cleanly without
+        // allocating scratch or poisoning `ctx.check()`.
+        let mut tight = Ctx::new(snap.clone());
+        tight.mem_limit = ids_bytes - 1;
+        tight.enable_cursor_accounting().unwrap();
+        let before_tight = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        prefetch_column_terms(&tight, &batch1, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_tight
+        );
+        assert!(tight.check().is_ok());
+        assert_eq!(tight.live_bytes(), 0);
+
+        // Under a normal cursor budget, the first cold batch admits its scratch once on
+        // the decode envelope; subsequent cold batches of the same size take 0 ledger
+        // operations, warm batches skip allocation entirely, and `release_cursor_work`
+        // frees the envelope.
+        let mut ctx = Ctx::new(snap);
+        ctx.mem_limit = 1 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let before_cold1 = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        prefetch_column_terms(&ctx, &batch1, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_cold1 + 1
+        );
+        assert!(ctx.live_bytes() >= ids_bytes);
+
+        let before_cold2_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        let before_cold2_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        prefetch_column_terms(&ctx, &batch2, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_cold2_allocs + 1
+        );
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before_cold2_ops,
+            "second cold cursor batch reuses the decoding envelope with zero ledger ops"
+        );
+
+        if crate::index::io_hints() {
+            let before_warm_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+            let before_warm_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+            prefetch_column_terms(&ctx, &batch1, &[0]);
+            assert_eq!(
+                PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+                before_warm_allocs
+            );
+            assert_eq!(
+                super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+                before_warm_ops
+            );
+        }
+
+        ctx.release_cursor_work();
+        assert_eq!(ctx.live_bytes(), 0);
+        assert!(ctx.check().is_ok());
     }
 
     #[test]

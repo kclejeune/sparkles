@@ -2158,6 +2158,27 @@ impl Ctx {
         }
     }
 
+    /// Admit `bytes` of transient dictionary decoding or prefetch scratch within the
+    /// query's decoding envelope. When the envelope already covers `bytes` (scaled by
+    /// active worker threads when called inside a Rayon pool), this is a single atomic
+    /// load and takes no ledger lock. A refusal is returned to the caller without
+    /// poisoning the context so optional prefetching or fallible operations can handle
+    /// it cleanly.
+    #[inline]
+    pub(super) fn reserve_decode_scratch(&self, bytes: u64) -> Result<()> {
+        self.check_memory_failure()?;
+        let workers = if rayon::current_thread_index().is_some() {
+            rayon::current_num_threads() as u64 + 1
+        } else {
+            1
+        };
+        let need = bytes.saturating_mul(workers);
+        if self.decode.reserved.load(Ordering::Acquire) >= need {
+            return Ok(());
+        }
+        self.grow_decode(need)
+    }
+
     /// Admit transient decoding of a key of `bytes` bytes for an explicitly fallible
     /// operation. A refused sort trial can release its storage and try a smaller piece,
     /// so it must not poison the context as an infallible scalar evaluation would. The
@@ -2165,20 +2186,8 @@ impl Ctx {
     /// common path is one atomic load.
     #[inline]
     pub(super) fn reserve_decode_checked(&self, bytes: usize) -> Result<()> {
-        self.check_memory_failure()?;
-        let workers = if rayon::current_thread_index().is_some() {
-            rayon::current_num_threads() as u64 + 1
-        } else {
-            1
-        };
-        let need = (bytes as u64)
-            .saturating_mul(8)
-            .saturating_add(1024)
-            .saturating_mul(workers);
-        if self.decode.reserved.load(Ordering::Acquire) >= need {
-            return Ok(());
-        }
-        self.grow_decode(need)
+        let need = (bytes as u64).saturating_mul(8).saturating_add(1024);
+        self.reserve_decode_scratch(need)
     }
 
     /// Whether the decode envelope can refuse a key before it is rebuilt. A cursor's
