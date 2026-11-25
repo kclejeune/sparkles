@@ -2,9 +2,11 @@
 
 use oxrdf::{Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 use sparkles_core::Error;
+use sparkles_core::commit::CommitKind;
 use sparkles_core::guard::WriteOptions;
-use sparkles_core::id::{Id, bnode_label};
+use sparkles_core::id::{Id, Tag, bnode_label};
 use sparkles_core::io::{RdfFormat, Source};
+use sparkles_core::preview::{self, DryRun};
 use sparkles_core::store::{Snapshot, Store, StoreOptions};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -187,6 +189,177 @@ fn copies_stop_on_cancellation_and_refuse_an_insufficient_memory_grant() {
     );
     assert!(matches!(result, Err(Error::StorageFull(_))));
     assert_eq!(state(&source.snapshot()), before);
+}
+
+#[test]
+fn retained_dry_run_nested_blank_ids_are_reserved_before_new_allocations() {
+    for case in ["triple", "cdt-list", "cdt-map"] {
+        let source = Store::in_memory(Default::default());
+        let options = WriteOptions {
+            dry_run: Some(DryRun {
+                retain_states: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut transaction = source.write_with(CommitKind::Load, options);
+        let node = transaction.new_bnode();
+        let blank = oxrdf::BlankNode::new(bnode_label(node.payload())).unwrap();
+        let object = match case {
+            "triple" => Term::Triple(Box::new(Triple::new(
+                NamedOrBlankNode::BlankNode(blank),
+                NamedNode::new("urn:inner").unwrap(),
+                Literal::from(1),
+            ))),
+            "cdt-list" => Term::Literal(Literal::new_typed_literal(
+                format!("[_:{}]", blank.as_str()),
+                NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+            )),
+            "cdt-map" => Term::Literal(Literal::new_typed_literal(
+                format!("{{ \"k\" : _:{} }}", blank.as_str()),
+                NamedNode::new(sparkles_core::sparql::cdt::MAP).unwrap(),
+            )),
+            _ => unreachable!(),
+        };
+        let subject = transaction
+            .intern(&Term::NamedNode(NamedNode::new("urn:s").unwrap()))
+            .unwrap();
+        let predicate = transaction
+            .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+            .unwrap();
+        let object = transaction.intern(&object).unwrap();
+        transaction
+            .insert([subject, predicate, object, Id::DEFAULT_GRAPH])
+            .unwrap();
+        let preview = preview::catch(transaction.commit()).unwrap();
+        let retained = preview.states.unwrap().after;
+        assert_eq!(source.snapshot().len(), 0);
+        let copied = source
+            .copy_view_to_memory(&retained, Default::default(), &Default::default(), |_| {
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(state(&retained), state(&copied.snapshot()));
+        let mut write = copied.write();
+        assert_ne!(
+            write.new_bnode(),
+            node,
+            "case {case}: blank referenced only inside retained dry-run nested term must be reserved"
+        );
+    }
+}
+
+#[test]
+fn compacted_base_vocab_copy_accounts_for_live_scratch_and_entry_overhead() {
+    let payload = "x".repeat(64 * 1024);
+    let source = Store::in_memory(Default::default());
+    load(&source, &format!("<urn:s> <urn:p> \"{payload}\" ."));
+    source.compact().unwrap();
+    let snapshot = source.snapshot();
+    let mut saw_vocab = false;
+    snapshot
+        .for_each_quad(|quad| {
+            if quad[2].tag() == Tag::Vocab {
+                saw_vocab = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(saw_vocab, "expected compacted literal in base vocabulary");
+
+    // Single-copy cap (96 KiB) admits either scratch (~64 KiB) or destination (~64 KiB)
+    // alone, but must refuse before allocating both simultaneously (~128 KiB).
+    let single_copy_cap = StoreOptions {
+        max_memory_bytes: Some(96 * 1024),
+        ..Default::default()
+    };
+    let refused =
+        source.copy_view_to_memory(&snapshot, single_copy_cap, &Default::default(), |_| {
+            Ok(true)
+        });
+    assert!(
+        matches!(refused, Err(Error::StorageFull(_))),
+        "expected StorageFull when live scratch and destination copy overlap, got: {:?}",
+        refused.err()
+    );
+
+    // Boundary excluding AppendVocab's 48-byte entry overhead:
+    // <urn:s> (6 + 48 = 54) + <urn:p> (6 + 48 = 54) = 108 base bytes;
+    // payload key = payload.len() + 2 (leading '"' + trailing KEY_SEP).
+    let key_len = payload.len() as u64 + 2;
+    let without_entry_overhead = StoreOptions {
+        max_memory_bytes: Some(108 + key_len * 2),
+        ..Default::default()
+    };
+    let refused_overhead = source.copy_view_to_memory(
+        &snapshot,
+        without_entry_overhead,
+        &Default::default(),
+        |_| Ok(true),
+    );
+    assert!(
+        matches!(refused_overhead, Err(Error::StorageFull(_))),
+        "expected StorageFull when AppendVocab 48-byte entry overhead exceeds cap, got: {:?}",
+        refused_overhead.err()
+    );
+
+    // Sufficient cap admits live scratch + destination copy + metadata.
+    let enough_cap = StoreOptions {
+        max_memory_bytes: Some(160 * 1024),
+        ..Default::default()
+    };
+    let copied = source
+        .copy_view_to_memory(&snapshot, enough_cap, &Default::default(), |_| Ok(true))
+        .unwrap();
+    assert_eq!(state(&snapshot), state(&copied.snapshot()));
+
+    // Compacted CDT literal containing a blank node must also account for live scratch
+    // alongside decode_bytes before calling key_to_term.
+    let cdt_source = Store::in_memory(Default::default());
+    let mut tx = cdt_source.write();
+    let node = tx.new_bnode();
+    let cdt_object = Term::Literal(Literal::new_typed_literal(
+        format!("[\"{payload}\", _:{}]", bnode_label(node.payload())),
+        NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+    ));
+    let subject = tx
+        .intern(&Term::NamedNode(NamedNode::new("urn:s").unwrap()))
+        .unwrap();
+    let predicate = tx
+        .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+        .unwrap();
+    let object = tx.intern(&cdt_object).unwrap();
+    tx.insert([subject, predicate, object, Id::DEFAULT_GRAPH])
+        .unwrap();
+    tx.commit().unwrap();
+    cdt_source.compact().unwrap();
+    let cdt_snap = cdt_source.snapshot();
+    let cdt_refused = cdt_source.copy_view_to_memory(
+        &cdt_snap,
+        StoreOptions {
+            max_memory_bytes: Some(96 * 1024),
+            ..Default::default()
+        },
+        &Default::default(),
+        |_| Ok(true),
+    );
+    assert!(
+        matches!(cdt_refused, Err(Error::StorageFull(_))),
+        "expected StorageFull for compacted CDT literal under single-copy cap, got: {:?}",
+        cdt_refused.err()
+    );
+    let cdt_copied = cdt_source
+        .copy_view_to_memory(
+            &cdt_snap,
+            StoreOptions {
+                max_memory_bytes: Some(160 * 1024),
+                ..Default::default()
+            },
+            &Default::default(),
+            |_| Ok(true),
+        )
+        .unwrap();
+    assert_eq!(state(&cdt_snap), state(&cdt_copied.snapshot()));
 }
 
 #[test]

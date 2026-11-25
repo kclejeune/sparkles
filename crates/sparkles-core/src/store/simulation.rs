@@ -62,6 +62,8 @@ fn reserve_term(term: &Term, next: &mut u64, ordinals: &mut u64) -> Result<()> {
     Ok(())
 }
 
+const APPEND_VOCAB_ENTRY_BYTES: u64 = 48;
+
 fn key_may_name_bnodes(key: &[u8]) -> bool {
     match key.first() {
         Some(b'(') => true,
@@ -69,11 +71,10 @@ fn key_may_name_bnodes(key: &[u8]) -> bool {
             let Some(sep) = key.iter().rposition(|&b| b == id::KEY_SEP) else {
                 return false;
             };
-            let suffix = &key[sep + 1..];
-            if suffix.is_empty() || suffix[0] == b'@' {
+            let Some(dt_bytes) = key[sep + 1..].strip_prefix(b"^") else {
                 return false;
-            }
-            let Ok(dt) = std::str::from_utf8(suffix) else {
+            };
+            let Ok(dt) = std::str::from_utf8(dt_bytes) else {
                 return false;
             };
             crate::sparql::cdt::is_cdt(dt) && key[1..sep].windows(2).any(|w| w == b"_:")
@@ -86,22 +87,34 @@ fn copy_key_into(
     copied: &Store,
     transaction: &mut WriteTxn<'_>,
     key: &[u8],
+    scratch_bytes: u64,
     next_ordinal: &mut u64,
 ) -> Result<Id> {
+    if let Some(existing) = transaction.lookup_key(key) {
+        return Ok(existing);
+    }
     if key_may_name_bnodes(key) {
         if copied.opts.max_memory_bytes.is_some() {
             let decode_bytes = id::key_decode_bytes(key)?;
-            copied.check_memory(transaction.memory_size().saturating_add(decode_bytes))?;
+            copied.check_memory(
+                transaction
+                    .memory_size()
+                    .saturating_add(scratch_bytes)
+                    .saturating_add(decode_bytes),
+            )?;
         }
         let term = id::key_to_term(key);
         crate::nesting::check_triple_term(&term)?;
         reserve_term(&term, &mut transaction.guard.next_bnode, next_ordinal)?;
     }
-    if let Some(existing) = transaction.lookup_key(key) {
-        return Ok(existing);
-    }
     if copied.opts.max_memory_bytes.is_some() {
-        copied.check_memory(transaction.memory_size().saturating_add(key.len() as u64))?;
+        copied.check_memory(
+            transaction
+                .memory_size()
+                .saturating_add(scratch_bytes)
+                .saturating_add(key.len() as u64)
+                .saturating_add(APPEND_VOCAB_ENTRY_BYTES),
+        )?;
     }
     transaction.intern_key(key)
 }
@@ -214,28 +227,34 @@ impl Store {
                             let key = v.get(id.payload()).ok_or_else(|| {
                                 Error::invalid("the simulated view contains an unknown term")
                             })?;
-                            copy_key_into(&copied, &mut transaction, key, &mut next_ordinal)
+                            copy_key_into(&copied, &mut transaction, key, 0, &mut next_ordinal)
                         })?,
                         crate::id::Tag::Vocab => {
-                            let base_mem = transaction.memory_size();
+                            let base_mem = if copied.opts.max_memory_bytes.is_some() {
+                                transaction.memory_size()
+                            } else {
+                                0
+                            };
+                            let scratch_bytes = std::cell::Cell::new(0u64);
                             view.generation
                                 .vocab
                                 .get_with_controlled_capacity_checked(
                                     id.payload(),
                                     |old, new| {
                                         if copied.opts.max_memory_bytes.is_some() {
-                                            copied
-                                                .check_memory(base_mem.saturating_add(
-                                                    old.saturating_add(new) as u64,
-                                                ))?;
+                                            copied.check_memory(
+                                                base_mem
+                                                    .saturating_add(old as u64)
+                                                    .saturating_add(new as u64),
+                                            )?;
                                         }
                                         Ok(())
                                     },
                                     |cap| {
+                                        let cap = cap as u64;
+                                        scratch_bytes.set(cap);
                                         if copied.opts.max_memory_bytes.is_some() {
-                                            copied.check_memory(
-                                                base_mem.saturating_add(cap as u64),
-                                            )?;
+                                            copied.check_memory(base_mem.saturating_add(cap))?;
                                         }
                                         Ok(())
                                     },
@@ -245,6 +264,7 @@ impl Store {
                                             &copied,
                                             &mut transaction,
                                             key,
+                                            scratch_bytes.get(),
                                             &mut next_ordinal,
                                         )
                                     },
