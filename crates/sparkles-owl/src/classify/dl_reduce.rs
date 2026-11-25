@@ -33,6 +33,7 @@
 //! the run's report.
 
 use super::Excluded;
+use super::ScratchBudget;
 use super::dl;
 use super::index::Gap;
 use crate::model::*;
@@ -146,20 +147,27 @@ impl Reduction {
         excluded: &[Excluded],
         budget: &mut impl super::ScratchBudget,
     ) -> Result<dl::OutsideEl, super::Error> {
-        budget.poll()?;
+        let mut work = super::ScopedScratch::new(budget);
+        work.poll()?;
         let mut out = dl::OutsideEl::default();
-        let mut seen: FxHashSet<&AxiomKind> = FxHashSet::default();
+        let mut seen: super::polled::PolledSet<'_, AxiomKind> = super::polled::PolledSet::new();
         let mut chains: Vec<&AxiomKind> = Vec::new();
+        let mut is_outside_bits: Vec<u64> = Vec::new();
+        let bit_words = axioms.len().div_ceil(64);
+        if bit_words > 0 {
+            super::vec_reserve(&mut is_outside_bits, bit_words, &mut work)?;
+            is_outside_bits.resize(bit_words, 0);
+        }
+        let mut steps = 0usize;
         for (i, &k) in axioms.iter().enumerate() {
             if i.is_multiple_of(super::RANGE_POLL_STEP) {
-                budget.poll()?;
+                work.poll()?;
             }
-            if super::logical(k) && super::el_breaks_polled(k, budget)? {
-                if !seen.contains(k) {
-                    super::set_admit(&mut seen, budget)?;
-                    seen.insert(k);
+            if super::logical(k) && super::el_breaks_polled(k, &work)? {
+                is_outside_bits[i / 64] |= 1u64 << (i % 64);
+                if seen.insert_polled(k, &mut steps, &mut work)? {
                     out.add(dl::shape_polled(k, super::RANGE_POLL_STEP, &mut || {
-                        budget.poll()
+                        work.poll()
                     })?);
                 }
             } else if matches!(
@@ -167,38 +175,52 @@ impl Reduction {
                 AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
             ) && !super::index::top_inclusion(k)
             {
-                super::vec_reserve(&mut chains, 1, budget)?;
+                super::vec_reserve(&mut chains, 1, &mut work)?;
                 chains.push(k);
             }
         }
         if !chains.is_empty() {
-            let missing =
-                super::check_chain_ranges(axioms, |_, k| seen.contains(k), &chains, false, budget)?;
-            for (i, (&k, miss)) in chains.iter().zip(missing).enumerate() {
+            let missing = super::check_chain_ranges(
+                axioms,
+                |i, _| (is_outside_bits[i / 64] >> (i % 64)) & 1 != 0,
+                &chains,
+                false,
+                &mut work,
+            )?;
+            let bits_bytes = super::vec_bytes(&is_outside_bits);
+            drop(is_outside_bits);
+            work.release(bits_bytes);
+            let missing_bytes = super::vec_bytes(&missing);
+            for (i, (&k, miss)) in chains.iter().zip(missing.iter()).enumerate() {
                 if i.is_multiple_of(super::RANGE_POLL_STEP) {
-                    budget.poll()?;
+                    work.poll()?;
                 }
-                if miss.is_some() && !seen.contains(k) {
-                    super::set_admit(&mut seen, budget)?;
-                    seen.insert(k);
+                if miss.is_some() && seen.insert_polled(k, &mut steps, &mut work)? {
                     out.horn += 1;
                 }
             }
+            drop(missing);
+            work.release(missing_bytes);
+        } else {
+            let bits_bytes = super::vec_bytes(&is_outside_bits);
+            drop(is_outside_bits);
+            work.release(bits_bytes);
         }
-        let mut left: FxHashSet<&AxiomKind> = FxHashSet::default();
+        let chains_bytes = super::vec_bytes(&chains);
+        drop(chains);
+        work.release(chains_bytes);
+        let mut left: super::polled::PolledSet<'_, AxiomKind> = super::polled::PolledSet::new();
         for (i, e) in excluded.iter().enumerate() {
             if i.is_multiple_of(super::RANGE_POLL_STEP) {
-                budget.poll()?;
+                work.poll()?;
             }
             if matches!(e.gap, Gap::Outside { .. })
-                && seen.contains(&e.axiom)
-                && !left.contains(&e.axiom)
+                && seen.contains_polled(&e.axiom, &mut steps, &work)?
             {
-                super::set_admit(&mut left, budget)?;
-                left.insert(&e.axiom);
+                left.insert_polled(&e.axiom, &mut steps, &mut work)?;
             }
         }
-        budget.poll()?;
+        work.poll()?;
         out.taken = seen.len() - left.len();
         Ok(out)
     }

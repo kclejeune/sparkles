@@ -63,6 +63,248 @@ impl Renderer {
         v
     }
 
+    /// Streams an IRI as a prefixed name or in angle brackets with zero intermediate allocations.
+    pub(crate) fn write_iri(&self, iri: &str, w: &mut impl fmt::Write) -> fmt::Result {
+        for (p, ns) in &self.prefixes {
+            if let Some(local) = iri.strip_prefix(ns.as_str())
+                && is_local_name(local)
+            {
+                w.write_str(p)?;
+                w.write_char(':')?;
+                return w.write_str(local);
+            }
+        }
+        w.write_char('<')?;
+        w.write_str(iri)?;
+        w.write_char('>')
+    }
+
+    pub(crate) fn write_literal(&self, l: &Literal, w: &mut impl fmt::Write) -> fmt::Result {
+        w.write_char('"')?;
+        for c in l.value().chars() {
+            match c {
+                '"' => w.write_str("\\\"")?,
+                '\\' => w.write_str("\\\\")?,
+                c => w.write_char(c)?,
+            }
+        }
+        w.write_char('"')?;
+        if let Some(lang) = l.language() {
+            w.write_char('@')?;
+            w.write_str(lang)?;
+        } else if l.datatype() != vocab::XSD_STRING {
+            w.write_str("^^")?;
+            self.write_iri(l.datatype(), w)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_individual(&self, i: &Individual, w: &mut impl fmt::Write) -> fmt::Result {
+        match i {
+            Individual::Named(n) => self.write_iri(n.as_str(), w),
+            Individual::Anonymous(a) => {
+                w.write_str("_:")?;
+                w.write_str(a.label())
+            }
+        }
+    }
+
+    pub(crate) fn write_ope(
+        &self,
+        p: &ObjectPropertyExpression,
+        w: &mut impl fmt::Write,
+    ) -> fmt::Result {
+        match p {
+            ObjectPropertyExpression::Property(p) => self.write_iri(p.as_str(), w),
+            ObjectPropertyExpression::InverseOf(p) => {
+                w.write_str("ObjectInverseOf(")?;
+                self.write_iri(p.as_str(), w)?;
+                w.write_char(')')
+            }
+        }
+    }
+
+    pub(crate) fn write_data_range(&self, r: &DataRange, w: &mut impl fmt::Write) -> fmt::Result {
+        match r {
+            DataRange::Datatype(d) => self.write_iri(d.as_str(), w),
+            DataRange::IntersectionOf(rs) => {
+                w.write_str("DataIntersectionOf(")?;
+                for (i, r) in rs.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char(' ')?;
+                    }
+                    self.write_data_range(r, w)?;
+                }
+                w.write_char(')')
+            }
+            DataRange::UnionOf(rs) => {
+                w.write_str("DataUnionOf(")?;
+                for (i, r) in rs.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char(' ')?;
+                    }
+                    self.write_data_range(r, w)?;
+                }
+                w.write_char(')')
+            }
+            DataRange::ComplementOf(r) => {
+                w.write_str("DataComplementOf(")?;
+                self.write_data_range(r, w)?;
+                w.write_char(')')
+            }
+            DataRange::OneOf(ls) => {
+                w.write_str("DataOneOf(")?;
+                for (i, l) in ls.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char(' ')?;
+                    }
+                    self.write_literal(l, w)?;
+                }
+                w.write_char(')')
+            }
+            DataRange::DatatypeRestriction(d, fs) => {
+                w.write_str("DatatypeRestriction(")?;
+                self.write_iri(d.as_str(), w)?;
+                for f in fs {
+                    w.write_char(' ')?;
+                    self.write_iri(f.facet.as_str(), w)?;
+                    w.write_char(' ')?;
+                    self.write_literal(&f.value, w)?;
+                }
+                w.write_char(')')
+            }
+        }
+    }
+
+    /// Streams a class expression in functional-style syntax with zero intermediate allocations.
+    pub(crate) fn write_class_expression(
+        &self,
+        c: &ClassExpression,
+        w: &mut impl fmt::Write,
+    ) -> fmt::Result {
+        use ClassExpression as C;
+        match c {
+            C::Class(c) => self.write_iri(c.as_str(), w),
+            C::ObjectIntersectionOf(cs) => {
+                w.write_str("ObjectIntersectionOf(")?;
+                for (i, c) in cs.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char(' ')?;
+                    }
+                    self.write_class_expression(c, w)?;
+                }
+                w.write_char(')')
+            }
+            C::ObjectUnionOf(cs) => {
+                w.write_str("ObjectUnionOf(")?;
+                for (i, c) in cs.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char(' ')?;
+                    }
+                    self.write_class_expression(c, w)?;
+                }
+                w.write_char(')')
+            }
+            C::ObjectComplementOf(c) => {
+                w.write_str("ObjectComplementOf(")?;
+                self.write_class_expression(c, w)?;
+                w.write_char(')')
+            }
+            C::ObjectOneOf(is) => {
+                w.write_str("ObjectOneOf(")?;
+                for (i, ind) in is.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char(' ')?;
+                    }
+                    self.write_individual(ind, w)?;
+                }
+                w.write_char(')')
+            }
+            C::ObjectSomeValuesFrom(p, c) => {
+                w.write_str("ObjectSomeValuesFrom(")?;
+                self.write_ope(p, w)?;
+                w.write_char(' ')?;
+                self.write_class_expression(c, w)?;
+                w.write_char(')')
+            }
+            C::ObjectAllValuesFrom(p, c) => {
+                w.write_str("ObjectAllValuesFrom(")?;
+                self.write_ope(p, w)?;
+                w.write_char(' ')?;
+                self.write_class_expression(c, w)?;
+                w.write_char(')')
+            }
+            C::ObjectHasValue(p, i) => {
+                w.write_str("ObjectHasValue(")?;
+                self.write_ope(p, w)?;
+                w.write_char(' ')?;
+                self.write_individual(i, w)?;
+                w.write_char(')')
+            }
+            C::ObjectHasSelf(p) => {
+                w.write_str("ObjectHasSelf(")?;
+                self.write_ope(p, w)?;
+                w.write_char(')')
+            }
+            C::ObjectMinCardinality(n, p, f)
+            | C::ObjectMaxCardinality(n, p, f)
+            | C::ObjectExactCardinality(n, p, f) => {
+                let name = match c {
+                    C::ObjectMinCardinality(..) => "ObjectMinCardinality",
+                    C::ObjectMaxCardinality(..) => "ObjectMaxCardinality",
+                    C::ObjectExactCardinality(..) => "ObjectExactCardinality",
+                    _ => unreachable!(),
+                };
+                write!(w, "{name}({n} ")?;
+                self.write_ope(p, w)?;
+                if let Some(f) = f {
+                    w.write_char(' ')?;
+                    self.write_class_expression(f, w)?;
+                }
+                w.write_char(')')
+            }
+            C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => {
+                let name = match c {
+                    C::DataSomeValuesFrom(..) => "DataSomeValuesFrom",
+                    C::DataAllValuesFrom(..) => "DataAllValuesFrom",
+                    _ => unreachable!(),
+                };
+                w.write_str(name)?;
+                w.write_char('(')?;
+                for p in ps {
+                    self.write_iri(p.as_str(), w)?;
+                    w.write_char(' ')?;
+                }
+                self.write_data_range(r, w)?;
+                w.write_char(')')
+            }
+            C::DataHasValue(p, l) => {
+                w.write_str("DataHasValue(")?;
+                self.write_iri(p.as_str(), w)?;
+                w.write_char(' ')?;
+                self.write_literal(l, w)?;
+                w.write_char(')')
+            }
+            C::DataMinCardinality(n, p, r)
+            | C::DataMaxCardinality(n, p, r)
+            | C::DataExactCardinality(n, p, r) => {
+                let name = match c {
+                    C::DataMinCardinality(..) => "DataMinCardinality",
+                    C::DataMaxCardinality(..) => "DataMaxCardinality",
+                    C::DataExactCardinality(..) => "DataExactCardinality",
+                    _ => unreachable!(),
+                };
+                write!(w, "{name}({n} ")?;
+                self.write_iri(p.as_str(), w)?;
+                if let Some(r) = r {
+                    w.write_char(' ')?;
+                    self.write_data_range(r, w)?;
+                }
+                w.write_char(')')
+            }
+        }
+    }
+
     /// An IRI as a prefixed name, or in angle brackets.
     pub fn iri(&self, iri: &str) -> String {
         for (p, ns) in &self.prefixes {
@@ -417,7 +659,11 @@ macro_rules! display {
 }
 
 display!(Axiom, axiom);
-display!(ClassExpression, class_expression);
+impl fmt::Display for ClassExpression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        DEFAULT.with(|r| r.write_class_expression(self, f))
+    }
+}
 display!(DataRange, data_range);
 display!(ObjectPropertyExpression, ope);
 display!(Individual, individual);
