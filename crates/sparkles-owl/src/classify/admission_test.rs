@@ -345,6 +345,8 @@ pub(super) enum MergePhase {
     PlanIndsDrainDone { restarts: usize },
     PlanRetarget { restarts: usize },
     PlanRetargetDone { restarts: usize },
+    PlanDisjointDedup { restarts: usize },
+    PlanDisjointDedupDone { restarts: usize },
     PlanKeyBody { restarts: usize },
     PlanKeyBodyDone { restarts: usize },
     PlanDone { restarts: usize, outcome: PlanKind },
@@ -441,6 +443,16 @@ pub(super) fn merge_phase_retarget() {
 pub(super) fn merge_phase_retarget_done() {
     let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
     emit_merge_phase(MergePhase::PlanRetargetDone { restarts });
+}
+
+pub(super) fn merge_phase_disjoint_dedup() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanDisjointDedup { restarts });
+}
+
+pub(super) fn merge_phase_disjoint_dedup_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanDisjointDedupDone { restarts });
 }
 
 pub(super) fn merge_phase_key_body() {

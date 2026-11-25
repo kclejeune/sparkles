@@ -6878,3 +6878,582 @@ fn has_key_rewritten_to_named_class_reuses_name_without_fresh_equivalence() {
         red2.axioms
     );
 }
+
+/// Sol P2 #1 + Neon P2 #1 (r4): singleton `DisjointUnion` rewrite must drop its temporary
+/// image container before releasing its budget and allocating `EquivalentClasses`, even
+/// when the union class has a long IRI that makes `EquivalentClasses` the peak admission.
+#[test]
+fn singleton_disjoint_union_with_long_iri_does_not_overlap_live_container_release() {
+    let disj = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:Z")),
+        ClassExpression::ObjectUnionOf(
+            [
+                ClassExpression::Class(Class::new("urn:tierd1291:Z1")),
+                ClassExpression::Class(Class::new("urn:tierd1291:Z2")),
+            ]
+            .into(),
+        ),
+    );
+    let long_union = Class::new(format!("urn:tierd1291:LongUnion_{}", "u".repeat(4096)));
+    let op1 = ClassExpression::ObjectSomeValuesFrom(
+        ObjectPropertyExpression::Property(ObjectProperty::top()),
+        Box::new(ClassExpression::Class(Class::new("urn:tierd1291:A"))),
+    );
+    let op2 = ClassExpression::ObjectMinCardinality(
+        1,
+        ObjectPropertyExpression::Property(ObjectProperty::top()),
+        Some(Box::new(ClassExpression::Class(Class::new(
+            "urn:tierd1291:A",
+        )))),
+    );
+
+    // Check both (a) 2-operand DisjointUnion collapsing to 1 image and (b) 1-operand AST.
+    for (label, operands) in [
+        ("2-operand collapsing", vec![op1.clone(), op2]),
+        ("1-operand singleton", vec![op1]),
+    ] {
+        let du = AxiomKind::DisjointUnion(long_union.clone(), operands.into_iter().collect());
+        let refs = [&disj, &du];
+
+        let mut thresholds = std::collections::BTreeSet::new();
+        let _ = super::dl_reduce::plan_budgeted(
+            &refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                thresholds.insert(used);
+                true
+            },
+        )
+        .unwrap();
+
+        let mut admitted_peak = 0usize;
+        let (red_opt, sample) = measure(|| {
+            match super::dl_reduce::plan_budgeted(
+                &refs,
+                None,
+                None,
+                0,
+                &mut || Ok::<(), ()>(()),
+                &mut |used| {
+                    admitted_peak = admitted_peak.max(used);
+                    true
+                },
+            )
+            .unwrap()
+            {
+                super::dl_reduce::Plan::Ready(r) => Some(r),
+                _ => None,
+            }
+        });
+        let red = red_opt.unwrap_or_else(|| panic!("{label}: unlimited plan must succeed"));
+        assert!(
+            admitted_peak >= sample.peak,
+            "{label}: admitted peak ({admitted_peak}) undercounted measured peak ({})",
+            sample.peak
+        );
+        assert!(
+            red.retained_bytes() >= sample.live,
+            "{label}: retained_bytes ({}) undercounted measured live ({})",
+            red.retained_bytes(),
+            sample.live
+        );
+        assert!(
+            red.axioms
+                .iter()
+                .any(|ax| matches!(ax, AxiomKind::EquivalentClasses(_))),
+            "{label}: singleton DisjointUnion must emit EquivalentClasses: {:?}",
+            red.axioms
+        );
+        drop(red);
+
+        // Tight-grant sweep across every observed admission boundary and one byte below it.
+        let mut grants = std::collections::BTreeSet::new();
+        for &t in &thresholds {
+            grants.insert(t);
+            if t > 0 {
+                grants.insert(t - 1);
+            }
+        }
+        for grant in grants {
+            let (plan, tight_sample) = measure(|| {
+                super::dl_reduce::plan_budgeted(
+                    &refs,
+                    None,
+                    None,
+                    0,
+                    &mut || Ok::<(), ()>(()),
+                    &mut |used| used <= grant,
+                )
+                .unwrap()
+            });
+            assert!(
+                tight_sample.peak <= grant,
+                "{label}: measured peak ({}) exceeded tight grant ({grant})",
+                tight_sample.peak
+            );
+            if grant == admitted_peak {
+                assert!(
+                    matches!(plan, super::dl_reduce::Plan::Ready(_)),
+                    "{label}: grant equal to admitted_peak ({admitted_peak}) must succeed"
+                );
+            }
+            drop(plan);
+        }
+    }
+}
+
+/// Sol P2 #2 (r4): deduplication in `disjoint_budgeted` must cooperatively poll wide
+/// rewritten expressions on both 2nd-operand and 3rd-operand duplicates and cancel
+/// mid-comparison before exiting deduplication.
+#[test]
+fn disjoint_union_deduplication_polls_wide_rewritten_operands_and_cancels() {
+    use super::admission_test::{MergePhase, with_merge_probe};
+    use parking_lot::Mutex;
+
+    let mut wide_oneof = std::collections::BTreeSet::new();
+    for i in 0..300usize {
+        wide_oneof.insert(Individual::anonymous(format!(
+            "dd_{i:03}_{}",
+            "x".repeat(64)
+        )));
+    }
+    let wide_oneof = ClassExpression::ObjectOneOf(wide_oneof);
+    let thing_inter = ClassExpression::ObjectIntersectionOf(
+        [wide_oneof.clone(), ClassExpression::Class(Class::thing())].into(),
+    );
+    let op1 = ClassExpression::ObjectSomeValuesFrom(
+        ObjectPropertyExpression::Property(ObjectProperty::top()),
+        Box::new(thing_inter.clone()),
+    );
+    let op2 = ClassExpression::ObjectMinCardinality(
+        1,
+        ObjectPropertyExpression::Property(ObjectProperty::top()),
+        Some(Box::new(thing_inter)),
+    );
+    let op3 = ClassExpression::ObjectSomeValuesFrom(
+        ObjectPropertyExpression::Property(ObjectProperty::top()),
+        Box::new(ClassExpression::ObjectIntersectionOf(
+            [
+                wide_oneof,
+                ClassExpression::ObjectMinCardinality(
+                    0,
+                    ObjectPropertyExpression::Property(ObjectProperty::top()),
+                    Some(Box::new(ClassExpression::Class(Class::new(
+                        "urn:tierd1291:Extra",
+                    )))),
+                ),
+            ]
+            .into(),
+        )),
+    );
+    let three_ops: std::collections::BTreeSet<ClassExpression> =
+        [op1.clone(), op2.clone(), op3].into();
+    assert_eq!(three_ops.len(), 3, "three source operands must be distinct");
+
+    let disj = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:Z")),
+        ClassExpression::ObjectUnionOf(
+            [
+                ClassExpression::Class(Class::new("urn:tierd1291:Z1")),
+                ClassExpression::Class(Class::new("urn:tierd1291:Z2")),
+            ]
+            .into(),
+        ),
+    );
+    let union_cls = Class::new("urn:tierd1291:WideDedupUnion");
+
+    // 1. 2-operand cancellation mid-deduplication comparison (former `images.contains(&d)`).
+    {
+        let du2 = AxiomKind::DisjointUnion(union_cls.clone(), [op1, op2].into());
+        let refs = [&disj, &du2];
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanDisjointDedup { restarts: 0 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs,
+                    None,
+                    None,
+                    0,
+                    &mut || {
+                        if cancel_cb.load(Ordering::SeqCst) {
+                            Err(Error::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut |_| true,
+                )
+            },
+        )
+        .err()
+        .expect("must cancel mid-deduplication on 2nd duplicate operand");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::PlanDisjointDedup { restarts: 0 }));
+        assert!(
+            !t.contains(&MergePhase::PlanDisjointDedupDone { restarts: 0 }),
+            "cancellation must stop inside wide deduplication comparison before exit: {t:?}"
+        );
+    }
+
+    // 2. 3-operand cancellation mid-deduplication on 3rd operand (former `empty.entry(d)`).
+    let du3 = AxiomKind::DisjointUnion(union_cls, three_ops);
+    let refs3 = [&disj, &du3];
+    {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let dedup_starts = Arc::new(AtomicUsize::new(0));
+        let dedup_starts_probe = dedup_starts.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanDisjointDedup { restarts: 0 })
+                    && dedup_starts_probe.fetch_add(1, Ordering::SeqCst) == 1
+                {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs3,
+                    None,
+                    None,
+                    0,
+                    &mut || {
+                        if cancel_cb.load(Ordering::SeqCst) {
+                            Err(Error::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut |_| true,
+                )
+            },
+        )
+        .err()
+        .expect("must cancel mid-deduplication on 3rd duplicate operand");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        let starts = t
+            .iter()
+            .filter(|p| matches!(p, MergePhase::PlanDisjointDedup { restarts: 0 }))
+            .count();
+        let dones = t
+            .iter()
+            .filter(|p| matches!(p, MergePhase::PlanDisjointDedupDone { restarts: 0 }))
+            .count();
+        assert_eq!(
+            starts, 2,
+            "expected dedup start for 2nd and 3rd operands: {t:?}"
+        );
+        assert_eq!(dones, 1, "3rd operand dedup must cancel before Done: {t:?}");
+    }
+
+    // 3. Uncancelled 3-operand run emits `SubClassOf(d, owl:Nothing)` once and stays sound.
+    {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let mut admitted_peak = 0usize;
+        let (red_opt, sample) = measure(|| {
+            with_merge_probe(
+                move |phase| trace_probe.lock().push(phase),
+                || match super::dl_reduce::plan_budgeted(
+                    &refs3,
+                    None,
+                    None,
+                    0,
+                    &mut || Ok::<(), ()>(()),
+                    &mut |used| {
+                        admitted_peak = admitted_peak.max(used);
+                        true
+                    },
+                )
+                .unwrap()
+                {
+                    super::dl_reduce::Plan::Ready(r) => Some(r),
+                    _ => None,
+                },
+            )
+        });
+        let red = red_opt.expect("3-operand duplicate-image DisjointUnion must succeed");
+        let empty_axioms = red
+            .axioms
+            .iter()
+            .filter(|ax| {
+                matches!(
+                    ax,
+                    AxiomKind::SubClassOf(_, ClassExpression::Class(c))
+                        if c.as_str() == crate::vocab::OWL_NOTHING
+                )
+            })
+            .count();
+        assert_eq!(
+            empty_axioms, 1,
+            "3 identical rewritten operands must emit SubClassOf(d, owl:Nothing) exactly once"
+        );
+        assert!(
+            admitted_peak >= sample.peak,
+            "3-operand DisjointUnion admitted peak ({admitted_peak}) undercounted peak ({})",
+            sample.peak
+        );
+        assert!(
+            red.retained_bytes() >= sample.live,
+            "3-operand DisjointUnion retained_bytes ({}) undercounted live ({})",
+            red.retained_bytes(),
+            sample.live
+        );
+        let t = trace.lock().clone();
+        let starts = t
+            .iter()
+            .filter(|p| matches!(p, MergePhase::PlanDisjointDedup { restarts: 0 }))
+            .count();
+        let dones = t
+            .iter()
+            .filter(|p| matches!(p, MergePhase::PlanDisjointDedupDone { restarts: 0 }))
+            .count();
+        assert_eq!(starts, 2);
+        assert_eq!(dones, 2);
+        drop(red);
+    }
+}
+
+/// Neon P3 (r4): every `Plan*` start probe must pair 1:1 with its `Plan*Done` probe on
+/// exact 16-iteration loop boundaries and on `EquivalentObjectProperties` with one
+/// non-top property preceding `owl:topObjectProperty`.
+#[test]
+fn merge_plan_probes_pair_start_and_done_at_exact_boundaries() {
+    use super::admission_test::{MergePhase, with_merge_probe};
+    use parking_lot::Mutex;
+
+    let count_phase =
+        |t: &[MergePhase], target: MergePhase| t.iter().filter(|&&p| p == target).count();
+    let assert_all_balanced = |t: &[MergePhase]| {
+        for (start, done) in [
+            (
+                MergePhase::PlanBlockedScan { restarts: 0 },
+                MergePhase::PlanBlockedScanDone { restarts: 0 },
+            ),
+            (
+                MergePhase::PlanHornCheck { restarts: 0 },
+                MergePhase::PlanHornCheckDone { restarts: 0 },
+            ),
+            (
+                MergePhase::PlanIndsDrain { restarts: 0 },
+                MergePhase::PlanIndsDrainDone { restarts: 0 },
+            ),
+            (
+                MergePhase::PlanRetarget { restarts: 0 },
+                MergePhase::PlanRetargetDone { restarts: 0 },
+            ),
+            (
+                MergePhase::PlanDisjointDedup { restarts: 0 },
+                MergePhase::PlanDisjointDedupDone { restarts: 0 },
+            ),
+            (
+                MergePhase::PlanKeyBody { restarts: 0 },
+                MergePhase::PlanKeyBodyDone { restarts: 0 },
+            ),
+        ] {
+            assert_eq!(
+                count_phase(t, start),
+                count_phase(t, done),
+                "unbalanced probe pair {start:?} vs {done:?} in {t:?}"
+            );
+        }
+    };
+    let run_trace = |refs: &[&AxiomKind]| -> Vec<MergePhase> {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let plan = with_merge_probe(
+            move |phase| trace_probe.lock().push(phase),
+            || {
+                super::dl_reduce::plan_budgeted(
+                    refs,
+                    None,
+                    None,
+                    0,
+                    &mut || Ok::<(), ()>(()),
+                    &mut |_| true,
+                )
+                .unwrap()
+            },
+        );
+        assert!(matches!(plan, super::dl_reduce::Plan::Ready(_)));
+        let t = trace.lock().clone();
+        assert_all_balanced(&t);
+        t
+    };
+
+    // 1a. Exact 16-iteration boundaries for blocked scan (16 named individuals), Horn check
+    //     (14 union members + LHS Class + RHS ObjectUnionOf = 16 ticks), inds drain (16),
+    //     and EquivalentObjectProperties with one non-top property preceding owl:topObjectProperty.
+    {
+        let mut union14 = std::collections::BTreeSet::new();
+        for i in 0..14usize {
+            union14.insert(ClassExpression::Class(Class::new(format!(
+                "urn:tierd1291:b16u{i:02}"
+            ))));
+        }
+        let disj16 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:B16Z")),
+            ClassExpression::ObjectUnionOf(union14),
+        );
+        let mut diff16 = std::collections::BTreeSet::new();
+        for i in 0..16usize {
+            diff16.insert(Individual::named(format!("urn:tierd1291:b16i{i:02}")));
+        }
+        let diff_ax = AxiomKind::DifferentIndividuals(diff16);
+        // One non-top property sorting before `http://www.w3.org/2002/07/owl#topObjectProperty`.
+        let eqop_one_non_top = AxiomKind::EquivalentObjectProperties(
+            [
+                ObjectPropertyExpression::Property(ObjectProperty::new(
+                    "http://example.org/b16_p0",
+                )),
+                ObjectPropertyExpression::Property(ObjectProperty::top()),
+            ]
+            .into(),
+        );
+        let t = run_trace(&[&disj16, &diff_ax, &eqop_one_non_top]);
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanBlockedScan { restarts: 0 }),
+            0
+        );
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanHornCheck { restarts: 0 }),
+            0
+        );
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanIndsDrain { restarts: 0 }),
+            0
+        );
+        assert_eq!(count_phase(&t, MergePhase::PlanRetarget { restarts: 0 }), 0);
+    }
+
+    // 1b. Exact 16-nominal ObjectOneOf clone and DisjointDedup comparison boundaries.
+    {
+        let disj = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:B16Z")),
+            ClassExpression::ObjectUnionOf(
+                [
+                    ClassExpression::Class(Class::new("urn:tierd1291:B16Z1")),
+                    ClassExpression::Class(Class::new("urn:tierd1291:B16Z2")),
+                ]
+                .into(),
+            ),
+        );
+        let mut oneof16 = std::collections::BTreeSet::new();
+        for i in 0..16usize {
+            oneof16.insert(Individual::anonymous(format!("b16a{i:02}")));
+        }
+        let filler16 = ClassExpression::ObjectOneOf(oneof16);
+        let top_oneof16 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:B16Top")),
+            ClassExpression::ObjectSomeValuesFrom(
+                ObjectPropertyExpression::Property(ObjectProperty::top()),
+                Box::new(filler16.clone()),
+            ),
+        );
+        let t1 = run_trace(&[&disj, &top_oneof16]);
+        assert_eq!(
+            count_phase(&t1, MergePhase::PlanRetarget { restarts: 0 }),
+            0
+        );
+
+        let du16 = AxiomKind::DisjointUnion(
+            Class::new("urn:tierd1291:B16DU"),
+            [
+                ClassExpression::ObjectSomeValuesFrom(
+                    ObjectPropertyExpression::Property(ObjectProperty::top()),
+                    Box::new(filler16.clone()),
+                ),
+                ClassExpression::ObjectMinCardinality(
+                    1,
+                    ObjectPropertyExpression::Property(ObjectProperty::top()),
+                    Some(Box::new(filler16)),
+                ),
+            ]
+            .into(),
+        );
+        let t2 = run_trace(&[&disj, &du16]);
+        assert_eq!(
+            count_phase(&t2, MergePhase::PlanDisjointDedup { restarts: 0 }),
+            0
+        );
+        // Only the outer 2-operand loop in `disjoint_budgeted` fires PlanRetarget (not the
+        // 16-nominal `ObjectOneOf` clones).
+        assert_eq!(
+            count_phase(&t2, MergePhase::PlanRetarget { restarts: 0 }),
+            1
+        );
+    }
+
+    // 2. 17-iteration boundaries emit matching start + done pairs for every probe.
+    {
+        let mut union15 = std::collections::BTreeSet::new();
+        for i in 0..15usize {
+            union15.insert(ClassExpression::Class(Class::new(format!(
+                "urn:tierd1291:b17u{i:02}"
+            ))));
+        }
+        let disj17 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:B17Z")),
+            ClassExpression::ObjectUnionOf(union15),
+        );
+        let mut diff17 = std::collections::BTreeSet::new();
+        for i in 0..17usize {
+            diff17.insert(Individual::named(format!("urn:tierd1291:b17i{i:02}")));
+        }
+        let diff_ax = AxiomKind::DifferentIndividuals(diff17);
+        let mut oneof17 = std::collections::BTreeSet::new();
+        for i in 0..17usize {
+            oneof17.insert(Individual::anonymous(format!("b17a{i:02}")));
+        }
+        let filler17 = ClassExpression::ObjectOneOf(oneof17);
+        let du17 = AxiomKind::DisjointUnion(
+            Class::new("urn:tierd1291:B17DU"),
+            [
+                ClassExpression::ObjectSomeValuesFrom(
+                    ObjectPropertyExpression::Property(ObjectProperty::top()),
+                    Box::new(filler17.clone()),
+                ),
+                ClassExpression::ObjectMinCardinality(
+                    1,
+                    ObjectPropertyExpression::Property(ObjectProperty::top()),
+                    Some(Box::new(filler17)),
+                ),
+            ]
+            .into(),
+        );
+        let t = run_trace(&[&disj17, &diff_ax, &du17]);
+        assert!(count_phase(&t, MergePhase::PlanBlockedScan { restarts: 0 }) >= 2);
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanHornCheck { restarts: 0 }),
+            1
+        );
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanIndsDrain { restarts: 0 }),
+            1
+        );
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanDisjointDedup { restarts: 0 }),
+            1
+        );
+        assert!(count_phase(&t, MergePhase::PlanRetarget { restarts: 0 }) >= 3);
+    }
+}

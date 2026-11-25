@@ -37,8 +37,9 @@ use super::dl;
 use super::index::Gap;
 use crate::model::*;
 use crate::vocab;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 
 /// The IRI prefix of the names that the reductions make up.
 pub const PREFIX: &str = "urn:sparkles:internal:";
@@ -472,20 +473,20 @@ impl Cx {
             C::ObjectOneOf(is) => {
                 let mut out = BTreeSet::new();
                 #[cfg(test)]
-                let mut copied = 0usize;
-                for i in is {
+                let mut probed = false;
+                for (copied, i) in is.iter().enumerate() {
                     #[cfg(test)]
-                    {
-                        if copied == 16 {
-                            super::admission_test::merge_phase_retarget();
-                        }
-                        copied += 1;
+                    if copied == 16 {
+                        super::admission_test::merge_phase_retarget();
+                        probed = true;
                     }
+                    #[cfg(not(test))]
+                    let _ = copied;
                     poller.tick()?;
                     out.insert(i.clone());
                 }
                 #[cfg(test)]
-                if copied >= 16 {
+                if probed {
                     super::admission_test::merge_phase_retarget_done();
                 }
                 C::ObjectOneOf(out)
@@ -612,6 +613,21 @@ fn dec_len(mut n: usize) -> usize {
         d += 1;
     }
     d
+}
+
+#[inline]
+fn btree_set_1<T: Ord>(a: T) -> BTreeSet<T> {
+    let mut s = BTreeSet::new();
+    s.insert(a);
+    s
+}
+
+#[inline]
+fn btree_set_2<T: Ord>(a: T, b: T) -> BTreeSet<T> {
+    let mut s = BTreeSet::new();
+    s.insert(a);
+    s.insert(b);
+    s
 }
 
 /// Safe upper bound on heap bytes owned by a `BTreeSet<T>` of `len` elements at any height.
@@ -1159,6 +1175,383 @@ fn push_axiom_polled<E, F: FnMut(usize) -> bool>(
     Ok(true)
 }
 
+/// Allocation-free, cooperatively polled structural hash of a `DataRange`, consistent
+/// with `eq_dr_polled` (and `PartialEq`).
+fn hash_dr_into_polled<E, F: FnMut() -> Result<(), E>>(
+    r: &DataRange,
+    hasher: &mut FxHasher,
+    poller: &mut Poller<'_, E, F>,
+) -> Result<(), E> {
+    poller.tick()?;
+    match r {
+        DataRange::Datatype(d) => {
+            0u8.hash(hasher);
+            d.hash(hasher);
+        }
+        DataRange::IntersectionOf(rs) => {
+            1u8.hash(hasher);
+            rs.len().hash(hasher);
+            for elem in rs {
+                hash_dr_into_polled(elem, hasher, poller)?;
+            }
+        }
+        DataRange::UnionOf(rs) => {
+            2u8.hash(hasher);
+            rs.len().hash(hasher);
+            for elem in rs {
+                hash_dr_into_polled(elem, hasher, poller)?;
+            }
+        }
+        DataRange::ComplementOf(inner) => {
+            3u8.hash(hasher);
+            hash_dr_into_polled(inner, hasher, poller)?;
+        }
+        DataRange::OneOf(ls) => {
+            4u8.hash(hasher);
+            ls.len().hash(hasher);
+            for l in ls {
+                poller.tick()?;
+                l.hash(hasher);
+            }
+        }
+        DataRange::DatatypeRestriction(d, fs) => {
+            5u8.hash(hasher);
+            d.hash(hasher);
+            fs.len().hash(hasher);
+            for f in fs {
+                poller.tick()?;
+                f.hash(hasher);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Allocation-free, cooperatively polled structural hash of a `ClassExpression`,
+/// consistent with `eq_ce_polled` (and `PartialEq`).
+fn hash_ce_into_polled<E, F: FnMut() -> Result<(), E>>(
+    c: &ClassExpression,
+    hasher: &mut FxHasher,
+    poller: &mut Poller<'_, E, F>,
+) -> Result<(), E> {
+    use ClassExpression as C;
+    poller.tick()?;
+    match c {
+        C::Class(cl) => {
+            0u8.hash(hasher);
+            cl.hash(hasher);
+        }
+        C::ObjectIntersectionOf(cs) => {
+            1u8.hash(hasher);
+            cs.len().hash(hasher);
+            for elem in cs {
+                hash_ce_into_polled(elem, hasher, poller)?;
+            }
+        }
+        C::ObjectUnionOf(cs) => {
+            2u8.hash(hasher);
+            cs.len().hash(hasher);
+            for elem in cs {
+                hash_ce_into_polled(elem, hasher, poller)?;
+            }
+        }
+        C::ObjectComplementOf(f) => {
+            3u8.hash(hasher);
+            hash_ce_into_polled(f, hasher, poller)?;
+        }
+        C::ObjectOneOf(is) => {
+            4u8.hash(hasher);
+            is.len().hash(hasher);
+            for i in is {
+                poller.tick()?;
+                i.hash(hasher);
+            }
+        }
+        C::ObjectSomeValuesFrom(p, f) => {
+            5u8.hash(hasher);
+            p.hash(hasher);
+            hash_ce_into_polled(f, hasher, poller)?;
+        }
+        C::ObjectAllValuesFrom(p, f) => {
+            6u8.hash(hasher);
+            p.hash(hasher);
+            hash_ce_into_polled(f, hasher, poller)?;
+        }
+        C::ObjectHasValue(p, i) => {
+            7u8.hash(hasher);
+            p.hash(hasher);
+            i.hash(hasher);
+        }
+        C::ObjectHasSelf(p) => {
+            8u8.hash(hasher);
+            p.hash(hasher);
+        }
+        C::ObjectMinCardinality(n, p, f) => {
+            9u8.hash(hasher);
+            n.hash(hasher);
+            p.hash(hasher);
+            match f {
+                None => 0u8.hash(hasher),
+                Some(inner) => {
+                    1u8.hash(hasher);
+                    hash_ce_into_polled(inner, hasher, poller)?;
+                }
+            }
+        }
+        C::ObjectMaxCardinality(n, p, f) => {
+            10u8.hash(hasher);
+            n.hash(hasher);
+            p.hash(hasher);
+            match f {
+                None => 0u8.hash(hasher),
+                Some(inner) => {
+                    1u8.hash(hasher);
+                    hash_ce_into_polled(inner, hasher, poller)?;
+                }
+            }
+        }
+        C::ObjectExactCardinality(n, p, f) => {
+            11u8.hash(hasher);
+            n.hash(hasher);
+            p.hash(hasher);
+            match f {
+                None => 0u8.hash(hasher),
+                Some(inner) => {
+                    1u8.hash(hasher);
+                    hash_ce_into_polled(inner, hasher, poller)?;
+                }
+            }
+        }
+        C::DataSomeValuesFrom(ps, r) => {
+            12u8.hash(hasher);
+            ps.len().hash(hasher);
+            for p in ps {
+                poller.tick()?;
+                p.hash(hasher);
+            }
+            hash_dr_into_polled(r, hasher, poller)?;
+        }
+        C::DataAllValuesFrom(ps, r) => {
+            13u8.hash(hasher);
+            ps.len().hash(hasher);
+            for p in ps {
+                poller.tick()?;
+                p.hash(hasher);
+            }
+            hash_dr_into_polled(r, hasher, poller)?;
+        }
+        C::DataHasValue(p, l) => {
+            14u8.hash(hasher);
+            p.hash(hasher);
+            l.hash(hasher);
+        }
+        C::DataMinCardinality(n, p, r) => {
+            15u8.hash(hasher);
+            n.hash(hasher);
+            p.hash(hasher);
+            match r {
+                None => 0u8.hash(hasher),
+                Some(inner) => {
+                    1u8.hash(hasher);
+                    hash_dr_into_polled(inner, hasher, poller)?;
+                }
+            }
+        }
+        C::DataMaxCardinality(n, p, r) => {
+            16u8.hash(hasher);
+            n.hash(hasher);
+            p.hash(hasher);
+            match r {
+                None => 0u8.hash(hasher),
+                Some(inner) => {
+                    1u8.hash(hasher);
+                    hash_dr_into_polled(inner, hasher, poller)?;
+                }
+            }
+        }
+        C::DataExactCardinality(n, p, r) => {
+            17u8.hash(hasher);
+            n.hash(hasher);
+            p.hash(hasher);
+            match r {
+                None => 0u8.hash(hasher),
+                Some(inner) => {
+                    1u8.hash(hasher);
+                    hash_dr_into_polled(inner, hasher, poller)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hash_ce_polled<E, F: FnMut() -> Result<(), E>>(
+    c: &ClassExpression,
+    poller: &mut Poller<'_, E, F>,
+) -> Result<u64, E> {
+    let mut hasher = FxHasher::default();
+    hash_ce_into_polled(c, &mut hasher, poller)?;
+    Ok(hasher.finish())
+}
+
+/// Allocation-free, cooperatively polled structural equality of `DataRange`.
+fn eq_dr_polled<E, F: FnMut() -> Result<(), E>>(
+    a: &DataRange,
+    b: &DataRange,
+    poller: &mut Poller<'_, E, F>,
+) -> Result<bool, E> {
+    poller.tick()?;
+    match (a, b) {
+        (DataRange::Datatype(x), DataRange::Datatype(y)) => Ok(x == y),
+        (DataRange::IntersectionOf(xs), DataRange::IntersectionOf(ys))
+        | (DataRange::UnionOf(xs), DataRange::UnionOf(ys)) => {
+            if xs.len() != ys.len() {
+                return Ok(false);
+            }
+            for (x, y) in xs.iter().zip(ys.iter()) {
+                if !eq_dr_polled(x, y, poller)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (DataRange::ComplementOf(x), DataRange::ComplementOf(y)) => eq_dr_polled(x, y, poller),
+        (DataRange::OneOf(xs), DataRange::OneOf(ys)) => {
+            if xs.len() != ys.len() {
+                return Ok(false);
+            }
+            for (x, y) in xs.iter().zip(ys.iter()) {
+                poller.tick()?;
+                if x != y {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (DataRange::DatatypeRestriction(dx, fx), DataRange::DatatypeRestriction(dy, fy)) => {
+            if dx != dy || fx.len() != fy.len() {
+                return Ok(false);
+            }
+            for (x, y) in fx.iter().zip(fy.iter()) {
+                poller.tick()?;
+                if x != y {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Allocation-free, cooperatively polled structural equality of `ClassExpression`.
+fn eq_ce_polled<E, F: FnMut() -> Result<(), E>>(
+    a: &ClassExpression,
+    b: &ClassExpression,
+    poller: &mut Poller<'_, E, F>,
+) -> Result<bool, E> {
+    use ClassExpression as C;
+    poller.tick()?;
+    match (a, b) {
+        (C::Class(x), C::Class(y)) => Ok(x == y),
+        (C::ObjectIntersectionOf(xs), C::ObjectIntersectionOf(ys))
+        | (C::ObjectUnionOf(xs), C::ObjectUnionOf(ys)) => {
+            if xs.len() != ys.len() {
+                return Ok(false);
+            }
+            for (x, y) in xs.iter().zip(ys.iter()) {
+                if !eq_ce_polled(x, y, poller)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (C::ObjectComplementOf(x), C::ObjectComplementOf(y)) => eq_ce_polled(x, y, poller),
+        (C::ObjectOneOf(xs), C::ObjectOneOf(ys)) => {
+            if xs.len() != ys.len() {
+                return Ok(false);
+            }
+            #[cfg(test)]
+            let mut probed = false;
+            let mut all_eq = true;
+            for (compared, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {
+                #[cfg(test)]
+                if compared == 16 {
+                    super::admission_test::merge_phase_disjoint_dedup();
+                    probed = true;
+                }
+                #[cfg(not(test))]
+                let _ = compared;
+                poller.tick()?;
+                if x != y {
+                    all_eq = false;
+                    break;
+                }
+            }
+            #[cfg(test)]
+            if probed {
+                super::admission_test::merge_phase_disjoint_dedup_done();
+            }
+            Ok(all_eq)
+        }
+        (C::ObjectSomeValuesFrom(px, fx), C::ObjectSomeValuesFrom(py, fy))
+        | (C::ObjectAllValuesFrom(px, fx), C::ObjectAllValuesFrom(py, fy)) => {
+            if px != py {
+                return Ok(false);
+            }
+            eq_ce_polled(fx, fy, poller)
+        }
+        (C::ObjectHasValue(px, ix), C::ObjectHasValue(py, iy)) => Ok(px == py && ix == iy),
+        (C::ObjectHasSelf(px), C::ObjectHasSelf(py)) => Ok(px == py),
+        (C::ObjectMinCardinality(nx, px, fx), C::ObjectMinCardinality(ny, py, fy))
+        | (C::ObjectMaxCardinality(nx, px, fx), C::ObjectMaxCardinality(ny, py, fy))
+        | (C::ObjectExactCardinality(nx, px, fx), C::ObjectExactCardinality(ny, py, fy)) => {
+            if nx != ny || px != py {
+                return Ok(false);
+            }
+            match (fx, fy) {
+                (None, None) => Ok(true),
+                (Some(x), Some(y)) => eq_ce_polled(x, y, poller),
+                _ => Ok(false),
+            }
+        }
+        (C::DataSomeValuesFrom(px, rx), C::DataSomeValuesFrom(py, ry))
+        | (C::DataAllValuesFrom(px, rx), C::DataAllValuesFrom(py, ry)) => {
+            if px.len() != py.len() {
+                return Ok(false);
+            }
+            for (x, y) in px.iter().zip(py.iter()) {
+                poller.tick()?;
+                if x != y {
+                    return Ok(false);
+                }
+            }
+            eq_dr_polled(rx, ry, poller)
+        }
+        (C::DataHasValue(px, lx), C::DataHasValue(py, ly)) => Ok(px == py && lx == ly),
+        (C::DataMinCardinality(nx, px, rx), C::DataMinCardinality(ny, py, ry))
+        | (C::DataMaxCardinality(nx, px, rx), C::DataMaxCardinality(ny, py, ry))
+        | (C::DataExactCardinality(nx, px, rx), C::DataExactCardinality(ny, py, ry)) => {
+            if nx != ny || px != py {
+                return Ok(false);
+            }
+            match (rx, ry) {
+                (None, None) => Ok(true),
+                (Some(x), Some(y)) => eq_dr_polled(x, y, poller),
+                _ => Ok(false),
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+struct DisjointImage {
+    expr: ClassExpression,
+    bytes: usize,
+    dup: Option<(ClassExpression, usize)>,
+    next_same_hash: Option<usize>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn disjoint_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
     cx: &mut Cx,
@@ -1169,17 +1562,19 @@ fn disjoint_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
     budget: &mut PlanBudget<'_, F>,
     poller: &mut Poller<'_, E, P>,
 ) -> Result<bool, E> {
-    let mut images: BTreeSet<ClassExpression> = BTreeSet::new();
-    let mut empty: BTreeMap<ClassExpression, usize> = BTreeMap::new();
+    let mut images: Vec<DisjointImage> = Vec::new();
+    let mut by_hash: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut images_vec_bytes = 0usize;
     let mut images_elem_bytes = 0usize;
-    let mut empty_elem_bytes = 0usize;
-    let mut images_tree_bytes = 0usize;
-    let mut empty_tree_bytes = 0usize;
+    let mut by_hash_tree_bytes = 0usize;
 
+    #[cfg(test)]
+    let mut probed = false;
     for (idx, elem) in cs.iter().enumerate() {
         #[cfg(test)]
         if idx == 1 {
             super::admission_test::merge_phase_retarget();
+            probed = true;
         }
         #[cfg(not(test))]
         let _ = idx;
@@ -1187,12 +1582,26 @@ fn disjoint_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
         let Ok(d_bytes) = estimate_ce_polled(elem, poller)? else {
             unreachable!("retarget_eligible_polled already validated disjoint operands");
         };
-        let img_next = btree_set_bytes::<ClassExpression>(images.len() + 1);
-        let emp_next = btree_map_bytes::<ClassExpression, usize>(empty.len() + 1);
-        let max_tree_delta = img_next
-            .saturating_sub(images_tree_bytes)
-            .max(emp_next.saturating_sub(empty_tree_bytes));
-        let Some(need) = d_bytes.checked_add(max_tree_delta) else {
+        let img_vec_grow = if images.len() == images.capacity() {
+            let Some(new_cap) = super::dl_clause::next_vec_cap(
+                images.capacity(),
+                std::mem::size_of::<DisjointImage>(),
+            ) else {
+                return Ok(false);
+            };
+            let Some(bytes) = new_cap.checked_mul(std::mem::size_of::<DisjointImage>()) else {
+                return Ok(false);
+            };
+            bytes
+        } else {
+            0
+        };
+        let hash_next = btree_map_bytes::<u64, usize>(by_hash.len() + 1);
+        let hash_delta = hash_next.saturating_sub(by_hash_tree_bytes);
+        let Some(need) = d_bytes
+            .checked_add(img_vec_grow)
+            .and_then(|b| b.checked_add(hash_delta))
+        else {
             return Ok(false);
         };
         if !budget.try_temp(need) {
@@ -1201,86 +1610,134 @@ fn disjoint_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
         let Ok(d) = cx.ce_polled(elem, poller)? else {
             unreachable!("retarget_eligible_polled already validated disjoint operands");
         };
-        if images.contains(&d) {
-            if let std::collections::btree_map::Entry::Vacant(e) = empty.entry(d) {
-                e.insert(d_bytes);
-                let delta = emp_next.saturating_sub(empty_tree_bytes);
-                empty_tree_bytes = emp_next;
-                empty_elem_bytes = empty_elem_bytes.saturating_add(d_bytes);
-                budget.held = budget.held.saturating_add(d_bytes).saturating_add(delta);
+        let h = hash_ce_polled(&d, poller)?;
+        let mut cur = by_hash.get(&h).copied();
+        let mut found = None;
+        while let Some(i) = cur {
+            poller.tick()?;
+            if eq_ce_polled(&images[i].expr, &d, poller)? {
+                found = Some(i);
+                break;
+            }
+            cur = images[i].next_same_hash;
+        }
+        if let Some(i) = found {
+            if images[i].dup.is_none() {
+                images[i].dup = Some((d, d_bytes));
+                budget.held = budget.held.saturating_add(d_bytes);
             }
         } else {
-            images.insert(d);
-            let delta = img_next.saturating_sub(images_tree_bytes);
-            images_tree_bytes = img_next;
+            let new_idx = images.len();
+            let old_cap = images.capacity();
+            let prev = by_hash.insert(h, new_idx);
+            let actual_hash_delta = if prev.is_none() {
+                let delta = hash_next.saturating_sub(by_hash_tree_bytes);
+                by_hash_tree_bytes = hash_next;
+                delta
+            } else {
+                0
+            };
+            images.push(DisjointImage {
+                expr: d,
+                bytes: d_bytes,
+                dup: None,
+                next_same_hash: prev,
+            });
+            let vec_delta = images
+                .capacity()
+                .saturating_sub(old_cap)
+                .saturating_mul(std::mem::size_of::<DisjointImage>());
+            images_vec_bytes = images_vec_bytes.saturating_add(vec_delta);
             images_elem_bytes = images_elem_bytes.saturating_add(d_bytes);
-            budget.held = budget.held.saturating_add(d_bytes).saturating_add(delta);
+            budget.held = budget
+                .held
+                .saturating_add(d_bytes)
+                .saturating_add(vec_delta)
+                .saturating_add(actual_hash_delta);
         }
     }
     #[cfg(test)]
-    if cs.len() >= 2 {
+    if probed {
         super::admission_test::merge_phase_retarget_done();
     }
+    drop(by_hash);
+    budget.release(by_hash_tree_bytes);
 
-    for (d, d_h) in empty {
+    for entry in &mut images {
         poller.tick()?;
-        let transfer = d_h.min(empty_elem_bytes);
-        empty_elem_bytes -= transfer;
-        let ax_heap = d_h.saturating_add(vocab::OWL_NOTHING.len());
-        if !push_axiom_polled(out, budget, origin_i, ax_heap, transfer, || {
-            Ok(AxiomKind::SubClassOf(
-                d,
-                ClassExpression::Class(Class::nothing()),
-            ))
-        })? {
-            return Ok(false);
-        }
-    }
-    budget.release(empty_elem_bytes.saturating_add(empty_tree_bytes));
-
-    match union_class {
-        None => {
-            if images.len() >= 2 {
-                let preheld = images_tree_bytes.saturating_add(images_elem_bytes);
-                if !push_axiom_polled(out, budget, origin_i, preheld, preheld, || {
-                    Ok(AxiomKind::DisjointClasses(images))
-                })? {
-                    return Ok(false);
-                }
-            } else {
-                drop(images);
-                budget.release(images_tree_bytes.saturating_add(images_elem_bytes));
+        if let Some((d, d_h)) = entry.dup.take() {
+            let ax_heap = d_h.saturating_add(vocab::OWL_NOTHING.len());
+            if !push_axiom_polled(out, budget, origin_i, ax_heap, d_h, || {
+                Ok(AxiomKind::SubClassOf(
+                    d,
+                    ClassExpression::Class(Class::nothing()),
+                ))
+            })? {
+                return Ok(false);
             }
         }
-        Some(c) => {
-            if images.len() >= 2 {
-                let preheld = images_tree_bytes.saturating_add(images_elem_bytes);
-                let ax_heap = preheld.saturating_add(c.as_str().len());
-                if !push_axiom_polled(out, budget, origin_i, ax_heap, preheld, || {
-                    Ok(AxiomKind::DisjointUnion(c.clone(), images))
+    }
+
+    if images.len() >= 2 {
+        let set_tree_bytes = btree_set_bytes::<ClassExpression>(images.len());
+        if !budget.try_add(set_tree_bytes) {
+            return Ok(false);
+        }
+        let mut set = BTreeSet::new();
+        for entry in images.drain(..) {
+            poller.tick()?;
+            set.insert(entry.expr);
+        }
+        drop(images);
+        budget.release(images_vec_bytes);
+        let preheld = set_tree_bytes.saturating_add(images_elem_bytes);
+        match union_class {
+            None => {
+                if !push_axiom_polled(out, budget, origin_i, preheld, preheld, || {
+                    Ok(AxiomKind::DisjointClasses(set))
                 })? {
                     return Ok(false);
                 }
-            } else if let Some(d) = images.into_iter().next() {
-                budget.release(images_tree_bytes);
-                if !matches!(&d, ClassExpression::Class(dc) if dc == c) {
-                    let d_h = images_elem_bytes;
-                    let ax_heap = btree_set_bytes::<ClassExpression>(2)
-                        .saturating_add(c.as_str().len())
-                        .saturating_add(d_h);
-                    if !push_axiom_polled(out, budget, origin_i, ax_heap, d_h, || {
-                        Ok(AxiomKind::EquivalentClasses(
-                            [ClassExpression::Class(c.clone()), d].into(),
-                        ))
-                    })? {
-                        return Ok(false);
-                    }
-                } else {
-                    drop(d);
-                    budget.release(images_elem_bytes);
+            }
+            Some(c) => {
+                let ax_heap = preheld.saturating_add(c.as_str().len());
+                if !push_axiom_polled(out, budget, origin_i, ax_heap, preheld, || {
+                    Ok(AxiomKind::DisjointUnion(c.clone(), set))
+                })? {
+                    return Ok(false);
                 }
-            } else {
-                budget.release(images_tree_bytes.saturating_add(images_elem_bytes));
+            }
+        }
+    } else {
+        match union_class {
+            None => {
+                drop(images);
+                budget.release(images_vec_bytes.saturating_add(images_elem_bytes));
+            }
+            Some(c) => {
+                let single = images.pop();
+                drop(images);
+                budget.release(images_vec_bytes);
+                if let Some(entry) = single {
+                    let d = entry.expr;
+                    let d_h = entry.bytes;
+                    if !matches!(&d, ClassExpression::Class(dc) if dc == c) {
+                        let ax_heap = btree_set_bytes::<ClassExpression>(2)
+                            .saturating_add(c.as_str().len())
+                            .saturating_add(d_h);
+                        if !push_axiom_polled(out, budget, origin_i, ax_heap, d_h, || {
+                            Ok(AxiomKind::EquivalentClasses(btree_set_2(
+                                ClassExpression::Class(c.clone()),
+                                d,
+                            )))
+                        })? {
+                            return Ok(false);
+                        }
+                    } else {
+                        drop(d);
+                        budget.release(d_h);
+                    }
+                }
             }
         }
     }
@@ -1318,10 +1775,13 @@ fn retarget_into<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
         }
         K::EquivalentClasses(cs) => {
             let mut ax_heap = btree_set_bytes::<ClassExpression>(cs.len());
+            #[cfg(test)]
+            let mut probed = false;
             for (idx, c) in cs.iter().enumerate() {
                 #[cfg(test)]
                 if idx == 1 {
                     super::admission_test::merge_phase_retarget();
+                    probed = true;
                 }
                 #[cfg(not(test))]
                 let _ = idx;
@@ -1331,7 +1791,7 @@ fn retarget_into<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
                 ax_heap = ax_heap.saturating_add(h);
             }
             #[cfg(test)]
-            if cs.len() >= 2 {
+            if probed {
                 super::admission_test::merge_phase_retarget_done();
             }
             push_axiom_polled(out, budget, origin_i, ax_heap, 0, || {
@@ -1407,10 +1867,13 @@ fn retarget_into<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
                     }
                     SubObjectPropertyExpression::Chain(ps) => {
                         let mut chain = Vec::with_capacity(ps.len());
+                        #[cfg(test)]
+                        let mut probed = false;
                         for (idx, p) in ps.iter().enumerate() {
                             #[cfg(test)]
                             if idx == 1 {
                                 super::admission_test::merge_phase_retarget();
+                                probed = true;
                             }
                             #[cfg(not(test))]
                             let _ = idx;
@@ -1418,7 +1881,7 @@ fn retarget_into<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
                             chain.push(cx.ope(p));
                         }
                         #[cfg(test)]
-                        if ps.len() >= 2 {
+                        if probed {
                             super::admission_test::merge_phase_retarget_done();
                         }
                         SubObjectPropertyExpression::Chain(chain)
@@ -1431,14 +1894,17 @@ fn retarget_into<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
         K::EquivalentObjectProperties(ps) => {
             #[cfg(test)]
             let mut emitted = 0usize;
+            #[cfg(test)]
+            let mut probed = false;
             for p in ps {
-                #[cfg(test)]
-                if emitted == 1 {
-                    super::admission_test::merge_phase_retarget();
-                }
                 poller.tick()?;
                 if is_top(p) {
                     continue;
+                }
+                #[cfg(test)]
+                if emitted == 1 {
+                    super::admission_test::merge_phase_retarget();
+                    probed = true;
                 }
                 let ax_heap = u_len.saturating_add(p.named().as_str().len());
                 if !push_axiom_polled(out, budget, origin_i, ax_heap, 0, || {
@@ -1458,7 +1924,7 @@ fn retarget_into<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
                 }
             }
             #[cfg(test)]
-            if emitted >= 2 {
+            if probed {
                 super::admission_test::merge_phase_retarget_done();
             }
             Ok(true)
@@ -1546,11 +2012,14 @@ fn blocked<'a, E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
     // any individual reference, so ineligible axioms always report `Ineligible`.
     #[cfg(test)]
     let mut visited = 0usize;
+    #[cfg(test)]
+    let mut probed = false;
     let check = visit_axiom_entities(k, &mut |e| {
         #[cfg(test)]
         {
             if visited == 16 {
                 super::admission_test::merge_phase_blocked_scan();
+                probed = true;
             }
             visited += 1;
         }
@@ -1573,7 +2042,7 @@ fn blocked<'a, E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
         Err(VisitStop::BudgetDeclined) => unreachable!(),
     }
     #[cfg(test)]
-    if visited >= 16 {
+    if probed {
         super::admission_test::merge_phase_blocked_scan_done();
     }
     // Pass B: collect borrowed canonical `&'a NamedIndividual` references with exact
@@ -1679,18 +2148,21 @@ pub fn plan_budgeted<'a, E>(
         poller.tick()?;
         #[cfg(test)]
         let mut horn_ops = 0usize;
+        #[cfg(test)]
+        let mut horn_probed = false;
         let horn = dl::is_horn_polled(k, &mut || {
             #[cfg(test)]
             {
                 if horn_ops == 16 {
                     super::admission_test::merge_phase_horn_check();
+                    horn_probed = true;
                 }
                 horn_ops += 1;
             }
             poller.tick()
         })?;
         #[cfg(test)]
-        if horn_ops >= 16 {
+        if horn_probed {
             super::admission_test::merge_phase_horn_check_done();
         }
         if !horn {
@@ -1713,20 +2185,20 @@ pub fn plan_budgeted<'a, E>(
     }
     let mut inds_vec: Vec<&'a NamedIndividual> = Vec::with_capacity(inds.len());
     #[cfg(test)]
-    let mut drained = 0usize;
-    for ind in inds {
+    let mut drained_probed = false;
+    for (drained, ind) in inds.into_iter().enumerate() {
         #[cfg(test)]
-        {
-            if drained == 16 {
-                super::admission_test::merge_phase_inds_drain();
-            }
-            drained += 1;
+        if drained == 16 {
+            super::admission_test::merge_phase_inds_drain();
+            drained_probed = true;
         }
+        #[cfg(not(test))]
+        let _ = drained;
         poller.tick()?;
         inds_vec.push(ind);
     }
     #[cfg(test)]
-    if drained >= 16 {
+    if drained_probed {
         super::admission_test::merge_phase_inds_drain_done();
     }
     let inds = inds_vec;
@@ -1831,9 +2303,10 @@ pub fn plan_budgeted<'a, E>(
                             eq_heap,
                             c_rewritten_heap,
                             || {
-                                Ok(AxiomKind::EquivalentClasses(
-                                    [name.clone(), rewritten_c].into(),
-                                ))
+                                Ok(AxiomKind::EquivalentClasses(btree_set_2(
+                                    name.clone(),
+                                    rewritten_c,
+                                )))
                             },
                         )? {
                             return Ok(Plan::Declined);
@@ -1900,7 +2373,7 @@ pub fn plan_budgeted<'a, E>(
                 ClassExpression::Class(Class::thing()),
                 ClassExpression::ObjectSomeValuesFrom(
                     ObjectPropertyExpression::Property(u()),
-                    Box::new(ClassExpression::ObjectOneOf([hub()].into())),
+                    Box::new(ClassExpression::ObjectOneOf(btree_set_1(hub()))),
                 ),
             ))
         })? {
@@ -2007,7 +2480,9 @@ fn key_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
         return Ok(true);
     }
     let one = |i: &NamedIndividual| {
-        C::ObjectOneOf([Individual::Named(super::index::exact_individual(i))].into())
+        C::ObjectOneOf(btree_set_1(Individual::Named(
+            super::index::exact_individual(i),
+        )))
     };
     let make_ope = |p: &ObjectPropertyExpression| {
         if is_top(p) {
@@ -2044,7 +2519,7 @@ fn key_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
                 .saturating_add(v_len(j, b));
             if !push_axiom_polled(out, budget, origin_i, ax_heap, 0, || {
                 Ok(AxiomKind::SubClassOf(
-                    C::ObjectIntersectionOf([one(ib), c.clone()].into()),
+                    C::ObjectIntersectionOf(btree_set_2(one(ib), c.clone())),
                     C::ObjectAllValuesFrom(make_ope(r), Box::new(C::Class(v(j, b)))),
                 ))
             })? {
@@ -2083,18 +2558,16 @@ fn key_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
                         .saturating_add(mj_len);
                     if !push_axiom_polled(out, budget, origin_i, ax_heap, 0, || {
                         Ok(AxiomKind::SubClassOf(
-                            C::ObjectIntersectionOf(
-                                [
-                                    one(ia),
-                                    C::ObjectSomeValuesFrom(
-                                        make_ope(r),
-                                        Box::new(C::ObjectIntersectionOf(
-                                            [one(ic), C::Class(vj.clone())].into(),
-                                        )),
-                                    ),
-                                ]
-                                .into(),
-                            ),
+                            C::ObjectIntersectionOf(btree_set_2(
+                                one(ia),
+                                C::ObjectSomeValuesFrom(
+                                    make_ope(r),
+                                    Box::new(C::ObjectIntersectionOf(btree_set_2(
+                                        one(ic),
+                                        C::Class(vj.clone()),
+                                    ))),
+                                ),
+                            )),
                             C::Class(m.clone()),
                         ))
                     })? {
@@ -2116,16 +2589,19 @@ fn key_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
                 let mut body = BTreeSet::new();
                 body.insert(one(ia));
                 body.insert(c.clone());
+                #[cfg(test)]
+                let mut probed = false;
                 for j in 0..ops.len() {
                     #[cfg(test)]
                     if j == 1 {
                         super::admission_test::merge_phase_key_body();
+                        probed = true;
                     }
                     poller.tick()?;
                     body.insert(C::Class(m_cls(j, a, b)));
                 }
                 #[cfg(test)]
-                if ops.len() >= 2 {
+                if probed {
                     super::admission_test::merge_phase_key_body_done();
                 }
                 Ok(AxiomKind::SubClassOf(
@@ -2138,4 +2614,107 @@ fn key_budgeted<E, F: FnMut(usize) -> bool, P: FnMut() -> Result<(), E>>(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polled_hash_and_eq_match_structural_eq_and_stop_on_poll_error() {
+        let a = ClassExpression::Class(Class::new("urn:t:A"));
+        let b = ClassExpression::Class(Class::new("urn:t:B"));
+        let p = ObjectPropertyExpression::Property(ObjectProperty::new("urn:t:p"));
+        let dp = DataProperty::new("urn:t:dp");
+        let dt = Datatype::new("http://www.w3.org/2001/XMLSchema#integer");
+        let lit = Literal::simple("42");
+        let dr1 = DataRange::IntersectionOf(
+            [
+                DataRange::Datatype(dt.clone()),
+                DataRange::OneOf([lit.clone()].into()),
+                DataRange::DatatypeRestriction(
+                    dt.clone(),
+                    [FacetRestriction {
+                        facet: iri("http://www.w3.org/2001/XMLSchema#minInclusive"),
+                        value: lit.clone(),
+                    }]
+                    .into(),
+                ),
+            ]
+            .into(),
+        );
+        let dr2 = DataRange::ComplementOf(Box::new(DataRange::UnionOf([dr1.clone()].into())));
+
+        let samples = vec![
+            a.clone(),
+            b.clone(),
+            ClassExpression::ObjectIntersectionOf([a.clone(), b.clone()].into()),
+            ClassExpression::ObjectUnionOf([a.clone(), b.clone()].into()),
+            ClassExpression::ObjectComplementOf(Box::new(a.clone())),
+            ClassExpression::ObjectOneOf([Individual::named("urn:t:i0")].into()),
+            ClassExpression::ObjectSomeValuesFrom(p.clone(), Box::new(a.clone())),
+            ClassExpression::ObjectAllValuesFrom(p.clone(), Box::new(a.clone())),
+            ClassExpression::ObjectHasValue(p.clone(), Individual::named("urn:t:i0")),
+            ClassExpression::ObjectHasSelf(p.clone()),
+            ClassExpression::ObjectMinCardinality(1, p.clone(), Some(Box::new(a.clone()))),
+            ClassExpression::ObjectMinCardinality(1, p.clone(), None),
+            ClassExpression::ObjectMaxCardinality(2, p.clone(), Some(Box::new(b.clone()))),
+            ClassExpression::ObjectExactCardinality(3, p.clone(), None),
+            ClassExpression::DataSomeValuesFrom(vec![dp.clone()], dr1.clone()),
+            ClassExpression::DataAllValuesFrom(vec![dp.clone()], dr2.clone()),
+            ClassExpression::DataHasValue(dp.clone(), lit.clone()),
+            ClassExpression::DataMinCardinality(1, dp.clone(), Some(dr1.clone())),
+            ClassExpression::DataMaxCardinality(1, dp.clone(), None),
+            ClassExpression::DataExactCardinality(1, dp.clone(), Some(dr2.clone())),
+        ];
+
+        for (i, x) in samples.iter().enumerate() {
+            let mut ok_poll = || Ok::<(), ()>(());
+            let mut poller = Poller {
+                steps: 0,
+                poll: &mut ok_poll,
+            };
+            let hx = hash_ce_polled(x, &mut poller).unwrap();
+            let hx_clone = hash_ce_polled(&x.clone(), &mut poller).unwrap();
+            assert_eq!(hx, hx_clone);
+            for (j, y) in samples.iter().enumerate() {
+                let eq = eq_ce_polled(x, y, &mut poller).unwrap();
+                assert_eq!(eq, x == y, "mismatch at ({i}, {j})");
+                if eq {
+                    let hy = hash_ce_polled(y, &mut poller).unwrap();
+                    assert_eq!(hx, hy);
+                }
+            }
+        }
+
+        // Wide ObjectOneOf stops cooperatively during both hash and equality checks.
+        let mut wide = BTreeSet::new();
+        for i in 0..300usize {
+            wide.insert(Individual::anonymous(format!("p{i:03}")));
+        }
+        let ce1 = ClassExpression::ObjectOneOf(wide.clone());
+        let ce2 = ClassExpression::ObjectOneOf(wide);
+
+        let mut polls = 0usize;
+        let mut err_after_two = || {
+            polls += 1;
+            if polls >= 2 { Err("stop") } else { Ok(()) }
+        };
+        let mut poller = Poller {
+            steps: 0,
+            poll: &mut err_after_two,
+        };
+        assert_eq!(hash_ce_polled(&ce1, &mut poller), Err("stop"));
+
+        let mut polls2 = 0usize;
+        let mut err_after_two_eq = || {
+            polls2 += 1;
+            if polls2 >= 2 { Err("stop") } else { Ok(()) }
+        };
+        let mut poller2 = Poller {
+            steps: 0,
+            poll: &mut err_after_two_eq,
+        };
+        assert_eq!(eq_ce_polled(&ce1, &ce2, &mut poller2), Err("stop"));
+    }
 }
