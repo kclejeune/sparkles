@@ -1,7 +1,8 @@
-//! Filesystem operations for startup delete recovery. The catalog lock serializes
+//! Filesystem operations for managed deletes and their startup recovery. The catalog lock serializes
 //! changes to the managed namespace. On Unix, directory descriptors also pin the
 //! tree across inspection, traversal, rename and removal.
 
+use sparkles_core::store::ProcessLock;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, ErrorKind};
@@ -28,6 +29,15 @@ pub(super) enum Kind {
 pub(super) struct Entry {
     pub kind: Kind,
     pub bytes: u64,
+}
+
+#[cfg(all(unix, test))]
+type RemovalHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(all(unix, test))]
+thread_local! {
+    pub(super) static DURING_REMOVAL: std::cell::RefCell<Option<RemovalHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl RecoveryDir {
@@ -174,9 +184,23 @@ impl RecoveryDir {
         Ok(std::fs::read_dir(&self.path)?.map(|entry| entry.map(|entry| entry.file_name())))
     }
 
-    pub fn rename_child(&self, name: &OsStr, mut child: Self, new: &OsStr) -> io::Result<Self> {
+    pub fn verify_child(&self, name: &OsStr, _child: &Self) -> io::Result<()> {
         #[cfg(unix)]
-        self.verify_entry(name, &child.file)?;
+        return self.verify_entry(name, &_child.file);
+        #[cfg(not(unix))]
+        if self.entry(name)?.kind == Kind::Directory {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                ErrorKind::NotADirectory,
+                "expected a real directory",
+            ))
+        }
+    }
+
+    pub fn rename_child(&self, child: &mut Self, new: &OsStr) -> io::Result<()> {
+        let name = child.name();
+        self.verify_child(name, child)?;
 
         #[cfg(any(
             target_os = "linux",
@@ -207,13 +231,14 @@ impl RecoveryDir {
             #[cfg(unix)]
             fs::renameat(&self.file, name, &self.file, new)?;
             #[cfg(not(unix))]
-            {
-                let _ = name;
-                std::fs::rename(child.path(), self.path.join(new))?;
-            }
+            std::fs::rename(child.path(), self.path.join(new))?;
         }
         child.path = self.path.join(new);
-        Ok(child)
+        Ok(())
+    }
+
+    fn name(&self) -> &OsStr {
+        self.path.file_name().expect("child directory name")
     }
 
     pub fn remove_file(&self, name: &OsStr) -> io::Result<()> {
@@ -223,29 +248,44 @@ impl RecoveryDir {
         std::fs::remove_file(self.path.join(name))
     }
 
-    pub fn remove_child(&self, name: &OsStr, child: &Self) -> io::Result<()> {
-        #[cfg(unix)]
-        {
-            self.verify_entry(name, &child.file)?;
-            child.remove_contents(Some(OsStr::new("sparkles.lock")))?;
-            self.verify_entry(name, &child.file)?;
-            match child.remove_file(OsStr::new("sparkles.lock")) {
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                result => result?,
-            }
-            fs::unlinkat(&self.file, name, AtFlags::REMOVEDIR)?;
-        }
+    pub fn remove_child(&self, child: &Self, lock: ProcessLock) -> io::Result<()> {
+        let name = child.name();
+        let lock_name = OsStr::new("sparkles.lock");
+        self.verify_child(name, child)?;
+        child.remove_contents(Some(lock_name))?;
+        self.verify_child(name, child)?;
+
+        // Windows cannot remove the directory while the lock handle is open.
         #[cfg(not(unix))]
-        {
-            let _ = name;
-            std::fs::remove_dir_all(child.path())?;
+        drop(lock);
+        match child.remove_file(lock_name) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            result => result?,
         }
+        self.remove_empty_child(child)?;
+        #[cfg(unix)]
+        drop(lock);
         Ok(())
     }
 
-    #[cfg(unix)]
+    fn remove_empty_child(&self, child: &Self) -> io::Result<()> {
+        #[cfg(unix)]
+        return Ok(fs::unlinkat(&self.file, child.name(), AtFlags::REMOVEDIR)?);
+        #[cfg(not(unix))]
+        std::fs::remove_dir(child.path())
+    }
+
     fn remove_contents(&self, last: Option<&OsStr>) -> io::Result<()> {
-        for name in self.names()? {
+        let names = self.names()?;
+        #[cfg(all(unix, test))]
+        if last.is_some() {
+            DURING_REMOVAL.with_borrow_mut(|hook| {
+                if let Some(hook) = hook {
+                    hook(self.path());
+                }
+            });
+        }
+        for name in names {
             let name = name?;
             if last == Some(&name) {
                 continue;
@@ -254,8 +294,8 @@ impl RecoveryDir {
                 Ok(entry) if entry.kind == Kind::Directory => {
                     let child = self.child(&name)?;
                     child.remove_contents(None)?;
-                    self.verify_entry(&name, &child.file)?;
-                    fs::unlinkat(&self.file, &name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+                    self.verify_child(&name, &child)?;
+                    self.remove_empty_child(&child)
                 }
                 Ok(_) => self.remove_file(&name),
                 Err(error) => Err(error),

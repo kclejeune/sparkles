@@ -4,12 +4,14 @@
 //! never enter the catalog namespace. A catalog is cheap to clone and shares its
 //! stores, reservations and lock with every clone.
 
+use self::delete_fs::RecoveryDir;
 use crate::store::caches::{CacheSizes, SharedCaches};
 use crate::store::{ProcessLock, Store, StoreOptions};
 use crate::{Dataset, DatasetOptions, Error, Result};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -213,6 +215,8 @@ fn failure_kind(e: &Error) -> &'static str {
 
 pub(crate) struct Inner {
     dir: Option<PathBuf>,
+    /// Keep the startup-verified database parent open for managed deletes.
+    databases: Option<RecoveryDir>,
     options: RwLock<CatalogOptions>,
     /// the caches every dataset opened by this catalog reads through
     caches: Option<SharedCaches>,
@@ -241,7 +245,7 @@ pub(crate) struct Inner {
     delete_intents: Mutex<()>,
     /// The registry replacement was visible but its parent sync failed. No
     /// operation may reuse those aliases while this catalog is open.
-    pending_delete_commits: Mutex<BTreeSet<String>>,
+    pending_registry_commits: Mutex<BTreeSet<String>>,
     /// Recovery refusals reported through the normal deferred startup path.
     startup_delete_refusals: BTreeMap<String, Refusal>,
     #[cfg(feature = "backup")]
@@ -315,18 +319,32 @@ impl Catalog {
         let dir = std::path::absolute(dir)?;
         std::fs::create_dir_all(&dir)?;
         let lock = lock_dir(&dir)?;
-        let intents = delete::read_intents(&dir)?;
-        let registry = read_registry(&dir)?;
-        let databases = delete::open_databases(&dir)?;
+        let catalog_dir = RecoveryDir::open(&dir)?;
+        let intents = delete::read_intents_at(&catalog_dir)?;
+        let registry = match read_registry_at(&catalog_dir)? {
+            Some(registry) => registry,
+            None if intents.iter().any(|intent| intent.state.is_prepared()) => {
+                return Err(Error::Corrupt(format!(
+                    "{CONFIG_FILE} is missing while a prepared delete requires recovery"
+                )));
+            }
+            None => Registry::default(),
+        };
+        let databases = delete::open_databases(&catalog_dir)?;
         rename::recover(&dir)?;
         #[cfg(feature = "backup")]
-        let restore_conflicts = delete::restore_conflicts(&databases, &intents)?;
+        let restore_conflicts = delete::restore_conflicts(&databases, &registry, &intents)?;
         #[cfg(not(feature = "backup"))]
         let restore_conflicts = BTreeSet::new();
         #[cfg(feature = "backup")]
         restore::recover(&dir, &restore_conflicts).map_err(component)?;
-        let delete_refusals =
-            delete::recover(&dir, &databases, &registry, intents, &restore_conflicts)?;
+        let delete_refusals = delete::recover(
+            &catalog_dir,
+            &databases,
+            &registry,
+            intents,
+            &restore_conflicts,
+        )?;
         for e in std::fs::read_dir(databases.path())? {
             let e = e?;
             if e.file_name().to_string_lossy().starts_with(".clone-") {
@@ -336,6 +354,7 @@ impl Catalog {
         let catalog = Self {
             inner: Arc::new(Inner {
                 dir: Some(dir.clone()),
+                databases: Some(databases),
                 caches: options.shared_caches(),
                 pool: options
                     .memory
@@ -350,7 +369,7 @@ impl Catalog {
                 expected: Mutex::new(BTreeSet::new()),
                 manage: gate::ManageGate::new(),
                 delete_intents: Mutex::new(()),
-                pending_delete_commits: Mutex::new(BTreeSet::new()),
+                pending_registry_commits: Mutex::new(BTreeSet::new()),
                 startup_delete_refusals: delete_refusals,
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
@@ -527,6 +546,7 @@ impl Catalog {
         Self {
             inner: Arc::new(Inner {
                 dir: None,
+                databases: None,
                 caches: options.shared_caches(),
                 pool: options
                     .memory
@@ -541,7 +561,7 @@ impl Catalog {
                 expected: Mutex::new(BTreeSet::new()),
                 manage: gate::ManageGate::new(),
                 delete_intents: Mutex::new(()),
-                pending_delete_commits: Mutex::new(BTreeSet::new()),
+                pending_registry_commits: Mutex::new(BTreeSet::new()),
                 startup_delete_refusals: BTreeMap::new(),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
@@ -791,17 +811,17 @@ impl Catalog {
         let store = Store::open_existing(&self.database_dir(name)?, opts.store.clone(), expected)?;
         Ok(Dataset::from_store_with(store, opts))
     }
-    fn require_determinate_delete(&self, name: &str) -> Result<()> {
-        if self.inner.pending_delete_commits.lock().contains(name) {
+    fn require_determinate_registry(&self, name: &str) -> Result<()> {
+        if self.inner.pending_registry_commits.lock().contains(name) {
             return Err(Error::Conflict(format!(
-                "the delete of /{name} has an indeterminate commit; reopen the catalog to recover it"
+                "the registry commit for /{name} is indeterminate. Reopen the catalog to recover it"
             )));
         }
         Ok(())
     }
 
     fn available(&self, name: &str, check_directory: bool) -> Result<()> {
-        self.require_determinate_delete(name)?;
+        self.require_determinate_registry(name)?;
         check_name(name)?;
         if self.get(name).is_some() {
             return Err(Error::Conflict(format!("dataset '{name}' already exists")));
@@ -891,7 +911,7 @@ impl Catalog {
     pub fn delete(&self, name: &str) -> Result<bool> {
         let trash = {
             let _g = self.manage()?;
-            self.require_determinate_delete(name)?;
+            self.require_determinate_registry(name)?;
             if self.is_opening(name) || self.inner.expected.lock().contains(name) {
                 return Err(Error::Conflict(format!("dataset /{name} is opening")));
             }
@@ -912,8 +932,10 @@ impl Catalog {
                     "dataset /{name} still has live handles"
                 )));
             }
+            let databases = self.inner.databases.as_ref();
             if managed {
                 let dir = self.dir().expect("persistent catalog");
+                self.verify_delete_parent()?;
                 let _intent_lock = self.inner.delete_intents.lock();
                 delete::check_prepare(dir)?;
                 delete::bind_registry_identity(dir, name, entry.dataset.dataset_id())?;
@@ -926,12 +948,7 @@ impl Catalog {
                 .remove(name)
                 .expect("checked");
             if managed {
-                let root = entry
-                    .dataset
-                    .store()
-                    .root()
-                    .expect("managed persistent root")
-                    .to_path_buf();
+                let databases = databases.expect("persistent catalog");
                 let id = entry.dataset.dataset_id();
                 self.hold_closing_locked(name, &entry.dataset);
                 let closed = {
@@ -981,15 +998,14 @@ impl Catalog {
                 }
                 delete::crash_point(delete::CRASH_AFTER_INTENT)?;
 
-                let databases = root.parent().expect("database parent");
-                let kept = databases.join(intent.kept_name());
-                let stage_lock = match stage_delete(databases, &intent) {
-                    Ok(lock) => lock,
+                let kept = databases.path().join(intent.kept_name());
+                let mut staged = match stage_delete(databases, &intent) {
+                    Ok(staged) => staged,
                     #[cfg(test)]
                     Err(MoveError::Crash(error)) => return Err(error),
                     Err(MoveError::Rollback(failure)) => {
                         let error = if failure.reopen {
-                            self.retire_delete_rollback(dir, intent.token);
+                            self.retire_delete_rollback(dir, databases, intent.token);
                             self.reopen_registered_delete(name, id, reasoning, failure.error)
                         } else {
                             self.keep_closed_locked(name, id, reasoning, failure.error)
@@ -1000,16 +1016,26 @@ impl Catalog {
                 #[cfg(test)]
                 delete::crash_point(delete::CRASH_AFTER_KEPT_RENAME)?;
 
+                #[cfg(test)]
+                DELETE_STAGE_HOOK.with_borrow_mut(|hook| {
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                });
+
+                if let Err(error) = self.verify_delete_parent() {
+                    return Err(self.keep_closed_locked(name, id, reasoning, error));
+                }
                 match self.commit_delete_registry(dir) {
                     Ok(()) => {}
-                    Err(DeleteCommitError::BeforeReplace(error)) => {
-                        drop(stage_lock);
+                    Err(RegistryCommitError::BeforeReplace(error)) => {
                         #[cfg(test)]
                         delete::crash_point(delete::CRASH_BEFORE_REGISTRY_REPLACE)?;
-                        let restored = restore_delete_root(databases, &intent);
+                        let restored = restore_delete_root(databases, &intent, &mut staged);
+                        drop(staged);
                         let error = match restored {
                             Ok(()) => {
-                                self.retire_delete_rollback(dir, intent.token);
+                                self.retire_delete_rollback(dir, databases, intent.token);
                                 self.reopen_registered_delete(name, id, reasoning, error)
                             }
                             Err(restore) => self.keep_closed_locked(
@@ -1024,17 +1050,20 @@ impl Catalog {
                         };
                         return Err(error);
                     }
-                    Err(DeleteCommitError::Indeterminate(error)) => {
-                        self.inner.pending_delete_commits.lock().insert(name.into());
+                    Err(RegistryCommitError::Indeterminate(error)) => {
+                        self.inner
+                            .pending_registry_commits
+                            .lock()
+                            .insert(name.into());
                         return Err(Error::Corrupt(format!(
-                            "the delete of /{name} has an indeterminate commit: {error};                              {} is retained until the catalog reopens",
+                            "the delete of /{name} has an indeterminate commit: {error}; {} is retained until the catalog reopens",
                             kept.display()
                         )));
                     }
                 }
                 delete::crash_point(delete::CRASH_AFTER_SAVE)?;
 
-                let moved = move_delete_to_trash(kept, intent.token, stage_lock);
+                let moved = move_delete_to_trash(databases, &intent, staged);
                 if moved.synchronized_as_trash {
                     let _intent_lock = self.inner.delete_intents.lock();
                     if let Err(error) = delete::clear(dir, intent.token) {
@@ -1046,8 +1075,7 @@ impl Catalog {
                         );
                     }
                 }
-                let pending = (!moved.synchronized_as_trash).then_some(intent);
-                Some((moved, pending))
+                Some((databases, moved, intent))
             } else {
                 drop(map);
                 if let Err(error) = self.save_locked() {
@@ -1058,13 +1086,13 @@ impl Catalog {
             }
         };
         delete_hook();
-        if let Some((moved, pending_intent)) = trash {
-            match std::fs::remove_dir_all(&moved.path) {
+        if let Some((databases, moved, intent)) = trash {
+            let path = moved.staged.path().to_path_buf();
+            match moved.staged.remove(databases, intent.id) {
                 Ok(()) => {
-                    if let Some(intent) = pending_intent
-                        && let Some(dir) = self.dir()
-                    {
-                        let synced = moved.path.parent().map(sync_dir).transpose().map(|_| ());
+                    if !moved.synchronized_as_trash {
+                        let dir = self.dir().expect("persistent catalog");
+                        let synced = databases.sync().and_then(|()| self.verify_delete_parent());
                         match synced {
                             Ok(()) => {
                                 let _intent_lock = self.inner.delete_intents.lock();
@@ -1080,7 +1108,7 @@ impl Catalog {
                             Err(error) => {
                                 tracing::warn!(
                                     target: "sparkles::catalog",
-                                    path = %moved.path.display(),
+                                    path = %path.display(),
                                     %error,
                                     "deleted dataset removal was not synchronized; keeping delete intent"
                                 );
@@ -1091,7 +1119,7 @@ impl Catalog {
                 Err(error) => {
                     tracing::warn!(
                         target: "sparkles::catalog",
-                        path = %moved.path.display(),
+                        path = %path.display(),
                         %error,
                         "deleted dataset cleanup failed; next catalog open will retry recorded delete cleanup"
                     );
@@ -1115,10 +1143,25 @@ impl Catalog {
         );
     }
 
-    fn retire_delete_rollback(&self, dir: &Path, token: Uuid) {
+    fn verify_delete_parent(&self) -> Result<()> {
+        let dir = self.dir().expect("persistent catalog");
+        let databases = self.inner.databases.as_ref().expect("persistent catalog");
+        RecoveryDir::open(dir)?
+            .verify_child(OsStr::new("databases"), databases)
+            .map_err(|error| {
+                Error::Corrupt(format!(
+                    "database directory {} changed during delete: {error}",
+                    databases.path().display()
+                ))
+            })
+    }
+
+    fn retire_delete_rollback(&self, dir: &Path, databases: &RecoveryDir, token: Uuid) {
         let _intent_lock = self.inner.delete_intents.lock();
-        if let Err(error) =
-            sync_dir(&dir.join("databases")).and_then(|()| delete::clear(dir, token))
+        if let Err(error) = self
+            .verify_delete_parent()
+            .and_then(|()| databases.sync())
+            .and_then(|()| delete::clear(dir, token))
         {
             tracing::warn!(
                 target: "sparkles::catalog",
@@ -1137,7 +1180,10 @@ impl Catalog {
         reasoning: Option<crate::reasoning::ReasoningRecord>,
         error: Error,
     ) -> Error {
-        match self.reattach_locked(name, Some(id)) {
+        match self
+            .verify_delete_parent()
+            .and_then(|()| self.reattach_locked(name, Some(id)))
+        {
             Ok(()) => error,
             Err(reopen) => self.keep_closed_locked(
                 name,
@@ -1183,7 +1229,7 @@ impl Catalog {
     /// [`delete`](Self::delete), the dataset's own views workers do not count.
     pub fn rename(&self, from: &str, to: &str) -> Result<Dataset> {
         let _g = self.manage()?;
-        self.require_determinate_delete(from)?;
+        self.require_determinate_registry(from)?;
         self.available(to, true)?;
         if self.is_opening(from) || self.inner.expected.lock().contains(from) {
             return Err(Error::Conflict(format!("dataset /{from} is opening")));
@@ -1404,24 +1450,18 @@ impl Catalog {
         let _g = self.manage()?;
         self.check_reservation(&reservation)?;
         let name = reservation.name();
-        let ds = self.open_existing_dataset(name, None);
-        let result = ds.and_then(|ds| {
-            self.inner.entries.write().insert(
-                name.into(),
-                Entry {
-                    dataset: ds.clone(),
-                    kind: DatasetKind::Persistent,
-                    attached: false,
-                },
-            );
-            self.save_locked()?;
-            Ok(ds)
-        });
-        if result.is_err() {
-            self.inner.entries.write().remove(name);
-            let _ = std::fs::remove_dir_all(self.database_dir(name)?);
+        let result = self
+            .open_existing_dataset(name, None)
+            .map_err(RegistryCommitError::BeforeReplace)
+            .and_then(|dataset| self.commit_staged_dataset_locked(name, dataset));
+        match result {
+            Ok(dataset) => Ok(dataset),
+            Err(RegistryCommitError::BeforeReplace(error)) => {
+                let _ = std::fs::remove_dir_all(self.database_dir(name)?);
+                Err(error)
+            }
+            Err(RegistryCommitError::Indeterminate(error)) => Err(error),
         }
-        result
     }
     pub(crate) fn adopt_memory(
         &self,
@@ -1586,7 +1626,7 @@ impl Catalog {
         let _g = self.manage()?;
         self.save_locked()
     }
-    fn serialize_registry_locked(&self) -> Result<Vec<u8>> {
+    fn registry_locked(&self) -> Registry {
         let mut datasets: Vec<RegistryEntry> = self
             .inner
             .entries
@@ -1612,26 +1652,74 @@ impl Catalog {
             }
         }
         datasets.sort_by(|a, b| a.name.cmp(&b.name));
-        let reg = Registry { datasets };
-        sparkles_core::formats::settings_to_vec(CONFIG_FILE, &reg)
+        Registry { datasets }
     }
-    fn save_locked(&self) -> Result<()> {
-        let Some(dir) = self.dir() else { return Ok(()) };
-        let bytes = self.serialize_registry_locked()?;
-        write_file_atomic(&dir.join(CONFIG_FILE), &bytes)
-    }
-    fn commit_delete_registry(&self, dir: &Path) -> std::result::Result<(), DeleteCommitError> {
-        let bytes = self
-            .serialize_registry_locked()
-            .map_err(DeleteCommitError::BeforeReplace)?;
+    fn replace_registry_locked(&self, dir: &Path, registry: &Registry) -> Result<()> {
+        let _intent_lock = self.inner.delete_intents.lock();
+        delete::settle_reused_identities(dir, registry)?;
+        let bytes = sparkles_core::formats::settings_to_vec(CONFIG_FILE, registry)?;
         let path = dir.join(CONFIG_FILE);
         let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+        Ok(sparkles_core::fsutil::replace_via(&path, &tmp, &bytes)?)
+    }
+
+    fn save_locked(&self) -> Result<()> {
+        let Some(dir) = self.dir() else { return Ok(()) };
+        self.replace_registry_locked(dir, &self.registry_locked())?;
+        sync_dir(dir)
+    }
+
+    fn commit_delete_registry(&self, dir: &Path) -> std::result::Result<(), RegistryCommitError> {
         delete_fail_point(DELETE_SAVE_BEFORE_REPLACE)
-            .and_then(|()| Ok(sparkles_core::fsutil::replace_via(&path, &tmp, &bytes)?))
-            .map_err(DeleteCommitError::BeforeReplace)?;
+            .and_then(|()| self.replace_registry_locked(dir, &self.registry_locked()))
+            .map_err(RegistryCommitError::BeforeReplace)?;
         delete_fail_point(DELETE_SAVE_SYNC)
             .and_then(|()| sync_dir(dir))
-            .map_err(DeleteCommitError::Indeterminate)
+            .map_err(RegistryCommitError::Indeterminate)
+    }
+
+    // The management gate keeps the new store invisible until its registry row
+    // is durable. If the replacement became visible, preserve the store bytes.
+    fn commit_staged_dataset_locked(
+        &self,
+        name: &str,
+        dataset: Dataset,
+    ) -> std::result::Result<Dataset, RegistryCommitError> {
+        let dir = self.dir().expect("persistent catalog");
+        let mut registry = self.registry_locked();
+        let entry = RegistryEntry {
+            name: name.into(),
+            kind: DatasetKind::Persistent,
+            id: Some(dataset.dataset_id()),
+            reasoning: dataset.reasoning_record(),
+        };
+        match registry
+            .datasets
+            .binary_search_by(|row| row.name.as_str().cmp(name))
+        {
+            Ok(index) => registry.datasets[index] = entry,
+            Err(index) => registry.datasets.insert(index, entry),
+        }
+        self.replace_registry_locked(dir, &registry)
+            .map_err(RegistryCommitError::BeforeReplace)?;
+        if let Err(error) = sync_restored_registry(dir) {
+            let message = format!("the registry commit for /{name} is indeterminate: {error}");
+            self.hold_closing_locked(name, &dataset);
+            self.inner
+                .pending_registry_commits
+                .lock()
+                .insert(name.into());
+            self.inner.refused.lock().insert(
+                name.into(),
+                Refusal {
+                    message: message.clone(),
+                    kind: "recovery",
+                },
+            );
+            return Err(RegistryCommitError::Indeterminate(Error::Corrupt(message)));
+        }
+        self.publish_reattached(name, dataset.clone());
+        Ok(dataset)
     }
 
     /// Take a managed persistent dataset out of the lookup map for an in-place
@@ -1682,20 +1770,31 @@ impl Catalog {
         Ok(self.get(name).expect("reattached"))
     }
     #[cfg(feature = "backup")]
-    fn reattach_expected(&self, name: &str, expected: Option<Uuid>) -> Result<Dataset> {
-        let _g = self.manage()?;
-        self.require_determinate_delete(name)?;
+    fn commit_restored_dataset(
+        &self,
+        name: &str,
+        expected: Option<Uuid>,
+    ) -> std::result::Result<Dataset, RegistryCommitError> {
+        let _g = self.manage().map_err(RegistryCommitError::BeforeReplace)?;
+        self.require_determinate_registry(name)
+            .map_err(RegistryCommitError::BeforeReplace)?;
         if self.get(name).is_some() {
-            return Err(Error::Conflict(format!("dataset '{name}' already exists")));
+            return Err(RegistryCommitError::BeforeReplace(Error::Conflict(
+                format!("dataset '{name}' already exists"),
+            )));
         }
-        // This is an intentional restore, so None means a genuine legacy
-        // restored root, never a fallback to the replaced dataset's identity.
-        let dataset = self.open_existing_dataset(name, expected)?;
-        self.publish_reattached(name, dataset);
-        Ok(self.get(name).expect("reattached"))
+        // None allows a genuine legacy restored root to supply its own identity.
+        let dataset = self
+            .open_existing_dataset(name, expected)
+            .map_err(|error| {
+                RegistryCommitError::BeforeReplace(Error::Corrupt(format!(
+                    "the restored /{name} does not open: {error:#}"
+                )))
+            })?;
+        self.commit_staged_dataset_locked(name, dataset)
     }
     fn reattach_locked(&self, name: &str, expected: Option<Uuid>) -> Result<()> {
-        self.require_determinate_delete(name)?;
+        self.require_determinate_registry(name)?;
         if self.get(name).is_some() {
             return Err(Error::Conflict(format!("dataset '{name}' already exists")));
         }
@@ -1749,18 +1848,27 @@ fn check_name(name: &str) -> Result<()> {
     }
 }
 fn read_registry(dir: &Path) -> Result<Registry> {
+    Ok(read_registry_at(&RecoveryDir::open(dir)?)?.unwrap_or_default())
+}
+
+fn read_registry_at(dir: &RecoveryDir) -> Result<Option<Registry>> {
     #[derive(Deserialize)]
     struct Header {
         format: Option<serde_json::Value>,
     }
 
-    let bytes = match std::fs::read(dir.join(CONFIG_FILE)) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Registry::default());
+    use std::io::ErrorKind;
+
+    let mut file = match dir.open_file(OsStr::new(CONFIG_FILE), false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == ErrorKind::InvalidData => {
+            return Err(Error::Corrupt(format!("{CONFIG_FILE}: {error}")));
         }
         Err(error) => return Err(error.into()),
     };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
     let corrupt = |error| Error::Corrupt(format!("{CONFIG_FILE}: {error}"));
     let header: Header = serde_json::from_slice(&bytes).map_err(corrupt)?;
     // Older catalog registries omit the version and persistent identities.
@@ -1779,7 +1887,7 @@ fn read_registry(dir: &Path) -> Result<Registry> {
             )));
         }
     }
-    Ok(registry)
+    Ok(Some(registry))
 }
 /// Take the catalog lock of a data directory without opening its datasets, for offline
 /// commands on a stopped server. The lock is held until the returned guard is dropped.
@@ -1822,7 +1930,7 @@ pub(crate) fn lock_dir(dir: &Path) -> Result<ProcessLock> {
 const TRASH_PREFIX: &str = ".deleted-";
 // Existing retained-restore convention: unresolved moves are never trash.
 pub(super) const KEPT_PREFIX: &str = ".kept-";
-enum DeleteCommitError {
+enum RegistryCommitError {
     BeforeReplace(Error),
     Indeterminate(Error),
 }
@@ -1839,11 +1947,9 @@ enum MoveError {
 }
 
 struct MovedToTrash {
-    path: PathBuf,
-    /// `true` only when `kept` was renamed to `.deleted-<token>` and `sync_dir(parent)`
-    /// succeeded, so startup `.deleted-*` cleanup owns the directory without `delete.json`.
+    staged: delete::LockedDeleteDir,
+    /// The trash name was synchronized, so startup can clean it without the journal.
     synchronized_as_trash: bool,
-    _lock: ProcessLock,
 }
 
 const DELETE_BEFORE_MOVE: u8 = 1;
@@ -1868,23 +1974,28 @@ fn delete_fail_point(point: u8) -> Result<()> {
     Ok(())
 }
 
-fn restore_delete_root(databases: &Path, intent: &delete::DeleteIntent) -> Result<()> {
+fn restore_delete_root(
+    databases: &RecoveryDir,
+    intent: &delete::DeleteIntent,
+    staged: &mut delete::LockedDeleteDir,
+) -> Result<()> {
     delete_fail_point(DELETE_ROLLBACK_MOVE)?;
-    let _lock = delete::move_verified(databases, &intent.kept_name(), &intent.name, intent.id)?;
+    staged.ensure_locked(intent.id)?;
+    staged.rename(databases, &intent.name)?;
     delete_fail_point(DELETE_ROLLBACK_SYNC)?;
-    sync_dir(databases)
+    databases.sync()
 }
 
 /// Stage the source while the old registry row still determines recovery.
 fn stage_delete(
-    databases: &Path,
+    databases: &RecoveryDir,
     intent: &delete::DeleteIntent,
-) -> std::result::Result<ProcessLock, MoveError> {
+) -> std::result::Result<delete::LockedDeleteDir, MoveError> {
     let kept = intent.kept_name();
-    let lock = match delete_fail_point(DELETE_BEFORE_MOVE)
+    let mut staged = match delete_fail_point(DELETE_BEFORE_MOVE)
         .and_then(|()| delete::move_verified(databases, &intent.name, &kept, intent.id))
     {
-        Ok(lock) => lock,
+        Ok(staged) => staged,
         Err(error) => {
             #[cfg(test)]
             delete::crash_point(delete::CRASH_AFTER_FAILED_FORWARD_MOVE)
@@ -1895,9 +2006,12 @@ fn stage_delete(
             }));
         }
     };
-    if let Err(error) = delete_fail_point(DELETE_STAGE_SYNC).and_then(|()| sync_dir(databases)) {
-        drop(lock);
-        let restored = restore_delete_root(databases, intent);
+    if let Err(error) = staged
+        .ensure_locked(intent.id)
+        .and_then(|()| delete_fail_point(DELETE_STAGE_SYNC))
+        .and_then(|()| databases.sync())
+    {
+        let restored = restore_delete_root(databases, intent, &mut staged);
         #[cfg(test)]
         {
             let stage = if restored.is_ok() {
@@ -1916,48 +2030,44 @@ fn stage_delete(
                 error: Error::Corrupt(format!(
                     "deletion could not synchronize: {error}; restoring /{} from {} failed: {restore}",
                     intent.name,
-                    databases.join(kept).display()
+                    databases.path().join(kept).display()
                 )),
                 reopen: false,
             },
         }));
     }
-    Ok(lock)
+    Ok(staged)
 }
 
-fn move_delete_to_trash(kept: PathBuf, token: Uuid, lock: ProcessLock) -> MovedToTrash {
-    let parent = kept.parent().expect("database parent");
-    // Registry removal and original-name removal are durable. Remaining names
-    // concern cleanup, not the acknowledged dataset identity.
-    let trash = parent.join(format!("{TRASH_PREFIX}{token}"));
-    if let Err(error) = delete_fail_point(DELETE_TRASH_RENAME)
-        .and_then(|()| std::fs::rename(&kept, &trash).map_err(Error::from))
-    {
-        tracing::warn!(path=%kept.display(), %error, "deleted dataset remains at its retained cleanup path");
-        return MovedToTrash {
-            path: kept,
-            synchronized_as_trash: false,
-            _lock: lock,
-        };
-    }
-    let synchronized_as_trash = match delete_fail_point(DELETE_TRASH_SYNC)
-        .and_then(|()| sync_dir(parent))
+fn move_delete_to_trash(
+    databases: &RecoveryDir,
+    intent: &delete::DeleteIntent,
+    mut staged: delete::LockedDeleteDir,
+) -> MovedToTrash {
+    // The registry and removal of the original name are durable.
+    let synchronized_as_trash = match delete_fail_point(DELETE_TRASH_RENAME)
+        .and_then(|()| staged.rename(databases, &intent.trash_name()))
+        .and_then(|()| delete_fail_point(DELETE_TRASH_SYNC))
+        .and_then(|()| databases.sync())
     {
         Ok(()) => true,
         Err(error) => {
-            tracing::warn!(path=%trash.display(), %error, "deleted dataset cleanup rename was not synchronized");
+            tracing::warn!(path = %staged.path().display(), %error,
+                "deleted dataset remains at its cleanup path");
             false
         }
     };
     MovedToTrash {
-        path: trash,
+        staged,
         synchronized_as_trash,
-        _lock: lock,
     }
 }
 
 #[cfg(test)]
 thread_local! {
+    /// Runs after the kept rename is synced and before the registry commit.
+    static DELETE_STAGE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
     /// Runs after a delete released the registry lock, before it removes the files.
     static DELETE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
@@ -1978,6 +2088,18 @@ pub(crate) fn component(e: anyhow::Error) -> Error {
         Err(e) => Error::invalid(format!("{e:#}")),
     }
 }
+#[cfg(test)]
+thread_local! {
+    static FAIL_RESTORE_REGISTRY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+fn sync_restored_registry(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_RESTORE_REGISTRY_SYNC.replace(false) {
+        return Err(std::io::Error::other("injected restore registry sync failure").into());
+    }
+    sync_dir(dir)
+}
+
 pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     sparkles_core::fsutil::write_atomic_via(path, &tmp, bytes)?;

@@ -10,6 +10,7 @@ Sparkles runs as a single binary packaged for NixOS, Home Manager, Docker, and K
 | [Observability](#observability) | Audit events, structured access logs, Prometheus metrics, and OpenTelemetry traces/metrics/logs. |
 | [Backups](#backups) | Deduplicated file-system and S3 backup repositories, encryption, verification, and lifecycle policies. |
 | [Upgrades and on-disk formats](#upgrades-and-on-disk-formats) | Format registry, `sparkles migrate`, parallel degraded startup, health probes, and graceful shutdown. |
+| [Interrupted dataset deletes](#interrupted-dataset-deletes) | Recovery decisions, retained copies and startup warnings. |
 | [API compatibility](#api-compatibility) | Compatibility policy and current development-baseline checks. |
 
 ## Operations
@@ -60,21 +61,31 @@ Sparkles runs as a single binary packaged for NixOS, Home Manager, Docker, and K
 ### Interrupted dataset deletes
 
 Managed persistent deletes use the catalog's `delete.json` journal. Startup checks the
-journal before recovering any pending rename, restore or delete. An unsupported version,
-invalid journal, or symlink in place of the journal or `databases` directory prevents
-the catalog from opening.
+journal and registry before recovering any pending rename, restore or delete. An
+unsupported format, invalid journal or registry, or symlink in place of `delete.json`,
+`config.json`, or the `databases` directory prevents the catalog from opening. A prepared
+delete requires a valid registry, even when the registry contains no datasets.
 
 Before committing a delete, the catalog moves the dataset to
 `databases/.kept-<name>-<token>` and synchronizes the database directory. The persistent
-dataset UUID in `config.json` identifies the original registration. Startup takes the
-store's process lock and verifies the staged copy. It restores the original path when
-the same UUID remains registered, or removes the staged copy when the registry records
-the deletion or a replacement. A busy or unverifiable copy keeps its journal entry for
-the next startup. Ambiguous journals from older formats and competing staged restore
-copies remain on disk for inspection.
+dataset UUID in `config.json` helps startup identify the original registration. Startup
+takes the store's process lock and verifies the staged copy. For a prepared delete, it
+restores the original path when the same UUID remains registered, or removes the staged
+copy when the registry records the deletion or a replacement. If a later registration
+reuses the name and UUID, the catalog durably records the old delete's commit in journal
+format 4 before publishing that registration. Recovery only reclaims that committed copy.
+A busy or unverifiable copy keeps its journal entry for the next startup. Format 3
+journals cannot distinguish a staged rollback from a later restore that reused the
+name and UUID. Startup leaves that combination closed and retains its files for
+inspection. Ambiguous earlier journals and competing staged restore copies also
+remain on disk.
 
 An indeterminate registry commit keeps the name unavailable until the catalog reopens.
-Startup synchronizes the registry before acting on the commit outcome it observes.
+A restore with that outcome preserves its published root. An in-place restore also
+preserves its predecessor for startup recovery. Publication synchronizes the journal
+namespace before replacing the registry. Startup synchronizes the registry before
+acting on the delete outcome it observes. Power-loss recovery requires a filesystem and
+platform that support durable directory synchronization.
 
 Warnings report `path`, `retained_bytes`, and whether the byte count is complete.
 Startup leaves unrecognized kept entries in place. Copies marked by a `keepReplaced`

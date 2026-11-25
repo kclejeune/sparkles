@@ -5,7 +5,7 @@
 //! the directory lock.
 
 use super::restore::{KEPT_PREFIX, REPLACED_PREFIX, RESTORE_PREFIX};
-use super::{Catalog, Reservation, ReservationKind, sync_dir};
+use super::{Catalog, RegistryCommitError, Reservation, ReservationKind, sync_dir};
 use crate::Dataset;
 use sparkles_backup::{BackupError, Code};
 use std::path::Path;
@@ -19,8 +19,8 @@ fn io(what: &str, path: &Path, e: std::io::Error) -> BackupError {
 }
 
 /// Publish `restored` as the new dataset of `reservation` (renamed into
-/// `databases/<name>`, then adopted). On failure nothing stays registered, and the
-/// restored directory is removed.
+/// `databases/<name>`, then adopted). If registry publication becomes indeterminate,
+/// the restored directory stays in place and the alias requires startup recovery.
 pub fn publish_new(
     st: &Catalog,
     reservation: Reservation,
@@ -43,7 +43,7 @@ pub fn publish_new(
         return Err(io("publishing", &dst, e));
     }
     sync_dir(&databases).map_err(|e| BackupError::internal(format!("{e:#}")))?;
-    // `adopt` removes the directory if it cannot open or register it
+    // Only a failure before the registry replacement permits removing the root.
     st.adopt(reservation)
         .map_err(|e| BackupError::internal(format!("registering /{name}: {e:#}")))
 }
@@ -298,10 +298,10 @@ fn swap(
         return Err(reopen_after(st, name, err));
     }
     crash_point(2)?;
-    if let Err(e) = sync_dir(&databases) {
-        tracing::warn!(target: "sparkles::backup", "syncing {}: {e:#}", databases.display());
-    }
-    match st.reattach_expected(name, restored_id) {
+    let published = sync_dir(&databases)
+        .map_err(RegistryCommitError::BeforeReplace)
+        .and_then(|()| st.commit_restored_dataset(name, restored_id));
+    match published {
         Ok(ds) => {
             let cleanup = if keep_replaced {
                 let kept_name = format!("{KEPT_PREFIX}{name}-{task}");
@@ -324,21 +324,27 @@ fn swap(
                     replaced.display()
                 );
             }
-            // the registry embeds the reasoning status, which the restore may change
-            if let Err(e) = st.save() {
-                tracing::warn!(target: "sparkles::backup", "saving the dataset registry: {e:#}");
-            }
             Ok(ds)
         }
-        Err(e) => {
-            // the restored store does not open: put the old one back
+        Err(RegistryCommitError::Indeterminate(error)) => {
+            // Both names were synchronized before the register write. Keep
+            // the predecessor available for startup to reconcile the swap.
+            Err(BackupError::internal(format!(
+                "publishing the restored /{name}: {error}"
+            )))
+        }
+        Err(RegistryCommitError::BeforeReplace(error)) => {
             let failed = databases.join(format!("{RESTORE_PREFIX}{name}-{task}"));
-            let back =
-                std::fs::rename(&root, &failed).and_then(|()| std::fs::rename(&replaced, &root));
-            let _ = std::fs::remove_dir_all(&failed);
-            let err = BackupError::internal(format!("the restored /{name} does not open: {e:#}"));
+            let back = std::fs::rename(&root, &failed)
+                .and_then(|()| std::fs::rename(&replaced, &root))
+                .map_err(crate::Error::from)
+                .and_then(|()| sync_dir(&databases));
+            let err = BackupError::internal(format!("publishing the restored /{name}: {error}"));
             match back {
-                Ok(()) => Err(reopen_after(st, name, err)),
+                Ok(()) => {
+                    let _ = std::fs::remove_dir_all(&failed);
+                    Err(reopen_after(st, name, err))
+                }
                 Err(e2) => Err(BackupError::internal(format!(
                     "{err}; putting back the old copy failed: {e2} (the next start repairs it)"
                 ))),
