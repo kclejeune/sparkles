@@ -2476,6 +2476,16 @@ pub(crate) fn decidable_range(range: &str) -> bool {
         || range.strip_prefix(XSD).is_some_and(|l| family(l).is_some())
 }
 
+/// Screen a borrowed IRI key before copying it from the materialization cache.
+pub(crate) fn decidable_range_key(key: &[u8]) -> bool {
+    // rdf:PlainLiteral is the longest IRI in the range table. Bound UTF-8
+    // validation by its length so unsupported keys can be rejected under the lock.
+    key.strip_prefix(b"<")
+        .filter(|iri| iri.len() <= RDF_PLAIN_LITERAL.len())
+        .and_then(|iri| std::str::from_utf8(iri).ok())
+        .is_some_and(decidable_range)
+}
+
 /// Whether `lit` is in the value space of the datatype `range` (OWL 2 RL `dt-not-type`),
 /// or `None` when the check does not decide it. It is undecided for a range outside the
 /// table and for a literal whose own datatype is outside it, such as xsd:date or a

@@ -2548,3 +2548,48 @@ fn public_diagnostic_summary_skips_local_subjects_of_unsupported_ranges() {
     );
     assert!(peak < 64 * 1024, "summary reader allocated {peak} bytes");
 }
+
+#[test]
+fn public_diagnostic_summary_skips_unsupported_local_class_keys() {
+    let store = Store::in_memory(StoreOptions::default());
+    load_turtle(&store, "<urn:item> <urn:number> 4 .");
+    let mut rules = String::from(
+        "[supported: (?x <urn:number> ?n) \
+         -> (?n <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+                <http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral>)]\n",
+    );
+    let suffix = "a".repeat(4 * 1024);
+    for i in 0..70 {
+        rules.push_str(&format!(
+            "[unsupported{i}: (?x <urn:number> ?n) \
+             -> (?n <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+                    <http://www.w3.org/2001/XMLSchema#integer{i}_{suffix}>)]\n"
+        ));
+    }
+    let cache = crate::Cache::default();
+    let report = crate::materialize_incremental(
+        &store,
+        &crate::Profile::Rules(rules),
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions::default(),
+    )
+    .unwrap();
+    let commit = report.receipt.unwrap().commit.seq;
+    let (typings, peak) = crate::alloc_probe::peak_of(|| {
+        crate::literal_typings(&store, commit, Some(&cache))
+            .unwrap()
+            .unwrap()
+    });
+    assert_eq!(typings.commit, commit);
+    assert_eq!(typings.facts.len(), 1);
+    assert_eq!(typings.facts[0].0.value(), "4");
+    assert_eq!(
+        typings.facts[0].1.as_str(),
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral"
+    );
+    assert!(peak < 64 * 1024, "summary reader allocated {peak} bytes");
+}

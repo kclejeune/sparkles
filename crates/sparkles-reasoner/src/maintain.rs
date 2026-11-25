@@ -1347,10 +1347,11 @@ fn read_saved(
 /// materialization were, so a caller that reports them checks that its rules are sound
 /// for OWL 2.
 ///
-/// The reader collects distinct datatype ids and keys from the cache, then resolves
-/// them outside its lock. It copies candidate subjects and their rule-local keys only
-/// for supported ranges in the same cache generation. Store vocabulary lookup, term
-/// decoding, and datatype validation run outside the lock.
+/// The reader collects distinct datatype ids from the cache and copies rule-local
+/// datatype keys only for supported ranges. It resolves store vocabulary ids and
+/// decodes terms outside the lock. It copies candidate subjects and their rule-local
+/// keys only for supported ranges in the same cache generation. Literal value-space
+/// checks run outside the lock.
 /// Nothing is kept between calls, and an in-memory dataset has no typings while a run has
 /// its closure out of the cache.
 pub fn literal_typings(

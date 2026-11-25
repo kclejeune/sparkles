@@ -137,8 +137,8 @@ fn local_keys(
         .filter_map(|id| terms.local_key(id).map(|key| (id, key)))
 }
 
-/// Copy each candidate datatype key once. Resolve store objects and validate ranges
-/// outside the lock before deciding which subjects to copy for the public reader.
+/// Copy each supported local datatype key once. Resolve store objects outside
+/// the lock before deciding which subjects to copy for the public reader.
 fn supported_datatypes(
     cache: &Cache,
     generation: u64,
@@ -153,9 +153,12 @@ fn supported_datatypes(
             return Ok(None);
         };
         visit_candidates(kept, ty_id, controls, None, |(_, object)| {
-            objects
-                .entry(object)
-                .or_insert_with(|| kept.closure.terms.local_key(object).map(<[u8]>::to_vec));
+            let key = kept.closure.terms.local_key(object);
+            if key.is_none_or(crate::diagnostics::decidable_range_key) {
+                objects
+                    .entry(object)
+                    .or_insert_with(|| key.map(<[u8]>::to_vec));
+            }
         })?;
     }
     let datatypes = objects
