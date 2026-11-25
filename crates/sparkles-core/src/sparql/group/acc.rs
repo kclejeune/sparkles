@@ -110,8 +110,10 @@ pub(crate) trait Accumulator: Send {
 
     /// Fold group `j` of `other`, which saw rows that come after the rows of this
     /// accumulator, into group `into[j]` of this one, for every group of `other`.
-    /// `other` is of the same kind and aggregate. An accumulator that is not
-    /// [`mergeable`](Accumulator::mergeable) leaves its groups as they are and fails.
+    /// `other` is of the same kind and aggregate. `into` must have one entry per group
+    /// of `other`, every destination must be in bounds of `self`, and all destinations
+    /// must be distinct; violating that precondition or attempting an inexact merge
+    /// leaves both accumulators unchanged and returns `Err(Error::Unsupported(_))`.
     fn merge(&mut self, _ctx: &Ctx, _other: &mut dyn Accumulator, _into: &[u32]) -> Result<()> {
         Err(crate::error::Error::unsupported(
             "this aggregate cannot be merged",
@@ -120,6 +122,12 @@ pub(crate) trait Accumulator: Send {
 
     /// The value of group `group`, which the call takes out of the accumulator.
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id>;
+
+    /// Upper bound on bytes that calling [`Accumulator::finish`] for every group can
+    /// charge to `ctx.retain_bytes()` when interning results.
+    fn finish_intern_bytes(&self) -> u64 {
+        0
+    }
 
     /// Whether [`Accumulator::retract`] can take back every row.
     fn retractable(&self) -> bool {
@@ -146,11 +154,39 @@ pub(crate) trait Accumulator: Send {
     fn as_any(&mut self) -> &mut dyn Any;
 }
 
+/// Whether `into` contains an out-of-bounds (`>= limit`) or repeated destination.
+fn has_invalid_or_duplicate_dest(into: &[u32], limit: usize) -> bool {
+    if into.len() <= 1 {
+        return into.first().is_some_and(|&to| to as usize >= limit);
+    }
+    if limit <= 4_096 {
+        let mut seen = [0u64; 64];
+        for &to in into {
+            let idx = to as usize;
+            if idx >= limit {
+                return true;
+            }
+            let bit = 1u64 << (idx & 63);
+            let word = &mut seen[idx >> 6];
+            if (*word & bit) != 0 {
+                return true;
+            }
+            *word |= bit;
+        }
+        false
+    } else {
+        let mut seen = FxHashSet::with_capacity_and_hasher(into.len(), Default::default());
+        into.iter()
+            .any(|&to| to as usize >= limit || !seen.insert(to))
+    }
+}
+
 /// The aggregates whose state is [`AggState`]: COUNT, SUM, AVG, MIN, MAX, SAMPLE and
 /// ARQ's variance and deviation aggregates.
 pub(crate) struct Running {
     agg: Agg,
-    /// Whether the decoded bytes of the best values are tracked, for a charged grouping
+    /// Whether heap-owned state (decoded best values, `Box<DecimalSum>`) is tracked, for
+    /// a charged grouping
     track: bool,
     states: Vec<AggState>,
     /// The decoded bytes of the best value of each group of a MIN or MAX, which the
@@ -185,6 +221,13 @@ impl Running {
             AggregateFunction::Min | AggregateFunction::Max
         )
     }
+
+    fn is_sum(&self) -> bool {
+        matches!(
+            self.agg.func,
+            AggregateFunction::Sum | AggregateFunction::Avg
+        )
+    }
 }
 
 impl Accumulator for Running {
@@ -192,7 +235,7 @@ impl Accumulator for Running {
         for _ in 0..groups {
             self.states.push(AggState::new(&self.agg));
         }
-        if self.is_best() {
+        if self.track && self.is_best() {
             self.payload.resize(self.states.len(), 0);
         }
     }
@@ -217,6 +260,7 @@ impl Accumulator for Running {
             }
             _ => {
                 let best = self.track && self.is_best();
+                let sum_track = self.track && self.is_sum();
                 for (row, &slot) in slots.iter().enumerate() {
                     if row.is_multiple_of(1024) {
                         ctx.check()?;
@@ -231,16 +275,20 @@ impl Accumulator for Running {
                             *held = decoded;
                         }
                     }
+                    let had_dec = sum_track && self.states[slot as usize].has_decimal_box();
                     self.states[slot as usize].add(ctx, agg, id);
+                    if sum_track && !had_dec && self.states[slot as usize].has_decimal_box() {
+                        self.growth += crate::sparql::exec::DECIMAL_SUM_BYTES;
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    /// `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` and `SAMPLE` support merging; `SUM` and `AVG`
-    /// verify exactness against single-pass semantics per group and refuse cleanly when
-    /// a float/double subtotal or right-side numeric overflow could differ.
+    /// `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` and `SAMPLE` support merging; `SUM`, `AVG`,
+    /// `MIN` and `MAX` verify exactness against single-pass semantics per group and
+    /// refuse cleanly when rounding, overflow or non-transitive ordering could differ.
     fn mergeable(&self) -> bool {
         crate::sparql::exec::stat_aggregate(&self.agg.func).is_none()
     }
@@ -251,6 +299,7 @@ impl Accumulator for Running {
             .downcast_mut::<Running>()
             .expect("an accumulator of the same kind");
         if other.states.len() != into.len()
+            || has_invalid_or_duplicate_dest(into, self.states.len())
             || other
                 .states
                 .iter()
@@ -261,11 +310,16 @@ impl Accumulator for Running {
                 "this aggregate cannot be merged",
             ));
         }
+        let sum_track = self.track && self.is_sum();
         for (state, &to) in std::mem::take(&mut other.states).into_iter().zip(into) {
+            let had_dec = sum_track && self.states[to as usize].has_decimal_box();
             let merged = self.states[to as usize].merge(ctx, &self.agg, state);
             debug_assert!(merged, "validated by can_merge");
+            if sum_track && !had_dec && self.states[to as usize].has_decimal_box() {
+                self.growth += crate::sparql::exec::DECIMAL_SUM_BYTES;
+            }
         }
-        if self.is_best() {
+        if self.track && self.is_best() {
             for (from, &to) in std::mem::take(&mut other.payload).iter().zip(into) {
                 let held = &mut self.payload[to as usize];
                 if *from > *held {
@@ -280,6 +334,22 @@ impl Accumulator for Running {
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         let state = std::mem::replace(&mut self.states[group], AggState::Count(0));
         Ok(state.finish(ctx, &self.agg))
+    }
+
+    fn finish_intern_bytes(&self) -> u64 {
+        if matches!(
+            self.agg.func,
+            AggregateFunction::Count
+                | AggregateFunction::Min
+                | AggregateFunction::Max
+                | AggregateFunction::Sample
+        ) {
+            return 0;
+        }
+        self.states
+            .iter()
+            .map(|state| state.finish_intern_bytes(&self.agg))
+            .fold(0u64, u64::saturating_add)
     }
 
     fn retractable(&self) -> bool {
@@ -405,6 +475,13 @@ impl Accumulator for Concat {
             .as_any()
             .downcast_mut::<Concat>()
             .expect("an accumulator of the same kind");
+        if other.groups.len() != into.len()
+            || has_invalid_or_duplicate_dest(into, self.groups.len())
+        {
+            return Err(crate::error::Error::unsupported(
+                "this aggregate cannot be merged",
+            ));
+        }
         for (from, &to) in std::mem::take(&mut other.groups).into_iter().zip(into) {
             let state = &mut self.groups[to as usize];
             state.ok &= from.ok;
@@ -440,6 +517,14 @@ impl Accumulator for Concat {
         } else {
             Id::UNDEF
         })
+    }
+
+    fn finish_intern_bytes(&self) -> u64 {
+        self.groups
+            .iter()
+            .filter(|state| state.ok)
+            .map(|state| (state.text.len() as u64).saturating_add(128))
+            .fold(0u64, u64::saturating_add)
     }
 
     fn group_bytes(&self) -> u64 {
@@ -547,6 +632,10 @@ impl Accumulator for Distinct {
 
     fn finish(&mut self, ctx: &Ctx, group: usize) -> Result<Id> {
         self.inner.finish(ctx, group)
+    }
+
+    fn finish_intern_bytes(&self) -> u64 {
+        self.inner.finish_intern_bytes()
     }
 
     fn take_growth(&mut self) -> u64 {

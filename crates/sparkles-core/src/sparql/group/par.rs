@@ -21,7 +21,7 @@ use super::op::{
 };
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::sparql::ctx::{Ctx, RetainedCharge};
+use crate::sparql::ctx::{Charge, Ctx, RetainedCharge, table_bytes};
 use crate::sparql::exec::{PAR_MIN_LEN, PAR_THRESHOLD, compute_column};
 use crate::sparql::exprcache::Report as ExprReport;
 use crate::sparql::plan::Agg;
@@ -135,11 +135,15 @@ impl WorkerErr {
     }
 }
 
+type ExprScratch<'a> = Option<(Vec<Option<Vec<Id>>>, Option<Charge<'a>>)>;
+
 struct LocalState {
     index: Index,
     order: Vec<Id>,
     first_row: Vec<u32>,
     accs: Vec<Box<dyn Accumulator>>,
+    acc_growth: Vec<u64>,
+    acc_group_bytes: u64,
     groups: usize,
     per_group: u64,
     charge: Option<RetainedCharge>,
@@ -148,12 +152,14 @@ struct LocalState {
 }
 
 impl LocalState {
-    fn empty(key_count: usize, per_group: u64) -> Self {
+    fn empty(key_count: usize, per_group: u64, acc_group_bytes: u64) -> Self {
         Self {
             index: Index::new(key_count),
             order: Vec::new(),
             first_row: Vec::new(),
             accs: Vec::new(),
+            acc_growth: Vec::new(),
+            acc_group_bytes,
             groups: 0,
             per_group,
             charge: None,
@@ -168,6 +174,7 @@ impl LocalState {
         agg_list: &[Agg],
         charged: bool,
         per_group: u64,
+        acc_group_bytes: u64,
     ) -> Result<Self> {
         let base = agg_list.len() as u64 * 256 + key_count as u64 * 64 + 1024;
         let charge = if charged {
@@ -181,6 +188,8 @@ impl LocalState {
             order: Vec::new(),
             first_row: Vec::new(),
             accs,
+            acc_growth: vec![0; agg_list.len()],
+            acc_group_bytes,
             groups: 0,
             per_group,
             charge,
@@ -206,6 +215,42 @@ impl LocalState {
         }
         self.bytes = retained;
         Ok(())
+    }
+
+    fn record_growth(&mut self, agg: usize, growth: u64) -> Result<()> {
+        if growth > 0 {
+            self.acc_growth[agg] = self.acc_growth[agg].saturating_add(growth);
+            self.retain(growth)?;
+        }
+        Ok(())
+    }
+
+    fn reset_acc(&mut self, agg: usize, acc: Box<dyn Accumulator>) {
+        let prev = std::mem::take(&mut self.acc_growth[agg]);
+        self.bytes = self.bytes.saturating_sub(prev);
+        self.accs[agg] = acc;
+    }
+
+    fn release_index(&mut self) {
+        self.index = Index::One(Default::default());
+    }
+
+    fn total_growth(&self) -> u64 {
+        self.acc_growth
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add)
+    }
+
+    fn shrink_charge(&mut self, live_bytes: u64) {
+        let target = live_bytes.min(self.reserved);
+        if let Some(charge) = &mut self.charge
+            && target < self.reserved
+        {
+            let _ = charge.resize(target);
+        }
+        self.bytes = target;
+        self.reserved = target;
     }
 
     fn insert(&mut self, key: &[Id], row: u32) -> Result<u32> {
@@ -240,6 +285,92 @@ impl LocalState {
     }
 }
 
+/// In-place cancellable binary MSD radix sort on unique `first_row: u32` keys.
+/// Allocates no heap memory and polls `ctx.check()` at most every 4,096 swaps and before
+/// every `<= 4,096`-element leaf sort.
+pub(crate) fn sort_order_map(ctx: &Ctx, slice: &mut [(u32, u16, u32)], max_row: u32) -> Result<()> {
+    ctx.check()?;
+    if slice.len() <= 4_096 {
+        slice.sort_unstable_by_key(|&(row, _, _)| row);
+        ctx.check()?;
+        return Ok(());
+    }
+    if max_row == 0 {
+        return Ok(());
+    }
+    let top_bit = 31 - max_row.leading_zeros();
+    let abort = AtomicBool::new(false);
+    match msd_radix_sort(ctx, &abort, slice, top_bit) {
+        Ok(()) => ctx.check(),
+        Err(WorkerErr::Real(e)) => Err(e),
+        Err(_) => ctx.check(),
+    }
+}
+
+fn msd_radix_sort(
+    ctx: &Ctx,
+    abort: &AtomicBool,
+    slice: &mut [(u32, u16, u32)],
+    bit: u32,
+) -> std::result::Result<(), WorkerErr> {
+    if abort.load(Ordering::Relaxed) {
+        return Err(WorkerErr::Aborted);
+    }
+    if let Err(e) = ctx.check() {
+        abort.store(true, Ordering::Relaxed);
+        return Err(WorkerErr::Real(e));
+    }
+    if slice.len() <= 4_096 {
+        slice.sort_unstable_by_key(|&(row, _, _)| row);
+        return Ok(());
+    }
+    let mask = 1u32 << bit;
+    let mut lo = 0usize;
+    let mut hi = slice.len();
+    let mut steps = 0usize;
+    while lo < hi {
+        if steps.is_multiple_of(4_096) {
+            if abort.load(Ordering::Relaxed) {
+                return Err(WorkerErr::Aborted);
+            }
+            if let Err(e) = ctx.check() {
+                abort.store(true, Ordering::Relaxed);
+                return Err(WorkerErr::Real(e));
+            }
+        }
+        steps += 1;
+        if (slice[lo].0 & mask) == 0 {
+            lo += 1;
+        } else {
+            hi -= 1;
+            slice.swap(lo, hi);
+        }
+    }
+    if bit == 0 {
+        return Ok(());
+    }
+    let (left, right) = slice.split_at_mut(lo);
+    if left.len() >= 8_192 && right.len() >= 8_192 {
+        let (rl, rr) = rayon::join(
+            || msd_radix_sort(ctx, abort, left, bit - 1),
+            || msd_radix_sort(ctx, abort, right, bit - 1),
+        );
+        match (rl, rr) {
+            (Err(WorkerErr::Real(e)), _) | (_, Err(WorkerErr::Real(e))) => Err(WorkerErr::Real(e)),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    } else {
+        if !left.is_empty() {
+            msd_radix_sort(ctx, abort, left, bit - 1)?;
+        }
+        if !right.is_empty() {
+            msd_radix_sort(ctx, abort, right, bit - 1)?;
+        }
+        Ok(())
+    }
+}
+
 enum RangeOutcome {
     Done(Table),
     TooManyGroups,
@@ -269,12 +400,20 @@ pub(super) fn whole_parallel(
     let sources = sources_of(&agg_list, &table.vars);
 
     // Evaluate expression arguments once up front so neither parallel strategy nor any
-    // sequential fallback re-evaluates them or duplicates ExprReport entries.
+    // sequential fallback re-evaluates them or duplicates ExprReport entries. Hold the
+    // sequential grouping slot charge during expression evaluation so `exprcache` sees
+    // the same admission headroom as `Grouping::add`, then release it before parallel
+    // workers start.
     let expr_count = sources
         .iter()
         .filter(|source| matches!(source, Source::Expr(_)))
         .count();
-    let _expr_scratch = if expr_count > 0 {
+    let eval_slots = if expr_count > 0 {
+        Some(ctx.charge(table.len as u64 * 4 + 64)?)
+    } else {
+        None
+    };
+    let expr_scratch = if expr_count > 0 {
         Some(ctx.charge(expr_count as u64 * (table.len as u64 * 8 + 64))?)
     } else {
         None
@@ -286,45 +425,95 @@ pub(super) fn whole_parallel(
             _ => Ok(None),
         })
         .collect::<Result<Vec<_>>>()?;
+    drop(eval_slots);
+    let mut expr_buf: ExprScratch<'_> = Some((computed, expr_scratch));
 
     let probe_accs = accumulators(ctx, &agg_list, charged);
     let all_mergeable = probe_accs.iter().all(|a| a.mergeable());
     let per_group = group_bytes_per_entry(keys.len(), &probe_accs);
+    let acc_group_bytes: u64 = probe_accs.iter().map(|a| a.group_bytes()).sum();
     drop(probe_accs);
 
     let threads = rayon::current_num_threads().max(1);
     let workers = threads.min(table.len / PAR_MIN_LEN).max(1);
     if workers <= 1 {
+        let (computed, expr_scratch) = expr_buf.take().expect("computed columns");
         return whole_sequential_with_computed(
-            ctx, table, keys, aggs, charged, eager, &vars, &computed,
+            ctx,
+            table,
+            keys,
+            aggs,
+            charged,
+            eager,
+            &vars,
+            computed,
+            expr_scratch,
         );
     }
 
     if keys.is_empty() {
         if all_mergeable {
             match run_range_split(
-                ctx, table, &key_cols, &agg_list, &sources, &computed, &vars, charged, eager,
-                per_group, workers,
+                ctx,
+                table,
+                &key_cols,
+                &agg_list,
+                &sources,
+                &mut expr_buf,
+                &vars,
+                charged,
+                eager,
+                per_group,
+                acc_group_bytes,
+                workers,
             )? {
                 RangeOutcome::Done(out) => return Ok(out),
                 RangeOutcome::TooManyGroups | RangeOutcome::MemoryFallback => {}
             }
         }
+        let (computed, expr_scratch) = expr_buf.take().expect("computed columns");
         return whole_sequential_with_computed(
-            ctx, table, keys, aggs, charged, eager, &vars, &computed,
+            ctx,
+            table,
+            keys,
+            aggs,
+            charged,
+            eager,
+            &vars,
+            computed,
+            expr_scratch,
         );
     }
 
     let sample_distinct = sample_distinct_keys(table, &key_cols, RANGE_SPLIT_SAMPLE_DISTINCT);
     if all_mergeable && sample_distinct <= RANGE_SPLIT_SAMPLE_DISTINCT {
         match run_range_split(
-            ctx, table, &key_cols, &agg_list, &sources, &computed, &vars, charged, eager,
-            per_group, workers,
+            ctx,
+            table,
+            &key_cols,
+            &agg_list,
+            &sources,
+            &mut expr_buf,
+            &vars,
+            charged,
+            eager,
+            per_group,
+            acc_group_bytes,
+            workers,
         )? {
             RangeOutcome::Done(out) => return Ok(out),
             RangeOutcome::MemoryFallback => {
+                let (computed, expr_scratch) = expr_buf.take().expect("computed columns");
                 return whole_sequential_with_computed(
-                    ctx, table, keys, aggs, charged, eager, &vars, &computed,
+                    ctx,
+                    table,
+                    keys,
+                    aggs,
+                    charged,
+                    eager,
+                    &vars,
+                    computed,
+                    expr_scratch,
                 );
             }
             RangeOutcome::TooManyGroups => {
@@ -333,19 +522,49 @@ pub(super) fn whole_parallel(
         }
     } else if !all_mergeable && sample_distinct <= 1 {
         // Every sampled row shares one key and aggregates cannot merge across slices.
+        let (computed, expr_scratch) = expr_buf.take().expect("computed columns");
         return whole_sequential_with_computed(
-            ctx, table, keys, aggs, charged, eager, &vars, &computed,
+            ctx,
+            table,
+            keys,
+            aggs,
+            charged,
+            eager,
+            &vars,
+            computed,
+            expr_scratch,
         );
     }
 
     if let Some(out) = run_hash_partitioned(
-        ctx, table, &key_cols, &agg_list, &sources, &computed, &vars, charged, eager, per_group,
+        ctx,
+        table,
+        &key_cols,
+        &agg_list,
+        &sources,
+        &mut expr_buf,
+        &vars,
+        charged,
+        eager,
+        per_group,
+        acc_group_bytes,
         workers,
     )? {
         return Ok(out);
     }
 
-    whole_sequential_with_computed(ctx, table, keys, aggs, charged, eager, &vars, &computed)
+    let (computed, expr_scratch) = expr_buf.take().expect("computed columns");
+    whole_sequential_with_computed(
+        ctx,
+        table,
+        keys,
+        aggs,
+        charged,
+        eager,
+        &vars,
+        computed,
+        expr_scratch,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -355,17 +574,19 @@ fn run_range_split(
     key_cols: &[Option<usize>],
     agg_list: &[Agg],
     sources: &[Source],
-    computed: &[Option<Vec<Id>>],
+    expr_buf: &mut ExprScratch<'_>,
     vars: &[VarId],
     charged: bool,
     eager: bool,
     per_group: u64,
+    acc_group_bytes: u64,
     workers: usize,
 ) -> Result<RangeOutcome> {
     let nk = key_cols.len();
     let width = vars.len();
     let abort = AtomicBool::new(false);
     let len = table.len;
+    let computed_slice = &expr_buf.as_ref().expect("computed columns").0;
 
     let results: Vec<std::result::Result<LocalState, WorkerErr>> = (0..workers)
         .into_par_iter()
@@ -377,9 +598,15 @@ fn run_range_split(
             }
             ctx.check().map_err(|e| WorkerErr::from_error(e, &abort))?;
 
-            let mut local = LocalState::new(ctx, nk, agg_list, charged, per_group)
+            let mut local = LocalState::new(ctx, nk, agg_list, charged, per_group, acc_group_bytes)
                 .map_err(|e| WorkerErr::from_error(e, &abort))?;
             if nk == 0 {
+                ctx.check_rows(1)
+                    .map_err(|e| WorkerErr::from_error(e, &abort))?;
+                if eager {
+                    ctx.check_output_rows(1)
+                        .map_err(|e| WorkerErr::from_error(e, &abort))?;
+                }
                 local
                     .insert_ungrouped(start as u32)
                     .map_err(|e| WorkerErr::from_error(e, &abort))?;
@@ -423,6 +650,13 @@ fn run_range_split(
                                     abort.store(true, Ordering::Relaxed);
                                     return Err(WorkerErr::TooManyGroups);
                                 }
+                                let next_groups = local.groups.saturating_add(1);
+                                ctx.check_rows(next_groups)
+                                    .map_err(|e| WorkerErr::from_error(e, &abort))?;
+                                if eager {
+                                    ctx.check_output_rows(next_groups)
+                                        .map_err(|e| WorkerErr::from_error(e, &abort))?;
+                                }
                                 local
                                     .insert(&[id], (base + offset) as u32)
                                     .map_err(|e| WorkerErr::from_error(e, &abort))?
@@ -452,6 +686,13 @@ fn run_range_split(
                                     abort.store(true, Ordering::Relaxed);
                                     return Err(WorkerErr::TooManyGroups);
                                 }
+                                let next_groups = local.groups.saturating_add(1);
+                                ctx.check_rows(next_groups)
+                                    .map_err(|e| WorkerErr::from_error(e, &abort))?;
+                                if eager {
+                                    ctx.check_output_rows(next_groups)
+                                        .map_err(|e| WorkerErr::from_error(e, &abort))?;
+                                }
                                 local
                                     .insert(&key_buf, row as u32)
                                     .map_err(|e| WorkerErr::from_error(e, &abort))?
@@ -461,7 +702,7 @@ fn run_range_split(
                     }
                 }
 
-                for (a, values) in computed.iter().enumerate() {
+                for (a, values) in computed_slice.iter().enumerate() {
                     if abort.load(Ordering::Relaxed) {
                         return Err(WorkerErr::Aborted);
                     }
@@ -487,7 +728,7 @@ fn run_range_split(
                     let growth = local.accs[a].take_growth();
                     if growth > 0 {
                         local
-                            .retain(growth)
+                            .record_growth(a, growth)
                             .map_err(|e| WorkerErr::from_error(e, &abort))?;
                     }
                 }
@@ -573,7 +814,7 @@ fn run_range_split(
                 Ok(()) => {
                     let growth = merged.accs[a].take_growth();
                     if growth > 0
-                        && let Err(e) = merged.retain(growth)
+                        && let Err(e) = merged.record_growth(a, growth)
                     {
                         if is_memory_budget_error(&e) {
                             return Ok(RangeOutcome::MemoryFallback);
@@ -593,14 +834,15 @@ fn run_range_split(
     }
 
     // Re-fold only the aggregates whose merge was refused (e.g. non-associative float/double
-    // SUM/AVG or right-side numeric overflow), reusing the already-built global group index.
+    // SUM/AVG, right-side numeric overflow, or non-transitive MIN/MAX), reusing the
+    // already-built global group index.
     if refused.iter().any(|&r| r) {
         let track = merged.charge.is_some();
         for (a, &is_refused) in refused.iter().enumerate() {
             if is_refused {
                 let mut acc = accumulator(ctx, &agg_list[a], track);
                 acc.init(merged.groups);
-                merged.accs[a] = acc;
+                merged.reset_acc(a, acc);
             }
         }
         let mut slots: Vec<u32> = Vec::new();
@@ -654,7 +896,7 @@ fn run_range_split(
                     continue;
                 }
                 ctx.check()?;
-                let arg = match (&sources[a], &computed[a]) {
+                let arg = match (&sources[a], &computed_slice[a]) {
                     (_, Some(values)) => Arg::Column(&values[base..chunk_end]),
                     (Source::Star | Source::Rows, _) => Arg::Star,
                     (Source::Column(Some(c)), _) => Arg::Column(&table.cols[*c][base..chunk_end]),
@@ -675,7 +917,7 @@ fn run_range_split(
                 }
                 let growth = merged.accs[a].take_growth();
                 if growth > 0
-                    && let Err(e) = merged.retain(growth)
+                    && let Err(e) = merged.record_growth(a, growth)
                 {
                     if is_memory_budget_error(&e) {
                         return Ok(RangeOutcome::MemoryFallback);
@@ -687,13 +929,21 @@ fn run_range_split(
         }
     }
 
+    // Release dead lookup structures, reservation slack, and expression scratch before
+    // checking output and running infallible `finish()` interning.
+    merged.release_index();
+    merged.first_row = Vec::new();
+    merged.shrink_charge(
+        (merged.groups as u64)
+            .saturating_mul(nk as u64 * 8 + merged.acc_group_bytes)
+            .saturating_add(merged.total_growth()),
+    );
+    *expr_buf = None;
+
     ctx.check()?;
     ctx.check_rows(merged.groups)?;
-    if eager && let Err(e) = ctx.check_output(merged.groups, width) {
-        if is_memory_budget_error(&e) {
-            return Ok(RangeOutcome::MemoryFallback);
-        }
-        return Err(e);
+    if eager {
+        ctx.check_output(merged.groups, width)?;
     }
 
     let n = merged.groups;
@@ -705,15 +955,30 @@ fn run_range_split(
         col.reserve_exact(n);
     }
     for k in 0..nk {
-        out.cols[k].extend((0..n).map(|g| merged.order[g * nk + k]));
+        for g in 0..n {
+            if g.is_multiple_of(4_096) {
+                ctx.check()?;
+            }
+            out.cols[k].push(merged.order[g * nk + k]);
+        }
     }
+    merged.order = Vec::new();
+    merged.shrink_charge(
+        (n as u64)
+            .saturating_mul(merged.acc_group_bytes)
+            .saturating_add(merged.total_growth()),
+    );
     for (a, acc) in merged.accs.iter_mut().enumerate() {
         ctx.check()?;
         for g in 0..n {
+            if g.is_multiple_of(1024) {
+                ctx.check()?;
+            }
             let id = acc.finish(ctx, g)?;
             out.cols[nk + a].push(id);
         }
     }
+    ctx.check()?;
     out.len = n;
     Ok(RangeOutcome::Done(out))
 }
@@ -725,11 +990,12 @@ fn run_hash_partitioned(
     key_cols: &[Option<usize>],
     agg_list: &[Agg],
     sources: &[Source],
-    computed: &[Option<Vec<Id>>],
+    expr_buf: &mut ExprScratch<'_>,
     vars: &[VarId],
     charged: bool,
     eager: bool,
     per_group: u64,
+    acc_group_bytes: u64,
     workers: usize,
 ) -> Result<Option<Table>> {
     let nk = key_cols.len();
@@ -740,18 +1006,28 @@ fn run_hash_partitioned(
         .clamp(MIN_HASH_PARTS, MAX_HASH_PARTS);
     let part_mask = parts_count - 1;
 
-    // Pre-admit worst-case radix bucket scratch; fall back to sequential if memory refuses.
-    let radix_bytes = (len as u64)
+    // Pre-admit worst-case radix bucket scratch including all preallocated buckets and
+    // transient Vec reallocation peaks; fall back to sequential if memory refuses.
+    let reserve_per_bucket = ((len / workers) / parts_count).clamp(16, 4_096);
+    let initial_bucket_bytes =
+        (workers * parts_count) as u64 * (reserve_per_bucket as u64 * 4 + 64);
+    let radix_retained_bytes = (len as u64)
         .saturating_mul(8)
-        .saturating_add((workers * parts_count) as u64 * 64 + 4096);
-    let radix_charge = match ctx.charge(radix_bytes) {
+        .saturating_add(initial_bucket_bytes)
+        .saturating_add(4096);
+    let radix_realloc_bytes = (len as u64).saturating_mul(4);
+    let radix_charge = match ctx.charge(radix_retained_bytes) {
+        Ok(c) => c,
+        Err(e) if is_memory_budget_error(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let realloc_charge = match ctx.charge(radix_realloc_bytes) {
         Ok(c) => c,
         Err(e) if is_memory_budget_error(&e) => return Ok(None),
         Err(e) => return Err(e),
     };
 
     // Pass 1: bucket row indices into `parts_count` disjoint key-hash partitions per worker.
-    let reserve_per_bucket = ((len / workers) / parts_count).clamp(16, 4_096);
     let abort = AtomicBool::new(false);
     let bucket_results: Vec<std::result::Result<Vec<Vec<u32>>, WorkerErr>> = (0..workers)
         .into_par_iter()
@@ -813,6 +1089,7 @@ fn run_hash_partitioned(
             Ok(buckets)
         })
         .collect();
+    drop(realloc_charge);
 
     let mut worker_buckets: Vec<Vec<Vec<u32>>> = Vec::with_capacity(workers);
     let mut saw_memory = false;
@@ -829,6 +1106,7 @@ fn run_hash_partitioned(
     }
 
     // Pass 2: fold each partition independently in worker order (exact original row order).
+    let computed_slice = &expr_buf.as_ref().expect("computed columns").0;
     let has_distinct_star = agg_list.iter().any(|a| a.distinct && a.expr.is_none());
     let global_groups = AtomicUsize::new(0);
     let abort = AtomicBool::new(false);
@@ -838,7 +1116,7 @@ fn run_hash_partitioned(
         .map(|p| {
             let total_rows: usize = worker_buckets.iter().map(|wb| wb[p].len()).sum();
             if total_rows == 0 {
-                return Ok(LocalState::empty(nk, per_group));
+                return Ok(LocalState::empty(nk, per_group, acc_group_bytes));
             }
             if abort.load(Ordering::Relaxed) {
                 return Err(WorkerErr::Aborted);
@@ -860,7 +1138,7 @@ fn run_hash_partitioned(
                 .charge(chunk_scratch)
                 .map_err(|e| WorkerErr::from_error(e, &abort))?;
 
-            let mut local = LocalState::new(ctx, nk, agg_list, charged, per_group)
+            let mut local = LocalState::new(ctx, nk, agg_list, charged, per_group, acc_group_bytes)
                 .map_err(|e| WorkerErr::from_error(e, &abort))?;
             let mut slots: Vec<u32> = Vec::with_capacity(chunk_cap);
             let mut vals: Vec<Id> = Vec::with_capacity(chunk_cap);
@@ -980,7 +1258,7 @@ fn run_hash_partitioned(
                         ct.len = chunk.len();
                     }
 
-                    for (a, values) in computed.iter().enumerate() {
+                    for (a, values) in computed_slice.iter().enumerate() {
                         if abort.load(Ordering::Relaxed) {
                             return Err(WorkerErr::Aborted);
                         }
@@ -1031,7 +1309,7 @@ fn run_hash_partitioned(
                         let growth = local.accs[a].take_growth();
                         if growth > 0 {
                             local
-                                .retain(growth)
+                                .record_growth(a, growth)
                                 .map_err(|e| WorkerErr::from_error(e, &abort))?;
                         }
                     }
@@ -1059,55 +1337,150 @@ fn run_hash_partitioned(
         return Ok(None);
     }
 
+    // Drop dead per-partition hash indexes and release RETAIN_STEP reservation slack
+    // before admitting assembly buffers and running infallible `finish()` interning.
+    for part in &mut parts {
+        part.release_index();
+        part.shrink_charge(
+            (part.groups as u64)
+                .saturating_mul(nk as u64 * 8 + 4 + part.acc_group_bytes)
+                .saturating_add(part.total_growth()),
+        );
+    }
+
     // Pass 3: deterministic assembly in exact first-appearance order.
     let total_groups: usize = parts.iter().map(|p| p.groups).sum();
     ctx.check()?;
     ctx.check_rows(total_groups)?;
+    if eager {
+        ctx.check_output_rows(total_groups)?;
+    }
+    if total_groups == 0 {
+        *expr_buf = None;
+        return Ok(Some(Table::new(vars.to_vec())));
+    }
+
+    // Charge `order_map` BEFORE checking the combined output + finish-interning peak,
+    // so any memory refusal falls back cleanly to sequential before committing to
+    // infallible `acc.finish()` interning (preventing a sticky `ctx.memory_failure`).
+    let _order_charge = match ctx.charge(total_groups as u64 * 12 + 64) {
+        Ok(c) => c,
+        Err(e) if is_memory_budget_error(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
     if eager && let Err(e) = ctx.check_output(total_groups, width) {
         if is_memory_budget_error(&e) {
             return Ok(None);
         }
         return Err(e);
     }
-    if total_groups == 0 {
-        return Ok(Some(Table::new(vars.to_vec())));
-    }
-
-    let _order_charge = match ctx.charge(total_groups as u64 * 12 + 64) {
-        Ok(c) => c,
-        Err(e) if is_memory_budget_error(&e) => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let mut order_map: Vec<(u32, u16, u32)> = Vec::with_capacity(total_groups);
-    for (p_idx, part) in parts.iter().enumerate() {
-        for (g, &first_row) in part.first_row.iter().enumerate() {
-            order_map.push((first_row, p_idx as u16, g as u32));
+    let finish_intern_bytes: u64 = parts
+        .iter()
+        .flat_map(|part| part.accs.iter())
+        .map(|acc| acc.finish_intern_bytes())
+        .fold(0u64, u64::saturating_add);
+    let assembly_peak = (if eager {
+        table_bytes(total_groups, width)
+    } else {
+        0
+    })
+    .saturating_add(finish_intern_bytes);
+    if assembly_peak > 0 {
+        match ctx.charge(assembly_peak) {
+            Ok(probe) => drop(probe),
+            Err(e) if is_memory_budget_error(&e) => return Ok(None),
+            Err(e) => return Err(e),
         }
     }
-    if total_groups >= PAR_GROUP_THRESHOLD {
-        order_map.par_sort_unstable_by_key(|&(row, _, _)| row);
-    } else {
-        order_map.sort_unstable_by_key(|&(row, _, _)| row);
+
+    // Committed to Pass 3: drop expression scratch before allocating output or interning.
+    *expr_buf = None;
+
+    let mut order_map: Vec<(u32, u16, u32)> = Vec::with_capacity(total_groups);
+    let mut written = 0usize;
+    for (p_idx, part) in parts.iter_mut().enumerate() {
+        for (g, first_row) in std::mem::take(&mut part.first_row).into_iter().enumerate() {
+            if written.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            order_map.push((first_row, p_idx as u16, g as u32));
+            written += 1;
+        }
     }
+    sort_order_map(ctx, &mut order_map, (len - 1) as u32)?;
 
     let mut out = Table::new(vars.to_vec());
     for col in &mut out.cols {
         col.reserve_exact(total_groups);
     }
     for k in 0..nk {
-        out.cols[k].extend(
-            order_map
-                .iter()
-                .map(|&(_, p, g)| parts[p as usize].order[g as usize * nk + k]),
+        for (i, &(_, p, g)) in order_map.iter().enumerate() {
+            if i.is_multiple_of(4_096) {
+                ctx.check()?;
+            }
+            out.cols[k].push(parts[p as usize].order[g as usize * nk + k]);
+        }
+    }
+    for part in &mut parts {
+        part.order = Vec::new();
+        part.shrink_charge(
+            (part.groups as u64)
+                .saturating_mul(part.acc_group_bytes)
+                .saturating_add(part.total_growth()),
         );
     }
     for a in 0..agg_list.len() {
         ctx.check()?;
-        for &(_, p, g) in &order_map {
+        for (i, &(_, p, g)) in order_map.iter().enumerate() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
             let id = parts[p as usize].accs[a].finish(ctx, g as usize)?;
             out.cols[nk + a].push(id);
         }
     }
+    ctx.check()?;
     out.len = total_groups;
     Ok(Some(out))
+}
+
+#[cfg(test)]
+pub(crate) fn range_split_hits_too_many_groups(
+    ctx: &Ctx,
+    table: &Table,
+    keys: &[VarId],
+    aggs: &[(VarId, Agg)],
+    workers: usize,
+) -> Result<bool> {
+    let mut vars = keys.to_vec();
+    vars.extend(aggs.iter().map(|(v, _)| *v));
+    let agg_list: Vec<Agg> = aggs.iter().map(|(_, a)| a.clone()).collect();
+    let key_cols: Vec<Option<usize>> = keys
+        .iter()
+        .map(|k| table.vars.iter().position(|v| v == k))
+        .collect();
+    let sources = sources_of(&agg_list, &table.vars);
+    let computed: Vec<Option<Vec<Id>>> = vec![None; sources.len()];
+    let mut expr_buf: ExprScratch<'_> = Some((computed, None));
+    let probe_accs = accumulators(ctx, &agg_list, false);
+    let per_group = group_bytes_per_entry(keys.len(), &probe_accs);
+    let acc_group_bytes: u64 = probe_accs.iter().map(|a| a.group_bytes()).sum();
+    drop(probe_accs);
+    Ok(matches!(
+        run_range_split(
+            ctx,
+            table,
+            &key_cols,
+            &agg_list,
+            &sources,
+            &mut expr_buf,
+            &vars,
+            false,
+            true,
+            per_group,
+            acc_group_bytes,
+            workers,
+        )?,
+        RangeOutcome::TooManyGroups
+    ))
 }

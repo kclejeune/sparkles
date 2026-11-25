@@ -7396,6 +7396,56 @@ pub(super) fn stat_aggregate(func: &AggregateFunction) -> Option<super::aggext::
     }
 }
 
+/// Heap bytes owned by a `SumAcc::Decimal(Box<DecimalSum>)` allocation.
+pub(super) const DECIMAL_SUM_BYTES: u64 = size_of::<DecimalSum>() as u64;
+
+/// Value-space hazard flags tracked on `AggState::Best` so `can_merge` only combines
+/// slice winners when `order_cmp` is guaranteed to be a transitive total preorder
+/// across every value seen in the merged group.
+const BEST_EXACT_NUM: u8 = 1 << 0;
+const BEST_FLOAT: u8 = 1 << 1;
+const BEST_INCOMPARABLE: u8 = 1 << 2;
+
+#[inline]
+fn best_value_flag(v: Option<&Value>) -> u8 {
+    match v {
+        None => BEST_INCOMPARABLE,
+        Some(Value::Integer(_) | Value::Decimal(_)) => BEST_EXACT_NUM,
+        Some(Value::Float(f)) => {
+            if f32::from(*f).is_nan() {
+                BEST_INCOMPARABLE
+            } else {
+                BEST_FLOAT
+            }
+        }
+        Some(Value::Double(d)) => {
+            if f64::from(*d).is_nan() {
+                BEST_INCOMPARABLE
+            } else {
+                BEST_FLOAT
+            }
+        }
+        Some(
+            Value::BNode(_)
+            | Value::Iri(_)
+            | Value::Str(_)
+            | Value::Lang(..)
+            | Value::LangDir(..)
+            | Value::Bool(_),
+        ) => 0,
+        Some(
+            Value::DateTime(_)
+            | Value::Date(_)
+            | Value::Time(_)
+            | Value::Duration(_)
+            | Value::YearMonth(_)
+            | Value::DayTime(_)
+            | Value::Triple(_)
+            | Value::Other { .. },
+        ) => BEST_INCOMPARABLE,
+    }
+}
+
 /// Decimal accumulator state with exact prefix bounds so merging two exact sums matches
 /// a single sequential pass on every intermediate overflow boundary.
 pub(super) struct DecimalSum {
@@ -7448,10 +7498,10 @@ pub(super) enum AggState {
         rows: u64,
         errs: u64,
     },
-    /// MIN / MAX: the best id and its value, and the count of arguments that were
-    /// errors, which some readings make the result unbound (see
-    /// [`super::AggregateErrors`])
-    Best(Option<Id>, Option<Value>, u64),
+    /// MIN / MAX: the best id and its value, the count of arguments that were errors
+    /// (which some readings make the result unbound, see [`super::AggregateErrors`]),
+    /// and a value-space hazard bitmask for exact merge validation.
+    Best(Option<Id>, Option<Value>, u64, u8),
     Sample(Option<Id>),
     /// ARQ's variance and deviation aggregates
     Stat(super::aggext::Arq, super::aggext::StatAcc),
@@ -7472,9 +7522,57 @@ impl AggState {
                 rows: 0,
                 errs: 0,
             },
-            AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None, 0),
+            AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None, 0, 0),
             AggregateFunction::Sample => AggState::Sample(None),
             _ => AggState::Count(0),
+        }
+    }
+
+    /// Whether this state currently owns a heap-allocated `Box<DecimalSum>`.
+    #[inline]
+    pub(super) fn has_decimal_box(&self) -> bool {
+        matches!(
+            self,
+            AggState::Sum {
+                acc: SumAcc::Decimal(_),
+                ..
+            }
+        )
+    }
+
+    /// Upper bound on bytes [`AggState::finish`] can charge to `ctx.retain_bytes()`
+    /// when interning the finalized result value.
+    pub(super) fn finish_intern_bytes(&self, agg: &Agg) -> u64 {
+        match self {
+            AggState::Count(_) | AggState::Best(..) | AggState::Sample(_) => 0,
+            AggState::Sum { acc, rows, errs } => {
+                if *rows > 0 && *errs == *rows && matches!(agg.func, AggregateFunction::Avg) {
+                    return 0;
+                }
+                match acc {
+                    SumAcc::HardError | SumAcc::Overflow => 0,
+                    SumAcc::Int { sum, .. } | SumAcc::IntRetracted(sum) => {
+                        if matches!(agg.func, AggregateFunction::Sum)
+                            && i64::try_from(*sum).ok().and_then(Id::from_i64).is_some()
+                        {
+                            0
+                        } else {
+                            256
+                        }
+                    }
+                    SumAcc::Decimal(_) | SumAcc::Float(_) => 256,
+                    SumAcc::Double(d) => {
+                        if matches!(agg.func, AggregateFunction::Sum)
+                            && Id::from_f64(f64::from(*d)).is_some()
+                        {
+                            0
+                        } else {
+                            256
+                        }
+                    }
+                }
+            }
+            AggState::Stat(..) => 256,
         }
     }
 
@@ -7504,12 +7602,13 @@ impl AggState {
                 }
                 self.add_sum_slow(ctx, id);
             }
-            AggState::Best(best, best_v, errs) => {
+            AggState::Best(best, best_v, errs, flags) => {
                 let Some(id) = id.filter(|id| !id.is_undef()) else {
                     *errs += 1;
                     return;
                 };
                 let v = ctx.value(id);
+                *flags |= best_value_flag(v.as_ref());
                 let better = match best_v {
                     None => best.is_none(),
                     Some(b) => {
@@ -7748,8 +7847,15 @@ impl AggState {
     pub(super) fn can_merge(&self, other: &AggState) -> bool {
         match (self, other) {
             (AggState::Count(_), AggState::Count(_))
-            | (AggState::Best(..), AggState::Best(..))
             | (AggState::Sample(_), AggState::Sample(_)) => true,
+            (AggState::Best(lb, _, _, lf), AggState::Best(rb, _, _, rf)) => {
+                if lb.is_none() || rb.is_none() {
+                    return true;
+                }
+                let combined = lf | rf;
+                (combined & BEST_INCOMPARABLE) == 0
+                    && (combined & (BEST_EXACT_NUM | BEST_FLOAT)) != (BEST_EXACT_NUM | BEST_FLOAT)
+            }
             (
                 AggState::Sum {
                     acc: la, rows: lr, ..
@@ -7791,10 +7897,10 @@ impl AggState {
                     ) => ls.checked_add(*rs).is_some(),
                     (SumAcc::Decimal(_), SumAcc::Int { .. }) => true,
                     (SumAcc::Int { sum: ls, .. }, SumAcc::Decimal(r)) => {
-                        ls.checked_add(r.int_before).is_some()
-                            && (!r.exact_int_prefix
-                                || (ls.checked_add(r.int_min).is_some()
-                                    && ls.checked_add(r.int_max).is_some()))
+                        r.exact_int_prefix
+                            && ls.checked_add(r.int_before).is_some()
+                            && ls.checked_add(r.int_min).is_some()
+                            && ls.checked_add(r.int_max).is_some()
                     }
                     (SumAcc::Decimal(_), SumAcc::Decimal(r)) => r.exact_int_prefix,
                     (SumAcc::Decimal(_), SumAcc::IntRetracted(_))
@@ -7915,10 +8021,9 @@ impl AggState {
                             r.min = smin;
                             r.max = smax;
                             r.int_before = trans_int;
-                            if r.exact_int_prefix {
-                                r.int_min = (*min).min(base + r.int_min);
-                                r.int_max = (*max).max(base + r.int_max);
-                            }
+                            debug_assert!(r.exact_int_prefix);
+                            r.int_min = (*min).min(base + r.int_min);
+                            r.int_max = (*max).max(base + r.int_max);
                             *acc = SumAcc::Decimal(r);
                         } else {
                             *acc = SumAcc::Overflow;
@@ -7975,8 +8080,12 @@ impl AggState {
                     }
                 }
             }
-            (AggState::Best(best, best_v, errs), AggState::Best(Some(id), v, oerrs)) => {
+            (
+                AggState::Best(best, best_v, errs, flags),
+                AggState::Best(Some(id), v, oerrs, oflags),
+            ) => {
                 *errs += oerrs;
+                *flags |= oflags;
                 let better = match best_v.as_ref() {
                     None => best.is_none(),
                     Some(b) => {
@@ -7993,7 +8102,10 @@ impl AggState {
                     *best_v = v;
                 }
             }
-            (AggState::Best(_, _, errs), AggState::Best(None, _, oerrs)) => *errs += oerrs,
+            (AggState::Best(_, _, errs, flags), AggState::Best(None, _, oerrs, oflags)) => {
+                *errs += oerrs;
+                *flags |= oflags;
+            }
             (AggState::Sample(x), AggState::Sample(y)) => {
                 if x.is_none() {
                     *x = y;
@@ -8071,7 +8183,7 @@ impl AggState {
                 };
                 v.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
             }
-            AggState::Best(best, _, errs) => {
+            AggState::Best(best, _, errs, _) => {
                 let min = matches!(agg.func, AggregateFunction::Min);
                 if errs > 0 && ctx.aggregate_errors.best_errs(min) {
                     Id::UNDEF

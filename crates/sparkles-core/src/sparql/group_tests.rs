@@ -737,18 +737,30 @@ fn sum_and_avg_merge_never_disagrees_with_single_pass_across_all_splits() {
     }
 }
 
-/// Exact row-by-row, column-by-column comparison of two grouping output tables, including
-/// exact row order and bit-level float/double equality.
-fn assert_tables_exact_eq(ctx: &Ctx, got: &Table, expected: &Table, label: &str) {
+/// Exact row-by-row, column-by-column comparison when `got` and `expected` were produced
+/// on two separate `Ctx` instances (each decoded against its own local term table).
+fn assert_tables_exact_eq_cross_ctx(
+    got_ctx: &Ctx,
+    got: &Table,
+    expected_ctx: &Ctx,
+    expected: &Table,
+    label: &str,
+) {
     assert_eq!(got.vars, expected.vars, "{label}: vars mismatch");
     assert_eq!(got.len, expected.len, "{label}: row count mismatch");
     for row in 0..expected.len {
         for col in 0..expected.cols.len() {
-            let g = exact_key(ctx, got.cols[col][row]);
-            let e = exact_key(ctx, expected.cols[col][row]);
+            let g = exact_key(got_ctx, got.cols[col][row]);
+            let e = exact_key(expected_ctx, expected.cols[col][row]);
             assert_eq!(g, e, "{label}: mismatch at row {row} col {col}");
         }
     }
+}
+
+/// Exact row-by-row, column-by-column comparison of two grouping output tables, including
+/// exact row order and bit-level float/double equality.
+fn assert_tables_exact_eq(ctx: &Ctx, got: &Table, expected: &Table, label: &str) {
+    assert_tables_exact_eq_cross_ctx(ctx, got, ctx, expected, label);
 }
 
 fn run_whole_in_pool(
@@ -983,11 +995,13 @@ fn parallel_whole_matches_sequential_low_cardinality_and_skew_fallback() {
     let (par, _) = run_whole_in_pool(4, &ctx, &low, &[0], &aggs, false).unwrap();
     assert_tables_exact_eq(&ctx, &par, &seq, "low-cardinality range-split");
 
-    // 2. Adversarial skew: mostly one key, with a burst of 4,000 unique keys triggering
-    // RANGE_SPLIT_MAX_GROUPS abort -> Key-Hash Partitioning fallback.
+    // 2. Adversarial skew: mostly one key, with a burst of 2,500 unique keys inside a
+    // single worker's slice (5_000..7_500 inside worker 1's 5_000..10_000 slice for 4
+    // threads) so sample_distinct <= 64 enters range-split, worker 1 exceeds
+    // RANGE_SPLIT_MAX_GROUPS (2,048), and range-split aborts to key-hash partitioning.
     let mut skewed = Table::new(vec![0, 1]);
     for i in 0..n {
-        let k = if (8_000..12_000).contains(&i) {
+        let k = if (5_000..7_500).contains(&i) {
             int(&ctx, i as i64)
         } else {
             int(&ctx, 0)
@@ -1007,6 +1021,19 @@ fn parallel_whole_matches_sequential_low_cardinality_and_skew_fallback() {
             },
         ),
     ];
+    let pool4 = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let hit_cap = pool4
+        .install(|| {
+            super::group::par::range_split_hits_too_many_groups(&ctx, &skewed, &[0], &skew_aggs, 4)
+        })
+        .unwrap();
+    assert!(
+        hit_cap,
+        "skewed table must actually hit RANGE_SPLIT_MAX_GROUPS in range-split"
+    );
     let (seq, _) = run_whole_in_pool(1, &ctx, &skewed, &[0], &skew_aggs, false).unwrap();
     let (par, _) = run_whole_in_pool(4, &ctx, &skewed, &[0], &skew_aggs, false).unwrap();
     assert_tables_exact_eq(&ctx, &par, &seq, "skew fallback to hash partitioning");
@@ -1245,4 +1272,650 @@ fn parallel_whole_honors_memory_fallback_row_limit_and_cancellation() {
         matches!(err, crate::error::Error::Cancelled),
         "expected Cancelled, got {err:?}"
     );
+}
+
+#[test]
+fn range_split_min_max_matches_sequential_on_non_transitive_mixed_and_incomparable_values() {
+    let ctx = ctx();
+    // Mixed numeric cycle where order_cmp is non-transitive:
+    // a = -200000001 (int) < b = -199999999 (int) by exact integer comparison,
+    // while both round to c = -200000000 (float) in f32 so lexical tie-breaking gives b < c < a.
+    let a = int(&ctx, -200_000_001);
+    let b = int(&ctx, -199_999_999);
+    let c = flt(&ctx, -200_000_000.0);
+
+    // Direct merge refusal on mixed exact/float numerics.
+    for func in [AggregateFunction::Min, AggregateFunction::Max] {
+        let ag = agg(func, true, false);
+        let (mut l, mut r) = (Running::new(&ag, false), Running::new(&ag, false));
+        l.init(1);
+        r.init(1);
+        fold(&ctx, &mut l, &[a], &[0]);
+        fold(&ctx, &mut r, &[c, b], &[0, 0]);
+        assert!(
+            matches!(
+                l.merge(&ctx, &mut r, &[0]),
+                Err(crate::error::Error::Unsupported(_))
+            ),
+            "{:?} must refuse mixed exact/float merge",
+            ag.func
+        );
+        // Refusal is atomic: left and right retain their winners.
+        assert_eq!(
+            exact_key(&ctx, l.finish(&ctx, 0).unwrap()),
+            exact_key(&ctx, a)
+        );
+        let expected_r = single_pass_result(&ctx, &ag, &[c, b]);
+        assert_eq!(exact_key(&ctx, r.finish(&ctx, 0).unwrap()), expected_r);
+    }
+
+    // Full parallel range-split with 2 workers on 16,384 ungrouped rows (MIN & MAX cycles).
+    let n = 16_384usize;
+    let half = n / 2;
+    let mut min_table = Table::new(vec![0]);
+    let mut max_table = Table::new(vec![0]);
+    for i in 0..n {
+        let min_v = if i < half {
+            a
+        } else if i == half {
+            c
+        } else {
+            b
+        };
+        let max_v = if i < half {
+            b
+        } else if i == half {
+            c
+        } else {
+            a
+        };
+        min_table.push_row(&[min_v]);
+        max_table.push_row(&[max_v]);
+    }
+    let min_aggs = vec![(10, agg(AggregateFunction::Min, true, false))];
+    let max_aggs = vec![(10, agg(AggregateFunction::Max, true, false))];
+    let (seq_min, _) = run_whole_in_pool(1, &ctx, &min_table, &[], &min_aggs, false).unwrap();
+    let (par_min, _) = run_whole_in_pool(2, &ctx, &min_table, &[], &min_aggs, false).unwrap();
+    assert_tables_exact_eq(&ctx, &par_min, &seq_min, "non-transitive mixed MIN");
+    assert_eq!(exact_key(&ctx, par_min.cols[0][0]), exact_key(&ctx, b));
+
+    let (seq_max, _) = run_whole_in_pool(1, &ctx, &max_table, &[], &max_aggs, false).unwrap();
+    let (par_max, _) = run_whole_in_pool(2, &ctx, &max_table, &[], &max_aggs, false).unwrap();
+    assert_tables_exact_eq(&ctx, &par_max, &seq_max, "non-transitive mixed MAX");
+    assert_eq!(exact_key(&ctx, par_max.cols[0][0]), exact_key(&ctx, a));
+
+    // Incomparable DateTime (tz vs no-tz) and Duration (P30D / P0Y31D / P1M) also refuse merge.
+    let dt_a = ctx.intern_term(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+        "2000-01-01T06:00:00+02:00",
+        oxrdf::vocab::xsd::DATE_TIME,
+    )));
+    let dt_b = ctx.intern_term(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+        "2000-01-01T05:00:00Z",
+        oxrdf::vocab::xsd::DATE_TIME,
+    )));
+    let dt_c = ctx.intern_term(&oxrdf::Term::Literal(oxrdf::Literal::new_typed_literal(
+        "2000-01-01T05:30:00",
+        oxrdf::vocab::xsd::DATE_TIME,
+    )));
+    let mut dt_table = Table::new(vec![0]);
+    for i in 0..n {
+        let v = if i < half {
+            dt_b
+        } else if i == half {
+            dt_a
+        } else {
+            dt_c
+        };
+        dt_table.push_row(&[v]);
+    }
+    let (seq_dt, _) = run_whole_in_pool(1, &ctx, &dt_table, &[], &min_aggs, false).unwrap();
+    let (par_dt, _) = run_whole_in_pool(2, &ctx, &dt_table, &[], &min_aggs, false).unwrap();
+    assert_tables_exact_eq(&ctx, &par_dt, &seq_dt, "incomparable DateTime MIN");
+
+    // Homogeneous exact numerics (Integer + Decimal) and finite Float + Double still merge.
+    let ag_min = agg(AggregateFunction::Min, true, false);
+    let (mut l, mut r) = (Running::new(&ag_min, false), Running::new(&ag_min, false));
+    l.init(1);
+    r.init(1);
+    fold(
+        &ctx,
+        &mut l,
+        &[int(&ctx, 10), dec_str(&ctx, "5.5")],
+        &[0, 0],
+    );
+    fold(&ctx, &mut r, &[int(&ctx, 3)], &[0]);
+    l.merge(&ctx, &mut r, &[0]).unwrap();
+    assert_eq!(
+        exact_key(&ctx, l.finish(&ctx, 0).unwrap()),
+        exact_key(&ctx, int(&ctx, 3))
+    );
+}
+
+#[test]
+fn parallel_scratch_releases_before_finish_under_query_and_server_limits() {
+    let n = 16_384usize;
+    let base_ctx = ctx();
+    let v_k = base_ctx.var("k");
+    let v_v = base_ctx.var("v");
+    let s = base_ctx.intern_value(&Value::Str("abcdefgh".into()));
+    let mut table = Table::new(vec![v_k, v_v]);
+    for i in 0..n {
+        table.push_row(&[int(&base_ctx, (i % 2_000) as i64), s]);
+    }
+
+    // 1. Ungrouped GROUP_CONCAT(STR(?v)): expression scratch (~131 KiB) + final result
+    // (~148 KiB) exceed 270 KiB when held simultaneously, but fit once scratch drops
+    // (including the 64 KiB initial retained-reservation step under a server pool).
+    let str_expr = super::expr::Expr::Call(
+        super::expr::Func::Builtin(spargebra::algebra::Function::Str),
+        vec![super::expr::Expr::Var(v_v)],
+    );
+    let concat_expr_agg = vec![(
+        10,
+        Agg {
+            func: AggregateFunction::GroupConcat {
+                separator: Some(",".into()),
+            },
+            expr: Some(str_expr),
+            distinct: false,
+            fold: None,
+            registered: None,
+        },
+    )];
+    let (seq_ungrouped, _) =
+        run_whole_in_pool(1, &base_ctx, &table, &[], &concat_expr_agg, false).unwrap();
+
+    // Query memory limit
+    let mut q_ctx = ctx();
+    let qk = q_ctx.var("k");
+    let qv = q_ctx.var("v");
+    assert_eq!((qk, qv), (v_k, v_v));
+    q_ctx.mem_limit = 270_000;
+    let s_q = q_ctx.intern_value(&Value::Str("abcdefgh".into()));
+    let mut q_table = Table::new(vec![qk, qv]);
+    for i in 0..n {
+        q_table.push_row(&[int(&q_ctx, (i % 2_000) as i64), s_q]);
+    }
+    let (par_q, _) = run_whole_in_pool(4, &q_ctx, &q_table, &[], &concat_expr_agg, false).unwrap();
+    q_ctx
+        .check()
+        .expect("no sticky memory_failure under query limit");
+    assert_tables_exact_eq_cross_ctx(
+        &q_ctx,
+        &par_q,
+        &base_ctx,
+        &seq_ungrouped,
+        "ungrouped concat query limit",
+    );
+
+    // Server memory pool limit
+    let pool = super::pool::QueryPool::new(270_000);
+    let grant = std::sync::Arc::new(pool.empty_grant());
+    let mut p_ctx = ctx();
+    let pk = p_ctx.var("k");
+    let pv = p_ctx.var("v");
+    assert_eq!((pk, pv), (v_k, v_v));
+    p_ctx.set_grant(Some(grant));
+    let s_p = p_ctx.intern_value(&Value::Str("abcdefgh".into()));
+    let mut p_table = Table::new(vec![pk, pv]);
+    for i in 0..n {
+        p_table.push_row(&[int(&p_ctx, (i % 2_000) as i64), s_p]);
+    }
+    let (par_p, _) = run_whole_in_pool(4, &p_ctx, &p_table, &[], &concat_expr_agg, false).unwrap();
+    p_ctx
+        .check()
+        .expect("no sticky memory_failure under server pool limit");
+    assert_tables_exact_eq_cross_ctx(
+        &p_ctx,
+        &par_p,
+        &base_ctx,
+        &seq_ungrouped,
+        "ungrouped concat pool limit",
+    );
+
+    // 2. Hash-partitioned GROUP_CONCAT(?k) over 4,000 groups with distinct result strings:
+    // ~520 KiB of finalized local terms fit sequentially once slots drop, while holding
+    // `_order_charge` (~48 KiB) + output (~64 KiB) + finalized terms exceeds 550 KiB.
+    // Hash Pass 3 must refuse BEFORE calling infallible `finish()`, falling back cleanly
+    // without latching `ctx.memory_failure` under both query and server pool limits.
+    let mut distinct_tbl = Table::new(vec![0]);
+    for i in 0..n {
+        distinct_tbl.push_row(&[int(&base_ctx, 10_000 + (i % 4_000) as i64)]);
+    }
+    let concat_key_agg = vec![(
+        10,
+        Agg {
+            func: AggregateFunction::GroupConcat {
+                separator: Some("----".into()),
+            },
+            expr: Some(super::expr::Expr::Var(0)),
+            distinct: false,
+            fold: None,
+            registered: None,
+        },
+    )];
+    let (seq_grouped, _) =
+        run_whole_in_pool(1, &base_ctx, &distinct_tbl, &[0], &concat_key_agg, false).unwrap();
+
+    let mut hq_ctx = ctx();
+    hq_ctx.mem_limit = 550_000;
+    let (par_hq, _) =
+        run_whole_in_pool(4, &hq_ctx, &distinct_tbl, &[0], &concat_key_agg, false).unwrap();
+    hq_ctx
+        .check()
+        .expect("hash fallback must not latch query memory_failure");
+    assert_tables_exact_eq_cross_ctx(
+        &hq_ctx,
+        &par_hq,
+        &base_ctx,
+        &seq_grouped,
+        "hash concat query limit",
+    );
+
+    let hpool = super::pool::QueryPool::new(550_000);
+    let hgrant = std::sync::Arc::new(hpool.empty_grant());
+    let mut hp_ctx = ctx();
+    hp_ctx.set_grant(Some(hgrant));
+    let (par_hp, _) =
+        run_whole_in_pool(4, &hp_ctx, &distinct_tbl, &[0], &concat_key_agg, false).unwrap();
+    hp_ctx
+        .check()
+        .expect("hash fallback must not latch server memory_failure");
+    assert_tables_exact_eq_cross_ctx(
+        &hp_ctx,
+        &par_hp,
+        &base_ctx,
+        &seq_grouped,
+        "hash concat pool limit",
+    );
+}
+
+#[test]
+fn hash_path_admits_bucket_capacities_and_combined_assembly_peak() {
+    // 1. Skewed radix buckets: 2 workers, 4 partitions, 65,538 rows, 2 keys landing in
+    // the same bucket, non-mergeable ARQ STDEV(?v) so the hash path is selected while
+    // sequential needs only 262 KiB of slots. Budget 600,000 B is above the old
+    // 528,912 B underestimate and below the 622,592 B retained bucket capacity, so
+    // parallel radix must refuse admission and fall back cleanly to sequential.
+    let base_ctx = ctx();
+    let k0 = int(&base_ctx, 0);
+    let mut k1 = int(&base_ctx, 1);
+    let mix = |mut x: u64| {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    };
+    let target_bucket = (mix(k0.0) as usize) & 3;
+    for candidate in 1..1000i64 {
+        let id = int(&base_ctx, candidate);
+        if ((mix(id.0) as usize) & 3) == target_bucket {
+            k1 = id;
+            break;
+        }
+    }
+    let n = 65_538usize;
+    let mut skewed = Table::new(vec![0, 1]);
+    for i in 0..n {
+        let k = if i < n / 2 { k0 } else { k1 };
+        skewed.push_row(&[k, int(&base_ctx, (i % 31) as i64)]);
+    }
+    let stdev_iri = oxrdf::NamedNode::new(format!(
+        "{}stdev",
+        spargebra::algebra::ARQ_AGGREGATE_NAMESPACE
+    ))
+    .unwrap();
+    let non_mergeable_aggs = vec![(
+        10,
+        Agg {
+            func: AggregateFunction::Custom(stdev_iri),
+            expr: Some(super::expr::Expr::Var(1)),
+            distinct: false,
+            fold: None,
+            registered: None,
+        },
+    )];
+    let (seq, _) =
+        run_whole_in_pool(1, &base_ctx, &skewed, &[0], &non_mergeable_aggs, false).unwrap();
+    let mut tight = ctx();
+    tight.mem_limit = 600_000;
+    let (par, _) = run_whole_in_pool(2, &tight, &skewed, &[0], &non_mergeable_aggs, false).unwrap();
+    assert_tables_exact_eq(&base_ctx, &par, &seq, "skewed radix bucket admission");
+    assert!(tight.mem_peak() <= 600_000);
+
+    // 2. Hash assembly combined peak: 100,000 unique keys, width 2 -> Pass 1 (~1.34 MB)
+    // and Pass 2 (~2.63 MB) fit under 2.70 MB, and in Pass 3 `order_map` (1.20 MB) and
+    // `output` (1.60 MB) each fit alone, but combined `order_map + output` (2.80 MB)
+    // exceeds 2.70 MB and must refuse and fall back cleanly to sequential (~2.00 MB).
+    let m = 100_000usize;
+    let mut wide = Table::new(vec![0]);
+    for i in 0..m {
+        wide.push_row(&[int(&base_ctx, i as i64)]);
+    }
+    let count_aggs = vec![(10, agg(AggregateFunction::Count, false, false))];
+    let (seq_w, _) = run_whole_in_pool(1, &base_ctx, &wide, &[0], &count_aggs, false).unwrap();
+    let mut asm_ctx = ctx();
+    asm_ctx.mem_limit = 2_700_000;
+    let (par_w, _) = run_whole_in_pool(2, &asm_ctx, &wide, &[0], &count_aggs, false).unwrap();
+    assert_tables_exact_eq(&base_ctx, &par_w, &seq_w, "hash assembly combined peak");
+    // `check_output` records the attempted combined peak (`order_map + output = 2,800,064`)
+    // before refusing and triggering the sequential fallback, proving Pass 3 admitted
+    // `order_map + output` together rather than checking output before `order_map`.
+    assert!(
+        asm_ctx.mem_peak() >= 2_800_000,
+        "expected combined assembly peak check >= 2,800,000, got {}",
+        asm_ctx.mem_peak()
+    );
+}
+
+#[test]
+fn decimal_sum_box_is_charged_in_running_add_and_merge() {
+    let ctx = ctx();
+    let dec_box = super::exec::DECIMAL_SUM_BYTES;
+    assert!(dec_box >= 96, "DecimalSum box size should be tracked");
+    let sum_agg = agg(AggregateFunction::Sum, true, false);
+
+    // add_batch reports Box<DecimalSum> growth once per group transitioning to decimal.
+    let mut acc = Running::new(&sum_agg, true);
+    acc.init(2);
+    fold(&ctx, &mut acc, &[int(&ctx, 1), int(&ctx, 2)], &[0, 1]);
+    assert_eq!(acc.take_growth(), 0);
+    fold(&ctx, &mut acc, &[dec_str(&ctx, "1.5")], &[0]);
+    assert_eq!(acc.take_growth(), dec_box);
+    fold(&ctx, &mut acc, &[dec_str(&ctx, "2.5")], &[0]);
+    assert_eq!(acc.take_growth(), 0);
+    fold(&ctx, &mut acc, &[dec_str(&ctx, "3.5")], &[1]);
+    assert_eq!(acc.take_growth(), dec_box);
+
+    // merge reports Box<DecimalSum> growth on empty-left adoption and Int->Decimal promotion,
+    // and reports 0 when left already owns a DecimalSum box or overflows.
+    let (mut left, mut right) = (Running::new(&sum_agg, true), Running::new(&sum_agg, true));
+    left.init(4);
+    right.init(4);
+    // Group 0: empty + Decimal -> adopts box (+dec_box)
+    // Group 1: Int + Decimal -> promotes to Decimal (+dec_box)
+    // Group 2: Decimal + Decimal -> reuses left box (+0)
+    // Group 3: Int(i64::MAX) + Decimal(MAX) -> overflows to Overflow (+0)
+    fold(
+        &ctx,
+        &mut left,
+        &[int(&ctx, 10), dec_str(&ctx, "1.0"), int(&ctx, i64::MAX)],
+        &[1, 2, 3],
+    );
+    let _ = left.take_growth();
+    fold(
+        &ctx,
+        &mut right,
+        &[
+            dec_str(&ctx, "1.0"),
+            dec_str(&ctx, "2.0"),
+            dec_str(&ctx, "3.0"),
+            dec(&ctx, i128::MAX),
+        ],
+        &[0, 1, 2, 3],
+    );
+    let _ = right.take_growth();
+    left.merge(&ctx, &mut right, &[0, 1, 2, 3]).unwrap();
+    assert_eq!(left.take_growth(), dec_box * 2);
+
+    // Retracted decimal prefix in right side must be refused for (Int, Decimal).
+    let (mut l_ret, mut r_ret) = (Running::new(&sum_agg, true), Running::new(&sum_agg, true));
+    l_ret.init(1);
+    r_ret.init(1);
+    fold(&ctx, &mut l_ret, &[int(&ctx, 5)], &[0]);
+    fold(&ctx, &mut r_ret, &[int(&ctx, 10)], &[0]);
+    let t = Table::new(vec![0]);
+    let ret_vals = [int(&ctx, 10)];
+    let batch = Batch {
+        table: &t,
+        arg: Arg::Column(&ret_vals),
+        rows: None,
+        base: 0,
+    };
+    assert!(r_ret.retract(&ctx, &batch, &[0]).unwrap());
+    fold(&ctx, &mut r_ret, &[dec_str(&ctx, "1.5")], &[0]);
+    assert!(matches!(
+        l_ret.merge(&ctx, &mut r_ret, &[0]),
+        Err(crate::error::Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn merge_refuses_repeated_and_out_of_bounds_destinations_atomically() {
+    let ctx = ctx();
+    let sum_agg = agg(AggregateFunction::Sum, true, false);
+    let (mut left, mut right) = (Running::new(&sum_agg, false), Running::new(&sum_agg, false));
+    left.init(1);
+    right.init(2);
+    fold(
+        &ctx,
+        &mut right,
+        &[dbl(&ctx, 1e16), dbl(&ctx, 1.0), dbl(&ctx, 1.0)],
+        &[0, 1, 1],
+    );
+    // Repeated destination [0, 0] must refuse before taking/mutating either side.
+    assert!(matches!(
+        left.merge(&ctx, &mut right, &[0, 0]),
+        Err(crate::error::Error::Unsupported(_))
+    ));
+    assert_eq!(results(&ctx, &mut left, 1), vec!["0"]);
+    assert_eq!(
+        exact_key(&ctx, right.finish(&ctx, 0).unwrap()),
+        exact_key(&ctx, dbl(&ctx, 1e16))
+    );
+    assert_eq!(
+        exact_key(&ctx, right.finish(&ctx, 1).unwrap()),
+        exact_key(&ctx, dbl(&ctx, 2.0))
+    );
+
+    // Out-of-bounds destination on Running and repeated destination on Concat.
+    let (mut l2, mut r2) = (Running::new(&sum_agg, false), Running::new(&sum_agg, false));
+    l2.init(1);
+    r2.init(1);
+    fold(&ctx, &mut r2, &[int(&ctx, 7)], &[0]);
+    assert!(matches!(
+        l2.merge(&ctx, &mut r2, &[1]),
+        Err(crate::error::Error::Unsupported(_))
+    ));
+    assert_eq!(results(&ctx, &mut r2, 1), vec!["7"]);
+
+    let concat_agg = agg(
+        AggregateFunction::GroupConcat {
+            separator: Some(",".into()),
+        },
+        true,
+        false,
+    );
+    let (mut cl, mut cr) = (Concat::new(&concat_agg), Concat::new(&concat_agg));
+    cl.init(1);
+    cr.init(2);
+    let sa = ctx.intern_value(&Value::Str("a".into()));
+    let sb = ctx.intern_value(&Value::Str("b".into()));
+    fold(&ctx, &mut cr, &[sa, sb], &[0, 1]);
+    assert!(matches!(
+        cl.merge(&ctx, &mut cr, &[0, 0]),
+        Err(crate::error::Error::Unsupported(_))
+    ));
+    assert_eq!(results(&ctx, &mut cr, 2), vec!["a", "b"]);
+}
+
+#[test]
+fn hash_assembly_sort_and_key_only_group_poll_cancellation_and_timeout() {
+    // 1. Direct verification of cancellable in-place sort_order_map correctness & cancel.
+    let ctx_ok = ctx();
+    let mut map: Vec<(u32, u16, u32)> = (0..25_000u32)
+        .map(|i| ((i.wrapping_mul(2654435761)) % 100_003, (i % 16) as u16, i))
+        .collect();
+    // Deduplicate first_row keys while keeping > 16,384 unique entries.
+    let mut seen = rustc_hash::FxHashSet::default();
+    map.retain(|&(r, _, _)| seen.insert(r));
+    let mut expected = map.clone();
+    expected.sort_unstable_by_key(|&(r, _, _)| r);
+    let max_row = map.iter().map(|&(r, _, _)| r).max().unwrap_or(0);
+    super::group::par::sort_order_map(&ctx_ok, &mut map, max_row).unwrap();
+    assert_eq!(map, expected);
+
+    // Cancelled context aborts sort_order_map immediately.
+    let mut cancel_ctx = ctx();
+    cancel_ctx.cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let err = super::group::par::sort_order_map(&cancel_ctx, &mut map, max_row).unwrap_err();
+    assert!(matches!(err, crate::error::Error::Cancelled));
+
+    // 2. Key-only GROUP BY (no aggregate columns) with expired deadline reports Timeout.
+    let n = 20_000usize;
+    let mut table = Table::new(vec![0]);
+    for i in 0..n {
+        table.push_row(&[int(&ctx_ok, i as i64)]);
+    }
+    let (seq, _) = run_whole_in_pool(1, &ctx_ok, &table, &[0], &[], false).unwrap();
+    let (par, _) = run_whole_in_pool(4, &ctx_ok, &table, &[0], &[], false).unwrap();
+    assert_tables_exact_eq(&ctx_ok, &par, &seq, "key-only parallel GROUP BY");
+
+    let mut timeout_ctx = ctx();
+    timeout_ctx.deadline = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    let err = run_whole_in_pool(4, &timeout_ctx, &table, &[0], &[], false).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::Timeout),
+        "expected Timeout, got {err:?}"
+    );
+}
+
+#[test]
+fn parallel_expr_cache_report_matches_sequential_at_threshold_boundary() {
+    let n = super::exec::PAR_THRESHOLD;
+    let base_ctx = ctx();
+    let v_id = base_ctx.var("v");
+    let mut table = Table::new(vec![v_id]);
+    let v0 = int(&base_ctx, 42);
+    for _ in 0..n {
+        table.push_row(&[v0]);
+    }
+    let expr = super::expr::Expr::Arith(
+        Box::new(super::expr::Expr::Var(v_id)),
+        Box::new(super::expr::Expr::Const(int(&base_ctx, 1))),
+        super::expr::ArithOp::Add,
+    );
+    let aggs = vec![(
+        10,
+        Agg {
+            func: AggregateFunction::Sum,
+            expr: Some(expr),
+            distinct: false,
+            fold: None,
+            registered: None,
+        },
+    )];
+
+    // Enough headroom for expr_scratch + exprcache (128 * n + 1024), but less than
+    // expr_scratch + exprcache + sequential slot charge (4 * n + 64).
+    let expr_scratch = n as u64 * 8 + 64;
+    let cache_res = n as u64 * 128 + 1024;
+    let slots = n as u64 * 4 + 64;
+    let limit = expr_scratch + cache_res + slots / 2;
+
+    let mut seq_ctx = ctx();
+    assert_eq!(seq_ctx.var("v"), v_id);
+    seq_ctx.mem_limit = limit;
+    let mut par_ctx = ctx();
+    assert_eq!(par_ctx.var("v"), v_id);
+    par_ctx.mem_limit = limit;
+
+    let (seq, seq_rep) = run_whole_in_pool(1, &seq_ctx, &table, &[], &aggs, false).unwrap();
+    let (par, par_rep) = run_whole_in_pool(4, &par_ctx, &table, &[], &aggs, false).unwrap();
+    assert_tables_exact_eq(&base_ctx, &par, &seq, "expr-cache threshold parity");
+    assert_eq!(seq_rep.note(), None, "sequential declines cache admission");
+    assert_eq!(
+        par_rep.note(),
+        seq_rep.note(),
+        "parallel and sequential ExprReport must match under tight exprcache headroom"
+    );
+
+    // With room for slots + expr_scratch + cache_res, both strategies admit reuse.
+    let mut seq_ok = ctx();
+    assert_eq!(seq_ok.var("v"), v_id);
+    seq_ok.mem_limit = limit + slots;
+    let mut par_ok = ctx();
+    assert_eq!(par_ok.var("v"), v_id);
+    par_ok.mem_limit = limit + slots;
+    let (_, seq_rep_ok) = run_whole_in_pool(1, &seq_ok, &table, &[], &aggs, false).unwrap();
+    let (_, par_rep_ok) = run_whole_in_pool(4, &par_ok, &table, &[], &aggs, false).unwrap();
+    assert!(seq_rep_ok.note().is_some());
+    assert_eq!(par_rep_ok.note(), seq_rep_ok.note());
+}
+
+#[test]
+fn parallel_range_split_row_limits_and_charged_fallback() {
+    let n = 16_384usize;
+    let base_ctx = ctx();
+    let mut table = Table::new(vec![0, 1]);
+    for i in 0..n {
+        table.push_row(&[int(&base_ctx, (i % 20) as i64), int(&base_ctx, 1)]);
+    }
+    let aggs = vec![(
+        10,
+        Agg {
+            func: AggregateFunction::Sum,
+            expr: Some(super::expr::Expr::Var(1)),
+            distinct: false,
+            fold: None,
+            registered: None,
+        },
+    )];
+
+    // 1. max_rows enforced in range-split Pass 1.
+    let mut rows_ctx = ctx();
+    rows_ctx.max_rows = 5;
+    let err = run_whole_in_pool(4, &rows_ctx, &table, &[0], &aggs, false).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Rows
+        ),
+        "expected BudgetKind::Rows, got {err:?}"
+    );
+
+    // 2. max_rows_produced enforced in range-split Pass 1.
+    let mut prod_ctx = ctx();
+    prod_ctx.max_rows_produced = 5;
+    let err = run_whole_in_pool(4, &prod_ctx, &table, &[0], &aggs, false).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::RowsProduced
+        ),
+        "expected BudgetKind::RowsProduced, got {err:?}"
+    );
+
+    // 3. charged = true (`into_shared()`) fallback under tight memory succeeds when
+    // sequential fits, and returns unlatched BudgetKind::Memory when even sequential
+    // does not fit (so group_or_spill can partition to disk).
+    let mut high_table = Table::new(vec![0, 1]);
+    for i in 0..n {
+        high_table.push_row(&[int(&base_ctx, (i % 400) as i64), int(&base_ctx, 1)]);
+    }
+    let (seq, _) = run_whole_in_pool(1, &base_ctx, &high_table, &[0], &aggs, false).unwrap();
+
+    let mut fit_ctx = ctx();
+    fit_ctx.mem_limit = 220_000;
+    let fit_shared = fit_ctx.into_shared();
+    let (par_fit, _) = run_whole_in_pool(4, &fit_shared, &high_table, &[0], &aggs, true).unwrap();
+    fit_shared
+        .check()
+        .expect("charged fallback must not latch memory_failure");
+    assert_tables_exact_eq(&base_ctx, &par_fit, &seq, "charged=true fallback");
+
+    let mut spill_ctx = ctx();
+    spill_ctx.mem_limit = 32_000;
+    let spill_shared = spill_ctx.into_shared();
+    let err = run_whole_in_pool(4, &spill_shared, &high_table, &[0], &aggs, true).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+        ),
+        "expected BudgetKind::Memory for spill handoff, got {err:?}"
+    );
+    spill_shared
+        .check()
+        .expect("refused charged grouping must not latch sticky memory_failure");
 }

@@ -24,7 +24,7 @@
 use super::acc::{Accumulator, Arg, Batch, Concat, Distinct, RowIndex, Rows, Running};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::sparql::ctx::{Ctx, RetainedCharge};
+use crate::sparql::ctx::{Charge, Ctx, RetainedCharge};
 use crate::sparql::exec::{compute_column, stat_aggregate};
 use crate::sparql::expr::Expr;
 use crate::sparql::exprcache::Report as ExprReport;
@@ -623,15 +623,24 @@ impl Grouping {
             col.reserve_exact(n);
         }
         for k in 0..nk {
-            out.cols[k].extend((self.at..self.at + n).map(|g| self.order[g * nk + k]));
+            for (i, g) in (self.at..self.at + n).enumerate() {
+                if i.is_multiple_of(4_096) {
+                    ctx.check()?;
+                }
+                out.cols[k].push(self.order[g * nk + k]);
+            }
         }
         for (a, acc) in self.accs.iter_mut().enumerate() {
             ctx.check()?;
-            for g in self.at..self.at + n {
+            for (i, g) in (self.at..self.at + n).enumerate() {
+                if i.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
                 let id = acc.finish(ctx, g)?;
                 out.cols[nk + a].push(id);
             }
         }
+        ctx.check()?;
         out.len = n;
         self.at += n;
         Ok(Some(out))
@@ -669,14 +678,22 @@ pub(super) fn whole_sequential_with_computed(
     charged: bool,
     eager: bool,
     vars: &[VarId],
-    computed: &[Option<Vec<Id>>],
+    computed: Vec<Option<Vec<Id>>>,
+    expr_scratch: Option<Charge<'_>>,
 ) -> Result<Table> {
     let mut grouping = Grouping::new(ctx, keys, aggs, &table.vars, charged, false)?;
-    grouping.eager = eager;
+    // While `expr_scratch` is still held, enforce row limits in `slots()` and defer the
+    // memory half of `check_output` until after expression scratch and slots drop.
+    grouping.eager = false;
     if grouping.only_counts_rows() {
         grouping.count_rows(table.len as u64);
     } else {
-        grouping.add_with_computed(ctx, table, computed)?;
+        grouping.add_with_computed(ctx, table, &computed)?;
+    }
+    drop(computed);
+    drop(expr_scratch);
+    if eager {
+        ctx.check_output(grouping.groups, vars.len())?;
     }
     Ok(grouping
         .output(ctx, vars, usize::MAX)?
