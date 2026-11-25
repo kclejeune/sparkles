@@ -280,6 +280,13 @@ while `str-pair-names` takes 5.3% longer in streaming and 9.7% longer in eager e
 The names query's table grows from its first 2^16 slots during the query. On wally, a
 first table as large as the vocabulary's clamp closed that gap but made `str-pair-lt`,
 whose table never grows, 1.5% slower in streaming and 2.2% in eager execution, and item 1140 follows the cost of the growth.
+Item 1140 sizes the first table from a stack-allocated stratified sample of the first
+eligible mask's two columns, clamped to the vocabulary's strings, the cache cap and the
+remaining memory budget, stepping down by halves to 2^10 slots before refusing, so
+small-distinct and one-unique-column inputs stay compact while large repeating inputs
+pre-size without growth. When a table does grow, live entries are copied directly into
+the replacement table before publication so lookups probe only the current table. The
+timing comparison is pending.
 
 `str-pair-colleague` holds 30,077 and 25,967 distinct names in its 30,077 rows, so its
 floors are nearly all computed once, and in streaming execution they cost more than

@@ -5813,6 +5813,184 @@ static STRING_ORDER_MASKS: AtomicUsize = AtomicUsize::new(0);
 /// The rows whose values the first test of [`string_order_mask`] reads.
 const STRING_ORDER_SAMPLE: usize = 64;
 
+/// Stratified sample rows used to size the first shared floor table without heap allocation.
+const FLOOR_ESTIMATE_SAMPLE: usize = 1024;
+
+/// Distinct count and frequency counts `(distinct, singletons, doubletons)` of a sorted
+/// non-empty slice of raw ids.
+fn sorted_id_freq(sorted: &[u64]) -> (usize, usize, usize) {
+    let (mut d, mut f1, mut f2) = (0, 0, 0);
+    let mut i = 0;
+    while i < sorted.len() {
+        let v = sorted[i];
+        let start = i;
+        while i < sorted.len() && sorted[i] == v {
+            i += 1;
+        }
+        d += 1;
+        match i - start {
+            1 => f1 += 1,
+            2 => f2 += 1,
+            _ => {}
+        }
+    }
+    (d, f1, f2)
+}
+
+/// Combined `(distinct, singletons, doubletons, cross_overlap)` across two sorted slices
+/// of raw ids in one linear merge without allocation.
+fn merged_id_freq(a: &[u64], b: &[u64]) -> (usize, usize, usize, usize) {
+    let (mut d, mut f1, mut f2, mut cross) = (0, 0, 0, 0);
+    let (mut ia, mut ib) = (0, 0);
+    while ia < a.len() || ib < b.len() {
+        let v = match (a.get(ia), b.get(ib)) {
+            (Some(&va), Some(&vb)) => va.min(vb),
+            (Some(&va), None) => va,
+            (None, Some(&vb)) => vb,
+            (None, None) => break,
+        };
+        let mut ca = 0;
+        while ia < a.len() && a[ia] == v {
+            ca += 1;
+            ia += 1;
+        }
+        let mut cb = 0;
+        while ib < b.len() && b[ib] == v {
+            cb += 1;
+            ib += 1;
+        }
+        d += 1;
+        if ca > 0 && cb > 0 {
+            cross += 1;
+        }
+        match ca + cb {
+            1 => f1 += 1,
+            2 => f2 += 1,
+            _ => {}
+        }
+    }
+    (d, f1, f2, cross)
+}
+
+/// Estimate `(distinct, has_repeats)` for one column of `n` rows from a stratified sample
+/// of `s` rows with adjacent-repeat count `adj`.
+fn col_distinct_estimate(
+    n: usize,
+    s: usize,
+    d: usize,
+    f1: usize,
+    f2: usize,
+    adj: usize,
+) -> (usize, bool) {
+    if f1 == d && adj == 0 {
+        return (n, false);
+    }
+    let run_est = if adj > 0 {
+        n.saturating_mul(s.saturating_sub(adj))
+            .checked_div(s)
+            .unwrap_or(1)
+            .max(1)
+    } else {
+        n
+    };
+    let chao = if f1 < d {
+        d.saturating_add(f1.saturating_mul(f1.saturating_sub(1)) / (2 * (f2 + 1)))
+    } else {
+        run_est
+    };
+    (chao.min(run_est).min(n).max(d), true)
+}
+
+/// Estimate the initial slot count of the shared floor table from a stack-allocated
+/// stratified sample of `(xs, ys)`.
+///
+/// Inputs whose strings are few or never repeat stay compact so small queries avoid
+/// over-allocating. Inputs with one non-repeating column and one small repeating column
+/// (such as a unique person name compared against a handful of cities) size a compact table
+/// wide enough that non-repeating writes do not trigger spurious growth. Large inputs with
+/// many repeating strings pre-size directly to avoid growth migrations and recomputations.
+fn estimate_floor_slots(xs: &[Id], ys: &[Id]) -> usize {
+    use super::ctx::{FLOOR_TABLE_FEWEST, FLOOR_TABLE_FIRST};
+    let n = xs.len().min(ys.len());
+    let s = FLOOR_ESTIMATE_SAMPLE.min(n);
+    if s == 0 {
+        return FLOOR_TABLE_FEWEST;
+    }
+    let mut bx = [0u64; FLOOR_ESTIMATE_SAMPLE];
+    let mut by = [0u64; FLOOR_ESTIMATE_SAMPLE];
+    let (mut adj_x, mut adj_y) = (0usize, 0usize);
+    for k in 0..s {
+        let lo = k * n / s;
+        let hi = (k + 1) * n / s;
+        let r = (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11;
+        let i = lo + (r % (hi - lo) as u64) as usize;
+        let (x, y) = (xs[i], ys[i]);
+        bx[k] = x.0;
+        by[k] = y.0;
+        if i + 1 < n {
+            adj_x += usize::from(xs[i + 1] == x);
+            adj_y += usize::from(ys[i + 1] == y);
+        }
+    }
+    let sx = &mut bx[..s];
+    let sy = &mut by[..s];
+    sx.sort_unstable();
+    sy.sort_unstable();
+    let (dx, f1x, f2x) = sorted_id_freq(sx);
+    let (dy, f1y, f2y) = sorted_id_freq(sy);
+    let (d_all, f1_all, f2_all, cross) = merged_id_freq(sx, sy);
+    let (est_x, rep_x) = col_distinct_estimate(n, s, dx, f1x, f2x, adj_x);
+    let (est_y, rep_y) = col_distinct_estimate(n, s, dy, f1y, f2y, adj_y);
+    let max_pow2 = 1usize << (usize::BITS - 1);
+    let round_slots = |target: usize| {
+        target
+            .max(FLOOR_TABLE_FEWEST)
+            .checked_next_power_of_two()
+            .unwrap_or(max_pow2)
+    };
+    if !rep_x && !rep_y && cross == 0 {
+        return FLOOR_TABLE_FEWEST;
+    }
+    if cross == 0 && (rep_x ^ rep_y) {
+        let r = if rep_x { est_x } else { est_y };
+        let writes = n.max(FLOOR_TABLE_FIRST);
+        // Keep expected read-again evictions `writes * r / M` below `M / 32`.
+        let guard = ((32u128)
+            .saturating_mul(writes as u128)
+            .saturating_mul(r as u128)
+            .isqrt() as usize)
+            .saturating_mul(2);
+        return round_slots(r.saturating_mul(4).max(guard.min(FLOOR_TABLE_FIRST)));
+    }
+    let u = if f1_all < d_all {
+        d_all.saturating_add(f1_all.saturating_mul(f1_all.saturating_sub(1)) / (2 * (f2_all + 1)))
+    } else {
+        est_x.saturating_add(est_y)
+    };
+    let cells = n.saturating_mul(2);
+    let u_f = u.max(1) as f64;
+    let lambda = cells as f64 / u_f;
+    let neg_exp = (-lambda).exp();
+    let distinct = ((u_f * (1.0 - neg_exp)).round() as usize)
+        .clamp(d_all, est_x.saturating_add(est_y).min(cells));
+    let poisson_rep = (u_f * (1.0 - neg_exp * (1.0 + lambda))).round() as usize;
+    let local_rep = if adj_x > 0 {
+        est_x.min(n.saturating_sub(est_x))
+    } else {
+        0
+    }
+    .saturating_add(if adj_y > 0 {
+        est_y.min(n.saturating_sub(est_y))
+    } else {
+        0
+    });
+    let repeating = poisson_rep.max(local_rep).min(distinct).min(n);
+    let target = repeating
+        .saturating_mul(4)
+        .max(distinct.saturating_mul(5).min(FLOOR_TABLE_FIRST));
+    round_slots(target)
+}
+
 /// `FILTER(?x < ?y)`, or `<=`, `>` or `>=`, over a table whose values of both variables
 /// are stored simple literals. Their order is read from their base-vocabulary ids and
 /// each string's floor ([`Ctx::string_floor`]), which the query's floor cache keeps for
@@ -5838,6 +6016,16 @@ fn string_order_mask(
         return Ok(None);
     }
     let (xs, ys) = (&t.cols[cx], &t.cols[cy]);
+    if !ctx.may_be_base_literal(xs[0]) {
+        return Ok(None);
+    }
+    if !ctx.may_be_base_literal(ys[0]) {
+        // Check `xs[0]` first so a refused floor decode still reports its failure,
+        // without allocating a floor table or mask buffer for a non-literal second column.
+        let _ = ctx.string_floor(xs[0]);
+        ctx.check_memory_failure()?;
+        return Ok(None);
+    }
     let sample = n.min(STRING_ORDER_SAMPLE);
     ctx.grow_floor_cache();
     let order = |a: Id, b: Id, fa: u64, fb: u64| -> bool {
@@ -5861,7 +6049,11 @@ fn string_order_mask(
     // cache for strings that do not recur.
     let mut keep = Vec::with_capacity(n);
     let strings = {
-        let mut floors = ctx.floor_map();
+        let mut floors = if ctx.floor_cache_needs_init() {
+            ctx.floor_map_for(estimate_floor_slots(xs, ys))
+        } else {
+            ctx.floor_map()
+        };
         (0..sample).all(|i| {
             let (a, b) = (xs[i], ys[i]);
             // the second floor is read only when the first is a string's, as the generic
@@ -11334,6 +11526,300 @@ mod string_order_tests {
                 "cursor {cursor}: the table grew"
             );
             assert!(ctx.check().is_ok(), "cursor {cursor}");
+        }
+    }
+
+    /// A mask over few distinct strings in a large vocabulary starts at a compact floor
+    /// table instead of `FLOOR_TABLE_FIRST`, keeps its charge small, never grows and
+    /// matches direct comparison in both modes.
+    #[test]
+    fn small_distinct_floor_input_uses_compact_initial_table() {
+        use super::super::ctx::{FLOOR_TABLE_FEWEST, FLOOR_TABLE_FIRST, FloorTable};
+        use super::super::expr::CmpOp;
+        let (s, mut ids) = word_store(20_000);
+        // Contiguous vocabulary ids have no direct-mapped collisions in 1,024 slots,
+        // verifying both compact initial sizing and zero spurious growth over 20,000 rows.
+        ids.sort_by_key(|id| id.payload());
+        let small = &ids[..200];
+        let rows = 20_000usize;
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let mut t = Table::new(vec![x, y]);
+            for i in 0..rows {
+                t.push_row(&[small[i % small.len()], small[(i * 7 + 3) % small.len()]]);
+            }
+            let e = cmp(x, y, CmpOp::Lt);
+            let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                .unwrap()
+                .expect("the floors apply");
+            let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic, "cursor {cursor}");
+            let cache = ctx.floor_cache();
+            assert_eq!(
+                cache.slots(),
+                FLOOR_TABLE_FEWEST,
+                "cursor {cursor}: stayed compact below {FLOOR_TABLE_FIRST}"
+            );
+            assert_eq!(
+                cache.used(),
+                FloorTable::bytes(FLOOR_TABLE_FEWEST),
+                "cursor {cursor}: no growth allocations"
+            );
+            assert!(
+                cache.reserved() <= 64 << 10,
+                "cursor {cursor}: compact charge ({})",
+                cache.reserved()
+            );
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+        }
+    }
+
+    /// Comparing one unique string column against a small repeating string column (like
+    /// `str-pair-lt`) allocates a compact table below `FLOOR_TABLE_FIRST`, never grows
+    /// across eager or batched execution and matches direct comparison.
+    #[test]
+    fn one_unique_and_one_small_column_stays_compact_without_growing() {
+        use super::super::ctx::{FLOOR_TABLE_FIRST, FloorTable};
+        use super::super::expr::CmpOp;
+        let unique_rows = 20_000usize;
+        let cities = 10usize;
+        let (s, ids) = word_store(unique_rows + cities);
+        let city_ids = &ids[..cities];
+        let name_ids = &ids[cities..];
+        for (cursor, batched) in [(false, false), (true, true)] {
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 64 << 20;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Lt);
+            let step = if batched {
+                STRING_ORDER_ROWS
+            } else {
+                unique_rows
+            };
+            let mut at = 0;
+            while at + STRING_ORDER_ROWS <= unique_rows {
+                let end = (at + step).min(unique_rows);
+                let mut t = Table::new(vec![x, y]);
+                for i in at..end {
+                    t.push_row(&[name_ids[i], city_ids[i % cities]]);
+                }
+                let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .expect("the floors apply");
+                let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                assert_eq!(mask, generic, "cursor {cursor} batched {batched} at {at}");
+                at = end;
+            }
+            let cache = ctx.floor_cache();
+            assert!(
+                cache.slots() < FLOOR_TABLE_FIRST,
+                "cursor {cursor} batched {batched}: {} slots",
+                cache.slots()
+            );
+            assert_eq!(
+                cache.used(),
+                FloorTable::bytes(cache.slots()),
+                "cursor {cursor} batched {batched}: never grew"
+            );
+            assert!(ctx.check().is_ok(), "cursor {cursor} batched {batched}");
+        }
+    }
+
+    /// A large repeating input whose distinct strings exceed `FLOOR_TABLE_FIRST` pre-sizes
+    /// its initial table cleanly to the vocabulary clamp without growth reallocations or
+    /// repeated floor computations, in both modes and on one or several threads.
+    #[test]
+    fn large_distinct_repeating_input_presizes_without_growth() {
+        use super::super::ctx::{FLOOR_TABLE_FIRST, FloorTable};
+        use super::super::expr::CmpOp;
+        let distinct = 70_000usize;
+        let rows = 3 * distinct;
+        let (s, ids) = word_store(distinct);
+        let expected_slots = s
+            .snapshot()
+            .generation
+            .vocab
+            .first_triple()
+            .next_power_of_two() as usize;
+        assert!(expected_slots > FLOOR_TABLE_FIRST);
+        // Reference mask computed once to keep debug-mode runtime short.
+        let ref_ctx = Ctx::new(s.snapshot());
+        let (rx, ry) = (ref_ctx.var("x"), ref_ctx.var("y"));
+        let mut ref_t = Table::new(vec![rx, ry]);
+        for i in 0..rows {
+            ref_t.push_row(&[ids[i % distinct], ids[(i * 13 + 7) % distinct]]);
+        }
+        let ref_e = cmp(rx, ry, CmpOp::Lt);
+        let generic = evaluate_mask(&ref_ctx, &ref_t, std::slice::from_ref(&ref_e), None).unwrap();
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for cursor in [false, true] {
+                    let mut ctx = Ctx::new(s.snapshot());
+                    ctx.mem_limit = 256 << 20;
+                    if cursor {
+                        ctx.enable_cursor_accounting().unwrap();
+                    }
+                    let (x, y) = (ctx.var("x"), ctx.var("y"));
+                    let mut t = Table::new(vec![x, y]);
+                    t.cols[0].clone_from(&ref_t.cols[0]);
+                    t.cols[1].clone_from(&ref_t.cols[1]);
+                    t.len = ref_t.len;
+                    let e = cmp(x, y, CmpOp::Lt);
+                    let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                        .unwrap()
+                        .expect("the floors apply");
+                    assert_eq!(mask, generic, "threads {threads} cursor {cursor}");
+                    let cache = ctx.floor_cache();
+                    assert_eq!(
+                        cache.slots(),
+                        expected_slots,
+                        "threads {threads} cursor {cursor}: pre-sized directly"
+                    );
+                    assert_eq!(
+                        cache.used(),
+                        FloorTable::bytes(expected_slots),
+                        "threads {threads} cursor {cursor}: single allocation, no growth"
+                    );
+                    if threads == 1 {
+                        assert_eq!(
+                            cache.computed(),
+                            distinct,
+                            "cursor {cursor}: zero evicted recomputations"
+                        );
+                    }
+                    assert!(ctx.check().is_ok(), "threads {threads} cursor {cursor}");
+                }
+            });
+        }
+    }
+
+    /// Tight memory budgets refuse or clamp an oversized estimated initial table before
+    /// allocation without recording a query failure, preserving exact parity with direct
+    /// comparison in both eager and cursor modes.
+    #[test]
+    fn tight_memory_budget_refuses_or_clamps_oversized_initial_table() {
+        use super::super::ctx::{FLOOR_TABLE_FEWEST, FloorTable};
+        use super::super::expr::CmpOp;
+        let distinct = 70_000usize;
+        let rows = 3 * distinct;
+        let (s, ids) = word_store(distinct);
+        let ref_ctx = Ctx::new(s.snapshot());
+        let (rx, ry) = (ref_ctx.var("x"), ref_ctx.var("y"));
+        let mut ref_t = Table::new(vec![rx, ry]);
+        for i in 0..rows {
+            ref_t.push_row(&[ids[i % distinct], ids[(i * 13 + 7) % distinct]]);
+        }
+        let ref_e = cmp(rx, ry, CmpOp::Lt);
+        let generic = evaluate_mask(&ref_ctx, &ref_t, std::slice::from_ref(&ref_e), None).unwrap();
+        let full_slots = s
+            .snapshot()
+            .generation
+            .vocab
+            .first_triple()
+            .next_power_of_two() as usize;
+        assert!(estimate_floor_slots(&ref_t.cols[0], &ref_t.cols[1]) >= full_slots);
+
+        for cursor in [false, true] {
+            // (a) Small cache cap clamps initial table before allocation.
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 4 << 20;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let cap = ctx.mem_limit / 16;
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let mut t = Table::new(vec![x, y]);
+                t.cols[0].clone_from(&ref_t.cols[0]);
+                t.cols[1].clone_from(&ref_t.cols[1]);
+                t.len = ref_t.len;
+                let e = cmp(x, y, CmpOp::Lt);
+                let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .expect("the floors apply");
+                assert_eq!(mask, generic, "cap clamp cursor {cursor}");
+                let cache = ctx.floor_cache();
+                assert!(cache.slots() >= FLOOR_TABLE_FEWEST && cache.slots() < full_slots);
+                assert!(cache.used() <= cap, "cursor {cursor}");
+                assert!(cache.reserved() <= cap, "cursor {cursor}");
+                assert!(ctx.check().is_ok(), "cursor {cursor}");
+            }
+
+            // (b) Remaining room smaller than one reservation step refuses allocation
+            // cleanly with zero reserved bytes and exact mask parity.
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 64 << 20;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let mut t = Table::new(vec![x, y]);
+                t.cols[0].clone_from(&ref_t.cols[0]);
+                t.cols[1].clone_from(&ref_t.cols[1]);
+                t.len = ref_t.len;
+                let e = cmp(x, y, CmpOp::Lt);
+                // 32 KiB leaves headroom for decoding short keys, not for a 64 KiB step.
+                let room = 32 << 10;
+                let held = ctx.charge(ctx.mem_limit - ctx.live_bytes() - room).unwrap();
+                let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .expect("the floors apply");
+                assert_eq!(mask, generic, "refused initial cursor {cursor}");
+                let cache = ctx.floor_cache();
+                assert_eq!(cache.slots(), 0, "cursor {cursor}: refused before alloc");
+                assert_eq!(cache.used(), 0, "cursor {cursor}");
+                assert_eq!(cache.reserved(), 0, "cursor {cursor}");
+                assert!(ctx.check().is_ok(), "cursor {cursor}");
+                drop(held);
+            }
+
+            // (c) Remaining room smaller than the estimated 1 MiB table steps down to a
+            // smaller admitted table without allocating the oversized table.
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 64 << 20;
+                if cursor {
+                    ctx.enable_cursor_accounting().unwrap();
+                }
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let mut t = Table::new(vec![x, y]);
+                t.cols[0].clone_from(&ref_t.cols[0]);
+                t.cols[1].clone_from(&ref_t.cols[1]);
+                t.len = ref_t.len;
+                let e = cmp(x, y, CmpOp::Lt);
+                let room = 200 << 10;
+                let held = ctx.charge(ctx.mem_limit - ctx.live_bytes() - room).unwrap();
+                let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                    .unwrap()
+                    .expect("the floors apply");
+                assert_eq!(mask, generic, "stepped-down initial cursor {cursor}");
+                let cache = ctx.floor_cache();
+                assert!(
+                    cache.slots() >= FLOOR_TABLE_FEWEST && cache.slots() < full_slots,
+                    "cursor {cursor}: stepped down to {} slots",
+                    cache.slots()
+                );
+                assert!(
+                    FloorTable::bytes(cache.slots()) <= room,
+                    "cursor {cursor}: fits remaining room"
+                );
+                assert!(cache.reserved() <= room, "cursor {cursor}");
+                assert!(ctx.check().is_ok(), "cursor {cursor}");
+                drop(held);
+            }
         }
     }
 }
