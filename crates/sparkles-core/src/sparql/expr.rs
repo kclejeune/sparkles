@@ -997,10 +997,11 @@ fn s(v: impl Into<Arc<str>>) -> Val {
     Val::V(Value::Str(v.into()))
 }
 
-/// Result string with the same "string-ness" (lang tag) as the argument.
-fn same_kind(lang: Option<&str>, v: String) -> Val {
+/// Result string with the same "string-ness" (language tag and base direction) as the argument.
+fn same_kind(lang: super::value::StringLang<'_>, v: String) -> Val {
     match lang {
-        Some(l) => Val::V(Value::Lang(v.into(), l.into())),
+        Some((l, Some(d))) => Val::V(Value::LangDir(v.into(), l.into(), d)),
+        Some((l, None)) => Val::V(Value::Lang(v.into(), l.into())),
         None => s(v),
     }
 }
@@ -1031,11 +1032,11 @@ pub(crate) fn arg<'r>(
     }
 }
 
-/// SPARQL 17.4.3.1.2 argument compatibility.
-pub(crate) fn compatible(a: Option<&str>, b: Option<&str>) -> bool {
+/// SPARQL 17.4.3.1.2 argument compatibility, including RDF 1.2 base direction.
+pub(crate) fn compatible(a: super::value::StringLang<'_>, b: super::value::StringLang<'_>) -> bool {
     match (a, b) {
         (_, None) => true,
-        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        (Some((lx, dx)), Some((ly, dy))) => lx.eq_ignore_ascii_case(ly) && dx == dy,
         (None, Some(_)) => false,
     }
 }
@@ -1296,32 +1297,28 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             // the result keeps a language tag (and base direction) only if every
             // argument has the same one
             let mut out = String::new();
-            type Tag = (Option<Arc<str>>, Option<oxrdf::BaseDirection>);
+            type Tag = Option<(Arc<str>, Option<oxrdf::BaseDirection>)>;
             let mut tag: Option<Tag> = None;
             for i in 0..args.len() {
                 let v = arg(args, i, row, ctx)?;
-                let (st, l) = v.string_arg()?;
+                let (st, ld) = v.string_arg_dir()?;
                 out.push_str(st);
-                let dir = match &*v {
-                    Value::LangDir(_, _, d) => Some(*d),
-                    _ => None,
-                };
-                let t: Tag = (l.map(Into::into), dir);
+                let t: Tag = ld.map(|(l, d)| (l.into(), d));
                 tag = match tag {
                     None => Some(t),
                     Some(prev) if prev == t => Some(prev),
-                    Some(_) => Some((None, None)),
+                    Some(_) => Some(None),
                 };
             }
             match tag {
-                Some((Some(l), Some(d))) => Val::V(Value::LangDir(out.into(), l, d)),
-                Some((l, _)) => same_kind(l.as_deref(), out),
-                None => s(out),
+                Some(Some((l, Some(d)))) => Val::V(Value::LangDir(out.into(), l, d)),
+                Some(Some((l, None))) => Val::V(Value::Lang(out.into(), l)),
+                _ => s(out),
             }
         }
         F::SubStr => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             let start = Num::of(&*a1()?)?.to_double();
             let len = if args.len() > 2 {
                 Some(f64::from(Num::of(&*a2()?)?.to_double()))
@@ -1354,7 +1351,7 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         F::Replace => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             let p = a1()?;
             let r = a2()?;
             let f = if args.len() > 3 {
@@ -1395,12 +1392,12 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         F::UCase => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             same_kind(l, st.to_uppercase())
         }
         F::LCase => {
             let v = a0()?;
-            let (st, l) = v.string_arg()?;
+            let (st, l) = v.string_arg_dir()?;
             same_kind(l, st.to_lowercase())
         }
         F::EncodeForUri => {
@@ -1416,8 +1413,8 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         F::Contains | F::StrStarts | F::StrEnds | F::StrBefore | F::StrAfter => {
             let x = a0()?;
             let y = a1()?;
-            let (xs, xl) = x.string_arg()?;
-            let (ys, yl) = y.string_arg()?;
+            let (xs, xl) = x.string_arg_dir()?;
+            let (ys, yl) = y.string_arg_dir()?;
             if !compatible(xl, yl) {
                 return Err(TypeError);
             }
@@ -2029,7 +2026,7 @@ fn extension(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<V
             "timezone-from-dateTime" => fb(Function::Timezone),
             "normalize-space" => {
                 let v = a(0)?;
-                let (st, l) = v.string_arg()?;
+                let (st, l) = v.string_arg_dir()?;
                 Ok(same_kind(
                     l,
                     st.split_whitespace().collect::<Vec<_>>().join(" "),

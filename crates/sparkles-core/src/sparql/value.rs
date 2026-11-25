@@ -37,6 +37,9 @@ pub enum Value {
     },
 }
 
+/// Language tag and optional RDF 1.2 base direction of a string literal argument.
+pub(crate) type StringLang<'a> = Option<(&'a str, Option<oxrdf::BaseDirection>)>;
+
 /// A SPARQL expression type error (evaluation → unbound / filter false).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeError;
@@ -295,11 +298,21 @@ impl Value {
             _ => None,
         }
     }
-    /// "string literal" argument per SPARQL 17.4.3 (simple, xsd:string or lang-tagged)
+    /// "string literal" argument per SPARQL 17.4.3 (simple, `xsd:string` or lang-tagged).
     pub fn string_arg(&self) -> EvalResult<(&str, Option<&str>)> {
         match self {
             Value::Str(s) => Ok((s, None)),
             Value::Lang(s, l) | Value::LangDir(s, l, _) => Ok((s, Some(l))),
+            _ => Err(TypeError),
+        }
+    }
+    /// "string literal" argument with optional RDF 1.2 base direction for
+    /// SPARQL 1.2 compatibility and result-kind preservation.
+    pub(crate) fn string_arg_dir(&self) -> EvalResult<(&str, StringLang<'_>)> {
+        match self {
+            Value::Str(s) => Ok((s, None)),
+            Value::Lang(s, l) => Ok((s, Some((l, None)))),
+            Value::LangDir(s, l, d) => Ok((s, Some((l, Some(*d))))),
             _ => Err(TypeError),
         }
     }
@@ -999,6 +1012,35 @@ mod tests {
         v.sort_by(|a, b| order_cmp(Some(a), Some(b)));
         assert!(matches!(v[0], Value::BNode(_)));
         assert!(matches!(v[1], Value::Iri(_)));
+    }
+
+    #[test]
+    fn string_arg_preserves_public_return_type_and_dir_helper() {
+        let plain = Value::Str("Ada".into());
+        let lang = Value::Lang("Ada".into(), "en".into());
+        let ltr = Value::LangDir("Ada".into(), "en".into(), oxrdf::BaseDirection::Ltr);
+        let rtl = Value::LangDir("Ada".into(), "ar".into(), oxrdf::BaseDirection::Rtl);
+        let iri = Value::Iri("urn:x".into());
+
+        let pub_plain: EvalResult<(&str, Option<&str>)> = plain.string_arg();
+        let pub_lang: EvalResult<(&str, Option<&str>)> = lang.string_arg();
+        let pub_ltr: EvalResult<(&str, Option<&str>)> = ltr.string_arg();
+        assert_eq!(pub_plain, Ok(("Ada", None)));
+        assert_eq!(pub_lang, Ok(("Ada", Some("en"))));
+        assert_eq!(pub_ltr, Ok(("Ada", Some("en"))));
+        assert_eq!(iri.string_arg(), Err(TypeError));
+
+        assert_eq!(plain.string_arg_dir(), Ok(("Ada", None)));
+        assert_eq!(lang.string_arg_dir(), Ok(("Ada", Some(("en", None)))));
+        assert_eq!(
+            ltr.string_arg_dir(),
+            Ok(("Ada", Some(("en", Some(oxrdf::BaseDirection::Ltr)))))
+        );
+        assert_eq!(
+            rtl.string_arg_dir(),
+            Ok(("Ada", Some(("ar", Some(oxrdf::BaseDirection::Rtl)))))
+        );
+        assert_eq!(iri.string_arg_dir(), Err(TypeError));
     }
 }
 

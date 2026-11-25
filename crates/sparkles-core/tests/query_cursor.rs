@@ -6336,15 +6336,15 @@ fn reference_evaluator_review_round_2_cases() {
     assert!(s1.rows_open);
     let s1b = selected("SELECT ?x WHERE { BIND(IF(RAND() < 0.5, 1, 1/0) AS ?x) VALUES ?x { 2 } }");
     assert!(s1b.rows_open);
-    // 2: the readings are taken until no new one is met. MAX passes over the error under
-    // the specification's reading and is unbound under Jena's, the engine's, which alone
-    // reaches the string arguments of different base directions
+    // 2: MAX passes over the error under the specification's reading and is unbound under
+    // Jena's, the engine's, which reaches STRSTARTS("Ada"@en--ltr, "A"@en); under SPARQL
+    // 1.2 (item 1071) mismatched base directions are incompatible and raise a type error
     let q2 = "SELECT (IF(!BOUND(?m), STRSTARTS(\"Ada\"@en--ltr, \"A\"@en), false) AS ?x) \
               WHERE { { SELECT (MAX(?v) AS ?m) WHERE { VALUES ?v { UNDEF 1 } } } }";
     let Expected::Select(s2) = under_engine_readings(&r, q2).unwrap().0 else {
         panic!("a SELECT answer");
     };
-    assert_eq!(s2.rows, vec![vec![boolean(true)]]);
+    assert_eq!(s2.rows, vec![vec![None]]);
     // 3: an open second key keeps the order of the first, and an answer that keeps it
     // is not passed, since the open key decides the rest of the order
     let s3 = selected("SELECT ?x WHERE { VALUES ?x { 1 2 } } ORDER BY ?x RAND()");
@@ -7660,4 +7660,360 @@ ex:f_ninf_lower ex:v "-inf"^^xsd:float .
 
     let clean = check(dir.path(), &CheckOptions { quick: false }).unwrap();
     assert_eq!(clean.status, Status::Ok, "{}", clean.to_text());
+}
+
+/// Roadmap item 1071: STRSTARTS, STRENDS, CONTAINS, STRBEFORE and STRAFTER require both
+/// matching language tags (case-insensitively) and matching base directions when both
+/// arguments are language-tagged, across eager, streaming/cursor and string-run/keyfilter
+/// pushdown paths, and preserve base direction on matching STRBEFORE/STRAFTER results.
+#[test]
+fn directional_string_function_compatibility_and_results() {
+    use oxrdf::{BaseDirection, Literal, Term};
+    use sparkles_core::sparql::Optimizations;
+
+    let store = Store::in_memory(StoreOptions::default());
+    // Populate >4,096 rows so cursor Morsels, CountFilterFromRuns and filter_scan_runs
+    // all activate on the compacted base vocabulary.
+    let mut nt = String::new();
+    for i in 0..5_000usize {
+        let lit = match i % 5 {
+            0 => format!("\"Ada{i}end\"@en--ltr"),
+            1 => format!("\"Ada{i}end\"@en"),
+            2 => format!("\"Ada{i}end\"@en--rtl"),
+            3 => format!("\"Ada{i}end\""),
+            _ => format!("\"Ada{i}end\"@EN-US--ltr"),
+        };
+        nt.push_str(&format!("<urn:s:{i}> <urn:label> {lit} .\n"));
+    }
+    store
+        .load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+
+    // Helper: run a query eagerly (ALL and NONE), via streaming cursors (batch 1, 3,
+    // 4096 with FallbackPolicy::RejectMaterialization), and compare against the reference
+    // evaluator when `compare_ref` is true.
+    let check_all_modes = |store: &Store, q: &str, compare_ref: bool| -> Vec<Vec<Option<Term>>> {
+        let snap = store.snapshot();
+        let eager_all = query(
+            snap.clone(),
+            q,
+            &QueryOptions {
+                optimizations: Some(Optimizations::ALL),
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("eager ALL failed for {q}: {e}"));
+        let eager_none = query(
+            snap.clone(),
+            q,
+            &QueryOptions {
+                optimizations: Some(Optimizations::NONE),
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("eager NONE failed for {q}: {e}"));
+
+        let mut want: Vec<Vec<Option<Term>>> = eager_all.application_rows();
+        let mut none_rows: Vec<Vec<Option<Term>>> = eager_none.application_rows();
+        let key = |r: &[Option<Term>]| {
+            r.iter()
+                .map(|t| {
+                    t.as_ref()
+                        .map_or_else(|| "UNDEF".to_string(), ToString::to_string)
+                })
+                .collect::<Vec<_>>()
+                .join("\t")
+        };
+        want.sort_by_key(|r| key(r));
+        none_rows.sort_by_key(|r| key(r));
+        assert_eq!(want, none_rows, "eager ALL vs NONE: {q}");
+
+        for batch_rows in [1usize, 3, 4096] {
+            let cur = select_cursor(
+                snap.clone(),
+                q,
+                &QueryOptions {
+                    optimizations: Some(Optimizations::ALL),
+                    no_cache: true,
+                    ..Default::default()
+                },
+                &options(batch_rows),
+            )
+            .unwrap_or_else(|e| panic!("cursor(batch={batch_rows}) open failed for {q}: {e}"));
+            let mut got = all(cur);
+            got.sort_by_key(|r| key(r));
+            assert_eq!(want, got, "cursor(batch={batch_rows}) vs eager: {q}");
+        }
+
+        if compare_ref {
+            let mut quads = Vec::new();
+            snap.for_each_quad(|quad| {
+                quads.push(snap.quad_to_terms(quad).unwrap());
+                Ok(())
+            })
+            .unwrap();
+            let oracle = reference::Reference::new(quads);
+            let (reference::check::Expected::Select(expected), _) =
+                reference::check::under_engine_readings(&oracle, q).unwrap()
+            else {
+                panic!("expected SELECT from reference: {q}");
+            };
+            assert_eq!(
+                reference::check::check_select(
+                    &expected,
+                    eager_all.variables(),
+                    &eager_all.application_rows(),
+                ),
+                Ok(reference::check::Outcome::Compared),
+                "reference mismatch for {q}"
+            );
+        }
+        want
+    };
+
+    // 1. Scalar / BIND / SELECT expression compatibility matrix for all 5 functions across
+    //    all 6 argument pairs (both in eager and streaming cursor execution).
+    let small = Store::in_memory(StoreOptions::default());
+    small
+        .load(&[Source::from_bytes(
+            b"<urn:x> <urn:p> \"seed\" .\n".to_vec(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+
+    let bool_t = Some(Term::Literal(Literal::from(true)));
+    let dir_ltr = |s: &str, lang: &str| {
+        Some(Term::Literal(
+            Literal::new_directional_language_tagged_literal_unchecked(s, lang, BaseDirection::Ltr),
+        ))
+    };
+    let dir_rtl = |s: &str, lang: &str| {
+        Some(Term::Literal(
+            Literal::new_directional_language_tagged_literal_unchecked(s, lang, BaseDirection::Rtl),
+        ))
+    };
+    let plain = |s: &str| Some(Term::Literal(Literal::new_simple_literal(s)));
+
+    // (arg1, arg2, compatible)
+    let pairs: [(&str, &str, bool); 6] = [
+        ("\"Ada1end\"@en--ltr", "\"Ada\"@en", false),
+        ("\"Ada1end\"@en", "\"Ada\"@en--ltr", false),
+        ("\"Ada1end\"@en--ltr", "\"Ada\"@en--rtl", false),
+        ("\"Ada1end\"@en--ltr", "\"Ada\"@EN--ltr", true),
+        ("\"Ada1end\"@en--ltr", "\"Ada\"", true),
+        ("\"Ada1end\"", "\"Ada\"@en--ltr", false),
+    ];
+    for (a, b, ok) in pairs {
+        for (func, arg2, expected) in [
+            ("STRSTARTS", b, if ok { bool_t.clone() } else { None }),
+            (
+                "STRENDS",
+                &b.replace("Ada", "end"),
+                if ok { bool_t.clone() } else { None },
+            ),
+            (
+                "CONTAINS",
+                &b.replace("Ada", "1"),
+                if ok { bool_t.clone() } else { None },
+            ),
+            (
+                "STRBEFORE",
+                &b.replace("Ada", "1"),
+                if ok { dir_ltr("Ada", "en") } else { None },
+            ),
+            (
+                "STRAFTER",
+                &b.replace("Ada", "1"),
+                if ok { dir_ltr("end", "en") } else { None },
+            ),
+        ] {
+            let q =
+                format!("SELECT ({func}({a}, {arg2}) AS ?r) WHERE {{ <urn:x> <urn:p> ?dummy }}");
+            let rows = check_all_modes(&small, &q, true);
+            assert_eq!(rows, vec![vec![expected]], "{q}");
+        }
+    }
+
+    // 2. STRBEFORE / STRAFTER edge cases: empty needle, match at start/end, non-match
+    //    returning simple "", RTL preservation, and SUBSTR/UCASE/LCASE/REPLACE preserving
+    //    base direction.
+    let result_cases: [(&str, Option<Term>); 14] = [
+        (r#"STRBEFORE("abc"@en--ltr, "b")"#, dir_ltr("a", "en")),
+        (
+            r#"STRBEFORE("abc"@en--ltr, "b"@EN--ltr)"#,
+            dir_ltr("a", "en"),
+        ),
+        (r#"STRBEFORE("abc"@en--ltr, "")"#, dir_ltr("", "en")),
+        (r#"STRBEFORE("abc"@en--ltr, ""@en--ltr)"#, dir_ltr("", "en")),
+        (r#"STRBEFORE("abc"@en--ltr, "a")"#, dir_ltr("", "en")),
+        (r#"STRBEFORE("abc"@en--ltr, "z")"#, plain("")),
+        (r#"STRBEFORE("abc"@en--ltr, "z"@en--ltr)"#, plain("")),
+        (r#"STRAFTER("abc"@en--ltr, "b")"#, dir_ltr("c", "en")),
+        (
+            r#"STRAFTER("abc"@en--ltr, "b"@EN--ltr)"#,
+            dir_ltr("c", "en"),
+        ),
+        (r#"STRAFTER("abc"@en--ltr, "")"#, dir_ltr("abc", "en")),
+        (r#"STRAFTER("abc"@en--ltr, "z")"#, plain("")),
+        (
+            r#"STRBEFORE("abc"@ar--rtl, "b"@ar--rtl)"#,
+            dir_rtl("a", "ar"),
+        ),
+        (
+            r#"STRAFTER("abc"@ar--rtl, "b"@AR--rtl)"#,
+            dir_rtl("c", "ar"),
+        ),
+        (r#"SUBSTR("abc"@en--ltr, 2, 1)"#, dir_ltr("b", "en")),
+    ];
+    for (expr, want) in result_cases {
+        let q = format!("SELECT ({expr} AS ?r) WHERE {{ <urn:x> <urn:p> ?dummy }}");
+        let rows = check_all_modes(&small, &q, true);
+        assert_eq!(rows, vec![vec![want]], "{q}");
+    }
+    for (expr, want) in [
+        (r#"UCASE("abc"@en--ltr)"#, dir_ltr("ABC", "en")),
+        (r#"LCASE("ABC"@ar--rtl)"#, dir_rtl("abc", "ar")),
+        (r#"REPLACE("abc"@en--ltr, "b", "X")"#, dir_ltr("aXc", "en")),
+    ] {
+        let q = format!("SELECT ({expr} AS ?r) WHERE {{ <urn:x> <urn:p> ?dummy }}");
+        let rows = check_all_modes(&small, &q, true);
+        assert_eq!(rows, vec![vec![want]], "{q}");
+    }
+    for (expr, want) in [
+        (
+            r#"<http://www.w3.org/2005/xpath-functions#normalize-space>("  a \t b  "@en--ltr)"#,
+            dir_ltr("a b", "en"),
+        ),
+        (
+            r#"<http://www.w3.org/2005/xpath-functions#normalize-space>("  a \n b  "@ar--rtl)"#,
+            dir_rtl("a b", "ar"),
+        ),
+    ] {
+        let q = format!("SELECT ({expr} AS ?r) WHERE {{ <urn:x> <urn:p> ?dummy }}");
+        let rows = check_all_modes(&small, &q, false);
+        assert_eq!(rows, vec![vec![want]], "{q}");
+    }
+
+    // 3. String-run / KeyFilter / CountFilterFromRuns / cursor Morsels pushdown paths on
+    //    the 5,000-row store (both compacted base vocab and uncompacted delta vocab).
+    let filter_cases: [(&str, usize); 14] = [
+        // STRSTARTS
+        (r#"STRSTARTS(?v, "Ada")"#, 5_000),
+        (r#"STRSTARTS(?v, "Ada"@en)"#, 1_000),
+        (r#"STRSTARTS(?v, "Ada"@en--ltr)"#, 1_000),
+        (r#"STRSTARTS(?v, "Ada"@EN--ltr)"#, 1_000),
+        (r#"STRSTARTS(?v, "Ada"@en--rtl)"#, 1_000),
+        (r#"STRSTARTS(?v, "Ada"@en-us--ltr)"#, 1_000),
+        (r#"STRSTARTS(?v, "Ada"@en-us)"#, 0),
+        (r#"STRSTARTS(?v, "Ada"@en-us--rtl)"#, 0),
+        // STRENDS
+        (r#"STRENDS(?v, "end"@en--ltr)"#, 1_000),
+        (r#"STRENDS(?v, "end"@en)"#, 1_000),
+        (r#"STRENDS(?v, "end"@en--rtl)"#, 1_000),
+        // CONTAINS
+        (r#"CONTAINS(?v, "da"@EN--ltr)"#, 1_000),
+        (r#"CONTAINS(?v, "da"@en-us)"#, 0),
+        // STRBEFORE / STRAFTER inside FILTER
+        (r#"STRBEFORE(?v, "end"@en--ltr) != """#, 1_000),
+    ];
+    for (pred, expected_count) in filter_cases {
+        let count_q =
+            format!("SELECT (COUNT(*) AS ?c) WHERE {{ ?s <urn:label> ?v FILTER({pred}) }}");
+        let rows = check_all_modes(&store, &count_q, false);
+        assert_eq!(
+            rows,
+            vec![vec![Some(Term::Literal(Literal::from(
+                expected_count as i64
+            )))]],
+            "{count_q}"
+        );
+
+        let scan_q = format!("SELECT ?s ?v WHERE {{ ?s <urn:label> ?v FILTER({pred}) }}");
+        let scan_rows = check_all_modes(&store, &scan_q, false);
+        assert_eq!(scan_rows.len(), expected_count, "{scan_q}");
+    }
+
+    // Confirm the KeyFilter pushdown plan is actually active for directional needles.
+    let plan_q = r#"SELECT (COUNT(*) AS ?c) WHERE { ?s <urn:label> ?v FILTER(STRSTARTS(?v, "Ada"@en-us--ltr)) }"#;
+    let plan_res = query(
+        store.snapshot(),
+        plan_q,
+        &QueryOptions {
+            optimizations: Some(Optimizations::ALL),
+            no_cache: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let plan_text = format!("{:#?}", plan_res.plan());
+    assert!(
+        plan_text.contains("CountFilterFromRuns")
+            && plan_text.contains("tested on vocabulary keys")
+            && plan_text.contains("key ranges"),
+        "expected KeyFilter count-from-runs plan: {plan_text}"
+    );
+
+    // Confirm the cursor morsel path actually runs on the compacted base scan for
+    // directional needles at 4,096-row demand (requires an empty delta).
+    for morsel_q in [
+        r#"SELECT ?s ?v WHERE { ?s <urn:label> ?v FILTER(STRSTARTS(?v, "Ada"@en-us--ltr)) }"#,
+        r#"SELECT ?s ?v WHERE { ?s <urn:label> ?v FILTER(CONTAINS(?v, "da"@EN--ltr)) }"#,
+    ] {
+        let mut cur = select_cursor(
+            store.snapshot(),
+            morsel_q,
+            &QueryOptions {
+                optimizations: Some(Optimizations::ALL),
+                no_cache: true,
+                ..Default::default()
+            },
+            &options(4096),
+        )
+        .unwrap();
+        let mut morsel_rows = 0usize;
+        while let Some(batch) = cur.next_batch().unwrap() {
+            morsel_rows += batch.len();
+        }
+        assert_eq!(cur.status(), CursorStatus::Complete, "{morsel_q}");
+        assert_eq!(morsel_rows, 1_000, "{morsel_q}");
+        assert!(
+            leaf_counter(cur.plan(), "morselRows") > 0,
+            "expected cursor morsel path for {morsel_q}: {:#?}",
+            cur.plan()
+        );
+    }
+
+    // 4. Add delta terms (uncompacted update) and re-check directional filter compatibility
+    //    across base + delta keys.
+    sparkles_core::sparql::update::update(
+        &store,
+        r#"INSERT DATA {
+            <urn:d:1> <urn:label> "AdaDelta1end"@en--ltr .
+            <urn:d:2> <urn:label> "AdaDelta2end"@en .
+            <urn:d:3> <urn:label> "AdaDelta3end"@en--rtl .
+            <urn:d:4> <urn:label> "AdaDelta4end" .
+        }"#,
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    for (pred, expected_count) in [
+        (r#"STRSTARTS(?v, "AdaDelta"@en--ltr)"#, 1usize),
+        (r#"STRSTARTS(?v, "AdaDelta"@EN--ltr)"#, 1),
+        (r#"STRSTARTS(?v, "AdaDelta"@en)"#, 1),
+        (r#"STRSTARTS(?v, "AdaDelta"@en--rtl)"#, 1),
+        (r#"STRSTARTS(?v, "AdaDelta")"#, 4),
+        (r#"STRENDS(?v, "end"@en--ltr) && CONTAINS(?v, "Delta")"#, 1),
+        (r#"STRAFTER(?v, "AdaDelta"@en--rtl) = "3end"@en--rtl"#, 1),
+    ] {
+        let scan_q = format!("SELECT ?s ?v WHERE {{ ?s <urn:label> ?v FILTER({pred}) }}");
+        let rows = check_all_modes(&store, &scan_q, false);
+        assert_eq!(rows.len(), expected_count, "delta: {scan_q}");
+    }
 }

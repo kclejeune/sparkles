@@ -54,7 +54,7 @@ fn like(src: &Literal, s: String) -> Term {
 fn compatible_strings(a: &Literal, b: &Literal) -> bool {
     match (a.language(), b.language()) {
         (None, None) => true,
-        (Some(x), Some(y)) => x == y && a.direction() == b.direction(),
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y) && a.direction() == b.direction(),
         (Some(_), None) => true,
         (None, Some(_)) => false,
     }
@@ -73,23 +73,6 @@ fn half_up(x: f64) -> f64 {
 }
 
 impl Evaluator<'_> {
-    /// [`compatible_strings`], noting where only the base direction makes two arguments
-    /// incompatible, and taking them as compatible when the reference is set to ignore
-    /// the direction, as [`super::Notes::direction_in_compatibility`] describes.
-    fn compatible_arguments(&self, a: &Literal, b: &Literal) -> bool {
-        if compatible_strings(a, b) {
-            return true;
-        }
-        let same_language = a.language().is_some() && a.language() == b.language();
-        if !same_language {
-            return false;
-        }
-        let mut notes = self.notes.get();
-        notes.direction_in_compatibility = true;
-        self.notes.set(notes);
-        self.data.ignore_direction_in_compatibility.get()
-    }
-
     fn rand_f64(&self) -> f64 {
         let mut x = self.rng.get();
         x ^= x << 13;
@@ -437,7 +420,7 @@ impl Evaluator<'_> {
             }
             F::Contains | F::StrStarts | F::StrEnds => {
                 let (x, y) = (string_arg(arg(0)?)?, string_arg(arg(1)?)?);
-                if !self.compatible_arguments(x, y) {
+                if !compatible_strings(x, y) {
                     return type_error();
                 }
                 let (x, y) = (x.value(), y.value());
@@ -449,7 +432,7 @@ impl Evaluator<'_> {
             }
             F::StrBefore | F::StrAfter => {
                 let (x, y) = (string_arg(arg(0)?)?, string_arg(arg(1)?)?);
-                if !self.compatible_arguments(x, y) {
+                if !compatible_strings(x, y) {
                     return type_error();
                 }
                 let (text, needle) = (x.value(), y.value());

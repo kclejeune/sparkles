@@ -400,19 +400,19 @@ by both copied terms and computed values that differs only in a number's lexical
 the algebra treats as a variable, so a `COUNT(DISTINCT *)` over such a middle is an open
 value. A query whose nested loops pass the evaluator's work limit of 20 million
 intermediate solutions is left uncompared, and so is one that reads a number of more than
-16 digits. The comparison found disagreements, which items 1064, 1065, 1071 and 1077 hold. The
+16 digits. The comparison found disagreements, which items 1064, 1065, 1071 and 1077 held. The
 engine passes over an error in MIN and MAX, where the specification's order makes MIN an
 error and Jena makes both an error, and it follows Jena in making AVG over errors only an
 error and in letting GROUP_CONCAT read IRIs and numbers. It does not read an
 `xsd:integer` or `xsd:decimal` beyond the range of its decimal type as a number, which
-XSD permits and Jena does not do. Its string functions take a directional string and a
+XSD permits and Jena does not do. Its string functions once took a directional string and a
 language-tagged string of the same language as compatible arguments, which SPARQL 1.2
-and Jena do not. The evaluator evaluates the aggregates of item 1064 under the
-specification's, Jena's or the engine's reading, answers the W3C suites under the
-specification's, and compares the engine under the engine's current reading until the
-setting of item 1064 lands with Jena's as its default. The evaluator notes where a query
-meets item 1064 or 1071, and the tests compare such a query exactly under the engine's
-reading. Item 1077 has shipped and resolves the three XSD and XPath disagreements flagged
+and Jena do not. With item 1071, `STRSTARTS`, `STRENDS`, `CONTAINS`, `STRBEFORE`,
+`STRAFTER` and vocabulary-key filters compare language tag and base direction.
+Matching string-returning functions preserve the base direction. The evaluator dropped
+its compatibility workaround for these functions. For the aggregates of item 1064,
+the evaluator answers the W3C suites under the specification's reading. Engine
+comparisons follow item 1064's setting, whose default is Jena's. Item 1077 has shipped and resolves the three XSD and XPath disagreements flagged
 by the reference comparison. `xsd:float` and `xsd:double` parsing now accepts only XSD 1.1
 lexical forms (`INF`, `+INF`, `-INF`, `NaN` and decimal or exponent numerals) across
 expression evaluation, XML-whitespace-trimmed string casts, `numeric_key`, inline literal

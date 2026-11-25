@@ -38,11 +38,8 @@ pub enum Expected {
 /// The reference's answer to `text` under the engine's readings of the questions where
 /// the specification and the engine differ, with the names of the readings it took. Where
 /// the query meets one, it is evaluated again with the engine's reading, so that the
-/// comparison is exact under it. These are the aggregates over errors and non-strings
-/// under [`ENGINE_AGGREGATE_ERRORS`], the default of item 1064's setting, and string
-/// arguments compatible whatever their base direction (item 1071). An
-/// evaluation under one reading can meet another item that the first did not reach, so
-/// the evaluations go on until one meets no item that the readings do not cover.
+/// comparison is exact under it. That covers the aggregates over errors and non-strings
+/// under [`ENGINE_AGGREGATE_ERRORS`], the default of item 1064's setting.
 pub fn under_engine_readings(
     r: &Reference,
     text: &str,
@@ -60,37 +57,26 @@ pub fn under_engine_readings(
         Expected::Ask(_, n) => Some(*n),
         Expected::Other => None,
     };
-    let (mut aggregates, mut direction) = (false, false);
-    let set = |aggregates: bool, direction: bool| {
+    let mut aggregates = false;
+    let set = |aggregates: bool| {
         r.set_aggregate_errors(if aggregates {
             ENGINE_AGGREGATE_ERRORS
         } else {
             AggregateErrors::Spec
         });
-        r.set_ignoring_direction_in_compatibility(direction);
     };
     let mut answer = run();
-    // each round turns on at least one of the two readings, so there are at most three
-    while let Some(notes) = answer.as_ref().ok().and_then(notes_of) {
-        let a = aggregates
-            || notes.min_max_error
-            || notes.avg_of_errors
-            || notes.group_concat_non_string;
-        let d = direction || notes.direction_in_compatibility;
-        if (a, d) == (aggregates, direction) {
-            break;
-        }
-        (aggregates, direction) = (a, d);
-        set(aggregates, direction);
+    if let Some(notes) = answer.as_ref().ok().and_then(notes_of)
+        && (notes.min_max_error || notes.avg_of_errors || notes.group_concat_non_string)
+    {
+        aggregates = true;
+        set(true);
         answer = run();
     }
-    set(false, false);
+    set(false);
     let mut readings = Vec::new();
     if aggregates {
         readings.push("the engine's aggregates over errors and non-strings");
-    }
-    if direction {
-        readings.push("string arguments ignore the base direction");
     }
     Ok((answer?, readings))
 }
