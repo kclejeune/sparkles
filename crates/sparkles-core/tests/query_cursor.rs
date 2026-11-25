@@ -6597,6 +6597,370 @@ fn reference_evaluator_review_round_3_cases() {
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
+/// Roadmap item 1093: `STR`, `STRDT`, `STRLANG` and `STRLANGDIR` over a non-constant
+/// argument that can carry a computed number are treated as both copied and computed, so
+/// another allowed numeric lexical form resolves as partial rather than failing, while
+/// constant and purely copied arguments keep exact comparison.
+#[test]
+fn reference_evaluator_str_computed_numbers_1093() {
+    use oxrdf::{BaseDirection, Literal, NamedNode};
+    use reference::check::{Outcome, check_select};
+    let iri = |s: &str| NamedNode::new_unchecked(s);
+    let string = |v: &str| Some(Term::Literal(Literal::new_simple_literal(v)));
+    let typed = |v: &str, dt: &str| Some(Term::Literal(Literal::new_typed_literal(v, iri(dt))));
+    let xsd = |v: &str, name: &str| typed(v, &format!("http://www.w3.org/2001/XMLSchema#{name}"));
+    let lang = |v: &str, l: &str| {
+        Some(Term::Literal(
+            Literal::new_language_tagged_literal(v, l).unwrap(),
+        ))
+    };
+    let lang_dir = |v: &str, l: &str, d: BaseDirection| {
+        Some(Term::Literal(
+            Literal::new_directional_language_tagged_literal(v, l, d).unwrap(),
+        ))
+    };
+    let vars = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let one = |t: Option<Term>| vec![vec![t]];
+    let r = reference::Reference::new(Vec::new());
+    let selected = |q: &str| r.run_selected(q, None).unwrap().unwrap();
+
+    // 1: STR over computed numbers (inline, via variable, via aggregate, scientific, INF)
+    for q in [
+        "SELECT (STR(1.0 + 1.0) AS ?s) WHERE {}",
+        "SELECT (STR(?x) AS ?s) WHERE { BIND(1.0 + 1.0 AS ?x) }",
+        "SELECT (STR(SUM(?v)) AS ?s) WHERE { VALUES ?v { 1.0 1.0 } }",
+        "SELECT (STR(IF(true, 1.0 + 1.0, \"01\")) AS ?s) WHERE {}",
+        "SELECT (COALESCE(?u, STR(1.0 + 1.0)) AS ?s) WHERE { VALUES ?u { UNDEF } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["s"]), &one(string("2"))),
+            Ok(Outcome::Compared),
+            "exact match: {q}"
+        );
+        for alt in ["2.0", "+2.00", "02"] {
+            assert!(
+                matches!(
+                    check_select(&s, &vars(&["s"]), &one(string(alt))),
+                    Ok(Outcome::Partial(_))
+                ),
+                "allowed lexical {alt}: {q}"
+            );
+        }
+        for bad in [
+            string("3"),
+            string("2.1"),
+            string("two"),
+            string(" 2"),
+            xsd("2.0", "decimal"),
+            lang("2.0", "en"),
+        ] {
+            assert!(
+                check_select(&s, &vars(&["s"]), &one(bad.clone())).is_err(),
+                "must fail for {bad:?}: {q}"
+            );
+        }
+    }
+
+    // Scientific notation and special floats through STR
+    let s_dbl = selected("SELECT (STR(1.0e0 + 1.0e0) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_dbl, &vars(&["s"]), &s_dbl.rows),
+        Ok(Outcome::Compared)
+    );
+    for alt in ["2.0E0", "2.0e+0", "2.0", "2E0"] {
+        let res = check_select(&s_dbl, &vars(&["s"]), &one(string(alt)));
+        assert!(
+            matches!(res, Ok(Outcome::Compared | Outcome::Partial(_))),
+            "double lexical {alt}: {res:?}"
+        );
+    }
+    assert!(
+        matches!(
+            check_select(&s_dbl, &vars(&["s"]), &one(string("2.00E+0"))),
+            Ok(Outcome::Partial(_))
+        ),
+        "distinct double lexical must be partial"
+    );
+
+    let s_inf = selected("SELECT (STR(1.0e0 / 0.0e0) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_inf, &vars(&["s"]), &one(string("INF"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(matches!(
+        check_select(&s_inf, &vars(&["s"]), &one(string("+INF"))),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_select(&s_inf, &vars(&["s"]), &one(string("inf"))).is_err());
+    assert!(check_select(&s_inf, &vars(&["s"]), &one(string("-INF"))).is_err());
+
+    // 16-digit computed integer past f64's 2^53 precision does not collapse via f64
+    let s_big = selected("SELECT (STR(9007199254740992 + 1) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_big, &vars(&["s"]), &one(string("9007199254740993"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(matches!(
+        check_select(&s_big, &vars(&["s"]), &one(string("+9007199254740993"))),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(
+        check_select(&s_big, &vars(&["s"]), &one(string("9007199254740992"))).is_err(),
+        "off-by-one 16-digit integer past 2^53 must fail"
+    );
+
+    // 2: STR over constants and purely copied variables stays exact
+    for (q, exact, alt) in [
+        (
+            "SELECT (STR(\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>) AS ?s) WHERE {}",
+            "01",
+            "1",
+        ),
+        ("SELECT (STR(1.0) AS ?s) WHERE {}", "1.0", "1"),
+        (
+            "SELECT (STR(?x) AS ?s) WHERE { VALUES ?x { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } }",
+            "01",
+            "1",
+        ),
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["s"]), &one(string(exact))),
+            Ok(Outcome::Compared),
+            "copied exact: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["s"]), &one(string(alt))).is_err(),
+            "copied STR must reject {alt}: {q}"
+        );
+    }
+
+    // 3: STRDT over computed numbers (xsd:decimal, xsd:integer, custom datatype, via variable)
+    for q in [
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(STR(1.0 + 1.0), xsd:decimal) AS ?x) WHERE {}",
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(?s, xsd:decimal) AS ?x) WHERE { BIND(STR(1.0 + 1.0) AS ?s) }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(xsd("2", "decimal"))),
+            Ok(Outcome::Compared),
+            "STRDT exact: {q}"
+        );
+        assert!(
+            matches!(
+                check_select(&s, &vars(&["x"]), &one(xsd("2.0", "decimal"))),
+                Ok(Outcome::Partial(_))
+            ),
+            "STRDT partial: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["x"]), &one(xsd("2", "integer"))).is_err(),
+            "STRDT wrong datatype: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["x"]), &one(xsd("3.0", "decimal"))).is_err(),
+            "STRDT wrong value: {q}"
+        );
+    }
+
+    // STRDT with custom datatype and with xsd:integer (where "2.0"^^xsd:integer is ill-formed)
+    let s_dt_custom = selected("SELECT (STRDT(STR(1.0 + 1.0), <urn:custom>) AS ?x) WHERE {}");
+    assert_eq!(
+        check_select(&s_dt_custom, &vars(&["x"]), &one(typed("2", "urn:custom"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(matches!(
+        check_select(
+            &s_dt_custom,
+            &vars(&["x"]),
+            &one(typed("2.0", "urn:custom"))
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_select(&s_dt_custom, &vars(&["x"]), &one(typed("2.0", "urn:other"))).is_err());
+
+    let s_dt_int = selected(
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(STR(1.0 + 1.0), xsd:integer) AS ?x) WHERE {}",
+    );
+    assert!(matches!(
+        check_select(&s_dt_int, &vars(&["x"]), &one(xsd("2.0", "integer"))),
+        Ok(Outcome::Partial(_))
+    ));
+
+    // STRDT over constant, copied variable, and STR of copied variable stays exact
+    for q in [
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(\"01\", xsd:integer) AS ?x) WHERE {}",
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(?s, xsd:integer) AS ?x) WHERE { VALUES ?s { \"01\" } }",
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(STR(?n), xsd:integer) AS ?x) WHERE { VALUES ?n { \"01\"^^xsd:integer } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(xsd("01", "integer"))),
+            Ok(Outcome::Compared),
+            "STRDT copied exact: {q}"
+        );
+        assert!(
+            check_select(&s, &vars(&["x"]), &one(xsd("1", "integer"))).is_err(),
+            "STRDT copied must reject different lexical: {q}"
+        );
+    }
+
+    // 4: STRLANG over computed numbers vs constants and copied variables
+    for q in [
+        "SELECT (STRLANG(STR(1.0 + 1.0), \"en\") AS ?x) WHERE {}",
+        "SELECT (STRLANG(?s, \"en\") AS ?x) WHERE { BIND(STR(1.0 + 1.0) AS ?s) }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(lang("2", "en"))),
+            Ok(Outcome::Compared),
+            "STRLANG exact: {q}"
+        );
+        assert!(
+            matches!(
+                check_select(&s, &vars(&["x"]), &one(lang("2.0", "en"))),
+                Ok(Outcome::Partial(_))
+            ),
+            "STRLANG partial: {q}"
+        );
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("2.0", "fr"))).is_err());
+        assert!(check_select(&s, &vars(&["x"]), &one(string("2.0"))).is_err());
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("3.0", "en"))).is_err());
+    }
+    for q in [
+        "SELECT (STRLANG(\"01\", \"en\") AS ?x) WHERE {}",
+        "SELECT (STRLANG(?s, \"en\") AS ?x) WHERE { VALUES ?s { \"01\" } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(&s, &vars(&["x"]), &one(lang("01", "en"))),
+            Ok(Outcome::Compared)
+        );
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("1", "en"))).is_err());
+    }
+
+    // 5: STRLANGDIR over computed numbers vs constants and copied variables
+    for q in [
+        "SELECT (STRLANGDIR(STR(1.0 + 1.0), \"en\", \"ltr\") AS ?x) WHERE {}",
+        "SELECT (STRLANGDIR(?s, \"en\", \"ltr\") AS ?x) WHERE { BIND(STR(1.0 + 1.0) AS ?s) }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("2", "en", BaseDirection::Ltr))
+            ),
+            Ok(Outcome::Compared),
+            "STRLANGDIR exact: {q}"
+        );
+        assert!(
+            matches!(
+                check_select(
+                    &s,
+                    &vars(&["x"]),
+                    &one(lang_dir("2.0", "en", BaseDirection::Ltr))
+                ),
+                Ok(Outcome::Partial(_))
+            ),
+            "STRLANGDIR partial: {q}"
+        );
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("2.0", "en", BaseDirection::Rtl))
+            )
+            .is_err()
+        );
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("2.0", "fr", BaseDirection::Ltr))
+            )
+            .is_err()
+        );
+        assert!(check_select(&s, &vars(&["x"]), &one(lang("2.0", "en"))).is_err());
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("3.0", "en", BaseDirection::Ltr))
+            )
+            .is_err()
+        );
+    }
+    for q in [
+        "SELECT (STRLANGDIR(\"01\", \"en\", \"ltr\") AS ?x) WHERE {}",
+        "SELECT (STRLANGDIR(?s, \"en\", \"ltr\") AS ?x) WHERE { VALUES ?s { \"01\" } }",
+    ] {
+        let s = selected(q);
+        assert_eq!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("01", "en", BaseDirection::Ltr))
+            ),
+            Ok(Outcome::Compared)
+        );
+        assert!(
+            check_select(
+                &s,
+                &vars(&["x"]),
+                &one(lang_dir("1", "en", BaseDirection::Ltr))
+            )
+            .is_err()
+        );
+    }
+
+    // 6: Isolation — xsd:string cast canonical form (item 1077) and copied sibling columns
+    // remain strictly exact, and weaker order outcomes stay as weak.
+    let s_cast = selected("SELECT (<http://www.w3.org/2001/XMLSchema#string>(1e6) AS ?s) WHERE {}");
+    assert_eq!(
+        check_select(&s_cast, &vars(&["s"]), &one(string("1.0E6"))),
+        Ok(Outcome::Compared)
+    );
+    assert!(
+        check_select(&s_cast, &vars(&["s"]), &one(string("1000000"))).is_err(),
+        "xsd:string(1e6) must not relax canonical form"
+    );
+
+    let s_two = selected(
+        "SELECT (STR(\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>) AS ?a) \
+         (STR(1.0 + 1.0) AS ?b) WHERE {}",
+    );
+    assert!(matches!(
+        check_select(
+            &s_two,
+            &vars(&["a", "b"]),
+            &[vec![string("01"), string("2.0")]]
+        ),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(
+        check_select(
+            &s_two,
+            &vars(&["a", "b"]),
+            &[vec![string("1"), string("2.0")]]
+        )
+        .is_err(),
+        "sibling copied column must stay exact"
+    );
+
+    let s_ord =
+        selected("SELECT (STR(1.0 + 1.0) AS ?s) WHERE { VALUES ?x { 1 2 } } ORDER BY ?x RAND()");
+    assert!(matches!(
+        check_select(
+            &s_ord,
+            &vars(&["s"]),
+            &[vec![string("2.0")], vec![string("2.0")]]
+        ),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+}
+
 /// The reference evaluator's own cases: the choices that it notes, the scope of the
 /// solution that LATERAL substitutes, BNODE across a join and its sort order.
 #[test]

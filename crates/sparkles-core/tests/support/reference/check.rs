@@ -8,7 +8,10 @@
 //! computed values bind compares numbers by datatype and value, since the lexical form of
 //! a computed number is the implementation's. Every other term must be the same term,
 //! except that a column bound by both copied terms and computed values, where a number
-//! that differs only in its lexical form may be either, makes the comparison partial.
+//! that differs only in its lexical form may be either, makes the comparison partial, as
+//! does a `STR`, `STRDT`, `STRLANG` or `STRLANGDIR` over an argument that can carry a
+//! computed number when another allowed numeric lexical form keeps the same datatype,
+//! language tag and base direction.
 //! Where the query orders or slices its answer, the engine's rows must be a slice, at the
 //! query's offset, of an order that ORDER BY allows. Where an ORDER BY condition reads an
 //! open value, the conditions after it can still order the rows that tie before it, so
@@ -22,7 +25,7 @@ use super::{AggregateErrors, Error, Notes, Provenance, Reference, Selected, valu
 /// comparisons take. Roadmap item 1064's setting makes Jena's reading the engine's
 /// default, and the engine runs under it whenever a query chooses no other.
 pub const ENGINE_AGGREGATE_ERRORS: AggregateErrors = AggregateErrors::Jena;
-use oxrdf::Term;
+use oxrdf::{Term, vocab::xsd};
 use std::collections::{BTreeSet, HashMap};
 
 /// The reference's answer to a query that an engine answered.
@@ -205,19 +208,22 @@ pub fn check_select(
         Err(e) => {
             // a number of another lexical form in a column that copies terms and computes
             // values may be allowed or not
-            let mixed = expected.computed.contains(&Provenance::Mixed);
+            let mixed = expected.computed.iter().any(|p| p.is_mixed());
+            if !mixed {
+                return Err(e);
+            }
             return match compare(true) {
-                Ok(Outcome::Compared) if mixed => Ok(Outcome::Partial(format!(
+                Ok(Outcome::Compared) => Ok(Outcome::Partial(format!(
                     "a column copies terms and computes values, and the answer agrees only \
                      where its numbers are compared by value: {e}"
                 ))),
                 // a weaker outcome under the relaxed comparison stays as weak
-                Ok(Outcome::OrderUnchecked(why)) if mixed => Ok(Outcome::OrderUnchecked(format!(
+                Ok(Outcome::OrderUnchecked(why)) => Ok(Outcome::OrderUnchecked(format!(
                     "{why}, and a column that copies terms and computes values agrees only \
                      where its numbers are compared by value"
                 ))),
-                Ok(weaker) if mixed => Ok(weaker),
-                _ => Err(e),
+                Ok(weaker) => Ok(weaker),
+                Err(_) => Err(e),
             };
         }
     };
@@ -237,19 +243,39 @@ pub fn check_select(
 }
 
 /// One cell of a row as the comparison sees it. Numbers compare by datatype and value in
-/// a computed column, and in a mixed one when `relax_mixed`.
+/// a computed column, and in a mixed one when `relax_mixed`. In a mixed-lexical column
+/// (where `STR`, `STRDT`, `STRLANG` or `STRLANGDIR` can read a computed number), a
+/// literal's numeric lexical form also compares by numeric value when `relax_mixed`, while
+/// its datatype, language tag and base direction stay exact.
 fn cell(t: &Option<Term>, open: bool, provenance: Provenance, relax_mixed: bool) -> String {
     if open {
         return "*".into();
     }
-    let relax = match provenance {
+    let relax_numeric = match provenance {
         Provenance::Computed => true,
-        Provenance::Mixed => relax_mixed,
+        Provenance::Mixed | Provenance::MixedLexical => relax_mixed,
         Provenance::Copied => false,
     };
+    let relax_lexical = matches!(provenance, Provenance::MixedLexical) && relax_mixed;
     match t {
         None => "UNDEF".into(),
-        Some(Term::Literal(l)) if relax => match value::numeric(l) {
+        Some(Term::Literal(l)) if relax_lexical => {
+            if (l.datatype() == xsd::FLOAT || l.datatype() == xsd::DOUBLE)
+                && let Some(n) = value::numeric(l)
+            {
+                return format!("#{}^^<{}>", n.canonical_lexical(), l.datatype().as_str());
+            }
+            match value::canonical_numeric_lexical(l.value()) {
+                Some(canon) => format!(
+                    "#{canon}^^<{}>@{:?}--{:?}",
+                    l.datatype().as_str(),
+                    l.language(),
+                    l.direction()
+                ),
+                None => l.to_string(),
+            }
+        }
+        Some(Term::Literal(l)) if relax_numeric => match value::numeric(l) {
             Some(n) => format!("\"{}\"^^<{}>", n.canonical_lexical(), l.datatype().as_str()),
             None => l.to_string(),
         },

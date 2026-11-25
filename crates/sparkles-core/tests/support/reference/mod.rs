@@ -532,25 +532,41 @@ pub enum Provenance {
     /// Only values that an operator or function computed, whose lexical form is the
     /// implementation's.
     Computed,
-    /// Both, so a cell's lexical form may be fixed or free.
+    /// Both copied terms and computed values, so a numeric literal's lexical form may be
+    /// fixed or free.
     Mixed,
+    /// Both copied terms and lexical forms taken from computed numbers through `STR`,
+    /// `STRDT`, `STRLANG` or `STRLANGDIR`, so a literal's numeric lexical form may be
+    /// fixed or free while its datatype, language tag and base direction stay exact.
+    MixedLexical,
+}
+
+impl Provenance {
+    pub(crate) fn is_mixed(self) -> bool {
+        matches!(self, Provenance::Mixed | Provenance::MixedLexical)
+    }
 }
 
 /// The provenance of each variable that `p` binds. A variable is copied where a basic
 /// graph pattern, a path, VALUES or a GRAPH name binds it, or an expression whose
-/// outermost operator passes a term through or keeps the lexical form it is given: a
-/// variable, a constant, COALESCE, IF, STRDT, STRLANG, STRLANGDIR and the MIN, MAX and
-/// SAMPLE aggregates. It is computed where arithmetic,
+/// outermost operator passes a term through or keeps the lexical form of a copied or
+/// constant argument: a variable, a constant, COALESCE, IF, STR, STRDT, STRLANG,
+/// STRLANGDIR and the MIN, MAX and SAMPLE aggregates. It is computed where arithmetic,
 /// a numeric function, a cast to a number or the COUNT, SUM and AVG aggregates bind it,
-/// whose numbers take the implementation's lexical form. Any other operator binds it
-/// both ways, so that its numbers compare exactly and a difference only in their
-/// lexical form makes the comparison partial.
+/// whose numbers take the implementation's lexical form. When `STR`, `STRDT`, `STRLANG`
+/// or `STRLANGDIR` reads an argument that can be a computed number or carry one's lexical
+/// form, the result is both copied and computed with a computed lexical form, so that an
+/// exact match is compared and another allowed numeric lexical form makes the comparison
+/// partial. Any other operator binds it both ways, so that its numbers compare exactly
+/// and a difference only in their lexical form makes the comparison partial.
 fn provenance(p: &GraphPattern) -> HashMap<Variable, Provenance> {
     #[derive(Default)]
     struct Site {
         copied: bool,
         computed: bool,
+        lexical: bool,
         from: Vec<Variable>,
+        from_lexical: Vec<Variable>,
     }
     fn expr_site(e: &Expression, site: &mut Site) {
         match e {
@@ -567,7 +583,7 @@ fn provenance(p: &GraphPattern) -> HashMap<Variable, Provenance> {
             | Expression::Divide(..)
             | Expression::UnaryPlus(_)
             | Expression::UnaryMinus(_) => site.computed = true,
-            Expression::FunctionCall(f, _) => match f {
+            Expression::FunctionCall(f, args) => match f {
                 Function::Abs
                 | Function::Ceil
                 | Function::Floor
@@ -587,7 +603,19 @@ fn provenance(p: &GraphPattern) -> HashMap<Variable, Provenance> {
                 {
                     site.computed = true
                 }
-                Function::StrDt | Function::StrLang | Function::StrLangDir => site.copied = true,
+                Function::Str | Function::StrDt | Function::StrLang | Function::StrLangDir => {
+                    site.copied = true;
+                    if let Some(arg) = args.first() {
+                        let mut inner = Site::default();
+                        expr_site(arg, &mut inner);
+                        if inner.computed || inner.lexical {
+                            site.computed = true;
+                            site.lexical = true;
+                        }
+                        site.from_lexical.extend(inner.from);
+                        site.from_lexical.extend(inner.from_lexical);
+                    }
+                }
                 _ => {
                     site.copied = true;
                     site.computed = true;
@@ -713,18 +741,25 @@ fn provenance(p: &GraphPattern) -> HashMap<Variable, Provenance> {
     let mut sites = Vec::new();
     walk(p, &mut sites);
     // a variable that copies another takes its provenance, to a fixed point
-    let mut of: HashMap<Variable, (bool, bool)> = HashMap::new();
+    let mut of: HashMap<Variable, (bool, bool, bool)> = HashMap::new();
     loop {
         let mut changed = false;
         for (v, site) in &sites {
-            let mut c = (site.copied, site.computed);
+            let mut c = (site.copied, site.computed, site.lexical);
             for f in &site.from {
                 // a variable that nothing binds is unbound, which copies nothing
-                let (a, b) = of.get(f).copied().unwrap_or((false, false));
-                c = (c.0 || a, c.1 || b);
+                let (a, b, l) = of.get(f).copied().unwrap_or((false, false, false));
+                c = (c.0 || a, c.1 || b, c.2 || l);
+            }
+            for f in &site.from_lexical {
+                let (_, b, l) = of.get(f).copied().unwrap_or((false, false, false));
+                if b || l {
+                    c.1 = true;
+                    c.2 = true;
+                }
             }
             let old = of.entry(v.clone()).or_default();
-            let new = (old.0 || c.0, old.1 || c.1);
+            let new = (old.0 || c.0, old.1 || c.1, old.2 || c.2);
             if new != *old {
                 *old = new;
                 changed = true;
@@ -737,9 +772,10 @@ fn provenance(p: &GraphPattern) -> HashMap<Variable, Provenance> {
     of.into_iter()
         .map(|(v, c)| {
             let p = match c {
-                (_, false) => Provenance::Copied,
-                (false, true) => Provenance::Computed,
-                (true, true) => Provenance::Mixed,
+                (_, false, false) => Provenance::Copied,
+                (false, true, false) => Provenance::Computed,
+                (true, true, false) => Provenance::Mixed,
+                (_, _, true) => Provenance::MixedLexical,
             };
             (v, p)
         })

@@ -93,6 +93,48 @@ pub fn is_float_lexical(lex: &str) -> bool {
     mantissa_ok && exponent_ok
 }
 
+/// A canonical key for a lexical form in the XSD numeric lexical space, grouping allowed
+/// lexical forms of the same exact numeric value (such as `2`, `2.0`, `+2.00` and
+/// `2.0E0`, or `+INF` and `INF`). Returns `None` when `lex` is not a valid XSD numeric
+/// lexical form or its exponent overflows `i128`.
+pub fn canonical_numeric_lexical(lex: &str) -> Option<String> {
+    if !is_float_lexical(lex) {
+        return None;
+    }
+    match lex {
+        "INF" | "+INF" => return Some("INF".into()),
+        "-INF" => return Some("-INF".into()),
+        "NaN" => return Some("NaN".into()),
+        _ => {}
+    }
+    let (neg, body) = match lex.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, lex.strip_prefix('+').unwrap_or(lex)),
+    };
+    let (mantissa, exp) = match body.find(['e', 'E']) {
+        Some(i) => (&body[..i], body[i + 1..].parse::<i128>().ok()?),
+        None => (body, 0i128),
+    };
+    let (whole, frac) = match mantissa.find('.') {
+        Some(i) => (&mantissa[..i], &mantissa[i + 1..]),
+        None => (mantissa, ""),
+    };
+    let mut digits = String::with_capacity(whole.len() + frac.len());
+    digits.push_str(whole);
+    digits.push_str(frac);
+    let trimmed_start = digits.trim_start_matches('0');
+    if trimmed_start.is_empty() {
+        return Some("0".into());
+    }
+    let trimmed = trimmed_start.trim_end_matches('0');
+    let trailing_zeros = (trimmed_start.len() - trimmed.len()) as i128;
+    let scale = exp
+        .checked_sub(frac.len() as i128)?
+        .checked_add(trailing_zeros)?;
+    let sign = if neg { "-" } else { "" };
+    Some(format!("{sign}{trimmed}e{scale}"))
+}
+
 /// Whether [`numeric`] read an integer or decimal with more than 16 digits since the last
 /// call, which XSD 1.1 section 5.4 lets an implementation limit. The call resets it.
 pub fn take_beyond_minimum_precision() -> bool {
