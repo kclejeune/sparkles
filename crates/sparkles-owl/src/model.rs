@@ -1092,6 +1092,62 @@ impl Axiom {
             _ => vec![self.clone()],
         }
     }
+
+    /// Visit each normal form of this axiom without cloning `self` in the common case,
+    /// stopping early if `f` returns `Ok(false)` or `Err(_)`.
+    pub fn for_each_normal_form<E>(
+        &self,
+        mut f: impl FnMut(std::borrow::Cow<'_, Axiom>) -> Result<bool, E>,
+    ) -> Result<bool, E> {
+        fn visit_pairs<T: Clone + Ord, E>(
+            set: &BTreeSet<T>,
+            annotations: &BTreeSet<Annotation>,
+            make: impl Fn(BTreeSet<T>) -> AxiomKind,
+            f: &mut impl FnMut(std::borrow::Cow<'_, Axiom>) -> Result<bool, E>,
+        ) -> Result<bool, E> {
+            let mut it = set.iter();
+            let Some(mut prev) = it.next() else {
+                return Ok(true);
+            };
+            for next in it {
+                let ax = Axiom {
+                    kind: make([prev.clone(), next.clone()].into_iter().collect()),
+                    annotations: annotations.clone(),
+                };
+                if !f(std::borrow::Cow::Owned(ax))? {
+                    return Ok(false);
+                }
+                prev = next;
+            }
+            Ok(true)
+        }
+        let a = &self.annotations;
+        match &self.kind {
+            AxiomKind::EquivalentClasses(s) if s.len() > 2 => {
+                visit_pairs(s, a, AxiomKind::EquivalentClasses, &mut f)
+            }
+            AxiomKind::EquivalentObjectProperties(s) if s.len() > 2 => {
+                visit_pairs(s, a, AxiomKind::EquivalentObjectProperties, &mut f)
+            }
+            AxiomKind::EquivalentDataProperties(s) if s.len() > 2 => {
+                visit_pairs(s, a, AxiomKind::EquivalentDataProperties, &mut f)
+            }
+            AxiomKind::SameIndividual(s) if s.len() > 2 => {
+                visit_pairs(s, a, AxiomKind::SameIndividual, &mut f)
+            }
+            AxiomKind::ObjectPropertyAssertion(ObjectPropertyExpression::InverseOf(p), x, y) => {
+                f(std::borrow::Cow::Owned(Axiom {
+                    kind: AxiomKind::ObjectPropertyAssertion(
+                        ObjectPropertyExpression::Property(p.clone()),
+                        y.clone(),
+                        x.clone(),
+                    ),
+                    annotations: a.clone(),
+                }))
+            }
+            _ => f(std::borrow::Cow::Borrowed(self)),
+        }
+    }
 }
 
 /// The signature of a structure, collected by walking it, its [`Shape`], and whether

@@ -44,6 +44,12 @@ const DEFAULT_PATTERN_PREFIXES: [(&str, &str); 6] = [
     ("obo", "http://purl.obolibrary.org/obo/"),
 ];
 
+/// Maximum byte length of a diagnostic column or rule label.
+pub(crate) const MAX_DIAGNOSTIC_COLUMN_BYTES: usize = 256;
+
+/// Maximum vocabulary-exclusion convergence rounds before refusing a deep dependency chain.
+pub(crate) const MAX_VOCAB_ROUNDS: usize = 16;
+
 /// Non-hierarchical URI schemes accepted without angle brackets when not bound as prefixes.
 const ALLOWED_NON_HIERARCHICAL_SCHEMES: &[&str] = &[
     "urn", "mailto", "tag", "doi", "info", "data", "did", "uuid", "ni", "geo", "tel", "ark", "hdl",
@@ -265,18 +271,22 @@ impl PatternResult {
     }
 
     /// Deterministically map all generated axioms to RDF triples via the OWL 2 forward
-    /// mapping (`sparkles_owl::write`), refusing if the output exceeds `max_triples`.
+    /// mapping (`sparkles_owl::write`), refusing before allocation if the output exceeds
+    /// `max_triples`.
     pub fn try_triples(&self, max_triples: usize) -> Result<Vec<Triple>, String> {
-        let mut fresh = write::counter("pat");
-        let mut out = Vec::new();
+        let mut total = 0usize;
         for item in &self.axioms {
-            let chunk = write::axiom_triples(&item.axiom, &mut fresh);
-            if out.len().saturating_add(chunk.len()) > max_triples {
+            total = total.saturating_add(write::axiom_triple_count(&item.axiom));
+            if total > max_triples {
                 return Err(format!(
                     "projected RDF triples exceeded the limit of {max_triples}"
                 ));
             }
-            out.extend(chunk);
+        }
+        let mut fresh = write::counter("pat");
+        let mut out = Vec::with_capacity(total);
+        for item in &self.axioms {
+            out.extend(write::axiom_triples(&item.axiom, &mut fresh));
         }
         Ok(out)
     }
@@ -301,7 +311,7 @@ pub(crate) struct Context {
 }
 
 impl Context {
-    fn build(base_vocab: &Vocabulary, spec: &PatternSpec) -> Self {
+    pub(crate) fn build(base_vocab: &Vocabulary, spec: &PatternSpec) -> Self {
         // Merge prefixes: spec prefixes take highest precedence, then base_vocab prefixes,
         // then standard/default pattern prefixes.
         let mut merged: BTreeMap<String, String> = BTreeMap::new();
@@ -312,8 +322,8 @@ impl Context {
             merged.insert(p.clone(), ns.clone());
         }
         for (p, ns) in &spec.prefixes {
-            let p_clean = p.trim().trim_end_matches(':');
-            if !p_clean.is_empty() && !ns.trim().is_empty() {
+            let p_clean = normalize_prefix_key(p);
+            if is_valid_prefix_name(p_clean) && !ns.trim().is_empty() {
                 merged.insert(p_clean.to_string(), ns.trim().to_string());
             }
         }
@@ -395,6 +405,28 @@ impl Emitter {
         }
     }
 
+    /// Clear per-round outputs and diagnostics before a vocabulary-exclusion retry while
+    /// keeping cumulative work, expanded-byte, and vocabulary budgets intact.
+    pub(crate) fn reset_for_retry(
+        &mut self,
+        initial_diagnostics: &[RowDiagnostic],
+        initial_truncated: bool,
+    ) {
+        self.axioms.clear();
+        self.index.clear();
+        self.declarations.clear();
+        self.diagnostics.clear();
+        self.diagnostics_truncated = initial_truncated;
+        self.error_rows.clear();
+        self.total_errors = 0;
+        self.structural_errors = 0;
+        self.rows_processed = 0;
+        self.rows_skipped = 0;
+        for d in initial_diagnostics {
+            self.diag(d.clone());
+        }
+    }
+
     pub(crate) fn mark_row_error(&mut self, row: usize) {
         self.error_rows.insert(row);
     }
@@ -402,6 +434,9 @@ impl Emitter {
     pub(crate) fn diag(&mut self, mut diag: RowDiagnostic) {
         if diag.severity == Severity::Error {
             self.total_errors = self.total_errors.saturating_add(1);
+        }
+        if let Some(col) = diag.column.as_mut() {
+            truncate_utf8(col, MAX_DIAGNOSTIC_COLUMN_BYTES);
         }
         truncate_utf8(&mut diag.message, self.limits.max_diagnostic_message_bytes);
         if self.diagnostics.len() < self.limits.max_diagnostics {
@@ -480,7 +515,7 @@ impl Emitter {
         true
     }
 
-    pub(crate) fn charge_vocab(&mut self, row: usize) -> bool {
+    pub(crate) fn charge_vocab_bytes(&mut self, row: usize, bytes: usize) -> bool {
         self.vocab_entries_added = self.vocab_entries_added.saturating_add(1);
         if self.vocab_entries_added > self.limits.max_vocab_entries_added {
             self.budget_error(
@@ -494,7 +529,7 @@ impl Emitter {
             );
             return false;
         }
-        true
+        self.charge_expanded_bytes(bytes, row, None)
     }
 
     pub(crate) fn remaining_axiom_capacity(&self) -> usize {
@@ -502,17 +537,32 @@ impl Emitter {
     }
 
     /// Validate all staged axioms for one row and commit declarations + axioms atomically.
-    /// If any axiom fails `validate::axiom`, records the diagnostic(s), marks the row as
-    /// erroneous, and discards every staged declaration and axiom from this row.
-    /// Returns `false` if a request-wide budget limit is exceeded and evaluation should stop.
+    /// If any axiom fails `validate::axiom` or exceeds `max_annotations_per_axiom`, records
+    /// the diagnostic(s), marks the row as erroneous, and discards every staged declaration
+    /// and axiom from this row.
     pub(crate) fn commit_row(
         &mut self,
         row: usize,
         declarations: Vec<Entity>,
         axioms: Vec<(Axiom, Option<String>)>,
-    ) -> bool {
+    ) -> RowCommit {
         let mut any_invalid = false;
         for (ax, col) in &axioms {
+            if count_annotations(&ax.annotations) > self.limits.max_annotations_per_axiom {
+                any_invalid = true;
+                self.mark_row_error(row);
+                self.diag(RowDiagnostic {
+                    row,
+                    column: col.clone(),
+                    severity: Severity::Error,
+                    code: "annotation-limit".to_string(),
+                    message: format!(
+                        "axiom carries more than {} annotations",
+                        self.limits.max_annotations_per_axiom
+                    ),
+                });
+                continue;
+            }
             if let Err(e) = crate::validate::axiom(ax) {
                 any_invalid = true;
                 self.mark_row_error(row);
@@ -526,7 +576,7 @@ impl Emitter {
             }
         }
         if any_invalid {
-            return true;
+            return RowCommit::Invalid;
         }
 
         // Check whether adding the new unique axioms from this row would exceed `max_axioms`
@@ -548,7 +598,7 @@ impl Emitter {
                     self.limits.max_axioms
                 ),
             );
-            return false;
+            return RowCommit::BudgetExceeded;
         }
 
         for entity in declarations {
@@ -569,7 +619,7 @@ impl Emitter {
                 });
             }
         }
-        true
+        RowCommit::Committed
     }
 
     fn finish(self, delimiter: Delimiter, headers: Vec<String>) -> PatternResult {
@@ -590,7 +640,14 @@ impl Emitter {
     }
 }
 
-fn truncate_utf8(s: &mut String, max_bytes: usize) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowCommit {
+    Committed,
+    Invalid,
+    BudgetExceeded,
+}
+
+pub(crate) fn truncate_utf8(s: &mut String, max_bytes: usize) {
     if s.len() <= max_bytes {
         return;
     }
@@ -604,6 +661,58 @@ fn truncate_utf8(s: &mut String, max_bytes: usize) {
     if max_bytes >= suffix.len() {
         s.push_str(suffix);
     }
+}
+
+pub(crate) fn truncated_snippet(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(max_bytes);
+    let suffix = "…";
+    let target = max_bytes.saturating_sub(suffix.len());
+    let mut end = target.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.push_str(&s[..end]);
+    if max_bytes >= suffix.len() {
+        out.push_str(suffix);
+    }
+    out
+}
+
+/// Recursively count all annotations (including nested annotations) in `anns`.
+pub(crate) fn count_annotations(anns: &BTreeSet<Annotation>) -> usize {
+    let mut total = 0usize;
+    for a in anns {
+        total = total
+            .saturating_add(1)
+            .saturating_add(count_annotations(&a.annotations));
+    }
+    total
+}
+
+/// Approximate heap footprint of an [`Annotation`] in bytes for pre-clone budget charging.
+pub(crate) fn annotation_bytes(a: &Annotation) -> usize {
+    let val_bytes = match &a.value {
+        AnnotationValue::Iri(i) => i.as_str().len(),
+        AnnotationValue::Literal(l) => l
+            .value()
+            .len()
+            .saturating_add(l.language().map_or(0, str::len))
+            .saturating_add(l.datatype().len()),
+        AnnotationValue::Anonymous(b) => b.label().len(),
+    };
+    let mut total = a
+        .property
+        .as_str()
+        .len()
+        .saturating_add(val_bytes)
+        .saturating_add(64);
+    for inner in &a.annotations {
+        total = total.saturating_add(annotation_bytes(inner));
+    }
+    total
 }
 
 /// Evaluate raw CSV/TSV spreadsheet text against `spec` using `base_vocab` (the existing
@@ -695,16 +804,23 @@ pub fn evaluate_table_with_cancel(
 ) -> Result<PatternResult, EvalError> {
     check_cancel()?;
     let mut emitter = Emitter::new(limits, initial_truncated);
-    for d in initial_diagnostics {
-        emitter.diag(d);
+    for d in &initial_diagnostics {
+        emitter.diag(d.clone());
     }
 
     if !check_spec_limits(spec, limits, &mut emitter) {
         return Ok(emitter.finish(table.delimiter, table.headers.clone()));
     }
 
-    let mut ctx = Context::build(base_vocab, spec);
-    if let Some(ref base) = ctx.base_iri
+    if !validate_spec_prefixes(spec, &mut emitter) {
+        return Ok(emitter.finish(table.delimiter, table.headers.clone()));
+    }
+
+    if let Some(base) = spec
+        .base_iri
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         && parse_iri(base).is_err()
     {
         emitter.structural_error(RowDiagnostic {
@@ -712,7 +828,10 @@ pub fn evaluate_table_with_cancel(
             column: None,
             severity: Severity::Error,
             code: "invalid-base-iri".to_string(),
-            message: format!("base IRI '{base}' is not a valid absolute IRI"),
+            message: format!(
+                "base IRI '{}' is not a valid absolute IRI",
+                truncated_snippet(base, 128)
+            ),
         });
         return Ok(emitter.finish(table.delimiter, table.headers.clone()));
     }
@@ -725,8 +844,11 @@ pub fn evaluate_table_with_cancel(
             table,
             *header_template_row,
             columns,
-            &mut ctx,
+            base_vocab,
+            spec,
             limits,
+            &initial_diagnostics,
+            initial_truncated,
             &mut emitter,
             check_cancel,
         )?,
@@ -737,14 +859,57 @@ pub fn evaluate_table_with_cancel(
             table,
             rules,
             declarations,
-            &mut ctx,
+            base_vocab,
+            spec,
             limits,
+            &initial_diagnostics,
+            initial_truncated,
             &mut emitter,
             check_cancel,
         )?,
     }
 
     Ok(emitter.finish(table.delimiter, table.headers.clone()))
+}
+
+fn validate_spec_prefixes(spec: &PatternSpec, emitter: &mut Emitter) -> bool {
+    let mut ok = true;
+    for (raw_key, raw_ns) in &spec.prefixes {
+        let trimmed_key = raw_key.trim();
+        let clean = normalize_prefix_key(trimmed_key);
+        let single_trailing_colon = trimmed_key
+            .strip_suffix(':')
+            .is_none_or(|rest| !rest.contains(':'));
+        if !single_trailing_colon || !is_valid_prefix_name(clean) {
+            ok = false;
+            emitter.structural_error(RowDiagnostic {
+                row: 1,
+                column: None,
+                severity: Severity::Error,
+                code: "invalid-prefix".to_string(),
+                message: format!(
+                    "prefix '{}' is not a valid ASCII prefix name",
+                    truncated_snippet(raw_key, 64)
+                ),
+            });
+            continue;
+        }
+        let ns = raw_ns.trim();
+        if ns.is_empty() || parse_iri(ns).is_err() {
+            ok = false;
+            emitter.structural_error(RowDiagnostic {
+                row: 1,
+                column: None,
+                severity: Severity::Error,
+                code: "invalid-prefix".to_string(),
+                message: format!(
+                    "namespace '{}' for prefix '{clean}' is not a valid absolute IRI",
+                    truncated_snippet(ns, 128)
+                ),
+            });
+        }
+    }
+    ok
 }
 
 fn check_spec_limits(spec: &PatternSpec, limits: &Limits, emitter: &mut Emitter) -> bool {
@@ -829,95 +994,254 @@ fn check_spec_limits(spec: &PatternSpec, limits: &Limits, emitter: &mut Emitter)
     true
 }
 
-fn is_curie_prefix(prefix: &str) -> bool {
-    prefix.is_empty()
-        || prefix
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+pub(crate) fn normalize_prefix_key(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    trimmed.strip_suffix(':').unwrap_or(trimmed)
 }
 
-/// Resolve an IRI, `<IRI>`, CURIE (`prefix:local`), or bare local name (when `base_iri`
-/// is configured) into a validated [`Iri`].
-pub(crate) fn resolve_iri(raw: &str, ctx: &Context) -> Result<Iri, String> {
+/// ASCII prefix name (`PN_PREFIX` subset) or empty default prefix, matching the store's
+/// prefix grammar so `resolve_iri`, Manchester syntax, and Functional-Style syntax agree.
+pub(crate) fn is_valid_prefix_name(prefix: &str) -> bool {
+    let b = prefix.as_bytes();
+    prefix.is_empty()
+        || (b[0].is_ascii_alphabetic()
+            && b.iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+            && !prefix.ends_with('.'))
+}
+
+pub(crate) enum ResolveError {
+    Invalid(String),
+    Budget,
+}
+
+/// Resolve an IRI, `<IRI>`, CURIE (`prefix:local`), or unqualified bare local name (when
+/// `base_iri` is configured) into a validated [`Iri`], charging the resolved byte length
+/// against `emitter` BEFORE allocating expanded strings.
+pub(crate) fn resolve_iri_charged(
+    raw: &str,
+    ctx: &Context,
+    emitter: &mut Emitter,
+    row: usize,
+    column: Option<&str>,
+) -> Result<Iri, ResolveError> {
     let s = raw.trim();
     if s.is_empty() {
-        return Err("empty IRI".to_string());
+        return Err(ResolveError::Invalid("empty IRI".to_string()));
     }
+    let max_per_template = emitter.limits.max_expanded_bytes_per_template;
+    let charge = |len: usize, emitter: &mut Emitter| -> Result<(), ResolveError> {
+        if len > max_per_template {
+            return Err(ResolveError::Invalid(format!(
+                "resolved IRI ({len} bytes) exceeds the {max_per_template} byte limit"
+            )));
+        }
+        if !emitter.charge_expanded_bytes(len, row, column.map(str::to_string)) {
+            return Err(ResolveError::Budget);
+        }
+        Ok(())
+    };
+
     if s.starts_with('<') && s.ends_with('>') && s.len() > 2 {
-        return parse_iri(&s[1..s.len() - 1]).map_err(|e| e.0);
+        let inner = &s[1..s.len() - 1];
+        charge(inner.len(), emitter)?;
+        return parse_iri(inner).map_err(|e| ResolveError::Invalid(e.0));
     }
     if !s.contains(char::is_whitespace)
         && let Some((prefix, local)) = s.split_once(':')
     {
         // Hierarchical full IRIs such as http://..., https://..., file://...
         if local.starts_with("//") {
-            return parse_iri(s).map_err(|e| e.0);
+            charge(s.len(), emitter)?;
+            return parse_iri(s).map_err(|e| ResolveError::Invalid(e.0));
         }
-        if is_curie_prefix(prefix) {
+        if is_valid_prefix_name(prefix) {
             if let Some((_, ns)) = ctx.prefixes.iter().find(|(p, _)| p == prefix) {
-                let full = format!("{ns}{local}");
-                return parse_iri(&full).map_err(|e| e.0);
+                let est_len = ns.len().saturating_add(local.len());
+                charge(est_len, emitter)?;
+                let mut full = String::with_capacity(est_len);
+                full.push_str(ns);
+                full.push_str(local);
+                return parse_iri(&full).map_err(|e| ResolveError::Invalid(e.0));
             }
             if !prefix.is_empty()
                 && ALLOWED_NON_HIERARCHICAL_SCHEMES
                     .iter()
                     .any(|scheme| prefix.eq_ignore_ascii_case(scheme))
             {
-                return parse_iri(s).map_err(|e| e.0);
+                charge(s.len(), emitter)?;
+                return parse_iri(s).map_err(|e| ResolveError::Invalid(e.0));
             }
-            return Err(format!(
-                "unknown prefix '{prefix}' in '{s}' (bind the prefix or wrap full IRIs in <...>)"
-            ));
+            return Err(ResolveError::Invalid(format!(
+                "unknown prefix '{}' in '{}' (bind the prefix or wrap full IRIs in <...>)",
+                truncated_snippet(prefix, 64),
+                truncated_snippet(s, 128)
+            )));
         }
+        // Any other non-whitespace token containing ':' is a malformed qualified name
+        // and must NOT fall through to base_iri expansion.
+        return Err(ResolveError::Invalid(format!(
+            "invalid prefix '{}' in '{}' (use an ASCII prefix name or wrap full IRIs in <...>)",
+            truncated_snippet(prefix, 64),
+            truncated_snippet(s, 128)
+        )));
     }
-    // Bare local name resolved against base_iri if configured.
+    // Unqualified bare local name resolved against base_iri if configured.
     if let Some(base) = &ctx.base_iri
         && !s.contains(char::is_whitespace)
+        && !s.contains(':')
     {
-        let joined = if base.ends_with('#') || base.ends_with('/') || base.ends_with(':') {
-            format!("{base}{s}")
-        } else {
-            format!("{base}#{s}")
-        };
-        return parse_iri(&joined).map_err(|e| e.0);
+        let needs_hash = !(base.ends_with('#') || base.ends_with('/') || base.ends_with(':'));
+        let est_len = base
+            .len()
+            .saturating_add(usize::from(needs_hash))
+            .saturating_add(s.len());
+        charge(est_len, emitter)?;
+        let mut joined = String::with_capacity(est_len);
+        joined.push_str(base);
+        if needs_hash {
+            joined.push('#');
+        }
+        joined.push_str(s);
+        return parse_iri(&joined).map_err(|e| ResolveError::Invalid(e.0));
     }
     // Fall back to unique label lookup in the vocabulary.
     let mut matches = ctx.vocab.named(s);
     if let Some(first) = matches.next() {
         if matches.next().is_none() {
-            return parse_iri(first).map_err(|e| e.0);
+            charge(first.len(), emitter)?;
+            return parse_iri(first).map_err(|e| ResolveError::Invalid(e.0));
         }
-        return Err(format!(
-            "name '{s}' is ambiguous in the ontology vocabulary"
-        ));
+        return Err(ResolveError::Invalid(format!(
+            "name '{}' is ambiguous in the ontology vocabulary",
+            truncated_snippet(s, 128)
+        )));
     }
-    Err(format!(
-        "cannot resolve '{s}' as an IRI, prefixed name, or known label"
-    ))
+    Err(ResolveError::Invalid(format!(
+        "cannot resolve '{}' as an IRI, prefixed name, or known label",
+        truncated_snippet(s, 128)
+    )))
 }
 
-/// Parse a Manchester class expression, falling back to resolving a simple class IRI/CURIE
-/// when the class is not yet declared in `ctx.vocab`.
-pub(crate) fn parse_class_expr_fallback(
+/// Charge estimated namespace expansion bytes for prefixed names appearing in a Manchester
+/// or Functional-Style expression BEFORE invoking the parser.
+pub(crate) fn charge_prefixed_expansions(
     text: &str,
     ctx: &Context,
-) -> Result<ClassExpression, String> {
+    emitter: &mut Emitter,
+    row: usize,
+    column: Option<&str>,
+) -> Result<(), ResolveError> {
+    let bytes = text.as_bytes();
+    let mut extra_bytes = 0usize;
+    let mut i = 0usize;
+    let mut in_double_quote = false;
+    let mut in_single_quote = false;
+    let mut in_angle = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_double_quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_double_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_single_quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'\'' {
+                in_single_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_angle {
+            if b == b'>' || b.is_ascii_whitespace() {
+                in_angle = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_double_quote = true,
+            b'\'' => in_single_quote = true,
+            b'<' => in_angle = true,
+            b':' if bytes.get(i + 1..i + 3) != Some(b"//") => {
+                // Skip hierarchical URI schemes (`scheme://...`).
+                let mut start = i;
+                while start > 0 {
+                    let prev = bytes[start - 1];
+                    if prev.is_ascii_alphanumeric() || matches!(prev, b'_' | b'-' | b'.') {
+                        start -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                let prefix = &text[start..i];
+                if is_valid_prefix_name(prefix)
+                    && let Some((_, ns)) = ctx.prefixes.iter().find(|(p, _)| p == prefix)
+                {
+                    extra_bytes = extra_bytes.saturating_add(ns.len());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if extra_bytes == 0 {
+        return Ok(());
+    }
+    let max_per_template = emitter.limits.max_expanded_bytes_per_template;
+    let total_est = text.len().saturating_add(extra_bytes);
+    if total_est > max_per_template {
+        return Err(ResolveError::Invalid(format!(
+            "expanded prefixed terms ({total_est} bytes) exceed the {max_per_template} byte limit"
+        )));
+    }
+    if !emitter.charge_expanded_bytes(extra_bytes, row, column.map(str::to_string)) {
+        return Err(ResolveError::Budget);
+    }
+    Ok(())
+}
+
+/// Parse a Manchester class expression after charging prefixed-name expansions, falling
+/// back to resolving a simple class IRI/CURIE when the class is not yet declared in
+/// `ctx.vocab`.
+pub(crate) fn parse_class_expr_fallback_charged(
+    text: &str,
+    ctx: &Context,
+    emitter: &mut Emitter,
+    row: usize,
+    column: Option<&str>,
+) -> Result<ClassExpression, ResolveError> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err("empty class expression".to_string());
+        return Err(ResolveError::Invalid("empty class expression".to_string()));
     }
+    charge_prefixed_expansions(trimmed, ctx, emitter, row, column)?;
     match manchester::class_expression(trimmed, &ctx.vocab) {
         Ok(ce) => Ok(ce),
         Err(err) => {
             // If the expression is a single token (IRI or CURIE) not yet in vocab, accept it
             // as a named Class so spreadsheets can reference external or undeclared superclasses.
-            if !trimmed.contains(char::is_whitespace)
-                && !trimmed.contains(['(', ')', '{', '}'])
-                && let Ok(iri) = resolve_iri(trimmed, ctx)
-            {
-                return Ok(ClassExpression::Class(Class(iri)));
+            if !trimmed.contains(char::is_whitespace) && !trimmed.contains(['(', ')', '{', '}']) {
+                match resolve_iri_charged(trimmed, ctx, emitter, row, column) {
+                    Ok(iri) => return Ok(ClassExpression::Class(Class(iri))),
+                    Err(ResolveError::Budget) => return Err(ResolveError::Budget),
+                    Err(ResolveError::Invalid(_)) => {}
+                }
             }
-            Err(err.message)
+            Err(ResolveError::Invalid(err.message))
         }
     }
 }

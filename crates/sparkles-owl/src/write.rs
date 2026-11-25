@@ -615,6 +615,465 @@ pub fn axiom_triples(ax: &Axiom, fresh: &mut dyn FnMut() -> BlankNode) -> Vec<Tr
     w.triples
 }
 
+/// Exact number of RDF triples [`axiom_triples`] would emit for `ax`, computed without
+/// allocating any triples.
+pub fn axiom_triple_count(ax: &Axiom) -> usize {
+    axiom_projection_cost(ax).0
+}
+
+/// Exact triple count and approximate serialized byte footprint that [`axiom_triples`]
+/// would allocate for `ax`, computed without allocating triples.
+pub fn axiom_projection_cost(ax: &Axiom) -> (usize, usize) {
+    struct Counter {
+        triples: usize,
+        bytes: usize,
+    }
+    impl Counter {
+        fn add(&mut self, triples: usize, extra_bytes: usize) {
+            self.triples = self.triples.saturating_add(triples);
+            self.bytes = self
+                .bytes
+                .saturating_add(triples.saturating_mul(64))
+                .saturating_add(extra_bytes);
+        }
+
+        fn lit_bytes(l: &Literal) -> usize {
+            l.value().len() + l.language().map_or(0, str::len) + l.datatype().len()
+        }
+
+        fn ind_bytes(i: &Individual) -> usize {
+            match i {
+                Individual::Named(n) => n.as_str().len(),
+                Individual::Anonymous(a) => a.label().len(),
+            }
+        }
+
+        fn ann_value_bytes(v: &AnnotationValue) -> usize {
+            match v {
+                AnnotationValue::Iri(i) => i.as_str().len(),
+                AnnotationValue::Literal(l) => Self::lit_bytes(l),
+                AnnotationValue::Anonymous(a) => a.label().len(),
+            }
+        }
+
+        fn list(&mut self, len: usize) {
+            self.add(len.saturating_mul(2), 0);
+        }
+
+        fn ope(&mut self, p: &ObjectPropertyExpression) -> usize {
+            match p {
+                ObjectPropertyExpression::Property(p) => p.as_str().len(),
+                ObjectPropertyExpression::InverseOf(p) => {
+                    self.add(1, p.as_str().len());
+                    16
+                }
+            }
+        }
+
+        fn data_range(&mut self, r: &DataRange) -> usize {
+            match r {
+                DataRange::Datatype(d) => d.as_str().len(),
+                DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => {
+                    let mut item_bytes = 0usize;
+                    for inner in rs {
+                        item_bytes = item_bytes.saturating_add(self.data_range(inner));
+                    }
+                    self.add(2, item_bytes);
+                    self.list(rs.len());
+                    16
+                }
+                DataRange::ComplementOf(inner) => {
+                    let b = self.data_range(inner);
+                    self.add(2, b);
+                    16
+                }
+                DataRange::OneOf(ls) => {
+                    let item_bytes = ls
+                        .iter()
+                        .fold(0usize, |a, l| a.saturating_add(Self::lit_bytes(l)));
+                    self.add(2, item_bytes);
+                    self.list(ls.len());
+                    16
+                }
+                DataRange::DatatypeRestriction(d, fs) => {
+                    let mut facet_bytes = d.as_str().len();
+                    for f in fs {
+                        facet_bytes = facet_bytes
+                            .saturating_add(f.facet.as_str().len())
+                            .saturating_add(Self::lit_bytes(&f.value));
+                    }
+                    self.add(3usize.saturating_add(fs.len()), facet_bytes);
+                    self.list(fs.len());
+                    16
+                }
+            }
+        }
+
+        fn class_expression(&mut self, c: &ClassExpression) -> usize {
+            use ClassExpression as C;
+            match c {
+                C::Class(c) => c.as_str().len(),
+                C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+                    let mut item_bytes = 0usize;
+                    for inner in cs {
+                        item_bytes = item_bytes.saturating_add(self.class_expression(inner));
+                    }
+                    self.add(2, item_bytes);
+                    self.list(cs.len());
+                    16
+                }
+                C::ObjectComplementOf(inner) => {
+                    let b = self.class_expression(inner);
+                    self.add(2, b);
+                    16
+                }
+                C::ObjectOneOf(is) => {
+                    let item_bytes = is
+                        .iter()
+                        .fold(0usize, |a, i| a.saturating_add(Self::ind_bytes(i)));
+                    self.add(2, item_bytes);
+                    self.list(is.len());
+                    16
+                }
+                C::ObjectSomeValuesFrom(p, f) | C::ObjectAllValuesFrom(p, f) => {
+                    let b = self.ope(p).saturating_add(self.class_expression(f));
+                    self.add(3, b);
+                    16
+                }
+                C::ObjectHasValue(p, i) => {
+                    let b = self.ope(p).saturating_add(Self::ind_bytes(i));
+                    self.add(3, b);
+                    16
+                }
+                C::ObjectHasSelf(p) => {
+                    let b = self.ope(p);
+                    self.add(3, b);
+                    16
+                }
+                C::ObjectMinCardinality(_, p, f)
+                | C::ObjectMaxCardinality(_, p, f)
+                | C::ObjectExactCardinality(_, p, f) => {
+                    let mut b = self.ope(p);
+                    let triples = if let Some(inner) = f {
+                        b = b.saturating_add(self.class_expression(inner));
+                        4
+                    } else {
+                        3
+                    };
+                    self.add(triples, b);
+                    16
+                }
+                C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => {
+                    let mut b = self.data_range(r);
+                    for p in ps {
+                        b = b.saturating_add(p.as_str().len());
+                    }
+                    if ps.len() == 1 {
+                        self.add(3, b);
+                    } else {
+                        self.add(3, b);
+                        self.list(ps.len());
+                    }
+                    16
+                }
+                C::DataHasValue(p, l) => {
+                    self.add(3, p.as_str().len().saturating_add(Self::lit_bytes(l)));
+                    16
+                }
+                C::DataMinCardinality(_, p, r)
+                | C::DataMaxCardinality(_, p, r)
+                | C::DataExactCardinality(_, p, r) => {
+                    let mut b = p.as_str().len();
+                    let triples = if let Some(inner) = r {
+                        b = b.saturating_add(self.data_range(inner));
+                        4
+                    } else {
+                        3
+                    };
+                    self.add(triples, b);
+                    16
+                }
+            }
+        }
+
+        fn annotation_cost(a: &Annotation) -> (usize, usize) {
+            let mut c = Counter {
+                triples: 0,
+                bytes: 0,
+            };
+            let v_bytes = Self::ann_value_bytes(&a.value);
+            let p_bytes = a.property.as_str().len();
+            c.add(1, p_bytes.saturating_add(v_bytes));
+            if !a.annotations.is_empty() {
+                c.add(4, p_bytes.saturating_add(v_bytes));
+                for inner in &a.annotations {
+                    let (t, b) = Self::annotation_cost(inner);
+                    c.triples = c.triples.saturating_add(t);
+                    c.bytes = c.bytes.saturating_add(b);
+                }
+            }
+            (c.triples, c.bytes)
+        }
+
+        fn annotations_cost(anns: &std::collections::BTreeSet<Annotation>) -> (usize, usize) {
+            let mut triples = 0usize;
+            let mut bytes = 0usize;
+            for a in anns {
+                let (t, b) = Self::annotation_cost(a);
+                triples = triples.saturating_add(t);
+                bytes = bytes.saturating_add(b);
+            }
+            (triples, bytes)
+        }
+
+        fn main(&mut self, main_bytes: usize, anns: &std::collections::BTreeSet<Annotation>) {
+            self.add(1, main_bytes);
+            if !anns.is_empty() {
+                self.add(4, main_bytes);
+                let (at, ab) = Self::annotations_cost(anns);
+                self.triples = self.triples.saturating_add(at);
+                self.bytes = self.bytes.saturating_add(ab);
+            }
+        }
+
+        fn blank_axiom(
+            &mut self,
+            member_count: usize,
+            member_bytes: usize,
+            anns: &std::collections::BTreeSet<Annotation>,
+        ) {
+            self.add(2, member_bytes);
+            self.list(member_count);
+            let (at, ab) = Self::annotations_cost(anns);
+            self.triples = self.triples.saturating_add(at);
+            self.bytes = self.bytes.saturating_add(ab);
+        }
+
+        fn pairwise(
+            &mut self,
+            node_bytes: &[usize],
+            anns: &std::collections::BTreeSet<Annotation>,
+        ) {
+            if let [only] = node_bytes {
+                self.main(only.saturating_mul(2), anns);
+                return;
+            }
+            for w in node_bytes.windows(2) {
+                self.main(w[0].saturating_add(w[1]), anns);
+            }
+        }
+    }
+
+    use AxiomKind as K;
+    let mut c = Counter {
+        triples: 0,
+        bytes: 0,
+    };
+    let ann = &ax.annotations;
+    match &ax.kind {
+        K::Declaration(e) => c.main(e.iri().as_str().len(), ann),
+        K::SubClassOf(a, b) => {
+            let nb = c.class_expression(a).saturating_add(c.class_expression(b));
+            c.main(nb, ann);
+        }
+        K::EquivalentClasses(cs) => {
+            let nodes: Vec<usize> = cs.iter().map(|ce| c.class_expression(ce)).collect();
+            c.pairwise(&nodes, ann);
+        }
+        K::DisjointClasses(cs) => {
+            if cs.len() == 2 {
+                let mut it = cs.iter();
+                let a = c.class_expression(it.next().unwrap());
+                let b = c.class_expression(it.next().unwrap());
+                c.main(a.saturating_add(b), ann);
+            } else {
+                let bytes = cs
+                    .iter()
+                    .fold(0usize, |acc, ce| acc.saturating_add(c.class_expression(ce)));
+                c.blank_axiom(cs.len(), bytes, ann);
+            }
+        }
+        K::DisjointUnion(cls, cs) => {
+            let bytes = cs.iter().fold(cls.as_str().len(), |acc, ce| {
+                acc.saturating_add(c.class_expression(ce))
+            });
+            c.list(cs.len());
+            c.main(bytes, ann);
+        }
+        K::SubObjectPropertyOf(sub, sup) => match sub {
+            SubObjectPropertyExpression::Expression(p) => {
+                let nb = c.ope(p).saturating_add(c.ope(sup));
+                c.main(nb, ann);
+            }
+            SubObjectPropertyExpression::Chain(ps) => {
+                let mut bytes = c.ope(sup);
+                for p in ps {
+                    bytes = bytes.saturating_add(c.ope(p));
+                }
+                c.list(ps.len());
+                c.main(bytes, ann);
+            }
+        },
+        K::EquivalentObjectProperties(ps) => {
+            let nodes: Vec<usize> = ps.iter().map(|p| c.ope(p)).collect();
+            c.pairwise(&nodes, ann);
+        }
+        K::DisjointObjectProperties(ps) => {
+            if ps.len() == 2 {
+                let mut it = ps.iter();
+                let a = c.ope(it.next().unwrap());
+                let b = c.ope(it.next().unwrap());
+                c.main(a.saturating_add(b), ann);
+            } else {
+                let bytes = ps
+                    .iter()
+                    .fold(0usize, |acc, p| acc.saturating_add(c.ope(p)));
+                c.blank_axiom(ps.len(), bytes, ann);
+            }
+        }
+        K::InverseObjectProperties(a, b) => {
+            let nb = c.ope(a).saturating_add(c.ope(b));
+            c.main(nb, ann);
+        }
+        K::ObjectPropertyDomain(p, ce) | K::ObjectPropertyRange(p, ce) => {
+            let nb = c.ope(p).saturating_add(c.class_expression(ce));
+            c.main(nb, ann);
+        }
+        K::FunctionalObjectProperty(p)
+        | K::InverseFunctionalObjectProperty(p)
+        | K::ReflexiveObjectProperty(p)
+        | K::IrreflexiveObjectProperty(p)
+        | K::SymmetricObjectProperty(p)
+        | K::AsymmetricObjectProperty(p)
+        | K::TransitiveObjectProperty(p) => {
+            let nb = c.ope(p);
+            c.main(nb, ann);
+        }
+        K::SubDataPropertyOf(a, b) => {
+            c.main(a.as_str().len().saturating_add(b.as_str().len()), ann);
+        }
+        K::EquivalentDataProperties(ps) => {
+            let nodes: Vec<usize> = ps.iter().map(|p| p.as_str().len()).collect();
+            c.pairwise(&nodes, ann);
+        }
+        K::DisjointDataProperties(ps) => {
+            if ps.len() == 2 {
+                let mut it = ps.iter();
+                let a = it.next().unwrap().as_str().len();
+                let b = it.next().unwrap().as_str().len();
+                c.main(a.saturating_add(b), ann);
+            } else {
+                let bytes = ps
+                    .iter()
+                    .fold(0usize, |acc, p| acc.saturating_add(p.as_str().len()));
+                c.blank_axiom(ps.len(), bytes, ann);
+            }
+        }
+        K::DataPropertyDomain(p, ce) => {
+            let nb = p.as_str().len().saturating_add(c.class_expression(ce));
+            c.main(nb, ann);
+        }
+        K::DataPropertyRange(p, dr) => {
+            let nb = p.as_str().len().saturating_add(c.data_range(dr));
+            c.main(nb, ann);
+        }
+        K::FunctionalDataProperty(p) => c.main(p.as_str().len(), ann),
+        K::DatatypeDefinition(d, dr) => {
+            let nb = d.as_str().len().saturating_add(c.data_range(dr));
+            c.main(nb, ann);
+        }
+        K::HasKey(ce, ops, dps) => {
+            let mut bytes = c.class_expression(ce);
+            for p in ops {
+                bytes = bytes.saturating_add(c.ope(p));
+            }
+            for p in dps {
+                bytes = bytes.saturating_add(p.as_str().len());
+            }
+            c.list(ops.len().saturating_add(dps.len()));
+            c.main(bytes, ann);
+        }
+        K::SameIndividual(is) => {
+            let nodes: Vec<usize> = is.iter().map(Counter::ind_bytes).collect();
+            c.pairwise(&nodes, ann);
+        }
+        K::DifferentIndividuals(is) => {
+            if is.len() == 2 {
+                let mut it = is.iter();
+                let a = Counter::ind_bytes(it.next().unwrap());
+                let b = Counter::ind_bytes(it.next().unwrap());
+                c.main(a.saturating_add(b), ann);
+            } else {
+                let bytes = is
+                    .iter()
+                    .fold(0usize, |acc, i| acc.saturating_add(Counter::ind_bytes(i)));
+                c.blank_axiom(is.len(), bytes, ann);
+            }
+        }
+        K::ClassAssertion(ce, i) => {
+            let nb = c.class_expression(ce).saturating_add(Counter::ind_bytes(i));
+            c.main(nb, ann);
+        }
+        K::ObjectPropertyAssertion(p, a, b) => {
+            let nb = p
+                .named()
+                .as_str()
+                .len()
+                .saturating_add(Counter::ind_bytes(a))
+                .saturating_add(Counter::ind_bytes(b));
+            c.main(nb, ann);
+        }
+        K::NegativeObjectPropertyAssertion(p, a, b) => {
+            let nb = c
+                .ope(p)
+                .saturating_add(Counter::ind_bytes(a))
+                .saturating_add(Counter::ind_bytes(b));
+            c.add(4, nb);
+            let (at, ab) = Counter::annotations_cost(ann);
+            c.triples = c.triples.saturating_add(at);
+            c.bytes = c.bytes.saturating_add(ab);
+        }
+        K::DataPropertyAssertion(p, a, l) => {
+            let nb = p
+                .as_str()
+                .len()
+                .saturating_add(Counter::ind_bytes(a))
+                .saturating_add(Counter::lit_bytes(l));
+            c.main(nb, ann);
+        }
+        K::NegativeDataPropertyAssertion(p, a, l) => {
+            let nb = p
+                .as_str()
+                .len()
+                .saturating_add(Counter::ind_bytes(a))
+                .saturating_add(Counter::lit_bytes(l));
+            c.add(4, nb);
+            let (at, ab) = Counter::annotations_cost(ann);
+            c.triples = c.triples.saturating_add(at);
+            c.bytes = c.bytes.saturating_add(ab);
+        }
+        K::AnnotationAssertion(p, s, v) => {
+            let sb = match s {
+                AnnotationSubject::Iri(i) => i.as_str().len(),
+                AnnotationSubject::Anonymous(a) => a.label().len(),
+            };
+            let nb = p
+                .as_str()
+                .len()
+                .saturating_add(sb)
+                .saturating_add(Counter::ann_value_bytes(v));
+            c.main(nb, ann);
+        }
+        K::SubAnnotationPropertyOf(a, b) => {
+            c.main(a.as_str().len().saturating_add(b.as_str().len()), ann);
+        }
+        K::AnnotationPropertyDomain(p, i) | K::AnnotationPropertyRange(p, i) => {
+            c.main(p.as_str().len().saturating_add(i.as_str().len()), ann);
+        }
+    }
+    (c.triples, c.bytes)
+}
+
 /// The triples of a whole ontology: its header (on its IRI, or a blank node for an
 /// anonymous ontology) and its axioms.
 pub fn ontology_triples<'a>(

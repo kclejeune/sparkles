@@ -3,12 +3,14 @@
 //! `AI <prop>`, `SPLIT=<sep>`, and axiom annotations `>A`, `>AL`, `>AT`, `>AI`).
 
 use super::{
-    CancelReason, Context, Emitter, EvalError, Limits, RowDiagnostic, Severity, Table, TableRow,
-    parse_class_expr_fallback, resolve_iri,
+    CancelReason, Context, Emitter, EvalError, Limits, MAX_VOCAB_ROUNDS, PatternSpec, ResolveError,
+    RowCommit, RowDiagnostic, Severity, Table, TableRow, annotation_bytes,
+    parse_class_expr_fallback_charged, resolve_iri_charged,
 };
+use crate::manchester::Vocabulary;
 use crate::model::*;
 use crate::vocab;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 
 /// Explicit mapping from a column name to a ROBOT directive string.
@@ -259,12 +261,16 @@ enum LastColTarget {
 }
 
 /// Resolve the parsed column directives and data rows for ROBOT mode.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_robot(
     table: &Table,
     header_template_row: bool,
     explicit_columns: &[ColumnDirective],
-    ctx: &mut Context,
+    base_vocab: &Vocabulary,
+    spec: &PatternSpec,
     limits: &Limits,
+    initial_diagnostics: &[RowDiagnostic],
+    initial_truncated: bool,
     emitter: &mut Emitter,
     check_cancel: &mut dyn FnMut() -> Result<(), CancelReason>,
 ) -> Result<(), EvalError> {
@@ -275,6 +281,7 @@ pub(crate) fn evaluate_robot(
         first_header_idx.entry(h.as_str()).or_insert(i);
     }
 
+    let mut structural_diags: Vec<RowDiagnostic> = Vec::new();
     let (template_cells, data_rows): (Vec<TemplateCell>, &[TableRow]) = if header_template_row {
         let Some((first, rest)) = table.rows.split_first() else {
             emitter.structural_error(RowDiagnostic {
@@ -297,7 +304,7 @@ pub(crate) fn evaluate_robot(
         for cd in explicit_columns {
             match header_counts.get(cd.column.as_str()).copied().unwrap_or(0) {
                 0 => {
-                    emitter.structural_error(RowDiagnostic {
+                    structural_diags.push(RowDiagnostic {
                         row: 1,
                         column: Some(cd.column.clone()),
                         severity: Severity::Error,
@@ -315,7 +322,7 @@ pub(crate) fn evaluate_robot(
                     }
                 }
                 _ => {
-                    emitter.structural_error(RowDiagnostic {
+                    structural_diags.push(RowDiagnostic {
                         row: 1,
                         column: Some(cd.column.clone()),
                         severity: Severity::Error,
@@ -334,7 +341,7 @@ pub(crate) fn evaluate_robot(
         for cd in explicit_columns {
             match header_counts.get(cd.column.as_str()).copied().unwrap_or(0) {
                 0 => {
-                    emitter.structural_error(RowDiagnostic {
+                    structural_diags.push(RowDiagnostic {
                         row: 1,
                         column: Some(cd.column.clone()),
                         severity: Severity::Error,
@@ -350,7 +357,7 @@ pub(crate) fn evaluate_robot(
                     cols.push((idx, cd.directive.clone(), cd.split.clone(), 1));
                 }
                 _ => {
-                    emitter.structural_error(RowDiagnostic {
+                    structural_diags.push(RowDiagnostic {
                         row: 1,
                         column: Some(cd.column.clone()),
                         severity: Severity::Error,
@@ -376,6 +383,9 @@ pub(crate) fn evaluate_robot(
     };
 
     if data_rows.len() > limits.max_rows {
+        for d in structural_diags {
+            emitter.structural_error(d);
+        }
         emitter.structural_error(RowDiagnostic {
             row: data_rows[limits.max_rows].line,
             column: None,
@@ -425,7 +435,7 @@ pub(crate) fn evaluate_robot(
                 });
             }
             Err(msg) => {
-                emitter.structural_error(RowDiagnostic {
+                structural_diags.push(RowDiagnostic {
                     row: dir_line,
                     column: Some(col_name),
                     severity: Severity::Error,
@@ -437,6 +447,9 @@ pub(crate) fn evaluate_robot(
     }
 
     let Some(id_idx) = id_col else {
+        for d in structural_diags {
+            emitter.structural_error(d);
+        }
         emitter.structural_error(RowDiagnostic {
             row: 1,
             column: None,
@@ -447,354 +460,519 @@ pub(crate) fn evaluate_robot(
         return Ok(());
     };
 
-    // Pass 1a: resolve row subject IRIs and register split labels so Pass 1b and Pass 2
-    // can reference any row's label across the batch.
-    let mut row_iris: Vec<Option<Iri>> = Vec::with_capacity(data_rows.len());
-    for (row_i, row) in data_rows.iter().enumerate() {
-        if row_i.is_multiple_of(64) {
-            check_cancel()?;
+    let n = data_rows.len();
+    let mut vocab_eligible: Vec<bool> = vec![true; n];
+    let mut monotonic_excluded: Vec<bool> = vec![false; n];
+    let mut monotonic_mode = false;
+    let mut seen_states: FxHashSet<Vec<bool>> = FxHashSet::default();
+    seen_states.insert(vocab_eligible.clone());
+
+    for round in 0..MAX_VOCAB_ROUNDS {
+        if round > 0 {
+            emitter.reset_for_retry(initial_diagnostics, initial_truncated);
         }
-        let raw_id = row.cells.get(id_idx).map(|s| s.trim()).unwrap_or("");
-        if raw_id.is_empty() {
-            row_iris.push(None);
-            continue;
+        for d in &structural_diags {
+            emitter.structural_error(d.clone());
         }
-        let Ok(subject_iri) = resolve_iri(raw_id, ctx) else {
-            row_iris.push(None);
-            continue;
-        };
-        for (l_idx, split) in &label_cols {
-            let raw_label = row.cells.get(*l_idx).map(|s| s.trim()).unwrap_or("");
-            if raw_label.is_empty() {
+
+        let mut ctx = Context::build(base_vocab, spec);
+        let mut round_contributed = vec![false; n];
+        let mut round_failed = vec![false; n];
+
+        // Pass 1a: resolve row subject IRIs, pre-validate Pass 1 splits and entity kinds,
+        // and register split labels ONLY for eligible rows with no Pass 1 errors.
+        struct RowSubject {
+            iri: Iri,
+            kind: EntityKind,
+            kind_conflict: Option<(EntityKind, EntityKind)>,
+        }
+
+        let mut row_subjects: Vec<Option<RowSubject>> = Vec::with_capacity(n);
+        let mut row_pass1_ok: Vec<bool> = vec![true; n];
+        let id_col_name = table.headers.get(id_idx).map(String::as_str);
+
+        for (row_i, row) in data_rows.iter().enumerate() {
+            if row_i.is_multiple_of(64) {
+                check_cancel()?;
+            }
+            let raw_id = row.cells.get(id_idx).map(|s| s.trim()).unwrap_or("");
+            if raw_id.is_empty() {
+                row_subjects.push(None);
                 continue;
             }
-            let (vals, _truncated) = split_cell_bounded(
-                raw_label,
-                split.as_deref(),
-                limits.max_split_values_per_cell,
-            );
-            for val in vals {
-                if !emitter.charge_vocab(row.line) {
-                    return Ok(());
-                }
-                ctx.vocab.add_label(subject_iri.as_str(), val);
-            }
-        }
-        row_iris.push(Some(subject_iri));
-    }
-
-    // Pass 1b: resolve split TYPE / TI cells to determine each row's entity kind, detect
-    // conflicting types, and register entities in the working vocabulary.
-    struct RowSubject {
-        iri: Iri,
-        kind: EntityKind,
-        kind_conflict: Option<(EntityKind, EntityKind)>,
-    }
-
-    let mut row_subjects: Vec<Option<RowSubject>> = Vec::with_capacity(data_rows.len());
-    for (row_i, (row, subject_opt)) in data_rows.iter().zip(row_iris).enumerate() {
-        if row_i.is_multiple_of(64) {
-            check_cancel()?;
-        }
-        let Some(subject_iri) = subject_opt else {
-            row_subjects.push(None);
-            continue;
-        };
-
-        let mut declared_kind: Option<EntityKind> = None;
-        let mut kind_conflict: Option<(EntityKind, EntityKind)> = None;
-        let mut class_types: Vec<Iri> = Vec::new();
-
-        let mut record_kind = |k: EntityKind| match declared_kind {
-            None => declared_kind = Some(k),
-            Some(prev) if prev == k => {}
-            Some(prev) => {
-                if kind_conflict.is_none() {
-                    kind_conflict = Some((prev, k));
-                }
-            }
-        };
-
-        for (t_idx, split) in &type_cols {
-            let cell = row.cells.get(*t_idx).map(|s| s.trim()).unwrap_or("");
-            if cell.is_empty() {
-                continue;
-            }
-            let (vals, _truncated) =
-                split_cell_bounded(cell, split.as_deref(), limits.max_split_values_per_cell);
-            for tok in vals {
-                if let Some(k) = parse_builtin_entity_kind(tok, ctx) {
-                    record_kind(k);
-                } else {
-                    // Any non-builtin TYPE token (named class IRI or Manchester class
-                    // expression) types the row subject as a NamedIndividual.
-                    record_kind(EntityKind::NamedIndividual);
-                    if !tok.contains(char::is_whitespace)
-                        && !tok.contains(['(', ')', '{', '}'])
-                        && let Ok(cls_iri) = resolve_iri(tok, ctx)
-                    {
-                        class_types.push(cls_iri);
-                    }
-                }
-            }
-        }
-
-        for (ti_idx, split) in &ti_cols {
-            let cell = row.cells.get(*ti_idx).map(|s| s.trim()).unwrap_or("");
-            if cell.is_empty() {
-                continue;
-            }
-            let (vals, _truncated) =
-                split_cell_bounded(cell, split.as_deref(), limits.max_split_values_per_cell);
-            if !vals.is_empty() {
-                record_kind(EntityKind::NamedIndividual);
-            }
-        }
-
-        let kind = declared_kind.unwrap_or(EntityKind::Class);
-        if !emitter.charge_vocab(row.line) {
-            return Ok(());
-        }
-        ctx.register_entity(&subject_iri, kind);
-        for cls in &class_types {
-            if !emitter.charge_vocab(row.line) {
-                return Ok(());
-            }
-            ctx.register_entity(cls, EntityKind::Class);
-        }
-        row_subjects.push(Some(RowSubject {
-            iri: subject_iri,
-            kind,
-            kind_conflict,
-        }));
-    }
-
-    // Pass 2: stage and emit axioms and diagnostics per row.
-    for (row, subject_info) in data_rows.iter().zip(row_subjects) {
-        check_cancel()?;
-
-        let raw_id = row.cells.get(id_idx).map(|s| s.trim()).unwrap_or("");
-        if raw_id.is_empty() {
-            let any_data = row.cells.iter().any(|c| !c.trim().is_empty());
-            if any_data {
-                emitter.mark_row_error(row.line);
-                emitter.diag(RowDiagnostic {
-                    row: row.line,
-                    column: table.headers.get(id_idx).cloned(),
-                    severity: Severity::Error,
-                    code: "missing-id".to_string(),
-                    message: "row has values but its ID cell is empty".to_string(),
-                });
-            } else {
-                emitter.rows_skipped += 1;
-            }
-            continue;
-        }
-
-        let Some(RowSubject {
-            iri: subject_iri,
-            kind: entity_kind,
-            kind_conflict,
-        }) = subject_info
-        else {
-            emitter.mark_row_error(row.line);
-            emitter.diag(RowDiagnostic {
-                row: row.line,
-                column: table.headers.get(id_idx).cloned(),
-                severity: Severity::Error,
-                code: "invalid-iri".to_string(),
-                message: format!("cannot resolve ID '{raw_id}' to a valid IRI"),
-            });
-            continue;
-        };
-
-        emitter.rows_processed += 1;
-
-        let mut row_has_error = false;
-        if let Some((k1, k2)) = kind_conflict {
-            row_has_error = true;
-            emitter.diag(RowDiagnostic {
-                row: row.line,
-                column: None,
-                severity: Severity::Error,
-                code: "conflicting-type".to_string(),
-                message: format!(
-                    "row declares incompatible entity types ({} and {})",
-                    k1.name(),
-                    k2.name()
-                ),
-            });
-        }
-
-        // Stage entity declaration and all axioms for this row; nothing enters `emitter`
-        // until the entire row finishes without errors.
-        let entity = make_entity(subject_iri.clone(), entity_kind);
-        let mut row_declarations: Vec<Entity> = vec![entity.clone()];
-        let mut row_axioms: Vec<(Axiom, Option<String>)> = vec![(Axiom::declaration(entity), None)];
-        let mut ec_exprs: Vec<ClassExpression> = Vec::new();
-        let mut ec_annotations: BTreeSet<Annotation> = BTreeSet::new();
-        let mut ec_col_name: Option<String> = None;
-        let mut last_col_target = LastColTarget::None;
-
-        if !emitter.charge_attempt(1, row.line, None) {
-            return Ok(());
-        }
-
-        for col in &parsed_cols {
-            if matches!(col.kind, DirectiveKind::Ignore | DirectiveKind::Id) {
-                continue;
-            }
-            let raw_cell = row.cells.get(col.col_index).map(|s| s.trim()).unwrap_or("");
-            if raw_cell.is_empty() {
-                if !matches!(col.kind, DirectiveKind::AxiomAnnotation { .. }) {
-                    last_col_target = LastColTarget::None;
-                }
-                continue;
-            }
-
-            let (values, split_truncated) = split_cell_bounded(
-                raw_cell,
-                col.split.as_deref(),
-                limits.max_split_values_per_cell,
-            );
-            if split_truncated {
-                row_has_error = true;
-                emitter.diag(RowDiagnostic {
-                    row: row.line,
-                    column: Some(col.col_name.clone()),
-                    severity: Severity::Error,
-                    code: "expansion-limit".to_string(),
-                    message: format!(
-                        "cell split in column '{}' exceeds the limit of {} values",
-                        col.col_name, limits.max_split_values_per_cell
-                    ),
-                });
-                if !matches!(col.kind, DirectiveKind::AxiomAnnotation { .. }) {
-                    last_col_target = LastColTarget::None;
-                }
-                continue;
-            }
-
-            if let DirectiveKind::AxiomAnnotation { property, format } = &col.kind {
-                let target_count = match &last_col_target {
-                    LastColTarget::None => 0,
-                    LastColTarget::Axioms(r) => r.len(),
-                    LastColTarget::EquivalentClasses => usize::from(!ec_exprs.is_empty()),
-                };
-                if target_count == 0 {
-                    emitter.diag(RowDiagnostic {
-                        row: row.line,
-                        column: Some(col.col_name.clone()),
-                        severity: Severity::Warning,
-                        code: "orphan-axiom-annotation".to_string(),
-                        message: "axiom annotation column has no preceding axiom on this row"
-                            .to_string(),
-                    });
-                    continue;
-                }
-
-                // Charge total annotation work BEFORE looping to prevent quadratic blowup.
-                let work = target_count.saturating_mul(values.len());
-                if !emitter.charge_attempt(work, row.line, Some(col.col_name.clone())) {
-                    return Ok(());
-                }
-
-                let prop_iri = match resolve_iri(property, ctx) {
-                    Ok(p) => p,
-                    Err(msg) => {
-                        row_has_error = true;
-                        emitter.diag(RowDiagnostic {
-                            row: row.line,
-                            column: Some(col.col_name.clone()),
-                            severity: Severity::Error,
-                            code: "invalid-iri".to_string(),
-                            message: msg,
-                        });
+            let subject_iri =
+                match resolve_iri_charged(raw_id, &ctx, emitter, row.line, id_col_name) {
+                    Ok(iri) => iri,
+                    Err(ResolveError::Budget) => return Ok(()),
+                    Err(ResolveError::Invalid(_)) => {
+                        row_subjects.push(None);
                         continue;
                     }
                 };
 
-                let mut built_anns: Vec<Annotation> = Vec::with_capacity(values.len());
-                for val in values {
-                    match build_annotation_value(val, format, ctx) {
-                        Ok(ann_val) => {
-                            built_anns.push(Annotation {
-                                property: AnnotationProperty(prop_iri.clone()),
-                                value: ann_val,
-                                annotations: Default::default(),
-                            });
-                        }
-                        Err(msg) => {
-                            row_has_error = true;
-                            emitter.diag(RowDiagnostic {
-                                row: row.line,
-                                column: Some(col.col_name.clone()),
-                                severity: Severity::Error,
-                                code: "invalid-annotation-value".to_string(),
-                                message: msg,
-                            });
+            let mut declared_kind: Option<EntityKind> = None;
+            let mut kind_conflict: Option<(EntityKind, EntityKind)> = None;
+            let mut record_kind = |k: EntityKind| match declared_kind {
+                None => declared_kind = Some(k),
+                Some(prev) if prev == k => {}
+                Some(prev) => {
+                    if kind_conflict.is_none() {
+                        kind_conflict = Some((prev, k));
+                    }
+                }
+            };
+
+            let mut label_vals: Vec<&str> = Vec::new();
+            for (l_idx, split) in &label_cols {
+                let raw_label = row.cells.get(*l_idx).map(|s| s.trim()).unwrap_or("");
+                if raw_label.is_empty() {
+                    continue;
+                }
+                let (vals, truncated) = split_cell_bounded(
+                    raw_label,
+                    split.as_deref(),
+                    limits.max_split_values_per_cell,
+                );
+                if truncated {
+                    row_pass1_ok[row_i] = false;
+                } else {
+                    label_vals.extend(vals);
+                }
+            }
+
+            let mut type_tokens: Vec<&str> = Vec::new();
+            for (t_idx, split) in &type_cols {
+                let cell = row.cells.get(*t_idx).map(|s| s.trim()).unwrap_or("");
+                if cell.is_empty() {
+                    continue;
+                }
+                let (vals, truncated) =
+                    split_cell_bounded(cell, split.as_deref(), limits.max_split_values_per_cell);
+                if truncated {
+                    row_pass1_ok[row_i] = false;
+                    continue;
+                }
+                for tok in vals {
+                    if let Some(k) = parse_builtin_entity_kind(tok, &ctx) {
+                        record_kind(k);
+                    } else {
+                        record_kind(EntityKind::NamedIndividual);
+                        type_tokens.push(tok);
+                    }
+                }
+            }
+
+            for (ti_idx, split) in &ti_cols {
+                let cell = row.cells.get(*ti_idx).map(|s| s.trim()).unwrap_or("");
+                if cell.is_empty() {
+                    continue;
+                }
+                let (vals, truncated) =
+                    split_cell_bounded(cell, split.as_deref(), limits.max_split_values_per_cell);
+                if truncated {
+                    row_pass1_ok[row_i] = false;
+                } else if !vals.is_empty() {
+                    record_kind(EntityKind::NamedIndividual);
+                }
+            }
+
+            if kind_conflict.is_some() {
+                row_pass1_ok[row_i] = false;
+            }
+
+            let kind = declared_kind.unwrap_or(EntityKind::Class);
+
+            // Register labels for eligible, Pass-1-clean rows now so Pass 1b can resolve
+            // class type tokens across rows.
+            if vocab_eligible[row_i] && row_pass1_ok[row_i] {
+                for val in label_vals {
+                    let vocab_bytes = subject_iri
+                        .as_str()
+                        .len()
+                        .saturating_add(val.len())
+                        .saturating_mul(2);
+                    if !emitter.charge_vocab_bytes(row.line, vocab_bytes) {
+                        return Ok(());
+                    }
+                    ctx.vocab.add_label(subject_iri.as_str(), val);
+                    round_contributed[row_i] = true;
+                }
+                let subj_bytes = subject_iri.as_str().len().saturating_mul(2);
+                if !emitter.charge_vocab_bytes(row.line, subj_bytes) {
+                    return Ok(());
+                }
+                ctx.register_entity(&subject_iri, kind);
+                round_contributed[row_i] = true;
+            }
+
+            row_subjects.push(Some(RowSubject {
+                iri: subject_iri,
+                kind,
+                kind_conflict,
+            }));
+            // Defer non-builtin TYPE class registration to Pass 1b after all labels are in.
+            let _ = type_tokens;
+        }
+
+        // Pass 1b: register simple class IRIs referenced by TYPE columns of eligible rows.
+        for (row_i, (row, subj)) in data_rows.iter().zip(&row_subjects).enumerate() {
+            if row_i.is_multiple_of(64) {
+                check_cancel()?;
+            }
+            if subj.is_none() || !vocab_eligible[row_i] || !row_pass1_ok[row_i] {
+                continue;
+            }
+            for (t_idx, split) in &type_cols {
+                let cell = row.cells.get(*t_idx).map(|s| s.trim()).unwrap_or("");
+                if cell.is_empty() {
+                    continue;
+                }
+                let (vals, truncated) =
+                    split_cell_bounded(cell, split.as_deref(), limits.max_split_values_per_cell);
+                if truncated {
+                    continue;
+                }
+                for tok in vals {
+                    if parse_builtin_entity_kind(tok, &ctx).is_none()
+                        && !tok.contains(char::is_whitespace)
+                        && !tok.contains(['(', ')', '{', '}'])
+                    {
+                        match resolve_iri_charged(tok, &ctx, emitter, row.line, None) {
+                            Ok(cls_iri) => {
+                                let cls_bytes = cls_iri.as_str().len().saturating_mul(2);
+                                if !emitter.charge_vocab_bytes(row.line, cls_bytes) {
+                                    return Ok(());
+                                }
+                                ctx.register_entity(&cls_iri, EntityKind::Class);
+                                round_contributed[row_i] = true;
+                            }
+                            Err(ResolveError::Budget) => return Ok(()),
+                            Err(ResolveError::Invalid(_)) => {}
                         }
                     }
                 }
+            }
+        }
 
-                match &last_col_target {
-                    LastColTarget::None => {}
-                    LastColTarget::EquivalentClasses => {
-                        if ec_annotations.len().saturating_add(built_anns.len())
-                            > limits.max_annotations_per_axiom
-                        {
-                            row_has_error = true;
-                            emitter.diag(RowDiagnostic {
-                                row: row.line,
-                                column: Some(col.col_name.clone()),
-                                severity: Severity::Error,
-                                code: "annotation-limit".to_string(),
-                                message: format!(
-                                    "axiom annotations on this row exceed the limit of {} per axiom",
-                                    limits.max_annotations_per_axiom
-                                ),
-                            });
-                        } else {
-                            ec_annotations.extend(built_anns);
-                        }
-                    }
-                    LastColTarget::Axioms(range) => {
-                        let max_existing = row_axioms[range.clone()]
-                            .iter()
-                            .map(|(ax, _)| ax.annotations.len())
-                            .max()
-                            .unwrap_or(0);
-                        if max_existing.saturating_add(built_anns.len())
-                            > limits.max_annotations_per_axiom
-                        {
-                            row_has_error = true;
-                            emitter.diag(RowDiagnostic {
-                                row: row.line,
-                                column: Some(col.col_name.clone()),
-                                severity: Severity::Error,
-                                code: "annotation-limit".to_string(),
-                                message: format!(
-                                    "axiom annotations on this row exceed the limit of {} per axiom",
-                                    limits.max_annotations_per_axiom
-                                ),
-                            });
-                        } else {
-                            for (ax, _) in &mut row_axioms[range.clone()] {
-                                for ann in &built_anns {
-                                    ax.annotations.insert(ann.clone());
-                                }
-                            }
-                        }
-                    }
+        // Pass 2: stage and emit axioms and diagnostics per row.
+        for (row_i, (row, subject_info)) in data_rows.iter().zip(row_subjects).enumerate() {
+            check_cancel()?;
+
+            let raw_id = row.cells.get(id_idx).map(|s| s.trim()).unwrap_or("");
+            if raw_id.is_empty() {
+                let any_data = row.cells.iter().any(|c| !c.trim().is_empty());
+                if any_data {
+                    round_failed[row_i] = true;
+                    emitter.mark_row_error(row.line);
+                    emitter.diag(RowDiagnostic {
+                        row: row.line,
+                        column: table.headers.get(id_idx).cloned(),
+                        severity: Severity::Error,
+                        code: "missing-id".to_string(),
+                        message: "row has values but its ID cell is empty".to_string(),
+                    });
+                } else {
+                    emitter.rows_skipped += 1;
                 }
                 continue;
             }
 
-            if matches!(col.kind, DirectiveKind::EquivalentClasses(_)) {
-                let DirectiveKind::EquivalentClasses(tmpl) = &col.kind else {
-                    unreachable!()
+            let Some(RowSubject {
+                iri: subject_iri,
+                kind: entity_kind,
+                kind_conflict,
+            }) = subject_info
+            else {
+                round_failed[row_i] = true;
+                emitter.mark_row_error(row.line);
+                let msg = match resolve_iri_charged(raw_id, &ctx, emitter, row.line, id_col_name) {
+                    Err(ResolveError::Invalid(m)) => m,
+                    Err(ResolveError::Budget) => return Ok(()),
+                    Ok(_) => format!("cannot resolve ID '{raw_id}' to a valid IRI"),
                 };
-                let before_ec = ec_exprs.len();
+                emitter.diag(RowDiagnostic {
+                    row: row.line,
+                    column: table.headers.get(id_idx).cloned(),
+                    severity: Severity::Error,
+                    code: "invalid-iri".to_string(),
+                    message: msg,
+                });
+                continue;
+            };
+
+            emitter.rows_processed += 1;
+
+            let mut row_has_error = false;
+            if let Some((k1, k2)) = kind_conflict {
+                row_has_error = true;
+                emitter.diag(RowDiagnostic {
+                    row: row.line,
+                    column: None,
+                    severity: Severity::Error,
+                    code: "conflicting-type".to_string(),
+                    message: format!(
+                        "row declares incompatible entity types ({} and {})",
+                        k1.name(),
+                        k2.name()
+                    ),
+                });
+            }
+
+            // Stage entity declaration and all axioms for this row; nothing enters `emitter`
+            // until the entire row finishes without errors.
+            let entity = make_entity(subject_iri.clone(), entity_kind);
+            let mut row_declarations: Vec<Entity> = vec![entity.clone()];
+            let mut row_axioms: Vec<(Axiom, Option<String>)> =
+                vec![(Axiom::declaration(entity), None)];
+            let mut ec_exprs: Vec<ClassExpression> = Vec::new();
+            let mut ec_annotations: BTreeSet<Annotation> = BTreeSet::new();
+            let mut ec_col_name: Option<String> = None;
+            let mut last_col_target = LastColTarget::None;
+
+            if !emitter.charge_attempt(1, row.line, None) {
+                return Ok(());
+            }
+
+            for col in &parsed_cols {
+                if matches!(col.kind, DirectiveKind::Ignore | DirectiveKind::Id) {
+                    continue;
+                }
+                let raw_cell = row.cells.get(col.col_index).map(|s| s.trim()).unwrap_or("");
+                if raw_cell.is_empty() {
+                    if !matches!(col.kind, DirectiveKind::AxiomAnnotation { .. }) {
+                        last_col_target = LastColTarget::None;
+                    }
+                    continue;
+                }
+
+                let (values, split_truncated) = split_cell_bounded(
+                    raw_cell,
+                    col.split.as_deref(),
+                    limits.max_split_values_per_cell,
+                );
+                if split_truncated {
+                    row_has_error = true;
+                    emitter.diag(RowDiagnostic {
+                        row: row.line,
+                        column: Some(col.col_name.clone()),
+                        severity: Severity::Error,
+                        code: "expansion-limit".to_string(),
+                        message: format!(
+                            "cell split in column '{}' exceeds the limit of {} values",
+                            col.col_name, limits.max_split_values_per_cell
+                        ),
+                    });
+                    if !matches!(col.kind, DirectiveKind::AxiomAnnotation { .. }) {
+                        last_col_target = LastColTarget::None;
+                    }
+                    continue;
+                }
+
+                if let DirectiveKind::AxiomAnnotation { property, format } = &col.kind {
+                    let target_count = match &last_col_target {
+                        LastColTarget::None => 0,
+                        LastColTarget::Axioms(r) => r.len(),
+                        LastColTarget::EquivalentClasses => usize::from(!ec_exprs.is_empty()),
+                    };
+                    if target_count == 0 {
+                        emitter.diag(RowDiagnostic {
+                            row: row.line,
+                            column: Some(col.col_name.clone()),
+                            severity: Severity::Warning,
+                            code: "orphan-axiom-annotation".to_string(),
+                            message: "axiom annotation column has no preceding axiom on this row"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+
+                    // Charge total annotation work BEFORE looping to prevent quadratic blowup.
+                    let work = target_count.saturating_mul(values.len());
+                    if !emitter.charge_attempt(work, row.line, Some(col.col_name.clone())) {
+                        return Ok(());
+                    }
+
+                    let prop_iri = match resolve_iri_charged(
+                        property,
+                        &ctx,
+                        emitter,
+                        row.line,
+                        Some(&col.col_name),
+                    ) {
+                        Ok(p) => p,
+                        Err(ResolveError::Budget) => return Ok(()),
+                        Err(ResolveError::Invalid(msg)) => {
+                            row_has_error = true;
+                            emitter.diag(RowDiagnostic {
+                                row: row.line,
+                                column: Some(col.col_name.clone()),
+                                severity: Severity::Error,
+                                code: "invalid-iri".to_string(),
+                                message: msg,
+                            });
+                            continue;
+                        }
+                    };
+
+                    let mut built_anns: Vec<Annotation> = Vec::with_capacity(values.len());
+                    for val in values {
+                        match build_annotation_value_charged(
+                            val,
+                            format,
+                            &ctx,
+                            emitter,
+                            row.line,
+                            &col.col_name,
+                        ) {
+                            Ok(ann_val) => {
+                                built_anns.push(Annotation {
+                                    property: AnnotationProperty(prop_iri.clone()),
+                                    value: ann_val,
+                                    annotations: Default::default(),
+                                });
+                            }
+                            Err(ResolveError::Budget) => return Ok(()),
+                            Err(ResolveError::Invalid(msg)) => {
+                                row_has_error = true;
+                                emitter.diag(RowDiagnostic {
+                                    row: row.line,
+                                    column: Some(col.col_name.clone()),
+                                    severity: Severity::Error,
+                                    code: "invalid-annotation-value".to_string(),
+                                    message: msg,
+                                });
+                            }
+                        }
+                    }
+
+                    // Charge replicated annotation bytes BEFORE cloning into every target.
+                    let total_ann_bytes = built_anns
+                        .iter()
+                        .map(annotation_bytes)
+                        .fold(0usize, usize::saturating_add);
+                    let replicated_bytes = total_ann_bytes.saturating_mul(target_count);
+                    if !emitter.charge_expanded_bytes(
+                        replicated_bytes,
+                        row.line,
+                        Some(col.col_name.clone()),
+                    ) {
+                        return Ok(());
+                    }
+
+                    match &last_col_target {
+                        LastColTarget::None => {}
+                        LastColTarget::EquivalentClasses => {
+                            if ec_annotations.len().saturating_add(built_anns.len())
+                                > limits.max_annotations_per_axiom
+                            {
+                                row_has_error = true;
+                                emitter.diag(RowDiagnostic {
+                                    row: row.line,
+                                    column: Some(col.col_name.clone()),
+                                    severity: Severity::Error,
+                                    code: "annotation-limit".to_string(),
+                                    message: format!(
+                                        "axiom annotations on this row exceed the limit of {} per axiom",
+                                        limits.max_annotations_per_axiom
+                                    ),
+                                });
+                            } else {
+                                ec_annotations.extend(built_anns);
+                            }
+                        }
+                        LastColTarget::Axioms(range) => {
+                            let max_existing = row_axioms[range.clone()]
+                                .iter()
+                                .map(|(ax, _)| ax.annotations.len())
+                                .max()
+                                .unwrap_or(0);
+                            if max_existing.saturating_add(built_anns.len())
+                                > limits.max_annotations_per_axiom
+                            {
+                                row_has_error = true;
+                                emitter.diag(RowDiagnostic {
+                                    row: row.line,
+                                    column: Some(col.col_name.clone()),
+                                    severity: Severity::Error,
+                                    code: "annotation-limit".to_string(),
+                                    message: format!(
+                                        "axiom annotations on this row exceed the limit of {} per axiom",
+                                        limits.max_annotations_per_axiom
+                                    ),
+                                });
+                            } else {
+                                for (ax, _) in &mut row_axioms[range.clone()] {
+                                    for ann in &built_anns {
+                                        ax.annotations.insert(ann.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if matches!(col.kind, DirectiveKind::EquivalentClasses(_)) {
+                    let DirectiveKind::EquivalentClasses(tmpl) = &col.kind else {
+                        unreachable!()
+                    };
+                    let before_ec = ec_exprs.len();
+                    for (val_i, val) in values.into_iter().enumerate() {
+                        if val_i.is_multiple_of(64) {
+                            check_cancel()?;
+                        }
+                        if !emitter.charge_attempt(1, row.line, Some(col.col_name.clone())) {
+                            return Ok(());
+                        }
+                        let Some(expanded) = expand_percent_bounded(
+                            tmpl,
+                            val,
+                            limits.max_expanded_bytes_per_template,
+                            emitter,
+                            row.line,
+                            &col.col_name,
+                            &mut row_has_error,
+                        ) else {
+                            if emitter.budget_exceeded {
+                                return Ok(());
+                            }
+                            continue;
+                        };
+                        match parse_class_expr_fallback_charged(
+                            &expanded,
+                            &ctx,
+                            emitter,
+                            row.line,
+                            Some(&col.col_name),
+                        ) {
+                            Ok(other) => {
+                                ec_exprs.push(other);
+                                if ec_col_name.is_none() {
+                                    ec_col_name = Some(col.col_name.clone());
+                                }
+                            }
+                            Err(ResolveError::Budget) => return Ok(()),
+                            Err(ResolveError::Invalid(msg)) => {
+                                row_has_error = true;
+                                emitter.diag(RowDiagnostic {
+                                    row: row.line,
+                                    column: Some(col.col_name.clone()),
+                                    severity: Severity::Error,
+                                    code: "invalid-expression".to_string(),
+                                    message: msg,
+                                });
+                            }
+                        }
+                    }
+                    last_col_target = if ec_exprs.len() > before_ec {
+                        LastColTarget::EquivalentClasses
+                    } else {
+                        LastColTarget::None
+                    };
+                    continue;
+                }
+
+                let start_idx = row_axioms.len();
                 for (val_i, val) in values.into_iter().enumerate() {
                     if val_i.is_multiple_of(64) {
                         check_cancel()?;
@@ -802,103 +980,318 @@ pub(crate) fn evaluate_robot(
                     if !emitter.charge_attempt(1, row.line, Some(col.col_name.clone())) {
                         return Ok(());
                     }
-                    let Some(expanded) = expand_percent_bounded(
-                        tmpl,
-                        val,
-                        limits.max_expanded_bytes_per_template,
-                        emitter,
-                        row.line,
-                        &col.col_name,
-                        &mut row_has_error,
-                    ) else {
-                        if emitter.budget_exceeded {
-                            return Ok(());
+                    if row_axioms.len() >= emitter.remaining_axiom_capacity().saturating_add(1)
+                        && row_axioms.len() > limits.max_axioms
+                    {
+                        emitter.budget_error(
+                            row.line,
+                            Some(col.col_name.clone()),
+                            "axiom-limit",
+                            format!(
+                                "generated axioms exceeded the limit of {}",
+                                limits.max_axioms
+                            ),
+                        );
+                        return Ok(());
+                    }
+
+                    match &col.kind {
+                        DirectiveKind::Label { lang } => {
+                            let bytes = val
+                                .len()
+                                .saturating_add(lang.as_deref().map_or(0, str::len))
+                                .saturating_add(subject_iri.as_str().len());
+                            if !emitter.charge_expanded_bytes(
+                                bytes,
+                                row.line,
+                                Some(col.col_name.clone()),
+                            ) {
+                                return Ok(());
+                            }
+                            let lit = match lang {
+                                Some(l) => match Literal::lang(val, l) {
+                                    Ok(lit) => lit,
+                                    Err(e) => {
+                                        row_has_error = true;
+                                        emitter.diag(RowDiagnostic {
+                                            row: row.line,
+                                            column: Some(col.col_name.clone()),
+                                            severity: Severity::Error,
+                                            code: "invalid-language-tag".to_string(),
+                                            message: e.0,
+                                        });
+                                        continue;
+                                    }
+                                },
+                                None => Literal::simple(val),
+                            };
+                            row_axioms.push((
+                                Axiom::new(AxiomKind::AnnotationAssertion(
+                                    AnnotationProperty::new(vocab::RDFS_LABEL),
+                                    AnnotationSubject::Iri(subject_iri.clone()),
+                                    AnnotationValue::Literal(lit),
+                                )),
+                                Some(col.col_name.clone()),
+                            ));
                         }
-                        continue;
-                    };
-                    match parse_class_expr_fallback(&expanded, ctx) {
-                        Ok(other) => {
-                            ec_exprs.push(other);
-                            if ec_col_name.is_none() {
-                                ec_col_name = Some(col.col_name.clone());
+                        DirectiveKind::Type => {
+                            if parse_builtin_entity_kind(val, &ctx).is_some() {
+                                // Already handled in declaration.
+                            } else {
+                                match parse_class_expr_fallback_charged(
+                                    val,
+                                    &ctx,
+                                    emitter,
+                                    row.line,
+                                    Some(&col.col_name),
+                                ) {
+                                    Ok(ce) => {
+                                        row_axioms.push((
+                                            Axiom::class_assertion(
+                                                ce,
+                                                Individual::Named(NamedIndividual(
+                                                    subject_iri.clone(),
+                                                )),
+                                            ),
+                                            Some(col.col_name.clone()),
+                                        ));
+                                    }
+                                    Err(ResolveError::Budget) => return Ok(()),
+                                    Err(ResolveError::Invalid(msg)) => {
+                                        row_has_error = true;
+                                        emitter.diag(RowDiagnostic {
+                                            row: row.line,
+                                            column: Some(col.col_name.clone()),
+                                            severity: Severity::Error,
+                                            code: "invalid-type".to_string(),
+                                            message: msg,
+                                        });
+                                    }
+                                }
                             }
                         }
-                        Err(msg) => {
-                            row_has_error = true;
-                            emitter.diag(RowDiagnostic {
-                                row: row.line,
-                                column: Some(col.col_name.clone()),
-                                severity: Severity::Error,
-                                code: "invalid-expression".to_string(),
-                                message: msg,
-                            });
-                        }
-                    }
-                }
-                last_col_target = if ec_exprs.len() > before_ec {
-                    LastColTarget::EquivalentClasses
-                } else {
-                    LastColTarget::None
-                };
-                continue;
-            }
-
-            let start_idx = row_axioms.len();
-            for (val_i, val) in values.into_iter().enumerate() {
-                if val_i.is_multiple_of(64) {
-                    check_cancel()?;
-                }
-                if !emitter.charge_attempt(1, row.line, Some(col.col_name.clone())) {
-                    return Ok(());
-                }
-                if row_axioms.len() >= emitter.remaining_axiom_capacity().saturating_add(1)
-                    && row_axioms.len() > limits.max_axioms
-                {
-                    emitter.budget_error(
-                        row.line,
-                        Some(col.col_name.clone()),
-                        "axiom-limit",
-                        format!(
-                            "generated axioms exceeded the limit of {}",
-                            limits.max_axioms
-                        ),
-                    );
-                    return Ok(());
-                }
-
-                match &col.kind {
-                    DirectiveKind::Label { lang } => {
-                        let lit = match lang {
-                            Some(l) => match Literal::lang(val, l) {
-                                Ok(lit) => lit,
-                                Err(e) => {
+                        DirectiveKind::SubClassOf(tmpl) => {
+                            let Some(expanded) = expand_percent_bounded(
+                                tmpl,
+                                val,
+                                limits.max_expanded_bytes_per_template,
+                                emitter,
+                                row.line,
+                                &col.col_name,
+                                &mut row_has_error,
+                            ) else {
+                                if emitter.budget_exceeded {
+                                    return Ok(());
+                                }
+                                continue;
+                            };
+                            match parse_class_expr_fallback_charged(
+                                &expanded,
+                                &ctx,
+                                emitter,
+                                row.line,
+                                Some(&col.col_name),
+                            ) {
+                                Ok(sup) => {
+                                    row_axioms.push((
+                                        Axiom::sub_class_of(Class(subject_iri.clone()), sup),
+                                        Some(col.col_name.clone()),
+                                    ));
+                                }
+                                Err(ResolveError::Budget) => return Ok(()),
+                                Err(ResolveError::Invalid(msg)) => {
                                     row_has_error = true;
                                     emitter.diag(RowDiagnostic {
                                         row: row.line,
                                         column: Some(col.col_name.clone()),
                                         severity: Severity::Error,
-                                        code: "invalid-language-tag".to_string(),
-                                        message: e.0,
+                                        code: "invalid-expression".to_string(),
+                                        message: msg,
                                     });
-                                    continue;
                                 }
-                            },
-                            None => Literal::simple(val),
-                        };
-                        row_axioms.push((
-                            Axiom::new(AxiomKind::AnnotationAssertion(
-                                AnnotationProperty::new(vocab::RDFS_LABEL),
-                                AnnotationSubject::Iri(subject_iri.clone()),
-                                AnnotationValue::Literal(lit),
-                            )),
-                            Some(col.col_name.clone()),
-                        ));
-                    }
-                    DirectiveKind::Type => {
-                        if parse_builtin_entity_kind(val, ctx).is_some() {
-                            // Already handled in declaration.
-                        } else {
-                            match parse_class_expr_fallback(val, ctx) {
+                            }
+                        }
+                        DirectiveKind::DisjointClasses(tmpl) => {
+                            let Some(expanded) = expand_percent_bounded(
+                                tmpl,
+                                val,
+                                limits.max_expanded_bytes_per_template,
+                                emitter,
+                                row.line,
+                                &col.col_name,
+                                &mut row_has_error,
+                            ) else {
+                                if emitter.budget_exceeded {
+                                    return Ok(());
+                                }
+                                continue;
+                            };
+                            match parse_class_expr_fallback_charged(
+                                &expanded,
+                                &ctx,
+                                emitter,
+                                row.line,
+                                Some(&col.col_name),
+                            ) {
+                                Ok(other) => {
+                                    row_axioms.push((
+                                        Axiom::disjoint_classes([
+                                            ClassExpression::Class(Class(subject_iri.clone())),
+                                            other,
+                                        ]),
+                                        Some(col.col_name.clone()),
+                                    ));
+                                }
+                                Err(ResolveError::Budget) => return Ok(()),
+                                Err(ResolveError::Invalid(msg)) => {
+                                    row_has_error = true;
+                                    emitter.diag(RowDiagnostic {
+                                        row: row.line,
+                                        column: Some(col.col_name.clone()),
+                                        severity: Severity::Error,
+                                        code: "invalid-expression".to_string(),
+                                        message: msg,
+                                    });
+                                }
+                            }
+                        }
+                        DirectiveKind::SubPropertyOf(tmpl) => {
+                            let Some(expanded) = expand_percent_bounded(
+                                tmpl,
+                                val,
+                                limits.max_expanded_bytes_per_template,
+                                emitter,
+                                row.line,
+                                &col.col_name,
+                                &mut row_has_error,
+                            ) else {
+                                if emitter.budget_exceeded {
+                                    return Ok(());
+                                }
+                                continue;
+                            };
+                            match resolve_iri_charged(
+                                &expanded,
+                                &ctx,
+                                emitter,
+                                row.line,
+                                Some(&col.col_name),
+                            ) {
+                                Ok(sup_iri) => {
+                                    let ax = match entity_kind {
+                                        EntityKind::DataProperty => {
+                                            Axiom::new(AxiomKind::SubDataPropertyOf(
+                                                DataProperty(subject_iri.clone()),
+                                                DataProperty(sup_iri),
+                                            ))
+                                        }
+                                        EntityKind::AnnotationProperty => {
+                                            Axiom::new(AxiomKind::SubAnnotationPropertyOf(
+                                                AnnotationProperty(subject_iri.clone()),
+                                                AnnotationProperty(sup_iri),
+                                            ))
+                                        }
+                                        _ => Axiom::new(AxiomKind::SubObjectPropertyOf(
+                                            SubObjectPropertyExpression::Expression(
+                                                ObjectPropertyExpression::Property(ObjectProperty(
+                                                    subject_iri.clone(),
+                                                )),
+                                            ),
+                                            ObjectPropertyExpression::Property(ObjectProperty(
+                                                sup_iri,
+                                            )),
+                                        )),
+                                    };
+                                    row_axioms.push((ax, Some(col.col_name.clone())));
+                                }
+                                Err(ResolveError::Budget) => return Ok(()),
+                                Err(ResolveError::Invalid(msg)) => {
+                                    row_has_error = true;
+                                    emitter.diag(RowDiagnostic {
+                                        row: row.line,
+                                        column: Some(col.col_name.clone()),
+                                        severity: Severity::Error,
+                                        code: "invalid-iri".to_string(),
+                                        message: msg,
+                                    });
+                                }
+                            }
+                        }
+                        DirectiveKind::ClassTemplate(tmpl) => {
+                            let Some(expanded) = expand_percent_bounded(
+                                tmpl,
+                                val,
+                                limits.max_expanded_bytes_per_template,
+                                emitter,
+                                row.line,
+                                &col.col_name,
+                                &mut row_has_error,
+                            ) else {
+                                if emitter.budget_exceeded {
+                                    return Ok(());
+                                }
+                                continue;
+                            };
+                            match parse_class_expr_fallback_charged(
+                                &expanded,
+                                &ctx,
+                                emitter,
+                                row.line,
+                                Some(&col.col_name),
+                            ) {
+                                Ok(ce) => {
+                                    if entity_kind == EntityKind::NamedIndividual {
+                                        row_axioms.push((
+                                            Axiom::class_assertion(
+                                                ce,
+                                                Individual::Named(NamedIndividual(
+                                                    subject_iri.clone(),
+                                                )),
+                                            ),
+                                            Some(col.col_name.clone()),
+                                        ));
+                                    } else {
+                                        row_axioms.push((
+                                            Axiom::sub_class_of(Class(subject_iri.clone()), ce),
+                                            Some(col.col_name.clone()),
+                                        ));
+                                    }
+                                }
+                                Err(ResolveError::Budget) => return Ok(()),
+                                Err(ResolveError::Invalid(msg)) => {
+                                    row_has_error = true;
+                                    emitter.diag(RowDiagnostic {
+                                        row: row.line,
+                                        column: Some(col.col_name.clone()),
+                                        severity: Severity::Error,
+                                        code: "invalid-expression".to_string(),
+                                        message: msg,
+                                    });
+                                }
+                            }
+                        }
+                        DirectiveKind::IndividualType(tmpl) => {
+                            let Some(expanded) = expand_percent_bounded(
+                                tmpl,
+                                val,
+                                limits.max_expanded_bytes_per_template,
+                                emitter,
+                                row.line,
+                                &col.col_name,
+                                &mut row_has_error,
+                            ) else {
+                                if emitter.budget_exceeded {
+                                    return Ok(());
+                                }
+                                continue;
+                            };
+                            match parse_class_expr_fallback_charged(
+                                &expanded,
+                                &ctx,
+                                emitter,
+                                row.line,
+                                Some(&col.col_name),
+                            ) {
                                 Ok(ce) => {
                                     row_axioms.push((
                                         Axiom::class_assertion(
@@ -908,306 +1301,187 @@ pub(crate) fn evaluate_robot(
                                         Some(col.col_name.clone()),
                                     ));
                                 }
-                                Err(msg) => {
+                                Err(ResolveError::Budget) => return Ok(()),
+                                Err(ResolveError::Invalid(msg)) => {
                                     row_has_error = true;
                                     emitter.diag(RowDiagnostic {
                                         row: row.line,
                                         column: Some(col.col_name.clone()),
                                         severity: Severity::Error,
-                                        code: "invalid-type".to_string(),
+                                        code: "invalid-expression".to_string(),
                                         message: msg,
                                     });
                                 }
                             }
                         }
-                    }
-                    DirectiveKind::SubClassOf(tmpl) => {
-                        let Some(expanded) = expand_percent_bounded(
-                            tmpl,
-                            val,
-                            limits.max_expanded_bytes_per_template,
-                            emitter,
-                            row.line,
-                            &col.col_name,
-                            &mut row_has_error,
-                        ) else {
-                            if emitter.budget_exceeded {
-                                return Ok(());
-                            }
-                            continue;
-                        };
-                        match parse_class_expr_fallback(&expanded, ctx) {
-                            Ok(sup) => {
-                                row_axioms.push((
-                                    Axiom::sub_class_of(Class(subject_iri.clone()), sup),
-                                    Some(col.col_name.clone()),
-                                ));
-                            }
-                            Err(msg) => {
-                                row_has_error = true;
-                                emitter.diag(RowDiagnostic {
-                                    row: row.line,
-                                    column: Some(col.col_name.clone()),
-                                    severity: Severity::Error,
-                                    code: "invalid-expression".to_string(),
-                                    message: msg,
-                                });
-                            }
-                        }
-                    }
-                    DirectiveKind::DisjointClasses(tmpl) => {
-                        let Some(expanded) = expand_percent_bounded(
-                            tmpl,
-                            val,
-                            limits.max_expanded_bytes_per_template,
-                            emitter,
-                            row.line,
-                            &col.col_name,
-                            &mut row_has_error,
-                        ) else {
-                            if emitter.budget_exceeded {
-                                return Ok(());
-                            }
-                            continue;
-                        };
-                        match parse_class_expr_fallback(&expanded, ctx) {
-                            Ok(other) => {
-                                row_axioms.push((
-                                    Axiom::disjoint_classes([
-                                        ClassExpression::Class(Class(subject_iri.clone())),
-                                        other,
-                                    ]),
-                                    Some(col.col_name.clone()),
-                                ));
-                            }
-                            Err(msg) => {
-                                row_has_error = true;
-                                emitter.diag(RowDiagnostic {
-                                    row: row.line,
-                                    column: Some(col.col_name.clone()),
-                                    severity: Severity::Error,
-                                    code: "invalid-expression".to_string(),
-                                    message: msg,
-                                });
-                            }
-                        }
-                    }
-                    DirectiveKind::SubPropertyOf(tmpl) => {
-                        let Some(expanded) = expand_percent_bounded(
-                            tmpl,
-                            val,
-                            limits.max_expanded_bytes_per_template,
-                            emitter,
-                            row.line,
-                            &col.col_name,
-                            &mut row_has_error,
-                        ) else {
-                            if emitter.budget_exceeded {
-                                return Ok(());
-                            }
-                            continue;
-                        };
-                        match resolve_iri(&expanded, ctx) {
-                            Ok(sup_iri) => {
-                                let ax = match entity_kind {
-                                    EntityKind::DataProperty => {
-                                        Axiom::new(AxiomKind::SubDataPropertyOf(
-                                            DataProperty(subject_iri.clone()),
-                                            DataProperty(sup_iri),
-                                        ))
-                                    }
-                                    EntityKind::AnnotationProperty => {
-                                        Axiom::new(AxiomKind::SubAnnotationPropertyOf(
-                                            AnnotationProperty(subject_iri.clone()),
-                                            AnnotationProperty(sup_iri),
-                                        ))
-                                    }
-                                    _ => Axiom::new(AxiomKind::SubObjectPropertyOf(
-                                        SubObjectPropertyExpression::Expression(
-                                            ObjectPropertyExpression::Property(ObjectProperty(
-                                                subject_iri.clone(),
-                                            )),
-                                        ),
-                                        ObjectPropertyExpression::Property(ObjectProperty(sup_iri)),
-                                    )),
-                                };
-                                row_axioms.push((ax, Some(col.col_name.clone())));
-                            }
-                            Err(msg) => {
-                                row_has_error = true;
-                                emitter.diag(RowDiagnostic {
-                                    row: row.line,
-                                    column: Some(col.col_name.clone()),
-                                    severity: Severity::Error,
-                                    code: "invalid-iri".to_string(),
-                                    message: msg,
-                                });
-                            }
-                        }
-                    }
-                    DirectiveKind::ClassTemplate(tmpl) => {
-                        let Some(expanded) = expand_percent_bounded(
-                            tmpl,
-                            val,
-                            limits.max_expanded_bytes_per_template,
-                            emitter,
-                            row.line,
-                            &col.col_name,
-                            &mut row_has_error,
-                        ) else {
-                            if emitter.budget_exceeded {
-                                return Ok(());
-                            }
-                            continue;
-                        };
-                        match parse_class_expr_fallback(&expanded, ctx) {
-                            Ok(ce) => {
-                                if entity_kind == EntityKind::NamedIndividual {
-                                    row_axioms.push((
-                                        Axiom::class_assertion(
-                                            ce,
-                                            Individual::Named(NamedIndividual(subject_iri.clone())),
-                                        ),
-                                        Some(col.col_name.clone()),
-                                    ));
-                                } else {
-                                    row_axioms.push((
-                                        Axiom::sub_class_of(Class(subject_iri.clone()), ce),
-                                        Some(col.col_name.clone()),
-                                    ));
-                                }
-                            }
-                            Err(msg) => {
-                                row_has_error = true;
-                                emitter.diag(RowDiagnostic {
-                                    row: row.line,
-                                    column: Some(col.col_name.clone()),
-                                    severity: Severity::Error,
-                                    code: "invalid-expression".to_string(),
-                                    message: msg,
-                                });
-                            }
-                        }
-                    }
-                    DirectiveKind::IndividualType(tmpl) => {
-                        let Some(expanded) = expand_percent_bounded(
-                            tmpl,
-                            val,
-                            limits.max_expanded_bytes_per_template,
-                            emitter,
-                            row.line,
-                            &col.col_name,
-                            &mut row_has_error,
-                        ) else {
-                            if emitter.budget_exceeded {
-                                return Ok(());
-                            }
-                            continue;
-                        };
-                        match parse_class_expr_fallback(&expanded, ctx) {
-                            Ok(ce) => {
-                                row_axioms.push((
-                                    Axiom::class_assertion(
-                                        ce,
-                                        Individual::Named(NamedIndividual(subject_iri.clone())),
-                                    ),
-                                    Some(col.col_name.clone()),
-                                ));
-                            }
-                            Err(msg) => {
-                                row_has_error = true;
-                                emitter.diag(RowDiagnostic {
-                                    row: row.line,
-                                    column: Some(col.col_name.clone()),
-                                    severity: Severity::Error,
-                                    code: "invalid-expression".to_string(),
-                                    message: msg,
-                                });
-                            }
-                        }
-                    }
-                    DirectiveKind::Individual(tmpl) => {
-                        if tmpl == "%" {
-                            // `I %`: cell names an individual of the row's class.
-                            match resolve_iri(val, ctx) {
-                                Ok(ind_iri) => {
-                                    let ind = NamedIndividual(ind_iri);
-                                    row_declarations.push(Entity::NamedIndividual(ind.clone()));
-                                    row_axioms.push((
-                                        Axiom::declaration(Entity::NamedIndividual(ind.clone())),
-                                        Some(col.col_name.clone()),
-                                    ));
-                                    if entity_kind == EntityKind::Class {
+                        DirectiveKind::Individual(tmpl) => {
+                            if tmpl == "%" {
+                                // `I %`: cell names an individual of the row's class.
+                                match resolve_iri_charged(
+                                    val,
+                                    &ctx,
+                                    emitter,
+                                    row.line,
+                                    Some(&col.col_name),
+                                ) {
+                                    Ok(ind_iri) => {
+                                        let ind = NamedIndividual(ind_iri);
+                                        row_declarations.push(Entity::NamedIndividual(ind.clone()));
                                         row_axioms.push((
-                                            Axiom::class_assertion(
-                                                Class(subject_iri.clone()),
-                                                Individual::Named(ind),
-                                            ),
-                                            Some(col.col_name.clone()),
-                                        ));
-                                    }
-                                }
-                                Err(msg) => {
-                                    row_has_error = true;
-                                    emitter.diag(RowDiagnostic {
-                                        row: row.line,
-                                        column: Some(col.col_name.clone()),
-                                        severity: Severity::Error,
-                                        code: "invalid-iri".to_string(),
-                                        message: msg,
-                                    });
-                                }
-                            }
-                        } else {
-                            // `I <prop>`: property assertion on the row's individual.
-                            match resolve_iri(tmpl, ctx) {
-                                Ok(prop_iri) => {
-                                    let is_data_prop = ctx
-                                        .vocab
-                                        .kinds(prop_iri.as_str())
-                                        .contains(&EntityKind::DataProperty);
-                                    if is_data_prop {
-                                        let lit = parse_cell_literal(val, ctx);
-                                        row_axioms.push((
-                                            Axiom::new(AxiomKind::DataPropertyAssertion(
-                                                DataProperty(prop_iri),
-                                                Individual::Named(NamedIndividual(
-                                                    subject_iri.clone(),
-                                                )),
-                                                lit,
+                                            Axiom::declaration(Entity::NamedIndividual(
+                                                ind.clone(),
                                             )),
                                             Some(col.col_name.clone()),
                                         ));
-                                    } else {
-                                        match resolve_iri(val, ctx) {
-                                            Ok(obj_iri) => {
-                                                row_axioms.push((
-                                                    Axiom::new(AxiomKind::ObjectPropertyAssertion(
-                                                        ObjectPropertyExpression::Property(
-                                                            ObjectProperty(prop_iri),
-                                                        ),
-                                                        Individual::Named(NamedIndividual(
-                                                            subject_iri.clone(),
-                                                        )),
-                                                        Individual::Named(NamedIndividual(obj_iri)),
-                                                    )),
-                                                    Some(col.col_name.clone()),
-                                                ));
+                                        if entity_kind == EntityKind::Class {
+                                            row_axioms.push((
+                                                Axiom::class_assertion(
+                                                    Class(subject_iri.clone()),
+                                                    Individual::Named(ind),
+                                                ),
+                                                Some(col.col_name.clone()),
+                                            ));
+                                        }
+                                    }
+                                    Err(ResolveError::Budget) => return Ok(()),
+                                    Err(ResolveError::Invalid(msg)) => {
+                                        row_has_error = true;
+                                        emitter.diag(RowDiagnostic {
+                                            row: row.line,
+                                            column: Some(col.col_name.clone()),
+                                            severity: Severity::Error,
+                                            code: "invalid-iri".to_string(),
+                                            message: msg,
+                                        });
+                                    }
+                                }
+                            } else {
+                                // `I <prop>`: property assertion on the row's individual.
+                                match resolve_iri_charged(
+                                    tmpl,
+                                    &ctx,
+                                    emitter,
+                                    row.line,
+                                    Some(&col.col_name),
+                                ) {
+                                    Ok(prop_iri) => {
+                                        let is_data_prop = ctx
+                                            .vocab
+                                            .kinds(prop_iri.as_str())
+                                            .contains(&EntityKind::DataProperty);
+                                        if is_data_prop {
+                                            if !emitter.charge_expanded_bytes(
+                                                val.len(),
+                                                row.line,
+                                                Some(col.col_name.clone()),
+                                            ) {
+                                                return Ok(());
                                             }
-                                            Err(msg) => {
-                                                row_has_error = true;
-                                                emitter.diag(RowDiagnostic {
-                                                    row: row.line,
-                                                    column: Some(col.col_name.clone()),
-                                                    severity: Severity::Error,
-                                                    code: "invalid-iri".to_string(),
-                                                    message: msg,
-                                                });
+                                            let lit = parse_cell_literal(val, &ctx);
+                                            row_axioms.push((
+                                                Axiom::new(AxiomKind::DataPropertyAssertion(
+                                                    DataProperty(prop_iri),
+                                                    Individual::Named(NamedIndividual(
+                                                        subject_iri.clone(),
+                                                    )),
+                                                    lit,
+                                                )),
+                                                Some(col.col_name.clone()),
+                                            ));
+                                        } else {
+                                            match resolve_iri_charged(
+                                                val,
+                                                &ctx,
+                                                emitter,
+                                                row.line,
+                                                Some(&col.col_name),
+                                            ) {
+                                                Ok(obj_iri) => {
+                                                    row_axioms.push((
+                                                        Axiom::new(
+                                                            AxiomKind::ObjectPropertyAssertion(
+                                                                ObjectPropertyExpression::Property(
+                                                                    ObjectProperty(prop_iri),
+                                                                ),
+                                                                Individual::Named(NamedIndividual(
+                                                                    subject_iri.clone(),
+                                                                )),
+                                                                Individual::Named(NamedIndividual(
+                                                                    obj_iri,
+                                                                )),
+                                                            ),
+                                                        ),
+                                                        Some(col.col_name.clone()),
+                                                    ));
+                                                }
+                                                Err(ResolveError::Budget) => return Ok(()),
+                                                Err(ResolveError::Invalid(msg)) => {
+                                                    row_has_error = true;
+                                                    emitter.diag(RowDiagnostic {
+                                                        row: row.line,
+                                                        column: Some(col.col_name.clone()),
+                                                        severity: Severity::Error,
+                                                        code: "invalid-iri".to_string(),
+                                                        message: msg,
+                                                    });
+                                                }
                                             }
                                         }
                                     }
+                                    Err(ResolveError::Budget) => return Ok(()),
+                                    Err(ResolveError::Invalid(msg)) => {
+                                        row_has_error = true;
+                                        emitter.diag(RowDiagnostic {
+                                            row: row.line,
+                                            column: Some(col.col_name.clone()),
+                                            severity: Severity::Error,
+                                            code: "invalid-iri".to_string(),
+                                            message: msg,
+                                        });
+                                    }
                                 }
-                                Err(msg) => {
+                            }
+                        }
+                        DirectiveKind::Annotation { property, format } => {
+                            match resolve_iri_charged(
+                                property,
+                                &ctx,
+                                emitter,
+                                row.line,
+                                Some(&col.col_name),
+                            ) {
+                                Ok(prop_iri) => match build_annotation_value_charged(
+                                    val,
+                                    format,
+                                    &ctx,
+                                    emitter,
+                                    row.line,
+                                    &col.col_name,
+                                ) {
+                                    Ok(ann_val) => {
+                                        row_axioms.push((
+                                            Axiom::new(AxiomKind::AnnotationAssertion(
+                                                AnnotationProperty(prop_iri),
+                                                AnnotationSubject::Iri(subject_iri.clone()),
+                                                ann_val,
+                                            )),
+                                            Some(col.col_name.clone()),
+                                        ));
+                                    }
+                                    Err(ResolveError::Budget) => return Ok(()),
+                                    Err(ResolveError::Invalid(msg)) => {
+                                        row_has_error = true;
+                                        emitter.diag(RowDiagnostic {
+                                            row: row.line,
+                                            column: Some(col.col_name.clone()),
+                                            severity: Severity::Error,
+                                            code: "invalid-annotation-value".to_string(),
+                                            message: msg,
+                                        });
+                                    }
+                                },
+                                Err(ResolveError::Budget) => return Ok(()),
+                                Err(ResolveError::Invalid(msg)) => {
                                     row_has_error = true;
                                     emitter.diag(RowDiagnostic {
                                         row: row.line,
@@ -1219,79 +1493,95 @@ pub(crate) fn evaluate_robot(
                                 }
                             }
                         }
+                        DirectiveKind::Ignore
+                        | DirectiveKind::Id
+                        | DirectiveKind::EquivalentClasses(_)
+                        | DirectiveKind::AxiomAnnotation { .. } => {}
                     }
-                    DirectiveKind::Annotation { property, format } => {
-                        match resolve_iri(property, ctx) {
-                            Ok(prop_iri) => match build_annotation_value(val, format, ctx) {
-                                Ok(ann_val) => {
-                                    row_axioms.push((
-                                        Axiom::new(AxiomKind::AnnotationAssertion(
-                                            AnnotationProperty(prop_iri),
-                                            AnnotationSubject::Iri(subject_iri.clone()),
-                                            ann_val,
-                                        )),
-                                        Some(col.col_name.clone()),
-                                    ));
-                                }
-                                Err(msg) => {
-                                    row_has_error = true;
-                                    emitter.diag(RowDiagnostic {
-                                        row: row.line,
-                                        column: Some(col.col_name.clone()),
-                                        severity: Severity::Error,
-                                        code: "invalid-annotation-value".to_string(),
-                                        message: msg,
-                                    });
-                                }
-                            },
-                            Err(msg) => {
-                                row_has_error = true;
-                                emitter.diag(RowDiagnostic {
-                                    row: row.line,
-                                    column: Some(col.col_name.clone()),
-                                    severity: Severity::Error,
-                                    code: "invalid-iri".to_string(),
-                                    message: msg,
-                                });
-                            }
-                        }
-                    }
-                    DirectiveKind::Ignore
-                    | DirectiveKind::Id
-                    | DirectiveKind::EquivalentClasses(_)
-                    | DirectiveKind::AxiomAnnotation { .. } => {}
+                }
+                last_col_target = if row_axioms.len() > start_idx {
+                    LastColTarget::Axioms(start_idx..row_axioms.len())
+                } else {
+                    LastColTarget::None
+                };
+            }
+
+            // Combine all `EC` expressions on this row into one EquivalentClasses axiom
+            // (using ObjectIntersectionOf when two or more distinct expressions are present).
+            if !ec_exprs.is_empty() {
+                let unique: BTreeSet<ClassExpression> = ec_exprs.into_iter().collect();
+                let rhs = if unique.len() == 1 {
+                    unique.into_iter().next().unwrap()
+                } else {
+                    ClassExpression::ObjectIntersectionOf(unique)
+                };
+                let mut ax = Axiom::equivalent_classes([
+                    ClassExpression::Class(Class(subject_iri.clone())),
+                    rhs,
+                ]);
+                ax.annotations = ec_annotations;
+                row_axioms.push((ax, ec_col_name));
+            }
+
+            if row_has_error {
+                round_failed[row_i] = true;
+                emitter.mark_row_error(row.line);
+                continue;
+            }
+            match emitter.commit_row(row.line, row_declarations, row_axioms) {
+                RowCommit::Committed => {}
+                RowCommit::Invalid => {
+                    round_failed[row_i] = true;
+                }
+                RowCommit::BudgetExceeded => return Ok(()),
+            }
+        }
+
+        let failed_contributor = (0..n).any(|i| round_contributed[i] && round_failed[i]);
+        let recovered_row = (0..n).any(|i| {
+            !vocab_eligible[i] && row_pass1_ok[i] && !round_failed[i] && !monotonic_excluded[i]
+        });
+        if !failed_contributor && !recovered_row {
+            return Ok(());
+        }
+
+        let next_eligible: Vec<bool> = if monotonic_mode {
+            for i in 0..n {
+                if round_failed[i] {
+                    monotonic_excluded[i] = true;
                 }
             }
-            last_col_target = if row_axioms.len() > start_idx {
-                LastColTarget::Axioms(start_idx..row_axioms.len())
-            } else {
-                LastColTarget::None
-            };
-        }
+            (0..n).map(|i| !monotonic_excluded[i]).collect()
+        } else {
+            (0..n).map(|i| !round_failed[i]).collect()
+        };
 
-        // Combine all `EC` expressions on this row into one EquivalentClasses axiom
-        // (using ObjectIntersectionOf when two or more distinct expressions are present).
-        if !ec_exprs.is_empty() {
-            let unique: BTreeSet<ClassExpression> = ec_exprs.into_iter().collect();
-            let rhs = if unique.len() == 1 {
-                unique.into_iter().next().unwrap()
-            } else {
-                ClassExpression::ObjectIntersectionOf(unique)
-            };
-            let mut ax = Axiom::equivalent_classes([
-                ClassExpression::Class(Class(subject_iri.clone())),
-                rhs,
-            ]);
-            ax.annotations = ec_annotations;
-            row_axioms.push((ax, ec_col_name));
-        }
-
-        if row_has_error {
-            emitter.mark_row_error(row.line);
-            continue;
-        }
-        if !emitter.commit_row(row.line, row_declarations, row_axioms) {
+        if next_eligible == vocab_eligible {
             return Ok(());
+        }
+
+        if round + 1 == MAX_VOCAB_ROUNDS {
+            emitter.budget_error(
+                1,
+                None,
+                "vocab-dependency-limit",
+                format!(
+                    "failed-row vocabulary dependency chain did not converge within {MAX_VOCAB_ROUNDS} passes"
+                ),
+            );
+            return Ok(());
+        }
+
+        if !seen_states.insert(next_eligible.clone()) {
+            monotonic_mode = true;
+            for i in 0..n {
+                if round_failed[i] || !vocab_eligible[i] {
+                    monotonic_excluded[i] = true;
+                }
+            }
+            vocab_eligible = (0..n).map(|i| !monotonic_excluded[i]).collect();
+        } else {
+            vocab_eligible = next_eligible;
         }
     }
     Ok(())
@@ -1362,7 +1652,8 @@ fn split_cell_bounded<'a>(
 }
 
 fn parse_builtin_entity_kind(val: &str, ctx: &Context) -> Option<EntityKind> {
-    let lower = val.trim().to_ascii_lowercase();
+    let trimmed = val.trim();
+    let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
         "class" | "owl:class" => return Some(EntityKind::Class),
         "objectproperty" | "object property" | "owl:objectproperty" => {
@@ -1380,19 +1671,44 @@ fn parse_builtin_entity_kind(val: &str, ctx: &Context) -> Option<EntityKind> {
         "datatype" | "rdfs:datatype" => return Some(EntityKind::Datatype),
         _ => {}
     }
-    if let Ok(iri) = resolve_iri(val, ctx) {
-        match iri.as_str() {
-            vocab::OWL_CLASS | vocab::RDFS_CLASS => Some(EntityKind::Class),
-            vocab::OWL_OBJECT_PROPERTY => Some(EntityKind::ObjectProperty),
-            vocab::OWL_DATATYPE_PROPERTY => Some(EntityKind::DataProperty),
-            vocab::OWL_ANNOTATION_PROPERTY => Some(EntityKind::AnnotationProperty),
-            vocab::OWL_NAMED_INDIVIDUAL => Some(EntityKind::NamedIndividual),
-            vocab::RDFS_DATATYPE => Some(EntityKind::Datatype),
-            _ => None,
-        }
-    } else {
-        None
+    let bare = trimmed
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(trimmed);
+    let match_iri = |iri: &str| match iri {
+        vocab::OWL_CLASS | vocab::RDFS_CLASS => Some(EntityKind::Class),
+        vocab::OWL_OBJECT_PROPERTY => Some(EntityKind::ObjectProperty),
+        vocab::OWL_DATATYPE_PROPERTY => Some(EntityKind::DataProperty),
+        vocab::OWL_ANNOTATION_PROPERTY => Some(EntityKind::AnnotationProperty),
+        vocab::OWL_NAMED_INDIVIDUAL => Some(EntityKind::NamedIndividual),
+        vocab::RDFS_DATATYPE => Some(EntityKind::Datatype),
+        _ => None,
+    };
+    if let Some(k) = match_iri(bare) {
+        return Some(k);
     }
+    if let Some((prefix, local)) = trimmed.split_once(':')
+        && let Some((_, ns)) = ctx.prefixes.iter().find(|(p, _)| p == prefix)
+    {
+        if ns == vocab::OWL {
+            return match local {
+                "Class" => Some(EntityKind::Class),
+                "ObjectProperty" => Some(EntityKind::ObjectProperty),
+                "DatatypeProperty" => Some(EntityKind::DataProperty),
+                "AnnotationProperty" => Some(EntityKind::AnnotationProperty),
+                "NamedIndividual" => Some(EntityKind::NamedIndividual),
+                _ => None,
+            };
+        }
+        if ns == vocab::RDFS {
+            return match local {
+                "Class" => Some(EntityKind::Class),
+                "Datatype" => Some(EntityKind::Datatype),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 fn make_entity(iri: Iri, kind: EntityKind) -> Entity {
@@ -1406,33 +1722,49 @@ fn make_entity(iri: Iri, kind: EntityKind) -> Entity {
     }
 }
 
-fn build_annotation_value(
+fn build_annotation_value_charged(
     val: &str,
     format: &AnnotationFormat,
     ctx: &Context,
-) -> Result<AnnotationValue, String> {
+    emitter: &mut Emitter,
+    row: usize,
+    col_name: &str,
+) -> Result<AnnotationValue, ResolveError> {
     match format {
         AnnotationFormat::Auto => {
             if val.starts_with('<') && val.ends_with('>') && val.len() > 2 {
-                let iri = resolve_iri(val, ctx)?;
+                let iri = resolve_iri_charged(val, ctx, emitter, row, Some(col_name))?;
                 Ok(AnnotationValue::Iri(iri))
             } else {
+                if !emitter.charge_expanded_bytes(val.len(), row, Some(col_name.to_string())) {
+                    return Err(ResolveError::Budget);
+                }
                 Ok(AnnotationValue::Literal(Literal::simple(val)))
             }
         }
         AnnotationFormat::Lang(lang) => {
-            let lit = Literal::lang(val, lang).map_err(|e| e.0)?;
+            if !emitter.charge_expanded_bytes(
+                val.len().saturating_add(lang.len()),
+                row,
+                Some(col_name.to_string()),
+            ) {
+                return Err(ResolveError::Budget);
+            }
+            let lit = Literal::lang(val, lang).map_err(|e| ResolveError::Invalid(e.0))?;
             Ok(AnnotationValue::Literal(lit))
         }
         AnnotationFormat::Typed(dt) => {
-            let dt_iri = resolve_iri(dt, ctx)?;
+            let dt_iri = resolve_iri_charged(dt, ctx, emitter, row, Some(col_name))?;
+            if !emitter.charge_expanded_bytes(val.len(), row, Some(col_name.to_string())) {
+                return Err(ResolveError::Budget);
+            }
             Ok(AnnotationValue::Literal(Literal::typed(
                 val,
                 dt_iri.as_str(),
             )))
         }
         AnnotationFormat::Iri => {
-            let iri = resolve_iri(val, ctx)?;
+            let iri = resolve_iri_charged(val, ctx, emitter, row, Some(col_name))?;
             Ok(AnnotationValue::Iri(iri))
         }
     }

@@ -816,3 +816,464 @@ fn fail_closed_when_diagnostic_cap_filled_by_warnings_and_misc_p3_fixes() {
     assert!(!res.is_valid());
     assert!(res.diagnostics.iter().any(|d| d.code == "ambiguous-column"));
 }
+
+#[test]
+fn axiom_triple_count_matches_writer_across_all_kinds() {
+    use crate::write::{axiom_triple_count, axiom_triples, counter};
+
+    let c1 = Class::new("http://ex.org/A");
+    let c2 = Class::new("http://ex.org/B");
+    let c3 = Class::new("http://ex.org/C");
+    let op = ObjectProperty::new("http://ex.org/p");
+    let op2 = ObjectProperty::new("http://ex.org/q");
+    let dp = DataProperty::new("http://ex.org/d");
+    let ap = AnnotationProperty::new("http://ex.org/ann");
+    let ind1 = Individual::Named(NamedIndividual::new("http://ex.org/i1"));
+    let ind2 = Individual::Named(NamedIndividual::new("http://ex.org/i2"));
+    let ind3 = Individual::Named(NamedIndividual::new("http://ex.org/i3"));
+
+    let nested_ann = Annotation {
+        property: ap.clone(),
+        value: AnnotationValue::Literal(Literal::simple("outer")),
+        annotations: [Annotation {
+            property: ap.clone(),
+            value: AnnotationValue::Literal(Literal::simple("inner")),
+            annotations: BTreeSet::new(),
+        }]
+        .into_iter()
+        .collect(),
+    };
+
+    let complex_ce = ClassExpression::ObjectIntersectionOf(
+        [
+            ClassExpression::Class(c1.clone()),
+            ClassExpression::some(op.clone(), ClassExpression::Class(c2.clone())),
+            ClassExpression::ObjectMinCardinality(
+                2,
+                ObjectPropertyExpression::InverseOf(op2.clone()),
+                Some(Box::new(ClassExpression::Class(c3.clone()))),
+            ),
+            ClassExpression::DataSomeValuesFrom(
+                vec![dp.clone()],
+                DataRange::DatatypeRestriction(
+                    Datatype::new("http://www.w3.org/2001/XMLSchema#integer"),
+                    [FacetRestriction {
+                        facet: Iri::new_unchecked("http://www.w3.org/2001/XMLSchema#minInclusive"),
+                        value: Literal::typed("1", "http://www.w3.org/2001/XMLSchema#integer"),
+                    }]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    let mut axioms = vec![
+        Axiom::declaration(Entity::Class(c1.clone())),
+        Axiom::sub_class_of(c1.clone(), complex_ce.clone()),
+        Axiom::equivalent_classes([
+            ClassExpression::Class(c1.clone()),
+            ClassExpression::Class(c2.clone()),
+            ClassExpression::Class(c3.clone()),
+        ]),
+        Axiom::disjoint_classes([
+            ClassExpression::Class(c1.clone()),
+            ClassExpression::Class(c2.clone()),
+        ]),
+        Axiom::disjoint_classes([
+            ClassExpression::Class(c1.clone()),
+            ClassExpression::Class(c2.clone()),
+            ClassExpression::Class(c3.clone()),
+        ]),
+        Axiom::new(AxiomKind::DisjointUnion(
+            c1.clone(),
+            [
+                ClassExpression::Class(c2.clone()),
+                ClassExpression::Class(c3.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        )),
+        Axiom::new(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Chain(vec![
+                ObjectPropertyExpression::Property(op.clone()),
+                ObjectPropertyExpression::InverseOf(op2.clone()),
+            ]),
+            ObjectPropertyExpression::Property(op.clone()),
+        )),
+        Axiom::new(AxiomKind::HasKey(
+            ClassExpression::Class(c1.clone()),
+            [ObjectPropertyExpression::Property(op.clone())]
+                .into_iter()
+                .collect(),
+            [dp.clone()].into_iter().collect(),
+        )),
+        Axiom::new(AxiomKind::SameIndividual(
+            [ind1.clone(), ind2.clone(), ind3.clone()]
+                .into_iter()
+                .collect(),
+        )),
+        Axiom::new(AxiomKind::DifferentIndividuals(
+            [ind1.clone(), ind2.clone()].into_iter().collect(),
+        )),
+        Axiom::new(AxiomKind::DifferentIndividuals(
+            [ind1.clone(), ind2.clone(), ind3.clone()]
+                .into_iter()
+                .collect(),
+        )),
+        Axiom::class_assertion(complex_ce, ind1.clone()),
+        Axiom::new(AxiomKind::ObjectPropertyAssertion(
+            ObjectPropertyExpression::InverseOf(op.clone()),
+            ind1.clone(),
+            ind2.clone(),
+        )),
+        Axiom::new(AxiomKind::NegativeObjectPropertyAssertion(
+            ObjectPropertyExpression::Property(op.clone()),
+            ind1.clone(),
+            ind2.clone(),
+        )),
+        Axiom::new(AxiomKind::DataPropertyAssertion(
+            dp.clone(),
+            ind1.clone(),
+            Literal::simple("v"),
+        )),
+        Axiom::new(AxiomKind::NegativeDataPropertyAssertion(
+            dp,
+            ind1,
+            Literal::simple("v"),
+        )),
+        Axiom::new(AxiomKind::AnnotationAssertion(
+            ap,
+            AnnotationSubject::Iri(c1.0.clone()),
+            AnnotationValue::Literal(Literal::simple("lbl")),
+        )),
+    ];
+
+    // Check both unannotated and nested-annotated variants of every axiom.
+    let annotated: Vec<Axiom> = axioms
+        .iter()
+        .map(|a| {
+            let mut copy = a.clone();
+            copy.annotations.insert(nested_ann.clone());
+            copy
+        })
+        .collect();
+    axioms.extend(annotated);
+
+    for ax in &axioms {
+        let mut fresh = counter("t");
+        let actual = axiom_triples(ax, &mut fresh).len();
+        let counted = axiom_triple_count(ax);
+        assert_eq!(counted, actual, "mismatch for {ax:?}");
+    }
+}
+
+#[test]
+fn resolved_iri_vocab_ofn_prefix_and_replicated_annotation_bytes_are_charged() {
+    // 1. Long namespace with short ROBOT IDs triggers expansion-bytes-limit in Pass 1.
+    let long_ns = format!("http://example.org/{}/", "a".repeat(1_500));
+    let mut prefixes = BTreeMap::new();
+    prefixes.insert("p".to_string(), long_ns.clone());
+    let csv = "ID\nID\np:1\np:2\np:3\np:4\n";
+    let spec = PatternSpec {
+        mode: TemplateMode::Robot {
+            header_template_row: true,
+            columns: Vec::new(),
+        },
+        base_iri: None,
+        prefixes: prefixes.clone(),
+    };
+    let tight = Limits {
+        max_total_expanded_bytes: 6_000,
+        ..Limits::default()
+    };
+    let res = evaluate(csv, Delimiter::Comma, &spec, &ex_vocab(), &tight).unwrap();
+    assert!(
+        res.budget_exceeded,
+        "expected Pass 1 IRI/vocab budget hit: {res:?}"
+    );
+    assert!(res.has_fatal_error());
+
+    // 2. ROBOT >A replicated annotation bytes charged BEFORE cloning into split targets.
+    let long_ann = "x".repeat(400);
+    let csv_rep = format!(
+        "ID,Parents,Note\nID,SC % SPLIT=|,>A rdfs:comment\nex:Heart,ex:A|ex:B|ex:C|ex:D|ex:E|ex:F|ex:G|ex:H|ex:I|ex:J,{long_ann}\n"
+    );
+    let rep_spec = PatternSpec {
+        mode: TemplateMode::Robot {
+            header_template_row: true,
+            columns: Vec::new(),
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let tight_rep = Limits {
+        max_total_expanded_bytes: 2_000,
+        ..Limits::default()
+    };
+    let res_rep = evaluate(
+        &csv_rep,
+        Delimiter::Comma,
+        &rep_spec,
+        &ex_vocab(),
+        &tight_rep,
+    )
+    .unwrap();
+    assert!(
+        res_rep.budget_exceeded,
+        "expected replicated >A annotation bytes budget hit: {res_rep:?}"
+    );
+    assert!(res_rep.axioms.is_empty());
+
+    // 3. OFN prefixed terms expand long namespaces and are charged BEFORE parsing.
+    let ofn_csv = "a,b\n1,2\n3,4\n5,6\n";
+    let ofn_spec = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: Vec::new(),
+            rules: vec![PatternRule::functional("SubClassOf(p:${a} p:${b})")],
+        },
+        base_iri: None,
+        prefixes,
+    };
+    let res_ofn = evaluate(ofn_csv, Delimiter::Comma, &ofn_spec, &ex_vocab(), &tight).unwrap();
+    assert!(
+        res_ofn.budget_exceeded,
+        "expected OFN prefix expansion budget hit: {res_ofn:?}"
+    );
+
+    // 4. Long diagnostic column/rule name is truncated to MAX_DIAGNOSTIC_COLUMN_BYTES.
+    let huge_col = "C".repeat(1_000);
+    let col_csv = format!("ID,{huge_col}\nID,SC %\nex:A,not valid (\n");
+    let res_col = evaluate(
+        &col_csv,
+        Delimiter::Comma,
+        &rep_spec,
+        &ex_vocab(),
+        &Limits::default(),
+    )
+    .unwrap();
+    let diag = res_col
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "invalid-expression")
+        .expect("diagnostic present");
+    assert!(
+        diag.column.as_deref().unwrap().len() <= MAX_DIAGNOSTIC_COLUMN_BYTES,
+        "diagnostic column was not truncated: {}",
+        diag.column.as_deref().unwrap().len()
+    );
+}
+
+#[test]
+fn ofn_inline_annotations_enforce_max_annotations_per_axiom() {
+    let csv = "c,p\nex:Heart,ex:Organ\n";
+    let ofn_template = "SubClassOf(Annotation(rdfs:comment \"a\") Annotation(rdfs:comment \"b\") Annotation(rdfs:comment \"c\") ${c} ${p})";
+    let spec = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: Vec::new(),
+            rules: vec![PatternRule::functional(ofn_template)],
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let tight = Limits {
+        max_annotations_per_axiom: 2,
+        ..Limits::default()
+    };
+    let res = evaluate(csv, Delimiter::Comma, &spec, &ex_vocab(), &tight).unwrap();
+    assert!(!res.is_valid());
+    assert!(res.axioms.is_empty());
+    assert!(
+        res.diagnostics.iter().any(|d| d.code == "annotation-limit"),
+        "expected annotation-limit diagnostic: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn failed_row_vocab_and_truncated_splits_are_excluded_from_retained_rows() {
+    let robot_spec = PatternSpec {
+        mode: TemplateMode::Robot {
+            header_template_row: true,
+            columns: Vec::new(),
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+
+    // 1. Alias supplied ONLY by a failing row must NOT resolve for another row.
+    let alias_csv = "\
+ID,Label,Parent,Source
+ID,LABEL,SC %,>AI dcterms:source
+ex:BadClass,Bad Alias,ex:Organ,unknownprefix:BadRef
+ex:GoodClass,Good,'Bad Alias',ex:Ref1
+";
+    let res = evaluate(
+        alias_csv,
+        Delimiter::Comma,
+        &robot_spec,
+        &ex_vocab(),
+        &Limits::default(),
+    )
+    .unwrap();
+    assert!(!res.is_valid());
+    let r = Renderer::new([("ex", "http://ex.org/")]);
+    let ofns: Vec<String> = res.axioms.iter().map(|g| r.axiom(&g.axiom)).collect();
+    assert!(
+        !ofns.iter().any(|s| s.contains("ex:BadClass")),
+        "failed row entity leaked via alias into retained axioms: {ofns:?}"
+    );
+    assert!(
+        !ofns.iter().any(|s| s.contains("ex:GoodClass")),
+        "dependent row should fail once failed row alias is excluded: {ofns:?}"
+    );
+
+    // 2. Failing row whose duplicate label made an existing label ambiguous must NOT drop a good row.
+    let mut vocab = ex_vocab();
+    vocab.add_label("http://ex.org/Organ", "Unique Organ");
+    let ambig_csv = "\
+ID,Label,Parent,Source
+ID,LABEL,SC %,>AI dcterms:source
+ex:BadDup,Unique Organ,ex:Organ,unknownprefix:BadRef
+ex:Heart,Heart,'Unique Organ',ex:Ref1
+";
+    let res_ambig = evaluate(
+        ambig_csv,
+        Delimiter::Comma,
+        &robot_spec,
+        &vocab,
+        &Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(res_ambig.rows_with_errors, 1, "{:?}", res_ambig.diagnostics);
+    let ofns_ambig: Vec<String> = res_ambig.axioms.iter().map(|g| r.axiom(&g.axiom)).collect();
+    assert!(
+        ofns_ambig
+            .iter()
+            .any(|s| s.contains("SubClassOf") && s.contains("ex:Heart") && s.contains("ex:Organ")),
+        "good row should survive after failing duplicate-label row is excluded: {ofns_ambig:?}"
+    );
+    assert!(
+        !ofns_ambig.iter().any(|s| s.contains("ex:BadDup")),
+        "failing duplicate row must not emit axioms: {ofns_ambig:?}"
+    );
+
+    // 3. Truncated LABEL split must NOT register its first tokens in Pass 1 vocab.
+    let trunc_csv = "\
+ID,Label,Parent
+ID,LABEL SPLIT=|,SC %
+ex:TruncRow,L1|L2|L3,ex:Organ
+ex:Other,Other,'L1'
+";
+    let tight_split = Limits {
+        max_split_values_per_cell: 2,
+        ..Limits::default()
+    };
+    let res_trunc = evaluate(
+        trunc_csv,
+        Delimiter::Comma,
+        &robot_spec,
+        &ex_vocab(),
+        &tight_split,
+    )
+    .unwrap();
+    let ofns_trunc: Vec<String> = res_trunc.axioms.iter().map(|g| r.axiom(&g.axiom)).collect();
+    assert!(
+        !ofns_trunc.iter().any(|s| s.contains("ex:TruncRow")),
+        "truncated LABEL split leaked into vocab: {ofns_trunc:?}"
+    );
+    assert!(
+        res_trunc.axioms.is_empty(),
+        "dependent row using truncated LABEL token must fail: {ofns_trunc:?}"
+    );
+
+    // 4. Pattern mode: failed row declaration & truncated declaration split must not enter vocab.
+    let pat_csv = "cls,parent\nex:BadDecl|ex:Second|ex:Third,ex:Organ\nex:Good,BadDecl\n";
+    let pat_spec = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: vec![ColumnDeclaration {
+                column: "cls".into(),
+                kind: EntityKind::Class,
+                split: Some("|".into()),
+            }],
+            rules: vec![PatternRule::manchester("${cls} SubClassOf ${parent}")],
+        },
+        base_iri: None,
+        prefixes: BTreeMap::new(),
+    };
+    let res_pat = evaluate(
+        pat_csv,
+        Delimiter::Comma,
+        &pat_spec,
+        &ex_vocab(),
+        &tight_split,
+    )
+    .unwrap();
+    assert!(
+        res_pat.axioms.is_empty(),
+        "truncated Pattern declaration leaked into vocab: {:?}",
+        res_pat.axioms
+    );
+}
+
+#[test]
+fn malformed_prefixes_and_qualified_names_never_fall_through_to_base_iri() {
+    // 1. Non-ASCII prefix key in spec.prefixes is rejected structurally across modes.
+    let mut bad_prefixes = BTreeMap::new();
+    bad_prefixes.insert("é".to_string(), "http://ex.org/".to_string());
+    let bad_spec = PatternSpec {
+        mode: TemplateMode::Pattern {
+            declarations: Vec::new(),
+            rules: vec![PatternRule::functional("SubClassOf(é:${a} ex:Organ)")],
+        },
+        base_iri: Some("http://base.org/".to_string()),
+        prefixes: bad_prefixes,
+    };
+    let res = evaluate(
+        "a\nHeart\n",
+        Delimiter::Comma,
+        &bad_spec,
+        &ex_vocab(),
+        &Limits::default(),
+    )
+    .unwrap();
+    assert!(res.has_fatal_error());
+    assert!(
+        res.diagnostics.iter().any(|d| d.code == "invalid-prefix"),
+        "expected invalid-prefix diagnostic: {:?}",
+        res.diagnostics
+    );
+
+    // 2. Malformed qualified name (non-ASCII or invalid prefix) with baseIri configured
+    //    must fail instead of resolving as http://base.org/é:Heart.
+    let robot_spec = PatternSpec {
+        mode: TemplateMode::Robot {
+            header_template_row: true,
+            columns: Vec::new(),
+        },
+        base_iri: Some("http://base.org/".to_string()),
+        prefixes: BTreeMap::new(),
+    };
+    let csv = "ID,Parent\nID,SC %\né:Heart,ex:Organ\nGoodLocal,ex:Organ\n";
+    let res2 = evaluate(
+        csv,
+        Delimiter::Comma,
+        &robot_spec,
+        &ex_vocab(),
+        &Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(res2.rows_with_errors, 1, "{:?}", res2.diagnostics);
+    let r = Renderer::new([("base", "http://base.org/"), ("ex", "http://ex.org/")]);
+    let ofns: Vec<String> = res2.axioms.iter().map(|g| r.axiom(&g.axiom)).collect();
+    assert!(
+        ofns.iter().any(|s| s.contains("base:GoodLocal")),
+        "unqualified bare local name should still resolve under baseIri: {ofns:?}"
+    );
+    assert!(
+        !ofns.iter().any(|s| s.contains("é:Heart")),
+        "malformed qualified name must not fall through to baseIri: {ofns:?}"
+    );
+}

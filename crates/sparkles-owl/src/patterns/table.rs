@@ -283,7 +283,15 @@ pub(crate) fn parse_table_with_options(
     })
 }
 
-fn push_diag(out: &mut Vec<RowDiagnostic>, max: usize, truncated: &mut bool, diag: RowDiagnostic) {
+fn push_diag(
+    out: &mut Vec<RowDiagnostic>,
+    max: usize,
+    truncated: &mut bool,
+    mut diag: RowDiagnostic,
+) {
+    if let Some(col) = diag.column.as_mut() {
+        super::truncate_utf8(col, super::MAX_DIAGNOSTIC_COLUMN_BYTES);
+    }
     if out.len() < max {
         out.push(diag);
     } else {
