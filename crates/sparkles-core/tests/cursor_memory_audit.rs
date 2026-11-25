@@ -1169,3 +1169,120 @@ fn native_one_constant_relation_fallback_admits_key_chunk() {
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Items 1122 & 1123: `path:allShortest`, shortest paths to a variable end, and
+/// unlimited path searches over a group input and/or nested edge pattern hold their
+/// ledger within `Allowance::EXACT`.
+#[test]
+fn native_path_search_1122_1123_forms_hold_exact_ledger() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    // A chain of 8 diamonds (256 tied shortest paths) plus a 1,500-node fan-out graph
+    // and weighted edges.
+    for i in 0..8 {
+        data.push_str(&format!(
+            "<urn:d:{i}> <urn:d> <urn:da:{i}> .\n\
+             <urn:d:{i}> <urn:d> <urn:db:{i}> .\n\
+             <urn:da:{i}> <urn:d> <urn:d:{}> .\n\
+             <urn:db:{i}> <urn:d> <urn:d:{}> .\n\
+             << <urn:d:{i}> <urn:d> <urn:da:{i}> >> <urn:w> 1.5 .\n\
+             << <urn:d:{i}> <urn:d> <urn:db:{i}> >> <urn:w> 1.5 .\n\
+             << <urn:da:{i}> <urn:d> <urn:d:{}> >> <urn:w> 1.0 .\n\
+             << <urn:db:{i}> <urn:d> <urn:d:{}> >> <urn:w> 1.0 .\n",
+            i + 1,
+            i + 1,
+            i + 1,
+            i + 1
+        ));
+    }
+    for i in 0..1500 {
+        data.push_str(&format!("<urn:n:{i}> <urn:k> {i} .\n"));
+        data.push_str(&format!(
+            "<urn:n:{i}> <urn:e> <urn:n:{}> .\n",
+            (i + 1) % 1500
+        ));
+        data.push_str(&format!(
+            "<urn:n:{i}> <urn:e> <urn:n:{}> .\n",
+            (i * 7 + 3) % 1500
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+
+    const P: &str = "PREFIX path: <urn:x-sparkles:path#> ";
+    let cases = [
+        (
+            "allShortest const unweighted",
+            format!(
+                "{P}SELECT ?p ?i ?es ?eo {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo }} }}"
+            ),
+        ),
+        (
+            "allShortest const weighted",
+            format!(
+                "{P}SELECT ?p ?i ?c {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:algorithm path:allShortest ; path:weight <urn:w> ; path:pathIndex ?p ; path:edgeIndex ?i ; path:cost ?c }} }}"
+            ),
+        ),
+        (
+            "shortest variable target",
+            format!(
+                "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:n:0> ; path:target ?t ; path:predicate <urn:e> ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "allShortest variable target",
+            format!(
+                "{P}SELECT ?t ?p ?l {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target ?t ; path:predicate <urn:d> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "shortest over group no limit",
+            format!(
+                "{P}SELECT ?s ?l {{ ?s <urn:k> ?k FILTER(?k < 15) SERVICE path:search {{ [] path:source ?s ; path:target <urn:n:50> ; path:predicate <urn:e> ; path:length ?l }} }}"
+            ),
+        ),
+        (
+            "shortest over edge pattern no limit",
+            format!(
+                "{P}SELECT ?t ?l {{ SERVICE path:search {{ [] path:source <urn:n:0> ; path:target ?t ; path:length ?l ; path:start ?x ; path:end ?y . ?x <urn:e> ?y }} }}"
+            ),
+        ),
+        (
+            "allShortest over group and edge pattern",
+            format!(
+                "{P}SELECT ?s ?p ?l {{ ?s <urn:k> ?k FILTER(?k < 5) SERVICE path:search {{ [] path:source ?s ; path:target <urn:n:20> ; path:algorithm path:allShortest ; path:pathIndex ?p ; path:length ?l ; path:start ?x ; path:end ?y . ?x <urn:e> ?y }} }}"
+            ),
+        ),
+        (
+            "kShortest const",
+            format!(
+                "{P}SELECT ?p ?i {{ SERVICE path:search {{ [] path:source <urn:d:0> ; path:target <urn:d:8> ; path:predicate <urn:d> ; path:algorithm path:kShortest ; path:k 8 ; path:pathIndex ?p ; path:edgeIndex ?i }} }}"
+            ),
+        ),
+    ];
+
+    let mut found = Vec::new();
+    for (name, q) in &cases {
+        for (granted, mode) in [(false, "local"), (true, "granted")] {
+            for batch in [16, 256] {
+                let mut a = run(&s, q, granted, batch);
+                for _ in 0..2 {
+                    a = run(&s, q, granted, batch);
+                }
+                print(name, &format!("{mode}/{batch}"), &a);
+                assert!(a.rows > 0, "{name}: no rows");
+                target(&a.plan, "PathSearch", true).unwrap();
+                found.extend(a.check(
+                    &format!("{name} ({mode}, batch {batch})"),
+                    &Allowance::EXACT,
+                ));
+            }
+        }
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}

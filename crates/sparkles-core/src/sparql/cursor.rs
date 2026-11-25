@@ -3357,7 +3357,7 @@ impl Operator {
         let text_reader = text::eligible(&node);
         // A history query without a limit holds a page of its changes at a time.
         let history_reader = history::eligible(&node);
-        // A path search between constants (shortest/kShortest) or `path:all` with a constant end.
+        // A path search without `path:limit` streams matching paths under the memory budget.
         let path_reader = pathsearch::eligible(&node);
         // Streaming GeoSPARQL operators (scan, unlimited property function, relate, join, kNN).
         let spatial_leaf = spatial::leaf_eligible(&node);
@@ -3662,10 +3662,18 @@ impl Operator {
                         node.operator()
                     )
                 } else if path_reader {
-                    format!(
-                        "{} streams matching paths under the memory budget and emits rows a batch at a time",
-                        node.operator()
-                    )
+                    if node.children.is_empty() {
+                        format!(
+                            "{} streams matching paths under the memory budget and emits rows a batch at a time",
+                            node.operator()
+                        )
+                    } else {
+                        let reads = whole::reads(&node);
+                        format!(
+                            "{} reads {reads} under the memory budget and streams matching paths a batch at a time",
+                            node.operator()
+                        )
+                    }
                 } else if spatial_leaf {
                     format!(
                         "{} streams matching spatial rows from the index or predicate scan under the memory budget",
@@ -4154,6 +4162,7 @@ impl Operator {
                     | State::Text(_)
             )
             || matches!(&self.state, State::SpatialJoin(_) if self.children.len() == 2)
+            || matches!(&self.state, State::PathSearch(_) if !self.children.is_empty())
             || matches!(&self.state, State::Service(service) if service.full_input_before_output())
     }
 
@@ -4716,7 +4725,7 @@ impl Operator {
                     b
                 }
                 State::PathSearch(ps) => {
-                    let b = ps.next(ctx, cap)?;
+                    let b = ps.next(ctx, &mut self.children, options, cap)?;
                     if let Some(counters) = &ps.counters {
                         self.info.counters = Some(counters.clone());
                     }
