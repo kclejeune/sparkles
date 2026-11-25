@@ -5089,7 +5089,7 @@ impl Store {
         if !self.opts.group_commit || w.wal.is_none() || o.dry_run.is_some() {
             return Err(None);
         }
-        let first = if w.poisoned {
+        let first = if w.poisoned || self.group.as_ref().is_some_and(|g| g.failed()) {
             Some(Poisoned)
         } else if !(kind == CommitKind::Transaction || Self::speculative_kind(kind)) {
             Some(Kind)

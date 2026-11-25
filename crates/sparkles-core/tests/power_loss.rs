@@ -908,7 +908,7 @@ impl Model {
         root: &Path,
         out: &Path,
         dir_prefix: usize,
-        mut keep: impl FnMut(&Op) -> Option<Vec<bool>>,
+        mut keep: impl FnMut(&str, &Op) -> Option<Vec<bool>>,
     ) {
         let _ = std::fs::remove_dir_all(out);
         copy_dir(base, out);
@@ -958,7 +958,7 @@ impl Model {
                     let pages = match op.state {
                         State::Dropped => continue,
                         State::Durable => None,
-                        State::Pending => match keep(op) {
+                        State::Pending => match keep(path, op) {
                             None => continue,
                             some => some,
                         },
@@ -1159,6 +1159,7 @@ fn check_image(
     base: u32,
     acked: &[(u64, u32, u32)],
     text: bool,
+    exact_head: Option<u64>,
     what: &str,
 ) -> Option<u64> {
     // The full-text index's checkpoint never names a commit above the recovered log, so
@@ -1189,6 +1190,17 @@ fn check_image(
         .max()
         .unwrap_or(0)
         .max(u64::from(base));
+    if let Some(expected) = exact_head {
+        assert_eq!(
+            head, expected,
+            "{what}: expected exact recovered head {expected}, got {head}"
+        );
+        assert!(
+            s.annotation(expected + 1).is_none(),
+            "{what}: dropped commit {} must have no annotation",
+            expected + 1
+        );
+    }
     assert!(
         head >= top,
         "{what}: head {head} is before the last acknowledged commit {top}"
@@ -1501,7 +1513,11 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
     // in either order and whether or not the writes overlap.
     let (mut open, mut ann_done, mut wal_done) = (false, false, false);
     let (mut forced, mut split) = (0usize, 0usize);
+    let (mut missing_ann_dropped, mut missing_ann_dropped_direct) = (0usize, 0usize);
+    let (mut last_asymmetric_seq, mut last_asymmetric_direct_seq) = (None::<u64>, None::<u64>);
+    let mut commit_wal_dsync = false;
     const FORCED: usize = 48;
+    const MAX_ASYMMETRIC: usize = 4;
     for (i, rec) in log.iter().enumerate() {
         if let Rec::Write { path, data, .. } = rec
             && path.ends_with("ack.log")
@@ -1510,6 +1526,7 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             let t = u32::from_le_bytes(data[8..12].try_into().unwrap());
             let k = u32::from_le_bytes(data[12..16].try_into().unwrap());
             acked.push((seq, t, k));
+            commit_wal_dsync = false;
         }
         model.apply(rec);
         // Always check the clean state just after the forced locked pass, even when
@@ -1518,6 +1535,13 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             matches!(rec, Rec::Write { path, .. } if path.ends_with("/locked-cleared"));
         let ann = |path: &str| path.ends_with("/annotations.bin");
         let wal = |path: &str| path.ends_with("/wal.log");
+        let vocab = |path: &str| path.ends_with("/delta.vocab");
+        if let Rec::Write { path, dsync, .. } = rec
+            && wal(path)
+            && *dsync
+        {
+            commit_wal_dsync = true;
+        }
         if let Rec::Write { path, .. } = rec
             && (ann(path) || wal(path))
             && !open
@@ -1538,6 +1562,53 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             }
             _ => (false, false),
         };
+        // Deterministically construct an asymmetric crash image where a complete WAL
+        // transaction and its vocabulary reached disk while its pending annotation write
+        // did not, and verify that recovery truncates that exact tail commit.
+        if !background
+            && matches!(
+                rec,
+                Rec::Write { path, .. } | Rec::WriteEnd { path, failed: false, .. }
+                    if wal(path) || vocab(path)
+            )
+        {
+            let top = acked
+                .iter()
+                .map(|a| a.0)
+                .max()
+                .unwrap_or(0)
+                .max(u64::from(base));
+            let next = top + 1;
+            let need = if commit_wal_dsync {
+                missing_ann_dropped_direct < MAX_ASYMMETRIC
+                    && last_asymmetric_direct_seq != Some(next)
+            } else {
+                missing_ann_dropped < MAX_ASYMMETRIC && last_asymmetric_seq != Some(next)
+            };
+            if need {
+                model.image(&base_db, &root, &img, usize::MAX, |path, _| {
+                    (!ann(path)).then(Vec::new)
+                });
+                let pre = check(&img, &CheckOptions::default()).unwrap();
+                let needle =
+                    format!("the annotation of commit {next} is missing from annotations.bin");
+                if pre.status == Status::Warning && pre.to_text().contains(&needle) {
+                    let what = format!(
+                        "{name}: crash after record {i} of {}, complete WAL+vocab with missing annotation for commit {next} (dsync={commit_wal_dsync})",
+                        log.len()
+                    );
+                    let p = check_image(&img, base, &acked, text, Some(top), &what);
+                    named = named.max(p.unwrap_or(0));
+                    images += 1;
+                    missing_ann_dropped += 1;
+                    last_asymmetric_seq = Some(next);
+                    if commit_wal_dsync {
+                        missing_ann_dropped_direct += 1;
+                        last_asymmetric_direct_seq = Some(next);
+                    }
+                }
+            }
+        }
         split += usize::from(between && is_split && forced < FORCED);
         let between = between && forced < FORCED;
         forced += usize::from(between);
@@ -1546,24 +1617,32 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
         }
         let what = format!("{name}: crash after record {i} of {}", log.len());
         // everything still unsynchronized is lost
-        model.image(&base_db, &root, &img, 0, |_| None);
+        model.image(&base_db, &root, &img, 0, |_, _| None);
         let p = check_image(
             &img,
             base,
             &acked,
             text,
+            None,
             &format!("{what}, unsynced writes lost"),
         );
         named = named.max(p.unwrap_or(0));
         // everything is kept, as after a process crash
-        model.image(&base_db, &root, &img, usize::MAX, |_| Some(Vec::new()));
-        let p = check_image(&img, base, &acked, text, &format!("{what}, nothing lost"));
+        model.image(&base_db, &root, &img, usize::MAX, |_, _| Some(Vec::new()));
+        let p = check_image(
+            &img,
+            base,
+            &acked,
+            text,
+            None,
+            &format!("{what}, nothing lost"),
+        );
         named = named.max(p.unwrap_or(0));
         // a random part of what is pending survives, in whole writes or single pages, and
         // a random prefix of the directory operations
         for _ in 0..2 {
             let dirs = (rng.next() % (model.pending_dirs() as u64 + 1)) as usize;
-            model.image(&base_db, &root, &img, dirs, |op| {
+            model.image(&base_db, &root, &img, dirs, |_, op| {
                 if !rng.coin(50) {
                     return None;
                 }
@@ -1581,6 +1660,7 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
                 base,
                 &acked,
                 text,
+                None,
                 &format!("{what}, random pages lost"),
             );
             named = named.max(p.unwrap_or(0));
@@ -1588,7 +1668,7 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
         images += 4;
     }
     println!(
-        "{name}: checked {images} crash images from {} I/O records, {} acknowledgements, highest text checkpoint {named}, {forced} points at annotation writes, {split} between an annotation write and a log write",
+        "{name}: checked {images} crash images from {} I/O records, {} acknowledgements, highest text checkpoint {named}, {forced} points at annotation writes, {split} between an annotation write and a log write, {missing_ann_dropped} asymmetric missing-annotation drops ({missing_ann_dropped_direct} direct)",
         log.len(),
         acked.len()
     );
@@ -1597,6 +1677,18 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             split > 0,
             "{name}: no crash point fell between a fence's annotation write and its log write"
         );
+    }
+    if cfg.threads == 1 && !text {
+        assert!(
+            missing_ann_dropped > 0,
+            "{name}: no crash image had a complete WAL commit and vocabulary with its annotation missing"
+        );
+        if cfg.direct && direct_io_available(&run.root) {
+            assert!(
+                missing_ann_dropped_direct > 0,
+                "{name}: no direct-I/O crash image had a complete WAL commit and vocabulary with its annotation missing"
+            );
+        }
     }
     assert!(images > 0);
     assert!(!acked.is_empty(), "the writer acknowledged no commit");

@@ -244,7 +244,6 @@ impl Coordinator {
     /// so the queued commits fail. A prefix whose fence is already running keeps that
     /// fence's outcome: when the sync succeeds, its commits are durable and are
     /// acknowledged.
-    #[cfg(any(feature = "text", test))]
     pub fn fail(&self) {
         let mut s = self.state.lock();
         s.failed = true;
@@ -751,7 +750,8 @@ impl Store {
         let direct = written.inspect_err(failed)?;
         let ann_written = ann_written.transpose().inspect_err(failed)?;
         #[cfg(test)]
-        if ann_written.is_some_and(|w| w.direct)
+        if first.grouped
+            && ann_written.is_some_and(|w| w.direct)
             && let Some(g) = &self.group
         {
             g.ann_direct_fences.fetch_add(1, Ordering::Relaxed);
@@ -921,11 +921,45 @@ impl WriteTxn<'_> {
             .as_ref()
             .expect("persistent WAL transaction")
             .clone();
+        // Encode and validate the WAL records before mutating `merges.bin`,
+        // `annotations.bin`, or writer offsets, so a fallible encoding error (such as an
+        // invalid configuration binding) leaves the store untouched and unpoisoned.
+        // The record says an annotation is expected when one will be queued, so replay
+        // treats a flagged tail commit without its annotation as torn.
+        let will_annotate = message.is_some() || store.commit_digests();
+        let annotated = if will_annotate {
+            commit::WAL_FLAG_ANNOTATED
+        } else {
+            0
+        };
+        let data = wal::encode_txn_with_control(
+            &self.log,
+            &control_bytes,
+            self.configuration,
+            self.guard.next_bnode,
+            wal::Seal::of(&c, annotated, unfenced),
+        )?;
+        let data_len = data.len() as u64;
+        if control_bytes.is_empty() {
+            debug_assert_eq!(data_len, bytes, "the queued bytes are the records'");
+        } else {
+            debug_assert!(
+                data_len <= bytes,
+                "control_wal_bytes ({bytes}) underestimated encoded records ({data_len})"
+            );
+        }
         // A merge's record is durable before its commit (open drops one above the head).
         if let Some(m) = self.merge.as_mut() {
             m.seq = c.seq;
             let rec = *m;
-            store.branching.merges.lock().append(rec)?;
+            // Arm poison before touching `merges.bin`: a sync error or an unwind at
+            // `merge-recorded` can leave a complete record for `c.seq` on disk, so no
+            // later commit may reuse `c.seq` before reopen truncates it.
+            self.guard.poisoned = true;
+            if let Err(e) = store.branching.merges.lock().append(rec) {
+                group.fail();
+                return Err(e);
+            }
             store.failpoint("merge-recorded");
         }
         // The annotation record is queued with the WAL records, and the fence writes both:
@@ -939,42 +973,25 @@ impl WriteTxn<'_> {
                 Err(e) => {
                     if self.merge.is_some() {
                         self.guard.poisoned = true;
+                        group.fail();
                     }
                     return Err(e);
                 }
             };
+        debug_assert_eq!(ann.is_some(), will_annotate);
         let family = self.guard.family.clone();
         let w = &mut **self.guard;
-        // The record says an annotation is expected when one is queued, so replay treats
-        // a flagged tail commit without its annotation as torn.
-        let annotated = if ann.is_some() {
-            commit::WAL_FLAG_ANNOTATED
-        } else {
-            0
-        };
-        let data = wal::encode_txn_with_control(
-            &self.log,
-            &control_bytes,
-            self.configuration,
-            w.next_bnode,
-            wal::Seal::of(&c, annotated, unfenced),
-        )?;
-        let data_len = data.len() as u64;
-        if control_bytes.is_empty() {
-            debug_assert_eq!(data_len, bytes, "the queued bytes are the records'");
-        } else {
-            debug_assert!(
-                data_len <= bytes,
-                "control_wal_bytes ({bytes}) underestimated encoded records ({data_len})"
-            );
-        }
-        // In a store with a control keyspace, a solo transaction arms the uncertainty
-        // guard before any byte reaches the log and disarms it only after the snapshot
-        // and the control state are published (spec C26 §7.1).
+        // Every solo commit arms the writer poison flag before advancing `wal_len` or
+        // driving its fence, and disarms it only after publication returns `Ok`, so an
+        // unwind during the fence cannot leave `w.poisoned == false` with unpublished
+        // offsets. In a store with a control keyspace, this also serves as the C26 §7.1
+        // uncertainty guard before any byte reaches the log.
         let arm_control = !grouped && store.control_enabled();
-        if arm_control {
+        if !grouped {
             w.poisoned = true;
-            store.failpoint("control-commit-armed");
+            if arm_control {
+                store.failpoint("control-commit-armed");
+            }
         }
         // The records are not written here: the leader of the commit's fence writes them
         // with the rest of its prefix (X09 item 446). From here on the commit holds its
@@ -1028,24 +1045,16 @@ impl WriteTxn<'_> {
             text,
             _family: family,
         };
-        w.head = c;
         if !grouped {
-            let batch = match group.enqueue_and_seal_idle(pending) {
-                Ok(batch) => batch,
-                Err(e) => {
-                    w.poisoned = true;
-                    return Err(e);
-                }
-            };
-            if let Err(e) = group.drive_sealed(store, batch, Some(sync)) {
-                w.poisoned = true;
-                return Err(e);
-            }
+            let batch = group.enqueue_and_seal_idle(pending)?;
+            group.drive_sealed(store, batch, Some(sync))?;
+            w.head = c;
             if arm_control {
                 store.failpoint("control-commit-published");
-                w.poisoned = false;
             }
+            w.poisoned = false;
         } else if self.opts.no_wait {
+            w.head = c;
             // The coordinator was verified idle under the writer lock: seal our group of
             // one before releasing the writer lock so this caller leads immediately
             // without ever parking, while arriving writers can still enqueue for the next
@@ -1062,6 +1071,7 @@ impl WriteTxn<'_> {
             group.drive_sealed(store, batch, None)?;
             store.commit_stats.waited(queued.elapsed());
         } else {
+            w.head = c;
             if let Err(e) = group.enqueue(pending) {
                 w.poisoned = true;
                 return Err(e);
@@ -4568,73 +4578,218 @@ mod tests {
         assert_eq!(s.snapshot().len(), s.snapshot().commit);
     }
 
-    /// X16 Phase 6: a group of one (direct or buffered) carries `WAL_FLAG_ANNOTATED` when
-    /// it carries an annotation, so a crash that leaves its log record on disk without its
-    /// annotation record is truncated as a torn tail on reopen and accepts the next commit.
+    /// X16 Phase 6: a group of one (direct or buffered, grouped or solo) carries
+    /// `WAL_FLAG_ANNOTATED` when it carries an annotation, so a crash that leaves its log
+    /// record on disk without its annotation record is truncated as a torn tail on reopen
+    /// and accepts the next commit.
     #[test]
     fn a_group_of_one_without_its_annotation_is_a_torn_tail_for_direct_and_buffered() {
-        for direct in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path().join(if direct { "direct" } else { "buffered" });
-            {
-                let opts = StoreOptions {
-                    wal_direct_writes: direct,
-                    ..options()
-                };
-                let s = Store::open(&root, opts).unwrap();
-                for name in ["m1", "m2"] {
-                    let r = kind_insert(
-                        &s,
-                        CommitKind::Update,
-                        message_options(name),
-                        in_graph(name, "urn:g"),
-                    )
-                    .unwrap();
-                    assert!(r.committed, "direct={direct}");
-                    assert_eq!(r.annotation.message.as_deref(), Some(name));
+        for group_commit in [true, false] {
+            for direct in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let tag = format!(
+                    "{}-{}",
+                    if group_commit { "grouped" } else { "solo" },
+                    if direct { "direct" } else { "buffered" }
+                );
+                let root = dir.path().join(&tag);
+                {
+                    let opts = StoreOptions {
+                        group_commit,
+                        wal_direct_writes: direct,
+                        ..options()
+                    };
+                    let s = Store::open(&root, opts).unwrap();
+                    for name in ["m1", "m2"] {
+                        let r = kind_insert(
+                            &s,
+                            CommitKind::Update,
+                            message_options(name),
+                            in_graph(name, "urn:g"),
+                        )
+                        .unwrap();
+                        assert!(r.committed, "{tag}");
+                        assert_eq!(r.annotation.message.as_deref(), Some(name), "{tag}");
+                    }
+                    let g = s.group.as_ref().unwrap();
+                    if group_commit {
+                        assert_eq!(g.fences.load(Ordering::Relaxed), 2, "{tag}");
+                        if direct && s.wal_direct_active() {
+                            assert_eq!(g.direct_fences.load(Ordering::Relaxed), 1, "{tag}");
+                            assert_eq!(g.ann_direct_fences.load(Ordering::Relaxed), 1, "{tag}");
+                        } else if !direct {
+                            assert!(!s.wal_direct_active(), "{tag}");
+                            assert_eq!(g.direct_fences.load(Ordering::Relaxed), 0, "{tag}");
+                            assert_eq!(g.ann_direct_fences.load(Ordering::Relaxed), 0, "{tag}");
+                        }
+                    } else {
+                        assert_eq!(g.fences.load(Ordering::Relaxed), 0, "{tag}");
+                        assert_eq!(g.direct_fences.load(Ordering::Relaxed), 0, "{tag}");
+                        assert_eq!(g.ann_direct_fences.load(Ordering::Relaxed), 0, "{tag}");
+                        if direct && s.wal_direct_active() {
+                            assert_eq!(synced(&s, SyncPath::Direct), 1, "{tag}");
+                            assert_eq!(synced(&s, SyncPath::Buffered), 1, "{tag}");
+                        } else if !direct {
+                            assert!(!s.wal_direct_active(), "{tag}");
+                            assert_eq!(synced(&s, SyncPath::Direct), 0, "{tag}");
+                            assert_eq!(synced(&s, SyncPath::Buffered), 2, "{tag}");
+                        }
+                    }
                 }
+                // drop the last commit's annotation record while keeping commit 1's (17 bytes each)
+                let path = root.join(crate::annotations::FILE);
+                let end = crate::annotations::records_end(&std::fs::read(&path).unwrap()).unwrap();
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(end as u64 - 17)
+                    .unwrap();
                 assert_eq!(
-                    s.group.as_ref().unwrap().fences.load(Ordering::Relaxed),
-                    2,
-                    "direct={direct}"
+                    wal_check(&root),
+                    crate::check::Status::Warning,
+                    "{tag}: missing tail annotation must be reported as a torn tail"
+                );
+                let s = Store::open(&root, Default::default()).unwrap();
+                let snap = s.snapshot();
+                assert_eq!(snap.commit, 1, "{tag}");
+                assert_eq!(snap.len(), 1, "{tag}");
+                assert_eq!(s.annotation(1).unwrap().message.as_deref(), Some("m1"));
+                assert!(s.annotation(2).is_none());
+                // the reopened store continues cleanly at sequence 2
+                let next = kind_insert(
+                    &s,
+                    CommitKind::Update,
+                    message_options("m2-retry"),
+                    in_graph("m2-retry", "urn:g"),
+                )
+                .unwrap();
+                assert_eq!(next.commit.seq, 2, "{tag}");
+                assert_eq!(next.annotation.message.as_deref(), Some("m2-retry"));
+                drop(s);
+                let reopened = Store::open(&root, Default::default()).unwrap();
+                assert_eq!(reopened.snapshot().commit, 2, "{tag}");
+                assert_eq!(
+                    reopened.annotation(2).unwrap().message.as_deref(),
+                    Some("m2-retry")
                 );
             }
-            // drop the last commit's annotation record while keeping commit 1's (17 bytes each)
-            let path = root.join(crate::annotations::FILE);
-            let end = crate::annotations::records_end(&std::fs::read(&path).unwrap()).unwrap();
-            OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_len(end as u64 - 17)
-                .unwrap();
-            assert_eq!(
-                wal_check(&root),
-                crate::check::Status::Warning,
-                "direct={direct}: missing tail annotation must be reported as a torn tail"
+        }
+    }
+
+    /// An unwind inside a non-control solo fence poisons the writer immediately without
+    /// exposing the unpublished head, so subsequent writes are rejected before interning
+    /// any term even when `group_commit` is enabled.
+    #[test]
+    fn solo_fence_unwind_poisons_writer_and_keeps_published_head() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        for group_commit in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir
+                .path()
+                .join(if group_commit { "grouped" } else { "solo" });
+            let opts = StoreOptions {
+                group_commit,
+                ..Default::default()
+            };
+            let s = Store::open(&root, opts.clone()).unwrap();
+            let r1 = insert(&s, "first").unwrap();
+            assert_eq!(r1.commit.seq, 1);
+
+            s.set_failpoint(
+                "group-preallocating",
+                Some(Arc::new(|_: &Store| panic!("solo fence unwind"))),
             );
-            let s = Store::open(&root, Default::default()).unwrap();
-            let snap = s.snapshot();
-            assert_eq!(snap.commit, 1, "direct={direct}");
-            assert_eq!(snap.len(), 1, "direct={direct}");
-            assert_eq!(s.annotation(1).unwrap().message.as_deref(), Some("m1"));
-            assert!(s.annotation(2).is_none());
-            // the reopened store continues cleanly at sequence 2
-            let next = kind_insert(
+            // `CommitKind::Load` takes the solo fallback even when `group_commit` is true.
+            let panicked = catch_unwind(AssertUnwindSafe(|| {
+                kind_insert(
+                    &s,
+                    CommitKind::Load,
+                    Default::default(),
+                    in_graph("second", "urn:g"),
+                )
+            }));
+            assert!(panicked.is_err(), "group_commit={group_commit}");
+            s.set_failpoint("group-preallocating", None);
+
+            assert_eq!(s.snapshot().commit, 1, "group_commit={group_commit}");
+            assert_eq!(s.head_commit().seq, 1, "group_commit={group_commit}");
+            assert!(
+                matches!(
+                    s.try_write_with(CommitKind::Update, Default::default()),
+                    Err(Error::Poisoned)
+                ),
+                "group_commit={group_commit}: try_write_with must fail immediately after solo unwind"
+            );
+            let mut txn = s.write_as(CommitKind::Update);
+            let term = Term::NamedNode(NamedNode::new("urn:after-unwind").unwrap());
+            assert!(
+                matches!(txn.intern(&term), Err(Error::Poisoned)),
+                "group_commit={group_commit}: intern must reject on poisoned writer"
+            );
+            drop(txn);
+            drop(s);
+
+            let reopened = Store::open(&root, opts).unwrap();
+            assert_eq!(reopened.snapshot().commit, 1, "group_commit={group_commit}");
+            let r2 = insert(&reopened, "second-after-reopen").unwrap();
+            assert_eq!(r2.commit.seq, 2, "group_commit={group_commit}");
+        }
+    }
+
+    /// A fallible WAL encoding error occurs before mutating annotations or poisoning the
+    /// writer, so subsequent annotated commits succeed and reopen cleanly.
+    #[test]
+    fn encode_failure_leaves_annotations_and_writer_clean() {
+        for group_commit in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir
+                .path()
+                .join(if group_commit { "grouped" } else { "solo" });
+            let opts = StoreOptions {
+                group_commit,
+                commit_digests: true,
+                ..Default::default()
+            };
+            let s = Store::open(&root, opts.clone()).unwrap();
+            let mut txn = s.write_with(CommitKind::Update, message_options("should-fail"));
+            txn.configuration = crate::history::ConfigurationBinding::ImportedUnbound {
+                source: crate::history::ConfigurationIdentity {
+                    dataset_id: uuid::Uuid::nil(),
+                    lineage_id: uuid::Uuid::nil(),
+                    generation: crate::evidence::Sha256Digest::from_digest_bytes([0u8; 32]),
+                },
+            };
+            let ids = txn
+                .encode_quad(&in_graph("bad-cfg", "urn:g"), &mut Default::default())
+                .unwrap();
+            txn.insert(ids).unwrap();
+            let mut sync = None;
+            let err = txn.publish_grouped(None, group_commit, &mut sync);
+            drop(txn);
+            assert!(
+                matches!(err, Err(Error::Corrupt(_))),
+                "group_commit={group_commit}: {err:?}"
+            );
+            assert_eq!(s.snapshot().commit, 0, "group_commit={group_commit}");
+            assert!(s.annotation(1).is_none(), "group_commit={group_commit}");
+
+            let r1 = kind_insert(
                 &s,
                 CommitKind::Update,
-                message_options("m2-retry"),
-                in_graph("m2-retry", "urn:g"),
+                message_options("after-encode-err"),
+                in_graph("ok-after", "urn:g"),
             )
             .unwrap();
-            assert_eq!(next.commit.seq, 2, "direct={direct}");
-            assert_eq!(next.annotation.message.as_deref(), Some("m2-retry"));
+            assert_eq!(r1.commit.seq, 1, "group_commit={group_commit}");
+            assert_eq!(r1.annotation.message.as_deref(), Some("after-encode-err"));
             drop(s);
-            let reopened = Store::open(&root, Default::default()).unwrap();
-            assert_eq!(reopened.snapshot().commit, 2, "direct={direct}");
+
+            let reopened = Store::open(&root, opts).unwrap();
+            assert_eq!(reopened.snapshot().commit, 1, "group_commit={group_commit}");
             assert_eq!(
-                reopened.annotation(2).unwrap().message.as_deref(),
-                Some("m2-retry")
+                reopened.annotation(1).unwrap().message.as_deref(),
+                Some("after-encode-err")
             );
         }
     }

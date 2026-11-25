@@ -753,3 +753,77 @@ fn a_dangling_vocabulary_link_creates_nothing() {
             .is_symlink()
     );
 }
+
+/// A transaction that acquires a control capability without staging any control edits
+/// writes no control frame; its WAL byte estimate matches its encoded records and
+/// subsequent annotated commits and reopens stay consistent.
+#[test]
+fn quad_only_commit_with_unused_control_capability_and_message() {
+    let (_dir, root, s) = setup();
+    let cap = s.control_writer(ControlOwner::Jobs).unwrap();
+    let mut txn = s.write_with(
+        CommitKind::Update,
+        crate::guard::WriteOptions {
+            message: Some("m1".into()),
+            ..Default::default()
+        },
+    );
+    txn.set_control(cap).unwrap();
+    let q = quad(&mut txn, "a");
+    txn.insert(q).unwrap();
+    let r1 = txn.commit().unwrap();
+    assert!(r1.committed);
+    assert_eq!(r1.commit.seq, 1);
+    assert_eq!(r1.annotation.message.as_deref(), Some("m1"));
+    assert_eq!(seq(&s), 0);
+
+    let mut txn2 = s.write_with(
+        CommitKind::Update,
+        crate::guard::WriteOptions {
+            message: Some("m2".into()),
+            ..Default::default()
+        },
+    );
+    let q2 = quad(&mut txn2, "b");
+    txn2.insert(q2).unwrap();
+    let r2 = txn2.commit().unwrap();
+    assert_eq!(r2.commit.seq, 2);
+    assert_eq!(r2.annotation.message.as_deref(), Some("m2"));
+
+    let cap3 = s.control_writer(ControlOwner::Jobs).unwrap();
+    let mut txn3 = s.write_with(
+        CommitKind::Update,
+        crate::guard::WriteOptions {
+            message: Some("m3".into()),
+            ..Default::default()
+        },
+    );
+    txn3.set_control(cap3).unwrap();
+    txn3.control_put(b"jobs/a", value("1")).unwrap();
+    let q3 = quad(&mut txn3, "c");
+    txn3.insert(q3).unwrap();
+    let r3 = txn3.commit().unwrap();
+    assert_eq!(r3.commit.seq, 3);
+    assert_eq!(r3.annotation.message.as_deref(), Some("m3"));
+    assert_eq!(seq(&s), 1);
+    assert_eq!(get(&s, "jobs/a"), Some("1".into()));
+
+    drop(s);
+    let reopened = open(&root).unwrap();
+    assert_eq!(reopened.snapshot().commit, 3);
+    assert_eq!(reopened.snapshot().len(), 3);
+    assert_eq!(
+        reopened.annotation(1).and_then(|a| a.message).as_deref(),
+        Some("m1")
+    );
+    assert_eq!(
+        reopened.annotation(2).and_then(|a| a.message).as_deref(),
+        Some("m2")
+    );
+    assert_eq!(
+        reopened.annotation(3).and_then(|a| a.message).as_deref(),
+        Some("m3")
+    );
+    assert_eq!(seq(&reopened), 1);
+    assert_eq!(get(&reopened, "jobs/a"), Some("1".into()));
+}

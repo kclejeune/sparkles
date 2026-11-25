@@ -326,9 +326,9 @@ impl Store {
 
     /// Upgrade the current log's header to version 3 through the writer's own handle
     /// (spec C26 §7): the group is drained (the caller holds the writer through
-    /// `lock_writer`), the buffered writer flushed, the direct writer's cached block
-    /// dropped, the header written and synchronized, and the writer's length and
-    /// allocation kept. A failure poisons the writer.
+    /// `lock_writer`), the direct writer's cached block dropped, the header written and
+    /// synchronized, and the writer's length and allocation kept. A failure poisons the
+    /// writer.
     fn upgrade_wal_header(&self, w: &mut WriterState) -> Result<()> {
         if w.wal.is_none() {
             return Ok(());
@@ -635,7 +635,7 @@ impl WriteTxn<'_> {
     /// About the bytes the transaction's frame adds to the write-ahead log, for the
     /// storage checks.
     pub(super) fn control_wal_bytes(&self) -> u64 {
-        let Some(c) = self.control.as_ref() else {
+        let Some(c) = self.control.as_ref().filter(|c| !c.changes.is_empty()) else {
             return 0;
         };
         let frame: usize = 64

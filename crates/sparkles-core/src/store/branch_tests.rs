@@ -725,6 +725,44 @@ fn a15_crash_between_the_merge_record_and_the_log() {
 }
 
 #[test]
+fn a15_unwind_after_merge_record_poisons_writer_against_seq_reuse() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let (dir, s) = setup();
+    s.create_branch("dev", &BranchOptions::default()).unwrap();
+    apply(&s.branch("dev").unwrap(), "+<urn:c> <urn:p> <urn:x> .");
+    apply(&s, "+<urn:d> <urn:p> <urn:x> .");
+    let head = s.head_commit().seq;
+    s.set_failpoint(
+        "merge-recorded",
+        Some(Arc::new(|_: &Store| panic!("crash"))),
+    );
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        s.merge("dev", "main", &Default::default())
+    }));
+    assert!(r.is_err());
+    s.set_failpoint("merge-recorded", None);
+    // An ordinary write before reopen must not reuse `head + 1`, which already has a
+    // merge record on disk.
+    assert!(matches!(
+        s.try_write_with(CommitKind::Update, Default::default()),
+        Err(Error::Poisoned)
+    ));
+    assert_eq!(s.head_commit().seq, head);
+    drop(s);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    assert_eq!(s.head_commit().seq, head);
+    assert!(s.merge_record(head + 1).is_none());
+    assert_eq!(
+        std::fs::metadata(dir.path().join("ds/merges.bin"))
+            .unwrap()
+            .len(),
+        0
+    );
+    merged(merge(&s, "dev", "main", &Default::default()));
+    assert!(has(&s, "urn:c"));
+}
+
+#[test]
 fn a15_a_generation_only_a_branch_holds_survives_main_collection() {
     let (dir, s) = setup();
     s.compact().unwrap();
