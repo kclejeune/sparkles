@@ -1440,7 +1440,14 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
         with_rooted_adaptive_diag(false, || {
             let mut s = Saturation::new();
             let _ = s
-                .run_once(&kinds, None, 0, &baseline_limits, true)
+                .run_once(
+                    &kinds,
+                    None,
+                    0,
+                    &baseline_limits,
+                    true,
+                    AttemptProvenance::Ineligible,
+                )
                 .expect("baseline");
             LAST_ALLOWANCE.get().0
         })
@@ -1454,7 +1461,14 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
     let (norm_peak, pre_sat_exact, pre_more) = with_rooted_adaptive_bound(true, || {
         let mut s = Saturation::new();
         let _ = s
-            .run_once(&kinds, None, 0, &baseline_limits, true)
+            .run_once(
+                &kinds,
+                None,
+                0,
+                &baseline_limits,
+                true,
+                AttemptProvenance::Ineligible,
+            )
             .expect("calibrate adaptive preadmit");
         last_adaptive_preadmit().expect("must record pre-box adaptive admission")
     });
@@ -1482,7 +1496,14 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
     let (res_base_cap, preadmit_b1, snaps_base_cap, allocs_base_cap) =
         with_rooted_adaptive_bound(true, || {
             let mut s = Saturation::new();
-            let r = s.run_once(&kinds, None, 0, &cap_at_base, true);
+            let r = s.run_once(
+                &kinds,
+                None,
+                0,
+                &cap_at_base,
+                true,
+                AttemptProvenance::Ineligible,
+            );
             (
                 r,
                 last_adaptive_preadmit(),
@@ -1546,7 +1567,14 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
     let (res_pool_refuse, preadmit_b2, snaps_pool_refuse, allocs_pool_refuse) =
         with_rooted_adaptive_bound(true, || {
             let mut s = Saturation::new();
-            let r = s.run_once(&kinds, None, 0, &pool_at_base, true);
+            let r = s.run_once(
+                &kinds,
+                None,
+                0,
+                &pool_at_base,
+                true,
+                AttemptProvenance::Ineligible,
+            );
             (
                 r,
                 last_adaptive_preadmit(),
@@ -1639,7 +1667,14 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
                 },
                 || {
                     let mut s = Saturation::new();
-                    let r = s.run_once(&kinds, None, 0, &pool_exact_presat, true);
+                    let r = s.run_once(
+                        &kinds,
+                        None,
+                        0,
+                        &pool_exact_presat,
+                        true,
+                        AttemptProvenance::Ineligible,
+                    );
                     (
                         r,
                         last_adaptive_preadmit(),

@@ -2132,6 +2132,7 @@ enum AttemptProvenance {
 }
 
 /// Why an incremental attempt must start over after building its index.
+#[derive(Debug)]
 enum LateRestart {
     Incompatible,
     NamedDomain { normalized_peak: usize },
