@@ -235,11 +235,10 @@ fn delete_registry_failure_reopens_actual_root_without_reviving_old_links() {
     drop(ds);
     let path = dir.path().join("config.json");
     let config = std::fs::read(&path).unwrap();
-    std::fs::remove_file(&path).unwrap();
-    std::fs::create_dir(&path).unwrap();
+    DELETE_FAIL.set(1 << DELETE_SAVE_BEFORE_REPLACE);
     let result = cat.delete("source");
-    std::fs::remove_dir(&path).unwrap();
-    std::fs::write(&path, config).unwrap();
+    DELETE_FAIL.set(0);
+    assert_eq!(std::fs::read(&path).unwrap(), config);
     assert!(result.is_err());
     assert!(reference.upgrade().is_none());
     let reopened = cat.get("source").unwrap();
@@ -534,7 +533,7 @@ fn failed_delete_rollback_keeps_original_bytes_unavailable_without_a_new_root() 
         DELETE_FAIL.set(0);
         let error = failed.unwrap_err().to_string();
         assert!(error.contains(&id.to_string()));
-        assert!(!dir.path().join("delete.json").exists());
+        assert!(dir.path().join("delete.json").exists());
         assert!(cat.get("source").is_none());
         assert!(reference.upgrade().is_none());
         let bytes = if point == DELETE_ROLLBACK_MOVE {
@@ -572,28 +571,12 @@ fn failed_delete_rollback_keeps_original_bytes_unavailable_without_a_new_root() 
                     .starts_with(&format!("{KEPT_PREFIX}source-")),
                 "{bytes:?}"
             );
-            // Boot refuses only the missing registered root. It neither invents it
-            // nor garbage-collects the kept source bytes.
-            let booted = Catalog::open(dir.path(), Default::default()).unwrap();
-            assert!(booted.get("source").is_none());
-            let refused = booted.refused();
-            assert_eq!(refused.len(), 1);
-            assert_eq!(refused[0].0, "source");
-            assert!(
-                refused[0].1.contains(&root.display().to_string()),
-                "{refused:?}"
-            );
-            assert!(matches!(
-                booted.create("source", &Default::default()),
-                Err(Error::Conflict(_))
-            ));
-            drop(booted);
             assert!(!root.exists());
             assert!(bytes.exists());
-            std::fs::rename(&bytes, &root).unwrap();
         }
         let cat = Catalog::open(dir.path(), Default::default()).unwrap();
         assert_eq!(cat.get("source").unwrap().dataset_id(), id);
+        assert!(!dir.path().join("delete.json").exists());
         assert!(cat.delete("source").unwrap());
     }
 }

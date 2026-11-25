@@ -64,12 +64,17 @@ journal before recovering any pending rename, restore or delete. An unsupported 
 invalid journal, or symlink in place of the journal or `databases` directory prevents
 the catalog from opening.
 
-During recovery, the catalog checks the dataset UUID and takes the store's process lock
-before removing a directory. An unregistered dataset at its original path moves to
-`databases/.kept-<name>-<token>` before cleanup begins. A failed cleanup or a busy store
-leaves its journal entry for the next startup. A delete that was rolling back preserves
-the original data. If the original root could not be restored, its registered name stays
-closed and the warning names the retained path.
+Before committing a delete, the catalog moves the dataset to
+`databases/.kept-<name>-<token>` and synchronizes the database directory. The persistent
+dataset UUID in `config.json` identifies the original registration. Startup takes the
+store's process lock and verifies the staged copy. It restores the original path when
+the same UUID remains registered, or removes the staged copy when the registry records
+the deletion or a replacement. A busy or unverifiable copy keeps its journal entry for
+the next startup. Ambiguous journals from older formats and competing staged restore
+copies remain on disk for inspection.
+
+An indeterminate registry commit keeps the name unavailable until the catalog reopens.
+Startup synchronizes the registry before acting on the commit outcome it observes.
 
 Warnings report `path`, `retained_bytes`, and whether the byte count is complete.
 Startup leaves unrecognized kept entries in place. Copies marked by a `keepReplaced`

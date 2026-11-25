@@ -1,16 +1,15 @@
 //! Recover managed persistent deletes under catalog and dataset process exclusion.
-//! A forward intent uses the registry as its commit point. Rollback first revokes
-//! that authorization durably so startup can never reclaim a rollback copy.
+//! The source is staged and synchronized before removing its registry row. The
+//! durable registry decides whether startup restores the source or reclaims it.
 
 use super::delete_fs::{Kind, RecoveryDir};
 use super::{
-    DatasetKind, KEPT_PREFIX, Registry, RegistryEntry, TRASH_PREFIX, check_name, read_registry,
-    sync_dir, write_file_atomic, write_registry,
+    DatasetKind, KEPT_PREFIX, Refusal, Registry, RegistryEntry, TRASH_PREFIX, check_name,
+    read_registry, sync_dir, write_file_atomic, write_registry,
 };
-use crate::reasoning::ReasoningRecord;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, ErrorKind, Read};
 use std::path::Path;
@@ -24,13 +23,11 @@ pub(super) const CRASH_AFTER_KEPT_RENAME: u8 = 3;
 #[cfg(test)]
 pub(super) const CRASH_AFTER_FAILED_FORWARD_MOVE: u8 = 4;
 #[cfg(test)]
-pub(super) const CRASH_AFTER_FAILED_ROLLBACK_MOVE: u8 = 5;
+pub(super) const CRASH_AFTER_FAILED_ROLLBACK: u8 = 5;
 #[cfg(test)]
-pub(super) const CRASH_AFTER_FAILED_ROLLBACK_SYNC: u8 = 6;
+pub(super) const CRASH_AFTER_ROLLBACK_MOVE_SYNC: u8 = 6;
 #[cfg(test)]
-pub(super) const CRASH_AFTER_ROLLBACK_MOVE_SYNC: u8 = 7;
-#[cfg(test)]
-pub(super) const CRASH_AFTER_SAVE_ROLLBACK_MARK: u8 = 8;
+pub(super) const CRASH_BEFORE_REGISTRY_REPLACE: u8 = 7;
 
 #[cfg(test)]
 thread_local! {
@@ -59,8 +56,8 @@ pub(super) fn crash_point(_stage: u8) -> Result<()> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) enum IntentState {
-    Deleting,
-    RollingBack,
+    Prepared,
+    Legacy,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -70,12 +67,10 @@ pub(super) struct DeleteIntent {
     pub(super) id: Uuid,
     pub(super) token: Uuid,
     pub(super) state: IntentState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) reasoning: Option<ReasoningRecord>,
 }
 
 impl DeleteIntent {
-    fn kept_name(&self) -> String {
+    pub(super) fn kept_name(&self) -> String {
         format!("{KEPT_PREFIX}{}-{}", self.name, self.token)
     }
 
@@ -98,9 +93,38 @@ impl From<LegacyIntent> for DeleteIntent {
             name: intent.name,
             id: intent.id,
             token: intent.token,
-            state: IntentState::Deleting,
-            reasoning: None,
+            state: IntentState::Legacy,
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum LegacyV2State {
+    Deleting,
+    RollingBack,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyV2Intent {
+    name: String,
+    id: Uuid,
+    token: Uuid,
+    #[serde(rename = "state")]
+    _state: LegacyV2State,
+    #[serde(rename = "reasoning", default)]
+    _reasoning: Option<crate::reasoning::ReasoningRecord>,
+}
+
+impl From<LegacyV2Intent> for DeleteIntent {
+    fn from(intent: LegacyV2Intent) -> Self {
+        LegacyIntent {
+            name: intent.name,
+            id: intent.id,
+            token: intent.token,
+        }
+        .into()
     }
 }
 
@@ -146,10 +170,10 @@ pub(super) fn read_intents(dir: &Path) -> Result<Vec<DeleteIntent>> {
     let mut intents = Vec::with_capacity(file.intents.len());
     for record in file.intents {
         let bytes = record.get().as_bytes();
-        let intent: DeleteIntent = if format == 1 {
-            parse_object::<LegacyIntent>(bytes)?.into()
-        } else {
-            parse_object(bytes)?
+        let intent: DeleteIntent = match format {
+            1 => parse_object::<LegacyIntent>(bytes)?.into(),
+            2 => parse_object::<LegacyV2Intent>(bytes)?.into(),
+            _ => parse_object(bytes)?,
         };
         check_name(&intent.name).map_err(corrupt)?;
         if !tokens.insert(intent.token) {
@@ -189,29 +213,29 @@ pub(super) fn check_prepare(dir: &Path) -> Result<()> {
     read_intents(dir).map(|_| ())
 }
 
+/// Older registries have no identity. Persist it before staging so startup
+/// can distinguish this row from any later registration of the same alias.
+pub(super) fn bind_registry_identity(dir: &Path, name: &str, id: Uuid) -> Result<()> {
+    let mut registry = read_registry(dir)?;
+    let entry = registry
+        .datasets
+        .iter_mut()
+        .find(|entry| entry.name == name && entry.kind == DatasetKind::Persistent)
+        .ok_or_else(|| Error::Corrupt(format!("dataset /{name} has no persistent registry row")))?;
+    if entry.id != Some(id) {
+        entry.id = Some(id);
+        write_registry(dir, &registry)?;
+    }
+    Ok(())
+}
+
 pub(super) fn record(dir: &Path, intent: &DeleteIntent) -> Result<()> {
     check_name(&intent.name)?;
     let mut intents = read_intents(dir)?;
     if intents.iter().any(|entry| entry.token == intent.token) {
         return Err(corrupt(format!("duplicate delete token {}", intent.token)));
     }
-    // A new explicit delete of the same dataset supersedes an unfinished rollback.
-    intents.retain(|entry| {
-        !(entry.state == IntentState::RollingBack
-            && entry.name == intent.name
-            && entry.id == intent.id)
-    });
     intents.push(intent.clone());
-    write_intents(dir, &intents)
-}
-
-pub(super) fn mark_rolling_back(dir: &Path, token: Uuid) -> Result<()> {
-    let mut intents = read_intents(dir)?;
-    let intent = intents
-        .iter_mut()
-        .find(|entry| entry.token == token)
-        .ok_or_else(|| corrupt(format!("missing delete token {token}")))?;
-    intent.state = IntentState::RollingBack;
     write_intents(dir, &intents)
 }
 
@@ -356,10 +380,61 @@ fn lock_candidate(
     Ok(lock)
 }
 
+/// Move a verified closed store under its process lease without replacing a
+/// destination. The caller establishes the fsync boundary for the move.
+pub(super) fn move_verified(
+    parent: &Path,
+    from: &str,
+    to: &str,
+    id: Uuid,
+) -> Result<sparkles_core::store::ProcessLock> {
+    let parent = RecoveryDir::open(parent)?;
+    let from = OsStr::new(from);
+    let candidate = parent.child(from)?;
+    let lock = lock_candidate(&candidate, id, false)?;
+    parent.rename_child(from, candidate, OsStr::new(to))?;
+    Ok(lock)
+}
+
+/// Keep the recovery evidence from either operation until an operator resolves
+/// two staged candidates for a missing registered root.
+#[cfg(feature = "backup")]
+pub(super) fn restore_conflicts(
+    databases: &RecoveryDir,
+    intents: &[DeleteIntent],
+) -> Result<BTreeSet<String>> {
+    let uncertain: BTreeSet<_> = intents
+        .iter()
+        .filter(|intent| {
+            let missing = |name: &str| {
+                databases
+                    .entry(OsStr::new(name))
+                    .is_err_and(|error| error.kind() == ErrorKind::NotFound)
+            };
+            let live = databases.entry(OsStr::new(&intent.name));
+            !live.is_ok_and(|entry| entry.kind == Kind::Directory)
+                && (!missing(&intent.kept_name()) || !missing(&intent.trash_name()))
+        })
+        .map(|intent| intent.name.as_str())
+        .collect();
+    let mut conflicts = BTreeSet::new();
+    if !uncertain.is_empty() {
+        for name in databases.names()? {
+            let name = name?;
+            if let Some(dataset) = name.to_str().and_then(super::restore::replaced_dataset)
+                && uncertain.contains(dataset)
+            {
+                conflicts.insert(dataset.into());
+            }
+        }
+    }
+    Ok(conflicts)
+}
+
 fn finish_delete(
     databases: &RecoveryDir,
     intent: &DeleteIntent,
-    registered: bool,
+    registered: Option<&RegistryEntry>,
     warning_name: &mut OsString,
 ) -> Result<()> {
     let kept = intent.kept_name();
@@ -370,48 +445,65 @@ fn finish_delete(
     let kept_dir = child_if_present(databases, kept_name)?;
     *warning_name = trash_name.into();
     let trash_dir = child_if_present(databases, trash_name)?;
-    let (mut staged, candidate) = match (kept_dir, trash_dir) {
+    let (staged, candidate) = match (kept_dir, trash_dir) {
         (Some(_), Some(_)) => return Err(Error::Corrupt("both staged delete paths exist".into())),
         (Some(candidate), None) => (kept_name, Some(candidate)),
         (None, trash_dir) => (trash_name, trash_dir),
     };
-    *warning_name = staged.into();
-    if candidate.is_some() && registered {
-        // If the registered root is missing or holds the same UUID, the kept
-        // path may be its only copy. An uncertain trash path needs its intent
-        // to prevent the generic trash scan from claiming it on a later start.
-        match child_if_present(databases, name)? {
-            Some(live) if dataset_id(&live)?.is_some_and(|id| id != intent.id) => {}
-            _ if staged == trash_name => {
-                return Err(Error::Corrupt(
-                    "trash may belong to a registered dataset".into(),
-                ));
+
+    if candidate.is_some() {
+        *warning_name = staged.into();
+    } else {
+        *warning_name = name.into();
+    }
+    if intent.state == IntentState::Legacy && candidate.is_some() {
+        return Err(Error::Corrupt(
+            "legacy delete journal cannot establish the commit outcome".into(),
+        ));
+    }
+
+    if let Some(registered) = registered {
+        let live = child_if_present(databases, name)?;
+        // A replacement recorded after this delete is authoritative, even
+        // if its root is now missing. A live root must also agree under lock.
+        if let Some(id) = registered.id.filter(|id| *id != intent.id) {
+            if let Some(live) = live {
+                let _live_lock = lock_dataset(&live)?;
+                require_identity(&live, id, false)?;
             }
-            _ => return Ok(()),
+        } else {
+            match (registered.id, live, candidate) {
+                (_, Some(live), None) => {
+                    let _lock = lock_candidate(&live, intent.id, false)?;
+                    return Ok(());
+                }
+                (Some(_), None, Some(kept)) if staged == kept_name => {
+                    let _lock = lock_candidate(&kept, intent.id, false)?;
+                    databases.rename_child(kept_name, kept, name)?;
+                    *warning_name = name.into();
+                    databases.sync()?;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(Error::Corrupt(
+                        "could not verify one original root for the registered delete".into(),
+                    ));
+                }
+            }
         }
     }
-    let _lock;
-    let candidate = match candidate {
-        Some(candidate) => {
-            _lock = lock_candidate(&candidate, intent.id, true)?;
-            // A restart may see a rename whose parent sync never completed.
-            databases.sync()?;
-            candidate
+
+    let Some(candidate) = candidate else {
+        if registered.is_none() && child_if_present(databases, name)?.is_some() {
+            return Err(Error::Corrupt(
+                "an unstaged directory remains after registry removal".into(),
+            ));
         }
-        None if registered => return Ok(()),
-        None => {
-            *warning_name = name.into();
-            let Some(live) = child_if_present(databases, name)? else {
-                return Ok(());
-            };
-            _lock = lock_candidate(&live, intent.id, false)?;
-            staged = OsStr::new(&kept);
-            let kept = databases.rename_child(name, live, staged)?;
-            *warning_name = staged.into();
-            databases.sync()?;
-            kept
-        }
+        return Ok(());
     };
+    let _lock = lock_candidate(&candidate, intent.id, true)?;
+    // A restart may see the trash rename before its parent sync completed.
+    databases.sync()?;
     #[cfg(test)]
     if RECOVERY_STOP.get() == RecoveryStop::AfterMetadataRemoval {
         candidate.remove_file(OsStr::new("dataset.json"))?;
@@ -428,56 +520,6 @@ fn finish_delete(
         reclaimed_bytes = bytes.count,
         "removed interrupted delete directory on startup"
     );
-    Ok(())
-}
-
-fn finish_rollback(
-    dir: &Path,
-    databases: &RecoveryDir,
-    intent: &DeleteIntent,
-    registry: &mut Registry,
-    warning_name: &mut OsString,
-) -> Result<()> {
-    if registry
-        .datasets
-        .iter()
-        .any(|entry| entry.name == intent.name)
-    {
-        return Ok(());
-    }
-
-    let kept = intent.kept_name();
-    let (name, original) = match child_if_present(databases, OsStr::new(&kept))? {
-        Some(kept_dir) => (kept.as_str(), Some(kept_dir)),
-        None => {
-            *warning_name = intent.name.as_str().into();
-            (
-                intent.name.as_str(),
-                child_if_present(databases, OsStr::new(&intent.name))?,
-            )
-        }
-    };
-    let original =
-        original.ok_or_else(|| Error::Corrupt("rollback directory is missing".into()))?;
-    require_identity(&original, intent.id, false)?;
-    if name == kept
-        && let Some(live) = child_if_present(databases, OsStr::new(&intent.name))?
-    {
-        require_identity(&live, intent.id, false)?;
-    }
-    databases.sync()?;
-    registry.datasets.push(RegistryEntry {
-        name: intent.name.clone(),
-        kind: DatasetKind::Persistent,
-        reasoning: intent.reasoning.clone(),
-    });
-    registry
-        .datasets
-        .sort_by(|left, right| left.name.cmp(&right.name));
-    if let Err(error) = write_registry(dir, registry) {
-        registry.datasets.retain(|entry| entry.name != intent.name);
-        return Err(error);
-    }
     Ok(())
 }
 
@@ -531,36 +573,50 @@ fn intentional_backup(databases: &RecoveryDir, name: &OsStr) -> bool {
 pub(super) fn recover(
     dir: &Path,
     databases: &RecoveryDir,
+    registry: &Registry,
     intents: Vec<DeleteIntent>,
-) -> Result<()> {
+    restore_conflicts: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Refusal>> {
     let catalog = RecoveryDir::open(dir)?;
     clean_temps(&catalog)?;
-    let mut registry = read_registry(dir)?;
     // A prior process may have made a registry rename visible without syncing it.
     // Make the registry decision durable before it can authorize removing bytes.
     if !intents.is_empty() {
         catalog.sync()?;
     }
     let mut retained = Vec::new();
+    let mut refusals = BTreeMap::new();
     let mut warned = BTreeSet::new();
     let tracked_trash: BTreeSet<_> = intents.iter().map(DeleteIntent::trash_name).collect();
     let count = intents.len();
     for intent in intents {
         let mut warning_name = OsString::from(intent.kept_name());
-        let result = match intent.state {
-            IntentState::Deleting => finish_delete(
-                databases,
-                &intent,
-                registry.datasets.iter().any(|entry| {
-                    entry.name == intent.name && entry.kind == DatasetKind::Persistent
-                }),
-                &mut warning_name,
-            ),
-            IntentState::RollingBack => {
-                finish_rollback(dir, databases, &intent, &mut registry, &mut warning_name)
-            }
+        let registered = registry
+            .datasets
+            .iter()
+            .find(|entry| entry.name == intent.name && entry.kind == DatasetKind::Persistent);
+        let result = if restore_conflicts.contains(&intent.name) {
+            Err(Error::Corrupt(
+                "both a staged restore and a staged delete may own the missing root".into(),
+            ))
+        } else {
+            finish_delete(databases, &intent, registered, &mut warning_name)
         };
         if let Err(error) = result {
+            if intent.state == IntentState::Prepared
+                && registered.is_some_and(|entry| entry.id == Some(intent.id))
+            {
+                refusals.insert(
+                    intent.name.clone(),
+                    Refusal {
+                        message: format!(
+                            "{}: {error}",
+                            databases.path().join(&warning_name).display()
+                        ),
+                        kind: "recovery",
+                    },
+                );
+            }
             warn_retained(databases, &warning_name, Some(&intent.name), error);
             warned.insert(warning_name);
             retained.push(intent);
@@ -600,7 +656,7 @@ pub(super) fn recover(
             warn_retained(databases, &name, None, "unrecognized kept entry");
         }
     }
-    Ok(())
+    Ok(refusals)
 }
 #[cfg(test)]
 mod tests {
@@ -698,7 +754,7 @@ mod tests {
         doomed.update("INSERT DATA { <urn:d> <urn:p> 2 }").unwrap();
         drop(doomed);
 
-        CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+        CRASH_AFTER.set(CRASH_AFTER_SAVE);
         let err = cat.delete("my-doomed");
         CRASH_AFTER.set(0);
         assert!(err.is_err());
@@ -707,7 +763,7 @@ mod tests {
         // Verify that the journal and staged bytes survived removal from the registry.
         let intent_raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join(INTENT_FILE)).unwrap()).unwrap();
-        assert_eq!(intent_raw["format"], 2);
+        assert_eq!(intent_raw["format"], 3);
         let kept = kept_entries(dir.path());
         assert_eq!(kept.len(), 1);
         assert!(
@@ -745,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_delete_after_save_before_move_removes_unregistered_root() {
+    fn legacy_unmoved_root_has_no_safe_delete_decision() {
         let dir = tempfile::tempdir().unwrap();
         let cat = Catalog::open(dir.path(), Default::default()).unwrap();
         let active = cat.create("active", &Default::default()).unwrap();
@@ -760,14 +816,26 @@ mod tests {
         CRASH_AFTER.set(0);
         drop(cat);
 
-        assert!(dir.path().join("databases/doomed").exists());
-        assert!(dir.path().join(INTENT_FILE).exists());
+        let intent = read_intents(dir.path()).unwrap().pop().unwrap();
+        let databases = dir.path().join("databases");
+        let root = databases.join("doomed");
+        std::fs::rename(databases.join(intent.kept_name()), &root).unwrap();
+        let journal = dir.path().join(INTENT_FILE);
+        std::fs::write(&journal, serde_json::to_vec(&serde_json::json!({
+            "format": 1, "intents": [{"name": intent.name, "id": intent.id, "token": intent.token}]
+        })).unwrap()).unwrap();
 
-        let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
-        assert!(!dir.path().join("databases/doomed").exists());
-        assert!(!dir.path().join(INTENT_FILE).exists());
+        let capture = EventCapture::default();
+        let reopened = tracing::subscriber::with_default(capture.clone(), || {
+            Catalog::open(dir.path(), Default::default()).unwrap()
+        });
+        assert!(root.join("dataset.json").exists());
+        assert!(journal.exists());
         assert_eq!(reopened.get("active").unwrap().dataset_id(), active_id);
-        drop(reopened.create("doomed", &Default::default()).unwrap());
+        assert!(capture.warnings().iter().any(|event| {
+            event.fields["path"].ends_with("databases/doomed")
+                && event.fields.contains_key("retained_bytes")
+        }));
     }
 
     #[test]
@@ -803,7 +871,7 @@ mod tests {
         let old_id = old.dataset_id();
         drop(old);
 
-        CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+        CRASH_AFTER.set(CRASH_AFTER_SAVE);
         assert!(cat.delete("ds").is_err());
         CRASH_AFTER.set(0);
         // Simulate a new dataset created under the same name before restart.
@@ -985,8 +1053,7 @@ mod tests {
                 name: "evil".into(),
                 id: Uuid::new_v4(),
                 token,
-                state: IntentState::Deleting,
-                reasoning: None,
+                state: IntentState::Prepared,
             },
         )
         .unwrap();
@@ -1014,7 +1081,7 @@ mod tests {
         let dir2 = tempfile::tempdir().unwrap();
         let cat = Catalog::open(dir2.path(), Default::default()).unwrap();
         drop(cat.create("doomed", &Default::default()).unwrap());
-        CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+        CRASH_AFTER.set(CRASH_AFTER_SAVE);
         assert!(cat.delete("doomed").is_err());
         CRASH_AFTER.set(0);
         drop(cat);
@@ -1046,7 +1113,7 @@ mod tests {
         doomed.update("INSERT DATA { <urn:d> <urn:p> 1 }").unwrap();
         drop(doomed);
 
-        CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+        CRASH_AFTER.set(CRASH_AFTER_SAVE);
         assert!(cat.delete("doomed").is_err());
         CRASH_AFTER.set(0);
         drop(cat);
@@ -1111,7 +1178,7 @@ mod tests {
         // Newer version is refused with Unsupported.
         std::fs::write(
             dir.path().join(INTENT_FILE),
-            br#"{"format": 3, "future": true}"#,
+            br#"{"format": 4, "future": true}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -1143,7 +1210,7 @@ mod tests {
         let cat = Catalog::open(dir.path(), Default::default()).unwrap();
         std::fs::write(
             dir.path().join(INTENT_FILE),
-            br#"{"format": 3, "future": true}"#,
+            br#"{"format": 4, "future": true}"#,
         )
         .unwrap();
         assert!(matches!(cat.delete("ds"), Err(Error::Unsupported(_))));
@@ -1158,7 +1225,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cat = Catalog::open(dir.path(), Default::default()).unwrap();
         drop(cat.create("doomed", &Default::default()).unwrap());
-        CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+        CRASH_AFTER.set(CRASH_AFTER_SAVE);
         assert!(cat.delete("doomed").is_err());
         CRASH_AFTER.set(0);
         drop(cat);
@@ -1199,27 +1266,25 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_rollbacks_keep_the_original_dataset_registered() {
+    fn staging_failures_and_precommit_crashes_restore_the_registered_dataset() {
         use super::super::{
-            DELETE_BEFORE_MOVE, DELETE_FAIL, DELETE_ROLLBACK_MOVE, DELETE_ROLLBACK_REGISTRY_SAVE,
-            DELETE_ROLLBACK_SYNC, DELETE_SAVE_SYNC, DELETE_STAGE_SYNC,
+            DELETE_BEFORE_MOVE, DELETE_FAIL, DELETE_ROLLBACK_MOVE, DELETE_ROLLBACK_SYNC,
+            DELETE_SAVE_BEFORE_REPLACE, DELETE_STAGE_SYNC,
         };
-        use crate::store::Store;
-
         for (failure, stage, kept) in [
             (
-                1 << DELETE_BEFORE_MOVE,
+                (1 << DELETE_BEFORE_MOVE) | (1 << DELETE_SAVE_BEFORE_REPLACE),
                 CRASH_AFTER_FAILED_FORWARD_MOVE,
                 false,
             ),
             (
                 (1 << DELETE_STAGE_SYNC) | (1 << DELETE_ROLLBACK_MOVE),
-                CRASH_AFTER_FAILED_ROLLBACK_MOVE,
+                CRASH_AFTER_FAILED_ROLLBACK,
                 true,
             ),
             (
                 (1 << DELETE_STAGE_SYNC) | (1 << DELETE_ROLLBACK_SYNC),
-                CRASH_AFTER_FAILED_ROLLBACK_SYNC,
+                CRASH_AFTER_FAILED_ROLLBACK,
                 false,
             ),
             (
@@ -1227,58 +1292,160 @@ mod tests {
                 CRASH_AFTER_ROLLBACK_MOVE_SYNC,
                 false,
             ),
-            (1 << DELETE_SAVE_SYNC, CRASH_AFTER_SAVE_ROLLBACK_MARK, false),
             (
-                (1 << DELETE_STAGE_SYNC) | (1 << DELETE_ROLLBACK_REGISTRY_SAVE),
-                0,
-                false,
+                1 << DELETE_SAVE_BEFORE_REPLACE,
+                CRASH_BEFORE_REGISTRY_REPLACE,
+                true,
             ),
+            (0, CRASH_AFTER_KEPT_RENAME, true),
         ] {
             let dir = tempfile::tempdir().unwrap();
             DELETE_FAIL.set(failure);
             let intent = interrupted_delete(dir.path(), stage);
             DELETE_FAIL.set(0);
-            assert_eq!(intent.state, IntentState::RollingBack);
-            assert!(read_registry(dir.path()).unwrap().datasets.is_empty());
+            assert_eq!(intent.state, IntentState::Prepared);
+            let registry = read_registry(dir.path()).unwrap();
+            assert_eq!(registry.datasets[0].id, Some(intent.id));
+            assert_eq!(kept_entries(dir.path()).len(), usize::from(kept));
 
-            let capture = EventCapture::default();
-            let catalog = tracing::subscriber::with_default(capture.clone(), || {
-                Catalog::open(dir.path(), Default::default()).unwrap()
-            });
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let dataset = catalog.get("doomed").unwrap();
+            assert_eq!(dataset.dataset_id(), intent.id);
+            assert_eq!(dataset.len(), 1);
             assert!(!dir.path().join(INTENT_FILE).exists());
-            if kept {
+        }
+    }
+
+    #[test]
+    fn registry_replace_sync_failure_follows_only_the_surviving_registry() {
+        use super::super::{DELETE_FAIL, DELETE_SAVE_SYNC};
+
+        for replacement_survives in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let doomed = catalog.create("doomed", &Default::default()).unwrap();
+            doomed.update("INSERT DATA { <urn:d> <urn:p> 2 }").unwrap();
+            let id = doomed.dataset_id();
+            drop(doomed);
+            let config = dir.path().join(super::super::CONFIG_FILE);
+            let original = std::fs::read(&config).unwrap();
+            DELETE_FAIL.set(1 << DELETE_SAVE_SYNC);
+            let result = catalog.delete("doomed");
+            DELETE_FAIL.set(0);
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("indeterminate commit")
+            );
+            assert!(catalog.get("doomed").is_none());
+            assert!(catalog.create("doomed", &Default::default()).is_err());
+            assert!(
+                catalog
+                    .attach("doomed", crate::catalog::Attach::Memory)
+                    .is_err()
+            );
+            assert!(catalog.delete("doomed").is_err());
+            assert!(catalog.rename("doomed", "elsewhere").is_err());
+            assert_eq!(kept_entries(dir.path()).len(), 1);
+            assert!(read_registry(dir.path()).unwrap().datasets.is_empty());
+            assert!(!dir.path().join("databases/doomed").exists());
+            drop(catalog);
+
+            if !replacement_survives {
+                write_file_atomic(&config, &original).unwrap();
+            }
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            if replacement_survives {
                 assert!(catalog.get("doomed").is_none());
-                assert!(catalog.refusal("doomed").is_some());
-                assert!(catalog.create("doomed", &Default::default()).is_err());
-                let path = dir.path().join("databases").join(intent.kept_name());
-                let store = Store::open(&path, Default::default()).unwrap();
-                assert_eq!(store.dataset_id(), intent.id);
-                assert_eq!(store.snapshot().len(), 1);
-                assert!(capture.warnings().iter().any(|event| {
-                    event
-                        .fields
-                        .get("path")
-                        .is_some_and(|p| p.contains(&intent.kept_name()))
-                        && event.fields.contains_key("retained_bytes")
-                }));
+                drop(catalog.create("doomed", &Default::default()).unwrap());
             } else {
                 let dataset = catalog.get("doomed").unwrap();
-                assert_eq!(dataset.dataset_id(), intent.id);
+                assert_eq!(dataset.dataset_id(), id);
                 assert_eq!(dataset.len(), 1);
             }
+            assert!(!dir.path().join(INTENT_FILE).exists());
+            assert!(kept_entries(dir.path()).is_empty());
         }
+    }
+
+    #[test]
+    fn prior_commit_cannot_restore_the_old_id_over_a_missing_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(catalog.create("doomed", &Default::default()).unwrap());
+        CRASH_AFTER.set(CRASH_AFTER_SAVE);
+        assert!(catalog.delete("doomed").is_err());
+        CRASH_AFTER.set(0);
+        let replacement = catalog.create("doomed", &Default::default()).unwrap();
+        let replacement_id = replacement.dataset_id();
+        drop(replacement);
+        drop(catalog);
+        std::fs::remove_dir_all(dir.path().join("databases/doomed")).unwrap();
+
+        let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(reopened.refusal("doomed").is_some());
+        assert!(reopened.get("doomed").is_none());
+        assert_eq!(
+            read_registry(dir.path()).unwrap().datasets[0].id,
+            Some(replacement_id)
+        );
+        assert!(!dir.path().join(INTENT_FILE).exists());
+        assert!(kept_entries(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn legacy_registry_id_is_bound_before_the_first_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+        let dataset = catalog.create("old", &Default::default()).unwrap();
+        let id = dataset.dataset_id();
+        drop(dataset);
+        let config = dir.path().join(super::super::CONFIG_FILE);
+        std::fs::write(
+            &config,
+            br#"{"format":1,"datasets":[{"name":"old","type":"persistent"}]}"#,
+        )
+        .unwrap();
+        CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+        assert!(catalog.delete("old").is_err());
+        CRASH_AFTER.set(0);
+        drop(catalog);
+
+        assert_eq!(read_registry(dir.path()).unwrap().datasets[0].id, Some(id));
+        let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(catalog.get("old").unwrap().dataset_id(), id);
+    }
+
+    #[cfg(feature = "backup")]
+    #[test]
+    fn staged_restore_and_delete_conflict_keeps_both_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_KEPT_RENAME);
+        let databases = dir.path().join("databases");
+        let replaced = databases.join(".replaced-doomed-42");
+        drop(crate::store::Store::open(&replaced, Default::default()).unwrap());
+        let kept = databases.join(intent.kept_name());
+        let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(catalog.refusal("doomed").is_some());
+        assert!(catalog.get("doomed").is_none());
+        assert!(!databases.join("doomed").exists());
+        assert!(kept.join("dataset.json").exists());
+        assert!(replaced.join("dataset.json").exists());
+        assert!(dir.path().join(INTENT_FILE).exists());
     }
 
     #[test]
     fn stale_forward_intent_cannot_reclaim_registered_datasets_only_copy() {
         let dir = tempfile::tempdir().unwrap();
-        let intent = interrupted_delete(dir.path(), CRASH_AFTER_KEPT_RENAME);
-        write_registry(
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
+        super::super::write_registry(
             dir.path(),
-            &Registry {
+            &super::super::Registry {
                 datasets: vec![RegistryEntry {
                     name: intent.name.clone(),
                     kind: DatasetKind::Persistent,
+                    id: None,
                     reasoning: None,
                 }],
             },
@@ -1295,7 +1462,7 @@ mod tests {
                 .join(intent.kept_name())
                 .exists()
         );
-        assert!(!dir.path().join(INTENT_FILE).exists());
+        assert!(dir.path().join(INTENT_FILE).exists());
         assert!(capture.warnings().iter().any(|event| {
             event
                 .fields
@@ -1312,11 +1479,7 @@ mod tests {
         for stage in [CRASH_AFTER_SAVE, CRASH_AFTER_KEPT_RENAME] {
             let dir = tempfile::tempdir().unwrap();
             let intent = interrupted_delete(dir.path(), stage);
-            let name = if stage == CRASH_AFTER_SAVE {
-                intent.name.clone()
-            } else {
-                intent.kept_name()
-            };
+            let name = intent.kept_name();
             let root = dir.path().join("databases").join(&name);
             let store = Store::open(&root, Default::default()).unwrap();
             assert_eq!(store.dataset_id(), intent.id);
@@ -1339,14 +1502,17 @@ mod tests {
                 capture.warnings()
             );
             drop(store);
-            drop(Catalog::open(dir.path(), Default::default()).unwrap());
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            if stage == CRASH_AFTER_KEPT_RENAME {
+                assert_eq!(reopened.get("doomed").unwrap().dataset_id(), intent.id);
+            }
             assert!(!root.exists());
             assert!(!dir.path().join(INTENT_FILE).exists());
         }
     }
 
     #[test]
-    fn restart_stages_the_original_root_before_partial_removal() {
+    fn staged_delete_releases_the_original_alias_before_partial_removal() {
         let dir = tempfile::tempdir().unwrap();
         let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
         let databases = dir.path().join("databases");
@@ -1383,7 +1549,7 @@ mod tests {
         use super::super::take_catalog_dir_syncs;
 
         let dir = tempfile::tempdir().unwrap();
-        let intent = interrupted_delete(dir.path(), CRASH_AFTER_KEPT_RENAME);
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
         RECOVERY_STOP.set(RecoveryStop::BeforeRemovalSync);
         assert!(Catalog::open(dir.path(), Default::default()).is_err());
         RECOVERY_STOP.set(RecoveryStop::None);
@@ -1414,10 +1580,10 @@ mod tests {
             return;
         }
 
-        for stage in [CRASH_AFTER_SAVE, CRASH_AFTER_KEPT_RENAME] {
+        for stage in [CRASH_AFTER_INTENT, CRASH_AFTER_SAVE] {
             let dir = tempfile::tempdir().unwrap();
             let intent = interrupted_delete(dir.path(), stage);
-            let name = if stage == CRASH_AFTER_SAVE {
+            let name = if stage == CRASH_AFTER_INTENT {
                 intent.name.clone()
             } else {
                 intent.kept_name()
@@ -1435,8 +1601,12 @@ mod tests {
                     && event.fields["retained_bytes"].parse::<u64>().unwrap() > 0
             }));
             std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(0o600)).unwrap();
-            drop(Catalog::open(dir.path(), Default::default()).unwrap());
-            assert!(!root.exists());
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            if stage == CRASH_AFTER_INTENT {
+                assert_eq!(reopened.get("doomed").unwrap().dataset_id(), intent.id);
+            } else {
+                assert!(!root.exists());
+            }
             assert!(!dir.path().join(INTENT_FILE).exists());
         }
     }
@@ -1450,7 +1620,7 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let intent = interrupted_delete(dir.path(), CRASH_AFTER_KEPT_RENAME);
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
         let name = intent.kept_name();
         let root = dir.path().join("databases").join(&name);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1474,7 +1644,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
-        let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_INTENT);
         let journal = dir.path().join(INTENT_FILE);
         let other = tempfile::tempdir().unwrap();
         let target = other.path().join(INTENT_FILE);
@@ -1512,23 +1682,32 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
-        interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
+        let kept = intent.kept_name();
         let intents = read_intents(dir.path()).unwrap();
         let databases = open_databases(dir.path()).unwrap();
         let original = dir.path().join("original");
         let alternate = dir.path().join("alternate");
         std::fs::rename(databases.path(), &original).unwrap();
-        std::fs::create_dir_all(alternate.join("doomed")).unwrap();
+        std::fs::create_dir_all(alternate.join(&kept)).unwrap();
         std::fs::copy(
-            original.join("doomed/dataset.json"),
-            alternate.join("doomed/dataset.json"),
+            original.join(&kept).join("dataset.json"),
+            alternate.join(&kept).join("dataset.json"),
         )
         .unwrap();
         symlink(&alternate, databases.path()).unwrap();
 
-        recover(dir.path(), &databases, intents).unwrap();
-        assert!(!original.join("doomed").exists());
-        assert!(alternate.join("doomed/dataset.json").exists());
+        let registry = read_registry(dir.path()).unwrap();
+        recover(
+            dir.path(),
+            &databases,
+            &registry,
+            intents,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!original.join(&kept).exists());
+        assert!(alternate.join(&kept).join("dataset.json").exists());
     }
 
     #[cfg(unix)]
@@ -1537,7 +1716,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
-        let intent = interrupted_delete(dir.path(), CRASH_AFTER_KEPT_RENAME);
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
         let kept = dir.path().join("databases").join(intent.kept_name());
         let metadata = kept.join("dataset.json");
         let external = dir.path().join("outside-dataset.json");
@@ -1564,7 +1743,7 @@ mod tests {
         let restore = databases.join(".restore-dataset-1");
         std::fs::create_dir(&restore).unwrap();
         let journal = dir.path().join(INTENT_FILE);
-        for bytes in [br#"{"format":3,"future":true}"#.as_slice(), b"invalid json"] {
+        for bytes in [br#"{"format":4,"future":true}"#.as_slice(), b"invalid json"] {
             std::fs::write(&journal, bytes).unwrap();
             assert!(Catalog::open(dir.path(), Default::default()).is_err());
             assert!(dir.path().join("rename.json").exists());
@@ -1581,9 +1760,44 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_journals_refuse_recovery_and_format_one_still_reads() {
+    fn ambiguous_registry_identity_refuses_before_startup_recovery() {
         let dir = tempfile::tempdir().unwrap();
-        let intent = interrupted_delete(dir.path(), CRASH_AFTER_KEPT_RENAME);
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
+        let databases = dir.path().join("databases");
+        let kept = databases.join(intent.kept_name());
+        let restore = databases.join(".restore-doomed-42");
+        std::fs::create_dir(&restore).unwrap();
+        let config = dir.path().join(super::super::CONFIG_FILE);
+        let replacement = format!(
+            r#"{{"name":"doomed","type":"persistent","id":"{}"}}"#,
+            Uuid::new_v4()
+        );
+        let original = format!(
+            r#"{{"name":"doomed","type":"persistent","id":"{}"}}"#,
+            intent.id
+        );
+        let duplicate_id = original.replacen(
+            r#""id":"#,
+            &format!(r#""id":"{}","id":"#, Uuid::new_v4()),
+            1,
+        );
+        for bytes in [
+            format!(r#"{{"format":2,"datasets":[{replacement},{original}]}}"#),
+            format!(r#"{{"format":2,"datasets":[{duplicate_id}]}}"#),
+            String::from(r#"{"format":3,"datasets":[]}"#),
+        ] {
+            std::fs::write(&config, bytes).unwrap();
+            assert!(Catalog::open(dir.path(), Default::default()).is_err());
+            assert!(kept.exists());
+            assert!(restore.exists());
+            assert!(dir.path().join(INTENT_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn ambiguous_journals_refuse_recovery_and_legacy_versions_remain_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
         let kept = dir.path().join("databases").join(intent.kept_name());
         let journal = dir.path().join(INTENT_FILE);
         let record = format!(
@@ -1591,7 +1805,7 @@ mod tests {
             intent.id, intent.token
         );
         for bytes in [
-            format!(r#"{{"format":3,"format":1,"intents":[{record}]}}"#),
+            format!(r#"{{"format":4,"format":1,"intents":[{record}]}}"#),
             format!(r#"{{"format":1,"intents":[{record},{record}]}}"#),
             format!(
                 r#"{{"format":1,"intents":[{}]}}"#,
@@ -1617,10 +1831,26 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&journal).unwrap(), bytes);
         }
 
-        std::fs::write(&journal, format!(r#"{{"format":1,"intents":[{record}]}}"#)).unwrap();
-        drop(Catalog::open(dir.path(), Default::default()).unwrap());
-        assert!(!kept.exists());
-        assert!(!journal.exists());
+        for version in [1, 2] {
+            let mut record: serde_json::Value = serde_json::from_str(&record).unwrap();
+            if version == 2 {
+                record["state"] = "deleting".into();
+            }
+            std::fs::write(
+                &journal,
+                serde_json::to_vec(&serde_json::json!({
+                    "format": version, "intents": [record]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            drop(Catalog::open(dir.path(), Default::default()).unwrap());
+            assert!(kept.exists());
+            assert_eq!(
+                read_intents(dir.path()).unwrap()[0].state,
+                IntentState::Legacy
+            );
+        }
     }
 
     #[test]
@@ -1631,7 +1861,7 @@ mod tests {
             .path()
             .join(INTENT_FILE)
             .with_extension(format!("tmp-{}", Uuid::new_v4()));
-        sparkles_core::fsutil::write_synced(&temp, br#"{"format":3,"future":true}"#).unwrap();
+        sparkles_core::fsutil::write_synced(&temp, br#"{"format":4,"future":true}"#).unwrap();
         let foreign = dir.path().join("delete.tmp-manual");
         std::fs::write(&foreign, b"operator file").unwrap();
         #[cfg(unix)]
@@ -1692,7 +1922,7 @@ mod tests {
             std::thread::scope(|scope| {
                 scope
                     .spawn(|| {
-                        CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+                        CRASH_AFTER.set(CRASH_AFTER_SAVE);
                         assert!(other.delete("two").is_err());
                     })
                     .join()

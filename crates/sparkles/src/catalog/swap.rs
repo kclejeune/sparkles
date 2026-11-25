@@ -572,7 +572,7 @@ mod tests {
         drop(st);
         let db = dir.path().join("databases");
         assert!(!db.join("ds").exists() && db.join(".replaced-ds-4").exists());
-        super::super::restore::recover(dir.path()).unwrap();
+        super::super::restore::recover(dir.path(), &Default::default()).unwrap();
         let st = state(dir.path());
         let ds = st.get("ds").unwrap();
         assert_eq!(
@@ -599,7 +599,7 @@ mod tests {
         drop(st);
         let db = dir.path().join("databases");
         assert!(db.join(".replaced-ds-5").exists());
-        super::super::restore::recover(dir.path()).unwrap();
+        super::super::restore::recover(dir.path(), &Default::default()).unwrap();
         let st = state(dir.path());
         assert_eq!(st.get("ds").unwrap().store().dataset_id(), id);
         assert!(!db.join(".replaced-ds-5").exists());

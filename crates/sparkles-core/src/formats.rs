@@ -389,10 +389,10 @@ pub const LINK: FileKind = FileKind {
 pub const CATALOG: FileKind = FileKind {
     id: "catalog",
     files: "config.json of the data directory",
-    marker: "`format`, absent meaning 1",
+    marker: "`format`, absent meaning 1. Format 2 records persistent dataset UUIDs",
     class: Class::Primary,
-    writes: 1,
-    reads: &[1],
+    writes: 2,
+    reads: &[1, 2],
 };
 
 /// The full-text index.
@@ -821,8 +821,8 @@ pub const SETTINGS: &[SettingsFile] = &[
     named(ds("graphrag/state.json", 3), "version"),
     named(ds("graphrag/ledger.json", 1), "version"),
     // the data directory
-    server("config.json", 1),
-    server("delete.json", 2),
+    server("config.json", 2),
+    server("delete.json", 3),
     server("models.json", 1),
     server("notifications.json", 1),
     server("notifications-state.json", 1),

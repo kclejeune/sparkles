@@ -176,26 +176,41 @@ impl RecoveryDir {
 
     pub fn rename_child(&self, name: &OsStr, mut child: Self, new: &OsStr) -> io::Result<Self> {
         #[cfg(unix)]
+        self.verify_entry(name, &child.file)?;
+
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "redox"
+        ))]
+        fs::renameat_with(
+            &self.file,
+            name,
+            &self.file,
+            new,
+            fs::RenameFlags::NOREPLACE,
+        )?;
+
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "redox"
+        )))]
         {
-            self.verify_entry(name, &child.file)?;
-            // The generated cleanup name must be vacant. Never replace an observed
-            // entry, even an empty directory.
             match self.entry(new) {
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
                 Ok(_) => return Err(ErrorKind::AlreadyExists.into()),
             }
+            #[cfg(unix)]
             fs::renameat(&self.file, name, &self.file, new)?;
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = name;
-            match self.entry(new) {
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-                Ok(_) => return Err(ErrorKind::AlreadyExists.into()),
+            #[cfg(not(unix))]
+            {
+                let _ = name;
+                std::fs::rename(child.path(), self.path.join(new))?;
             }
-            std::fs::rename(child.path(), self.path.join(new))?;
         }
         child.path = self.path.join(new);
         Ok(child)

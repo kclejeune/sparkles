@@ -30,7 +30,10 @@ pub fn replaced_dataset(file_name: &str) -> Option<&str> {
 
 /// Recover `<data_dir>/databases` after the catalog lock is held and before opening
 /// any registered datasets.
-pub fn recover(data_dir: &Path) -> anyhow::Result<()> {
+pub(super) fn recover(
+    data_dir: &Path,
+    protected: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<()> {
     let databases = data_dir.join("databases");
     let entries = match std::fs::read_dir(&databases) {
         Ok(e) => e,
@@ -47,6 +50,9 @@ pub fn recover(data_dir: &Path) -> anyhow::Result<()> {
                 .with_context(|| format!("removing {}", path.display()))?;
             changed = true;
         } else if let Some(ds) = replaced_dataset(&name) {
+            if protected.contains(ds) {
+                continue;
+            }
             let target = databases.join(ds);
             if target.exists() {
                 tracing::info!(
@@ -273,7 +279,7 @@ mod tests {
         std::fs::write(db.join(".replaced-b-6").join("marker"), b"old b").unwrap();
         std::fs::create_dir_all(dir.path().join("tmp").join("verify-9")).unwrap();
         std::fs::create_dir_all(dir.path().join("tmp").join("memory-backup-x1")).unwrap();
-        recover(dir.path()).unwrap();
+        recover(dir.path(), &Default::default()).unwrap();
         let mut left: Vec<String> = std::fs::read_dir(&db)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -287,7 +293,7 @@ mod tests {
         assert!(!dir.path().join("tmp").join("verify-9").exists());
         assert!(!dir.path().join("tmp").join("memory-backup-x1").exists());
         // nothing to do: fine, also without a databases directory
-        recover(dir.path()).unwrap();
-        recover(&dir.path().join("none")).unwrap();
+        recover(dir.path(), &Default::default()).unwrap();
+        recover(&dir.path().join("none"), &Default::default()).unwrap();
     }
 }
