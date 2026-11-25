@@ -3349,3 +3349,243 @@ async fn patterns_preview_dry_run_and_atomic_apply_robot_and_dosdp() {
     assert_eq!(sj["pattern"]["rowsWithErrors"], 1);
     assert_eq!(ds.store.head_commit().seq, initial_head + 2);
 }
+
+#[tokio::test]
+async fn patterns_preview_assertion_parity_row_atomicity_and_refusal_ordering() {
+    let s = persistent();
+    let ds = s._state.get("h").unwrap();
+
+    // 1. Apply an individual + class assertion + object property assertion table, then
+    //    re-preview: store-resident assertions must be reported as `existing` with 0 new
+    //    axioms and 0 estimated triples (matching apply).
+    let ind_body = json!({
+        "table": {
+            "format": "tsv",
+            "data": "ID\tClass\tTeaches\nID\tTYPE\tI ex:teaches\nex:bob\tex:Professor\tex:logic\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        },
+        "declare": true
+    });
+    let first_prev = post(&s.app, "/$/ontology/h/patterns/preview", ind_body.clone()).await;
+    assert_eq!(first_prev.status, StatusCode::OK, "{}", first_prev.text());
+    let fpj = first_prev.json();
+    assert_eq!(fpj["valid"], true);
+    assert_eq!(fpj["newAxioms"], 3, "{fpj}");
+    assert_eq!(fpj["existingAxioms"], 0, "{fpj}");
+
+    // Dry-run with changes=50 returns triple sample quads.
+    let dry = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?dryRun=true&changes=50",
+        ind_body.clone(),
+    )
+    .await;
+    assert_eq!(dry.status, StatusCode::OK, "{}", dry.text());
+    let dj = dry.json();
+    assert!(
+        !dj["changes"]["quads"].as_array().unwrap().is_empty(),
+        "dryRun with changes=50 must return quads: {dj}"
+    );
+
+    let applied = post(&s.app, "/$/ontology/h/patterns/apply", ind_body.clone()).await;
+    assert_eq!(applied.status, StatusCode::OK, "{}", applied.text());
+    assert_eq!(applied.json()["committed"], true);
+
+    let second_prev = post(&s.app, "/$/ontology/h/patterns/preview", ind_body).await;
+    assert_eq!(second_prev.status, StatusCode::OK, "{}", second_prev.text());
+    let spj = second_prev.json();
+    assert_eq!(
+        spj["newAxioms"], 0,
+        "repeat preview must see stored assertions: {spj}"
+    );
+    assert_eq!(spj["existingAxioms"], 3, "{spj}");
+    assert_eq!(spj["estimatedTriples"], 0, "{spj}");
+
+    // 2. Row-atomic onError=skip: Row 2 has a valid declaration (`ex:ValidBadRow`) AND a
+    //    broken restriction; skipping it must NOT commit `Declaration(Class(ex:ValidBadRow))`.
+    let partial_row = json!({
+        "table": {
+            "data": "ID,Parent\nID,SC %\nex:GoodRow,ex:Person\nex:ValidBadRow,not valid ( syntax\n"
+        },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        },
+        "onError": "skip"
+    });
+    let skip_resp = post(&s.app, "/$/ontology/h/patterns/apply", partial_row).await;
+    assert_eq!(skip_resp.status, StatusCode::OK, "{}", skip_resp.text());
+    let sj = skip_resp.json();
+    assert_eq!(sj["committed"], true, "{sj}");
+    assert_eq!(sj["pattern"]["rowsWithErrors"], 1);
+    let entities = get(&s.app, "/$/ontology/h/entities?kind=Class")
+        .await
+        .json();
+    let entity_text = entities.to_string();
+    assert!(
+        entity_text.contains("http://ex.org/GoodRow"),
+        "{entity_text}"
+    );
+    assert!(
+        !entity_text.contains("http://ex.org/ValidBadRow"),
+        "failed row's declaration must not commit under onError=skip: {entity_text}"
+    );
+
+    // 3. Structural spec errors refuse commit even under onError=skip.
+    let structural_err = json!({
+        "table": { "data": "ID,Parent\nID,NO_SUCH_DIRECTIVE\nex:X,ex:Person\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        },
+        "onError": "skip"
+    });
+    let struct_resp = post(&s.app, "/$/ontology/h/patterns/apply", structural_err).await;
+    assert_eq!(
+        struct_resp.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        struct_resp.text()
+    );
+    assert_eq!(struct_resp.json()["code"], "pattern-errors");
+
+    // 4. Stale If-Match and protected branch refuse BEFORE 422 pattern-errors.
+    let invalid_pattern = json!({
+        "table": { "data": "ID,Parent\nID,SC %\nex:Bad,not valid (\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let stale_tag = format!("W/\"{}:0:owl\"", ds.store.dataset_id());
+    let stale_resp = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/patterns/apply",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &stale_tag),
+        ],
+        &invalid_pattern.to_string(),
+    )
+    .await;
+    assert_eq!(
+        stale_resp.status,
+        StatusCode::PRECONDITION_FAILED,
+        "stale If-Match must win over 422 pattern-errors: {}",
+        stale_resp.text()
+    );
+
+    // 5. Import-target digest change invalidates preview ETag on apply with 412.
+    let valid_pattern = json!({
+        "table": { "data": "ID,Parent\nID,SC %\nex:AfterImport,ex:Person\n" },
+        "spec": {
+            "mode": "robot",
+            "headerTemplateRow": true,
+            "prefixes": { "ex": "http://ex.org/" }
+        }
+    });
+    let prev_before_import = post(
+        &s.app,
+        "/$/ontology/h/patterns/preview",
+        valid_pattern.clone(),
+    )
+    .await;
+    assert_eq!(prev_before_import.status, StatusCode::OK);
+    let tag_before = prev_before_import.headers[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let imp_get = get(&s.app, "/$/ontology/h/imports").await;
+    assert_eq!(imp_get.status, StatusCode::OK, "{}", imp_get.text());
+    let imp_etag = imp_get.headers[header::ETAG].to_str().unwrap().to_string();
+    let patch_imp = send(
+        &s.app,
+        "PATCH",
+        "/$/ontology/h/imports",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &imp_etag),
+        ],
+        &json!({ "set": { "http://ex.org/imp": "http://ex.org/g-imp" } }).to_string(),
+    )
+    .await;
+    assert_eq!(patch_imp.status, StatusCode::OK, "{}", patch_imp.text());
+    let apply_after_import = send(
+        &s.app,
+        "POST",
+        "/$/ontology/h/patterns/apply",
+        &[
+            ("content-type", "application/json"),
+            ("if-match", &tag_before),
+        ],
+        &valid_pattern.to_string(),
+    )
+    .await;
+    assert_eq!(
+        apply_after_import.status,
+        StatusCode::PRECONDITION_FAILED,
+        "import map change must invalidate preview ETag: {}",
+        apply_after_import.text()
+    );
+
+    // 6. Protected branch returns 403 branch-protected BEFORE 422 pattern-errors.
+    ds.dataset
+        .create_branch("locked", &sparkles::branch::BranchOptions::default())
+        .unwrap();
+    ds.dataset.set_branch_protected("locked", true).unwrap();
+    let prot_resp = post(
+        &s.app,
+        "/$/ontology/h/patterns/apply?branch=locked",
+        invalid_pattern,
+    )
+    .await;
+    assert_eq!(
+        prot_resp.status,
+        StatusCode::FORBIDDEN,
+        "branch-protected must win over 422 pattern-errors: {}",
+        prot_resp.text()
+    );
+    assert_eq!(prot_resp.json()["code"], "branch-protected");
+}
+
+#[tokio::test]
+async fn patterns_apply_refuses_read_only_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.read_only = true;
+    let state = Arc::new(st);
+    let ds = state.attach("ro", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let app = router(state);
+    let body = json!({
+        "table": { "data": "ID,Parent\nID,SC %\nex:A,ex:Person\n" },
+        "spec": { "mode": "robot", "headerTemplateRow": true, "prefixes": { "ex": "http://ex.org/" } }
+    });
+    assert_eq!(
+        post(&app, "/$/ontology/ro/patterns/preview", body.clone())
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(&app, "/$/ontology/ro/patterns/apply", body)
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+}

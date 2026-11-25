@@ -1414,6 +1414,91 @@ impl Ontologies {
         self.edit_with(req, edit, None, opts, Extra::default())
     }
 
+    /// Acquire the writer lock, check preconditions, protected-branch status and target
+    /// graph write permissions, open the ontology from the writer head snapshot, run
+    /// `build` against that opened ontology to produce the [`EditRequest`] and an extra
+    /// return value, and commit the edit on that exact snapshot.
+    pub fn edit_from_head<T, E, F>(
+        &self,
+        req: &OntologyRequest,
+        target_graph: Option<&GraphRef>,
+        message: Option<&str>,
+        opts: &QueryOptions,
+        build: F,
+    ) -> std::result::Result<(EditOutcome, T), EditFromHeadError<E>>
+    where
+        F: FnOnce(&Opened) -> std::result::Result<(EditRequest, T), E>,
+    {
+        req.validate().map_err(EditFromHeadError::Store)?;
+        if req.at.is_some() {
+            return Err(EditFromHeadError::Store(Error::invalid(
+                "an edit starts from the head: leave out 'at'",
+            )));
+        }
+        if req.inferences {
+            return Err(EditFromHeadError::Store(Error::invalid(
+                "an edit changes the asserted axioms: leave out 'inferences'",
+            )));
+        }
+        let opts = self.anchored(opts).map_err(EditFromHeadError::Store)?;
+        let store = self.ds.store();
+        let mut wopts = opts.write.clone();
+        if wopts.graphs.is_none() {
+            wopts.graphs = opts.graphs.clone();
+        }
+        if let Some(m) = message {
+            wopts.message = Some(Arc::from(m));
+        }
+        if wopts.deadline.is_none() {
+            wopts.deadline = opts.deadline;
+        }
+        if wopts.cancel.is_none() {
+            wopts.cancel = opts.cancel.clone();
+        }
+        let mut txn = store
+            .try_write_with(CommitKind::Update, wopts)
+            .map_err(EditFromHeadError::Store)?;
+        txn.check_protected().map_err(EditFromHeadError::Store)?;
+        let target = target_graph
+            .cloned()
+            .unwrap_or_else(|| req.graphs()[0].clone());
+        let target_id = match &target {
+            GraphRef::Default => Id::DEFAULT_GRAPH,
+            GraphRef::Named(g) => txn
+                .intern(&Term::NamedNode(
+                    oxrdf::NamedNode::new(g.as_str()).map_err(|e| {
+                        EditFromHeadError::Store(Error::invalid(format!("graph <{g}>: {e}")))
+                    })?,
+                ))
+                .map_err(EditFromHeadError::Store)?,
+        };
+        txn.check_graph_writable(target_id)
+            .map_err(EditFromHeadError::Store)?;
+        let head = txn.base().clone();
+        let o = self
+            .open_at(&head, req, &opts)
+            .map_err(EditFromHeadError::Store)?;
+        let (edit, extra_val) = build(&o).map_err(EditFromHeadError::Build)?;
+        for ax in edit.add.iter().chain(&edit.remove) {
+            sparkles_owl::validate::axiom(ax)
+                .map_err(|e| EditFromHeadError::Store(Error::invalid(e.0)))?;
+        }
+        let outcome = self
+            .apply_edit_in_txn(
+                txn,
+                head,
+                o,
+                req,
+                &edit,
+                target_id,
+                None,
+                &opts,
+                Extra::default(),
+            )
+            .map_err(EditFromHeadError::Store)?;
+        Ok((outcome, extra_val))
+    }
+
     /// [`edit`](Self::edit), also removing what mentions `entity`, selected from the
     /// head under the writer lock.
     fn edit_with(
@@ -1422,7 +1507,7 @@ impl Ontologies {
         edit: &EditRequest,
         entity: Option<&str>,
         opts: &QueryOptions,
-        mut extra: Extra<'_>,
+        extra: Extra<'_>,
     ) -> Result<EditOutcome> {
         req.validate()?;
         if req.at.is_some() {
@@ -1467,6 +1552,22 @@ impl Ontologies {
                     .map_err(|e| Error::invalid(format!("graph <{g}>: {e}")))?,
             ))?,
         };
+        self.apply_edit_in_txn(txn, head, o, req, edit, target_id, entity, &opts, extra)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_edit_in_txn(
+        &self,
+        mut txn: crate::store::WriteTxn<'_>,
+        head: Arc<Snapshot>,
+        o: Opened,
+        req: &OntologyRequest,
+        edit: &EditRequest,
+        target_id: Id,
+        entity: Option<&str>,
+        opts: &QueryOptions,
+        mut extra: Extra<'_>,
+    ) -> Result<EditOutcome> {
         let mut outcome = Plan::default();
         // removals edit the graphs the request names and the target it names (§5.4):
         // an axiom read from an imported graph is removed there only when the edit
@@ -1516,7 +1617,7 @@ impl Ontologies {
                     })
                     .map(|(a, _)| a.clone()),
             );
-            o.assertions(&opts, |ax, _, g| {
+            o.assertions(opts, |ax, _, g| {
                 if let Some(ax) = ax
                     && scope.contains(&g)
                     && ax.mentions(iri)
@@ -1622,7 +1723,7 @@ impl Ontologies {
         }
         let mut count_deleted = 0;
         for q in deleted {
-            check(&opts)?;
+            check(opts)?;
             if txn.delete(q)? {
                 count_deleted += 1;
             }
@@ -1702,7 +1803,7 @@ impl Ontologies {
         let mut labels: FxHashMap<String, Id> = FxHashMap::default();
         let mut inserted = 0;
         for ax in &adding {
-            check(&opts)?;
+            check(opts)?;
             for t in write::axiom_triples(ax, &mut fresh) {
                 let s = subject_term(&t.subject);
                 let q = [
@@ -1784,6 +1885,29 @@ fn encode(
     })
 }
 
+/// Error returned by [`OntologyHandle::edit_from_head`].
+pub enum EditFromHeadError<E> {
+    Store(Error),
+    Build(E),
+}
+
+impl Opened {
+    /// Whether `ax` is already present in this opened ontology, checking both the loaded
+    /// terminology (`self.ontology`) and store-resident ABox assertions on `self.snapshot`
+    /// across all graphs read — matching [`OntologyHandle::edit`].
+    pub fn contains_axiom(&self, ax: &Axiom) -> Result<bool> {
+        let all_graphs: BTreeSet<u32> = (0..self.graphs.len() as u32).collect();
+        for form in ax.normal_forms() {
+            if !self.ontology.contains(&form)
+                && snapshot_assertion_quads(self, &form, &all_graphs, None)?.is_none()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
 /// The stored quads of an assertion that the open read left in the store, in every
 /// graph read; `None` when it has none. Such an assertion is one triple: the one the
 /// forward mapping writes, or for an equality or inequality of two individuals, that
@@ -1793,6 +1917,15 @@ fn assertion_quads(
     ax: &Axiom,
     txn: &crate::store::WriteTxn<'_>,
     graphs: &BTreeSet<u32>,
+) -> Result<Option<Vec<[Id; 4]>>> {
+    snapshot_assertion_quads(o, ax, graphs, Some(txn))
+}
+
+fn snapshot_assertion_quads(
+    o: &Opened,
+    ax: &Axiom,
+    graphs: &BTreeSet<u32>,
+    txn: Option<&crate::store::WriteTxn<'_>>,
 ) -> Result<Option<Vec<[Id; 4]>>> {
     use sparkles_owl::AxiomKind as K;
     if !ax.annotations.is_empty() {
@@ -1829,8 +1962,13 @@ fn assertion_quads(
             }
             let q = [s, p, obj, *g];
             // through the caller's view, so a protected triple is absent, and as this
-            // transaction leaves it
-            if snap.contains(&q)? && txn.contains(&q)? {
+            // transaction leaves it (when inside a write transaction)
+            if snap.contains(&q)?
+                && match txn {
+                    Some(tx) => tx.contains(&q)?,
+                    None => true,
+                }
+            {
                 out.push(q);
             }
         }

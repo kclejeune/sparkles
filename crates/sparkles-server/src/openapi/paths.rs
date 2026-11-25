@@ -1392,9 +1392,57 @@ fn ontology(p: &mut Paths) {
             "message": { "type": "string" }
         }
     });
+    let mut preview_headers = commit_headers();
+    if let Some(m) = preview_headers.as_object_mut() {
+        m.insert(
+            "ETag".into(),
+            json!({ "description": "A weak entity tag naming the commit and ontology import-target digest, reusable as `If-Match` on apply.", "schema": { "type": "string" } }),
+        );
+    }
+    let pattern_apply_ok = json!({
+        "type": "object",
+        "properties": {
+            "added": { "type": "integer" },
+            "present": { "type": "integer" },
+            "removed": { "type": "integer" },
+            "absent": { "type": "array", "items": { "type": "string" } },
+            "declared": { "type": "array", "items": { "type": "string" } },
+            "addedAxioms": edited.clone(),
+            "removedAxioms": edited.clone(),
+            "axiomsTruncated": { "type": "boolean" },
+            "inserted": { "type": "integer" },
+            "deleted": { "type": "integer" },
+            "kept": { "type": "integer" },
+            "committed": { "type": "boolean" },
+            "pattern": { "type": "object", "properties": {
+                "delimiter": { "type": "string" },
+                "headers": { "type": "array", "items": { "type": "string" } },
+                "rowsProcessed": { "type": "integer" },
+                "rowsSkipped": { "type": "integer" },
+                "rowsWithErrors": { "type": "integer" },
+                "generated": { "type": "integer" },
+                "valid": { "type": "boolean" },
+                "diagnostics": { "type": "array", "items": pattern_diag.clone() },
+                "diagnosticsTruncated": { "type": "boolean" }
+            } }
+        }
+    });
+    let pattern_errors = json!({
+        "type": "object",
+        "required": ["error", "code", "rowsProcessed", "rowsSkipped", "rowsWithErrors", "diagnostics", "diagnosticsTruncated"],
+        "properties": {
+            "error": { "type": "string" },
+            "code": { "type": "string", "const": "pattern-errors" },
+            "rowsProcessed": { "type": "integer" },
+            "rowsSkipped": { "type": "integer" },
+            "rowsWithErrors": { "type": "integer" },
+            "diagnostics": { "type": "array", "items": pattern_diag.clone() },
+            "diagnosticsTruncated": { "type": "boolean" }
+        }
+    });
     p.add(
         read(op(POST, "/$/ontology/{ds}/patterns/preview", "previewOntologyPatterns", "Ontology", "Preview axioms generated from a table"))
-            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the ontology's entity tag for `If-Match` on apply.")
+            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms matching the store, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the ontology's entity tag and commit headers for `If-Match` on apply.")
             .see("ontology")
             .param("at")
             .param("timeout")
@@ -1417,7 +1465,7 @@ fn ontology(p: &mut Paths) {
                     }
                 } } }),
             )
-            .resp(
+            .resp_h(
                 "200",
                 "The preview of generated axioms, diff summary, and row diagnostics.",
                 Some(json!({ "application/json": { "schema": {
@@ -1450,16 +1498,17 @@ fn ontology(p: &mut Paths) {
                             }
                         } },
                         "axiomsTruncated": { "type": "boolean" },
-                        "diagnostics": { "type": "array", "items": pattern_diag.clone() },
+                        "diagnostics": { "type": "array", "items": pattern_diag },
                         "diagnosticsTruncated": { "type": "boolean" }
                     }
                 } } })),
+                preview_headers,
             )
-            .errors(&[400, 403, 404, 408, 413]),
+            .errors(&[400, 403, 404, 408, 413, 507]),
     );
     p.add(
         write_params(op(POST, "/$/ontology/{ds}/patterns/apply", "applyOntologyPatterns", "Ontology", "Generate and commit axioms from a table"))
-            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, `If-Match` preconditions, `receipt=true`, and `dryRun=true` preview parity. With `onError: \"abort\"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: \"skip\"` skips erroneous rows and commits the valid axioms.")
+            .doc("Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification under the writer lock and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, target graph write grants, `If-Match` preconditions (including import-target digest parity), `receipt=true`, and `dryRun=true` preview parity. With `onError: \"abort\"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: \"skip\"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either policy.")
             .see("ontology")
             .param("ifMatch")
             .body(
@@ -1478,43 +1527,26 @@ fn ontology(p: &mut Paths) {
                         "declare": { "type": "boolean" },
                         "target": { "type": "string", "description": "The graph that takes the added axioms." },
                         "message": { "type": "string" },
-                        "onError": { "type": "string", "enum": ["abort", "skip"], "description": "Whether row errors refuse the commit (`abort`, the default) or skip the erroneous entries (`skip`)." }
+                        "onError": { "type": "string", "enum": ["abort", "skip"], "description": "Whether row errors refuse the commit (`abort`, the default) or skip erroneous rows (`skip`)." }
                     }
                 } } }),
             )
-            .resp(
+            .resp_h(
                 "200",
-                "What the commit wrote, with pattern counts and diagnostics and the receipt when asked for.",
-                Some(json!({ "application/json": { "schema": {
-                    "type": "object",
-                    "properties": {
-                        "added": { "type": "integer" },
-                        "present": { "type": "integer" },
-                        "removed": { "type": "integer" },
-                        "absent": { "type": "array", "items": { "type": "string" } },
-                        "declared": { "type": "array", "items": { "type": "string" } },
-                        "addedAxioms": edited.clone(),
-                        "removedAxioms": edited.clone(),
-                        "axiomsTruncated": { "type": "boolean" },
-                        "inserted": { "type": "integer" },
-                        "deleted": { "type": "integer" },
-                        "kept": { "type": "integer" },
-                        "committed": { "type": "boolean" },
-                        "pattern": { "type": "object", "properties": {
-                            "delimiter": { "type": "string" },
-                            "headers": { "type": "array", "items": { "type": "string" } },
-                            "rowsProcessed": { "type": "integer" },
-                            "rowsSkipped": { "type": "integer" },
-                            "rowsWithErrors": { "type": "integer" },
-                            "generated": { "type": "integer" },
-                            "valid": { "type": "boolean" },
-                            "diagnostics": { "type": "array", "items": pattern_diag },
-                            "diagnosticsTruncated": { "type": "boolean" }
-                        } }
-                    }
-                } } })),
+                "What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report when `dryRun=true`.",
+                Some(json!({
+                    "application/json": { "schema": { "anyOf": [pattern_apply_ok.clone(), sref("DryRunReport")] } },
+                    "application/x-sparkles+json": { "schema": { "allOf": [sref("Receipt"), pattern_apply_ok] } },
+                    "application/rdf-patch": { "schema": { "type": "string" } }
+                })),
+                commit_headers(),
             )
-            .errors(&[400, 403, 404, 408, 412, 413, 422, 507]),
+            .errors(&[400, 403, 404, 408, 412, 413, 507])
+            .resp(
+                "422",
+                "Pattern evaluation errors (`pattern-errors`) or write validation refusal.",
+                Some(json!({ "application/json": { "schema": { "anyOf": [pattern_errors, sref("Error")] } } })),
+            ),
     );
     p.add(
         write_params(sel(op(DELETE, "/$/ontology/{ds}/entity", "removeOntologyEntity", "Ontology", "Remove an entity")))

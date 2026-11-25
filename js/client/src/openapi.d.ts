@@ -2632,7 +2632,7 @@ export interface paths {
         put?: never;
         /**
          * Generate and commit axioms from a table
-         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, `If-Match` preconditions, `receipt=true`, and `dryRun=true` preview parity. With `onError: "abort"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: "skip"` skips erroneous rows and commits the valid axioms.
+         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification under the writer lock and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, target graph write grants, `If-Match` preconditions (including import-target digest parity), `receipt=true`, and `dryRun=true` preview parity. With `onError: "abort"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: "skip"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either policy.
          */
         post: operations["applyOntologyPatterns"];
         delete?: never;
@@ -2652,7 +2652,7 @@ export interface paths {
         put?: never;
         /**
          * Preview axioms generated from a table
-         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the ontology's entity tag for `If-Match` on apply.
+         * @description Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms matching the store, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the ontology's entity tag and commit headers for `If-Match` on apply.
          */
         post: operations["previewOntologyPatterns"];
         delete?: never;
@@ -21311,7 +21311,7 @@ export interface operations {
                     /** @enum {string} */
                     mode?: "lenient" | "strict";
                     /**
-                     * @description Whether row errors refuse the commit (`abort`, the default) or skip the erroneous entries (`skip`).
+                     * @description Whether row errors refuse the commit (`abort`, the default) or skip erroneous rows (`skip`).
                      * @enum {string}
                      */
                     onError?: "abort" | "skip";
@@ -21374,13 +21374,65 @@ export interface operations {
             };
         };
         responses: {
-            /** @description What the commit wrote, with pattern counts and diagnostics and the receipt when asked for. */
+            /** @description What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report when `dryRun=true`. */
             200: {
                 headers: {
+                    /** @description The branch, when it is not `main`. */
+                    "Sparkles-Branch"?: string;
+                    /** @description The branch's id, when it is not `main`. */
+                    "Sparkles-Branch-Id"?: string;
+                    /** @description The commit a read saw, or a write produced. */
+                    "Sparkles-Commit"?: number;
+                    /** @description The dataset id. */
+                    "Sparkles-Dataset-Id"?: string;
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": {
+                        absent?: string[];
+                        added?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        addedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                        axiomsTruncated?: boolean;
+                        committed?: boolean;
+                        declared?: string[];
+                        deleted?: number;
+                        inserted?: number;
+                        kept?: number;
+                        pattern?: {
+                            delimiter?: string;
+                            diagnostics?: {
+                                code?: string;
+                                column?: string | null;
+                                message?: string;
+                                /** @description 1-based source line number. */
+                                row?: number;
+                                /** @enum {string} */
+                                severity?: "error" | "warning";
+                            }[];
+                            diagnosticsTruncated?: boolean;
+                            generated?: number;
+                            headers?: string[];
+                            rowsProcessed?: number;
+                            rowsSkipped?: number;
+                            rowsWithErrors?: number;
+                            valid?: boolean;
+                        };
+                        present?: number;
+                        removed?: number;
+                        /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
+                        removedAxioms?: {
+                            axiom?: Record<string, never>;
+                            ofn?: string;
+                            type?: string;
+                        }[];
+                    } | components["schemas"]["DryRunReport"];
+                    "application/rdf-patch": string;
+                    "application/x-sparkles+json": components["schemas"]["Receipt"] & {
                         absent?: string[];
                         added?: number;
                         /** @description The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit. */
@@ -21432,7 +21484,32 @@ export interface operations {
             408: components["responses"]["Timeout"];
             412: components["responses"]["PreconditionFailed"];
             413: components["responses"]["PayloadTooLarge"];
-            422: components["responses"]["Unprocessable"];
+            /** @description Pattern evaluation errors (`pattern-errors`) or write validation refusal. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @constant */
+                        code: "pattern-errors";
+                        diagnostics: {
+                            code?: string;
+                            column?: string | null;
+                            message?: string;
+                            /** @description 1-based source line number. */
+                            row?: number;
+                            /** @enum {string} */
+                            severity?: "error" | "warning";
+                        }[];
+                        diagnosticsTruncated: boolean;
+                        error: string;
+                        rowsProcessed: number;
+                        rowsSkipped: number;
+                        rowsWithErrors: number;
+                    } | components["schemas"]["Error"];
+                };
+            };
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
@@ -21535,6 +21612,16 @@ export interface operations {
             /** @description The preview of generated axioms, diff summary, and row diagnostics. */
             200: {
                 headers: {
+                    /** @description A weak entity tag naming the commit and ontology import-target digest, reusable as `If-Match` on apply. */
+                    ETag?: string;
+                    /** @description The branch, when it is not `main`. */
+                    "Sparkles-Branch"?: string;
+                    /** @description The branch's id, when it is not `main`. */
+                    "Sparkles-Branch-Id"?: string;
+                    /** @description The commit a read saw, or a write produced. */
+                    "Sparkles-Commit"?: number;
+                    /** @description The dataset id. */
+                    "Sparkles-Dataset-Id"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -21587,6 +21674,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
             413: components["responses"]["PayloadTooLarge"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };

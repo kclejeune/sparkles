@@ -88,6 +88,8 @@ mod ontology {
     pub(super) use self::summary as imports_fetch;
     pub(super) use self::summary as imports_get;
     pub(super) use self::summary as imports_patch;
+    pub(super) use self::summary as patterns_apply;
+    pub(super) use self::summary as patterns_preview;
 
     pub(super) async fn axioms() -> ApiResult {
         not_built()

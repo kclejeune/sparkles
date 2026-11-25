@@ -94,6 +94,33 @@ fn names_commit(opaque: &str, id: DatasetId, seq: u64) -> bool {
     FORMATS.contains(&fmt) && s.parse() == Ok(seq) && d.parse::<DatasetId>() == Ok(id)
 }
 
+/// Like [`names_commit`], but for ontology tags (`owl*`) also requires the optional
+/// `.<hex>` import-target digest to match `expected_digest`.
+#[cfg(feature = "ontology")]
+fn names_commit_with_import_digest(
+    opaque: &str,
+    id: DatasetId,
+    seq: u64,
+    expected_digest: Option<&str>,
+) -> bool {
+    let mut parts = opaque.rsplitn(3, ':');
+    let (Some(fmt_full), Some(s), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let (fmt, tag_digest) = match fmt_full.split_once('.') {
+        Some((base, dig)) => (base, Some(dig)),
+        None => (fmt_full, None),
+    };
+    if !(FORMATS.contains(&fmt) && s.parse() == Ok(seq) && d.parse::<DatasetId>() == Ok(id)) {
+        return false;
+    }
+    if matches!(fmt, "owl" | "owl-head" | "owl-tree" | "owl-term") {
+        tag_digest == expected_digest
+    } else {
+        true
+    }
+}
+
 fn failed(msg: &str) -> ApiError {
     ApiError(
         StatusCode::PRECONDITION_FAILED,
@@ -208,6 +235,69 @@ pub(super) fn write_precondition(
                 return fail("If-Match: the graph does not exist".into());
             }
             Some(Tags::List(l)) if !current(l) => {
+                return fail(format!(
+                    "If-Match: the dataset is at commit {} now",
+                    head.commit
+                ));
+            }
+            _ => {}
+        }
+        match &if_none {
+            Some(Tags::Any) if exists => fail("If-None-Match: the graph exists".into()),
+            Some(Tags::List(l)) if current(l) => fail(format!(
+                "If-None-Match: the dataset is still at commit {}",
+                head.commit
+            )),
+            _ => Ok(()),
+        }
+    }))
+}
+
+/// Like [`write_precondition`], but enforces import-target digest parity for ontology
+/// entity tags (`owl*`) using the live digest computed by `expected_digest`.
+#[cfg(feature = "ontology")]
+pub(super) fn write_precondition_with_import_digest(
+    headers: &HeaderMap,
+    dataset_id: DatasetId,
+    target: &Target,
+    expected_digest: impl Fn() -> Option<String> + Send + Sync + 'static,
+) -> Option<Precondition> {
+    let if_match = tags(headers, header::IF_MATCH);
+    let if_none = tags(headers, header::IF_NONE_MATCH);
+    if if_match.is_none() && if_none.is_none() {
+        return None;
+    }
+    let graph = match target {
+        Target::Named(iri) => Some(iri.clone()),
+        _ => None,
+    };
+    Some(Precondition::new(move |head: &Snapshot| {
+        let exists = match &graph {
+            Some(iri) => head
+                .lookup_iri(iri)
+                .is_some_and(|g| head.count(Perm::Gspo, &[g.0]).unwrap_or(0) > 0),
+            None => true,
+        };
+        let digest = expected_digest();
+        let current = |l: &[String]| {
+            exists
+                && l.iter().any(|o| {
+                    names_commit_with_import_digest(o, dataset_id, head.commit, digest.as_deref())
+                })
+        };
+        let fail = |m: String| Err(Error::PreconditionFailed(m));
+        match &if_match {
+            Some(Tags::Any) if !exists => {
+                return fail("If-Match: the graph does not exist".into());
+            }
+            Some(Tags::List(l)) if !current(l) => {
+                let same_commit =
+                    exists && l.iter().any(|o| names_commit(o, dataset_id, head.commit));
+                if same_commit {
+                    return fail(
+                        "If-Match: the ontology import map changed since the tag was issued".into(),
+                    );
+                }
                 return fail(format!(
                     "If-Match: the dataset is at commit {} now",
                     head.commit

@@ -685,6 +685,28 @@ async fn ontology_patterns_preview_reads_and_apply_enforces_write_grants() {
         deny_graph.text()
     );
 
+    // Graph-restricted writer cannot apply to a graph outside its write grant, even when
+    // the pattern itself has row errors (403 must precede 422 pattern-errors).
+    let mut secret_bad_payload = payload.clone();
+    secret_bad_payload["graph"] = json!("http://ex/open");
+    secret_bad_payload["target"] = json!("http://ex/secret");
+    secret_bad_payload["table"] =
+        json!({ "data": "ID,Parent\nID,SC %\nhttp://ex/X,not valid (\n" });
+    let deny_graph_bad = as_user(
+        &app,
+        "oopen",
+        "POST",
+        "/$/ontology/ont/patterns/apply",
+        &secret_bad_payload,
+    )
+    .await;
+    assert_eq!(
+        deny_graph_bad.status,
+        StatusCode::FORBIDDEN,
+        "target graph grant must refuse before 422 pattern-errors: {}",
+        deny_graph_bad.text()
+    );
+
     // Full writer can apply to the open graph in one commit.
     let ok = as_user(
         &app,

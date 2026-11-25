@@ -6900,6 +6900,21 @@ impl WriteTxn<'_> {
         }
     }
 
+    /// Check that this transaction's caller is permitted to write to graph `g`.
+    pub fn check_graph_writable(&mut self, g: Id) -> Result<()> {
+        self.check_graph(g)
+    }
+
+    /// Check that this transaction is permitted to commit on the branch (refusing
+    /// protected branches unless this is a merge or a new-branch dry-run preview).
+    pub fn check_protected(&self) -> Result<()> {
+        let as_new_branch = self.opts.preview_as_new_branch && self.opts.dry_run.is_some();
+        if self.merge.is_none() && !as_new_branch {
+            self.store.check_protected(self.kind)?;
+        }
+        Ok(())
+    }
+
     /// Let this transaction change the managed graphs of the capability's owner (see
     /// [`crate::managed`]), before it changes anything. A transaction that started
     /// from a speculative group-commit state waits for that state to be durable and

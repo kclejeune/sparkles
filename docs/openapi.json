@@ -45865,7 +45865,7 @@
     },
     "/$/ontology/{ds}/patterns/apply": {
       "post": {
-        "description": "Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, `If-Match` preconditions, `receipt=true`, and `dryRun=true` preview parity. With `onError: \"abort\"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: \"skip\"` skips erroneous rows and commits the valid axioms.",
+        "description": "Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification under the writer lock and commits all generated axioms as one atomic ontology edit. Honors dataset write authorization, protected branches, target graph write grants, `If-Match` preconditions (including import-target digest parity), `receipt=true`, and `dryRun=true` preview parity. With `onError: \"abort\"` (the default), any row diagnostic error refuses the commit with `422` (`pattern-errors`) and writes nothing; `onError: \"skip\"` discards erroneous rows atomically and commits the axioms from valid rows. Request-wide budget and structural specification errors refuse the commit under either policy.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
         },
@@ -46008,7 +46008,7 @@
                     "type": "string"
                   },
                   "onError": {
-                    "description": "Whether row errors refuse the commit (`abort`, the default) or skip the erroneous entries (`skip`).",
+                    "description": "Whether row errors refuse the commit (`abort`, the default) or skip erroneous rows (`skip`).",
                     "enum": [
                       "abort",
                       "skip"
@@ -46228,58 +46228,366 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "absent": {
-                      "items": {
-                        "type": "string"
-                      },
-                      "type": "array"
-                    },
-                    "added": {
-                      "type": "integer"
-                    },
-                    "addedAxioms": {
-                      "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
-                      "items": {
-                        "properties": {
-                          "axiom": {
+                  "anyOf": [
+                    {
+                      "properties": {
+                        "absent": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "added": {
+                          "type": "integer"
+                        },
+                        "addedAxioms": {
+                          "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                          "items": {
+                            "properties": {
+                              "axiom": {
+                                "type": "object"
+                              },
+                              "ofn": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
                             "type": "object"
                           },
-                          "ofn": {
+                          "type": "array"
+                        },
+                        "axiomsTruncated": {
+                          "type": "boolean"
+                        },
+                        "committed": {
+                          "type": "boolean"
+                        },
+                        "declared": {
+                          "items": {
                             "type": "string"
                           },
-                          "type": {
-                            "type": "string"
-                          }
+                          "type": "array"
                         },
-                        "type": "object"
+                        "deleted": {
+                          "type": "integer"
+                        },
+                        "inserted": {
+                          "type": "integer"
+                        },
+                        "kept": {
+                          "type": "integer"
+                        },
+                        "pattern": {
+                          "properties": {
+                            "delimiter": {
+                              "type": "string"
+                            },
+                            "diagnostics": {
+                              "items": {
+                                "properties": {
+                                  "code": {
+                                    "type": "string"
+                                  },
+                                  "column": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "message": {
+                                    "type": "string"
+                                  },
+                                  "row": {
+                                    "description": "1-based source line number.",
+                                    "type": "integer"
+                                  },
+                                  "severity": {
+                                    "enum": [
+                                      "error",
+                                      "warning"
+                                    ],
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object"
+                              },
+                              "type": "array"
+                            },
+                            "diagnosticsTruncated": {
+                              "type": "boolean"
+                            },
+                            "generated": {
+                              "type": "integer"
+                            },
+                            "headers": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "rowsProcessed": {
+                              "type": "integer"
+                            },
+                            "rowsSkipped": {
+                              "type": "integer"
+                            },
+                            "rowsWithErrors": {
+                              "type": "integer"
+                            },
+                            "valid": {
+                              "type": "boolean"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "present": {
+                          "type": "integer"
+                        },
+                        "removed": {
+                          "type": "integer"
+                        },
+                        "removedAxioms": {
+                          "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                          "items": {
+                            "properties": {
+                              "axiom": {
+                                "type": "object"
+                              },
+                              "ofn": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
                       },
-                      "type": "array"
+                      "type": "object"
                     },
-                    "axiomsTruncated": {
-                      "type": "boolean"
+                    {
+                      "$ref": "#/components/schemas/DryRunReport"
+                    }
+                  ]
+                }
+              },
+              "application/rdf-patch": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/x-sparkles+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Receipt"
                     },
-                    "committed": {
-                      "type": "boolean"
-                    },
-                    "declared": {
-                      "items": {
-                        "type": "string"
-                      },
-                      "type": "array"
-                    },
-                    "deleted": {
-                      "type": "integer"
-                    },
-                    "inserted": {
-                      "type": "integer"
-                    },
-                    "kept": {
-                      "type": "integer"
-                    },
-                    "pattern": {
+                    {
                       "properties": {
-                        "delimiter": {
+                        "absent": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "added": {
+                          "type": "integer"
+                        },
+                        "addedAxioms": {
+                          "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                          "items": {
+                            "properties": {
+                              "axiom": {
+                                "type": "object"
+                              },
+                              "ofn": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "axiomsTruncated": {
+                          "type": "boolean"
+                        },
+                        "committed": {
+                          "type": "boolean"
+                        },
+                        "declared": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "deleted": {
+                          "type": "integer"
+                        },
+                        "inserted": {
+                          "type": "integer"
+                        },
+                        "kept": {
+                          "type": "integer"
+                        },
+                        "pattern": {
+                          "properties": {
+                            "delimiter": {
+                              "type": "string"
+                            },
+                            "diagnostics": {
+                              "items": {
+                                "properties": {
+                                  "code": {
+                                    "type": "string"
+                                  },
+                                  "column": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "message": {
+                                    "type": "string"
+                                  },
+                                  "row": {
+                                    "description": "1-based source line number.",
+                                    "type": "integer"
+                                  },
+                                  "severity": {
+                                    "enum": [
+                                      "error",
+                                      "warning"
+                                    ],
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object"
+                              },
+                              "type": "array"
+                            },
+                            "diagnosticsTruncated": {
+                              "type": "boolean"
+                            },
+                            "generated": {
+                              "type": "integer"
+                            },
+                            "headers": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "rowsProcessed": {
+                              "type": "integer"
+                            },
+                            "rowsSkipped": {
+                              "type": "integer"
+                            },
+                            "rowsWithErrors": {
+                              "type": "integer"
+                            },
+                            "valid": {
+                              "type": "boolean"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "present": {
+                          "type": "integer"
+                        },
+                        "removed": {
+                          "type": "integer"
+                        },
+                        "removedAxioms": {
+                          "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
+                          "items": {
+                            "properties": {
+                              "axiom": {
+                                "type": "object"
+                              },
+                              "ofn": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "What the commit wrote with pattern counts and diagnostics, a receipt-bearing response when `receipt=true` or `Accept: application/x-sparkles+json`, or a dry-run report when `dryRun=true`.",
+            "headers": {
+              "Sparkles-Branch": {
+                "description": "The branch, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch-Id": {
+                "description": "The branch's id, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Commit": {
+                "description": "The commit a read saw, or a write produced.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Sparkles-Dataset-Id": {
+                "description": "The dataset id.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "properties": {
+                        "code": {
+                          "const": "pattern-errors",
                           "type": "string"
                         },
                         "diagnostics": {
@@ -46316,14 +46624,8 @@
                         "diagnosticsTruncated": {
                           "type": "boolean"
                         },
-                        "generated": {
-                          "type": "integer"
-                        },
-                        "headers": {
-                          "items": {
-                            "type": "string"
-                          },
-                          "type": "array"
+                        "error": {
+                          "type": "string"
                         },
                         "rowsProcessed": {
                           "type": "integer"
@@ -46333,67 +46635,27 @@
                         },
                         "rowsWithErrors": {
                           "type": "integer"
-                        },
-                        "valid": {
-                          "type": "boolean"
                         }
                       },
+                      "required": [
+                        "error",
+                        "code",
+                        "rowsProcessed",
+                        "rowsSkipped",
+                        "rowsWithErrors",
+                        "diagnostics",
+                        "diagnosticsTruncated"
+                      ],
                       "type": "object"
                     },
-                    "present": {
-                      "type": "integer"
-                    },
-                    "removed": {
-                      "type": "integer"
-                    },
-                    "removedAxioms": {
-                      "description": "The axioms the edit wrote or removed, at most 10,000, each with its `type`, its functional-style form `ofn` and its JSON form `axiom`, so that a client can undo the edit.",
-                      "items": {
-                        "properties": {
-                          "axiom": {
-                            "type": "object"
-                          },
-                          "ofn": {
-                            "type": "string"
-                          },
-                          "type": {
-                            "type": "string"
-                          }
-                        },
-                        "type": "object"
-                      },
-                      "type": "array"
+                    {
+                      "$ref": "#/components/schemas/Error"
                     }
-                  },
-                  "type": "object"
+                  ]
                 }
               }
             },
-            "description": "What the commit wrote, with pattern counts and diagnostics and the receipt when asked for."
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "408": {
-            "$ref": "#/components/responses/Timeout"
-          },
-          "412": {
-            "$ref": "#/components/responses/PreconditionFailed"
-          },
-          "413": {
-            "$ref": "#/components/responses/PayloadTooLarge"
-          },
-          "422": {
-            "$ref": "#/components/responses/Unprocessable"
+            "description": "Pattern evaluation errors (`pattern-errors`) or write validation refusal."
           },
           "507": {
             "$ref": "#/components/responses/InsufficientStorage"
@@ -46429,7 +46691,7 @@
     },
     "/$/ontology/{ds}/patterns/preview": {
       "post": {
-        "description": "Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the ontology's entity tag for `If-Match` on apply.",
+        "description": "Evaluates CSV or TSV spreadsheet rows against a ROBOT-template or DOSDP/Cellfie-style parameterized axiom pattern specification using the ontology's vocabulary and prefixes, without modifying the dataset. Returns deduplicated generated axioms (bounded by `limit`, default 200, max 2,000), counts of new and existing axioms matching the store, auto-declarations that `declare=true` would add, estimated RDF triples, and per-row diagnostics. The response carries the ontology's entity tag and commit headers for `If-Match` on apply.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
         },
@@ -46863,7 +47125,39 @@
                 }
               }
             },
-            "description": "The preview of generated axioms, diff summary, and row diagnostics."
+            "description": "The preview of generated axioms, diff summary, and row diagnostics.",
+            "headers": {
+              "ETag": {
+                "description": "A weak entity tag naming the commit and ontology import-target digest, reusable as `If-Match` on apply.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch": {
+                "description": "The branch, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Branch-Id": {
+                "description": "The branch's id, when it is not `main`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Sparkles-Commit": {
+                "description": "The commit a read saw, or a write produced.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Sparkles-Dataset-Id": {
+                "description": "The dataset id.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -46882,6 +47176,9 @@
           },
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
           },
           "default": {
             "$ref": "#/components/responses/Error"

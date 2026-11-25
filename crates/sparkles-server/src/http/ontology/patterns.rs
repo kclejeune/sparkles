@@ -4,22 +4,28 @@
 //!   ROBOT-template or DOSDP/Cellfie pattern specification against the ontology's
 //!   vocabulary and prefixes, returning generated axioms, diff counts against the open
 //!   ontology, estimated RDF triple count, auto-declarations, and per-row diagnostics.
-//! - `POST /$/ontology/{ds}/patterns/apply`: evaluate the same specification and commit
-//!   all generated axioms in one atomic ontology edit, with dataset write authorization,
-//!   protected-branch enforcement, `If-Match` preconditions, and `dryRun=true` preview
-//!   parity.
+//! - `POST /$/ontology/{ds}/patterns/apply`: evaluate the same specification under the
+//!   writer lock against the head snapshot and commit all generated axioms in one atomic
+//!   ontology edit, with dataset write authorization, protected-branch enforcement,
+//!   `If-Match` preconditions (including import-target digest parity), and `dryRun=true`
+//!   preview parity.
 
 use super::*;
+use sparkles::handles::ontology::EditFromHeadError;
 use sparkles::owl::manchester;
 use sparkles::owl::patterns::{
-    self, ColumnDeclaration, ColumnDirective, Delimiter, Limits, PatternResult, PatternRule,
-    PatternSpec, PatternSyntax, RuleAnnotation, TemplateMode,
+    self, CancelReason, ColumnDeclaration, ColumnDirective, Delimiter, EvalError, Limits,
+    PatternResult, PatternRule, PatternSpec, PatternSyntax, RuleAnnotation, TemplateMode,
 };
 use sparkles::owl::{Axiom, Entity, EntityKind, write as owl_write};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 const DEFAULT_PREVIEW_LIMIT: usize = 200;
 const MAX_PREVIEW_LIMIT: usize = 2_000;
+/// Maximum approximate serialized bytes accumulated across rendered preview axioms.
+const MAX_PREVIEW_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OnError {
@@ -51,6 +57,7 @@ fn parse_entity_kind(s: &str) -> ApiResult<EntityKind> {
 }
 
 fn parse_input(o: &serde_json::Map<String, J>, allow_apply_fields: bool) -> ApiResult<ParsedInput> {
+    let limits = Limits::default();
     let table_obj = match o.get("table") {
         Some(J::Object(m)) => m,
         _ => return Err(bad("table: an object with 'data' and optional 'format'")),
@@ -99,6 +106,13 @@ fn parse_input(o: &serde_json::Map<String, J>, allow_apply_fields: bool) -> ApiR
     match spec_obj.get("prefixes") {
         None | Some(J::Null) => {}
         Some(J::Object(m)) => {
+            if m.len() > limits.max_prefixes {
+                return Err(bad(format!(
+                    "spec.prefixes defines {} entries, exceeding the limit of {}",
+                    m.len(),
+                    limits.max_prefixes
+                )));
+            }
             for (k, v) in m {
                 let ns = v
                     .as_str()
@@ -123,6 +137,13 @@ fn parse_input(o: &serde_json::Map<String, J>, allow_apply_fields: bool) -> ApiR
             match spec_obj.get("columns") {
                 None | Some(J::Null) => {}
                 Some(J::Array(arr)) => {
+                    if arr.len() > limits.max_columns_spec {
+                        return Err(bad(format!(
+                            "spec.columns defines {} entries, exceeding the limit of {}",
+                            arr.len(),
+                            limits.max_columns_spec
+                        )));
+                    }
                     for (i, item) in arr.iter().enumerate() {
                         let J::Object(m) = item else {
                             return Err(bad(format!("spec.columns[{i}]: an object")));
@@ -175,6 +196,13 @@ fn parse_input(o: &serde_json::Map<String, J>, allow_apply_fields: bool) -> ApiR
             match spec_obj.get("rules") {
                 None | Some(J::Null) => {}
                 Some(J::Array(arr)) => {
+                    if arr.len() > limits.max_rules {
+                        return Err(bad(format!(
+                            "spec.rules defines {} entries, exceeding the limit of {}",
+                            arr.len(),
+                            limits.max_rules
+                        )));
+                    }
                     for (i, item) in arr.iter().enumerate() {
                         let J::Object(m) = item else {
                             return Err(bad(format!("spec.rules[{i}]: an object")));
@@ -229,6 +257,12 @@ fn parse_input(o: &serde_json::Map<String, J>, allow_apply_fields: bool) -> ApiR
                         match m.get("requiredColumns") {
                             None | Some(J::Null) => {}
                             Some(J::Array(reqs)) => {
+                                if reqs.len() > limits.max_cols {
+                                    return Err(bad(format!(
+                                        "spec.rules[{i}].requiredColumns exceeds the {} column limit",
+                                        limits.max_cols
+                                    )));
+                                }
                                 for r in reqs {
                                     let s = r.as_str().ok_or_else(|| {
                                         bad(format!("spec.rules[{i}].requiredColumns: strings"))
@@ -246,6 +280,12 @@ fn parse_input(o: &serde_json::Map<String, J>, allow_apply_fields: bool) -> ApiR
                         match m.get("split") {
                             None | Some(J::Null) => {}
                             Some(J::Object(sm)) => {
+                                if sm.len() > limits.max_cols {
+                                    return Err(bad(format!(
+                                        "spec.rules[{i}].split exceeds the {} column limit",
+                                        limits.max_cols
+                                    )));
+                                }
                                 for (k, v) in sm {
                                     let d = v.as_str().ok_or_else(|| {
                                         bad(format!("spec.rules[{i}].split.{k}: a string"))
@@ -263,6 +303,13 @@ fn parse_input(o: &serde_json::Map<String, J>, allow_apply_fields: bool) -> ApiR
                         match m.get("annotations") {
                             None | Some(J::Null) => {}
                             Some(J::Array(anns)) => {
+                                if anns.len() > limits.max_annotations_per_rule {
+                                    return Err(bad(format!(
+                                        "spec.rules[{i}].annotations defines {} entries, exceeding the limit of {}",
+                                        anns.len(),
+                                        limits.max_annotations_per_rule
+                                    )));
+                                }
                                 for (j, a) in anns.iter().enumerate() {
                                     let J::Object(am) = a else {
                                         return Err(bad(format!(
@@ -324,6 +371,16 @@ fn parse_input(o: &serde_json::Map<String, J>, allow_apply_fields: bool) -> ApiR
                                             )));
                                         }
                                     };
+                                    if iri && (lang.is_some() || datatype.is_some()) {
+                                        return Err(bad(format!(
+                                            "spec.rules[{i}].annotations[{j}]: cannot combine iri=true with lang or datatype"
+                                        )));
+                                    }
+                                    if lang.is_some() && datatype.is_some() {
+                                        return Err(bad(format!(
+                                            "spec.rules[{i}].annotations[{j}]: cannot combine lang and datatype"
+                                        )));
+                                    }
                                     annotations.push(RuleAnnotation {
                                         property,
                                         value,
@@ -357,6 +414,13 @@ fn parse_input(o: &serde_json::Map<String, J>, allow_apply_fields: bool) -> ApiR
             match spec_obj.get("declarations") {
                 None | Some(J::Null) => {}
                 Some(J::Array(arr)) => {
+                    if arr.len() > limits.max_declarations {
+                        return Err(bad(format!(
+                            "spec.declarations defines {} entries, exceeding the limit of {}",
+                            arr.len(),
+                            limits.max_declarations
+                        )));
+                    }
                     for (i, item) in arr.iter().enumerate() {
                         let J::Object(m) = item else {
                             return Err(bad(format!("spec.declarations[{i}]: an object")));
@@ -468,12 +532,33 @@ fn parse_input(o: &serde_json::Map<String, J>, allow_apply_fields: bool) -> ApiR
     })
 }
 
+fn check_cancel(
+    cancel: Option<&Arc<AtomicBool>>,
+    deadline: Option<Instant>,
+) -> Result<(), CancelReason> {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(CancelReason::Cancelled);
+    }
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(CancelReason::Timeout);
+    }
+    Ok(())
+}
+
 fn table_error(e: patterns::TableError) -> ApiError {
     let status = match e.code {
         "input-too-large" => StatusCode::PAYLOAD_TOO_LARGE,
         _ => StatusCode::BAD_REQUEST,
     };
     err_code(status, e.code, e.to_string())
+}
+
+fn eval_error(e: EvalError) -> ApiError {
+    match e {
+        EvalError::Table(te) => table_error(te),
+        EvalError::Cancelled => ontology_error(Error::Cancelled),
+        EvalError::Timeout => ontology_error(Error::Timeout),
+    }
 }
 
 fn diagnostics_json(res: &PatternResult) -> Vec<J> {
@@ -505,6 +590,36 @@ fn pattern_summary_json(res: &PatternResult) -> J {
     })
 }
 
+fn pattern_errors_response(result: &PatternResult) -> Response {
+    let message = if result.budget_exceeded {
+        format!(
+            "pattern evaluation exceeded a request budget ({} error(s)); no changes were committed",
+            result.error_count(),
+        )
+    } else if result.structural_error_count > 0 && result.rows_with_errors == 0 {
+        format!(
+            "pattern specification has {} error(s); no changes were committed",
+            result.error_count(),
+        )
+    } else {
+        format!(
+            "pattern evaluation found {} error(s) across {} row(s); no changes were committed",
+            result.error_count(),
+            result.rows_with_errors,
+        )
+    };
+    let err_body = json!({
+        "error": message,
+        "code": "pattern-errors",
+        "rowsProcessed": result.rows_processed,
+        "rowsSkipped": result.rows_skipped,
+        "rowsWithErrors": result.rows_with_errors,
+        "diagnostics": diagnostics_json(result),
+        "diagnosticsTruncated": result.diagnostics_truncated,
+    });
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(err_body)).into_response()
+}
+
 /// `POST /$/ontology/{ds}/patterns/preview`: parse spreadsheet rows and a pattern
 /// specification against the ontology, returning generated axioms, diff counts, estimated
 /// triples, auto-declarations and per-row diagnostics without modifying the dataset.
@@ -530,20 +645,27 @@ pub(crate) async fn preview(
         ));
     }
     let parsed = parse_input(&o, false)?;
-    let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+    let mut opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+    let (cancel, _cancel_on_drop) = cancel_on_drop();
+    opts.cancel = Some(cancel);
     blocking(move || {
+        let limits = Limits::default();
         let handle = ds.dataset.ontology();
         let opts = handle.anchored(&opts).map_err(ontology_error)?;
         let opened = handle.open(&req, &opts).map_err(ontology_error)?;
         let vocab = handle.vocabulary(&opened);
-        let result = patterns::evaluate(
+        let cancel_ref = opts.cancel.clone();
+        let deadline = opts.deadline;
+        let mut cancel_fn = || check_cancel(cancel_ref.as_ref(), deadline);
+        let result = patterns::evaluate_with_cancel(
             &parsed.table_data,
             parsed.delimiter,
             &parsed.spec,
             &vocab,
-            &Limits::default(),
+            &limits,
+            &mut cancel_fn,
         )
-        .map_err(table_error)?;
+        .map_err(eval_error)?;
 
         // Merge dataset prefixes with spec prefixes for clean OFN and Manchester rendering.
         let mut render_prefixes: Vec<(String, String)> = ds.store.prefixes().into_iter().collect();
@@ -568,16 +690,16 @@ pub(crate) async fn preview(
         }
         let manch_r = manchester::Renderer::of_vocabulary(&render_vocab);
 
-        // Compute exact new vs existing status and auto-declarations matching `ontology::edit`.
+        // Compute exact new vs existing status matching `ontology::edit`, including
+        // store-resident ABox assertions on `opened.snapshot`.
         let mut new_axioms: Vec<&Axiom> = Vec::new();
         let mut existing_count = 0usize;
         let mut statuses: Vec<&'static str> = Vec::with_capacity(result.axioms.len());
-        for item in &result.axioms {
-            let present = item
-                .axiom
-                .normal_forms()
-                .iter()
-                .all(|form| opened.ontology.contains(form));
+        for (i, item) in result.axioms.iter().enumerate() {
+            if i.is_multiple_of(64) {
+                cancel_fn().map_err(|r| eval_error(r.into()))?;
+            }
+            let present = opened.contains_axiom(&item.axiom).map_err(ontology_error)?;
             if present {
                 existing_count += 1;
                 statuses.push("existing");
@@ -623,31 +745,78 @@ pub(crate) async fn preview(
 
         let mut fresh = owl_write::counter("pat");
         let mut estimated_triples = 0usize;
-        for ax in &new_axioms {
-            estimated_triples += owl_write::axiom_triples(ax, &mut fresh).len();
+        for (i, ax) in new_axioms.iter().enumerate() {
+            if i.is_multiple_of(64) {
+                cancel_fn().map_err(|r| eval_error(r.into()))?;
+            }
+            estimated_triples =
+                estimated_triples.saturating_add(owl_write::axiom_triples(ax, &mut fresh).len());
+            if estimated_triples > limits.max_triples {
+                return Err(err_code(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "triple-limit",
+                    format!(
+                        "projected RDF triples exceeded the limit of {}",
+                        limits.max_triples
+                    ),
+                ));
+            }
         }
         for e in &auto_declarations {
-            estimated_triples +=
-                owl_write::axiom_triples(&Axiom::declaration(e.clone()), &mut fresh).len();
+            estimated_triples = estimated_triples.saturating_add(
+                owl_write::axiom_triples(&Axiom::declaration(e.clone()), &mut fresh).len(),
+            );
+            if estimated_triples > limits.max_triples {
+                return Err(err_code(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "triple-limit",
+                    format!(
+                        "projected RDF triples exceeded the limit of {}",
+                        limits.max_triples
+                    ),
+                ));
+            }
         }
 
-        let truncated = result.axioms.len() > parsed.limit;
-        let axioms_json: Vec<J> = result
+        let mut truncated = result.axioms.len() > parsed.limit;
+        let mut axioms_json: Vec<J> = Vec::with_capacity(result.axioms.len().min(parsed.limit));
+        let mut rendered_bytes = 0usize;
+        for (i, (item, status)) in result
             .axioms
             .iter()
             .zip(statuses)
             .take(parsed.limit)
-            .map(|(item, status)| {
-                json!({
-                    "type": item.axiom.axiom_type().name(),
-                    "ofn": ofn_r.axiom(&item.axiom),
-                    "manchester": manch_r.axiom(&item.axiom),
-                    "axiom": sparkles::owl::json::axiom(&item.axiom),
-                    "rows": item.rows,
-                    "status": status,
-                })
-            })
-            .collect();
+            .enumerate()
+        {
+            if i.is_multiple_of(64) {
+                cancel_fn().map_err(|r| eval_error(r.into()))?;
+            }
+            let ofn = ofn_r.axiom(&item.axiom);
+            let manchester = manch_r.axiom(&item.axiom);
+            let ax_json = sparkles::owl::json::axiom(&item.axiom);
+            // Bound serialized preview response bytes before accumulating arbitrarily large JSON.
+            let est_entry_bytes = ofn
+                .len()
+                .saturating_add(manchester.as_deref().map_or(0, str::len))
+                .saturating_add(item.rows.len().saturating_mul(8))
+                .saturating_add(ax_json.to_string().len())
+                .saturating_add(128);
+            if !axioms_json.is_empty()
+                && rendered_bytes.saturating_add(est_entry_bytes) > MAX_PREVIEW_RESPONSE_BYTES
+            {
+                truncated = true;
+                break;
+            }
+            rendered_bytes = rendered_bytes.saturating_add(est_entry_bytes);
+            axioms_json.push(json!({
+                "type": item.axiom.axiom_type().name(),
+                "ofn": ofn,
+                "manchester": manchester,
+                "axiom": ax_json,
+                "rows": item.rows,
+                "status": status,
+            }));
+        }
 
         let target_graph = parsed
             .target
@@ -688,9 +857,15 @@ pub(crate) async fn preview(
     .await
 }
 
+enum ApplyBuildError {
+    Eval(EvalError),
+    PatternErrors(Box<PatternResult>),
+}
+
 /// `POST /$/ontology/{ds}/patterns/apply`: evaluate spreadsheet rows and a pattern
-/// specification and commit all generated axioms in one atomic commit, honoring write
-/// authorization, protected branches, `If-Match` preconditions, and `dryRun=true`.
+/// specification under the writer lock and commit all generated axioms in one atomic
+/// commit, honoring write authorization, protected branches, `If-Match` preconditions
+/// (with import-target digest parity), and `dryRun=true`.
 pub(crate) async fn apply(
     State(st): St,
     Path(name): Path<String>,
@@ -724,8 +899,22 @@ pub(crate) async fn apply(
     let (mut wopts, _cancel_on_drop) = body_write_options(&st, &params, &headers, Some(&p))?;
     wopts.opts.graphs = opts.graphs.clone();
     if wopts.opts.precondition.is_none() {
-        wopts.opts.precondition =
-            conditional::write_precondition(&headers, ds.store.dataset_id(), &Target::Dataset);
+        let st_pre = st.clone();
+        let ds_pre = ds.clone();
+        let imports_mode = req.imports;
+        wopts.opts.precondition = conditional::write_precondition_with_import_digest(
+            &headers,
+            ds.store.dataset_id(),
+            &Target::Dataset,
+            move || {
+                if imports_mode == ImportMode::None {
+                    None
+                } else {
+                    let targets = imports::targets(&st_pre, &ds_pre);
+                    (!targets.is_empty()).then(|| format!("{:016x}", targets.digest()))
+                }
+            },
+        );
     }
     let dry = wopts
         .opts
@@ -751,51 +940,76 @@ pub(crate) async fn apply(
     opts.timeout = None;
     opts.write = wopts;
 
+    let st_eval = st.clone();
     blocking(move || {
+        let mut req = req;
+        // Refresh import targets immediately before acquiring the writer lock so the
+        // opened ontology matches the import map checked by the precondition.
+        req.import_targets = imports::targets(&st_eval, &ds);
         let handle = ds.dataset.ontology();
-        let opened = handle.open(&req, &opts).map_err(ontology_error)?;
-        let vocab = handle.vocabulary(&opened);
-        let result = patterns::evaluate(
-            &parsed.table_data,
-            parsed.delimiter,
-            &parsed.spec,
-            &vocab,
-            &Limits::default(),
-        )
-        .map_err(table_error)?;
+        let commit_msg = parsed
+            .message
+            .clone()
+            .unwrap_or_else(|| "Generate axioms from pattern".to_string());
+        let eval_cancel = opts.cancel.clone();
+        let eval_deadline = opts.deadline;
 
-        if parsed.on_error == OnError::Abort && !result.is_valid() {
-            let err_body = json!({
-                "error": format!(
-                    "pattern evaluation found {} error(s) across {} row(s); no changes were committed",
-                    result.error_count(),
-                    result.rows_with_errors,
-                ),
-                "code": "pattern-errors",
-                "rowsProcessed": result.rows_processed,
-                "rowsSkipped": result.rows_skipped,
-                "rowsWithErrors": result.rows_with_errors,
-                "diagnostics": diagnostics_json(&result),
-                "diagnosticsTruncated": result.diagnostics_truncated,
-            });
-            return Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(err_body)).into_response());
-        }
+        let res = handle.edit_from_head(
+            &req,
+            parsed.target.as_ref(),
+            Some(&commit_msg),
+            &opts,
+            |opened| {
+                let vocab = handle.vocabulary(opened);
+                let mut cancel_fn = || check_cancel(eval_cancel.as_ref(), eval_deadline);
+                let result = patterns::evaluate_with_cancel(
+                    &parsed.table_data,
+                    parsed.delimiter,
+                    &parsed.spec,
+                    &vocab,
+                    &Limits::default(),
+                    &mut cancel_fn,
+                )
+                .map_err(ApplyBuildError::Eval)?;
 
-        let edit = EditRequest {
-            add: result.axioms.iter().map(|g| g.axiom.clone()).collect(),
-            remove: Vec::new(),
-            declare: Some(parsed.declare),
-            graph: parsed.target,
-            message: parsed
-                .message
-                .or_else(|| Some("Generate axioms from pattern".to_string())),
+                // Request-wide budget failures and structural spec errors always refuse
+                // the write, under both `abort` and `skip`.
+                if result.has_fatal_error()
+                    || (parsed.on_error == OnError::Abort && !result.is_valid())
+                {
+                    return Err(ApplyBuildError::PatternErrors(Box::new(result)));
+                }
+
+                let edit = EditRequest {
+                    add: result.axioms.iter().map(|g| g.axiom.clone()).collect(),
+                    remove: Vec::new(),
+                    declare: Some(parsed.declare),
+                    graph: parsed.target.clone(),
+                    message: Some(commit_msg.clone()),
+                };
+                Ok((edit, result))
+            },
+        );
+
+        let (e, result) = match (res, dry) {
+            (Ok(pair), _) => pair,
+            (Err(EditFromHeadError::Build(ApplyBuildError::PatternErrors(result))), _) => {
+                return Ok(pattern_errors_response(&result));
+            }
+            (Err(EditFromHeadError::Build(ApplyBuildError::Eval(err))), _) => {
+                return Err(eval_error(err));
+            }
+            (Err(EditFromHeadError::Store(Error::DryRun(preview))), Some(d)) => {
+                return Ok(d.respond(&ds, &preview));
+            }
+            (Err(EditFromHeadError::Store(e @ Error::Invalid(_))), _) => {
+                return Err(ontology_error(e));
+            }
+            (Err(EditFromHeadError::Store(e)), _) => {
+                return Err(write_error(e, restricted));
+            }
         };
-        let r = handle.edit(&req, &edit, &opts);
-        let e = match (r, dry) {
-            (Err(Error::DryRun(preview)), Some(d)) => return Ok(d.respond(&ds, &preview)),
-            (Err(e @ Error::Invalid(_)), _) => return Err(ontology_error(e)),
-            (r, _) => r.map_err(|e| write_error(e, restricted))?,
-        };
+
         let mut body = edit_body(&e, &renderer(&ds));
         if let Some(map) = body.as_object_mut() {
             map.insert("pattern".to_string(), pattern_summary_json(&result));
