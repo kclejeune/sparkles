@@ -3246,14 +3246,9 @@ pub(super) fn apply_range_filter(
     let n = col.len();
     let vocab_count = col.iter().filter(|x| x.tag() == Tag::Vocab).count();
     let decided_bytes = n.saturating_mul(size_of::<Option<bool>>()) as u64;
-    let par_extra = if n > PAR_THRESHOLD { decided_bytes } else { 0 };
     let vocab_bytes = (vocab_count as u64)
         .saturating_mul((size_of::<u64>() + size_of::<(u8, u64)>() + size_of::<Numeric>()) as u64);
-    let scratch = ctx.charge(
-        decided_bytes
-            .saturating_add(par_extra)
-            .saturating_add(vocab_bytes),
-    )?;
+    let scratch = ctx.charge(decided_bytes.saturating_add(vocab_bytes))?;
     use super::value::Num;
     let test = |x: Id, v: Num| atoms.iter().all(|a| a.holds(x, v));
     // `Some(passes)`, or `None` for the generic filter
@@ -3275,8 +3270,9 @@ pub(super) fn apply_range_filter(
         }
     };
     // the distinct vocabulary ids of a run of rows read from the column at once, and
-    // runs of one id (the scan's sorted column) decided once
-    let chunk = |ids: &[Id]| -> Vec<Option<bool>> {
+    // runs of one id (the scan's sorted column) decided once, written directly into
+    // disjoint slices of the pre-admitted `decided` buffer
+    let fill_chunk = |ids: &[Id], out: &mut [Option<bool>]| {
         let vocab_len = ids.iter().filter(|x| x.tag() == Tag::Vocab).count();
         let mut vocab = Vec::with_capacity(vocab_len);
         if vocab_len > 0 {
@@ -3298,8 +3294,8 @@ pub(super) fn apply_range_filter(
         };
         let mut at = 0;
         let mut last: Option<(Id, Option<bool>)> = None;
-        ids.iter()
-            .map(|&x| match last {
+        for (&x, slot) in ids.iter().zip(out.iter_mut()) {
+            *slot = match last {
                 Some((l, d)) if l == x => d,
                 _ => {
                     let n = if x.tag() == Tag::Vocab {
@@ -3319,16 +3315,18 @@ pub(super) fn apply_range_filter(
                     last = Some((x, d));
                     d
                 }
-            })
-            .collect()
+            };
+        }
     };
-    let decided: Vec<Option<bool>> = if col.len() > PAR_THRESHOLD {
-        col.par_chunks(PAR_MIN_LEN.max(4096))
-            .flat_map_iter(chunk)
-            .collect()
+    let mut decided = vec![None; n];
+    if col.len() > PAR_THRESHOLD {
+        let step = PAR_MIN_LEN.max(4096);
+        col.par_chunks(step)
+            .zip(decided.par_chunks_mut(step))
+            .for_each(|(ids, out)| fill_chunk(ids, out));
     } else {
-        chunk(col)
-    };
+        fill_chunk(col, &mut decided);
+    }
     let rest_len = decided.iter().filter(|d| d.is_none()).count();
     let keep_bytes = n.saturating_mul(size_of::<bool>()) as u64;
     let rest_bytes = rest_len.saturating_mul(size_of::<usize>()) as u64;
@@ -5838,21 +5836,60 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Result<Option<Decoded>> 
     }))
 }
 
+/// Count of admitted `prefetch_column_terms` allocations (for tests that verify
+/// budget-checked admission and scalar fallback).
+#[cfg(test)]
+static PREFETCH_COLUMN_TERMS_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+
 /// Ask for the vocabulary pages of the terms in the columns of `vars` of a small table
-/// (see [`decode_for`]).
+/// (see [`decode_for`]). The optional scratch vector is admitted first and skipped if
+/// the remaining memory budget cannot hold it.
 fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
-    let mut ids: Vec<u64> = vars
+    let count: usize = vars
         .iter()
         .filter_map(|&v| t.col_of(v))
-        .flat_map(|c| t.cols[c].iter())
-        .filter(|id| id.tag() == crate::id::Tag::Vocab)
-        .map(|id| id.payload())
-        .collect();
+        .map(|c| {
+            t.cols[c]
+                .iter()
+                .filter(|id| id.tag() == crate::id::Tag::Vocab)
+                .count()
+        })
+        .sum();
+    if count < 2 {
+        return;
+    }
+    let Some(ids_bytes) = count
+        .checked_mul(size_of::<u64>())
+        .and_then(|b| u64::try_from(b).ok())
+    else {
+        return;
+    };
+    let Ok(scratch) = ctx.charge(ids_bytes) else {
+        return;
+    };
+    #[cfg(test)]
+    PREFETCH_COLUMN_TERMS_ALLOCATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut ids = Vec::with_capacity(count);
+    ids.extend(
+        vars.iter()
+            .filter_map(|&v| t.col_of(v))
+            .flat_map(|c| t.cols[c].iter())
+            .filter(|id| id.tag() == crate::id::Tag::Vocab)
+            .map(|id| id.payload()),
+    );
     ids.sort_unstable();
     ids.dedup();
     if ids.len() >= 2 {
-        ctx.snap.generation.vocab.prefetch_value_pages(&ids);
+        let _ = ctx
+            .snap
+            .generation
+            .vocab
+            .prefetch_value_pages_checked(&ids, |block_bytes| {
+                scratch.resize(ids_bytes.saturating_add(block_bytes as u64))
+            });
     }
+    drop(ids);
+    drop(scratch);
 }
 
 /// Keep the rows that pass every conjunct: EXISTS conjuncts answered from a key set
@@ -10360,6 +10397,282 @@ mod paid_eager_producer_tests {
         let before_drop = ok_ctx.live_bytes();
         drop(filtered);
         assert_eq!(before_drop - ok_ctx.live_bytes(), raw_bytes);
+    }
+
+    #[test]
+    fn r4_topk_parallel_range_filter_admits_disjoint_decisions() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, expr::CmpOp, update::update};
+        use oxrdfio::RdfFormat;
+
+        let n = PAR_THRESHOLD + 64;
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:base> <urn:p> \"999999.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                    .to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let data = (0..n)
+            .map(|i| {
+                format!(
+                    "<urn:delta:{i}> <urn:p> \"{i}.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n"
+                )
+            })
+            .collect::<String>();
+        update(
+            &store,
+            &format!("INSERT DATA {{ {data} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.numeric().is_some());
+        let probe = Ctx::new(snap.clone());
+        let pred = probe.snap.lookup_iri("urn:p").unwrap();
+        let delta = probe
+            .snap
+            .lookup_term(&oxrdf::Literal::from(0.5_f32).into())
+            .unwrap();
+        assert_eq!(delta.tag(), crate::id::Tag::Delta);
+        let [lo, hi] = [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(delta.tag(), payload).0);
+        let threshold = Id::from_i64(100).unwrap();
+        let spec = OrderedTopK {
+            scan: ScanSpec {
+                perm: Perm::Pos,
+                prefix: vec![pred.0],
+                cols: vec![(1, 0), (2, 1)],
+                eqs: Vec::new(),
+                graph: GraphFilter::Default,
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            },
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: vec![Expr::Cmp(
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Const(threshold)),
+                CmpOp::Ge,
+            )],
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+
+        let (raw, scanned) = topk_read(&probe, &spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        let raw_bytes = probe.live_bytes();
+
+        let decided_bytes = n as u64 * size_of::<Option<bool>>() as u64;
+        let keep_bytes = n as u64 * size_of::<bool>() as u64;
+        let rest_bytes = n as u64 * size_of::<usize>() as u64;
+        let sub_bytes = topk_table_bytes(n, 2);
+        let mask_bytes = (n * size_of::<bool>()
+            + probe.nvars() * size_of::<Option<usize>>()
+            + size_of::<&Expr>()) as u64;
+
+        // Direct Phase 1 & Phase 2 checks on the already-scanned table (so `scan_into`'s
+        // power-of-two doubling peak cannot mask the exact Phase 1/2 boundaries):
+        // 1 byte below Phase 1 (`decided` disjoint output slice) refuses cleanly.
+        let mut p1 = Ctx::new(snap.clone());
+        p1.mem_limit = raw_bytes + decided_bytes - 1;
+        let held = p1.charge(raw_bytes).unwrap();
+        let mut tbl = raw.table.clone();
+        let err = apply_range_filter(&p1, &mut tbl, 0, &spec.range_filter)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory
+                    && b.requested == raw_bytes + decided_bytes
+        ));
+        drop(held);
+        assert_eq!(p1.live_bytes(), 0);
+
+        // Room for a single `decided` copy passes Phase 1 (no extra Rayon collector copy)
+        // and refuses at Phase 2 (`decided + keep + rest`).
+        let mut p2 = Ctx::new(snap.clone());
+        p2.mem_limit = raw_bytes + decided_bytes + 512;
+        let held = p2.charge(raw_bytes).unwrap();
+        let mut tbl = raw.table.clone();
+        let err = apply_range_filter(&p2, &mut tbl, 0, &spec.range_filter)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory
+                    && b.requested == raw_bytes + decided_bytes + keep_bytes + rest_bytes
+        ));
+        drop(held);
+        assert_eq!(p2.live_bytes(), 0);
+        drop(raw);
+        assert_eq!(probe.live_bytes(), 0);
+
+        // End-to-end `topk_read` 1 byte below Phase 3 (`keep + rest + sub + mask`) passes
+        // `scan_into`, Phase 1 parallel slices, and Phase 2, then refuses before copying `sub`.
+        let mut p3 = Ctx::new(snap.clone());
+        let p3_peak = raw_bytes + keep_bytes + rest_bytes + sub_bytes + mask_bytes;
+        p3.mem_limit = p3_peak - 1;
+        let err = topk_read(&p3, &spec, lo, hi, false, &[0, 1]).err().unwrap();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b)
+                if b.kind == crate::error::BudgetKind::Memory && b.requested == p3_peak
+        ));
+        assert_eq!(p3.live_bytes(), 0);
+
+        // With room for the residual copy, all `n - 100` matching rows survive.
+        let ok_ctx = Ctx::new(snap);
+        let (filtered, scanned) = topk_read(&ok_ctx, &spec, lo, hi, false, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.len(), n - 100);
+        let before_drop = ok_ctx.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ok_ctx.live_bytes(), raw_bytes);
+    }
+
+    #[test]
+    fn r4_filter_vocabulary_prefetch_admits_or_skips_under_tight_budget() {
+        use crate::io::Source;
+        use crate::sparql::expr::CmpOp;
+        use crate::vocab::numeric::Numeric;
+        use oxrdfio::RdfFormat;
+        use std::sync::atomic::Ordering;
+
+        let n = 2048usize;
+        let store = Store::in_memory(StoreOptions::default());
+        // Include one packed float on an unrelated predicate so `vocab.num` is built, plus
+        // 2,048 21-digit decimals that exceed both inline Tag::Decimal and vocab.num's 58-bit
+        // packed mantissa so they remain Tag::Vocab + Numeric::Unknown and reach the residual
+        // filter + prefetch path.
+        let mut data = String::from(
+            "<urn:base> <urn:other> \"999999.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n",
+        );
+        for i in 0..n {
+            data.push_str(&format!(
+                "<urn:dec:{i}> <urn:p> \"100000000000000000000.{i:04}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n"
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let num = snap
+            .generation
+            .vocab
+            .numeric()
+            .expect("base vocab numeric column");
+        let sample = snap
+            .lookup_term(
+                &oxrdf::Literal::new_typed_literal(
+                    "100000000000000000000.0000",
+                    oxrdf::NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#decimal"),
+                )
+                .into(),
+            )
+            .unwrap();
+        assert_eq!(sample.tag(), crate::id::Tag::Vocab);
+        assert_eq!(num.get_many(&[sample.payload()]), vec![Numeric::Unknown]);
+
+        let probe = Ctx::new(snap.clone());
+        let pred = probe.snap.lookup_iri("urn:p").unwrap();
+        let [lo, hi] = [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(sample.tag(), payload).0);
+        let threshold = Id::from_i64(0).unwrap();
+        let spec = OrderedTopK {
+            scan: ScanSpec {
+                perm: Perm::Pos,
+                prefix: vec![pred.0],
+                cols: vec![(1, 0), (2, 1)],
+                eqs: Vec::new(),
+                graph: GraphFilter::Default,
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            },
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: vec![Expr::Cmp(
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Const(threshold)),
+                CmpOp::Ge,
+            )],
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+
+        let (raw, scanned) = topk_read(&probe, &spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        let raw_bytes = probe.live_bytes();
+
+        // Direct check: 1 byte below the `n * 8` prefetch vector skips allocation (scalar fallback).
+        let ids_bytes = (n * size_of::<u64>()) as u64;
+        let mut tight_direct = Ctx::new(snap.clone());
+        tight_direct.mem_limit = ids_bytes - 1;
+        let before = PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed);
+        prefetch_column_terms(&tight_direct, &raw.table, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed),
+            before
+        );
+        assert_eq!(tight_direct.live_bytes(), 0);
+
+        // With room for `ids_bytes`, prefetch admits, allocates, and releases cleanly.
+        let mut ok_direct = Ctx::new(snap.clone());
+        ok_direct.mem_limit = ids_bytes * 2;
+        let before = PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed);
+        prefetch_column_terms(&ok_direct, &raw.table, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed),
+            before + 1
+        );
+        assert_eq!(ok_direct.live_bytes(), 0);
+        // Generic `apply_filter` (`topk_read_keys_last` `spec.filter` path) with a budget
+        // 1 byte below `raw_bytes + filter_scratch + ids_bytes` skips the optional 16 KiB
+        // prefetch vector via scalar fallback and still evaluates all 2,048 rows within budget.
+        let filter_scratch = (n as u64).saturating_add(
+            (probe.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
+        );
+        let mut tight_filter = Ctx::new(snap.clone());
+        tight_filter.opt.prefetch_terms = true;
+        tight_filter.mem_limit = raw_bytes + filter_scratch + ids_bytes - 1;
+        let held = tight_filter.charge(raw_bytes + filter_scratch).unwrap();
+        let mut tbl = raw.table.clone();
+        let before = PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed);
+        apply_filter(&tight_filter, &mut tbl, &spec.range_filter).unwrap();
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed),
+            before
+        );
+        assert_eq!(tbl.len(), n);
+        assert!(tight_filter.mem_peak() <= tight_filter.mem_limit);
+        drop(held);
+        drop(raw);
+        assert_eq!(probe.live_bytes(), 0);
+
+        // End-to-end `topk_read` (`exact = false`) over the 2,048 `Numeric::Unknown` base
+        // decimals keeps every row and releases the table charge cleanly.
+        let ok_topk = Ctx::new(snap);
+        let (filtered, scanned) = topk_read(&ok_topk, &spec, lo, hi, false, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.len(), n);
+        let before_drop = ok_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ok_topk.live_bytes(), raw_bytes);
     }
 
     #[test]

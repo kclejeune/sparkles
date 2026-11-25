@@ -741,14 +741,25 @@ impl SpatialPfReader {
                 }
                 let (h_g, g_key) = (act.h_g, act.g_key);
                 let mut raw = Vec::new();
+                let base_now = bytes_for(
+                    &self.iter,
+                    self.pending_hits.capacity(),
+                    self.pending_feats.capacity(),
+                    self.seen_lit.capacity(),
+                    self.seen_geom.capacity(),
+                    self.seen_feat.capacity(),
+                );
+                let charge = &mut self.charge;
                 let ended = act.scan.as_mut().expect("link scan").next_chunk(
                     ctx,
                     &mut raw,
                     cap.clamp(64, 4096),
+                    &mut |raw_bytes| charge.resize(base_now.saturating_add(raw_bytes)),
                 )?;
                 if ended {
                     act.scan = None;
                 }
+                let raw_bytes = raw.capacity() as u64 * size_of::<[u64; 4]>() as u64;
                 let mut link_steps = 0usize;
                 for k in raw {
                     link_steps += 1;
@@ -771,22 +782,25 @@ impl SpatialPfReader {
                             || (out.len() >= cap
                                 && self.pending_feats.len() == self.pending_feats.capacity())
                         {
-                            self.charge.resize(bytes_for(
-                                &self.iter,
-                                self.pending_hits.capacity(),
-                                if out.len() >= cap {
-                                    next_cap(
-                                        self.pending_feats.len(),
-                                        self.pending_feats.capacity(),
-                                        1,
-                                    )
-                                } else {
-                                    self.pending_feats.capacity()
-                                },
-                                self.seen_lit.capacity(),
-                                self.seen_geom.capacity(),
-                                next_cap(self.seen_feat.len(), self.seen_feat.capacity(), 1),
-                            ))?;
+                            self.charge.resize(
+                                bytes_for(
+                                    &self.iter,
+                                    self.pending_hits.capacity(),
+                                    if out.len() >= cap {
+                                        next_cap(
+                                            self.pending_feats.len(),
+                                            self.pending_feats.capacity(),
+                                            1,
+                                        )
+                                    } else {
+                                        self.pending_feats.capacity()
+                                    },
+                                    self.seen_lit.capacity(),
+                                    self.seen_geom.capacity(),
+                                    next_cap(self.seen_feat.len(), self.seen_feat.capacity(), 1),
+                                )
+                                .saturating_add(raw_bytes),
+                            )?;
                         }
                         self.seen_feat.insert((f, g_key));
                         if out.len() < cap {
@@ -1101,7 +1115,13 @@ impl PrefixScan {
         }
     }
 
-    fn next_chunk(&mut self, ctx: &Ctx, out: &mut Vec<[u64; 4]>, limit: usize) -> Result<bool> {
+    fn next_chunk(
+        &mut self,
+        ctx: &Ctx,
+        out: &mut Vec<[u64; 4]>,
+        limit: usize,
+        admit: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<bool> {
         out.clear();
         if self.done {
             return Ok(true);
@@ -1116,12 +1136,22 @@ impl PrefixScan {
         let mut err: Option<Error> = None;
         ctx.snap.scan_between(self.perm, start, self.hi, |c| {
             let mut push = |k: [u64; 4]| -> Result<bool> {
-                last = Some(k);
                 scanned += 1;
                 if scanned.is_multiple_of(4096) {
                     ctx.check()?;
                 }
+                let elem = size_of::<[u64; 4]>();
+                let grew = out.len() == out.capacity();
+                if grew {
+                    let cur = out.capacity() as u64 * elem as u64;
+                    let next = vec_grown(out.capacity(), out.len(), 1, elem) as u64 * elem as u64;
+                    admit(cur.saturating_add(next))?;
+                }
                 out.push(k);
+                if grew {
+                    admit(out.capacity() as u64 * elem as u64)?;
+                }
+                last = Some(k);
                 if out.len() >= limit {
                     stopped = true;
                     return Ok(false);
@@ -1569,16 +1599,27 @@ impl SpatialRelateReader {
             let mut scan = PrefixScan::new(Perm::Pos, &[link.0, s.0]);
             let mut raw = Vec::new();
             loop {
-                let ended = scan.next_chunk(ctx, &mut raw, 4096)?;
+                let base_now = self
+                    .base_retained_bytes()
+                    .saturating_add(extra_bytes)
+                    .saturating_add(out.capacity() as u64 * size_of::<Id>() as u64);
+                let charge = &mut self.charge;
+                let ended = scan.next_chunk(ctx, &mut raw, 4096, &mut |raw_bytes| {
+                    charge.resize(base_now.saturating_add(raw_bytes))
+                })?;
+                let raw_bytes = raw.capacity() as u64 * size_of::<[u64; 4]>() as u64;
                 for &k in &raw {
                     let g1 = k[3];
                     if (same && g1 == g.0) || (!same && self.spec.graph.accepts(g1)) {
                         if out.len() == out.capacity() {
+                            let cur_out = out.capacity() as u64 * size_of::<Id>() as u64;
                             let next_out = next_cap(out.len(), out.capacity(), 1) as u64
                                 * size_of::<Id>() as u64;
                             self.charge.resize(
                                 self.base_retained_bytes()
                                     .saturating_add(extra_bytes)
+                                    .saturating_add(raw_bytes)
+                                    .saturating_add(cur_out)
                                     .saturating_add(next_out),
                             )?;
                         }
@@ -1589,6 +1630,7 @@ impl SpatialRelateReader {
                     break;
                 }
             }
+            drop(raw);
             out.sort_unstable();
             out.dedup();
             out.shrink_to_fit();
@@ -1755,16 +1797,24 @@ impl SpatialRelateReader {
                     let mut scan = PrefixScan::new(Perm::Pso, &[p.0]);
                     let mut raw = Vec::new();
                     loop {
-                        let ended = scan.next_chunk(ctx, &mut raw, 4096)?;
+                        let base_now = self
+                            .base_retained_bytes()
+                            .saturating_add(rows.capacity() as u64 * size_of::<Ser>() as u64);
+                        let charge = &mut self.charge;
+                        let ended = scan.next_chunk(ctx, &mut raw, 4096, &mut |raw_bytes| {
+                            charge.resize(base_now.saturating_add(raw_bytes))
+                        })?;
                         let raw_bytes = raw.capacity() as u64 * size_of::<[u64; 4]>() as u64;
                         for &k in &raw {
                             if self.ser_graph(ctx, k[3]) {
                                 if rows.len() == rows.capacity() {
+                                    let cur_rows = rows.capacity() as u64 * size_of::<Ser>() as u64;
                                     let next_rows = next_cap(rows.len(), rows.capacity(), 1) as u64
                                         * size_of::<Ser>() as u64;
                                     self.charge.resize(
                                         self.base_retained_bytes()
                                             .saturating_add(raw_bytes)
+                                            .saturating_add(cur_rows)
                                             .saturating_add(next_rows),
                                     )?;
                                 }
@@ -2166,6 +2216,7 @@ impl SpatialRelateReader {
                 self.update_charge()?;
                 return Ok(false);
             }
+            let asserted_base = self.base_retained_bytes();
             match &mut self.stage {
                 RelateStage::Done => {
                     self.update_charge()?;
@@ -2175,19 +2226,25 @@ impl SpatialRelateReader {
                     let o_filter = *o_filter;
                     let perm = scan.perm;
                     let mut raw = Vec::new();
-                    let ended = scan.next_chunk(ctx, &mut raw, cap.clamp(64, 4096))?;
+                    let charge = &mut self.charge;
+                    let ended =
+                        scan.next_chunk(ctx, &mut raw, cap.clamp(64, 4096), &mut |raw_bytes| {
+                            charge.resize(asserted_base.saturating_add(raw_bytes))
+                        })?;
                     if ended {
                         self.stage = RelateStage::EnterDerived;
                     }
+                    let raw_bytes = raw.capacity() as u64 * size_of::<[u64; 4]>() as u64;
                     for k in raw {
                         let q = perm.to_quad(&k);
                         if self.spec.graph.accepts(q[3].0)
                             && o_filter.is_none_or(|o| o == q[2])
-                            && self.record_emit_charged(ctx, q[0], q[2], q[3], 0)?
+                            && self.record_emit_charged(ctx, q[0], q[2], q[3], raw_bytes)?
                         {
                             self.asserted_count += 1;
                         }
                     }
+                    self.update_charge()?;
                     self.update_charge()?;
                 }
                 RelateStage::EnterDerived => {
@@ -2413,8 +2470,23 @@ impl SpatialRelateReader {
                                 }
                                 if !cand_done && let Some(sc) = scan {
                                     let mut raw = Vec::new();
-                                    let ended =
-                                        sc.next_chunk(ctx, &mut raw, cap.clamp(64, 4096))?;
+                                    let base_now = self
+                                        .base_retained_bytes()
+                                        .saturating_add(fixed_stage_bytes)
+                                        .saturating_add(
+                                            pending_sers.capacity() as u64
+                                                * size_of::<Ser>() as u64,
+                                        )
+                                        .saturating_add(lit_pass_bytes(&lit_pass));
+                                    let charge = &mut self.charge;
+                                    let ended = sc.next_chunk(
+                                        ctx,
+                                        &mut raw,
+                                        cap.clamp(64, 4096),
+                                        &mut |raw_bytes| {
+                                            charge.resize(base_now.saturating_add(raw_bytes))
+                                        },
+                                    )?;
                                     if ended {
                                         *scan = None;
                                     }
@@ -2468,6 +2540,15 @@ impl SpatialRelateReader {
                                         }
                                         pending_sers.push_back(ser);
                                     }
+                                    let settled = self
+                                        .base_retained_bytes()
+                                        .saturating_add(fixed_stage_bytes)
+                                        .saturating_add(
+                                            pending_sers.capacity() as u64
+                                                * size_of::<Ser>() as u64,
+                                        )
+                                        .saturating_add(lit_pass_bytes(&lit_pass));
+                                    self.charge.resize(settled)?;
                                 }
                             }
                             OneConstCand::Done => {}
@@ -4891,10 +4972,14 @@ mod tests {
         let geom = ctx.snap.lookup_iri("urn:geometry").unwrap();
         let mut scan = PrefixScan::new(Perm::Pos, &[link.0, geom.0]);
         let mut raw = Vec::new();
-        assert!(!scan.next_chunk(&ctx, &mut raw, 64).unwrap());
+        assert!(
+            !scan
+                .next_chunk(&ctx, &mut raw, 64, &mut |_| Ok(()))
+                .unwrap()
+        );
         assert_eq!(raw.len(), 64);
         ctx.cancel.store(true, Ordering::Relaxed);
-        let result = scan.next_chunk(&ctx, &mut raw, 4096);
+        let result = scan.next_chunk(&ctx, &mut raw, 4096, &mut |_| Ok(()));
         assert!(matches!(result, Err(Error::Cancelled)));
         assert_eq!(raw.len(), 4095);
     }
@@ -5166,11 +5251,11 @@ mod tests {
         drop(probe_reader);
         assert_eq!(full_ctx_unbounded.live_bytes(), before_drop - held);
 
-        // At 4,000 distinct literals, `new_geoms (204,816) + old_lit_pass (69,648) + new_lit_pass (139,280)`
-        // alone exceeds 400 KiB even if caches stay empty, whereas the old 10-byte `lit_pass` estimate
-        // only charged 71,680 bytes total across old + delta.
-        let mut full_ctx = Ctx::new(snap);
-        full_ctx.mem_limit = 400 * 1024;
+        // At 4,000 distinct literals, both `(Id, Option<GeomRef>)` and `(Id, bool)` are 16 bytes,
+        // so `new_geoms (139,280) + old_lit_pass (69,648) + new_lit_pass (139,280) = 348,208` bytes
+        // even before cache reservations; a 340 KiB cap refuses before `lit_pass` can grow to 7,168.
+        let mut full_ctx = Ctx::new(snap.clone());
+        full_ctx.mem_limit = 340 * 1024;
         let full_ctx = Arc::new(full_ctx);
         let full_spec = make_spec(full_ctx.intern_term(&poly_term), q_geom);
         let mut tight_reader = SpatialRelateReader::open(&full_ctx, &full_spec, &[0]).unwrap();
@@ -5191,5 +5276,93 @@ mod tests {
         let before_drop = full_ctx.live_bytes();
         drop(tight_reader);
         assert_eq!(full_ctx.live_bytes(), before_drop - held);
+    }
+
+    #[test]
+    fn r4_one_const_fallback_scan_admits_key_chunk_before_push() {
+        use crate::io::Source;
+        use oxrdfio::RdfFormat;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n");
+        for i in 0..4096 {
+            data.push_str(&format!(
+                "<urn:p:{i}> geo:asWKT \"POINT(5.{i:04} 5)\"^^geo:wktLiteral .\n"
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let pred = snap.lookup_iri(vocab::AS_WKT).unwrap();
+
+        // Direct `PrefixScan::next_chunk` check: refusing the initial 0 -> 4 allocation leaves `raw` empty.
+        let direct_ctx = Ctx::new(snap.clone());
+        let mut scan = PrefixScan::new(Perm::Pso, &[pred.0]);
+        let mut raw = Vec::new();
+        let err = scan
+            .next_chunk(&direct_ctx, &mut raw, 4096, &mut |bytes| {
+                assert_eq!(bytes, 4 * size_of::<[u64; 4]>() as u64);
+                Err(Error::BudgetExceeded(Budget {
+                    kind: BudgetKind::Memory,
+                    limit: bytes - 1,
+                    requested: bytes,
+                }))
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory));
+        assert_eq!(raw.capacity(), 0);
+        assert!(raw.is_empty());
+
+        // Fallback `OneConstCand::Scan` with a 4,096-row pull (128 KiB key chunk + doubling overlap)
+        // refuses inside `PrefixScan::next_chunk` before reaching any candidate geometry lookup.
+        let poly_term: oxrdf::Term = oxrdf::Literal::new_typed_literal(
+            "POLYGON((0 0, 10 0, 10 1, 1 1, 1 10, 0 10, 0 0))",
+            oxrdf::NamedNode::new_unchecked(vocab::WKT_LITERAL),
+        )
+        .into();
+        let mut ctx = Ctx::new(snap);
+        let q_lit = ctx.intern_term(&poly_term);
+        let q_geom = {
+            let v = ctx.value(q_lit).unwrap();
+            ctx.geo
+                .get_or_parse_charged(&ctx, MemoKey::Id(q_lit), || {
+                    parse_value(&v, max_vertices(&ctx))
+                })
+                .unwrap()
+        };
+        let warm_bytes = ctx.live_bytes();
+        // Fits setup and a 1,024-key chunk (32 KiB) but cannot fit the 4,096-key chunk (128 KiB + 64 KiB overlap).
+        ctx.mem_limit = warm_bytes + 64 * 1024;
+        let ctx = Arc::new(ctx);
+        let spec = SpatialRelateSpec {
+            rel: Relation::SfIntersects,
+            subject: RelateEnd::Geometry(q_lit, q_geom),
+            object: RelateEnd::Var(0),
+            property: None,
+            graph: GraphFilter::Default,
+            graph_var: None,
+            dedup: false,
+            key: 0,
+        };
+        let mut reader = SpatialRelateReader::open(&ctx, &spec, &[0]).unwrap();
+        let mut out = Table::new(vec![0]);
+        let err = reader.next(&ctx, &mut out, 4096).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory
+        ));
+        assert_eq!(
+            reader.st.candidates, 0,
+            "must refuse inside PrefixScan::next_chunk before consuming the key chunk"
+        );
+        let held = reader.charge.bytes();
+        let before_drop = ctx.live_bytes();
+        drop(reader);
+        assert_eq!(ctx.live_bytes(), before_drop - held);
     }
 }

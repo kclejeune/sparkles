@@ -1126,3 +1126,46 @@ fn native_one_constant_relation_admits_lit_pass_memo() {
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[cfg(feature = "geo")]
+#[test]
+fn native_one_constant_relation_fallback_admits_key_chunk() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix geo: <http://www.opengis.net/ont/geosparql#> .\n");
+    for i in 0..4096 {
+        data.push_str(&format!(
+            "<urn:p:{i}> geo:asWKT \"POINT(5.{:04} 5)\"^^geo:wktLiteral .\n",
+            i % 64
+        ));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    // `geo:sfDisjoint` is not index-usable, so SpatialRelate takes the `OneConstCand::Scan`
+    // fallback arm with a 4,096-key chunk pull while every point lies inside the query polygon.
+    s.enable_geo(sparkles_core::geo::GeoConfig {
+        query_rewrite: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let q = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> SELECT ?s { ?s geo:sfDisjoint \"POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))\"^^geo:wktLiteral }";
+    let _ = run_under(&s, q, false, 4096, 512 << 10, None);
+    let audit = run_under(&s, q, false, 4096, 512 << 10, None);
+    assert_eq!(audit.rows, 0);
+    target(&audit.plan, "SpatialRelate", true).unwrap();
+    let plan = serde_json::from_str(&audit.plan).unwrap();
+    assert!(nodes(&plan).into_iter().any(|node| {
+        node["operator"]["operator"] == "SpatialRelate"
+            && node["operator"]["counters"]["candidates"] == 4096
+            && node["operator"]["counters"]["treeNodesVisited"] == 0
+    }));
+    let failures = audit.check(
+        "one-constant SpatialRelate fallback scan",
+        &Allowance::EXACT,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
