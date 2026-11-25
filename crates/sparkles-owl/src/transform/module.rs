@@ -4,7 +4,7 @@
 //! classes, as ROBOT writes the `BOT` module that its `extract` computes. The module
 //! holds every justification of each entailment over the signature.
 //!
-//! [`coverage`] decides, for a classification that left axioms out, which classes still
+//! [`coverage_refs`] decides, for a classification that left axioms out, which classes still
 //! have their complete answer and whether the run's consistency holds for the whole
 //! ontology. Its soundness rests on the locality rules below, so a rule that is unsure
 //! calls an axiom non-local, which only makes a module larger.
@@ -113,7 +113,7 @@ pub struct Coverage {
 /// own deadline.
 pub type Dropped<'d> = dyn FnMut(&mut dyn FnMut(&AxiomKind) -> bool) -> bool + 'd;
 
-/// Why [`coverage`] stopped before an answer: its caller's stop said so.
+/// Why [`coverage_refs`] stopped before an answer: its caller's stop said so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Stopped;
 

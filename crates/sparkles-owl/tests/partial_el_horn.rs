@@ -1,7 +1,9 @@
 //! Partial classification answers for EL (`Plain`, `Full`) and Horn (`Horn`, `HornFull`)
 //! tiers (roadmap item 714).
 
-use sparkles_owl::classify::{Classification, Classifier, Consistency, Error, Limits, Tier};
+use sparkles_owl::classify::{
+    Classification, Classifier, Consistency, Error, Limits, Tier, Unmapped,
+};
 use sparkles_owl::model::*;
 use sparkles_owl::ofn_read;
 use std::collections::BTreeSet;
@@ -1218,4 +1220,36 @@ fn classification_public_fields_allow_literal_and_exhaustive_destructuring() {
     };
     assert!(rebuilt.complete && rebuilt.consistent);
     assert_eq!(rebuilt.consistency, Consistency::Consistent);
+}
+
+#[test]
+fn bare_coverage_mutators_preserve_memory_estimates() {
+    let ax = axioms("SubClassOf(:A :B) SubClassOf(:B ObjectUnionOf(:C :D)) SubClassOf(:X :Y)");
+    let limits = Limits {
+        el_only: true,
+        cover_later: true,
+        ..Limits::default()
+    };
+    let mut classifier = Classifier::of(&ax);
+    let mut out = classifier.classify(&limits).unwrap();
+    out.incomplete.push(Class::new(format!("{EX}X")));
+    let memory = out.stats.memory;
+    let peak = out.stats.peak_memory;
+    let kinds: Vec<_> = ax.iter().map(|a| &a.kind).collect();
+
+    out.cover(&kinds, &classifier.excluded(), None, &limits);
+    let after_cover = (out.stats.memory, out.stats.peak_memory);
+    assert!(out.incomplete.contains(&Class::new(format!("{EX}A"))));
+    assert!(out.incomplete.contains(&Class::new(format!("{EX}X"))));
+    assert!(!out.incomplete.contains(&Class::new(format!("{EX}Y"))));
+
+    out.leave_out_unmapped(Unmapped {
+        count: 1,
+        ..Unmapped::default()
+    });
+    assert!(out.incomplete.contains(&Class::new(format!("{EX}Y"))));
+    assert_eq!(out.consistency, Consistency::Unknown);
+    assert_eq!(out.stats.unmapped, 1);
+    assert_eq!(after_cover, (memory, peak));
+    assert_eq!((out.stats.memory, out.stats.peak_memory), (memory, peak));
 }

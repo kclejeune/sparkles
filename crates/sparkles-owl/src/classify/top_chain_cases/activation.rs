@@ -701,10 +701,18 @@ fn paid_horn_fallback_keeps_legacy_top_chain_answer() {
         .unwrap();
     assert!(!old.taxonomy.is_subclass(&class("A"), &class("D")));
 
+    // Set the cap from saturation and taxonomy so the refusal exercises tier fallback.
     let horn_grant = Arc::new(accounting::Grant::default());
     let mut full = Saturation::new();
     let horn = full
-        .classify(&input, None, &horn_grant.limits(usize::MAX))
+        .classify(
+            &input,
+            None,
+            &Limits {
+                cover_later: true,
+                ..horn_grant.limits(usize::MAX)
+            },
+        )
         .unwrap();
     assert_eq!(horn.stats.tier, Tier::Horn);
     assert!(!horn.stats.horn_over_budget);
