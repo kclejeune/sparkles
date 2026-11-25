@@ -1695,6 +1695,97 @@ pub fn candidates(
     out
 }
 
+/// Whether `x` has an untested candidate subsumer in the canonical model of its
+/// disjunctive clauses, admitting its scratch against `admit` before allocation.
+/// Returns `true` (conservatively treating `x` as incomplete) if admission or allocation
+/// fails.
+pub(super) fn has_pending_candidate(
+    ix: &Index,
+    ctx: &super::saturate::Contexts,
+    x: Ex,
+    tested: &FxHashSet<(Ex, Ex)>,
+    admit: &mut dyn FnMut(usize) -> bool,
+) -> bool {
+    let Some(c) = ctx.get(x as usize).and_then(|c| c.get()) else {
+        return false;
+    };
+    let st = c.st.lock();
+    if st.bottom {
+        return false;
+    }
+    let Some(d) = dl(&st) else {
+        return false;
+    };
+    let mut eligible = 0usize;
+    let mut max_head = 0usize;
+    for s in &d.store.clauses {
+        if !s.dead && s.c.body().is_empty() {
+            eligible += 1;
+            max_head = max_head.max(s.c.head().len());
+        }
+    }
+    if eligible == 0 {
+        return false;
+    }
+    let cs_bytes = eligible.checked_mul(std::mem::size_of::<((u8, Ex), &Clause)>());
+    let max_bytes = max_head.checked_mul(std::mem::size_of::<Lit>());
+    // Conservative hash-table estimate for `FxHashSet<Ex>` holding up to `eligible` entries.
+    let model_bytes = eligible
+        .checked_mul(8)
+        .and_then(|n| n.checked_div(7))
+        .and_then(|n| n.checked_next_power_of_two())
+        .and_then(|b| b.checked_mul(std::mem::size_of::<Ex>() + 1))
+        .and_then(|b| b.checked_add(16));
+    let Some(scratch) = cs_bytes
+        .and_then(|a| a.checked_add(max_bytes?))
+        .and_then(|a| a.checked_add(model_bytes?))
+    else {
+        return true;
+    };
+    if !admit(scratch) {
+        return true;
+    }
+    let mut max = Vec::new();
+    if max.try_reserve_exact(max_head).is_err() {
+        return true;
+    }
+    let mut cs: Vec<((u8, Ex), &Clause)> = Vec::new();
+    if cs.try_reserve_exact(eligible).is_err() {
+        return true;
+    }
+    for s in &d.store.clauses {
+        if s.dead || !s.c.body().is_empty() {
+            continue;
+        }
+        s.c.maximal(ix, &mut max);
+        if let [m] = max.as_slice()
+            && m.kind() == X
+        {
+            cs.push((super::dl_clause::rank(ix, m.atom()), &s.c));
+        }
+    }
+    cs.sort_by_key(|&(k, _)| k);
+    let mut model: FxHashSet<Ex> = FxHashSet::default();
+    if model.try_reserve(cs.len()).is_err() {
+        return true;
+    }
+    for (k, c) in cs {
+        let a = k.1;
+        let holds = c
+            .head()
+            .iter()
+            .any(|l| l.kind() == X && (st.subs.contains(&l.atom()) || model.contains(&l.atom())));
+        if holds {
+            continue;
+        }
+        model.insert(a);
+        if a != x && matches!(ix.head(a).node, Node::Class(_)) && !tested.contains(&(x, a)) {
+            return true;
+        }
+    }
+    false
+}
+
 pub(super) fn ds(st: &mut State) -> &mut DlSt {
     st.extra().dl.get_or_insert_with(Box::default)
 }
@@ -7189,119 +7280,6 @@ fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex
         }
     }
     v
-}
-
-/// Whether the ontology has a model, as far as a stopped run of Tier D knows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Known {
-    Consistent,
-    Inconsistent,
-    Unknown,
-}
-
-/// The dependency record of a run of Tier D that stopped: which roots have their whole
-/// answer, and whether the ontology's consistency is decided.
-///
-/// A context's units and unsatisfiability depend only on the contexts it reaches forward:
-/// the successors of its existential restrictions, the hypothetical successors it
-/// registered with and the targets of its forward links. A predecessor's later markers
-/// make clauses whose bodies only that predecessor resolves. A context is closed when it
-/// has started and its to-do list and clause queue are empty, which a stopped worker's
-/// returned conclusions and delivered outbox make false where work was left. A root is
-/// complete when every context it reaches is closed, no candidate of its tests is left
-/// untested, and the ontology is consistent. The ontology is consistent when `owl:Thing`'s
-/// context and every context it reaches are closed and it is satisfiable, and
-/// inconsistent when that context is unsatisfiable, whatever else is open.
-pub fn record(
-    ix: &Index,
-    ctx: &super::saturate::Contexts,
-    dynamic: Option<&super::saturate::Dynamic>,
-    roots: &[Ex],
-    refuted: &FxHashSet<(Ex, Ex)>,
-) -> (Vec<bool>, Known) {
-    let n = ctx.len() as Ex;
-    let get = |e: Ex| -> Option<&super::saturate::Ctx> {
-        if e < n {
-            ctx[e as usize].get().map(|c| &**c)
-        } else {
-            dynamic.map(|d| d.ctx(e))
-        }
-    };
-    let all: Vec<Ex> = (0..n)
-        .chain(dynamic.map_or(0..0, |d| n..n + d.len() as Ex))
-        .collect();
-    // the contexts that are not closed, and the reverse of the forward edges
-    let mut open: FxHashSet<Ex> = FxHashSet::default();
-    let mut rev: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
-    let mut reached: Vec<Ex> = Vec::new();
-    for &e in &all {
-        let Some(c) = get(e) else { continue };
-        let st = c.st.lock();
-        let started = c.started.load(Ordering::Acquire) && st.init;
-        let idle = !st.interrupted && dl(&st).is_none_or(|d| d.is_idle());
-        if !started || !idle || !c.todo.lock().is_empty() {
-            open.insert(e);
-        }
-        let mut edge = |to: Ex| {
-            rev.entry(to).or_default().push(e);
-            reached.push(to);
-        };
-        for &d in &st.subs {
-            if let Node::Exist(..) = ix.head(d).node {
-                edge(ix.head(d).succ);
-            }
-        }
-        if let Some(d) = dl(&st) {
-            for &(_, v) in d.edges() {
-                edge(v);
-            }
-        }
-        for &(_, f) in &st.fwd.list {
-            edge(f);
-        }
-    }
-    // a context reached but never made has not started either, nor has a root's that
-    // the run stopped before it made
-    for e in reached.into_iter().chain(roots.iter().copied()) {
-        if get(e).is_none() {
-            open.insert(e);
-        }
-    }
-    // the contexts that reach an open one
-    let mut bad = open.clone();
-    let mut stack: Vec<Ex> = open.into_iter().collect();
-    while let Some(e) = stack.pop() {
-        for &p in rev.get(&e).into_iter().flatten() {
-            if bad.insert(p) {
-                stack.push(p);
-            }
-        }
-    }
-    let unsat = |e: Ex| {
-        ctx.get(e as usize)
-            .and_then(|c| c.get())
-            .is_some_and(|c| c.st.lock().bottom)
-    };
-    let known = if unsat(TOP) {
-        Known::Inconsistent
-    } else if !bad.contains(&TOP) {
-        Known::Consistent
-    } else {
-        Known::Unknown
-    };
-    let pending: FxHashSet<Ex> = candidates(ix, ctx, roots, refuted)
-        .into_iter()
-        .map(|(x, _)| x)
-        .collect();
-    let complete = roots
-        .iter()
-        .map(|&r| match known {
-            Known::Inconsistent => true,
-            Known::Unknown => false,
-            Known::Consistent => !bad.contains(&r) && !pending.contains(&r),
-        })
-        .collect();
-    (complete, known)
 }
 
 #[cfg(test)]

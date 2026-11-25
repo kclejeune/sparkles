@@ -91,6 +91,7 @@ mod horn_range_tests;
 mod horn_rules;
 mod index;
 mod numeric;
+mod partial;
 mod query;
 #[cfg(test)]
 mod retained_accounting_tests;
@@ -518,10 +519,11 @@ pub struct Limits {
     /// told each growth of the estimated memory, in bytes: false stops the run as over
     /// its memory budget, as a server's memory pool refuses a grant
     pub charge: Option<std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync>>,
-    /// a run with Tier D (roadmap item 603) that its deadline, cancellation or memory
-    /// budget stops answers with what it proved, in a [`Classification`] whose
+    /// a classification run (EL, Horn, or Tier D; roadmap items 603 and 714) that its
+    /// deadline, cancellation or memory budget stops after saturation begins answers with
+    /// what it proved, in a [`Classification`] whose
     /// [`complete_for_taken`](Classification::complete_for_taken) is false, instead of
-    /// failing. Runs of the other tiers fail as before.
+    /// failing.
     pub partial: bool,
     /// refuse a run that leaves an axiom out or uses one only in part with
     /// [`Error::Incomplete`], after the run, as a complete reasoner such as HermiT
@@ -1380,8 +1382,8 @@ pub struct Saturation {
     dl_attempt: bool,
     /// set by a run of Tier D that passed its bound on derived conclusions
     dl_worked: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// set when a Tier D classification requesting partial answers cannot fit its
-    /// completed or stopped result, so the error does not retry without Tier D
+    /// set when a classification requesting partial answers cannot fit its completed or
+    /// stopped result, so the error does not silently fall back to a weaker tier
     partial_over: bool,
     /// A normalization resource halt must survive Horn/DL fallback unchanged.
     numeric_halt: bool,
@@ -3600,6 +3602,7 @@ impl Saturation {
         self.horn_tried = false;
         self.dl_tried = false;
         self.partial_over = false;
+        self.partial = None;
         self.numeric_halt = false;
         // the profile check of each axiom, which depends on it alone
         let outside: Vec<(usize, (String, String))> =
@@ -4137,6 +4140,7 @@ impl Saturation {
         } else {
             limits.max_memory
         };
+        let partial = limits.partial && with_taxonomy;
         // the pool has been charged for the peak of a parallel normalization
         let more = pre_sat.saturating_sub(normalized_peak);
         #[cfg(test)]
@@ -4144,6 +4148,9 @@ impl Saturation {
             LAST_ADAPTIVE_PREADMIT.with(|c| c.set(Some((normalized_peak, pre_sat, more))));
         }
         if pre_cap.is_some_and(|m| pre_sat > m) || charge_fn.is_some_and(|f| more > 0 && !f(more)) {
+            if partial {
+                self.partial_over = true;
+            }
             return Err(Error::Memory {
                 limit: pre_cap.unwrap_or(pre_sat),
                 used: pre_sat,
@@ -4187,7 +4194,7 @@ impl Saturation {
             },
             dynamic: dynamic.as_ref(),
             dl: dl_run.as_ref(),
-            partial: limits.partial && disj && with_taxonomy,
+            partial,
             steps,
         };
         let t = Instant::now();
@@ -4207,7 +4214,6 @@ impl Saturation {
         // fallback chain reads in `dl_worked`: a check that saw the bound passed but lost
         // the stop to the caller's deadline, cancellation or memory refusal does not count
         let mut over_work = false;
-        let partial = bounds.partial;
         let (sat_totals, sat_stop) =
             saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds);
         // Capture saturation counters, heap occupancy oracle, and winning stop reason
@@ -4372,38 +4378,70 @@ impl Saturation {
             return Err(h);
         }
         // the dependency record of a partial answer: the classes it leaves open and the
-        // consistency
-        let open = halted.as_ref().map(|_| {
-            #[cfg(test)]
-            if admission_test::observing() && matches!(halted, Some(Error::Memory { .. })) {
-                admission_test::observe(admission_test::Attempt::Dependencies {
-                    messages: admission_test::queued(&self.ctx, dynamic.as_ref()),
-                    peak: totals.peak,
-                    paid: totals.paid,
-                });
-            }
-            // The dependency record cannot see the work in the root, in what the root
-            // reaches or on a propagation to or from it, so a stopped rooted run leaves
-            // every class open and its consistency unknown.
-            if rooted.is_some() {
-                let incomplete: Vec<Ex> = roots.iter().copied().filter(|&r| r != TOP).collect();
-                return (incomplete, Consistency::Unknown);
-            }
-            let (complete, known) =
-                dl_rules::record(&ix, &self.ctx, dynamic.as_ref(), &roots, &refuted);
-            let incomplete: Vec<Ex> = roots
-                .iter()
-                .zip(complete)
-                .filter(|&(&r, c)| !c && r != TOP)
-                .map(|(&r, _)| r)
-                .collect();
-            let consistency = match known {
-                dl_rules::Known::Consistent => Consistency::Consistent,
-                dl_rules::Known::Inconsistent => Consistency::Inconsistent,
-                dl_rules::Known::Unknown => Consistency::Unknown,
-            };
-            (incomplete, consistency)
-        });
+        // consistency. For Tier D this runs immediately after saturation/tests; for EL and
+        // Horn it runs after Phase 2/3 so stops in marking, key merges, or worlds are also
+        // recorded cleanly.
+        let mut open = if disj {
+            halted.as_ref().map(|_| {
+                #[cfg(test)]
+                if admission_test::observing() && matches!(halted, Some(Error::Memory { .. })) {
+                    admission_test::observe(admission_test::Attempt::Dependencies {
+                        messages: admission_test::queued(&self.ctx, dynamic.as_ref()),
+                        peak: totals.peak,
+                        paid: totals.paid,
+                    });
+                }
+                let pending_count = self.pending_messages(dynamic.as_ref());
+                let live_now = self.live_record_bytes(
+                    &ix,
+                    held_bytes,
+                    ax.bytes(),
+                    roots.capacity() * 4,
+                    dynamic.as_ref(),
+                    dl_run.as_ref(),
+                    0,
+                    pending_count,
+                );
+                let memory_stop = matches!(halted, Some(Error::Memory { .. }));
+                let mut record_admit = |scratch: usize| -> bool {
+                    let Some(used) = live_now.checked_add(scratch) else {
+                        return false;
+                    };
+                    if limits.max_memory.is_some_and(|m| used > m) {
+                        return false;
+                    }
+                    if let Some(charge) = charge_fn {
+                        if memory_stop {
+                            if used > totals.paid {
+                                return false;
+                            }
+                        } else if !cover_memory(
+                            used,
+                            limits.max_memory,
+                            Some(charge),
+                            &mut totals.paid,
+                        ) {
+                            return false;
+                        }
+                    }
+                    totals.peak = totals.peak.max(used);
+                    true
+                };
+                partial::record(
+                    &ix,
+                    &self.ctx,
+                    dynamic.as_ref(),
+                    &roots,
+                    partial::RecordKind::Disj {
+                        rooted: rooted.is_some(),
+                        refuted: &refuted,
+                    },
+                    &mut record_admit,
+                )
+            })
+        } else {
+            None
+        };
         // A non-work stop already won and a partial answer is being constructed: disarm
         // adaptive work-bound enforcement on `dl_run` before the individual-marking round
         // so a previously latched adaptive guard cannot abort the partial answer with a
@@ -4416,14 +4454,14 @@ impl Saturation {
         }
         // Dependency recording has seen the stopped to-do lists. The messages still
         // occupy memory while marking and retained output run.
-        let pending_messages = || {
-            if charge_fn.is_some() && open.is_some() {
+        let pending_messages = |open_now: bool| {
+            if charge_fn.is_some() && open_now {
                 self.pending_messages(dynamic.as_ref())
             } else {
                 0
             }
         };
-        let mut pending = pending_messages();
+        let mut pending = pending_messages(open.is_some());
         #[cfg(test)]
         if open.is_some() && admission_test::observing() {
             admission_test::observe(admission_test::Attempt::Pending {
@@ -4452,13 +4490,21 @@ impl Saturation {
         // the real predecessors of the global state (roadmap item 692)
         let entangled = ix.has_individuals()
             && (totals.merged || !ix.universal.is_empty() || !ix.keys.is_empty() || horn);
-        if entangled {
+        let mut phase2_started = false;
+        if entangled && (disj || halted.is_none()) {
+            phase2_started = true;
             let mut seeds: Vec<(Ex, saturate::Concl)> = std::iter::once(TOP)
                 .chain(ix.nominals.iter().copied())
                 .map(|e| (e, saturate::Concl::Real))
                 .collect();
             loop {
-                poll(limits)?;
+                if let Err(e) = poll(limits) {
+                    if partial && !disj {
+                        halted = Some(e);
+                        break;
+                    }
+                    return Err(e);
+                }
                 #[cfg(test)]
                 let before = admission_test::observing()
                     .then(|| admission_test::queued(&self.ctx, dynamic.as_ref()));
@@ -4492,8 +4538,8 @@ impl Saturation {
                     paid_memory: totals.paid,
                     ..bounds
                 };
-                let more = saturate::saturate(&ix, &self.ctx, &[], &woken, &universal, &round)
-                    .map_err(stopped)?;
+                let (more, stop) =
+                    saturate::saturate_counted(&ix, &self.ctx, &[], &woken, &universal, &round);
                 totals = saturate::Totals {
                     conclusions: totals.conclusions + more.conclusions,
                     memory: more.memory,
@@ -4501,29 +4547,58 @@ impl Saturation {
                     paid: more.paid,
                     merged: totals.merged || more.merged,
                 };
-                pending = pending_messages();
+                if let Some(s) = stop {
+                    if partial && !disj {
+                        halted = Some(stopped(s));
+                        break;
+                    }
+                    return Err(stopped(s));
+                }
+                pending = pending_messages(open.is_some());
                 let view = world::GlobalAll {
                     ctx: &self.ctx,
                     dynamic: dynamic.as_ref(),
                 };
                 let facts = world::universal_facts(&ix, &view, &universal);
-                let key_budget = WorldBudget::start(
-                    limits,
-                    charge_fn,
-                    world_base(totals.memory, pending)?,
-                    &mut totals,
-                )?;
+                let key_base = match world_base(totals.memory, pending) {
+                    Ok(b) => b,
+                    Err(e) if partial && !disj => {
+                        halted = Some(e);
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
+                let key_budget = match WorldBudget::start(limits, charge_fn, key_base, &mut totals)
+                {
+                    Ok(b) => b,
+                    Err(e) if partial && !disj => {
+                        halted = Some(e);
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
                 let key_bound = |delta: isize| key_budget.tell(delta);
-                let merges = world::key_merges(&ix, &view, &key_bound).map_err(|h| {
-                    key_budget.stopped().err().unwrap_or_else(|| match h {
-                        index::Halt::Memory(used) => Error::Memory {
-                            limit: limits.max_memory.unwrap_or(usize::MAX),
-                            used,
-                        },
-                        index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
-                    })
-                })?;
-                key_budget.finish(&mut totals);
+                let merges = match world::key_merges(&ix, &view, &key_bound) {
+                    Ok(m) => {
+                        key_budget.finish(&mut totals);
+                        m
+                    }
+                    Err(h) => {
+                        key_budget.finish(&mut totals);
+                        let err = key_budget.stopped().err().unwrap_or_else(|| match h {
+                            index::Halt::Memory(used) => Error::Memory {
+                                limit: limits.max_memory.unwrap_or(usize::MAX),
+                                used,
+                            },
+                            index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+                        });
+                        if partial && !disj {
+                            halted = Some(err);
+                            break;
+                        }
+                        return Err(err);
+                    }
+                };
                 if facts.is_empty() && merges.is_empty() {
                     break;
                 }
@@ -4553,8 +4628,15 @@ impl Saturation {
         // real, each in a world of its own
         let mut world_bytes = 0usize;
         let mut world_live = 0usize;
-        if entangled {
-            let witnesses = world::witnesses(&ix, &self.ctx, dynamic.as_ref(), &universal);
+        let mut world_open: Option<(Vec<Ex>, Consistency)> = None;
+        if entangled && (disj || halted.is_none()) {
+            let phase12_consistent = self.consistent(&ax, &ix.nominals, rooted);
+            let skip_worlds = partial && !disj && !phase12_consistent;
+            let witnesses = if skip_worlds {
+                Vec::new()
+            } else {
+                world::witnesses(&ix, &self.ctx, dynamic.as_ref(), &universal)
+            };
             if !witnesses.is_empty() {
                 let classes = world::reaching(&ix, &self.ctx, dynamic.as_ref(), &witnesses);
                 let mut real: Vec<Ex> = (0..self.ctx.len() as Ex)
@@ -4570,176 +4652,344 @@ impl Saturation {
                 // the worlds running and the subsumers of those done count against the
                 // budget beside the saturated state, and the pool is charged for what
                 // passes the peak
-                let budget = WorldBudget::start(
-                    limits,
-                    charge_fn,
-                    world_base(totals.memory, pending)?,
-                    &mut totals,
-                )?;
-                #[cfg(test)]
-                let row_test = shared_world_found_row_tests::active();
-                #[cfg(test)]
-                let _row_phase = row_test
-                    .as_deref()
-                    .map(|test| test.phase(&budget, &self.interner, &classes, ix.dt.as_deref()));
-                #[cfg(test)]
-                let mixed_test = world_retirement_mixed_tests::active();
-                #[cfg(test)]
-                let _mixed_phase = mixed_test.as_deref().map(|test| {
-                    assert!(ix.dt.is_none(), "mixed fixture excludes checker ownership");
-                    test.phase(&budget, &classes, ix.top_chain.is_some(), self.worlds.len())
-                });
-                let bound = |delta: isize| budget.tell(delta);
-                let found = par_map(&classes, threads, MIN_CLASSES, |_offset, chunk| {
-                    #[cfg(test)]
-                    let mixed_worker = mixed_test
-                        .as_ref()
-                        .map(|test| test.worker(_offset, chunk, &budget));
-                    #[cfg(test)]
-                    let _row_worker = row_test.as_deref().map(|test| test.worker(_offset, chunk));
-                    let mut out = FoundWorldChunk {
-                        rows: Vec::with_capacity(chunk.len()),
-                        debit: FoundWorldDebit {
-                            budget: &budget,
-                            outstanding: 0,
-                        },
-                    };
-                    for &d in chunk {
-                        #[cfg(test)]
-                        if let Some(test) = row_test.as_deref() {
-                            test.before_world(_offset, out.rows.len())?;
-                        }
-                        #[cfg(test)]
-                        if let Some(worker) = &mixed_worker {
-                            worker.before_world(out.rows.len())?;
-                        }
-                        let w = world::World::new_with_budget(
-                            &ix,
-                            &self.ctx,
-                            dynamic.as_ref(),
-                            &universal,
-                            &real,
-                            &bound,
-                            &budget,
-                        );
-                        let f = w.classify(d)?;
-                        #[cfg(test)]
-                        if let Some(worker) = &mixed_worker {
-                            worker.after_world(d)?;
-                        }
-                        let kept = f
-                            .subs
-                            .len()
-                            .checked_mul(4)
-                            .and_then(|bytes| bytes.checked_add(48))
-                            .and_then(|bytes| isize::try_from(bytes).ok())
-                            .ok_or(index::Halt::Memory(usize::MAX))?;
-                        let outstanding = out
-                            .debit
-                            .outstanding
-                            .checked_add(kept)
-                            .ok_or(index::Halt::Memory(usize::MAX))?;
-                        #[cfg(test)]
-                        if let Some(test) = row_test.as_deref() {
-                            test.before_report(&budget, _offset, d, &f, kept as usize);
-                        }
-                        out.rows.push((d, f, kept));
-                        #[cfg(test)]
-                        if let Some(test) = row_test.as_deref() {
-                            test.before_post(out.rows.len());
-                        }
-                        #[cfg(test)]
-                        if let Some(worker) = &mixed_worker {
-                            worker.before_row_post(out.rows.len(), d, kept);
-                        }
-                        if !out.debit.post(kept, outstanding) {
-                            return Err(index::Halt::Stopped);
-                        }
-                        #[cfg(test)]
-                        if let Some(test) = row_test.as_deref() {
-                            test.admitted(_offset, d);
-                        }
-                        #[cfg(test)]
-                        if let Some(worker) = &mixed_worker {
-                            worker.admitted(d, kept);
-                        }
+                let wb_start = world_base(totals.memory, pending)
+                    .and_then(|b| WorldBudget::start(limits, charge_fn, b, &mut totals));
+                let budget = match wb_start {
+                    Ok(b) => Some(b),
+                    Err(e) if partial && !disj => {
+                        halted = Some(e);
+                        world_open = Some((classes.clone(), Consistency::Consistent));
+                        None
                     }
-                    Ok(out)
-                })
-                .into_iter()
-                .collect::<Result<Vec<_>, index::Halt>>();
-                #[cfg(test)]
-                if let Some(test) = row_test.as_deref() {
-                    test.collected(
-                        &budget,
-                        found
-                            .as_ref()
-                            .map(|chunks| chunks.iter().map(|chunk| chunk.rows.len()).sum())
-                            .map_err(|&halt| halt),
-                        ix.dt.as_deref(),
-                    );
-                }
-                #[cfg(test)]
-                if let Some(test) = mixed_test.as_deref() {
-                    test.collected(&budget, found.as_ref().err().copied());
-                }
-                budget.stopped()?;
-                let found = found.map_err(|h| match h {
-                    index::Halt::Memory(used) => Error::Memory {
-                        limit: limits.max_memory.unwrap_or(usize::MAX),
-                        used,
-                    },
-                    index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
-                })?;
-                budget.finish(&mut totals);
-                if charge_fn.is_some() {
-                    world_live = budget.held.load(Ordering::Relaxed).max(0) as usize;
-                    #[cfg(test)]
-                    if let Some(test) = row_test.as_deref() {
-                        test.pooled_live(world_live);
-                    }
-                }
-                for FoundWorldChunk { rows, mut debit } in found {
-                    // The iterator and each yielded row drop before the debit.
-                    for (d, f, kept) in rows {
-                        let next_bytes =
-                            world_bytes
-                                .checked_add(kept as usize)
-                                .ok_or(Error::Memory {
+                    Err(e) => return Err(e),
+                };
+                if let Some(budget) = budget {
+                    if partial && !disj {
+                        let bound = |delta: isize| budget.tell(delta);
+                        let chunks: Vec<(FoundWorldChunk<'_, '_>, Option<index::Halt>)> =
+                            par_map(&classes, threads, MIN_CLASSES, |_offset, chunk| {
+                                let mut out = FoundWorldChunk {
+                                    rows: Vec::with_capacity(chunk.len()),
+                                    debit: FoundWorldDebit {
+                                        budget: &budget,
+                                        outstanding: 0,
+                                    },
+                                };
+                                let mut chunk_halt = None;
+                                for &d in chunk {
+                                    let w = world::World::new_with_budget(
+                                        &ix,
+                                        &self.ctx,
+                                        dynamic.as_ref(),
+                                        &universal,
+                                        &real,
+                                        &bound,
+                                        &budget,
+                                    );
+                                    let f = match w.classify(d) {
+                                        Ok(f) => f,
+                                        Err(h) => {
+                                            chunk_halt = Some(h);
+                                            break;
+                                        }
+                                    };
+                                    let Some(kept) = f
+                                        .subs
+                                        .len()
+                                        .checked_mul(4)
+                                        .and_then(|bytes| bytes.checked_add(48))
+                                        .and_then(|bytes| isize::try_from(bytes).ok())
+                                    else {
+                                        chunk_halt = Some(index::Halt::Memory(usize::MAX));
+                                        break;
+                                    };
+                                    let Some(outstanding) = out.debit.outstanding.checked_add(kept)
+                                    else {
+                                        chunk_halt = Some(index::Halt::Memory(usize::MAX));
+                                        break;
+                                    };
+                                    out.rows.push((d, f, kept));
+                                    if !out.debit.post(kept, outstanding) {
+                                        out.rows.pop();
+                                        out.debit.outstanding -= kept;
+                                        budget.retire(kept);
+                                        chunk_halt = Some(index::Halt::Stopped);
+                                        break;
+                                    }
+                                }
+                                (out, chunk_halt)
+                            });
+                        budget.finish(&mut totals);
+                        let mut first_halt = None;
+                        for (_, h) in &chunks {
+                            if first_halt.is_none() && h.is_some() {
+                                first_halt = *h;
+                            }
+                        }
+                        let mut world_err = budget.stopped().err().or_else(|| {
+                            first_halt.map(|h| match h {
+                                index::Halt::Memory(used) => Error::Memory {
                                     limit: limits.max_memory.unwrap_or(usize::MAX),
-                                    used: usize::MAX,
-                                })?;
-                        let remaining = debit.outstanding - kept;
-                        #[cfg(test)]
-                        if let Some(test) = row_test.as_deref() {
-                            test.before_insert(self.worlds.len());
+                                    used,
+                                },
+                                index::Halt::Stopped => {
+                                    poll(limits).err().unwrap_or(Error::Cancelled)
+                                }
+                            })
+                        });
+                        if charge_fn.is_some() && world_err.is_none() {
+                            world_live = budget.held.load(Ordering::Relaxed).max(0) as usize;
                         }
-                        self.worlds.insert(d, (f.bottom, f.subs));
-                        world_bytes = next_bytes;
-                        debit.outstanding = remaining;
+                        for (FoundWorldChunk { rows, mut debit }, _) in chunks {
+                            for (d, f, kept) in rows {
+                                let Some(next_bytes) = world_bytes.checked_add(kept as usize)
+                                else {
+                                    world_err.get_or_insert(Error::Memory {
+                                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                                        used: usize::MAX,
+                                    });
+                                    break;
+                                };
+                                let remaining = debit.outstanding - kept;
+                                self.worlds.insert(d, (f.bottom, f.subs));
+                                world_bytes = next_bytes;
+                                debit.outstanding = remaining;
+                            }
+                        }
+                        if let Some(err) = world_err {
+                            halted = Some(err);
+                            let incomplete: Vec<Ex> = classes
+                                .into_iter()
+                                .filter(|d| !self.worlds.contains_key(d))
+                                .collect();
+                            world_open = Some((incomplete, Consistency::Consistent));
+                        }
+                    } else {
+                        #[cfg(test)]
+                        let row_test = shared_world_found_row_tests::active();
+                        #[cfg(test)]
+                        let _row_phase = row_test.as_deref().map(|test| {
+                            test.phase(&budget, &self.interner, &classes, ix.dt.as_deref())
+                        });
+                        #[cfg(test)]
+                        let mixed_test = world_retirement_mixed_tests::active();
+                        #[cfg(test)]
+                        let _mixed_phase = mixed_test.as_deref().map(|test| {
+                            assert!(ix.dt.is_none(), "mixed fixture excludes checker ownership");
+                            test.phase(&budget, &classes, ix.top_chain.is_some(), self.worlds.len())
+                        });
+                        let bound = |delta: isize| budget.tell(delta);
+                        let found = par_map(&classes, threads, MIN_CLASSES, |_offset, chunk| {
+                            #[cfg(test)]
+                            let mixed_worker = mixed_test
+                                .as_ref()
+                                .map(|test| test.worker(_offset, chunk, &budget));
+                            #[cfg(test)]
+                            let _row_worker =
+                                row_test.as_deref().map(|test| test.worker(_offset, chunk));
+                            let mut out = FoundWorldChunk {
+                                rows: Vec::with_capacity(chunk.len()),
+                                debit: FoundWorldDebit {
+                                    budget: &budget,
+                                    outstanding: 0,
+                                },
+                            };
+                            for &d in chunk {
+                                #[cfg(test)]
+                                if let Some(test) = row_test.as_deref() {
+                                    test.before_world(_offset, out.rows.len())?;
+                                }
+                                #[cfg(test)]
+                                if let Some(worker) = &mixed_worker {
+                                    worker.before_world(out.rows.len())?;
+                                }
+                                let w = world::World::new_with_budget(
+                                    &ix,
+                                    &self.ctx,
+                                    dynamic.as_ref(),
+                                    &universal,
+                                    &real,
+                                    &bound,
+                                    &budget,
+                                );
+                                let f = w.classify(d)?;
+                                #[cfg(test)]
+                                if let Some(worker) = &mixed_worker {
+                                    worker.after_world(d)?;
+                                }
+                                let kept = f
+                                    .subs
+                                    .len()
+                                    .checked_mul(4)
+                                    .and_then(|bytes| bytes.checked_add(48))
+                                    .and_then(|bytes| isize::try_from(bytes).ok())
+                                    .ok_or(index::Halt::Memory(usize::MAX))?;
+                                let outstanding = out
+                                    .debit
+                                    .outstanding
+                                    .checked_add(kept)
+                                    .ok_or(index::Halt::Memory(usize::MAX))?;
+                                #[cfg(test)]
+                                if let Some(test) = row_test.as_deref() {
+                                    test.before_report(&budget, _offset, d, &f, kept as usize);
+                                }
+                                out.rows.push((d, f, kept));
+                                #[cfg(test)]
+                                if let Some(test) = row_test.as_deref() {
+                                    test.before_post(out.rows.len());
+                                }
+                                #[cfg(test)]
+                                if let Some(worker) = &mixed_worker {
+                                    worker.before_row_post(out.rows.len(), d, kept);
+                                }
+                                if !out.debit.post(kept, outstanding) {
+                                    return Err(index::Halt::Stopped);
+                                }
+                                #[cfg(test)]
+                                if let Some(test) = row_test.as_deref() {
+                                    test.admitted(_offset, d);
+                                }
+                                #[cfg(test)]
+                                if let Some(worker) = &mixed_worker {
+                                    worker.admitted(d, kept);
+                                }
+                            }
+                            Ok(out)
+                        })
+                        .into_iter()
+                        .collect::<Result<Vec<_>, index::Halt>>();
                         #[cfg(test)]
                         if let Some(test) = row_test.as_deref() {
-                            test.after_insert(self.worlds.len());
+                            test.collected(
+                                &budget,
+                                found
+                                    .as_ref()
+                                    .map(|chunks| chunks.iter().map(|chunk| chunk.rows.len()).sum())
+                                    .map_err(|&halt| halt),
+                                ix.dt.as_deref(),
+                            );
+                        }
+                        #[cfg(test)]
+                        if let Some(test) = mixed_test.as_deref() {
+                            test.collected(&budget, found.as_ref().err().copied());
+                        }
+                        budget.stopped()?;
+                        let found = found.map_err(|h| match h {
+                            index::Halt::Memory(used) => Error::Memory {
+                                limit: limits.max_memory.unwrap_or(usize::MAX),
+                                used,
+                            },
+                            index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
+                        })?;
+                        budget.finish(&mut totals);
+                        if charge_fn.is_some() {
+                            world_live = budget.held.load(Ordering::Relaxed).max(0) as usize;
+                            #[cfg(test)]
+                            if let Some(test) = row_test.as_deref() {
+                                test.pooled_live(world_live);
+                            }
+                        }
+                        for FoundWorldChunk { rows, mut debit } in found {
+                            // The iterator and each yielded row drop before the debit.
+                            for (d, f, kept) in rows {
+                                let next_bytes = world_bytes.checked_add(kept as usize).ok_or(
+                                    Error::Memory {
+                                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                                        used: usize::MAX,
+                                    },
+                                )?;
+                                let remaining = debit.outstanding - kept;
+                                #[cfg(test)]
+                                if let Some(test) = row_test.as_deref() {
+                                    test.before_insert(self.worlds.len());
+                                }
+                                self.worlds.insert(d, (f.bottom, f.subs));
+                                world_bytes = next_bytes;
+                                debit.outstanding = remaining;
+                                #[cfg(test)]
+                                if let Some(test) = row_test.as_deref() {
+                                    test.after_insert(self.worlds.len());
+                                }
+                            }
+                        }
+                        #[cfg(test)]
+                        if admission_test::observing() {
+                            admission_test::observe(admission_test::Attempt::Joined {
+                                base: budget.base,
+                                live: budget.held.load(Ordering::Relaxed),
+                                rows: self
+                                    .worlds
+                                    .values()
+                                    .map(|(_, subs)| 48 + 4 * subs.len())
+                                    .sum(),
+                                paid: totals.paid,
+                            });
                         }
                     }
-                }
-                #[cfg(test)]
-                if admission_test::observing() {
-                    admission_test::observe(admission_test::Attempt::Joined {
-                        base: budget.base,
-                        live: budget.held.load(Ordering::Relaxed),
-                        rows: self
-                            .worlds
-                            .values()
-                            .map(|(_, subs)| 48 + 4 * subs.len())
-                            .sum(),
-                        paid: totals.paid,
-                    });
                 }
             }
             self.entangled = entangled;
         } else {
             self.entangled = false;
+        }
+        if !disj {
+            open = if let Some(wo) = world_open {
+                Some(wo)
+            } else {
+                halted.as_ref().map(|_| {
+                    let pending_count = self.pending_messages(dynamic.as_ref());
+                    let live_now = self.live_record_bytes(
+                        &ix,
+                        held_bytes,
+                        ax.bytes(),
+                        roots.capacity() * 4,
+                        dynamic.as_ref(),
+                        dl_run.as_ref(),
+                        world_bytes,
+                        pending_count,
+                    );
+                    let memory_stop = matches!(halted, Some(Error::Memory { .. }));
+                    let mut record_admit = |scratch: usize| -> bool {
+                        let Some(used) = live_now.checked_add(scratch) else {
+                            return false;
+                        };
+                        if limits.max_memory.is_some_and(|m| used > m) {
+                            return false;
+                        }
+                        if let Some(charge) = charge_fn {
+                            if memory_stop {
+                                if used > totals.paid {
+                                    return false;
+                                }
+                            } else if !cover_memory(
+                                used,
+                                limits.max_memory,
+                                Some(charge),
+                                &mut totals.paid,
+                            ) {
+                                return false;
+                            }
+                        }
+                        totals.peak = totals.peak.max(used);
+                        true
+                    };
+                    partial::record(
+                        &ix,
+                        &self.ctx,
+                        dynamic.as_ref(),
+                        &roots,
+                        partial::RecordKind::ElHorn {
+                            individuals: ix.has_individuals(),
+                            has_universal_or_keys: !ix.universal.is_empty() || !ix.keys.is_empty(),
+                            horn,
+                            phase2_started,
+                            individuals_list: &ax.individuals,
+                            nominals: &ix.nominals,
+                        },
+                        &mut record_admit,
+                    )
+                })
+            };
         }
         // a change after a run with the Horn normalization or Tier D saturates everything
         // again, unless the run's contexts depend on one another only in ways the
@@ -5023,6 +5273,35 @@ impl Saturation {
                 self.excluded.dedup();
             }
         }
+        let contexts_count = self.context_count(dynamic.as_ref());
+        let mut dynamic = dynamic;
+        if open.is_some() && !disj {
+            // Free conjunction contexts, waiting to-do buffers, and non-subsumer tables
+            // before admitting retained state and building the partial taxonomy.
+            dynamic = None;
+            for (e, cell) in self.ctx.iter().enumerate() {
+                if let Some(c) = cell.get() {
+                    *c.todo.lock() = Vec::new();
+                    let keep_subs = e as Ex == TOP
+                        || matches!(self.interner.nodes.get(e), Some(Node::Class(_)));
+                    let mut st = c.st.lock();
+                    if keep_subs {
+                        if st.bottom {
+                            st.subs = saturate::Subs::default();
+                        }
+                        st.props = Vec::new();
+                        st.back = Vec::new();
+                        st.fwd = saturate::Small::default();
+                        st.disj = FxHashMap::default();
+                        st.loops = Vec::new();
+                        st.extra = None;
+                    } else {
+                        *st = saturate::State::default();
+                    }
+                }
+            }
+            pending = 0;
+        }
         self.dynamic = dynamic;
         stats.marking = marking_start.elapsed();
         stats.saturation = t.elapsed();
@@ -5070,7 +5349,7 @@ impl Saturation {
         if !with_taxonomy {
             stats.memory = held;
             stats.peak_memory = totals.peak.max(held);
-            stats.contexts = self.context_count();
+            stats.contexts = contexts_count;
             poll(limits)?;
             return Ok(ControlFlow::Continue((consistent, None, stats)));
         }
@@ -5099,7 +5378,7 @@ impl Saturation {
         stats.taxonomy_memory = tax_bytes;
         stats.peak_memory = totals.peak.max(stats.memory).max(paid.get());
         stats.taxonomy = t.elapsed();
-        stats.contexts = self.context_count();
+        stats.contexts = contexts_count;
         if let Some((incomplete, consistency)) = open {
             let mut classes: Vec<Class> = incomplete
                 .into_iter()
@@ -5118,9 +5397,8 @@ impl Saturation {
     }
 
     /// The contexts saturated, those of the Horn rules' conjunctions included.
-    fn context_count(&self) -> usize {
-        self.ctx.iter().filter(|c| c.get().is_some()).count()
-            + self.dynamic.as_ref().map_or(0, |d| d.len())
+    fn context_count(&self, dynamic: Option<&saturate::Dynamic>) -> usize {
+        self.ctx.iter().filter(|c| c.get().is_some()).count() + dynamic.map_or(0, |d| d.len())
     }
 
     /// Whether the saturated contexts show a model: owl:Thing, the individuals and a rooted
@@ -5184,6 +5462,29 @@ impl Saturation {
                 .as_ref()
                 .map_or(0, |d| d.table.bytes() + d.lits.bytes())
             + world_bytes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn live_record_bytes(
+        &self,
+        ix: &Index,
+        held_bytes: usize,
+        ax_bytes: usize,
+        root_bytes: usize,
+        dynamic: Option<&saturate::Dynamic>,
+        dl_run: Option<&dl_rules::DlRun>,
+        world_bytes: usize,
+        pending_count: usize,
+    ) -> usize {
+        self.index_bytes(ix)
+            .saturating_add(held_bytes)
+            .saturating_add(ax_bytes)
+            .saturating_add(root_bytes)
+            .saturating_add(self.context_bytes())
+            .saturating_add(dynamic.map_or(0, |d| d.retained_bytes()))
+            .saturating_add(dl_run.map_or(0, |d| d.bytes()))
+            .saturating_add(world_bytes)
+            .saturating_add(pending_count.saturating_mul(std::mem::size_of::<saturate::Concl>()))
     }
 
     fn admit_retained(

@@ -337,7 +337,8 @@ pub struct State {
     pub bottom: bool,
     /// whether the context has an instance in every model
     pub real: bool,
-    /// whether a Tier D stop or memory refusal cut work short before a store was created
+    /// whether a stop or memory refusal cut an activation or flush short, so a partial
+    /// answer still marks this context open
     pub interrupted: bool,
     /// choices derived by Tier D since the last bounds poll (kept inline to avoid boxing
     /// `DlSt` solely to count choices)
@@ -982,7 +983,13 @@ impl Drop for PendingTagRetirement<'_, '_> {
                     let mut todo = ctx.todo.lock();
                     let before = todo.len();
                     todo.retain(|c| !matches!(c, Concl::TopChainSub(_)));
-                    self.run.credit((before - todo.len()) * CONCLUSION_BYTES);
+                    let removed = before - todo.len();
+                    if removed > 0 {
+                        self.run.credit(removed * CONCLUSION_BYTES);
+                        if self.run.bounds.partial {
+                            ctx.st.lock().interrupted = true;
+                        }
+                    }
                 }
             }
         }
@@ -1561,6 +1568,7 @@ pub struct Totals {
 /// Saturates `roots` and every context they reach. Contexts already saturated keep their
 /// conclusions and take new ones: `seeds` are contexts with conclusions waiting in their
 /// to-do lists. `universal` are subsumers of every context beyond the index's.
+#[cfg(test)]
 pub fn saturate(
     ix: &Index,
     ctx: &Contexts,
@@ -1622,8 +1630,7 @@ pub fn saturate_counted(
     };
     let pending_tags = ix.top_chain.as_ref().map(|_| {
         assert!(
-            !bounds.partial
-                && !bounds.steps
+            !bounds.steps
                 && bounds.dynamic.is_none()
                 && bounds.dl.is_none()
                 && ix.horn.is_none()
@@ -2665,8 +2672,8 @@ impl<'a> Run<'a> {
         let fwd_mark = marks.fwd.min(st.fwd.list.len());
         let props_mark = marks.props.min(st.props.len());
         let (new_fwd, old_fwd) = (&st.fwd.list[fwd_mark..], &st.fwd.list[..fwd_mark]);
-        // a check of the bounds after every SEND_EVERY messages, as the rules make them; a
-        // run that answers in part keeps sending, so that its contexts hold every product
+        // a check of the bounds after every SEND_EVERY messages, as the rules make them;
+        // if cut short, `Run::process` marks `st.interrupted = true` for partial answers
         let mut ok = true;
         'sources: for (i, (r1, srcs)) in st.back.iter().enumerate() {
             let mark = marks.back[i].min(srcs.list.len());
@@ -2709,9 +2716,7 @@ impl<'a> Run<'a> {
                         out.send_all(some, &marks.run);
                         if out.sent >= SEND_EVERY && !self.flush_sends(out, tally) {
                             ok = false;
-                            if !self.bounds.partial {
-                                break 'sources;
-                            }
+                            break 'sources;
                         }
                     }
                 }
@@ -2721,7 +2726,7 @@ impl<'a> Run<'a> {
         // source, old targets the new sources. Consecutive forward links by one role take
         // the same links, which go to their targets together, so that each target
         // receives its messages in the order of the forward links.
-        if ok || self.bounds.partial {
+        if ok {
             'targets: for (fwds, all) in [(new_fwd, true), (old_fwd, false)] {
                 let mut next = 0;
                 while next < fwds.len() {
@@ -2756,9 +2761,7 @@ impl<'a> Run<'a> {
                             out.send_all(some, &marks.run);
                             if out.sent >= SEND_EVERY && !self.flush_sends(out, tally) {
                                 ok = false;
-                                if !self.bounds.partial {
-                                    break 'targets;
-                                }
+                                break 'targets;
                             }
                         }
                     }
@@ -3754,7 +3757,10 @@ impl<'a> Run<'a> {
             });
         }
         if self.bounds.partial {
-            self.flush_links(&st, &mut out, tally);
+            let flushed = self.flush_links(&st, &mut out, tally);
+            if self.stopped() || !flushed {
+                st.interrupted = true;
+            }
         }
         tally.queued += std::mem::take(&mut out.sent) as isize;
         if self.bounds.partial && (taken.at < taken.batch.len() || !out.local.is_empty()) {
@@ -3763,6 +3769,8 @@ impl<'a> Run<'a> {
             let mut t = ctx.todo.lock();
             t.extend(taken.batch[taken.at..].iter().rev());
             t.append(out.local);
+            // Any remaining top-chain tags and queued items now belong to `ctx.todo`.
+            taken.active_run = None;
         }
         // the activation charges what it kept as it ends
         drop(out);
@@ -7046,6 +7054,169 @@ mod horn_accounting_tests {
         let mut want = vec![Concl::Sub(x2), Concl::Sub(x1)];
         want.extend(std::iter::repeat_n(Concl::Sub(TOP), 9));
         assert_eq!(*root.todo.lock(), want);
+        assert!(root.st.lock().interrupted);
+    }
+
+    /// A stopped partial activation whose `flush_links` exceeds `SEND_EVERY` breaks promptly
+    /// instead of fanning out unbounded messages, and sets `st.interrupted = true` so the
+    /// dependency record marks the context open (roadmap item 714).
+    #[test]
+    fn a_stopped_partial_flush_links_breaks_at_send_every_and_marks_interrupted() {
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let root = ctx[f.root as usize].get_or_init(Box::default);
+        let bounds = bounds(true);
+        let run = run(&f.ix, &ctx, &bounds);
+        run.batch.store(true, Ordering::Relaxed);
+        run.stop.store(STOP_MEMORY, Ordering::SeqCst);
+        // Many forward links + many backward sources produce far more than SEND_EVERY products.
+        {
+            let mut st = root.st.lock();
+            st.init = true;
+            for &t in &f.targets[..16] {
+                st.fwd.insert((f.r, t));
+            }
+            for i in 0..2048u32 {
+                let src = f.targets[(i as usize) % f.targets.len()];
+                st.back_by(f.s).list.push(src);
+            }
+        }
+        let mut marks = Marks::default();
+        let mut outbox = Outbox::default();
+        let mut local = Vec::new();
+        let mut mine = VecDeque::new();
+        let mut tally = Tally::default();
+        let st = root.st.lock();
+        let mut out = Out {
+            run: &run,
+            me: f.root,
+            local: &mut local,
+            woke: &mut mine,
+            outbox: &mut outbox,
+            marks: &mut marks,
+            pending: true,
+            sent: 0,
+            work: 0,
+            kept: 0,
+        };
+        let flushed = run.flush_links(&st, &mut out, &mut tally);
+        assert!(
+            !flushed,
+            "flush_links must break on STOP_MEMORY past SEND_EVERY"
+        );
+        assert!(
+            tally.queued < 2 * SEND_EVERY as isize,
+            "flush_links fanned out unbounded messages: {}",
+            tally.queued
+        );
+    }
+
+    /// When `functional` is aborted by `!reserve_data`, `Run::process` marks
+    /// `st.interrupted = true` in partial mode so the class stays incomplete.
+    #[test]
+    fn a_functional_data_refusal_marks_context_interrupted() {
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<urn:fn-int:>)
+             Prefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)
+             Ontology(
+                 FunctionalDataProperty(:p)
+                 SubClassOf(:A DataHasValue(:p \"1\"^^xsd:integer))
+                 SubClassOf(:A DataHasValue(:p \"2\"^^xsd:integer))
+             )",
+        )
+        .unwrap();
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        for a in &doc.axioms {
+            super::super::index::normalize(&a.kind, &mut it, &mut ax);
+        }
+        ax.classes.extend(it.met_classes());
+        let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+        let a = ax.classes[0];
+        let ctx: Contexts = (0..it.len()).map(|_| OnceLock::new()).collect();
+        let bounds = Bounds {
+            max_memory: Some(1),
+            partial: true,
+            ..bounds(true)
+        };
+        let (_, stop) = saturate_counted(&ix, &ctx, &[a], &[], &[], &bounds);
+        assert!(matches!(stop, Some(Stop::Memory { .. })), "{stop:?}");
+        assert!(
+            ctx[a as usize]
+                .get()
+                .is_some_and(|c| c.st.lock().interrupted),
+            "functional data refusal must mark context interrupted"
+        );
+    }
+
+    /// When `horn_rules::flush` hits `sends.stop` during R3/R5 `send_named`, it returns
+    /// `false` so `Run::process` breaks and marks `st.interrupted = true`.
+    #[test]
+    fn horn_flush_stop_marks_context_interrupted() {
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<urn:horn-flush-stop:>)
+             Ontology(
+                 SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:i)))
+                 SubClassOf(:A ObjectAllValuesFrom(:r :B))
+                 SubClassOf(owl:Thing :A)
+             )",
+        )
+        .unwrap();
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let mut out_el = Vec::new();
+        for a in &doc.axioms {
+            if super::super::el_break(&a.kind).is_some() {
+                out_el.push(&a.kind);
+            } else {
+                super::super::index::normalize(&a.kind, &mut it, &mut ax);
+            }
+        }
+        super::super::horn::normalize(&out_el, &mut it, &mut ax, None, &|| false).unwrap();
+        ax.classes.extend(it.met_classes());
+        let mut ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+        super::super::horn::absorb(&mut ix, &|| false);
+        let dyn_ctx = Dynamic::new(it.len() as Ex);
+        let ctx: Contexts = (0..it.len()).map(|_| OnceLock::new()).collect();
+        let stop_flag = AtomicBool::new(false);
+        let bounds = Bounds {
+            threads: 1,
+            cancelled: Some(&|| stop_flag.load(Ordering::Relaxed)),
+            dynamic: Some(&dyn_ctx),
+            partial: true,
+            ..bounds(true)
+        };
+        let run = run(&ix, &ctx, &bounds);
+        let me = TOP;
+        let c = run.get(me);
+        // Pre-populate `st` so `horn_rules::flush` triggers `send_named` to individual `:i`
+        // while `stop_flag` is already armed, triggering `sends.stop`.
+        {
+            let mut st = c.st.lock();
+            st.init = true;
+            st.real = true;
+            let i_ex = ix.nominals[0];
+            let r_role = 0;
+            let b_ex = ax.classes.iter().copied().find(|&e| e != me).unwrap();
+            let h = &mut st.extra().horn;
+            h.succ.insert((r_role, i_ex));
+            h.alls.push((r_role, b_ex));
+            h.dirty = true;
+        }
+        stop_flag.store(true, Ordering::Relaxed);
+        run.stop.store(STOP_CANCEL, Ordering::SeqCst);
+        run.process::<HornFull>(
+            me,
+            &mut VecDeque::new(),
+            &mut Tally::default(),
+            &mut Vec::new(),
+            &mut Outbox::default(),
+            &mut Marks::default(),
+        );
+        assert!(
+            c.st.lock().interrupted,
+            "stopped HornFull flush must mark context interrupted"
+        );
     }
 
     #[test]
