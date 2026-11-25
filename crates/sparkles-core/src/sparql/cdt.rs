@@ -582,6 +582,282 @@ fn literal(lex: &str, dt: &str) -> Term {
 // literal again with each label replaced by the label of the node it names, so a query
 // that reads the literal later finds that node (see `Ctx::intern_term`).
 
+/// Maximum nesting depth of *quoted* composite literals (`"..."^^<cdt:List>`
+/// nested inside another composite literal). Bare `[` / `{` nesting is scanned
+/// iteratively with O(1) stack and O(1) heap.
+const MAX_QUOTED_CDT_DEPTH: usize = 64;
+
+struct CdtStream<'a> {
+    s: &'a str,
+    pos: usize,
+    depth: usize,
+    ends: [usize; MAX_QUOTED_CDT_DEPTH],
+}
+
+impl<'a> CdtStream<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            s,
+            pos: 0,
+            depth: 0,
+            ends: [0; MAX_QUOTED_CDT_DEPTH],
+        }
+    }
+
+    #[inline]
+    fn limit(&self) -> usize {
+        if self.depth == 0 {
+            self.s.len()
+        } else {
+            self.ends[self.depth - 1]
+        }
+    }
+
+    #[inline]
+    fn next_char(&mut self) -> Option<char> {
+        self.next_at(self.depth)
+    }
+
+    #[inline]
+    fn peek_char(&mut self) -> Option<char> {
+        let saved = self.pos;
+        let c = self.next_char();
+        self.pos = saved;
+        c
+    }
+
+    fn next_at(&mut self, level: usize) -> Option<char> {
+        if level == 0 {
+            let limit = self.limit();
+            if self.pos >= limit {
+                return None;
+            }
+            let c = self.s[self.pos..limit].chars().next()?;
+            self.pos += c.len_utf8();
+            return Some(c);
+        }
+        let c = self.next_at(level - 1)?;
+        if c == '\\' {
+            self.next_escape(level - 1)
+        } else {
+            Some(c)
+        }
+    }
+
+    fn next_escape(&mut self, level: usize) -> Option<char> {
+        let e = self.next_at(level)?;
+        match e {
+            't' => Some('\t'),
+            'b' => Some('\u{8}'),
+            'n' => Some('\n'),
+            'r' => Some('\r'),
+            'f' => Some('\u{c}'),
+            '\\' | '"' | '\'' => Some(e),
+            'u' | 'U' => {
+                let digits = if e == 'u' { 4 } else { 8 };
+                let mut code = 0u32;
+                for _ in 0..digits {
+                    let d = self.next_at(level)?.to_digit(16)?;
+                    code = (code << 4) | d;
+                }
+                char::from_u32(code)
+            }
+            _ => None,
+        }
+    }
+
+    fn eat_double_quote(&mut self, q: char) -> bool {
+        let saved = self.pos;
+        if self.next_char() == Some(q) && self.next_char() == Some(q) {
+            return true;
+        }
+        self.pos = saved;
+        false
+    }
+
+    fn eat_str(&mut self, expected: &str) -> bool {
+        let saved = self.pos;
+        for want in expected.chars() {
+            if self.next_char() != Some(want) {
+                self.pos = saved;
+                return false;
+            }
+        }
+        true
+    }
+
+    fn eat_cdt_datatype(&mut self) -> bool {
+        let saved = self.pos;
+        if !self.eat_str("^^<") || !self.eat_str(NS) {
+            self.pos = saved;
+            return false;
+        }
+        if self.eat_str("List>") || self.eat_str("Map>") {
+            return true;
+        }
+        self.pos = saved;
+        false
+    }
+}
+
+/// Scan a composite literal's lexical form in O(1) heap and O(1) stack without
+/// constructing parsed elements or replacement strings, calling `visit` for
+/// every stored blank-node id referenced as a CDT blank node (including inside
+/// arbitrarily nested bare lists/maps and quoted nested `cdt:List` / `cdt:Map`
+/// literals).
+pub(crate) fn scan_bnode_ids(
+    lex: &str,
+    mut visit: impl FnMut(crate::id::Id) -> crate::error::Result<()>,
+) -> crate::error::Result<()> {
+    let mut stream = CdtStream::new(lex);
+    let mut resumes = [0usize; MAX_QUOTED_CDT_DEPTH];
+    loop {
+        let Some(c) = stream.next_char() else {
+            if stream.depth == 0 {
+                return Ok(());
+            }
+            stream.depth -= 1;
+            stream.pos = resumes[stream.depth];
+            continue;
+        };
+        match c {
+            ' ' | '\t' | '\n' | '\r' | '\x0c' | '[' | ']' | '{' | '}' | ',' | ':' => {}
+            '<' => {
+                while let Some(ch) = stream.peek_char() {
+                    if ch == '>' {
+                        let _ = stream.next_char();
+                        break;
+                    }
+                    if matches!(ch, '<' | '"' | '{' | '}' | '^' | '\\' | '|' | '`') || ch <= ' ' {
+                        break;
+                    }
+                    let _ = stream.next_char();
+                }
+            }
+            '"' | '\'' => {
+                let q = c;
+                let long = stream.eat_double_quote(q);
+                let body_start = stream.pos;
+                let mut body_end = None;
+                loop {
+                    let before = stream.pos;
+                    let Some(ch) = stream.next_char() else {
+                        break;
+                    };
+                    if long {
+                        if ch == q && stream.eat_double_quote(q) {
+                            body_end = Some(before);
+                            break;
+                        }
+                    } else if ch == q {
+                        body_end = Some(before);
+                        break;
+                    } else if ch == '\n' || ch == '\r' {
+                        break;
+                    }
+                    if ch == '\\' && stream.next_escape(stream.depth).is_none() {
+                        break;
+                    }
+                }
+                if let Some(body_end) = body_end {
+                    if stream.eat_cdt_datatype() {
+                        if stream.depth >= MAX_QUOTED_CDT_DEPTH {
+                            return Err(crate::error::Error::invalid(
+                                "composite literal exceeds quoted nesting ceiling",
+                            ));
+                        }
+                        resumes[stream.depth] = stream.pos;
+                        stream.ends[stream.depth] = body_end;
+                        stream.depth += 1;
+                        stream.pos = body_start;
+                    } else if stream.peek_char() == Some('@') {
+                        let _ = stream.next_char();
+                        while let Some(ch) = stream.peek_char() {
+                            if ch.is_ascii_alphanumeric() || ch == '-' {
+                                let _ = stream.next_char();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            '_' => {
+                if stream.peek_char() == Some(':') {
+                    let _ = stream.next_char();
+                    let first_saved = stream.pos;
+                    if let Some(first) = stream.next_char()
+                        && (first == '_' || first.is_alphabetic() || first.is_ascii_digit())
+                    {
+                        let mut buf = [0u8; 16];
+                        let mut len = 0usize;
+                        let mut valid_stored = first.is_ascii();
+                        if valid_stored {
+                            buf[0] = first as u8;
+                            len = 1;
+                        }
+                        let mut last_ok_pos = stream.pos;
+                        let mut last_ok_len = len;
+                        let mut last_ok_valid = valid_stored;
+                        let mut saw_dot = false;
+                        while let Some(ch) = stream.next_char() {
+                            if ch == '_' || ch == '-' || ch == '\u{b7}' || ch.is_alphanumeric() {
+                                if saw_dot {
+                                    valid_stored = false;
+                                    saw_dot = false;
+                                }
+                                if valid_stored {
+                                    if ch.is_ascii() && len < buf.len() {
+                                        buf[len] = ch as u8;
+                                        len += 1;
+                                    } else {
+                                        valid_stored = false;
+                                    }
+                                }
+                                last_ok_pos = stream.pos;
+                                last_ok_len = len;
+                                last_ok_valid = valid_stored;
+                            } else if ch == '.' {
+                                saw_dot = true;
+                            } else {
+                                break;
+                            }
+                        }
+                        stream.pos = last_ok_pos;
+                        if last_ok_valid
+                            && let Ok(label) = std::str::from_utf8(&buf[..last_ok_len])
+                            && let Some(payload) = crate::id::parse_bnode_payload(label)
+                            && payload & crate::id::Id::LOCAL_BNODE_BIT == 0
+                        {
+                            visit(crate::id::Id::bnode(payload))?;
+                        }
+                    } else {
+                        stream.pos = first_saved;
+                    }
+                } else {
+                    while let Some(ch) = stream.peek_char() {
+                        if ch.is_alphanumeric() || ch == '_' {
+                            let _ = stream.next_char();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            c if c.is_alphanumeric() => {
+                while let Some(ch) = stream.peek_char() {
+                    if ch.is_alphanumeric() || ch == '_' {
+                        let _ = stream.next_char();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Whether a literal is a composite literal whose lexical form may name blank nodes.
 /// This is the only test that a literal without blank nodes pays.
 #[inline]
@@ -1383,6 +1659,70 @@ mod tests {
         assert_eq!(relabel("[\"_:a\"]", LIST), None);
         assert_eq!(relabel("[_:a", LIST), None);
         assert_eq!(relabel("[_:a]", "http://example/List"), None);
+    }
+
+    #[test]
+    fn scans_bnode_ids_iteratively_across_strings_iris_and_quoted_cdts() {
+        let scan = |lex: &str| -> Vec<u64> {
+            let mut ids = Vec::new();
+            scan_bnode_ids(lex, |id| {
+                ids.push(id.payload());
+                Ok(())
+            })
+            .unwrap();
+            ids
+        };
+
+        // Direct blank nodes, skipping strings, IRIs, query-local labels, non-stored labels,
+        // dotted labels, and bareword suffixes.
+        assert_eq!(
+            scan(
+                r#"[_:b0, "_:b1", '_:b2', """_:b3""", '''_:b4''', <urn:_:b5>, _:q6, _:foo, _:b7.1, foo_:b8, _:b9., _:ba]"#
+            ),
+            vec![0, 9, 0xa]
+        );
+
+        // Unescaped, escaped, unicode-escaped, map-key, and doubly-nested quoted CDT literals.
+        let nested = format!(
+            concat!(
+                "[",
+                "'[_:b1]'^^<{L}>, ",
+                "'''{{\"k\": _:b2}}'''^^<{M}>, ",
+                "\"[\\\"_:b99\\\", _:b3]\"^^<{L}>, ",
+                "\"[\\u005F:b4]\"^^<{L}>, ",
+                "{{\"[_:b5]\"^^<{L}> : 1}}, ",
+                "\"[\\\"[_:b6]\\\"^^<{L}>]\"^^<{L}>, ",
+                "\"[_:b77]\"^^<http://www.w3.org/2001/XMLSchema#string>",
+                "]"
+            ),
+            L = LIST,
+            M = MAP,
+        );
+        assert_eq!(scan(&nested), vec![1, 2, 3, 4, 5, 6]);
+
+        // Deeply nested bare lists do not overflow a 2 MiB stack.
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let depth = 25_000;
+                let mut deep = String::with_capacity(depth * 2 + 5);
+                for _ in 0..depth {
+                    deep.push('[');
+                }
+                deep.push_str("_:b2a");
+                for _ in 0..depth {
+                    deep.push(']');
+                }
+                let mut ids = Vec::new();
+                scan_bnode_ids(&deep, |id| {
+                    ids.push(id.payload());
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(ids, vec![0x2a]);
+            })
+            .unwrap();
+        handle.join().unwrap();
     }
 
     #[test]

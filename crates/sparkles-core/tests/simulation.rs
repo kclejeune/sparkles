@@ -313,13 +313,14 @@ fn compacted_base_vocab_copy_accounts_for_live_scratch_and_entry_overhead() {
         .unwrap();
     assert_eq!(state(&snapshot), state(&copied.snapshot()));
 
-    // Compacted CDT literal containing a blank node must also account for live scratch
-    // alongside decode_bytes before calling key_to_term.
+    // Compacted CDT literal containing a blank node must scan without allocating
+    // a decoded Term or parsed CDT AST while live vocab scratch is held.
     let cdt_source = Store::in_memory(Default::default());
     let mut tx = cdt_source.write();
     let node = tx.new_bnode();
+    let cdt_lex = format!("[\"{payload}\", _:{}]", bnode_label(node.payload()));
     let cdt_object = Term::Literal(Literal::new_typed_literal(
-        format!("[\"{payload}\", _:{}]", bnode_label(node.payload())),
+        cdt_lex.clone(),
         NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
     ));
     let subject = tx
@@ -334,6 +335,20 @@ fn compacted_base_vocab_copy_accounts_for_live_scratch_and_entry_overhead() {
     tx.commit().unwrap();
     cdt_source.compact().unwrap();
     let cdt_snap = cdt_source.snapshot();
+    let mut saw_cdt_vocab = false;
+    cdt_snap
+        .for_each_quad(|quad| {
+            if quad[2].tag() == Tag::Vocab {
+                saw_cdt_vocab = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        saw_cdt_vocab,
+        "expected compacted CDT literal in base vocabulary"
+    );
+
     let cdt_refused = cdt_source.copy_view_to_memory(
         &cdt_snap,
         StoreOptions {
@@ -348,18 +363,265 @@ fn compacted_base_vocab_copy_accounts_for_live_scratch_and_entry_overhead() {
         "expected StorageFull for compacted CDT literal under single-copy cap, got: {:?}",
         cdt_refused.err()
     );
+
+    // Exact boundary excluding and including AppendVocab's 48-byte entry overhead:
+    // '"' + lex + KEY_SEP + '^' + LIST.len().
+    // Leaving zero headroom for key_to_term or CDT AST parsing proves blank-node
+    // reservation runs in O(1) heap while scratch and destination overlap.
+    let cdt_key_len = cdt_lex.len() as u64 + 3 + sparkles_core::sparql::cdt::LIST.len() as u64;
+    let cdt_without_entry_overhead = cdt_source.copy_view_to_memory(
+        &cdt_snap,
+        StoreOptions {
+            max_memory_bytes: Some(108 + cdt_key_len * 2),
+            ..Default::default()
+        },
+        &Default::default(),
+        |_| Ok(true),
+    );
+    assert!(
+        matches!(cdt_without_entry_overhead, Err(Error::StorageFull(_))),
+        "expected StorageFull when compacted CDT AppendVocab entry overhead exceeds cap, got: {:?}",
+        cdt_without_entry_overhead.err()
+    );
+
+    let cdt_tight_cap = StoreOptions {
+        max_memory_bytes: Some(108 + cdt_key_len * 2 + 48),
+        ..Default::default()
+    };
     let cdt_copied = cdt_source
+        .copy_view_to_memory(&cdt_snap, cdt_tight_cap, &Default::default(), |_| Ok(true))
+        .unwrap();
+    assert_eq!(state(&cdt_snap), state(&cdt_copied.snapshot()));
+    let mut cdt_write = cdt_copied.write();
+    assert_ne!(
+        cdt_write.new_bnode(),
+        node,
+        "compacted CDT blank node must be reserved under tight memory cap"
+    );
+    drop(cdt_write);
+
+    // Same tight-cap check for an escaped quoted nested CDT literal holding a 64 KiB string.
+    let quoted_source = Store::in_memory(Default::default());
+    let mut qtx = quoted_source.write();
+    let qnode = qtx.new_bnode();
+    let quoted_lex = format!(
+        "[\"[\\\"{payload}\\\", _:{}]\"^^<{}>]",
+        bnode_label(qnode.payload()),
+        sparkles_core::sparql::cdt::LIST
+    );
+    let quoted_object = Term::Literal(Literal::new_typed_literal(
+        quoted_lex.clone(),
+        NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+    ));
+    let qs = qtx
+        .intern(&Term::NamedNode(NamedNode::new("urn:s").unwrap()))
+        .unwrap();
+    let qp = qtx
+        .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+        .unwrap();
+    let qo = qtx.intern(&quoted_object).unwrap();
+    qtx.insert([qs, qp, qo, Id::DEFAULT_GRAPH]).unwrap();
+    qtx.commit().unwrap();
+    quoted_source.compact().unwrap();
+    let quoted_snap = quoted_source.snapshot();
+    let quoted_key_len =
+        quoted_lex.len() as u64 + 3 + sparkles_core::sparql::cdt::LIST.len() as u64;
+    let quoted_refused = quoted_source.copy_view_to_memory(
+        &quoted_snap,
+        StoreOptions {
+            max_memory_bytes: Some(108 + quoted_key_len * 2),
+            ..Default::default()
+        },
+        &Default::default(),
+        |_| Ok(true),
+    );
+    assert!(
+        matches!(quoted_refused, Err(Error::StorageFull(_))),
+        "expected StorageFull when quoted CDT AppendVocab entry overhead exceeds cap, got: {:?}",
+        quoted_refused.err()
+    );
+    let quoted_copied = quoted_source
         .copy_view_to_memory(
-            &cdt_snap,
+            &quoted_snap,
             StoreOptions {
-                max_memory_bytes: Some(160 * 1024),
+                max_memory_bytes: Some(108 + quoted_key_len * 2 + 48),
                 ..Default::default()
             },
             &Default::default(),
             |_| Ok(true),
         )
         .unwrap();
-    assert_eq!(state(&cdt_snap), state(&cdt_copied.snapshot()));
+    assert_eq!(state(&quoted_snap), state(&quoted_copied.snapshot()));
+    let mut qwrite = quoted_copied.write();
+    assert_ne!(
+        qwrite.new_bnode(),
+        qnode,
+        "blank node inside escaped quoted nested CDT must be reserved under tight cap"
+    );
+}
+
+#[test]
+fn deeply_nested_cdt_blank_ids_are_reserved_without_stack_overflow() {
+    let handle = std::thread::Builder::new()
+        .name("deep-cdt-sim-copy".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            for case in ["deep-list", "deep-map", "deep-triple-cdt"] {
+                let source = Store::in_memory(Default::default());
+                let options = WriteOptions {
+                    dry_run: Some(DryRun {
+                        retain_states: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let mut tx = source.write_with(CommitKind::Load, options);
+                let node = tx.new_bnode();
+                let label = bnode_label(node.payload());
+                let object = match case {
+                    "deep-list" => {
+                        let depth = 20_000;
+                        let mut lex = String::with_capacity(depth * 2 + label.len() + 2);
+                        for _ in 0..depth {
+                            lex.push('[');
+                        }
+                        lex.push_str("_:");
+                        lex.push_str(&label);
+                        for _ in 0..depth {
+                            lex.push(']');
+                        }
+                        Term::Literal(Literal::new_typed_literal(
+                            lex,
+                            NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+                        ))
+                    }
+                    "deep-map" => {
+                        let depth = 10_000;
+                        let mut lex = String::with_capacity(depth * 6 + label.len() + 2);
+                        for _ in 0..depth {
+                            lex.push_str("{\"k\":");
+                        }
+                        lex.push_str("_:");
+                        lex.push_str(&label);
+                        for _ in 0..depth {
+                            lex.push('}');
+                        }
+                        Term::Literal(Literal::new_typed_literal(
+                            lex,
+                            NamedNode::new(sparkles_core::sparql::cdt::MAP).unwrap(),
+                        ))
+                    }
+                    "deep-triple-cdt" => {
+                        let depth = 20_000;
+                        let mut lex = String::with_capacity(depth * 2 + label.len() + 2);
+                        for _ in 0..depth {
+                            lex.push('[');
+                        }
+                        lex.push_str("_:");
+                        lex.push_str(&label);
+                        for _ in 0..depth {
+                            lex.push(']');
+                        }
+                        Term::Triple(Box::new(Triple::new(
+                            NamedOrBlankNode::NamedNode(NamedNode::new("urn:inner-s").unwrap()),
+                            NamedNode::new("urn:inner-p").unwrap(),
+                            Term::Literal(Literal::new_typed_literal(
+                                lex,
+                                NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+                            )),
+                        )))
+                    }
+                    _ => unreachable!(),
+                };
+                let subject = tx
+                    .intern(&Term::NamedNode(NamedNode::new("urn:s").unwrap()))
+                    .unwrap();
+                let predicate = tx
+                    .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+                    .unwrap();
+                let object = tx.intern(&object).unwrap();
+                tx.insert([subject, predicate, object, Id::DEFAULT_GRAPH])
+                    .unwrap();
+                let preview = preview::catch(tx.commit()).unwrap();
+                let retained = preview.states.unwrap().after;
+
+                // Both uncapped and capped copies must succeed without overflowing the stack.
+                let copied = source
+                    .copy_view_to_memory(&retained, Default::default(), &Default::default(), |_| {
+                        Ok(true)
+                    })
+                    .unwrap();
+                assert_eq!(state(&retained), state(&copied.snapshot()));
+                let mut write = copied.write();
+                assert_ne!(
+                    write.new_bnode(),
+                    node,
+                    "case {case}: deeply nested CDT blank node must be reserved"
+                );
+                drop(write);
+
+                let capped = source
+                    .copy_view_to_memory(
+                        &retained,
+                        StoreOptions {
+                            max_memory_bytes: Some(512 * 1024),
+                            ..Default::default()
+                        },
+                        &Default::default(),
+                        |_| Ok(true),
+                    )
+                    .unwrap();
+                assert_eq!(state(&retained), state(&capped.snapshot()));
+                let mut capped_write = capped.write();
+                assert_ne!(
+                    capped_write.new_bnode(),
+                    node,
+                    "case {case}: deeply nested CDT blank node must be reserved under memory cap"
+                );
+            }
+
+            // Plain strings and IRIs inside CDT literals that look like blank-node labels
+            // must not be mistaken for blank nodes during reservation.
+            let source = Store::in_memory(Default::default());
+            let options = WriteOptions {
+                dry_run: Some(DryRun {
+                    retain_states: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut tx = source.write_with(CommitKind::Load, options);
+            let node = tx.new_bnode();
+            let label = bnode_label(node.payload());
+            let decoy = Term::Literal(Literal::new_typed_literal(
+                format!("[\"[_:{label}]\", <urn:_:{label}>, \"[_:{label}]\"^^<urn:not-cdt>]"),
+                NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+            ));
+            let subject = tx
+                .intern(&Term::NamedNode(NamedNode::new("urn:s").unwrap()))
+                .unwrap();
+            let predicate = tx
+                .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+                .unwrap();
+            let object = tx.intern(&decoy).unwrap();
+            tx.insert([subject, predicate, object, Id::DEFAULT_GRAPH])
+                .unwrap();
+            let preview = preview::catch(tx.commit()).unwrap();
+            let retained = preview.states.unwrap().after;
+            let copied = source
+                .copy_view_to_memory(&retained, Default::default(), &Default::default(), |_| {
+                    Ok(true)
+                })
+                .unwrap();
+            let mut write = copied.write();
+            assert_eq!(
+                write.new_bnode(),
+                node,
+                "blank-node-like text inside plain strings or IRIs must not be reserved"
+            );
+        })
+        .unwrap();
+    handle.join().unwrap();
 }
 
 #[test]
