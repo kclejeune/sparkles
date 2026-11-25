@@ -75,17 +75,24 @@ copy when the registry records the deletion or a replacement. If a later registr
 reuses the name and UUID, the catalog durably records the old delete's commit in journal
 format 4 before publishing that registration. Recovery only reclaims that committed copy.
 A busy or unverifiable copy keeps its journal entry for the next startup. Format 3
-journals cannot distinguish a staged rollback from a later restore that reused the
-name and UUID. Startup leaves that combination closed and retains its files for
-inspection. Ambiguous earlier journals and competing staged restore copies also
-remain on disk.
+journals treat a sole verified `.deleted-<token>` trash copy as proof that the older
+delete committed, allowing a same-UUID replacement to open while reclaiming only the
+trash copy. When format 3 leaves an ambiguous kept copy or conflicting paths next to a
+matching registration, startup leaves the dataset closed and retains its files for
+inspection. Ambiguous earlier journals and competing staged restore copies also remain
+on disk.
 
 An indeterminate registry commit keeps the name unavailable until the catalog reopens.
-A restore with that outcome preserves its published root. An in-place restore also
-preserves its predecessor for startup recovery. Publication synchronizes the journal
-namespace before replacing the registry. Startup synchronizes the registry before
-acting on the delete outcome it observes. Power-loss recovery requires a filesystem and
-platform that support durable directory synchronization.
+A restore with that outcome preserves its published root. An in-place restore records a
+swap revision in `config.json` and writes a versioned swap marker in its `.replaced-`
+predecessor directory before moving the restored copy into place. Startup synchronizes
+the registry before reconciling marked swaps, restoring the predecessor when the
+predecessor revision survived or a live rollback failed and removing the predecessor
+when the restored revision committed. Unmarked swaps from older releases retain their
+existing roll-forward recovery. Publication synchronizes the journal namespace before
+replacing the registry, and startup synchronizes the registry before acting on the
+delete outcome it observes. Power-loss recovery requires a filesystem and platform that
+support durable directory synchronization.
 
 Warnings report `path`, `retained_bytes`, and whether the byte count is complete.
 Startup leaves unrecognized kept entries in place. Copies marked by a `keepReplaced`

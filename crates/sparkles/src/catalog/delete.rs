@@ -304,7 +304,10 @@ pub(super) fn settle_reused_identities(dir: &Path, next: &Registry) -> Result<()
     Ok(())
 }
 
-fn registered_dataset<'a>(registry: &'a Registry, name: &str) -> Option<&'a RegistryEntry> {
+pub(super) fn registered_dataset<'a>(
+    registry: &'a Registry,
+    name: &str,
+) -> Option<&'a RegistryEntry> {
     registry
         .datasets
         .iter()
@@ -351,7 +354,7 @@ pub(super) fn open_databases(catalog: &RecoveryDir) -> Result<RecoveryDir> {
     Ok(catalog.child(name)?)
 }
 
-fn dataset_id(dir: &RecoveryDir) -> Result<Option<Uuid>> {
+pub(super) fn dataset_id(dir: &RecoveryDir) -> Result<Option<Uuid>> {
     #[derive(Deserialize)]
     struct Identity {
         id: Uuid,
@@ -371,7 +374,10 @@ fn dataset_id(dir: &RecoveryDir) -> Result<Option<Uuid>> {
     Ok(Some(metadata.id))
 }
 
-fn child_if_present(parent: &RecoveryDir, name: &OsStr) -> io::Result<Option<RecoveryDir>> {
+pub(super) fn child_if_present(
+    parent: &RecoveryDir,
+    name: &OsStr,
+) -> io::Result<Option<RecoveryDir>> {
     match parent.child(name) {
         Ok(dir) => Ok(Some(dir)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
@@ -379,7 +385,7 @@ fn child_if_present(parent: &RecoveryDir, name: &OsStr) -> io::Result<Option<Rec
     }
 }
 
-fn lock_dataset(dir: &RecoveryDir) -> Result<ProcessLock> {
+pub(super) fn lock_dataset(dir: &RecoveryDir) -> Result<ProcessLock> {
     let lock = dir.open_file(OsStr::new("sparkles.lock"), true)?;
     match lock.try_lock() {
         Ok(()) => {
@@ -451,7 +457,11 @@ fn require_identity(candidate: &RecoveryDir, expected: Uuid, allow_missing: bool
 
 /// Verify before creating a lock file and recheck under the lease. A missing
 /// identity is possible only after a staged directory has begun removal.
-fn lock_candidate(candidate: &RecoveryDir, id: Uuid, staged: bool) -> Result<ProcessLock> {
+pub(super) fn lock_candidate(
+    candidate: &RecoveryDir,
+    id: Uuid,
+    staged: bool,
+) -> Result<ProcessLock> {
     require_identity(candidate, id, staged)?;
     let lock = lock_dataset(candidate)?;
     require_identity(candidate, id, staged)?;
@@ -465,9 +475,14 @@ pub(super) struct LockedDeleteDir {
 }
 
 impl LockedDeleteDir {
-    fn open(dir: RecoveryDir, id: Uuid) -> Result<Self> {
+    pub(super) fn open(dir: RecoveryDir, id: Uuid) -> Result<Self> {
         let lock = Some(lock_candidate(&dir, id, false)?);
         Ok(Self { dir, lock })
+    }
+
+    #[cfg_attr(not(feature = "backup"), allow(dead_code))]
+    pub(super) fn dir(&self) -> &RecoveryDir {
+        &self.dir
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -597,7 +612,7 @@ pub(super) fn restore_conflicts(
 
 fn finish_delete(
     databases: &RecoveryDir,
-    intent: &DeleteIntent,
+    intent: &mut DeleteIntent,
     registered: Option<&RegistryEntry>,
     warning_name: &mut OsString,
 ) -> Result<()> {
@@ -626,7 +641,9 @@ fn finish_delete(
         ));
     }
 
-    if let Some(registered) = registered.filter(|_| intent.state != IntentState::Committed) {
+    let candidate = if let Some(registered) =
+        registered.filter(|_| intent.state != IntentState::Committed)
+    {
         let live = child_if_present(databases, name)?;
         // A replacement recorded after this delete is authoritative, even
         // if its root is now missing. A live root must also agree under lock.
@@ -634,6 +651,7 @@ fn finish_delete(
             if let Some(live) = live {
                 let _live_lock = lock_candidate(&live, id, false)?;
             }
+            candidate
         } else {
             match (registered.id, live, candidate) {
                 (_, Some(live), None) => {
@@ -649,6 +667,18 @@ fn finish_delete(
                     databases.sync()?;
                     return Ok(());
                 }
+                // Format 3 renamed to `.deleted-<token>` only after durable registry
+                // removal. A sole verified trash copy proves that delete committed.
+                (Some(id), live, Some(trash))
+                    if staged == trash_name && intent.state == IntentState::PreparedV3 =>
+                {
+                    if let Some(live) = live {
+                        let _live_lock = lock_candidate(&live, id, false)?;
+                    }
+                    require_identity(&trash, intent.id, true)?;
+                    intent.state = IntentState::Committed;
+                    Some(trash)
+                }
                 _ if intent.state == IntentState::PreparedV3 => {
                     return Err(Error::Corrupt(
                         "format 3 delete intent cannot distinguish this registration from a restore that reused its identity".into(),
@@ -661,7 +691,9 @@ fn finish_delete(
                 }
             }
         }
-    }
+    } else {
+        candidate
+    };
 
     let Some(candidate) = candidate else {
         if intent.state != IntentState::Committed
@@ -780,11 +812,13 @@ pub(super) fn recover(
                 .insert(intent.id);
         }
     }
-    for (intent, staged_name) in staged.into_iter().chain(unstaged) {
+    let mut journal_changed = false;
+    for (mut intent, staged_name) in staged.into_iter().chain(unstaged) {
         let mut warning_name = staged_name
             .clone()
             .unwrap_or_else(|| intent.kept_name().into());
         let registered = registered_dataset(registry, &intent.name);
+        let initial_state = intent.state;
         let result = if intent.state != IntentState::Committed
             && staged_name.is_some()
             && restore_conflicts.contains(&intent.name)
@@ -803,9 +837,10 @@ pub(super) fn recover(
                 "multiple staged deletes may own the registered root".into(),
             ))
         } else {
-            finish_delete(databases, &intent, registered, &mut warning_name)
+            finish_delete(databases, &mut intent, registered, &mut warning_name)
         };
         if let Err(error) = result {
+            journal_changed |= intent.state != initial_state;
             if intent.state.is_prepared()
                 && registered.is_some_and(|entry| entry.id == Some(intent.id))
             {
@@ -831,7 +866,7 @@ pub(super) fn recover(
             "interrupted recovery before syncing removal",
         ));
     }
-    if retained.len() != count {
+    if retained.len() != count || journal_changed {
         // Retiring even an already absent cleanup path requires its parent sync.
         databases.sync()?;
         write_intents(catalog.path(), &retained)?;
@@ -1531,7 +1566,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "backup")]
     fn copy_store(from: &Path, to: &Path) {
         std::fs::create_dir(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
@@ -2116,6 +2150,341 @@ mod tests {
         assert!(!replaced.exists() && !kept.exists());
     }
 
+    #[cfg(feature = "backup")]
+    #[test]
+    fn r3_indeterminate_in_place_restore_reconciles_both_registry_images() {
+        use super::super::{CONFIG_FILE, FAIL_RESTORE_REGISTRY_SYNC};
+        use crate::catalog::swap;
+        use crate::store::Store;
+
+        for replacement_survives in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
+            let db = dir.path().join("databases");
+            let kept = db.join(intent.kept_name());
+            let replaced = db.join(".replaced-doomed-42");
+            let busy = Store::open_existing(&kept, Default::default(), None).unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let predecessor = catalog.create("doomed", &Default::default()).unwrap();
+            predecessor
+                .update("INSERT DATA { <urn:predecessor> <urn:p> 1 }")
+                .unwrap();
+            let previous_id = predecessor.dataset_id();
+            let previous_head = predecessor.head_commit();
+            drop(predecessor);
+
+            let config = dir.path().join(CONFIG_FILE);
+            let old_config = std::fs::read(&config).unwrap();
+
+            let staged = db.join(".restore-doomed-42");
+            copy_store(&kept, &staged);
+            let copy = Store::open_existing(&staged, Default::default(), None).unwrap();
+            crate::sparql::update::update(
+                &copy,
+                "INSERT DATA { <urn:new> <urn:p> 2 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let new_head = copy.head_commit();
+            drop(copy);
+
+            FAIL_RESTORE_REGISTRY_SYNC.set(true);
+            let result = swap::replace_in_place(&catalog, "doomed", &staged, "42", false);
+            assert!(!FAIL_RESTORE_REGISTRY_SYNC.replace(false));
+            assert!(result.is_err());
+            assert!(db.join("doomed/CURRENT").exists() && replaced.join("CURRENT").exists());
+            assert_eq!(
+                read_intents(dir.path()).unwrap()[0].state,
+                IntentState::Committed
+            );
+            drop(catalog);
+
+            if !replacement_survives {
+                std::fs::write(&config, &old_config).unwrap();
+            }
+
+            let expected = if replacement_survives {
+                (intent.id, new_head)
+            } else {
+                (previous_id, previous_head)
+            };
+
+            // First reopen while the older committed delete copy is still held busy.
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            let active = reopened.get("doomed").unwrap();
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                expected,
+                "replacement_survives={replacement_survives}"
+            );
+            assert_eq!(
+                read_registry(dir.path()).unwrap().datasets[0].id,
+                Some(expected.0)
+            );
+            assert!(!replaced.exists() && kept.exists());
+            drop(active);
+            reopened.save().unwrap();
+            assert_eq!(
+                read_registry(dir.path()).unwrap().datasets[0].id,
+                Some(expected.0)
+            );
+            drop((reopened, busy));
+
+            // Second reopen once the older copy is free reclaims only the older copy.
+            let final_open = Catalog::open(dir.path(), Default::default()).unwrap();
+            let active = final_open.get("doomed").unwrap();
+            assert_eq!((active.dataset_id(), active.head_commit()), expected);
+            assert_eq!(
+                read_registry(dir.path()).unwrap().datasets[0].id,
+                Some(expected.0)
+            );
+            assert!(!replaced.exists() && !kept.exists());
+            assert!(!dir.path().join(INTENT_FILE).exists());
+        }
+    }
+
+    #[cfg(feature = "backup")]
+    #[test]
+    fn r3_indeterminate_same_uuid_in_place_restore_reconciles_by_revision() {
+        use super::super::{CONFIG_FILE, FAIL_RESTORE_REGISTRY_SYNC};
+        use crate::catalog::swap;
+        use crate::store::Store;
+
+        for replacement_survives in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let predecessor = catalog.create("ds", &Default::default()).unwrap();
+            predecessor
+                .update("INSERT DATA { <urn:old> <urn:p> 1 }")
+                .unwrap();
+            let id = predecessor.dataset_id();
+            let old_head = predecessor.head_commit();
+            drop(predecessor);
+
+            let db = dir.path().join("databases");
+            let staged = db.join(".restore-ds-42");
+            copy_store(&db.join("ds"), &staged);
+            let copy = Store::open_existing(&staged, Default::default(), None).unwrap();
+            crate::sparql::update::update(
+                &copy,
+                "INSERT DATA { <urn:new> <urn:p> 2 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let new_head = copy.head_commit();
+            assert_ne!(old_head, new_head);
+            drop(copy);
+
+            let config = dir.path().join(CONFIG_FILE);
+            let old_config = std::fs::read(&config).unwrap();
+
+            FAIL_RESTORE_REGISTRY_SYNC.set(true);
+            let result = swap::replace_in_place(&catalog, "ds", &staged, "42", false);
+            assert!(!FAIL_RESTORE_REGISTRY_SYNC.replace(false));
+            assert!(result.is_err());
+            drop(catalog);
+
+            if !replacement_survives {
+                std::fs::write(&config, &old_config).unwrap();
+            }
+
+            let expected_head = if replacement_survives {
+                new_head
+            } else {
+                old_head
+            };
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            let active = reopened.get("ds").unwrap();
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (id, expected_head),
+                "replacement_survives={replacement_survives}"
+            );
+            assert!(!db.join(".replaced-ds-42").exists());
+        }
+    }
+
+    #[cfg(feature = "backup")]
+    #[test]
+    fn r3_pre_replacement_error_with_failed_rollback_rename_recovers_predecessor() {
+        use crate::catalog::swap;
+        use crate::store::Store;
+
+        for corrupt_restored in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
+            let db = dir.path().join("databases");
+            let kept = db.join(intent.kept_name());
+            let replaced = db.join(".replaced-doomed-42");
+            let busy = Store::open_existing(&kept, Default::default(), None).unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let predecessor = catalog.create("doomed", &Default::default()).unwrap();
+            predecessor
+                .update("INSERT DATA { <urn:predecessor> <urn:p> 1 }")
+                .unwrap();
+            let previous_id = predecessor.dataset_id();
+            let previous_head = predecessor.head_commit();
+            drop(predecessor);
+
+            let staged = db.join(".restore-doomed-42");
+            if corrupt_restored {
+                std::fs::create_dir_all(&staged).unwrap();
+                std::fs::write(staged.join("CURRENT"), b"gen-0042\n").unwrap();
+            } else {
+                copy_store(&kept, &staged);
+                let copy = Store::open_existing(&staged, Default::default(), None).unwrap();
+                crate::sparql::update::update(
+                    &copy,
+                    "INSERT DATA { <urn:new> <urn:p> 2 }",
+                    &Default::default(),
+                )
+                .unwrap();
+                drop(copy);
+                FAIL_JOURNAL_SYNC.set(true);
+            }
+
+            swap::FAIL_ROLLBACK_RENAME.set(true);
+            let result = swap::replace_in_place(&catalog, "doomed", &staged, "42", false);
+            assert!(!swap::FAIL_ROLLBACK_RENAME.replace(false));
+            assert!(!FAIL_JOURNAL_SYNC.replace(false));
+            let error = result.err().unwrap().to_string();
+            assert!(error.contains("the next start repairs it"), "{error}");
+            assert!(db.join("doomed").exists() && replaced.join("CURRENT").exists());
+            assert_eq!(
+                read_registry(dir.path()).unwrap().datasets[0].id,
+                Some(previous_id)
+            );
+            drop((catalog, busy));
+
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            let active = reopened.get("doomed").unwrap();
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (previous_id, previous_head),
+                "corrupt_restored={corrupt_restored}"
+            );
+            assert_eq!(
+                read_registry(dir.path()).unwrap().datasets[0].id,
+                Some(previous_id)
+            );
+            assert!(!replaced.exists() && !kept.exists());
+            assert!(!dir.path().join(INTENT_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn r3_format3_sole_trash_copy_allows_same_uuid_replacement() {
+        use crate::store::Store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
+        let db = dir.path().join("databases");
+        let kept = db.join(intent.kept_name());
+        let trash = db.join(intent.trash_name());
+        let root = db.join("doomed");
+        std::fs::rename(&kept, &trash).unwrap();
+
+        // Build a same-UUID replacement with a distinguishable head.
+        copy_store(&trash, &root);
+        let replacement = Store::open_existing(&root, Default::default(), Some(intent.id)).unwrap();
+        let old_head = replacement.head_commit();
+        crate::sparql::update::update(
+            &replacement,
+            "INSERT DATA { <urn:replacement> <urn:p> 9 }",
+            &Default::default(),
+        )
+        .unwrap();
+        let new_head = replacement.head_commit();
+        assert_ne!(new_head, old_head);
+        drop(replacement);
+
+        // Register the replacement in config.json and write a format 3 prepared delete journal.
+        let mut registry = read_registry(dir.path()).unwrap();
+        registry.datasets.push(RegistryEntry {
+            name: "doomed".into(),
+            kind: DatasetKind::Persistent,
+            id: Some(intent.id),
+            revision: None,
+            reasoning: None,
+        });
+        write_registry(dir.path(), &registry).unwrap();
+        let journal = dir.path().join(INTENT_FILE);
+        std::fs::write(
+            &journal,
+            serde_json::to_vec(&serde_json::json!({
+                "format": 3,
+                "intents": [{
+                    "name": intent.name,
+                    "id": intent.id,
+                    "token": intent.token,
+                    "state": "prepared",
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Even while the old trash copy is held busy, the healthy replacement opens.
+        let busy = Store::open_existing(&trash, Default::default(), Some(intent.id)).unwrap();
+        let capture = EventCapture::default();
+        let catalog = tracing::subscriber::with_default(capture.clone(), || {
+            Catalog::open(dir.path(), Default::default()).unwrap()
+        });
+        assert!(
+            catalog.refusal("doomed").is_none(),
+            "{:?}",
+            catalog.refusals()
+        );
+        let active = catalog.get("doomed").unwrap();
+        assert_eq!(
+            (active.dataset_id(), active.head_commit()),
+            (intent.id, new_head)
+        );
+        assert!(trash.exists() && !kept.exists());
+        assert!(!capture.warnings().is_empty());
+        drop((active, catalog, busy));
+
+        // Once the old trash copy is free, startup opens the replacement and reclaims only trash.
+        let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(
+            reopened.refusal("doomed").is_none(),
+            "{:?}",
+            reopened.refusals()
+        );
+        let active = reopened.get("doomed").unwrap();
+        assert_eq!(
+            (active.dataset_id(), active.head_commit()),
+            (intent.id, new_head)
+        );
+        assert!(!trash.exists() && !kept.exists());
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn r3_format3_rejects_format4_only_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
+        let kept = dir.path().join("databases").join(intent.kept_name());
+        let journal = dir.path().join(INTENT_FILE);
+
+        for state in ["committed", "prepared-v3"] {
+            let bytes = format!(
+                r#"{{"format":3,"intents":[{{"name":"doomed","id":"{}","token":"{}","state":"{state}"}}]}}"#,
+                intent.id, intent.token
+            );
+            std::fs::write(&journal, &bytes).unwrap();
+            let err = Catalog::open(dir.path(), Default::default())
+                .err()
+                .expect("format 3 must reject format-4-only states");
+            assert!(
+                matches!(err, Error::Corrupt(ref msg) if msg.contains("requires format 4")),
+                "state={state}: {err:?}"
+            );
+            assert!(kept.exists(), "state={state}");
+            assert_eq!(std::fs::read_to_string(&journal).unwrap(), bytes);
+        }
+    }
+
     #[test]
     fn staging_failures_and_precommit_crashes_restore_the_registered_dataset() {
         use super::super::{
@@ -2295,6 +2664,7 @@ mod tests {
                     name: intent.name.clone(),
                     kind: DatasetKind::Persistent,
                     id: None,
+                    revision: None,
                     reasoning: None,
                 }],
             },

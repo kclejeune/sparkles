@@ -4,12 +4,15 @@
 //! open rolls back both renames. Catalog::open repairs interrupted swaps while holding
 //! the directory lock.
 
-use super::restore::{KEPT_PREFIX, REPLACED_PREFIX, RESTORE_PREFIX};
+use super::restore::{
+    KEPT_PREFIX, REPLACED_PREFIX, RESTORE_PREFIX, SwapMarker, remove_swap_marker, write_swap_marker,
+};
 use super::{Catalog, RegistryCommitError, Reservation, ReservationKind, sync_dir};
 use crate::Dataset;
 use sparkles_backup::{BackupError, Code};
 use std::path::Path;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 /// How long an in-place restore waits for requests to release the dataset.
 pub const DRAIN: Duration = Duration::from_secs(30);
@@ -63,8 +66,20 @@ pub fn replace_in_place(
 
 #[cfg(test)]
 thread_local! {
-    /// Stop the swap after rename 1 or 2 without cleaning up, as a crash would.
+    /// Stop the swap after rename 1, 2 or 3 without cleaning up, as a crash would.
     pub(crate) static CRASH_AFTER: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// Inject a failure on the first live rollback rename after a pre-replacement error.
+    pub(crate) static FAIL_ROLLBACK_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn rollback_rename_fail_point() -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_ROLLBACK_RENAME.replace(false) {
+        return Err(std::io::Error::other(
+            "injected swap rollback rename failure",
+        ));
+    }
+    Ok(())
 }
 
 fn crash_point(_n: u8) -> Result<(), BackupError> {
@@ -179,6 +194,7 @@ fn swap(
             None => BackupError::internal(format!("no dataset /{name}")),
         });
     };
+    let old_id = old.store().dataset_id();
     let Some(root) = old.store().root().map(Path::to_path_buf) else {
         st.reinsert(name, old);
         return Err(BackupError::new(
@@ -269,6 +285,16 @@ fn swap(
     if let Some(detached) = st.inner.detached.lock().get_mut(name) {
         detached.reasoning = reasoning;
     }
+    let predecessor_revision = match st.bind_swap_revision(name, old_id) {
+        Ok(rev) => rev,
+        Err(error) => {
+            let err = BackupError::internal(format!(
+                "recording the predecessor revision of /{name}: {error:#}"
+            ));
+            return Err(reopen_after(st, name, err));
+        }
+    };
+    let restored_revision = Uuid::new_v4();
     // the storage quota is the operator's, not the backup's: the restored dataset keeps
     // the one it replaces
     let quota = root.join(crate::store::QUOTA_FILE);
@@ -287,9 +313,36 @@ fn swap(
         return Err(reopen_after(st, name, err));
     }
     crash_point(1)?;
+    let marker = SwapMarker::new(
+        name,
+        old_id,
+        predecessor_revision,
+        restored_id,
+        restored_revision,
+    );
+    if let Err(error) = write_swap_marker(&replaced, &marker).and_then(|()| sync_dir(&databases)) {
+        let err = BackupError::internal(format!(
+            "marking the in-place restore swap of /{name}: {error:#}"
+        ));
+        if let Err(e2) = remove_swap_marker(&replaced)
+            .and_then(|()| std::fs::rename(&replaced, &root))
+            .map_err(crate::Error::from)
+            .and_then(|()| sync_dir(&databases))
+        {
+            return Err(BackupError::internal(format!(
+                "{err}; putting back {} failed too: {e2} (the next start repairs it)",
+                replaced.display()
+            )));
+        }
+        return Err(reopen_after(st, name, err));
+    }
     if let Err(e) = std::fs::rename(restored, &root) {
         let err = io("moving the restored copy to", &root, e);
-        if let Err(e2) = std::fs::rename(&replaced, &root) {
+        if let Err(e2) = remove_swap_marker(&replaced)
+            .and_then(|()| std::fs::rename(&replaced, &root))
+            .map_err(crate::Error::from)
+            .and_then(|()| sync_dir(&databases))
+        {
             return Err(BackupError::internal(format!(
                 "{err}; putting back {} failed too: {e2} (the next start repairs it)",
                 replaced.display()
@@ -300,12 +353,21 @@ fn swap(
     crash_point(2)?;
     let published = sync_dir(&databases)
         .map_err(RegistryCommitError::BeforeReplace)
-        .and_then(|()| st.commit_restored_dataset(name, restored_id));
+        .and_then(|()| st.commit_restored_dataset(name, restored_id, restored_revision));
     match published {
         Ok(ds) => {
+            crash_point(3)?;
             let cleanup = if keep_replaced {
                 let kept_name = format!("{KEPT_PREFIX}{name}-{task}");
                 let kept = databases.join(&kept_name);
+                if let Err(error) = remove_swap_marker(&replaced) {
+                    tracing::warn!(
+                        target: "sparkles::backup",
+                        path = %replaced.display(),
+                        %error,
+                        "could not clear the restore swap marker before retaining the old copy"
+                    );
+                }
                 let marker = replaced.join(super::delete::KEEP_REPLACED_MARKER);
                 let marked = super::write_file_atomic(&marker, kept_name.as_bytes());
                 if let Err(error) = marked {
@@ -316,6 +378,7 @@ fn swap(
                     .and_then(|()| sparkles_core::fsutil::sync_dir(&databases))
             } else {
                 std::fs::remove_dir_all(&replaced)
+                    .and_then(|()| sparkles_core::fsutil::sync_dir(&databases))
             };
             if let Err(e) = cleanup {
                 tracing::warn!(
@@ -335,7 +398,9 @@ fn swap(
         }
         Err(RegistryCommitError::BeforeReplace(error)) => {
             let failed = databases.join(format!("{RESTORE_PREFIX}{name}-{task}"));
-            let back = std::fs::rename(&root, &failed)
+            let back = rollback_rename_fail_point()
+                .and_then(|()| std::fs::rename(&root, &failed))
+                .and_then(|()| remove_swap_marker(&replaced))
                 .and_then(|()| std::fs::rename(&replaced, &root))
                 .map_err(crate::Error::from)
                 .and_then(|()| sync_dir(&databases));
@@ -345,9 +410,13 @@ fn swap(
                     let _ = std::fs::remove_dir_all(&failed);
                     Err(reopen_after(st, name, err))
                 }
-                Err(e2) => Err(BackupError::internal(format!(
-                    "{err}; putting back the old copy failed: {e2} (the next start repairs it)"
-                ))),
+                Err(e2) => {
+                    let message = format!(
+                        "{err}; putting back the old copy failed: {e2} (the next start repairs it)"
+                    );
+                    st.mark_swap_rollback_failed(name, message.clone());
+                    Err(BackupError::internal(message))
+                }
             }
         }
     }
@@ -578,7 +647,6 @@ mod tests {
         drop(st);
         let db = dir.path().join("databases");
         assert!(!db.join("ds").exists() && db.join(".replaced-ds-4").exists());
-        super::super::restore::recover(dir.path(), &Default::default()).unwrap();
         let st = state(dir.path());
         let ds = st.get("ds").unwrap();
         assert_eq!(
@@ -588,26 +656,129 @@ mod tests {
         assert!(!tmp.exists() && !db.join(".replaced-ds-4").exists());
     }
 
-    /// A crash after both renames: the restored copy is the dataset, the old one goes.
+    /// A crash after both renames and before registry commit rolls back to the predecessor.
     #[test]
-    fn a_crash_after_both_renames_keeps_the_restored_copy() {
+    fn a_crash_after_both_renames_before_commit_restores_the_predecessor() {
         let dir = tempfile::tempdir().unwrap();
         let st = state(dir.path());
         let ds = st.create("ds", &CreateDataset::default()).unwrap();
         update(&ds, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        let before = (ds.store().dataset_id(), ds.store().head_commit().seq);
         drop(ds);
         let tmp = dir.path().join("databases").join(".restore-ds-5");
-        let id = restored(&tmp, 2);
+        let new_id = restored(&tmp, 2);
+        assert_ne!(new_id, before.0);
         CRASH_AFTER.set(2);
         let r = replace_in_place(&st, "ds", &tmp, "5", false);
         CRASH_AFTER.set(0);
         assert!(r.is_err());
         drop(st);
         let db = dir.path().join("databases");
-        assert!(db.join(".replaced-ds-5").exists());
-        super::super::restore::recover(dir.path(), &Default::default()).unwrap();
+        assert!(db.join("ds").exists() && db.join(".replaced-ds-5").exists());
         let st = state(dir.path());
-        assert_eq!(st.get("ds").unwrap().store().dataset_id(), id);
+        let ds = st.get("ds").unwrap();
+        assert_eq!(
+            (ds.store().dataset_id(), ds.store().head_commit().seq),
+            before
+        );
         assert!(!db.join(".replaced-ds-5").exists());
+        assert!(
+            !db.join("ds")
+                .join(super::super::restore::SWAP_MARKER)
+                .exists()
+        );
+    }
+
+    /// A crash after the registry commit keeps the restored copy and removes the predecessor.
+    #[test]
+    fn a_crash_after_registry_commit_keeps_the_restored_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        let ds = st.create("ds", &CreateDataset::default()).unwrap();
+        update(&ds, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        drop(ds);
+        let tmp = dir.path().join("databases").join(".restore-ds-6");
+        let id = restored(&tmp, 2);
+        CRASH_AFTER.set(3);
+        let r = replace_in_place(&st, "ds", &tmp, "6", false);
+        CRASH_AFTER.set(0);
+        assert!(r.is_err());
+        drop(st);
+        let db = dir.path().join("databases");
+        assert!(db.join("ds").exists() && db.join(".replaced-ds-6").exists());
+        let st = state(dir.path());
+        let ds = st.get("ds").unwrap();
+        assert_eq!((ds.store().dataset_id(), ds.len()), (id, 2));
+        assert!(!db.join(".replaced-ds-6").exists());
+    }
+
+    /// An older unmarked swap without a swap marker preserves legacy roll-forward behavior.
+    #[test]
+    fn an_unmarked_legacy_swap_preserves_roll_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        let ds = st.create("ds", &CreateDataset::default()).unwrap();
+        update(&ds, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        drop(ds);
+        drop(st);
+        let db = dir.path().join("databases");
+        std::fs::rename(db.join("ds"), db.join(".replaced-ds-5")).unwrap();
+        let id = restored(&db.join("ds"), 2);
+        // Legacy format 1 registry had no dataset UUID or swap revision.
+        std::fs::write(
+            dir.path().join(super::super::CONFIG_FILE),
+            r#"{"format":1,"datasets":[{"name":"ds","type":"persistent"}]}"#,
+        )
+        .unwrap();
+        let st = state(dir.path());
+        let ds = st.get("ds").unwrap();
+        assert_eq!((ds.store().dataset_id(), ds.len()), (id, 2));
+        assert!(!db.join(".replaced-ds-5").exists());
+    }
+
+    /// Missing config.json or a future swap marker format fails closed without discarding copies.
+    #[test]
+    fn marked_swap_requires_registry_and_rejects_future_marker_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        let ds = st.create("ds", &CreateDataset::default()).unwrap();
+        update(&ds, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        drop(ds);
+        let tmp = dir.path().join("databases").join(".restore-ds-7");
+        restored(&tmp, 2);
+        CRASH_AFTER.set(2);
+        assert!(replace_in_place(&st, "ds", &tmp, "7", false).is_err());
+        CRASH_AFTER.set(0);
+        drop(st);
+
+        let config = dir.path().join(super::super::CONFIG_FILE);
+        let saved_config = std::fs::read(&config).unwrap();
+        let db = dir.path().join("databases");
+        let replaced = db.join(".replaced-ds-7");
+        let marker = replaced.join(super::super::restore::SWAP_MARKER);
+
+        // Missing config.json fails closed and preserves both directories.
+        std::fs::remove_file(&config).unwrap();
+        let err = Catalog::open(dir.path(), StoreOptions::default().into())
+            .err()
+            .unwrap();
+        assert!(matches!(err, crate::Error::Corrupt(_)), "{err:?}");
+        assert!(db.join("ds/CURRENT").exists() && replaced.join("CURRENT").exists());
+        std::fs::write(&config, &saved_config).unwrap();
+
+        // Future swap marker format fails closed with Unsupported and preserves both directories.
+        let saved_marker = std::fs::read(&marker).unwrap();
+        std::fs::write(&marker, br#"{"format":2,"dataset":"ds"}"#).unwrap();
+        let err = Catalog::open(dir.path(), StoreOptions::default().into())
+            .err()
+            .unwrap();
+        assert!(matches!(err, crate::Error::Unsupported(_)), "{err:?}");
+        assert!(db.join("ds/CURRENT").exists() && replaced.join("CURRENT").exists());
+
+        // Restoring the valid marker allows clean rollback recovery.
+        std::fs::write(&marker, &saved_marker).unwrap();
+        let st = state(dir.path());
+        assert_eq!(st.get("ds").unwrap().len(), 1);
+        assert!(!replaced.exists());
     }
 }

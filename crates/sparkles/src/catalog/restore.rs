@@ -1,18 +1,29 @@
 //! Startup recovery of interrupted restores, run before the registry's datasets are
 //! opened (a crash between the two renames of an in-place restore leaves
 //! `databases/<ds>` missing, which would stop the server):
-//! * `databases/.restore-*` (an unfinished download) is removed;
-//! * `databases/.replaced-<ds>-<task>` with no `databases/<ds>` is renamed back to
-//!   `<ds>` with a WARN (the crash came between the renames);
-//! * `databases/.replaced-<ds>-<task>` next to a `databases/<ds>` is removed (the swap
-//!   finished before the crash). A copy kept on purpose (`keepReplaced`) is renamed
-//!   by the restore to `.kept-<ds>-<task>`, which this rule does not match;
+//! * `databases/.restore-*` (an unfinished download or discarded rollback copy) is removed;
+//! * `databases/.replaced-<ds>-<task>` carrying a `.restore-swap.json` marker is
+//!   reconciled against the durable `config.json` revision (rolling back to the
+//!   predecessor when the predecessor revision survived, or removing `.replaced-*`
+//!   when the restored revision or a later registration survived);
+//! * an unmarked legacy `databases/.replaced-<ds>-<task>` with no `databases/<ds>` is
+//!   renamed back to `<ds>` with a WARN, and next to a `databases/<ds>` is removed. A
+//!   copy kept on purpose (`keepReplaced`) is renamed by the restore to `.kept-<ds>-<task>`,
+//!   which this rule does not match;
 //! * `tmp/verify-*` (the scratch directory of a `restore`-level verification) and
 //!   `tmp/memory-backup-*` (the temporary copy of an in-memory dataset being backed
 //!   up) are removed.
 
-use anyhow::Context;
+use super::delete;
+use super::delete_fs::RecoveryDir;
+use super::{CONFIG_FILE, Registry, write_file_atomic};
+use crate::{Error, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
+use std::io::{ErrorKind, Read};
 use std::path::Path;
+use uuid::Uuid;
 
 /// Prefix of a restore's download directory: `.restore-<target>-<task>`.
 pub const RESTORE_PREFIX: &str = ".restore-";
@@ -20,6 +31,122 @@ pub const RESTORE_PREFIX: &str = ".restore-";
 pub const REPLACED_PREFIX: &str = ".replaced-";
 /// Prefix of a replaced directory kept with `keepReplaced`: `.kept-<ds>-<task>`.
 pub const KEPT_PREFIX: &str = super::KEPT_PREFIX;
+/// Versioned marker stored inside `.replaced-<ds>-<task>` for registry-backed swaps.
+pub(super) const SWAP_MARKER: &str = ".restore-swap.json";
+const SWAP_MARKER_FORMAT: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SwapMarker {
+    pub(super) format: u32,
+    pub(super) dataset: String,
+    pub(super) predecessor_id: Uuid,
+    pub(super) predecessor_revision: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) restored_id: Option<Uuid>,
+    pub(super) restored_revision: Uuid,
+}
+
+impl SwapMarker {
+    pub(super) fn new(
+        dataset: impl Into<String>,
+        predecessor_id: Uuid,
+        predecessor_revision: Uuid,
+        restored_id: Option<Uuid>,
+        restored_revision: Uuid,
+    ) -> Self {
+        Self {
+            format: SWAP_MARKER_FORMAT,
+            dataset: dataset.into(),
+            predecessor_id,
+            predecessor_revision,
+            restored_id,
+            restored_revision,
+        }
+    }
+}
+
+pub(super) fn write_swap_marker(replaced: &Path, marker: &SwapMarker) -> Result<()> {
+    let bytes = serde_json::to_vec(marker).map_err(|e| Error::invalid(e.to_string()))?;
+    write_file_atomic(&replaced.join(SWAP_MARKER), &bytes)
+}
+
+pub(super) fn remove_swap_marker(replaced: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(replaced.join(SWAP_MARKER)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    sparkles_core::fsutil::sync_dir(replaced)
+}
+
+fn read_swap_marker(replaced: &RecoveryDir, dataset: &str) -> Result<Option<SwapMarker>> {
+    #[derive(Deserialize)]
+    struct Header {
+        format: serde_json::Value,
+    }
+    let corrupt = |error: &dyn std::fmt::Display| {
+        Error::Corrupt(format!(
+            "{}/{SWAP_MARKER}: {error}",
+            replaced.path().display()
+        ))
+    };
+    let mut file = match replaced.open_file(OsStr::new(SWAP_MARKER), false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == ErrorKind::InvalidData => return Err(corrupt(&error)),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(corrupt(&"expected a JSON object"));
+    }
+    let header: Header = serde_json::from_slice(&bytes).map_err(|e| corrupt(&e))?;
+    let Some(format) = header.format.as_u64() else {
+        return Err(corrupt(&"invalid format version"));
+    };
+    if format == 0 {
+        return Err(corrupt(&"invalid format version 0"));
+    }
+    if format > u64::from(SWAP_MARKER_FORMAT) {
+        return Err(Error::Unsupported(format!(
+            "{}/{SWAP_MARKER} uses format {format}, which is newer than supported format {SWAP_MARKER_FORMAT}",
+            replaced.path().display()
+        )));
+    }
+    let marker: SwapMarker = serde_json::from_slice(&bytes).map_err(|e| corrupt(&e))?;
+    if marker.format != SWAP_MARKER_FORMAT {
+        return Err(corrupt(&"format version mismatch"));
+    }
+    if marker.dataset != dataset {
+        return Err(corrupt(&format!(
+            "dataset {:?} does not match directory for /{dataset}",
+            marker.dataset
+        )));
+    }
+    if marker.predecessor_revision == marker.restored_revision {
+        return Err(corrupt(&"swap revisions must be distinct"));
+    }
+    Ok(Some(marker))
+}
+
+/// Whether `databases` contains any `.replaced-<ds>-<task>` directory with a
+/// registry-backed swap marker (requiring `config.json` for recovery).
+pub(super) fn has_marked_swaps(databases: &RecoveryDir) -> Result<bool> {
+    for entry in databases.names()? {
+        let name = entry?;
+        let text = name.to_string_lossy();
+        let Some(ds) = replaced_dataset(&text) else {
+            continue;
+        };
+        let dir = databases.child(&name)?;
+        if read_swap_marker(&dir, ds)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 /// The dataset name of `.replaced-<ds>-<task>` (the task id is numeric).
 pub fn replaced_dataset(file_name: &str) -> Option<&str> {
@@ -31,54 +158,184 @@ pub fn replaced_dataset(file_name: &str) -> Option<&str> {
 /// Recover `<data_dir>/databases` after the catalog lock is held and before opening
 /// any registered datasets.
 pub(super) fn recover(
-    data_dir: &Path,
-    protected: &std::collections::BTreeSet<String>,
-) -> anyhow::Result<()> {
-    let databases = data_dir.join("databases");
-    let entries = match std::fs::read_dir(&databases) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", databases.display())),
-    };
-    let mut changed = false;
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let path = e.path();
-        if name.starts_with(RESTORE_PREFIX) {
-            tracing::info!(target: "sparkles::backup", "removing unfinished restore {}", path.display());
-            std::fs::remove_dir_all(&path)
-                .with_context(|| format!("removing {}", path.display()))?;
-            changed = true;
-        } else if let Some(ds) = replaced_dataset(&name) {
+    catalog: &RecoveryDir,
+    databases: &RecoveryDir,
+    registry: &Registry,
+    protected: &BTreeSet<String>,
+) -> Result<()> {
+    let mut restore_leftovers = Vec::new();
+    let mut replaced_entries: BTreeMap<String, Vec<(RecoveryDir, Option<SwapMarker>)>> =
+        BTreeMap::new();
+    let mut has_marked = false;
+    for entry in databases.names()? {
+        let name = entry?;
+        let text = name.to_string_lossy().into_owned();
+        if text.starts_with(RESTORE_PREFIX) {
+            restore_leftovers.push(databases.path().join(&name));
+        } else if let Some(ds) = replaced_dataset(&text) {
             if protected.contains(ds) {
                 continue;
             }
-            let target = databases.join(ds);
+            let dir = databases.child(&name)?;
+            let marker = read_swap_marker(&dir, ds)?;
+            has_marked |= marker.is_some();
+            replaced_entries
+                .entry(ds.to_string())
+                .or_default()
+                .push((dir, marker));
+        }
+    }
+
+    if !restore_leftovers.is_empty() {
+        for path in restore_leftovers {
+            tracing::info!(
+                target: "sparkles::backup",
+                "removing unfinished restore {}",
+                path.display()
+            );
+            std::fs::remove_dir_all(&path)?;
+        }
+        databases.sync()?;
+    }
+
+    // Make the observed registry durable before any marked swap removes either copy.
+    if has_marked {
+        catalog.sync()?;
+    }
+
+    for (ds, entries) in replaced_entries {
+        let mut rollbacks = Vec::new();
+        let mut completions = Vec::new();
+        let mut unmarked = Vec::new();
+        let registered = delete::registered_dataset(registry, &ds);
+        for (dir, marker) in entries {
+            let Some(marker) = marker else {
+                unmarked.push(dir);
+                continue;
+            };
+            match registered {
+                Some(row) if row.revision.is_none() => {
+                    return Err(Error::Corrupt(format!(
+                        "{CONFIG_FILE} is missing the swap revision for /{ds}"
+                    )));
+                }
+                Some(row) if row.revision == Some(marker.predecessor_revision) => {
+                    rollbacks.push((dir, marker, row));
+                }
+                Some(row) if row.revision == Some(marker.restored_revision) => {
+                    completions.push((dir, marker, Some(row)));
+                }
+                _ => {
+                    completions.push((dir, marker, None));
+                }
+            }
+        }
+        if rollbacks.len() > 1 {
+            return Err(Error::Corrupt(format!(
+                "multiple staged restore swaps match the registered revision of /{ds}"
+            )));
+        }
+
+        // Roll back any uncommitted swap before cleaning up older completed swap copies.
+        for (replaced_dir, marker, row) in rollbacks {
+            if row.id.is_some_and(|id| id != marker.predecessor_id) {
+                return Err(Error::Corrupt(format!(
+                    "{CONFIG_FILE} identity {:?} disagrees with staged restore predecessor {}",
+                    row.id, marker.predecessor_id
+                )));
+            }
+            let mut replaced = delete::LockedDeleteDir::open(replaced_dir, marker.predecessor_id)?;
+            let discard =
+                if let Some(mut live) = delete::child_if_present(databases, OsStr::new(&ds))? {
+                    if let Some(expected_restored) = marker.restored_id
+                        && let Ok(Some(found)) = delete::dataset_id(&live)
+                        && found != expected_restored
+                        && found != marker.predecessor_id
+                    {
+                        return Err(Error::Corrupt(format!(
+                            "live dataset /{ds} identity {found} does not match staged restore swap"
+                        )));
+                    }
+                    let live_lock = delete::lock_dataset(&live)?;
+                    #[cfg(not(unix))]
+                    let live_lock = {
+                        drop(live_lock);
+                        None
+                    };
+                    #[cfg(unix)]
+                    let live_lock = Some(live_lock);
+                    let discard_name =
+                        OsString::from(format!("{RESTORE_PREFIX}{ds}-rollback-{}", Uuid::new_v4()));
+                    databases.rename_child(&mut live, &discard_name)?;
+                    databases.sync()?;
+                    Some((live, live_lock))
+                } else {
+                    None
+                };
+            tracing::warn!(
+                target: "sparkles::backup",
+                "an in-place restore of /{ds} did not commit: putting back {}",
+                replaced.path().display()
+            );
+            match replaced.dir().remove_file(OsStr::new(SWAP_MARKER)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            replaced.dir().sync()?;
+            replaced.rename(databases, &ds)?;
+            databases.sync()?;
+            drop(replaced);
+            if let Some((discard_dir, live_lock)) = discard {
+                let lock = match live_lock {
+                    Some(lock) => lock,
+                    None => delete::lock_dataset(&discard_dir)?,
+                };
+                databases.remove_child(&discard_dir, lock)?;
+                databases.sync()?;
+            }
+        }
+
+        for (replaced_dir, marker, committed_row) in completions {
+            if let Some(row) = committed_row
+                && let Some(expected_id) = row.id
+                && let Some(live) = delete::child_if_present(databases, OsStr::new(&ds))?
+            {
+                let _live_lock = delete::lock_candidate(&live, expected_id, false)?;
+            }
+            tracing::info!(
+                target: "sparkles::backup",
+                "removing {} (the restore of /{ds} had committed)",
+                replaced_dir.path().display()
+            );
+            let lock = delete::lock_candidate(&replaced_dir, marker.predecessor_id, true)?;
+            databases.remove_child(&replaced_dir, lock)?;
+            databases.sync()?;
+        }
+
+        for replaced_dir in unmarked {
+            let path = replaced_dir.path().to_path_buf();
+            let target = databases.path().join(&ds);
             if target.exists() {
                 tracing::info!(
                     target: "sparkles::backup",
                     "removing {} (the restore of /{ds} had finished)",
                     path.display()
                 );
-                std::fs::remove_dir_all(&path)
-                    .with_context(|| format!("removing {}", path.display()))?;
+                std::fs::remove_dir_all(&path)?;
             } else {
                 tracing::warn!(
                     target: "sparkles::backup",
                     "an in-place restore of /{ds} was interrupted: putting back {}",
                     path.display()
                 );
-                std::fs::rename(&path, &target).with_context(|| {
-                    format!("renaming {} to {}", path.display(), target.display())
-                })?;
+                std::fs::rename(&path, &target)?;
             }
-            changed = true;
+            databases.sync()?;
         }
     }
-    if changed {
-        super::sync_dir(&databases)?;
-    }
-    if let Ok(entries) = std::fs::read_dir(data_dir.join("tmp")) {
+
+    if let Ok(entries) = std::fs::read_dir(catalog.path().join("tmp")) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             if name.starts_with("verify-") || name.starts_with(crate::store::MEMORY_CAPTURE_PREFIX)
@@ -279,7 +536,15 @@ mod tests {
         std::fs::write(db.join(".replaced-b-6").join("marker"), b"old b").unwrap();
         std::fs::create_dir_all(dir.path().join("tmp").join("verify-9")).unwrap();
         std::fs::create_dir_all(dir.path().join("tmp").join("memory-backup-x1")).unwrap();
-        recover(dir.path(), &Default::default()).unwrap();
+        let catalog = RecoveryDir::open(dir.path()).unwrap();
+        let databases = delete::open_databases(&catalog).unwrap();
+        recover(
+            &catalog,
+            &databases,
+            &Registry::default(),
+            &Default::default(),
+        )
+        .unwrap();
         let mut left: Vec<String> = std::fs::read_dir(&db)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -292,8 +557,13 @@ mod tests {
         );
         assert!(!dir.path().join("tmp").join("verify-9").exists());
         assert!(!dir.path().join("tmp").join("memory-backup-x1").exists());
-        // nothing to do: fine, also without a databases directory
-        recover(dir.path(), &Default::default()).unwrap();
-        recover(&dir.path().join("none"), &Default::default()).unwrap();
+        // nothing to do: fine on an empty databases directory
+        recover(
+            &catalog,
+            &databases,
+            &Registry::default(),
+            &Default::default(),
+        )
+        .unwrap();
     }
 }

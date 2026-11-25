@@ -164,6 +164,7 @@ struct Entry {
     dataset: Dataset,
     kind: DatasetKind,
     attached: bool,
+    revision: Option<Uuid>,
 }
 /// The catalog's registry of datasets in the data directory. Its `format` member
 /// ([`sparkles_core::formats::CATALOG`]) is added on write and checked on read.
@@ -180,6 +181,8 @@ struct RegistryEntry {
     kind: DatasetKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision: Option<Uuid>,
     #[serde(default)]
     reasoning: Option<crate::reasoning::ReasoningRecord>,
 }
@@ -188,6 +191,7 @@ struct RegistryEntry {
 /// catalog works on its directory, so that saves made meanwhile keep it registered.
 struct Detached {
     id: Option<Uuid>,
+    revision: Option<Uuid>,
     reasoning: Option<crate::reasoning::ReasoningRecord>,
 }
 
@@ -328,7 +332,18 @@ impl Catalog {
                     "{CONFIG_FILE} is missing while a prepared delete requires recovery"
                 )));
             }
-            None => Registry::default(),
+            None => {
+                #[cfg(feature = "backup")]
+                if let Some(existing_databases) =
+                    delete::child_if_present(&catalog_dir, OsStr::new("databases"))?
+                    && restore::has_marked_swaps(&existing_databases)?
+                {
+                    return Err(Error::Corrupt(format!(
+                        "{CONFIG_FILE} is missing while a staged restore swap requires recovery"
+                    )));
+                }
+                Registry::default()
+            }
         };
         let databases = delete::open_databases(&catalog_dir)?;
         rename::recover(&dir)?;
@@ -337,7 +352,7 @@ impl Catalog {
         #[cfg(not(feature = "backup"))]
         let restore_conflicts = BTreeSet::new();
         #[cfg(feature = "backup")]
-        restore::recover(&dir, &restore_conflicts).map_err(component)?;
+        restore::recover(&catalog_dir, &databases, &registry, &restore_conflicts)?;
         let delete_refusals = delete::recover(
             &catalog_dir,
             &databases,
@@ -383,6 +398,7 @@ impl Catalog {
                     e.name.clone(),
                     Detached {
                         id: e.id,
+                        revision: e.revision,
                         reasoning: e.reasoning,
                     },
                 );
@@ -400,6 +416,7 @@ impl Catalog {
                     dataset: ds,
                     kind: e.kind,
                     attached: false,
+                    revision: None,
                 },
             );
         }
@@ -422,16 +439,23 @@ impl Catalog {
         // A registered root that lost its directory or CURRENT is refused alone, so
         // that nothing recreates it.
         let recovery = self.inner.startup_delete_refusals.get(name).cloned();
+        let expected = self
+            .inner
+            .detached
+            .lock()
+            .get(name)
+            .and_then(|detached| detached.id);
         let opened = if let Some(refusal) = &recovery {
             Err(Error::Corrupt(refusal.message.clone()))
         } else {
             match self.missing_registered_root(name) {
                 Ok(None) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // only a missing root is reported as `NotFound` below
-                    self.open_existing_dataset(name, None).map_err(|e| match e {
-                        Error::NotFound(m) => Error::Corrupt(m),
-                        e => e,
-                    })
+                    self.open_existing_dataset(name, expected)
+                        .map_err(|e| match e {
+                            Error::NotFound(m) => Error::Corrupt(m),
+                            e => e,
+                        })
                 }))
                 .unwrap_or_else(|panic| {
                     let what = panic
@@ -864,6 +888,7 @@ impl Catalog {
                     dataset: ds.clone(),
                     kind: req.kind,
                     attached: false,
+                    revision: (req.kind == DatasetKind::Persistent).then(Uuid::new_v4),
                 },
             );
             self.save_locked()
@@ -896,6 +921,7 @@ impl Catalog {
                 dataset: ds.clone(),
                 kind,
                 attached: true,
+                revision: None,
             },
         );
         Ok(ds)
@@ -950,7 +976,8 @@ impl Catalog {
             if managed {
                 let databases = databases.expect("persistent catalog");
                 let id = entry.dataset.dataset_id();
-                self.hold_closing_locked(name, &entry.dataset);
+                let revision = entry.revision;
+                self.hold_closing_locked(name, &entry.dataset, revision);
                 let closed = {
                     let _disposing = self.disposal_scope();
                     entry.dataset.close_for_disposal(|| drop(map.take()))
@@ -971,6 +998,7 @@ impl Catalog {
                                     dataset,
                                     kind: entry.kind,
                                     attached: entry.attached,
+                                    revision,
                                 },
                             );
                         drop(map.take());
@@ -994,7 +1022,7 @@ impl Catalog {
                     delete::record(dir, &intent)
                 };
                 if let Err(error) = recorded {
-                    return Err(self.reopen_registered_delete(name, id, reasoning, error));
+                    return Err(self.reopen_registered_delete(name, id, revision, reasoning, error));
                 }
                 delete::crash_point(delete::CRASH_AFTER_INTENT)?;
 
@@ -1006,9 +1034,15 @@ impl Catalog {
                     Err(MoveError::Rollback(failure)) => {
                         let error = if failure.reopen {
                             self.retire_delete_rollback(dir, databases, intent.token);
-                            self.reopen_registered_delete(name, id, reasoning, failure.error)
+                            self.reopen_registered_delete(
+                                name,
+                                id,
+                                revision,
+                                reasoning,
+                                failure.error,
+                            )
                         } else {
-                            self.keep_closed_locked(name, id, reasoning, failure.error)
+                            self.keep_closed_locked(name, id, revision, reasoning, failure.error)
                         };
                         return Err(error);
                     }
@@ -1024,7 +1058,7 @@ impl Catalog {
                 });
 
                 if let Err(error) = self.verify_delete_parent() {
-                    return Err(self.keep_closed_locked(name, id, reasoning, error));
+                    return Err(self.keep_closed_locked(name, id, revision, reasoning, error));
                 }
                 match self.commit_delete_registry(dir) {
                     Ok(()) => {}
@@ -1036,11 +1070,12 @@ impl Catalog {
                         let error = match restored {
                             Ok(()) => {
                                 self.retire_delete_rollback(dir, databases, intent.token);
-                                self.reopen_registered_delete(name, id, reasoning, error)
+                                self.reopen_registered_delete(name, id, revision, reasoning, error)
                             }
                             Err(restore) => self.keep_closed_locked(
                                 name,
                                 id,
+                                revision,
                                 reasoning,
                                 Error::Corrupt(format!(
                                     "{error}; restoring {} failed: {restore}",
@@ -1133,11 +1168,12 @@ impl Catalog {
     /// restore does. If a close callback panics after the close commits, the unwind
     /// leaves this record, so later saves keep the dataset in `config.json` and the
     /// name stays unavailable until the next [`Catalog::open`] reopens it.
-    fn hold_closing_locked(&self, name: &str, dataset: &Dataset) {
+    fn hold_closing_locked(&self, name: &str, dataset: &Dataset, revision: Option<Uuid>) {
         self.inner.detached.lock().insert(
             name.into(),
             Detached {
                 id: Some(dataset.dataset_id()),
+                revision,
                 reasoning: dataset.reasoning_record(),
             },
         );
@@ -1177,17 +1213,19 @@ impl Catalog {
         &self,
         name: &str,
         id: Uuid,
+        revision: Option<Uuid>,
         reasoning: Option<crate::reasoning::ReasoningRecord>,
         error: Error,
     ) -> Error {
         match self
             .verify_delete_parent()
-            .and_then(|()| self.reattach_locked(name, Some(id)))
+            .and_then(|()| self.reattach_locked_with_revision(name, Some(id), revision))
         {
             Ok(()) => error,
             Err(reopen) => self.keep_closed_locked(
                 name,
                 id,
+                revision,
                 reasoning,
                 Error::Corrupt(format!(
                     "{error}; reopening /{name} after close failed: {reopen}"
@@ -1202,6 +1240,7 @@ impl Catalog {
         &self,
         name: &str,
         id: Uuid,
+        revision: Option<Uuid>,
         reasoning: Option<crate::reasoning::ReasoningRecord>,
         error: Error,
     ) -> Error {
@@ -1211,6 +1250,7 @@ impl Catalog {
             name.into(),
             Detached {
                 id: Some(id),
+                revision,
                 reasoning,
             },
         );
@@ -1276,7 +1316,8 @@ impl Catalog {
         }
         let dir = self.dir().expect("persistent catalog");
         let id = entry.dataset.dataset_id();
-        self.hold_closing_locked(from, &entry.dataset);
+        let revision = entry.revision;
+        self.hold_closing_locked(from, &entry.dataset, revision);
         let closed = {
             let _disposing = self.disposal_scope();
             entry.dataset.close_for_disposal(|| drop(map.take()))
@@ -1296,6 +1337,7 @@ impl Catalog {
                             dataset,
                             kind: entry.kind,
                             attached: entry.attached,
+                            revision,
                         },
                     );
                 drop(map.take());
@@ -1308,7 +1350,7 @@ impl Catalog {
             }
         };
         if let Err(error) = rename::prepare(dir, from, to, id) {
-            return Err(self.roll_back_rename(from, to, id, reasoning, error));
+            return Err(self.roll_back_rename(from, to, id, revision, reasoning, error));
         }
         let old = self.database_dir(from)?;
         let new = self.database_dir(to)?;
@@ -1326,6 +1368,7 @@ impl Catalog {
                 to.into(),
                 Detached {
                     id: Some(id),
+                    revision,
                     reasoning: ds.reasoning_record(),
                 },
             );
@@ -1338,12 +1381,13 @@ impl Catalog {
                     dataset: ds,
                     kind: DatasetKind::Persistent,
                     attached: false,
+                    revision,
                 },
             );
             Ok(())
         });
         if let Err(e) = result {
-            return Err(self.roll_back_rename(from, to, id, reasoning, e));
+            return Err(self.roll_back_rename(from, to, id, revision, reasoning, e));
         }
         rename::crash_point(3)?;
         rename::finish(dir)?;
@@ -1357,6 +1401,7 @@ impl Catalog {
         from: &str,
         to: &str,
         id: Uuid,
+        revision: Option<Uuid>,
         reasoning: Option<crate::reasoning::ReasoningRecord>,
         err: Error,
     ) -> Error {
@@ -1372,20 +1417,22 @@ impl Catalog {
                 .as_ref()
                 .map(|r| r.name.clone())
                 .ok_or_else(|| Error::Corrupt("renamed dataset is unregistered".into()))?;
+            let rev = registered.as_ref().and_then(|r| r.revision).or(revision);
             rename::fail_point(rename::FAIL_ROLLBACK_REOPEN)?;
-            self.reattach_locked(&name, Some(id))
+            self.reattach_locked_with_revision(&name, Some(id), rev)
         })();
         match reopened {
             Ok(()) => err,
             Err(again) => {
-                let (name, reasoning) = match registered {
-                    Some(r) => (r.name, r.reasoning),
-                    None => (from.to_string(), reasoning),
+                let (name, rev, reasoning) = match registered {
+                    Some(r) => (r.name, r.revision.or(revision), r.reasoning),
+                    None => (from.to_string(), revision, reasoning),
                 };
                 self.inner.detached.lock().insert(
                     name.clone(),
                     Detached {
                         id: Some(id),
+                        revision: rev,
                         reasoning,
                     },
                 );
@@ -1453,7 +1500,9 @@ impl Catalog {
         let result = self
             .open_existing_dataset(name, None)
             .map_err(RegistryCommitError::BeforeReplace)
-            .and_then(|dataset| self.commit_staged_dataset_locked(name, dataset));
+            .and_then(|dataset| {
+                self.commit_staged_dataset_locked(name, dataset, Some(Uuid::new_v4()))
+            });
         match result {
             Ok(dataset) => Ok(dataset),
             Err(RegistryCommitError::BeforeReplace(error)) => {
@@ -1485,6 +1534,7 @@ impl Catalog {
                 dataset: ds.clone(),
                 kind: DatasetKind::Memory,
                 attached: false,
+                revision: None,
             },
         );
         if let Err(e) = self.save_locked() {
@@ -1637,6 +1687,9 @@ impl Catalog {
                 name: name.clone(),
                 kind: e.kind,
                 id: (e.kind == DatasetKind::Persistent).then(|| e.dataset.dataset_id()),
+                revision: (e.kind == DatasetKind::Persistent)
+                    .then_some(e.revision)
+                    .flatten(),
                 reasoning: e.dataset.reasoning_record(),
             })
             .collect();
@@ -1647,6 +1700,7 @@ impl Catalog {
                     name: name.clone(),
                     kind: DatasetKind::Persistent,
                     id: d.id,
+                    revision: d.revision,
                     reasoning: d.reasoning.clone(),
                 });
             }
@@ -1684,6 +1738,7 @@ impl Catalog {
         &self,
         name: &str,
         dataset: Dataset,
+        revision: Option<Uuid>,
     ) -> std::result::Result<Dataset, RegistryCommitError> {
         let dir = self.dir().expect("persistent catalog");
         let mut registry = self.registry_locked();
@@ -1691,6 +1746,7 @@ impl Catalog {
             name: name.into(),
             kind: DatasetKind::Persistent,
             id: Some(dataset.dataset_id()),
+            revision,
             reasoning: dataset.reasoning_record(),
         };
         match registry
@@ -1704,7 +1760,7 @@ impl Catalog {
             .map_err(RegistryCommitError::BeforeReplace)?;
         if let Err(error) = sync_restored_registry(dir) {
             let message = format!("the registry commit for /{name} is indeterminate: {error}");
-            self.hold_closing_locked(name, &dataset);
+            self.hold_closing_locked(name, &dataset, revision);
             self.inner
                 .pending_registry_commits
                 .lock()
@@ -1718,7 +1774,7 @@ impl Catalog {
             );
             return Err(RegistryCommitError::Indeterminate(Error::Corrupt(message)));
         }
-        self.publish_reattached(name, dataset.clone());
+        self.publish_reattached_with_revision(name, dataset.clone(), revision);
         Ok(dataset)
     }
 
@@ -1735,17 +1791,54 @@ impl Catalog {
         {
             return Ok(None);
         }
-        let Some(ds) = map.remove(name).map(|e| e.dataset) else {
+        let Some(entry) = map.remove(name) else {
             return Ok(None);
         };
+        let ds = entry.dataset;
         self.inner.detached.lock().insert(
             name.into(),
             Detached {
                 id: Some(ds.dataset_id()),
+                revision: entry.revision,
                 reasoning: ds.reasoning_record(),
             },
         );
         Ok(Some(ds))
+    }
+    /// Ensure the detached predecessor has a durable identity and revision in
+    /// `config.json` before an in-place swap renames its directories.
+    #[cfg(feature = "backup")]
+    pub(crate) fn bind_swap_revision(&self, name: &str, id: Uuid) -> Result<Uuid> {
+        let _g = self.manage()?;
+        self.require_determinate_registry(name)?;
+        let (revision, needs_save) = {
+            let mut detached = self.inner.detached.lock();
+            let entry = detached.get_mut(name).ok_or_else(|| {
+                Error::Corrupt(format!("dataset /{name} is not detached for swap"))
+            })?;
+            let needs_save = entry.id != Some(id) || entry.revision.is_none();
+            let revision = entry.revision.unwrap_or_else(Uuid::new_v4);
+            entry.id = Some(id);
+            entry.revision = Some(revision);
+            (revision, needs_save)
+        };
+        if needs_save {
+            self.save_locked()?;
+        }
+        Ok(revision)
+    }
+    /// Record a recovery refusal when live rollback after a pre-replacement swap
+    /// error cannot move the directories back, keeping the predecessor detached.
+    #[cfg(feature = "backup")]
+    pub(crate) fn mark_swap_rollback_failed(&self, name: &str, message: String) {
+        let _g = self.manage_internal();
+        self.inner.refused.lock().insert(
+            name.into(),
+            Refusal {
+                message,
+                kind: "recovery",
+            },
+        );
     }
     /// Put back a dataset taken out by [`detach_for_swap`](Self::detach_for_swap).
     /// Only swap recovery calls it, outside any disposal and without the lock, so it
@@ -1753,15 +1846,21 @@ impl Catalog {
     #[cfg_attr(not(feature = "backup"), allow(dead_code))]
     pub(crate) fn reinsert(&self, name: &str, ds: Dataset) {
         let _g = self.manage_internal();
+        let revision = self
+            .inner
+            .detached
+            .lock()
+            .remove(name)
+            .and_then(|d| d.revision);
         self.inner.entries.write().insert(
             name.into(),
             Entry {
                 dataset: ds,
                 kind: DatasetKind::Persistent,
                 attached: false,
+                revision,
             },
         );
-        self.inner.detached.lock().remove(name);
     }
     #[cfg_attr(not(feature = "backup"), allow(dead_code))]
     pub(crate) fn reattach(&self, name: &str) -> Result<Dataset> {
@@ -1774,6 +1873,7 @@ impl Catalog {
         &self,
         name: &str,
         expected: Option<Uuid>,
+        revision: Uuid,
     ) -> std::result::Result<Dataset, RegistryCommitError> {
         let _g = self.manage().map_err(RegistryCommitError::BeforeReplace)?;
         self.require_determinate_registry(name)
@@ -1791,9 +1891,23 @@ impl Catalog {
                     "the restored /{name} does not open: {error:#}"
                 )))
             })?;
-        self.commit_staged_dataset_locked(name, dataset)
+        self.commit_staged_dataset_locked(name, dataset, Some(revision))
     }
     fn reattach_locked(&self, name: &str, expected: Option<Uuid>) -> Result<()> {
+        let revision = self
+            .inner
+            .detached
+            .lock()
+            .get(name)
+            .and_then(|detached| detached.revision);
+        self.reattach_locked_with_revision(name, expected, revision)
+    }
+    fn reattach_locked_with_revision(
+        &self,
+        name: &str,
+        expected: Option<Uuid>,
+        revision: Option<Uuid>,
+    ) -> Result<()> {
         self.require_determinate_registry(name)?;
         if self.get(name).is_some() {
             return Err(Error::Conflict(format!("dataset '{name}' already exists")));
@@ -1806,16 +1920,26 @@ impl Catalog {
                 .and_then(|detached| detached.id)
         });
         let ds = self.open_existing_dataset(name, expected)?;
-        self.publish_reattached(name, ds);
+        self.publish_reattached_with_revision(name, ds, revision);
         Ok(())
     }
     fn publish_reattached(&self, name: &str, ds: Dataset) {
+        let revision = self
+            .inner
+            .detached
+            .lock()
+            .get(name)
+            .and_then(|detached| detached.revision);
+        self.publish_reattached_with_revision(name, ds, revision);
+    }
+    fn publish_reattached_with_revision(&self, name: &str, ds: Dataset, revision: Option<Uuid>) {
         self.inner.entries.write().insert(
             name.into(),
             Entry {
                 dataset: ds,
                 kind: DatasetKind::Persistent,
                 attached: false,
+                revision,
             },
         );
         self.inner.detached.lock().remove(name);

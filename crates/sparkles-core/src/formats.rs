@@ -389,7 +389,7 @@ pub const LINK: FileKind = FileKind {
 pub const CATALOG: FileKind = FileKind {
     id: "catalog",
     files: "config.json of the data directory",
-    marker: "`format`, absent meaning 1. Format 2 records persistent dataset UUIDs",
+    marker: "`format`, absent meaning 1. Format 2 records persistent dataset UUIDs and swap revisions",
     class: Class::Primary,
     writes: 2,
     reads: &[1, 2],
