@@ -144,7 +144,7 @@ const VALUE_CACHE_BYTES: u64 = 64 << 20;
 /// [`VALUE_CACHE_BYTES`] or an eighth of the memory budget, whichever is smaller, and a
 /// shard that reaches its share of that is cleared and freed. The reservation is kept
 /// until the context drops.
-pub(super) struct ValueCache {
+pub(crate) struct ValueCache {
     /// Made on the first value cached or looked up. Most short queries decode nothing
     /// through the cache and skip the 64 shards' allocation, setup and drop.
     shards: std::sync::OnceLock<Box<[RwLock<ValueShard>]>>,
@@ -180,7 +180,7 @@ impl Default for ValueCache {
 impl ValueCache {
     /// The estimated bytes one cached entry keeps: its slot, counted twice since a map
     /// grows by doubling, and the heap storage of its text.
-    pub(super) fn entry_bytes(v: &Value) -> u64 {
+    pub(crate) fn entry_bytes(v: &Value) -> u64 {
         fn text(s: &str) -> u64 {
             s.len() as u64 + 16
         }
@@ -2019,7 +2019,6 @@ impl Ctx {
     }
 
     /// Lightweight relaxed probe for latched fatal refusals on cold error paths.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     pub(crate) fn has_memory_failure(&self) -> bool {
         self.memory_failure.failed.load(Ordering::Relaxed)

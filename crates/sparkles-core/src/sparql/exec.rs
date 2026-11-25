@@ -61,7 +61,7 @@ pub(super) fn map_rows<T: Send>(
             .saturating_mul(2)
             .saturating_add(rayon::current_num_threads() as u64 * 1024);
         if let Ok(_scratch) = ctx.charge(bytes) {
-            return (0..n)
+            let out: Vec<T> = (0..n)
                 .into_par_iter()
                 .with_min_len(MAP_POLL_ROWS)
                 .map(|i| {
@@ -70,7 +70,9 @@ pub(super) fn map_rows<T: Send>(
                     }
                     Ok(f(i))
                 })
-                .collect();
+                .collect::<Result<Vec<T>>>()?;
+            ctx.check()?;
+            return Ok(out);
         }
     }
     // Without the collector's charge, a parallel map runs in pieces that each collect
@@ -88,6 +90,7 @@ pub(super) fn map_rows<T: Send>(
         }
         start = end;
     }
+    ctx.check()?;
     Ok(out)
 }
 
@@ -145,6 +148,7 @@ pub(super) fn map_batch_with<S, T: Send>(
     let may_split = par && batch_may_split(n) && rayon::current_num_threads() > 1;
     let t0 = may_split.then(Instant::now);
     out.extend((0..sample).map(|i| f(&mut state, i)));
+    ctx.check()?;
     if let Some(t0) = t0
         && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
     {
@@ -171,6 +175,7 @@ pub(super) fn map_batch_with<S, T: Send>(
             for piece in pieces {
                 out.extend(piece?);
             }
+            ctx.check()?;
             return Ok(out);
         }
     }
@@ -181,6 +186,7 @@ pub(super) fn map_batch_with<S, T: Send>(
         out.extend((start..end).map(|i| f(&mut state, i)));
         start = end;
     }
+    ctx.check()?;
     Ok(out)
 }
 

@@ -460,7 +460,8 @@ impl<'a> Pass<'a> {
                 }
             }
         }
-        let ctx = self.ctx()?;
+        let ctx = Arc::clone(self.ctx.as_ref().expect("initialized above"));
+        let ctx = ctx.as_ref();
         let to_ctx: FxHashMap<Id, Id> = local
             .into_iter()
             .map(|(i, t)| (i, ctx.intern_term(&t)))
@@ -500,8 +501,12 @@ impl<'a> Pass<'a> {
             Id(Option<Id>),
             Term(Term),
         }
+        let outs_credit = ctx.charge((rows.len() * std::mem::size_of::<Out>()) as u64)?;
         let mut outs: Vec<Out> = Vec::with_capacity(rows.len());
         for i in 0..rows.len() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
             let row = expr::Row {
                 table: &table,
                 i,
@@ -510,38 +515,60 @@ impl<'a> Pass<'a> {
                 exists: None,
             };
             if ebv {
-                let b = expr::ebv(&compiled, &row, ctx).unwrap_or(false);
+                let b = match expr::ebv(&compiled, &row, ctx) {
+                    Ok(b) => b,
+                    Err(_) if ctx.has_memory_failure() => {
+                        ctx.check()?;
+                        false
+                    }
+                    Err(_) => false,
+                };
                 outs.push(Out::Id(Some(Id::from_bool(b))));
                 continue;
             }
-            outs.push(match expr::eval(&compiled, &row, ctx) {
-                Err(_) => Out::Id(None),
+            let out = match expr::eval(&compiled, &row, ctx) {
+                Err(_) => {
+                    if ctx.has_memory_failure() {
+                        ctx.check()?;
+                    }
+                    Out::Id(None)
+                }
                 Ok(expr::Val::Id(i)) | Ok(expr::Val::Dec(i, _)) => {
                     if i.tag() == Tag::Local
                         || (i.tag() == Tag::BNode && i.payload() & Id::LOCAL_BNODE_BIT != 0)
                     {
-                        ctx.term(i).map_or(Out::Id(None), Out::Term)
+                        ctx.term_checked_into(i, &outs_credit)?
+                            .map_or(Out::Id(None), Out::Term)
                     } else {
                         Out::Id(Some(i))
                     }
                 }
                 Ok(expr::Val::V(Value::Integer(n))) => match Id::from_i64(i64::from(n)) {
                     Some(i) => Out::Id(Some(i)),
-                    None => Out::Term(Value::Integer(n).to_term()),
+                    None => {
+                        outs_credit.add(128)?;
+                        Out::Term(Value::Integer(n).to_term())
+                    }
                 },
                 Ok(expr::Val::V(Value::Bool(b))) => Out::Id(Some(Id::from_bool(b))),
-                Ok(expr::Val::V(v)) => Out::Term(v.to_term()),
-            });
+                Ok(expr::Val::V(v)) => {
+                    outs_credit.add(crate::sparql::ctx::ValueCache::entry_bytes(&v))?;
+                    Out::Term(v.to_term())
+                }
+            };
+            outs.push(out);
         }
         ctx.check()?;
         let snap = self.new.clone();
-        Ok(outs
+        let interned: Vec<Option<Id>> = outs
             .into_iter()
             .map(|o| match o {
                 Out::Id(x) => x,
                 Out::Term(t) => Some(self.terms.intern(&snap, &t)),
             })
-            .collect())
+            .collect();
+        drop(outs_credit);
+        Ok(interned)
     }
 
     /// The value of an id of this circuit's space.

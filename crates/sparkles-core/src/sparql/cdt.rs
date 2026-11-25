@@ -964,6 +964,28 @@ fn term_of(v: Val, ctx: &Ctx) -> EvalResult<Term> {
     }
 }
 
+/// Checked variant of [`term_of`] that keeps owned term credit live on `credit`.
+fn term_of_into(v: Val, ctx: &Ctx, credit: &super::ctx::Charge<'_>) -> EvalResult<Term> {
+    match v {
+        Val::Id(id) | Val::Dec(id, _) => ctx
+            .term_checked_into(id, credit)
+            .map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?
+            .ok_or(TypeError),
+        Val::V(v) => {
+            credit
+                .add(super::ctx::ValueCache::entry_bytes(&v))
+                .map_err(|e| {
+                    ctx.fail_memory(&e);
+                    TypeError
+                })?;
+            Ok(v.to_term())
+        }
+    }
+}
+
 /// A map key: an IRI or a literal.
 fn key_of(t: Term) -> Option<Term> {
     matches!(t, Term::NamedNode(_) | Term::Literal(_)).then_some(t)
@@ -991,7 +1013,11 @@ fn elem_val(e: &Elem, ctx: &Ctx) -> EvalResult<Val> {
         Elem::Term(t) => {
             let v = Value::from_term(t);
             if matches!(t, Term::Literal(_)) && v.to_term() != *t {
-                Ok(Val::Dec(ctx.intern_term(t), v))
+                let id = ctx.intern_term(t);
+                if ctx.has_memory_failure() {
+                    return Err(TypeError);
+                }
+                Ok(Val::Dec(id, v))
             } else {
                 Ok(Val::V(v))
             }
@@ -1036,23 +1062,45 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
     };
     match local {
-        // the constructors read errors as nulls
+        // the constructors read expression errors as nulls, but never swallow fatal refusals
         "List" => {
-            let l: Vec<Elem> = (0..n)
-                .map(|i| term(i).map_or(Elem::Null, Elem::Term))
-                .collect();
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
+            let mut l = Vec::with_capacity(n);
+            for i in 0..n {
+                match ev(i).and_then(|v| term_of_into(v, ctx, &decode)) {
+                    Ok(t) => l.push(Elem::Term(t)),
+                    Err(_) if ctx.has_memory_failure() => return Err(TypeError),
+                    Err(_) => l.push(Elem::Null),
+                }
+            }
             list(&l)
         }
         "Map" => {
             if n % 2 == 1 {
                 return Err(TypeError);
             }
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
             let mut m = Map::new();
             for i in (0..n).step_by(2) {
-                let Some(k) = term(i).ok().and_then(key_of) else {
-                    continue;
+                let k = match ev(i).and_then(|v| term_of_into(v, ctx, &decode)) {
+                    Ok(t) => match key_of(t) {
+                        Some(k) => k,
+                        None => continue,
+                    },
+                    Err(_) if ctx.has_memory_failure() => return Err(TypeError),
+                    Err(_) => continue,
                 };
-                let v = term(i + 1).map_or(Elem::Null, Elem::Term);
+                let v = match ev(i + 1).and_then(|v| term_of_into(v, ctx, &decode)) {
+                    Ok(t) => Elem::Term(t),
+                    Err(_) if ctx.has_memory_failure() => return Err(TypeError),
+                    Err(_) => Elem::Null,
+                };
                 map_put(&mut m, k, v);
             }
             map(&m)
@@ -1065,9 +1113,14 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 Ok(v)
             }
             _ => {
+                let decode = ctx.charge(0).map_err(|e| {
+                    ctx.fail_memory(&e);
+                    TypeError
+                })?;
                 let mut out = Vec::new();
                 for i in 0..n {
-                    out.extend(list_arg(&term(i)?)?);
+                    let t = term_of_into(ev(i)?, ctx, &decode)?;
+                    out.extend(list_arg(&t)?);
                 }
                 list(&out)
             }
@@ -1077,31 +1130,66 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             let l = list_arg(&term(0)?)?;
             let x = ev(1)?;
             let id = x.clone().into_id(ctx);
+            if ctx.has_memory_failure() {
+                return Err(TypeError);
+            }
             let x = x.value(ctx)?;
             // a blank node of a literal is the one its label names in this query
-            Ok(Val::Id(crate::id::Id::from_bool(l.iter().any(
-                |e| match e {
-                    Elem::Term(t @ Term::BlankNode(_)) => ctx.intern_term(t) == id,
-                    Elem::Term(t) => equals(&val(t), &x).unwrap_or(false),
-                    Elem::Null => false,
-                },
-            ))))
+            let mut found = false;
+            for e in &l {
+                match e {
+                    Elem::Term(t @ Term::BlankNode(_)) => {
+                        let tid = ctx.intern_term(t);
+                        if ctx.has_memory_failure() {
+                            return Err(TypeError);
+                        }
+                        if tid == id {
+                            found = true;
+                            break;
+                        }
+                    }
+                    Elem::Term(t) => {
+                        if equals(&val(t), &x).unwrap_or(false) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    Elem::Null => {}
+                }
+            }
+            Ok(Val::Id(crate::id::Id::from_bool(found)))
         }
         "containsTerm" => {
             arity(2, 2)?;
             let l = list_arg(&term(0)?)?;
             let id = ev(1)?.into_id(ctx);
-            Ok(Val::Id(crate::id::Id::from_bool(l.iter().any(
-                |e| matches!(e, Elem::Term(t) if ctx.intern_term(t) == id),
-            ))))
+            if ctx.has_memory_failure() {
+                return Err(TypeError);
+            }
+            let mut found = false;
+            for e in &l {
+                if let Elem::Term(t) = e {
+                    let tid = ctx.intern_term(t);
+                    if ctx.has_memory_failure() {
+                        return Err(TypeError);
+                    }
+                    if tid == id {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            Ok(Val::Id(crate::id::Id::from_bool(found)))
         }
         "containsKey" => {
             arity(2, 2)?;
             let m = map_arg(&term(0)?)?;
-            let found = term(1)
-                .ok()
-                .and_then(key_of)
-                .is_some_and(|k| map_get(&m, &k).is_some());
+            let key = match term(1) {
+                Ok(t) => key_of(t),
+                Err(_) if ctx.has_memory_failure() => return Err(TypeError),
+                Err(_) => None,
+            };
+            let found = key.is_some_and(|k| map_get(&m, &k).is_some());
             Ok(Val::Id(crate::id::Id::from_bool(found)))
         }
         "get" => {
@@ -1144,9 +1232,13 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         "merge" => {
             arity(2, 2)?;
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
             let (v1, v2) = (ev(0)?, ev(1)?);
-            let a = map_arg(&term_of(v1.clone(), ctx)?)?;
-            let b = map_arg(&term_of(v2.clone(), ctx)?)?;
+            let a = map_arg(&term_of_into(v1.clone(), ctx, &decode)?)?;
+            let b = map_arg(&term_of_into(v2.clone(), ctx, &decode)?)?;
             if a.is_empty() {
                 return Ok(v2);
             }
@@ -1162,11 +1254,19 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         }
         "put" => {
             arity(2, 3)?;
-            let k = key_of(term(1)?).ok_or(TypeError)?;
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
+            let k = key_of(term_of_into(ev(1)?, ctx, &decode)?).ok_or(TypeError)?;
             let v1 = ev(0)?;
-            let mut m = map_arg(&term_of(v1.clone(), ctx)?)?;
+            let mut m = map_arg(&term_of_into(v1.clone(), ctx, &decode)?)?;
             let v = if n == 3 {
-                term(2).map_or(Elem::Null, Elem::Term)
+                match ev(2).and_then(|v| term_of_into(v, ctx, &decode)) {
+                    Ok(t) => Elem::Term(t),
+                    Err(_) if ctx.has_memory_failure() => return Err(TypeError),
+                    Err(_) => Elem::Null,
+                }
             } else {
                 Elem::Null
             };
@@ -1180,12 +1280,13 @@ pub fn call(local: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
             arity(2, 2)?;
             let v1 = ev(0)?;
             let mut m = map_arg(&term_of(v1.clone(), ctx)?)?;
-            let Some(k) = ev(1)
-                .ok()
-                .and_then(|v| term_of(v, ctx).ok())
-                .and_then(key_of)
-            else {
-                return Ok(v1);
+            let k = match ev(1).and_then(|v| term_of(v, ctx)) {
+                Ok(t) => match key_of(t) {
+                    Some(k) => k,
+                    None => return Ok(v1),
+                },
+                Err(_) if ctx.has_memory_failure() => return Err(TypeError),
+                Err(_) => return Ok(v1),
             };
             match m.binary_search_by(|(x, _)| key_cmp(x, &k)) {
                 Ok(at) => {
