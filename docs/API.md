@@ -2313,7 +2313,8 @@ the ELK reasoner. It takes `graph`, `imports` and `mode` in the body and `at` as
 parameter, and answers the inferred class hierarchy and the unsatisfiable classes.
 An optional `projection: "frame"` requires a valid `about` and returns bounded direct
 parents, equivalents, source/warning samples and exclusion samples with totals and
-truncation flags, exact immutable result/source identity and outcome. `limit` is from
+truncation flags, exact immutable result/source identity, outcome and `frame.incomplete`
+to report whether the queried class remained open and may miss inferred clauses. `limit` is from
 1 to 1,000 for this projection. It branches before constructing legacy ancestor or
 whole-equivalence arrays. It accepts harmless `nodes: false`, null/zero offset and null
 target defaults, but refuses `nodes: true`, nonzero offset, an effective write target or
@@ -2355,8 +2356,9 @@ unmapped triples, before writing a target graph.
 The answer counts the classes, the nodes of the taxonomy, the unsatisfiable classes and
 the excluded axioms, lists at most `limit` of the last two, 100 by default and at most
 10,000, and gives the times of the run under `stats`. `about` names a class and answers
-its node under `class`, with its equivalent classes, direct superclasses and subclasses
-and all its superclasses. An unsatisfiable class is a subclass of every class, so its
+its node under `class`, with its equivalent classes, direct superclasses and subclasses,
+all its superclasses and `incomplete` to report whether that class is in the incomplete set
+even when `limit` truncates the top-level `incomplete` list. An unsatisfiable class is a subclass of every class, so its
 node lists no superclasses and `unsatisfiable` is true. An `about` class that the
 taxonomy does not have is `404`, and a run that would write then writes nothing.
 `nodes: true` lists the taxonomy's nodes, `limit` from `offset`, each with its classes
@@ -2420,12 +2422,21 @@ between is `409`. A write takes the parameters of the other writes, such as
 
 ```json
 { "dataset": "go", "commit": 3, "mode": "lenient", "graphs": ["default"], "imports": [],
-  "warnings": [], "consistent": true, "complete": true, "reused": false,
-  "classes": 51986, "nodeCount": 51988, "unsatisfiableCount": 0, "unsatisfiable": [],
-  "excludedCount": 0, "excluded": [], "unmappedTriples": [], "unmappedTruncated": false,
+  "warnings": [], "consistent": true, "consistency": "consistent", "complete": true,
+  "completeForTaken": true, "partial": false, "tier": "el", "incompleteCount": 0,
+  "incomplete": [], "reused": false, "classes": 51986, "nodeCount": 51988,
+  "unsatisfiableCount": 0, "unsatisfiable": [], "excludedCount": 0, "excluded": [],
+  "unmappedTriples": [], "unmappedTruncated": false,
+  "classificationSource": { "boundStoreId": "019a2e8c-5b3a-7f10-8a11-4f9e2f8c7b10",
+    "familyId": "019a2e8c-5b3a-7f10-8a11-4f9e2f8c7b10", "commit": 3,
+    "inputFingerprint": "sha256:...", "contentFingerprint": "sha256:...",
+    "producer": { "assertions": false, "elOnly": false, "partialRequested": false,
+      "expansion": "cautious" } },
+  "resultId": "019a2e8c-5b3a-7f10-8a11-4f9e2f8c7b11",
   "stats": { "incremental": false, "added": 117650, "removed": 0, "cleared": 0,
     "contexts": 51987, "conclusions": 2801981, "estimatedBytes": 54673800, "threads": 4,
-    "indexMs": 453.1, "saturationMs": 402.7, "taxonomyMs": 251.8, "unmapped": 0 } }
+    "indexMs": 453.1, "saturationMs": 402.7, "taxonomyMs": 251.8, "coverageMs": 0.0,
+    "coverageOver": false, "coverageStopped": false, "unmapped": 0 } }
 ```
 
 A triple of the input that maps to no axiom, such as the domain of a property that is not
