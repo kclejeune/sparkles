@@ -654,7 +654,23 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
             mark_interrupted(st);
             return;
         }
+        let Some(prem_bytes) = super::dl_rules::side_bytes(c, l) else {
+            found_guard.data_overflow();
+            mark_interrupted(st);
+            return;
+        };
+        let Some(prem_need) = found.held_bytes().checked_add(prem_bytes) else {
+            found_guard.data_overflow();
+            mark_interrupted(st);
+            return;
+        };
+        if !found_guard.ensure_admitted(prem_need) {
+            mark_interrupted(st);
+            return;
+        }
         let prem = side(c, l);
+        debug_assert_eq!(super::dl_rules::side_cap_bytes(&prem), prem_bytes);
+        found.set_extra_bytes(prem_bytes);
         let q = super::dl_eq::Eqs {
             ix,
             dx,
@@ -677,7 +693,11 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
             mark_interrupted(st);
             return;
         }
+        drop(prem);
+        found.set_extra_bytes(0);
+        found_guard.release_to(found.held_bytes());
     }
+    debug_assert_eq!(found.extra_bytes(), 0);
     drain_with_admitted(ix, st, found, &mut found_guard, &RootDerive);
 }
 
@@ -2480,7 +2500,7 @@ fn mrep_admit<S: Sink>(r: &mut RootSt, out: &mut S) -> bool {
 fn successors(ix: &Index, st: &State) -> Vec<Ex> {
     let mut v: Vec<Ex> = Vec::new();
     if let Some(x) = dl(st) {
-        v.extend(x.edges.iter().map(|&(_, w)| w));
+        v.extend(x.edges().iter().map(|&(_, w)| w));
         if let Some(r) = x.root.as_deref() {
             v.extend(r.by_succ.keys().copied());
         }
@@ -4254,7 +4274,7 @@ pub(super) fn marker_ctx(
     let ground = x.root.as_deref().map_or(0, |r| r.ground.len());
     let scratch = (SLACK * ground * 2 * (std::mem::size_of::<Lit>() + 1)) as isize;
     let mut kept = ground * std::mem::size_of::<Lit>()
-        + (x.edges.len() + x.root.as_deref().map_or(0, |r| r.by_succ.len()) + st.subs.len())
+        + (x.edges().len() + x.root.as_deref().map_or(0, |r| r.by_succ.len()) + st.subs.len())
             * std::mem::size_of::<Ex>();
     if is_root {
         kept += x.store.clauses.len() * std::mem::size_of::<Lit>();
@@ -8790,7 +8810,7 @@ pub(super) mod tests {
             };
             let lb2 = atom(&ix, &out2, b, ub);
             let cid = run2.table.push(Clause::new(Vec::new(), vec![lb2]));
-            ds(&mut st2).edges.push((e1, w));
+            ds(&mut st2).insert_edge(e1, w);
             assert!(super::super::dl_rules::pred_c(
                 &ix, z, &mut st2, w, cid, &mut out2
             ));
@@ -8821,7 +8841,7 @@ pub(super) mod tests {
             };
             let lb_nom = atom(&ix, &out_nom, b, ub);
             let cid_nom = run_nom.table.push(Clause::new(Vec::new(), vec![lb_nom]));
-            ds(&mut st_nom).edges.push((e_nom, w_nom));
+            ds(&mut st_nom).insert_edge(e_nom, w_nom);
             st_nom.subs.insert(e_nom);
             assert!(
                 !super::super::dl_rules::has_eligible_ordinary_edge(&ix, dx, &st_nom, w_nom),
@@ -8841,7 +8861,7 @@ pub(super) mod tests {
                 "pred_c with only an into_nominal edge must not emit constants-only clause"
             );
             // Also verify an into_nominal edge pointing at `w` does not block `succ_at` replay.
-            ds(&mut st_nom).edges.push((e_nom, w));
+            ds(&mut st_nom).insert_edge(e_nom, w);
             assert!(!super::super::dl_rules::has_eligible_ordinary_edge(
                 &ix, dx, &st_nom, w
             ));
@@ -8899,7 +8919,7 @@ pub(super) mod tests {
             ));
             assert_eq!(run_late.work(), 0);
             // First eligible ordinary edge `(e1, w)` triggers `late("edge")`: emits ONCE, skips marker.
-            ds(&mut st_late).edges.push((e1, w));
+            ds(&mut st_late).insert_edge(e1, w);
             let mut gl1 = Guard::new(&mut out_late);
             let mut fl1 = Found::default();
             assert!(super::super::dl_rules::late(
@@ -8920,7 +8940,7 @@ pub(super) mod tests {
                 "late(\"edge\") on first eligible ordinary edge emits once and skips marker"
             );
             // Second eligible ordinary edge `(e2, w)` triggers `late("edge")`: suppressed!
-            ds(&mut st_late).edges.push((e2, w));
+            ds(&mut st_late).insert_edge(e2, w);
             let mut gl2 = Guard::new(&mut out_late);
             let mut fl2 = Found::default();
             assert!(super::super::dl_rules::late(
@@ -9017,7 +9037,7 @@ pub(super) mod tests {
             drain_admitted(&ix, &mut st_ro, fro1, &mut gro1);
             drop(gro1);
             assert_eq!(run_ro.work(), 1, "first rooted edge replays once");
-            ds(&mut st_ro).edges.push((e1, w));
+            ds(&mut st_ro).insert_edge(e1, w);
             let mut gro2 = Guard::new(&mut out_ro);
             let mut fro2 = Found::default();
             assert!(super::super::dl_rules::late(
@@ -9433,7 +9453,7 @@ Ontology(<http://example.org/g6>
                 if use_unit_edge {
                     st.subs.insert(e_p);
                 } else {
-                    ds(&mut st).edges.push((e_p, v_c));
+                    ds(&mut st).insert_edge(e_p, v_c);
                 }
                 // Destination holds private `-> G(c)`, then ingests `PredC(V, -> E(b))`.
                 super::super::dl_rules::derive(&ix, &mut st, (Vec::new(), vec![lg]), &mut out);
@@ -9535,7 +9555,7 @@ Ontology(<http://example.org/g6>
                 assert_eq!(run.work(), 0, "share={share}: cached before edge");
 
                 // 2. Open an eligible ordinary edge in late_unit_mode 0: late() does NOT replay.
-                ds(&mut st).edges.push((e1, w));
+                ds(&mut st).insert_edge(e1, w);
                 let mut gl = Guard::new(&mut out);
                 let mut f_late = Found::default();
                 let replayed = super::super::dl_rules::late(
@@ -9595,7 +9615,7 @@ Ontology(<http://example.org/g6>
                     &ix, z, &mut st_e, w, cid_empty, &mut out_e
                 ));
                 assert!(!out_e.mine.contains(&Concl::Sub(BOTTOM)));
-                ds(&mut st_e).edges.push((e1, w));
+                ds(&mut st_e).insert_edge(e1, w);
                 let mut gel = Guard::new(&mut out_e);
                 let mut fe_late = Found::default();
                 assert!(!super::super::dl_rules::late(
@@ -9643,7 +9663,7 @@ Ontology(<http://example.org/g6>
                 &ix, z, &mut st_m, w, cid1, &mut out_m
             ));
             assert_eq!(run_m.work(), 0, "mixed mode 0: cid1 cached before edge");
-            ds(&mut st_m).edges.push((e1, w));
+            ds(&mut st_m).insert_edge(e1, w);
             let mut glm = Guard::new(&mut out_m);
             let mut flm = Found::default();
             assert!(!super::super::dl_rules::late(
@@ -9690,7 +9710,7 @@ Ontology(<http://example.org/g6>
                 };
                 let lb_inv = atom(&ix, &out_inv, b, ub);
                 let cid_inv = run_inv.table.push(Clause::new(Vec::new(), vec![lb_inv]));
-                ds(&mut st_inv).edges.push((e1, w));
+                ds(&mut st_inv).insert_edge(e1, w);
                 assert!(super::super::dl_rules::pred_c(
                     &ix,
                     z,
@@ -9727,7 +9747,7 @@ Ontology(<http://example.org/g6>
                     ..State::default()
                 };
                 let cid_ie = run_ie.empty();
-                ds(&mut st_ie).edges.push((e1, w));
+                ds(&mut st_ie).insert_edge(e1, w);
                 assert!(super::super::dl_rules::pred_c(
                     &ix,
                     z,

@@ -419,18 +419,22 @@ impl Eqs<'_> {
             return true;
         };
         let (ts, n) = terms_of(v);
-        let mut seen: Vec<RTerm> = Vec::with_capacity(4);
+        let mut seen = [RTerm::X; 4];
+        let mut seen_len = 0usize;
         let mut made = Vec::new();
         for &t in &ts[..n] {
-            let mut look = vec![t];
+            let mut look = [t, RTerm::X];
+            let mut look_len = 1usize;
             if let RTerm::Fc(_, u) = t {
-                look.push(RTerm::C(u));
+                look[1] = RTerm::C(u);
+                look_len = 2;
             }
-            for s1 in look {
-                if seen.contains(&s1) {
+            for &s1 in &look[..look_len] {
+                if seen[..seen_len].contains(&s1) {
                     continue;
                 }
-                seen.push(s1);
+                seen[seen_len] = s1;
+                seen_len += 1;
                 for &i in by.eqs.get(&s1).into_iter().flatten() {
                     let s = &d.store.clauses[i as usize];
                     if s.dead {

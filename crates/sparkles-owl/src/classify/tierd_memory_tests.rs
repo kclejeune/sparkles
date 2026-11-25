@@ -3628,7 +3628,7 @@ fn pred_and_root_pred_refuse_first_product_before_materializing_premises() {
     let build_ord_state = |subsume_output: bool| {
         let mut st = State::default();
         let x = super::dl_rules::ds(&mut st);
-        x.edges.push((exist_e, c_cls));
+        x.insert_edge(exist_e, c_cls);
         let ground_total = super::dl_clause::ground_total();
         let o = Rooted {
             ix: &ix,
@@ -3949,7 +3949,7 @@ fn at_most_refuses_first_product_before_materializing_partners_and_covers_setup(
         let mut st = State::default();
         let x = super::dl_rules::ds(&mut st);
         // Pre-populate edge for f1 so `process` does not allocate `edges` during the trigger.
-        x.edges.push((f1, c1_cls));
+        x.insert_edge(f1, c1_cls);
         let mut max = Vec::new();
         // 1. Live `X(holder_m)` holder premises (`X` > `Y`, so `X(holder_m)` is always maximal).
         for i in 0..n_partners {
@@ -4196,7 +4196,7 @@ fn pred_product_vector_growth_from_full_prods_with_singleton_lists_covers_reallo
 
     let mut st = State::default();
     let x = super::dl_rules::ds(&mut st);
-    x.edges.push((exist_e, c_cls));
+    x.insert_edge(exist_e, c_cls);
     x.pred_in.insert(c_cls, cids);
     // Exactly ONE live partner clause for `F(e, A)` -> singleton premise list (`prune_scratch == 0`).
     let lf = Lit::f(exist_e, a_cls);
@@ -4250,4 +4250,592 @@ fn pred_product_vector_growth_from_full_prods_with_singleton_lists_covers_reallo
         sample.peak
     );
     assert_eq!(sink.live, 0, "dropping guard must release all reservations");
+}
+
+/// Sol r5 P1: conditional triggers with a wide body (and residual head) must pre-admit
+/// the working `Side` built by `side(c, l)` before allocating it and keep its bytes live
+/// across downstream product and setup reservations in both ordinary `dl_rules::process`
+/// and rooted `dl_root::process`.
+#[test]
+fn wide_conditional_trigger_admits_working_side_in_ordinary_and_rooted_process() {
+    struct BudgetSink<'a> {
+        run: &'a DlRun,
+        cap: usize,
+        live: usize,
+        peak: usize,
+        stopped: bool,
+    }
+    impl Sink for BudgetSink<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            if self.stopped || self.live.saturating_add(bytes) > self.cap {
+                self.stopped = true;
+                return false;
+            }
+            self.live += bytes;
+            self.peak = self.peak.max(self.live);
+            true
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.live = self.live.saturating_sub(bytes);
+        }
+        fn admit_dl(&mut self, bytes: usize) -> bool {
+            self.reserve_data(bytes)
+        }
+        fn commit_dl(&mut self, admitted: usize, kept: usize) {
+            self.live = self.live.saturating_sub(admitted.saturating_sub(kept));
+        }
+        fn go_on(&self) -> bool {
+            !self.stopped
+        }
+        fn stopped(&self) -> bool {
+            self.stopped
+        }
+        fn worked(&mut self, _: usize) {}
+    }
+
+    // --- Part 1: Ordinary `dl_rules::process` -> `on_rl` -> `at_most` ---
+    let mut ord_body = String::new();
+    for i in 0..2048 {
+        ord_body.push_str(&format!("Declaration(Class(:H{i}))\n"));
+    }
+    ord_body.push_str(
+        "Declaration(Class(:M))\n\
+         Declaration(Class(:C0))\n\
+         Declaration(Class(:C1))\n\
+         Declaration(Class(:Seed))\n\
+         Declaration(ObjectProperty(:r))\n\
+         SubClassOf(:M ObjectMaxCardinality(1 :r))\n\
+         SubClassOf(:Seed ObjectSomeValuesFrom(:r :C0))\n\
+         SubClassOf(:Seed ObjectSomeValuesFrom(:r :C1))\n\
+         SubClassOf(:Seed ObjectUnionOf(:U0 :U1))\n",
+    );
+    let input = axioms(&ord_body);
+    let mut it = Interner::new();
+    let mut ax = Axioms::default();
+    let mut outside = Vec::new();
+    for a in &input {
+        if super::index::normalize(&a.kind, &mut it, &mut ax).is_some() {
+            outside.push(&a.kind);
+        }
+    }
+    let allowed = super::dl_norm::Allowed {
+        counting: true,
+        ..Default::default()
+    };
+    let dl_ax = super::dl_norm::normalize(&outside, &mut it, &mut ax, None, &|| false, allowed)
+        .expect("dl_norm")
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let (holder_m, _, q_role, _) = *dl_ax
+        .atmost
+        .first()
+        .expect("expected atmost holder entry in dl_ax.atmost");
+    ax.dl = Some(Box::new(dl_ax));
+    let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+    let c0_cls = it.class(&Class::new("urn:tierd1291:C0"));
+    let c1_cls = it.class(&Class::new("urn:tierd1291:C1"));
+    let seed_cls = it.class(&Class::new("urn:tierd1291:Seed"));
+    let h_cls: Vec<Ex> = (0..2048)
+        .map(|i| it.class(&Class::new(format!("urn:tierd1291:H{i}"))))
+        .collect();
+    let f0 = (0..it.nodes.len() as Ex)
+        .find(|&e| {
+            matches!(ix.head(e).node, super::index::Node::Exist(..)) && ix.head(e).succ == c0_cls
+        })
+        .expect("existential for :r :C0");
+    let f1 = (0..it.nodes.len() as Ex)
+        .find(|&e| {
+            matches!(ix.head(e).node, super::index::Node::Exist(..)) && ix.head(e).succ == c1_cls
+        })
+        .expect("existential for :r :C1");
+    let run = DlRun::new(false, Default::default());
+
+    let trig_body_len = 2048usize;
+    let trig_extra_head = 256usize;
+    let ord_c_bytes = (trig_body_len + 1 + trig_extra_head) * std::mem::size_of::<Lit>();
+    let build_ord_state = |n_partners: usize, extra_lits: usize| {
+        let mut st = State::default();
+        let x = super::dl_rules::ds(&mut st);
+        x.insert_edge(f1, c1_cls);
+        let mut max = Vec::new();
+        for i in 0..n_partners {
+            let mut head = vec![Lit::x(holder_m)];
+            for j in 0..extra_lits {
+                head.push(Lit::y(h_cls[(i + j * 7) % 520]));
+            }
+            let _ = x.store.add(Clause::new(vec![Lit::x(h_cls[i % 520])], head));
+            let id = x.store.peek_live().expect("holder partner queued");
+            let _ = x.store.next_prepare_id(&ix, None, id, &mut max);
+            let _ = x.store.next_commit(&ix, None, id, &max);
+        }
+        let l_rl0 = Lit::rl(f0, q_role);
+        for i in 0..n_partners {
+            let mut head = vec![l_rl0];
+            for j in 0..extra_lits {
+                head.push(Lit::y(h_cls[(i + j * 11) % 520]));
+            }
+            let _ = x
+                .store
+                .add(Clause::new(vec![Lit::x(h_cls[(i + 1) % 520])], head));
+            let id = x.store.peek_live().expect("role partner queued");
+            let _ = x.store.next_prepare_id(&ix, None, id, &mut max);
+            let _ = x.store.next_commit(&ix, None, id, &max);
+        }
+        // Wide conditional trigger: 2048 body lits + 256 residual Y head lits + maximal RL(f1, q).
+        let body: Vec<Lit> = h_cls.iter().map(|&c| Lit::x(c)).collect();
+        let mut head = Vec::with_capacity(1 + trig_extra_head);
+        head.push(Lit::rl(f1, q_role));
+        for &hc in &h_cls[..trig_extra_head] {
+            head.push(Lit::y(hc));
+        }
+        let _ = x.store.add(Clause::new(body, head));
+        st
+    };
+
+    // 1a. Tight cap admitting working `Clause` (~9.2 KiB) + `max` + store commit, refusing `prem`.
+    let ord_tight_cap = ord_c_bytes + 4096;
+    let mut st_ord_tight = build_ord_state(513, 7);
+    let mut ord_tight = BudgetSink {
+        run: &run,
+        cap: ord_tight_cap,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (_, sample_ord_tight) =
+        measure(|| super::dl_rules::flush(&ix, seed_cls, &mut st_ord_tight, &mut ord_tight, 1));
+    assert!(
+        ord_tight.stopped,
+        "ordinary wide conditional trigger must stop under tight cap"
+    );
+    assert!(
+        super::dl_rules::dl(&st_ord_tight).is_some_and(|x| x.store.interrupted),
+        "ordinary wide conditional trigger refusal must mark store interrupted"
+    );
+    assert!(
+        sample_ord_tight.peak <= ord_tight_cap + 1024,
+        "ordinary process allocated uncharged working Side past tight cap ({ord_tight_cap}): measured peak = {} B",
+        sample_ord_tight.peak
+    );
+    assert!(
+        ord_tight.peak >= sample_ord_tight.peak,
+        "ordinary tight cap admitted peak ({}) < measured peak ({})",
+        ord_tight.peak,
+        sample_ord_tight.peak
+    );
+
+    // 1b. Mid cap admitting working `Clause` + `prem` + compact `refs`/`cands`, refusing product.
+    let ord_prem_bytes = (trig_body_len + trig_extra_head) * std::mem::size_of::<Lit>();
+    let ord_mid_cap = ord_c_bytes + ord_prem_bytes + (20 << 10);
+    let mut st_ord_mid = build_ord_state(513, 7);
+    let mut ord_mid = BudgetSink {
+        run: &run,
+        cap: ord_mid_cap,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (_, sample_ord_mid) =
+        measure(|| super::dl_rules::flush(&ix, seed_cls, &mut st_ord_mid, &mut ord_mid, 1));
+    assert!(
+        ord_mid.stopped,
+        "ordinary wide conditional trigger must refuse first ~115 KiB product under mid cap"
+    );
+    assert!(
+        super::dl_rules::dl(&st_ord_mid).is_some_and(|x| x.store.interrupted),
+        "ordinary mid-cap refusal must mark store interrupted"
+    );
+    assert!(
+        ord_mid.peak >= sample_ord_mid.peak,
+        "ordinary mid-cap admitted peak ({}) < measured peak ({}) (working Side uncharged alongside setup)",
+        ord_mid.peak,
+        sample_ord_mid.peak
+    );
+    assert!(
+        sample_ord_mid.peak <= ord_mid_cap + 4096,
+        "ordinary mid-cap measured peak ({}) overshot cap ({ord_mid_cap})",
+        sample_ord_mid.peak
+    );
+    assert_eq!(
+        ord_mid.live, ord_tight.live,
+        "ordinary mid-cap refusal must release 100% of working Side and setup reservations"
+    );
+
+    // 1c. Unbounded cap with wide conditional trigger (8x8 partners): peak covered, zero leak.
+    let mut st_ord_unbounded = build_ord_state(8, 8);
+    let before_store_bytes = super::dl_rules::dl(&st_ord_unbounded)
+        .expect("dl state")
+        .store
+        .bytes();
+    let mut ord_unbounded = BudgetSink {
+        run: &run,
+        cap: usize::MAX,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (processed, sample_ord_unbounded) = measure(|| {
+        super::dl_rules::flush(&ix, seed_cls, &mut st_ord_unbounded, &mut ord_unbounded, 1)
+    });
+    assert_eq!(processed, 1);
+    let after_store_bytes = super::dl_rules::dl(&st_ord_unbounded)
+        .expect("dl state")
+        .store
+        .bytes();
+    let store_growth = after_store_bytes.saturating_sub(before_store_bytes);
+    assert!(
+        ord_unbounded.peak >= sample_ord_unbounded.peak,
+        "ordinary unbounded admitted peak ({}) < measured peak ({})",
+        ord_unbounded.peak,
+        sample_ord_unbounded.peak
+    );
+    assert!(
+        ord_unbounded.live <= store_growth + 256,
+        "ordinary unbounded leaked reservation: live ({}) > store growth ({}) + 256",
+        ord_unbounded.live,
+        store_growth
+    );
+
+    // --- Part 2: Rooted `dl_root::process` -> `at_consts` -> `root_pred` ---
+    let mut root_body = String::new();
+    for i in 0..2048 {
+        root_body.push_str(&format!("Declaration(Class(:H{i}))\n"));
+    }
+    root_body.push_str(
+        "Declaration(Class(:A))\n\
+         Declaration(Class(:A2))\n\
+         Declaration(Class(:B))\n\
+         Declaration(Class(:C))\n\
+         Declaration(Class(:Seed))\n\
+         Declaration(ObjectProperty(:r))\n\
+         SubClassOf(:Seed ObjectSomeValuesFrom(:r :C))\n\
+         SubClassOf(:Seed ObjectUnionOf(:U0 :U1))\n\
+         ClassAssertion(:Seed :u0)\n",
+    );
+    let r_input = axioms(&root_body);
+    let mut r_it = Interner::new();
+    let mut r_ax = Axioms::default();
+    let mut r_outside = Vec::new();
+    for a in &r_input {
+        if super::index::normalize(&a.kind, &mut r_it, &mut r_ax).is_some() {
+            r_outside.push(&a.kind);
+        }
+    }
+    let r_allowed = super::dl_norm::Allowed {
+        rooted: true,
+        ..Default::default()
+    };
+    let mut r_dl_ax =
+        super::dl_norm::normalize(&r_outside, &mut r_it, &mut r_ax, None, &|| false, r_allowed)
+            .expect("dl_norm")
+            .map(|(_, d)| d)
+            .unwrap_or_default();
+    if r_dl_ax.root.is_none() {
+        r_dl_ax.root = Some(r_it.fresh_class());
+    }
+    for set in &mut r_ax.disjoint {
+        set.sort_unstable();
+    }
+    r_ax.dl = Some(Box::new(r_dl_ax));
+    let r_ix = Index::build(&r_ax, &mut r_it, None, &|| false).unwrap();
+    let r_dx = r_ix.dl.as_deref().expect("rooted dl index");
+    let a_cls = r_it.class(&Class::new("urn:tierd1291:A"));
+    let a2_cls = r_it.class(&Class::new("urn:tierd1291:A2"));
+    let b_cls = r_it.class(&Class::new("urn:tierd1291:B"));
+    let c_cls = r_it.class(&Class::new("urn:tierd1291:C"));
+    let rh_cls: Vec<Ex> = (0..2048)
+        .map(|i| r_it.class(&Class::new(format!("urn:tierd1291:H{i}"))))
+        .collect();
+    let exist_e = (0..r_it.nodes.len() as Ex)
+        .find(|&e| {
+            matches!(r_ix.head(e).node, super::index::Node::Exist(..)) && r_ix.head(e).succ == c_cls
+        })
+        .expect("existential restriction for :r :C");
+    let u0 = r_dx.consts[0].0;
+    let hyp_w = r_dx.hyp[&exist_e];
+    let inv = |r: super::index::Role| r_dx.inv(&r_ix, r);
+    let r_run = DlRun::new(false, Default::default()).with_shared_facts(true);
+    let mk_xl = |xl: XLit| match r_run.lits.lit(xl, inv) {
+        Made::Lit(l) => l,
+        _ => unreachable!(),
+    };
+    let la_fc = mk_xl(XLit::Atom(a_cls, RTerm::Fc(exist_e, u0)));
+    let la2_fc = mk_xl(XLit::Atom(a2_cls, RTerm::Fc(exist_e, u0)));
+    let lh_u0: Vec<Lit> = rh_cls[..520]
+        .iter()
+        .map(|&c| mk_xl(XLit::Atom(c, RTerm::C(u0))))
+        .collect();
+    // Successor clause: A(x) ∧ A2(x) -> B(y). Trigger fixes A(f_e(u0)), leaving 513 A2 partners.
+    let cid = r_run.table.push(Clause::new(
+        vec![Lit::x(a_cls), Lit::x(a2_cls)],
+        vec![Lit::y(b_cls)],
+    ));
+
+    let root_c_bytes = (2048 + 1) * std::mem::size_of::<Lit>();
+    let root_prem_bytes = 2048 * std::mem::size_of::<Lit>();
+    let build_root_state = || {
+        let mut st = State::default();
+        let mut setup_sink = BudgetSink {
+            run: &r_run,
+            cap: usize::MAX,
+            live: 0,
+            peak: 0,
+            stopped: false,
+        };
+        let x = super::dl_rules::ds(&mut st);
+        // Seed edge `(exist_e, u0)` to `hyp_w` and mark `(hyp_w, a_cls)` already sent.
+        let _ = x.store.add(Clause::new(Vec::new(), vec![la_fc]));
+        let _ = super::dl_root::flush(&r_ix, &mut st, &mut setup_sink, 1);
+        let x = super::dl_rules::ds(&mut st);
+        x.store.clauses[0].dead = true;
+        x.pred_in.insert(hyp_w, vec![cid]);
+        let ground_total = super::dl_clause::ground_total();
+        let o = Rooted {
+            ix: &r_ix,
+            lits: &r_run.lits,
+            inv: &inv,
+            ground_total,
+        };
+        let mut max = Vec::new();
+        for i in 0..513usize {
+            let mut head = vec![la2_fc];
+            for j in 0..7usize {
+                head.push(lh_u0[(i + j * 73) % 520]);
+            }
+            let _ = x.store.add(Clause::new(vec![Lit::x(rh_cls[i])], head));
+            let id = x.store.peek_live().expect("A2(f_e(u0)) partner queued");
+            let _ = x.store.next_prepare_id(&r_ix, Some(&o), id, &mut max);
+            let _ = x.store.next_commit(&r_ix, Some(&o), id, &max);
+            assert!(max.contains(&la2_fc));
+        }
+        // Wide conditional trigger: 2048 non-ground X body lits -> A(f_e(u0)).
+        let body: Vec<Lit> = rh_cls.iter().map(|&c| Lit::x(c)).collect();
+        let _ = x.store.add(Clause::new(body, vec![la_fc]));
+        st
+    };
+
+    // 2a. Tight cap admitting working `Clause` (~8.2 KiB) + `max` + store commit, refusing `prem`.
+    let root_tight_cap = root_c_bytes + 4096;
+    let mut st_root_tight = build_root_state();
+    let mut root_tight = BudgetSink {
+        run: &r_run,
+        cap: root_tight_cap,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (_, sample_root_tight) =
+        measure(|| super::dl_root::flush(&r_ix, &mut st_root_tight, &mut root_tight, 1));
+    assert!(
+        root_tight.stopped,
+        "rooted wide conditional trigger must stop under tight cap"
+    );
+    assert!(
+        super::dl_rules::dl(&st_root_tight).is_some_and(|x| x.store.interrupted),
+        "rooted tight-cap refusal must mark store interrupted"
+    );
+    assert!(
+        sample_root_tight.peak <= root_tight_cap + 1024,
+        "rooted process allocated uncharged working Side past tight cap ({root_tight_cap}): measured peak = {} B",
+        sample_root_tight.peak
+    );
+    assert!(
+        root_tight.peak >= sample_root_tight.peak,
+        "rooted tight-cap admitted peak ({}) < measured peak ({})",
+        root_tight.peak,
+        sample_root_tight.peak
+    );
+
+    // 2b. Mid cap admitting working `Clause` + `prem`, refusing the ~70 KiB first `root_pred` product.
+    let root_mid_cap = root_c_bytes + root_prem_bytes + 8192;
+    let mut st_root_mid = build_root_state();
+    let mut root_mid = BudgetSink {
+        run: &r_run,
+        cap: root_mid_cap,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (_, sample_root_mid) =
+        measure(|| super::dl_root::flush(&r_ix, &mut st_root_mid, &mut root_mid, 1));
+    assert!(
+        root_mid.stopped,
+        "rooted wide conditional trigger must refuse first ~70 KiB product under mid cap"
+    );
+    assert!(
+        super::dl_rules::dl(&st_root_mid).is_some_and(|x| x.store.interrupted),
+        "rooted mid-cap refusal must mark store interrupted"
+    );
+    assert!(
+        root_mid.peak >= sample_root_mid.peak,
+        "rooted mid-cap admitted peak ({}) < measured peak ({}) (working Side uncharged)",
+        root_mid.peak,
+        sample_root_mid.peak
+    );
+    assert!(
+        sample_root_mid.peak <= root_mid_cap + 4096,
+        "rooted mid-cap measured peak ({}) overshot cap ({root_mid_cap})",
+        sample_root_mid.peak
+    );
+    assert_eq!(
+        root_mid.live, root_tight.live,
+        "rooted mid-cap refusal must release 100% of working Side reservation"
+    );
+}
+
+/// Sol r5 P2: for a non-hypothetical successor, `pred_c` must visit reaching edges in
+/// ascending restriction-ID union order (merging explicit edges and unit edges), so a
+/// lower-ID unit edge with a singleton product delivers its conclusion before a higher-ID
+/// explicit edge whose wide product hits the width limit.
+#[test]
+fn pred_c_visits_reaching_edges_in_id_order_before_width_stop() {
+    struct CollectSink<'a> {
+        run: &'a DlRun,
+        me_concls: Vec<Concl>,
+    }
+    impl Sink for CollectSink<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, c: Concl) {
+            self.me_concls.push(c);
+        }
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn reserve_data(&mut self, _: usize) -> bool {
+            true
+        }
+        fn release_data(&mut self, _: usize) {}
+        fn admit_dl(&mut self, _: usize) -> bool {
+            true
+        }
+        fn commit_dl(&mut self, _: usize, _: usize) {}
+        fn go_on(&self) -> bool {
+            true
+        }
+        fn stopped(&self) -> bool {
+            false
+        }
+        fn worked(&mut self, _: usize) {}
+    }
+
+    let body = "Declaration(Class(:A1))\n\
+                Declaration(Class(:A2))\n\
+                Declaration(Class(:B))\n\
+                Declaration(Class(:C))\n\
+                Declaration(Class(:Seed))\n\
+                Declaration(Class(:H0))\n\
+                Declaration(Class(:H1))\n\
+                Declaration(Class(:H2))\n\
+                Declaration(Class(:H3))\n\
+                Declaration(ObjectProperty(:r1))\n\
+                Declaration(ObjectProperty(:r2))\n\
+                SubClassOf(:Seed ObjectSomeValuesFrom(:r1 :C))\n\
+                SubClassOf(:Seed ObjectSomeValuesFrom(:r2 :C))\n\
+                SubClassOf(:Seed ObjectUnionOf(:U0 :U1))\n";
+    let input = axioms(body);
+    let mut it = Interner::new();
+    let mut ax = Axioms::default();
+    let mut outside = Vec::new();
+    for a in &input {
+        if super::index::normalize(&a.kind, &mut it, &mut ax).is_some() {
+            outside.push(&a.kind);
+        }
+    }
+    let dl_ax = super::dl_norm::normalize(
+        &outside,
+        &mut it,
+        &mut ax,
+        None,
+        &|| false,
+        Default::default(),
+    )
+    .expect("dl_norm")
+    .map(|(_, d)| d)
+    .unwrap_or_default();
+    ax.dl = Some(Box::new(dl_ax));
+    let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+
+    let a1_cls = it.class(&Class::new("urn:tierd1291:A1"));
+    let a2_cls = it.class(&Class::new("urn:tierd1291:A2"));
+    let b_cls = it.class(&Class::new("urn:tierd1291:B"));
+    let c_cls = it.class(&Class::new("urn:tierd1291:C"));
+    let seed_cls = it.class(&Class::new("urn:tierd1291:Seed"));
+    let h_cls: Vec<Ex> = (0..4)
+        .map(|i| it.class(&Class::new(format!("urn:tierd1291:H{i}"))))
+        .collect();
+    let mut exist_to_c: Vec<Ex> = (0..it.nodes.len() as Ex)
+        .filter(|&e| {
+            matches!(ix.head(e).node, super::index::Node::Exist(..)) && ix.head(e).succ == c_cls
+        })
+        .collect();
+    exist_to_c.sort_unstable();
+    assert_eq!(
+        exist_to_c.len(),
+        2,
+        "expected two existential restrictions reaching :C"
+    );
+    let (e_low, e_high) = (exist_to_c[0], exist_to_c[1]);
+    assert!(e_low < e_high);
+
+    let run = DlRun::new(false, Default::default());
+    run.set_width_limit(2);
+    let cid = run.table.push(Clause::new(
+        vec![Lit::x(a1_cls), Lit::x(a2_cls)],
+        vec![Lit::y(b_cls)],
+    ));
+
+    let mut st = State::default();
+    // Lower-ID restriction is a unit edge; higher-ID restriction is an explicit edge.
+    st.subs.insert(e_low);
+    let x = super::dl_rules::ds(&mut st);
+    x.insert_edge(e_high, c_cls);
+
+    let mut max = Vec::new();
+    let mut commit = |c: Clause| {
+        let _ = x.store.add(c);
+        let id = x.store.peek_live().expect("clause queued");
+        let _ = x.store.next_prepare_id(&ix, None, id, &mut max);
+        let _ = x.store.next_commit(&ix, None, id, &max);
+    };
+    // Lower-ID unit edge `e_low`: singleton product (1 * 1 = 1 <= 2) deriving unit `-> B(x)`.
+    commit(Clause::new(Vec::new(), vec![Lit::f(e_low, a1_cls)]));
+    commit(Clause::new(Vec::new(), vec![Lit::f(e_low, a2_cls)]));
+    // Higher-ID explicit edge `e_high`: wide product (2 * 2 = 4 > 2) exceeding width limit.
+    commit(Clause::new(
+        vec![Lit::x(h_cls[0])],
+        vec![Lit::f(e_high, a1_cls)],
+    ));
+    commit(Clause::new(
+        vec![Lit::x(h_cls[1])],
+        vec![Lit::f(e_high, a1_cls)],
+    ));
+    commit(Clause::new(
+        vec![Lit::x(h_cls[2])],
+        vec![Lit::f(e_high, a2_cls)],
+    ));
+    commit(Clause::new(
+        vec![Lit::x(h_cls[3])],
+        vec![Lit::f(e_high, a2_cls)],
+    ));
+
+    let mut sink = CollectSink {
+        run: &run,
+        me_concls: Vec::new(),
+    };
+    let ok = super::dl_rules::pred_c(&ix, seed_cls, &mut st, c_cls, cid, &mut sink);
+    assert!(ok);
+    assert!(
+        sink.me_concls.contains(&Concl::Sub(b_cls)),
+        "lower-ID unit edge's singleton conclusion `-> B(x)` must be delivered before higher-ID explicit edge triggers width-limit stop; got {:?}",
+        sink.me_concls
+    );
+    assert!(
+        super::dl_rules::dl(&st).is_some_and(|x| x.store.interrupted),
+        "higher-ID explicit edge's wide product must still trigger width-limit interruption"
+    );
 }

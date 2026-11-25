@@ -766,8 +766,9 @@ pub struct DlSt {
     pub dpreds: Vec<(Ex, Ex)>,
     /// the successors this context registered with, by existential restriction: the
     /// hypothetical successor, or under the eager strategy the context of what holds of
-    /// the successor for certain
-    pub edges: Vec<(Ex, Ex)>,
+    /// the successor for certain. Kept sorted by `(target, ex_id)` with no duplicates so
+    /// [`Self::edges_to`] slices a successor's explicit edges in O(log E) without scanning.
+    edges: Vec<(Ex, Ex)>,
     /// the markers this context holds
     hyps: FxHashSet<Ex>,
     /// the markers sent, by target
@@ -821,6 +822,60 @@ impl DlSt {
         self.hyps.contains(&a)
     }
 
+    /// All explicit `(ex_id, target)` edges registered by this context, sorted by
+    /// `(target, ex_id)` with no duplicates.
+    #[inline]
+    pub(super) fn edges(&self) -> &[(Ex, Ex)] {
+        &self.edges
+    }
+
+    /// The contiguous slice of explicit `(ex_id, v)` edges reaching successor `v`, sorted
+    /// in strictly ascending order of restriction id `ex_id`.
+    #[inline]
+    pub(super) fn edges_to(&self, v: Ex) -> &[(Ex, Ex)] {
+        let start = self.edges.partition_point(|&(_, w)| w < v);
+        let end = start + self.edges[start..].partition_point(|&(_, w)| w == v);
+        &self.edges[start..end]
+    }
+
+    /// Returns the registered successor of existential restriction `e`, if any.
+    #[inline]
+    pub(super) fn edge_target(&self, e: Ex) -> Option<Ex> {
+        self.edges.iter().find(|&&(f, _)| f == e).map(|&(_, w)| w)
+    }
+
+    /// Inserts `(e, v)` into `self.edges` in ascending `(v, e)` order (deduplicated),
+    /// pre-admitting any vector growth against `out`.
+    pub(super) fn insert_edge_admit<S: Sink>(&mut self, e: Ex, v: Ex, out: &mut S) -> bool {
+        let pos = self.edges.partition_point(|&(pe, pw)| (pw, pe) < (v, e));
+        if self.edges.get(pos) == Some(&(e, v)) {
+            return true;
+        }
+        let Some(bound) = vec_grow_bound(&self.edges) else {
+            out.data_overflow();
+            return false;
+        };
+        if bound > 0 && !out.admit_dl(bound) {
+            return false;
+        }
+        let before = self.edges.capacity();
+        self.edges.insert(pos, (e, v));
+        let delta = (self.edges.capacity() - before) * std::mem::size_of::<(Ex, Ex)>();
+        if bound > 0 {
+            out.commit_dl(bound, delta);
+        }
+        true
+    }
+
+    /// Test helper that inserts `(e, v)` while preserving the `(v, e)` sort invariant.
+    #[cfg(test)]
+    pub(super) fn insert_edge(&mut self, e: Ex, v: Ex) {
+        let pos = self.edges.partition_point(|&(pe, pw)| (pw, pe) < (v, e));
+        if self.edges.get(pos) != Some(&(e, v)) {
+            self.edges.insert(pos, (e, v));
+        }
+    }
+
     /// Whether a marker or a stored clause of the context, dead or not, names an
     /// expression that `changed` marks, or one it does not cover (roadmap item 753).
     /// Every rule reads the index by the atoms and the successor terms of its premises,
@@ -859,6 +914,11 @@ impl DlSt {
         for (_, v) in &mut self.edges {
             *v = up(*v);
         }
+        debug_assert!(
+            self.edges
+                .windows(2)
+                .all(|w| (w[0].1, w[0].0) < (w[1].1, w[1].0))
+        );
         if self.pred_in.keys().any(|&v| v >= from) {
             self.pred_in = std::mem::take(&mut self.pred_in)
                 .into_iter()
@@ -1542,9 +1602,9 @@ fn skip_non_root_late_predc() -> bool {
 /// reaching successor `v` (an existential restriction with `into_nominal(ix, e).is_none()`).
 pub(super) fn has_eligible_ordinary_edge(ix: &Index, dx: &DlIx, st: &State, v: Ex) -> bool {
     if let Some(x) = dl(st)
-        && x.edges
+        && x.edges_to(v)
             .iter()
-            .any(|&(e, w)| w == v && into_nominal(ix, e).is_none())
+            .any(|&(e, _)| into_nominal(ix, e).is_none())
     {
         return true;
     }
@@ -1789,8 +1849,15 @@ pub(super) fn local(v: super::dl_clause::XLit) -> bool {
 pub(super) const PRUNE_SCRATCH_ELEM: usize = std::mem::size_of::<(Side, u64, u64, bool)>();
 
 #[inline]
-fn side_cap_bytes(s: &Side) -> usize {
+pub(super) fn side_cap_bytes(s: &Side) -> usize {
     (s.0.capacity() + s.1.capacity()) * std::mem::size_of::<Lit>()
+}
+
+/// Checked byte size of [`side(c, without)`] before allocation.
+#[inline]
+pub(super) fn side_bytes(c: &Clause, without: Lit) -> Option<usize> {
+    let h_len = c.head().iter().filter(|&&l| l != without).count();
+    side_exact_bytes(c.body().len(), h_len)
 }
 
 #[inline]
@@ -1883,6 +1950,10 @@ pub(super) struct Found {
     one_side_bytes: usize,
     prods: Vec<(Vec<Vec<Side>>, Side, bool, &'static str)>,
     prods_bytes: usize,
+    /// caller-owned live working bytes (such as the active `prem = side(c, l)` in
+    /// `process`) currently covered by the caller's `Found` guard alongside `one` and
+    /// `prods`; must be cleared back to `0` after the buffer drops and before `drain`
+    extra_bytes: usize,
     /// set when an inference has more choices than a context enumerates, which passes the
     /// run's bound on derived conclusions instead
     over: bool,
@@ -2096,6 +2167,17 @@ impl Found {
     pub(super) fn ground_products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
         self.products_of(lists, base, true);
     }
+    /// Sets the caller-owned working buffer bytes currently live alongside `one` and
+    /// `prods` under the same `Found` guard.
+    #[inline]
+    pub(super) fn set_extra_bytes(&mut self, bytes: usize) {
+        self.extra_bytes = bytes;
+    }
+    /// Returns the caller-owned live working buffer bytes tracked on `Found`.
+    #[inline]
+    pub(super) fn extra_bytes(&self) -> usize {
+        self.extra_bytes
+    }
     /// The bytes that the conclusions and products waiting here hold, their vectors'
     /// capacities included, tracked incrementally in O(1).
     #[inline]
@@ -2105,6 +2187,7 @@ impl Found {
             + self.one_side_bytes
             + self.prods.capacity() * size_of::<(Vec<Vec<Side>>, Side, bool, &str)>()
             + self.prods_bytes
+            + self.extra_bytes
     }
     fn products_of(&mut self, mut lists: Vec<Vec<Side>>, base: Side, ground: bool) {
         if lists.iter().any(|l| l.is_empty()) {
@@ -2779,6 +2862,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
     slack_covered: usize,
     held_admitted: usize,
 ) {
+    debug_assert_eq!(found.extra_bytes, 0);
     if found.over {
         out.dl().exhaust();
         mark_interrupted(st);
@@ -4660,7 +4744,7 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
             }
             // a restriction that had an edge before it became a unit reaches that
             // successor too, now with the unit's premises
-            let w = dl(st).and_then(|x| x.edges.iter().find(|&&(f, _)| f == d).map(|&(_, w)| w));
+            let w = dl(st).and_then(|x| x.edge_target(d));
             if let Some(w) = w.filter(|&w| w != h.succ) {
                 late(ix, me, st, d, w, "unit-edge", &mut found, &mut found_guard);
                 if found_guard.stopped() {
@@ -5116,30 +5200,66 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
     true
 }
 
-/// Visits each existential restriction of this context whose successor is `v` without
-/// allocating an intermediate edge snapshot, stopping early when `cb` returns `false`.
+/// Visits each existential restriction of this context whose successor is `v` in
+/// ascending restriction-ID order without duplicates and without allocating an
+/// intermediate edge snapshot, stopping early when `cb` returns `false`.
 fn for_each_reaching(dx: &DlIx, st: &State, v: Ex, mut cb: impl FnMut(Ex) -> bool) -> bool {
-    if let Some(x) = dl(st) {
-        for (idx, &(e, w)) in x.edges.iter().enumerate() {
-            if w == v && !x.edges[..idx].iter().any(|&(pe, pw)| pw == v && pe == e) && !cb(e) {
+    let explicit = dl(st).map_or(&[][..], |x| x.edges_to(v));
+    if dx.of_hyp.contains_key(&v) {
+        for &(e, _) in explicit {
+            if !cb(e) {
                 return false;
             }
         }
-    }
-    if dx.of_hyp.contains_key(&v) {
         return true;
     }
-    if let Some(es) = dx.by_succ.get(&v) {
-        for &e in es {
-            if st.subs.contains(&e)
-                && !dl(st).is_some_and(|x| x.edges.iter().any(|&(pe, pw)| pw == v && pe == e))
-                && !cb(e)
-            {
-                return false;
+    let unit_candidates = dx.by_succ.get(&v).map_or(&[][..], Vec::as_slice);
+    debug_assert!(unit_candidates.windows(2).all(|w| w[0] < w[1]));
+    let mut ei = 0usize;
+    let mut ui = 0usize;
+    loop {
+        while ui < unit_candidates.len() && !st.subs.contains(&unit_candidates[ui]) {
+            ui += 1;
+        }
+        match (
+            explicit.get(ei).map(|&(e, _)| e),
+            unit_candidates.get(ui).copied(),
+        ) {
+            (Some(ee), Some(ue)) => {
+                let next = match ee.cmp(&ue) {
+                    std::cmp::Ordering::Less => {
+                        ei += 1;
+                        ee
+                    }
+                    std::cmp::Ordering::Greater => {
+                        ui += 1;
+                        ue
+                    }
+                    std::cmp::Ordering::Equal => {
+                        ei += 1;
+                        ui += 1;
+                        ee
+                    }
+                };
+                if !cb(next) {
+                    return false;
+                }
             }
+            (Some(ee), None) => {
+                ei += 1;
+                if !cb(ee) {
+                    return false;
+                }
+            }
+            (None, Some(ue)) => {
+                ui += 1;
+                if !cb(ue) {
+                    return false;
+                }
+            }
+            (None, None) => return true,
         }
     }
-    true
 }
 
 /// A clause over the predecessor from the successor `v`, in the context `me`: Pred with
@@ -5914,7 +6034,23 @@ fn process<S: Sink>(
             mark_interrupted(st);
             break;
         }
+        let Some(prem_bytes) = side_bytes(c, l) else {
+            found_guard.data_overflow();
+            mark_interrupted(st);
+            return;
+        };
+        let Some(prem_need) = found.held_bytes().checked_add(prem_bytes) else {
+            found_guard.data_overflow();
+            mark_interrupted(st);
+            return;
+        };
+        if !found_guard.ensure_admitted(prem_need) {
+            mark_interrupted(st);
+            return;
+        }
         let prem = side(c, l);
+        debug_assert_eq!(side_cap_bytes(&prem), prem_bytes);
+        found.set_extra_bytes(prem_bytes);
         if dx.root.is_some()
             && !rooted_max(
                 ix,
@@ -6176,7 +6312,7 @@ fn process<S: Sink>(
             }
             F | RL | EQ | NE => {
                 let e = l.fun();
-                let had = dl(st).is_some_and(|x| x.edges.iter().any(|&(f, _)| f == e));
+                let had = dl(st).is_some_and(|x| x.edge_target(e).is_some());
                 // Succ: the successor takes the marker
                 let v = target(ix, me, st, e, &mut found_guard);
                 let edge_v = v;
@@ -6184,7 +6320,7 @@ fn process<S: Sink>(
                 // premise included, so the replay below skips v
                 let replayed = late_rules(dx)
                     && !had
-                    && dl(st).is_some_and(|x| x.edges.iter().any(|&(f, _)| f == e))
+                    && dl(st).is_some_and(|x| x.edge_target(e).is_some())
                     && late(ix, me, st, e, v, "edge", &mut found, &mut found_guard);
                 if found_guard.stopped() {
                     mark_interrupted(st);
@@ -6221,40 +6357,39 @@ fn process<S: Sink>(
                         return;
                     }
                 }
-                if !matches!(l.kind(), F | RL) || into_nominal(ix, e).is_some() {
-                    continue;
-                }
-                // Pred with the clauses the successors of e sent: the one registered with,
-                // and the EL one when e is a unit
-                let mut es = [0 as Ex; 2];
-                let mut es_len = 0usize;
-                if let Some(&(_, w)) = dl(st).and_then(|x| x.edges.iter().find(|&&(f, _)| f == e)) {
-                    es[es_len] = w;
-                    es_len += 1;
-                }
-                if st.subs.contains(&e) && !es[..es_len].contains(&ix.head(e).succ) {
-                    es[es_len] = ix.head(e).succ;
-                    es_len += 1;
-                }
-                for &v in &es[..es_len] {
-                    if replayed && v == edge_v {
-                        continue;
+                if matches!(l.kind(), F | RL) && into_nominal(ix, e).is_none() {
+                    // Pred with the clauses the successors of e sent: the one registered with,
+                    // and the EL one when e is a unit
+                    let mut es = [0 as Ex; 2];
+                    let mut es_len = 0usize;
+                    if let Some(w) = dl(st).and_then(|x| x.edge_target(e)) {
+                        es[es_len] = w;
+                        es_len += 1;
                     }
-                    let cids = dl(st)
-                        .and_then(|x| x.pred_in.get(&v))
-                        .map_or(&[][..], |v| v.as_slice());
-                    for &cid in cids {
-                        if !pred(
-                            ix,
-                            st,
-                            e,
-                            cid,
-                            Some((l, &prem)),
-                            &mut found,
-                            &mut found_guard,
-                        ) {
-                            mark_interrupted(st);
-                            return;
+                    if st.subs.contains(&e) && !es[..es_len].contains(&ix.head(e).succ) {
+                        es[es_len] = ix.head(e).succ;
+                        es_len += 1;
+                    }
+                    for &v in &es[..es_len] {
+                        if replayed && v == edge_v {
+                            continue;
+                        }
+                        let cids = dl(st)
+                            .and_then(|x| x.pred_in.get(&v))
+                            .map_or(&[][..], |v| v.as_slice());
+                        for &cid in cids {
+                            if !pred(
+                                ix,
+                                st,
+                                e,
+                                cid,
+                                Some((l, &prem)),
+                                &mut found,
+                                &mut found_guard,
+                            ) {
+                                mark_interrupted(st);
+                                return;
+                            }
                         }
                     }
                 }
@@ -6277,8 +6412,12 @@ fn process<S: Sink>(
             }
             _ => {}
         }
+        drop(prem);
+        found.set_extra_bytes(0);
+        found_guard.release_to(found.held_bytes());
     }
     drop(ps);
+    debug_assert_eq!(found.extra_bytes(), 0);
     drain_admitted(ix, st, found, &mut found_guard);
 }
 
@@ -6313,7 +6452,7 @@ fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex
     let unit = st.subs.contains(&e);
     let h = dx.hyp.get(&e).copied().unwrap_or(TOP);
     let succ = ix.head(e).succ;
-    if let Some(&(_, v)) = dl(st).and_then(|x| x.edges.iter().find(|&&(f, _)| f == e)) {
+    if let Some(v) = dl(st).and_then(|x| x.edge_target(e)) {
         return v;
     }
     let v = if out.dl().eager {
@@ -6351,7 +6490,7 @@ fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex
     let Some(x) = ds_admit(st, out) else {
         return v;
     };
-    if !vec_push_admit(&mut x.edges, (e, v), out) {
+    if !x.insert_edge_admit(e, v, out) {
         x.store.interrupted = true;
         return v;
     }
@@ -6428,7 +6567,7 @@ pub fn record(
             }
         }
         if let Some(d) = dl(&st) {
-            for &(_, v) in &d.edges {
+            for &(_, v) in d.edges() {
                 edge(v);
             }
         }
@@ -6937,5 +7076,65 @@ mod tests {
             fold_slack_lens([usize::MAX, 2, 0].into_iter(), 48, usize::MAX as u128),
             0
         );
+    }
+
+    #[test]
+    fn for_each_reaching_merges_sorted_unique_and_handles_early_stop() {
+        let mut dx = DlIx::default();
+        // `by_succ[10]` is strictly ascending as built by `DlIx::build`.
+        dx.by_succ.insert(10, vec![2, 5, 8, 12, 15]);
+        // Hypothetical successor `20` should ignore `by_succ`.
+        dx.of_hyp.insert(20, 7);
+        dx.by_succ.insert(20, vec![1, 3]);
+
+        let mut st = State::default();
+        // Active unit edges: 2, 8, 15 (5 and 12 are absent from `subs`).
+        st.subs.insert(2);
+        st.subs.insert(8);
+        st.subs.insert(15);
+        // Insert explicit edges out of order across multiple targets, including an overlap (8).
+        let x = ds(&mut st);
+        x.insert_edge(99, 30);
+        x.insert_edge(14, 10);
+        x.insert_edge(8, 10);
+        x.insert_edge(4, 10);
+        x.insert_edge(7, 20);
+        x.insert_edge(1, 5);
+        x.insert_edge(14, 10); // duplicate must be ignored
+
+        let mut visited = Vec::new();
+        let completed = for_each_reaching(&dx, &st, 10, |e| {
+            visited.push(e);
+            true
+        });
+        assert!(completed);
+        assert_eq!(visited, vec![2, 4, 8, 14, 15]);
+
+        // Early stop after second element.
+        visited.clear();
+        let completed = for_each_reaching(&dx, &st, 10, |e| {
+            visited.push(e);
+            visited.len() < 2
+        });
+        assert!(!completed);
+        assert_eq!(visited, vec![2, 4]);
+
+        // Hypothetical successor visits only explicit edges to `20`, ignoring `by_succ[20]`.
+        visited.clear();
+        let completed = for_each_reaching(&dx, &st, 20, |e| {
+            visited.push(e);
+            true
+        });
+        assert!(completed);
+        assert_eq!(visited, vec![7]);
+
+        // Target with no explicit edges and matching units still returns units cleanly.
+        dx.by_succ.insert(40, vec![2, 15]);
+        visited.clear();
+        assert!(for_each_reaching(&dx, &st, 40, |e| {
+            visited.push(e);
+            true
+        }));
+        assert_eq!(visited, vec![2, 15]);
     }
 }
