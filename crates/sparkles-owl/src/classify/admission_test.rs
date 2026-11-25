@@ -338,8 +338,15 @@ pub(super) enum PlanKind {
 pub(super) enum MergePhase {
     PlanStart { restarts: usize },
     PlanBlockedScan { restarts: usize },
+    PlanBlockedScanDone { restarts: usize },
+    PlanHornCheck { restarts: usize },
+    PlanHornCheckDone { restarts: usize },
+    PlanIndsDrain { restarts: usize },
+    PlanIndsDrainDone { restarts: usize },
     PlanRetarget { restarts: usize },
+    PlanRetargetDone { restarts: usize },
     PlanKeyBody { restarts: usize },
+    PlanKeyBodyDone { restarts: usize },
     PlanDone { restarts: usize, outcome: PlanKind },
     SatStop { stop: u8, helper_ran: bool },
     MergeRestart { restarts: usize },
@@ -401,12 +408,47 @@ pub(super) fn merge_phase_blocked_scan() {
     emit_merge_phase(MergePhase::PlanBlockedScan { restarts });
 }
 
+pub(super) fn merge_phase_blocked_scan_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanBlockedScanDone { restarts });
+}
+
+pub(super) fn merge_phase_horn_check() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanHornCheck { restarts });
+}
+
+pub(super) fn merge_phase_horn_check_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanHornCheckDone { restarts });
+}
+
+pub(super) fn merge_phase_inds_drain() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanIndsDrain { restarts });
+}
+
+pub(super) fn merge_phase_inds_drain_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanIndsDrainDone { restarts });
+}
+
 pub(super) fn merge_phase_retarget() {
     let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
     emit_merge_phase(MergePhase::PlanRetarget { restarts });
 }
 
+pub(super) fn merge_phase_retarget_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanRetargetDone { restarts });
+}
+
 pub(super) fn merge_phase_key_body() {
     let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
     emit_merge_phase(MergePhase::PlanKeyBody { restarts });
+}
+
+pub(super) fn merge_phase_key_body_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanKeyBodyDone { restarts });
 }

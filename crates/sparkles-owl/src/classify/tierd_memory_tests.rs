@@ -5926,6 +5926,10 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
         let t = trace.lock().clone();
         assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
         assert!(t.contains(&MergePhase::PlanBlockedScan { restarts: 1 }));
+        assert!(
+            !t.contains(&MergePhase::PlanBlockedScanDone { restarts: 1 }),
+            "cancellation must stop inside wide DifferentIndividuals scan before it finishes: {t:?}"
+        );
         assert!(t.contains(&MergePhase::PlanDone {
             restarts: 1,
             outcome: PlanKind::PollErr
@@ -5984,6 +5988,10 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
         let t = trace.lock().clone();
         assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
         assert!(t.contains(&MergePhase::PlanRetarget { restarts: 1 }));
+        assert!(
+            !t.contains(&MergePhase::PlanRetargetDone { restarts: 1 }),
+            "cancellation must stop inside EquivalentObjectProperties loop before it exits: {t:?}"
+        );
         assert!(t.contains(&MergePhase::PlanDone {
             restarts: 1,
             outcome: PlanKind::PollErr
@@ -6024,6 +6032,10 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
         let t = trace.lock().clone();
         assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
         assert!(t.contains(&MergePhase::PlanRetarget { restarts: 1 }));
+        assert!(
+            !t.contains(&MergePhase::PlanRetargetDone { restarts: 1 }),
+            "deadline expiry must stop inside EquivalentObjectProperties loop before it exits: {t:?}"
+        );
         assert!(t.contains(&MergePhase::PlanDone {
             restarts: 1,
             outcome: PlanKind::PollErr
@@ -6084,6 +6096,10 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
         let t = trace.lock().clone();
         assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
         assert!(t.contains(&MergePhase::PlanKeyBody { restarts: 1 }));
+        assert!(
+            !t.contains(&MergePhase::PlanKeyBodyDone { restarts: 1 }),
+            "cancellation must stop inside final key-body loop before it exits: {t:?}"
+        );
         assert!(t.contains(&MergePhase::PlanDone {
             restarts: 1,
             outcome: PlanKind::PollErr
@@ -6098,6 +6114,254 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
             .expect("recovery after wide key-body cancel");
         assert!(rec.complete);
         assert_eq!(rec.stats.dl_rooted_restarts, 1);
+    }
+
+    // 3d. Sol P2 #1 (r3): cancellation inside the streaming Horn check on a wide
+    //     `ObjectUnionOf` with zero named individuals before the Horn check loop exits.
+    {
+        let mut union_members = std::collections::BTreeSet::new();
+        for i in 0..300usize {
+            union_members.insert(ClassExpression::Class(Class::new(format!(
+                "urn:tierd1291:wh{i:03}"
+            ))));
+        }
+        let ax0 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:A")),
+            ClassExpression::ObjectUnionOf(union_members),
+        );
+        let ax1 = AxiomKind::HasKey(
+            ClassExpression::Class(Class::new("urn:tierd1291:K")),
+            [ObjectPropertyExpression::Property(ObjectProperty::new(
+                "urn:tierd1291:r",
+            ))]
+            .into(),
+            std::collections::BTreeSet::new(),
+        );
+        let refs = [&ax0, &ax1];
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanHornCheck { restarts: 0 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs,
+                    None,
+                    None,
+                    0,
+                    &mut || {
+                        if cancel_cb.load(Ordering::SeqCst) {
+                            Err(Error::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut |_| true,
+                )
+            },
+        )
+        .err()
+        .expect("must cancel inside wide ObjectUnionOf streaming Horn check");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::PlanHornCheck { restarts: 0 }));
+        assert!(
+            !t.contains(&MergePhase::PlanHornCheckDone { restarts: 0 }),
+            "cancellation must stop inside streaming Horn check before it exits: {t:?}"
+        );
+    }
+
+    // 3e. Sol P2 #3 (r3): cancellation inside `Cx::ce_polled` cloning a wide `ObjectOneOf`
+    //     of 300 anonymous nominals under `owl:topObjectProperty` before the clone exits.
+    {
+        let mut anons = std::collections::BTreeSet::new();
+        for i in 0..300usize {
+            anons.insert(Individual::anonymous(format!("an{i:03}")));
+        }
+        let disj = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:Z")),
+            ClassExpression::ObjectUnionOf(
+                [
+                    ClassExpression::Class(Class::new("urn:tierd1291:Z1")),
+                    ClassExpression::Class(Class::new("urn:tierd1291:Z2")),
+                ]
+                .into(),
+            ),
+        );
+        let wide_oneof = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:TopOneOf")),
+            ClassExpression::ObjectSomeValuesFrom(
+                ObjectPropertyExpression::Property(ObjectProperty::top()),
+                Box::new(ClassExpression::ObjectOneOf(anons)),
+            ),
+        );
+        let refs = [&disj, &wide_oneof];
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanRetarget { restarts: 0 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs,
+                    None,
+                    None,
+                    0,
+                    &mut || {
+                        if cancel_cb.load(Ordering::SeqCst) {
+                            Err(Error::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut |_| true,
+                )
+            },
+        )
+        .err()
+        .expect("must cancel inside wide ObjectOneOf cooperative clone");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::PlanRetarget { restarts: 0 }));
+        assert!(
+            !t.contains(&MergePhase::PlanRetargetDone { restarts: 0 }),
+            "cancellation must stop inside ObjectOneOf clone loop before it exits: {t:?}"
+        );
+    }
+
+    // 3f. Sol P2 #3 (r3): cancellation inside `inds` BTreeSet-to-Vec drain before it exits.
+    {
+        let mut body = String::from(
+            "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+             HasKey(:K (:r) ())\n\
+             DifferentIndividuals(",
+        );
+        for i in 0..300usize {
+            body.push_str(&format!(" :di{i:03}"));
+        }
+        body.push_str(")\n");
+        let drain_ax = axioms(&body);
+        let refs: Vec<&AxiomKind> = drain_ax.iter().map(|a| &a.kind).collect();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanIndsDrain { restarts: 0 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs,
+                    None,
+                    None,
+                    0,
+                    &mut || {
+                        if cancel_cb.load(Ordering::SeqCst) {
+                            Err(Error::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut |_| true,
+                )
+            },
+        )
+        .err()
+        .expect("must cancel inside named-individual drain loop");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::PlanIndsDrain { restarts: 0 }));
+        assert!(
+            !t.contains(&MergePhase::PlanIndsDrainDone { restarts: 0 }),
+            "cancellation must stop inside inds drain loop before it exits: {t:?}"
+        );
+    }
+
+    // 3g. Sol P2 #3 (r3): `DisjointUnion` collapsing duplicate wide rewritten images reuses
+    //     computed accounting without unpolled re-walks and keeps peak/retained sound.
+    {
+        let mut wide_oneof_a = std::collections::BTreeSet::new();
+        for i in 0..24usize {
+            wide_oneof_a.insert(Individual::anonymous(format!(
+                "du_{i:02}_{}",
+                "d".repeat(512)
+            )));
+        }
+        let wide_filler = ClassExpression::ObjectOneOf(wide_oneof_a);
+        let img1 = ClassExpression::ObjectSomeValuesFrom(
+            ObjectPropertyExpression::Property(ObjectProperty::top()),
+            Box::new(wide_filler.clone()),
+        );
+        let img2 = ClassExpression::ObjectMinCardinality(
+            1,
+            ObjectPropertyExpression::Property(ObjectProperty::top()),
+            Some(Box::new(wide_filler)),
+        );
+        let disj = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:Z")),
+            ClassExpression::ObjectUnionOf(
+                [
+                    ClassExpression::Class(Class::new("urn:tierd1291:Z1")),
+                    ClassExpression::Class(Class::new("urn:tierd1291:Z2")),
+                ]
+                .into(),
+            ),
+        );
+        let du =
+            AxiomKind::DisjointUnion(Class::new("urn:tierd1291:UnionCls"), [img1, img2].into());
+        let refs = [&disj, &du];
+        let mut admitted_peak = 0usize;
+        let (red_opt, sample) = measure(|| {
+            match super::dl_reduce::plan_budgeted(
+                &refs,
+                None,
+                None,
+                0,
+                &mut || Ok::<(), ()>(()),
+                &mut |used| {
+                    admitted_peak = admitted_peak.max(used);
+                    true
+                },
+            )
+            .unwrap()
+            {
+                super::dl_reduce::Plan::Ready(r) => Some(r),
+                _ => None,
+            }
+        });
+        let red = red_opt.expect("duplicate-image DisjointUnion retarget must succeed");
+        assert!(sample.live > 16 * 1024);
+        assert!(
+            admitted_peak >= sample.peak,
+            "DisjointUnion admitted peak ({admitted_peak}) undercounted measured peak ({})",
+            sample.peak
+        );
+        assert!(
+            red.retained_bytes() >= sample.live,
+            "DisjointUnion retained_bytes ({}) undercounted measured live ({})",
+            red.retained_bytes(),
+            sample.live
+        );
+        drop(red);
     }
 }
 
@@ -6268,10 +6532,9 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
     assert_eq!(mt_base.stats.dl_rooted_restarts, 1);
     let mt_total_polls = mt_count_polls.load(Ordering::SeqCst);
 
-    let mut saw_mt_helper = false;
-    let mut saw_mt_cancel_winner = false;
-    let mut saw_mt_merge_winner = false;
-    let mut saw_mt_merge_then_cancel = false;
+    let mut saw_mt_cancel_winner_with_helper = false;
+    let mut saw_mt_merge_winner_with_helper = false;
+    let mut saw_mt_merge_then_cancel_with_helper = false;
 
     // 2a. Sweep every poll point across the 4-thread `dl_steps: false` run.
     for cancel_at in 1..=(mt_total_polls + 4) {
@@ -6301,21 +6564,20 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
         );
         let sat_stops = stops.lock().clone();
         for &(stop, helper_ran) in &sat_stops {
-            saw_mt_helper |= helper_ran;
-            if stop == super::saturate::STOP_CANCEL {
-                saw_mt_cancel_winner = true;
+            if stop == super::saturate::STOP_CANCEL && helper_ran {
+                saw_mt_cancel_winner_with_helper = true;
             }
-            if stop == super::saturate::STOP_MERGE {
-                saw_mt_merge_winner = true;
+            if stop == super::saturate::STOP_MERGE && helper_ran {
+                saw_mt_merge_winner_with_helper = true;
             }
         }
         match res {
             Err(Error::Cancelled) => {
                 if sat_stops
                     .iter()
-                    .any(|&(s, _)| s == super::saturate::STOP_MERGE)
+                    .any(|&(s, h)| s == super::saturate::STOP_MERGE && h)
                 {
-                    saw_mt_merge_then_cancel = true;
+                    saw_mt_merge_then_cancel_with_helper = true;
                 }
                 assert!(!k.sat.dl_worked.load(Ordering::Relaxed));
                 let after = k
@@ -6369,13 +6631,12 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
         assert_eq!(err, Error::Cancelled);
         assert!(!k.sat.dl_worked.load(Ordering::Relaxed));
         for &(stop, helper_ran) in stops.lock().iter() {
-            saw_mt_helper |= helper_ran;
-            if stop == super::saturate::STOP_CANCEL {
-                saw_mt_cancel_winner = true;
+            if stop == super::saturate::STOP_CANCEL && helper_ran {
+                saw_mt_cancel_winner_with_helper = true;
             }
-            if stop == super::saturate::STOP_MERGE {
-                saw_mt_merge_winner = true;
-                saw_mt_merge_then_cancel = true;
+            if stop == super::saturate::STOP_MERGE && helper_ran {
+                saw_mt_merge_winner_with_helper = true;
+                saw_mt_merge_then_cancel_with_helper = true;
             }
         }
     }
@@ -6416,28 +6677,204 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
         assert!(
             sat_stops
                 .iter()
-                .any(|&(s, _)| s == super::saturate::STOP_MERGE),
-            "expected STOP_MERGE winner before restart cancellation: {sat_stops:?}"
+                .any(|&(s, h)| s == super::saturate::STOP_MERGE && h),
+            "expected STOP_MERGE winner with helper participation before restart cancellation: {sat_stops:?}"
         );
         for &(stop, helper_ran) in &sat_stops {
-            saw_mt_helper |= helper_ran;
-            if stop == super::saturate::STOP_MERGE {
-                saw_mt_merge_winner = true;
-                saw_mt_merge_then_cancel = true;
+            if stop == super::saturate::STOP_MERGE && helper_ran {
+                saw_mt_merge_winner_with_helper = true;
+                saw_mt_merge_then_cancel_with_helper = true;
             }
         }
     }
 
     assert!(
-        saw_mt_helper,
-        "4-thread dl_steps=false trials must observe helper thread participation"
+        saw_mt_cancel_winner_with_helper,
+        "4-thread dl_steps=false trials must observe STOP_CANCEL winning on a saturation with helper participation"
     );
     assert!(
-        saw_mt_cancel_winner,
-        "4-thread dl_steps=false trials must observe STOP_CANCEL winning"
+        saw_mt_merge_winner_with_helper && saw_mt_merge_then_cancel_with_helper,
+        "4-thread dl_steps=false trials must observe STOP_MERGE winning with helper participation and restart cancellation"
+    );
+}
+
+/// Sol P2 #1 (r3): planner Horn check must not allocate `Vec<Pl>` before admission on a
+/// wide class expression followed by an object key with zero named individuals.
+#[test]
+fn plan_budgeted_wide_union_horn_check_does_not_allocate_before_admission() {
+    let mut union_members = std::collections::BTreeSet::new();
+    for i in 0..4096usize {
+        union_members.insert(ClassExpression::Class(Class::new(format!(
+            "urn:tierd1291:wu{i:04}"
+        ))));
+    }
+    let ax0 = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:A")),
+        ClassExpression::ObjectUnionOf(union_members),
+    );
+    let ax1 = AxiomKind::HasKey(
+        ClassExpression::Class(Class::new("urn:tierd1291:K")),
+        [ObjectPropertyExpression::Property(ObjectProperty::new(
+            "urn:tierd1291:r",
+        ))]
+        .into(),
+        std::collections::BTreeSet::new(),
+    );
+    let refs = [&ax0, &ax1];
+    let (plan, sample) = measure(|| {
+        super::dl_reduce::plan_budgeted(
+            &refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |_used| false,
+        )
+        .unwrap()
+    });
+    assert!(
+        matches!(plan, super::dl_reduce::Plan::Declined),
+        "0-byte grant must decline wide union + HasKey plan"
+    );
+    assert_eq!(
+        sample.peak, 0,
+        "streaming Horn check must not allocate before admission (peak={})",
+        sample.peak
+    );
+}
+
+/// Sol P2 #2 (r3): inserting 12 ordered members and removing the first leaves a 3-node
+/// `BTreeSet` of length 11 (5 + 1 + 5) preserved across `clone()`. Both
+/// `excluded_copy_bytes` and `dl_reduce::plan_budgeted` (`ObjectOneOf` retarget) must
+/// account for the internal root node at length 11 while the clone is live.
+#[test]
+fn eleven_element_three_node_btree_set_is_not_undercounted_when_cloned() {
+    let mut inds = std::collections::BTreeSet::new();
+    for i in 0..12usize {
+        inds.insert(Individual::named(format!("urn:tierd1291:bt{i:02}")));
+    }
+    let first = inds.iter().next().unwrap().clone();
+    assert!(inds.remove(&first));
+    assert_eq!(inds.len(), 11);
+
+    // 1. Retained exclusion cloning (`DifferentIndividuals` with 11-member 3-node set).
+    let excl_template = vec![Excluded {
+        axiom: AxiomKind::DifferentIndividuals(inds.clone()),
+        gap: index::Gap::Partial("eleven-3node"),
+    }];
+    let (excl_cloned, excl_clone_sample) = measure(|| excl_template.clone());
+    let (excl_est, excl_est_sample) = measure(|| excluded_copy_bytes(&excl_cloned));
+    assert_eq!(excl_est_sample.peak, 0);
+    assert!(
+        excl_est >= excl_clone_sample.live,
+        "excluded_copy_bytes ({excl_est}) undercounted live 11-element 3-node BTreeSet ({})",
+        excl_clone_sample.live
+    );
+    drop(excl_cloned);
+
+    // 2. Retargeted `ObjectOneOf` with 11-member 3-node set in `dl_reduce::plan_budgeted`.
+    let disj = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:Z")),
+        ClassExpression::ObjectUnionOf(
+            [
+                ClassExpression::Class(Class::new("urn:tierd1291:Z1")),
+                ClassExpression::Class(Class::new("urn:tierd1291:Z2")),
+            ]
+            .into(),
+        ),
+    );
+    let top_oneof = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:TopSrc")),
+        ClassExpression::ObjectSomeValuesFrom(
+            ObjectPropertyExpression::Property(ObjectProperty::top()),
+            Box::new(ClassExpression::ObjectOneOf(inds)),
+        ),
+    );
+    let refs = [&disj, &top_oneof];
+    let mut admitted_peak = 0usize;
+    let (red_opt, red_sample) = measure(|| {
+        match super::dl_reduce::plan_budgeted(
+            &refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                admitted_peak = admitted_peak.max(used);
+                true
+            },
+        )
+        .unwrap()
+        {
+            super::dl_reduce::Plan::Ready(r) => Some(r),
+            _ => None,
+        }
+    });
+    let red = red_opt.expect("retarget of 11-element ObjectOneOf must succeed");
+    assert!(
+        admitted_peak >= red_sample.peak,
+        "plan_budgeted admitted peak ({admitted_peak}) undercounted 11-element 3-node ObjectOneOf peak ({})",
+        red_sample.peak
     );
     assert!(
-        saw_mt_merge_winner && saw_mt_merge_then_cancel,
-        "4-thread dl_steps=false trials must observe STOP_MERGE winning and restart cancellation"
+        red.retained_bytes() >= red_sample.live,
+        "Reduction::retained_bytes ({}) undercounted 11-element 3-node ObjectOneOf live ({})",
+        red.retained_bytes(),
+        red_sample.live
+    );
+    drop(red);
+}
+
+/// Sol P3 #5 (r3): `HasKey(ObjectMinCardinality(0 owl:topObjectProperty) (:r) ())` rewrites
+/// its key class to `owl:Thing`, so with zero named individuals it emits no fresh
+/// equivalence class and succeeds under a tight grant covering only `replaced`.
+#[test]
+fn has_key_rewritten_to_named_class_reuses_name_without_fresh_equivalence() {
+    let input = axioms(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         HasKey(ObjectMinCardinality(0 owl:topObjectProperty) (:r) ())\n",
+    );
+    let refs: Vec<&AxiomKind> = input.iter().map(|a| &a.kind).collect();
+    let plan = super::dl_reduce::plan_budgeted(
+        &refs,
+        None,
+        None,
+        0,
+        &mut || Ok::<(), ()>(()),
+        &mut |used| used <= refs.len(),
+    )
+    .unwrap();
+    let red = match plan {
+        super::dl_reduce::Plan::Ready(r) => r,
+        other => panic!(
+            "tight grant ({}) must accept empty key reduction, got {:?}",
+            refs.len(),
+            std::mem::discriminant(&other)
+        ),
+    };
+    assert!(
+        red.axioms.is_empty(),
+        "empty key over ObjectMinCardinality(0 owl:topObjectProperty) must emit no axioms, got {:?}",
+        red.axioms
+    );
+    assert!(red.hub.is_none());
+
+    // With two named individuals, the key uses `owl:Thing` directly without a fresh `k0`
+    // equivalence axiom.
+    let input2 = axioms(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         ClassAssertion(:A :a0)\n\
+         ClassAssertion(:A :a1)\n\
+         HasKey(ObjectMinCardinality(0 owl:topObjectProperty) (:r) ())\n",
+    );
+    let refs2: Vec<&AxiomKind> = input2.iter().map(|a| &a.kind).collect();
+    let red2 = super::dl_reduce::plan(&refs2, None, None).expect("2-ind key must plan");
+    assert!(
+        !red2
+            .axioms
+            .iter()
+            .any(|ax| matches!(ax, AxiomKind::EquivalentClasses(_))),
+        "key reduced to owl:Thing must not emit a fresh EquivalentClasses axiom: {:?}",
+        red2.axioms
     );
 }
