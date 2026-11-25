@@ -633,11 +633,11 @@ pub(super) fn restore_conflicts(
         let Some(candidates) = replaced.get(&intent.name) else {
             continue;
         };
-        let replacement = registered_dataset(registry, &intent.name).and_then(|row| row.id);
-        let distinct = match (intent.state, replacement, candidates.as_slice()) {
-            (state, Some(id), [replaced])
+        let registered = registered_dataset(registry, &intent.name);
+        let distinct = match (intent.state, registered, candidates.as_slice()) {
+            (state, Some(row), [replaced])
                 if state.is_prepared()
-                    && id != intent.id
+                    && row.id.is_some_and(|id| id != intent.id)
                     && !path_present(databases, OsStr::new(&intent.name)) =>
             {
                 let kept = intent.kept_name();
@@ -658,7 +658,12 @@ pub(super) fn restore_conflicts(
                 staged
                     .as_deref()
                     .is_some_and(|name| matches(OsStr::new(name), intent.id, true))
-                    && matches(replaced, id, false)
+                    && super::restore::is_verified_rollback_candidate(
+                        databases,
+                        replaced,
+                        &intent.name,
+                        row,
+                    )
             }
             _ => false,
         };
@@ -882,11 +887,11 @@ pub(super) fn recover(
         let registered = registered_dataset(registry, &intent.name);
         let initial_state = intent.state;
         let committed_v3 = is_committed_v3_trash(databases, &intent);
-        let result = if intent.state != IntentState::Committed
+        let conflict = intent.state != IntentState::Committed
             && !committed_v3
             && staged_name.is_some()
-            && restore_conflicts.contains(&intent.name)
-        {
+            && restore_conflicts.contains(&intent.name);
+        let result = if conflict {
             Err(Error::Corrupt(
                 "both a staged restore and a staged delete may own the missing root".into(),
             ))
@@ -906,9 +911,9 @@ pub(super) fn recover(
         };
         if let Err(error) = result {
             journal_changed |= intent.state != initial_state;
-            if intent.state.is_prepared()
-                && registered.is_some_and(|entry| entry.id == Some(intent.id))
-            {
+            if registered.is_some_and(|entry| {
+                conflict || (intent.state.is_prepared() && entry.id == Some(intent.id))
+            }) {
                 refusals.insert(
                     intent.name.clone(),
                     Refusal {
@@ -4476,6 +4481,460 @@ mod tests {
         assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
         assert!(kept.join("dataset.json").exists());
         assert!(journal.exists());
+    }
+
+    #[cfg(feature = "backup")]
+    #[test]
+    fn r8_live_keep_replaced_requires_durable_keep_marker_before_commit() {
+        use super::super::{FAIL_NEXT_DIR_SYNC, FAIL_REGISTRY_REPLACE, take_catalog_dir_syncs};
+        use crate::catalog::{restore, swap};
+        use crate::store::Store;
+
+        // Subtest A: occupied destination with injected keep-marker sync failure and blocked
+        // rollback must not acknowledge success, must keep `.restore-swap.json` intact, and
+        // must preserve the predecessor on a restart image where the failed marker is absent.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let pred = catalog.create("ds", &Default::default()).unwrap();
+            pred.update("INSERT DATA { <urn:r8-pred-a> <urn:p> 1 }")
+                .unwrap();
+            let pred_id = pred.dataset_id();
+            let pred_head = pred.head_commit();
+            drop(pred);
+
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let kept_dst = db.join(".kept-ds-7");
+            let earlier = Store::open(&kept_dst, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &earlier,
+                "INSERT DATA { <urn:r8-earlier-a> <urn:p> 10 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let earlier_id = earlier.dataset_id();
+            let earlier_head = earlier.head_commit();
+            drop(earlier);
+            write_file_atomic(&kept_dst.join(KEEP_REPLACED_MARKER), b".kept-ds-7").unwrap();
+
+            let staged = db.join(".restore-ds-7");
+            let restored = Store::open(&staged, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &restored,
+                "INSERT DATA { <urn:r8-restored-a> <urn:p> 20 . <urn:r8-restored-a> <urn:p> 21 }",
+                &Default::default(),
+            )
+            .unwrap();
+            drop(restored);
+
+            let replaced = db.join(".replaced-ds-7");
+            let replaced_for_hook = replaced.clone();
+            restore::BEFORE_KEEP_MARKER_WRITE.set(Some(Box::new(move |_| {
+                FAIL_NEXT_DIR_SYNC.set(Some(replaced_for_hook.clone()));
+            })));
+            swap::FAIL_ROLLBACK_RENAME.set(true);
+            let res = swap::replace_in_place(&catalog, "ds", &staged, "7", true);
+            restore::BEFORE_KEEP_MARKER_WRITE.set(None);
+            swap::FAIL_ROLLBACK_RENAME.set(false);
+            let remaining = FAIL_NEXT_DIR_SYNC.replace(None);
+
+            assert!(
+                remaining.is_none(),
+                "keep-marker sync failure must fire on {replaced:?}"
+            );
+            assert!(
+                res.is_err(),
+                "keepReplaced swap must not acknowledge success when keep-marker sync fails"
+            );
+            assert!(
+                replaced.join(restore::SWAP_MARKER).exists(),
+                "swap marker must remain intact when keep-marker sync fails"
+            );
+            assert!(
+                replaced.join(KEEP_REPLACED_MARKER).exists(),
+                "unsynced keep marker rename should be visible before simulated power loss"
+            );
+            drop(catalog);
+
+            // Simulate power loss dropping the unsynced `.keep-replaced-v1` publication.
+            std::fs::remove_file(replaced.join(KEEP_REPLACED_MARKER)).unwrap();
+
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            let active = reopened
+                .get("ds")
+                .expect("predecessor must be recovered instead of deleted on restart");
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (pred_id, pred_head)
+            );
+            assert!(!replaced.exists());
+            assert!(!db.join("ds").join(KEEP_REPLACED_MARKER).exists());
+            assert!(!db.join("ds").join(restore::SWAP_MARKER).exists());
+            let earlier_check =
+                Store::open_existing(&kept_dst, Default::default(), Some(earlier_id)).unwrap();
+            assert_eq!(earlier_check.head_commit(), earlier_head);
+        }
+
+        // Subtest B: occupied destination with injected keep-marker sync failure and normal live
+        // rollback restores the predecessor cleanly without acknowledging retention.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let pred = catalog.create("ds", &Default::default()).unwrap();
+            pred.update("INSERT DATA { <urn:r8-pred-b> <urn:p> 1 }")
+                .unwrap();
+            let pred_id = pred.dataset_id();
+            let pred_head = pred.head_commit();
+            drop(pred);
+
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let kept_dst = db.join(".kept-ds-8");
+            let earlier = Store::open(&kept_dst, Default::default()).unwrap();
+            let earlier_id = earlier.dataset_id();
+            let earlier_head = earlier.head_commit();
+            drop(earlier);
+            write_file_atomic(&kept_dst.join(KEEP_REPLACED_MARKER), b".kept-ds-8").unwrap();
+
+            let staged = db.join(".restore-ds-8");
+            drop(Store::open(&staged, Default::default()).unwrap());
+
+            let replaced = db.join(".replaced-ds-8");
+            let replaced_for_hook = replaced.clone();
+            restore::BEFORE_KEEP_MARKER_WRITE.set(Some(Box::new(move |_| {
+                FAIL_NEXT_DIR_SYNC.set(Some(replaced_for_hook.clone()));
+            })));
+            let res = swap::replace_in_place(&catalog, "ds", &staged, "8", true);
+            restore::BEFORE_KEEP_MARKER_WRITE.set(None);
+            assert!(FAIL_NEXT_DIR_SYNC.replace(None).is_none());
+            assert!(res.is_err());
+
+            let active = catalog.get("ds").expect("live rollback must reopen ds");
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (pred_id, pred_head)
+            );
+            assert!(!replaced.exists());
+            assert!(!db.join("ds").join(KEEP_REPLACED_MARKER).exists());
+            assert!(!db.join("ds").join(restore::SWAP_MARKER).exists());
+            let earlier_check =
+                Store::open_existing(&kept_dst, Default::default(), Some(earlier_id)).unwrap();
+            assert_eq!(earlier_check.head_commit(), earlier_head);
+        }
+
+        // Subtest C: occupied destination with durable keep-marker sync keeps all three heads
+        // and proves `.keep-replaced-v1` is synced before `.restore-swap.json` is cleared.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let pred = catalog.create("ds", &Default::default()).unwrap();
+            pred.update("INSERT DATA { <urn:r8-pred-c> <urn:p> 1 }")
+                .unwrap();
+            let pred_id = pred.dataset_id();
+            let pred_head = pred.head_commit();
+            drop(pred);
+
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let kept_dst = db.join(".kept-ds-9");
+            let earlier = Store::open(&kept_dst, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &earlier,
+                "INSERT DATA { <urn:r8-earlier-c> <urn:p> 10 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let earlier_id = earlier.dataset_id();
+            let earlier_head = earlier.head_commit();
+            drop(earlier);
+            write_file_atomic(&kept_dst.join(KEEP_REPLACED_MARKER), b".kept-ds-9").unwrap();
+
+            let staged = db.join(".restore-ds-9");
+            let restored = Store::open(&staged, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &restored,
+                "INSERT DATA { <urn:r8-restored-c> <urn:p> 20 . <urn:r8-restored-c> <urn:p> 21 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let restored_id = restored.dataset_id();
+            let restored_head = restored.head_commit();
+            drop(restored);
+
+            let replaced = db.join(".replaced-ds-9");
+            let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let observed_in_hook = observed.clone();
+            let _ = take_catalog_dir_syncs();
+            restore::BEFORE_SWAP_MARKER_REMOVE.set(Some(Box::new(move |dir| {
+                let keep_present = dir.join(KEEP_REPLACED_MARKER).exists();
+                let syncs = take_catalog_dir_syncs();
+                *observed_in_hook.borrow_mut() = Some((keep_present, syncs));
+            })));
+            let ds = swap::replace_in_place(&catalog, "ds", &staged, "9", true).unwrap();
+            restore::BEFORE_SWAP_MARKER_REMOVE.set(None);
+            assert_eq!(
+                (ds.dataset_id(), ds.head_commit()),
+                (restored_id, restored_head)
+            );
+            let (keep_present, syncs) = observed
+                .borrow_mut()
+                .take()
+                .expect("remove_swap_marker must run post-commit");
+            assert!(
+                keep_present,
+                "keep marker must exist before clearing swap marker"
+            );
+            assert!(
+                syncs.contains(&replaced),
+                "predecessor dir {replaced:?} must be synced before clearing swap marker; saw {syncs:?}"
+            );
+            assert!(replaced.join(KEEP_REPLACED_MARKER).exists());
+            assert!(!replaced.join(restore::SWAP_MARKER).exists());
+            drop((ds, catalog));
+
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            let live = reopened.get("ds").unwrap();
+            assert_eq!(
+                (live.dataset_id(), live.head_commit()),
+                (restored_id, restored_head)
+            );
+            let earlier_check =
+                Store::open_existing(&kept_dst, Default::default(), Some(earlier_id)).unwrap();
+            assert_eq!(earlier_check.head_commit(), earlier_head);
+            let pred_check =
+                Store::open_existing(&replaced, Default::default(), Some(pred_id)).unwrap();
+            assert_eq!(pred_check.head_commit(), pred_head);
+        }
+
+        // Subtest D: BeforeReplace rollback of a `keepReplaced` swap clears and syncs
+        // `.keep-replaced-v1` before clearing `.restore-swap.json`.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let pred = catalog.create("ds", &Default::default()).unwrap();
+            pred.update("INSERT DATA { <urn:r8-pred-d> <urn:p> 1 }")
+                .unwrap();
+            let pred_id = pred.dataset_id();
+            let pred_head = pred.head_commit();
+            drop(pred);
+
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let staged = db.join(".restore-ds-10");
+            drop(Store::open(&staged, Default::default()).unwrap());
+            let replaced = db.join(".replaced-ds-10");
+
+            let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let observed_in_hook = observed.clone();
+            swap::ROLLBACK_HOOK.set(Some(Box::new(move || {
+                let _ = take_catalog_dir_syncs();
+            })));
+            restore::BEFORE_SWAP_MARKER_REMOVE.set(Some(Box::new(move |dir| {
+                let keep_present = dir.join(KEEP_REPLACED_MARKER).exists();
+                let syncs = take_catalog_dir_syncs();
+                *observed_in_hook.borrow_mut() = Some((keep_present, syncs));
+            })));
+            FAIL_REGISTRY_REPLACE.set(1);
+            let res = swap::replace_in_place(&catalog, "ds", &staged, "10", true);
+            FAIL_REGISTRY_REPLACE.set(0);
+            swap::ROLLBACK_HOOK.set(None);
+            restore::BEFORE_SWAP_MARKER_REMOVE.set(None);
+            assert!(res.is_err());
+
+            let (keep_present, syncs) = observed
+                .borrow_mut()
+                .take()
+                .expect("remove_swap_marker must run on BeforeReplace rollback");
+            assert!(
+                !keep_present,
+                "rollback must remove keep marker before removing swap marker"
+            );
+            assert!(
+                syncs.contains(&replaced),
+                "rollback must sync predecessor dir {replaced:?} after removing keep marker; saw {syncs:?}"
+            );
+            let active = catalog.get("ds").unwrap();
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (pred_id, pred_head)
+            );
+            assert!(!db.join("ds").join(KEEP_REPLACED_MARKER).exists());
+            assert!(!db.join("ds").join(restore::SWAP_MARKER).exists());
+        }
+    }
+
+    #[test]
+    fn r8_distinct_uuid_conflict_requires_valid_swap_classification() {
+        use super::super::CONFIG_FILE;
+        use crate::store::Store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+        let healthy = catalog.create("healthy", &Default::default()).unwrap();
+        healthy
+            .update("INSERT DATA { <urn:r8-healthy> <urn:p> 1 }")
+            .unwrap();
+        let healthy_id = healthy.dataset_id();
+        let healthy_head = healthy.head_commit();
+        drop(healthy);
+        let doomed = catalog.create("doomed", &Default::default()).unwrap();
+        doomed
+            .update("INSERT DATA { <urn:r8-doomed-a> <urn:p> 2 }")
+            .unwrap();
+        drop(doomed);
+
+        CRASH_AFTER.set(CRASH_AFTER_KEPT_RENAME);
+        assert!(catalog.delete("doomed").is_err());
+        CRASH_AFTER.set(0);
+        drop(catalog);
+
+        let intent = read_intents(dir.path()).unwrap().pop().unwrap();
+        assert_eq!(intent.state, IntentState::Prepared);
+        let db = dir.path().join("databases");
+        let kept = db.join(intent.kept_name());
+        let journal = dir.path().join(INTENT_FILE);
+
+        // Build a distinct registered replacement (UUID B != intent UUID A) whose live path is
+        // missing and whose sole `.replaced-doomed-42` carries readable `dataset.json` with UUID B.
+        let replaced = db.join(".replaced-doomed-42");
+        let replacement = Store::open(&replaced, Default::default()).unwrap();
+        crate::sparql::update::update(
+            &replacement,
+            "INSERT DATA { <urn:r8-doomed-b> <urn:p> 3 . <urn:r8-doomed-b> <urn:p> 4 }",
+            &Default::default(),
+        )
+        .unwrap();
+        let replacement_id = replacement.dataset_id();
+        let replacement_head = replacement.head_commit();
+        assert_ne!(replacement_id, intent.id);
+        drop(replacement);
+
+        let replacement_rev = Uuid::new_v4();
+        let mut reg = read_registry(dir.path()).unwrap();
+        let row = reg
+            .datasets
+            .iter_mut()
+            .find(|entry| entry.name == "doomed")
+            .expect("doomed row must exist");
+        row.id = Some(replacement_id);
+        row.revision = Some(replacement_rev);
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            sparkles_core::formats::settings_to_vec(CONFIG_FILE, &reg).unwrap(),
+        )
+        .unwrap();
+        assert!(!db.join("doomed").exists());
+
+        let swap_marker = replaced.join(super::super::restore::SWAP_MARKER);
+
+        // Case 1: truncated swap marker (with and without `.keep-replaced-v1`) must NOT use the
+        // distinct-UUID exception; healthy sibling opens, doomed stays closed, and all staged
+        // copies + delete journal survive.
+        for with_keep_marker in [false, true] {
+            if with_keep_marker {
+                write_file_atomic(&replaced.join(KEEP_REPLACED_MARKER), b".kept-doomed-42")
+                    .unwrap();
+            }
+            std::fs::write(&swap_marker, b"{\"format\":1,").unwrap();
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            let h = reopened
+                .get("healthy")
+                .expect("healthy sibling must open despite distinct-UUID malformed swap marker");
+            assert_eq!(
+                (h.dataset_id(), h.head_commit()),
+                (healthy_id, healthy_head)
+            );
+            assert_eq!(reopened.refusal("doomed").map(|r| r.kind), Some("recovery"));
+            assert!(reopened.get("doomed").is_none());
+            assert!(!db.join("doomed").exists());
+            assert!(kept.join("dataset.json").exists());
+            assert!(replaced.join("dataset.json").exists());
+            assert!(journal.exists());
+        }
+        std::fs::remove_file(replaced.join(KEEP_REPLACED_MARKER)).unwrap();
+
+        // Case 2: valid JSON swap marker whose predecessor_revision does NOT match the registered
+        // revision is not a verified rollback of B and must also stay isolated to `/doomed`.
+        std::fs::write(
+            &swap_marker,
+            serde_json::to_vec(&serde_json::json!({
+                "format": 1,
+                "dataset": "doomed",
+                "predecessor_id": replacement_id,
+                "predecessor_revision": Uuid::new_v4(),
+                "restored_id": Uuid::new_v4(),
+                "restored_revision": Uuid::new_v4(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            let h = reopened.get("healthy").unwrap();
+            assert_eq!(
+                (h.dataset_id(), h.head_commit()),
+                (healthy_id, healthy_head)
+            );
+            assert_eq!(reopened.refusal("doomed").map(|r| r.kind), Some("recovery"));
+            assert!(reopened.get("doomed").is_none());
+            assert!(!db.join("doomed").exists());
+            assert!(kept.join("dataset.json").exists());
+            assert!(replaced.join("dataset.json").exists());
+            assert!(journal.exists());
+        }
+
+        // Prepare a verified rollback swap marker matching UUID B and `replacement_rev`.
+        let valid_rollback_marker = serde_json::to_vec(&serde_json::json!({
+            "format": 1,
+            "dataset": "doomed",
+            "predecessor_id": replacement_id,
+            "predecessor_revision": replacement_rev,
+            "restored_id": Uuid::new_v4(),
+            "restored_revision": Uuid::new_v4(),
+        }))
+        .unwrap();
+        std::fs::write(&swap_marker, &valid_rollback_marker).unwrap();
+
+        // Case 3: unreadable swap marker must stay isolated to `/doomed` while `/healthy` opens.
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&swap_marker, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let opened = Catalog::open(dir.path(), Default::default());
+            std::fs::set_permissions(&swap_marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let reopened = opened
+                .expect("healthy sibling must open when distinct-UUID swap marker is unreadable");
+            let h = reopened.get("healthy").unwrap();
+            assert_eq!(
+                (h.dataset_id(), h.head_commit()),
+                (healthy_id, healthy_head)
+            );
+            assert_eq!(reopened.refusal("doomed").map(|r| r.kind), Some("recovery"));
+            assert!(reopened.get("doomed").is_none());
+            assert!(!db.join("doomed").exists());
+            assert!(kept.join("dataset.json").exists());
+            assert!(replaced.join("dataset.json").exists());
+            assert!(journal.exists());
+        }
+
+        // Case 4 (positive control): once the swap marker is readable and valid for B's rollback,
+        // the distinct-UUID exception rolls back `/doomed` to B and retires A's delete copy.
+        let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+        let h = reopened.get("healthy").unwrap();
+        assert_eq!(
+            (h.dataset_id(), h.head_commit()),
+            (healthy_id, healthy_head)
+        );
+        assert!(
+            reopened.refusal("doomed").is_none(),
+            "{:?}",
+            reopened.refusals()
+        );
+        let restored_b = reopened.get("doomed").unwrap();
+        assert_eq!(
+            (restored_b.dataset_id(), restored_b.head_commit()),
+            (replacement_id, replacement_head)
+        );
+        assert!(!replaced.exists());
+        assert!(!kept.exists());
+        assert!(!journal.exists());
     }
 
     #[test]

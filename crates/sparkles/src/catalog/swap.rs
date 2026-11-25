@@ -5,7 +5,8 @@
 //! the directory lock.
 
 use super::restore::{
-    KEPT_PREFIX, REPLACED_PREFIX, RESTORE_PREFIX, SwapMarker, remove_swap_marker, write_swap_marker,
+    KEPT_PREFIX, REPLACED_PREFIX, RESTORE_PREFIX, SwapMarker, remove_keep_marker,
+    remove_swap_marker, write_keep_marker, write_swap_marker,
 };
 use super::{Catalog, RegistryCommitError, Reservation, ReservationKind, sync_dir};
 use crate::Dataset;
@@ -319,6 +320,7 @@ fn swap(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| st.dir().expect("persistent catalog").join("databases"));
     let replaced = databases.join(format!("{REPLACED_PREFIX}{name}-{task}"));
+    let kept_name = keep_replaced.then(|| format!("{KEPT_PREFIX}{name}-{task}"));
     if let Err(e) = std::fs::rename(&root, &replaced) {
         let err = io("moving aside", &root, e);
         return Err(reopen_after(st, name, err));
@@ -331,16 +333,37 @@ fn swap(
         restored_id,
         restored_revision,
     );
-    // Make rename 1 durable before writing the swap marker into `replaced` so a
-    // power loss cannot lose rename 1 while leaving the marker inside `root`.
-    if let Err(error) = sync_dir(&databases).and_then(|()| write_swap_marker(&replaced, &marker)) {
+    // Make rename 1 durable before writing markers into `replaced` so a power
+    // loss cannot lose rename 1 while leaving markers inside `root`. Publish
+    // and sync `.keep-replaced-v1` before publishing the replacement or
+    // committing the registry so a `keepReplaced` swap has a durable retention
+    // decision before the swap can commit or clear `.restore-swap.json`.
+    let prepared = sync_dir(&databases)
+        .and_then(|()| write_swap_marker(&replaced, &marker))
+        .and_then(|()| {
+            if let Some(kept_name) = &kept_name {
+                write_keep_marker(&replaced, kept_name)
+            } else {
+                Ok(())
+            }
+        });
+    if let Err(error) = prepared {
         let err = BackupError::internal(format!(
             "marking the in-place restore swap of /{name}: {error:#}"
         ));
-        if let Err(e2) = remove_swap_marker(&replaced)
+        let rollback = rollback_rename_fail_point()
+            .map_err(crate::Error::from)
+            .and_then(|()| {
+                if keep_replaced {
+                    remove_keep_marker(&replaced)
+                } else {
+                    Ok(())
+                }
+            })
+            .and_then(|()| remove_swap_marker(&replaced))
             .and_then(|()| std::fs::rename(&replaced, &root).map_err(crate::Error::from))
-            .and_then(|()| sync_dir(&databases))
-        {
+            .and_then(|()| sync_dir(&databases));
+        if let Err(e2) = rollback {
             let message = format!(
                 "{err}; putting back {} failed too: {e2} (the next start repairs it)",
                 replaced.display()
@@ -352,10 +375,15 @@ fn swap(
     }
     if let Err(e) = std::fs::rename(restored, &root) {
         let err = io("moving the restored copy to", &root, e);
-        if let Err(e2) = remove_swap_marker(&replaced)
-            .and_then(|()| std::fs::rename(&replaced, &root).map_err(crate::Error::from))
-            .and_then(|()| sync_dir(&databases))
-        {
+        let rollback = if keep_replaced {
+            remove_keep_marker(&replaced)
+        } else {
+            Ok(())
+        }
+        .and_then(|()| remove_swap_marker(&replaced))
+        .and_then(|()| std::fs::rename(&replaced, &root).map_err(crate::Error::from))
+        .and_then(|()| sync_dir(&databases));
+        if let Err(e2) = rollback {
             let message = format!(
                 "{err}; putting back {} failed too: {e2} (the next start repairs it)",
                 replaced.display()
@@ -372,35 +400,44 @@ fn swap(
     match published {
         Ok(ds) => {
             crash_point(3)?;
-            let cleanup = if keep_replaced {
-                let kept_name = format!("{KEPT_PREFIX}{name}-{task}");
+            let cleanup = if let Some(kept_name) = kept_name {
                 let kept = databases.join(&kept_name);
-                if let Err(error) = remove_swap_marker(&replaced) {
-                    tracing::warn!(
-                        target: "sparkles::backup",
-                        path = %replaced.display(),
-                        %error,
-                        "could not clear the restore swap marker before retaining the old copy"
-                    );
-                }
-                let marker = replaced.join(super::delete::KEEP_REPLACED_MARKER);
-                let marked = super::write_file_atomic(&marker, kept_name.as_bytes());
-                if let Err(error) = marked {
-                    tracing::warn!(target: "sparkles::backup", path = %marker.display(), %error,
-                        "could not mark the intentionally retained restore copy");
-                }
-                std::fs::rename(&replaced, &kept)
-                    .and_then(|()| sparkles_core::fsutil::sync_dir(&databases))
+                // `.keep-replaced-v1` is already durably synced inside `replaced`.
+                // Clear `.restore-swap.json` first so the retained copy never
+                // carries a stale swap marker into `.kept-*`.
+                remove_swap_marker(&replaced)
+                    .and_then(|()| {
+                        if std::fs::symlink_metadata(&kept).is_ok() {
+                            return Err(crate::Error::from(std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                format!(
+                                    "keepReplaced destination {} already exists",
+                                    kept.display()
+                                ),
+                            )));
+                        }
+                        std::fs::rename(&replaced, &kept).map_err(crate::Error::from)
+                    })
+                    .and_then(|()| sync_dir(&databases))
             } else {
                 std::fs::remove_dir_all(&replaced)
-                    .and_then(|()| sparkles_core::fsutil::sync_dir(&databases))
+                    .map_err(crate::Error::from)
+                    .and_then(|()| sync_dir(&databases))
             };
             if let Err(e) = cleanup {
-                tracing::warn!(
-                    target: "sparkles::backup",
-                    "{}: {e} (the next start removes it)",
-                    replaced.display()
-                );
+                if keep_replaced {
+                    tracing::warn!(
+                        target: "sparkles::backup",
+                        "{}: {e} (the next start finishes retaining it)",
+                        replaced.display()
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "sparkles::backup",
+                        "{}: {e} (the next start removes it)",
+                        replaced.display()
+                    );
+                }
             }
             Ok(ds)
         }
@@ -413,12 +450,21 @@ fn swap(
         }
         Err(RegistryCommitError::BeforeReplace(error)) => {
             let failed = databases.join(format!("{RESTORE_PREFIX}{name}-{task}"));
-            // Synchronize moving the restored copy aside before removing the swap
-            // marker so power loss cannot leave both live C and unmarked staged B.
+            // Synchronize moving the restored copy aside before removing markers
+            // so power loss cannot leave both live C and unmarked staged B.
+            // Clear `.keep-replaced-v1` before `.restore-swap.json` so power loss
+            // cannot leave an orphan keep marker without its swap marker.
             let back = rollback_rename_fail_point()
                 .and_then(|()| std::fs::rename(&root, &failed))
                 .map_err(crate::Error::from)
                 .and_then(|()| sync_dir(&databases))
+                .and_then(|()| {
+                    if keep_replaced {
+                        remove_keep_marker(&replaced)
+                    } else {
+                        Ok(())
+                    }
+                })
                 .and_then(|()| remove_swap_marker(&replaced))
                 .and_then(|()| std::fs::rename(&replaced, &root).map_err(crate::Error::from))
                 .and_then(|()| sync_dir(&databases));

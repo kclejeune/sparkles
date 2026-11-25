@@ -4,8 +4,10 @@
 //! * `databases/.restore-*` (an unfinished download or discarded rollback copy) is removed;
 //! * `databases/.replaced-<ds>-<task>` carrying a `.restore-swap.json` marker is
 //!   reconciled against the durable `config.json` revision (rolling back to the
-//!   predecessor when the predecessor revision survived, or removing `.replaced-*`
-//!   when the restored revision or a later registration survived);
+//!   predecessor when the predecessor revision survived, retaining it when a
+//!   committed swap also carries a validated `.keep-replaced-v1` marker, or
+//!   removing `.replaced-*` when the restored revision or a later registration
+//!   survived without retention);
 //! * `databases/.replaced-<ds>-<task>` carrying a validated `.keep-replaced-v1`
 //!   marker from a `keepReplaced` restore whose final rename did not finish
 //!   synchronizes the predecessor directory, then moves it to `.kept-<ds>-<task>`
@@ -93,6 +95,32 @@ type MarkerRemoveHook = Box<dyn FnMut(&Path)>;
 thread_local! {
     pub(crate) static BEFORE_SWAP_MARKER_REMOVE: std::cell::RefCell<Option<MarkerRemoveHook>> =
         const { std::cell::RefCell::new(None) };
+    pub(crate) static BEFORE_KEEP_MARKER_WRITE: std::cell::RefCell<Option<MarkerRemoveHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "backup")]
+pub(super) fn write_keep_marker(replaced: &Path, kept_name: &str) -> Result<()> {
+    #[cfg(test)]
+    BEFORE_KEEP_MARKER_WRITE.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook(replaced);
+        }
+    });
+    super::write_file_atomic(
+        &replaced.join(delete::KEEP_REPLACED_MARKER),
+        kept_name.as_bytes(),
+    )
+}
+
+#[cfg(feature = "backup")]
+pub(super) fn remove_keep_marker(replaced: &Path) -> Result<()> {
+    match std::fs::remove_file(replaced.join(delete::KEEP_REPLACED_MARKER)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    super::sync_dir(replaced)
 }
 
 #[cfg(feature = "backup")]
@@ -250,6 +278,34 @@ pub(super) fn is_retained_keep_replaced(
                     Ok(Some(id)) if id == marker.predecessor_id
                 )
         }
+        Err(_) => false,
+    }
+}
+
+/// Whether `databases/<name>` (a `.replaced-<ds>-<task>` directory) is a readable,
+/// valid rollback candidate for the registered persistent dataset `row` whose live
+/// root is absent.
+pub(super) fn is_verified_rollback_candidate(
+    databases: &RecoveryDir,
+    name: &OsStr,
+    ds: &str,
+    row: &super::RegistryEntry,
+) -> bool {
+    let Some(expected_id) = row.id else {
+        return false;
+    };
+    let Ok(dir) = databases.child(name) else {
+        return false;
+    };
+    if !matches!(delete::dataset_id(&dir), Ok(Some(id)) if id == expected_id) {
+        return false;
+    }
+    match read_swap_marker(&dir, ds) {
+        Ok(Some(marker)) => {
+            row.revision == Some(marker.predecessor_revision)
+                && marker.predecessor_id == expected_id
+        }
+        Ok(None) => matches!(keep_replaced_target(&dir), Ok(None)),
         Err(_) => false,
     }
 }
@@ -496,6 +552,17 @@ pub(super) fn recover(
                 "an in-place restore of /{ds} did not commit: putting back {}",
                 replaced.path().display()
             );
+            // Clear any pre-published keep marker and sync before unlinking the
+            // swap marker so power loss cannot leave an orphan keep marker.
+            match replaced
+                .dir()
+                .remove_file(OsStr::new(delete::KEEP_REPLACED_MARKER))
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            replaced.dir().sync()?;
             match replaced.dir().remove_file(OsStr::new(SWAP_MARKER)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == ErrorKind::NotFound => {}

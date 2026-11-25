@@ -2257,10 +2257,8 @@ fn sync_restored_registry(dir: &Path) -> Result<()> {
 
 pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    sparkles_core::fsutil::write_atomic_via(path, &tmp, bytes)?;
-    #[cfg(test)]
-    record_dir_sync(path.parent().unwrap_or(Path::new(".")));
-    Ok(())
+    sparkles_core::fsutil::replace_via(path, &tmp, bytes)?;
+    sync_dir(path.parent().unwrap_or(Path::new(".")))
 }
 #[cfg(test)]
 pub(super) fn check_dir_sync_fail(dir: &Path) -> Result<()> {
