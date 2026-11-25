@@ -50,6 +50,13 @@ pub struct ViewRead<'a> {
     /// reading than the view's, the view's query is evaluated at the reader's snapshot
     /// and the view's state is neither read nor changed.
     pub aggregate_errors: Option<super::AggregateErrors>,
+    /// upstream memory parent for fallback evaluation (`read_back` / `evaluate_under`),
+    /// binding any temporary circuit to the reading query's budget and pool
+    pub memory_parent: Option<sparkles_budget::ParentHandle>,
+    /// query pool backing `memory_parent`, when the reading query runs under a pool
+    pub memory_pool: Option<&'a Arc<super::pool::QueryPool>>,
+    /// local memory ceiling for fallback evaluation (`None`: inherit the view's limit)
+    pub max_memory_bytes: Option<u64>,
 }
 
 /// The rows of a view.
@@ -193,6 +200,9 @@ pub(super) fn run(ctx: &Ctx, spec: &ViewSpec, vars: &[VarId]) -> Result<Table> {
             format!("no view {:?}: views are not available here", spec.name),
         ));
     };
+    let memory_parent = Some(ctx.memory_parent()?);
+    let memory_pool = ctx.grant().map(|g| g.pool());
+    let max_memory_bytes = (ctx.mem_limit != u64::MAX).then_some(ctx.mem_limit);
     let rows = source.read_view(&ViewRead {
         name: &spec.name,
         at: ctx.snap.commit,
@@ -201,6 +211,9 @@ pub(super) fn run(ctx: &Ctx, spec: &ViewSpec, vars: &[VarId]) -> Result<Table> {
         caller: ctx.graphs.as_ref(),
         deadline: ctx.current_deadline(),
         aggregate_errors: Some(ctx.aggregate_errors),
+        memory_parent,
+        memory_pool,
+        max_memory_bytes,
     })?;
     if let Some(m) = rows.evaluated_under {
         ctx.warn(evaluated(&spec.name, m));

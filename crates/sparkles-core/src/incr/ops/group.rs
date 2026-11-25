@@ -639,7 +639,12 @@ impl Group {
         }
         let mut touched: Vec<Row> = Vec::new();
         let mut seen: rustc_hash::FxHashSet<Row> = Default::default();
+        let mut tracked = self.bytes();
         for (i, (r, w)) in c.iter().enumerate() {
+            if i % 1024 == 1023 {
+                p.tick()?;
+                p.sync_op_state(&mut tracked, self.bytes())?;
+            }
             let key: Row = self
                 .keys
                 .iter()
@@ -743,6 +748,7 @@ impl Group {
                 s.out = new;
             }
         }
+        p.sync_op_state(&mut tracked, self.bytes())?;
         Ok(out)
     }
 
@@ -796,6 +802,13 @@ impl Group {
                 .gann
                 .as_ref()
                 .map_or(0, |m| prov::map_bytes(m, self.keys.len()))
+    }
+
+    pub fn clear(&mut self) {
+        self.groups = FxHashMap::default();
+        if let Some(m) = &mut self.gann {
+            *m = AnnMap::default();
+        }
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {

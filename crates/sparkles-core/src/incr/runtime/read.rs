@@ -9,9 +9,11 @@ impl Runtime {
         let wait = Instant::now() + self.opts.read().view_wait;
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         loop {
+            let mut dropped = Vec::new();
+            let mut retired = Vec::new();
             let (cell, access, suspended, error, errors) = {
                 let mut reg = self.reg.lock();
-                self.sync_for_read(&mut reg);
+                self.sync_for_read(&mut reg, &mut dropped, &mut retired);
                 let errors = reg.aggregate_errors;
                 let e = reg.view(r.name)?;
                 (
@@ -22,6 +24,8 @@ impl Runtime {
                     errors,
                 )
             };
+            drop(dropped);
+            drop(retired);
             if let Some(why) = suspended {
                 return Err(crate::incr::error(
                     "view-suspended",
@@ -147,6 +151,13 @@ impl Runtime {
         };
         let mut c = st.fresh(st.circuit.inference.clone())?;
         drop(st);
+        let pool = r.memory_pool.cloned().or_else(|| self.pool.clone());
+        let parent = r.memory_parent.clone().or_else(|| self.circuit_parent());
+        c.set_pool(pool, parent);
+        if let Some(limit) = r.max_memory_bytes {
+            let effective = c.max_memory_bytes.map_or(limit, |m| m.min(limit));
+            c.set_local_limit(Some(effective));
+        }
         let control = Control {
             deadline: r.deadline.or(self.control().deadline),
             ..Control::none()
@@ -196,6 +207,13 @@ impl Runtime {
         let mut c = st.fresh(st.circuit.inference.clone())?;
         drop(st);
         c.aggregate_errors = Some(m);
+        let pool = r.memory_pool.cloned().or_else(|| self.pool.clone());
+        let parent = r.memory_parent.clone().or_else(|| self.circuit_parent());
+        c.set_pool(pool, parent);
+        if let Some(limit) = r.max_memory_bytes {
+            let effective = c.max_memory_bytes.map_or(limit, |m| m.min(limit));
+            c.set_local_limit(Some(effective));
+        }
         let control = Control {
             deadline: r.deadline.or(self.control().deadline),
             ..Control::none()

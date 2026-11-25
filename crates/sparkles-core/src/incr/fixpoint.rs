@@ -751,6 +751,13 @@ impl<P: Program> FixedPoint<P> {
         self.ann_bytes = 0;
     }
 
+    /// Clear all derived facts and annotations, releasing backing capacity.
+    pub fn clear_state(&mut self) {
+        let _ = self.store.clear();
+        self.ann = FxHashMap::default();
+        self.ann_bytes = 0;
+    }
+
     pub fn provenance(&self) -> Provenance {
         self.mode
     }

@@ -120,19 +120,40 @@ impl Runtime {
             return;
         }
         self.checkpoint(store);
-        let cells: Vec<Arc<Cell>> = {
+        let (cells, view_cells, internal) = {
             let mut reg = self.reg.lock();
-            reg.internal.clear();
-            reg.cells.drain().map(|(_, c)| c).collect()
+            let internal = std::mem::take(&mut reg.internal);
+            let cells: Vec<Arc<Cell>> = reg.cells.drain().map(|(_, c)| c).collect();
+            let view_cells: Vec<Arc<Cell>> = reg
+                .views
+                .values_mut()
+                .filter_map(|e| e.cell.take())
+                .collect();
+            (cells, view_cells, internal)
         };
-        for c in cells {
+        let mut retired = Vec::new();
+        for c in &cells {
             let mut st = c.state.lock();
             for s in st.subs.drain(..) {
                 if let Some(sh) = s.shared.upgrade() {
                     sh.close();
                 }
             }
+            st.clear_history();
+            st.circuit.clear_state();
+            retired.extend(st.circuit.drain_retired());
         }
+        for c in internal.values() {
+            let mut st = c.state.lock();
+            st.tally = None;
+            st.circuit.set_external_best_effort(0);
+            st.circuit.clear_state();
+            retired.extend(st.circuit.drain_retired());
+        }
+        drop(retired);
+        drop(cells);
+        drop(view_cells);
+        drop(internal);
         *self.subscription.lock() = None;
         self.kick();
         self.cv.notify_all();

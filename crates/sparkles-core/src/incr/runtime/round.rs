@@ -36,21 +36,24 @@ impl Runtime {
         for cell in &cells {
             // the status is read under the state lock: a switch of the inference replaces
             // the circuit and marks it `building` under that lock
-            let mut st = cell.state.lock();
-            let status = cell.info.lock().status.clone();
-            match status {
-                Status::Building => {
-                    self.build(store, cell, &mut st);
-                    worked = true;
-                }
-                Status::Ready => {
-                    if self.advance(store, cell, &mut st, &mut deltas) {
+            let retired = {
+                let mut st = cell.state.lock();
+                let status = cell.info.lock().status.clone();
+                match status {
+                    Status::Building => {
+                        self.build(store, cell, &mut st);
                         worked = true;
                     }
+                    Status::Ready => {
+                        if self.advance(store, cell, &mut st, &mut deltas) {
+                            worked = true;
+                        }
+                    }
+                    Status::Failed { .. } => {}
                 }
-                Status::Failed { .. } => {}
-            }
-            drop(st);
+                st.circuit.drain_retired()
+            };
+            drop(retired);
             let bytes = cell.info.lock().bytes;
             over.push((cell.clone(), bytes));
         }
@@ -136,7 +139,11 @@ impl Runtime {
             }
         }
         st.clear_history();
-        cell.info.lock().status = Status::Failed { code, message };
+        st.circuit.clear_state();
+        let mut info = cell.info.lock();
+        info.rows = 0;
+        info.bytes = 0;
+        info.status = Status::Failed { code, message };
     }
 
     pub(super) fn build(&self, store: &Store, cell: &Cell, st: &mut Slot) {
@@ -323,59 +330,79 @@ impl Runtime {
 
     /// Suspend the views whose circuit passed their budget or the pool's.
     pub(super) fn budgets(&self, cells: &[(Arc<Cell>, u64)]) {
-        let mut reg = self.reg.lock();
-        let mut total: u64 = reg
-            .views
-            .values()
-            .filter_map(|e| e.cell.as_ref())
-            .map(|c| c.info.lock().bytes)
-            .sum();
-        let pool = self.opts.read().views_memory;
-        for (cell, bytes) in cells {
-            let names: Vec<String> = reg
+        let mut detached: Vec<Arc<Cell>> = Vec::new();
+        {
+            let mut reg = self.reg.lock();
+            let mut total: u64 = reg
                 .views
-                .iter()
-                .filter(|(_, e)| e.cell.as_ref().is_some_and(|c| c.key == cell.key))
-                .filter(|(_, e)| *bytes > e.def.memory_bytes || pool.is_some_and(|p| total > p))
-                .map(|(n, _)| n.clone())
-                .collect();
-            for n in names {
-                let e = reg.views.get_mut(&n).expect("listed");
-                let why = if *bytes > e.def.memory_bytes {
-                    format!(
-                        "over-budget: its state of {bytes} bytes passed memoryBytes {}",
-                        e.def.memory_bytes
-                    )
-                } else {
-                    format!(
-                        "over-budget: the views' state passed --views-memory {}",
-                        pool.unwrap_or(0)
-                    )
-                };
-                tracing::warn!(target: "sparkles::incr::runtime", "view {n} suspended: {why}");
-                e.suspended = Some(why);
-                if let Some(c) = e.cell.take()
-                    && c.release_view() == 0
-                {
-                    total = total.saturating_sub(*bytes);
+                .values()
+                .filter_map(|e| e.cell.as_ref())
+                .map(|c| c.info.lock().bytes)
+                .sum();
+            let pool = self.opts.read().views_memory;
+            for (cell, bytes) in cells {
+                let names: Vec<String> = reg
+                    .views
+                    .iter()
+                    .filter(|(_, e)| e.cell.as_ref().is_some_and(|c| c.key == cell.key))
+                    .filter(|(_, e)| *bytes > e.def.memory_bytes || pool.is_some_and(|p| total > p))
+                    .map(|(n, _)| n.clone())
+                    .collect();
+                for n in names {
+                    let e = reg.views.get_mut(&n).expect("listed");
+                    let why = if *bytes > e.def.memory_bytes {
+                        format!(
+                            "over-budget: its state of {bytes} bytes passed memoryBytes {}",
+                            e.def.memory_bytes
+                        )
+                    } else {
+                        format!(
+                            "over-budget: the views' state passed --views-memory {}",
+                            pool.unwrap_or(0)
+                        )
+                    };
+                    tracing::warn!(target: "sparkles::incr::runtime", "view {n} suspended: {why}");
+                    e.suspended = Some(why);
+                    if let Some(c) = e.cell.take() {
+                        if c.release_view() == 0 {
+                            total = total.saturating_sub(*bytes);
+                        }
+                        detached.push(c);
+                    }
                 }
             }
         }
+        drop(detached);
     }
 
     /// Drop the circuits nobody uses.
     pub(super) fn gc(&self) {
-        let mut reg = self.reg.lock();
-        reg.cells.retain(|_, c| {
-            c.pending.load(Ordering::Acquire) > 0
-                || match c.state.try_lock() {
-                    Some(mut st) => st.alive(),
+        let mut dead: Vec<Arc<Cell>> = Vec::new();
+        let mut retired: Vec<MemoryLease> = Vec::new();
+        {
+            let mut reg = self.reg.lock();
+            reg.cells.retain(|_, c| {
+                if c.pending.load(Ordering::Acquire) > 0 {
+                    return true;
+                }
+                match c.state.try_lock() {
+                    Some(mut st) => {
+                        let keep = st.alive();
+                        retired.extend(st.circuit.drain_retired());
+                        if !keep {
+                            dead.push(c.clone());
+                        }
+                        keep
+                    }
                     None => true,
                 }
-        });
-        if reg.cells.is_empty() && reg.internal.is_empty() {
-            *self.subscription.lock() = None;
+            });
+            if reg.cells.is_empty() && reg.internal.is_empty() {
+                *self.subscription.lock() = None;
+            }
         }
+        drop(retired);
+        drop(dead);
     }
 
     /// Checkpoint every view whose state moved since its last checkpoint.

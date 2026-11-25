@@ -183,20 +183,22 @@ impl Window {
             return Ok(());
         }
         p.control.check()?;
-        let mut used = self.bytes();
+        let base_state = self.bytes();
+        let mut used = base_state;
         let mut keys = Vec::with_capacity(self.kept.len());
         for e in &self.kept {
             p.tick()?;
             let k = self.key_of(p, &e.row);
             // `bytes` counts each row's key slots already, so only the strings are new
             used = used.saturating_add(k.iter().map(SortKey::payload_bytes).sum::<u64>());
-            charge(p, used)?;
+            charge(p, used, base_state)?;
             keys.push(k);
         }
         p.control.check()?;
         for (e, k) in self.kept.iter_mut().zip(keys) {
             e.keys = k;
         }
+        p.clear_window_scratch();
         self.partial = self
             .kept
             .iter()
@@ -211,16 +213,15 @@ impl Window {
         p.control.check()?;
         let width = self.inner.schema.len();
         let slot = std::mem::size_of::<(Row, i64, Vec<SortKey>)>() as u64;
-        let mut used = self
-            .bytes()
-            .saturating_add((c.len() as u64).saturating_mul(slot));
-        charge(p, used)?;
+        let base_state = self.bytes();
+        let mut used = base_state.saturating_add((c.len() as u64).saturating_mul(slot));
+        charge(p, used, base_state)?;
         let mut out = Vec::with_capacity(c.len());
         for (r, w) in c {
             p.tick()?;
             let k = self.key_of(p, &r);
             used = used.saturating_add(heap_bytes(&k, width));
-            charge(p, used)?;
+            charge(p, used, base_state)?;
             out.push((r, w, k));
         }
         p.control.check()?;
@@ -377,9 +378,8 @@ impl Window {
         let mut counts = vec![0i64; if keep { self.kept.len() } else { 0 }];
         // the window's rows stay allocated until the new ones replace them
         let per = std::mem::size_of::<(&[crate::id::Id], usize)>() as u64 + 16;
-        let base = self
-            .bytes()
-            .saturating_add((index.capacity() as u64).saturating_mul(per));
+        let base_state = self.bytes();
+        let base = base_state.saturating_add((index.capacity() as u64).saturating_mul(per));
         let slot = std::mem::size_of::<HeapEntry>() as u64;
         let mut payloads = 0u64;
         for (r, w) in rows {
@@ -401,7 +401,11 @@ impl Window {
             // the heap is the operator's state to be, charged as it grows; a vector
             // doubles, so its slots are charged at the next power of two
             let slots = (top.kept().next_power_of_two() as u64).saturating_mul(slot);
-            charge(p, base.saturating_add(payloads).saturating_add(slots))?;
+            charge(
+                p,
+                base.saturating_add(payloads).saturating_add(slots),
+                base_state,
+            )?;
         }
         drop(index);
         #[cfg(test)]
@@ -418,6 +422,7 @@ impl Window {
             base.saturating_add(payloads)
                 .saturating_add(slots)
                 .saturating_add(sorting),
+            base_state,
         )?;
         p.control.check()?;
         let sorted = top.into_sorted();
@@ -438,6 +443,7 @@ impl Window {
         self.total = total;
         self.partial = partial;
         self.trim();
+        p.clear_window_scratch();
         Ok(())
     }
 
@@ -713,6 +719,15 @@ impl Window {
                 .sum::<u64>()
     }
 
+    pub fn clear(&mut self) {
+        self.kept = Vec::new();
+        self.held = 0;
+        self.total = 0;
+        self.stale = false;
+        self.partial = false;
+        self.moves = None;
+    }
+
     pub fn save(&self, w: &mut Writer) -> Result<()> {
         w.i64(self.total);
         w.u64(self.kept.len() as u64);
@@ -785,16 +800,9 @@ fn key_bytes(keys: &[SortKey]) -> u64 {
     (std::mem::size_of_val(keys) as u64).saturating_add(strings)
 }
 
-/// Fail with a memory budget error when `used` passes the pass's budget.
-fn charge(p: &Pass, used: u64) -> Result<()> {
-    match p.max_memory_bytes {
-        Some(max) if used > max => Err(crate::error::Error::BudgetExceeded(crate::error::Budget {
-            kind: crate::error::BudgetKind::Memory,
-            limit: max,
-            requested: used,
-        })),
-        _ => Ok(()),
-    }
+/// Fail with a memory budget error when `used` passes the pass's budget or parent pool.
+fn charge(p: &mut Pass, used: u64, base_state: u64) -> Result<()> {
+    p.charge_window(used, base_state)
 }
 
 fn strip(c: AChanges) -> Changes {

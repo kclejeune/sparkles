@@ -529,7 +529,8 @@ impl ExistsOp {
             }
         }
         // the input's own changes
-        for (r, dw) in dl {
+        let mut tracked = self.bytes();
+        for (i, (r, dw)) in dl.into_iter().enumerate() {
             let (ow, oh) = self.rows.get(&r).copied().unwrap_or((0, false));
             let nw = ow + dw;
             let nh = held.remove(&r).unwrap_or(oh);
@@ -543,7 +544,12 @@ impl ExistsOp {
             } else {
                 self.rows.insert(r, (nw, nh));
             }
+            if i % 1024 == 1023 {
+                p.tick()?;
+                p.sync_op_state(&mut tracked, self.bytes())?;
+            }
         }
+        p.sync_op_state(&mut tracked, self.bytes())?;
         Ok(consolidate(out))
     }
 
@@ -601,6 +607,11 @@ impl ExistsOp {
 
     pub fn bytes(&self) -> u64 {
         self.rows.len() as u64 * (row_bytes(self.inner.schema.len()) + 16)
+    }
+
+    pub fn clear(&mut self) {
+        self.rows = FxHashMap::default();
+        self.resolved = None;
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {

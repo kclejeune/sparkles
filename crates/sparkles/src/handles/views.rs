@@ -271,6 +271,9 @@ impl Views {
             caller: None,
             deadline: None,
             aggregate_errors: None,
+            memory_parent: None,
+            memory_pool: self.ds.inner.pool.as_ref(),
+            max_memory_bytes: None,
         })
     }
 
@@ -612,6 +615,9 @@ mod tests {
                             caller: None,
                             deadline: None,
                             aggregate_errors: None,
+                            memory_parent: None,
+                            memory_pool: None,
+                            max_memory_bytes: None,
                         });
                     }
                     "live" => {

@@ -22,6 +22,7 @@ use super::views::{self, ViewDef, ViewInfo, ViewState};
 use super::zset::Changes;
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
+use crate::sparql::pool::QueryPool;
 use crate::sparql::viewsvc::{ViewRead, ViewRows, ViewSource};
 use crate::store::definitions::{self, DefinitionFile, DefinitionSource};
 use crate::store::{DeltaSubscription, Store};
@@ -31,6 +32,7 @@ use parking_lot::{Condvar, Mutex, ReentrantMutex, RwLock};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use spargebra::Query;
+use sparkles_budget::{MemoryLease, ParentHandle};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::ManuallyDrop;
@@ -167,6 +169,7 @@ pub struct Runtime {
     opts: RwLock<RuntimeOptions>,
     root: Option<PathBuf>,
     dataset: uuid::Uuid,
+    pool: Option<Arc<QueryPool>>,
     host: RwLock<Option<Arc<dyn Host>>>,
     reg: Mutex<Registry>,
     /// The definitions as backups and clones capture them, replaced while `reg` is
@@ -210,12 +213,25 @@ impl Runtime {
     /// A runtime for the dataset at `root` (`None`: in memory, without checkpoints)
     /// with the definitions found there. Views are attached once a host is set.
     pub fn open(root: Option<PathBuf>, dataset: uuid::Uuid, opts: RuntimeOptions) -> Arc<Runtime> {
+        Self::open_with_pool(root, dataset, opts, None)
+    }
+
+    /// [`open`](Self::open) wired to a shared [`QueryPool`], so every view, live query
+    /// and internal circuit reserves its state, history/tally and nested SPARQL work
+    /// from the pool.
+    pub fn open_with_pool(
+        root: Option<PathBuf>,
+        dataset: uuid::Uuid,
+        opts: RuntimeOptions,
+        pool: Option<Arc<QueryPool>>,
+    ) -> Arc<Runtime> {
         let reg = Registry::load(root.as_deref());
         let defs = RwLock::new(reg.defs());
         Arc::new(Runtime {
             opts: RwLock::new(opts),
             root,
             dataset,
+            pool,
             host: RwLock::new(None),
             reg: Mutex::new(reg),
             defs,
@@ -235,6 +251,10 @@ impl Runtime {
             seen: AtomicU64::new(0),
             switched: AtomicU64::new(0),
         })
+    }
+
+    pub(super) fn circuit_parent(&self) -> Option<ParentHandle> {
+        self.pool.as_ref().map(QueryPool::work_parent)
     }
 
     pub fn options(&self) -> RuntimeOptions {

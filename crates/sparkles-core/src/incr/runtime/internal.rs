@@ -35,8 +35,9 @@ pub(crate) struct InternalCell {
     pub(super) applied: AtomicU64,
 }
 
+/// `circuit` is declared last so `tally` (whose bytes are accounted on `circuit`'s
+/// budget) drops strictly before `circuit`'s credit returns to the pool.
 pub(super) struct InternalSlot {
-    pub(super) circuit: Circuit,
     pub(super) status: Status,
     /// the counts of an accumulator, from its first build
     pub(super) tally: Option<Tally>,
@@ -44,6 +45,7 @@ pub(super) struct InternalSlot {
     pub(super) checkpointed: u64,
     /// the counts changed without a pass (counts were discarded)
     pub(super) dirty: bool,
+    pub(super) circuit: Circuit,
 }
 
 /// A handle on an internal circuit that server code attached
@@ -142,12 +144,18 @@ impl InternalCircuit {
     /// Drop an accumulator's counts of the commits up to `commit`, which server code
     /// has acted on. Later reads count from `commit` at the earliest.
     pub fn discard_through(&self, commit: u64) {
-        let mut st = self.cell.state.lock();
-        let through = commit.min(st.circuit.applied);
-        if let Some(t) = st.tally.as_mut() {
-            t.discard_through(through);
-            st.dirty = true;
-        }
+        let retired = {
+            let mut st = self.cell.state.lock();
+            let through = commit.min(st.circuit.applied);
+            if let Some(t) = st.tally.as_mut() {
+                t.discard_through(through);
+                let bytes = t.bytes();
+                st.circuit.set_external_best_effort(bytes);
+                st.dirty = true;
+            }
+            st.circuit.drain_retired()
+        };
+        drop(retired);
     }
 
     /// The circuit's rows at its commit.
@@ -343,7 +351,8 @@ impl Runtime {
         let whole = whole_reason(graphs.as_ref()).map(str::to_string);
         let compiled = compile(&q, whole.as_deref())?;
         let mut circuit = Circuit::new(compiled, graphs.clone());
-        circuit.max_memory_bytes = Some(spec.max_memory_bytes);
+        circuit.set_pool(self.pool.clone(), self.circuit_parent());
+        circuit.set_local_limit(Some(spec.max_memory_bytes));
         // the dataset's reading of errors in aggregates when the circuit attaches
         let errors = self.host_or_open().aggregate_errors();
         circuit.aggregate_errors = Some(errors);
@@ -433,12 +442,12 @@ impl Runtime {
             spec,
             fingerprint,
             state: Mutex::new(InternalSlot {
-                circuit,
                 status: Status::Building,
                 tally: None,
                 key_cols,
                 checkpointed: 0,
                 dirty: false,
+                circuit,
             }),
             handles: AtomicUsize::new(1),
             applied: AtomicU64::new(0),
@@ -462,18 +471,26 @@ impl Runtime {
             self.build_internal(store, &cell, &mut st);
         }
         let failed = status_error(&st.status);
+        let retired = st.circuit.drain_retired();
         drop(st);
+        drop(retired);
         if let Some(e) = failed {
             // a circuit that could not be built is not attached
-            let mut reg = self.reg.lock();
-            if reg
-                .internal
-                .get(&cell.spec.id)
-                .is_some_and(|c| Arc::ptr_eq(c, &cell))
-                && cell.handles.fetch_sub(1, Ordering::AcqRel) == 1
-            {
-                reg.internal.remove(&cell.spec.id);
-            }
+            let removed = {
+                let mut reg = self.reg.lock();
+                if reg
+                    .internal
+                    .get(&cell.spec.id)
+                    .is_some_and(|c| Arc::ptr_eq(c, &cell))
+                    && cell.handles.fetch_sub(1, Ordering::AcqRel) == 1
+                {
+                    reg.internal.remove(&cell.spec.id)
+                } else {
+                    None
+                }
+            };
+            drop(removed);
+            drop(cell);
             return Err(e);
         }
         let handle = InternalCircuit {
@@ -523,7 +540,40 @@ impl Runtime {
             "internal circuit {} failed ({code}): {message}",
             cell.spec.id
         );
+        st.circuit.clear_state();
         st.status = Status::Failed { code, message };
+    }
+
+    /// Reconcile an accumulator's tally bytes against the circuit's budget and parent
+    /// pool, shrinking the oldest counts when needed.
+    fn charge_tally(
+        circuit: &Circuit,
+        tally: &mut Tally,
+        dirty: &mut bool,
+        applied: u64,
+    ) -> Result<()> {
+        while let Err(e) = circuit.try_set_external(tally.bytes()) {
+            let cur = tally.bytes();
+            let shrunk = if cur > 0 {
+                tally.shrink_to(cur / 2)
+            } else {
+                false
+            };
+            if shrunk {
+                *dirty = true;
+                continue;
+            }
+            if tally.since < applied {
+                tally.discard_through(applied);
+                *dirty = true;
+                if circuit.try_set_external(tally.bytes()).is_ok() {
+                    return Ok(());
+                }
+            }
+            circuit.set_external_best_effort(0);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Fail the circuit whose state passed its budget, and drop the oldest counts of an
@@ -538,31 +588,39 @@ impl Runtime {
                 requested: bytes,
             }));
         }
-        if let Some(t) = st.tally.as_mut()
-            && t.shrink_to(max - bytes)
-        {
-            st.dirty = true;
-            tracing::warn!(
-                target: "sparkles::incr::runtime",
-                "an internal circuit's counts passed its budget: counts start after commit {}",
-                t.since
-            );
+        let applied = st.circuit.applied;
+        if let Some(t) = st.tally.as_mut() {
+            if t.shrink_to(max - bytes) {
+                st.dirty = true;
+                tracing::warn!(
+                    target: "sparkles::incr::runtime",
+                    "an internal circuit's counts passed its budget: counts start after commit {}",
+                    t.since
+                );
+            }
+            if let Err(e) = Self::charge_tally(&st.circuit, t, &mut st.dirty, applied) {
+                return Some(e);
+            }
         }
         None
     }
 
     /// One round's work on internal circuit `cell`: build it, or advance it to the head.
     pub(super) fn round_internal(&self, store: &Store, cell: &InternalCell) -> bool {
-        let mut st = cell.state.lock();
-        let worked = match st.status {
-            Status::Building => {
-                self.build_internal(store, cell, &mut st);
-                true
-            }
-            Status::Ready => self.advance_internal(store, cell, &mut st),
-            Status::Failed { .. } => false,
+        let (worked, retired) = {
+            let mut st = cell.state.lock();
+            let worked = match st.status {
+                Status::Building => {
+                    self.build_internal(store, cell, &mut st);
+                    true
+                }
+                Status::Ready => self.advance_internal(store, cell, &mut st),
+                Status::Failed { .. } => false,
+            };
+            cell.applied.store(st.circuit.applied, Ordering::Release);
+            (worked, st.circuit.drain_retired())
         };
-        cell.applied.store(st.circuit.applied, Ordering::Release);
+        drop(retired);
         worked
     }
 
@@ -637,6 +695,7 @@ impl Runtime {
                     if tally.shrink_to(max - state) {
                         *dirty = true;
                     }
+                    Self::charge_tally(circuit, tally, dirty, at)?;
                 }
                 Advance::Reset(_) => tally.lose(d.after + 1, at),
             }
@@ -774,8 +833,7 @@ impl Runtime {
                         "internal circuit {id}: checkpoint {}: {e}; the circuit is built again",
                         path.display()
                     );
-                    st.circuit.result = Default::default();
-                    st.circuit.snap = None;
+                    st.circuit.clear_state();
                 }
             }
         }
@@ -798,16 +856,22 @@ impl Runtime {
             return;
         }
         self.checkpoint_internal(store, &idle);
-        let mut reg = self.reg.lock();
-        for c in idle {
-            if c.handles.load(Ordering::Acquire) == 0
-                && reg
-                    .internal
-                    .get(&c.spec.id)
-                    .is_some_and(|r| Arc::ptr_eq(r, &c))
-            {
-                reg.internal.remove(&c.spec.id);
+        let mut dead: Vec<Arc<InternalCell>> = Vec::new();
+        {
+            let mut reg = self.reg.lock();
+            for c in &idle {
+                if c.handles.load(Ordering::Acquire) == 0
+                    && reg
+                        .internal
+                        .get(&c.spec.id)
+                        .is_some_and(|r| Arc::ptr_eq(r, c))
+                    && let Some(removed) = reg.internal.remove(&c.spec.id)
+                {
+                    dead.push(removed);
+                }
             }
         }
+        drop(dead);
+        drop(idle);
     }
 }

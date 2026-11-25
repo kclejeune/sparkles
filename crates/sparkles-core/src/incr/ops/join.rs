@@ -63,6 +63,7 @@ impl Join {
         let mode = p.prov;
         let l = prov::consolidate(self.left.init_a(p)?);
         let r = prov::consolidate(self.right.init_a(p)?);
+        let mut tracked = self.bytes();
         let l = match (&mut self.larr, &mut self.lann) {
             (Some(a), Some(m)) => {
                 a.clear();
@@ -79,6 +80,7 @@ impl Join {
             }
             _ => r,
         };
+        p.sync_op_state(&mut tracked, self.bytes())?;
         let mut by_key: FxHashMap<_, Vec<usize>> = FxHashMap::default();
         for (i, (row, _, _)) in r.iter().enumerate() {
             by_key.entry(self.m.key_right(row)).or_default().push(i);
@@ -105,10 +107,12 @@ impl Join {
         let mode = p.prov;
         let dl = prov::consolidate(self.left.delta_a(p)?);
         let dr = prov::consolidate(self.right.delta_a(p)?);
+        let mut tracked = self.bytes();
         let dl = match (&mut self.larr, &mut self.lann) {
             (Some(a), Some(m)) => absorb_side(a, m, dl, mode),
             _ => dl,
         };
+        p.sync_op_state(&mut tracked, self.bytes())?;
         let mut out = AChanges::new();
         // ΔA ⋈ B_old
         for (a, wa, aa) in &dl {
@@ -132,6 +136,7 @@ impl Join {
             (Some(a), Some(m)) => absorb_side(a, m, dr, mode),
             _ => dr,
         };
+        p.sync_op_state(&mut tracked, self.bytes())?;
         // A_new ⋈ ΔB
         for (b, wb, ab) in &dr {
             let key = self.m.key_right(b);
@@ -156,6 +161,7 @@ impl Join {
     pub fn init(&mut self, p: &mut Pass) -> Result<Changes> {
         let l = consolidate(self.left.init(p)?);
         let r = consolidate(self.right.init(p)?);
+        let mut tracked = self.bytes();
         // a rebuild starts from nothing: the old rows hold ids of the old term space
         if let Some(a) = &mut self.larr {
             a.clear();
@@ -165,6 +171,7 @@ impl Join {
             a.clear();
             a.apply(&r);
         }
+        p.sync_op_state(&mut tracked, self.bytes())?;
         let mut by_key: FxHashMap<_, Vec<usize>> = FxHashMap::default();
         for (i, (row, _)) in r.iter().enumerate() {
             by_key.entry(self.m.key_right(row)).or_default().push(i);
@@ -187,6 +194,7 @@ impl Join {
     pub fn delta(&mut self, p: &mut Pass) -> Result<Changes> {
         let dl = consolidate(self.left.delta(p)?);
         let dr = consolidate(self.right.delta(p)?);
+        let mut tracked = self.bytes();
         let mut out = Changes::new();
         // ΔA ⋈ B_old
         for (a, wa) in &dl {
@@ -203,6 +211,7 @@ impl Join {
         if let Some(arr) = &mut self.larr {
             arr.apply(&dl);
         }
+        p.sync_op_state(&mut tracked, self.bytes())?;
         // A_new ⋈ ΔB
         for (b, wb) in &dr {
             let key = self.m.key_right(b);
@@ -217,6 +226,7 @@ impl Join {
         if let Some(arr) = &mut self.rarr {
             arr.apply(&dr);
         }
+        p.sync_op_state(&mut tracked, self.bytes())?;
         Ok(out)
     }
 
@@ -231,6 +241,21 @@ impl Join {
                 .rann
                 .as_ref()
                 .map_or(0, |m| prov::map_bytes(m, self.right.schema.len()))
+    }
+
+    pub fn clear(&mut self) {
+        if let Some(a) = &mut self.larr {
+            a.clear();
+        }
+        if let Some(a) = &mut self.rarr {
+            a.clear();
+        }
+        if let Some(m) = &mut self.lann {
+            *m = AnnMap::default();
+        }
+        if let Some(m) = &mut self.rann {
+            *m = AnnMap::default();
+        }
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {

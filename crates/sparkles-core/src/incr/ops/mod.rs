@@ -307,6 +307,26 @@ impl Node {
         own + self.children().iter().map(|c| c.bytes()).sum::<u64>()
     }
 
+    /// Free all operator state in this node and its children while keeping the compiled
+    /// plan structure intact for a future build.
+    pub fn clear(&mut self) {
+        match &mut self.op {
+            Op::Join(o) => o.clear(),
+            Op::Match(o) => o.clear(),
+            Op::Distinct(o) => o.clear(),
+            Op::Exists(o) => o.clear(),
+            Op::Group(o) => o.clear(),
+            Op::Recompute(o) => o.clear(),
+            Op::Template(o) => o.clear(),
+            Op::Path(o) => o.clear(),
+            Op::Window(o) => o.clear(),
+            _ => {}
+        }
+        for c in self.children_mut() {
+            c.clear();
+        }
+    }
+
     /// Write the state of the node and its children, depth first.
     pub fn save(&self, w: &mut Writer) -> Result<()> {
         match &self.op {

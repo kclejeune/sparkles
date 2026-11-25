@@ -1,6 +1,7 @@
 //! A compiled circuit with its state: the result it keeps current, the commit it
 //! reflects, and the passes that move it (spec F13 §3.3, §3.4).
 
+use super::budget::ViewBudget;
 use super::compile::{Compiled, Kind};
 use super::footprint::{Footprint, Resolved};
 use super::inference::{Inference, InferredFootprint};
@@ -13,10 +14,12 @@ use super::zset::{Changes, Row, ZSet, consolidate};
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
 use crate::id::Id;
+use crate::sparql::pool::QueryPool;
 use crate::store::{ChangesOptions, Snapshot, Store};
 use crate::task::Control;
 use oxrdf::Term;
 use rustc_hash::FxHashMap;
+use sparkles_budget::{MemoryLease, ParentHandle};
 use std::sync::{Arc, OnceLock};
 
 /// The most net changes a pass applies; more are cheaper to evaluate from scratch.
@@ -256,7 +259,6 @@ pub enum Advance {
     Reset(Changes),
 }
 
-#[derive(Clone)]
 pub struct Circuit {
     pub kind: Kind,
     pub vars: Vec<String>,
@@ -302,6 +304,12 @@ pub struct Circuit {
     /// the index estimates the latest build computed, which tests read
     #[cfg(test)]
     pub(crate) build_estimated: u64,
+    /// query pool backing this circuit's accounting domain, when attached
+    pool: Option<Arc<QueryPool>>,
+    /// hierarchical budget for operator state, result, terms, provenance, history/tally,
+    /// pass scratch, and nested SPARQL evaluation. Declared last so all payloads drop
+    /// strictly before parent credit returns.
+    budget: ViewBudget,
 }
 
 /// Annotated changes split into the weights' changes, consolidated, and the changes
@@ -344,7 +352,79 @@ impl Circuit {
             build_scanned: 0,
             #[cfg(test)]
             build_estimated: 0,
+            pool: None,
+            budget: ViewBudget::new(None, None),
         }
+    }
+
+    /// Bind this circuit's accounting to `pool` and `parent` before any state is built.
+    pub fn set_pool(&mut self, pool: Option<Arc<QueryPool>>, parent: Option<ParentHandle>) {
+        self.pool = pool;
+        self.budget.set_parent(parent);
+    }
+
+    /// Set the circuit's local byte limit (`None`: unlimited locally).
+    pub(crate) fn set_local_limit(&mut self, limit: Option<u64>) {
+        self.max_memory_bytes = limit;
+        self.budget.set_local_limit(limit);
+    }
+
+    /// Raise a shared circuit's local byte limit so all attached consumers can stay
+    /// within the largest consumer's bound (narrower consumers are evicted post-pass).
+    pub(crate) fn raise_local_limit(&mut self, limit: u64) {
+        if let Some(cur) = self.max_memory_bytes {
+            let next = cur.max(limit);
+            self.max_memory_bytes = Some(next);
+            self.budget.raise_local_limit(next);
+        }
+    }
+
+    /// Drain excess [`MemoryLease`]s split during shrinks so the caller can drop them
+    /// outside runtime and cell locks.
+    pub(crate) fn drain_retired(&self) -> Vec<MemoryLease> {
+        self.budget.drain_retired()
+    }
+
+    /// Free all operator, result, term, provenance and snapshot state and detach all
+    /// persistent state credit down to zero (when no external/scratch bytes remain).
+    pub(crate) fn clear_state(&mut self) {
+        self.root.clear();
+        self.result = ZSet::new();
+        self.terms = Terms::default();
+        self.ann = AnnMap::default();
+        self.facts.clear();
+        self.resolved = None;
+        self.inferred = InferredFootprint::default();
+        self.snap = None;
+        self.budget.clear_state();
+    }
+
+    /// Transfer this circuit's pool and live budget to a replacement circuit during an
+    /// inference switch without a transient 2× reservation peak.
+    pub(crate) fn take_budget(&mut self) -> (Option<Arc<QueryPool>>, ViewBudget) {
+        (self.pool.take(), std::mem::take(&mut self.budget))
+    }
+
+    /// Install a transferred pool and budget onto a fresh replacement circuit.
+    pub(crate) fn install_budget(&mut self, pool: Option<Arc<QueryPool>>, budget: ViewBudget) {
+        self.pool = pool;
+        self.budget = budget;
+        self.budget.set_local_limit(self.max_memory_bytes);
+    }
+
+    /// Reconcile a transferred budget downward after the old circuit's operators were
+    /// detached (caller drops the old circuit strictly before dropping retired leases).
+    pub(crate) fn shrink_budget_state(&self) {
+        self.budget.shrink_state_to(self.bytes());
+    }
+
+    pub(crate) fn try_set_external(&self, bytes: u64) -> Result<()> {
+        self.budget.set_local_limit(self.max_memory_bytes);
+        self.budget.try_set_external(bytes)
+    }
+
+    pub(crate) fn set_external_best_effort(&self, bytes: u64) {
+        self.budget.set_external_best_effort(bytes);
     }
 
     /// Keep annotation `mode` from the next build on (spec F13 §5). The circuit must
@@ -559,6 +639,9 @@ impl Circuit {
         vis: &'a Vis,
         control: &'a Control,
     ) -> (Pass<'a>, &'a mut Node) {
+        self.budget.set_local_limit(self.max_memory_bytes);
+        let budget_handle = self.budget.handle();
+        let pool = self.pool.clone();
         let mut p = Pass::new(
             snap,
             old,
@@ -571,6 +654,8 @@ impl Circuit {
             &self.vars,
         );
         p.max_memory_bytes = self.max_memory_bytes;
+        p.budget = Some(budget_handle);
+        p.pool = pool;
         p.base = self.base.clone();
         p.inference = self.inference.clone();
         if let Some(m) = self.aggregate_errors {
@@ -614,16 +699,25 @@ impl Circuit {
         let vis = Vis::new(self.access.as_ref(), &snap);
         self.facts.clear();
         let (mut p, root) = self.pass(snap.clone(), None, &[], &[], &vis, control);
-        let (out, ann) = if p.prov.is_none() {
-            (root.init(&mut p)?, None)
+        let res = if p.prov.is_none() {
+            root.init(&mut p).map(|out| (out, None))
         } else {
-            let (w, a) = split(root.init_a(&mut p)?);
-            (w, Some(a))
+            root.init_a(&mut p).map(|a| {
+                let (w, a) = split(a);
+                (w, Some(a))
+            })
         };
         let stats = p.stats;
         #[cfg(test)]
         let (scanned, estimated) = (p.scanned.get(), p.estimated.get());
         drop(p);
+        let (out, ann) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                self.budget.abort_pass(self.bytes());
+                return Err(e);
+            }
+        };
         #[cfg(test)]
         {
             self.build_scanned = scanned;
@@ -636,6 +730,10 @@ impl Circuit {
         };
         self.ann.clear();
         self.absorb(ann);
+        if let Err(e) = self.budget.commit_pass(self.bytes()) {
+            self.clear_state();
+            return Err(e);
+        }
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.last = stats;
@@ -662,19 +760,34 @@ impl Circuit {
 
     /// Load a state written by [`encode`](Self::encode) into the id space of `snap`.
     pub fn decode(&mut self, body: &[u8], snap: &Arc<Snapshot>) -> Result<()> {
-        let mut terms = Terms::default();
-        let mut r = Reader::new(body, snap, &mut terms)?;
-        self.result = r.zset()?;
-        self.root.load(&mut r)?;
-        if !self.prov.is_none() {
-            self.ann = prov::load_map(&mut r, self.prov)?;
+        self.budget.set_local_limit(self.max_memory_bytes);
+        let scratch = body.len() as u64;
+        self.budget.try_reserve_scratch(scratch)?;
+        let decoded = (|| {
+            let mut terms = Terms::default();
+            let mut r = Reader::new(body, snap, &mut terms)?;
+            self.result = r.zset()?;
+            self.root.load(&mut r)?;
+            if !self.prov.is_none() {
+                self.ann = prov::load_map(&mut r, self.prov)?;
+            }
+            // ids change with the id space
+            self.facts.clear();
+            if !r.done() {
+                return Err(Error::Corrupt("a view's state has trailing bytes".into()));
+            }
+            self.terms = terms;
+            Ok(())
+        })();
+        self.budget.release_scratch(scratch);
+        if let Err(e) = decoded {
+            self.clear_state();
+            return Err(e);
         }
-        // ids change with the id space
-        self.facts.clear();
-        if !r.done() {
-            return Err(Error::Corrupt("a view's state has trailing bytes".into()));
+        if let Err(e) = self.budget.try_set_state(self.bytes()) {
+            self.clear_state();
+            return Err(e);
         }
-        self.terms = terms;
         self.snap = Some(snap.clone());
         self.resolved = None;
         self.inferred = InferredFootprint::default();
@@ -695,9 +808,27 @@ impl Circuit {
         {
             self.remap(&prev, &snap)?;
         }
+        self.budget.set_local_limit(self.max_memory_bytes);
         let before = std::mem::take(&mut self.result);
         let old_terms = self.terms.clone();
-        self.build(snap.clone(), control)?;
+        // Keep the old result and terms charged alongside the replacement build until
+        // both are dropped after computing the diff.
+        let before_bytes = before
+            .bytes(self.root.schema.len())
+            .saturating_add(old_terms.bytes());
+        if let Err(e) = self.budget.try_reserve_scratch(before_bytes) {
+            self.result = before;
+            return Err(e);
+        }
+        // Lower persistent state accounting for the moved-out result before `build`
+        // (its bytes are now covered by `before_bytes` in scratch).
+        self.budget.shrink_state_to(self.bytes());
+        if let Err(e) = self.build(snap.clone(), control) {
+            drop(before);
+            drop(old_terms);
+            self.budget.release_scratch(before_bytes);
+            return Err(e);
+        }
         // local ids of the old result must mean what the new ones mean
         let mut before_keys: ZSet = ZSet::new();
         for (r, w) in before.iter() {
@@ -715,7 +846,13 @@ impl Circuit {
                 .collect();
             before_keys.add(row, w);
         }
-        Ok(self.result.minus(&before_keys))
+        let diff = self.result.minus(&before_keys);
+        drop(before_keys);
+        drop(before);
+        drop(old_terms);
+        self.budget.release_scratch(before_bytes);
+        self.budget.try_set_state(self.bytes())?;
+        Ok(diff)
     }
 
     /// Apply the net changes `d` (whose `after` must be the circuit's commit).
@@ -764,13 +901,24 @@ impl Circuit {
             let (mut p, root) =
                 self.pass(snap.clone(), Some(old), &d.added, &d.removed, &vis, control);
             p.full = true;
-            let (out, ann) = Self::run_delta(root, &mut p)?;
+            let res = Self::run_delta(root, &mut p);
             let stats = p.stats;
             drop(p);
+            let (out, ann) = match res {
+                Ok(v) => v,
+                Err(e) => {
+                    self.budget.abort_pass(self.bytes());
+                    return Err(e);
+                }
+            };
             if self.keep_result {
                 self.result.apply(&out);
             }
             self.absorb(ann);
+            if let Err(e) = self.budget.commit_pass(self.bytes()) {
+                self.budget.abort_pass(self.bytes());
+                return Err(e);
+            }
             self.applied = snap.commit;
             self.snap = Some(snap);
             self.last = stats;
@@ -807,13 +955,24 @@ impl Circuit {
         }
         let old = d.old()?;
         let (mut p, root) = self.pass(snap.clone(), Some(old), &added, &removed, &vis, control);
-        let (out, ann) = Self::run_delta(root, &mut p)?;
+        let res = Self::run_delta(root, &mut p);
         let stats = p.stats;
         drop(p);
+        let (out, ann) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                self.budget.abort_pass(self.bytes());
+                return Err(e);
+            }
+        };
         if self.keep_result {
             self.result.apply(&out);
         }
         self.absorb(ann);
+        if let Err(e) = self.budget.commit_pass(self.bytes()) {
+            self.budget.abort_pass(self.bytes());
+            return Err(e);
+        }
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.last = stats;

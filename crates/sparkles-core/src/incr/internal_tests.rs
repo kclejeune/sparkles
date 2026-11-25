@@ -359,6 +359,9 @@ fn internal_circuits_are_invisible_to_callers() {
         caller: None,
         deadline: None,
         aggregate_errors: None,
+        memory_parent: None,
+        memory_pool: None,
+        max_memory_bytes: None,
     });
     assert_eq!(code(read.err().expect("refused")), "view-not-found");
     assert!(!rt.readable_by("secret", None));

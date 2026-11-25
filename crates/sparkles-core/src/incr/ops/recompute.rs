@@ -37,8 +37,10 @@ impl Recompute {
     }
 
     pub fn init(&mut self, p: &mut Pass, schema: &[u32]) -> Result<Changes> {
+        let mut tracked = self.bytes(schema.len());
         let rows = p.evaluate(&self.pattern, schema, self.dataset.as_ref())?;
         self.prev = rows.iter().cloned().collect();
+        p.sync_op_state(&mut tracked, self.bytes(schema.len()))?;
         Ok(rows)
     }
 
@@ -55,12 +57,14 @@ impl Recompute {
                 return Ok(Vec::new());
             }
         }
+        let mut tracked = self.bytes(schema.len());
         let now: ZSet = p
             .evaluate(&self.pattern, schema, self.dataset.as_ref())?
             .into_iter()
             .collect();
         let d = now.minus(&self.prev);
         self.prev = now;
+        p.sync_op_state(&mut tracked, self.bytes(schema.len()))?;
         Ok(d)
     }
 
@@ -86,6 +90,11 @@ impl Recompute {
 
     pub fn bytes(&self, width: usize) -> u64 {
         self.prev.bytes(width)
+    }
+
+    pub fn clear(&mut self) {
+        self.prev = ZSet::new();
+        self.resolved = None;
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {

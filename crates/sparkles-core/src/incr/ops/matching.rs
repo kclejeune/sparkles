@@ -179,8 +179,9 @@ impl MatchOp {
         if let Some(s) = sann.as_mut() {
             s.clear();
         }
+        let mut tracked = self.bytes();
         let mut out = AChanges::new();
-        for (a, wa, aa) in l {
+        for (idx, (a, wa, aa)) in l.into_iter().enumerate() {
             p.tick()?;
             prov::absorb_row(&mut lann, &a, aa, mode);
             if wa == 0 {
@@ -218,6 +219,9 @@ impl MatchOp {
                 None => sum,
             };
             self.set(&a, (wa, m));
+            if idx % 1024 == 1023 {
+                p.sync_op_state(&mut tracked, self.bytes())?;
+            }
             if self.mode.alone(m) {
                 let ann = self.alone_ann(p, &a, &la, &sa);
                 out.push((self.out_row(&a), wa, ann));
@@ -225,6 +229,7 @@ impl MatchOp {
         }
         self.lann = Some(lann);
         self.sann = sann;
+        p.sync_op_state(&mut tracked, self.bytes())?;
         Ok(out)
     }
 
@@ -336,9 +341,11 @@ impl MatchOp {
             }
             new.push((a, (ow, om), (nw, nm)));
         }
+        let mut tracked = self.bytes();
         for (a, _, v) in &new {
             self.set(a, *v);
         }
+        p.sync_op_state(&mut tracked, self.bytes())?;
         // the joined part: L_new ⋈ ΔR
         if lj {
             for (b, wb, ab) in &dr {
@@ -488,8 +495,9 @@ impl MatchOp {
         }
         self.lstate.clear();
         self.lrows = 0;
+        let mut tracked = self.bytes();
         let mut out = Changes::new();
-        for (a, wa) in &l {
+        for (idx, (a, wa)) in l.iter().enumerate() {
             p.tick()?;
             let cands: Changes = rindex
                 .get(&self.m.key_left(a))
@@ -508,10 +516,14 @@ impl MatchOp {
                 }
             }
             self.set(a, (*wa, m));
+            if idx % 1024 == 1023 {
+                p.sync_op_state(&mut tracked, self.bytes())?;
+            }
             if self.mode.alone(m) {
                 out.push((self.out_row(a), *wa));
             }
         }
+        p.sync_op_state(&mut tracked, self.bytes())?;
         Ok(out)
     }
 
@@ -572,9 +584,11 @@ impl MatchOp {
             };
             new.push((a, (ow, om), (nw, nm)));
         }
+        let mut tracked = self.bytes();
         for (a, _, v) in &new {
             self.set(a, *v);
         }
+        p.sync_op_state(&mut tracked, self.bytes())?;
         // the joined part: L_new ⋈ ΔR
         if lj {
             for (b, wb) in &dr {
@@ -622,6 +636,20 @@ impl MatchOp {
                 .rann
                 .as_ref()
                 .map_or(0, |m| prov::map_bytes(m, self.right.schema.len()))
+    }
+
+    pub fn clear(&mut self) {
+        self.lstate = FxHashMap::default();
+        self.lrows = 0;
+        if let Some(a) = &mut self.rarr {
+            a.clear();
+        }
+        for m in [&mut self.lann, &mut self.sann, &mut self.rann]
+            .into_iter()
+            .flatten()
+        {
+            *m = AnnMap::default();
+        }
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {

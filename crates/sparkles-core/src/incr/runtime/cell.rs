@@ -35,6 +35,38 @@ pub(super) struct Hist {
     from: u64,
     to: u64,
     rows: Arc<[(Vec<Option<Term>>, i64)]>,
+    bytes: u64,
+}
+
+fn term_bytes(t: &Term) -> u64 {
+    match t {
+        Term::NamedNode(n) => 32 + n.as_str().len() as u64,
+        Term::BlankNode(b) => 32 + b.as_str().len() as u64,
+        Term::Literal(l) => {
+            48 + l.value().len() as u64
+                + l.language().map_or(0, |s| s.len() as u64)
+                + l.datatype().as_str().len() as u64
+        }
+        Term::Triple(tr) => {
+            64 + term_bytes(&Term::from(tr.subject.clone()))
+                + term_bytes(&Term::NamedNode(tr.predicate.clone()))
+                + term_bytes(&tr.object)
+        }
+    }
+}
+
+pub(super) fn hist_bytes(rows: &[(Vec<Option<Term>>, i64)]) -> u64 {
+    let mut total = std::mem::size_of::<Hist>() as u64;
+    for (row, _) in rows {
+        total = total.saturating_add(32);
+        for cell in row {
+            total = total.saturating_add(match cell {
+                Some(t) => term_bytes(t),
+                None => 8,
+            });
+        }
+    }
+    total
 }
 
 pub(super) struct Sub {
@@ -45,14 +77,17 @@ pub(super) struct Sub {
 }
 
 /// A circuit's state, shared by its views and live queries.
+///
+/// `circuit` is declared last so `history` (whose bytes are accounted on `circuit`'s
+/// budget) drops strictly before `circuit`'s credit returns to the pool.
 pub(crate) struct Slot {
-    pub(super) circuit: Circuit,
     pub(super) query: Query,
     /// why the access makes the whole query be evaluated again, when it does
     pub(super) whole: Option<String>,
     pub(super) vars: Arc<[String]>,
     pub(super) history: VecDeque<Hist>,
     pub(super) history_rows: usize,
+    pub(super) history_bytes: u64,
     pub(super) subs: Vec<Sub>,
     /// the views attached to the circuit
     pub(super) views: usize,
@@ -60,6 +95,7 @@ pub(crate) struct Slot {
     /// that evaluation publishes leads from one mode to the other, and diffs from before
     /// it must not rewind a view across the switch
     pub(super) rebased: bool,
+    pub(super) circuit: Circuit,
 }
 
 impl Slot {
@@ -186,6 +222,8 @@ impl Slot {
     pub(super) fn clear_history(&mut self) {
         self.history.clear();
         self.history_rows = 0;
+        self.history_bytes = 0;
+        self.circuit.set_external_best_effort(0);
     }
 
     pub(super) fn alive(&mut self) -> bool {
@@ -219,12 +257,39 @@ impl Slot {
             last.to = to;
             return;
         }
+        let bytes = hist_bytes(&rows);
         self.history_rows += rows.len();
-        self.history.push_back(Hist { from, to, rows });
+        self.history_bytes = self.history_bytes.saturating_add(bytes);
+        self.history.push_back(Hist {
+            from,
+            to,
+            rows,
+            bytes,
+        });
         while self.history.len() > max.max(1) || self.history_rows > HISTORY_ROWS {
             match self.history.pop_front() {
-                Some(h) => self.history_rows -= h.rows.len(),
+                Some(h) => {
+                    self.history_rows -= h.rows.len();
+                    self.history_bytes = self.history_bytes.saturating_sub(h.bytes);
+                }
                 None => break,
+            }
+        }
+        // Admit the retained history against the circuit's budget and parent pool,
+        // dropping the oldest diffs first when memory is tight so history never
+        // escapes the pool or breaks an otherwise healthy view.
+        while self.circuit.try_set_external(self.history_bytes).is_err() {
+            match self.history.pop_front() {
+                Some(h) => {
+                    self.history_rows -= h.rows.len();
+                    self.history_bytes = self.history_bytes.saturating_sub(h.bytes);
+                }
+                None => {
+                    self.history_rows = 0;
+                    self.history_bytes = 0;
+                    self.circuit.set_external_best_effort(0);
+                    break;
+                }
             }
         }
     }

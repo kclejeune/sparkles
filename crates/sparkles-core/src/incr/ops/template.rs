@@ -58,7 +58,8 @@ impl Template {
             .triples
             .iter()
             .any(|t| t.iter().any(|s| matches!(s, TSlot::Blank(_))));
-        for (row, w) in c {
+        let mut tracked = self.bytes();
+        for (i, (row, w)) in c.into_iter().enumerate() {
             p.tick()?;
             if !blanks {
                 self.emit(p, &row, &[], None, w, &mut out);
@@ -72,6 +73,9 @@ impl Template {
             // the occurrences added or removed, the newest removed first
             let before = self.counts.get(&row);
             self.counts.add(row.clone(), w);
+            if i % 1024 == 1023 {
+                p.sync_op_state(&mut tracked, self.bytes())?;
+            }
             let (range, sign) = if w > 0 {
                 (before..before + w, 1)
             } else {
@@ -83,6 +87,7 @@ impl Template {
                 self.emit(p, &row, &keys, k, sign, &mut out);
             }
         }
+        p.sync_op_state(&mut tracked, self.bytes())?;
         Ok(out)
     }
 
@@ -206,6 +211,10 @@ impl Template {
 
     pub fn bytes(&self) -> u64 {
         self.counts.bytes(self.inner.schema.len())
+    }
+
+    pub fn clear(&mut self) {
+        self.counts = ZSet::new();
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {

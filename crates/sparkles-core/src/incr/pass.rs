@@ -12,6 +12,7 @@
 //! reads. Protections that depend on the data never reach a pass: such a circuit is one
 //! `recompute` node over its masked snapshot.
 
+use super::budget::BudgetHandle;
 use super::terms::Terms;
 use super::zset::{Changes, Row};
 use crate::access::GraphAccess;
@@ -20,6 +21,7 @@ use crate::id::{self, Id, Tag};
 use crate::index::Perm;
 use crate::sparql::ctx::Ctx;
 use crate::sparql::expr;
+use crate::sparql::pool::QueryPool;
 use crate::sparql::table::{Table, VarId};
 use crate::sparql::value::Value;
 use crate::store::{Chunk, Snapshot};
@@ -139,6 +141,12 @@ pub struct Pass<'a> {
     pub full: bool,
     /// the budget of one evaluation's intermediate results
     pub max_memory_bytes: Option<u64>,
+    /// hierarchical budget handle for the owning circuit, when attached
+    pub(crate) budget: Option<BudgetHandle>,
+    /// query pool backing the owning circuit's memory domain, when attached
+    pub(crate) pool: Option<Arc<QueryPool>>,
+    /// current window scratch bytes reserved on `budget` during this pass
+    window_scratch: u64,
     /// the query's base IRI
     pub base: Option<oxiri::Iri<String>>,
     /// the dataset's inference, which evaluations read with
@@ -191,6 +199,9 @@ impl<'a> Pass<'a> {
             stats: PassStats::default(),
             full,
             max_memory_bytes: None,
+            budget: None,
+            pool: None,
+            window_scratch: 0,
             base: None,
             inference: None,
             aggregate_errors,
@@ -214,6 +225,77 @@ impl<'a> Pass<'a> {
             self.control.check()?;
         }
         Ok(())
+    }
+
+    pub(crate) fn budget_handle(&self) -> Option<BudgetHandle> {
+        self.budget.clone()
+    }
+
+    pub(crate) fn reserve_pass(&mut self, delta: u64) -> Result<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+        if let Some(budget) = &self.budget {
+            budget.try_reserve_pass(delta)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_pass(&mut self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(budget) = &self.budget {
+            budget.release_pass(delta);
+        }
+    }
+
+    /// Reconcile an operator's tracked byte estimate during a pass so growth is
+    /// pre-admitted against both the local budget and the parent pool.
+    pub(crate) fn sync_op_state(&mut self, tracked: &mut u64, current: u64) -> Result<()> {
+        if current > *tracked {
+            let delta = current - *tracked;
+            self.reserve_pass(delta)?;
+            *tracked = current;
+        } else if current < *tracked {
+            let delta = *tracked - current;
+            self.release_pass(delta);
+            *tracked = current;
+        }
+        Ok(())
+    }
+
+    /// Admit a window operator's estimated peak memory (`total_used`, which includes its
+    /// existing `base_state` bytes already accounted in the circuit's persistent state).
+    pub(crate) fn charge_window(&mut self, total_used: u64, base_state: u64) -> Result<()> {
+        if let Some(max) = self.max_memory_bytes
+            && total_used > max
+        {
+            return Err(Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                limit: max,
+                requested: total_used,
+            }));
+        }
+        let extra = total_used.saturating_sub(base_state);
+        if extra > self.window_scratch {
+            let delta = extra - self.window_scratch;
+            self.reserve_pass(delta)?;
+            self.window_scratch = extra;
+        } else if extra < self.window_scratch {
+            let delta = self.window_scratch - extra;
+            self.release_pass(delta);
+            self.window_scratch = extra;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_window_scratch(&mut self) {
+        if self.window_scratch > 0 {
+            let prev = self.window_scratch;
+            self.window_scratch = 0;
+            self.release_pass(prev);
+        }
     }
 
     pub fn snap(&self, w: Which) -> &Arc<Snapshot> {
@@ -419,8 +501,19 @@ impl<'a> Pass<'a> {
             c.base_iri = self.base.clone();
             c.deadline = self.control.deadline;
             c.cancel = self.control.cancel.flag();
-            if let Some(m) = self.max_memory_bytes {
+            if let Some(m) = self
+                .budget
+                .as_ref()
+                .and_then(BudgetHandle::remaining_local)
+                .or(self.max_memory_bytes)
+            {
                 c.mem_limit = m;
+            }
+            if let Some(budget) = &self.budget
+                && let Some((parent, grant)) = budget.child_parent(self.pool.as_ref())
+            {
+                c.set_grant(grant);
+                c.set_memory_parent(parent)?;
             }
             c.allow_service = false;
             c.forbid_service = true;
@@ -596,12 +689,26 @@ impl<'a> Pass<'a> {
             },
             base_iri: self.base.clone(),
         };
+        let child = self
+            .budget
+            .as_ref()
+            .and_then(|b| b.child_parent(self.pool.as_ref()));
+        let (parent, grant) = match child {
+            Some((p, g)) => (Some(p), g),
+            None => (None, None),
+        };
+        let max_memory_bytes = self
+            .budget
+            .as_ref()
+            .and_then(BudgetHandle::remaining_local)
+            .or(self.max_memory_bytes);
         let opts = crate::sparql::QueryOptions {
             graphs: self.access.clone(),
             deadline: self.control.deadline,
             cancel: Some(self.control.cancel.flag()),
             no_cache: true,
-            max_memory_bytes: self.max_memory_bytes,
+            max_memory_bytes,
+            grant,
             allow_service: false,
             forbid_service: true,
             defaults_applied: true,
@@ -614,11 +721,16 @@ impl<'a> Pass<'a> {
                 .unwrap_or_default(),
             ..Default::default()
         };
-        let r = crate::sparql::execute_query(self.new.clone(), &q, &opts, 0.0)?;
+        let r = if parent.is_some() {
+            crate::sparql::execute_query_with_parent(self.new.clone(), &q, &opts, 0.0, parent)?
+        } else {
+            crate::sparql::execute_query(self.new.clone(), &q, &opts, 0.0)?
+        };
         let snap = self.new.clone();
         let width = r.table().width();
         let mut z = super::zset::ZSet::new();
         let mut decoded: FxHashMap<Id, Id> = FxHashMap::default();
+        let mut z_tracked = 0u64;
         for i in 0..r.table().len() {
             let mut row: Vec<Id> = Vec::with_capacity(width);
             for c in 0..width {
@@ -644,13 +756,20 @@ impl<'a> Pass<'a> {
             }
             let row: Row = row.into();
             z.add(row, 1);
+            if i % 1024 == 1023 {
+                self.sync_op_state(&mut z_tracked, z.bytes(width))?;
+            }
             if i % 4096 == 4095 {
                 self.control.check()?;
             }
         }
+        self.sync_op_state(&mut z_tracked, z.bytes(width))?;
+        let r_width = r.table().width();
+        drop(r);
+        self.release_pass(z_tracked);
         self.stats.recompute += t0.elapsed();
         self.stats.recomputes += 1;
-        if r.table().width() != vars.len() {
+        if r_width != vars.len() {
             return Err(Error::Corrupt(
                 "a recompute node's evaluation returned other columns".into(),
             ));

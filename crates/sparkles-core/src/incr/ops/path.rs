@@ -20,7 +20,10 @@
 //! exists, which is how the query engine evaluates them. Neither needs state: the nodes
 //! and graphs that the changed quads name are checked at both snapshots.
 
-use super::super::fixpoint::{self, Change, FixedPoint, HashStore, NewStore, Program, Sink};
+use super::super::budget::BudgetHandle;
+use super::super::fixpoint::{
+    self, Change, FactStore, FixedPoint, HashStore, NewStore, Program, Sink,
+};
 use super::super::pass::{GraphSel, Pass, Which};
 use super::super::persist::{Reader, Writer};
 use super::super::prov::{AChanges, Ann, Atom, Provenance, Witness};
@@ -196,7 +199,9 @@ impl Closure {
         v.sort_unstable();
         v.dedup();
         let v: Arc<[Id]> = v.into();
-        self.cache.bytes += memo_bytes(v.len());
+        let added = memo_bytes(v.len());
+        p.reserve_pass(added)?;
+        self.cache.bytes += added;
         self.cache.next.insert(key, v.clone());
         Ok(v)
     }
@@ -273,7 +278,9 @@ impl Closure {
             let new = self.edge(p, Which::New, g, a, b)?;
             out.push((g, a, b, old, new));
         }
-        self.cache.bytes += 32 * out.len() as u64;
+        let added = 32 * out.len() as u64;
+        p.reserve_pass(added)?;
+        self.cache.bytes += added;
         self.cache.edges = Some(out.clone());
         Ok(out)
     }
@@ -296,7 +303,9 @@ impl Closure {
             }
         }
         let v: Arc<[Id]> = seen.into_iter().collect::<Vec<_>>().into();
-        self.cache.bytes += memo_bytes(v.len());
+        let added = memo_bytes(v.len());
+        p.reserve_pass(added)?;
+        self.cache.bytes += added;
         self.cache.reach.insert(key, v.clone());
         Ok(v)
     }
@@ -311,10 +320,122 @@ impl Closure {
     }
 }
 
+/// A [`HashStore`] for path closures that routes fixed-point buffer reservations and
+/// map capacity growth through the owning circuit's [`BudgetHandle`] during a pass.
+#[derive(Debug)]
+pub struct PathStore {
+    inner: HashStore<Fact, Id>,
+    budget: Option<BudgetHandle>,
+    tracked: u64,
+}
+
+impl Clone for PathStore {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            budget: None,
+            tracked: 0,
+        }
+    }
+}
+
+impl PathStore {
+    fn new() -> Self {
+        Self {
+            // the key, the record and the map's slot overhead
+            inner: HashStore::new(24 + 8 + 8),
+            budget: None,
+            tracked: 0,
+        }
+    }
+
+    fn attach_budget(&mut self, budget: Option<BudgetHandle>) {
+        self.budget = budget;
+        self.tracked = self.inner.bytes();
+    }
+
+    fn detach_budget(&mut self) {
+        self.budget = None;
+        self.tracked = 0;
+    }
+}
+
+impl FactStore<Fact, Id> for PathStore {
+    type Error = Error;
+
+    #[inline]
+    fn contains(&self, f: &Fact) -> bool {
+        self.inner.contains(f)
+    }
+
+    #[inline]
+    fn record(&self, f: &Fact) -> Option<Id> {
+        self.inner.record(f)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn for_each(&self, visit: &mut dyn FnMut(&Fact, &Id)) {
+        self.inner.for_each(visit);
+    }
+
+    fn bytes(&self) -> u64 {
+        self.inner.bytes()
+    }
+
+    #[inline]
+    fn insert(&mut self, f: Fact, r: Id) -> Result<bool> {
+        let inserted = self.inner.insert(f, r)?;
+        if inserted {
+            let now = self.inner.bytes();
+            if now > self.tracked {
+                let delta = now - self.tracked;
+                if let Some(budget) = &self.budget
+                    && let Err(e) = budget.try_reserve_pass(delta)
+                {
+                    let _ = self.inner.remove(&f);
+                    return Err(e);
+                }
+                self.tracked = now;
+            }
+        }
+        Ok(inserted)
+    }
+
+    #[inline]
+    fn set_record(&mut self, f: Fact, r: Id) -> Result<()> {
+        self.inner.set_record(f, r)
+    }
+
+    #[inline]
+    fn remove(&mut self, f: &Fact) -> Result<bool> {
+        self.inner.remove(f)
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        self.inner.clear()
+    }
+
+    fn reserve(&self, bytes: u64) -> Result<()> {
+        if let Some(budget) = &self.budget {
+            budget.try_reserve_scratch(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn release(&self, bytes: u64) {
+        if let Some(budget) = &self.budget {
+            budget.release_scratch(bytes);
+        }
+    }
+}
+
 impl NewStore for Closure {
-    fn new_store(&self) -> HashStore<Fact, Id> {
-        // the key, the record and the map's slot overhead
-        HashStore::new(24 + 8 + 8)
+    fn new_store(&self) -> PathStore {
+        PathStore::new()
     }
 }
 
@@ -323,7 +444,7 @@ impl Program for Closure {
     type Record = Id;
     type Cx<'c> = Pass<'c>;
     type Error = Error;
-    type Store = HashStore<Fact, Id>;
+    type Store = PathStore;
 
     fn premises(&self, f: &Fact, r: &Id, out: &mut Sink<'_, Fact, Error>) -> Result<()> {
         if !r.is_undef() {
@@ -335,7 +456,7 @@ impl Program for Closure {
     fn axioms(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         out: &mut Sink<'_, (Fact, Id), Error>,
     ) -> Result<()> {
         self.ensure(p);
@@ -372,7 +493,7 @@ impl Program for Closure {
     fn consequences(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         w: Which,
         f: &Fact,
         _held: &dyn Fn(&Fact) -> bool,
@@ -388,7 +509,7 @@ impl Program for Closure {
     fn prove(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         f: &Fact,
         held: &dyn Fn(&Fact) -> bool,
     ) -> Result<Option<Id>> {
@@ -407,7 +528,7 @@ impl Program for Closure {
     fn broken(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         recorded: &dyn Fn(&Fact) -> Option<Id>,
         out: &mut Sink<'_, Fact, Error>,
     ) -> Result<()> {
@@ -430,7 +551,7 @@ impl Program for Closure {
     fn added(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         held: &dyn Fn(&Fact) -> bool,
         out: &mut Sink<'_, (Fact, Id), Error>,
     ) -> Result<()> {
@@ -452,7 +573,7 @@ impl Program for Closure {
     fn moved(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         recorded: &dyn Fn(&Fact) -> Option<Id>,
         out: &mut Sink<'_, Fact, Error>,
     ) -> Result<()> {
@@ -478,7 +599,7 @@ impl Program for Closure {
     fn annotate(
         &mut self,
         p: &mut Pass,
-        _store: &HashStore<Fact, Id>,
+        _store: &PathStore,
         mode: Provenance,
         f: &Fact,
         r: &Id,
@@ -648,9 +769,13 @@ impl PathOp {
 
     pub fn init_a(&mut self, p: &mut Pass, schema: &[u32]) -> Result<AChanges> {
         self.fixed.program.begin(p);
+        self.fixed.store_mut().attach_budget(p.budget_handle());
         let out = self.init_rows(p, schema);
+        self.fixed.store_mut().detach_budget();
         // the memos of the pass are released whether it succeeded or not
+        let cache_bytes = self.fixed.program.cache.bytes;
         self.fixed.program.end();
+        p.release_pass(cache_bytes);
         out
     }
 
@@ -670,8 +795,12 @@ impl PathOp {
             return Ok(Vec::new());
         }
         self.fixed.program.begin(p);
+        self.fixed.store_mut().attach_budget(p.budget_handle());
         let out = self.delta_rows(p, schema);
+        self.fixed.store_mut().detach_budget();
+        let cache_bytes = self.fixed.program.cache.bytes;
         self.fixed.program.end();
+        p.release_pass(cache_bytes);
         out
     }
 
@@ -962,6 +1091,12 @@ impl PathOp {
 
     pub fn bytes(&self) -> u64 {
         self.fixed.bytes()
+    }
+
+    pub fn clear(&mut self) {
+        self.fixed.clear_state();
+        *self.fixed.store_mut() = PathStore::new();
+        self.fixed.program.end();
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {

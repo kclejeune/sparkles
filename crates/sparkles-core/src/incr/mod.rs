@@ -10,6 +10,7 @@
 //! that ask the same question with the same access, keeps the [`views`] defined in the
 //! dataset, and checkpoints their state ([`persist`]).
 
+pub(crate) mod budget;
 pub mod circuit;
 pub mod compile;
 pub mod fixpoint;

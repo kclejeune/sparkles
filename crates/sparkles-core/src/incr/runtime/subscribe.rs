@@ -22,6 +22,8 @@ impl Runtime {
         let budget = o
             .max_memory_bytes
             .unwrap_or(self.opts.read().live_memory_bytes);
+        let mut dropped_circuits = Vec::new();
+        let mut retired = Vec::new();
         let cell = {
             let mut reg = self.reg.lock();
             if self.is_closed() {
@@ -30,30 +32,33 @@ impl Runtime {
                     "the dataset is closing",
                 ));
             }
-            self.sync_inference(&mut reg, host.as_ref());
-            let (cell, _) = self.cell_for(&mut reg, q, query, access, Some(budget))?;
-            cell.pending.fetch_add(1, Ordering::AcqRel);
-            cell
+            self.sync_inference(&mut reg, host.as_ref(), &mut dropped_circuits, &mut retired);
+            let res = self.cell_for(&mut reg, q, query, access, Some(budget));
+            if let Ok((cell, _)) = &res {
+                cell.pending.fetch_add(1, Ordering::AcqRel);
+            }
+            res
         };
+        drop(dropped_circuits);
+        drop(retired);
+        let (cell, _) = cell?;
         let joining = Joining(&cell);
         self.ensure_subscription(store);
         let shared = Arc::new(Shared::default());
-        {
+        let mut retired_after_state = Vec::new();
+        let mut temp_circuits = Vec::new();
+        let subscribe_res: Result<()> = (|| {
             let mut st = cell.state.lock();
             let status = cell.info.lock().status.clone();
             if status != Status::Ready
                 && let Err(e) = self.evaluate_for_live(store, &cell, &mut st)
             {
-                drop(st);
-                drop(joining);
-                self.gc();
+                retired_after_state.extend(st.circuit.drain_retired());
                 return Err(e);
             }
             if st.circuit.bytes() > budget {
                 let bytes = st.circuit.bytes();
-                drop(st);
-                drop(joining);
-                self.gc();
+                retired_after_state.extend(st.circuit.drain_retired());
                 return Err(crate::incr::error(
                     "over-budget",
                     format!(
@@ -63,7 +68,7 @@ impl Runtime {
             }
             let first = match o.after {
                 None => Some(st.event(false)),
-                Some(after) => self.resume(store, &st, after),
+                Some(after) => self.resume(store, &st, after, &mut temp_circuits),
             };
             // queued before a pass can see the subscriber, so that no later diff
             // overtakes it
@@ -76,6 +81,15 @@ impl Runtime {
                 budget,
                 last,
             });
+            retired_after_state.extend(st.circuit.drain_retired());
+            Ok(())
+        })();
+        drop(temp_circuits);
+        drop(retired_after_state);
+        if let Err(e) = subscribe_res {
+            drop(joining);
+            self.gc();
+            return Err(e);
         }
         drop(joining);
         let (kind, vars) = {
@@ -152,8 +166,15 @@ impl Runtime {
 
     /// The first event of a live query resumed after commit `after`: the change from
     /// it from the circuit's history, or by evaluating the query before the changes
-    /// since, or a `reset` (spec F13 §2.3).
-    pub(super) fn resume(&self, store: &Store, st: &Slot, after: u64) -> Option<LiveEvent> {
+    /// since, or a `reset` (spec F13 §2.3). Any temporary circuit built is pushed into
+    /// `temp_circuits` so the caller drops it outside `cell.state.lock()`.
+    pub(super) fn resume(
+        &self,
+        store: &Store,
+        st: &Slot,
+        after: u64,
+        temp_circuits: &mut Vec<Circuit>,
+    ) -> Option<LiveEvent> {
         let applied = st.circuit.applied;
         let switched = self.switched.load(Ordering::Acquire);
         if switched > 0 && after <= switched {
@@ -178,16 +199,24 @@ impl Runtime {
             }
             let old = d.old().ok()?;
             let mut c = st.fresh(st.circuit.inference.clone()).ok()?;
-            c.build(old, &self.control()).ok()?;
-            if ask {
-                let delta = st.circuit.result.total() - c.result.total();
-                return Some(vec![(Vec::new(), delta)]);
-            }
-            let now = st.circuit.rows();
-            let before = c.rows();
-            Some(net(now
-                .into_iter()
-                .chain(before.into_iter().map(|(r, w)| (r, -w)))))
+            c.set_pool(self.pool.clone(), self.circuit_parent());
+            let built = c.build(old, &self.control());
+            let out = if built.is_ok() {
+                if ask {
+                    let delta = st.circuit.result.total() - c.result.total();
+                    Some(vec![(Vec::new(), delta)])
+                } else {
+                    let now = st.circuit.rows();
+                    let before = c.rows();
+                    Some(net(now
+                        .into_iter()
+                        .chain(before.into_iter().map(|(r, w)| (r, -w)))))
+                }
+            } else {
+                None
+            };
+            temp_circuits.push(c);
+            out
         });
         let Some(change) = change else {
             return Some(st.event(true));

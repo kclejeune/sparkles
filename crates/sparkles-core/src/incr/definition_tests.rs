@@ -216,6 +216,9 @@ fn a_clone_carries_paused_definitions_until_resumed() {
         caller: None,
         deadline: None,
         aggregate_errors: None,
+        memory_parent: None,
+        memory_pool: None,
+        max_memory_bytes: None,
     }) else {
         panic!("a paused view is read")
     };

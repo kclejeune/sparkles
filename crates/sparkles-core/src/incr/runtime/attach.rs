@@ -16,6 +16,9 @@ impl Runtime {
         let whole = whole_reason(access.as_ref()).map(str::to_string);
         let key = key_of(&q, text, access.as_ref(), whole.as_deref());
         if let Some(c) = reg.cells.get(&key) {
+            if let Some(limit) = max_memory_bytes {
+                c.state.lock().circuit.raise_local_limit(limit);
+            }
             return Ok((c.clone(), false));
         }
         let inference = reg.inference.clone();
@@ -24,7 +27,8 @@ impl Runtime {
             .or_else(|| inference.as_ref().map(|i| i.reason().to_string()));
         let compiled = compile(&q, mode.as_deref())?;
         let mut circuit = Circuit::new(compiled, access);
-        circuit.max_memory_bytes = max_memory_bytes;
+        circuit.set_pool(self.pool.clone(), self.circuit_parent());
+        circuit.set_local_limit(max_memory_bytes);
         circuit.inference = inference;
         circuit.aggregate_errors = Some(reg.aggregate_errors);
         let info = Info {
@@ -44,15 +48,16 @@ impl Runtime {
         let cell = Arc::new(Cell {
             key,
             state: Mutex::new(Slot {
-                circuit,
                 query: q,
                 whole,
                 vars,
                 history: VecDeque::new(),
                 history_rows: 0,
+                history_bytes: 0,
                 subs: Vec::new(),
                 views: 0,
                 rebased: false,
+                circuit,
             }),
             info: Mutex::new(info),
             pending: AtomicUsize::new(0),
@@ -62,7 +67,13 @@ impl Runtime {
     }
 
     /// Attach view `name` to its circuit, loading its newest checkpoint into a new one.
-    pub(super) fn attach(&self, store: &Store, reg: &mut Registry, name: &str) -> Result<()> {
+    pub(super) fn attach(
+        &self,
+        store: &Store,
+        reg: &mut Registry,
+        name: &str,
+        retired: &mut Vec<MemoryLease>,
+    ) -> Result<()> {
         let host = self.host()?;
         let Some(entry) = reg.views.get(name) else {
             return Ok(());
@@ -81,11 +92,17 @@ impl Runtime {
         let text = Self::view_text(host.as_ref(), &def)?;
         let q = self.parse(host.as_ref(), &text)?;
         let access = host.access(def.principal.as_deref())?;
-        let (cell, new) = self.cell_for(reg, q, &text, access.clone(), None)?;
+        let (cell, new) = self.cell_for(reg, q, &text, access.clone(), Some(def.memory_bytes))?;
         if new {
             self.ensure_subscription(store);
             if let Some(root) = &self.root {
-                self.recover(store, &cell, &views::dir(root, name).join(BRANCH), name);
+                self.recover(
+                    store,
+                    &cell,
+                    &views::dir(root, name).join(BRANCH),
+                    name,
+                    retired,
+                );
             }
         }
         cell.state.lock().views += 1;
@@ -97,7 +114,14 @@ impl Runtime {
     }
 
     /// Load the newest checkpoint of a view that this release reads into `cell`.
-    pub(super) fn recover(&self, store: &Store, cell: &Cell, dir: &std::path::Path, name: &str) {
+    pub(super) fn recover(
+        &self,
+        store: &Store,
+        cell: &Cell,
+        dir: &std::path::Path,
+        name: &str,
+        retired: &mut Vec<MemoryLease>,
+    ) {
         let snap = store.snapshot();
         let kind = persist::view_kind(cell.state.lock().circuit.has_fixpoint());
         for (commit, path) in persist::list(dir) {
@@ -124,6 +148,7 @@ impl Runtime {
             }
             match st.circuit.decode(body, &snap) {
                 Ok(()) => {
+                    retired.extend(st.circuit.drain_retired());
                     st.circuit.applied = h.commit;
                     self.seen.fetch_max(h.commit, Ordering::AcqRel);
                     self.counters.loaded.fetch_add(1, Ordering::Relaxed);
@@ -146,7 +171,8 @@ impl Runtime {
                         "view {name}: checkpoint {}: {e}; the view is built again",
                         path.display()
                     );
-                    st.circuit.result = Default::default();
+                    st.circuit.clear_state();
+                    retired.extend(st.circuit.drain_retired());
                 }
             }
         }
@@ -156,39 +182,54 @@ impl Runtime {
         let Some(host) = self.host.read().clone() else {
             return;
         };
-        let mut reg = self.reg.lock();
-        self.sync_inference(&mut reg, host.as_ref());
-        let epoch = host.epoch();
-        if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
-            // grants may have changed: resolve every view's principal again
-            for e in reg.views.values_mut() {
-                e.error = None;
-                if let Some(c) = e.cell.take() {
-                    c.release_view();
+        let mut dropped_cells: Vec<Arc<Cell>> = Vec::new();
+        let mut dropped_circuits: Vec<Circuit> = Vec::new();
+        let mut retired: Vec<MemoryLease> = Vec::new();
+        {
+            let mut reg = self.reg.lock();
+            self.sync_inference(&mut reg, host.as_ref(), &mut dropped_circuits, &mut retired);
+            let epoch = host.epoch();
+            if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
+                // grants may have changed: resolve every view's principal again
+                for e in reg.views.values_mut() {
+                    e.error = None;
+                    if let Some(c) = e.cell.take() {
+                        c.release_view();
+                        dropped_cells.push(c);
+                    }
+                }
+            }
+            let pending: Vec<String> = reg
+                .views
+                .iter()
+                .filter(|(_, e)| e.cell.is_none() && e.suspended.is_none() && e.error.is_none())
+                .map(|(n, _)| n.clone())
+                .collect();
+            for name in pending {
+                if let Err(e) = self.attach(store, &mut reg, &name, &mut retired) {
+                    tracing::warn!(target: "sparkles::incr::runtime", "view {name}: {e}");
+                    if let Some(entry) = reg.views.get_mut(&name) {
+                        entry.error = Some(e.to_string());
+                    }
                 }
             }
         }
-        let pending: Vec<String> = reg
-            .views
-            .iter()
-            .filter(|(_, e)| e.cell.is_none() && e.suspended.is_none() && e.error.is_none())
-            .map(|(n, _)| n.clone())
-            .collect();
-        for name in pending {
-            if let Err(e) = self.attach(store, &mut reg, &name) {
-                tracing::warn!(target: "sparkles::incr::runtime", "view {name}: {e}");
-                if let Some(entry) = reg.views.get_mut(&name) {
-                    entry.error = Some(e.to_string());
-                }
-            }
-        }
+        drop(dropped_circuits);
+        drop(retired);
+        drop(dropped_cells);
     }
 
     /// Compile every circuit for the host's inference and reading of errors in
     /// aggregates when either has changed. Each circuit then evaluates its query again
     /// in the new mode on the next round, and the difference reaches its live queries as
     /// a diff or a `reset`, so views stay attached and live queries keep running.
-    pub(super) fn sync_inference(&self, reg: &mut Registry, host: &dyn Host) {
+    pub(super) fn sync_inference(
+        &self,
+        reg: &mut Registry,
+        host: &dyn Host,
+        dropped_circuits: &mut Vec<Circuit>,
+        retired: &mut Vec<MemoryLease>,
+    ) {
         let now = host.inference();
         let errors = host.aggregate_errors();
         if Inference::same(reg.inference.as_deref(), now.as_ref()) && errors == reg.aggregate_errors
@@ -213,26 +254,32 @@ impl Runtime {
             boundary = boundary.max(st.circuit.applied);
             self.switched.fetch_max(boundary, Ordering::AcqRel);
             let fresh = st.fresh(now.clone());
-            let mut c = match fresh {
+            let c = match fresh {
                 Ok(mut c) => {
                     c.aggregate_errors = Some(errors);
                     c
                 }
                 Err(e) => {
                     self.fail(cell, &mut st, &e);
+                    retired.extend(st.circuit.drain_retired());
                     continue;
                 }
             };
             // the old result stays, for the first evaluation in the new mode to be
-            // compared with
-            let old = &mut st.circuit;
-            c.result = std::mem::take(&mut old.result);
-            c.terms = std::mem::take(&mut old.terms);
-            c.snap = old.snap.take();
-            c.applied = old.applied;
-            st.circuit = c;
+            // compared with; transfer the existing budget without a 2× reservation peak,
+            // and drop the old operators outside all locks before returning their credit
+            let mut old = std::mem::replace(&mut st.circuit, c);
+            st.circuit.result = std::mem::take(&mut old.result);
+            st.circuit.terms = std::mem::take(&mut old.terms);
+            st.circuit.snap = old.snap.take();
+            st.circuit.applied = old.applied;
+            let (pool, budget) = old.take_budget();
+            st.circuit.install_budget(pool, budget);
+            st.circuit.shrink_budget_state();
             // diffs of the old mode do not lead to rows of the new one
             st.clear_history();
+            retired.extend(st.circuit.drain_retired());
+            dropped_circuits.push(old);
             st.rebased = true;
             let mut info = cell.info.lock();
             info.plan = st.circuit.plan();
@@ -245,9 +292,14 @@ impl Runtime {
 
     /// [`sync_inference`](Self::sync_inference) for a reader, so that a read after a
     /// change of the setting never sees a circuit of the old mode as current.
-    pub(super) fn sync_for_read(&self, reg: &mut Registry) {
+    pub(super) fn sync_for_read(
+        &self,
+        reg: &mut Registry,
+        dropped_circuits: &mut Vec<Circuit>,
+        retired: &mut Vec<MemoryLease>,
+    ) {
         if let Some(host) = self.host.read().clone() {
-            self.sync_inference(reg, host.as_ref());
+            self.sync_inference(reg, host.as_ref(), dropped_circuits, retired);
         }
     }
 }
@@ -295,8 +347,14 @@ mod switch_tests {
             Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None)))),
             Vec::new(),
         );
-        let mut reg = rt.reg.lock();
-        rt.sync_inference(&mut reg, host.as_ref());
+        let mut dropped = Vec::new();
+        let mut retired = Vec::new();
+        {
+            let mut reg = rt.reg.lock();
+            rt.sync_inference(&mut reg, host.as_ref(), &mut dropped, &mut retired);
+        }
+        drop(dropped);
+        drop(retired);
         assert_eq!(rt.switched.load(Ordering::Acquire), 7);
     }
 
@@ -396,6 +454,9 @@ mod switch_tests {
                     caller: None,
                     deadline: None,
                     aggregate_errors: m,
+                    memory_parent: None,
+                    memory_pool: None,
+                    max_memory_bytes: None,
                 })
                 .unwrap();
             let cells: Vec<String> = r

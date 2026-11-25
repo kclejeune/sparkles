@@ -1573,6 +1573,28 @@ pub fn execute_query(
     execute_query_with_plan(snap, parsed, opts, parse_ms).map_err(|f| f.error)
 }
 
+/// [`execute_query`] charging an upstream [`sparkles_budget::ParentHandle`] (used by
+/// incremental view `recompute` evaluation).
+pub(crate) fn execute_query_with_parent(
+    snap: Arc<Snapshot>,
+    parsed: &Query,
+    opts: &QueryOptions,
+    parse_ms: f64,
+    parent: Option<sparkles_budget::ParentHandle>,
+) -> Result<QueryResult> {
+    let depth = depth::check_query(parsed)?;
+    depth::with_stack(depth, || {
+        let t1 = Instant::now();
+        let prepared =
+            prepare_query_input_policy(snap, parsed, opts, None, None, None, None, parent, None)?;
+        let plan_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        depth::with_stack(prepared.plan_depth, || {
+            execute_prepared(parsed, opts, parse_ms, plan_ms, prepared)
+        })
+        .map_err(|f| f.error)
+    })
+}
+
 /// [`execute_query`], with the plan of a query that failed while it ran.
 pub fn execute_query_with_plan(
     snap: Arc<Snapshot>,
