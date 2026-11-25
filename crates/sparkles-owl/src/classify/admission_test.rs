@@ -519,6 +519,71 @@ impl Race {
         };
         assert_eq!(&*self.requests.lock(), want);
     }
+
+    /// Serialized admission race fixture (for `Run::admission: Mutex<MemLedger>`):
+    /// drives `first` (64 B) and `second` (128 B) in the chosen order so the second waiter
+    /// contends on `admission` while the first is inside `charge`, then verifies their
+    /// separate serialized outcomes.
+    pub(super) fn run_serial(
+        &self,
+        first: impl FnOnce() -> bool + Send,
+        second: impl FnOnce() -> bool + Send,
+        smaller_first: bool,
+    ) {
+        let (resume, paused) = mpsc::channel();
+        let (initial, next, first_res, second_res) = thread::scope(|scope| {
+            let a = self.send.clone();
+            let first = scope.spawn(move || {
+                let out = a.clone();
+                set_hook(move |point| match point {
+                    Point::BeforeDebit if !smaller_first => {
+                        a.send(Event::Observed).unwrap();
+                        paused.recv_timeout(WAIT).unwrap();
+                    }
+                    Point::Contended => a.send(Event::Contended).unwrap(),
+                    _ => {}
+                });
+                let ok = first();
+                out.send(Event::Returned(ok)).unwrap();
+                ok
+            });
+            let first_evt = self.events.recv_timeout(WAIT).unwrap();
+            let b = self.send.clone();
+            let second = scope.spawn(move || {
+                let out = b.clone();
+                set_hook(move |point| {
+                    if point == Point::Contended {
+                        b.send(Event::Contended).unwrap();
+                    }
+                });
+                let ok = second();
+                out.send(Event::Returned(ok)).unwrap();
+                ok
+            });
+            let initial = if smaller_first {
+                first_evt
+            } else {
+                assert_eq!(first_evt, Event::Observed);
+                let second_charge = self.events.recv_timeout(WAIT).unwrap();
+                let _ = resume.send(());
+                second_charge
+            };
+            let next = self.events.recv_timeout(WAIT).unwrap();
+            let _ = self.release.send(());
+            (initial, next, first.join(), second.join())
+        });
+        assert_eq!(initial, Event::Charge(if smaller_first { 64 } else { 128 }));
+        assert_eq!(next, Event::Contended);
+        assert_eq!(first_res.unwrap(), self.accept);
+        assert_eq!(second_res.unwrap(), self.accept);
+        let want: &[usize] = match (smaller_first, self.accept) {
+            (true, true) => &[64, 128],
+            (true, false) => &[64],
+            (false, true) => &[128, 64],
+            (false, false) => &[128],
+        };
+        assert_eq!(&*self.requests.lock(), want);
+    }
 }
 
 /// Outcome of a `dl_reduce::plan_budgeted` call observed by [`with_merge_probe`].
@@ -530,32 +595,135 @@ pub(super) enum PlanKind {
     PollErr,
 }
 
+/// Named allocation sites inside `Saturation::run_splitting` for site-specific refusal tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SplitAllocSite {
+    OrigSigTable,
+    OrigSig,
+    RootStack,
+    SynthAxioms,
+    LeafLive,
+    StopHandoff,
+    MergeHandoff,
+    ForkStack,
+    ForkMergeClone,
+    ForkNeq,
+    ForkEqUnion,
+    ForkEqRemap,
+    ForkEqCanon,
+    MergeRemap,
+    MergeCanon,
+}
+
+/// Which `SplitLedger` entry point invoked `cover_memory`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LedgerChargeSource {
+    Delta,
+    Cover,
+}
+
 /// Phase-specific events emitted during rooted constant merging and post-merge replanning
 /// so regression tests can verify exact phases, stop winners, and helper participation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MergePhase {
-    PlanStart { restarts: usize },
-    PlanBlockedScan { restarts: usize },
-    PlanBlockedScanDone { restarts: usize },
-    PlanHornCheck { restarts: usize },
-    PlanHornCheckDone { restarts: usize },
-    PlanIndsDrain { restarts: usize },
-    PlanIndsDrainDone { restarts: usize },
-    PlanRetarget { restarts: usize },
-    PlanRetargetDone { restarts: usize },
-    PlanDisjointDedup { restarts: usize },
-    PlanDisjointDedupDone { restarts: usize },
-    PlanKeyBody { restarts: usize },
-    PlanKeyBodyDone { restarts: usize },
-    PlanDone { restarts: usize, outcome: PlanKind },
-    SatStop { stop: u8, helper_ran: bool },
-    MergeRestart { restarts: usize },
+    PlanStart {
+        restarts: usize,
+    },
+    PlanBlockedScan {
+        restarts: usize,
+    },
+    PlanBlockedScanDone {
+        restarts: usize,
+    },
+    PlanHornCheck {
+        restarts: usize,
+    },
+    PlanHornCheckDone {
+        restarts: usize,
+    },
+    PlanIndsDrain {
+        restarts: usize,
+    },
+    PlanIndsDrainDone {
+        restarts: usize,
+    },
+    PlanRetarget {
+        restarts: usize,
+    },
+    PlanRetargetDone {
+        restarts: usize,
+    },
+    PlanDisjointDedup {
+        restarts: usize,
+    },
+    PlanDisjointDedupDone {
+        restarts: usize,
+    },
+    PlanKeyBody {
+        restarts: usize,
+    },
+    PlanKeyBodyDone {
+        restarts: usize,
+    },
+    PlanDone {
+        restarts: usize,
+        outcome: PlanKind,
+    },
+    SplitHelperHandoff,
+    SatStop {
+        stop: u8,
+        helper_ran: bool,
+        helper_worked: bool,
+    },
+    MergeRestart {
+        restarts: usize,
+    },
+    BetweenRoundsTestStart,
+    BetweenRoundsTestRefused,
+    SplitFork {
+        splits: usize,
+        depth: usize,
+        prio: u8,
+    },
+    SplitAlloc {
+        site: SplitAllocSite,
+        proposed: usize,
+        admitted: bool,
+    },
+    LedgerCharge {
+        source: LedgerChargeSource,
+        used: usize,
+        paid_before: usize,
+        paid_after: usize,
+        requested: usize,
+        admitted: bool,
+    },
+    SplitLeafExportStart {
+        leaves: usize,
+    },
+    SplitLeafExportRefused,
+    SplitLeafExportDone {
+        leaves: usize,
+    },
+    SplitExcludedAbort {
+        spent: usize,
+        bound: usize,
+        remaining: usize,
+    },
+    SplitPostLeafReset {
+        canon_want_none: bool,
+        leaf_inds_cap: usize,
+        interner_bytes: usize,
+        residual_bytes: usize,
+    },
 }
 
 type MergeProbe = Box<dyn FnMut(MergePhase)>;
+type SplitPairProbe = Box<dyn FnMut(usize, usize, u8, &str, &str)>;
 
 thread_local! {
     static MERGE_PROBE: RefCell<Option<MergeProbe>> = const { RefCell::new(None) };
+    static SPLIT_PAIR_PROBE: RefCell<Option<SplitPairProbe>> = const { RefCell::new(None) };
     static PLAN_RESTARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -583,6 +751,33 @@ pub(super) fn emit_merge_phase(phase: MergePhase) {
     MERGE_PROBE.with(|slot| {
         if let Some(hook) = slot.borrow_mut().as_mut() {
             hook(phase);
+        }
+    });
+}
+
+pub(super) fn with_split_pair_probe<T>(
+    observe: impl FnMut(usize, usize, u8, &str, &str) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SPLIT_PAIR_PROBE.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    SPLIT_PAIR_PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none());
+        *slot = Some(Box::new(observe));
+    });
+    let _reset = Reset;
+    run()
+}
+
+pub(super) fn emit_split_pair(splits: usize, depth: usize, prio: u8, u: &str, v: &str) {
+    SPLIT_PAIR_PROBE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(splits, depth, prio, u, v);
         }
     });
 }

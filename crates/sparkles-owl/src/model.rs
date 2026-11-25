@@ -1346,6 +1346,119 @@ impl Signature {
             }
         }
     }
+
+    /// Zero-allocation visitor invoking `on_class` for every `Class` and `on_ind` for every
+    /// `NamedIndividual` mentioned anywhere in `k` (excluding annotations).
+    pub(crate) fn visit_classes_and_individuals<'a>(
+        k: &'a AxiomKind,
+        on_class: &mut impl FnMut(&'a Class),
+        on_ind: &mut impl FnMut(&'a NamedIndividual),
+    ) {
+        fn visit_ind<'a>(i: &'a Individual, on_ind: &mut impl FnMut(&'a NamedIndividual)) {
+            if let Individual::Named(n) = i {
+                on_ind(n);
+            }
+        }
+        fn visit_ce<'a>(
+            c: &'a ClassExpression,
+            on_class: &mut impl FnMut(&'a Class),
+            on_ind: &mut impl FnMut(&'a NamedIndividual),
+        ) {
+            use ClassExpression as C;
+            match c {
+                C::Class(c) => on_class(c),
+                C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+                    for x in cs {
+                        visit_ce(x, on_class, on_ind);
+                    }
+                }
+                C::ObjectComplementOf(c)
+                | C::ObjectSomeValuesFrom(_, c)
+                | C::ObjectAllValuesFrom(_, c) => visit_ce(c, on_class, on_ind),
+                C::ObjectOneOf(is) => {
+                    for i in is {
+                        visit_ind(i, on_ind);
+                    }
+                }
+                C::ObjectHasValue(_, i) => visit_ind(i, on_ind),
+                C::ObjectMinCardinality(_, _, Some(c))
+                | C::ObjectMaxCardinality(_, _, Some(c))
+                | C::ObjectExactCardinality(_, _, Some(c)) => visit_ce(c, on_class, on_ind),
+                C::ObjectHasSelf(_)
+                | C::ObjectMinCardinality(_, _, None)
+                | C::ObjectMaxCardinality(_, _, None)
+                | C::ObjectExactCardinality(_, _, None)
+                | C::DataSomeValuesFrom(_, _)
+                | C::DataAllValuesFrom(_, _)
+                | C::DataHasValue(_, _)
+                | C::DataMinCardinality(_, _, _)
+                | C::DataMaxCardinality(_, _, _)
+                | C::DataExactCardinality(_, _, _) => {}
+            }
+        }
+        use AxiomKind as K;
+        match k {
+            K::Declaration(Entity::Class(c)) => on_class(c),
+            K::Declaration(Entity::NamedIndividual(n)) => on_ind(n),
+            K::SubClassOf(a, b) => {
+                visit_ce(a, on_class, on_ind);
+                visit_ce(b, on_class, on_ind);
+            }
+            K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
+                for c in cs {
+                    visit_ce(c, on_class, on_ind);
+                }
+            }
+            K::DisjointUnion(c, cs) => {
+                on_class(c);
+                for x in cs {
+                    visit_ce(x, on_class, on_ind);
+                }
+            }
+            K::ObjectPropertyDomain(_, c)
+            | K::ObjectPropertyRange(_, c)
+            | K::DataPropertyDomain(_, c)
+            | K::HasKey(c, _, _) => visit_ce(c, on_class, on_ind),
+            K::SameIndividual(is) | K::DifferentIndividuals(is) => {
+                for i in is {
+                    visit_ind(i, on_ind);
+                }
+            }
+            K::ClassAssertion(c, i) => {
+                visit_ce(c, on_class, on_ind);
+                visit_ind(i, on_ind);
+            }
+            K::ObjectPropertyAssertion(_, a, b) | K::NegativeObjectPropertyAssertion(_, a, b) => {
+                visit_ind(a, on_ind);
+                visit_ind(b, on_ind);
+            }
+            K::DataPropertyAssertion(_, a, _) | K::NegativeDataPropertyAssertion(_, a, _) => {
+                visit_ind(a, on_ind);
+            }
+            K::Declaration(_)
+            | K::SubObjectPropertyOf(_, _)
+            | K::EquivalentObjectProperties(_)
+            | K::DisjointObjectProperties(_)
+            | K::InverseObjectProperties(_, _)
+            | K::FunctionalObjectProperty(_)
+            | K::InverseFunctionalObjectProperty(_)
+            | K::ReflexiveObjectProperty(_)
+            | K::IrreflexiveObjectProperty(_)
+            | K::SymmetricObjectProperty(_)
+            | K::AsymmetricObjectProperty(_)
+            | K::TransitiveObjectProperty(_)
+            | K::SubDataPropertyOf(_, _)
+            | K::EquivalentDataProperties(_)
+            | K::DisjointDataProperties(_)
+            | K::DataPropertyRange(_, _)
+            | K::FunctionalDataProperty(_)
+            | K::DatatypeDefinition(_, _)
+            | K::AnnotationAssertion(_, _, _)
+            | K::SubAnnotationPropertyOf(_, _)
+            | K::AnnotationPropertyDomain(_, _)
+            | K::AnnotationPropertyRange(_, _) => {}
+        }
+    }
 }
 
 /// Borrowed entity or leaf visited during an allocation-free walk of an axiom's

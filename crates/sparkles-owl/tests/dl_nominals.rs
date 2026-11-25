@@ -5084,3 +5084,683 @@ fn post_merge_reduction_decline_clears_derived_aliases_and_never_leaks_hub() {
     );
     assert_eq!(d_b.instances, fresh_desc_b.instances);
 }
+
+/// Design v12 §4.1: Primary `shoi-042` acceptance gate across all 4 `(threads, expansion)`
+/// configs × `dl_steps ∈ {true, false}` × `rooted_merge ∈ {true, false}` + cross-lane
+/// controls + Split OFF control + exact HermiT taxonomy and independent `describe(&C)`
+/// instance expectations.
+#[test]
+fn a_rooted_run_that_splits_disjunctive_equalities_finishes_shoi_042() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
+    let doc = ofn_read::parse(&std::fs::read_to_string(dir.join("shoi-042.ofn")).unwrap()).unwrap();
+    let hermit_text = std::fs::read_to_string(dir.join("shoi-042.hermit.ofn")).unwrap();
+    let mut classes: std::collections::BTreeSet<String> = doc
+        .axioms
+        .iter()
+        .filter_map(|a| match &a.kind {
+            AxiomKind::Declaration(Entity::Class(cls)) => Some(cls.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    classes.insert(vocab::OWL_THING.to_string());
+    classes.insert(vocab::OWL_NOTHING.to_string());
+    let want_tax = parse_hermit_subsumptions(&hermit_text, &classes);
+
+    let d = |s: &str| Class::new(format!("http://example.org/d#{s}"));
+    let ind = |s: &str| NamedIndividual::new(format!("http://example.org/d#{s}"));
+    // Exact semantic instances of shoi-042.ofn (proven by M1: a1=a2, C0={a2}, C3={a3}
+    // and M2: a0=a1=a3, C0=C3={a3}):
+    let expected_instances: Vec<(Class, Vec<NamedIndividual>)> = vec![
+        (d("C0"), vec![ind("a1")]),
+        (d("C1"), vec![ind("a1")]),
+        (d("C5"), vec![ind("a1")]),
+        (d("C2"), vec![]),
+        (d("C3"), vec![ind("a3")]),
+        (d("C4"), vec![]),
+        (
+            Class::thing(),
+            vec![ind("a0"), ind("a1"), ind("a2"), ind("a3")],
+        ),
+        (Class::nothing(), vec![]),
+    ];
+
+    // 1. Control: Split OFF still overflows the rooted work bound on shoi-042.ofn for both
+    //    `rooted_merge = false` and `rooted_merge = true`.
+    for rooted_merge in [false, true] {
+        let mut k_off = Classifier::of(&doc.axioms);
+        let off = k_off
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge,
+                rooted_eq_split: false,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(
+            off.stats.dl_rooted_over,
+            "split OFF (merge={rooted_merge}) control must still exceed rooted bound on shoi-042"
+        );
+        assert_eq!(off.stats.dl_rooted_splits, 0);
+        assert_eq!(off.stats.dl_rooted_leaves, 0);
+    }
+
+    // 2. Split ON finishes shoi-042 across all 4 configs × dl_steps {true, false} ×
+    //    rooted_merge {true, false} with exact HermiT taxonomy AND exact describe() instances.
+    for rooted_merge in [true, false] {
+        let mut baseline_splits = None;
+        let mut baseline_leaves = None;
+        for dl_steps in [true, false] {
+            for (threads, expansion) in CONFIGS {
+                let at = format!(
+                    "shoi-042 merge={rooted_merge} dl_steps={dl_steps} {threads}t {expansion:?}"
+                );
+                let mut k = Classifier::of(&doc.axioms);
+                let out = k
+                    .classify(&Limits {
+                        threads,
+                        expansion,
+                        rooted: true,
+                        rooted_merge,
+                        rooted_eq_split: true,
+                        dl_steps,
+                        ..Limits::default()
+                    })
+                    .unwrap();
+                assert!(out.complete, "{at}: expected complete: {:?}", out.stats);
+                assert!(
+                    !out.stats.dl_rooted_over && !out.stats.dl_rooted_declined,
+                    "{at}: unexpected fallback: {:?}",
+                    out.stats
+                );
+                assert!(k.excluded().is_empty(), "{at}: {:?}", k.excluded());
+                assert_eq!(out.consistency, Consistency::Consistent, "{at}");
+                assert!(
+                    out.stats.dl_rooted_splits >= 1,
+                    "{at}: expected real fork: {:?}",
+                    out.stats
+                );
+                assert!(
+                    out.stats.dl_rooted_leaves >= 2,
+                    "{at}: expected >= 2 leaves: {:?}",
+                    out.stats
+                );
+                if dl_steps {
+                    if let Some(s) = baseline_splits {
+                        assert_eq!(
+                            out.stats.dl_rooted_splits, s,
+                            "{at}: stepped split count mismatch"
+                        );
+                    } else {
+                        baseline_splits = Some(out.stats.dl_rooted_splits);
+                    }
+                    if let Some(l) = baseline_leaves {
+                        assert_eq!(
+                            out.stats.dl_rooted_leaves, l,
+                            "{at}: stepped leaf count mismatch"
+                        );
+                    } else {
+                        baseline_leaves = Some(out.stats.dl_rooted_leaves);
+                    }
+                }
+                assert!(
+                    out.stats.dl_rooted_spent + out.stats.dl_work <= (1 << 19),
+                    "{at}: total work exceeded bound: {:?}",
+                    out.stats
+                );
+                let got_tax = taxonomy_subsumptions(&out, &classes);
+                assert_eq!(got_tax, want_tax, "{at}: taxonomy differs from HermiT");
+                for (cls, want_insts) in &expected_instances {
+                    let desc = k
+                        .describe(cls)
+                        .unwrap_or_else(|| panic!("{at}: describe({cls:?}) returned None"));
+                    assert_eq!(
+                        desc.instances, *want_insts,
+                        "{at}: instances mismatch for {cls:?}"
+                    );
+                }
+                assert!(
+                    k.describe(&Class::new("http://example.org/d#UnknownClass"))
+                        .is_none(),
+                    "{at}: unknown class must describe as None"
+                );
+            }
+        }
+    }
+
+    // 3. Cross-lane control: marker repair ON on shoi-042 completes with exact taxonomy.
+    let mut k_rep = Classifier::of(&doc.axioms);
+    let out_rep = k_rep
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            rooted_eq_split: true,
+            rooted_marker_repair: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out_rep.complete);
+    assert!(!out_rep.stats.dl_rooted_over && !out_rep.stats.dl_rooted_declined);
+    assert_eq!(taxonomy_subsumptions(&out_rep, &classes), want_tax);
+}
+
+/// Design v12 §4.2: Full 50/50 `shoi` HermiT oracle parity with `rooted_eq_split = true`
+/// (and `rooted_merge = true`) in `(1, Cautious)` and `(4, Eager)`: all 50/50 complete
+/// within the 524,288 bound with 0 taxonomy differences against HermiT!
+#[test]
+fn all_50_shoi_fixtures_complete_within_bound_and_match_hermit_with_rooted_eq_split() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
+    let mut split_fixtures = 0usize;
+    for i in 0..50 {
+        let name = format!("shoi-{i:03}");
+        let doc =
+            ofn_read::parse(&std::fs::read_to_string(dir.join(format!("{name}.ofn"))).unwrap())
+                .unwrap();
+        let hermit_text = std::fs::read_to_string(dir.join(format!("{name}.hermit.ofn"))).unwrap();
+        let mut classes: std::collections::BTreeSet<String> = doc
+            .axioms
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AxiomKind::Declaration(Entity::Class(cls)) => Some(cls.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        classes.insert(vocab::OWL_THING.to_string());
+        classes.insert(vocab::OWL_NOTHING.to_string());
+        let want = parse_hermit_subsumptions(&hermit_text, &classes);
+
+        for (threads, expansion) in [(1, Expansion::Cautious), (4, Expansion::Eager)] {
+            let at = format!("{name} {threads}t {expansion:?}");
+            let mut k = Classifier::of(&doc.axioms);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    rooted: true,
+                    rooted_merge: true,
+                    rooted_eq_split: true,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(
+                out.complete && !out.stats.dl_rooted_over && !out.stats.dl_rooted_declined,
+                "{at}: did not complete cleanly: {:?}",
+                out.stats
+            );
+            assert!(k.excluded().is_empty(), "{at}: {:?}", k.excluded());
+            assert!(
+                out.stats.dl_rooted_spent + out.stats.dl_work <= (1 << 19),
+                "{at}: exceeded 524,288 bound: {:?}",
+                out.stats
+            );
+            if threads == 1 && out.stats.dl_rooted_splits > 0 {
+                split_fixtures += 1;
+            }
+            let got = taxonomy_subsumptions(&out, &classes);
+            assert_eq!(got, want, "{at}: taxonomy differs from HermiT");
+        }
+    }
+    assert!(
+        split_fixtures >= 1,
+        "at least shoi-042 must have forked during the 50-fixture sweep"
+    );
+}
+
+/// Design v12 §4.3.1: Completeness controls E1 (+ negative), E2, and E3 (+ negative) with
+/// `rooted_eq_split` BOTH `false` AND `true` across all 4 `(threads, expansion)` configs.
+#[test]
+fn completeness_controls_e1_e2_e3_with_split_off_and_on() {
+    // E1: Disjunctive equality `a = b ∨ a = c` carried into `x`-clause (`A ⊑ ∃r.{a}`,
+    // `B(b)`, `B(c)`, `∃r.B ⊑ D`) => `A ⊑ D`.
+    let e1_pos = "ClassAssertion(ObjectOneOf(:b :c) :a)
+                  ClassAssertion(:B :b)
+                  ClassAssertion(:B :c)
+                  SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+                  SubClassOf(ObjectSomeValuesFrom(:r :B) :D)";
+    let e1_neg = "ClassAssertion(ObjectOneOf(:b :c) :a)
+                  ClassAssertion(:B :b)
+                  SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+                  SubClassOf(ObjectSomeValuesFrom(:r :B) :D)";
+    // E2: Disjunctive equality `a = b ∨ a = c` with universal restriction at a predecessor:
+    // `A ⊑ ∃r.{a} ⊓ ∀r.P`, `¬P(b)`, `¬P(c)` => `A ⊑ ⊥` (ontology stays consistent!).
+    let e2 = "ClassAssertion(ObjectOneOf(:b :c) :a)
+              ClassAssertion(ObjectComplementOf(:P) :b)
+              ClassAssertion(ObjectComplementOf(:P) :c)
+              SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+              SubClassOf(:A ObjectAllValuesFrom(:r :P))";
+    // E3: Disjunctive equality `a = b ∨ a = c` interacts with `x ≈ b` / `x = c` across
+    // branches (`A ⊑ {a}`, `B ⊑ {b}`, `C ⊑ {c}`, `B ⊑ D`, `C ⊑ D` => `A ⊑ D`; negative
+    // drops `C ⊑ D`).
+    let e3_pos = "ClassAssertion(ObjectOneOf(:b :c) :a)
+                  SubClassOf(:A ObjectOneOf(:a))
+                  SubClassOf(ObjectOneOf(:b) :D)
+                  SubClassOf(ObjectOneOf(:c) :D)";
+    let e3_neg = "ClassAssertion(ObjectOneOf(:b :c) :a)
+                  SubClassOf(:A ObjectOneOf(:a))
+                  SubClassOf(ObjectOneOf(:b) :D)";
+
+    for rooted_eq_split in [false, true] {
+        for (threads, expansion) in CONFIGS {
+            let lim = Limits {
+                threads,
+                expansion,
+                rooted: true,
+                rooted_merge: true,
+                rooted_eq_split,
+                ..Limits::default()
+            };
+            let run_case = |body: &str| {
+                let ax = axioms(body);
+                let mut k = Classifier::of(&ax);
+                let out = k.classify(&lim).unwrap();
+                assert!(out.complete);
+                (k, out)
+            };
+
+            let (_, r1p) = run_case(e1_pos);
+            assert_eq!(r1p.consistency, Consistency::Consistent);
+            assert!(r1p.taxonomy.is_subclass(&c("A"), &c("D")));
+            assert!(!r1p.taxonomy.is_unsatisfiable(&c("A")));
+
+            let (_, r1n) = run_case(e1_neg);
+            assert_eq!(r1n.consistency, Consistency::Consistent);
+            assert!(!r1n.taxonomy.is_subclass(&c("A"), &c("D")));
+
+            let (_, r2) = run_case(e2);
+            assert_eq!(r2.consistency, Consistency::Consistent);
+            assert!(r2.taxonomy.is_unsatisfiable(&c("A")));
+
+            let (_, r3p) = run_case(e3_pos);
+            assert_eq!(r3p.consistency, Consistency::Consistent);
+            assert!(r3p.taxonomy.is_subclass(&c("A"), &c("D")));
+
+            let (_, r3n) = run_case(e3_neg);
+            assert_eq!(r3n.consistency, Consistency::Consistent);
+            assert!(!r3n.taxonomy.is_subclass(&c("A"), &c("D")));
+        }
+    }
+}
+
+/// Design v12 §4.3.3: Hidden-only nominal inconsistency, hidden-intermediate closure paths,
+/// declared-only named individuals, class unsat in leaf 1 & sat in leaf 2, `0`/`1`/`>=2`
+/// consistent leaves, `A < B < C` vs `A < C`, `owl:Thing`/`owl:Nothing`/unknown class, and
+/// named aliases across forced forks (triggered with `SPARKLES_ROOTED_EQ_SPLIT_PROBE=0`?
+/// No — we test via public `Limits` on ontologies that naturally fork OR via a test helper;
+/// here we combine a controlled `shoi-042`-style disjunctive equality gadget so splitting
+/// genuinely fires under default probe settings OR test probe=0 cleanly without env races).
+#[test]
+fn split_export_edge_cases_hidden_nominals_declared_individuals_and_leaves() {
+    // Helper: add a small disjunctive-equality + work gadget that makes `rooted_eq_split`
+    // actually fork on `shoi-042.ofn` merged with extra axioms in a separate namespace!
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
+    let shoi042 = ofn_read::parse(&std::fs::read_to_string(dir.join("shoi-042.ofn")).unwrap())
+        .unwrap()
+        .axioms;
+    let with_fork = |extra: &str| {
+        let mut ax: Vec<Axiom> = shoi042
+            .iter()
+            .filter(|a| !matches!(a.kind, AxiomKind::Declaration(Entity::DataProperty(_))))
+            .cloned()
+            .collect();
+        ax.extend(axioms(extra));
+        ax
+    };
+    let lim_split = Limits {
+        threads: 1,
+        rooted: true,
+        rooted_merge: true,
+        rooted_eq_split: true,
+        ..Limits::default()
+    };
+
+    // 1. Declared-only named individual `:ghost` + top-subsumed class `:Every`:
+    //    `SubClassOf(owl:Thing :Every)` => `:ghost` MUST appear in `describe(:Every)` and
+    //    `describe(owl:Thing)` even though `:ghost` only appears in `Declaration(...)`!
+    {
+        let ax = with_fork(
+            "Declaration(NamedIndividual(:ghost))
+             SubClassOf(owl:Thing :Every)
+             Declaration(Class(:Unmet))",
+        );
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                rooted_decline: false,
+                rooted_marker_repair: true,
+                ..lim_split.clone()
+            })
+            .unwrap();
+        assert!(
+            out.complete,
+            "Part 1 declared-only+fork must complete: stats={:?} excluded={:?}",
+            out.stats,
+            k.excluded()
+        );
+        assert!(out.stats.dl_rooted_splits >= 1);
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(out.taxonomy.is_subclass(&Class::thing(), &c("Every")));
+        assert!(out.taxonomy.is_subclass(&c("Unmet"), &c("Every")));
+        let ghost = NamedIndividual::new(format!("{EX}ghost"));
+        assert!(k.describe(&c("Every")).unwrap().instances.contains(&ghost));
+        assert!(
+            k.describe(&Class::thing())
+                .unwrap()
+                .instances
+                .contains(&ghost)
+        );
+        assert!(k.describe(&c("Unmet")).unwrap().instances.is_empty());
+    }
+
+    // 2. Hidden-only nominal inconsistency (anonymous witness `_:w` forced into an
+    //    unsatisfiable class inside leaf `a1 == a2` while consistent in leaf `a1 != a2`),
+    //    AND branch-specific all-inconsistent ontology (0 consistent leaves AFTER a real
+    //    fork!) where declared-only `:ghost` belongs to every class (including `owl:Nothing`).
+    {
+        let ax_one_incons = with_fork(
+            "ClassAssertion(:Hide _:w)
+             ObjectPropertyAssertion(:rHide _:w <http://example.org/d#a1>)
+             SubClassOf(ObjectHasValue(:rHide <http://example.org/d#a2>) ObjectComplementOf(:Hide))",
+        );
+        let mut k = Classifier::of(&ax_one_incons);
+        let out = k.classify(&lim_split).unwrap();
+        assert!(out.complete);
+        assert!(out.stats.dl_rooted_splits >= 1);
+        // Leaf `a1 == a2` is inconsistent because anonymous `_:w` is both `Hide` and `¬Hide`,
+        // while `a1 != a2` leaves remain consistent!
+        assert_eq!(out.consistency, Consistency::Consistent);
+    }
+    {
+        // All-inconsistent ontology with a real fork (`dl_rooted_splits >= 1`, 0 consistent
+        // leaves): put the existential contradiction axioms BEFORE `shoi-042` so `shoi-042`'s
+        // higher-Ex non-root contexts are activated first and cross SPLIT_PROBE (16,384)
+        // before `:Trap` resolves its contradiction; depth 0 forks and every terminal leaf
+        // is proved inconsistent, and the resulting `SplitAnswer` (`build_inconsistent`)
+        // lists declared-only `:ghost` in `describe(:Boom)` and `describe(owl:Nothing)`.
+        let mut ax_all_incons = axioms(
+            "Declaration(NamedIndividual(:ghost))
+             Declaration(Class(:Boom))
+             ClassAssertion(ObjectSomeValuesFrom(:rTrap1 :Trap1) <http://example.org/d#a0>)
+             SubClassOf(:Trap1 ObjectSomeValuesFrom(:rTrap2 :Trap2))
+             SubClassOf(:Trap2 ObjectSomeValuesFrom(:rTrap3 :Trap3))
+             SubClassOf(:Trap3 :ContraA)
+             SubClassOf(:Trap3 :ContraB)
+             SubClassOf(:ContraA ObjectComplementOf(:ContraB))",
+        );
+        ax_all_incons.extend(
+            shoi042
+                .iter()
+                .filter(|a| !matches!(a.kind, AxiomKind::Declaration(Entity::DataProperty(_))))
+                .cloned(),
+        );
+        let mut k = Classifier::of(&ax_all_incons);
+        let out = k.classify(&lim_split).unwrap();
+        assert!(out.complete);
+        assert_eq!(out.consistency, Consistency::Inconsistent);
+        assert!(
+            out.stats.dl_rooted_splits >= 1 && out.stats.dl_rooted_leaves >= 2,
+            "all-inconsistent fixture must exercise a real fork with 0 consistent leaves: {:?}",
+            out.stats
+        );
+        assert!(out.taxonomy.is_unsatisfiable(&c("Boom")));
+        let ghost = NamedIndividual::new(format!("{EX}ghost"));
+        assert!(
+            k.describe(&c("Boom")).unwrap().instances.contains(&ghost),
+            "declared-only :ghost must appear in describe(:Boom) on inconsistent ontology"
+        );
+        assert!(
+            k.describe(&Class::nothing())
+                .unwrap()
+                .instances
+                .contains(&ghost),
+            "declared-only :ghost must appear in describe(owl:Nothing) on inconsistent ontology"
+        );
+    }
+
+    // 3. Class unsat in leaf 1 (`a1 == a2`) and sat in leaf 2 (`a1 != a2`):
+    //    `:Half` is satisfiable overall (`Half ⊑ Target` holds in all consistent leaves),
+    //    and has ZERO instances.
+    {
+        let ax = with_fork(
+            "ClassAssertion(:MarkA2 <http://example.org/d#a2>)
+             SubClassOf(:Half ObjectSomeValuesFrom(:rHalf ObjectIntersectionOf(ObjectOneOf(<http://example.org/d#a1>) ObjectComplementOf(:MarkA2))))
+             SubClassOf(:Half :Target)",
+        );
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                rooted_decline: false,
+                rooted_marker_repair: true,
+                ..lim_split.clone()
+            })
+            .unwrap();
+        assert!(
+            out.complete,
+            "Part 3 half-unsat+fork must complete: stats={:?} excluded={:?}",
+            out.stats,
+            k.excluded()
+        );
+        assert!(out.stats.dl_rooted_splits >= 1);
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(
+            !out.taxonomy.is_unsatisfiable(&c("Half")),
+            "class satisfiable in a1 != a2 leaves must stay satisfiable overall"
+        );
+        assert!(out.taxonomy.is_subclass(&c("Half"), &c("Target")));
+        assert!(k.describe(&c("Half")).unwrap().instances.is_empty());
+    }
+
+    // 4. Hidden-intermediate closure path (`:Src ⊑ K_internal ⊑ :Dst` via `HasKey` reduction)
+    //    beside an actual fork!
+    {
+        let ax = with_fork(
+            "HasKey(:Src (:hk) ())
+             SubClassOf(:Src :Mid)
+             SubClassOf(:Mid :Dst)
+             ClassAssertion(:Src :p0)
+             ClassAssertion(:Src :p1)
+             ObjectPropertyAssertion(:hk :p0 :v0)
+             ObjectPropertyAssertion(:hk :p1 :v0)
+             ClassAssertion(:Tag :p0)",
+        );
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                rooted_decline: false,
+                rooted_marker_repair: true,
+                ..lim_split.clone()
+            })
+            .unwrap();
+        assert!(
+            out.complete,
+            "Part 4 HasKey+fork must complete: stats={:?} excluded={:?}",
+            out.stats,
+            k.excluded()
+        );
+        assert!(out.stats.dl_rooted_splits >= 1);
+        assert!(out.taxonomy.is_subclass(&c("Src"), &c("Dst")));
+        let tag_insts = k.describe(&c("Tag")).unwrap().instances;
+        assert!(tag_insts.contains(&NamedIndividual::new(format!("{EX}p0"))));
+        assert!(tag_insts.contains(&NamedIndividual::new(format!("{EX}p1"))));
+        no_internal_names(&k, &out, &[c("Src"), c("Mid"), c("Dst"), c("Tag")]);
+    }
+}
+
+/// Design v12 §4.3.3 & §4.3.4: Strict `Error::Incomplete` invalidation on BOTH
+/// `Classifier::classify` and `Saturation::classify`, switch-off incremental reuse,
+/// `partial = true` / `saturate()` bypass, and inclusive work bound `Some(total)` vs
+/// `Some(total - 1)`.
+#[test]
+fn split_lifecycle_strict_error_invalidation_incremental_reuse_and_inclusive_bound() {
+    use sparkles_owl::classify::{Error, Saturation};
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
+    let shoi042 = ofn_read::parse(&std::fs::read_to_string(dir.join("shoi-042.ofn")).unwrap())
+        .unwrap()
+        .axioms;
+    let c0 = Class::new("http://example.org/d#C0");
+    let lim_split = Limits {
+        threads: 1,
+        rooted: true,
+        rooted_merge: true,
+        rooted_eq_split: true,
+        ..Limits::default()
+    };
+
+    // 1. Strict `Error::Incomplete` invalidation on BOTH `Classifier::classify` AND
+    //    `Saturation::classify`: after a successful forked classify (`describe` works!),
+    //    a strict call that returns `Err(Error::Incomplete(_))` MUST leave `describe == None`!
+    {
+        let mut k = Classifier::of(&shoi042);
+        let ok = k.classify(&lim_split).unwrap();
+        assert!(ok.complete && ok.stats.dl_rooted_splits >= 1);
+        assert!(k.describe(&c0).is_some());
+
+        // Add an unsupported axiom (`IrreflexiveObjectProperty` beside nominal) and call
+        // with `strict: true` -> returns `Err(Error::Incomplete(_))` and invalidates prior
+        // `SplitAnswer` immediately!
+        let irref = Axiom::new(AxiomKind::IrreflexiveObjectProperty(
+            ObjectProperty::new("http://example.org/d#r0").into(),
+        ));
+        k.add([&irref]);
+        let err = k
+            .classify(&Limits {
+                strict: true,
+                ..lim_split.clone()
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::Incomplete(_)), "got {err:?}");
+        assert!(
+            k.describe(&c0).is_none(),
+            "Classifier::describe must return None immediately after Err(Error::Incomplete)"
+        );
+        // Remove the unsupported axiom -> subsequent classify recovers cleanly.
+        k.remove([&irref]);
+        let recovered = k.classify(&lim_split).unwrap();
+        assert!(recovered.complete);
+        assert!(k.describe(&c0).is_some());
+    }
+    {
+        let refs: Vec<&AxiomKind> = shoi042.iter().map(|a| &a.kind).collect();
+        let mut sat = Saturation::new();
+        let ok = sat.classify(&refs, None, &lim_split).unwrap();
+        assert!(ok.complete && ok.stats.dl_rooted_splits >= 1);
+        assert!(sat.describe(&c0).is_some());
+
+        let irref = AxiomKind::IrreflexiveObjectProperty(
+            ObjectProperty::new("http://example.org/d#r0").into(),
+        );
+        let mut refs2 = refs.clone();
+        refs2.push(&irref);
+        let err = sat
+            .classify(
+                &refs2,
+                None,
+                &Limits {
+                    strict: true,
+                    ..lim_split.clone()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Incomplete(_)), "got {err:?}");
+        assert!(
+            sat.describe(&c0).is_none(),
+            "Saturation::describe must return None immediately after Err(Error::Incomplete)"
+        );
+    }
+
+    // 2. `partial = true` and `saturate()` bypass splitting cleanly (never return SplitAnswer).
+    {
+        let refs: Vec<&AxiomKind> = shoi042.iter().map(|a| &a.kind).collect();
+        let mut sat = Saturation::new();
+        let partial_out = sat
+            .classify(
+                &refs,
+                None,
+                &Limits {
+                    partial: true,
+                    dl_work: Some(100),
+                    ..lim_split.clone()
+                },
+            )
+            .unwrap();
+        assert_eq!(partial_out.stats.dl_rooted_splits, 0);
+        assert_eq!(partial_out.stats.dl_rooted_leaves, 0);
+
+        let mut sat2 = Saturation::new();
+        let sat_out = sat2
+            .saturate(
+                &refs,
+                None,
+                &Limits {
+                    dl_work: Some(100),
+                    ..lim_split.clone()
+                },
+            )
+            .unwrap();
+        assert_eq!(sat_out.stats.dl_rooted_splits, 0);
+    }
+
+    // 3. Inclusive work bound `Some(total)` completes vs `Some(total - 1)` exhausts!
+    {
+        let mut k = Classifier::of(&shoi042);
+        let exact = k.classify(&lim_split).unwrap();
+        assert!(exact.complete && exact.stats.dl_rooted_splits >= 1);
+        let total = exact.stats.dl_rooted_spent + exact.stats.dl_work;
+        assert!(total > 0);
+
+        let mut k_eq = Classifier::of(&shoi042);
+        let at_bound = k_eq
+            .classify(&Limits {
+                dl_work: Some(total),
+                ..lim_split.clone()
+            })
+            .unwrap();
+        assert!(
+            at_bound.complete && !at_bound.stats.dl_rooted_over,
+            "exact inclusive bound total={total} must complete: {:?}",
+            at_bound.stats
+        );
+
+        let mut k_under = Classifier::of(&shoi042);
+        let under = k_under
+            .classify(&Limits {
+                dl_work: Some(total - 1),
+                ..lim_split.clone()
+            })
+            .unwrap();
+        assert!(
+            under.stats.dl_rooted_over,
+            "total-1={} must exhaust rooted bound: {:?}",
+            total - 1,
+            under.stats
+        );
+    }
+
+    // 4. Switch-off incremental reuse is preserved (`rooted_eq_split = false`).
+    {
+        let ax = axioms(
+            "SubClassOf(:A ObjectUnionOf(:B :C))
+             SubClassOf(:B :D)
+             SubClassOf(:C :D)",
+        );
+        let mut k = Classifier::of(&ax);
+        let lim_off = Limits {
+            threads: 1,
+            rooted: true,
+            rooted_eq_split: false,
+            ..Limits::default()
+        };
+        let r1 = k.classify(&lim_off).unwrap();
+        assert!(r1.taxonomy.is_subclass(&c("A"), &c("D")));
+        let extra = Axiom::sub_class_of(c("E"), c("F"));
+        k.add([&extra]);
+        let r2 = k.classify(&lim_off).unwrap();
+        assert!(
+            r2.stats.incremental,
+            "switch-off reuse must keep incremental context state"
+        );
+        assert!(r2.taxonomy.is_subclass(&c("A"), &c("D")));
+        assert!(r2.taxonomy.is_subclass(&c("E"), &c("F")));
+    }
+}

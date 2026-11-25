@@ -42,7 +42,7 @@ use super::dl_clause::{
     next_vec_cap, set_insert_bound, set_insert_delta, vec_grow_bound, vec_push_delta,
 };
 use super::index::{BOTTOM, Ex, Index, Node, POLL_CHANGED, Role, TOP};
-use super::saturate::{Concl, Guard, Sink, State, flatten, table_bytes};
+use super::saturate::{Concl, DlGuard, DynamicBudget, Guard, Sink, State, flatten, table_bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -981,6 +981,65 @@ pub(super) fn adaptive_alloc_count() -> usize {
 /// Harvested constant-equality pairs and their retained vector capacity in bytes.
 pub(super) type MergedPairs = (Vec<(u32, u32)>, usize);
 
+/// Rooted equality splitting mode for the current saturation epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum SplitMode {
+    #[default]
+    Disabled = 0,
+    /// Always populate `best` from eligible empty-body root clauses; stop at post-activation
+    /// probe once `dl.work() >= split_probe` (or eagerly on pure positive clauses when
+    /// `split_probe == 0`).
+    ProbeOnly = 1,
+    /// Always populate `best`; stop eagerly on Priority-2 pure positive constant-equality
+    /// disjunctions, and at post-activation probe for Priority-1 mixed clauses.
+    EagerPureThenProbe = 2,
+}
+
+impl SplitMode {
+    #[inline]
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::ProbeOnly,
+            2 => Self::EagerPureThenProbe,
+            _ => Self::Disabled,
+        }
+    }
+}
+
+/// Full-width candidate disjunctive constant equality discovered in the root context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SplitCand {
+    pub(crate) epoch: u32,
+    /// 2 = pure positive constant-equality disjunction; 1 = mixed empty-body root clause
+    pub(crate) prio: u8,
+    pub(crate) head_len: u32,
+    pub(crate) rank_lo: u32,
+    pub(crate) rank_hi: u32,
+    pub(crate) u_id: u32,
+    pub(crate) v_id: u32,
+    pub(crate) clause_id: u32,
+}
+
+impl SplitCand {
+    #[inline]
+    pub(crate) fn cmp_key(&self) -> (std::cmp::Reverse<u8>, u32, u32, u32) {
+        (
+            std::cmp::Reverse(self.prio),
+            self.head_len,
+            self.rank_lo,
+            self.rank_hi,
+        )
+    }
+}
+
+/// Synchronized candidate discovery and immutable winning-stop payload slot (inline, 0 B heap).
+#[derive(Default)]
+pub(crate) struct SplitSlot {
+    pub(crate) best: Option<SplitCand>,
+    pub(crate) winner: Option<SplitCand>,
+}
+
 /// What a saturation with Tier D shares: the table of the clauses that contexts send one
 /// another and the bytes of the clause stores.
 #[derive(Default)]
@@ -1029,6 +1088,23 @@ pub struct DlRun {
     /// winning `STOP_MERGE` and taken by move after workers join; its bytes are carried
     /// in `Run::memory` via `DlGuard::commit`, not in `DlRun::bytes()`
     merged: parking_lot::Mutex<Option<MergedPairs>>,
+    /// active item 1075 equality-splitting mode (`SplitMode as u8`), disabled outside the
+    /// primary saturation round
+    split_mode: std::sync::atomic::AtomicU8,
+    /// work threshold after which post-activation probe splitting activates
+    split_probe: usize,
+    /// branch/merge epoch tag validated against `SplitCand::epoch`
+    split_epoch: u32,
+    /// epoch-local individual ID -> 0-based sorted rank in original genuine named individuals
+    /// (`u32::MAX` for ineligible anonymous witnesses and generated hubs)
+    pub(super) const_rank: Box<[u32]>,
+    /// sorted deduplicated epoch-local `(id_lo, id_hi)` pairs already decided unequal in `D`
+    pub(super) branch_neq: Box<[(u32, u32)]>,
+    /// leaf lock protecting mutable `best` and immutable winning `winner`
+    pub(crate) split_slot: parking_lot::Mutex<SplitSlot>,
+    /// atomic hints updated strictly while holding `split_slot`
+    pub(crate) has_split_cand: std::sync::atomic::AtomicBool,
+    pub(crate) best_split_prio: std::sync::atomic::AtomicU8,
     /// the repair's counts, for measurements: the notices of held triggers the root took,
     /// the markers it sent and the clauses it returned
     pub mcount: [AtomicUsize; 3],
@@ -1077,10 +1153,21 @@ impl DlRun {
         self.shared_facts = on;
         self
     }
+    pub(super) fn split_meta_bytes(&self) -> usize {
+        self.const_rank
+            .len()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(
+                self.branch_neq
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(u32, u32)>()),
+            )
+    }
     pub fn bytes(&self) -> usize {
-        self.table.bytes()
+        self.table.unadmitted_bytes()
             + self.lits.unadmitted_bytes()
             + self.stores.load(Ordering::Relaxed)
+            + self.split_meta_bytes()
             + self
                 .adaptive
                 .as_ref()
@@ -1093,6 +1180,87 @@ impl DlRun {
     #[inline]
     pub(super) fn set_merge(&self, on: bool) {
         self.merge.store(on, Ordering::Relaxed);
+    }
+    #[inline]
+    pub(super) fn split_mode(&self) -> SplitMode {
+        SplitMode::from_u8(self.split_mode.load(Ordering::Relaxed))
+    }
+    #[inline]
+    pub(super) fn set_split_mode(&self, mode: SplitMode) {
+        self.split_mode.store(mode as u8, Ordering::Relaxed);
+    }
+    #[inline]
+    pub(super) fn split_epoch(&self) -> u32 {
+        self.split_epoch
+    }
+    #[inline]
+    pub(super) fn split_probe(&self) -> usize {
+        self.split_probe
+    }
+    /// Configures item 1075 equality splitting metadata for a fresh rooted branch epoch.
+    pub(super) fn configure_split(
+        &mut self,
+        mode: SplitMode,
+        probe: usize,
+        epoch: u32,
+        const_rank: Box<[u32]>,
+        branch_neq: Box<[(u32, u32)]>,
+    ) {
+        *self.split_mode.get_mut() = mode as u8;
+        self.split_probe = probe;
+        self.split_epoch = epoch;
+        self.const_rank = const_rank;
+        self.branch_neq = branch_neq;
+        *self.split_slot.get_mut() = SplitSlot::default();
+        *self.has_split_cand.get_mut() = false;
+        *self.best_split_prio.get_mut() = 0;
+    }
+    /// Records an eligible root disjunctive constant-equality candidate while no immutable
+    /// winner has been published. Always populates `best` and both atomic hints regardless
+    /// of current work count.
+    pub(crate) fn record_split_cand(&self, cand: SplitCand) {
+        let mut slot = self.split_slot.lock();
+        if slot.winner.is_some() {
+            return;
+        }
+        if slot.best.is_none_or(|cur| cand.cmp_key() < cur.cmp_key()) {
+            slot.best = Some(cand);
+            self.has_split_cand.store(true, Ordering::Release);
+            self.best_split_prio.store(cand.prio, Ordering::Release);
+        }
+    }
+    /// Updates `slot.best` and both atomic hints together while the caller already holds
+    /// `self.split_slot`.
+    pub(crate) fn refresh_split_best_locked(&self, slot: &mut SplitSlot, best: Option<SplitCand>) {
+        slot.best = best;
+        match best {
+            Some(c) => {
+                self.has_split_cand.store(true, Ordering::Release);
+                self.best_split_prio.store(c.prio, Ordering::Release);
+            }
+            None => {
+                self.has_split_cand.store(false, Ordering::Release);
+                self.best_split_prio.store(0, Ordering::Release);
+            }
+        }
+    }
+    /// Takes the immutable winning split payload after all workers have joined.
+    pub(super) fn take_winning_split(&self) -> Option<SplitCand> {
+        self.split_slot.lock().winner.take()
+    }
+    /// Fast lock-free check of whether a probe split checkpoint is due.
+    #[inline]
+    pub(super) fn split_probe_reached(&self) -> bool {
+        let mode = self.split_mode();
+        if mode == SplitMode::Disabled {
+            return false;
+        }
+        if !self.has_split_cand.load(Ordering::Acquire) {
+            return false;
+        }
+        self.work() >= self.split_probe
+            || (mode == SplitMode::EagerPureThenProbe
+                && self.best_split_prio.load(Ordering::Acquire) >= 2)
     }
     /// Total conclusions counted against this run's bound, including carried prefix work.
     pub fn work_total(&self) -> usize {
@@ -1132,6 +1300,7 @@ impl DlRun {
     /// run can answer in full where a run that starts again falls back.
     pub fn begin_run(&mut self) {
         *self.stores.get_mut() = 0;
+        self.table.sync_unadmitted_on_begin_run();
         self.lits.sync_unadmitted_on_begin_run();
         self.carried = self.carried.saturating_add(*self.work.get_mut());
         *self.work.get_mut() = 0;
@@ -1145,6 +1314,14 @@ impl DlRun {
             *c.get_mut() = 0;
         }
         self.adaptive = None;
+        *self.split_mode.get_mut() = SplitMode::Disabled as u8;
+        self.split_probe = 0;
+        self.split_epoch = 0;
+        self.const_rank = Box::new([]);
+        self.branch_neq = Box::new([]);
+        *self.split_slot.get_mut() = SplitSlot::default();
+        *self.has_split_cand.get_mut() = false;
+        *self.best_split_prio.get_mut() = 0;
     }
     /// Enables Option 2 (`rawQ`) adaptive tracking for this attempt. When `enforce` is
     /// `true`, also sets `work_limit = policy.ceiling` and arms the adaptive stop latch;
@@ -1520,10 +1697,24 @@ impl DlRun {
         }
         over
     }
+    #[cfg(test)]
     pub(super) fn empty(&self) -> u32 {
         *self
             .empty
             .get_or_init(|| self.table.push(Clause::new(Vec::new(), Vec::new())))
+    }
+
+    /// Returns the table ID of the empty clause, pre-admitting its table entry and any
+    /// new segment against `out` on first use.
+    pub(super) fn empty_admitted<S: Sink>(out: &mut S) -> Option<u32> {
+        if let Some(&id) = out.dl().empty.get() {
+            return Some(id);
+        }
+        let id =
+            super::dl_clause::push_clause_admitted(out, std::mem::size_of::<Clause>(), || {
+                Clause::new(Vec::new(), Vec::new())
+            })?;
+        Some(*out.dl().empty.get_or_init(|| id))
     }
 }
 
@@ -1639,7 +1830,7 @@ impl DlSt {
             return true;
         }
         let Some(bound) = vec_grow_bound(&self.edges) else {
-            out.data_overflow();
+            out.speculative_overflow();
             return false;
         };
         if bound > 0 && !out.admit_dl(bound) {
@@ -1916,12 +2107,26 @@ impl DlSt {
 /// The bit that marks the class a test context's core denies.
 const NEG: Ex = 1 << 31;
 
-/// The test context of whether `x` is below one of `bs`, sorted: its core is `x` and the
-/// complements of `bs`.
-pub fn test(d: &super::saturate::Dynamic, x: Ex, bs: &[Ex]) -> Ex {
-    let mut core = vec![x];
+/// Fallible budgeted variant of the between-rounds group-test context constructor.
+/// Its core is `x` and the complements of sorted `bs`.
+pub(super) fn test_admitted(
+    d: &super::saturate::Dynamic,
+    x: Ex,
+    bs: &[Ex],
+    budget: &mut impl DynamicBudget,
+) -> Option<Ex> {
+    if bs.len() < 16 {
+        let mut stack = [0 as Ex; 16];
+        stack[0] = x;
+        for (i, &b) in bs.iter().enumerate() {
+            stack[i + 1] = b | NEG;
+        }
+        return d.intern_with_budget(&stack[..1 + bs.len()], budget);
+    }
+    let mut core = Vec::with_capacity(1 + bs.len());
+    core.push(x);
     core.extend(bs.iter().map(|&b| b | NEG));
-    d.intern(&core)
+    d.intern_with_budget(&core, budget)
 }
 
 /// Whether the run has made the test context of whether `x` is below one of `bs`.
@@ -2194,7 +2399,7 @@ pub(super) fn ds_admit<'a, S: Sink>(st: &'a mut State, out: &mut S) -> Option<&'
 /// Pushes `v` to `list`, pre-admitting reallocation overlap against `out`.
 pub(super) fn vec_push_admit<T, S: Sink>(list: &mut Vec<T>, v: T, out: &mut S) -> bool {
     let Some(bound) = vec_grow_bound(list) else {
-        out.data_overflow();
+        out.speculative_overflow();
         return false;
     };
     if bound > 0 && !out.admit_dl(bound) {
@@ -2218,7 +2423,7 @@ pub(super) fn set_insert_admit<T: Eq + std::hash::Hash, S: Sink>(
         return Some(false);
     }
     let Some(bound) = set_insert_bound(set, &v) else {
-        out.data_overflow();
+        out.speculative_overflow();
         return None;
     };
     if bound > 0 && !out.admit_dl(bound) {
@@ -2907,7 +3112,7 @@ pub(super) fn late<S: Sink>(
                             side_exact_bytes(c.body().len(), c.head().len())
                         };
                         let Some(bytes) = bytes else {
-                            out.data_overflow();
+                            out.speculative_overflow();
                             failed = true;
                             break;
                         };
@@ -3239,7 +3444,7 @@ impl Found {
             return true;
         }
         let Some(need_len) = self.one.len().checked_add(add_count) else {
-            guard.data_overflow();
+            guard.speculative_overflow();
             return false;
         };
         let elem = std::mem::size_of::<(Side, &'static str)>();
@@ -3251,19 +3456,19 @@ impl Found {
                 None => need_len,
             };
             let Some(new_cap_bytes) = target_cap.checked_mul(elem) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             let old_cap_bytes = cap * elem;
             let Some(realloc_peak) = held.checked_add(new_cap_bytes) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             let Some(post_peak) = (held - old_cap_bytes)
                 .checked_add(new_cap_bytes)
                 .and_then(|b| b.checked_add(side_bytes))
             else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             if !guard.ensure_admitted(realloc_peak.max(post_peak)) {
@@ -3272,7 +3477,7 @@ impl Found {
             self.one.reserve_exact(target_cap - self.one.len());
         } else {
             let Some(peak) = held.checked_add(side_bytes) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             if !guard.ensure_admitted(peak) {
@@ -3312,17 +3517,17 @@ impl Found {
         guard: &mut Guard<'_, S>,
     ) -> bool {
         let Some(need_len) = self.prods.len().checked_add(1) else {
-            guard.data_overflow();
+            guard.speculative_overflow();
             return false;
         };
         let elem = std::mem::size_of::<(Vec<Vec<Side>>, Side, bool, &'static str)>();
         let cap = self.prods.capacity();
         let Some(live) = self.held_bytes().checked_add(extra_live) else {
-            guard.data_overflow();
+            guard.speculative_overflow();
             return false;
         };
         let Some(total_new) = prod_bytes.checked_add(prune_scratch) else {
-            guard.data_overflow();
+            guard.speculative_overflow();
             return false;
         };
         if need_len > cap {
@@ -3331,19 +3536,19 @@ impl Found {
                 None => need_len,
             };
             let Some(new_cap_bytes) = target_cap.checked_mul(elem) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             let old_cap_bytes = cap * elem;
             let Some(realloc_peak) = live.checked_add(new_cap_bytes) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             let Some(post_peak) = (live - old_cap_bytes)
                 .checked_add(new_cap_bytes)
                 .and_then(|b| b.checked_add(total_new))
             else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             if !guard.ensure_admitted(realloc_peak.max(post_peak)) {
@@ -3352,7 +3557,7 @@ impl Found {
             self.prods.reserve_exact(target_cap - self.prods.len());
         } else {
             let Some(peak) = live.checked_add(total_new) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             if !guard.ensure_admitted(peak) {
@@ -3741,7 +3946,7 @@ fn fold<S: Sink, D: Deriver>(
                         .checked_mul(std::mem::size_of::<Lit>())?;
                     Some((cb, ch, bytes))
                 })() else {
-                    guard.data_overflow();
+                    guard.speculative_overflow();
                     mark_interrupted(st);
                     return false;
                 };
@@ -3754,7 +3959,7 @@ fn fold<S: Sink, D: Deriver>(
                     .and_then(|n| n.checked_add(next_live))
                     .and_then(|n| n.checked_add(cand_bytes))
                 else {
-                    guard.data_overflow();
+                    guard.speculative_overflow();
                     mark_interrupted(st);
                     return false;
                 };
@@ -3786,7 +3991,7 @@ fn fold<S: Sink, D: Deriver>(
                     let cloned_lits = (s.0.len() + s.1.len()) * std::mem::size_of::<Lit>();
                     let seen_rehash = if seen.len() >= seen.capacity() {
                         let Some(b) = next_hash_table_bytes(seen.capacity(), SIDE) else {
-                            guard.data_overflow();
+                            guard.speculative_overflow();
                             mark_interrupted(st);
                             return false;
                         };
@@ -3799,7 +4004,7 @@ fn fold<S: Sink, D: Deriver>(
                         let Some(b) =
                             next_vec_cap(next.capacity(), SIDE).and_then(|c| c.checked_mul(SIDE))
                         else {
-                            guard.data_overflow();
+                            guard.speculative_overflow();
                             mark_interrupted(st);
                             return false;
                         };
@@ -3819,7 +4024,7 @@ fn fold<S: Sink, D: Deriver>(
                         seen_table
                     };
                     let Some(pair_lits) = s_lits.checked_add(cloned_lits) else {
-                        guard.data_overflow();
+                        guard.speculative_overflow();
                         mark_interrupted(st);
                         return false;
                     };
@@ -3830,7 +4035,7 @@ fn fold<S: Sink, D: Deriver>(
                         .and_then(|n| n.checked_add(next_live))
                         .and_then(|n| n.checked_add(pair_lits))
                     else {
-                        guard.data_overflow();
+                        guard.speculative_overflow();
                         mark_interrupted(st);
                         return false;
                     };
@@ -3841,7 +4046,7 @@ fn fold<S: Sink, D: Deriver>(
                         .and_then(|n| n.checked_add(next_grow))
                         .and_then(|n| n.checked_add(pair_lits))
                     else {
-                        guard.data_overflow();
+                        guard.speculative_overflow();
                         mark_interrupted(st);
                         return false;
                     };
@@ -4197,7 +4402,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
         // and index vector before releasing their reservation, including on panic unwind.
         let mut guard = Guard::new(&mut held_guard);
         let Some(at_bytes) = lists.len().checked_mul(std::mem::size_of::<usize>()) else {
-            guard.data_overflow();
+            guard.speculative_overflow();
             mark_interrupted(st);
             return;
         };
@@ -4232,7 +4437,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
                     .checked_mul(std::mem::size_of::<Lit>())?;
                 Some((cb, ch, bytes))
             })() else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 mark_interrupted(st);
                 return;
             };
@@ -4242,7 +4447,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
                 .and_then(|n| n.checked_add(seen_lits))
                 .and_then(|n| n.checked_add(cand_bytes))
             else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 mark_interrupted(st);
                 return;
             };
@@ -4270,7 +4475,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
                     let key_lits = (s.0.len() + s.1.len()) * std::mem::size_of::<Lit>();
                     let next_table = if seen.len() >= seen.capacity() {
                         let Some(b) = next_hash_table_bytes(seen.capacity(), key_size) else {
-                            guard.data_overflow();
+                            guard.speculative_overflow();
                             mark_interrupted(st);
                             return;
                         };
@@ -4287,7 +4492,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
                         .and_then(|n| n.checked_add(s_lits))
                         .and_then(|n| n.checked_add(key_lits))
                     else {
-                        guard.data_overflow();
+                        guard.speculative_overflow();
                         mark_interrupted(st);
                         return;
                     };
@@ -4570,6 +4775,15 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
             return;
         };
         if !x.promoted.contains(head.as_slice()) {
+            let Some(clause_bytes) = head
+                .len()
+                .checked_mul(std::mem::size_of::<Lit>())
+                .and_then(|n| n.checked_add(std::mem::size_of::<Clause>()))
+            else {
+                out.speculative_overflow();
+                x.store.interrupted = true;
+                return;
+            };
             let entry = std::mem::size_of::<Box<[Lit]>>();
             let map_grow = if x.promoted.len() >= x.promoted.capacity() {
                 next_hash_table_bytes(x.promoted.capacity(), entry)
@@ -4578,26 +4792,34 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
             };
             let payload = head.len().checked_mul(std::mem::size_of::<Lit>());
             let Some(bound) = map_grow.and_then(|m| payload.and_then(|p| m.checked_add(p))) else {
-                out.data_overflow();
+                out.speculative_overflow();
                 x.store.interrupted = true;
                 return;
             };
-            if bound > 0 && !out.admit_dl(bound) {
+            let mut prom_guard = DlGuard::new(out);
+            if bound > 0 && !prom_guard.admit_add(bound) {
                 x.store.interrupted = true;
                 return;
             }
+            let mut head_opt = Some(head);
+            let Some(cid) =
+                super::dl_clause::push_clause_admitted(&mut prom_guard, clause_bytes, || {
+                    Clause::new(Vec::new(), head_opt.as_ref().unwrap().clone())
+                })
+            else {
+                x.store.interrupted = true;
+                return;
+            };
+            let head = head_opt.take().unwrap();
             let before = x.promoted.capacity();
-            if x.promoted.insert(head.clone().into_boxed_slice()) {
+            if x.promoted.insert(head.into_boxed_slice()) {
                 let delta = hash_table_bytes(x.promoted.capacity(), entry)
                     .saturating_sub(hash_table_bytes(before, entry))
-                    + head.len() * std::mem::size_of::<Lit>();
-                if bound > 0 {
-                    out.commit_dl(bound, delta);
-                }
-                let cid = out.dl().table.push(Clause::new(Vec::new(), head));
+                    + payload.unwrap();
+                prom_guard.commit(delta);
                 out.send(root, Concl::RFact(cid));
-            } else if bound > 0 {
-                out.commit_dl(bound, 0);
+            } else {
+                prom_guard.commit(0);
             }
         }
         return;
@@ -4752,7 +4974,7 @@ fn again<S: Sink>(
             let s = &d.store.clauses[j as usize];
             if !s.dead && j != id {
                 let Some(bytes) = side_exact_bytes(s.c.body().len(), s.c.head().len()) else {
-                    guard.data_overflow();
+                    guard.speculative_overflow();
                     return false;
                 };
                 if !found.push_admitted(bytes, || (s.c.body().to_vec(), s.c.head().to_vec()), guard)
@@ -4797,7 +5019,7 @@ fn hyper_clause<S: Sink>(
     let (body, head) = &dix(ix).clauses[id as usize];
     let empty_side = unit();
     let Some(mut lists_bytes) = body.len().checked_mul(std::mem::size_of::<Vec<Side>>()) else {
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     };
     let mut max_list_len = 0usize;
@@ -4847,22 +5069,22 @@ fn hyper_clause<S: Sink>(
         lists_bytes = pos_bytes;
     }
     if overflow {
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     }
     let Some(base_bytes) = side_exact_bytes(0, head.len()) else {
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     };
     let Some(prod_bytes) = lists_bytes.checked_add(base_bytes) else {
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     };
     let prune_scratch = if max_list_len < 2 {
         0
     } else {
         let Some(ps) = max_list_len.checked_mul(PRUNE_SCRATCH_ELEM) else {
-            guard.data_overflow();
+            guard.speculative_overflow();
             return false;
         };
         ps
@@ -4926,7 +5148,7 @@ fn univ_over<S: Sink>(
             && roles.sub(r, t)
         {
             let Some(bytes) = side_parts_bytes(prem, &[], &[], None, Some(Lit::f(f, x))) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             if !found.push_admitted(bytes, || with_exact(prem, Lit::f(f, x)), guard) {
@@ -4951,7 +5173,7 @@ fn univ_over<S: Sink>(
                     let w = Some(Lit::x(b));
                     let add = Some(Lit::f(f, c));
                     let Some(bytes) = side_parts_bytes(prem, cl.body(), cl.head(), w, add) else {
-                        guard.data_overflow();
+                        guard.speculative_overflow();
                         return false;
                     };
                     if !found.push_admitted(
@@ -5047,7 +5269,7 @@ fn at_most<S: Sink>(
         true
     });
     if overflow {
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     }
     if holder_count == 0 {
@@ -5057,7 +5279,7 @@ fn at_most<S: Sink>(
         .checked_mul(size_of::<Side>())
         .and_then(|b| b.checked_add(holder_sides_bytes))
     else {
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     };
 
@@ -5065,7 +5287,7 @@ fn at_most<S: Sink>(
         let Some(b) =
             side_exact_bytes(p.0.len(), p.1.len()).and_then(|sb| sb.checked_add(size_of::<Side>()))
         else {
-            guard.data_overflow();
+            guard.speculative_overflow();
             return false;
         };
         b
@@ -5131,7 +5353,7 @@ fn at_most<S: Sink>(
                         continue;
                     }
                     let Some(nr) = refs_len.checked_add(1) else {
-                        guard.data_overflow();
+                        guard.speculative_overflow();
                         return false;
                     };
                     refs_len = nr;
@@ -5142,11 +5364,11 @@ fn at_most<S: Sink>(
 
     // 3. Admit and build exact-capacity `refs` metadata buffer (12/16 B per clause, no `Side`s).
     let Some(refs_bytes) = refs_len.checked_mul(size_of::<(Ex, u32, Lit)>()) else {
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     };
     let Some(need_refs) = found.held_bytes().checked_add(refs_bytes) else {
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     };
     if !guard.ensure_admitted(need_refs) {
@@ -5218,19 +5440,19 @@ fn at_most<S: Sink>(
     let Some(cands_bytes) = cand_len.checked_mul(size_of::<AtMostCand>()) else {
         drop(refs);
         guard.release_to(found.held_bytes());
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     };
     let Some(setup_bytes) = refs_bytes.checked_add(cands_bytes) else {
         drop(refs);
         guard.release_to(found.held_bytes());
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     };
     let Some(need_setup) = found.held_bytes().checked_add(setup_bytes) else {
         drop(refs);
         guard.release_to(found.held_bytes());
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     };
     if !guard.ensure_admitted(need_setup) {
@@ -5329,7 +5551,7 @@ fn at_most<S: Sink>(
                 drop(cands);
                 drop(refs);
                 guard.release_to(found.held_bytes());
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             cands.push(AtMostCand {
@@ -5395,7 +5617,7 @@ fn at_most<S: Sink>(
                 let Some(prod_bytes) =
                     prod_bytes.and_then(|b| b.checked_add(side_exact_bytes(0, eqs_len)?))
                 else {
-                    guard.data_overflow();
+                    guard.speculative_overflow();
                     ok = false;
                     break;
                 };
@@ -5403,7 +5625,7 @@ fn at_most<S: Sink>(
                     0
                 } else {
                     let Some(ps) = max_len.checked_mul(PRUNE_SCRATCH_ELEM) else {
-                        guard.data_overflow();
+                        guard.speculative_overflow();
                         ok = false;
                         break;
                     };
@@ -5580,7 +5802,7 @@ fn on_rl<S: Sink>(
             && !for_each_partner_x(st, b, |pb, ph, without| {
                 let add = Some(Lit::rl(f, q ^ 1));
                 let Some(bytes) = side_parts_bytes(prem, pb, ph, without, add) else {
-                    guard.data_overflow();
+                    guard.speculative_overflow();
                     return false;
                 };
                 found.push_admitted(bytes, || merge_parts(prem, pb, ph, without, add), guard)
@@ -5594,7 +5816,7 @@ fn on_rl<S: Sink>(
         if dx.sub(ix, s, a)
             && !for_each_partner_rl(ix, dx, st, f, b, |pb, ph, without| {
                 let Some(bytes) = side_parts_bytes(prem, pb, ph, without, None) else {
-                    guard.data_overflow();
+                    guard.speculative_overflow();
                     return false;
                 };
                 found.push_admitted(bytes, || merge_parts(prem, pb, ph, without, None), guard)
@@ -5626,7 +5848,7 @@ fn on_filler<S: Sink>(
         let r = dx.quals[((q - dx.base) / 2) as usize].0;
         if dx.carries(r) {
             let Some(bytes) = side_exact_bytes(prem.0.len() + 1, prem.1.len() + 1) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             if !found.push_admitted(
@@ -5650,7 +5872,7 @@ fn on_filler<S: Sink>(
                 for p in ps {
                     let add = Lit::rl(f, q ^ 1);
                     let Some(bytes) = side_parts_bytes(prem, &p.0, &p.1, None, Some(add)) else {
-                        guard.data_overflow();
+                        guard.speculative_overflow();
                         return false;
                     };
                     if !found.push_admitted(bytes, || merge_with_exact(prem, &p, add), guard) {
@@ -5694,14 +5916,14 @@ fn paramodulate<S: Sink>(
     match rewrite(ix, dx, l2, t) {
         Some(Made::Lit(l)) => {
             let Some(bytes) = side_parts_bytes(c1, &c2.0, &c2.1, None, Some(l)) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             found.push_admitted(bytes, || merge_with_exact(c1, c2, l), guard)
         }
         Some(Made::False) => {
             let Some(bytes) = side_parts_bytes(c1, &c2.0, &c2.1, None, None) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             found.push_admitted(bytes, || merge_exact(c1, c2), guard)
@@ -5771,7 +5993,7 @@ fn on_eq<S: Sink>(
             let h_len =
                 prem.1.iter().filter(|&&m| m != o).count() + 1 + usize::from(extra_lit.is_some());
             let Some(bytes) = side_exact_bytes(prem.0.len(), h_len) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             if !found.push_admitted(
@@ -5858,7 +6080,7 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
                 && !for_each_partner_x(st, p, |pb, ph, without| {
                     let add = Some(Lit::x(k));
                     let Some(bytes) = side_parts_bytes(&unit, pb, ph, without, add) else {
-                        found_guard.data_overflow();
+                        found_guard.speculative_overflow();
                         return false;
                     };
                     found.push_admitted(
@@ -5878,7 +6100,7 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
                     && !st.subs.contains(&m)
                     && !for_each_partner_x(st, m, |pb, ph, without| {
                         let Some(bytes) = side_parts_bytes(&unit, pb, ph, without, None) else {
-                            found_guard.data_overflow();
+                            found_guard.speculative_overflow();
                             return false;
                         };
                         found.push_admitted(
@@ -5934,7 +6156,7 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
             for p in prems {
                 let add = Lit::f(e, c);
                 let Some(bytes) = side_parts_bytes(&p, &[], &[], None, Some(add)) else {
-                    found_guard.data_overflow();
+                    found_guard.speculative_overflow();
                     mark_interrupted(st);
                     return;
                 };
@@ -6124,7 +6346,7 @@ fn rooted_unit<S: Sink>(
         ] {
             if let Made::Lit(l) = guard.dl().lits.lit(l.canon(inv), inv) {
                 let Some(bytes) = side_exact_bytes(0, 1) else {
-                    guard.data_overflow();
+                    guard.speculative_overflow();
                     return false;
                 };
                 if !found.push_admitted(bytes, || with_exact(&u, l), guard) {
@@ -6170,7 +6392,7 @@ fn rooted_hyper<S: Sink>(
         && let Made::Lit(e) = guard.dl().lits.lit(XLit::Eq(RTerm::X, RTerm::C(u)), inv)
     {
         let Some(bytes) = side_parts_bytes(prem, &[], &[], None, Some(e)) else {
-            guard.data_overflow();
+            guard.speculative_overflow();
             return false;
         };
         if !found.push_admitted(bytes, || with_exact(prem, e), guard) {
@@ -6182,7 +6404,7 @@ fn rooted_hyper<S: Sink>(
             for &b in &es[i + 1..] {
                 if let Made::Lit(n) = Lit::ne(Term::Fun(a), Term::Fun(b)) {
                     let Some(bytes) = side_parts_bytes(prem, &[], &[], None, Some(n)) else {
-                        guard.data_overflow();
+                        guard.speculative_overflow();
                         return false;
                     };
                     if !found.push_admitted(bytes, || with_exact(prem, n), guard) {
@@ -6202,7 +6424,11 @@ pub fn bottom<S: Sink>(me: Ex, st: &mut State, out: &mut S) {
     if x.dpreds.is_empty() {
         return;
     }
-    let id = out.dl().empty();
+    let Some(id) = DlRun::empty_admitted(out) else {
+        mark_interrupted(st);
+        return;
+    };
+    let Some(x) = dl(st) else { return };
     for &(u, _) in &x.dpreds {
         out.send(u, Concl::PredC(me, id));
     }
@@ -6216,7 +6442,7 @@ fn prop_id<S: Sink>(x: &mut DlSt, s: Role, c: Ex, out: &mut S) -> Option<u32> {
     let entry = std::mem::size_of::<((Role, Ex), u32)>();
     let bound = if x.props.len() >= x.props.capacity() {
         let Some(b) = next_hash_table_bytes(x.props.capacity(), entry) else {
-            out.data_overflow();
+            out.speculative_overflow();
             x.store.interrupted = true;
             return None;
         };
@@ -6224,21 +6450,23 @@ fn prop_id<S: Sink>(x: &mut DlSt, s: Role, c: Ex, out: &mut S) -> Option<u32> {
     } else {
         0
     };
-    if bound > 0 && !out.admit_dl(bound) {
+    let mut prop_guard = DlGuard::new(out);
+    if bound > 0 && !prop_guard.admit_add(bound) {
         x.store.interrupted = true;
         return None;
     }
+    let clause_bytes = std::mem::size_of::<Clause>() + 2 * std::mem::size_of::<Lit>();
+    let Some(id) = super::dl_clause::push_clause_admitted(&mut prop_guard, clause_bytes, || {
+        Clause::new(vec![Lit::ry(s)], vec![Lit::y(c)])
+    }) else {
+        x.store.interrupted = true;
+        return None;
+    };
     let before = x.props.capacity();
-    let id = out
-        .dl()
-        .table
-        .push(Clause::new(vec![Lit::ry(s)], vec![Lit::y(c)]));
     x.props.insert((s, c), id);
-    if bound > 0 {
-        let delta = hash_table_bytes(x.props.capacity(), entry)
-            .saturating_sub(hash_table_bytes(before, entry));
-        out.commit_dl(bound, delta);
-    }
+    let delta =
+        hash_table_bytes(x.props.capacity(), entry).saturating_sub(hash_table_bytes(before, entry));
+    prop_guard.commit(delta);
     Some(id)
 }
 
@@ -6340,16 +6568,24 @@ pub(super) fn pred_ready(ix: &Index, dx: &DlIx, lits: &Lits, c: &Clause) -> bool
     })
 }
 
-/// The table id of a stored clause over the predecessor, `None` once it is dead.
+/// The table id of a stored clause over the predecessor, `None` once it is dead or on
+/// admission refusal.
 pub(super) fn pred_id<S: Sink>(x: &mut DlSt, i: u32, out: &mut S) -> Option<u32> {
-    let s = &mut x.store.clauses[i as usize];
-    if s.dead {
+    if x.store.clauses[i as usize].dead {
         return None;
     }
-    if s.sent.is_none() {
-        s.sent = Some(out.dl().table.push(s.c.clone()));
+    if let Some(id) = x.store.clauses[i as usize].sent {
+        return Some(id);
     }
-    s.sent
+    let clause_bytes = x.store.clauses[i as usize].c.bytes();
+    let Some(id) = super::dl_clause::push_clause_admitted(out, clause_bytes, || {
+        x.store.clauses[i as usize].c.clone()
+    }) else {
+        x.store.interrupted = true;
+        return None;
+    };
+    x.store.clauses[i as usize].sent = Some(id);
+    Some(id)
 }
 
 /// A new backward link from `e` by `r`: the source takes the clauses over the predecessor
@@ -6438,7 +6674,10 @@ pub fn dedge<S: Sink>(ix: &Index, me: Ex, st: &mut State, u: Ex, e: Ex, out: &mu
         return false;
     }
     if bottom {
-        let id = out.dl().empty();
+        let Some(id) = DlRun::empty_admitted(out) else {
+            x.store.interrupted = true;
+            return false;
+        };
         out.send(u, Concl::PredC(me, id));
         return true;
     }
@@ -6568,7 +6807,7 @@ pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out:
             }
         })
     else {
-        out.data_overflow();
+        out.speculative_overflow();
         x.store.interrupted = true;
         return false;
     };
@@ -6602,7 +6841,7 @@ pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out:
                 side_exact_bytes(c.body().len(), c.head().len())
             };
             let Some(bytes) = bytes else {
-                found_guard.data_overflow();
+                found_guard.speculative_overflow();
                 mark_interrupted(st);
                 return true;
             };
@@ -6788,7 +7027,7 @@ fn pred<S: Sink>(
     };
 
     let Some(base_bytes) = side_exact_bytes(ground_len, head_len) else {
-        guard.data_overflow();
+        guard.speculative_overflow();
         return false;
     };
     let for_each_need = |c: &Clause, cb: &mut dyn FnMut(usize, Lit) -> bool| {
@@ -6824,7 +7063,7 @@ fn pred<S: Sink>(
         let (prod_bytes, prune_scratch, empty_pos) = {
             let c = guard.dl().table.get(cid);
             let Some(mut lists_bytes) = need_len.checked_mul(size_of::<Vec<Side>>()) else {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             };
             let mut max_list_len = 0usize;
@@ -6887,21 +7126,21 @@ fn pred<S: Sink>(
                 true
             });
             if overflow {
-                guard.data_overflow();
+                guard.speculative_overflow();
                 return false;
             }
             if empty_pos {
                 (0, 0, true)
             } else {
                 let Some(prod_bytes) = lists_bytes.checked_add(base_bytes) else {
-                    guard.data_overflow();
+                    guard.speculative_overflow();
                     return false;
                 };
                 let prune_scratch = if max_list_len < 2 {
                     0
                 } else {
                     let Some(ps) = max_list_len.checked_mul(PRUNE_SCRATCH_ELEM) else {
-                        guard.data_overflow();
+                        guard.speculative_overflow();
                         return false;
                     };
                     ps
@@ -7086,7 +7325,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
         let Some((views_bytes, max_realloc)) =
             x.store.next_scratch_bound(id, rooted, &max, max.capacity())
         else {
-            max_guard.data_overflow();
+            max_guard.speculative_overflow();
             x.store.interrupted = true;
             break;
         };
@@ -7095,7 +7334,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
             .checked_add(max_realloc)
             .and_then(|b| b.checked_add(views_bytes))
         else {
-            max_guard.data_overflow();
+            max_guard.speculative_overflow();
             x.store.interrupted = true;
             break;
         };
@@ -7117,7 +7356,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
             };
             max_guard.release_to(max.capacity() * std::mem::size_of::<Lit>());
             let Some(bound) = bound else {
-                max_guard.data_overflow();
+                max_guard.speculative_overflow();
                 x.store.interrupted = true;
                 break;
             };
@@ -7139,7 +7378,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
             let bound = x.store.next_prepare_id(ix, None, id, &mut max);
             max_guard.release_to(max.capacity() * std::mem::size_of::<Lit>());
             let Some(bound) = bound else {
-                max_guard.data_overflow();
+                max_guard.speculative_overflow();
                 x.store.interrupted = true;
                 break;
             };
@@ -7175,7 +7414,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
         };
         let Some(live_need) = (max.capacity() * std::mem::size_of::<Lit>()).checked_add(c_bytes)
         else {
-            max_guard.data_overflow();
+            max_guard.speculative_overflow();
             x.given_fact = false;
             x.store.interrupted = true;
             break;
@@ -7310,12 +7549,12 @@ fn process<S: Sink>(
             break;
         }
         let Some(prem_bytes) = side_bytes(c, l) else {
-            found_guard.data_overflow();
+            found_guard.speculative_overflow();
             mark_interrupted(st);
             return;
         };
         let Some(prem_need) = found.held_bytes().checked_add(prem_bytes) else {
-            found_guard.data_overflow();
+            found_guard.speculative_overflow();
             mark_interrupted(st);
             return;
         };
@@ -7356,7 +7595,7 @@ fn process<S: Sink>(
                             let add = Lit::f(e, x);
                             let Some(bytes) = side_parts_bytes(&prem, &q.0, &q.1, None, Some(add))
                             else {
-                                found_guard.data_overflow();
+                                found_guard.speculative_overflow();
                                 mark_interrupted(st);
                                 return;
                             };
@@ -7381,7 +7620,7 @@ fn process<S: Sink>(
                         for lit in [Lit::x(a), Lit::x(b)] {
                             let Some(bytes) = side_parts_bytes(&prem, &[], &[], None, Some(lit))
                             else {
-                                found_guard.data_overflow();
+                                found_guard.speculative_overflow();
                                 mark_interrupted(st);
                                 return;
                             };
@@ -7408,7 +7647,7 @@ fn process<S: Sink>(
                                     let Some(bytes) =
                                         side_parts_bytes(&prem, &[], &[], None, Some(lit))
                                     else {
-                                        found_guard.data_overflow();
+                                        found_guard.speculative_overflow();
                                         mark_interrupted(st);
                                         return;
                                     };
@@ -7427,7 +7666,7 @@ fn process<S: Sink>(
                                 let Some(bytes) =
                                     side_parts_bytes(&prem, &[], &[], None, Some(lit))
                                 else {
-                                    found_guard.data_overflow();
+                                    found_guard.speculative_overflow();
                                     mark_interrupted(st);
                                     return;
                                 };
@@ -7464,7 +7703,7 @@ fn process<S: Sink>(
                     if Some(t) != skip && !dx.skips_weaken(d, t) {
                         let lit = Lit::x(t);
                         let Some(bytes) = side_parts_bytes(&prem, &[], &[], None, Some(lit)) else {
-                            found_guard.data_overflow();
+                            found_guard.speculative_overflow();
                             mark_interrupted(st);
                             return;
                         };
@@ -7480,7 +7719,7 @@ fn process<S: Sink>(
                     if !for_each_partner_x(st, p, |pb, ph, without| {
                         let add = Some(Lit::x(k));
                         let Some(bytes) = side_parts_bytes(&prem, pb, ph, without, add) else {
-                            found_guard.data_overflow();
+                            found_guard.speculative_overflow();
                             return false;
                         };
                         found.push_admitted(
@@ -7500,7 +7739,7 @@ fn process<S: Sink>(
                             && !for_each_partner_x(st, m, |pb, ph, without| {
                                 let Some(bytes) = side_parts_bytes(&prem, pb, ph, without, None)
                                 else {
-                                    found_guard.data_overflow();
+                                    found_guard.speculative_overflow();
                                     return false;
                                 };
                                 found.push_admitted(
@@ -7532,7 +7771,7 @@ fn process<S: Sink>(
                     {
                         let Some(bytes) = side_exact_bytes(prem.0.len() + 1, prem.1.len() + 1)
                         else {
-                            found_guard.data_overflow();
+                            found_guard.speculative_overflow();
                             mark_interrupted(st);
                             return;
                         };
@@ -7558,7 +7797,7 @@ fn process<S: Sink>(
                             let add = Lit::f(e, x);
                             let Some(bytes) = side_parts_bytes(&prem, &q.0, &q.1, None, Some(add))
                             else {
-                                found_guard.data_overflow();
+                                found_guard.speculative_overflow();
                                 mark_interrupted(st);
                                 return;
                             };
@@ -7619,7 +7858,10 @@ fn process<S: Sink>(
                 let e = l.fun();
                 let had = dl(st).is_some_and(|x| x.edge_target(e).is_some());
                 // Succ: the successor takes the marker
-                let v = target(ix, me, st, e, &mut found_guard);
+                let Some(v) = target(ix, me, st, e, &mut found_guard) else {
+                    mark_interrupted(st);
+                    return;
+                };
                 let edge_v = v;
                 // the late rule's replay takes the clauses with every partner, this
                 // premise included, so the replay below skips v
@@ -7752,13 +7994,13 @@ pub(super) fn send_hyp<S: Sink>(ix: &Index, st: &mut State, v: Ex, a: Ex, out: &
 /// for certain: the EL successor when that is all, and else the hypothetical successor
 /// for nothing, the context of the one atom, or that of the conjunction. A successor the
 /// context registers with takes the markers of the EL core's atoms it lacks.
-fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex {
+fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Option<Ex> {
     let dx = dix(ix);
     let unit = st.subs.contains(&e);
     let h = dx.hyp.get(&e).copied().unwrap_or(TOP);
     let succ = ix.head(e).succ;
     if let Some(v) = dl(st).and_then(|x| x.edge_target(e)) {
-        return v;
+        return Some(v);
     }
     let v = if out.dl().eager {
         let mut k1: Vec<Ex> = Vec::new();
@@ -7779,25 +8021,25 @@ fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex
         k1.sort_unstable();
         k1.dedup();
         if unit && dx.cores.get(&e).is_some_and(|c| **c == *k1) {
-            return succ;
+            return Some(succ);
         }
         match k1.as_slice() {
             [] => h,
             [a] => *a,
-            _ => out.intern(&k1),
+            _ => out.conjunction(&k1)?,
         }
     } else {
         if unit {
-            return succ;
+            return Some(succ);
         }
         h
     };
     let Some(x) = ds_admit(st, out) else {
-        return v;
+        return Some(v);
     };
     if !x.insert_edge_admit(e, v, out) {
         x.store.interrupted = true;
-        return v;
+        return Some(v);
     }
     out.send(v, Concl::DEdge(me, e));
     if dx.root.is_some() {
@@ -7808,7 +8050,7 @@ fn target<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> Ex
             send_hyp(ix, st, v, a, out);
         }
     }
-    v
+    Some(v)
 }
 
 #[cfg(test)]

@@ -69,9 +69,13 @@ impl Saturation {
 
     /// [`Saturation::describe`] with every name of the run's axioms.
     fn describe_all(&self, c: &Class) -> Option<Description> {
-        if self.dirty || self.index.is_none() {
+        if self.dirty {
             return None;
         }
+        if let Some(split) = &self.split_answer {
+            return split.describe(c);
+        }
+        let _ = self.index.as_ref()?;
         let q = self.interner.class_ex(c)?;
         if q != TOP && q != BOTTOM && !self.interner.in_signature(c) {
             return None;

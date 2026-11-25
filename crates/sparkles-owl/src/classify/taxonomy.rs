@@ -757,6 +757,9 @@ const SORT_MIN: usize = if cfg!(test) { 256 } else { 16 * 1024 };
 /// The places of `owl:Thing` and `owl:Nothing` among a node's classes.
 const THING: u32 = u32::MAX - 1;
 const NOTHING: u32 = u32::MAX - 2;
+/// Maximum number of classes representable in a [`Taxonomy`] without colliding with
+/// `NOTHING` (`u32::MAX - 2`), `THING` (`u32::MAX - 1`), or `NONE` (`u32::MAX`).
+pub(super) const MAX_CLASS_COUNT: usize = NOTHING as usize;
 
 /// The estimated bytes of a taxonomy and of what building it holds before its links: the
 /// subsumers read, the tables by class and by expression, the tables that place the
@@ -1014,6 +1017,943 @@ fn direct_parents(
     };
     parents.sort_unstable();
     parents
+}
+
+/// RAII delta-debit tracker against a synchronized single-ledger budget callback.
+/// Releases all remaining `bytes` on drop unless [`Self::transfer`] moves ownership.
+struct BudgetDebit<'a> {
+    budget: &'a (dyn Fn(isize) -> Result<(), usize> + Sync),
+    bytes: usize,
+}
+
+impl<'a> BudgetDebit<'a> {
+    fn new(budget: &'a (dyn Fn(isize) -> Result<(), usize> + Sync)) -> Self {
+        Self { budget, bytes: 0 }
+    }
+
+    fn add(&mut self, bytes: usize) -> Result<(), Halt> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let Ok(delta) = isize::try_from(bytes) else {
+            return Err(Halt::Memory(usize::MAX));
+        };
+        let Some(next) = self.bytes.checked_add(bytes) else {
+            return Err(Halt::Memory(usize::MAX));
+        };
+        (self.budget)(delta).map_err(Halt::Memory)?;
+        self.bytes = next;
+        Ok(())
+    }
+
+    fn sub(&mut self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let drop_bytes = bytes.min(self.bytes);
+        self.bytes -= drop_bytes;
+        if let Ok(delta) = isize::try_from(drop_bytes) {
+            let _ = (self.budget)(-delta);
+        }
+    }
+
+    fn transfer(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_sub(bytes);
+    }
+}
+
+impl Drop for BudgetDebit<'_> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            let rem = std::mem::take(&mut self.bytes);
+            if let Ok(delta) = isize::try_from(rem) {
+                let _ = (self.budget)(-delta);
+            }
+        }
+    }
+}
+
+/// Computes the exact length of the sorted deduplicated union of sorted slices `a` and `b`.
+fn sorted_union_len(a: &[u32], b: &[u32]) -> usize {
+    let (mut i, mut j, mut len) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+        len += 1;
+    }
+    len + (a.len() - i) + (b.len() - j)
+}
+
+/// Writes the sorted deduplicated union of sorted `a` and `b` into `out`, which must
+/// already have capacity `>= sorted_union_len(a, b)`.
+fn write_sorted_union(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+}
+
+/// Merges sorted `a` and `b` into `scratch`, strictly pre-admitting the full replacement
+/// buffer while the old `scratch` buffer is still live and charged whenever growth is needed.
+fn merge_into_admitted(
+    a: &[u32],
+    b: &[u32],
+    scratch: &mut Vec<u32>,
+    debit: &mut BudgetDebit<'_>,
+) -> Result<(), Halt> {
+    let need = sorted_union_len(a, b);
+    if need > scratch.capacity() {
+        let old_bytes = scratch
+            .capacity()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(Halt::Memory(usize::MAX))?;
+        let new_bytes = need
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(Halt::Memory(usize::MAX))?;
+        // Pre-admit full replacement buffer while the old buffer is still live and charged.
+        debit.add(new_bytes)?;
+        let mut next = Vec::with_capacity(need);
+        let actual_new = next
+            .capacity()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(Halt::Memory(usize::MAX))?;
+        if actual_new > new_bytes {
+            debit.add(actual_new - new_bytes)?;
+        }
+        write_sorted_union(a, b, &mut next);
+        let old = std::mem::replace(scratch, next);
+        drop(old);
+        debit.sub(old_bytes);
+    } else {
+        write_sorted_union(a, b, scratch);
+    }
+    Ok(())
+}
+
+/// Strictly pre-admitted transitive closure of raw subsumer rows `subs[0..n]` and `top`
+/// (with cooperative `stop()` polling and full moving-reallocation + swap-overlap admission).
+///
+/// On success, every `subs[i].1` is sorted, deduplicated, and transitively closed (including
+/// `top`), `subs[i].0` reflects unsatisfiability through any reached class or `top`, and
+/// the returned `Vec<u32>` is the closed row of `owl:Thing`. Net capacity growth on `subs`
+/// and the capacity of the returned `top` vector remain charged in `budget` on return.
+pub(super) fn close_rows_admitted(
+    subs: &mut [(bool, Vec<u32>)],
+    top: &[u32],
+    stop: &(dyn Fn() -> bool + Sync),
+    budget: &(dyn Fn(isize) -> Result<(), usize> + Sync),
+) -> Result<Vec<u32>, Halt> {
+    let n = subs.len();
+    if n > MAX_CLASS_COUNT {
+        return Err(Halt::Memory(usize::MAX));
+    }
+    let mut tarjan_debit = BudgetDebit::new(budget);
+    let tarjan_bytes = n
+        .checked_mul(
+            3 * std::mem::size_of::<u32>()
+                + std::mem::size_of::<bool>()
+                + std::mem::size_of::<u32>()
+                + std::mem::size_of::<(u32, usize)>(),
+        )
+        .ok_or(Halt::Memory(usize::MAX))?;
+    tarjan_debit.add(tarjan_bytes)?;
+    let mut index = vec![NONE; n];
+    let mut low = vec![0u32; n];
+    let mut on = vec![false; n];
+    let mut stack: Vec<u32> = Vec::with_capacity(n);
+    let mut calls: Vec<(u32, usize)> = Vec::with_capacity(n);
+
+    let mut comp_debit = BudgetDebit::new(budget);
+    let comp_hdr_bytes = n
+        .checked_mul(std::mem::size_of::<u32>() + std::mem::size_of::<Vec<u32>>())
+        .ok_or(Halt::Memory(usize::MAX))?;
+    comp_debit.add(comp_hdr_bytes)?;
+    let mut comp = vec![NONE; n];
+    let mut comps: Vec<Vec<u32>> = Vec::with_capacity(n);
+
+    let mut next = 0u32;
+    let mut ops = 0usize;
+    for root in 0..n {
+        ops += 1;
+        if ops.is_multiple_of(POLL_EVERY) && stop() {
+            return Err(Halt::Stopped);
+        }
+        if index[root] != NONE {
+            continue;
+        }
+        calls.clear();
+        calls.push((root as u32, 0));
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root as u32);
+        on[root] = true;
+        while let Some(&mut (v, ref mut e)) = calls.last_mut() {
+            ops += 1;
+            if ops.is_multiple_of(POLL_EVERY) && stop() {
+                return Err(Halt::Stopped);
+            }
+            let vu = v as usize;
+            if let Some(&w) = subs[vu].1.get(*e) {
+                *e += 1;
+                let wu = w as usize;
+                if index[wu] == NONE {
+                    index[wu] = next;
+                    low[wu] = next;
+                    next += 1;
+                    stack.push(w);
+                    on[wu] = true;
+                    calls.push((w, 0));
+                } else if on[wu] {
+                    low[vu] = low[vu].min(index[wu]);
+                }
+                continue;
+            }
+            calls.pop();
+            if let Some(&(p, _)) = calls.last() {
+                low[p as usize] = low[p as usize].min(low[vu]);
+            }
+            if low[vu] == index[vu] {
+                let id = comps.len() as u32;
+                let start_pos = stack
+                    .iter()
+                    .rposition(|&w| w == v)
+                    .expect("SCC root on stack");
+                let count = stack.len() - start_pos;
+                let mem_bytes = count
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or(Halt::Memory(usize::MAX))?;
+                comp_debit.add(mem_bytes)?;
+                let mut members = Vec::with_capacity(count);
+                for w in stack.drain(start_pos..) {
+                    on[w as usize] = false;
+                    comp[w as usize] = id;
+                    members.push(w);
+                }
+                let actual = members.capacity() * std::mem::size_of::<u32>();
+                if actual > mem_bytes {
+                    comp_debit.add(actual - mem_bytes)?;
+                }
+                comps.push(members);
+            }
+        }
+    }
+    drop((index, low, on, stack, calls));
+    drop(tarjan_debit);
+
+    let mut rows_debit = BudgetDebit::new(budget);
+    let rows_hdr_bytes = comps
+        .len()
+        .checked_mul(std::mem::size_of::<(bool, Vec<u32>)>() + std::mem::size_of::<u32>())
+        .ok_or(Halt::Memory(usize::MAX))?;
+    rows_debit.add(rows_hdr_bytes)?;
+    let mut rows: Vec<(bool, Vec<u32>)> = Vec::with_capacity(comps.len());
+    let mut seen = vec![NONE; comps.len()];
+    let mut scratch_debit = BudgetDebit::new(budget);
+    let mut scratch: Vec<u32> = Vec::new();
+    let mut row_debit = BudgetDebit::new(budget);
+    let mut row: Vec<u32> = Vec::new();
+
+    for members in &comps {
+        ops += 1;
+        if ops.is_multiple_of(POLL_EVERY) && stop() {
+            return Err(Halt::Stopped);
+        }
+        let id = rows.len() as u32;
+        let mut unsat = false;
+        let init_bytes = members
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(Halt::Memory(usize::MAX))?;
+        row_debit.add(init_bytes)?;
+        row = Vec::with_capacity(members.len());
+        row.extend_from_slice(members);
+        row.sort_unstable();
+        let actual_init = row.capacity() * std::mem::size_of::<u32>();
+        if actual_init > init_bytes {
+            row_debit.add(actual_init - init_bytes)?;
+        }
+        for &m in members {
+            unsat |= subs[m as usize].0;
+            for &w in &subs[m as usize].1 {
+                ops += 1;
+                if ops.is_multiple_of(POLL_EVERY) && stop() {
+                    return Err(Halt::Stopped);
+                }
+                let c = comp[w as usize];
+                if c == id || seen[c as usize] == id {
+                    continue;
+                }
+                seen[c as usize] = id;
+                let (u, other) = &rows[c as usize];
+                unsat |= *u;
+                merge_into_admitted(&row, other, &mut scratch, &mut scratch_debit)?;
+                std::mem::swap(&mut row, &mut scratch);
+                std::mem::swap(&mut row_debit.bytes, &mut scratch_debit.bytes);
+            }
+        }
+        let moved_bytes = row.capacity() * std::mem::size_of::<u32>();
+        let finalized = std::mem::take(&mut row);
+        row_debit.transfer(moved_bytes);
+        rows_debit.bytes = rows_debit.bytes.saturating_add(moved_bytes);
+        rows.push((unsat, finalized));
+    }
+    drop(row);
+    drop(row_debit);
+
+    // Close owl:Thing's row against all component rows.
+    let mut top_debit = BudgetDebit::new(budget);
+    let top_init_bytes = top
+        .len()
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(Halt::Memory(usize::MAX))?;
+    top_debit.add(top_init_bytes)?;
+    let mut t: Vec<u32> = Vec::with_capacity(top.len());
+    t.extend_from_slice(top);
+    t.sort_unstable();
+    t.dedup();
+    let actual_top_init = t.capacity() * std::mem::size_of::<u32>();
+    if actual_top_init > top_init_bytes {
+        top_debit.add(actual_top_init - top_init_bytes)?;
+    }
+    let mut t_unsat = false;
+    for &p in top {
+        ops += 1;
+        if ops.is_multiple_of(POLL_EVERY) && stop() {
+            return Err(Halt::Stopped);
+        }
+        let (u, r) = &rows[comp[p as usize] as usize];
+        t_unsat |= *u;
+        merge_into_admitted(&t, r, &mut scratch, &mut scratch_debit)?;
+        std::mem::swap(&mut t, &mut scratch);
+        std::mem::swap(&mut top_debit.bytes, &mut scratch_debit.bytes);
+    }
+    drop(scratch);
+    drop(scratch_debit);
+
+    // Replace each slot in `subs` with its final closed row, pre-admitting simultaneous
+    // old+new buffer overlap and crediting the old capacity strictly after drop.
+    for (i, slot) in subs.iter_mut().enumerate() {
+        ops += 1;
+        if ops.is_multiple_of(POLL_EVERY) && stop() {
+            return Err(Halt::Stopped);
+        }
+        let (u, r) = &rows[comp[i] as usize];
+        let need = sorted_union_len(r, &t);
+        let new_bytes = need
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(Halt::Memory(usize::MAX))?;
+        let mut slot_debit = BudgetDebit::new(budget);
+        slot_debit.add(new_bytes)?;
+        let mut new_row = Vec::with_capacity(need);
+        let actual_new = new_row.capacity() * std::mem::size_of::<u32>();
+        if actual_new > new_bytes {
+            slot_debit.add(actual_new - new_bytes)?;
+        }
+        write_sorted_union(r, &t, &mut new_row);
+        let old_bytes = slot.1.capacity() * std::mem::size_of::<u32>();
+        let old = std::mem::replace(slot, (*u || t_unsat, new_row));
+        drop(old);
+        // Transfer new_row's debit to caller (`subs`) and credit old buffer strictly after drop.
+        slot_debit.transfer(actual_new);
+        if old_bytes > 0
+            && let Ok(delta) = isize::try_from(old_bytes)
+        {
+            let _ = budget(-delta);
+        }
+    }
+    drop((rows, seen));
+    drop(rows_debit);
+    drop((comps, comp));
+    drop(comp_debit);
+    // Transfer closed `t`'s exact capacity debit to the caller.
+    let t_bytes = t.capacity() * std::mem::size_of::<u32>();
+    top_debit.transfer(t_bytes);
+    Ok(t)
+}
+
+/// Builds an inconsistent [`Taxonomy`] from sorted original classes with full upfront
+/// pre-admission against `budget`.
+pub(super) fn build_inconsistent(
+    classes: &[Class],
+    threads: usize,
+    stop: &(dyn Fn() -> bool + Sync),
+    budget: &(dyn Fn(isize) -> Result<(), usize> + Sync),
+) -> Result<(Taxonomy, usize), Halt> {
+    if classes.len() > MAX_CLASS_COUNT {
+        return Err(Halt::Memory(usize::MAX));
+    }
+    if stop() {
+        return Err(Halt::Stopped);
+    }
+    let iri_bytes: usize = classes
+        .iter()
+        .try_fold(0usize, |acc, c| acc.checked_add(c.as_str().len()))
+        .ok_or(Halt::Memory(usize::MAX))?;
+    let bottom_len = classes
+        .len()
+        .checked_add(2)
+        .ok_or(Halt::Memory(usize::MAX))?;
+    let bytes = 2usize
+        .checked_mul(std::mem::size_of::<Node>())
+        .and_then(|b| b.checked_add(bottom_len.checked_mul(std::mem::size_of::<Class>())?))
+        .and_then(|b| {
+            b.checked_add(
+                classes
+                    .len()
+                    .checked_mul(std::mem::size_of::<(u32, u32)>())?,
+            )
+        })
+        .and_then(|b| b.checked_add(iri_bytes))
+        .and_then(|b| b.checked_add(vocab::OWL_NOTHING.len() + vocab::OWL_THING.len()))
+        .ok_or(Halt::Memory(usize::MAX))?;
+    let mut debit = BudgetDebit::new(budget);
+    debit.add(bytes)?;
+    let mut bottom = Vec::with_capacity(bottom_len);
+    bottom.push(Class::nothing());
+    bottom.push(Class::thing());
+    let stopped = AtomicBool::new(false);
+    if threads <= 1 || classes.len() < super::MIN_CLASSES {
+        for (i, c) in classes.iter().enumerate() {
+            if i.is_multiple_of(POLL_EVERY) && stop() {
+                return Err(Halt::Stopped);
+            }
+            bottom.push(c.clone());
+        }
+    } else {
+        let active_threads = threads.clamp(1, classes.len().div_ceil(super::MIN_CLASSES).max(1));
+        let chunk_size = classes.len().div_ceil(active_threads);
+        let num_chunks = classes.len().div_ceil(chunk_size);
+        let chunks_bytes = num_chunks
+            .checked_mul(std::mem::size_of::<Vec<Class>>())
+            .and_then(|b| b.checked_add(classes.len().checked_mul(std::mem::size_of::<Class>())?))
+            .ok_or(Halt::Memory(usize::MAX))?;
+        let mut chunks_debit = BudgetDebit::new(budget);
+        chunks_debit.add(chunks_bytes)?;
+        let chunks = super::par_map(classes, threads, super::MIN_CLASSES, |_, chunk| {
+            let mut out = Vec::with_capacity(chunk.len());
+            for (i, c) in chunk.iter().enumerate() {
+                if i.is_multiple_of(POLL_EVERY) && (stopped.load(Ordering::Relaxed) || stop()) {
+                    stopped.store(true, Ordering::Relaxed);
+                    return out;
+                }
+                out.push(c.clone());
+            }
+            out
+        });
+        if stopped.load(Ordering::Relaxed) {
+            drop(chunks);
+            drop(chunks_debit);
+            return Err(Halt::Stopped);
+        }
+        for chunk in chunks {
+            bottom.extend(chunk);
+        }
+        drop(chunks_debit);
+    }
+    let mut at = Vec::with_capacity(classes.len());
+    for i in 0..classes.len() {
+        at.push((BOTTOM_NODE as u32, (i + 2) as u32));
+    }
+    let nodes = vec![
+        Node {
+            classes: Vec::new(),
+            parents: Vec::new(),
+            children: Vec::new(),
+        },
+        Node {
+            classes: bottom,
+            parents: Vec::new(),
+            children: Vec::new(),
+        },
+    ];
+    debit.transfer(bytes);
+    Ok((Taxonomy { nodes, at }, bytes))
+}
+
+/// Exact retained heap bytes of a built [`Taxonomy`].
+pub(super) fn taxonomy_owned_bytes(t: &Taxonomy) -> usize {
+    let mut bytes = t.nodes.capacity() * std::mem::size_of::<Node>()
+        + t.at.capacity() * std::mem::size_of::<(u32, u32)>();
+    for n in &t.nodes {
+        bytes = bytes
+            .saturating_add(n.classes.capacity() * std::mem::size_of::<Class>())
+            .saturating_add(n.parents.capacity() * std::mem::size_of::<usize>())
+            .saturating_add(n.children.capacity() * std::mem::size_of::<usize>());
+        for c in &n.classes {
+            bytes = bytes.saturating_add(c.as_str().len());
+        }
+    }
+    bytes
+}
+
+/// Builds a consistent [`Taxonomy`] from sorted original classes and closed subsumer rows
+/// (`subs[0..n]`, `top`), pre-admitting every working buffer, hash table growth, parent
+/// vector, and child link against `budget` before allocation.
+pub(super) fn build_from_rows(
+    classes: &[Class],
+    subs: &[(bool, Vec<u32>)],
+    top: &[u32],
+    threads: usize,
+    stop: &(dyn Fn() -> bool + Sync),
+    budget: &(dyn Fn(isize) -> Result<(), usize> + Sync),
+) -> Result<(Taxonomy, usize), Halt> {
+    let n = classes.len();
+    debug_assert_eq!(n, subs.len());
+    if n > MAX_CLASS_COUNT {
+        return Err(Halt::Memory(usize::MAX));
+    }
+    let threads = threads.max(1);
+    let stopped = AtomicBool::new(false);
+    let halt = |i: usize| {
+        if i.is_multiple_of(POLL_EVERY) && (stopped.load(Ordering::Relaxed) || stop()) {
+            stopped.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
+    };
+    let mut scratch = BudgetDebit::new(budget);
+    // Pre-admit `at_top`, `key`, `at_bottom`.
+    let eq_bytes = n
+        .checked_mul(2 * std::mem::size_of::<bool>() + std::mem::size_of::<u32>())
+        .ok_or(Halt::Memory(usize::MAX))?;
+    scratch.add(eq_bytes)?;
+    let mut at_top = vec![false; n];
+    for &p in top {
+        at_top[p as usize] = true;
+    }
+    let has = |a: u32, b: u32| a == b || subs[a as usize].1.binary_search(&b).is_ok();
+    let mut key: Vec<u32> = vec![NONE; n];
+    // Direct parallel chunking over `key` (zero auxiliary `work` vector).
+    let key_workers = threads.min(n.div_ceil(super::MIN_CLASSES).max(1));
+    if key_workers <= 1 {
+        for (i, slot) in key.iter_mut().enumerate() {
+            if halt(i) {
+                return Err(Halt::Stopped);
+            }
+            let i32 = i as u32;
+            let (unsat, s) = &subs[i];
+            if *unsat || at_top[i] {
+                continue;
+            }
+            *slot = s
+                .iter()
+                .copied()
+                .find(|&b| has(b, i32))
+                .unwrap_or(i32)
+                .min(i32);
+        }
+    } else {
+        let chunk_len = n.div_ceil(key_workers);
+        std::thread::scope(|scope| {
+            for (ci, chunk) in key.chunks_mut(chunk_len).enumerate() {
+                let start = ci * chunk_len;
+                let at_top = &at_top;
+                let stopped = &stopped;
+                scope.spawn(move || {
+                    for (j, slot) in chunk.iter_mut().enumerate() {
+                        if halt(j) {
+                            return;
+                        }
+                        let i = start + j;
+                        let i32 = i as u32;
+                        let (unsat, s) = &subs[i];
+                        if *unsat || at_top[i] {
+                            continue;
+                        }
+                        *slot = s
+                            .iter()
+                            .copied()
+                            .find(|&b| has(b, i32))
+                            .unwrap_or(i32)
+                            .min(i32);
+                    }
+                    let _ = stopped;
+                });
+            }
+        });
+    }
+    if stopped.load(Ordering::Relaxed) {
+        return Err(Halt::Stopped);
+    }
+    let mut at_bottom: Vec<bool> = Vec::with_capacity(n);
+    for (i, s) in subs.iter().enumerate() {
+        if halt(i) {
+            return Err(Halt::Stopped);
+        }
+        at_bottom.push(s.0);
+    }
+    for i in 0..n {
+        let r = key[i] as usize;
+        if key[i] == NONE || r == i {
+            continue;
+        }
+        if at_bottom[r] {
+            at_bottom[i] = true;
+            key[i] = NONE;
+        } else if at_top[r] {
+            at_top[i] = true;
+            key[i] = NONE;
+        }
+    }
+
+    // Count distinct representatives first so `size` and `reps` allocate exact capacity once.
+    let rep_count = (0..n)
+        .filter(|&i| !at_bottom[i] && !at_top[i] && key[i] == i as u32)
+        .count();
+    let node_count = rep_count + 2;
+    let sum = n.checked_add(2).ok_or(Halt::Memory(usize::MAX))?;
+
+    let mut tax_debit = BudgetDebit::new(budget);
+    let at_bytes = n
+        .checked_mul(std::mem::size_of::<(u32, u32)>())
+        .ok_or(Halt::Memory(usize::MAX))?;
+    tax_debit.add(at_bytes)?;
+    let mut at: Vec<(u32, u32)> = vec![(0, 0); n];
+
+    let layout_bytes = n
+        .checked_mul(std::mem::size_of::<u32>())
+        .and_then(|b| b.checked_add(node_count.checked_mul(std::mem::size_of::<u32>())?))
+        .and_then(|b| b.checked_add(rep_count.checked_mul(std::mem::size_of::<u32>())?))
+        .and_then(|b| b.checked_add((node_count + 1).checked_mul(std::mem::size_of::<usize>())?))
+        .and_then(|b| b.checked_add(sum.checked_mul(std::mem::size_of::<u32>())?))
+        .ok_or(Halt::Memory(usize::MAX))?;
+    scratch.add(layout_bytes)?;
+    let mut node_of: Vec<u32> = vec![NONE; n];
+    let mut size: Vec<u32> = Vec::with_capacity(node_count);
+    size.push(1);
+    size.push(1);
+    let mut reps: Vec<u32> = Vec::with_capacity(rep_count);
+    for i in 0..n {
+        let node = if at_bottom[i] {
+            BOTTOM_NODE as u32
+        } else if at_top[i] {
+            TOP_NODE as u32
+        } else if key[i] == i as u32 {
+            reps.push(i as u32);
+            size.push(0);
+            node_of[i] = (size.len() - 1) as u32;
+            node_of[i]
+        } else {
+            node_of[i] = node_of[key[i] as usize];
+            node_of[i]
+        };
+        at[i] = (node, size[node as usize]);
+        size[node as usize] += 1;
+    }
+    let mut start: Vec<usize> = Vec::with_capacity(node_count + 1);
+    let mut off = 0usize;
+    for &z in &size {
+        start.push(off);
+        off += z as usize;
+    }
+    start.push(off);
+    let mut members: Vec<u32> = vec![NONE; sum];
+    members[start[TOP_NODE]] = THING;
+    members[start[BOTTOM_NODE]] = NOTHING;
+    for (i, &(node, slot)) in at.iter().enumerate() {
+        members[start[node as usize] + slot as usize] = i as u32;
+    }
+
+    // Pre-admit `nodes` + class vectors + IRI copies.
+    let iri_bytes: usize = classes
+        .iter()
+        .try_fold(0usize, |acc, c| acc.checked_add(c.as_str().len()))
+        .ok_or(Halt::Memory(usize::MAX))?;
+    let nodes_bytes = node_count
+        .checked_mul(std::mem::size_of::<Node>())
+        .and_then(|b| b.checked_add(sum.checked_mul(std::mem::size_of::<Class>())?))
+        .and_then(|b| b.checked_add(iri_bytes))
+        .and_then(|b| b.checked_add(vocab::OWL_THING.len() + vocab::OWL_NOTHING.len()))
+        .ok_or(Halt::Memory(usize::MAX))?;
+    tax_debit.add(nodes_bytes)?;
+    let mut nodes: Vec<Node> = Vec::with_capacity(node_count);
+    for j in 0..node_count {
+        if halt(j) {
+            return Err(Halt::Stopped);
+        }
+        let slice = &members[start[j]..start[j + 1]];
+        let mut cls = Vec::with_capacity(slice.len());
+        for &i in slice {
+            cls.push(match i {
+                THING => Class::thing(),
+                NOTHING => Class::nothing(),
+                i => classes[i as usize].clone(),
+            });
+        }
+        nodes.push(Node {
+            classes: cls,
+            parents: Vec::new(),
+            children: Vec::new(),
+        });
+    }
+    drop((members, start, size, at_top, at_bottom));
+    // Credit back released layout arrays (`at_top`, `at_bottom`, `size`, `start`, `members`).
+    let freed_layout = n
+        .saturating_mul(2 * std::mem::size_of::<bool>())
+        .saturating_add(node_count.saturating_mul(std::mem::size_of::<u32>()))
+        .saturating_add((node_count + 1).saturating_mul(std::mem::size_of::<usize>()))
+        .saturating_add(sum.saturating_mul(std::mem::size_of::<u32>()));
+    scratch.sub(freed_layout);
+
+    // Pre-admit `parents` outer header and per-worker fixed-capacity scratch buffers
+    // (`cands` and `direct`) up front before spawning workers.
+    let parents_hdr_bytes = reps
+        .len()
+        .checked_mul(std::mem::size_of::<Vec<usize>>())
+        .ok_or(Halt::Memory(usize::MAX))?;
+    let mut parents_hdr_debit = BudgetDebit::new(budget);
+    parents_hdr_debit.add(parents_hdr_bytes)?;
+    let mut parents: Vec<Vec<usize>> = Vec::with_capacity(reps.len());
+    parents.resize_with(reps.len(), Vec::new);
+
+    let max_sub = reps
+        .iter()
+        .map(|&r| subs[r as usize].1.len())
+        .max()
+        .unwrap_or(0);
+    let active_workers = threads.min(reps.len().div_ceil(super::MIN_CLASSES).max(1));
+    let direct_cap = (GREEDY_MAX + 1).min(max_sub);
+    let worker_buf_bytes = max_sub
+        .checked_add(direct_cap)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<u32>()))
+        .and_then(|n| n.checked_mul(active_workers))
+        .ok_or(Halt::Memory(usize::MAX))?;
+    let mut worker_buf_debit = BudgetDebit::new(budget);
+    worker_buf_debit.add(worker_buf_bytes)?;
+
+    let mem_fail = std::sync::atomic::AtomicUsize::new(0);
+    let has_mem_fail = AtomicBool::new(false);
+    let parent_out_bytes = std::sync::atomic::AtomicUsize::new(0);
+
+    let run_chunk = |rep_chunk: &[u32], parent_chunk: &mut [Vec<usize>]| {
+        let mut cands: Vec<u32> = Vec::with_capacity(max_sub);
+        let mut direct: Vec<u32> = Vec::with_capacity(direct_cap);
+        for (j, (&r, slot)) in rep_chunk.iter().zip(parent_chunk.iter_mut()).enumerate() {
+            if halt(j) || has_mem_fail.load(Ordering::Relaxed) {
+                return;
+            }
+            cands.clear();
+            for &b in &subs[r as usize].1 {
+                let g = key[b as usize];
+                if g != NONE && g != r {
+                    cands.push(g);
+                }
+            }
+            cands.sort_unstable();
+            cands.dedup();
+            // Zero-allocation in-place sort by descending subsumer count.
+            cands.sort_unstable_by_key(|&g| (std::cmp::Reverse(subs[g as usize].1.len()), g));
+            direct.clear();
+            for &g in &cands {
+                if direct.iter().any(|&d| has(d, g)) {
+                    continue;
+                }
+                direct.retain(|&d| !has(g, d));
+                direct.push(g);
+                if direct.len() > GREEDY_MAX {
+                    break;
+                }
+            }
+            let wide = direct.len() > GREEDY_MAX;
+            if wide {
+                // Wide-row path: strict duplicate-bypass `covered` admission + in-place
+                // `cands.retain` compaction (zero replacement `direct` allocation).
+                let mut covered: FxHashSet<u32> = FxHashSet::default();
+                let mut covered_debit = BudgetDebit::new(budget);
+                let mut inner_ops = 0usize;
+                for &d in &cands {
+                    for &b in &subs[d as usize].1 {
+                        inner_ops += 1;
+                        if inner_ops.is_multiple_of(POLL_EVERY)
+                            && (has_mem_fail.load(Ordering::Relaxed)
+                                || stopped.load(Ordering::Relaxed)
+                                || stop())
+                        {
+                            stopped.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                        let kb = key[b as usize];
+                        if kb == NONE || kb == d {
+                            continue;
+                        }
+                        // Duplicate bypass: NEVER call `covered.insert(kb)` on duplicates
+                        // (hashbrown reserves before lookup on a full table).
+                        if covered.contains(&kb) {
+                            continue;
+                        }
+                        if covered.len() < covered.capacity() {
+                            covered.insert(kb);
+                            continue;
+                        }
+                        let Some(need) = super::dl_clause::next_hash_table_bytes(
+                            covered.capacity(),
+                            std::mem::size_of::<u32>(),
+                        ) else {
+                            mem_fail.store(usize::MAX, Ordering::Relaxed);
+                            has_mem_fail.store(true, Ordering::Relaxed);
+                            stopped.store(true, Ordering::Relaxed);
+                            return;
+                        };
+                        let old_live = super::dl_clause::hash_table_bytes(
+                            covered.capacity(),
+                            std::mem::size_of::<u32>(),
+                        );
+                        if let Err(Halt::Memory(used)) = covered_debit.add(need) {
+                            mem_fail.store(used, Ordering::Relaxed);
+                            has_mem_fail.store(true, Ordering::Relaxed);
+                            stopped.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                        covered.insert(kb);
+                        let new_live = super::dl_clause::hash_table_bytes(
+                            covered.capacity(),
+                            std::mem::size_of::<u32>(),
+                        );
+                        let refund = old_live.saturating_add(need).saturating_sub(new_live);
+                        if refund > 0 {
+                            covered_debit.sub(refund);
+                        }
+                    }
+                }
+                direct.clear();
+                cands.retain(|g| !covered.contains(g));
+                drop(covered);
+                drop(covered_debit);
+            }
+            let src: &[u32] = if wide { &cands } else { &direct };
+            let out_len = src.len().max(1);
+            let Some(out_bytes) = out_len.checked_mul(std::mem::size_of::<usize>()) else {
+                mem_fail.store(usize::MAX, Ordering::Relaxed);
+                has_mem_fail.store(true, Ordering::Relaxed);
+                stopped.store(true, Ordering::Relaxed);
+                return;
+            };
+            let Ok(delta) = isize::try_from(out_bytes) else {
+                mem_fail.store(usize::MAX, Ordering::Relaxed);
+                has_mem_fail.store(true, Ordering::Relaxed);
+                stopped.store(true, Ordering::Relaxed);
+                return;
+            };
+            if let Err(used) = budget(delta) {
+                mem_fail.store(used, Ordering::Relaxed);
+                has_mem_fail.store(true, Ordering::Relaxed);
+                stopped.store(true, Ordering::Relaxed);
+                return;
+            }
+            parent_out_bytes.fetch_add(out_bytes, Ordering::Relaxed);
+            let mut out = Vec::with_capacity(out_len);
+            if src.is_empty() {
+                out.push(TOP_NODE);
+            } else {
+                for &g in src {
+                    out.push(node_of[g as usize] as usize);
+                }
+                out.sort_unstable();
+            }
+            *slot = out;
+        }
+    };
+
+    if !reps.is_empty() {
+        if active_workers <= 1 {
+            run_chunk(&reps, &mut parents);
+        } else {
+            let chunk_len = reps.len().div_ceil(active_workers);
+            std::thread::scope(|scope| {
+                for (rep_chunk, parent_chunk) in
+                    reps.chunks(chunk_len).zip(parents.chunks_mut(chunk_len))
+                {
+                    let run_chunk = &run_chunk;
+                    scope.spawn(move || run_chunk(rep_chunk, parent_chunk));
+                }
+            });
+        }
+    }
+    drop(worker_buf_debit);
+    // Attach parent output vectors' debit to `tax_debit` so any error return releases them.
+    tax_debit.bytes = tax_debit
+        .bytes
+        .saturating_add(parent_out_bytes.load(Ordering::Relaxed));
+
+    if has_mem_fail.load(Ordering::Relaxed) {
+        return Err(Halt::Memory(mem_fail.load(Ordering::Relaxed)));
+    }
+    if stopped.load(Ordering::Relaxed) {
+        return Err(Halt::Stopped);
+    }
+
+    drop((key, node_of, reps));
+    drop(scratch);
+
+    // Pre-admit `fan_in` scratch + all `node.children` link capacities.
+    let links: usize = parents.iter().map(|ps| ps.len()).sum();
+    let fan_in_bytes = nodes
+        .len()
+        .checked_mul(std::mem::size_of::<usize>())
+        .ok_or(Halt::Memory(usize::MAX))?;
+    let children_bytes = links
+        .checked_mul(std::mem::size_of::<usize>())
+        .ok_or(Halt::Memory(usize::MAX))?;
+    let mut fan_in_debit = BudgetDebit::new(budget);
+    fan_in_debit.add(fan_in_bytes)?;
+    tax_debit.add(children_bytes)?;
+
+    let mut fan_in = vec![0usize; nodes.len()];
+    for ps in &parents {
+        for &p in ps {
+            fan_in[p] += 1;
+        }
+    }
+    for (node, k) in nodes.iter_mut().zip(fan_in) {
+        node.children.reserve_exact(k);
+    }
+    drop(fan_in_debit);
+    for (j, ps) in parents.into_iter().enumerate() {
+        for &p in &ps {
+            nodes[p].children.push(j + 2);
+        }
+        nodes[j + 2].parents = ps;
+    }
+    drop(parents_hdr_debit);
+
+    let tax = Taxonomy { nodes, at };
+    let owned = taxonomy_owned_bytes(&tax);
+    // Settle any minor capacity discrepancy between exact `owned` and `tax_debit.bytes`.
+    if owned > tax_debit.bytes {
+        tax_debit.add(owned - tax_debit.bytes)?;
+    } else if tax_debit.bytes > owned {
+        tax_debit.sub(tax_debit.bytes - owned);
+    }
+    tax_debit.transfer(owned);
+    Ok((tax, owned))
 }
 
 #[cfg(test)]

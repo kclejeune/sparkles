@@ -308,6 +308,8 @@ pub struct Interner {
     /// the id of each name in [`Interner::roles`], by [`role_hash`], so that an object
     /// property is looked up without a copy of its IRI
     role_ids: hashbrown::HashTable<Role>,
+    /// owned heap IRI bytes across `RoleName::Object`, `RoleName::Data`, and `RoleName::Inverse`
+    role_name_bytes: usize,
     fresh: u32,
     /// the fresh classes of the Horn normalization
     fresh_classes: u32,
@@ -497,11 +499,21 @@ fn next_value_capacity(len: usize, capacity: usize) -> Option<usize> {
 }
 
 impl Interner {
+    /// Bytes allocated by [`Interner::ensure_top_bottom`] (`nodes` initial capacity 4 × 40).
+    pub const EMPTY_INIT_BYTES: usize = 4 * 40;
+
     pub fn new() -> Interner {
         let mut i = Interner::default();
-        i.node(Node::Top);
-        i.node(Node::Bottom);
+        i.ensure_top_bottom();
         i
+    }
+
+    /// Initialises `Node::Top` and `Node::Bottom` on a zero-allocation default interner.
+    pub fn ensure_top_bottom(&mut self) {
+        if self.nodes.is_empty() {
+            self.node(Node::Top);
+            self.node(Node::Bottom);
+        }
     }
 
     /// The interner of a chunk of a parallel normalization, with the datatype
@@ -574,6 +586,7 @@ impl Interner {
             + self.individuals.name_bytes()
             + self.individual_nodes.capacity() * 4
             + self.roles.capacity() * 48
+            + self.role_name_bytes
             + self.ands.len() * 80
             + self.and_ops * 4
             + self.scope_bytes()
@@ -1022,6 +1035,12 @@ impl Interner {
         }
         let id = self.roles.len() as Role;
         let h = role_hash(&r);
+        let name_len = match &r {
+            RoleName::Object(p) | RoleName::Inverse(p) => p.as_str().len(),
+            RoleName::Data(p) => p.as_str().len(),
+            RoleName::Fresh(_) => 0,
+        };
+        self.role_name_bytes = self.role_name_bytes.saturating_add(name_len);
         self.roles.push(r);
         let roles = &self.roles;
         self.role_ids

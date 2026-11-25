@@ -733,14 +733,14 @@ struct Slot {
 /// Owns the estimate reported for a world's private state.
 struct WorldDebit<'a> {
     reporter: Reporter<'a>,
-    reported: usize,
+    reported: Cell<usize>,
 }
 
 impl Drop for WorldDebit<'_> {
     fn drop(&mut self) {
         match self.reporter {
             Reporter::Callback(_) => {}
-            Reporter::NamedDomain(budget) => budget.retire(self.reported as isize),
+            Reporter::NamedDomain(budget) => budget.retire(self.reported.get() as isize),
         }
     }
 }
@@ -764,7 +764,7 @@ pub struct World<'a> {
     /// the facts of universal roles that hold in this world alone
     universal: Vec<Ex>,
     /// the bytes of the copies, the slots and the stored conclusions
-    held: usize,
+    held: Cell<usize>,
     /// the messages waiting in the slots' to-do lists
     waiting: usize,
     applied: usize,
@@ -838,32 +838,97 @@ impl WorldSink<'_> {
     }
 }
 
+/// RAII guard for an in-flight positive delta reported to a world's `bound` callback.
+/// Retires `-delta` on refusal OR callback panic so `WorldBudget.held` never leaks.
+struct WorldDeltaGuard<'b> {
+    bound: &'b (dyn Fn(isize) -> bool + Sync),
+    delta: isize,
+}
+
+impl Drop for WorldDeltaGuard<'_> {
+    fn drop(&mut self) {
+        if self.delta != 0 {
+            let back = std::mem::take(&mut self.delta);
+            (self.bound)(-back);
+        }
+    }
+}
+
+/// Flushes an activation's retained `data_growth` into `World::{held, reported}` and
+/// refunds buffered message charges on BOTH normal activation exit and panic unwind.
+///
+/// Order is explicit: `data_growth` transfers to `held`/`reported` BEFORE calling
+/// `(self.bound)(-charged)` so that if the negative message-refund call itself panics on
+/// cancellation, `World::drop` still releases earlier retained local debits cleanly.
+struct ActivationFlushGuard<'a> {
+    held: &'a Cell<usize>,
+    reported: &'a Cell<usize>,
+    bound: &'a (dyn Fn(isize) -> bool + Sync),
+    data_growth: &'a Cell<isize>,
+    charged: &'a Cell<isize>,
+}
+
+impl Drop for ActivationFlushGuard<'_> {
+    fn drop(&mut self) {
+        let dg = self.data_growth.replace(0);
+        if dg != 0 {
+            self.held.set(self.held.get().saturating_add_signed(dg));
+            self.reported
+                .set(self.reported.get().saturating_add_signed(dg));
+        }
+        let ch = self.charged.replace(0);
+        if ch != 0 {
+            (self.bound)(-ch);
+        }
+    }
+}
+
 impl Sink for WorldSink<'_> {
     fn reserve_data(&mut self, bytes: usize) -> bool {
         if self.halted.get() {
             return false;
         }
         let Ok(add) = isize::try_from(bytes) else {
-            self.data_overflow();
+            self.speculative_overflow();
             return false;
         };
         let Some(next) = self.data_growth.get().checked_add(add) else {
-            self.data_overflow();
+            self.speculative_overflow();
             return false;
         };
         #[cfg(test)]
         if add > 0 {
             super::admission_test::hit(super::admission_test::Point::WorldDataReserve);
         }
-        let ok = self.reporter.tell_owned(add, || self.data_growth.set(next));
-        if !ok {
-            self.data_growth.set(next - add);
-            self.reporter.retire(add);
-            self.halted.set(true);
-        }
+        let ok = match self.reporter {
+            Reporter::Callback(bound) => {
+                let mut in_flight = WorldDeltaGuard { bound, delta: add };
+                let ok = bound(add);
+                if ok {
+                    in_flight.delta = 0;
+                    self.data_growth.set(next);
+                } else {
+                    self.halted.set(true);
+                }
+                ok
+            }
+            Reporter::NamedDomain(_) => {
+                let ok = self.reporter.tell_owned(add, || self.data_growth.set(next));
+                if !ok {
+                    self.data_growth.set(next - add);
+                    self.reporter.retire(add);
+                    self.halted.set(true);
+                }
+                ok
+            }
+        };
         ok
     }
-    fn data_overflow(&mut self) {
+    fn speculative_overflow(&mut self) {
+        self.halted.set(true);
+        self.overflow.set(true);
+    }
+    fn retained_overflow(&mut self) {
         self.halted.set(true);
         self.overflow.set(true);
     }
@@ -871,7 +936,7 @@ impl Sink for WorldSink<'_> {
     // worlds end
     fn keep_shared(&mut self, bytes: usize) {
         if bytes > isize::MAX as usize {
-            self.data_overflow();
+            self.retained_overflow();
         } else if !self.reporter.tell(bytes as isize) {
             self.halted.set(true);
         }
@@ -893,6 +958,13 @@ impl Sink for WorldSink<'_> {
     fn stopped(&self) -> bool {
         self.halted.get()
     }
+    fn halt_merge(&self) -> bool {
+        false
+    }
+    fn publish_split_stop(&self) -> bool {
+        false
+    }
+    fn wake_split_stop(&mut self) {}
 
     fn top_chain_sub(
         &mut self,
@@ -959,12 +1031,75 @@ impl Sink for WorldSink<'_> {
         }
     }
 
-    fn intern(&mut self, core: &[Ex]) -> Ex {
-        // the global table first, which no world changes, then the world's own
-        match self.dynamic.and_then(|d| d.find(core)) {
-            Some(e) => e,
-            None => self.table.intern(core),
+    fn conjunction(&mut self, core: &[Ex]) -> Option<Ex> {
+        // Global hit first: zero bytes requested.
+        if let Some(e) = self.dynamic.and_then(|d| d.find(core)) {
+            return Some(e);
         }
+        if self.halted.get() {
+            return None;
+        }
+        struct WorldDynamicBudget<'b> {
+            reporter: Reporter<'b>,
+            data_growth: &'b Cell<isize>,
+            halted: &'b Cell<bool>,
+            overflow: &'b Cell<bool>,
+        }
+        impl super::saturate::DynamicBudget for WorldDynamicBudget<'_> {
+            fn admit(&mut self, bytes: usize) -> bool {
+                if self.halted.get() {
+                    return false;
+                }
+                let Ok(add) = isize::try_from(bytes) else {
+                    self.on_overflow();
+                    return false;
+                };
+                let Some(next) = self.data_growth.get().checked_add(add) else {
+                    self.on_overflow();
+                    return false;
+                };
+                match self.reporter {
+                    Reporter::Callback(bound) => {
+                        let mut in_flight = WorldDeltaGuard { bound, delta: add };
+                        let ok = bound(add);
+                        if ok {
+                            in_flight.delta = 0;
+                            self.data_growth.set(next);
+                        } else {
+                            self.halted.set(true);
+                        }
+                        ok
+                    }
+                    Reporter::NamedDomain(_) => {
+                        let ok = self.reporter.tell_owned(add, || self.data_growth.set(next));
+                        if !ok {
+                            self.data_growth.set(next - add);
+                            self.reporter.retire(add);
+                            self.halted.set(true);
+                        }
+                        ok
+                    }
+                }
+            }
+            fn credit(&mut self, bytes: usize) {
+                if bytes > 0 {
+                    let sub = bytes as isize;
+                    self.data_growth.set(self.data_growth.get() - sub);
+                    self.reporter.retire(sub);
+                }
+            }
+            fn on_overflow(&mut self) {
+                self.halted.set(true);
+                self.overflow.set(true);
+            }
+        }
+        let mut budget = WorldDynamicBudget {
+            reporter: self.reporter,
+            data_growth: self.data_growth,
+            halted: self.halted,
+            overflow: self.overflow,
+        };
+        self.table.intern_with_budget(core, &mut budget)
     }
 }
 
@@ -1081,7 +1216,7 @@ impl<'a> World<'a> {
             queue: Vec::new(),
             pending: Vec::new(),
             universal: Vec::new(),
-            held: 0,
+            held: Cell::new(0),
             waiting: 0,
             applied: 0,
             halted: false,
@@ -1090,7 +1225,7 @@ impl<'a> World<'a> {
             retirement_witness: None,
             debit: WorldDebit {
                 reporter,
-                reported: 0,
+                reported: Cell::new(0),
             },
         }
     }
@@ -1099,10 +1234,10 @@ impl<'a> World<'a> {
     /// stops the world when the bound refuses. `busy` counts the messages in the buffers
     /// of the context being processed.
     fn checkpoint(&mut self, busy: usize) {
-        let used = self.held
-            + self.local.bytes()
+        let used = self.held.get()
+            + self.local.unadmitted_bytes()
             + (self.waiting + self.pending.len() + busy) * std::mem::size_of::<(Ex, Concl)>();
-        let delta = used as isize - self.debit.reported as isize;
+        let delta = used as isize - self.debit.reported.get() as isize;
         #[cfg(test)]
         if self.ix.top_chain.is_some() {
             super::admission_test::hit(super::admission_test::Point::TopChainWorldCheckpoint);
@@ -1110,7 +1245,7 @@ impl<'a> World<'a> {
         if !self
             .debit
             .reporter
-            .tell_owned(delta, || self.debit.reported = used)
+            .tell_owned(delta, || self.debit.reported.set(used))
         {
             self.halted = true;
         }
@@ -1134,9 +1269,10 @@ impl<'a> World<'a> {
 
     fn admit_slot(&mut self, to: Ex) {
         let (Some(held), Some(reported)) = (
-            self.held.checked_add(SLOT_BYTES),
+            self.held.get().checked_add(SLOT_BYTES),
             self.debit
                 .reported
+                .get()
                 .checked_add(SLOT_BYTES)
                 .filter(|&total| isize::try_from(total).is_ok()),
         ) else {
@@ -1158,8 +1294,8 @@ impl<'a> World<'a> {
         }
         let real = self.global_real(to);
         self.insert_slot(to, real);
-        self.held = held;
-        self.debit.reported = reported;
+        self.held.set(held);
+        self.debit.reported.set(reported);
         debit.bytes = 0;
     }
 
@@ -1183,7 +1319,7 @@ impl<'a> World<'a> {
                 }
             } else {
                 let real = self.global_real(to);
-                self.held += SLOT_BYTES;
+                self.held.set(self.held.get() + SLOT_BYTES);
                 self.insert_slot(to, real);
             }
         }
@@ -1325,16 +1461,16 @@ impl<'a> World<'a> {
                             return;
                         };
                         // A clone shares numeric payload, but owns every state container.
-                        let reported = self.debit.reported + bytes;
+                        let reported = self.debit.reported.get() + bytes;
                         if !self
                             .debit
                             .reporter
-                            .tell_owned(bytes as isize, || self.debit.reported = reported)
+                            .tell_owned(bytes as isize, || self.debit.reported.set(reported))
                         {
                             self.halted = true;
                             return;
                         }
-                        self.held += bytes;
+                        self.held.set(self.held.get() + bytes);
                         copy = Some(st.clone());
                     });
                     if self.halted {
@@ -1345,7 +1481,7 @@ impl<'a> World<'a> {
                     // the world made it real from the global state already
                     st.real |= real && st.init;
                     if !copied {
-                        self.held += CONTEXT_BYTES;
+                        self.held.set(self.held.get() + CONTEXT_BYTES);
                     }
                     self.checkpoint(todo.len());
                     st
@@ -1360,6 +1496,16 @@ impl<'a> World<'a> {
             // the buffers below
             let grown = Cell::new(0usize);
             {
+                let _flush_guard = match self.debit.reporter {
+                    Reporter::Callback(bound) => Some(ActivationFlushGuard {
+                        held: &self.held,
+                        reported: &self.debit.reported,
+                        bound,
+                        data_growth: &data_growth,
+                        charged: &charged,
+                    }),
+                    Reporter::NamedDomain(_) => None,
+                };
                 let core = self.conjunction_core(e).map(|c| c.to_vec());
                 let mut sink = WorldSink {
                     me: e,
@@ -1394,7 +1540,7 @@ impl<'a> World<'a> {
                 loop {
                     while let Some(c) = sink.local.pop() {
                         if apply(ix, e, &mut st, c, &mut sink) {
-                            self.held += CONCLUSION_BYTES;
+                            self.held.set(self.held.get() + CONCLUSION_BYTES);
                         }
                         self.applied += 1;
                         if data_halted.get() {
@@ -1403,13 +1549,31 @@ impl<'a> World<'a> {
                         if self.applied.is_multiple_of(CHECK_EVERY) {
                             // the sink's charge for the buffers counts as reported, so
                             // that the checkpoint charges the buffers once
-                            self.debit.reported = self
+                            self.debit.reported.set(
+                                self.debit
+                                    .reported
+                                    .get()
+                                    .saturating_add_signed(charged.replace(0)),
+                            );
+                            let busy = sink.local.len() + sink.out.len();
+                            grown.set(busy);
+                            let used = self.held.get()
+                                + self.local.unadmitted_bytes()
+                                + (self.waiting + self.pending.len() + busy)
+                                    * std::mem::size_of::<(Ex, Concl)>();
+                            let delta = used as isize - self.debit.reported.get() as isize;
+                            #[cfg(test)]
+                            if self.ix.top_chain.is_some() {
+                                super::admission_test::hit(
+                                    super::admission_test::Point::TopChainWorldCheckpoint,
+                                );
+                            }
+                            if !self
                                 .debit
-                                .reported
-                                .saturating_add_signed(charged.replace(0));
-                            grown.set(sink.local.len() + sink.out.len());
-                            self.checkpoint(sink.local.len() + sink.out.len());
-                            if self.halted {
+                                .reporter
+                                .tell_owned(delta, || self.debit.reported.set(used))
+                            {
+                                self.halted = true;
                                 break;
                             }
                         }
@@ -1425,23 +1589,26 @@ impl<'a> World<'a> {
                     }
                 }
             }
-            // the messages charged as they were pushed are released here, and the
-            // checkpoint below counts those still waiting
+            // the messages charged as they were pushed are released here (or already
+            // flushed by `_flush_guard` for callback reporters), and the checkpoint below
+            // counts those still waiting
             let top_chain = self.ix.top_chain.is_some();
             if top_chain {
                 // The local work is finished or discarded. The outgoing buffer stays
                 // owned through the checkpoint and moves to pending only on success.
                 drop(local);
-                self.debit.reported = self
-                    .debit
+                self.debit.reported.set(
+                    self.debit
+                        .reported
+                        .get()
+                        .saturating_add_signed(charged.replace(0)),
+                );
+                let data = data_growth.replace(0);
+                self.held.set(self.held.get().saturating_add_signed(data));
+                self.debit
                     .reported
-                    .saturating_add_signed(charged.replace(0));
-            } else if charged.get() != 0 {
-                self.debit.reporter.tell(-charged.get());
+                    .set(self.debit.reported.get().saturating_add_signed(data));
             }
-            let data = data_growth.replace(0);
-            self.held = self.held.saturating_add_signed(data);
-            self.debit.reported = self.debit.reported.saturating_add_signed(data);
             self.halted |= data_halted.get();
             if data_overflow.get() {
                 self.halt_reason = Some(Halt::Memory(usize::MAX));
@@ -1523,16 +1690,20 @@ impl<'a> World<'a> {
         }
         #[cfg(test)]
         if let Some(rules) = &self.ix.top_chain {
-            rules.world_ready(class, self.debit.reported);
+            rules.world_ready(class, self.debit.reported.get());
         }
         #[cfg(test)]
         if let Reporter::NamedDomain(budget) = self.debit.reporter {
-            super::world_retirement_mixed_tests::world_ready(budget, class, self.debit.reported);
+            super::world_retirement_mixed_tests::world_ready(
+                budget,
+                class,
+                self.debit.reported.get(),
+            );
         }
         #[cfg(test)]
         if let Some(witness) = &self.retirement_witness {
             let state = self.slots[&class].st.as_ref().expect("resident COW slot");
-            witness.ready(class, state, &found, self.debit.reported);
+            witness.ready(class, state, &found, self.debit.reported.get());
         }
         // the world's copies go when it does
         Ok(found)
@@ -1544,7 +1715,7 @@ impl Drop for World<'_> {
         match self.debit.reporter {
             Reporter::Callback(bound) => {
                 // Keep the ordinary callback ahead of field destruction, even at zero.
-                bound(-(self.debit.reported as isize));
+                bound(-(self.debit.reported.get() as isize));
             }
             Reporter::NamedDomain(_) => {}
         }
@@ -1690,10 +1861,13 @@ mod numeric_resource_tests {
             real: true,
             ..State::default()
         };
-        world.held = SLOT_BYTES + CONTEXT_BYTES + st.bytes();
+        world.held.set(SLOT_BYTES + CONTEXT_BYTES + st.bytes());
         world.waiting = todo.len();
-        world.debit.reported = world.held + world.waiting * MESSAGE;
-        let setup = world.debit.reported;
+        world
+            .debit
+            .reported
+            .set(world.held.get() + world.waiting * MESSAGE);
+        let setup = world.debit.reported.get();
         assert!(bound(setup as isize));
         world.slots.insert(
             tail,
@@ -1950,7 +2124,7 @@ mod numeric_resource_tests {
             reports.lock().push(delta);
             budget.tell(delta)
         };
-        let mut world = World::new(
+        let world = World::new(
             sat.index.as_ref().unwrap(),
             &sat.ctx,
             None,
@@ -1985,7 +2159,10 @@ mod numeric_resource_tests {
         sink.release_data(16);
         assert_eq!(growth.get(), 16);
         // The activation transfers only its remaining local debit to the world.
-        world.debit.reported += growth.get() as usize;
+        world
+            .debit
+            .reported
+            .set(world.debit.reported.get() + growth.get() as usize);
         drop(world);
         assert_eq!(budget.held.load(Ordering::Relaxed), 32);
         assert_eq!(*reports.lock(), [64, 128, -128, -16, -16]);
@@ -2954,5 +3131,457 @@ mod numeric_resource_tests {
         );
         assert!(world.classify(root).is_ok());
         assert_eq!(held.load(Ordering::Relaxed), 0);
+    }
+
+    /// Astra r12 minor implementation note test: `ActivationFlushGuard::drop` transfers
+    /// `data_growth` to `World::{held, reported}` BEFORE calling `(self.bound)(-charged)`
+    /// to refund buffered messages. With both counters nonzero and a cancellation panic
+    /// armed ONLY for that negative message-refund call, catching the original panic and
+    /// dropping the world must return `WorldBudget.held` to its exact starting balance.
+    #[test]
+    fn activation_flush_guard_drop_transfers_data_growth_before_message_refund_panic() {
+        use super::super::saturate::Totals;
+        use super::super::{Error, Limits, Saturation, WorldBudget};
+        use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct RefundPanic;
+
+        let ax = owner_axioms("SubClassOf(:A :B)");
+        let kinds: Vec<_> = ax.iter().map(|a| &a.kind).collect();
+        let mut sat = Saturation::new();
+        sat.saturate(&kinds, None, &Limits::default()).unwrap();
+
+        let arm_panic = Arc::new(AtomicBool::new(false));
+        let arm_clone = arm_panic.clone();
+        let limits = Limits {
+            cancelled: Some(Arc::new(move || {
+                if arm_clone.load(Ordering::SeqCst) {
+                    panic_any(RefundPanic);
+                }
+                false
+            })),
+            ..Limits::default()
+        };
+        let mut totals = Totals {
+            peak: 4096,
+            paid: 4096,
+            ..Totals::default()
+        };
+        let budget = WorldBudget::start(&limits, None, 4096, &mut totals).unwrap();
+        // Establish a known non-zero starting balance (64 B held outside this world).
+        assert!(budget.tell(64));
+        assert_eq!(budget.held.load(Ordering::Relaxed), 64);
+
+        let bound = |delta: isize| budget.tell(delta);
+        let world = World::new(
+            sat.index.as_ref().unwrap(),
+            &sat.ctx,
+            None,
+            &[],
+            &[],
+            &bound,
+        );
+        let data_growth = Cell::new(0isize);
+        let charged = Cell::new(0isize);
+        // Simulate an activation that admitted 96 B of local data growth AND 48 B of
+        // buffered outgoing messages, both live in `WorldBudget.held`.
+        assert!(bound(96));
+        data_growth.set(96);
+        assert!(bound(48));
+        charged.set(48);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 64 + 96 + 48);
+
+        // Arm the cancellation panic ONLY for the negative message refund on ordinary
+        // activation exit (NOT while already panicking!).
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = ActivationFlushGuard {
+                held: &world.held,
+                reported: &world.reported,
+                bound: &bound,
+                data_growth: &data_growth,
+                charged: &charged,
+            };
+            arm_panic.store(true, Ordering::SeqCst);
+            // Normal scope exit drops `_guard`, which MUST transfer `data_growth` (96)
+            // into `world.{held, reported}` BEFORE calling `(bound)(-48)` which panics
+            // in `WorldBudget::tell`'s cancellation poll (after already subtracting 48
+            // from `budget.held`!).
+        }))
+        .unwrap_err();
+        assert_eq!(
+            caught.downcast_ref::<RefundPanic>(),
+            Some(&RefundPanic),
+            "original refund panic must reach catcher"
+        );
+        // Disarm so drop check verifies clean release (and even armed, unwind skips poll).
+        arm_panic.store(false, Ordering::SeqCst);
+        // `data_growth` (96) must already be in `world.{held, reported}`, while `-48`
+        // already retired from `budget.held` before the panic!
+        assert_eq!(world.held.get(), 96);
+        assert_eq!(world.reported.get(), 96);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 64 + 96);
+
+        drop(world);
+        assert_eq!(
+            budget.held.load(Ordering::Relaxed),
+            64,
+            "dropping world must release the 96 B local debit and return to exact starting balance"
+        );
+        assert_eq!(budget.stopped(), Err(Error::Cancelled));
+    }
+
+    /// Design v12 §4.3.4 / r10 #3 / r11: exercises `WorldSink::conjunction` against the
+    /// production `WorldBudget` across (a) global hit (0 B), (b) local segment-boundary
+    /// refusal restoring `WorldBudget.held` immediately, (c) exact sufficient budget with
+    /// zero double-count at `World::checkpoint`, and (d) panicking `charge` and panicking
+    /// `cancelled` after an earlier successful local insertion in the same activation.
+    #[test]
+    fn world_local_conjunction_accounting_and_unwind_with_production_budget() {
+        use super::super::saturate::Dynamic;
+        use super::super::saturate::Totals;
+        use super::super::{Error, Limits, Saturation, WorldBudget};
+        use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
+        use std::sync::atomic::AtomicUsize;
+
+        let ax = owner_axioms("SubClassOf(:A :B)");
+        let kinds: Vec<_> = ax.iter().map(|a| &a.kind).collect();
+        let mut sat = Saturation::new();
+        sat.saturate(&kinds, None, &Limits::default()).unwrap();
+
+        // (a) Global hit requests 0 bytes even under a refusing bound.
+        let global_dyn = Dynamic::new(100);
+        let global_ex = global_dyn.intern(&[1, 2]);
+        {
+            let limits = Limits {
+                charge: Some(Arc::new(|_| false)),
+                ..Limits::default()
+            };
+            let charge = limits
+                .charge
+                .as_deref()
+                .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+            let mut totals = Totals {
+                peak: 4096,
+                paid: 4096,
+                ..Totals::default()
+            };
+            let budget = WorldBudget::start(&limits, charge, 4096, &mut totals).unwrap();
+            let calls = AtomicUsize::new(0);
+            let bound = |d: isize| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                budget.tell(d)
+            };
+            let world = World::new(
+                sat.index.as_ref().unwrap(),
+                &sat.ctx,
+                Some(&global_dyn),
+                &[],
+                &[],
+                &bound,
+            );
+            let growth = Cell::new(0);
+            let halted = Cell::new(false);
+            let overflow = Cell::new(false);
+            let mut sink = WorldSink {
+                me: 0,
+                local: &mut Vec::new(),
+                out: &mut Vec::new(),
+                bound: &bound,
+                data_growth: &growth,
+                halted: &halted,
+                overflow: &overflow,
+                ctx_len: sat.ctx.len(),
+                dynamic: Some(&global_dyn),
+                table: world.local.clone(),
+                grown: &Cell::new(0),
+                charged: &Cell::new(0),
+            };
+            assert_eq!(sink.conjunction(&[1, 2]), Some(global_ex));
+            assert_eq!(calls.load(Ordering::Relaxed), 0, "global hit requests 0 B");
+            assert_eq!(growth.get(), 0);
+            assert!(!halted.get());
+        }
+
+        // (b) Local segment-boundary miss with refusing budget: zero segment allocation,
+        // zero published ID, restores `WorldBudget.held` immediately back to 64, records
+        // refusal stop & attempted peak, and dropping world releases earlier 64 -> 0.
+        {
+            let limits = Limits {
+                charge: Some(Arc::new(|_| false)),
+                ..Limits::default()
+            };
+            let charge = limits
+                .charge
+                .as_deref()
+                .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+            let mut totals = Totals {
+                peak: 4160,
+                paid: 4160,
+                ..Totals::default()
+            };
+            let budget = WorldBudget::start(&limits, charge, 4096, &mut totals).unwrap();
+            let bound = |d: isize| budget.tell(d);
+            let world = World::new(
+                sat.index.as_ref().unwrap(),
+                &sat.ctx,
+                None,
+                &[],
+                &[],
+                &bound,
+            );
+            assert!(bound(64));
+            world.held.set(64);
+            world.reported.set(64);
+            assert_eq!(budget.held.load(Ordering::Relaxed), 64);
+
+            let growth = Cell::new(0);
+            let halted = Cell::new(false);
+            let overflow = Cell::new(false);
+            let mut sink = WorldSink {
+                me: 0,
+                local: &mut Vec::new(),
+                out: &mut Vec::new(),
+                bound: &bound,
+                data_growth: &growth,
+                halted: &halted,
+                overflow: &overflow,
+                ctx_len: sat.ctx.len(),
+                dynamic: None,
+                table: world.local.clone(),
+                grown: &Cell::new(0),
+                charged: &Cell::new(0),
+            };
+            assert_eq!(sink.conjunction(&[10, 20]), None);
+            assert!(halted.get());
+            assert_eq!(world.local.len(), 0, "refused miss must publish zero ID");
+            assert_eq!(
+                world.local.bytes(),
+                0,
+                "refused miss must allocate zero segment"
+            );
+            assert_eq!(growth.get(), 0);
+            assert_eq!(
+                budget.held.load(Ordering::Relaxed),
+                64,
+                "refused local miss must restore WorldBudget.held back to 64 immediately"
+            );
+            assert!(matches!(budget.stopped(), Err(Error::Memory { used, .. }) if used > 4160));
+            drop(world);
+            assert_eq!(budget.held.load(Ordering::Relaxed), 0);
+        }
+
+        // (c) Local segment-boundary miss with exact sufficient budget: zero double-count
+        // delta at next `World::checkpoint` and exact release on `World::drop`.
+        {
+            let limits = Limits::default();
+            let mut totals = Totals {
+                peak: 4096,
+                paid: 4096,
+                ..Totals::default()
+            };
+            let budget = WorldBudget::start(&limits, None, 4096, &mut totals).unwrap();
+            let bound = |d: isize| budget.tell(d);
+            let world = World::new(
+                sat.index.as_ref().unwrap(),
+                &sat.ctx,
+                None,
+                &[],
+                &[],
+                &bound,
+            );
+            let growth = Cell::new(0);
+            let halted = Cell::new(false);
+            let overflow = Cell::new(false);
+            let charged = Cell::new(0);
+            let id = {
+                let _flush = ActivationFlushGuard {
+                    held: &world.held,
+                    reported: &world.reported,
+                    bound: &bound,
+                    data_growth: &growth,
+                    charged: &charged,
+                };
+                let mut sink = WorldSink {
+                    me: 0,
+                    local: &mut Vec::new(),
+                    out: &mut Vec::new(),
+                    bound: &bound,
+                    data_growth: &growth,
+                    halted: &halted,
+                    overflow: &overflow,
+                    ctx_len: sat.ctx.len(),
+                    dynamic: None,
+                    table: world.local.clone(),
+                    grown: &Cell::new(0),
+                    charged: &charged,
+                };
+                sink.conjunction(&[10, 20]).expect("sufficient budget")
+            };
+            assert!(id >= sat.ctx.len() as u32);
+            let exact_bytes = world.local.bytes();
+            assert!(exact_bytes > 0);
+            assert_eq!(world.local.unadmitted_bytes(), 0);
+            assert_eq!(budget.held.load(Ordering::Relaxed), exact_bytes as isize);
+            assert!(World::checkpoint_fields(
+                &world.held,
+                &world.reported,
+                &world.local,
+                0,
+                0,
+                0,
+                &bound
+            ));
+            assert_eq!(
+                budget.held.load(Ordering::Relaxed),
+                exact_bytes as isize,
+                "checkpoint must not double-count admitted local conjunction bytes"
+            );
+            drop(world);
+            assert_eq!(budget.held.load(Ordering::Relaxed), 0);
+        }
+
+        // (d) Panicking `charge` OR panicking `cancelled` after an earlier successful
+        // local insertion in the same activation: catches original panic, rolls back
+        // in-flight delta, transfers earlier retained insertion via `ActivationFlushGuard`,
+        // releases cleanly on `World::drop` (`held == 0`), and preserves `paid`.
+        #[derive(Debug, PartialEq, Eq)]
+        struct CallbackBoom;
+        for panic_in_charge in [true, false] {
+            let arm = Arc::new(AtomicUsize::new(0));
+            let arm_c = arm.clone();
+            let arm_x = arm.clone();
+            let limits = Limits {
+                charge: Some(Arc::new(move |_| {
+                    if panic_in_charge && arm_c.load(Ordering::SeqCst) == 1 {
+                        panic_any(CallbackBoom);
+                    }
+                    true
+                })),
+                cancelled: Some(Arc::new(move || {
+                    if !panic_in_charge && arm_x.load(Ordering::SeqCst) == 1 {
+                        panic_any(CallbackBoom);
+                    }
+                    false
+                })),
+                ..Limits::default()
+            };
+            let charge = limits
+                .charge
+                .as_deref()
+                .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+            let mut totals = Totals {
+                peak: 4096,
+                paid: 4096,
+                ..Totals::default()
+            };
+            let budget = WorldBudget::start(&limits, charge, 4096, &mut totals).unwrap();
+            let bound = |d: isize| budget.tell(d);
+            let world = World::new(
+                sat.index.as_ref().unwrap(),
+                &sat.ctx,
+                None,
+                &[],
+                &[],
+                &bound,
+            );
+            let growth = Cell::new(0);
+            let halted = Cell::new(false);
+            let overflow = Cell::new(false);
+            let charged = Cell::new(0);
+
+            let first_bytes = Cell::new(0usize);
+            let caught = catch_unwind(AssertUnwindSafe(|| {
+                let _flush = ActivationFlushGuard {
+                    held: &world.held,
+                    reported: &world.reported,
+                    bound: &bound,
+                    data_growth: &growth,
+                    charged: &charged,
+                };
+                let mut sink = WorldSink {
+                    me: 0,
+                    local: &mut Vec::new(),
+                    out: &mut Vec::new(),
+                    bound: &bound,
+                    data_growth: &growth,
+                    halted: &halted,
+                    overflow: &overflow,
+                    ctx_len: sat.ctx.len(),
+                    dynamic: None,
+                    table: world.local.clone(),
+                    grown: &Cell::new(0),
+                    charged: &charged,
+                };
+                // First local insertion succeeds (allocates segment 0 + entry).
+                assert!(sink.conjunction(&[1, 2]).is_some());
+                first_bytes.set(world.local.bytes());
+                // Now arm the callback panic and request a distinct second insertion.
+                arm.store(1, Ordering::SeqCst);
+                let _ = sink.conjunction(&[3, 4]);
+            }))
+            .unwrap_err();
+            assert_eq!(
+                caught.downcast_ref::<CallbackBoom>(),
+                Some(&CallbackBoom),
+                "panic_in_charge={panic_in_charge}: original panic must reach catcher"
+            );
+            budget.finish(&mut totals);
+            assert!(
+                totals.paid >= 4096 + first_bytes.get(),
+                "prior successful pool payment must be preserved in paid ({})",
+                totals.paid
+            );
+            assert_eq!(
+                budget.held.load(Ordering::Relaxed),
+                first_bytes.get() as isize,
+                "in-flight delta must roll back while earlier insertion stays tracked on world"
+            );
+            drop(world);
+            assert_eq!(
+                budget.held.load(Ordering::Relaxed),
+                0,
+                "dropping world must release the earlier retained insertion completely"
+            );
+        }
+
+        // Speculative vs retained overflow both halt and mark overflow on WorldSink.
+        {
+            let bound = |_: isize| true;
+            let world = World::new(
+                sat.index.as_ref().unwrap(),
+                &sat.ctx,
+                None,
+                &[],
+                &[],
+                &bound,
+            );
+            for retained in [false, true] {
+                let halted = Cell::new(false);
+                let overflow = Cell::new(false);
+                let mut sink = WorldSink {
+                    me: 0,
+                    local: &mut Vec::new(),
+                    out: &mut Vec::new(),
+                    bound: &bound,
+                    data_growth: &Cell::new(0),
+                    halted: &halted,
+                    overflow: &overflow,
+                    ctx_len: sat.ctx.len(),
+                    dynamic: None,
+                    table: world.local.clone(),
+                    grown: &Cell::new(0),
+                    charged: &Cell::new(0),
+                };
+                if retained {
+                    sink.retained_overflow();
+                } else {
+                    sink.speculative_overflow();
+                }
+                assert!(halted.get());
+                assert!(overflow.get());
+            }
+        }
     }
 }
