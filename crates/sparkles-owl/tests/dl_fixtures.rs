@@ -329,12 +329,13 @@ fn the_cases_past_the_bound_fall_back_on_every_schedule() {
 /// qualifiers: `tests/fixtures/dl897/generate.py` wrote 300 with its default seed, and
 /// these are the 25 on which a run that gave such a qualifier no name reported an answer
 /// other than HermiT's as complete, with `qz-0202` and `qz-0082`, which finished then and
-/// pass the bound on derived conclusions now. Each of the 25 is taken whole within the
-/// default bound with HermiT's answer, on one thread, four and eight. `qz-0048` stays
-/// within the bound on one thread because a context gives way to the contexts it woke:
-/// the context of `C1` equates six successors under a maximum of three, and the
-/// successors' contexts find that `C0` has no model. The other two fall back on every
-/// schedule to an answer that HermiT entails.
+/// passed the bound once qualifiers were named. Each of the 25 and `qz-0082` (with item
+/// 896's counting refinements) is taken whole within the default bound with HermiT's
+/// answer, on one thread, four and eight. `qz-0048` stays within the bound on one thread
+/// because a context gives way to the contexts it woke: the context of `C1` equates six
+/// successors under a maximum of three, and the successors' contexts find that `C0` has
+/// no model. `qz-0202` still falls back on every schedule to an answer that HermiT
+/// entails.
 #[test]
 fn the_compound_qualifier_cases_give_hermits_answer_within_the_bound() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl897");
@@ -355,7 +356,7 @@ fn the_compound_qualifier_cases_give_hermits_answer_within_the_bound() {
             .file_stem()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        let past = ["qz-0082", "qz-0202"].contains(&stem);
+        let past = stem == "qz-0202";
         let doc = ofn_read::parse(&std::fs::read_to_string(case).unwrap()).unwrap();
         let mut classes: BTreeSet<String> = doc
             .axioms

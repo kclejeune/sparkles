@@ -2823,6 +2823,11 @@ impl Index {
                     b.negative(e, it);
                 }
             }
+            for (guard, _, _, _, _) in &d.lazy {
+                if let Some(g) = *guard {
+                    b.negative(g, it);
+                }
+            }
         }
         for &(r, w, x) in &b.neg_data {
             ix.neg_data.entry(r).or_default().push((w, x));
@@ -2852,6 +2857,11 @@ impl Index {
         }
         if let Some(d) = &ax.dl {
             for (_, head) in &d.clauses {
+                for &e in head {
+                    b.positive(e, it, &mut ix);
+                }
+            }
+            for (_, _, _, _, head) in &d.lazy {
                 for &e in head {
                     b.positive(e, it, &mut ix);
                 }

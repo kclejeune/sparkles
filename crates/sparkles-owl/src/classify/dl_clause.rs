@@ -2153,6 +2153,86 @@ impl Store {
         }
     }
 
+    /// Whether any live clause `D` in this store contains one of `blockers` in its head
+    /// and subsumes the weakened witness conclusion
+    /// `body → (head \ {resolved}) ∨ witness ∨ ⋁ blockers` (item 896, R1a).
+    ///
+    /// Every inspected setup literal, blocker-key probe, and `by_lit` entry (including dead
+    /// and signature-rejected clauses) increments `*reads`, and `keep_going` is invoked
+    /// every `chunk` reads so the caller can charge scan work with remainder carry and
+    /// respect cancellation or work bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn has_clause_blocker(
+        &self,
+        body: &[Lit],
+        head: &[Lit],
+        resolved: Lit,
+        witness: Lit,
+        blockers: &[Ex],
+        chunk: usize,
+        reads: &mut usize,
+        mut keep_going: impl FnMut(&mut usize) -> bool,
+    ) -> bool {
+        if self.by_lit.is_empty() || blockers.is_empty() {
+            return false;
+        }
+        let chunk = chunk.max(1);
+        let mut allowed_sig = witness.sig_bit();
+        for &l in body {
+            *reads += 1;
+            if *reads >= chunk && !keep_going(reads) {
+                return false;
+            }
+            allowed_sig |= l.sig_bit();
+        }
+        for &l in head {
+            *reads += 1;
+            if *reads >= chunk && !keep_going(reads) {
+                return false;
+            }
+            if l != resolved {
+                allowed_sig |= l.sig_bit();
+            }
+        }
+        for &g in blockers {
+            *reads += 1;
+            if *reads >= chunk && !keep_going(reads) {
+                return false;
+            }
+            allowed_sig |= Lit::x(g).sig_bit();
+        }
+        for &g in blockers {
+            *reads += 1;
+            if *reads >= chunk && !keep_going(reads) {
+                return false;
+            }
+            let Some(ids) = self.by_lit.get(&Lit::x(g)) else {
+                continue;
+            };
+            for &i in ids {
+                *reads += 1;
+                if *reads >= chunk && !keep_going(reads) {
+                    return false;
+                }
+                let s = &self.clauses[i as usize];
+                if s.dead || (s.sig & !allowed_sig) != 0 {
+                    continue;
+                }
+                if !subset(s.c.body(), body) {
+                    continue;
+                }
+                if s.c.head().iter().all(|&m| {
+                    m == witness
+                        || (m != resolved && head.binary_search(&m).is_ok())
+                        || (m.kind() == X && blockers.binary_search(&m.atom()).is_ok())
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Indexes a processed clause by its maximal literal over a successor term, and adds
     /// what the table and the list grew by to the bytes the run's estimate has not seen,
     /// since a store can hold as many keys as clauses.
@@ -3051,5 +3131,124 @@ mod tests {
         for (i, id) in ids.into_iter().enumerate() {
             assert_eq!(t.get(id).head(), &[Lit::x(i as u32)]);
         }
+    }
+
+    #[test]
+    fn clause_blocker_checks_exact_subsumption_and_charges_every_inspected_entry() {
+        let mut s = Store::default();
+        let (p, q, r, g1, g2, w2) = (10, 11, 12, 20, 21, 22);
+        // C: P -> Q v G2 (also present in store so we verify C never self-blocks)
+        let c = Clause::new(vec![Lit::x(p)], vec![Lit::x(q), Lit::x(g2)]);
+        s.add(c.clone());
+        // Dead and non-subsuming clauses carrying G1 must still be counted as reads.
+        let dead_id = s
+            .add(Clause::new(
+                vec![Lit::x(p)],
+                vec![Lit::x(q), Lit::x(r), Lit::x(g1)],
+            ))
+            .is_some();
+        assert!(dead_id);
+        s.clauses.last_mut().unwrap().dead = true;
+        // Clause with extra literal R outside Q v W2 v {G1} must NOT block C.
+        s.add(Clause::new(
+            vec![Lit::x(p)],
+            vec![Lit::x(q), Lit::x(r), Lit::x(g1)],
+        ));
+        // Clause with extra body literal R must NOT block C.
+        s.add(Clause::new(
+            vec![Lit::x(p), Lit::x(r)],
+            vec![Lit::x(q), Lit::x(g1)],
+        ));
+        // Clause whose head contains G2 itself must NOT block C (resolved G2 is excluded).
+        s.add(Clause::new(vec![Lit::x(p)], vec![Lit::x(g1), Lit::x(g2)]));
+
+        let mut reads = 0usize;
+        let hit = s.has_clause_blocker(
+            c.body(),
+            c.head(),
+            Lit::x(g2),
+            Lit::x(w2),
+            &[g1],
+            16,
+            &mut reads,
+            |_| true,
+        );
+        assert!(!hit, "non-subsuming clauses must not block C");
+        assert_eq!(
+            reads, 9,
+            "setup (1 body + 2 head + 1 blocker), 1 blocker-key probe, and 4 by_lit entries must be counted"
+        );
+
+        // Stopping early via keep_going must terminate the scan and return false.
+        let mut reads_stop = 0usize;
+        let mut ticks = 0usize;
+        let hit_stop = s.has_clause_blocker(
+            c.body(),
+            c.head(),
+            Lit::x(g2),
+            Lit::x(w2),
+            &[g1],
+            2,
+            &mut reads_stop,
+            |r| {
+                ticks += 1;
+                *r = 0;
+                false
+            },
+        );
+        assert!(!hit_stop);
+        assert_eq!(ticks, 1);
+
+        // Long blocker-key lists that miss `by_lit` completely must still charge setup and
+        // key probes and abort when `keep_going` returns false.
+        let missed: Vec<Ex> = (100..164).collect();
+        let mut missed_reads = 0usize;
+        let hit_missed = s.has_clause_blocker(
+            c.body(),
+            c.head(),
+            Lit::x(g2),
+            Lit::x(w2),
+            &missed,
+            1024,
+            &mut missed_reads,
+            |_| true,
+        );
+        assert!(!hit_missed);
+        assert_eq!(missed_reads, 1 + 2 + 64 + 64);
+
+        let mut missed_stop_reads = 0usize;
+        let mut missed_ticks = 0usize;
+        let hit_missed_stop = s.has_clause_blocker(
+            c.body(),
+            c.head(),
+            Lit::x(g2),
+            Lit::x(w2),
+            &missed,
+            16,
+            &mut missed_stop_reads,
+            |r| {
+                missed_ticks += 1;
+                *r = 0;
+                false
+            },
+        );
+        assert!(!hit_missed_stop);
+        assert_eq!(missed_ticks, 1);
+
+        // Now add a live unprocessed clause D: P -> Q v G1 subsuming C's weakened head.
+        s.add(Clause::new(vec![Lit::x(p)], vec![Lit::x(q), Lit::x(g1)]));
+        let mut reads_hit = 0usize;
+        let hit2 = s.has_clause_blocker(
+            c.body(),
+            c.head(),
+            Lit::x(g2),
+            Lit::x(w2),
+            &[g1],
+            16,
+            &mut reads_hit,
+            |_| true,
+        );
+        assert!(hit2, "live unprocessed D: P -> Q v G1 must block C");
+        assert!(reads_hit >= 1);
     }
 }
