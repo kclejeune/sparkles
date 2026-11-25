@@ -115,7 +115,7 @@ pub(crate) struct Solution {
     terms: BTreeMap<Variable, Term>,
     origins: BTreeMap<Variable, Origin>,
     /// Includes unbound variables whose expression may succeed under another spelling.
-    spelling: HashMap<Variable, SpellingDependency>,
+    spelling: BTreeMap<Variable, SpellingDependency>,
 }
 
 impl std::ops::Deref for Solution {
@@ -858,15 +858,30 @@ fn always_distinct_on(a: &Solution, b: &Solution, v: &Variable) -> bool {
     }
 }
 
-fn always_distinct(a: &Solution, b: &Solution) -> bool {
-    a.terms
-        .keys()
-        .filter(|v| !is_hidden(v))
-        .any(|v| always_distinct_on(a, b, v))
-        || b.terms
-            .keys()
-            .filter(|v| !is_hidden(v) && !a.terms.contains_key(*v))
-            .any(|v| always_distinct_on(a, b, v))
+fn always_distinct(a: &Solution, b: &Solution, budget: &mut u64) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    for v in a.terms.keys() {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if !is_hidden(v) && always_distinct_on(a, b, v) {
+            return true;
+        }
+    }
+    for v in b.terms.keys() {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if !is_hidden(v) && !a.terms.contains_key(v) && always_distinct_on(a, b, v) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Maximum work units used across a query to prove `COUNT(DISTINCT *)`
@@ -988,14 +1003,12 @@ fn distinct_count_bucket_depends_on_spelling(members: &[&Solution], budget: &mut
     }
     for (i, &a) in dep.iter().enumerate() {
         for &b in &dep[i + 1..] {
-            *budget -= 1;
-            if !always_distinct(a, b) {
+            if !always_distinct(a, b, budget) {
                 return true;
             }
         }
         for &b in &fixed {
-            *budget -= 1;
-            if !always_distinct(a, b) {
+            if !always_distinct(a, b, budget) {
                 return true;
             }
         }

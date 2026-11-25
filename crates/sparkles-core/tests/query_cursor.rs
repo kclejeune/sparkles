@@ -8047,6 +8047,292 @@ fn reference_str_1093_r7_bounds_count_distinct_star_bucket_refinement() {
 }
 
 #[test]
+fn reference_str_1093_r8_projects_sparse_spelling_maps_in_peeling_chain() {
+    use reference::check::Outcome;
+    use std::fmt::Write as _;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    fn balanced_union(branches: &[String]) -> String {
+        match branches {
+            [] => unreachable!(),
+            [single] => single.clone(),
+            _ => {
+                let mid = branches.len() / 2;
+                format!(
+                    "{{ {} UNION {} }}",
+                    balanced_union(&branches[..mid]),
+                    balanced_union(&branches[mid..])
+                )
+            }
+        }
+    }
+
+    fn balanced_binds(vars: &[String]) -> String {
+        if vars.len() <= 8 {
+            let mut out = String::new();
+            for v in vars {
+                let _ = write!(out, " BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{v})");
+            }
+            return format!("{{ {out} }}");
+        }
+        let mid = vars.len() / 2;
+        format!(
+            "{{ {} {} }}",
+            balanced_binds(&vars[..mid]),
+            balanced_binds(&vars[mid..])
+        )
+    }
+
+    let projected_peeling_union = |count: usize, dropped_bindings: usize, prefix: &str| -> String {
+        let drop_vars: Vec<String> = (0..dropped_bindings).map(|j| format!("drop{j}")).collect();
+        let dropped = balanced_binds(&drop_vars);
+        let branches: Vec<String> = (1..=count)
+            .map(|i| {
+                if i < count {
+                    format!(
+                        "{{ BIND(1 AS ?{prefix}{i}) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{prefix}{}) }}",
+                        i + 1
+                    )
+                } else {
+                    format!(
+                        "{{ SELECT ?{prefix}{i} ?keep WHERE {{ {{ BIND(1 AS ?{prefix}{i}) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?keep) }} {dropped} }} }}"
+                    )
+                }
+            })
+            .collect();
+        balanced_union(&branches)
+    };
+
+    let grouped_slice = |count: usize, dropped_bindings: usize| -> String {
+        let body = projected_peeling_union(count, dropped_bindings, "v");
+        format!(
+            "SELECT ?g WHERE {{ \
+                {{ VALUES (?g ?x) {{ (1 1) (1 2) }} }} \
+                UNION {{ {body} BIND(2 AS ?g) }} \
+            }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+        )
+    };
+
+    let count_only = |count: usize, dropped_bindings: usize| -> String {
+        let body = projected_peeling_union(count, dropped_bindings, "v");
+        format!("SELECT (COUNT(DISTINCT *) AS ?count) WHERE {{ {body} }}")
+    };
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+    let default_oracle = reference::Reference::new(Vec::new());
+
+    // Small peeling chain whose last row drops 300 of 301 spelling-dependent
+    // bindings via projection still proves COUNT(DISTINCT *) fixed.
+    let small_slice = grouped_slice(10, 300);
+    assert!(check(&default_oracle, &small_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &small_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+    assert_eq!(
+        check(&default_oracle, &count_only(10, 300), &[&["10"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Multi-pass peeling chain (~36k refinement units <= 100k) where the
+    // projected row survives all 119 splits with one retained spelling entry
+    // out of 501 completes quickly and proves fixed.
+    let medium_slice = grouped_slice(120, 500);
+    assert!(check(&default_oracle, &medium_slice, &[two]).is_err());
+    assert_eq!(
+        check(&default_oracle, &medium_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+
+    // Over-budget peeling chain with a projected trailing row falls back
+    // conservatively while keeping the numeric count unchanged.
+    let over_budget_slice = grouped_slice(240, 300);
+    assert!(matches!(
+        check(&default_oracle, &over_budget_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&default_oracle, &count_only(240, 300), &[&["240"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Projection that drops every spelling-dependent binding leaves a
+    // spelling-free row whose COUNT(DISTINCT *) remains fixed.
+    let drop_vars: Vec<String> = (0..300).map(|j| format!("drop{j}")).collect();
+    let dropped = balanced_binds(&drop_vars);
+    let all_dropped_slice = format!(
+        "SELECT ?g WHERE {{ \
+            {{ VALUES (?g ?v) {{ (1 1) }} }} \
+            UNION {{ \
+                {{ SELECT ?v WHERE {{ {{ BIND(1 AS ?v) }} {dropped} }} }} \
+                UNION {{ SELECT ?v WHERE {{ {{ BIND(2 AS ?v) }} {dropped} }} }} \
+                BIND(2 AS ?g) \
+            }} \
+        }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+    );
+    let tight = reference::Reference::new(Vec::new()).with_work_limit(2_000);
+    assert!(check(&tight, &all_dropped_slice, &[two]).is_err());
+    assert_eq!(
+        check(&tight, &all_dropped_slice, &[one]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
+fn reference_str_1093_r8_charges_pair_variable_visits() {
+    use oxrdf::{GraphName, NamedNode, Quad};
+    use reference::check::Outcome;
+    use std::fmt::Write as _;
+
+    let check =
+        |oracle: &reference::Reference, query: &str, rows: &[&[&str]]| -> Result<Outcome, String> {
+            let query = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {query}");
+            let expected = oracle
+                .run_selected(&query, None)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .unwrap();
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|text| Some(text.parse::<Term>().unwrap()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            reference::check::check_select(&expected, &expected.variables, &rows)
+        };
+
+    let member_pred = NamedNode::new_unchecked("urn:member");
+    let group_obj = NamedNode::new_unchecked("urn:group");
+    let make_quads = |count: usize| -> Vec<Quad> {
+        (0..count)
+            .map(|i| {
+                Quad::new(
+                    NamedNode::new_unchecked(format!("urn:item:{i}")),
+                    member_pred.clone(),
+                    group_obj.clone(),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect()
+    };
+
+    fn balanced_binds(vars: &[String]) -> String {
+        if vars.len() <= 8 {
+            let mut out = String::new();
+            for v in vars {
+                let _ = write!(out, " BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?{v})");
+            }
+            return format!("{{ {out} }}");
+        }
+        let mid = vars.len() / 2;
+        format!(
+            "{{ {} {} }}",
+            balanced_binds(&vars[..mid]),
+            balanced_binds(&vars[mid..])
+        )
+    }
+
+    let wide_rotating_body = |extra_vars: usize, duplicate_fixed: bool| -> String {
+        let fixed_arm = if duplicate_fixed {
+            "{ SELECT ?a ?b ?c WHERE { ?dummy <urn:member> <urn:group> . BIND(<urn:fixed> AS ?a) BIND(0 AS ?b) BIND(0 AS ?c) } }"
+        } else {
+            "{ ?a <urn:member> <urn:group> . BIND(0 AS ?b) BIND(0 AS ?c) }"
+        };
+        let extra_names: Vec<String> = (0..extra_vars).map(|i| format!("A{i}")).collect();
+        let extra = balanced_binds(&extra_names);
+        format!(
+            "{fixed_arm} \
+            UNION {{ {{ BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?a) BIND(1 AS ?b) BIND(1 AS ?c) }} {extra} }} \
+            UNION {{ BIND(0 AS ?a) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?b) BIND(2 AS ?c) }} \
+            UNION {{ BIND(1 AS ?a) BIND(2 AS ?b) BIND(IF(STR(1 + 0) = \"1\", 0, 1) AS ?c) }}"
+        )
+    };
+
+    let grouped_slice = |extra_vars: usize, duplicate_fixed: bool| -> String {
+        let body = wide_rotating_body(extra_vars, duplicate_fixed);
+        format!(
+            "SELECT ?g WHERE {{ \
+                {{ VALUES (?g ?a ?b ?c) {{ (1 <urn:only> 0 0) }} }} \
+                UNION {{ {body} BIND(2 AS ?g) }} \
+            }} GROUP BY ?g ORDER BY COUNT(DISTINCT *) LIMIT 1"
+        )
+    };
+
+    let count_only = |extra_vars: usize, duplicate_fixed: bool| -> String {
+        let body = wide_rotating_body(extra_vars, duplicate_fixed);
+        format!("SELECT (COUNT(DISTINCT *) AS ?count) WHERE {{ {body} }}")
+    };
+
+    let one = &["1"][..];
+    let two = &["2"][..];
+
+    // Small wide-row group still proves COUNT(DISTINCT *) fixed within budget.
+    let small = reference::Reference::new(make_quads(5));
+    let small_slice = grouped_slice(10, false);
+    assert!(check(&small, &small_slice, &[two]).is_err());
+    assert_eq!(check(&small, &small_slice, &[one]), Ok(Outcome::Compared));
+
+    // Tight-budget case: only 63 pairs, but repeated scans across 100 extra
+    // spelling-dependent bindings on the wide row exhaust the remaining proof
+    // budget, retaining the dependency without changing the count.
+    let tight = reference::Reference::new(make_quads(20)).with_work_limit(2_000);
+    let tight_slice = grouped_slice(100, false);
+    assert!(matches!(
+        check(&tight, &tight_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&tight, &count_only(100, false), &[&["23"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Default proof budget (100,000): refinement (~2.3k) plus pair count (903)
+    // is far below 100,000, but 302 comparisons against 400 extra bindings
+    // (~121k variable visits) exhaust the default budget cleanly.
+    let wide_default = reference::Reference::new(make_quads(300));
+    let wide_slice = grouped_slice(400, false);
+    assert!(matches!(
+        check(&wide_default, &wide_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&wide_default, &count_only(400, false), &[&["303"]]),
+        Ok(Outcome::Compared)
+    );
+
+    // Duplicate fixed rows also exhaust the pair variable-visit budget while
+    // leaving the distinct count (4) unchanged.
+    let dup_slice = grouped_slice(400, true);
+    assert!(matches!(
+        check(&wide_default, &dup_slice, &[two]),
+        Ok(Outcome::Skipped(_))
+    ));
+    assert_eq!(
+        check(&wide_default, &count_only(400, true), &[&["4"]]),
+        Ok(Outcome::Compared)
+    );
+}
+
+#[test]
 fn reference_str_1093_r5_keeps_min_max_fixed_across_strict_term_classes() {
     use reference::check::Outcome;
     let two = &["2"][..];
