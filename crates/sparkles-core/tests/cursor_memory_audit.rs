@@ -363,8 +363,11 @@ fn allowance(name: &str) -> Allowance {
         // min(hits, 4096) * 192 bytes in text::Reader::open. Because enable_text builds
         // with available_parallelism().min(8) Tantivy writer threads and hit_terms
         // decodes one segment at a time, multi-segment builds hold a smaller peak heap
-        // (~318 KiB on 4-vCPU runners, down to ~288 KiB on 8 balanced segments) than a
-        // single-segment build (~406 KiB) against the same 958,497-byte ledger peak.
+        // than a single-segment build against the same 958,497-byte (959 kB) ledger peak.
+        // Measured granted-run heap peaks range from 313 kB (4-vCPU CI) to 407 kB
+        // (406,344 bytes on 1 segment), all rounded upward in decimal kB, while 8 balanced
+        // segments are estimated around 290 kB; 640 KiB (655,360 bytes) covers peaks down
+        // to 243 kB under the five-quarters check.
         "text" => Allowance {
             under: 24 * K,
             over: 880 * K,

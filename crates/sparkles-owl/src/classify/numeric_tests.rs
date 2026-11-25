@@ -26,11 +26,19 @@ thread_local! {
         requested_alloc_bytes: 0, requested_realloc_bytes: 0, replaced_realloc_bytes: 0,
     }) };
 }
+const MAX_DEALLOCATION_WATCHES: usize = 32;
+
 #[derive(Clone, Copy)]
-struct DeallocationWatch {
+struct DeallocationWatchEntry {
     address: usize,
     layout: Layout,
     count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DeallocationWatch {
+    entries: [DeallocationWatchEntry; MAX_DEALLOCATION_WATCHES],
+    len: usize,
 }
 
 thread_local! {
@@ -38,32 +46,73 @@ thread_local! {
 }
 
 pub(in crate::classify) fn watch_deallocation(address: usize, layout: Layout) {
+    watch_deallocations(&[(address, layout)]);
+}
+
+pub(in crate::classify) fn watch_deallocations(targets: &[(usize, Layout)]) {
+    assert!(
+        !targets.is_empty() && targets.len() <= MAX_DEALLOCATION_WATCHES,
+        "watch_deallocations expects 1..={MAX_DEALLOCATION_WATCHES} targets, got {}",
+        targets.len()
+    );
     DEALLOCATION_WATCH.with(|watch| {
         assert!(watch.get().is_none());
-        watch.set(Some(DeallocationWatch {
-            address,
-            layout,
+        let mut entries = [DeallocationWatchEntry {
+            address: 0,
+            layout: Layout::new::<()>(),
             count: 0,
+        }; MAX_DEALLOCATION_WATCHES];
+        for (slot, &(address, layout)) in entries.iter_mut().zip(targets.iter()) {
+            *slot = DeallocationWatchEntry {
+                address,
+                layout,
+                count: 0,
+            };
+        }
+        watch.set(Some(DeallocationWatch {
+            entries,
+            len: targets.len(),
         }));
     });
 }
 
 pub(in crate::classify) fn watched_deallocations() -> Option<usize> {
-    DEALLOCATION_WATCH.with(|watch| watch.get().map(|watch| watch.count))
+    DEALLOCATION_WATCH.with(|watch| {
+        watch
+            .get()
+            .map(|watch| watch.entries[..watch.len].iter().map(|e| e.count).sum())
+    })
+}
+
+pub(in crate::classify) fn watched_deallocations_distinct() -> Option<usize> {
+    DEALLOCATION_WATCH.with(|watch| {
+        watch.get().map(|watch| {
+            watch.entries[..watch.len]
+                .iter()
+                .filter(|e| e.count >= 1)
+                .count()
+        })
+    })
 }
 
 pub(in crate::classify) fn take_watched_deallocations() -> Option<usize> {
-    DEALLOCATION_WATCH.with(|watch| watch.take().map(|watch| watch.count))
+    DEALLOCATION_WATCH.with(|watch| {
+        watch
+            .take()
+            .map(|watch| watch.entries[..watch.len].iter().map(|e| e.count).sum())
+    })
 }
 
 fn completed_deallocation(address: usize, layout: Layout) {
     let _ = DEALLOCATION_WATCH.try_with(|slot| {
-        if let Some(mut watch) = slot.get()
-            && watch.address == address
-            && watch.layout == layout
-        {
-            watch.count = watch.count.saturating_add(1);
-            slot.set(Some(watch));
+        if let Some(mut watch) = slot.get() {
+            for entry in &mut watch.entries[..watch.len] {
+                if entry.address == address && entry.layout == layout {
+                    entry.count = entry.count.saturating_add(1);
+                    slot.set(Some(watch));
+                    break;
+                }
+            }
         }
     });
 }
