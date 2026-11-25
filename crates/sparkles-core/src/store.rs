@@ -3443,27 +3443,12 @@ impl Store {
         if owner == current {
             return Ok(live.generation.clone());
         }
-        if C::ACCOUNTS {
-            branching::readonly::authenticate_retained_generation(
-                self,
-                entry,
-                &limit.read_limit(),
-                through,
-            )?;
-        } else {
-            let history_options = crate::history::HistoryOptions::default();
-            let history_limit = crate::history::ReadLimit {
-                options: &history_options,
-                memory: None,
-                held: 0,
-            };
-            branching::readonly::authenticate_retained_generation(
-                self,
-                entry,
-                &history_limit,
-                through,
-            )?;
-        }
+        branching::readonly::authenticate_retained_generation(
+            self,
+            entry,
+            &limit.read_limit(),
+            through,
+        )?;
         if let Some(i) = h.open.iter().position(|(n, _)| *n == owner) {
             if C::ACCOUNTS {
                 h.open[i].1.retained_bytes_with(limit)?;
@@ -10898,5 +10883,101 @@ mod ordinary_sync_tests {
         let reopened = Store::open(dir.path(), Default::default()).unwrap();
         assert_eq!(reopened.snapshot().commit, receipt.commit.seq);
         assert_eq!(reopened.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn uncapped_snapshot_at_propagates_cancel_and_timeout_into_history_generation() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                build: crate::builder::BuildOptions {
+                    threads: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .set_retention(crate::history::Retention {
+                keep_commits: Some(10),
+                keep_age_ms: None,
+                max_bytes: None,
+            })
+            .unwrap();
+        let r1 = insert(&store, "first").unwrap();
+        insert(&store, "second").unwrap();
+        store.compact().unwrap();
+        insert(&store, "third").unwrap();
+        let at = crate::history::At::Commit(r1.commit.seq);
+        assert!(store.snapshot_at(&at, &Default::default()).is_ok());
+
+        let cancel_opts = crate::history::HistoryOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            deadline: None,
+        };
+        assert!(matches!(
+            store.snapshot_at(&at, &cancel_opts),
+            Err(Error::Cancelled)
+        ));
+
+        let expired_opts = crate::history::HistoryOptions {
+            cancel: None,
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+        };
+        assert!(matches!(
+            store.snapshot_at(&at, &expired_opts),
+            Err(Error::Timeout)
+        ));
+
+        // Directly verify history_generation_with forwards HistoryCeiling's ReadLimit
+        // (and not a blank HistoryOptions) into authenticate_retained_generation:
+        // let the entry check(0) pass once, then cancel inside authenticate_retained_generation.
+        struct CancelAfterFirst(std::sync::atomic::AtomicUsize);
+        impl crate::history::ReadControl for CancelAfterFirst {
+            fn check_read(&self) -> Result<()> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+            }
+        }
+        let live = store.snapshot();
+        let current = commit::generation_number(&live.generation.name);
+        let hist = store.history.as_ref().unwrap();
+        let mut h = hist.lock();
+        let owner = h.owner(r1.commit.seq, current, live.commit).unwrap();
+        assert_ne!(owner, current);
+        let entry = h.gens[&owner].clone();
+        let after_first = CancelAfterFirst(std::sync::atomic::AtomicUsize::new(0));
+        let ceiling = HistoryCeiling {
+            limit: crate::history::ReadLimit {
+                options: &after_first,
+                memory: None,
+                held: 0,
+            },
+            ceiling: u64::MAX,
+        };
+        assert!(matches!(
+            store.history_generation_with(
+                &mut h,
+                owner,
+                current,
+                &live,
+                &entry,
+                r1.commit.seq,
+                &ceiling
+            ),
+            Err(Error::Cancelled)
+        ));
     }
 }

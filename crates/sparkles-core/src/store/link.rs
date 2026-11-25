@@ -113,9 +113,7 @@ pub(crate) fn read_link_with<C: crate::budgeted::BudgetControl>(
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let label = (!C::ACCOUNTS).then(|| path.display().to_string());
-    let loaded: cold::Loaded<LinkFile> =
-        control.json(&bytes, label.as_deref().unwrap_or(LINK_FILE))?;
+    let loaded: cold::Loaded<LinkFile> = control.json(&bytes, path.display())?;
     control.drop_vec(bytes);
     check_link(&path, &loaded.value)?;
     if !C::ACCOUNTS {
@@ -290,6 +288,7 @@ impl Generation {
             // WAL replay owns and admits the delta itself. Keep all dictionary,
             // descriptor and link storage in the same remaining allowance.
             control.release(delta_charge);
+            delta_charge = 0;
             control.check(0)?;
             wal::apply_forward(
                 &source.value.join("wal.log"),
@@ -307,8 +306,9 @@ impl Generation {
                 &*control,
             )?;
             if C::ACCOUNTS {
-                delta_charge = history_limited::preparation_delta_bytes(&delta);
-                control.charge(delta_charge)?;
+                let next = history_limited::preparation_delta_bytes(&delta);
+                control.charge(next)?;
+                delta_charge = next;
             }
             drop(source.value);
             control.release(source.charge);
@@ -377,40 +377,54 @@ fn apply_overlay_with<C: crate::budgeted::BudgetControl>(
 ) -> Result<()> {
     let path = dir.join(OVERLAY_FILE);
     let bytes = read_verified_overlay_with(&path, overlay, control)?;
-    for record in bytes.as_chunks::<WAL_REC>().0 {
-        control.check(0)?;
-        if !matches!(record[0], WAL_INSERT | WAL_DELETE) {
-            control.drop_vec(bytes);
-            return Err(Error::Corrupt(format!(
-                "{}: invalid base overlay operation",
-                path.display()
-            )));
+    let result = (|| -> Result<()> {
+        if !C::ACCOUNTS {
+            for record in bytes.as_chunks::<WAL_REC>().0 {
+                if !matches!(record[0], WAL_INSERT | WAL_DELETE) {
+                    return Err(Error::Corrupt(format!(
+                        "{}: invalid base overlay operation",
+                        path.display()
+                    )));
+                }
+            }
         }
-        let quad = wal::record_quad(record);
-        let in_base = if C::ACCOUNTS {
-            control.release(*delta_charge);
+        for record in bytes.as_chunks::<WAL_REC>().0 {
             control.check(0)?;
-            let mutation = history_limited::preparation_mutation_bytes(delta);
-            control.check(mutation)?;
-            generation.perm(Perm::Spo).contains_with(
-                cache,
-                &Perm::Spo.to_key(&quad),
-                &*control,
-                mutation,
-            )?
-        } else {
-            generation
-                .perm(Perm::Spo)
-                .contains(cache, &Perm::Spo.to_key(&quad))?
-        };
-        apply(delta, &quad, record[0] == WAL_INSERT, in_base);
-        if C::ACCOUNTS {
-            *delta_charge = history_limited::preparation_delta_bytes(delta);
-            control.charge(*delta_charge)?;
+            if C::ACCOUNTS && !matches!(record[0], WAL_INSERT | WAL_DELETE) {
+                return Err(Error::Corrupt(
+                    "invalid linked base overlay operation".into(),
+                ));
+            }
+            let quad = wal::record_quad(record);
+            let in_base = if C::ACCOUNTS {
+                control.release(*delta_charge);
+                *delta_charge = 0;
+                control.check(0)?;
+                let mutation = history_limited::preparation_mutation_bytes(delta);
+                control.check(mutation)?;
+                generation.perm(Perm::Spo).contains_with(
+                    cache,
+                    &Perm::Spo.to_key(&quad),
+                    &*control,
+                    mutation,
+                )?
+            } else {
+                generation
+                    .perm(Perm::Spo)
+                    .contains(cache, &Perm::Spo.to_key(&quad))?
+            };
+            apply(delta, &quad, record[0] == WAL_INSERT, in_base);
+            if C::ACCOUNTS {
+                let next = history_limited::preparation_delta_bytes(delta);
+                control.charge(next)?;
+                *delta_charge = next;
+            }
         }
-    }
-    generation.meta.next_bnode = generation.meta.next_bnode.max(overlay.next_bnode);
+        generation.meta.next_bnode = generation.meta.next_bnode.max(overlay.next_bnode);
+        Ok(())
+    })();
     control.drop_vec(bytes);
+    result?;
     control.check(0)
 }
 
@@ -420,21 +434,36 @@ fn read_verified_overlay_with<C: crate::budgeted::BudgetControl>(
     control: &mut C,
 ) -> Result<Vec<u8>> {
     let bytes = control.read_file(path)?;
-    let digest = control.sha256(&bytes)?;
-    let hex = b"0123456789abcdef";
-    let matches = overlay.sha256.len() == 64
-        && digest.iter().enumerate().all(|(index, byte)| {
-            overlay.sha256.as_bytes()[index * 2] == hex[(byte >> 4) as usize]
-                && overlay.sha256.as_bytes()[index * 2 + 1] == hex[(byte & 15) as usize]
-        });
-    if bytes.len() as u64 != overlay.bytes || !bytes.len().is_multiple_of(WAL_REC) || !matches {
-        control.drop_vec(bytes);
-        return Err(Error::Corrupt(format!(
-            "{}: invalid base overlay length or checksum",
-            path.display()
-        )));
+    let valid = (|| -> Result<bool> {
+        if bytes.len() as u64 != overlay.bytes || !bytes.len().is_multiple_of(WAL_REC) {
+            return Ok(false);
+        }
+        let digest = control.sha256(&bytes)?;
+        let hex = b"0123456789abcdef";
+        Ok(overlay.sha256.len() == 64
+            && digest.iter().enumerate().all(|(index, byte)| {
+                overlay.sha256.as_bytes()[index * 2] == hex[(byte >> 4) as usize]
+                    && overlay.sha256.as_bytes()[index * 2 + 1] == hex[(byte & 15) as usize]
+            }))
+    })();
+    match valid {
+        Ok(true) => Ok(bytes),
+        Ok(false) => {
+            control.drop_vec(bytes);
+            Err(if C::ACCOUNTS {
+                Error::Corrupt("invalid linked base overlay length or checksum".into())
+            } else {
+                Error::Corrupt(format!(
+                    "{}: invalid base overlay length or checksum",
+                    path.display()
+                ))
+            })
+        }
+        Err(error) => {
+            control.drop_vec(bytes);
+            Err(error)
+        }
     }
-    Ok(bytes)
 }
 
 fn checked_overlay(dir: &Path, overlay: &Overlay) -> Result<Vec<u8>> {
@@ -479,4 +508,313 @@ pub fn read_link_file(gen_dir: &Path) -> Result<Option<Vec<(String, u64, u64)>>>
             .map(|s| (s.path, s.wal_end, s.dvocab_len))
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::{HistoryOptions, ReadControl, ReadLimit};
+    use crate::store::cold::ColdBudget;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct SwitchTimeout(AtomicBool);
+
+    impl ReadControl for SwitchTimeout {
+        fn check_read(&self) -> Result<()> {
+            if self.0.load(Ordering::Relaxed) {
+                Err(Error::Timeout)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+            crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+        }
+    }
+
+    fn linked_overlay_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, LinkFile) {
+        use crate::{io::Source, sparql::update::update};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ds");
+        let store = Store::open(
+            &root,
+            StoreOptions {
+                build: crate::builder::BuildOptions {
+                    threads: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:base> <urn:p> \"b\" .\n".to_vec(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        store.create_branch("dev", &Default::default()).unwrap();
+        let dev = store.branch("dev").unwrap();
+        update(
+            &dev,
+            "INSERT DATA { <urn:dev> <urn:p> \"overlay\" }",
+            &Default::default(),
+        )
+        .unwrap();
+        update(
+            &store,
+            "INSERT DATA { <urn:main> <urn:p> \"compact\" }",
+            &Default::default(),
+        )
+        .unwrap();
+        store.compact().unwrap();
+        store.relink_branch("dev", &Default::default()).unwrap();
+        let gen_dir = dev.snapshot().generation.dir.clone().unwrap();
+        let branch_root = gen_dir.parent().unwrap().to_path_buf();
+        let link = read_link(&gen_dir).unwrap().expect("linked generation");
+        assert!(link.overlay.is_some());
+        drop(dev);
+        drop(store);
+        (dir, gen_dir, branch_root, link)
+    }
+
+    #[test]
+    fn open_linked_and_overlay_preserve_precheck_path_free_errors_and_cleanup() {
+        let (_dir, gen_dir, branch_root, file) = linked_overlay_fixture();
+        let cache = Arc::new(BlockCache::new(1 << 20));
+        let plain = Generation::open_linked(
+            &gen_dir,
+            "gen-0001",
+            &branch_root,
+            file.clone(),
+            true,
+            &cache,
+        )
+        .unwrap();
+
+        // Controlled open matches ordinary open and accounts for retained bytes.
+        let options = HistoryOptions::default();
+        let limit = ReadLimit {
+            options: &options,
+            memory: Some(16 << 20),
+            held: 0,
+        };
+        let mut budget = ColdBudget::new(limit).unwrap();
+        let loaded_link = read_link_with(&gen_dir, &mut budget).unwrap().unwrap();
+        let controlled = Generation::open_linked_with(
+            &gen_dir,
+            "gen-0001",
+            &branch_root,
+            loaded_link,
+            true,
+            &cache,
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            plain.base_delta().ins[Perm::Spo.index()].len(),
+            controlled.value.base_delta().ins[Perm::Spo.index()].len()
+        );
+        assert_eq!(controlled.charge, controlled.value.cold_bytes);
+        assert_eq!(
+            controlled.value.retained_bytes_with(&limit).unwrap(),
+            controlled.charge
+        );
+        assert!(plain.retained_bytes_with(&limit).unwrap() > 0);
+        drop(controlled.value);
+        budget.release(controlled.charge);
+        assert_eq!(budget.used(), 0);
+
+        // Uncapped cancel and deterministic timeout stop open_linked_with cleanly.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_opts = HistoryOptions {
+            cancel: Some(cancel.clone()),
+            deadline: None,
+        };
+        let mut cancel_budget = ColdBudget::new(ReadLimit {
+            options: &cancel_opts,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        let link_for_cancel = read_link_with(&gen_dir, &mut cancel_budget)
+            .unwrap()
+            .unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            Generation::open_linked_with(
+                &gen_dir,
+                "gen-0001",
+                &branch_root,
+                link_for_cancel,
+                true,
+                &cache,
+                &mut cancel_budget,
+            ),
+            Err(Error::Cancelled)
+        ));
+
+        let timeout = SwitchTimeout(AtomicBool::new(false));
+        let mut timeout_budget = ColdBudget::new(ReadLimit {
+            options: &timeout,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        let link_for_timeout = read_link_with(&gen_dir, &mut timeout_budget)
+            .unwrap()
+            .unwrap();
+        timeout.0.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            Generation::open_linked_with(
+                &gen_dir,
+                "gen-0001",
+                &branch_root,
+                link_for_timeout,
+                true,
+                &cache,
+                &mut timeout_budget,
+            ),
+            Err(Error::Timeout)
+        ));
+
+        // Craft a checksum-valid overlay whose first record is valid and second has a bad opcode.
+        let overlay_dir = tempfile::tempdir().unwrap();
+        let mut raw = std::fs::read(gen_dir.join(OVERLAY_FILE)).unwrap();
+        assert!(raw.len() >= WAL_REC);
+        let mut bad_rec = [0u8; WAL_REC];
+        bad_rec[0] = 0xFF;
+        raw.extend_from_slice(&bad_rec);
+        let malformed = Overlay {
+            bytes: raw.len() as u64,
+            sha256: overlay_checksum(&raw),
+            next_bnode: 10,
+        };
+        std::fs::write(overlay_dir.path().join(OVERLAY_FILE), &raw).unwrap();
+
+        // Ordinary apply_overlay_with prechecks opcodes before any index lookup or cache fill.
+        let fresh_cache = BlockCache::new(1 << 20);
+        let mut plain_gen =
+            Generation::open_sealed(&plain.link.as_ref().unwrap().base_dir, "gen-0001").unwrap();
+        let mut plain_delta = Delta::default();
+        let mut plain_charge = 0;
+        let err = apply_overlay_with(
+            overlay_dir.path(),
+            &malformed,
+            &mut plain_gen,
+            &fresh_cache,
+            &mut plain_delta,
+            &mut plain_charge,
+            &mut crate::budgeted::Unlimited,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)));
+        assert!(err.to_string().contains("invalid base overlay operation"));
+        assert!(plain_delta.ins[Perm::Spo.index()].is_empty());
+        assert_eq!(fresh_cache.entries(), 0);
+        assert_eq!(fresh_cache.misses(), 0);
+
+        // Controlled apply_overlay_with returns static path-free errors and releases buffer & delta charges.
+        let dir_str = overlay_dir.path().display().to_string();
+        let mut c_budget = ColdBudget::new(limit).unwrap();
+        let mut c_delta = Delta::default();
+        let mut c_charge = 0;
+        let err = apply_overlay_with(
+            overlay_dir.path(),
+            &malformed,
+            &mut plain_gen,
+            &fresh_cache,
+            &mut c_delta,
+            &mut c_charge,
+            &mut c_budget,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            Error::Corrupt("invalid linked base overlay operation".into()).to_string()
+        );
+        assert!(!err.to_string().contains(&dir_str));
+        // Only the admitted first-record delta remains charged; the overlay buffer was dropped.
+        assert_eq!(c_budget.used(), c_charge);
+        c_budget.release(c_charge);
+        assert_eq!(c_budget.used(), 0);
+
+        // Bad length short-circuits cleanly, is path-free under ColdBudget, and leaves budget.used() == 0.
+        let bad_len = Overlay {
+            bytes: raw.len() as u64 + 1,
+            sha256: "not-even-hex".into(),
+            next_bnode: 10,
+        };
+        let mut len_delta = Delta::default();
+        let mut len_charge = 0;
+        let err = apply_overlay_with(
+            overlay_dir.path(),
+            &bad_len,
+            &mut plain_gen,
+            &fresh_cache,
+            &mut len_delta,
+            &mut len_charge,
+            &mut c_budget,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            Error::Corrupt("invalid linked base overlay length or checksum".into()).to_string()
+        );
+        assert!(!err.to_string().contains(&dir_str));
+        assert_eq!(c_budget.used(), 0);
+
+        // Cancellation inside read_verified_overlay_with (during sha256) drops the read buffer,
+        // and pre-charged *delta_charge is preserved without double-release.
+        struct CancelAfter(std::sync::atomic::AtomicUsize, usize);
+        impl ReadControl for CancelAfter {
+            fn check_read(&self) -> Result<()> {
+                let n = self.0.fetch_add(1, Ordering::Relaxed);
+                if n >= self.1 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+            }
+        }
+        let big_raw = vec![WAL_INSERT; WAL_REC * 3000];
+        let big_overlay = Overlay {
+            bytes: big_raw.len() as u64,
+            sha256: overlay_checksum(&big_raw),
+            next_bnode: 1,
+        };
+        std::fs::write(overlay_dir.path().join(OVERLAY_FILE), &big_raw).unwrap();
+        // ColdBudget::new + read_file checks run first; cancel during sha256 chunk loop.
+        let sha_ctrl = CancelAfter(std::sync::atomic::AtomicUsize::new(0), 10);
+        let mut sha_budget = ColdBudget::new(ReadLimit {
+            options: &sha_ctrl,
+            memory: Some(2 << 20),
+            held: 0,
+        })
+        .unwrap();
+        sha_budget.charge(64).unwrap();
+        let mut delta_cancel = Delta::default();
+        let mut charge_cancel = 64;
+        assert!(matches!(
+            apply_overlay_with(
+                overlay_dir.path(),
+                &big_overlay,
+                &mut plain_gen,
+                &fresh_cache,
+                &mut delta_cancel,
+                &mut charge_cancel,
+                &mut sha_budget,
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(sha_budget.used(), charge_cancel);
+        sha_budget.release(charge_cancel);
+        assert_eq!(sha_budget.used(), 0);
+    }
 }

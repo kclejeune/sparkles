@@ -1268,6 +1268,11 @@ impl Segments {
         self.start[b + 1] - self.start[b]
     }
 
+    #[cfg(test)]
+    pub(crate) fn start_len_and_capacity(&self) -> (usize, usize) {
+        (self.start.len(), self.start.capacity())
+    }
+
     /// The segments of block `b` that readers may decode one by one before they read it
     /// whole: a quarter of them. Past that, one read and decode of the block costs less
     /// than more reads of its segments, which on a cold file wait for a page each.

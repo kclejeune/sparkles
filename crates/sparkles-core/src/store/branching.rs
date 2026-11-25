@@ -3308,4 +3308,71 @@ mod source_tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn normalize_with_and_listed_with_match_unlimited_and_honor_uncapped_controls() {
+        use crate::history::{HistoryOptions, ReadLimit};
+        use std::sync::atomic::AtomicBool;
+
+        let main = Store::in_memory(Default::default());
+        let dev = main.create_branch("dev", &Default::default()).unwrap();
+        let set = main.owned_set().unwrap();
+        let commit = CommitRef {
+            branch_id: dev.id,
+            seq: dev.from.unwrap().seq,
+        };
+        let options = HistoryOptions::default();
+        let uncapped = ReadLimit {
+            options: &options,
+            memory: None,
+            held: 0,
+        };
+        assert_eq!(
+            set.normalize(commit),
+            set.normalize_with(commit, &uncapped).unwrap()
+        );
+        assert!(
+            main.listed_with(dev.id, &crate::budgeted::Unlimited)
+                .is_ok()
+        );
+        assert!(main.listed_with(dev.id, &uncapped).is_ok());
+        assert!(main.listed_with(uuid::Uuid::new_v4(), &uncapped).is_err());
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let cancel_opts = HistoryOptions {
+            cancel: Some(cancel),
+            deadline: None,
+        };
+        let cancelled = ReadLimit {
+            options: &cancel_opts,
+            memory: None,
+            held: 0,
+        };
+        assert!(matches!(
+            set.normalize_with(commit, &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            main.listed_with(dev.id, &cancelled),
+            Err(Error::Cancelled)
+        ));
+
+        let expired_opts = HistoryOptions {
+            cancel: None,
+            deadline: Some(Instant::now() - std::time::Duration::from_secs(1)),
+        };
+        let timed_out = ReadLimit {
+            options: &expired_opts,
+            memory: None,
+            held: 0,
+        };
+        assert!(matches!(
+            set.normalize_with(commit, &timed_out),
+            Err(Error::Timeout)
+        ));
+        assert!(matches!(
+            main.listed_with(dev.id, &timed_out),
+            Err(Error::Timeout)
+        ));
+    }
 }

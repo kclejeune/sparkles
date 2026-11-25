@@ -90,6 +90,14 @@ impl<T> WeakLink<T> {
                 Err(Error::WriterBusy) if !control.no_wait() => {
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                Err(Error::WriterBusy) => {
+                    control.check(0)?;
+                    return Err(if C::ACCOUNTS {
+                        Error::invalid("controlled view preparation would wait (no_wait)")
+                    } else {
+                        Error::WriterBusy
+                    });
+                }
                 result => {
                     control.check(0)?;
                     return result;
@@ -825,5 +833,34 @@ mod tests {
         assert!(matches!(e, Error::Unsupported(_)), "{e}");
         assert!(!root.join("dataset.json").exists());
         assert_eq!(std::fs::read(&wal).unwrap(), bytes);
+    }
+
+    #[test]
+    fn weak_link_upgrade_with_preserves_no_wait_contract_by_control_kind() {
+        let target = Arc::new(42u32);
+        let link = WeakLink::new(Arc::downgrade(&target));
+        let _guard = link.state.lock();
+
+        // WriteOptions (!ACCOUNTS) keeps WriterBusy under no_wait.
+        let write_no_wait = crate::guard::WriteOptions {
+            no_wait: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            link.upgrade_with(&write_no_wait),
+            Err(Error::WriterBusy)
+        ));
+
+        // Preparation / ReadLimit (ACCOUNTS) keeps the controlled no_wait invalid error.
+        let prep = crate::access::Preparation::new(crate::task::Control::none(), 4096)
+            .unwrap()
+            .with_no_wait(true);
+        assert!(matches!(link.upgrade_with(&prep), Err(Error::Invalid(_))));
+        let limit = crate::history::ReadLimit {
+            options: &prep,
+            memory: None,
+            held: 0,
+        };
+        assert!(matches!(link.upgrade_with(&limit), Err(Error::Invalid(_))));
     }
 }

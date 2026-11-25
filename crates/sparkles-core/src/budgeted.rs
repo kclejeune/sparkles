@@ -121,13 +121,21 @@ pub(crate) trait BudgetControl: Control {
     fn drop_vec<T>(&mut self, value: Vec<T>);
     fn filled<T: Default>(&mut self, count: usize) -> Result<Box<[T]>>;
     fn read_file(&mut self, path: &Path) -> Result<Vec<u8>>;
-    fn json<T: DeserializeOwned>(&mut self, bytes: &[u8], label: &str) -> Result<Loaded<T>>;
-    fn value<T: DeserializeOwned>(&self, value: serde_json::Value, label: &str) -> Result<T>;
+    fn json<T: DeserializeOwned>(
+        &mut self,
+        bytes: &[u8],
+        label: impl std::fmt::Display,
+    ) -> Result<Loaded<T>>;
+    fn value<T: DeserializeOwned>(
+        &self,
+        value: serde_json::Value,
+        label: impl std::fmt::Display,
+    ) -> Result<T>;
     fn value_fields<T: DeserializeOwned>(
         &self,
         value: serde_json::Value,
         fields: &[&str],
-        label: &str,
+        label: impl std::fmt::Display,
     ) -> Result<T>;
     fn sha256(&self, bytes: &[u8]) -> Result<[u8; 32]>;
     fn open_vocab(&mut self, dir: &Path, fsst: bool) -> Result<Loaded<crate::vocab::Vocab>>;
@@ -217,7 +225,11 @@ impl BudgetControl for Unlimited {
     #[inline(always)]
     fn reserve<T>(&mut self, value: &mut Vec<T>, need: usize) -> Result<()> {
         if need > value.capacity() {
-            value.reserve(need - value.len());
+            if value.capacity() == 0 {
+                value.reserve_exact(need);
+            } else {
+                value.reserve(need - value.len());
+            }
         }
         Ok(())
     }
@@ -238,14 +250,22 @@ impl BudgetControl for Unlimited {
     }
 
     #[inline(always)]
-    fn json<T: DeserializeOwned>(&mut self, bytes: &[u8], label: &str) -> Result<Loaded<T>> {
+    fn json<T: DeserializeOwned>(
+        &mut self,
+        bytes: &[u8],
+        label: impl std::fmt::Display,
+    ) -> Result<Loaded<T>> {
         let value = serde_json::from_slice(bytes)
             .map_err(|error| Error::Corrupt(format!("{label}: {error}")))?;
         Ok(Loaded { value, charge: 0 })
     }
 
     #[inline(always)]
-    fn value<T: DeserializeOwned>(&self, value: serde_json::Value, label: &str) -> Result<T> {
+    fn value<T: DeserializeOwned>(
+        &self,
+        value: serde_json::Value,
+        label: impl std::fmt::Display,
+    ) -> Result<T> {
         serde_json::from_value(value).map_err(|error| Error::Corrupt(format!("{label}: {error}")))
     }
 
@@ -254,7 +274,7 @@ impl BudgetControl for Unlimited {
         &self,
         value: serde_json::Value,
         _fields: &[&str],
-        label: &str,
+        label: impl std::fmt::Display,
     ) -> Result<T> {
         serde_json::from_value(value).map_err(|error| Error::Corrupt(format!("{label}: {error}")))
     }
@@ -312,6 +332,34 @@ impl<F: Fn() -> Result<()>> Control for FnControl<F> {
     #[inline(always)]
     fn remaining(&self) -> u64 {
         u64::MAX
+    }
+
+    #[inline]
+    fn lock<'m, T>(
+        &self,
+        mutex: &'m parking_lot::Mutex<T>,
+    ) -> Result<parking_lot::MutexGuard<'m, T>> {
+        loop {
+            (self.0)()?;
+            if let Some(guard) = mutex.try_lock_for(std::time::Duration::from_millis(10)) {
+                (self.0)()?;
+                return Ok(guard);
+            }
+        }
+    }
+
+    #[inline]
+    fn read_lock<'m, T>(
+        &self,
+        lock: &'m parking_lot::RwLock<T>,
+    ) -> Result<parking_lot::RwLockReadGuard<'m, T>> {
+        loop {
+            (self.0)()?;
+            if let Some(guard) = lock.try_read_for(std::time::Duration::from_millis(10)) {
+                (self.0)()?;
+                return Ok(guard);
+            }
+        }
     }
 
     #[inline(always)]
@@ -443,12 +491,20 @@ impl BudgetControl for ColdBudget<'_> {
     }
 
     #[inline]
-    fn json<T: DeserializeOwned>(&mut self, bytes: &[u8], _label: &str) -> Result<Loaded<T>> {
+    fn json<T: DeserializeOwned>(
+        &mut self,
+        bytes: &[u8],
+        _label: impl std::fmt::Display,
+    ) -> Result<Loaded<T>> {
         ColdBudget::json(self, bytes)
     }
 
     #[inline]
-    fn value<T: DeserializeOwned>(&self, value: serde_json::Value, _label: &str) -> Result<T> {
+    fn value<T: DeserializeOwned>(
+        &self,
+        value: serde_json::Value,
+        _label: impl std::fmt::Display,
+    ) -> Result<T> {
         ColdBudget::value(self, value)
     }
 
@@ -457,7 +513,7 @@ impl BudgetControl for ColdBudget<'_> {
         &self,
         value: serde_json::Value,
         fields: &[&str],
-        _label: &str,
+        _label: impl std::fmt::Display,
     ) -> Result<T> {
         ColdBudget::value_fields(self, value, fields)
     }
@@ -482,8 +538,12 @@ impl BudgetControl for ColdBudget<'_> {
         &mut self,
         prefix: &[(PathBuf, u64)],
         path: &Path,
-        _read_only: bool,
+        read_only: bool,
     ) -> Result<Loaded<crate::vocab::DeltaVocab>> {
+        debug_assert!(
+            read_only,
+            "ColdBudget opens layered delta vocabularies read-only"
+        );
         crate::vocab::DeltaVocab::open_layered_controlled(prefix, path, self)
     }
 }
@@ -495,7 +555,7 @@ impl Control for crate::access::Preparation {
     #[inline]
     fn check(&self, bytes: u64) -> Result<()> {
         crate::access::Preparation::check(self)?;
-        if bytes > self.room() {
+        if bytes > 0 && bytes > self.available_room() {
             return Err(self.exhausted());
         }
         Ok(())
@@ -503,7 +563,7 @@ impl Control for crate::access::Preparation {
 
     #[inline]
     fn remaining(&self) -> u64 {
-        self.room()
+        self.available_room()
     }
 
     #[inline]
@@ -531,7 +591,7 @@ impl Control for crate::access::Preparation {
     fn read_limit(&self) -> ReadLimit<'_> {
         ReadLimit {
             options: self,
-            memory: Some(self.room()),
+            memory: Some(self.available_room()),
             held: 0,
         }
     }
@@ -759,12 +819,20 @@ impl<C: BudgetControl> BudgetControl for &mut C {
     }
 
     #[inline(always)]
-    fn json<T: DeserializeOwned>(&mut self, bytes: &[u8], label: &str) -> Result<Loaded<T>> {
+    fn json<T: DeserializeOwned>(
+        &mut self,
+        bytes: &[u8],
+        label: impl std::fmt::Display,
+    ) -> Result<Loaded<T>> {
         (**self).json(bytes, label)
     }
 
     #[inline(always)]
-    fn value<T: DeserializeOwned>(&self, value: serde_json::Value, label: &str) -> Result<T> {
+    fn value<T: DeserializeOwned>(
+        &self,
+        value: serde_json::Value,
+        label: impl std::fmt::Display,
+    ) -> Result<T> {
         (**self).value(value, label)
     }
 
@@ -773,7 +841,7 @@ impl<C: BudgetControl> BudgetControl for &mut C {
         &self,
         value: serde_json::Value,
         fields: &[&str],
-        label: &str,
+        label: impl std::fmt::Display,
     ) -> Result<T> {
         (**self).value_fields(value, fields, label)
     }
@@ -904,13 +972,49 @@ mod tests {
         let fail = FnControl(|| Err(Error::Cancelled));
         assert!(matches!(Control::check(&fail, 0), Err(Error::Cancelled)));
 
-        // Preparation enforces budget, cancellation, and no_wait lock refusal.
+        // FnControl polls its closure while waiting on contended locks.
+        let contended = parking_lot::Mutex::new(1u32);
+        let _held_mutex = contended.lock();
+        assert!(matches!(
+            Control::lock(&fail, &contended),
+            Err(Error::Cancelled)
+        ));
+        let rw = parking_lot::RwLock::new(1u32);
+        let _held_write = rw.write();
+        assert!(matches!(
+            Control::read_lock(&fail, &rw),
+            Err(Error::Cancelled)
+        ));
+        drop(_held_write);
+        drop(_held_mutex);
+
+        // Preparation enforces budget, pool-grant headroom, cancellation, and no_wait lock refusal.
         let prep = crate::access::Preparation::new(crate::task::Control::none(), 4096).unwrap();
         assert!(Control::check(&prep, 0).is_ok());
         assert!(matches!(
             Control::check(&prep, u64::MAX),
             Err(Error::BudgetExceeded(_))
         ));
+        let pool = crate::sparql::pool::QueryPool::new(16 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        let pooled = crate::access::Preparation::with_grant(
+            crate::task::Control::none(),
+            64 << 20,
+            grant.clone(),
+        )
+        .unwrap();
+        let expected_room = pooled.available_room();
+        assert!(expected_room <= 16 << 20);
+        assert_eq!(Control::remaining(&pooled), expected_room);
+        assert_eq!(Control::read_limit(&pooled).memory, Some(expected_room));
+        assert!(Control::check(&pooled, 0).is_ok());
+        assert!(Control::check(&pooled, expected_room).is_ok());
+        assert!(matches!(
+            Control::check(&pooled, expected_room + 1),
+            Err(Error::BudgetExceeded(_))
+        ));
+        drop(pooled);
+        drop(grant);
         let mutex = parking_lot::Mutex::new(1u32);
         let _guard = mutex.lock();
         let no_wait_prep = prep.with_no_wait(true);

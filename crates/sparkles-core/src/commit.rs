@@ -1171,11 +1171,10 @@ fn parse_gen_commit_with<C: crate::budgeted::BudgetControl>(
     bytes: &[u8],
     control: &mut C,
 ) -> Result<crate::store::cold::Loaded<GenCommitFile>> {
-    let label = (!C::ACCOUNTS).then(|| path.display().to_string());
-    let label = label.as_deref().unwrap_or("commit.json");
-    let parsed: crate::store::cold::Loaded<serde_json::Value> = control.json(bytes, label)?;
+    let parsed: crate::store::cold::Loaded<serde_json::Value> =
+        control.json(bytes, path.display())?;
     check_gen_commit_value(path, &parsed.value)?;
-    let file: GenCommitFile = control.value(parsed.value, label)?;
+    let file: GenCommitFile = control.value(parsed.value, path.display())?;
     check_gen_binding(path, &file, bytes)?;
     Ok(crate::store::cold::Loaded {
         value: file,
@@ -1406,7 +1405,11 @@ pub(crate) fn decode_header(h: &[u8]) -> Option<(uuid::Uuid, u64)> {
 }
 
 /// Read the valid, consecutive records of a catalog file without modifying it (used by
-/// lock-free readers such as `sparkles log`).
+/// lock-free readers such as `sparkles log` and by [`Catalog::open`] before
+/// reconciliation). Returns [`Error::Unsupported`] when the file begins with `MAGIC`
+/// followed by a future format version (`> 1`), even for a 12-byte truncated header,
+/// so reconciliation never overwrites a future catalog. A zero version or bad version-1
+/// header returns `Ok(None)`.
 pub fn read_catalog(path: &Path) -> Result<Option<(uuid::Uuid, Vec<CommitInfo>)>> {
     let mut out = Vec::new();
     let Some((id, _, _)) = walk_catalog_with(path, &mut crate::budgeted::Unlimited, |c, _| {
@@ -1454,6 +1457,9 @@ pub(crate) fn walk_catalog_with<C: crate::budgeted::BudgetControl>(
         control.check(0)?;
         // A known primary-file magic with a future version must refuse before
         // any valid-prefix/reconciliation path can treat it as a missing catalog.
+        // Under `!C::ACCOUNTS`, `version == 0` stays reconcilable (`Ok(None)`) so
+        // `Catalog::open` can recover from torn or zero-filled header writes, while
+        // read-only controlled decoding (`C::ACCOUNTS`) refuses any unknown version.
         if &record[..8] == MAGIC {
             let version = u32::from_le_bytes(record[8..12].try_into().unwrap());
             if C::ACCOUNTS || version > 1 {
@@ -1542,7 +1548,8 @@ impl Catalog {
     /// generation and the WAL: `base` (the generation's commit) and `replayed` (WAL
     /// commits after it, in order). Records beyond the head are dropped, missing ones are
     /// appended; if the file cannot supply history up to `base`, a new one starts at
-    /// `base` (the old file is kept aside).
+    /// `base` (the old file is kept aside). A recognized primary header with a future
+    /// version (`> 1`) is refused with [`Error::Unsupported`] before reconciliation.
     pub fn open(
         path: &Path,
         dataset_id: uuid::Uuid,
@@ -2165,7 +2172,7 @@ mod tests {
         let path = root.path().join("commits.bin");
         let id = uuid::Uuid::new_v4();
         let options = HistoryOptions::default();
-        for version in [1u32, 99] {
+        for version in [0u32, 1, 99] {
             for len in [0, 7, 8, 11, 12, 13, 31, 32, REC - 1, REC] {
                 for known_magic in [true, false] {
                     let mut bytes = encode_header(id, 10);
@@ -2188,10 +2195,10 @@ mod tests {
                         visits += 1;
                         Ok(())
                     });
-                    if known_magic && version == 99 && len >= 12 {
+                    if known_magic && version != 1 && len >= 12 {
                         assert!(
                             matches!(result, Err(Error::Unsupported(_))),
-                            "recognizable future catalog prefix must refuse: len={len}, result={result:?}"
+                            "controlled reader must refuse unknown version: version={version}, len={len}, result={result:?}"
                         );
                     } else if known_magic && version == 1 && len == REC {
                         assert_eq!(result.unwrap(), Some((id, 10, None)));
@@ -2200,10 +2207,51 @@ mod tests {
                     }
                     assert_eq!(visits, 0);
                     assert_eq!(budget.used(), 0);
+
+                    // Ordinary read_catalog refuses recognized future versions (> 1) even on
+                    // a 12-byte prefix, while keeping version 0 reconcilable (Ok(None)).
+                    let ordinary = read_catalog(&path);
+                    if known_magic && version > 1 && len >= 12 {
+                        assert!(
+                            matches!(ordinary, Err(Error::Unsupported(_))),
+                            "ordinary read_catalog must refuse future version: version={version}, len={len}, result={ordinary:?}"
+                        );
+                    } else if known_magic && version == 1 && len == REC {
+                        assert_eq!(ordinary.unwrap(), Some((id, Vec::new())));
+                    } else {
+                        assert_eq!(ordinary.unwrap(), None);
+                    }
                     assert_eq!(std::fs::read(&path).unwrap(), bytes);
                 }
             }
         }
+
+        // Bad CRC on a full version-1 header returns Ok(None) on both paths.
+        let mut bad_crc = encode_header(id, 10);
+        bad_crc[60] ^= 0xFF;
+        std::fs::write(&path, bad_crc).unwrap();
+        assert_eq!(read_catalog(&path).unwrap(), None);
+        let mut budget = ColdBudget::new(ReadLimit {
+            options: &options,
+            memory: Some(4096),
+            held: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            walk_catalog_with(&path, &mut budget, |_, _| Ok(())).unwrap(),
+            None
+        );
+        assert_eq!(budget.used(), 0);
+
+        // Catalog::open refuses a truncated future-version header without modifying the file.
+        let mut future_prefix = encode_header(id, 10);
+        future_prefix[8..12].copy_from_slice(&99u32.to_le_bytes());
+        std::fs::write(&path, &future_prefix[..12]).unwrap();
+        assert!(matches!(
+            Catalog::open(&path, id, sample_commit(10), &[]),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), &future_prefix[..12]);
     }
 
     fn sample_commit(seq: u64) -> CommitInfo {
@@ -2825,7 +2873,6 @@ mod tests {
             Arc,
             atomic::{AtomicBool, Ordering},
         };
-        use std::time::{Duration, Instant};
 
         let dir = tempfile::tempdir().unwrap();
         let id = uuid::Uuid::new_v4();
@@ -2910,19 +2957,35 @@ mod tests {
         ));
         assert_eq!(cancelled.used(), 0);
 
-        let expired_opts = HistoryOptions {
-            cancel: None,
-            deadline: Some(Instant::now() + Duration::from_millis(5)),
-        };
+        struct SwitchTimeout(AtomicBool);
+        impl crate::history::ReadControl for SwitchTimeout {
+            fn check_read(&self) -> Result<()> {
+                if self.0.load(Ordering::Relaxed) {
+                    Err(Error::Timeout)
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+            }
+        }
+
+        let timeout = SwitchTimeout(AtomicBool::new(false));
         let mut expired = ColdBudget::new(ReadLimit {
-            options: &expired_opts,
+            options: &timeout,
             memory: None,
             held: 0,
         })
         .unwrap();
-        std::thread::sleep(Duration::from_millis(10));
+        timeout.0.store(true, Ordering::Relaxed);
         assert!(matches!(
             read_dataset_file_with(dir.path(), &mut expired),
+            Err(Error::Timeout)
+        ));
+        assert!(matches!(
+            read_gen_commit_with(dir.path(), &mut expired),
             Err(Error::Timeout)
         ));
         assert!(matches!(

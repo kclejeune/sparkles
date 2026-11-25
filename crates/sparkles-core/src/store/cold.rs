@@ -561,10 +561,19 @@ impl super::Generation {
         let label = dir_label.as_deref().unwrap_or("historical generation");
         crate::formats::INDEX.check(label, number, written_by)?;
         builder::check_features_listed(&version.value, "meta.json")?;
-        drop(version.value);
-        control.release(version.charge);
-        let meta: Loaded<builder::IndexMeta> = control.json(&bytes, "meta.json")?;
-        control.drop_vec(bytes);
+        let meta: Loaded<builder::IndexMeta> = if C::ACCOUNTS {
+            drop(version.value);
+            control.release(version.charge);
+            let meta = control.json(&bytes, "meta.json")?;
+            control.drop_vec(bytes);
+            meta
+        } else {
+            control.drop_vec(bytes);
+            Loaded {
+                value: control.value(version.value, "meta.json")?,
+                charge: 0,
+            }
+        };
         let meta = if C::ACCOUNTS {
             // check_features only allocates on an unsupported-feature error. Its
             // payloads and output remain covered by the admitted metadata parse lease.
@@ -1254,5 +1263,60 @@ mod tests {
             held: 0,
         };
         assert!(matches!(ColdBudget::new(limit), Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn ordinary_open_matches_read_index_meta_duplicate_key_and_exact_small_capacities() {
+        use crate::{builder, index::Perm};
+        let dir = immutable_base(false);
+        let normal = super::super::Generation::open_sealed(dir.path(), "gen-0001").unwrap();
+        assert_eq!(normal.perms.capacity(), Perm::ALL.len());
+        for perm in Perm::ALL {
+            let p = normal.perm(perm);
+            assert_eq!(p.blocks.len(), 1);
+            assert_eq!(p.blocks.capacity(), 1);
+            let segs = p.segs.as_ref().expect("segmented");
+            assert_eq!(segs.start_len_and_capacity(), (2, 2));
+        }
+        let options = HistoryOptions::default();
+        let limit = ReadLimit {
+            options: &options,
+            memory: Some(16 << 20),
+            held: 0,
+        };
+        let retained_normal = normal.retained_bytes_with(&limit).unwrap();
+        let mut budget = ColdBudget::new(limit).unwrap();
+        let loaded =
+            super::super::Generation::open_sealed_with(dir.path(), "gen-0001", None, &mut budget)
+                .unwrap();
+        for perm in Perm::ALL {
+            assert_eq!(
+                normal.perm(perm).resident_bytes(),
+                loaded.value.perm(perm).resident_bytes()
+            );
+        }
+        let exact_cap = ReadLimit {
+            options: &options,
+            memory: Some(retained_normal),
+            held: 0,
+        };
+        assert_eq!(
+            normal.retained_bytes_with(&exact_cap).unwrap(),
+            retained_normal
+        );
+        drop(loaded.value);
+        budget.release(loaded.charge);
+
+        // Repeat a known JSON key ("quads") as `builder::read_index_meta` accepts via `Value`.
+        let meta_path = dir.path().join("meta.json");
+        let raw = std::fs::read_to_string(&meta_path).unwrap();
+        let needle = "\"quads\":";
+        let pos = raw.find(needle).expect("quads field present");
+        let duplicated = format!("{}\"quads\": 0, {}", &raw[..pos], &raw[pos..]);
+        std::fs::write(&meta_path, duplicated).unwrap();
+        let expected = builder::read_index_meta(dir.path(), None).unwrap();
+        let opened = super::super::Generation::open_sealed(dir.path(), "gen-0001").unwrap();
+        assert_eq!(opened.meta.quads, expected.quads);
+        assert_eq!(opened.meta.features, expected.features);
     }
 }

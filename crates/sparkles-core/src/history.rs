@@ -2060,5 +2060,33 @@ mod tests {
             decode_file_with(&bytes, id, &mut cancelled),
             Err(Error::Cancelled)
         ));
+
+        struct SwitchTimeout(AtomicBool);
+        impl ReadControl for SwitchTimeout {
+            fn check_read(&self) -> Result<()> {
+                if self.0.load(Ordering::Relaxed) {
+                    Err(Error::Timeout)
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+            }
+        }
+        let timeout = SwitchTimeout(AtomicBool::new(false));
+        let mut timed_out = ColdBudget::new(ReadLimit {
+            options: &timeout,
+            memory: None,
+            held: 0,
+        })
+        .unwrap();
+        timeout.0.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            decode_file_with(&bytes, id, &mut timed_out),
+            Err(Error::Timeout)
+        ));
+        assert_eq!(timed_out.used(), 0);
     }
 }
