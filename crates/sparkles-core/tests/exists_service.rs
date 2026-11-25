@@ -74,9 +74,11 @@ fn rows_with(s: &Store, q: &str, mode: ExecutionMode, o: &QueryOptions) -> usize
 #[test]
 fn a_service_in_an_exists_without_shared_variables_is_called_once() {
     let s = store();
-    // A budget that a streamed scan of the rows nearly fills, so that a cursor keeps no
-    // answer in the EXISTS memo. It used to call the service once per row.
-    let tight = Some(1152u64 << 10);
+    // A budget that a streamed scan of the rows nearly fills (leaving room for the
+    // 24 KiB metered SERVICE parser slack, but well below the quarter-budget memo
+    // threshold), so that a cursor keeps no answer in the EXISTS memo. It used to call
+    // the service once per row.
+    let tight = Some(1200u64 << 10);
     for (response, found) in [(FAILING, true), (EMPTY, false)] {
         let (url, calls) = endpoint(response);
         for negated in [false, true] {

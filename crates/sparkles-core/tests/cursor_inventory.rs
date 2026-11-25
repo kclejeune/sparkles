@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Why the strict policy refuses a form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum Why {
     /// A decision of the X14 plan keeps it refused.
     Decision(&'static str),
@@ -29,6 +30,7 @@ enum Why {
 
 /// What the strict policy does with a form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum Expect {
     Native,
     Refused(Why),
@@ -338,6 +340,15 @@ fn strict_view_read_refuses_legacy_sources_before_calling_them() {
     };
     assert!(select_cursor(s.snapshot(), q, &opts, &strict).is_err());
     assert_eq!(source.0.load(Ordering::Relaxed), 0);
+    // An operator whose own EXISTS embeds a refused form is also refused under strict policy.
+    let order_exists = "SELECT ?s { ?s <urn:p> ?o } ORDER BY (EXISTS { SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"ints\" ; <urn:x-sparkles:view#bind> ?x } })";
+    let err = select_cursor(s.snapshot(), order_exists, &opts, &strict)
+        .err()
+        .expect("ORDER BY over non-streaming EXISTS must be refused");
+    assert!(
+        matches!(err, Error::Unsupported(ref m) if m.contains("materialization at OrderBy")),
+        "unexpected error: {err:?}"
+    );
     let permissive = CursorOptions {
         fallback: FallbackPolicy::AllowMaterialization,
         ..strict
@@ -384,7 +395,7 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             "SILENT SERVICE",
             "Service",
             "SELECT ?s ?o { SERVICE SILENT <http://local/sparql> { ?s <urn:p> ?o } }",
-            Refused(Why::Decision("Q-SVC1: SILENT buffers its whole answer")),
+            Native,
         ),
         // views
         form(
@@ -423,15 +434,13 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             "constant property function",
             "PropertyFunction",
             "SELECT ?t { ?t apf:strSplit (\"a b c\" \" \") }",
-            Refused(Why::Decision("Q1: ARQ's constant property functions")),
+            Native,
         ),
         form(
-            "ORDER BY over an EXISTS that does not stream",
+            "ORDER BY over an EXISTS with leaf PropertyFunction",
             "OrderBy",
             "SELECT ?s { ?s <urn:p> ?o } ORDER BY (EXISTS { ?t apf:strSplit (\"a b\" \" \") })",
-            Refused(Why::Decision(
-                "an operator whose own EXISTS does not stream",
-            )),
+            Native,
         ),
         // path searches
         form(
@@ -569,12 +578,10 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
     refused.extend(text_forms());
     #[cfg(feature = "geo")]
     refused.extend(geo_forms());
-    // Every refused form names the decision that keeps it eager.
+    // Every built-in plan form runs natively under RejectMaterialization.
     assert!(
-        refused
-            .iter()
-            .all(|(_, why)| matches!(why, Why::Decision(reason) if !reason.is_empty())),
-        "unexpected refusal: {refused:?}"
+        refused.is_empty(),
+        "expected zero refused built-in forms: {refused:?}"
     );
 }
 

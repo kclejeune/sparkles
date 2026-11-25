@@ -1,11 +1,21 @@
-//! A SERVICE without SILENT, read from its endpoint a batch at a time (item 829).
+//! A SERVICE leaf (`silent: false` and `silent: true`), read from its endpoint under the
+//! query's memory budget (item 829).
 //!
-//! A remote endpoint's response is parsed as it arrives, so the operator holds one
-//! output batch and the parser's buffer between pulls, never the whole answer. A query
-//! endpoint of this process is opened as a cursor of its own under the same policy, as
-//! the caller, and the operator pulls one of its batches per batch. A cached answer is
-//! read from the cache entry, which the operator holds under a charge while it reads it,
-//! since the cache may evict the entry meanwhile.
+//! For a non-`SILENT` SERVICE, a remote endpoint's response is parsed as it arrives, so
+//! the operator holds one output batch and the parser's buffer between pulls, never the
+//! whole answer. A query endpoint of this process is opened as a cursor of its own under
+//! the same policy as the caller, and the operator pulls one of its batches per batch. A
+//! cached answer is read from the cache entry, which the operator holds under a charge
+//! while it reads it, since the cache may evict the entry meanwhile.
+//!
+//! For a `SILENT` SERVICE, SPARQL 1.1 Federation requires replacing any remote or local
+//! endpoint error — including a mid-stream truncation or parse failure after rows have
+//! arrived — with a single empty solution. The operator therefore drains remote and local
+//! sources into a memory-charged buffer before emitting its first row (reporting
+//! `fullInputBeforeOutput`), drops any partial buffer and cache copy on endpoint failure,
+//! and emits one empty binding row. Local control errors (`Cancelled`, `Timeout`,
+//! `NotPermitted`, `BudgetExceeded`, and strict cursor refusals from an in-process
+//! callee) are never suppressed. A cache hit is already complete and streams directly.
 //!
 //! Nothing happens before the first pull, because operators are also built only to see
 //! whether an EXISTS pattern streams. The request, the policy checks and the endpoint's
@@ -14,23 +24,21 @@
 //! The endpoint's blank nodes are its own. One map for the whole answer gives each label
 //! one new blank node of this query, across batches, as one eager call does.
 //!
-//! Three things differ from an eager run. A failure after rows were emitted fails the
-//! cursor, as any streamed failure does. A response is cached only when it has been read
-//! to its end, so a consumer that stops early leaves nothing in the cache, and a copy
-//! that grows past the largest entry the cache keeps, or past what the query's budget
-//! holds beside the answer, is dropped as it grows. And the
-//! outbound timeout counts from the start of the request, while the query's deadline
-//! leaves out the time a consumer keeps the cursor waiting, so a slow consumer can expire
-//! a remote transfer that an eager run would finish.
+//! Three things differ from an eager run for non-`SILENT` SERVICE. A failure after rows
+//! were emitted fails the cursor, as any streamed failure does. A response is cached only
+//! when it has been read to its end, so a consumer that stops early leaves nothing in the
+//! cache, and a copy that grows past the largest entry the cache keeps, or past what the
+//! query's budget holds beside the answer, is dropped as it grows. And the outbound
+//! timeout counts from the start of the request, while the query's deadline leaves out
+//! the time a consumer keeps the cursor waiting, so a slow consumer can expire a remote
+//! transfer that an eager run would finish.
 //!
-//! The parser buffers a JSON response whose results come before its head's variables,
-//! so the strict policy refuses one by name and a permissive cursor reads it under a
-//! charge for the buffered answer (see `svcread`).
-//!
-//! A SILENT SERVICE answers one empty solution when the call fails, after any number of
-//! rows, so it needs the whole answer before its first row and stays an eager leaf that
-//! the strict policy refuses (decision Q-SVC1).
-use super::{Buffer, CursorOptions, FallbackPolicy, QueryCursor};
+//! For non-`SILENT` SERVICE, the parser buffers a JSON response whose results come before
+//! its head's variables, so the strict policy refuses one by name and a permissive cursor
+//! reads it under a charge for the buffered answer (see `svcread`). For `SILENT` SERVICE,
+//! the whole answer is already buffered under a charge, so late-head JSON is accepted
+//! under full byte metering.
+use super::{Buffer, CursorOptions, FallbackPolicy, QueryCursor, copy_rows, merge};
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::sparql::ctx::{Ctx, OwnedCharge};
@@ -43,10 +51,10 @@ use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-/// Whether a plan node runs as a streamed SERVICE: one without SILENT, which reads no
-/// input.
+/// Whether a plan node runs as a native SERVICE cursor (both `silent: false` and
+/// `silent: true`, reading no plan input).
 pub(super) fn eligible(node: &Node) -> bool {
-    matches!(node.kind, Kind::Service { silent: false, .. }) && node.children.is_empty()
+    matches!(node.kind, Kind::Service { .. }) && node.children.is_empty()
 }
 
 /// Fixed runtime plan explanation when a permissive SERVICE reader discovers a JSON
@@ -54,9 +62,26 @@ pub(super) fn eligible(node: &Node) -> bool {
 pub(super) const BUFFERED_REASON: &str =
     "SERVICE JSON results precede head variables and are buffered before output";
 
+/// Plan explanation for a `SILENT` SERVICE cursor, which buffers its answer under the
+/// memory budget before emitting rows so mid-stream endpoint errors become one empty
+/// solution.
+pub(super) const SILENT_REASON: &str = "Service (SILENT) buffers its answer under the memory budget before output so an endpoint error becomes one empty solution";
+
+/// Largest chunk pulled per step while draining a `SILENT` SERVICE into its buffer.
+const SILENT_CHUNK_MAX: usize = 4096;
+
+/// Errors that `SILENT` SERVICE must propagate rather than suppress into an empty row.
+fn is_non_suppressible(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Cancelled | Error::Timeout | Error::NotPermitted(_) | Error::BudgetExceeded(_)
+    ) || matches!(err, Error::Unsupported(m) if m.starts_with(super::REFUSAL))
+}
+
 pub(super) struct Service {
     endpoint: PathEnd,
     query: String,
+    silent: bool,
     cache: CacheMode,
     vars: Vec<VarId>,
     /// the names of `vars`, as the endpoint's solutions name their variables
@@ -68,6 +93,10 @@ pub(super) struct Service {
     /// yielding its first row; retained after the source is released
     buffered_before_output: bool,
     source: Option<Source>,
+    /// Charged answer buffered for `SILENT` SERVICE (either the complete drained rows or
+    /// the single empty solution produced when a suppressible endpoint error occurred).
+    buffered: Option<Buffer>,
+    at: usize,
     /// the blank node of this query for each label of the endpoint's answer
     bnodes: FxHashMap<String, Id>,
 }
@@ -217,8 +246,8 @@ impl Service {
         let Kind::Service {
             endpoint,
             query,
+            silent,
             cache,
-            ..
         } = &node.kind
         else {
             unreachable!("a SERVICE node")
@@ -226,6 +255,7 @@ impl Service {
         Self {
             endpoint: endpoint.clone(),
             query: query.clone(),
+            silent: *silent,
             cache: *cache,
             vars: node.vars.clone(),
             names: node.vars.iter().map(|v| ctx.var_name(*v)).collect(),
@@ -233,26 +263,32 @@ impl Service {
             opened: false,
             buffered_before_output: false,
             source: None,
+            buffered: None,
+            at: 0,
             bnodes: FxHashMap::default(),
         }
     }
 
-    /// Whether this reader discovered that its remote response buffers its solution
-    /// sequence before yielding its first row.
+    /// Whether this reader buffers its full answer before emitting its first row
+    /// (`SILENT` SERVICE, or a permissive non-`SILENT` reader whose remote JSON response
+    /// placed results before head variables).
     pub(super) fn full_input_before_output(&self) -> bool {
-        self.buffered_before_output
+        self.silent || self.buffered_before_output
     }
 
-    /// Close the answer, its response, copy, entry or in-process call, once nothing
-    /// reads it any more.
+    /// Close the answer, its response, buffered rows, copy, entry or in-process call,
+    /// once nothing reads it any more.
     pub(super) fn release(&mut self) {
         self.opened = true;
         self.source = None;
+        self.buffered = None;
+        self.at = 0;
+        self.bnodes.clear();
     }
 
     /// Whether the answer has been read to its end.
     pub(super) fn done(&self) -> bool {
-        self.opened && self.source.is_none()
+        self.opened && self.source.is_none() && self.buffered.is_none()
     }
 
     /// Send the request, or open the in-process call or the cache entry.
@@ -336,7 +372,8 @@ impl Service {
         }
         let meter = crate::sparql::exec::Meter {
             ctx,
-            strict: self.fallback.at_pull(ctx) == FallbackPolicy::RejectMaterialization,
+            strict: !self.silent
+                && self.fallback.at_pull(ctx) == FallbackPolicy::RejectMaterialization,
         };
         let answer = RemoteAnswer::open(ctx, &url, &self.query, Some(meter))?;
         self.buffered_before_output = answer.buffered_before_output();
@@ -344,6 +381,46 @@ impl Service {
             answer: Box::new(answer),
             tee,
         });
+        Ok(())
+    }
+
+    /// Drain a remote or local source for `SILENT` SERVICE into a charged buffer before
+    /// emitting any row, so a mid-stream endpoint error can be replaced cleanly with one
+    /// empty binding row.
+    fn drain_silent(&mut self, ctx: &Arc<Ctx>) -> Result<Buffer> {
+        let mut all = Buffer::new(ctx, &self.vars, 0)?;
+        let mut chunk = 64usize;
+        while self.source.is_some() {
+            ctx.check()?;
+            let cap = chunk
+                .min(SILENT_CHUNK_MAX)
+                .min(ctx.rows_within_budget(self.vars.len()).max(1));
+            if let Some(batch) = self.fill(ctx, cap)? {
+                merge::append(ctx, &mut all, &batch.table, 0..batch.table.len)?;
+            }
+            chunk = chunk.saturating_mul(2).min(SILENT_CHUNK_MAX);
+        }
+        Ok(all)
+    }
+
+    /// Handle an error during `SILENT` SERVICE open or draining: release partial state,
+    /// propagate local control/policy/budget/strict-refusal errors, and suppress endpoint
+    /// failures into a single empty solution row.
+    fn handle_silent_error(&mut self, ctx: &Arc<Ctx>, err: Error) -> Result<()> {
+        self.source = None;
+        self.buffered = None;
+        self.at = 0;
+        self.bnodes.clear();
+        ctx.check()?;
+        if is_non_suppressible(&err) {
+            return Err(err);
+        }
+        let mut unit = Buffer::new(ctx, &self.vars, 1)?;
+        let row = vec![Id::UNDEF; self.vars.len()];
+        unit.table.push_row(&row);
+        unit.reconcile()?;
+        self.buffered = Some(unit);
+        self.at = 0;
         Ok(())
     }
 
@@ -356,7 +433,40 @@ impl Service {
     ) -> Result<Option<Buffer>> {
         if !self.opened {
             self.opened = true;
-            self.open(ctx, options)?;
+            if self.silent {
+                match self.open(ctx, options) {
+                    Ok(()) => {
+                        if !matches!(self.source, Some(Source::Cached { .. })) {
+                            match self.drain_silent(ctx) {
+                                Ok(buf) => {
+                                    self.source = None;
+                                    self.bnodes.clear();
+                                    if !buf.table.is_empty() {
+                                        self.buffered = Some(buf);
+                                        self.at = 0;
+                                    }
+                                }
+                                Err(err) => self.handle_silent_error(ctx, err)?,
+                            }
+                        }
+                    }
+                    Err(err) => self.handle_silent_error(ctx, err)?,
+                }
+            } else {
+                self.open(ctx, options)?;
+            }
+        }
+        if let Some(buf) = &self.buffered {
+            if self.at == 0 && buf.table.len <= cap {
+                return Ok(self.buffered.take());
+            }
+            let batch = copy_rows(ctx, &buf.table, self.at, cap)?;
+            self.at += batch.as_ref().map_or(0, |b| b.table.len);
+            if self.at >= buf.table.len {
+                self.buffered = None;
+                self.at = 0;
+            }
+            return Ok(batch);
         }
         if self.source.is_none() {
             return Ok(None);
@@ -553,6 +663,7 @@ mod tests {
         Service {
             endpoint: PathEnd::Const(Id::UNDEF),
             query: "SELECT ?s { ?s ?p ?o }".into(),
+            silent: false,
             cache: CacheMode::Default,
             vars: vec![var],
             names: vec![ctx.var_name(var)],
@@ -560,6 +671,8 @@ mod tests {
             opened: true,
             buffered_before_output: false,
             source: Some(source),
+            buffered: None,
+            at: 0,
             bnodes: FxHashMap::default(),
         }
     }

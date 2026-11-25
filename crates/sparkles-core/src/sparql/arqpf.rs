@@ -1303,3 +1303,2011 @@ impl<'a> Lists<'a> {
         Ok(out)
     }
 }
+
+// ------------------------------------------------------------ streaming leaf reader ----
+
+const RANGE_CHUNK: usize = 256;
+
+fn key_successor(mut key: [u64; 4]) -> Option<[u64; 4]> {
+    for i in (0..4).rev() {
+        if key[i] != u64::MAX {
+            key[i] += 1;
+            return Some(key);
+        }
+        key[i] = 0;
+    }
+    None
+}
+
+fn has_local(prefix: &[u64]) -> bool {
+    prefix.iter().any(|&x| Id(x).tag() == crate::id::Tag::Local)
+}
+
+fn has_any(ctx: &Ctx, graph: &GraphFilter, perm: Perm, prefix: &[u64]) -> Result<bool> {
+    if has_local(prefix) {
+        return Ok(false);
+    }
+    let gc = perm.col_of(G);
+    let (lo, hi) = (pad(prefix, 0), pad(prefix, u64::MAX));
+    let mut found = false;
+    let mut scanned = 0usize;
+    ctx.snap
+        .scan_between_cols(perm, lo, hi, crate::index::ALL_COLS, |c| {
+            match c {
+                Chunk::Block(b, s, e) => {
+                    for i in s..e {
+                        scanned += 1;
+                        if scanned.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        if graph.accepts(b.cols[gc][i]) {
+                            found = true;
+                            return Ok(false);
+                        }
+                    }
+                }
+                Chunk::Row(k) => {
+                    scanned += 1;
+                    if scanned.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    if graph.accepts(k[gc]) {
+                        found = true;
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        })?;
+    Ok(found)
+}
+
+fn first_col(
+    ctx: &Ctx,
+    graph: &GraphFilter,
+    perm: Perm,
+    prefix: &[u64],
+    col: usize,
+) -> Result<Option<Id>> {
+    if has_local(prefix) {
+        return Ok(None);
+    }
+    let gc = perm.col_of(G);
+    let (lo, hi) = (pad(prefix, 0), pad(prefix, u64::MAX));
+    let mut found = None;
+    let mut scanned = 0usize;
+    ctx.snap
+        .scan_between_cols(perm, lo, hi, crate::index::ALL_COLS, |c| {
+            match c {
+                Chunk::Block(b, s, e) => {
+                    for i in s..e {
+                        scanned += 1;
+                        if scanned.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        if graph.accepts(b.cols[gc][i]) {
+                            found = Some(Id(b.cols[col][i]));
+                            return Ok(false);
+                        }
+                    }
+                }
+                Chunk::Row(k) => {
+                    scanned += 1;
+                    if scanned.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    if graph.accepts(k[gc]) {
+                        found = Some(Id(k[col]));
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        })?;
+    Ok(found)
+}
+
+fn has_any_col_ne(
+    ctx: &Ctx,
+    graph: &GraphFilter,
+    perm: Perm,
+    prefix: &[u64],
+    col: usize,
+    excluded: u64,
+) -> Result<bool> {
+    if has_local(prefix) {
+        return Ok(false);
+    }
+    let gc = perm.col_of(G);
+    let (lo, hi) = (pad(prefix, 0), pad(prefix, u64::MAX));
+    let mut found = false;
+    let mut scanned = 0usize;
+    ctx.snap
+        .scan_between_cols(perm, lo, hi, crate::index::ALL_COLS, |c| {
+            match c {
+                Chunk::Block(b, s, e) => {
+                    for i in s..e {
+                        scanned += 1;
+                        if scanned.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        if graph.accepts(b.cols[gc][i]) && b.cols[col][i] != excluded {
+                            found = true;
+                            return Ok(false);
+                        }
+                    }
+                }
+                Chunk::Row(k) => {
+                    scanned += 1;
+                    if scanned.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    if graph.accepts(k[gc]) && k[col] != excluded {
+                        found = true;
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        })?;
+    Ok(found)
+}
+
+/// Resumable chunked range scan over a single index permutation, deduplicating projected
+/// columns across graphs in O(1) memory.
+struct RangeCursor {
+    perm: Perm,
+    lo: Option<[u64; 4]>,
+    hi: [u64; 4],
+    last_id: Option<Id>,
+    last_pair: Option<(Id, Id)>,
+}
+
+impl RangeCursor {
+    fn new(perm: Perm, prefix: &[u64]) -> Self {
+        let lo = (!has_local(prefix)).then(|| pad(prefix, 0));
+        Self {
+            perm,
+            lo,
+            hi: pad(prefix, u64::MAX),
+            last_id: None,
+            last_pair: None,
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.lo.is_none()
+    }
+
+    fn next_ids(
+        &mut self,
+        ctx: &Ctx,
+        graph: &GraphFilter,
+        col: usize,
+        skip_after_col1: bool,
+        out: &mut Vec<Id>,
+        limit: usize,
+    ) -> Result<()> {
+        out.clear();
+        let Some(lo) = self.lo else {
+            return Ok(());
+        };
+        let gc = self.perm.col_of(G);
+        let mut last_key: Option<[u64; 4]> = None;
+        let mut stopped = false;
+        let mut scanned = 0usize;
+        let mut last_id = self.last_id;
+        ctx.snap
+            .scan_between_cols(self.perm, lo, self.hi, crate::index::ALL_COLS, |c| {
+                match c {
+                    Chunk::Block(b, s, e) => {
+                        for i in s..e {
+                            scanned += 1;
+                            if scanned.is_multiple_of(1024) {
+                                ctx.check()?;
+                            }
+                            if !graph.accepts(b.cols[gc][i]) {
+                                continue;
+                            }
+                            let k = [b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]];
+                            let id = Id(k[col]);
+                            last_key = Some(k);
+                            if col < 3 && last_id == Some(id) {
+                                continue;
+                            }
+                            last_id = Some(id);
+                            out.push(id);
+                            if out.len() >= limit {
+                                stopped = true;
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    Chunk::Row(k) => {
+                        scanned += 1;
+                        if scanned.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        if !graph.accepts(k[gc]) {
+                            return Ok(true);
+                        }
+                        let id = Id(k[col]);
+                        last_key = Some(k);
+                        if col < 3 && last_id == Some(id) {
+                            return Ok(true);
+                        }
+                        last_id = Some(id);
+                        out.push(id);
+                        if out.len() >= limit {
+                            stopped = true;
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            })?;
+        self.last_id = last_id;
+        self.lo = if stopped {
+            last_key
+                .and_then(|k| {
+                    if skip_after_col1 {
+                        k[1].checked_add(1).map(|next| [k[0], next, 0, 0])
+                    } else {
+                        key_successor(k)
+                    }
+                })
+                .filter(|k| *k <= self.hi)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    fn next_pairs(
+        &mut self,
+        ctx: &Ctx,
+        graph: &GraphFilter,
+        cols: [usize; 2],
+        out: &mut Vec<(Id, Id)>,
+        limit: usize,
+    ) -> Result<()> {
+        out.clear();
+        let Some(lo) = self.lo else {
+            return Ok(());
+        };
+        let gc = self.perm.col_of(G);
+        let mut last_key: Option<[u64; 4]> = None;
+        let mut stopped = false;
+        let mut scanned = 0usize;
+        let mut last_pair = self.last_pair;
+        ctx.snap
+            .scan_between_cols(self.perm, lo, self.hi, crate::index::ALL_COLS, |c| {
+                match c {
+                    Chunk::Block(b, s, e) => {
+                        for i in s..e {
+                            scanned += 1;
+                            if scanned.is_multiple_of(1024) {
+                                ctx.check()?;
+                            }
+                            if !graph.accepts(b.cols[gc][i]) {
+                                continue;
+                            }
+                            let k = [b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]];
+                            let pair = (Id(k[cols[0]]), Id(k[cols[1]]));
+                            last_key = Some(k);
+                            if last_pair == Some(pair) {
+                                continue;
+                            }
+                            last_pair = Some(pair);
+                            out.push(pair);
+                            if out.len() >= limit {
+                                stopped = true;
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    Chunk::Row(k) => {
+                        scanned += 1;
+                        if scanned.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        if !graph.accepts(k[gc]) {
+                            return Ok(true);
+                        }
+                        let pair = (Id(k[cols[0]]), Id(k[cols[1]]));
+                        last_key = Some(k);
+                        if last_pair == Some(pair) {
+                            return Ok(true);
+                        }
+                        last_pair = Some(pair);
+                        out.push(pair);
+                        if out.len() >= limit {
+                            stopped = true;
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            })?;
+        self.last_pair = last_pair;
+        self.lo = if stopped {
+            last_key.and_then(key_successor).filter(|k| *k <= self.hi)
+        } else {
+            None
+        };
+        Ok(())
+    }
+}
+
+/// Constants interned once for store-scanning list and container readers.
+#[derive(Clone, Copy)]
+struct StoreIds {
+    first: Id,
+    rest: Id,
+    nil: Id,
+    rdf_type: Id,
+    container_types: [Id; 3],
+}
+
+impl StoreIds {
+    fn new(ctx: &Ctx) -> Result<Self> {
+        let iri = |n: oxrdf::NamedNodeRef<'_>| ctx.intern_term(&Term::NamedNode(n.into_owned()));
+        let first = iri(rdf::FIRST);
+        let rest = iri(rdf::REST);
+        let nil = iri(rdf::NIL);
+        let rdf_type = iri(rdf::TYPE);
+        let container_types = [
+            ctx.intern_term(&Term::NamedNode(ContainerType::Bag.iri())),
+            ctx.intern_term(&Term::NamedNode(ContainerType::Seq.iri())),
+            ctx.intern_term(&Term::NamedNode(ContainerType::Alt.iri())),
+        ];
+        ctx.check()?;
+        Ok(Self {
+            first,
+            rest,
+            nil,
+            rdf_type,
+            container_types,
+        })
+    }
+
+    fn is_list(&self, ctx: &Ctx, graph: &GraphFilter, n: Id) -> Result<bool> {
+        Ok(n == self.nil || has_any(ctx, graph, Perm::Pso, &[self.rest.0, n.0])?)
+    }
+
+    fn is_container(
+        &self,
+        ctx: &Ctx,
+        graph: &GraphFilter,
+        c: Id,
+        ty: Option<ContainerType>,
+    ) -> Result<bool> {
+        for (idx, t) in ContainerType::ALL.iter().enumerate() {
+            if ty.is_some_and(|x| x != *t) {
+                continue;
+            }
+            if has_any(
+                ctx,
+                graph,
+                Perm::Pso,
+                &[self.rdf_type.0, c.0, self.container_types[idx].0],
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Resumable walker over one RDF collection starting at `head`, charging its cycle set
+/// before growth.
+struct ListWalk {
+    head: Id,
+    cell: Option<Id>,
+    seen: FxHashSet<Id>,
+    pos: i64,
+}
+
+impl ListWalk {
+    fn new(ctx: &Ctx, graph: &GraphFilter, ids: &StoreIds, head: Id) -> Result<Self> {
+        let cell = ids.is_list(ctx, graph, head)?.then_some(head);
+        Ok(Self {
+            head,
+            cell,
+            seen: FxHashSet::default(),
+            pos: 0,
+        })
+    }
+
+    fn bytes(&self) -> u64 {
+        (self.seen.capacity() as u64).saturating_mul(16)
+    }
+
+    fn step(
+        &mut self,
+        ctx: &Ctx,
+        graph: &GraphFilter,
+        ids: &StoreIds,
+        admit_extra: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<Option<(i64, Id)>> {
+        while let Some(c) = self.cell {
+            if c == ids.nil || self.seen.len() >= MAX_CELLS {
+                self.cell = None;
+                return Ok(None);
+            }
+            if !self.seen.contains(&c) {
+                if self.seen.len() == self.seen.capacity() {
+                    let grown = (self.seen.capacity() * 2).max(8);
+                    admit_extra((grown as u64).saturating_mul(16))?;
+                }
+                self.seen.insert(c);
+            } else {
+                self.cell = None;
+                return Ok(None);
+            }
+            if self.seen.len().is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let member = first_col(ctx, graph, Perm::Pso, &[ids.first.0, c.0], 2)?;
+            self.cell = first_col(ctx, graph, Perm::Pso, &[ids.rest.0, c.0], 2)?;
+            if let Some(m) = member {
+                let p = self.pos;
+                self.pos += 1;
+                return Ok(Some((p, m)));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Resumable stream of all list heads in the active graph, matching `Lists::heads`.
+struct HeadScan {
+    rest_scan: RangeCursor,
+    buf: Vec<Id>,
+    at: usize,
+    checked_nil: bool,
+}
+
+impl HeadScan {
+    fn new(ids: &StoreIds) -> Self {
+        Self {
+            rest_scan: RangeCursor::new(Perm::Pso, &[ids.rest.0]),
+            buf: Vec::new(),
+            at: 0,
+            checked_nil: false,
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        (self.buf.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64)
+    }
+
+    fn next_head(&mut self, ctx: &Ctx, graph: &GraphFilter, ids: &StoreIds) -> Result<Option<Id>> {
+        loop {
+            while self.at < self.buf.len() {
+                let s = self.buf[self.at];
+                self.at += 1;
+                if !has_any(ctx, graph, Perm::Pos, &[ids.rest.0, s.0])? {
+                    return Ok(Some(s));
+                }
+            }
+            if !self.rest_scan.is_done() {
+                self.rest_scan
+                    .next_ids(ctx, graph, 1, true, &mut self.buf, RANGE_CHUNK)?;
+                self.at = 0;
+                continue;
+            }
+            if !self.checked_nil {
+                self.checked_nil = true;
+                let as_object = has_any_col_ne(ctx, graph, Perm::Osp, &[ids.nil.0], 2, ids.rest.0)?;
+                let as_subject = has_any(ctx, graph, Perm::Spo, &[ids.nil.0])?;
+                if as_object || as_subject {
+                    return Ok(Some(ids.nil));
+                }
+            }
+            return Ok(None);
+        }
+    }
+}
+
+/// Walk backwards from a list cell to its list head, charging the cycle set.
+fn head_of_cell(
+    ctx: &Ctx,
+    graph: &GraphFilter,
+    ids: &StoreIds,
+    cell: Id,
+    admit: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<Id> {
+    let mut c = cell;
+    let mut seen = FxHashSet::default();
+    while seen.len() < MAX_CELLS && !seen.contains(&c) {
+        if seen.len() == seen.capacity() {
+            let grown = (seen.capacity() * 2).max(8);
+            admit((grown as u64).saturating_mul(16))?;
+        }
+        seen.insert(c);
+        if seen.len().is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        match first_col(ctx, graph, Perm::Pos, &[ids.rest.0, c.0], 2)? {
+            Some(prev) => c = prev,
+            None => break,
+        }
+    }
+    admit(0)?;
+    Ok(c)
+}
+
+/// Compute the length of one list starting at `head`, charging its cycle set.
+fn list_length(
+    ctx: &Ctx,
+    graph: &GraphFilter,
+    ids: &StoreIds,
+    head: Id,
+    admit: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<Option<usize>> {
+    if !ids.is_list(ctx, graph, head)? {
+        return Ok(None);
+    }
+    let mut len = 0usize;
+    let mut cell = head;
+    let mut seen = FxHashSet::default();
+    while cell != ids.nil && seen.len() < MAX_CELLS && !seen.contains(&cell) {
+        if seen.len() == seen.capacity() {
+            let grown = (seen.capacity() * 2).max(8);
+            admit((grown as u64).saturating_mul(16))?;
+        }
+        seen.insert(cell);
+        len += 1;
+        if seen.len().is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        match first_col(ctx, graph, Perm::Pso, &[ids.rest.0, cell.0], 2)? {
+            Some(next) => cell = next,
+            None => break,
+        }
+    }
+    admit(0)?;
+    Ok(Some(len))
+}
+
+/// Resumable O(1)-memory iterator reproducing [`java_split`] verbatim.
+struct StrSplitIter {
+    re: regex::Regex,
+    text: String,
+    search_at: usize,
+    last: usize,
+    pending_empty: usize,
+    next_non_empty: Option<String>,
+    emitted_any: bool,
+    empty_input: bool,
+    finished_scan: bool,
+}
+
+impl StrSplitIter {
+    fn new(re: regex::Regex, text: String) -> Self {
+        let empty_input = text.is_empty();
+        Self {
+            re,
+            text,
+            search_at: 0,
+            last: 0,
+            pending_empty: 0,
+            next_non_empty: None,
+            emitted_any: false,
+            empty_input,
+            finished_scan: empty_input,
+        }
+    }
+
+    fn next_token(&mut self) -> Option<String> {
+        if self.empty_input {
+            self.empty_input = false;
+            return Some(String::new());
+        }
+        loop {
+            if let Some(next) = self.next_non_empty.as_ref() {
+                if self.pending_empty > 0 {
+                    self.pending_empty -= 1;
+                    self.emitted_any = true;
+                    return Some(String::new());
+                }
+                let out = next.trim().to_string();
+                self.next_non_empty = None;
+                self.emitted_any = true;
+                return Some(out);
+            }
+            if self.finished_scan {
+                // Any remaining pending_empty are trailing empty strings and are dropped.
+                self.pending_empty = 0;
+                return None;
+            }
+            let part: &str = loop {
+                if self.search_at > self.text.len() {
+                    self.finished_scan = true;
+                    break &self.text[self.last..];
+                }
+                match self.re.find_at(&self.text, self.search_at) {
+                    Some(m) => {
+                        if m.start() == m.end() {
+                            if m.end() == 0 {
+                                self.search_at = self.text[0..]
+                                    .chars()
+                                    .next()
+                                    .map_or(self.text.len() + 1, char::len_utf8);
+                                continue;
+                            }
+                            if m.start() >= self.text.len() {
+                                self.finished_scan = true;
+                                break &self.text[self.last..];
+                            }
+                            let p = &self.text[self.last..m.start()];
+                            self.last = m.end();
+                            self.search_at = self.text[m.end()..]
+                                .chars()
+                                .next()
+                                .map_or(self.text.len() + 1, |c| m.end() + c.len_utf8());
+                            break p;
+                        } else {
+                            let p = &self.text[self.last..m.start()];
+                            self.last = m.end();
+                            self.search_at = m.end();
+                            break p;
+                        }
+                    }
+                    None => {
+                        self.finished_scan = true;
+                        break &self.text[self.last..];
+                    }
+                }
+            };
+            if part.is_empty() {
+                self.pending_empty += 1;
+            } else {
+                self.next_non_empty = Some(part.to_owned());
+            }
+        }
+    }
+}
+
+/// Resumable stream of the members of one container `c`.
+enum OneContainer {
+    /// Bound member `m`: stream predicates from `Perm::Sop [c, m]`, emitting `(c, m)` for
+    /// each `rdf:_n`.
+    BoundMember {
+        c: Id,
+        m: Id,
+        scan: RangeCursor,
+        buf: Vec<Id>,
+        at: usize,
+    },
+    /// Unbound member: scan `Perm::Spo [c]` into a charged `BTreeMap<u64, Id>`, then drain
+    /// in numeric order.
+    UnboundMember {
+        c: Id,
+        scan: RangeCursor,
+        pair_buf: Vec<(Id, Id)>,
+        by_number: std::collections::BTreeMap<u64, Id>,
+    },
+}
+
+impl OneContainer {
+    fn new(c: Id, m: Option<Id>) -> Self {
+        match m {
+            Some(m) => Self::BoundMember {
+                c,
+                m,
+                scan: RangeCursor::new(Perm::Sop, &[c.0, m.0]),
+                buf: Vec::new(),
+                at: 0,
+            },
+            None => Self::UnboundMember {
+                c,
+                scan: RangeCursor::new(Perm::Spo, &[c.0]),
+                pair_buf: Vec::new(),
+                by_number: std::collections::BTreeMap::new(),
+            },
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::BoundMember { buf, .. } => {
+                (buf.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64)
+            }
+            Self::UnboundMember {
+                pair_buf,
+                by_number,
+                ..
+            } => (pair_buf.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<(Id, Id)>() as u64)
+                .saturating_add((by_number.len() as u64).saturating_mul(40)),
+        }
+    }
+}
+
+/// Resumable stream of container `(c, m)` solutions matching [`containers`].
+struct ContainerStream {
+    ty: Option<ContainerType>,
+    m: Option<Id>,
+    /// Fixed single container when subject is bound, or `None` when scanning candidates.
+    bound_c: Option<Id>,
+    /// Candidate container scanner when subject is unbound.
+    candidates: ContainerCandidates,
+    current: Option<OneContainer>,
+}
+
+enum ContainerCandidates {
+    Done,
+    ByType {
+        ty_idx: usize,
+        scan: Option<RangeCursor>,
+        buf: Vec<Id>,
+        at: usize,
+        seen: FxHashSet<Id>,
+    },
+    ByMember {
+        scan: RangeCursor,
+        buf: Vec<Id>,
+        at: usize,
+    },
+}
+
+impl ContainerStream {
+    fn new(ty: Option<ContainerType>, c: Option<Id>, m: Option<Id>) -> Self {
+        let (bound_c, candidates) = match (c, m) {
+            (Some(c), _) => (Some(c), ContainerCandidates::Done),
+            (None, None) => (
+                None,
+                ContainerCandidates::ByType {
+                    ty_idx: 0,
+                    scan: None,
+                    buf: Vec::new(),
+                    at: 0,
+                    seen: FxHashSet::default(),
+                },
+            ),
+            (None, Some(m)) => (
+                None,
+                ContainerCandidates::ByMember {
+                    scan: RangeCursor::new(Perm::Osp, &[m.0]),
+                    buf: Vec::new(),
+                    at: 0,
+                },
+            ),
+        };
+        Self {
+            ty,
+            m,
+            bound_c,
+            candidates,
+            current: None,
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        let cand = match &self.candidates {
+            ContainerCandidates::Done => 0,
+            ContainerCandidates::ByType { buf, seen, .. } => (buf.capacity() as u64)
+                .saturating_mul(std::mem::size_of::<Id>() as u64)
+                .saturating_add((seen.capacity() as u64).saturating_mul(16)),
+            ContainerCandidates::ByMember { buf, .. } => {
+                (buf.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64)
+            }
+        };
+        cand.saturating_add(self.current.as_ref().map_or(0, OneContainer::bytes))
+    }
+}
+
+enum ReaderMode {
+    Done,
+    /// Pre-evaluated 0-or-1-row constant result (`Version`, `Assign`, `BNode`, `Str`,
+    /// `Concat`, `SplitIri`, or bound-subject `StrSplit`).
+    Single(Option<Vec<Id>>),
+    StrSplit {
+        iter: StrSplitIter,
+        s: Id,
+        re: Id,
+    },
+    MemberBound {
+        walk: ListWalk,
+        filter_m: Option<Id>,
+    },
+    MemberAll {
+        heads: HeadScan,
+        walk: Option<ListWalk>,
+    },
+    MemberByObject {
+        m: Id,
+        cells: RangeCursor,
+        buf: Vec<Id>,
+        at: usize,
+    },
+    LengthAll {
+        heads: HeadScan,
+    },
+    IndexBound {
+        walk: ListWalk,
+        i_arg: Option<Id>,
+        target_pos: Option<i64>,
+        m_arg: Option<Id>,
+    },
+    IndexAll {
+        heads: IndexHeads,
+        seen_heads: FxHashSet<Id>,
+        walk: Option<ListWalk>,
+        i_arg: Option<Id>,
+        target_pos: Option<i64>,
+        m_arg: Option<Id>,
+    },
+    Container(ContainerStream),
+    RdfsMember {
+        stored: RdfsStored,
+        m_arg: Option<Id>,
+        s_arg: Option<Id>,
+    },
+}
+
+enum IndexHeads {
+    All(HeadScan),
+    ByMember {
+        cells: RangeCursor,
+        buf: Vec<Id>,
+        at: usize,
+    },
+}
+
+enum RdfsStored {
+    Single(Option<(Id, Id)>),
+    SingleCol {
+        fixed: Id,
+        fixed_is_subject: bool,
+        scan: RangeCursor,
+        buf: Vec<Id>,
+        at: usize,
+    },
+    Pairs {
+        scan: RangeCursor,
+        buf: Vec<(Id, Id)>,
+        at: usize,
+    },
+}
+
+/// Resumable, budget-charged streaming reader for a leaf [`Kind::PropertyFn`] (one whose
+/// `needs_input()` is false and which has no plan children).
+pub(crate) struct LeafReader {
+    graph: GraphFilter,
+    same_var_pairs: Vec<(usize, usize)>,
+    out_slot: Vec<usize>,
+    ids: Option<StoreIds>,
+    numbers: FxHashMap<Id, Option<u64>>,
+    mode: ReaderMode,
+    charge: super::ctx::OwnedCharge,
+    scratch_bytes: u64,
+}
+
+impl LeafReader {
+    pub(crate) fn open(ctx: &std::sync::Arc<Ctx>, spec: &PfSpec, vars: &[VarId]) -> Result<Self> {
+        ctx.check()?;
+        let args: Vec<Option<Id>> = spec
+            .slots
+            .iter()
+            .map(|s| match s {
+                PathEnd::Const(id) => Some(*id),
+                PathEnd::Var(_) => None,
+            })
+            .collect();
+        let mut same_var_pairs = Vec::new();
+        for (j, s) in spec.slots.iter().enumerate() {
+            let PathEnd::Var(v) = s else {
+                continue;
+            };
+            for (k, t) in spec.slots.iter().enumerate().skip(j + 1) {
+                if matches!(t, PathEnd::Var(x) if x == v) {
+                    same_var_pairs.push((j, k));
+                }
+            }
+        }
+        let out_slot: Vec<usize> = vars
+            .iter()
+            .map(|v| {
+                spec.slots
+                    .iter()
+                    .position(|s| matches!(s, PathEnd::Var(x) if x == v))
+                    .expect("a leaf property-function variable belongs to a slot")
+            })
+            .collect();
+        let mut charge = super::ctx::OwnedCharge::new(ctx, 0)?;
+        let int = |n: i64| ctx.intern_value(&Value::Integer(n.into()));
+        let string = |s: &str| ctx.intern_value(&Value::Str(s.into()));
+        let bad = |m: &str| Error::invalid(format!("{}: {m}", spec.kind.name()));
+
+        let mut ids: Option<StoreIds> = None;
+        let mode = match spec.kind {
+            PfKind::Member => {
+                let sids = StoreIds::new(ctx)?;
+                ids = Some(sids);
+                match (args[0], args[1]) {
+                    (Some(l), o) => ReaderMode::MemberBound {
+                        walk: ListWalk::new(ctx, &spec.graph, &sids, l)?,
+                        filter_m: o,
+                    },
+                    (None, None) => ReaderMode::MemberAll {
+                        heads: HeadScan::new(&sids),
+                        walk: None,
+                    },
+                    (None, Some(m)) => ReaderMode::MemberByObject {
+                        m,
+                        cells: RangeCursor::new(Perm::Pos, &[sids.first.0, m.0]),
+                        buf: Vec::new(),
+                        at: 0,
+                    },
+                }
+            }
+            PfKind::Length => {
+                let sids = StoreIds::new(ctx)?;
+                ids = Some(sids);
+                match (args[0], args[1]) {
+                    (Some(l), o) => {
+                        let len =
+                            list_length(ctx, &spec.graph, &sids, l, &mut |b| charge.resize(b))?;
+                        match len {
+                            Some(n) => {
+                                let nid = int(n as i64);
+                                ctx.check()?;
+                                match o {
+                                    None => ReaderMode::Single(Some(vec![l, nid])),
+                                    Some(x) if integer(ctx, x) == integer(ctx, nid) => {
+                                        ReaderMode::Single(Some(vec![l, x]))
+                                    }
+                                    Some(_) => ReaderMode::Done,
+                                }
+                            }
+                            None => ReaderMode::Done,
+                        }
+                    }
+                    (None, None) => ReaderMode::LengthAll {
+                        heads: HeadScan::new(&sids),
+                    },
+                    (None, Some(_)) => ReaderMode::Done,
+                }
+            }
+            PfKind::Index => {
+                let sids = StoreIds::new(ctx)?;
+                ids = Some(sids);
+                let (i_arg, m_arg) = (args[1], args[2]);
+                let target_pos = match i_arg {
+                    Some(i) => match integer(ctx, i) {
+                        Some(p) if p >= 0 => Some(p),
+                        _ => {
+                            return Ok(Self::empty(
+                                spec.graph.clone(),
+                                same_var_pairs,
+                                out_slot,
+                                charge,
+                            ));
+                        }
+                    },
+                    None => None,
+                };
+                match args[0] {
+                    Some(l) => ReaderMode::IndexBound {
+                        walk: ListWalk::new(ctx, &spec.graph, &sids, l)?,
+                        i_arg,
+                        target_pos,
+                        m_arg,
+                    },
+                    None => {
+                        let heads = match m_arg {
+                            Some(m) => IndexHeads::ByMember {
+                                cells: RangeCursor::new(Perm::Pos, &[sids.first.0, m.0]),
+                                buf: Vec::new(),
+                                at: 0,
+                            },
+                            None => IndexHeads::All(HeadScan::new(&sids)),
+                        };
+                        ReaderMode::IndexAll {
+                            heads,
+                            seen_heads: FxHashSet::default(),
+                            walk: None,
+                            i_arg,
+                            target_pos,
+                            m_arg,
+                        }
+                    }
+                }
+            }
+            PfKind::Container(ty) => {
+                let sids = StoreIds::new(ctx)?;
+                ids = Some(sids);
+                ReaderMode::Container(ContainerStream::new(ty, args[0], args[1]))
+            }
+            PfKind::RdfsMember => {
+                let sids = StoreIds::new(ctx)?;
+                ids = Some(sids);
+                let member =
+                    ctx.intern_term(&Term::NamedNode(NamedNode::new_unchecked(RDFS_MEMBER)));
+                ctx.check()?;
+                let stored = match (args[0], args[1]) {
+                    (Some(s), Some(o)) => {
+                        let hit = has_any(ctx, &spec.graph, Perm::Pso, &[member.0, s.0, o.0])?;
+                        RdfsStored::Single(hit.then_some((s, o)))
+                    }
+                    (Some(s), None) => RdfsStored::SingleCol {
+                        fixed: s,
+                        fixed_is_subject: true,
+                        scan: RangeCursor::new(Perm::Pso, &[member.0, s.0]),
+                        buf: Vec::new(),
+                        at: 0,
+                    },
+                    (None, Some(o)) => RdfsStored::SingleCol {
+                        fixed: o,
+                        fixed_is_subject: false,
+                        scan: RangeCursor::new(Perm::Pos, &[member.0, o.0]),
+                        buf: Vec::new(),
+                        at: 0,
+                    },
+                    (None, None) => RdfsStored::Pairs {
+                        scan: RangeCursor::new(Perm::Pso, &[member.0]),
+                        buf: Vec::new(),
+                        at: 0,
+                    },
+                };
+                ReaderMode::RdfsMember {
+                    stored,
+                    s_arg: args[0],
+                    m_arg: args[1],
+                }
+            }
+            PfKind::StrSplit => {
+                let (Some(s), Some(re_arg)) = (args[1], args[2]) else {
+                    return Ok(Self::empty(
+                        spec.graph.clone(),
+                        same_var_pairs,
+                        out_slot,
+                        charge,
+                    ));
+                };
+                let (Some(text), Some(pattern)) =
+                    (literal_lexical(ctx, s), literal_lexical(ctx, re_arg))
+                else {
+                    return Ok(Self::empty(
+                        spec.graph.clone(),
+                        same_var_pairs,
+                        out_slot,
+                        charge,
+                    ));
+                };
+                ctx.check()?;
+                let re = regex::Regex::new(&pattern).map_err(|e| bad(&e.to_string()))?;
+                match args[0] {
+                    None => {
+                        charge.resize(text.capacity() as u64)?;
+                        ReaderMode::StrSplit {
+                            iter: StrSplitIter::new(re, text),
+                            s,
+                            re: re_arg,
+                        }
+                    }
+                    Some(x) => match ctx.value(x) {
+                        Some(Value::Str(v)) => {
+                            let mut iter = StrSplitIter::new(re, text);
+                            let mut matched = false;
+                            let mut checked = 0usize;
+                            while let Some(tok) = iter.next_token() {
+                                checked += 1;
+                                if checked.is_multiple_of(1024) {
+                                    ctx.check()?;
+                                }
+                                if tok == *v {
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                            if matched {
+                                ReaderMode::Single(Some(vec![x, s, re_arg]))
+                            } else {
+                                ReaderMode::Done
+                            }
+                        }
+                        _ => ReaderMode::Done,
+                    },
+                }
+            }
+            PfKind::Concat => {
+                let mut text = String::new();
+                for a in &args[1..] {
+                    let Some(a) = a else {
+                        return Ok(Self::empty(
+                            spec.graph.clone(),
+                            same_var_pairs,
+                            out_slot,
+                            charge,
+                        ));
+                    };
+                    match ctx.term(*a) {
+                        Some(Term::NamedNode(n)) => text.push_str(n.as_str()),
+                        Some(Term::Literal(l)) => text.push_str(l.value()),
+                        _ => {
+                            return Ok(Self::empty(
+                                spec.graph.clone(),
+                                same_var_pairs,
+                                out_slot,
+                                charge,
+                            ));
+                        }
+                    }
+                }
+                let v = string(&text);
+                ctx.check()?;
+                match args[0] {
+                    None => ReaderMode::Single(Some(
+                        std::iter::once(v)
+                            .chain(args[1..].iter().flatten().copied())
+                            .collect(),
+                    )),
+                    Some(x) if x == v => {
+                        ReaderMode::Single(Some(args.iter().flatten().copied().collect()))
+                    }
+                    Some(_) => ReaderMode::Done,
+                }
+            }
+            PfKind::Str => {
+                if let Some(s) = args[0]
+                    && !matches!(ctx.term(s), Some(Term::Literal(_)))
+                {
+                    return Ok(Self::empty(
+                        spec.graph.clone(),
+                        same_var_pairs,
+                        out_slot,
+                        charge,
+                    ));
+                }
+                let Some(o) = args[1] else {
+                    return Err(bad("the object is an unbound variable"));
+                };
+                let v = match ctx.term(o) {
+                    Some(Term::NamedNode(n)) => string(n.as_str()),
+                    Some(Term::Literal(l)) => string(l.value()),
+                    _ => return Err(bad("the object is a blank node")),
+                };
+                ctx.check()?;
+                match args[0] {
+                    None => ReaderMode::Single(Some(vec![v, o])),
+                    Some(s) if s == v => ReaderMode::Single(Some(vec![s, o])),
+                    Some(_) => ReaderMode::Done,
+                }
+            }
+            PfKind::SplitIri => {
+                let Some(s) = args[0] else {
+                    return Ok(Self::empty(
+                        spec.graph.clone(),
+                        same_var_pairs,
+                        out_slot,
+                        charge,
+                    ));
+                };
+                let Some(Term::NamedNode(iri)) = ctx.term(s) else {
+                    return Ok(Self::empty(
+                        spec.graph.clone(),
+                        same_var_pairs,
+                        out_slot,
+                        charge,
+                    ));
+                };
+                let at = super::fnlib::split_xml(iri.as_str());
+                let (ns, local) = iri.as_str().split_at(at);
+                let nsv = match args[1] {
+                    None => {
+                        let id = ctx.intern_term(&Term::NamedNode(NamedNode::new_unchecked(ns)));
+                        ctx.check()?;
+                        id
+                    }
+                    Some(x) => {
+                        let text = match ctx.term(x) {
+                            Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
+                            Some(Term::Literal(_)) => string_literal(ctx, x),
+                            _ => None,
+                        };
+                        if text.as_deref() != Some(ns) {
+                            return Ok(Self::empty(
+                                spec.graph.clone(),
+                                same_var_pairs,
+                                out_slot,
+                                charge,
+                            ));
+                        }
+                        x
+                    }
+                };
+                let lv = match args[2] {
+                    None => {
+                        let id = string(local);
+                        ctx.check()?;
+                        id
+                    }
+                    Some(x) => {
+                        if string_literal(ctx, x).as_deref() != Some(local) {
+                            return Ok(Self::empty(
+                                spec.graph.clone(),
+                                same_var_pairs,
+                                out_slot,
+                                charge,
+                            ));
+                        }
+                        x
+                    }
+                };
+                ReaderMode::Single(Some(vec![s, nsv, lv]))
+            }
+            PfKind::Assign => match (args[0], args[1]) {
+                (None, None) => return Err(bad("both the subject and the object are unbound")),
+                (None, Some(o)) => ReaderMode::Single(Some(vec![o, o])),
+                (Some(s), None) => ReaderMode::Single(Some(vec![s, s])),
+                (Some(s), Some(o)) => {
+                    let same = s == o
+                        || matches!((ctx.term(s), ctx.term(o)), (Some(a), Some(b))
+                            if super::cdt::same_value(&a, &b).unwrap_or(false));
+                    if same {
+                        ReaderMode::Single(Some(vec![s, o]))
+                    } else {
+                        ReaderMode::Done
+                    }
+                }
+            },
+            PfKind::BNode => {
+                let Some(s) = args[0] else {
+                    return Err(bad("the subject is an unbound variable"));
+                };
+                let Some(Term::BlankNode(b)) = ctx.term(s) else {
+                    return Ok(Self::empty(
+                        spec.graph.clone(),
+                        same_var_pairs,
+                        out_slot,
+                        charge,
+                    ));
+                };
+                let label = string(b.as_str());
+                ctx.check()?;
+                match args[1] {
+                    None => ReaderMode::Single(Some(vec![s, label])),
+                    Some(o) if o == label => ReaderMode::Single(Some(vec![s, o])),
+                    Some(_) => ReaderMode::Done,
+                }
+            }
+            PfKind::Version => {
+                let subject =
+                    ctx.intern_term(&Term::NamedNode(NamedNode::new_unchecked(VERSION_SUBJECT)));
+                let version = string(env!("CARGO_PKG_VERSION"));
+                ctx.check()?;
+                match (args[0], args[1]) {
+                    (s, o) if s.is_none_or(|s| s == subject) && o.is_none_or(|o| o == version) => {
+                        ReaderMode::Single(Some(vec![subject, version]))
+                    }
+                    _ => ReaderMode::Done,
+                }
+            }
+        };
+
+        let mut reader = Self {
+            graph: spec.graph.clone(),
+            same_var_pairs,
+            out_slot,
+            ids,
+            numbers: FxHashMap::default(),
+            mode,
+            charge,
+            scratch_bytes: 0,
+        };
+        reader.sync_charge(0)?;
+        Ok(reader)
+    }
+
+    fn empty(
+        graph: GraphFilter,
+        same_var_pairs: Vec<(usize, usize)>,
+        out_slot: Vec<usize>,
+        charge: super::ctx::OwnedCharge,
+    ) -> Self {
+        Self {
+            graph,
+            same_var_pairs,
+            out_slot,
+            ids: None,
+            numbers: FxHashMap::default(),
+            mode: ReaderMode::Done,
+            charge,
+            scratch_bytes: 0,
+        }
+    }
+
+    fn base_bytes(&self) -> u64 {
+        let nums = (self.numbers.capacity() as u64).saturating_mul(32);
+        let mode = match &self.mode {
+            ReaderMode::Done | ReaderMode::Single(_) => 0,
+            ReaderMode::StrSplit { iter, .. } => iter.text.capacity() as u64,
+            ReaderMode::MemberBound { walk, .. } | ReaderMode::IndexBound { walk, .. } => {
+                walk.bytes()
+            }
+            ReaderMode::MemberAll { heads, walk } => heads
+                .bytes()
+                .saturating_add(walk.as_ref().map_or(0, ListWalk::bytes)),
+            ReaderMode::MemberByObject { buf, .. } => {
+                (buf.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64)
+            }
+            ReaderMode::LengthAll { heads } => heads.bytes(),
+            ReaderMode::IndexAll {
+                heads,
+                seen_heads,
+                walk,
+                ..
+            } => {
+                let h = match heads {
+                    IndexHeads::All(s) => s.bytes(),
+                    IndexHeads::ByMember { buf, .. } => {
+                        (buf.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64)
+                    }
+                };
+                h.saturating_add((seen_heads.capacity() as u64).saturating_mul(16))
+                    .saturating_add(walk.as_ref().map_or(0, ListWalk::bytes))
+            }
+            ReaderMode::Container(c) => c.bytes(),
+            ReaderMode::RdfsMember { stored, .. } => match stored {
+                RdfsStored::Single(_) => 0,
+                RdfsStored::SingleCol { buf, .. } => {
+                    (buf.capacity() as u64).saturating_mul(std::mem::size_of::<Id>() as u64)
+                }
+                RdfsStored::Pairs { buf, .. } => {
+                    (buf.capacity() as u64).saturating_mul(std::mem::size_of::<(Id, Id)>() as u64)
+                }
+            },
+        };
+        nums.saturating_add(mode).saturating_add(self.scratch_bytes)
+    }
+
+    fn sync_charge(&mut self, extra: u64) -> Result<()> {
+        let bytes = self.base_bytes().saturating_add(extra);
+        self.charge.resize(bytes)
+    }
+
+    fn predicate_number(&mut self, ctx: &Ctx, p: Id) -> Result<Option<u64>> {
+        if let Some(&cached) = self.numbers.get(&p) {
+            return Ok(cached);
+        }
+        if self.numbers.len() == self.numbers.capacity() {
+            let grown = (self.numbers.capacity() * 2).max(8);
+            self.sync_charge((grown as u64).saturating_mul(32))?;
+        }
+        let num = match ctx.term(p) {
+            Some(Term::NamedNode(n)) => n
+                .as_str()
+                .strip_prefix(RDF_NS)
+                .and_then(|l| l.strip_prefix('_'))
+                .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|d| d.parse().ok()),
+            _ => None,
+        };
+        self.numbers.insert(p, num);
+        Ok(num)
+    }
+
+    fn push_solution(&self, sol: &[Id], out: &mut Table, row_buf: &mut [Id]) -> bool {
+        for &(j, k) in &self.same_var_pairs {
+            if sol[j] != sol[k] {
+                return false;
+            }
+        }
+        for (c, &slot_idx) in self.out_slot.iter().enumerate() {
+            row_buf[c] = sol[slot_idx];
+        }
+        out.push_row(row_buf);
+        true
+    }
+
+    /// Fill `out` with up to `cap` rows. Returns `true` once the reader is exhausted.
+    pub(crate) fn next(&mut self, ctx: &Ctx, out: &mut Table, cap: usize) -> Result<bool> {
+        let want = cap.max(1);
+        let mut row_buf = vec![Id::UNDEF; self.out_slot.len()];
+        let mut skipped = 0usize;
+        while out.len < want {
+            ctx.check()?;
+            let sol = self.next_solution(ctx)?;
+            let Some(sol) = sol else {
+                self.sync_charge(0)?;
+                return Ok(true);
+            };
+            if !self.push_solution(&sol, out, &mut row_buf) {
+                skipped += 1;
+                if skipped.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+            }
+        }
+        self.sync_charge(0)?;
+        Ok(matches!(self.mode, ReaderMode::Done))
+    }
+
+    fn next_solution(&mut self, ctx: &Ctx) -> Result<Option<Vec<Id>>> {
+        let mut spins = 0usize;
+        loop {
+            spins += 1;
+            if spins.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            match &mut self.mode {
+                ReaderMode::Done => return Ok(None),
+                ReaderMode::Single(slot) => {
+                    let out = slot.take();
+                    self.mode = ReaderMode::Done;
+                    return Ok(out);
+                }
+                ReaderMode::StrSplit { iter, s, re } => {
+                    let (s, re) = (*s, *re);
+                    let Some(tok) = iter.next_token() else {
+                        self.mode = ReaderMode::Done;
+                        return Ok(None);
+                    };
+                    let id = ctx.intern_value(&Value::Str(tok.into()));
+                    ctx.check()?;
+                    return Ok(Some(vec![id, s, re]));
+                }
+                ReaderMode::MemberBound { .. } => {
+                    let ids = self.ids.expect("list ids");
+                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let (graph, charge) = (&self.graph, &mut self.charge);
+                    let ReaderMode::MemberBound { walk, filter_m } = &mut self.mode else {
+                        unreachable!()
+                    };
+                    let Some((_, m)) = walk.step(ctx, graph, &ids, &mut |walk_b| {
+                        charge.resize(base.saturating_add(walk_b))
+                    })?
+                    else {
+                        self.mode = ReaderMode::Done;
+                        return Ok(None);
+                    };
+                    if filter_m.is_none_or(|want| want == m) {
+                        return Ok(Some(vec![walk.head, m]));
+                    }
+                }
+                ReaderMode::MemberAll { .. } => {
+                    let ids = self.ids.expect("list ids");
+                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let (graph, charge) = (&self.graph, &mut self.charge);
+                    let ReaderMode::MemberAll { heads, walk } = &mut self.mode else {
+                        unreachable!()
+                    };
+                    if let Some(w) = walk.as_mut() {
+                        let hb = heads.bytes();
+                        if let Some((_, m)) = w.step(ctx, graph, &ids, &mut |walk_b| {
+                            charge.resize(base.saturating_add(hb).saturating_add(walk_b))
+                        })? {
+                            return Ok(Some(vec![w.head, m]));
+                        }
+                        *walk = None;
+                    }
+                    let Some(h) = heads.next_head(ctx, graph, &ids)? else {
+                        self.mode = ReaderMode::Done;
+                        return Ok(None);
+                    };
+                    *walk = Some(ListWalk::new(ctx, graph, &ids, h)?);
+                }
+                ReaderMode::MemberByObject { .. } => {
+                    let ids = self.ids.expect("list ids");
+                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let (graph, charge) = (&self.graph, &mut self.charge);
+                    let ReaderMode::MemberByObject { m, cells, buf, at } = &mut self.mode else {
+                        unreachable!()
+                    };
+                    let m = *m;
+                    if *at < buf.len() {
+                        let cell = buf[*at];
+                        *at += 1;
+                        let buf_b = (buf.capacity() as u64)
+                            .saturating_mul(std::mem::size_of::<Id>() as u64);
+                        let head = head_of_cell(ctx, graph, &ids, cell, &mut |extra| {
+                            charge.resize(base.saturating_add(buf_b).saturating_add(extra))
+                        })?;
+                        return Ok(Some(vec![head, m]));
+                    }
+                    if cells.is_done() {
+                        self.mode = ReaderMode::Done;
+                        return Ok(None);
+                    }
+                    cells.next_ids(ctx, graph, 2, false, buf, RANGE_CHUNK)?;
+                    *at = 0;
+                }
+                ReaderMode::LengthAll { .. } => {
+                    let ids = self.ids.expect("list ids");
+                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let (graph, charge) = (&self.graph, &mut self.charge);
+                    let ReaderMode::LengthAll { heads } = &mut self.mode else {
+                        unreachable!()
+                    };
+                    let Some(h) = heads.next_head(ctx, graph, &ids)? else {
+                        self.mode = ReaderMode::Done;
+                        return Ok(None);
+                    };
+                    let hb = heads.bytes();
+                    if let Some(len) = list_length(ctx, graph, &ids, h, &mut |extra| {
+                        charge.resize(base.saturating_add(hb).saturating_add(extra))
+                    })? {
+                        let n = ctx.intern_value(&Value::Integer((len as i64).into()));
+                        ctx.check()?;
+                        return Ok(Some(vec![h, n]));
+                    }
+                }
+                ReaderMode::IndexBound { .. } => {
+                    let ids = self.ids.expect("list ids");
+                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let (graph, charge) = (&self.graph, &mut self.charge);
+                    let ReaderMode::IndexBound {
+                        walk,
+                        i_arg,
+                        target_pos,
+                        m_arg,
+                    } = &mut self.mode
+                    else {
+                        unreachable!()
+                    };
+                    let (i_arg, target_pos, m_arg) = (*i_arg, *target_pos, *m_arg);
+                    let Some((p, x)) = walk.step(ctx, graph, &ids, &mut |walk_b| {
+                        charge.resize(base.saturating_add(walk_b))
+                    })?
+                    else {
+                        self.mode = ReaderMode::Done;
+                        return Ok(None);
+                    };
+                    match (target_pos, m_arg) {
+                        (None, Some(m)) => {
+                            if x == m {
+                                let head = walk.head;
+                                self.mode = ReaderMode::Done;
+                                let pid = ctx.intern_value(&Value::Integer(p.into()));
+                                ctx.check()?;
+                                return Ok(Some(vec![head, pid, m]));
+                            }
+                        }
+                        (Some(target), m) => {
+                            if p == target {
+                                let head = walk.head;
+                                self.mode = ReaderMode::Done;
+                                if m.is_none_or(|m| m == x) {
+                                    return Ok(Some(vec![head, i_arg.unwrap(), x]));
+                                }
+                                return Ok(None);
+                            }
+                        }
+                        (None, None) => {
+                            let head = walk.head;
+                            let pid = ctx.intern_value(&Value::Integer(p.into()));
+                            ctx.check()?;
+                            return Ok(Some(vec![head, pid, x]));
+                        }
+                    }
+                }
+                ReaderMode::IndexAll { .. } => {
+                    let ids = self.ids.expect("list ids");
+                    let base = (self.numbers.capacity() as u64).saturating_mul(32);
+                    let (graph, charge) = (&self.graph, &mut self.charge);
+                    let ReaderMode::IndexAll {
+                        heads,
+                        seen_heads,
+                        walk,
+                        i_arg,
+                        target_pos,
+                        m_arg,
+                    } = &mut self.mode
+                    else {
+                        unreachable!()
+                    };
+                    let (i_arg, target_pos, m_arg) = (*i_arg, *target_pos, *m_arg);
+                    if let Some(w) = walk.as_mut() {
+                        let fixed = base
+                            .saturating_add(match heads {
+                                IndexHeads::All(s) => s.bytes(),
+                                IndexHeads::ByMember { buf, .. } => (buf.capacity() as u64)
+                                    .saturating_mul(std::mem::size_of::<Id>() as u64),
+                            })
+                            .saturating_add((seen_heads.capacity() as u64).saturating_mul(16));
+                        match w.step(ctx, graph, &ids, &mut |walk_b| {
+                            charge.resize(fixed.saturating_add(walk_b))
+                        })? {
+                            Some((p, x)) => match (target_pos, m_arg) {
+                                (None, Some(m)) => {
+                                    if x == m {
+                                        let head = w.head;
+                                        *walk = None;
+                                        let pid = ctx.intern_value(&Value::Integer(p.into()));
+                                        ctx.check()?;
+                                        return Ok(Some(vec![head, pid, m]));
+                                    }
+                                    continue;
+                                }
+                                (Some(target), m) => {
+                                    if p == target {
+                                        let head = w.head;
+                                        *walk = None;
+                                        if m.is_none_or(|m| m == x) {
+                                            return Ok(Some(vec![head, i_arg.unwrap(), x]));
+                                        }
+                                    }
+                                    continue;
+                                }
+                                (None, None) => {
+                                    let head = w.head;
+                                    let pid = ctx.intern_value(&Value::Integer(p.into()));
+                                    ctx.check()?;
+                                    return Ok(Some(vec![head, pid, x]));
+                                }
+                            },
+                            None => {
+                                *walk = None;
+                            }
+                        }
+                    }
+                    // Advance to next unique head.
+                    let next_h = match heads {
+                        IndexHeads::All(scan) => scan.next_head(ctx, graph, &ids)?,
+                        IndexHeads::ByMember { cells, buf, at } => loop {
+                            if *at < buf.len() {
+                                let cell = buf[*at];
+                                *at += 1;
+                                let fixed = base
+                                    .saturating_add(
+                                        (buf.capacity() as u64)
+                                            .saturating_mul(std::mem::size_of::<Id>() as u64),
+                                    )
+                                    .saturating_add(
+                                        (seen_heads.capacity() as u64).saturating_mul(16),
+                                    );
+                                break Some(head_of_cell(ctx, graph, &ids, cell, &mut |ex| {
+                                    charge.resize(fixed.saturating_add(ex))
+                                })?);
+                            }
+                            if cells.is_done() {
+                                break None;
+                            }
+                            cells.next_ids(ctx, graph, 2, false, buf, RANGE_CHUNK)?;
+                            *at = 0;
+                        },
+                    };
+                    let Some(h) = next_h else {
+                        self.mode = ReaderMode::Done;
+                        return Ok(None);
+                    };
+                    if !seen_heads.contains(&h) {
+                        if seen_heads.len() == seen_heads.capacity() {
+                            let grown = (seen_heads.capacity() * 2).max(8);
+                            let hb = match heads {
+                                IndexHeads::All(s) => s.bytes(),
+                                IndexHeads::ByMember { buf, .. } => (buf.capacity() as u64)
+                                    .saturating_mul(std::mem::size_of::<Id>() as u64),
+                            };
+                            charge.resize(
+                                base.saturating_add(hb)
+                                    .saturating_add((grown as u64).saturating_mul(16)),
+                            )?;
+                        }
+                        seen_heads.insert(h);
+                        *walk = Some(ListWalk::new(ctx, graph, &ids, h)?);
+                    }
+                }
+                ReaderMode::Container(_) => {
+                    if let Some(sol) = self.step_container(ctx)? {
+                        return Ok(Some(sol));
+                    }
+                    self.mode = ReaderMode::Done;
+                    return Ok(None);
+                }
+                ReaderMode::RdfsMember { .. } => {
+                    let stored_sol = match &mut self.mode {
+                        ReaderMode::RdfsMember { stored, .. } => match stored {
+                            RdfsStored::Single(slot) => slot.take(),
+                            RdfsStored::SingleCol {
+                                fixed,
+                                fixed_is_subject,
+                                scan,
+                                buf,
+                                at,
+                            } => loop {
+                                if *at < buf.len() {
+                                    let x = buf[*at];
+                                    *at += 1;
+                                    break Some(if *fixed_is_subject {
+                                        (*fixed, x)
+                                    } else {
+                                        (x, *fixed)
+                                    });
+                                }
+                                if scan.is_done() {
+                                    break None;
+                                }
+                                scan.next_ids(ctx, &self.graph, 2, false, buf, RANGE_CHUNK)?;
+                                *at = 0;
+                            },
+                            RdfsStored::Pairs { scan, buf, at } => loop {
+                                if *at < buf.len() {
+                                    let pair = buf[*at];
+                                    *at += 1;
+                                    break Some(pair);
+                                }
+                                if scan.is_done() {
+                                    break None;
+                                }
+                                scan.next_pairs(ctx, &self.graph, [1, 2], buf, RANGE_CHUNK)?;
+                                *at = 0;
+                            },
+                        },
+                        _ => unreachable!(),
+                    };
+                    if let Some((s, o)) = stored_sol {
+                        return Ok(Some(vec![s, o]));
+                    }
+                    let ReaderMode::RdfsMember { s_arg, m_arg, .. } = self.mode else {
+                        unreachable!()
+                    };
+                    self.mode = ReaderMode::Container(ContainerStream::new(None, s_arg, m_arg));
+                }
+            }
+        }
+    }
+
+    fn step_container(&mut self, ctx: &Ctx) -> Result<Option<Vec<Id>>> {
+        let ids = self.ids.expect("container ids");
+        loop {
+            ctx.check()?;
+            // First, drain the active container if any.
+            let mut active_done = false;
+            let has_current = matches!(
+                &self.mode,
+                ReaderMode::Container(ContainerStream {
+                    current: Some(_),
+                    ..
+                })
+            );
+            if has_current {
+                let is_bound = matches!(
+                    &self.mode,
+                    ReaderMode::Container(ContainerStream {
+                        current: Some(OneContainer::BoundMember { .. }),
+                        ..
+                    })
+                );
+                if is_bound {
+                    let mut candidate_p = None;
+                    let (c, m) = match &mut self.mode {
+                        ReaderMode::Container(ContainerStream {
+                            current:
+                                Some(OneContainer::BoundMember {
+                                    c,
+                                    m,
+                                    scan,
+                                    buf,
+                                    at,
+                                }),
+                            ..
+                        }) => {
+                            let (c, m) = (*c, *m);
+                            loop {
+                                if *at < buf.len() {
+                                    candidate_p = Some(buf[*at]);
+                                    *at += 1;
+                                    break;
+                                }
+                                if scan.is_done() {
+                                    active_done = true;
+                                    break;
+                                }
+                                scan.next_ids(ctx, &self.graph, 2, false, buf, RANGE_CHUNK)?;
+                                *at = 0;
+                            }
+                            (c, m)
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Some(p) = candidate_p {
+                        if self.predicate_number(ctx, p)?.is_some() {
+                            return Ok(Some(vec![c, m]));
+                        }
+                        continue;
+                    }
+                } else {
+                    // UnboundMember: scan `Perm::Spo [c]` into `by_number`, then pop_first.
+                    loop {
+                        let next_pair = match &mut self.mode {
+                            ReaderMode::Container(ContainerStream {
+                                current: Some(OneContainer::UnboundMember { scan, pair_buf, .. }),
+                                ..
+                            }) => {
+                                if pair_buf.is_empty() && !scan.is_done() {
+                                    scan.next_pairs(
+                                        ctx,
+                                        &self.graph,
+                                        [1, 2],
+                                        pair_buf,
+                                        RANGE_CHUNK,
+                                    )?;
+                                    pair_buf.reverse();
+                                }
+                                pair_buf.pop()
+                            }
+                            _ => unreachable!(),
+                        };
+                        let Some((p, o)) = next_pair else {
+                            break;
+                        };
+                        ctx.check()?;
+                        if let Some(n) = self.predicate_number(ctx, p)? {
+                            let already = match &self.mode {
+                                ReaderMode::Container(ContainerStream {
+                                    current: Some(OneContainer::UnboundMember { by_number, .. }),
+                                    ..
+                                }) => by_number.contains_key(&n),
+                                _ => unreachable!(),
+                            };
+                            if !already {
+                                self.sync_charge(40)?;
+                            }
+                            if let ReaderMode::Container(ContainerStream {
+                                current: Some(OneContainer::UnboundMember { by_number, .. }),
+                                ..
+                            }) = &mut self.mode
+                            {
+                                by_number.insert(n, o);
+                            }
+                        }
+                    }
+                    let popped = match &mut self.mode {
+                        ReaderMode::Container(ContainerStream {
+                            current: Some(OneContainer::UnboundMember { c, by_number, .. }),
+                            ..
+                        }) => by_number.pop_first().map(|(_, o)| (*c, o)),
+                        _ => unreachable!(),
+                    };
+                    if let Some((c, o)) = popped {
+                        return Ok(Some(vec![c, o]));
+                    }
+                    active_done = true;
+                }
+                if active_done {
+                    if let ReaderMode::Container(stream) = &mut self.mode {
+                        stream.current = None;
+                    }
+                    self.sync_charge(0)?;
+                }
+            }
+
+            // Advance to next candidate container.
+            let next_c = {
+                let (graph, mode, charge, numbers_cap) = (
+                    &self.graph,
+                    &mut self.mode,
+                    &mut self.charge,
+                    self.numbers.capacity(),
+                );
+                let ReaderMode::Container(stream) = mode else {
+                    unreachable!()
+                };
+                if let Some(c) = stream.bound_c.take() {
+                    if ids.is_container(ctx, graph, c, stream.ty)? {
+                        Some((c, stream.m))
+                    } else {
+                        None
+                    }
+                } else {
+                    match &mut stream.candidates {
+                        ContainerCandidates::Done => None,
+                        ContainerCandidates::ByType {
+                            ty_idx,
+                            scan,
+                            buf,
+                            at,
+                            seen,
+                        } => loop {
+                            if *at < buf.len() {
+                                let c = buf[*at];
+                                *at += 1;
+                                if !seen.contains(&c) {
+                                    if seen.len() == seen.capacity() {
+                                        let grown = (seen.capacity() * 2).max(8);
+                                        let bytes = (numbers_cap as u64)
+                                            .saturating_mul(32)
+                                            .saturating_add(
+                                                (buf.capacity() as u64).saturating_mul(
+                                                    std::mem::size_of::<Id>() as u64,
+                                                ),
+                                            )
+                                            .saturating_add((grown as u64).saturating_mul(16));
+                                        charge.resize(bytes)?;
+                                    }
+                                    seen.insert(c);
+                                    break Some((c, stream.m));
+                                }
+                                continue;
+                            }
+                            if let Some(s) = scan.as_mut()
+                                && !s.is_done()
+                            {
+                                s.next_ids(ctx, graph, 2, false, buf, RANGE_CHUNK)?;
+                                *at = 0;
+                                continue;
+                            }
+                            *scan = None;
+                            while *ty_idx < ContainerType::ALL.len()
+                                && stream.ty.is_some_and(|x| x != ContainerType::ALL[*ty_idx])
+                            {
+                                *ty_idx += 1;
+                            }
+                            if *ty_idx >= ContainerType::ALL.len() {
+                                break None;
+                            }
+                            let t = ids.container_types[*ty_idx];
+                            *ty_idx += 1;
+                            *scan = Some(RangeCursor::new(Perm::Pos, &[ids.rdf_type.0, t.0]));
+                        },
+                        ContainerCandidates::ByMember { scan, buf, at } => loop {
+                            if *at < buf.len() {
+                                let c = buf[*at];
+                                *at += 1;
+                                if ids.is_container(ctx, graph, c, stream.ty)? {
+                                    break Some((c, stream.m));
+                                }
+                                continue;
+                            }
+                            if scan.is_done() {
+                                break None;
+                            }
+                            scan.next_ids(ctx, graph, 1, true, buf, RANGE_CHUNK)?;
+                            *at = 0;
+                        },
+                    }
+                }
+            };
+            let Some((c, m)) = next_c else {
+                return Ok(None);
+            };
+            if let ReaderMode::Container(stream) = &mut self.mode {
+                stream.current = Some(OneContainer::new(c, m));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Streaming [`StrSplitIter`] agrees verbatim with [`java_split`] across edge cases:
+    /// empty inputs, whitespace-only segments, leading/trailing delimiters, empty/zero-width
+    /// regexes, and multi-byte UTF-8.
+    #[test]
+    fn str_split_iter_matches_java_split() {
+        let cases = [
+            ("", ","),
+            ("a,b,c", ","),
+            ("a b c", " "),
+            (",a,b,", ","),
+            (",,,", ","),
+            (" , , ", ","),
+            ("a,,b,,", ","),
+            ("  a , b  ,  ", ","),
+            ("ab", ""),
+            ("αβγ", ""),
+            ("a1b22c333", r"\d+"),
+            ("123", r"\d+"),
+            ("foo", "^"),
+            ("foo", "$"),
+            ("a|b|c|", r"\|"),
+        ];
+        for (s, pat) in cases {
+            let re = regex::Regex::new(pat).unwrap();
+            let expected = java_split(&re, s);
+            let mut iter = StrSplitIter::new(re, s.to_string());
+            let mut got = Vec::new();
+            while let Some(tok) = iter.next_token() {
+                got.push(tok);
+            }
+            assert_eq!(got, expected, "s={s:?} pat={pat:?}");
+        }
+    }
+}
