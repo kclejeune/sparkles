@@ -3755,4 +3755,1329 @@ fn kept_rewritten_original_range_scan_respects_budget_polling_and_restart() {
         .classify(&with_chain, None, &Limits::default())
         .unwrap();
     assert_eq!(recovered_plain.taxonomy, plain_fresh.taxonomy);
+
+// ============================================================================
+// Item 1061 Phase 2: Rooted Constant Merging Tests (`Limits::rooted_merge`)
+// ============================================================================
+
+fn parse_hermit_subsumptions(
+    text: &str,
+    classes: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<(String, String)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let iris = |line: &str| -> Vec<String> {
+        line.split('<')
+            .skip(1)
+            .filter_map(|p| p.split_once('>').map(|(iri, _)| iri.to_string()))
+            .collect()
+    };
+    let mut up: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for line in text.lines() {
+        let ns = iris(line);
+        if line.starts_with("SubClassOf(") && ns.len() == 2 {
+            up.entry(ns[0].clone()).or_default().insert(ns[1].clone());
+        } else if line.starts_with("EquivalentClasses(") {
+            for a in &ns {
+                for b in &ns {
+                    up.entry(a.clone()).or_default().insert(b.clone());
+                }
+            }
+        }
+    }
+    let above = |cls: &str| -> BTreeSet<String> {
+        let mut seen = BTreeSet::from([cls.to_string(), vocab::OWL_THING.to_string()]);
+        let mut stack = vec![cls.to_string()];
+        while let Some(x) = stack.pop() {
+            for y in up.get(&x).into_iter().flatten() {
+                if seen.insert(y.clone()) {
+                    stack.push(y.clone());
+                }
+            }
+        }
+        seen
+    };
+    let inconsistent = above(vocab::OWL_THING).contains(vocab::OWL_NOTHING);
+    let mut out = BTreeSet::new();
+    for a in classes {
+        let s = above(a);
+        let unsat = inconsistent || s.contains(vocab::OWL_NOTHING);
+        for b in classes {
+            if unsat || s.contains(b) || b == vocab::OWL_THING || a == vocab::OWL_NOTHING {
+                out.insert((a.clone(), b.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn taxonomy_subsumptions(
+    out: &Classification,
+    classes: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<(String, String)> {
+    let mut got = std::collections::BTreeSet::new();
+    for a in classes {
+        for b in classes {
+            if out
+                .taxonomy
+                .is_subclass(&Class::new(a.as_str()), &Class::new(b.as_str()))
+            {
+                got.insert((a.clone(), b.clone()));
+            }
+        }
+    }
+    got
+}
+
+#[test]
+fn a_rooted_run_that_merges_equal_individuals_finishes_shoi_022() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
+    let doc = ofn_read::parse(&std::fs::read_to_string(dir.join("shoi-022.ofn")).unwrap()).unwrap();
+    let hermit_text = std::fs::read_to_string(dir.join("shoi-022.hermit.ofn")).unwrap();
+    let mut classes: std::collections::BTreeSet<String> = doc
+        .axioms
+        .iter()
+        .filter_map(|a| match &a.kind {
+            AxiomKind::Declaration(Entity::Class(cls)) => Some(cls.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    classes.insert(vocab::OWL_THING.to_string());
+    classes.insert(vocab::OWL_NOTHING.to_string());
+    let want = parse_hermit_subsumptions(&hermit_text, &classes);
+
+    // Control: merge OFF still overflows the rooted work bound on original shoi-022.ofn.
+    let mut k_off = Classifier::of(&doc.axioms);
+    let off = k_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(
+        off.stats.dl_rooted_over,
+        "merge OFF control should still exceed rooted bound on shoi-022"
+    );
+
+    // Merge ON finishes original shoi-022 across all 4 configs × dl_steps {true, false}
+    // and matches HermiT's full taxonomy exactly.
+    for dl_steps in [true, false] {
+        for (threads, expansion) in CONFIGS {
+            let at = format!("shoi-022 {threads}t {expansion:?} dl_steps={dl_steps}");
+            let mut k = Classifier::of(&doc.axioms);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    rooted: true,
+                    rooted_merge: true,
+                    dl_steps,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(out.complete, "{at}: expected complete: {:?}", out.stats);
+            assert!(
+                !out.stats.dl_rooted_over && !out.stats.dl_rooted_declined,
+                "{at}: unexpected fallback: {:?}",
+                out.stats
+            );
+            assert!(k.excluded().is_empty(), "{at}: {:?}", k.excluded());
+            assert_eq!(out.consistency, Consistency::Consistent, "{at}");
+            assert_eq!(out.stats.dl_rooted_restarts, 1, "{at}: {:?}", out.stats);
+            assert_eq!(out.stats.dl_rooted_merged, 2, "{at}: {:?}", out.stats);
+            assert!(out.stats.dl_rooted_spent > 0, "{at}: {:?}", out.stats);
+            assert!(
+                out.stats.dl_rooted_spent + out.stats.dl_work <= (1 << 19),
+                "{at}: total work exceeded bound: {:?}",
+                out.stats
+            );
+            let got = taxonomy_subsumptions(&out, &classes);
+            assert_eq!(got, want, "{at}: taxonomy differs from HermiT");
+        }
+    }
+}
+
+#[test]
+fn a_restart_counts_the_conclusions_before_it_against_the_bound() {
+    let ax = axioms(
+        "SubClassOf(:C0 ObjectOneOf(:a2))
+         SubClassOf(ObjectOneOf(:a0 :a2) :C0)
+         ClassAssertion(ObjectUnionOf(:A :B) :a0)
+         SubClassOf(:A :Done)
+         SubClassOf(:B :Done)
+         SubClassOf(:Q ObjectSomeValuesFrom(:r ObjectOneOf(:a2)))
+         SubClassOf(ObjectSomeValuesFrom(:r :Done) :Out)",
+    );
+    let mut k = Classifier::of(&ax);
+    let exact = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(exact.complete);
+    assert_eq!(exact.stats.dl_rooted_restarts, 1);
+    assert!(exact.stats.dl_rooted_spent > 0);
+    assert!(exact.stats.dl_work > 0);
+    assert!(exact.taxonomy.is_subclass(&c("Q"), &c("Out")));
+
+    let total = exact.stats.dl_rooted_spent + exact.stats.dl_work;
+    // Exact bound completes.
+    let mut k_eq = Classifier::of(&ax);
+    let at_bound = k_eq
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            dl_work: Some(total),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(at_bound.complete, "exact total={total} must complete");
+    assert!(!at_bound.stats.dl_rooted_over);
+
+    // One less than exact total falls back as rooted work exhaustion.
+    let mut k_less = Classifier::of(&ax);
+    let under = k_less
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            dl_work: Some(total - 1),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(
+        under.stats.dl_rooted_over,
+        "total-1={} must exhaust rooted bound: {:?}",
+        total - 1,
+        under.stats
+    );
+}
+
+#[test]
+fn an_entailed_equality_with_different_individuals_is_inconsistent() {
+    let cases = [
+        // Asserted SameIndividual + DifferentIndividuals
+        "SameIndividual(:a :b)
+         DifferentIndividuals(:a :b)",
+        // Entailed equality + DifferentIndividuals
+        "SubClassOf(ObjectOneOf(:a) :C)
+         SubClassOf(:C ObjectOneOf(:b))
+         DifferentIndividuals(:a :b)",
+        // 3-member DifferentIndividuals with two colliding
+        "SameIndividual(:a :b)
+         DifferentIndividuals(:a :b :c)",
+        // Entailed equality with 3-member DifferentIndividuals
+        "SubClassOf(ObjectOneOf(:a) :C)
+         SubClassOf(:C ObjectOneOf(:b))
+         DifferentIndividuals(:a :b :c)",
+    ];
+    for body in cases {
+        let ax = axioms(body);
+        for rooted_merge in [false, true] {
+            for (threads, expansion) in CONFIGS {
+                let mut k = Classifier::of(&ax);
+                let out = k
+                    .classify(&Limits {
+                        threads,
+                        expansion,
+                        rooted: true,
+                        rooted_merge,
+                        ..Limits::default()
+                    })
+                    .unwrap();
+                assert_eq!(
+                    out.consistency,
+                    Consistency::Inconsistent,
+                    "merge={rooted_merge} {threads}t {expansion:?} body={body}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn repeated_name_in_different_individuals_stays_consistent() {
+    // Construct a 1-member DifferentIndividuals directly (as survives structural set
+    // deduplication) and verify it does not falsely collide with itself.
+    let mut ax = axioms("ClassAssertion(:A :a)");
+    ax.push(Axiom::new(AxiomKind::DifferentIndividuals(
+        [Individual::named(format!("{EX}a"))].into(),
+    )));
+    for rooted_merge in [false, true] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Consistent);
+    }
+}
+
+#[test]
+fn different_individuals_collision_with_anonymous_individuals() {
+    let cases = [
+        // Named + anonymous asserted equal and different
+        "SameIndividual(:a _:b0)
+         DifferentIndividuals(:a _:b0)",
+        // Named + anonymous entailed equal and different
+        "SubClassOf(ObjectOneOf(:a) :C)
+         SubClassOf(:C ObjectOneOf(_:b0))
+         DifferentIndividuals(:a _:b0)",
+        // Anonymous + anonymous asserted equal and different
+        "SameIndividual(_:x _:y)
+         DifferentIndividuals(_:x _:y)",
+        // 3-member mixed named + anonymous collision
+        "SameIndividual(:a _:b0)
+         DifferentIndividuals(:a _:b0 :c)",
+    ];
+    for body in cases {
+        let ax = axioms(body);
+        for rooted_merge in [false, true] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert_eq!(
+                out.consistency,
+                Consistency::Inconsistent,
+                "merge={rooted_merge} body={body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn anonymous_and_named_merge_picks_named_representative() {
+    // ASCII "_:b0" < "http://ex.org/a", so naive IRI order would wrongly pick _:b0.
+    // 3-tier ordering must keep :a as representative, preserve HasKey over :a, and
+    // expose :a (never _:b0) in describe().
+    let cases = [
+        "SameIndividual(:a _:b0)
+         ClassAssertion(:C _:b0)
+         ClassAssertion(:C :b)
+         ObjectPropertyAssertion(:r _:b0 :v)
+         ObjectPropertyAssertion(:r :b :v)
+         HasKey(:C (:r) ())
+         ClassAssertion(:Tag :b)",
+        "SubClassOf(ObjectOneOf(_:b0) :Link)
+         SubClassOf(:Link ObjectOneOf(:a))
+         ClassAssertion(:C _:b0)
+         ClassAssertion(:C :b)
+         ObjectPropertyAssertion(:r _:b0 :v)
+         ObjectPropertyAssertion(:r :b :v)
+         HasKey(:C (:r) ())
+         ClassAssertion(:Tag :b)",
+    ];
+    for (idx, body) in cases.iter().enumerate() {
+        let ax = axioms(body);
+        let mut k_off = Classifier::of(&ax);
+        let off = k_off
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: false,
+                ..Limits::default()
+            })
+            .unwrap();
+        let d_off = k_off.describe(&c("Tag")).unwrap();
+
+        let mut k_on = Classifier::of(&ax);
+        let on = k_on
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        let d_on = k_on.describe(&c("Tag")).unwrap();
+
+        assert_eq!(on.consistency, off.consistency);
+        assert!(on.complete);
+        // Under OWL 2 Direct Semantics, _:b0 ≈ :a and HasKey(:C (:r) ()) identify :a with :b,
+        // so both :a and :b are instances of :Tag (and _:b0 never leaks).
+        let want_instances = vec![
+            NamedIndividual::new(format!("{EX}a")),
+            NamedIndividual::new(format!("{EX}b")),
+        ];
+        assert_eq!(d_on.instances, want_instances, "case {idx}: body={body}");
+        if idx == 0 {
+            assert_eq!(
+                d_on.instances, d_off.instances,
+                "case 0 must match merge OFF"
+            );
+        }
+        assert!(
+            d_on.instances.iter().all(|i| !i.as_str().starts_with("_:")),
+            "anonymous label leaked into describe: {:?}",
+            d_on.instances
+        );
+    }
+}
+
+#[test]
+fn input_with_internal_prefix_iri_merged_with_blank_keeps_named_status() {
+    // Legal user input IRI `urn:sparkles:internal:hub` (Astra consult §3): item 805
+    // declines reduction on prefix collision, so this name is a genuine user input name
+    // (Tier 0), must beat `_:b0` (Tier 1), participate in HasKey, and stay visible in
+    // describe().
+    let body = "Prefix(:=<http://ex.org/>)
+        Ontology(
+            SameIndividual(<urn:sparkles:internal:hub> _:b0)
+            ClassAssertion(:K _:b0)
+            ClassAssertion(:K :other)
+            ObjectPropertyAssertion(:r _:b0 :v)
+            ObjectPropertyAssertion(:r :other :v)
+            HasKey(:K (:r) ())
+            ClassAssertion(:Mark :other)
+        )";
+    let doc = ofn_read::parse(body).unwrap();
+    let mut k_off = Classifier::of(&doc.axioms);
+    let _ = k_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    let d_off = k_off.describe(&c("Mark")).unwrap();
+
+    let mut k_on = Classifier::of(&doc.axioms);
+    let _ = k_on
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    let d_on = k_on.describe(&c("Mark")).unwrap();
+
+    let hub_in = NamedIndividual::new("urn:sparkles:internal:hub");
+    assert_eq!(d_on.instances, d_off.instances);
+    assert!(
+        d_on.instances.contains(&hub_in),
+        "input IRI urn:sparkles:internal:hub must remain a named key participant and public instance: {:?}",
+        d_on.instances
+    );
+}
+
+#[test]
+fn operands_that_a_merge_makes_equal_keep_their_disjointness() {
+    // Astra disjointness counterexample: both DisjointClasses and DisjointUnion.
+    let cases = [
+        "SubClassOf(ObjectOneOf(:a) ObjectOneOf(:b))
+         DisjointClasses(ObjectHasValue(:r :a) ObjectHasValue(:r :b) :D)
+         SubClassOf(:A ObjectHasValue(:r :a))",
+        "SameIndividual(:a :b)
+         DisjointClasses(ObjectHasValue(:r :a) ObjectHasValue(:r :b) :D)
+         SubClassOf(:A ObjectHasValue(:r :a))",
+        "SubClassOf(ObjectOneOf(:a) ObjectOneOf(:b))
+         DisjointUnion(:U ObjectHasValue(:r :a) ObjectHasValue(:r :b) :D)
+         SubClassOf(:A ObjectHasValue(:r :a))",
+    ];
+    for body in cases {
+        let ax = axioms(body);
+        for rooted_merge in [false, true] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert_eq!(out.consistency, Consistency::Consistent);
+            assert!(
+                out.taxonomy.is_unsatisfiable(&c("A")),
+                "merge={rooted_merge}: :A must be unsatisfiable for body={body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn multi_hop_and_multi_restart_merges() {
+    // Deterministic staged 2-restart chain:
+    // Pass 1 discovers a0 ≈ a1 (via C0). Pass 2 merges a0,a1 so C0(a0) + B(a1) meet on
+    // the single constant a0, deriving C1(a0) -> a0 ≈ a2 (restart 2)!
+    let ax = axioms(
+        "SubClassOf(ObjectOneOf(:a0) :C0)
+         SubClassOf(:C0 ObjectOneOf(:a1))
+         ClassAssertion(:NeedA :a0)
+         ClassAssertion(:NeedB :a1)
+         SubClassOf(ObjectIntersectionOf(:NeedA :NeedB) ObjectOneOf(:a2))
+         ClassAssertion(:Goal :a2)
+         SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:a0)))
+         SubClassOf(ObjectSomeValuesFrom(:r :Goal) :Ans)",
+    );
+    let mut k_off = Classifier::of(&ax);
+    let off = k_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    let mut k_on = Classifier::of(&ax);
+    let on = k_on
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(on.complete && off.complete);
+    assert_eq!(on.stats.dl_rooted_merged, 2);
+    assert!(
+        on.stats.dl_rooted_restarts >= 2,
+        "expected >= 2 staged restarts, got {:?}",
+        on.stats
+    );
+    assert!(on.taxonomy.is_subclass(&c("Probe"), &c("Ans")));
+    assert!(off.taxonomy.is_subclass(&c("Probe"), &c("Ans")));
+}
+
+#[test]
+fn disjunctive_and_conditional_equalities_are_never_merged() {
+    let ax = axioms(
+        "SubClassOf(owl:Thing ObjectOneOf(:a :b))
+         SubClassOf(:P ObjectIntersectionOf(ObjectOneOf(:a) ObjectOneOf(:b)))
+         ClassAssertion(:A :a)
+         SubClassOf(:Q ObjectSomeValuesFrom(:r ObjectOneOf(:b)))
+         SubClassOf(ObjectSomeValuesFrom(:r :A) :Hit)",
+    );
+    let mut k_off = Classifier::of(&ax);
+    let off = k_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    let mut k_on = Classifier::of(&ax);
+    let on = k_on
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(on.complete && off.complete);
+    assert_eq!(on.stats.dl_rooted_restarts, 0);
+    assert_eq!(on.stats.dl_rooted_merged, 0);
+    assert_eq!(
+        on.taxonomy.is_subclass(&c("Q"), &c("Hit")),
+        off.taxonomy.is_subclass(&c("Q"), &c("Hit"))
+    );
+    assert!(!on.taxonomy.is_subclass(&c("Q"), &c("Hit")));
+}
+
+#[test]
+fn punning_keeps_class_and_property_names_separate() {
+    let ax = axioms(
+        "Declaration(Class(:x))
+         Declaration(Class(:y))
+         Declaration(NamedIndividual(:x))
+         Declaration(NamedIndividual(:y))
+         SameIndividual(:x :y)
+         SubClassOf(:x :OnlyX)
+         ClassAssertion(:Tag :x)",
+    );
+    let mut k_on = Classifier::of(&ax);
+    let on = k_on
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(on.complete);
+    assert_eq!(on.stats.dl_rooted_merged, 1);
+    assert!(on.taxonomy.is_subclass(&c("x"), &c("OnlyX")));
+    assert!(!on.taxonomy.is_subclass(&c("y"), &c("OnlyX")));
+    assert!(!on.taxonomy.is_subclass(&c("x"), &c("y")));
+    assert!(!on.taxonomy.is_subclass(&c("y"), &c("x")));
+}
+
+#[test]
+fn a_description_lists_every_merged_individual() {
+    // Consistent case: SameIndividual + entailed equality + anonymous + universal hub.
+    let consistent_ax = axioms(
+        "SameIndividual(:a :b)
+         SubClassOf(ObjectOneOf(:b) :Link)
+         SubClassOf(:Link ObjectOneOf(:c))
+         SameIndividual(:a _:anon0)
+         SubClassOf(:Q ObjectSomeValuesFrom(owl:topObjectProperty :T))
+         ClassAssertion(:T :a)",
+    );
+    let mut k_off = Classifier::of(&consistent_ax);
+    let _ = k_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    let mut k_on = Classifier::of(&consistent_ax);
+    let on = k_on
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(on.complete);
+    let d_on = k_on.describe(&c("T")).unwrap();
+    // :a ≈ :b ≈ :c ⇒ all three named individuals are instances of :T, and neither
+    // _:anon0 nor urn:sparkles:internal:hub leaks into describe().
+    assert_eq!(
+        d_on.instances,
+        vec![
+            NamedIndividual::new(format!("{EX}a")),
+            NamedIndividual::new(format!("{EX}b")),
+            NamedIndividual::new(format!("{EX}c")),
+        ]
+    );
+    assert!(
+        k_off
+            .describe(&c("T"))
+            .unwrap()
+            .instances
+            .iter()
+            .all(|i| d_on.instances.contains(i))
+    );
+
+    // Inconsistent case: describe must still list every original named individual (no
+    // anonymous or internal hub names) and match merge OFF.
+    let inconsistent_ax = axioms(
+        "SameIndividual(:a :b)
+         SameIndividual(:a _:anon0)
+         DifferentIndividuals(:a :b)
+         ClassAssertion(:T :c)",
+    );
+    let mut ki_off = Classifier::of(&inconsistent_ax);
+    let _ = ki_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    let mut ki_on = Classifier::of(&inconsistent_ax);
+    let out_i = ki_on
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert_eq!(out_i.consistency, Consistency::Inconsistent);
+    assert_eq!(
+        ki_on.describe(&c("T")).unwrap().instances,
+        ki_off.describe(&c("T")).unwrap().instances
+    );
+}
+
+#[test]
+fn the_hub_of_the_universal_property_merges_with_a_named_individual() {
+    let ax = axioms(
+        "SubClassOf(owl:Thing ObjectOneOf(:a))
+         SubClassOf(:Q ObjectSomeValuesFrom(owl:topObjectProperty :Tag))
+         ClassAssertion(:K :a)
+         ClassAssertion(:K :b)
+         ObjectPropertyAssertion(:r :a :a)
+         ObjectPropertyAssertion(:r :b :a)
+         HasKey(:K (:r) ())
+         ClassAssertion(:Tag :a)",
+    );
+    let mut k_off = Classifier::of(&ax);
+    let off = k_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    let mut k_on = Classifier::of(&ax);
+    let on = k_on
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(on.complete && off.complete);
+    assert!(on.stats.dl_rooted_restarts >= 1);
+    assert_eq!(on.consistency, off.consistency);
+    let d_on = k_on.describe(&c("Tag")).unwrap();
+    let d_off = k_off.describe(&c("Tag")).unwrap();
+    assert_eq!(d_on.instances, d_off.instances);
+    assert!(
+        d_on.instances
+            .iter()
+            .all(|i| !i.as_str().starts_with("urn:sparkles:internal:"))
+    );
+}
+
+#[test]
+fn parallel_normalization_chunks_share_canon_map() {
+    let mut body = String::from(
+        "SameIndividual(:a0 :a1)
+         ClassAssertion(:Seed :a1)
+         SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:a0)))
+         SubClassOf(ObjectSomeValuesFrom(:r :Seed) :Ans)\n",
+    );
+    for i in 0..1200usize {
+        body.push_str(&format!("SubClassOf(:N{i} :M{i})\n"));
+    }
+    let ax = axioms(&body);
+    let mut k1 = Classifier::of(&ax);
+    let out1 = k1
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    let mut k4 = Classifier::of(&ax);
+    let out4 = k4
+        .classify(&Limits {
+            threads: 4,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out1.complete && out4.complete);
+    assert_eq!(out1.stats.dl_rooted_merged, 1);
+    assert_eq!(out4.stats.dl_rooted_merged, 1);
+    assert!(out1.taxonomy.is_subclass(&c("Probe"), &c("Ans")));
+    assert!(out4.taxonomy.is_subclass(&c("Probe"), &c("Ans")));
+    assert_eq!(
+        k1.describe(&c("Seed")).unwrap().instances,
+        k4.describe(&c("Seed")).unwrap().instances
+    );
+}
+
+#[test]
+fn a_restart_after_the_counting_fallback_keeps_counting_off_and_its_bound() {
+    // Counting + rooted hits `dl_work` in the counting run (same AV2 + maxCardinality
+    // counting trigger used above), falls back to `no_counting` rooted retry starting
+    // from asserted partition only, and performs a derived constant-merge restart cleanly
+    // within its actual rooted limit.
+    let ax = axioms(&format!(
+        "{AV2}
+         SubClassOf(:K ObjectMaxCardinality(1 :q))
+         SubClassOf(:C0 ObjectOneOf(:a2))
+         SubClassOf(ObjectOneOf(:a0 :a2) :C0)
+         ClassAssertion(:Tag :a2)
+         SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:a0)))
+         SubClassOf(ObjectSomeValuesFrom(:r :Tag) :Hit)"
+    ));
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            threads: 1,
+            counting: true,
+            rooted: true,
+            rooted_decline: false,
+            rooted_merge: true,
+            dl_work: Some(380),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(
+        out.stats.dl_counting_over,
+        "dl_work=380 must trigger counting fallback: {:?}",
+        out.stats
+    );
+    assert!(
+        !out.stats.dl_rooted_over,
+        "no_counting retry must finish within rooted limit: {:?}",
+        out.stats
+    );
+    assert!(out.complete_for_taken);
+    assert!(
+        out.stats.dl_rooted_restarts >= 1,
+        "expected derived merge restart on no_counting retry: {:?}",
+        out.stats
+    );
+    assert!(out.stats.dl_rooted_merged >= 1, "{:?}", out.stats);
+    assert!(out.taxonomy.is_subclass(&c("Probe"), &c("Hit")));
+}
+
+#[test]
+fn a_restart_on_several_threads_without_steps_is_repeated_on_one() {
+    // Multi-thread `dl_steps = false` attempt that exhausts a tiny work bound retries on
+    // 1 thread with a cleanly reset asserted-only Merge partition (`spent = 0`).
+    let ax = axioms(
+        "SameIndividual(:s0 :s1)
+         SubClassOf(:C0 ObjectOneOf(:a2))
+         SubClassOf(ObjectOneOf(:a0 :a2) :C0)
+         ClassAssertion(:Tag :a2)
+         SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:a0)))
+         SubClassOf(ObjectSomeValuesFrom(:r :Tag) :Hit)",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            threads: 4,
+            rooted: true,
+            rooted_merge: true,
+            dl_steps: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out.complete);
+    assert!(!out.stats.dl_rooted_over);
+    assert_eq!(out.stats.dl_rooted_restarts, 1);
+    assert_eq!(out.stats.dl_rooted_merged, 2);
+    assert!(out.taxonomy.is_subclass(&c("Probe"), &c("Hit")));
+
+    // With a tight bound below 1t work, both 4t and 1t retry exhaust cleanly and fall back
+    // without stale merge state.
+    let mut k_tight = Classifier::of(&ax);
+    let out_tight = k_tight
+        .classify(&Limits {
+            threads: 4,
+            rooted: true,
+            rooted_merge: true,
+            dl_steps: false,
+            dl_work: Some(10),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out_tight.stats.dl_rooted_over);
+    assert_eq!(out_tight.stats.dl_rooted_merged, 0);
+}
+
+#[test]
+fn merge_after_decline_clears_canon_on_unrooted_fallback() {
+    // Combines AV2 (triggers item 1231 decline when rooted_decline=true, repair=false)
+    // with an entailed constant merge (restarts >= 1 before decline fires on the final
+    // quotient). The unrooted fallback must clear canon and match merge OFF.
+    let ax = axioms(&format!(
+        "{AV2}
+         SubClassOf(:M0 ObjectOneOf(:m2))
+         SubClassOf(ObjectOneOf(:m0 :m2) :M0)
+         ClassAssertion(:Tag :m0)"
+    ));
+    let mut k_off = Classifier::of(&ax);
+    let off = k_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_decline: true,
+            rooted_marker_repair: false,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    let mut k_on = Classifier::of(&ax);
+    let on = k_on
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_decline: true,
+            rooted_marker_repair: false,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(off.stats.dl_rooted_declined);
+    assert!(on.stats.dl_rooted_declined);
+    assert_eq!(
+        on.stats.dl_rooted_merged, 0,
+        "unrooted fallback after decline must clear canon"
+    );
+    assert_eq!(
+        k_on.describe(&c("Tag")).unwrap().instances,
+        k_off.describe(&c("Tag")).unwrap().instances
+    );
+}
+
+#[test]
+fn merge_with_marker_repair_and_shoi_022() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
+    let doc = ofn_read::parse(&std::fs::read_to_string(dir.join("shoi-022.ofn")).unwrap()).unwrap();
+    let mut k = Classifier::of(&doc.axioms);
+    let out = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            rooted_marker_repair: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out.complete);
+    assert!(!out.stats.dl_rooted_over && !out.stats.dl_rooted_declined);
+    assert_eq!(out.stats.dl_rooted_restarts, 1);
+    assert_eq!(out.stats.dl_rooted_merged, 2);
+
+    // AV2 + entailed equality with repair ON (and decline off, matching existing repair
+    // tests): completes and entails K ⊑ Ans.
+    let av2_merge = axioms(&format!(
+        "{AV2}
+         SubClassOf(:M0 ObjectOneOf(:m2))
+         SubClassOf(ObjectOneOf(:m0 :m2) :M0)"
+    ));
+    let mut k2 = Classifier::of(&av2_merge);
+    let out2 = k2
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_decline: false,
+            rooted_merge: true,
+            rooted_marker_repair: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out2.complete);
+    assert!(!out2.stats.dl_rooted_declined);
+    assert_eq!(out2.stats.dl_rooted_restarts, 1);
+    assert!(out2.taxonomy.is_subclass(&c("K"), &c("Ans")));
+}
+
+#[test]
+fn incremental_classify_after_merged_run_resets_cleanly() {
+    // 1. Removing a class inclusion that supported a derived equality (without naming an
+    //    individual!) must drop the derived merge on the next call.
+    let bridge = Axiom::sub_class_of(c("Mid"), c("Gate"));
+    let mut k = Classifier::of(&axioms(
+        "SubClassOf(ObjectOneOf(:a0) :Mid)
+         SubClassOf(:Gate ObjectOneOf(:a1))
+         ClassAssertion(:Tag :a1)
+         SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:a0)))
+         SubClassOf(ObjectSomeValuesFrom(:r :Tag) :Hit)",
+    ));
+    k.add([&bridge]);
+    let lim_on = Limits {
+        threads: 1,
+        rooted: true,
+        rooted_merge: true,
+        ..Limits::default()
+    };
+    let r1 = k.classify(&lim_on).unwrap();
+    assert_eq!(r1.stats.dl_rooted_restarts, 1);
+    assert_eq!(r1.stats.dl_rooted_merged, 1);
+    assert!(r1.taxonomy.is_subclass(&c("Probe"), &c("Hit")));
+
+    // Remove only `Mid ⊑ Gate` (mentions NO individuals!).
+    k.remove([&bridge]);
+    let r2 = k.classify(&lim_on).unwrap();
+    assert_eq!(r2.stats.dl_rooted_restarts, 0);
+    assert_eq!(r2.stats.dl_rooted_merged, 0);
+    assert!(!r2.taxonomy.is_subclass(&c("Probe"), &c("Hit")));
+
+    // 2. Toggling `rooted_merge` OFF -> ON on a reused Classifier with empty canon on both
+    //    sides must still force a fresh root and discover the equality.
+    k.add([&bridge]);
+    let lim_off = Limits {
+        threads: 1,
+        rooted: true,
+        rooted_merge: false,
+        ..Limits::default()
+    };
+    let r3 = k.classify(&lim_off).unwrap();
+    assert_eq!(r3.stats.dl_rooted_restarts, 0);
+    assert!(r3.taxonomy.is_subclass(&c("Probe"), &c("Hit")));
+    let r4 = k.classify(&lim_on).unwrap();
+    assert_eq!(r4.stats.dl_rooted_restarts, 1);
+    assert_eq!(r4.stats.dl_rooted_merged, 1);
+    assert!(r4.taxonomy.is_subclass(&c("Probe"), &c("Hit")));
+
+    // 3. Removing SameIndividual resets canon cleanly.
+    let same = Axiom::new(AxiomKind::SameIndividual(
+        [
+            Individual::named(format!("{EX}x")),
+            Individual::named(format!("{EX}y")),
+        ]
+        .into(),
+    ));
+    let mut k2 = Classifier::of(&axioms(
+        "ClassAssertion(:Tag :x)
+         SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:y)))
+         SubClassOf(ObjectSomeValuesFrom(:r :Tag) :Hit)",
+    ));
+    k2.add([&same]);
+    let s1 = k2.classify(&lim_on).unwrap();
+    assert_eq!(s1.stats.dl_rooted_merged, 1);
+    assert!(s1.taxonomy.is_subclass(&c("Probe"), &c("Hit")));
+    k2.remove([&same]);
+    let s2 = k2.classify(&lim_on).unwrap();
+    assert_eq!(s2.stats.dl_rooted_merged, 0);
+    assert!(!s2.taxonomy.is_subclass(&c("Probe"), &c("Hit")));
+}
+
+#[test]
+fn merge_stop_never_returns_partial_taxonomy() {
+    let ax = axioms(
+        "SubClassOf(:C0 ObjectOneOf(:a2))
+         SubClassOf(ObjectOneOf(:a0 :a2) :C0)
+         ClassAssertion(:Tag :a2)
+         SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:a0)))
+         SubClassOf(ObjectSomeValuesFrom(:r :Tag) :Hit)",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            partial: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(
+        out.complete,
+        "merge stop must restart, never return partial"
+    );
+    assert!(out.complete_for_taken);
+    assert_eq!(out.stats.dl_rooted_restarts, 1);
+    assert!(out.taxonomy.is_subclass(&c("Probe"), &c("Hit")));
+}
+
+/// Sol P1 #1 / Neon B1 regression: starting with `SameIndividual(_:x _:y)` and deriving
+/// `_:x ≈ :a` in the root must deduplicate `_:x` across asserted and harvested paths,
+/// build a flat `CanonMap` (`_:x -> :a`, `_:y -> :a`), and finish with zero panic or
+/// spurious fallback.
+#[test]
+fn asserted_anonymous_same_individual_followed_by_root_derived_named_merge() {
+    let ax = axioms(
+        "SameIndividual(_:x _:y)
+         ClassAssertion(:Tag _:y)
+         SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))
+         SubClassOf(ObjectOneOf(_:x) :Bridge)
+         SubClassOf(:Bridge ObjectOneOf(:a))
+         SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+         SubClassOf(ObjectSomeValuesFrom(:r :Tag) :Hit)",
+    );
+    let mut k_off = Classifier::of(&ax);
+    let off = k_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    let d_off = k_off.describe(&c("Tag")).unwrap();
+
+    for (threads, expansion) in CONFIGS {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(out.complete, "{threads}t {expansion:?}");
+        assert!(!out.stats.dl_over_budget && !out.stats.dl_rooted_over);
+        assert_eq!(out.consistency, off.consistency);
+        assert_eq!(out.stats.dl_rooted_restarts, 1);
+        assert_eq!(out.stats.dl_rooted_merged, 2);
+        assert!(
+            out.taxonomy.is_subclass(&c("Probe"), &c("Hit")),
+            "{threads}t {expansion:?}: _:y assertion must reach :a via flat CanonMap"
+        );
+        assert_eq!(
+            out.taxonomy.is_subclass(&c("Probe"), &c("Hit")),
+            off.taxonomy.is_subclass(&c("Probe"), &c("Hit"))
+        );
+        let d_on = k.describe(&c("Tag")).unwrap();
+        assert_eq!(d_on.instances, vec![NamedIndividual::new(format!("{EX}a"))]);
+        assert!(
+            d_off.instances.iter().all(|i| d_on.instances.contains(i)),
+            "merge ON must retain every public instance from merge OFF"
+        );
+        assert!(
+            d_on.instances.iter().all(|i| !i.as_str().starts_with("_:")),
+            "anonymous individual leaked into describe(): {:?}",
+            d_on.instances
+        );
+    }
+}
+
+/// Sol P1 #2 / Neon B2 regression: if post-merge `dl_reduce::plan` declines on Pass 1
+/// (after Pass 0 reduced and derived aliases / hub merge), derived aliases and any
+/// generated hub must be cleared cleanly before Horn fallback runs on the original axioms,
+/// matching a fresh run on the original axioms and never leaking `urn:sparkles:internal:hub`.
+#[test]
+fn post_merge_reduction_decline_clears_derived_aliases_and_never_leaks_hub() {
+    // Part A (Sol P1 #2): Anonymous witness equality `_:w0 ≈ _:w1` derived ONLY from a
+    // disjunctive axiom beside `HasKey` over 8 long-IRI named individuals `:k00..:k07`.
+    // Merging the two 256 KiB anonymous witnesses leaves `n = 8` unchanged while adding
+    // `UF + Canon` (~1 MiB) to Pass 1's `plan_budgeted` base (`H + UF + Canon + R`),
+    // strictly exceeding both Pass 0 (`H + R + I`) and restart `build_canon`
+    // (`H + UF + Canon`). Choosing `cap = off_peak + 128 KiB` guarantees Pass 0 succeeds
+    // and merges, `build_canon` succeeds, Pass 1's `plan_budgeted` declines, and Horn
+    // fallback runs cleanly without inheriting `_:w0 ≈ _:w1` (`:Probe ⊑ :OnlyFromDisj`).
+    let w0 = format!("w0_{}", "a".repeat(256 * 1024));
+    let w1 = format!("w1_{}", "b".repeat(256 * 1024));
+    let mut body_a = format!(
+        "HasKey(:K (:r) ())
+         SubClassOf(ObjectOneOf(_:{w0}) ObjectUnionOf(:P :Q))
+         SubClassOf(:P ObjectOneOf(_:{w1}))
+         SubClassOf(:Q ObjectOneOf(_:{w1}))
+         ClassAssertion(:Flag _:{w1})
+         SubClassOf(:Probe ObjectSomeValuesFrom(:s ObjectOneOf(_:{w0})))
+         SubClassOf(ObjectSomeValuesFrom(:s :Flag) :OnlyFromDisj)\n"
+    );
+    for i in 0..8usize {
+        body_a.push_str(&format!(
+            "ClassAssertion(:K :k{i:02}_{})\n",
+            "k".repeat(2048)
+        ));
+    }
+    let ax_a = axioms(&body_a);
+    let mut fresh_a = Classifier::of(&ax_a);
+    let expected_a = fresh_a
+        .classify(&Limits {
+            threads: 1,
+            rooted: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(!fresh_a.excluded().is_empty());
+    assert!(
+        !expected_a
+            .taxonomy
+            .is_subclass(&c("Probe"), &c("OnlyFromDisj")),
+        "fresh Horn run must not derive disjunctive witness equality"
+    );
+
+    // Unrestricted merged run confirms Pass 0 reduces, derives `_:w0 ≈ _:w1`, and restarts.
+    let mut unres_a = Classifier::of(&ax_a);
+    let base_a = unres_a
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(base_a.complete);
+    assert_eq!(base_a.stats.dl_rooted_restarts, 1);
+    assert_eq!(base_a.stats.dl_rooted_merged, 1);
+    assert!(base_a.taxonomy.is_subclass(&c("Probe"), &c("OnlyFromDisj")));
+
+    // Measure Pass 0 peak (`rooted_merge: false`, no `SameIndividual` axioms so Pass 0
+    // sees the identical `reduce_mem` and `plan_base`), then verify `cap_a` strictly
+    // allows Pass 0 to complete in full while declining Pass 1 after the merge restart.
+    let mut off_unres_a = Classifier::of(&ax_a);
+    let off_base_a = off_unres_a
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(off_base_a.complete);
+    let cap_a = off_base_a.stats.peak_memory + (128 * 1024);
+    assert!(
+        cap_a < base_a.stats.peak_memory,
+        "expected cap_a ({cap_a}) below Pass 1 replan peak ({})",
+        base_a.stats.peak_memory
+    );
+
+    let mut k_a_off = Classifier::of(&ax_a);
+    let off_capped_a = k_a_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            max_memory: Some(cap_a),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(
+        off_capped_a.complete,
+        "Pass 0 reduction and saturation must succeed under cap_a ({cap_a}, off peak={})",
+        off_capped_a.stats.peak_memory
+    );
+    assert!(
+        off_capped_a
+            .taxonomy
+            .is_subclass(&c("Probe"), &c("OnlyFromDisj")),
+        "Pass 0 without merge must still derive disjunctive witness equality"
+    );
+
+    let mut k_a = Classifier::of(&ax_a);
+    let got_a = k_a
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            max_memory: Some(cap_a),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(!got_a.complete, "Pass 1 reduction must decline into Horn");
+    assert!(
+        got_a.stats.peak_memory > expected_a.stats.peak_memory,
+        "Pass 0 must have reduced and saturated before Pass 1 declined (got peak {} vs fresh Horn {})",
+        got_a.stats.peak_memory,
+        expected_a.stats.peak_memory
+    );
+    assert_eq!(
+        got_a.stats.dl_rooted_merged, 0,
+        "declined Pass 1 must clear derived aliases"
+    );
+    assert_eq!(got_a.consistency, expected_a.consistency);
+    assert_eq!(k_a.excluded(), fresh_a.excluded());
+    assert!(
+        !got_a.taxonomy.is_subclass(&c("Probe"), &c("OnlyFromDisj")),
+        "Horn fallback after Pass 1 reduction decline must NOT inherit derived disjunctive alias"
+    );
+    assert_eq!(
+        k_a.describe(&c("Flag")).unwrap().instances,
+        fresh_a.describe(&c("Flag")).unwrap().instances
+    );
+
+    // Part B (Neon B2): Pass 0 synthesizes `urn:sparkles:internal:hub` via
+    // `owl:topObjectProperty` (and retargets a wide long-IRI `EquivalentObjectProperties`
+    // axiom) and merges `hub -> :a` alongside long anonymous witness merge `_:w0 ≈ _:w1`.
+    // On restart, `UF + Canon + retargeted roles` exceeds `cap_b = off_peak + 256 KiB`,
+    // so Pass 1 reduction declines under `max_memory`. Verify Pass 0 succeeds under
+    // `cap_b` (`rooted_merge: false`), Pass 1 declines cleanly into Horn, and `describe()`
+    // NEVER leaks `urn:sparkles:internal:hub` and matches a fresh run.
+    let w0_b = format!("w0b_{}", "a".repeat(512 * 1024));
+    let w1_b = format!("w1b_{}", "b".repeat(512 * 1024));
+    let mut body_b = format!(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))
+         SubClassOf(ObjectOneOf(_:{w0_b}) :Bridge)
+         SubClassOf(:Bridge ObjectOneOf(_:{w1_b}))
+         SubClassOf(:Q ObjectSomeValuesFrom(owl:topObjectProperty :Tag))
+         SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty :Seed) ObjectOneOf(:a))
+         ClassAssertion(:Seed :a)
+         ClassAssertion(:Tag :a)
+         EquivalentObjectProperties(owl:topObjectProperty"
+    );
+    for i in 0..100usize {
+        body_b.push_str(&format!(" :hp{i:03}_{}", "p".repeat(8192)));
+    }
+    body_b.push_str(")\n");
+    let ax_b = axioms(&body_b);
+    let mut fresh_b = Classifier::of(&ax_b);
+    let expected_b = fresh_b
+        .classify(&Limits {
+            threads: 1,
+            rooted: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    let fresh_desc_b = fresh_b.describe(&c("Tag")).unwrap();
+
+    // Unrestricted merged baseline proves Pass 0 merges and triggers a restart.
+    let mut unres_b = Classifier::of(&ax_b);
+    let base_b = unres_b
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(base_b.complete);
+    assert!(
+        base_b.stats.dl_rooted_restarts >= 1,
+        "Part B unrestricted run must perform at least one merge restart"
+    );
+
+    let mut off_unres_b = Classifier::of(&ax_b);
+    let off_base_b = off_unres_b
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(off_base_b.complete);
+    let cap_b = off_base_b.stats.peak_memory + (256 * 1024);
+    assert!(
+        cap_b < base_b.stats.peak_memory,
+        "expected cap_b ({cap_b}) below Pass 1 replan peak ({})",
+        base_b.stats.peak_memory
+    );
+
+    let mut k_b_off = Classifier::of(&ax_b);
+    let off_capped_b = k_b_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            max_memory: Some(cap_b),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(
+        off_capped_b.complete,
+        "Part B Pass 0 reduction and saturation must succeed under cap_b ({cap_b}, off peak={})",
+        off_capped_b.stats.peak_memory
+    );
+
+    let mut k_b = Classifier::of(&ax_b);
+    let got_b = k_b
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            max_memory: Some(cap_b),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(!got_b.complete, "Part B Pass 1 reduction must decline");
+    assert!(
+        got_b.stats.peak_memory > expected_b.stats.peak_memory,
+        "Part B Pass 0 must have reduced and saturated before Pass 1 declined (got peak {} vs fresh Horn {})",
+        got_b.stats.peak_memory,
+        expected_b.stats.peak_memory
+    );
+    assert_eq!(got_b.stats.dl_rooted_merged, 0);
+    assert_eq!(got_b.consistency, expected_b.consistency);
+    assert_eq!(k_b.excluded(), fresh_b.excluded());
+    let d_b = k_b.describe(&c("Tag")).unwrap();
+    assert!(
+        d_b.instances
+            .iter()
+            .all(|i| !i.as_str().starts_with("urn:sparkles:internal:")),
+        "generated hub leaked into describe(): {:?}",
+        d_b.instances
+    );
+    assert_eq!(d_b.instances, fresh_desc_b.instances);
 }

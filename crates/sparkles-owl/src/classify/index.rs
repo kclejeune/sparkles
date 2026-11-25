@@ -182,6 +182,23 @@ impl<T: Named> Names<T> {
         self.items.len() * (std::mem::size_of::<T>() + 8 + 5)
     }
 
+    /// Exact retained heap bytes of this table, including the hashbrown bucket allocation.
+    pub fn exact_bytes(&self) -> usize {
+        self.items
+            .capacity()
+            .saturating_mul(std::mem::size_of::<T>())
+            .saturating_add(
+                self.hashes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(super::dl_clause::hash_table_bytes(
+                self.table.capacity(),
+                std::mem::size_of::<u32>(),
+            ))
+            .saturating_add(self.name_bytes)
+    }
+
     /// Takes the entities and their hashes out, leaving the table empty.
     pub fn take(&mut self) -> (Vec<T>, Vec<u64>) {
         self.table.clear();
@@ -324,6 +341,81 @@ pub struct Interner {
     and_ids: FxHashMap<(Vec<Ex>, bool), u32>,
     /// the operands of [`Interner::ands`], counted twice, once for the table's key
     and_ops: usize,
+    /// Optional canonical individual map shared across the main interner and parallel
+    /// chunk interners via `Arc` (item 1061 phase 2 constant merging).
+    pub canon: Option<std::sync::Arc<CanonMap>>,
+}
+
+/// Exact heap allocation size of an `Arc<T>`'s `ArcInner<T>` control block and payload,
+/// accounting for both atomic reference counts and target alignment.
+pub fn arc_payload_bytes<T>() -> Option<usize> {
+    let header = std::alloc::Layout::array::<std::sync::atomic::AtomicUsize>(2).ok()?;
+    let (layout, _) = header.extend(std::alloc::Layout::new::<T>()).ok()?;
+    Some(layout.pad_to_align().size())
+}
+
+/// Clones `n` into a fresh `NamedIndividual` whose backing `String` has exact capacity
+/// equal to its byte length.
+pub fn exact_individual(n: &NamedIndividual) -> NamedIndividual {
+    NamedIndividual::new(n.as_str().to_owned())
+}
+
+/// Immutable canonical individual map shared across the main `Interner` and parallel
+/// chunk interners via `Arc`, carrying exact retained and logical byte sizes for
+/// Item 1291 memory accounting. Each representative string is stored once in `reps`.
+pub struct CanonMap {
+    reps: Vec<NamedIndividual>,
+    map: FxHashMap<NamedIndividual, u32>,
+    generated_hub: Option<NamedIndividual>,
+    owned_bytes: usize,
+    logical_bytes: usize,
+}
+
+impl CanonMap {
+    pub fn new_from_parts(
+        reps: Vec<NamedIndividual>,
+        map: FxHashMap<NamedIndividual, u32>,
+        generated_hub: Option<NamedIndividual>,
+        owned_bytes: usize,
+        logical_bytes: usize,
+    ) -> Self {
+        Self {
+            reps,
+            map,
+            generated_hub,
+            owned_bytes,
+            logical_bytes,
+        }
+    }
+
+    #[inline]
+    pub fn generated_hub(&self) -> Option<&NamedIndividual> {
+        self.generated_hub.as_ref()
+    }
+
+    #[inline]
+    pub fn get(&self, i: &NamedIndividual) -> Option<&NamedIndividual> {
+        self.map.get(i).map(|&r| &self.reps[r as usize])
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&NamedIndividual, &NamedIndividual)> + '_ {
+        self.map.iter().map(|(k, &r)| (k, &self.reps[r as usize]))
+    }
+
+    #[inline]
+    pub fn owned_bytes(&self) -> usize {
+        self.owned_bytes
+    }
+
+    #[inline]
+    pub fn logical_bytes(&self) -> usize {
+        self.logical_bytes
+    }
 }
 
 /// What a run of fresh classes is made for, which names them across the runs over one
@@ -421,6 +513,16 @@ impl Interner {
             .checked_add(self.dt.bytes())
     }
 
+    /// Exact retained bytes of the shared canonical individual map on the main interner
+    /// (`0` on parallel chunk interners that share the same `Arc`).
+    pub fn canon_bytes(&self) -> usize {
+        if self.chunk {
+            0
+        } else {
+            self.canon.as_ref().map_or(0, |c| c.owned_bytes())
+        }
+    }
+
     /// O(1) bytes of the interner excluding [`Interner::dt_run`].
     pub fn core_bytes(&self) -> usize {
         self.data_bytes()
@@ -452,7 +554,7 @@ impl Interner {
     /// The bytes the interner takes, roughly: each expression with its entry in the
     /// table, the names with their IRIs, and a chunk's intersections.
     pub fn bytes(&self) -> usize {
-        self.core_bytes() + self.dt_run.as_ref().map_or(0, |r| r.bytes())
+        self.core_bytes() + self.dt_run.as_ref().map_or(0, |r| r.bytes()) + self.canon_bytes()
     }
 
     /// Whether a chunk met data ranges or literals, whose ids its merge does not map, so
@@ -602,6 +704,7 @@ impl Interner {
     }
 
     fn individual_id(&mut self, i: &NamedIndividual) -> u32 {
+        let i = self.canon.as_ref().and_then(|m| m.get(i)).unwrap_or(i);
         self.individuals.id(i)
     }
 
@@ -751,9 +854,7 @@ impl Interner {
     pub fn individual(&mut self, i: &Individual) -> Ex {
         match i {
             Individual::Named(n) => self.nominal(n),
-            Individual::Anonymous(a) => {
-                self.nominal(&NamedIndividual::new(format!("{ANONYMOUS}{}", a.label())))
-            }
+            Individual::Anonymous(a) => self.nominal(&anon_individual(a)),
         }
     }
 
@@ -1643,6 +1744,15 @@ pub fn top_inclusion(ax: &AxiomKind) -> bool {
 /// The start of the interner's name for an anonymous individual ([`Interner::individual`]).
 pub const ANONYMOUS: &str = "_:";
 
+/// The interner's canonical `NamedIndividual` spelling for an anonymous individual,
+/// allocated with exact string capacity.
+pub fn anon_individual(a: &AnonymousIndividual) -> NamedIndividual {
+    let mut s = String::with_capacity(ANONYMOUS.len() + a.label().len());
+    s.push_str(ANONYMOUS);
+    s.push_str(a.label());
+    NamedIndividual::new(s)
+}
+
 /// Whether the interner's individual stands for an anonymous individual, which no answer
 /// names.
 pub fn is_anonymous(i: &NamedIndividual) -> bool {
@@ -2012,14 +2122,16 @@ fn normalize_axiom(
         }
         K::DifferentIndividuals(is) => {
             let mut es: Vec<Ex> = is.iter().map(|i| it.individual(i)).collect();
-            out.individuals.extend(es.iter().copied());
             es.sort_unstable();
+            let mut prev_dup: Option<Ex> = None;
             for w in es.windows(2) {
-                if w[0] == w[1] {
+                if w[0] == w[1] && prev_dup != Some(w[0]) {
                     out.subs.push((w[0], BOTTOM));
+                    prev_dup = Some(w[0]);
                 }
             }
             es.dedup();
+            out.individuals.extend(es.iter().copied());
             if es.len() >= 2 {
                 out.disjoint.push(es);
             }

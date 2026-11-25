@@ -589,6 +589,14 @@ pub(super) fn shape_polled<E>(
     })
 }
 
+/// Streaming, allocation-free, cooperatively polled Horn check.
+pub(super) fn is_horn_polled<E>(
+    ax: &AxiomKind,
+    poll: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    Ok(shape_polled(ax, 1, poll)?.horn)
+}
+
 /// What an axiom needs: whether it is Horn and, when it is not, whether it is global.
 pub fn shape(ax: &AxiomKind) -> Shape {
     shape_polled(ax, usize::MAX, &mut || Ok::<(), ()>(())).unwrap()
@@ -906,5 +914,57 @@ mod tests {
                 global: false
             }
         );
+    }
+
+    #[test]
+    fn streaming_is_horn_polled_matches_shape_and_stops_on_poll_error() {
+        let cases = [
+            "SubClassOf(:A ObjectUnionOf(:B :C))",
+            "SubClassOf(ObjectUnionOf(:B :C) :A)",
+            "EquivalentClasses(:A :B)",
+            "EquivalentClasses(:A ObjectUnionOf(:B :C))",
+            "EquivalentClasses(:A ObjectComplementOf(:B))",
+            "EquivalentClasses(:A ObjectAllValuesFrom(:r :B) :C)",
+            "DisjointClasses(:A :B :C)",
+            "DisjointClasses(ObjectComplementOf(:A) ObjectComplementOf(:B))",
+            "DisjointUnion(:A :B :C)",
+            "DisjointUnion(:A owl:Nothing :B)",
+            "HasKey(:A (:r) ())",
+            "HasKey(ObjectComplementOf(:A) (:r) ())",
+            "DataPropertyRange(:d DataUnionOf(xsd:int xsd:string))",
+            "DataPropertyRange(:d DataIntersectionOf(xsd:int xsd:string))",
+        ];
+        for src in cases {
+            let doc = ofn_read::parse(&format!(
+                "Prefix(:=<http://ex.org/>)\nPrefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)\n\
+                 Prefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\n{src}\n)"
+            ))
+            .unwrap();
+            let ax = doc
+                .axioms
+                .iter()
+                .map(|a| &a.kind)
+                .find(|k| !matches!(k, AxiomKind::Declaration(_)))
+                .unwrap();
+            let polled = is_horn_polled(ax, &mut || Ok::<(), ()>(())).unwrap();
+            assert_eq!(polled, shape(ax).horn, "{src}");
+        }
+
+        // Cooperative poll error halts mid-expression.
+        let wide = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("http://ex.org/A")),
+            ClassExpression::ObjectUnionOf(
+                (0..100usize)
+                    .map(|i| ClassExpression::Class(Class::new(format!("http://ex.org/C{i}"))))
+                    .collect(),
+            ),
+        );
+        let mut ticks = 0usize;
+        let res = is_horn_polled(&wide, &mut || {
+            ticks += 1;
+            if ticks == 10 { Err(()) } else { Ok(()) }
+        });
+        assert_eq!(res, Err(()));
+        assert_eq!(ticks, 10);
     }
 }

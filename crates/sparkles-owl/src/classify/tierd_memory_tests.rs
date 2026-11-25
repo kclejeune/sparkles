@@ -4895,3 +4895,2807 @@ fn pred_c_visits_reaching_edges_in_id_order_before_width_stop() {
         "higher-ID explicit edge's wide product must still trigger width-limit interruption"
     );
 }
+
+/// Phase 2 `Merge` UF + `CanonMap` exact accounting must cover actual counting-allocator
+/// live heap, including many aliases sharing one long representative, long-IRI pairs, and
+/// long anonymous blank labels.
+#[test]
+fn merge_canon_and_uf_cover_counting_allocator_heap() {
+    let long_rep = NamedIndividual::new(format!("http://example.org/rep/{}", "r".repeat(1024)));
+    let mut pairs: Vec<(Individual, Individual)> = Vec::new();
+    // 500 aliases sharing one 1024-byte representative.
+    for i in 0..500usize {
+        let alias = NamedIndividual::new(format!(
+            "http://example.org/z-alias-{i:04}/{}",
+            "a".repeat(256)
+        ));
+        pairs.push((
+            Individual::Named(long_rep.clone()),
+            Individual::Named(alias),
+        ));
+    }
+    // 200 distinct long-IRI pairs (512-byte IRIs).
+    for i in 0..200usize {
+        let a = NamedIndividual::new(format!("http://example.org/p{i:04}a/{}", "x".repeat(512)));
+        let b = NamedIndividual::new(format!("http://example.org/p{i:04}b/{}", "y".repeat(512)));
+        pairs.push((Individual::Named(a), Individual::Named(b)));
+    }
+    // Long anonymous blank label merged with a named individual.
+    let long_blank = AnonymousIndividual::new(format!("blank_{}", "b".repeat(1024)));
+    pairs.push((
+        Individual::Named(long_rep.clone()),
+        Individual::Anonymous(long_blank),
+    ));
+
+    let limits = Limits::default();
+    let mut peak_admitted = 0usize;
+    let mut admit = |used: usize| -> bool {
+        peak_admitted = peak_admitted.max(used);
+        true
+    };
+    let ((uf_bytes, canon_bytes, canon_len), sample) = measure(|| {
+        let mut m = Merge::default();
+        for (a, b) in &pairs {
+            m.union_individual(a, b, 0, &mut admit).expect("admitted");
+        }
+        let uf_bytes = m.uf_bytes();
+        let canon = m
+            .build_canon(0, &limits, &mut admit)
+            .ok()
+            .flatten()
+            .expect("non-empty canon");
+        let canon_bytes = canon.owned_bytes();
+        let canon_len = canon.len();
+        (uf_bytes, canon_bytes, canon_len)
+    });
+
+    assert_eq!(canon_len, 500 + 200 + 1);
+    assert!(
+        uf_bytes + canon_bytes >= sample.live,
+        "uf_bytes ({uf_bytes}) + canon_bytes ({canon_bytes}) undercounted live heap ({})",
+        sample.live
+    );
+    assert!(
+        peak_admitted >= sample.peak,
+        "peak_admitted ({peak_admitted}) undercounted measured peak heap ({})",
+        sample.peak
+    );
+
+    // End-to-end classification with long-IRI SameIndividual + entailed merge must cover peak.
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:C0 ObjectOneOf(:e1))\n\
+         SubClassOf(ObjectOneOf(:e0 :e1) :C0)\n",
+    );
+    let rep_name = format!("rep_{}", "r".repeat(512));
+    for i in 0..80usize {
+        let alias = format!("z_{i:03}_{}", "a".repeat(256));
+        body.push_str(&format!("SameIndividual(:{rep_name} :{alias})\n"));
+    }
+    body.push_str(&format!("ClassAssertion(:C0 :{rep_name})\n"));
+    let input = axioms(&body);
+    let mut k = Classifier::of(&input);
+    let (res, run_sample) = measure(|| {
+        k.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+    });
+    let out = res.expect("classify");
+    assert!(out.complete);
+    assert!(out.stats.dl_rooted_restarts >= 1);
+    assert!(out.stats.dl_rooted_merged >= 81);
+    assert!(
+        out.stats.peak_memory >= run_sample.peak,
+        "peak_memory ({}) < measured peak ({})",
+        out.stats.peak_memory,
+        run_sample.peak
+    );
+}
+
+/// Optional prepass (`collect_same`) refusal must discard provisional partition/map,
+/// disable merging for the call, answer cleanly with the ordinary classifier, and leave a
+/// follow-up unrestricted classify on the same `Classifier` identical to a fresh one.
+#[test]
+fn merge_prepass_charge_refusal_disables_merge_and_answers_normally() {
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:A :B)\n",
+    );
+    let rep = format!("r_{}", "x".repeat(512));
+    for i in 0..40usize {
+        body.push_str(&format!(
+            "SameIndividual(:{rep} :z_{i:02}_{})\n",
+            "y".repeat(512)
+        ));
+    }
+    body.push_str(&format!("ClassAssertion(:A :{rep})\n"));
+    let input = axioms(&body);
+
+    // Refuse the first non-zero charge during `collect_same` UF/CanonMap build, then allow
+    // subsequent ordinary classifier charges so the fallback finishes.
+    let refused = Arc::new(AtomicBool::new(false));
+    let refused_cb = refused.clone();
+    let charge = Arc::new(move |bytes: usize| -> bool {
+        if !refused_cb.swap(true, Ordering::SeqCst) && bytes > 0 {
+            return false;
+        }
+        true
+    });
+
+    let mut k = Classifier::of(&input);
+    let out = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            charge: Some(charge),
+            ..Limits::default()
+        })
+        .expect("ordinary classifier should succeed when prepass declines");
+    assert!(refused.load(Ordering::SeqCst), "prepass charge was hit");
+    assert_eq!(
+        out.stats.dl_rooted_merged, 0,
+        "merging disabled after refusal"
+    );
+    assert!(out.taxonomy.is_subclass(
+        &Class::new("urn:tierd1291:A"),
+        &Class::new("urn:tierd1291:B")
+    ));
+
+    // Follow-up unrestricted classify on the same Classifier must match a fresh one.
+    let follow = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("follow-up classify");
+    assert_eq!(follow.stats.dl_rooted_merged, 40);
+
+    let mut fresh = Classifier::of(&input);
+    let expected = fresh
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("fresh classify");
+    assert_eq!(follow.consistent, expected.consistent);
+    assert_eq!(
+        follow.stats.dl_rooted_merged,
+        expected.stats.dl_rooted_merged
+    );
+}
+
+/// Refusal during harvest/restart allocation must route through ordinary memory handling
+/// (clearing `dl_worked` so `dl_rooted_over` is not falsely claimed), stay bounded, and
+/// recover cleanly on a follow-up unrestricted call on the same `Classifier`.
+#[test]
+fn merge_restart_and_harvest_refusal_reclaims_and_routes_to_memory_fallback() {
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:C0 ObjectOneOf(:a2))\n\
+         SubClassOf(ObjectOneOf(:a0 :a2) :C0)\n\
+         ClassAssertion(:C0 :a0)\n",
+    );
+    // Add long-IRI derived equalities so restart union/CanonMap allocates noticeably.
+    for i in 0..16usize {
+        let a = format!("u{i:02}_{}", "p".repeat(512));
+        let b = format!("v{i:02}_{}", "q".repeat(512));
+        body.push_str(&format!(
+            "SubClassOf(:K{i} ObjectOneOf(:{b}))\n\
+             SubClassOf(ObjectOneOf(:{a} :{b}) :K{i})\n"
+        ));
+    }
+    let input = axioms(&body);
+
+    // First measure baseline unrestricted peak to calibrate a tight charge cap that lets
+    // prefix saturation start and refuses during harvest/restart.
+    let mut base_k = Classifier::of(&input);
+    let base_out = base_k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("unrestricted");
+    assert!(base_out.stats.dl_rooted_restarts >= 1);
+
+    // Sweep several tight caps below `base_out.stats.peak_memory` so we exercise refusal
+    // during harvest and restart rebuilding.
+    let mut saw_memory_path = false;
+    for frac in [1usize, 2, 3, 4] {
+        let cap = (base_out.stats.peak_memory * frac) / 6;
+        let mut k = Classifier::of(&input);
+        let (res, sample) = measure(|| {
+            k.classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                max_memory: Some(cap),
+                ..Limits::default()
+            })
+        });
+        match res {
+            Ok(out) => {
+                assert!(
+                    !out.stats.dl_rooted_over,
+                    "memory refusal must not masquerade as rooted work exhaustion"
+                );
+                if out.stats.dl_over_budget || out.stats.horn_over_budget {
+                    saw_memory_path = true;
+                }
+            }
+            Err(Error::Memory { .. }) => {
+                saw_memory_path = true;
+            }
+            Err(other) => panic!("unexpected error under tight memory cap: {other:?}"),
+        }
+        assert!(
+            sample.peak <= cap + (512 << 10),
+            "tight cap measured peak ({}) overshot cap ({cap})",
+            sample.peak
+        );
+        // Follow-up unrestricted classify on the same Classifier must succeed cleanly.
+        let recovered = k
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .expect("follow-up unrestricted classify");
+        assert!(recovered.complete);
+        assert_eq!(recovered.consistent, base_out.consistent);
+        assert_eq!(
+            recovered.stats.dl_rooted_merged,
+            base_out.stats.dl_rooted_merged
+        );
+    }
+    assert!(
+        saw_memory_path,
+        "expected at least one cap to trigger memory refusal"
+    );
+}
+
+/// Cancellation during `collect_same` (including inside a single large n-ary
+/// `SameIndividual` axiom) and during saturation/restart must return `Error::Cancelled`
+/// and invalidate cached answers on `Classifier`.
+#[test]
+fn merge_cancellation_polls_n_ary_same_and_invalidates_old_answers() {
+    let mut k = Classifier::of(&axioms("SubClassOf(:A :B)\nClassAssertion(:A :a0)\n"));
+    let first = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("initial classify");
+    assert!(first.consistent);
+    assert!(k.describe(&Class::new("urn:tierd1291:A")).is_some());
+
+    // Add a single very large n-ary SameIndividual axiom (> POLL_AXIOMS members).
+    let mut members = std::collections::BTreeSet::new();
+    for i in 0..300usize {
+        members.insert(Individual::Named(NamedIndividual::new(format!(
+            "urn:tierd1291:n{i:04}"
+        ))));
+    }
+    k.add([&Axiom::new(AxiomKind::SameIndividual(members))]);
+    k.add([&Axiom::sub_class_of(
+        Class::new("urn:tierd1291:B"),
+        Class::new("urn:tierd1291:C"),
+    )]);
+
+    // Cancel after 2 poll checks so it fires mid-loop inside the single n-ary axiom.
+    let polls = Arc::new(AtomicUsize::new(0));
+    let polls_cb = polls.clone();
+    let err = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            cancelled: Some(Arc::new(move || {
+                polls_cb.fetch_add(1, Ordering::SeqCst) >= 2
+            })),
+            ..Limits::default()
+        })
+        .expect_err("must cancel inside large n-ary SameIndividual");
+    assert_eq!(err, Error::Cancelled);
+    assert!(
+        k.describe(&Class::new("urn:tierd1291:A")).is_none(),
+        "cancelled pre-saturation preparation must invalidate old describe() answers"
+    );
+
+    // Follow-up unrestricted classify must reflect the added axioms (A ⊑ C) even though
+    // `Classifier::run_held` advanced its edit counters on the cancelled call!
+    let after = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("follow-up classify after cancel");
+    assert!(after.taxonomy.is_subclass(
+        &Class::new("urn:tierd1291:A"),
+        &Class::new("urn:tierd1291:C")
+    ));
+    assert_eq!(after.stats.dl_rooted_merged, 299);
+}
+
+/// Logical allowance (`allowance_base` and `own`) must be identical on 1 thread vs 4
+/// threads past `PARALLEL_AXIOMS` when `rooted_merge` is enabled.
+#[test]
+fn merge_deterministic_allowance_across_threads() {
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SameIndividual(:a0 :a1)\n\
+         SubClassOf(:C0 ObjectOneOf(:a2))\n\
+         SubClassOf(ObjectOneOf(:a0 :a2) :C0)\n",
+    );
+    for i in 0..(PARALLEL_AXIOMS + 64) {
+        body.push_str(&format!("SubClassOf(:P{i} :Q{i})\n"));
+    }
+    let input = axioms(&body);
+
+    let mut k1 = Classifier::of(&input);
+    let out1 = k1
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("1t classify");
+    let (_, base1, own1) = LAST_ALLOWANCE.get();
+
+    let mut k4 = Classifier::of(&input);
+    let out4 = k4
+        .classify(&Limits {
+            threads: 4,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("4t classify");
+    let (_, base4, own4) = LAST_ALLOWANCE.get();
+
+    assert_eq!(out1.stats.dl_rooted_merged, 2);
+    assert_eq!(out4.stats.dl_rooted_merged, 2);
+    assert_eq!(base1, base4, "allowance_base must be thread-independent");
+    assert_eq!(
+        own1, own4,
+        "discretionary allowance must be thread-independent"
+    );
+}
+
+/// Class-scaled rooted work bound (`SPARKLES_ROOTED_BOUND_PER_CLASS=1`) must be captured
+/// and honored across merge restarts instead of hardcoding `ROOTED_WORK_BOUND`.
+#[test]
+fn merge_restart_honors_class_scaled_bound_and_hub_skip_switch() {
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:C0 ObjectOneOf(:a1))\n\
+         SubClassOf(ObjectOneOf(:a0 :a1) :C0)\n",
+    );
+    for i in 0..32usize {
+        body.push_str(&format!("Declaration(Class(:Extra{i}))\n"));
+    }
+    let input = axioms(&body);
+    with_rooted_bound_per_class(true, || {
+        let mut k = Classifier::of(&input);
+        let out = k
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .expect("classify");
+        assert!(out.complete);
+        assert_eq!(out.stats.dl_rooted_restarts, 1);
+        assert_eq!(
+            LAST_ROOTED_WORK_LIMIT.get(),
+            rooted_work_bound(36, true),
+            "captured bound must match class-scaled bound"
+        );
+    });
+
+    // Hub skipping (`SPARKLES_ROOTED_MERGE_HUB=0`): when the ONLY forced equality involves
+    // the generated hub (`⊤ ⊑ {:a}` + `ObjectSomeValuesFrom(owl:topObjectProperty ...)`),
+    // hub-merge OFF triggers 0 restarts while hub-merge ON triggers 1 restart, with
+    // identical semantics.
+    let hub_ax = axioms(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(owl:Thing ObjectOneOf(:a))\n\
+         SubClassOf(:Q ObjectSomeValuesFrom(owl:topObjectProperty :A))\n\
+         ClassAssertion(:A :a)\n",
+    );
+    let out_hub_on = with_merge_hub(true, || {
+        let mut k = Classifier::of(&hub_ax);
+        k.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("hub on")
+    });
+    let out_hub_off = with_merge_hub(false, || {
+        let mut k = Classifier::of(&hub_ax);
+        k.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+        .expect("hub off")
+    });
+    assert!(out_hub_on.complete && out_hub_off.complete);
+    assert_eq!(out_hub_on.stats.dl_rooted_restarts, 1);
+    assert_eq!(out_hub_off.stats.dl_rooted_restarts, 0);
+    assert_eq!(out_hub_on.consistent, out_hub_off.consistent);
+}
+
+/// Sol P1 #1 / Neon B1: asserted anonymous individuals (`union_individual`) and harvested
+/// anonymous individuals (`union_named`) must hash and look up identically in `Merge`,
+/// producing a single component and a flat `CanonMap` even for labels beginning with `_:`.
+#[test]
+fn merge_canonicalizes_anonymous_keys_across_asserted_and_harvested_paths() {
+    let mut m = Merge::default();
+    let mut admit = |_: usize| true;
+    let limits = Limits::default();
+
+    let bx = Individual::Anonymous(AnonymousIndividual::new("x"));
+    let by = Individual::Anonymous(AnonymousIndividual::new("y"));
+    assert_eq!(m.union_individual(&bx, &by, 0, &mut admit), Ok(true));
+    assert_eq!(m.names.len(), 2);
+
+    // Harvested name `"_:x"` must hit the existing entry rather than inserting a duplicate.
+    let nx = NamedIndividual::new("_:x");
+    let na = NamedIndividual::new("urn:tierd1291:a");
+    assert_eq!(m.union_named(&nx, &na, 0, &mut admit), Ok(true));
+    assert_eq!(
+        m.names.len(),
+        3,
+        "harvested _:x must reuse existing anonymous entry"
+    );
+    // Repeating the same union reports no new progress.
+    assert_eq!(m.union_named(&nx, &na, 0, &mut admit), Ok(false));
+
+    // Also cover a blank label that itself starts with `_:`: interner stores `_:_:nested`.
+    let bnest = Individual::Anonymous(AnonymousIndividual::new("_:nested"));
+    let bnest2 = Individual::Anonymous(AnonymousIndividual::new("_:nested2"));
+    assert_eq!(m.union_individual(&bnest, &bnest2, 0, &mut admit), Ok(true));
+    let nnest = NamedIndividual::new("_:_:nested");
+    let nb = NamedIndividual::new("urn:tierd1291:b");
+    assert_eq!(m.union_named(&nnest, &nb, 0, &mut admit), Ok(true));
+    assert_eq!(m.names.len(), 6);
+
+    let canon = m
+        .build_canon(0, &limits, &mut admit)
+        .ok()
+        .flatten()
+        .expect("non-empty canon");
+    assert_eq!(canon.len(), 4);
+    assert_eq!(canon.get(&NamedIndividual::new("_:x")), Some(&na));
+    assert_eq!(canon.get(&NamedIndividual::new("_:y")), Some(&na));
+    assert_eq!(canon.get(&NamedIndividual::new("_:_:nested")), Some(&nb));
+    assert_eq!(canon.get(&NamedIndividual::new("_:_:nested2")), Some(&nb));
+    // Every representative must itself be a fixed point (flat map).
+    for (_, rep) in canon.iter() {
+        assert!(
+            canon.get(rep).is_none(),
+            "CanonMap must be flat: representative {rep:?} is also an alias"
+        );
+    }
+}
+
+/// Sol P2 #3: `collect_same` must release prior Horn `worlds` via `reset()` before growing
+/// UF/`CanonMap` and include live `excluded` bytes in its admission base.
+#[test]
+fn collect_same_releases_prior_horn_worlds_and_admits_excluded() {
+    // Build a Horn ontology that populates a substantial `worlds` map (many classes
+    // reaching an individual through non-real contexts) plus an excluded disjunctive axiom
+    // when run without rooted Tier D.
+    let mut body = String::from(
+        "SubClassOf(:K ObjectAllValuesFrom(:p :D))\n\
+         SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         ClassAssertion(:A :u0)\n",
+    );
+    for i in 0..160usize {
+        body.push_str(&format!(
+            "SubClassOf(:W{i} ObjectOneOf(:u0))\n\
+             SubClassOf(:W{i} :Tag{i})\n"
+        ));
+    }
+    let base_ax = axioms(&body);
+    let mut k = Classifier::of(&base_ax);
+    // Run in Horn mode (`rooted: false`) so `k.sat.worlds` and `k.sat.excluded` are both
+    // populated on the reused classifier.
+    let first = k
+        .classify(&Limits {
+            threads: 1,
+            rooted: false,
+            ..Limits::default()
+        })
+        .expect("initial Horn classify");
+    assert!(first.consistent);
+    assert!(
+        k.sat.worlds.len() >= 100,
+        "expected prior Horn run to populate worlds, got {}",
+        k.sat.worlds.len()
+    );
+    assert!(
+        !k.sat.excluded.is_empty(),
+        "expected prior Horn run to record excluded disjunctive axiom"
+    );
+
+    // Add long-IRI SameIndividual axioms and classify with `rooted_merge: true`.
+    let rep = NamedIndividual::new(format!("urn:tierd1291:rep_{}", "r".repeat(512)));
+    let mut added = Vec::new();
+    for i in 0..40usize {
+        let alias = NamedIndividual::new(format!("urn:tierd1291:z_{i:02}_{}", "a".repeat(512)));
+        added.push(Axiom::new(AxiomKind::SameIndividual(
+            [Individual::Named(rep.clone()), Individual::Named(alias)].into(),
+        )));
+    }
+    k.add(&added);
+
+    let (res, sample) = measure(|| {
+        k.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            ..Limits::default()
+        })
+    });
+    let out = res.expect("reused rooted_merge classify");
+    assert!(out.complete);
+    assert_eq!(out.stats.dl_rooted_merged, 40);
+    assert!(
+        out.stats.peak_memory >= sample.peak,
+        "reused classifier peak_memory ({}) undercounted measured peak ({})",
+        out.stats.peak_memory,
+        sample.peak
+    );
+}
+
+/// Neon N3: when optional `collect_same` declines under `max_memory`, the refused
+/// unallocated bytes must NOT inflate `stats.peak_memory` above `max_memory` on a
+/// subsequent successful classification.
+#[test]
+fn collect_same_refusal_under_max_memory_does_not_inflate_peak_memory() {
+    // 200 distinct long-IRI SameIndividual pairs: during `collect_same::build_canon`,
+    // BOTH `Merge` UF and `CanonMap` hold copies of all 400 long IRIs simultaneously, so
+    // the prepass peak exceeds the ordinary EL run's peak. Under `cap` between the two,
+    // `collect_same` declines and the ordinary run succeeds with `peak_memory <= cap`.
+    let mut body = String::from("SubClassOf(:A :B)\n");
+    for i in 0..200usize {
+        body.push_str(&format!(
+            "SameIndividual(:p{i:03}a_{} :p{i:03}b_{})\n",
+            "x".repeat(1024),
+            "y".repeat(1024)
+        ));
+    }
+    let input = axioms(&body);
+
+    let mut k_off = Classifier::of(&input);
+    let off = k_off
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: false,
+            ..Limits::default()
+        })
+        .expect("merge off");
+
+    let mut saw_declined_ok = false;
+    for extra in [0usize, 32 << 10, 64 << 10, 128 << 10, 256 << 10] {
+        let cap = off.stats.peak_memory + extra;
+        let mut k = Classifier::of(&input);
+        if let Ok(out) = k.classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            max_memory: Some(cap),
+            ..Limits::default()
+        }) && out.stats.dl_rooted_merged == 0
+        {
+            saw_declined_ok = true;
+            assert!(
+                out.stats.peak_memory <= cap,
+                "refused collect_same inflated peak_memory ({}) above max_memory ({cap})",
+                out.stats.peak_memory
+            );
+        }
+    }
+    assert!(
+        saw_declined_ok,
+        "expected at least one cap where collect_same declines and ordinary run succeeds"
+    );
+}
+
+/// Sol P2 #2 (r2): `excluded_copy_bytes` must perform zero heap allocations and cover
+/// retained anonymous blank-node labels, repeated AST payloads, containers, and
+/// `Gap::Outside` strings.
+#[test]
+fn excluded_copy_bytes_is_allocation_free_and_covers_anonymous_and_repeated_ast() {
+    let b0 = AnonymousIndividual::new(format!("b0_{}", "a".repeat(4096)));
+    let b1 = AnonymousIndividual::new(format!("b1_{}", "b".repeat(4096)));
+    let repeated_cls = Class::new(format!("urn:tierd1291:rep_{}", "c".repeat(2048)));
+    let repeated_prop = ObjectProperty::new(format!("urn:tierd1291:p_{}", "p".repeat(1024)));
+    let repeated_branches: std::collections::BTreeSet<ClassExpression> = (0..8usize)
+        .map(|i| {
+            let tag = Class::new(format!("urn:tierd1291:t{i}"));
+            ClassExpression::ObjectSomeValuesFrom(
+                ObjectPropertyExpression::Property(repeated_prop.clone()),
+                Box::new(ClassExpression::ObjectIntersectionOf(
+                    [
+                        ClassExpression::Class(repeated_cls.clone()),
+                        ClassExpression::Class(tag),
+                    ]
+                    .into(),
+                )),
+            )
+        })
+        .collect();
+    let template = vec![
+        Excluded {
+            axiom: AxiomKind::DifferentIndividuals(
+                [Individual::Anonymous(b0), Individual::Anonymous(b1)].into(),
+            ),
+            gap: index::Gap::Outside {
+                rule: "anonymous-rule".to_owned(),
+                message: "x".repeat(512),
+            },
+        },
+        Excluded {
+            axiom: AxiomKind::SubClassOf(
+                ClassExpression::Class(repeated_cls.clone()),
+                ClassExpression::ObjectUnionOf(repeated_branches),
+            ),
+            gap: index::Gap::Partial("repeated-ast"),
+        },
+    ];
+
+    // Keep the cloned `Vec<Excluded>` alive through `measure` to observe its true live heap.
+    let (cloned, clone_sample) = measure(|| template.clone());
+    assert!(
+        clone_sample.live > 24 * 1024,
+        "expected substantial excluded payload, got {} B",
+        clone_sample.live
+    );
+
+    let (estimated, est_sample) = measure(|| excluded_copy_bytes(&cloned));
+    assert_eq!(
+        est_sample.peak, 0,
+        "excluded_copy_bytes must not allocate while estimating (allocated {} B)",
+        est_sample.peak
+    );
+    assert!(
+        estimated >= clone_sample.live,
+        "excluded_copy_bytes ({estimated}) undercounted retained excluded heap ({})",
+        clone_sample.live
+    );
+}
+
+/// Sol P2 #1/#3 & P3 #4 (r2): Item 805 `dl_reduce::plan_budgeted` must pre-admit actual
+/// mapped-signature, key-expansion, and retarget payloads without uncharged scratch clones
+/// (keeping `Reduction` alive through live-bytes sampling), decline cleanly on post-merge
+/// replan `charge` refusal (verified via phase probe, never accepting an error), and
+/// cooperatively poll cancellation and deadline expiry inside wide axioms after a merge
+/// restart.
+#[test]
+fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
+    use super::admission_test::{MergePhase, PlanKind, with_merge_probe};
+    use parking_lot::Mutex;
+
+    // 1. Direct counting-allocator check on `dl_reduce::plan_budgeted` with long IRIs,
+    //    keeping `Reduction` alive through `measure` so `sample.live` measures its heap.
+    let mut direct_body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         HasKey(:K (:r) ())\n",
+    );
+    for i in 0..8usize {
+        direct_body.push_str(&format!(
+            "ClassAssertion(:K :ind{i:02}_{})\n",
+            "l".repeat(1536)
+        ));
+    }
+    let direct_ax = axioms(&direct_body);
+    let direct_refs: Vec<&AxiomKind> = direct_ax.iter().map(|a| &a.kind).collect();
+    let mut admitted_peak = 0usize;
+    let (red_opt, sample) = measure(|| {
+        let p = super::dl_reduce::plan_budgeted(
+            &direct_refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                admitted_peak = admitted_peak.max(used);
+                true
+            },
+        )
+        .unwrap();
+        match p {
+            super::dl_reduce::Plan::Ready(red) => Some(red),
+            _ => None,
+        }
+    });
+    let red = red_opt.expect("direct plan_budgeted must succeed");
+    let retained = red.retained_bytes();
+    assert!(
+        sample.live > 64 * 1024,
+        "expected Reduction live bytes > 64 KiB while alive, got {}",
+        sample.live
+    );
+    assert!(
+        admitted_peak >= sample.peak,
+        "plan_budgeted admitted peak ({admitted_peak}) undercounted measured peak ({})",
+        sample.peak
+    );
+    assert!(
+        retained >= sample.live,
+        "Reduction::retained_bytes ({retained}) undercounted measured live ({})",
+        sample.live
+    );
+    drop(red);
+
+    // 1b. Sol P2 #1: wide `DifferentIndividuals` with 200 long IRIs (400 KiB total) must
+    //     NOT clone IRIs before admission; a tight cap declines with tiny measured peak.
+    let mut diff_inds = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         HasKey(:K (:r) ())\n\
+         DifferentIndividuals(",
+    );
+    for i in 0..200usize {
+        diff_inds.push_str(&format!(" :d{i:03}_{}", "x".repeat(2048)));
+    }
+    diff_inds.push_str(")\n");
+    let diff_ax = axioms(&diff_inds);
+    let diff_refs: Vec<&AxiomKind> = diff_ax.iter().map(|a| &a.kind).collect();
+    let (diff_plan, diff_sample) = measure(|| {
+        super::dl_reduce::plan_budgeted(
+            &diff_refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| used <= 2048,
+        )
+        .unwrap()
+    });
+    assert!(
+        matches!(diff_plan, super::dl_reduce::Plan::Declined),
+        "tight cap on wide DifferentIndividuals must decline"
+    );
+    assert!(
+        diff_sample.peak < 32 * 1024,
+        "borrowed signature visitor must not clone 400 KiB DifferentIndividuals IRIs before admission (peak={})",
+        diff_sample.peak
+    );
+
+    // 1c. Sol P2 #1: retargeting `EquivalentObjectProperties` with `owl:topObjectProperty`
+    //     and 120 long-IRI roles must pre-admit inclusions before constructing them, and
+    //     keep `admitted_peak >= sample.peak` and `retained_bytes >= sample.live`.
+    let mut eqop = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         EquivalentObjectProperties(owl:topObjectProperty",
+    );
+    for i in 0..120usize {
+        eqop.push_str(&format!(" :rp{i:03}_{}", "q".repeat(2048)));
+    }
+    eqop.push_str(")\n");
+    let eqop_ax = axioms(&eqop);
+    let eqop_refs: Vec<&AxiomKind> = eqop_ax.iter().map(|a| &a.kind).collect();
+    let mut eqop_admitted = 0usize;
+    let (eqop_red, eqop_sample) = measure(|| {
+        match super::dl_reduce::plan_budgeted(
+            &eqop_refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                eqop_admitted = eqop_admitted.max(used);
+                true
+            },
+        )
+        .unwrap()
+        {
+            super::dl_reduce::Plan::Ready(r) => Some(r),
+            _ => None,
+        }
+    });
+    let eqop_red = eqop_red.expect("EquivalentObjectProperties retarget must succeed");
+    assert!(eqop_sample.live > 200 * 1024);
+    assert!(
+        eqop_admitted >= eqop_sample.peak,
+        "retarget admitted peak ({eqop_admitted}) undercounted measured peak ({})",
+        eqop_sample.peak
+    );
+    assert!(
+        eqop_red.retained_bytes() >= eqop_sample.live,
+        "retarget retained_bytes ({}) undercounted measured live ({})",
+        eqop_red.retained_bytes(),
+        eqop_sample.live
+    );
+    drop(eqop_red);
+
+    let (eqop_refused, eqop_refused_sample) = measure(|| {
+        super::dl_reduce::plan_budgeted(
+            &eqop_refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| used <= 16 * 1024,
+        )
+        .unwrap()
+    });
+    assert!(matches!(eqop_refused, super::dl_reduce::Plan::Declined));
+    assert!(
+        eqop_refused_sample.peak <= 32 * 1024,
+        "refused EquivalentObjectProperties retarget overshot 16 KiB grant (peak={})",
+        eqop_refused_sample.peak
+    );
+
+    // 1d. Sol P2 #1: `HasKey` with a complex rewritten `ClassExpression` (using
+    //     `owl:topObjectProperty` and long IRIs) and many long-IRI roles must pre-admit
+    //     both the rewritten class expression and role uses before construction.
+    let mut complex_key = format!(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         ClassAssertion(:A :ck0)\n\
+         ClassAssertion(:A :ck1)\n\
+         HasKey(ObjectIntersectionOf(:A ObjectSomeValuesFrom(owl:topObjectProperty :LongC_{})) (",
+        "c".repeat(4096)
+    );
+    for i in 0..20usize {
+        complex_key.push_str(&format!(" :kr_{i:02}_{}", "r".repeat(1024)));
+    }
+    complex_key.push_str(") ())\n");
+    let ckey_ax = axioms(&complex_key);
+    let ckey_refs: Vec<&AxiomKind> = ckey_ax.iter().map(|a| &a.kind).collect();
+    let mut ckey_admitted = 0usize;
+    let (ckey_red, ckey_sample) = measure(|| {
+        match super::dl_reduce::plan_budgeted(
+            &ckey_refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                ckey_admitted = ckey_admitted.max(used);
+                true
+            },
+        )
+        .unwrap()
+        {
+            super::dl_reduce::Plan::Ready(r) => Some(r),
+            _ => None,
+        }
+    });
+    let ckey_red = ckey_red.expect("complex HasKey plan must succeed");
+    assert!(ckey_sample.live > 32 * 1024);
+    assert!(
+        ckey_admitted >= ckey_sample.peak,
+        "complex HasKey admitted peak ({ckey_admitted}) undercounted measured peak ({})",
+        ckey_sample.peak
+    );
+    assert!(
+        ckey_red.retained_bytes() >= ckey_sample.live,
+        "complex HasKey retained_bytes ({}) undercounted measured live ({})",
+        ckey_red.retained_bytes(),
+        ckey_sample.live
+    );
+    drop(ckey_red);
+
+    // 2. Phase-specific post-merge replan `charge` refusal: Pass 0 succeeds, merges two
+    //    large anonymous witnesses (`_:w0 ≈ _:w1`, 512 KiB labels each so `UF + Canon`
+    //    exceeds Pass 0's index/context overhead and Pass 1's `plan_budgeted` strictly
+    //    exceeds Pass 0's `paid` credit and invokes `charge`), Pass 1's `charge` refuses,
+    //    `plan_budgeted` declines, and Horn fallback succeeds (`Ok(out)`, never accepting
+    //    an error!).
+    let w0 = format!("w0_{}", "a".repeat(512 * 1024));
+    let w1 = format!("w1_{}", "b".repeat(512 * 1024));
+    let mut body = format!(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:Z1 :OnlyDisj)\n\
+         SubClassOf(:Z2 :OnlyDisj)\n\
+         SubClassOf(ObjectOneOf(_:{w0}) :Bridge)\n\
+         SubClassOf(:Bridge ObjectOneOf(_:{w1}))\n\
+         HasKey(:K (:r) ())\n"
+    );
+    for i in 0..8usize {
+        body.push_str(&format!(
+            "ClassAssertion(:K :long{i:02}_{})\n",
+            "k".repeat(2048)
+        ));
+    }
+    let input = axioms(&body);
+
+    let mut fresh_horn_k = Classifier::of(&input);
+    let fresh_horn = fresh_horn_k
+        .classify(&Limits {
+            threads: 1,
+            rooted: false,
+            ..Limits::default()
+        })
+        .expect("fresh Horn");
+
+    let in_replan = Arc::new(AtomicBool::new(false));
+    let refused_in_replan = Arc::new(AtomicBool::new(false));
+    let phases: Arc<Mutex<Vec<MergePhase>>> = Arc::new(Mutex::new(Vec::new()));
+    let in_replan_probe = in_replan.clone();
+    let phases_probe = phases.clone();
+    let in_replan_cb = in_replan.clone();
+    let refused_cb = refused_in_replan.clone();
+    let charge = Arc::new(move |_bytes: usize| -> bool {
+        if in_replan_cb.load(Ordering::SeqCst) {
+            refused_cb.store(true, Ordering::SeqCst);
+            return false;
+        }
+        true
+    });
+    let mut k_refuse = Classifier::of(&input);
+    let out = with_merge_probe(
+        move |phase| {
+            match phase {
+                MergePhase::PlanStart { restarts: 1 } => {
+                    in_replan_probe.store(true, Ordering::SeqCst);
+                }
+                MergePhase::PlanDone { restarts: 1, .. } => {
+                    in_replan_probe.store(false, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            phases_probe.lock().push(phase);
+        },
+        || {
+            k_refuse.classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                charge: Some(charge),
+                ..Limits::default()
+            })
+        },
+    )
+    .expect("post-merge replan charge refusal must fall back cleanly to Horn Ok(out)");
+    assert!(
+        refused_in_replan.load(Ordering::SeqCst),
+        "charge callback must be refused specifically during Pass 1 replan"
+    );
+    let trace = phases.lock().clone();
+    let pos_p0_ready = trace
+        .iter()
+        .position(|p| {
+            matches!(
+                p,
+                MergePhase::PlanDone {
+                    restarts: 0,
+                    outcome: PlanKind::Ready
+                }
+            )
+        })
+        .expect("Pass 0 plan must succeed");
+    let pos_merge_stop = trace
+        .iter()
+        .position(|p| {
+            matches!(
+                p,
+                MergePhase::SatStop {
+                    stop,
+                    ..
+                } if *stop == super::saturate::STOP_MERGE
+            )
+        })
+        .expect("Pass 0 must stop with STOP_MERGE");
+    let pos_restart = trace
+        .iter()
+        .position(|p| matches!(p, MergePhase::MergeRestart { restarts: 1 }))
+        .expect("MergeRestart(1) must occur");
+    let pos_p1_declined = trace
+        .iter()
+        .position(|p| {
+            matches!(
+                p,
+                MergePhase::PlanDone {
+                    restarts: 1,
+                    outcome: PlanKind::Declined
+                }
+            )
+        })
+        .expect("Pass 1 replan must decline on charge refusal");
+    assert!(
+        pos_p0_ready < pos_merge_stop
+            && pos_merge_stop < pos_restart
+            && pos_restart < pos_p1_declined,
+        "unexpected phase order: {trace:?}"
+    );
+    assert!(!out.complete);
+    assert_eq!(out.stats.dl_rooted_merged, 0);
+    assert_eq!(out.consistent, fresh_horn.consistent);
+    assert_eq!(k_refuse.excluded(), fresh_horn_k.excluded());
+
+    // 3. Sol P2 #3 & P3 #4: Phase-specific cooperative cancellation and deadline expiry
+    //    AFTER the merge restart enters each wide-axiom planner loop.
+
+    // 3a. Cancellation inside wide `DifferentIndividuals` borrowed signature scan on Pass 1.
+    let mut wide_diff = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(ObjectOneOf(_:w0) :Bridge)\n\
+         SubClassOf(:Bridge ObjectOneOf(_:w1))\n\
+         SubClassOf(:Q ObjectSomeValuesFrom(owl:topObjectProperty :Tag))\n\
+         DifferentIndividuals(",
+    );
+    for i in 0..300usize {
+        wide_diff.push_str(&format!(" :wi{i:03}"));
+    }
+    wide_diff.push_str(")\n");
+    let wide_diff_ax = axioms(&wide_diff);
+    {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let polls_after = Arc::new(AtomicUsize::new(0));
+        let polls_after_cb = polls_after.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let mut k = Classifier::of(&wide_diff_ax);
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanBlockedScan { restarts: 1 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    cancelled: Some(Arc::new(move || {
+                        let armed = cancel_cb.load(Ordering::SeqCst);
+                        if armed {
+                            polls_after_cb.fetch_add(1, Ordering::SeqCst);
+                        }
+                        armed
+                    })),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("must cancel inside wide DifferentIndividuals blocked scan on Pass 1");
+        assert_eq!(err, Error::Cancelled);
+        assert!(polls_after.load(Ordering::SeqCst) <= 2);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanBlockedScan { restarts: 1 }));
+        assert!(
+            !t.contains(&MergePhase::PlanBlockedScanDone { restarts: 1 }),
+            "cancellation must stop inside wide DifferentIndividuals scan before it finishes: {t:?}"
+        );
+        assert!(t.contains(&MergePhase::PlanDone {
+            restarts: 1,
+            outcome: PlanKind::PollErr
+        }));
+        let rec = k
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .expect("recovery after wide DifferentIndividuals cancel");
+        assert!(rec.complete);
+        assert_eq!(rec.stats.dl_rooted_restarts, 1);
+    }
+
+    // 3b. Cancellation AND deadline expiry inside wide `EquivalentObjectProperties` retarget
+    //     expansion on Pass 1.
+    let mut wide_eqop = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(ObjectOneOf(_:w0) :Bridge)\n\
+         SubClassOf(:Bridge ObjectOneOf(_:w1))\n\
+         EquivalentObjectProperties(owl:topObjectProperty",
+    );
+    for i in 0..300usize {
+        wide_eqop.push_str(&format!(" :wr{i:03}"));
+    }
+    wide_eqop.push_str(")\n");
+    let wide_eqop_ax = axioms(&wide_eqop);
+    {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let mut k = Classifier::of(&wide_eqop_ax);
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanRetarget { restarts: 1 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    cancelled: Some(Arc::new(move || cancel_cb.load(Ordering::SeqCst))),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("must cancel inside wide EquivalentObjectProperties retarget on Pass 1");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanRetarget { restarts: 1 }));
+        assert!(
+            !t.contains(&MergePhase::PlanRetargetDone { restarts: 1 }),
+            "cancellation must stop inside EquivalentObjectProperties loop before it exits: {t:?}"
+        );
+        assert!(t.contains(&MergePhase::PlanDone {
+            restarts: 1,
+            outcome: PlanKind::PollErr
+        }));
+    }
+    {
+        // Deadline expiry after Pass 1 enters wide retarget expansion.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(80);
+        let slept = Arc::new(AtomicBool::new(false));
+        let slept_probe = slept.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let mut k = Classifier::of(&wide_eqop_ax);
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanRetarget { restarts: 1 })
+                    && !slept_probe.swap(true, Ordering::SeqCst)
+                {
+                    let now = std::time::Instant::now();
+                    if deadline > now {
+                        std::thread::sleep(deadline - now + std::time::Duration::from_millis(5));
+                    }
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    deadline: Some(deadline),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("must time out inside wide EquivalentObjectProperties retarget on Pass 1");
+        assert_eq!(err, Error::Timeout);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanRetarget { restarts: 1 }));
+        assert!(
+            !t.contains(&MergePhase::PlanRetargetDone { restarts: 1 }),
+            "deadline expiry must stop inside EquivalentObjectProperties loop before it exits: {t:?}"
+        );
+        assert!(t.contains(&MergePhase::PlanDone {
+            restarts: 1,
+            outcome: PlanKind::PollErr
+        }));
+        let rec = k
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .expect("recovery after wide retarget timeout");
+        assert!(rec.complete);
+        assert_eq!(rec.stats.dl_rooted_restarts, 1);
+    }
+
+    // 3c. Cancellation inside final key-body construction on Pass 1 for a wide `HasKey`
+    //     with 200 object properties.
+    let mut wide_key = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(ObjectOneOf(_:w0) :Bridge)\n\
+         SubClassOf(:Bridge ObjectOneOf(_:w1))\n\
+         ClassAssertion(:K :ka)\n\
+         ClassAssertion(:K :kb)\n\
+         HasKey(:K (",
+    );
+    for i in 0..200usize {
+        wide_key.push_str(&format!(" :kr{i:03}"));
+    }
+    wide_key.push_str(") ())\n");
+    let wide_key_ax = axioms(&wide_key);
+    {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let mut k = Classifier::of(&wide_key_ax);
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanKeyBody { restarts: 1 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    cancelled: Some(Arc::new(move || cancel_cb.load(Ordering::SeqCst))),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("must cancel inside wide HasKey final key-body construction on Pass 1");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanKeyBody { restarts: 1 }));
+        assert!(
+            !t.contains(&MergePhase::PlanKeyBodyDone { restarts: 1 }),
+            "cancellation must stop inside final key-body loop before it exits: {t:?}"
+        );
+        assert!(t.contains(&MergePhase::PlanDone {
+            restarts: 1,
+            outcome: PlanKind::PollErr
+        }));
+        let rec = k
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .expect("recovery after wide key-body cancel");
+        assert!(rec.complete);
+        assert_eq!(rec.stats.dl_rooted_restarts, 1);
+    }
+
+    // 3d. Sol P2 #1 (r3): cancellation inside the streaming Horn check on a wide
+    //     `ObjectUnionOf` with zero named individuals before the Horn check loop exits.
+    {
+        let mut union_members = std::collections::BTreeSet::new();
+        for i in 0..300usize {
+            union_members.insert(ClassExpression::Class(Class::new(format!(
+                "urn:tierd1291:wh{i:03}"
+            ))));
+        }
+        let ax0 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:A")),
+            ClassExpression::ObjectUnionOf(union_members),
+        );
+        let ax1 = AxiomKind::HasKey(
+            ClassExpression::Class(Class::new("urn:tierd1291:K")),
+            [ObjectPropertyExpression::Property(ObjectProperty::new(
+                "urn:tierd1291:r",
+            ))]
+            .into(),
+            std::collections::BTreeSet::new(),
+        );
+        let refs = [&ax0, &ax1];
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanHornCheck { restarts: 0 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs,
+                    None,
+                    None,
+                    0,
+                    &mut || {
+                        if cancel_cb.load(Ordering::SeqCst) {
+                            Err(Error::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut |_| true,
+                )
+            },
+        )
+        .err()
+        .expect("must cancel inside wide ObjectUnionOf streaming Horn check");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::PlanHornCheck { restarts: 0 }));
+        assert!(
+            !t.contains(&MergePhase::PlanHornCheckDone { restarts: 0 }),
+            "cancellation must stop inside streaming Horn check before it exits: {t:?}"
+        );
+    }
+
+    // 3e. Sol P2 #3 (r3): cancellation inside `Cx::ce_polled` cloning a wide `ObjectOneOf`
+    //     of 300 anonymous nominals under `owl:topObjectProperty` before the clone exits.
+    {
+        let mut anons = std::collections::BTreeSet::new();
+        for i in 0..300usize {
+            anons.insert(Individual::anonymous(format!("an{i:03}")));
+        }
+        let disj = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:Z")),
+            ClassExpression::ObjectUnionOf(
+                [
+                    ClassExpression::Class(Class::new("urn:tierd1291:Z1")),
+                    ClassExpression::Class(Class::new("urn:tierd1291:Z2")),
+                ]
+                .into(),
+            ),
+        );
+        let wide_oneof = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:TopOneOf")),
+            ClassExpression::ObjectSomeValuesFrom(
+                ObjectPropertyExpression::Property(ObjectProperty::top()),
+                Box::new(ClassExpression::ObjectOneOf(anons)),
+            ),
+        );
+        let refs = [&disj, &wide_oneof];
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanRetarget { restarts: 0 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs,
+                    None,
+                    None,
+                    0,
+                    &mut || {
+                        if cancel_cb.load(Ordering::SeqCst) {
+                            Err(Error::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut |_| true,
+                )
+            },
+        )
+        .err()
+        .expect("must cancel inside wide ObjectOneOf cooperative clone");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::PlanRetarget { restarts: 0 }));
+        assert!(
+            !t.contains(&MergePhase::PlanRetargetDone { restarts: 0 }),
+            "cancellation must stop inside ObjectOneOf clone loop before it exits: {t:?}"
+        );
+    }
+
+    // 3f. Sol P2 #3 (r3): cancellation inside `inds` BTreeSet-to-Vec drain before it exits.
+    {
+        let mut body = String::from(
+            "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+             HasKey(:K (:r) ())\n\
+             DifferentIndividuals(",
+        );
+        for i in 0..300usize {
+            body.push_str(&format!(" :di{i:03}"));
+        }
+        body.push_str(")\n");
+        let drain_ax = axioms(&body);
+        let refs: Vec<&AxiomKind> = drain_ax.iter().map(|a| &a.kind).collect();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanIndsDrain { restarts: 0 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs,
+                    None,
+                    None,
+                    0,
+                    &mut || {
+                        if cancel_cb.load(Ordering::SeqCst) {
+                            Err(Error::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut |_| true,
+                )
+            },
+        )
+        .err()
+        .expect("must cancel inside named-individual drain loop");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::PlanIndsDrain { restarts: 0 }));
+        assert!(
+            !t.contains(&MergePhase::PlanIndsDrainDone { restarts: 0 }),
+            "cancellation must stop inside inds drain loop before it exits: {t:?}"
+        );
+    }
+
+    // 3g. Sol P2 #3 (r3): `DisjointUnion` collapsing duplicate wide rewritten images reuses
+    //     computed accounting without unpolled re-walks and keeps peak/retained sound.
+    {
+        let mut wide_oneof_a = std::collections::BTreeSet::new();
+        for i in 0..24usize {
+            wide_oneof_a.insert(Individual::anonymous(format!(
+                "du_{i:02}_{}",
+                "d".repeat(512)
+            )));
+        }
+        let wide_filler = ClassExpression::ObjectOneOf(wide_oneof_a);
+        let img1 = ClassExpression::ObjectSomeValuesFrom(
+            ObjectPropertyExpression::Property(ObjectProperty::top()),
+            Box::new(wide_filler.clone()),
+        );
+        let img2 = ClassExpression::ObjectMinCardinality(
+            1,
+            ObjectPropertyExpression::Property(ObjectProperty::top()),
+            Some(Box::new(wide_filler)),
+        );
+        let disj = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:Z")),
+            ClassExpression::ObjectUnionOf(
+                [
+                    ClassExpression::Class(Class::new("urn:tierd1291:Z1")),
+                    ClassExpression::Class(Class::new("urn:tierd1291:Z2")),
+                ]
+                .into(),
+            ),
+        );
+        let du =
+            AxiomKind::DisjointUnion(Class::new("urn:tierd1291:UnionCls"), [img1, img2].into());
+        let refs = [&disj, &du];
+        let mut admitted_peak = 0usize;
+        let (red_opt, sample) = measure(|| {
+            match super::dl_reduce::plan_budgeted(
+                &refs,
+                None,
+                None,
+                0,
+                &mut || Ok::<(), ()>(()),
+                &mut |used| {
+                    admitted_peak = admitted_peak.max(used);
+                    true
+                },
+            )
+            .unwrap()
+            {
+                super::dl_reduce::Plan::Ready(r) => Some(r),
+                _ => None,
+            }
+        });
+        let red = red_opt.expect("duplicate-image DisjointUnion retarget must succeed");
+        assert!(sample.live > 16 * 1024);
+        assert!(
+            admitted_peak >= sample.peak,
+            "DisjointUnion admitted peak ({admitted_peak}) undercounted measured peak ({})",
+            sample.peak
+        );
+        assert!(
+            red.retained_bytes() >= sample.live,
+            "DisjointUnion retained_bytes ({}) undercounted measured live ({})",
+            red.retained_bytes(),
+            sample.live
+        );
+        drop(red);
+    }
+}
+
+/// Neon N4 / Sol P3 #4 (r2): end-to-end cancellation-vs-`STOP_MERGE` stop-race test
+/// explicitly observing both stop winners (`STOP_CANCEL` and `STOP_MERGE`, including
+/// `STOP_MERGE` winning followed by cancellation at the restart boundary) and verifying
+/// helper thread participation in multi-thread `dl_steps = false` trials.
+#[test]
+fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
+    use super::admission_test::{MergePhase, with_merge_probe};
+    use parking_lot::Mutex;
+
+    let mut body = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(:C0 ObjectOneOf(:a2))\n\
+         SubClassOf(ObjectOneOf(:a0 :a2) :C0)\n\
+         ClassAssertion(:Tag :a2)\n\
+         SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:a0)))\n\
+         SubClassOf(ObjectSomeValuesFrom(:r :Tag) :Hit)\n",
+    );
+    // >= EAGER_ROOTS (64 in test) named classes ensure multi-thread runs spawn helpers.
+    for i in 0..80usize {
+        body.push_str(&format!("SubClassOf(:P{i} :Q{i})\n"));
+    }
+    let input = axioms(&body);
+
+    // 1. Deterministic 1-thread sweep across every poll point from pre-merge saturation
+    //    through the STOP_MERGE restart boundary and Pass 1, observing stop winners.
+    let count_polls = Arc::new(AtomicUsize::new(0));
+    let cp_cb = count_polls.clone();
+    let mut k_probe = Classifier::of(&input);
+    let base = k_probe
+        .classify(&Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            cancelled: Some(Arc::new(move || {
+                cp_cb.fetch_add(1, Ordering::SeqCst);
+                false
+            })),
+            ..Limits::default()
+        })
+        .expect("unrestricted run");
+    assert!(base.complete);
+    assert_eq!(base.stats.dl_rooted_restarts, 1);
+    let total_polls = count_polls.load(Ordering::SeqCst);
+    assert!(total_polls >= 4);
+
+    let mut saw_cancel_winner = 0usize;
+    let mut saw_merge_winner_then_cancel = 0usize;
+    let mut saw_cancelled_dirty = 0usize;
+    let mut saw_merge_winner_then_ok = 0usize;
+    let expected_instances = vec![
+        NamedIndividual::new("urn:tierd1291:a0"),
+        NamedIndividual::new("urn:tierd1291:a2"),
+    ];
+    for cancel_at in 1..=(total_polls + 2) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let polls_cb = polls.clone();
+        let stops = Arc::new(Mutex::new(Vec::new()));
+        let stops_probe = stops.clone();
+        let mut k = Classifier::of(&input);
+        let res = with_merge_probe(
+            move |phase| {
+                if let MergePhase::SatStop { stop, .. } = phase {
+                    stops_probe.lock().push(stop);
+                }
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    cancelled: Some(Arc::new(move || {
+                        polls_cb.fetch_add(1, Ordering::SeqCst) >= cancel_at
+                    })),
+                    ..Limits::default()
+                })
+            },
+        );
+        let sat_stops = stops.lock().clone();
+        match res {
+            Err(Error::Cancelled) => {
+                if sat_stops.contains(&super::saturate::STOP_CANCEL) {
+                    saw_cancel_winner += 1;
+                }
+                if sat_stops.contains(&super::saturate::STOP_MERGE) {
+                    saw_merge_winner_then_cancel += 1;
+                }
+                assert!(
+                    !k.sat.dl_worked.load(Ordering::Relaxed),
+                    "cancel_at={cancel_at}: cancelled race must not set dl_worked"
+                );
+                match k.describe(&Class::new("urn:tierd1291:Tag")) {
+                    None => saw_cancelled_dirty += 1,
+                    Some(d) => {
+                        assert_eq!(
+                            d.instances, expected_instances,
+                            "cancel_at={cancel_at}: post-saturation describe() must be complete"
+                        );
+                    }
+                }
+                let after = k
+                    .classify(&Limits {
+                        threads: 1,
+                        rooted: true,
+                        rooted_merge: true,
+                        ..Limits::default()
+                    })
+                    .expect("recovery after cancel");
+                assert!(after.complete);
+                assert_eq!(after.stats.dl_rooted_restarts, 1);
+                assert!(after.taxonomy.is_subclass(
+                    &Class::new("urn:tierd1291:Probe"),
+                    &Class::new("urn:tierd1291:Hit")
+                ));
+            }
+            Ok(out) => {
+                if sat_stops.contains(&super::saturate::STOP_MERGE) {
+                    saw_merge_winner_then_ok += 1;
+                }
+                assert!(out.complete);
+                assert_eq!(out.stats.dl_rooted_restarts, 1);
+                assert!(!out.stats.dl_rooted_over);
+                assert!(out.taxonomy.is_subclass(
+                    &Class::new("urn:tierd1291:Probe"),
+                    &Class::new("urn:tierd1291:Hit")
+                ));
+            }
+            Err(other) => {
+                panic!("cancel_at={cancel_at}: unexpected error in stop race: {other:?}")
+            }
+        }
+    }
+    assert!(
+        saw_cancel_winner >= 1,
+        "1-thread sweep must observe STOP_CANCEL winning"
+    );
+    assert!(
+        saw_merge_winner_then_cancel >= 1,
+        "1-thread sweep must observe STOP_MERGE winning followed by cancellation"
+    );
+    assert!(
+        saw_cancelled_dirty >= 2 && saw_merge_winner_then_ok >= 1,
+        "1-thread sweep must observe dirty cancellation and completed merge restart"
+    );
+
+    // 2. Multi-thread (`threads: 4, dl_steps: false`) concurrent cancellation vs STOP_MERGE,
+    //    observing helper thread participation and BOTH stop winners (`STOP_CANCEL` and
+    //    `STOP_MERGE`, including `STOP_MERGE` followed by restart-boundary cancellation).
+    let mt_count_polls = Arc::new(AtomicUsize::new(0));
+    let mt_cp_cb = mt_count_polls.clone();
+    let mut k_mt_probe = Classifier::of(&input);
+    let mt_base = k_mt_probe
+        .classify(&Limits {
+            threads: 4,
+            rooted: true,
+            rooted_merge: true,
+            dl_steps: false,
+            cancelled: Some(Arc::new(move || {
+                mt_cp_cb.fetch_add(1, Ordering::SeqCst);
+                false
+            })),
+            ..Limits::default()
+        })
+        .expect("mt unrestricted run");
+    assert!(mt_base.complete);
+    assert_eq!(mt_base.stats.dl_rooted_restarts, 1);
+    let mt_total_polls = mt_count_polls.load(Ordering::SeqCst);
+
+    let mut saw_mt_cancel_winner_with_helper = false;
+    let mut saw_mt_merge_winner_with_helper = false;
+    let mut saw_mt_merge_then_cancel_with_helper = false;
+
+    // 2a. Sweep every poll point across the 4-thread `dl_steps: false` run.
+    for cancel_at in 1..=(mt_total_polls + 4) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let polls_cb = polls.clone();
+        let stops = Arc::new(Mutex::new(Vec::new()));
+        let stops_probe = stops.clone();
+        let mut k = Classifier::of(&input);
+        let res = with_merge_probe(
+            move |phase| {
+                if let MergePhase::SatStop { stop, helper_ran } = phase {
+                    stops_probe.lock().push((stop, helper_ran));
+                }
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 4,
+                    rooted: true,
+                    rooted_merge: true,
+                    dl_steps: false,
+                    cancelled: Some(Arc::new(move || {
+                        polls_cb.fetch_add(1, Ordering::SeqCst) >= cancel_at
+                    })),
+                    ..Limits::default()
+                })
+            },
+        );
+        let sat_stops = stops.lock().clone();
+        for &(stop, helper_ran) in &sat_stops {
+            if stop == super::saturate::STOP_CANCEL && helper_ran {
+                saw_mt_cancel_winner_with_helper = true;
+            }
+            if stop == super::saturate::STOP_MERGE && helper_ran {
+                saw_mt_merge_winner_with_helper = true;
+            }
+        }
+        match res {
+            Err(Error::Cancelled) => {
+                if sat_stops
+                    .iter()
+                    .any(|&(s, h)| s == super::saturate::STOP_MERGE && h)
+                {
+                    saw_mt_merge_then_cancel_with_helper = true;
+                }
+                assert!(!k.sat.dl_worked.load(Ordering::Relaxed));
+                let after = k
+                    .classify(&Limits {
+                        threads: 4,
+                        rooted: true,
+                        rooted_merge: true,
+                        dl_steps: false,
+                        ..Limits::default()
+                    })
+                    .expect("mt recovery");
+                assert!(after.complete);
+                assert!(after.taxonomy.is_subclass(
+                    &Class::new("urn:tierd1291:Probe"),
+                    &Class::new("urn:tierd1291:Hit")
+                ));
+            }
+            Ok(out) => {
+                assert!(out.complete);
+                assert!(!out.stats.dl_rooted_over);
+                assert_eq!(out.stats.dl_rooted_restarts, 1);
+            }
+            Err(other) => panic!("mt cancel_at={cancel_at}: unexpected error {other:?}"),
+        }
+    }
+
+    // 2b. Deterministic 4-thread `STOP_CANCEL` winner inside `saturate_counted`: arm
+    //     cancellation specifically when a saturation worker thread polls `cancelled`.
+    {
+        let stops = Arc::new(Mutex::new(Vec::new()));
+        let stops_probe = stops.clone();
+        let mut k = Classifier::of(&input);
+        let err = with_merge_probe(
+            move |phase| {
+                if let MergePhase::SatStop { stop, helper_ran } = phase {
+                    stops_probe.lock().push((stop, helper_ran));
+                }
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 4,
+                    rooted: true,
+                    rooted_merge: true,
+                    dl_steps: false,
+                    cancelled: Some(Arc::new(|| super::saturate::WORKER.get() != 0)),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("worker-thread cancellation must stop saturation");
+        assert_eq!(err, Error::Cancelled);
+        assert!(!k.sat.dl_worked.load(Ordering::Relaxed));
+        for &(stop, helper_ran) in stops.lock().iter() {
+            if stop == super::saturate::STOP_CANCEL && helper_ran {
+                saw_mt_cancel_winner_with_helper = true;
+            }
+            if stop == super::saturate::STOP_MERGE && helper_ran {
+                saw_mt_merge_winner_with_helper = true;
+                saw_mt_merge_then_cancel_with_helper = true;
+            }
+        }
+    }
+
+    // 2c. Deterministic 4-thread `STOP_MERGE` winner followed immediately by cancellation
+    //     at the restart boundary (`run_merging` poll).
+    {
+        let cancel_after_merge = Arc::new(AtomicBool::new(false));
+        let cam_probe = cancel_after_merge.clone();
+        let cam_cb = cancel_after_merge.clone();
+        let stops = Arc::new(Mutex::new(Vec::new()));
+        let stops_probe = stops.clone();
+        let mut k = Classifier::of(&input);
+        let err = with_merge_probe(
+            move |phase| {
+                if let MergePhase::SatStop { stop, helper_ran } = phase {
+                    stops_probe.lock().push((stop, helper_ran));
+                    if stop == super::saturate::STOP_MERGE {
+                        cam_probe.store(true, Ordering::SeqCst);
+                    }
+                }
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 4,
+                    rooted: true,
+                    rooted_merge: true,
+                    dl_steps: false,
+                    cancelled: Some(Arc::new(move || cam_cb.load(Ordering::SeqCst))),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("cancellation armed right after STOP_MERGE must cancel at restart");
+        assert_eq!(err, Error::Cancelled);
+        assert!(!k.sat.dl_worked.load(Ordering::Relaxed));
+        let sat_stops = stops.lock().clone();
+        assert!(
+            sat_stops
+                .iter()
+                .any(|&(s, h)| s == super::saturate::STOP_MERGE && h),
+            "expected STOP_MERGE winner with helper participation before restart cancellation: {sat_stops:?}"
+        );
+        for &(stop, helper_ran) in &sat_stops {
+            if stop == super::saturate::STOP_MERGE && helper_ran {
+                saw_mt_merge_winner_with_helper = true;
+                saw_mt_merge_then_cancel_with_helper = true;
+            }
+        }
+    }
+
+    assert!(
+        saw_mt_cancel_winner_with_helper,
+        "4-thread dl_steps=false trials must observe STOP_CANCEL winning on a saturation with helper participation"
+    );
+    assert!(
+        saw_mt_merge_winner_with_helper && saw_mt_merge_then_cancel_with_helper,
+        "4-thread dl_steps=false trials must observe STOP_MERGE winning with helper participation and restart cancellation"
+    );
+}
+
+/// Sol P2 #1 (r3): planner Horn check must not allocate `Vec<Pl>` before admission on a
+/// wide class expression followed by an object key with zero named individuals.
+#[test]
+fn plan_budgeted_wide_union_horn_check_does_not_allocate_before_admission() {
+    let mut union_members = std::collections::BTreeSet::new();
+    for i in 0..4096usize {
+        union_members.insert(ClassExpression::Class(Class::new(format!(
+            "urn:tierd1291:wu{i:04}"
+        ))));
+    }
+    let ax0 = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:A")),
+        ClassExpression::ObjectUnionOf(union_members),
+    );
+    let ax1 = AxiomKind::HasKey(
+        ClassExpression::Class(Class::new("urn:tierd1291:K")),
+        [ObjectPropertyExpression::Property(ObjectProperty::new(
+            "urn:tierd1291:r",
+        ))]
+        .into(),
+        std::collections::BTreeSet::new(),
+    );
+    let refs = [&ax0, &ax1];
+    let (plan, sample) = measure(|| {
+        super::dl_reduce::plan_budgeted(
+            &refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |_used| false,
+        )
+        .unwrap()
+    });
+    assert!(
+        matches!(plan, super::dl_reduce::Plan::Declined),
+        "0-byte grant must decline wide union + HasKey plan"
+    );
+    assert_eq!(
+        sample.peak, 0,
+        "streaming Horn check must not allocate before admission (peak={})",
+        sample.peak
+    );
+}
+
+/// Sol P2 #2 (r3): inserting 12 ordered members and removing the first leaves a 3-node
+/// `BTreeSet` of length 11 (5 + 1 + 5) preserved across `clone()`. Both
+/// `excluded_copy_bytes` and `dl_reduce::plan_budgeted` (`ObjectOneOf` retarget) must
+/// account for the internal root node at length 11 while the clone is live.
+#[test]
+fn eleven_element_three_node_btree_set_is_not_undercounted_when_cloned() {
+    let mut inds = std::collections::BTreeSet::new();
+    for i in 0..12usize {
+        inds.insert(Individual::named(format!("urn:tierd1291:bt{i:02}")));
+    }
+    let first = inds.iter().next().unwrap().clone();
+    assert!(inds.remove(&first));
+    assert_eq!(inds.len(), 11);
+
+    // 1. Retained exclusion cloning (`DifferentIndividuals` with 11-member 3-node set).
+    let excl_template = vec![Excluded {
+        axiom: AxiomKind::DifferentIndividuals(inds.clone()),
+        gap: index::Gap::Partial("eleven-3node"),
+    }];
+    let (excl_cloned, excl_clone_sample) = measure(|| excl_template.clone());
+    let (excl_est, excl_est_sample) = measure(|| excluded_copy_bytes(&excl_cloned));
+    assert_eq!(excl_est_sample.peak, 0);
+    assert!(
+        excl_est >= excl_clone_sample.live,
+        "excluded_copy_bytes ({excl_est}) undercounted live 11-element 3-node BTreeSet ({})",
+        excl_clone_sample.live
+    );
+    drop(excl_cloned);
+
+    // 2. Retargeted `ObjectOneOf` with 11-member 3-node set in `dl_reduce::plan_budgeted`.
+    let disj = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:Z")),
+        ClassExpression::ObjectUnionOf(
+            [
+                ClassExpression::Class(Class::new("urn:tierd1291:Z1")),
+                ClassExpression::Class(Class::new("urn:tierd1291:Z2")),
+            ]
+            .into(),
+        ),
+    );
+    let top_oneof = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:TopSrc")),
+        ClassExpression::ObjectSomeValuesFrom(
+            ObjectPropertyExpression::Property(ObjectProperty::top()),
+            Box::new(ClassExpression::ObjectOneOf(inds)),
+        ),
+    );
+    let refs = [&disj, &top_oneof];
+    let mut admitted_peak = 0usize;
+    let (red_opt, red_sample) = measure(|| {
+        match super::dl_reduce::plan_budgeted(
+            &refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                admitted_peak = admitted_peak.max(used);
+                true
+            },
+        )
+        .unwrap()
+        {
+            super::dl_reduce::Plan::Ready(r) => Some(r),
+            _ => None,
+        }
+    });
+    let red = red_opt.expect("retarget of 11-element ObjectOneOf must succeed");
+    assert!(
+        admitted_peak >= red_sample.peak,
+        "plan_budgeted admitted peak ({admitted_peak}) undercounted 11-element 3-node ObjectOneOf peak ({})",
+        red_sample.peak
+    );
+    assert!(
+        red.retained_bytes() >= red_sample.live,
+        "Reduction::retained_bytes ({}) undercounted 11-element 3-node ObjectOneOf live ({})",
+        red.retained_bytes(),
+        red_sample.live
+    );
+    drop(red);
+}
+
+/// Sol P3 #5 (r3): `HasKey(ObjectMinCardinality(0 owl:topObjectProperty) (:r) ())` rewrites
+/// its key class to `owl:Thing`, so with zero named individuals it emits no fresh
+/// equivalence class and succeeds under a tight grant covering only `replaced`.
+#[test]
+fn has_key_rewritten_to_named_class_reuses_name_without_fresh_equivalence() {
+    let input = axioms(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         HasKey(ObjectMinCardinality(0 owl:topObjectProperty) (:r) ())\n",
+    );
+    let refs: Vec<&AxiomKind> = input.iter().map(|a| &a.kind).collect();
+    let plan = super::dl_reduce::plan_budgeted(
+        &refs,
+        None,
+        None,
+        0,
+        &mut || Ok::<(), ()>(()),
+        &mut |used| used <= refs.len(),
+    )
+    .unwrap();
+    let red = match plan {
+        super::dl_reduce::Plan::Ready(r) => r,
+        other => panic!(
+            "tight grant ({}) must accept empty key reduction, got {:?}",
+            refs.len(),
+            std::mem::discriminant(&other)
+        ),
+    };
+    assert!(
+        red.axioms.is_empty(),
+        "empty key over ObjectMinCardinality(0 owl:topObjectProperty) must emit no axioms, got {:?}",
+        red.axioms
+    );
+    assert!(red.hub.is_none());
+
+    // With two named individuals, the key uses `owl:Thing` directly without a fresh `k0`
+    // equivalence axiom.
+    let input2 = axioms(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         ClassAssertion(:A :a0)\n\
+         ClassAssertion(:A :a1)\n\
+         HasKey(ObjectMinCardinality(0 owl:topObjectProperty) (:r) ())\n",
+    );
+    let refs2: Vec<&AxiomKind> = input2.iter().map(|a| &a.kind).collect();
+    let red2 = super::dl_reduce::plan(&refs2, None, None).expect("2-ind key must plan");
+    assert!(
+        !red2
+            .axioms
+            .iter()
+            .any(|ax| matches!(ax, AxiomKind::EquivalentClasses(_))),
+        "key reduced to owl:Thing must not emit a fresh EquivalentClasses axiom: {:?}",
+        red2.axioms
+    );
+}
+
+/// Sol P2 #1 + Neon P2 #1 (r4): singleton `DisjointUnion` rewrite must drop its temporary
+/// image container before releasing its budget and allocating `EquivalentClasses`, even
+/// when the union class has a long IRI that makes `EquivalentClasses` the peak admission.
+#[test]
+fn singleton_disjoint_union_with_long_iri_does_not_overlap_live_container_release() {
+    let disj = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:Z")),
+        ClassExpression::ObjectUnionOf(
+            [
+                ClassExpression::Class(Class::new("urn:tierd1291:Z1")),
+                ClassExpression::Class(Class::new("urn:tierd1291:Z2")),
+            ]
+            .into(),
+        ),
+    );
+    let long_union = Class::new(format!("urn:tierd1291:LongUnion_{}", "u".repeat(4096)));
+    let op1 = ClassExpression::ObjectSomeValuesFrom(
+        ObjectPropertyExpression::Property(ObjectProperty::top()),
+        Box::new(ClassExpression::Class(Class::new("urn:tierd1291:A"))),
+    );
+    let op2 = ClassExpression::ObjectMinCardinality(
+        1,
+        ObjectPropertyExpression::Property(ObjectProperty::top()),
+        Some(Box::new(ClassExpression::Class(Class::new(
+            "urn:tierd1291:A",
+        )))),
+    );
+
+    // Check both (a) 2-operand DisjointUnion collapsing to 1 image and (b) 1-operand AST.
+    for (label, operands) in [
+        ("2-operand collapsing", vec![op1.clone(), op2]),
+        ("1-operand singleton", vec![op1]),
+    ] {
+        let du = AxiomKind::DisjointUnion(long_union.clone(), operands.into_iter().collect());
+        let refs = [&disj, &du];
+
+        let mut thresholds = std::collections::BTreeSet::new();
+        let _ = super::dl_reduce::plan_budgeted(
+            &refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                thresholds.insert(used);
+                true
+            },
+        )
+        .unwrap();
+
+        let mut admitted_peak = 0usize;
+        let (red_opt, sample) = measure(|| {
+            match super::dl_reduce::plan_budgeted(
+                &refs,
+                None,
+                None,
+                0,
+                &mut || Ok::<(), ()>(()),
+                &mut |used| {
+                    admitted_peak = admitted_peak.max(used);
+                    true
+                },
+            )
+            .unwrap()
+            {
+                super::dl_reduce::Plan::Ready(r) => Some(r),
+                _ => None,
+            }
+        });
+        let red = red_opt.unwrap_or_else(|| panic!("{label}: unlimited plan must succeed"));
+        assert!(
+            admitted_peak >= sample.peak,
+            "{label}: admitted peak ({admitted_peak}) undercounted measured peak ({})",
+            sample.peak
+        );
+        assert!(
+            red.retained_bytes() >= sample.live,
+            "{label}: retained_bytes ({}) undercounted measured live ({})",
+            red.retained_bytes(),
+            sample.live
+        );
+        assert!(
+            red.axioms
+                .iter()
+                .any(|ax| matches!(ax, AxiomKind::EquivalentClasses(_))),
+            "{label}: singleton DisjointUnion must emit EquivalentClasses: {:?}",
+            red.axioms
+        );
+        drop(red);
+
+        // Tight-grant sweep across every observed admission boundary and one byte below it.
+        let mut grants = std::collections::BTreeSet::new();
+        for &t in &thresholds {
+            grants.insert(t);
+            if t > 0 {
+                grants.insert(t - 1);
+            }
+        }
+        for grant in grants {
+            let (plan, tight_sample) = measure(|| {
+                super::dl_reduce::plan_budgeted(
+                    &refs,
+                    None,
+                    None,
+                    0,
+                    &mut || Ok::<(), ()>(()),
+                    &mut |used| used <= grant,
+                )
+                .unwrap()
+            });
+            assert!(
+                tight_sample.peak <= grant,
+                "{label}: measured peak ({}) exceeded tight grant ({grant})",
+                tight_sample.peak
+            );
+            if grant == admitted_peak {
+                assert!(
+                    matches!(plan, super::dl_reduce::Plan::Ready(_)),
+                    "{label}: grant equal to admitted_peak ({admitted_peak}) must succeed"
+                );
+            }
+            drop(plan);
+        }
+    }
+}
+
+/// Sol P2 #2 (r4): deduplication in `disjoint_budgeted` must cooperatively poll wide
+/// rewritten expressions on both 2nd-operand and 3rd-operand duplicates and cancel
+/// mid-comparison before exiting deduplication.
+#[test]
+fn disjoint_union_deduplication_polls_wide_rewritten_operands_and_cancels() {
+    use super::admission_test::{MergePhase, with_merge_probe};
+    use parking_lot::Mutex;
+
+    let mut wide_oneof = std::collections::BTreeSet::new();
+    for i in 0..300usize {
+        wide_oneof.insert(Individual::anonymous(format!(
+            "dd_{i:03}_{}",
+            "x".repeat(64)
+        )));
+    }
+    let wide_oneof = ClassExpression::ObjectOneOf(wide_oneof);
+    let thing_inter = ClassExpression::ObjectIntersectionOf(
+        [wide_oneof.clone(), ClassExpression::Class(Class::thing())].into(),
+    );
+    let op1 = ClassExpression::ObjectSomeValuesFrom(
+        ObjectPropertyExpression::Property(ObjectProperty::top()),
+        Box::new(thing_inter.clone()),
+    );
+    let op2 = ClassExpression::ObjectMinCardinality(
+        1,
+        ObjectPropertyExpression::Property(ObjectProperty::top()),
+        Some(Box::new(thing_inter)),
+    );
+    let op3 = ClassExpression::ObjectSomeValuesFrom(
+        ObjectPropertyExpression::Property(ObjectProperty::top()),
+        Box::new(ClassExpression::ObjectIntersectionOf(
+            [
+                wide_oneof,
+                ClassExpression::ObjectMinCardinality(
+                    0,
+                    ObjectPropertyExpression::Property(ObjectProperty::top()),
+                    Some(Box::new(ClassExpression::Class(Class::new(
+                        "urn:tierd1291:Extra",
+                    )))),
+                ),
+            ]
+            .into(),
+        )),
+    );
+    let three_ops: std::collections::BTreeSet<ClassExpression> =
+        [op1.clone(), op2.clone(), op3].into();
+    assert_eq!(three_ops.len(), 3, "three source operands must be distinct");
+
+    let disj = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:Z")),
+        ClassExpression::ObjectUnionOf(
+            [
+                ClassExpression::Class(Class::new("urn:tierd1291:Z1")),
+                ClassExpression::Class(Class::new("urn:tierd1291:Z2")),
+            ]
+            .into(),
+        ),
+    );
+    let union_cls = Class::new("urn:tierd1291:WideDedupUnion");
+
+    // 1. 2-operand cancellation mid-deduplication comparison (former `images.contains(&d)`).
+    {
+        let du2 = AxiomKind::DisjointUnion(union_cls.clone(), [op1, op2].into());
+        let refs = [&disj, &du2];
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanDisjointDedup { restarts: 0 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs,
+                    None,
+                    None,
+                    0,
+                    &mut || {
+                        if cancel_cb.load(Ordering::SeqCst) {
+                            Err(Error::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut |_| true,
+                )
+            },
+        )
+        .err()
+        .expect("must cancel mid-deduplication on 2nd duplicate operand");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::PlanDisjointDedup { restarts: 0 }));
+        assert!(
+            !t.contains(&MergePhase::PlanDisjointDedupDone { restarts: 0 }),
+            "cancellation must stop inside wide deduplication comparison before exit: {t:?}"
+        );
+    }
+
+    // 2. 3-operand cancellation mid-deduplication on 3rd operand (former `empty.entry(d)`).
+    let du3 = AxiomKind::DisjointUnion(union_cls, three_ops);
+    let refs3 = [&disj, &du3];
+    {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let dedup_starts = Arc::new(AtomicUsize::new(0));
+        let dedup_starts_probe = dedup_starts.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanDisjointDedup { restarts: 0 })
+                    && dedup_starts_probe.fetch_add(1, Ordering::SeqCst) == 1
+                {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs3,
+                    None,
+                    None,
+                    0,
+                    &mut || {
+                        if cancel_cb.load(Ordering::SeqCst) {
+                            Err(Error::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut |_| true,
+                )
+            },
+        )
+        .err()
+        .expect("must cancel mid-deduplication on 3rd duplicate operand");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        let starts = t
+            .iter()
+            .filter(|p| matches!(p, MergePhase::PlanDisjointDedup { restarts: 0 }))
+            .count();
+        let dones = t
+            .iter()
+            .filter(|p| matches!(p, MergePhase::PlanDisjointDedupDone { restarts: 0 }))
+            .count();
+        assert_eq!(
+            starts, 2,
+            "expected dedup start for 2nd and 3rd operands: {t:?}"
+        );
+        assert_eq!(dones, 1, "3rd operand dedup must cancel before Done: {t:?}");
+    }
+
+    // 3. Uncancelled 3-operand run emits `SubClassOf(d, owl:Nothing)` once and stays sound.
+    //    Measure planner allocations without any test probe installed so probe hooks and
+    //    trace buffers are excluded from `sample.peak` and `sample.live`.
+    {
+        let mut admitted_peak = 0usize;
+        let (red_opt, sample) = measure(|| {
+            match super::dl_reduce::plan_budgeted(
+                &refs3,
+                None,
+                None,
+                0,
+                &mut || Ok::<(), ()>(()),
+                &mut |used| {
+                    admitted_peak = admitted_peak.max(used);
+                    true
+                },
+            )
+            .unwrap()
+            {
+                super::dl_reduce::Plan::Ready(r) => Some(r),
+                _ => None,
+            }
+        });
+        let red = red_opt.expect("3-operand duplicate-image DisjointUnion must succeed");
+        let empty_axioms = red
+            .axioms
+            .iter()
+            .filter(|ax| {
+                matches!(
+                    ax,
+                    AxiomKind::SubClassOf(_, ClassExpression::Class(c))
+                        if c.as_str() == crate::vocab::OWL_NOTHING
+                )
+            })
+            .count();
+        assert_eq!(
+            empty_axioms, 1,
+            "3 identical rewritten operands must emit SubClassOf(d, owl:Nothing) exactly once"
+        );
+        assert!(
+            admitted_peak >= sample.peak,
+            "3-operand DisjointUnion admitted peak ({admitted_peak}) undercounted peak ({})",
+            sample.peak
+        );
+        assert!(
+            red.retained_bytes() >= sample.live,
+            "3-operand DisjointUnion retained_bytes ({}) undercounted live ({})",
+            red.retained_bytes(),
+            sample.live
+        );
+        drop(red);
+
+        // Verify probe pairing separately outside the counting-allocator sample.
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let plan = with_merge_probe(
+            move |phase| trace_probe.lock().push(phase),
+            || {
+                super::dl_reduce::plan_budgeted(
+                    &refs3,
+                    None,
+                    None,
+                    0,
+                    &mut || Ok::<(), ()>(()),
+                    &mut |_| true,
+                )
+                .unwrap()
+            },
+        );
+        assert!(matches!(plan, super::dl_reduce::Plan::Ready(_)));
+        let t = trace.lock().clone();
+        let starts = t
+            .iter()
+            .filter(|p| matches!(p, MergePhase::PlanDisjointDedup { restarts: 0 }))
+            .count();
+        let dones = t
+            .iter()
+            .filter(|p| matches!(p, MergePhase::PlanDisjointDedupDone { restarts: 0 }))
+            .count();
+        assert_eq!(starts, 2);
+        assert_eq!(dones, 2);
+    }
+}
+
+/// Sol P2 (r5): a duplicate rewritten operand arriving when `images` is at capacity
+/// (`len == capacity`, e.g. 1,024 entries) must not reserve unused vector doubling or
+/// hash-map growth before deduplication, so a tight grant covering actual allocations
+/// still succeeds.
+#[test]
+fn disjoint_union_full_vector_duplicate_does_not_reserve_unused_growth() {
+    let disj = AxiomKind::SubClassOf(
+        ClassExpression::Class(Class::new("urn:tierd1291:FullVecZ")),
+        ClassExpression::ObjectUnionOf(
+            [
+                ClassExpression::Class(Class::new("urn:tierd1291:FullVecZ1")),
+                ClassExpression::Class(Class::new("urn:tierd1291:FullVecZ2")),
+            ]
+            .into(),
+        ),
+    );
+    let union_cls = Class::new("urn:tierd1291:FullVecUnion");
+    let top = ObjectPropertyExpression::Property(ObjectProperty::top());
+    let filler = ClassExpression::Class(Class::new("urn:tierd1291:FullVecA"));
+
+    // Variant order in `ClassExpression`:
+    //   ObjectSomeValuesFrom < ObjectHasValue < ObjectMinCardinality
+    // So 1 existential + 1,023 distinct `ObjectHasValue` fill `images` to len == cap == 1024
+    // before the trailing equivalent `ObjectMinCardinality(1, top, Some(filler))` is visited.
+    let first = ClassExpression::ObjectSomeValuesFrom(top.clone(), Box::new(filler.clone()));
+    let dup = ClassExpression::ObjectMinCardinality(1, top.clone(), Some(Box::new(filler)));
+    let mut base_ops = std::collections::BTreeSet::new();
+    base_ops.insert(first);
+    for i in 0..1023usize {
+        base_ops.insert(ClassExpression::ObjectHasValue(
+            top.clone(),
+            Individual::anonymous(format!("fv{i}")),
+        ));
+    }
+    assert_eq!(base_ops.len(), 1024);
+
+    let mut dup_ops = base_ops.clone();
+    assert!(dup_ops.insert(dup.clone()));
+    assert_eq!(dup_ops.len(), 1025);
+    assert_eq!(
+        dup_ops.last(),
+        Some(&dup),
+        "duplicate operand must sort last after 1,024 unique operands"
+    );
+
+    let du_no_dup = AxiomKind::DisjointUnion(union_cls.clone(), base_ops);
+    let du_with_dup = AxiomKind::DisjointUnion(union_cls, dup_ops);
+    let refs_no_dup = [&disj, &du_no_dup];
+    let refs_with_dup = [&disj, &du_with_dup];
+
+    // Baseline peak for the 1,024 unique operands alone.
+    let mut base_admitted_peak = 0usize;
+    let base_plan = super::dl_reduce::plan_budgeted(
+        &refs_no_dup,
+        None,
+        None,
+        0,
+        &mut || Ok::<(), ()>(()),
+        &mut |used| {
+            base_admitted_peak = base_admitted_peak.max(used);
+            true
+        },
+    )
+    .unwrap();
+    assert!(matches!(base_plan, super::dl_reduce::Plan::Ready(_)));
+    drop(base_plan);
+
+    // Measure the 1,025-operand (1,024 unique + 1 full-vector duplicate) run.
+    let mut admitted_peak = 0usize;
+    let (red_opt, sample) = measure(|| {
+        match super::dl_reduce::plan_budgeted(
+            &refs_with_dup,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                admitted_peak = admitted_peak.max(used);
+                true
+            },
+        )
+        .unwrap()
+        {
+            super::dl_reduce::Plan::Ready(r) => Some(r),
+            _ => None,
+        }
+    });
+    let red = red_opt.expect("unlimited full-vector duplicate DisjointUnion must succeed");
+    assert!(
+        admitted_peak >= sample.peak,
+        "admitted peak ({admitted_peak}) undercounted measured peak ({})",
+        sample.peak
+    );
+    assert!(
+        red.retained_bytes() >= sample.live,
+        "retained_bytes ({}) undercounted measured live ({})",
+        red.retained_bytes(),
+        sample.live
+    );
+    let empty_axioms = red
+        .axioms
+        .iter()
+        .filter(|ax| {
+            matches!(
+                ax,
+                AxiomKind::SubClassOf(_, ClassExpression::Class(c))
+                    if c.as_str() == crate::vocab::OWL_NOTHING
+            )
+        })
+        .count();
+    assert_eq!(empty_axioms, 1);
+    drop(red);
+
+    // A tight grant covering the 1,024-entry baseline plus the duplicate payload and its
+    // emitted `SubClassOf(d, owl:Nothing)` (far below a speculative 2,048-entry `images`
+    // doubling) must succeed rather than decline.
+    let tight_grant = base_admitted_peak + 4096;
+    assert!(
+        admitted_peak <= tight_grant,
+        "full-vector duplicate over-reserved: admitted_peak={admitted_peak} > tight_grant={tight_grant} (base={base_admitted_peak})"
+    );
+    let (tight_plan, tight_sample) = measure(|| {
+        super::dl_reduce::plan_budgeted(
+            &refs_with_dup,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| used <= tight_grant,
+        )
+        .unwrap()
+    });
+    assert!(
+        matches!(tight_plan, super::dl_reduce::Plan::Ready(_)),
+        "tight grant ({tight_grant}) covering actual allocations must succeed"
+    );
+    assert!(
+        tight_sample.peak <= tight_grant,
+        "measured peak ({}) exceeded tight grant ({tight_grant})",
+        tight_sample.peak
+    );
+    drop(tight_plan);
+
+    // Exact boundary check at `admitted_peak` and `admitted_peak - 1`.
+    for (grant, expect_ready) in [(admitted_peak, true), (admitted_peak - 1, false)] {
+        let (plan, boundary_sample) = measure(|| {
+            super::dl_reduce::plan_budgeted(
+                &refs_with_dup,
+                None,
+                None,
+                0,
+                &mut || Ok::<(), ()>(()),
+                &mut |used| used <= grant,
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            matches!(plan, super::dl_reduce::Plan::Ready(_)),
+            expect_ready,
+            "grant={grant} expected ready={expect_ready}"
+        );
+        assert!(
+            boundary_sample.peak <= grant,
+            "measured peak ({}) exceeded boundary grant ({grant})",
+            boundary_sample.peak
+        );
+        drop(plan);
+    }
+}
+
+/// Neon P3 (r4): every `Plan*` start probe must pair 1:1 with its `Plan*Done` probe on
+/// exact 16-iteration loop boundaries and on `EquivalentObjectProperties` with one
+/// non-top property preceding `owl:topObjectProperty`.
+#[test]
+fn merge_plan_probes_pair_start_and_done_at_exact_boundaries() {
+    use super::admission_test::{MergePhase, with_merge_probe};
+    use parking_lot::Mutex;
+
+    let count_phase =
+        |t: &[MergePhase], target: MergePhase| t.iter().filter(|&&p| p == target).count();
+    let assert_all_balanced = |t: &[MergePhase]| {
+        for (start, done) in [
+            (
+                MergePhase::PlanBlockedScan { restarts: 0 },
+                MergePhase::PlanBlockedScanDone { restarts: 0 },
+            ),
+            (
+                MergePhase::PlanHornCheck { restarts: 0 },
+                MergePhase::PlanHornCheckDone { restarts: 0 },
+            ),
+            (
+                MergePhase::PlanIndsDrain { restarts: 0 },
+                MergePhase::PlanIndsDrainDone { restarts: 0 },
+            ),
+            (
+                MergePhase::PlanRetarget { restarts: 0 },
+                MergePhase::PlanRetargetDone { restarts: 0 },
+            ),
+            (
+                MergePhase::PlanDisjointDedup { restarts: 0 },
+                MergePhase::PlanDisjointDedupDone { restarts: 0 },
+            ),
+            (
+                MergePhase::PlanKeyBody { restarts: 0 },
+                MergePhase::PlanKeyBodyDone { restarts: 0 },
+            ),
+        ] {
+            assert_eq!(
+                count_phase(t, start),
+                count_phase(t, done),
+                "unbalanced probe pair {start:?} vs {done:?} in {t:?}"
+            );
+        }
+    };
+    let run_trace = |refs: &[&AxiomKind]| -> Vec<MergePhase> {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let plan = with_merge_probe(
+            move |phase| trace_probe.lock().push(phase),
+            || {
+                super::dl_reduce::plan_budgeted(
+                    refs,
+                    None,
+                    None,
+                    0,
+                    &mut || Ok::<(), ()>(()),
+                    &mut |_| true,
+                )
+                .unwrap()
+            },
+        );
+        assert!(matches!(plan, super::dl_reduce::Plan::Ready(_)));
+        let t = trace.lock().clone();
+        assert_all_balanced(&t);
+        t
+    };
+
+    // 1a. Exact 16-iteration boundaries for blocked scan (16 named individuals), Horn check
+    //     (14 union members + LHS Class + RHS ObjectUnionOf = 16 ticks), inds drain (16),
+    //     and EquivalentObjectProperties with one non-top property preceding owl:topObjectProperty.
+    {
+        let mut union14 = std::collections::BTreeSet::new();
+        for i in 0..14usize {
+            union14.insert(ClassExpression::Class(Class::new(format!(
+                "urn:tierd1291:b16u{i:02}"
+            ))));
+        }
+        let disj16 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:B16Z")),
+            ClassExpression::ObjectUnionOf(union14),
+        );
+        let mut diff16 = std::collections::BTreeSet::new();
+        for i in 0..16usize {
+            diff16.insert(Individual::named(format!("urn:tierd1291:b16i{i:02}")));
+        }
+        let diff_ax = AxiomKind::DifferentIndividuals(diff16);
+        // One non-top property sorting before `http://www.w3.org/2002/07/owl#topObjectProperty`.
+        let eqop_one_non_top = AxiomKind::EquivalentObjectProperties(
+            [
+                ObjectPropertyExpression::Property(ObjectProperty::new(
+                    "http://example.org/b16_p0",
+                )),
+                ObjectPropertyExpression::Property(ObjectProperty::top()),
+            ]
+            .into(),
+        );
+        let t = run_trace(&[&disj16, &diff_ax, &eqop_one_non_top]);
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanBlockedScan { restarts: 0 }),
+            0
+        );
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanHornCheck { restarts: 0 }),
+            0
+        );
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanIndsDrain { restarts: 0 }),
+            0
+        );
+        assert_eq!(count_phase(&t, MergePhase::PlanRetarget { restarts: 0 }), 0);
+    }
+
+    // 1b. Exact 16-nominal ObjectOneOf clone and DisjointDedup comparison boundaries.
+    {
+        let disj = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:B16Z")),
+            ClassExpression::ObjectUnionOf(
+                [
+                    ClassExpression::Class(Class::new("urn:tierd1291:B16Z1")),
+                    ClassExpression::Class(Class::new("urn:tierd1291:B16Z2")),
+                ]
+                .into(),
+            ),
+        );
+        let mut oneof16 = std::collections::BTreeSet::new();
+        for i in 0..16usize {
+            oneof16.insert(Individual::anonymous(format!("b16a{i:02}")));
+        }
+        let filler16 = ClassExpression::ObjectOneOf(oneof16);
+        let top_oneof16 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:B16Top")),
+            ClassExpression::ObjectSomeValuesFrom(
+                ObjectPropertyExpression::Property(ObjectProperty::top()),
+                Box::new(filler16.clone()),
+            ),
+        );
+        let t1 = run_trace(&[&disj, &top_oneof16]);
+        assert_eq!(
+            count_phase(&t1, MergePhase::PlanRetarget { restarts: 0 }),
+            0
+        );
+
+        let du16 = AxiomKind::DisjointUnion(
+            Class::new("urn:tierd1291:B16DU"),
+            [
+                ClassExpression::ObjectSomeValuesFrom(
+                    ObjectPropertyExpression::Property(ObjectProperty::top()),
+                    Box::new(filler16.clone()),
+                ),
+                ClassExpression::ObjectMinCardinality(
+                    1,
+                    ObjectPropertyExpression::Property(ObjectProperty::top()),
+                    Some(Box::new(filler16)),
+                ),
+            ]
+            .into(),
+        );
+        let t2 = run_trace(&[&disj, &du16]);
+        assert_eq!(
+            count_phase(&t2, MergePhase::PlanDisjointDedup { restarts: 0 }),
+            0
+        );
+        // Only the outer 2-operand loop in `disjoint_budgeted` fires PlanRetarget (not the
+        // 16-nominal `ObjectOneOf` clones).
+        assert_eq!(
+            count_phase(&t2, MergePhase::PlanRetarget { restarts: 0 }),
+            1
+        );
+    }
+
+    // 2. 17-iteration boundaries emit matching start + done pairs for every probe.
+    {
+        let mut union15 = std::collections::BTreeSet::new();
+        for i in 0..15usize {
+            union15.insert(ClassExpression::Class(Class::new(format!(
+                "urn:tierd1291:b17u{i:02}"
+            ))));
+        }
+        let disj17 = AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:tierd1291:B17Z")),
+            ClassExpression::ObjectUnionOf(union15),
+        );
+        let mut diff17 = std::collections::BTreeSet::new();
+        for i in 0..17usize {
+            diff17.insert(Individual::named(format!("urn:tierd1291:b17i{i:02}")));
+        }
+        let diff_ax = AxiomKind::DifferentIndividuals(diff17);
+        let mut oneof17 = std::collections::BTreeSet::new();
+        for i in 0..17usize {
+            oneof17.insert(Individual::anonymous(format!("b17a{i:02}")));
+        }
+        let filler17 = ClassExpression::ObjectOneOf(oneof17);
+        let du17 = AxiomKind::DisjointUnion(
+            Class::new("urn:tierd1291:B17DU"),
+            [
+                ClassExpression::ObjectSomeValuesFrom(
+                    ObjectPropertyExpression::Property(ObjectProperty::top()),
+                    Box::new(filler17.clone()),
+                ),
+                ClassExpression::ObjectMinCardinality(
+                    1,
+                    ObjectPropertyExpression::Property(ObjectProperty::top()),
+                    Some(Box::new(filler17)),
+                ),
+            ]
+            .into(),
+        );
+        let t = run_trace(&[&disj17, &diff_ax, &du17]);
+        assert!(count_phase(&t, MergePhase::PlanBlockedScan { restarts: 0 }) >= 2);
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanHornCheck { restarts: 0 }),
+            1
+        );
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanIndsDrain { restarts: 0 }),
+            1
+        );
+        assert_eq!(
+            count_phase(&t, MergePhase::PlanDisjointDedup { restarts: 0 }),
+            1
+        );
+        assert!(count_phase(&t, MergePhase::PlanRetarget { restarts: 0 }) >= 3);
+    }
+}

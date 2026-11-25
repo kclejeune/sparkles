@@ -1500,8 +1500,8 @@ fn rooted_reduction_declines_checker_data_and_uses_original_axioms() {
          SubClassOf(:X ObjectUnionOf(:Y :Z))",
     );
     let refs: Vec<_> = ax.iter().collect();
-    assert!(dl_reduce::plan(&[&ax[0], &ax[4]], None).is_some());
-    assert!(dl_reduce::plan(&refs, None).is_none());
+    assert!(dl_reduce::plan(&[&ax[0], &ax[4]], None, None).is_some());
+    assert!(dl_reduce::plan(&refs, None, None).is_none());
     let mut sat = Saturation::new();
     let rooted = sat
         .classify(

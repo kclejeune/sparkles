@@ -406,3 +406,145 @@ impl Race {
         assert_eq!(&*self.requests.lock(), want);
     }
 }
+
+/// Outcome of a `dl_reduce::plan_budgeted` call observed by [`with_merge_probe`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlanKind {
+    NotNeeded,
+    Declined,
+    Ready,
+    PollErr,
+}
+
+/// Phase-specific events emitted during rooted constant merging and post-merge replanning
+/// so regression tests can verify exact phases, stop winners, and helper participation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MergePhase {
+    PlanStart { restarts: usize },
+    PlanBlockedScan { restarts: usize },
+    PlanBlockedScanDone { restarts: usize },
+    PlanHornCheck { restarts: usize },
+    PlanHornCheckDone { restarts: usize },
+    PlanIndsDrain { restarts: usize },
+    PlanIndsDrainDone { restarts: usize },
+    PlanRetarget { restarts: usize },
+    PlanRetargetDone { restarts: usize },
+    PlanDisjointDedup { restarts: usize },
+    PlanDisjointDedupDone { restarts: usize },
+    PlanKeyBody { restarts: usize },
+    PlanKeyBodyDone { restarts: usize },
+    PlanDone { restarts: usize, outcome: PlanKind },
+    SatStop { stop: u8, helper_ran: bool },
+    MergeRestart { restarts: usize },
+}
+
+type MergeProbe = Box<dyn FnMut(MergePhase)>;
+
+thread_local! {
+    static MERGE_PROBE: RefCell<Option<MergeProbe>> = const { RefCell::new(None) };
+    static PLAN_RESTARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn with_merge_probe<T>(
+    observe: impl FnMut(MergePhase) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MERGE_PROBE.with(|slot| slot.borrow_mut().take());
+            PLAN_RESTARTS.with(|r| r.set(0));
+        }
+    }
+    MERGE_PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none());
+        *slot = Some(Box::new(observe));
+    });
+    let _reset = Reset;
+    run()
+}
+
+pub(super) fn emit_merge_phase(phase: MergePhase) {
+    MERGE_PROBE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(phase);
+        }
+    });
+}
+
+pub(super) struct PlanPhaseGuard {
+    prev: usize,
+}
+
+impl Drop for PlanPhaseGuard {
+    fn drop(&mut self) {
+        PLAN_RESTARTS.with(|r| r.set(self.prev));
+    }
+}
+
+pub(super) fn enter_plan(restarts: usize) -> PlanPhaseGuard {
+    let prev = PLAN_RESTARTS.with(|r| r.replace(restarts));
+    emit_merge_phase(MergePhase::PlanStart { restarts });
+    PlanPhaseGuard { prev }
+}
+
+pub(super) fn merge_phase_blocked_scan() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanBlockedScan { restarts });
+}
+
+pub(super) fn merge_phase_blocked_scan_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanBlockedScanDone { restarts });
+}
+
+pub(super) fn merge_phase_horn_check() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanHornCheck { restarts });
+}
+
+pub(super) fn merge_phase_horn_check_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanHornCheckDone { restarts });
+}
+
+pub(super) fn merge_phase_inds_drain() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanIndsDrain { restarts });
+}
+
+pub(super) fn merge_phase_inds_drain_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanIndsDrainDone { restarts });
+}
+
+pub(super) fn merge_phase_retarget() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanRetarget { restarts });
+}
+
+pub(super) fn merge_phase_retarget_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanRetargetDone { restarts });
+}
+
+pub(super) fn merge_phase_disjoint_dedup() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanDisjointDedup { restarts });
+}
+
+pub(super) fn merge_phase_disjoint_dedup_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanDisjointDedupDone { restarts });
+}
+
+pub(super) fn merge_phase_key_body() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanKeyBody { restarts });
+}
+
+pub(super) fn merge_phase_key_body_done() {
+    let restarts = PLAN_RESTARTS.with(std::cell::Cell::get);
+    emit_merge_phase(MergePhase::PlanKeyBodyDone { restarts });
+}
