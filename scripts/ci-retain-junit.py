@@ -215,7 +215,10 @@ def cache_origin(root, out, run):
 
 
 def replay_origin(out):
-    log, _ = read_regular(out.parent / "logs/test.log")
+    logs = out.parent / "logs"
+    if logs.is_symlink():
+        raise ValueError("test log directory is a symlink")
+    log, _ = read_regular(logs / "test.log")
     origins = [
         match.groups()
         for line in log.decode(errors="replace").splitlines()
@@ -229,7 +232,11 @@ def replay_origin(out):
 
 def finish_test(root, out, task_exit, gate_run):
     manifest = load_manifest(out)
-    if not gate_run or task_exit != 0 or manifest["selection_packages"] == "none":
+    if gate_run and manifest["status"] == "error":
+        # An earlier capture attempt already recorded its diagnostic.
+        manifest["task_exit"] = task_exit
+        atomic_json(out / "manifest.json", manifest)
+    elif not gate_run or task_exit != 0 or manifest["selection_packages"] == "none":
         after(root, out, task_exit)
     elif manifest["status"] == "running":
         # A cache hit replays the log without running cache-origin. The current

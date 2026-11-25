@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from hashlib import sha256
 from pathlib import Path
 from unittest import mock
 
@@ -16,8 +17,108 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CiJunitIntegration(unittest.TestCase):
-    def run_ci(
+    def run_ci(self, **options):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.prepare_ci_fixture(root)
+            return self.run_ci_fixture(root, **options)
+
+    def prepare_ci_fixture(self, root, *, real_mise=False):
+        (root / "scripts").mkdir()
+        (root / "bin").mkdir()
+        (root / "global.toml").touch()
+        for name in ("ci.sh", "ci-retain-junit.py", "nextest-slow.py"):
+            shutil.copyfile(ROOT / "scripts" / name, root / "scripts" / name)
+        config = (ROOT / "mise.toml").read_text()
+        test_task = config.split("\n[tasks.test]\n", 1)[1].split("\n[tasks.", 1)[0]
+        (root / "mise.toml").write_text(
+            '[settings]\nexperimental = true\n'
+            '[task_config]\nglobal_env = ["SPARKLES_CHANGED_PACKAGES"]\n'
+            '[task_config.input_groups]\n'
+            'rust = ["scripts/*.py"]\nui = []\ndocs = []\n'
+            '[tasks."ui:build"]\nrun = "true"\n'
+            '[tasks.test]\n' + test_task
+        )
+        (root / "scripts/changed-crates.py").write_text(
+            """import os, sys
+selection = os.environ["FIXTURE_SELECTION"]
+if sys.argv[1:] == ["fixture-base"]:
+    print(selection)
+elif sys.argv[1:] == ["--cargo-args", "--doc"] and selection == "sparkles-server":
+    print("none")
+elif sys.argv[1:2] == ["--cargo-args"]:
+    print({"all": "--workspace", "none": "none"}.get(selection, f"-p {selection}"))
+else:
+    sys.exit("unexpected changed-crates arguments")
+"""
+        )
+        tools = {
+            "git": '#!/bin/sh\ncase "$1" in rev-parse) echo "$FIXTURE_COMMIT";; status) :;; *) exit 1;; esac\n',
+            "rustc": "#!/bin/sh\n[ \"$*\" = -V ] && echo 'fixture rustc'\n",
+            "mbx-policy-key.py": "#!/bin/sh\necho 'fixture policy'\n",
+            "mbx": """#!/usr/bin/env python3
+import os, pathlib, shutil, subprocess, sys
+root = pathlib.Path.cwd()
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("fixture mbx")
+elif args[:2] == ["sparkles-task", "--"]:
+    lease = root / "lease-live"
+    lease.touch()
+    try:
+        sys.exit(subprocess.call(args[2:]))
+    finally:
+        shutil.rmtree(root / "cache")
+        (root / "target").unlink()
+        lease.unlink()
+elif args[:2] == ["nextest", "run"]:
+    assert (root / "lease-live").exists()
+    if os.environ["MISSING"] == "0":
+        for profile in os.environ["PROFILES"].split(","):
+            p = root / "target/nextest" / profile / "junit.xml"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(
+                f'<testsuites fixture="{profile}"><testsuite failures="{os.environ["FAIL"]}"/></testsuites>\\n'
+            )
+    if os.environ["COPY_ERROR"] == "1":
+        (root / ".artifacts/ci/junit/.staging").mkdir()
+    sys.exit(29 if os.environ["FAIL"] == "1" else 0)
+elif args[0] == "test":
+    assert (root / "lease-live").exists()
+    if "--doc" in args:
+        assert os.environ["FIXTURE_SELECTION"] not in ("sparkles-server", "none")
+    elif args[:4] != ["test", "--locked", "-p", "sparkles-backup"]:
+        assert args == ["test", "--workspace", "--no-run", "--bin", "sparkles"]
+else:
+    sys.exit("unexpected mbx arguments")
+""",
+        }
+        if not real_mise:
+            tools["mise"] = """#!/usr/bin/env python3
+import os, pathlib, subprocess, sys, tomllib
+root = pathlib.Path.cwd()
+task = sys.argv[-1]
+if task == "test":
+    assert (root / "lease-live").exists()
+    if "REPLAYED_LOG" in os.environ:
+        print(os.environ["REPLAYED_LOG"], end="")
+        sys.exit(0)
+    config = tomllib.loads((root / "mise.toml").read_text())
+    for script in config["tasks"]["test"]["run"]:
+        result = subprocess.run(["bash", "-c", script], check=False)
+        if result.returncode:
+            sys.exit(result.returncode)
+elif task == "node:test":
+    (root / "target/nextest/default/junit.xml").write_text("overwritten by later task")
+"""
+        for name, script in tools.items():
+            path = root / "bin" / name
+            path.write_text(script)
+            path.chmod(0o755)
+
+    def run_ci_fixture(
         self,
+        root,
         *,
         failing=False,
         missing=False,
@@ -27,84 +128,55 @@ class CiJunitIntegration(unittest.TestCase):
         gate_run="",
         replayed_log=None,
         preexisting=False,
+        selection="all",
     ):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "scripts").mkdir()
-            (root / "bin").mkdir()
-            target = root / "cache/targets/v1/key"
-            target.mkdir(parents=True)
-            (root / "target").symlink_to(target)
-            target.with_suffix(".json").write_text('{"workspace_root":"fixture"}\n')
-            if preexisting:
-                report = target / "nextest/default/junit.xml"
-                report.parent.mkdir(parents=True)
-                report.write_bytes(b"<testsuites/>\n")
-            for name in ("ci.sh", "ci-retain-junit.py"):
-                if (ROOT / "scripts" / name).exists():
-                    shutil.copyfile(ROOT / "scripts" / name, root / "scripts" / name)
-            tools = {
-                "git": '#!/bin/sh\ncase "$1" in rev-parse) echo "$FIXTURE_COMMIT";; status) :;; *) exit 1;; esac\n',
-                "mbx": '#!/bin/bash\nshift 2\ntouch "$PWD/lease-live"\n"$@"\nrc=$?\nrm -rf "$PWD/cache" "$PWD/target" "$PWD/lease-live"\nexit "$rc"\n',
-                "mise": """#!/usr/bin/env python3
-import os,pathlib,subprocess,sys
-root=pathlib.Path.cwd(); task=sys.argv[-1]
-if task=='test':
- assert (root/'lease-live').exists()
- if 'REPLAYED_LOG' in os.environ:
-  print(os.environ['REPLAYED_LOG'], end='')
-  sys.exit(0)
- if os.environ['MISSING']=='0':
-  for profile in os.environ['PROFILES'].split(','):
-   p=root/'target/nextest'/profile/'junit.xml'; p.parent.mkdir(parents=True,exist_ok=True)
-   p.write_bytes(('<testsuites fixture="'+profile+'"><testsuite failures="'+os.environ['FAIL']+'"/></testsuites>\\n').encode())
- if os.environ['COPY_ERROR']=='1': (root/'.artifacts/ci/junit/.staging').mkdir()
- if os.environ['FAIL']=='0' and os.environ['SPARKLES_CI_GATE_RUN']:
-  with open('.artifacts/ci/junit-retention.log', 'a') as log:
-   subprocess.run([sys.executable, 'scripts/ci-retain-junit.py', 'cache-origin'], stderr=log)
- sys.exit(29 if os.environ['FAIL']=='1' else 0)
-if task=='node:test':
- p=root/'target/nextest/default/junit.xml';p.write_text('overwritten by later task')
-""",
-            }
-            for name, text in tools.items():
-                p = root / "bin" / name
-                p.write_text(text)
-                p.chmod(0o755)
-            env = dict(
-                os.environ,
-                PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
-                FAIL="1" if failing else "0",
-                MISSING="1" if missing else "0",
-                PROFILES=",".join(profiles),
-                COPY_ERROR="1" if copy_error else "0",
-                FIXTURE_COMMIT=("2" if replayed_log is not None else "1") * 40,
-                SPARKLES_CI_GATE_RUN=gate_run,
-            )
-            if replayed_log is not None:
-                env["REPLAYED_LOG"] = replayed_log
-            env.pop("SPARKLES_CI_LEASED", None)
-            tasks = ["test", "node:test"] if later else ["test"]
-            result = subprocess.run(
-                ["bash", "scripts/ci.sh", "--jobs", "1", *tasks],
-                check=False,
-                cwd=root,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-            out = root / ".artifacts/ci"
-            receipt = json.loads((out / "junit/manifest.json").read_text())
-            contents = {
-                str(p.relative_to(out)): p.read_bytes()
-                for p in out.rglob("*")
-                if p.is_file()
-            }
-            self.assertFalse(
-                target.exists(), "fixture lease did not collect its original target"
-            )
-            return result, receipt, contents
+        target = root / "cache/targets/v1/key"
+        target.mkdir(parents=True)
+        (root / "target").symlink_to(target)
+        target.with_suffix(".json").write_text('{"workspace_root":"fixture"}\n')
+        if preexisting:
+            report = target / "nextest/default/junit.xml"
+            report.parent.mkdir(parents=True)
+            report.write_bytes(b"<testsuites/>\n")
+        env = dict(
+            os.environ,
+            PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
+            FAIL="1" if failing else "0",
+            MISSING="1" if missing else "0",
+            PROFILES=",".join(profiles),
+            COPY_ERROR="1" if copy_error else "0",
+            FIXTURE_COMMIT=("2" if replayed_log is not None else "1") * 40,
+            FIXTURE_SELECTION=selection,
+            SPARKLES_CI_GATE_RUN=gate_run,
+            MISE_CACHE_DIR=str(root / "mise-cache"),
+            MISE_GLOBAL_CONFIG_FILE=str(root / "global.toml"),
+            MISE_TRUSTED_CONFIG_PATHS=str(root),
+            MISE_TASK_CACHE="read-write",
+        )
+        if replayed_log is not None:
+            env["REPLAYED_LOG"] = replayed_log
+        env.pop("SPARKLES_CI_LEASED", None)
+        tasks = ["test", "node:test"] if later else ["test"]
+        result = subprocess.run(
+            ["bash", "scripts/ci.sh", "--jobs", "1", "--changed", "fixture-base", *tasks],
+            check=False,
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        out = root / ".artifacts/ci"
+        receipt = json.loads((out / "junit/manifest.json").read_text())
+        contents = {
+            str(p.relative_to(out)): p.read_bytes()
+            for p in out.rglob("*")
+            if p.is_file()
+        }
+        self.assertFalse(
+            target.exists(), "fixture lease did not collect its original target"
+        )
+        return result, receipt, contents
 
     def test_success_survives_managed_target_collection(self):
         result, receipt, files = self.run_ci()
@@ -455,6 +527,8 @@ class ReaderContractControls(unittest.TestCase):
 
 class GateRetentionControls(unittest.TestCase):
     run_ci = CiJunitIntegration.run_ci
+    prepare_ci_fixture = CiJunitIntegration.prepare_ci_fixture
+    run_ci_fixture = CiJunitIntegration.run_ci_fixture
 
     def retain(self, root):
         source = (ROOT / "scripts/gate/remote/gate-inner.sh").read_text()
@@ -476,7 +550,14 @@ class GateRetentionControls(unittest.TestCase):
         )
 
     def gate_receipts(
-        self, files, source_files=None, *, archive=False, ci_exit=0, copy_error=False
+        self,
+        files,
+        source_files=None,
+        *,
+        archive=False,
+        ci_exit=0,
+        copy_error=False,
+        linked_logs=False,
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -498,6 +579,10 @@ class GateRetentionControls(unittest.TestCase):
                     path = target / name
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(data)
+            if linked_logs:
+                logs = root / ".artifacts/ci/logs"
+                shutil.rmtree(logs)
+                logs.symlink_to(out.parent / source / "ci-receipts/logs")
             result = self.retain(root)
             self.assertEqual((out / "ci.exit").read_text(), f"{ci_exit}\n")
             self.assertEqual(
@@ -526,14 +611,102 @@ class GateRetentionControls(unittest.TestCase):
         gate = self.gate_receipts(files, ci_exit=result.returncode)
         self.assertEqual(gate.returncode, 0, gate.stderr)
 
+    def test_server_only_gate_retains_and_replays_junit_without_doctests(self):
+        result, receipt, original = self.run_ci(
+            gate_run="original", selection="sparkles-server"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(receipt["selection_packages"], "sparkles-server")
+        self.assertEqual(receipt["status"], "retained", receipt)
+        gate = self.gate_receipts(original)
+        self.assertEqual(gate.returncode, 0, gate.stderr)
+        replayed = self.reuse(original, selection="sparkles-server")
+        gate = self.gate_receipts(replayed, original)
+        self.assertEqual(gate.returncode, 0, gate.stderr)
+
+    @unittest.skipUnless(shutil.which("mise"), "needs mise for actual cache replay")
+    def test_real_mise_replays_an_attested_server_only_gate_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.check_real_mise_replay(Path(directory))
+
+    def check_real_mise_replay(self, root):
+        self.prepare_ci_fixture(root, real_mise=True)
+        runs = {}
+        for name, gate_run, copy_error in (
+            ("standalone", "", False),
+            ("capture-error", "first", True),
+            ("original", "original", False),
+            ("replayed", "current", False),
+        ):
+            runs[name] = self.run_ci_fixture(
+                root,
+                gate_run=gate_run,
+                copy_error=copy_error,
+                selection="sparkles-server",
+            )
+        result, receipt, standalone = runs["standalone"]
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt["status"], "retained")
+        self.assertNotIn(b"sparkles-gate-junit-v1", standalone["logs/test.log"])
+        result, receipt, _ = runs["capture-error"]
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(receipt["status"], "error")
+        result, receipt, original = runs["original"]
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt["status"], "retained", original["logs/test.log"])
+        manifest_hash = sha256(original["junit/manifest.json"]).hexdigest()
+        marker = f"sparkles-gate-junit-v1 original {manifest_hash}".encode()
+        result, receipt, replayed = runs["replayed"]
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(receipt["status"], "reused", replayed["logs/test.log"])
+        self.assertEqual(
+            receipt["reused_from"], {"run": "original", "manifest_sha256": manifest_hash}
+        )
+        for files in (original, replayed):
+            self.assertEqual(
+                [
+                    line
+                    for line in files["logs/test.log"].splitlines()
+                    if line.startswith(b"sparkles-gate-junit-v1 ")
+                ],
+                [marker],
+            )
+        fresh_gate = self.gate_receipts(original)
+        reused_gate = self.gate_receipts(replayed, original)
+        self.assertEqual(fresh_gate.returncode, 0, fresh_gate.stderr)
+        self.assertEqual(reused_gate.returncode, 0, reused_gate.stderr)
+        return runs
+
+    def test_gate_with_no_changed_packages_needs_no_origin(self):
+        result, receipt, files = self.run_ci(gate_run="current", selection="none")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(receipt["status"], "not-applicable")
+        self.assertNotIn(b"sparkles-gate-junit-v1", files["logs/test.log"])
+        gate = self.gate_receipts(files)
+        self.assertEqual(gate.returncode, 0, gate.stderr)
+
+    def test_gate_origin_capture_error_fails_task_and_preserves_diagnostic(self):
+        result, receipt, files = self.run_ci(gate_run="current", copy_error=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(receipt["task_exit"], 1)
+        self.assertEqual(receipt["status"], "error")
+        self.assertIn(".staging", receipt["error"])
+        self.assertIn(b"JUnit retention cache-origin:", files["junit-retention.log"])
+        self.assertNotIn(b"JUnit retention after:", files["junit-retention.log"])
+        self.assertNotIn(b"sparkles-gate-junit-v1", files["logs/test.log"])
+        gate = self.gate_receipts(files, ci_exit=result.returncode)
+        self.assertEqual(gate.returncode, 1)
+
     def test_copy_failure_is_not_hidden(self):
         _, _, files = self.run_ci(gate_run="current")
         gate = self.gate_receipts(files, copy_error=True)
         self.assertEqual(gate.returncode, 1)
 
-    def reuse(self, source_files):
+    def reuse(self, source_files, *, selection="all"):
         result, receipt, files = self.run_ci(
-            gate_run="current", replayed_log=source_files["logs/test.log"].decode()
+            gate_run="current",
+            selection=selection,
+            replayed_log=source_files["logs/test.log"].decode(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(receipt["status"], "reused")
@@ -552,6 +725,12 @@ class GateRetentionControls(unittest.TestCase):
                 gate = self.gate_receipts(files, original, archive=archive)
                 self.assertEqual(gate.returncode, 0, gate.stderr)
 
+    def test_reused_gate_refuses_a_symlinked_log_directory(self):
+        _, _, original = self.run_ci(gate_run="original")
+        gate = self.gate_receipts(self.reuse(original), original, linked_logs=True)
+        self.assertEqual(gate.returncode, 1)
+        self.assertIn("test log directory is a symlink", gate.stderr)
+
     def test_reused_gate_refuses_missing_or_changed_original_evidence(self):
         _, _, original = self.run_ci(gate_run="original")
         files = self.reuse(original)
@@ -565,10 +744,26 @@ class GateRetentionControls(unittest.TestCase):
                     invalid = dict(original)
                     if delete:
                         del invalid[name]
+                    elif name == "junit/manifest.json":
+                        invalid[name] += b" "
                     else:
-                        invalid[name] += b"changed"
+                        substitutions = (
+                            (b'failures="0"', b'failures="1"')
+                            if name.endswith(".xml")
+                            else (b'"fixture"', b'"altered"')
+                        )
+                        invalid[name] = invalid[name].replace(*substitutions)
+                        self.assertNotEqual(invalid[name], original[name])
+                        self.assertEqual(len(invalid[name]), len(original[name]))
                     gate = self.gate_receipts(files, invalid)
                     self.assertEqual(gate.returncode, 1, gate.stderr)
+                    if not delete:
+                        message = (
+                            "JUnit origin manifest is missing or differs"
+                            if name == "junit/manifest.json"
+                            else "retained bytes differ:"
+                        )
+                        self.assertIn(message, gate.stderr)
         gate = self.gate_receipts(files)
         self.assertIn("JUnit origin manifest is missing or differs", gate.stderr)
 

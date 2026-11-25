@@ -996,7 +996,8 @@ normal test report, rather than every intermediate report from the feature matri
 `ci.exit` keeps the original CI result. The separate `ci-receipts.exit` fails if a
 selected Rust task has no retained report or evidence cannot be copied and verified.
 Not-selected tasks, tasks that never started and selections with no Rust packages are
-recorded separately. No replacement XML is generated for a missing report.
+recorded separately. No replacement XML is generated for a missing report. Compiler
+cache directories are not a store for validation evidence.
 
 When mise reuses a passing Rust test task, its replayed log names the gate run that
 produced the report and gives the hash of that run's JUnit manifest. The current
@@ -1005,7 +1006,10 @@ manifest, its passing test result and the hashes of its retained files on the CI
 At least one report must have been created or changed during the source test task.
 The check looks in archived output if the gate name has since been used again. A missing
 or changed source still fails evidence retention even when the cached task passes.
-The gate does not rerun that task automatically.
+The gate does not rerun that task automatically. Use `gate.sh --full <rev>` to run
+the checks again if a cached pass has an invalid origin. An error while recording the
+origin fails the gate's test task before mise caches a pass. Custom gate run names
+must start with a letter, digit, underscore or hyphen for JUnit origin recording.
 
 `scripts/ci.sh` runs on the primary host, which is `GATE_PRIMARY` or the first gate host.
 When the batch needs a conformance step, the steps run on a second gate host for the same
@@ -1200,8 +1204,10 @@ and the commit to the checks it calls for, and writes the choice and its reasons
 
 The run then calls `scripts/ci.sh` without `--force`, with the chosen tasks and with
 `--changed` when the packages are not the whole workspace, so mise's task cache on that
-host skips a chosen check whose inputs already passed there. The conformance steps that
-the selection leaves out appear in `steps.txt` as skipped. A commit without
+host skips a chosen check whose inputs already passed there. The gate's `test` task
+reuses only earlier gate passes on that host. Changes to the JUnit retention script
+invalidate those passes because it writes the cached origin line. The conformance steps
+that the selection leaves out appear in `steps.txt` as skipped. A commit without
 `select-checks.py`, or a run without a base, runs every check without `--force`. The Rust
 tests of the ci half also run the W3C, SHACL and ShEx suites whenever their packages are
 chosen, since the gate sets the suites' directories, so the conformance steps add the

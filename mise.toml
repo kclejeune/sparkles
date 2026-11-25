@@ -497,11 +497,12 @@ exit $rc
   '''
 set -e
 pkgs=$(python3 scripts/changed-crates.py --cargo-args --doc)
-[ "$pkgs" != none ] || exit 0
-if [ "$(uname -s)" = Darwin ]; then ulimit -c 0; fi
-mbx test $pkgs --doc
+if [ "$pkgs" != none ]; then
+  if [ "$(uname -s)" = Darwin ]; then ulimit -c 0; fi
+  mbx test $pkgs --doc
+fi
 if [ -n "${SPARKLES_CI_GATE_RUN:-}" ]; then
-  python3 scripts/ci-retain-junit.py cache-origin 2>> .artifacts/ci/junit-retention.log || true
+  python3 scripts/ci-retain-junit.py cache-origin 2>> .artifacts/ci/junit-retention.log
 fi
 ''',
 ]
