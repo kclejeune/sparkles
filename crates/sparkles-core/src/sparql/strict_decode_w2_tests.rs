@@ -1055,15 +1055,17 @@ fn group_accumulators_and_rows_aggregates_strict_decode() {
 
     // Also test the per-group Rows kernel (incremental_group = false) for MIN, SUM, GROUP_CONCAT.
     for (label, ctrl_q, tgt_q) in &cases[..5] {
-        let mut opt = super::Optimizations::default();
-        opt.incremental_group = false;
+        let opt = super::Optimizations {
+            incremental_group: false,
+            ..Default::default()
+        };
         let ctrl_res = super::query(
             store.snapshot(),
             ctrl_q,
             &QueryOptions {
                 max_memory_bytes: Some(budget),
                 no_cache: true,
-                optimizations: Some(opt.clone()),
+                optimizations: Some(opt),
                 ..QueryOptions::default()
             },
         );
@@ -1113,6 +1115,179 @@ fn group_accumulators_and_rows_aggregates_strict_decode() {
         mc_tgt,
         mc_budget,
         "GROUP_CONCAT mid-chunk",
+        false,
+    );
+}
+
+// =========================================================================
+// T9: GeoSPARQL execution operators, GeoMemo, spatialF, join, rewrite, search
+// =========================================================================
+
+#[cfg(feature = "geo")]
+#[test]
+fn geo_execution_operators_and_spatialf_strict_decode() {
+    let pad = " ".repeat(32 * 1024);
+    let big_wkt = format!("{pad}POINT(1 2)");
+    // Keep geo:asWKT geometries short in `store` so spatial:nearbyGeom's control
+    // query scans only short indexable geometries while ex:q_big tests bound-arg
+    // decoding (and `big_rewrite_store` below tests geo:asWKT scan/rewrite paths).
+    let ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix geo: <http://www.opengis.net/ont/geosparql#> .\n\
+         ex:f_small geo:hasGeometry ex:g_small .\n\
+         ex:g_small geo:asWKT \"POINT(1 2)\"^^geo:wktLiteral .\n\
+         ex:f_small2 geo:hasGeometry ex:g_small2 .\n\
+         ex:g_small2 geo:asWKT \"POINT(1 2)\"^^geo:wktLiteral .\n\
+         ex:q_small ex:wkt \"POINT(1 2)\"^^geo:wktLiteral .\n\
+         ex:q_big ex:wkt \"{big_wkt}\"^^geo:wktLiteral .\n"
+    );
+    let store = store_with_turtle(&ttl, true);
+    let big_id = store
+        .snapshot()
+        .lookup_term(&Term::Literal(Literal::new_typed_literal(
+            &big_wkt,
+            oxrdf::NamedNode::new_unchecked(crate::geo::vocab::WKT_LITERAL),
+        )))
+        .expect("big WKT literal interned");
+    assert_eq!(big_id.tag(), Tag::Vocab);
+
+    // 1. GeoMemo::by_id_checked & by_id refuse under tight budget and NEVER cache None!
+    {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 16 * 1024;
+        assert_memory_budget_error(
+            crate::geo::memo::by_id_checked(&ctx, big_id),
+            "GeoMemo::by_id_checked refuses oversized WKT",
+        );
+        // Raise budget on the SAME ctx and retry: must parse and return Some(geom),
+        // proving refusal was NOT negatively cached in GeoMemo!
+        ctx.mem_limit = MIB;
+        let geom = crate::geo::memo::by_id_checked(&ctx, big_id)
+            .expect("retry after raising budget succeeds")
+            .expect("valid WKT parses on retry");
+        assert!(!geom.empty);
+    }
+    {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 16 * 1024;
+        assert!(crate::geo::memo::by_id(&ctx, big_id, None).is_err());
+        assert_memory_budget_error(
+            ctx.check(),
+            "GeoMemo::by_id latches memory refusal onto ctx",
+        );
+    }
+
+    let budget = 64 * 1024;
+
+    // 2. spatialF:transformSRS, geof:envelope, spatial:nearbyGeom, geo join Side::of_table
+    let sf_cases: &[(&str, &str, &str)] = &[
+        (
+            "spatialF:transformSRS",
+            "PREFIX ex: <http://example.org/> \
+             PREFIX spatialF: <http://jena.apache.org/function/spatial#> \
+             SELECT ?out WHERE { ex:q_small ex:wkt ?g . BIND(spatialF:transformSRS(?g, <http://www.opengis.net/def/crs/EPSG/0/4326>) AS ?out) }",
+            "PREFIX ex: <http://example.org/> \
+             PREFIX spatialF: <http://jena.apache.org/function/spatial#> \
+             SELECT ?out WHERE { ex:q_big ex:wkt ?g . BIND(spatialF:transformSRS(?g, <http://www.opengis.net/def/crs/EPSG/0/4326>) AS ?out) }",
+        ),
+        (
+            "geof:envelope",
+            "PREFIX ex: <http://example.org/> \
+             PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+             SELECT ?out WHERE { ex:q_small ex:wkt ?g . BIND(geof:envelope(?g) AS ?out) }",
+            "PREFIX ex: <http://example.org/> \
+             PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+             SELECT ?out WHERE { ex:q_big ex:wkt ?g . BIND(geof:envelope(?g) AS ?out) }",
+        ),
+        (
+            "spatial:nearbyGeom bound arg",
+            "PREFIX ex: <http://example.org/> \
+             PREFIX spatial: <http://jena.apache.org/spatial#> \
+             SELECT ?f WHERE { ex:q_small ex:wkt ?g . ?f spatial:nearbyGeom (?g 1000 <http://www.opengis.net/def/uom/OGC/1.0/metre>) }",
+            "PREFIX ex: <http://example.org/> \
+             PREFIX spatial: <http://jena.apache.org/spatial#> \
+             SELECT ?f WHERE { ex:q_big ex:wkt ?g . ?f spatial:nearbyGeom (?g 1000 <http://www.opengis.net/def/uom/OGC/1.0/metre>) }",
+        ),
+        (
+            "geo join Side::of_table",
+            "PREFIX ex: <http://example.org/> \
+             PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+             SELECT ?g1 ?g2 WHERE { ex:q_small ex:wkt ?g1 . ex:q_small ex:wkt ?g2 . FILTER(geof:sfIntersects(?g1, ?g2)) }",
+            "PREFIX ex: <http://example.org/> \
+             PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \
+             SELECT ?g1 ?g2 WHERE { ex:q_small ex:wkt ?g1 . ex:q_big ex:wkt ?g2 . FILTER(geof:sfIntersects(?g1, ?g2)) }",
+        ),
+    ];
+
+    for (label, ctrl_q, tgt_q) in sf_cases {
+        run_select_both_modes(&store, ctrl_q, budget, label, true);
+        run_select_both_modes(&store, tgt_q, budget, label, false);
+    }
+
+    // 3. geo/rewrite (geo:sfIntersects topological property rewrite) & geo/search fallback:
+    let small_ttl = "@prefix ex: <http://example.org/> .\n\
+        @prefix geo: <http://www.opengis.net/ont/geosparql#> .\n\
+        ex:f1 geo:hasDefaultGeometry ex:g1 .\n\
+        ex:g1 geo:asWKT \"POINT(1 2)\"^^geo:wktLiteral .\n\
+        ex:f2 geo:hasDefaultGeometry ex:g2 .\n\
+        ex:g2 geo:asWKT \"POINT(1 2)\"^^geo:wktLiteral .\n";
+    let small_store = store_with_turtle(small_ttl, true);
+    small_store.pause_geo_build(true);
+    small_store
+        .enable_geo(crate::geo::GeoConfig {
+            query_rewrite: true,
+            ..crate::geo::GeoConfig::default()
+        })
+        .unwrap();
+    let big_rewrite_ttl = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix geo: <http://www.opengis.net/ont/geosparql#> .\n\
+         ex:f1 geo:hasDefaultGeometry ex:g1 .\n\
+         ex:g1 geo:asWKT \"POINT(1 2)\"^^geo:wktLiteral .\n\
+         ex:f2 geo:hasDefaultGeometry ex:g2 .\n\
+         ex:g2 geo:asWKT \"{big_wkt}\"^^geo:wktLiteral .\n"
+    );
+    let big_rewrite_store = store_with_turtle(&big_rewrite_ttl, true);
+    big_rewrite_store.pause_geo_build(true);
+    big_rewrite_store
+        .enable_geo(crate::geo::GeoConfig {
+            query_rewrite: true,
+            ..crate::geo::GeoConfig::default()
+        })
+        .unwrap();
+    let rewrite_q = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> \
+        SELECT ?a ?b WHERE { ?a geo:sfIntersects ?b }";
+    run_select_both_modes(
+        &small_store,
+        rewrite_q,
+        budget,
+        "geo:sfIntersects rewrite",
+        true,
+    );
+    run_select_both_modes(
+        &big_rewrite_store,
+        rewrite_q,
+        budget,
+        "geo:sfIntersects rewrite",
+        false,
+    );
+
+    // 4. geo/search fallback (Literals::entry) on store containing oversized geo:asWKT:
+    let search_q = "PREFIX spatial: <http://jena.apache.org/spatial#> \
+        PREFIX geo: <http://www.opengis.net/ont/geosparql#> \
+        SELECT ?f WHERE { ?f spatial:nearbyGeom (\"POINT(1 2)\"^^geo:wktLiteral 1000 <http://www.opengis.net/def/uom/OGC/1.0/metre>) }";
+    run_select_both_modes(
+        &small_store,
+        search_q,
+        budget,
+        "geo/search fallback Literals::entry",
+        true,
+    );
+    run_select_both_modes(
+        &big_rewrite_store,
+        search_q,
+        budget,
+        "geo/search fallback Literals::entry",
         false,
     );
 }

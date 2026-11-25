@@ -429,13 +429,15 @@ impl Head {
                             bytes = bytes.saturating_add(slots_bytes);
                             charge.cover(bytes, step)?;
                             let mut col = Vec::with_capacity(len);
-                            let crate::sparql::exprcache::Column::Rows { vals, _charge } =
-                                evaluated
+                            let crate::sparql::exprcache::Column::Rows {
+                                vals: raw_vals,
+                                _charge,
+                            } = evaluated
                             else {
                                 unreachable!("key_rows_charged always returns Column::Rows");
                             };
                             let _eval_charge = _charge;
-                            let vals = vals;
+                            let vals = raw_vals;
                             for (row, val) in vals.into_iter().enumerate() {
                                 if row.is_multiple_of(1024) {
                                     ctx.check()?;

@@ -352,6 +352,7 @@ impl Side {
             return Ok(s);
         };
         // literal → its item (u32::MAX: no geometry)
+        let seen_charge = ctx.charge(0)?;
         let mut seen: FxHashMap<Id, u32> = FxHashMap::default();
         for i in 0..s.table.len() {
             if i % CHECK_CANDIDATES as usize == 0 {
@@ -361,26 +362,35 @@ impl Side {
             if id.is_undef() {
                 continue;
             }
-            let item = *seen.entry(id).or_insert_with(|| {
-                let g = super::memo::by_id(ctx, id, None).ok();
-                match g.as_ref().and_then(|g| item_box(g)) {
+            let item = if let Some(&cached) = seen.get(&id) {
+                cached
+            } else {
+                let g = super::memo::by_id_checked(ctx, id)?;
+                let idx = match g.as_ref().and_then(|g| item_box(g)) {
                     Some(b) => {
+                        seen_charge.add(128)?;
                         s.items.push(JoinItem {
                             row: s.items.len() as u32,
                             id,
                             bbox84: b,
-                            geom: g.unwrap(),
+                            geom: g.expect("checked Some"),
                         });
                         s.rows.push(Vec::new());
                         (s.items.len() - 1) as u32
                     }
                     None => u32::MAX,
-                }
-            });
+                };
+                seen_charge.add(32)?;
+                seen.insert(id, idx);
+                idx
+            };
             if item != u32::MAX {
                 s.rows[item as usize].push(i as u32);
             }
         }
+        drop(seen);
+        drop(seen_charge);
+        ctx.check()?;
         Ok(s)
     }
 
@@ -695,20 +705,38 @@ pub fn spatial_join(
     if !spec.filter.is_empty() {
         use crate::sparql::expr::{Row, ebv};
         let map = t.var_map(ctx.nvars());
-        let keep: Vec<bool> = (0..t.len())
-            .map(|i| {
-                let row = Row {
-                    table: &t,
-                    i,
-                    map: &map,
-                    dec: None,
-                    exists: None,
-                };
-                spec.filter
-                    .iter()
-                    .all(|e| ebv(e, &row, ctx).unwrap_or(false))
-            })
-            .collect();
+        let mut keep = Vec::with_capacity(t.len());
+        for i in 0..t.len() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let row = Row {
+                table: &t,
+                i,
+                map: &map,
+                dec: None,
+                exists: None,
+            };
+            let mut ok = true;
+            for e in &spec.filter {
+                match ebv(e, &row, ctx) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        ok = false;
+                        break;
+                    }
+                    Err(_) => {
+                        if ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            keep.push(ok);
+        }
+        ctx.check()?;
         t.filter_rows(&keep);
     }
     let mut c = Counters::new();

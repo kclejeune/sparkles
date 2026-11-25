@@ -5512,7 +5512,7 @@ fn unfold(
             ctx.check()?;
             ctx.check_output(out.len(), out.width())?;
         }
-        if !seen.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(id) {
             let decode = ctx.charge(0)?;
             let entry = match ctx.term_checked_into(id, &decode)? {
                 Some(t) => match super::cdt::unfold(&t) {
@@ -5536,7 +5536,7 @@ fn unfold(
                 .map_or(0, |p| (p.len() as u64).saturating_mul(16))
                 .saturating_add(64);
             seen_charge.add(entry_bytes)?;
-            seen.insert(id, entry);
+            e.insert(entry);
         }
         let elems = &seen[&id];
         row.clear();

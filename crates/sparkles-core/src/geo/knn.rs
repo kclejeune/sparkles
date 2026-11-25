@@ -120,22 +120,38 @@ impl Runner<'_, '_> {
             self.runs.push(info);
         }
         let map = res.var_map(self.ctx.nvars());
-        let keys = (0..res.len())
-            .map(|i| {
-                let row = Row {
-                    table: res,
-                    i,
-                    map: &map,
-                    dec: None,
-                    exists: None,
-                };
-                eval(&spec.order, &row, self.ctx)
-                    .ok()
-                    .and_then(|v| v.value(self.ctx).ok())
-                    .as_ref()
-                    .and_then(number)
-            })
-            .collect::<Vec<_>>();
+        let mut keys = Vec::with_capacity(res.len());
+        for i in 0..res.len() {
+            if i.is_multiple_of(1024) {
+                self.ctx.check()?;
+            }
+            let row = Row {
+                table: res,
+                i,
+                map: &map,
+                dec: None,
+                exists: None,
+            };
+            let k = match eval(&spec.order, &row, self.ctx) {
+                Ok(v) => match v.value(self.ctx) {
+                    Ok(val) => number(&val),
+                    Err(_) => {
+                        if self.ctx.has_memory_failure() {
+                            self.ctx.check()?;
+                        }
+                        None
+                    }
+                },
+                Err(_) => {
+                    if self.ctx.has_memory_failure() {
+                        self.ctx.check()?;
+                    }
+                    None
+                }
+            };
+            keys.push(k);
+        }
+        self.ctx.check()?;
         self.keyed += keys.len() as u64;
         let projected = input.project(self.ctx, self.vars)?;
         self.out.append_copy(self.ctx, &projected)?;
@@ -278,7 +294,7 @@ fn rows_without_distance(
         op_vertices: ctx.geo.op_vertices(),
         crs: FxHashMap::default(),
     };
-    let mut rechecked = Rechecked::new(snap);
+    let mut rechecked = Rechecked::new(ctx);
     // literal → whether its distance is an error
     let mut memo: FxHashMap<u64, bool> = FxHashMap::default();
     let mut out = Vec::new();
@@ -310,24 +326,28 @@ fn rows_without_distance(
         if subj.is_some_and(|x| x != s) {
             return Ok(());
         }
-        let bad = *memo.entry(o.0).or_insert_with(|| {
-            if !matches!(o.tag(), Tag::Vocab | Tag::Delta) {
-                return true;
-            }
-            let slot = base
-                .as_ref()
-                .and_then(|b| b.column.get(o.0))
-                .unwrap_or_else(|| match snap.key(o) {
-                    Some(key) => classify(&key, &cfg),
-                    None => Slot::Other,
-                });
-            let geom = match slot {
-                Slot::Geom(e) => e.geom(snap).ok(),
-                s if s.rechecked() => rechecked.entry(o.0).and_then(|e| e.geom(snap).ok()),
-                _ => None,
+        let bad = if let Some(&cached) = memo.get(&o.0) {
+            cached
+        } else {
+            let is_bad = if !matches!(o.tag(), Tag::Vocab | Tag::Delta) {
+                true
+            } else {
+                let slot = match base.as_ref().and_then(|b| b.column.get(o.0)) {
+                    Some(slot) => slot,
+                    None => ctx
+                        .with_controlled_key(o, |key| Ok(classify(key, &cfg)))?
+                        .unwrap_or(Slot::Other),
+                };
+                let geom = match slot {
+                    Slot::Geom(e) => e.geom(snap).ok(),
+                    s if s.rechecked() => rechecked.entry(o.0)?.and_then(|e| e.geom(snap).ok()),
+                    _ => None,
+                };
+                geom.is_none_or(|g| !test.measurable(&g))
             };
-            geom.is_none_or(|g| !test.measurable(&g))
-        });
+            memo.insert(o.0, is_bad);
+            is_bad
+        };
         if bad {
             out.push([s, o, g.unwrap_or(Id::DEFAULT_GRAPH)]);
         }
