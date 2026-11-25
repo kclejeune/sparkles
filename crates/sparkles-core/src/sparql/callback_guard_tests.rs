@@ -96,6 +96,7 @@ pub(super) fn prepare_unconfigured(parsed: &Query, mut ctx: Ctx, cursor: bool) -
         bound: Vec::new(),
         kind: QueryKind::Select,
         plan_depth,
+        _rewrite_guard: None,
     }
 }
 

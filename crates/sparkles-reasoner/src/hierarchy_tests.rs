@@ -708,3 +708,886 @@ fn session_payloads_drop_before_parent_credit() {
     drop(session);
     assert_eq!(owned.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn cached_diagnostic_summary_releases_credit_outside_cache_lock() {
+    use sparkles_budget::MemoryDomain;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    let store = Store::in_memory(StoreOptions::default());
+    // 256 KiB literal: term_controlled charges key.len() * 8 + 256 (> 2 MiB),
+    // exceeding PARENT_SLACK + PARENT_STEP so Budget::trim() fires on drop.
+    let big = "z".repeat(256 * 1024);
+    load_turtle(&store, &format!("<urn:item> <urn:value> \"{big}\" ."));
+    let cache = Arc::new(crate::Cache::default());
+    let profile = crate::Profile::Rules(
+        "[type: (?x <urn:value> ?v) -> (?v <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#integer>)]"
+            .into(),
+    );
+    crate::materialize_incremental(
+        &store,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions::default(),
+    )
+    .unwrap();
+    assert!(cache.kept().is_some());
+
+    let owned = Arc::new(AtomicU64::new(0));
+    let releases = Arc::new(AtomicUsize::new(0));
+    let cleared = Arc::new(AtomicBool::new(false));
+    let take = owned.clone();
+    let give = owned.clone();
+    let rel_count = releases.clone();
+    let cache_cb = cache.clone();
+    let did_clear = cleared.clone();
+    let domain = MemoryDomain::new();
+    let parent = domain.parent(
+        move |n| {
+            take.fetch_add(n, Ordering::SeqCst);
+            Ok(())
+        },
+        move |n| {
+            give.fetch_sub(n, Ordering::SeqCst);
+            rel_count.fetch_add(1, Ordering::SeqCst);
+            // Must not deadlock: cache.kept mutex is unlocked during decode & release.
+            let _ = cache_cb.kept();
+            if !did_clear.swap(true, Ordering::SeqCst) {
+                cache_cb.clear();
+            }
+        },
+    );
+
+    let controls = crate::diagnostics::DiagnosticControls {
+        memory_parent: Some(parent),
+        ..Default::default()
+    };
+    let typings =
+        crate::literal_typings_controlled(&store, store.snapshot().commit, Some(&cache), &controls)
+            .unwrap()
+            .expect("cached summary");
+    assert_eq!(typings.facts.len(), 1);
+    assert!(
+        releases.load(Ordering::SeqCst) >= 1,
+        "expected Budget::trim() release callback to fire during decode"
+    );
+    assert!(
+        cleared.load(Ordering::SeqCst) && cache.kept().is_none(),
+        "release callback must be able to call cache.clear() without deadlock"
+    );
+    assert!(
+        owned.load(Ordering::SeqCst) > 0,
+        "returned LiteralTypings must retain credit until dropped"
+    );
+    drop(typings);
+    assert_eq!(owned.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn cold_incremental_rules_memory_refusal_does_not_poison_cache() {
+    use sparkles_budget::{MemoryDomain, ParentRefused, Scope};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    let store = Store::in_memory(StoreOptions::default());
+    load_turtle(
+        &store,
+        "@prefix ex: <http://ex.org/> .
+         ex:a ex:edge ex:b .",
+    );
+    // Unique relation program so its digest is cold in INCREMENTAL_RULES.
+    let profile = crate::Profile::Rules(
+        "[r1: (?x <http://ex.org/edge> ?y) -> rel_cold_675_poison(?x, ?y)]
+         [r2: rel_cold_675_poison(?x, ?y) -> (?x <http://ex.org/reach> ?y)]"
+            .into(),
+    );
+    let cache = crate::Cache::default();
+    let pool = QueryPool::new((16 * MIB) as u64);
+    let r1 = crate::materialize_incremental(
+        &store,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(pool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let c1 = r1.receipt.expect("commit receipt").commit.seq;
+    assert_eq!(pool.granted(), 0);
+
+    // Trigger incremental update with a parent that lets Terms::new_in succeed on the
+    // first reservation chunk, then refuses subsequent growth inside RunRules::new.
+    load_turtle(&store, "@prefix ex: <http://ex.org/> . ex:b ex:edge ex:c .");
+    let domain = MemoryDomain::new();
+    let reserves = Arc::new(AtomicUsize::new(0));
+    let owned = Arc::new(AtomicU64::new(0));
+    let res_n = reserves.clone();
+    let take = owned.clone();
+    let give = owned.clone();
+    // Allow only 1 byte past Terms' fixed initial reservation, refusing lowering/relation_part.
+    let parent = domain.parent(
+        move |n| {
+            let call = res_n.fetch_add(1, Ordering::SeqCst);
+            if call >= 1 {
+                return Err(ParentRefused::Limit {
+                    limit: 64 * 1024,
+                    requested: n,
+                    scope: Scope::Work,
+                });
+            }
+            take.fetch_add(n, Ordering::SeqCst);
+            Ok(())
+        },
+        move |n| {
+            give.fetch_sub(n, Ordering::SeqCst);
+        },
+    );
+    let err = crate::materialize_incremental(
+        &store,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: Some(c1),
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            max_memory: Some(16 * MIB),
+            memory_parent: Some(parent),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(is_server_memory_anyhow(&err), "unexpected error: {err:#}");
+    assert_eq!(owned.load(Ordering::SeqCst), 0);
+
+    // Retry the exact same digest with ample memory: must remain incrementally eligible.
+    let r2 = crate::materialize_incremental(
+        &store,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: Some(c1),
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(pool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        r2.method,
+        crate::Method::Incremental,
+        "transient memory refusal must not poison incremental rule capability"
+    );
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn owl_ql_tbox_hit_combined_budget_and_rewritten_guard_stay_charged() {
+    use sparkles_core::sparql::reasoning::{ReasoningProvider, SessionRequest};
+
+    let store = Store::in_memory(StoreOptions::default());
+    let mut onto = String::from(
+        "@prefix ex: <http://ex.org/> .
+         @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:A a owl:Class .
+         ex:p a owl:ObjectProperty .
+         ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ; owl:someValuesFrom owl:Thing ] .\n",
+    );
+    for i in 0..80 {
+        onto.push_str(&format!(
+            "ex:SubClassLongName_{i:03}_{} a owl:Class ; rdfs:subClassOf ex:A .\n",
+            "x".repeat(400)
+        ));
+    }
+    load_turtle(&store, &onto);
+
+    let pool = QueryPool::new((64 * MIB) as u64);
+    let ql = crate::query::QueryReasoner::new(
+        crate::Profile::OwlQl,
+        &crate::Extras::default(),
+        crate::Inputs::default(),
+    )
+    .unwrap()
+    .with_pool(pool.clone());
+
+    // 1. Warm the TBOXES cache (no_cache: false), then verify cache hit still admits budget.
+    crate::qlrewrite::clear();
+    let warm_req = SessionRequest {
+        snap: store.snapshot(),
+        readable: None,
+        stop: Arc::new(|| Ok(())),
+        max_memory: Some((16 * MIB) as u64),
+        memory_parent: Some(pool.work_parent()),
+        no_cache: false,
+    };
+    let tbox = ql.owl_ql_tbox(&warm_req).unwrap().expect("ql tbox");
+    assert_eq!(pool.granted(), 0);
+    drop(tbox);
+
+    let tight_hit = QueryPool::new(1024);
+    let hit_err = ql
+        .owl_ql_tbox(&SessionRequest {
+            snap: store.snapshot(),
+            readable: None,
+            stop: Arc::new(|| Ok(())),
+            max_memory: Some((16 * MIB) as u64),
+            memory_parent: Some(tight_hit.work_parent()),
+            no_cache: false,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            hit_err,
+            sparkles_core::Error::BudgetExceeded(sparkles_core::Budget {
+                kind: sparkles_core::BudgetKind::ServerMemory,
+                ..
+            })
+        ),
+        "warmed TBox cache hit must still be admitted: {hit_err:?}"
+    );
+    assert_eq!(tight_hit.granted(), 0);
+
+    // 2. Rewritten with non-zero copied algebra retains pool credit until Rewritten drops.
+    let long = "v".repeat(64 * 1024);
+    let parsed = spargebra::SparqlParser::new()
+        .parse_query(&format!(
+            "PREFIX ex: <http://ex.org/> ASK {{ ?{long} ex:p ?o . ex:a ex:p ?o }}"
+        ))
+        .unwrap();
+    let rw_req = SessionRequest {
+        snap: store.snapshot(),
+        readable: None,
+        stop: Arc::new(|| Ok(())),
+        max_memory: Some((16 * MIB) as u64),
+        memory_parent: Some(pool.work_parent()),
+        no_cache: false,
+    };
+    let rewritten = ql
+        .rewrite(&parsed, &[], &rw_req)
+        .unwrap()
+        .expect("rewritten");
+    let live_copies = pool.granted();
+    assert!(
+        live_copies > 0,
+        "Rewritten must keep copies_held charged while alive"
+    );
+    drop(rewritten);
+    assert_eq!(pool.granted(), 0);
+
+    // 3. Cold TBox + rewrite combined live bytes exceeding budget must refuse.
+    // TBox (~70 KiB) fits alone and copies_held (~65 KiB) fits alone under 110 KiB,
+    // while both live simultaneously exceed 110 KiB.
+    crate::qlrewrite::clear();
+    let combined_cap = 110 * 1024u64;
+    let combined_pool = QueryPool::new(combined_cap);
+    let combined_err = ql
+        .rewrite(
+            &parsed,
+            &[],
+            &SessionRequest {
+                snap: store.snapshot(),
+                readable: None,
+                stop: Arc::new(|| Ok(())),
+                max_memory: Some((16 * MIB) as u64),
+                memory_parent: Some(combined_pool.work_parent()),
+                no_cache: true,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            combined_err,
+            sparkles_core::Error::BudgetExceeded(sparkles_core::Budget {
+                kind: sparkles_core::BudgetKind::ServerMemory,
+                ..
+            })
+        ),
+        "combined cold TBox + rewrite must refuse under tight pool: {combined_err:?}"
+    );
+    assert_eq!(combined_pool.granted(), 0);
+}
+
+#[test]
+fn retained_cache_replacement_avoids_double_peak_and_clears_stale() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from(
+        "@prefix ex: <http://ex.org/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:A rdfs:subClassOf ex:B .
+         ex:B rdfs:subClassOf ex:C .\n",
+    );
+    for i in 0..500 {
+        ttl.push_str(&format!("ex:x{i} a ex:A .\n"));
+    }
+    load_turtle(&store, &ttl);
+
+    // Measure single closure retained reservation.
+    let probe_pool =
+        QueryPool::with_retained_capacity((16 * MIB) as u64, (8 * MIB) as u64).unwrap();
+    let probe_cache =
+        crate::Cache::new(100_000).with_retained_parent(Some(probe_pool.retained_parent()));
+    crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&probe_cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(probe_pool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let one_retained = probe_pool.domain_stats().retained_reserved;
+    assert!(one_retained > 0);
+    probe_cache.clear();
+
+    // Retained capacity fits 1 closure (+ 1 step margin) but strictly less than 2 closures.
+    let cap = one_retained + (one_retained / 2).max(64 * 1024);
+    assert!(cap < one_retained * 2);
+    let rpool = QueryPool::with_retained_capacity((16 * MIB) as u64, cap).unwrap();
+    let rcache = crate::Cache::new(100_000).with_retained_parent(Some(rpool.retained_parent()));
+
+    let r1 = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&rcache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(rpool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let c1 = r1.receipt.unwrap().commit.seq;
+    assert_eq!(rcache.kept().unwrap().1, c1);
+
+    // Second consecutive full materialization (since: None) replaces the kept closure
+    // without hitting a 2x retained-pool peak.
+    load_turtle(&store, "@prefix ex: <http://ex.org/> . ex:extra a ex:A .");
+    let r2 = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&rcache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(rpool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let c2 = r2.receipt.unwrap().commit.seq;
+    assert_ne!(c1, c2);
+    assert_eq!(
+        rcache.kept().map(|(_, seq)| seq),
+        Some(c2),
+        "second materialization must replace stale kept closure within 1x retained capacity"
+    );
+    let stats = rpool.domain_stats();
+    assert_eq!(stats.work_reserved, 0);
+    assert!(stats.retained_reserved > 0 && stats.retained_reserved <= cap);
+    rcache.clear();
+    let after = rpool.domain_stats();
+    assert_eq!((after.work_reserved, after.retained_reserved), (0, 0));
+}
+
+#[test]
+fn take_for_uses_single_reservation_and_preserves_generalized_on_refusal() {
+    use sparkles_budget::MemoryDomain;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    // Part A: Large kept closure (> PARENT_SLACK + PARENT_STEP = 1.06 MiB) taken via
+    // take_for must never release its prepared reservation back to 0 and re-reserve.
+    let store = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::from(
+        "@prefix ex: <http://ex.org/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:A rdfs:subClassOf ex:B .
+         ex:B rdfs:subClassOf ex:C .
+         ex:C rdfs:subClassOf ex:D .\n",
+    );
+    for i in 0..4_500 {
+        ttl.push_str(&format!("ex:n{i} a ex:A .\n"));
+    }
+    load_turtle(&store, &ttl);
+    let cache = crate::Cache::new(100_000);
+    let r1 = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions::default(),
+    )
+    .unwrap();
+    let c1 = r1.receipt.unwrap().commit.seq;
+    assert!(cache.kept().is_some());
+
+    load_turtle(&store, "@prefix ex: <http://ex.org/> . ex:n_extra a ex:A .");
+    let owned = Arc::new(AtomicU64::new(0));
+    let saw_large = Arc::new(AtomicBool::new(false));
+    let bounced_to_zero = Arc::new(AtomicBool::new(false));
+    let take = owned.clone();
+    let give = owned.clone();
+    let large_take = saw_large.clone();
+    let large_give = saw_large.clone();
+    let bounced_take = bounced_to_zero.clone();
+    let dropped_to_zero = Arc::new(AtomicBool::new(false));
+    let dz_take = dropped_to_zero.clone();
+    let dz_give = dropped_to_zero.clone();
+    let domain = MemoryDomain::new();
+    let parent = domain.parent(
+        move |n| {
+            let next = take.fetch_add(n, Ordering::SeqCst) + n;
+            if next > (1 << 20) + (64 << 10) {
+                large_take.store(true, Ordering::SeqCst);
+            }
+            if dz_take.load(Ordering::SeqCst) {
+                bounced_take.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        },
+        move |n| {
+            let prev = give.fetch_sub(n, Ordering::SeqCst);
+            if prev == n && large_give.load(Ordering::SeqCst) {
+                dz_give.store(true, Ordering::SeqCst);
+            }
+        },
+    );
+    let r2 = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: Some(c1),
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(parent),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(r2.method, crate::Method::Incremental);
+    assert!(
+        saw_large.load(Ordering::SeqCst),
+        "closure should exceed slack threshold"
+    );
+    assert!(
+        !bounced_to_zero.load(Ordering::SeqCst),
+        "take_for must not drop a probe reservation to 0 and re-reserve"
+    );
+    assert_eq!(owned.load(Ordering::SeqCst), 0);
+
+    // Part B: Admission refusal with nonempty generalized facts leaves the kept closure
+    // in Cache intact instead of losing it inside `previous`.
+    let gstore = Store::in_memory(StoreOptions::default());
+    let mut gttl = String::new();
+    for i in 0..400 {
+        gttl.push_str(&format!("<urn:item{i}> <urn:val> \"lit{i}\" .\n"));
+    }
+    load_turtle(&gstore, &gttl);
+    let gprofile = crate::Profile::Rules(
+        "[g: (?x <urn:val> ?v) -> (?v <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#integer>)]"
+            .into(),
+    );
+    let gcache = crate::Cache::new(100_000);
+    let gr1 = crate::materialize_incremental(
+        &gstore,
+        &gprofile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&gcache),
+        },
+        &crate::ReasonOptions::default(),
+    )
+    .unwrap();
+    let gc1 = gr1.receipt.unwrap().commit.seq;
+    assert!(gcache.kept().is_some());
+
+    load_turtle(&gstore, "<urn:item_new> <urn:val> \"lit_new\" .");
+    // Size the tight pool so incremental_rules succeeds but the full kept heap
+    // (closure + generalized facts) is refused during take_for.
+    let tight = QueryPool::new(80 * 1024);
+    let err = crate::materialize_incremental(
+        &gstore,
+        &gprofile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: Some(gc1),
+            cache: Some(&gcache),
+        },
+        &crate::ReasonOptions {
+            max_memory: Some(16 * MIB),
+            memory_parent: Some(tight.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(is_server_memory_anyhow(&err), "unexpected error: {err:#}");
+    assert_eq!(
+        gcache.kept().map(|(_, seq)| seq),
+        Some(gc1),
+        "kept closure with generalized facts must remain in cache after admission refusal"
+    );
+    assert_eq!(tight.granted(), 0);
+}
+
+#[test]
+fn failed_take_for_does_not_restore_after_interleaved_clear() {
+    let store = Store::in_memory(StoreOptions::default());
+    load_turtle(
+        &store,
+        "@prefix ex: <http://ex.org/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:A rdfs:subClassOf ex:B .
+         ex:x a ex:A .",
+    );
+    let rpool = QueryPool::with_retained_capacity((16 * MIB) as u64, (4 * MIB) as u64).unwrap();
+    let cache =
+        Arc::new(crate::Cache::new(10_000).with_retained_parent(Some(rpool.retained_parent())));
+    let r1 = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(rpool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let c1 = r1.receipt.unwrap().commit.seq;
+    // Run one incremental step with ample memory so INCREMENTAL_RULES is warm for RdfsSimple.
+    load_turtle(&store, "@prefix ex: <http://ex.org/> . ex:y0 a ex:A .");
+    let r2 = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: Some(c1),
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(rpool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let c1 = r2.receipt.unwrap().commit.seq;
+    assert!(cache.kept().is_some());
+    assert!(rpool.domain_stats().retained_reserved > 0);
+
+    load_turtle(&store, "@prefix ex: <http://ex.org/> . ex:y a ex:A .");
+    // Interleave cache.clear() after take_for detaches the entry and before transfer fails.
+    let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_flag = hook_fired.clone();
+    let cache_clear = cache.clone();
+    crate::maintain::on_take_detached(move || {
+        hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        cache_clear.clear();
+    });
+
+    // Reserve nearly all of rpool's work capacity so transfer_budget refuses on Scope::Work,
+    // while leaving room if `incremental_rules` runs cold before `take_for`.
+    let blocker = rpool.empty_grant();
+    blocker.charge((16 * MIB - 128) as u64).unwrap();
+    let err = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: Some(c1),
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            max_memory: Some(16 * MIB),
+            memory_parent: Some(rpool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        hook_fired.load(std::sync::atomic::Ordering::SeqCst),
+        "test hook must fire between Cache::take_for detach and transfer_budget"
+    );
+    assert!(is_server_memory_anyhow(&err), "unexpected error: {err:#}");
+    assert!(
+        cache.kept().is_none(),
+        "failed take_for must not restore an entry after an interleaved cache.clear()"
+    );
+    assert_eq!(
+        rpool.domain_stats().retained_reserved,
+        0,
+        "interleaved clear must drop retained credit to 0"
+    );
+    drop(blocker);
+    assert_eq!(rpool.granted(), 0);
+}
+
+#[test]
+fn literal_typings_retains_credit_across_cached_file_and_analysis() {
+    let mut ttl = String::new();
+    for i in 0..40 {
+        ttl.push_str(&format!(
+            "<urn:item{i}> <urn:val> \"not-an-int-{i}-{}\" .\n",
+            "x".repeat(256)
+        ));
+    }
+    let profile = crate::Profile::Rules(
+        "[t: (?x <urn:val> ?v) -> (?v <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#integer>)]"
+            .into(),
+    );
+
+    // 1. AnalysisContext::take_literal_typings (in-memory analysis store) retains pool
+    //    credit even after AnalysisContext and WitnessMap drop.
+    let mem_store = Store::in_memory(StoreOptions::default());
+    load_turtle(&mem_store, &ttl);
+    let pool = QueryPool::new((16 * MIB) as u64);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let witnesses = crate::analysis::WitnessMap::with_memory_parent(
+        1,
+        Some(16 * MIB),
+        Some(pool.work_parent()),
+        cancel,
+        None,
+    );
+    let ctx = crate::analysis::AnalysisContext::new(witnesses.clone(), Some(16 * MIB), "p".into())
+        .unwrap();
+    let mem_report = crate::materialize_incremental(
+        &mem_store,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental::default(),
+        &crate::ReasonOptions {
+            memory_parent: Some(pool.work_parent()),
+            analysis: Some(ctx.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mem_commit = mem_report.receipt.unwrap().commit.seq;
+    let analysis_typings = ctx
+        .take_literal_typings(mem_commit)
+        .expect("analysis typings");
+    drop(ctx);
+    drop(witnesses);
+    assert_eq!(analysis_typings.facts.len(), 40);
+    assert!(
+        pool.granted() > 0,
+        "AnalysisContext::take_literal_typings must retain pool credit"
+    );
+    drop(analysis_typings);
+    assert_eq!(pool.granted(), 0);
+
+    // 2. Cached & file-backed literal_typings_controlled (persistent store) retain pool
+    //    credit until dropped, and file-backed refuses under a tight pool near capacity.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    load_turtle(&store, &ttl);
+    let cache = crate::Cache::default();
+    let report = crate::materialize_incremental(
+        &store,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(pool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let commit = report.receipt.unwrap().commit.seq;
+    assert_eq!(pool.granted(), 0);
+
+    let controls = crate::diagnostics::DiagnosticControls {
+        memory_parent: Some(pool.work_parent()),
+        ..Default::default()
+    };
+    let cached_typings = crate::literal_typings_controlled(&store, commit, Some(&cache), &controls)
+        .unwrap()
+        .expect("cached typings");
+    assert_eq!(cached_typings.facts.len(), 40);
+    assert!(
+        pool.granted() > 0,
+        "cached literal_typings_controlled must retain pool credit"
+    );
+    drop(cached_typings);
+    assert_eq!(pool.granted(), 0);
+
+    let file_typings = crate::literal_typings_controlled(&store, commit, None, &controls)
+        .unwrap()
+        .expect("file-backed typings");
+    assert_eq!(file_typings.facts.len(), 40);
+    assert!(
+        pool.granted() > 0,
+        "file-backed literal_typings_controlled must retain pool credit"
+    );
+    drop(file_typings);
+    assert_eq!(pool.granted(), 0);
+
+    let tight = QueryPool::new(40 * 1024);
+    let tight_controls = crate::diagnostics::DiagnosticControls {
+        max_memory: Some((16 * MIB) as u64),
+        memory_parent: Some(tight.work_parent()),
+        ..Default::default()
+    };
+    let err = crate::literal_typings_controlled(&store, commit, None, &tight_controls).unwrap_err();
+    assert!(is_server_memory_anyhow(&err), "unexpected error: {err:#}");
+    assert_eq!(tight.granted(), 0);
+}
+
+#[test]
+fn cross_domain_transfer_refused_with_foreign_domain() {
+    use sparkles_budget::ParentRefused;
+
+    let store = Store::in_memory(StoreOptions::default());
+    load_turtle(
+        &store,
+        "@prefix ex: <http://ex.org/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:A rdfs:subClassOf ex:B .
+         ex:B rdfs:subClassOf ex:C .
+         ex:x a ex:A .",
+    );
+
+    let pool_a = QueryPool::with_retained_capacity((16 * MIB) as u64, (4 * MIB) as u64).unwrap();
+    let pool_b = QueryPool::new((16 * MIB) as u64);
+    let cache = crate::Cache::new(10_000).with_retained_parent(Some(pool_a.retained_parent()));
+    let r1 = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(pool_a.work_parent()),
+            witnesses: Some(4),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let c1 = r1.receipt.unwrap().commit.seq;
+    let retained_before = pool_a.domain_stats().retained_reserved;
+    assert!(retained_before > 0);
+
+    // Attempting an incremental run backed by a distinct QueryPool domain refuses with
+    // ForeignDomain, preserves the kept closure in pool_a, and leaves pool_b at 0.
+    load_turtle(&store, "@prefix ex: <http://ex.org/> . ex:y a ex:A .");
+    let err = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: Some(c1),
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(pool_b.work_parent()),
+            witnesses: Some(4),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<ParentRefused>(),
+            Some(ParentRefused::ForeignDomain)
+        ),
+        "expected ForeignDomain refusal, got: {err:#}"
+    );
+    assert_eq!(cache.kept().map(|(_, seq)| seq), Some(c1));
+    assert_eq!(pool_a.domain_stats().retained_reserved, retained_before);
+    assert_eq!(pool_b.granted(), 0);
+
+    // Direct Closure::set_budget & Witnesses::set_budget cross-domain refusal checks.
+    {
+        let b_a = Budget::with_parent(None, Some(pool_a.work_parent()));
+        let b_b = Budget::with_parent(None, Some(pool_b.work_parent()));
+        let snap = store.snapshot();
+        let base = Arc::new(
+            crate::facts::Base::new(snap.clone(), &[sparkles_core::id::Id::DEFAULT_GRAPH]).unwrap(),
+        );
+        let g = Graph::with_base_in(base, &b_a).unwrap();
+        let t = Terms::new_in(snap, &b_a).unwrap();
+        let mut closure = Closure::new(g, t).unwrap();
+        let err = closure.set_budget(&b_b).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BudgetFailure::Parent {
+                    refusal: ParentRefused::ForeignDomain,
+                    ..
+                }
+            ),
+            "Closure::set_budget must refuse ForeignDomain: {err:?}"
+        );
+        assert_eq!(pool_b.granted(), 0);
+
+        let rules =
+            crate::profile_rules(&crate::Profile::RdfsSimple, &crate::Extras::default()).unwrap();
+        let mut warnings = crate::budget::WorkingWarnings::new(&b_a);
+        let compiled = crate::engine::compile(&rules, &closure.terms, &mut warnings).unwrap();
+        let limits = crate::engine::Limits {
+            max_iterations: 100,
+            max_inferred: 10_000,
+            cancel: None,
+            deadline: None,
+            progress: None,
+            budget: b_a.clone(),
+            closures: false,
+            magic: None,
+            sampled_planning: false,
+        };
+        let _ = crate::engine::run(&mut closure.graph, &compiled, &closure.terms, &limits, None)
+            .unwrap();
+        let mut witnesses =
+            crate::witness::Witnesses::build(&mut closure, &compiled, 4, &limits).unwrap();
+        assert!(witnesses.heap_bytes() > 0);
+        let err = witnesses.set_budget(&b_b).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BudgetFailure::Parent {
+                    refusal: ParentRefused::ForeignDomain,
+                    ..
+                }
+            ),
+            "Witnesses::set_budget must refuse ForeignDomain: {err:?}"
+        );
+        assert_eq!(pool_b.granted(), 0);
+    }
+    cache.clear();
+    assert_eq!(pool_a.domain_stats().work_reserved, 0);
+    assert_eq!(pool_a.domain_stats().retained_reserved, 0);
+}

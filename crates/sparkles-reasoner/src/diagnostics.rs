@@ -634,12 +634,20 @@ fn sh(local: &str) -> NamedNode {
 /// whose value space they are: the facts `lit rdf:type DT`, with `DT` in the OWL 2 RL
 /// datatype map, which RDF cannot state and the inferred graph therefore lacks. See
 /// [`crate::literal_typings`].
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct LiteralTypings {
     /// the commit of the materialization
     pub commit: u64,
     /// the literal and the datatype, each literal outside the datatype's value space
     pub facts: Vec<(Literal, NamedNode)>,
+    /// Keeps pooled/bounded summary credit alive until `facts` drops.
+    pub(crate) _held: Option<Arc<crate::budget::Held>>,
+}
+
+impl PartialEq for LiteralTypings {
+    fn eq(&self, other: &Self) -> bool {
+        self.commit == other.commit && self.facts == other.facts
+    }
 }
 
 impl LiteralTypings {

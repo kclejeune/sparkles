@@ -1033,7 +1033,10 @@ impl RunRules {
         }
         let budget = terms.budget();
         let info = engine::frontend::compile(rules, terms, warnings, false)?;
-        let mut lowered = info.program.lower(&budget)?;
+        let mut lowered = info
+            .program
+            .lower(&budget)
+            .map_err(ir::lower::LowerError::into_anyhow)?;
         let strata = lowered.strata.len();
         let part = info
             .program
@@ -1190,9 +1193,16 @@ fn incremental_rules(
     let terms = Terms::new_in(snap.clone(), budget)?;
     let mut w = WorkingWarnings::new(budget);
     // a rule program that cannot be lowered, such as one with an existential head, has
-    // its error reported by the full run
+    // its error reported by the full run; transient memory or core refusals must propagate
+    // without poisoning the digest's cached incremental capability.
     let blocker = match RunRules::new(&rules, &terms, &mut w) {
         Ok(compiled) => compiled.blocker(&terms),
+        Err(e)
+            if budget::BudgetFailure::from_anyhow(&e).is_some()
+                || e.downcast_ref::<sparkles_core::Error>().is_some() =>
+        {
+            return Err(e);
+        }
         Err(e) if parser::uses_program(&rules) => Some(format!("{e:#}")),
         Err(e) => return Err(e),
     };

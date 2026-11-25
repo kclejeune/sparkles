@@ -1583,6 +1583,8 @@ struct PreparedQuery {
     kind: QueryKind,
     /// the depth of `node`, which the evaluation and the drop of the plan need stack for
     plan_depth: usize,
+    /// Keeps rewritten algebra credit charged until `node` and `pattern` drop.
+    _rewrite_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// With query-time reasoning, the options the context is made with: without the inferred
@@ -1748,6 +1750,7 @@ fn prepare_query_input_policy(
     // so its planning keeps what it retains uncharged, as before.
     ctx.attach_owner();
     ctx.check()?;
+    let rewrite_guard = rewritten.as_ref().and_then(|r| r.memory_guard.clone());
     Ok(PreparedQuery {
         ctx,
         node,
@@ -1755,6 +1758,7 @@ fn prepare_query_input_policy(
         bound,
         kind,
         plan_depth,
+        _rewrite_guard: rewrite_guard,
     })
 }
 
@@ -1822,6 +1826,7 @@ fn execute_prepared_parts(
     prepared: PreparedQuery,
 ) -> std::result::Result<ResultParts, Box<Failed>> {
     let PreparedQuery {
+        _rewrite_guard,
         ctx,
         node,
         pattern,

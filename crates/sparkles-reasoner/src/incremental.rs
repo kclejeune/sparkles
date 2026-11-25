@@ -293,11 +293,41 @@ impl Closure {
     fn own_bytes(&self) -> usize {
         self.defaults.as_ref().map_or(0, Defaults::heap_bytes)
     }
+}
 
+/// Validated byte plan for migrating a [`Closure`] onto a target [`Budget`].
+pub(crate) struct ClosureTransferPlan {
+    graph: Arc<Budget>,
+    terms: Arc<Budget>,
+    flags: Arc<Budget>,
+    lookups: Option<Arc<Budget>>,
+    graph_bytes: usize,
+    term_bytes: usize,
+    flag_bytes: usize,
+    lookup_bytes: usize,
+    pub(crate) total: usize,
+}
+
+impl Closure {
     /// Charge the closure to `budget` from now on, or fail when it does not fit.
+    #[cfg(test)]
     pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
+        let plan = self.plan_budget_transfer(budget)?;
+        let mut prepared = Held::try_new_exact(budget, plan.total)?;
+        self.apply_budget_transfer(plan, budget, &mut prepared);
+        debug_assert_eq!(prepared.bytes(), 0);
+        drop(prepared);
+        Ok(())
+    }
+
+    /// Validate domain rules and compute the exact bytes required to move this closure
+    /// onto `budget`, without mutating any existing credit owner.
+    pub(crate) fn plan_budget_transfer(
+        &self,
+        budget: &Arc<Budget>,
+    ) -> Result<ClosureTransferPlan, BudgetFailure> {
         // Validate exclusivity before reserving or mutating any existing owner.
-        if self.lookups().is_some() && self.lookups_mut().is_none() {
+        if self.lookups().is_some() && self.graph.base_is_shared() {
             return Err(BudgetFailure::parent(
                 sparkles_budget::ParentRefused::DifferentParent,
             ));
@@ -333,26 +363,43 @@ impl Closure {
             .and_then(|n| n.checked_add(flag_bytes))
             .and_then(|n| n.checked_add(lookup_bytes))
             .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
-        // One still-owned reservation backs all components until their commit.
-        // Refusal above or here preserves every old owner and its contribution.
-        let mut prepared = Held::try_new_exact(budget, total)?;
-        let old_terms = (!Arc::ptr_eq(&terms, budget)).then(|| {
+        Ok(ClosureTransferPlan {
+            graph,
+            terms,
+            flags,
+            lookups,
+            graph_bytes,
+            term_bytes,
+            flag_bytes,
+            lookup_bytes,
+            total,
+        })
+    }
+
+    /// Commit a validated transfer plan using already-prepared credit on `budget`.
+    pub(crate) fn apply_budget_transfer(
+        &mut self,
+        plan: ClosureTransferPlan,
+        budget: &Arc<Budget>,
+        prepared: &mut Held,
+    ) {
+        let old_terms = (!Arc::ptr_eq(&plan.terms, budget)).then(|| {
             self.terms
-                .replace_credit(&terms, prepared.split(term_bytes))
+                .replace_credit(&plan.terms, prepared.split(plan.term_bytes))
         });
-        let old_graph = (!Arc::ptr_eq(&graph, budget))
-            .then(|| self.graph.replace_credit(prepared.split(graph_bytes)));
-        let old_flags = (!Arc::ptr_eq(&flags, budget))
-            .then(|| std::mem::replace(&mut self.flags_held, prepared.split(flag_bytes)));
-        let old_lookups = lookups
+        let old_graph = (!Arc::ptr_eq(&plan.graph, budget))
+            .then(|| self.graph.replace_credit(prepared.split(plan.graph_bytes)));
+        let old_flags = (!Arc::ptr_eq(&plan.flags, budget))
+            .then(|| std::mem::replace(&mut self.flags_held, prepared.split(plan.flag_bytes)));
+        let old_lookups = plan
+            .lookups
             .as_ref()
             .filter(|source| !Arc::ptr_eq(source, budget))
             .map(|_| {
                 self.lookups_mut()
                     .expect("exclusive prepared lookups")
-                    .replace_credit(prepared.split(lookup_bytes))
+                    .replace_credit(prepared.split(plan.lookup_bytes))
             });
-        drop(prepared);
         // The entire transition is visible before returning any old contribution.
         drop(old_graph);
         drop(old_flags);
@@ -363,7 +410,6 @@ impl Closure {
         if let Some((source, bytes)) = old_lookups {
             source.release(bytes);
         }
-        Ok(())
     }
 
     /// Charge the change of the closure's own buffers (the flags and the default
@@ -1049,7 +1095,9 @@ impl<'a> Program for TierProgram<'a> {
         c.graph.try_add_batch(back)?;
         drop(back_held);
         if let Some(part) = cx.rebuild {
-            let lowered = part.lower(budget)?;
+            let lowered = part
+                .lower(budget)
+                .map_err(crate::ir::lower::LowerError::into_anyhow)?;
             if lowered
                 .strata
                 .iter()

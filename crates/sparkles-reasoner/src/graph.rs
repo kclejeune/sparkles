@@ -353,6 +353,13 @@ impl Graph {
         self.base.as_mut().and_then(Arc::get_mut)
     }
 
+    /// Whether the base tier cannot be mutated exclusively.
+    pub(crate) fn base_is_shared(&self) -> bool {
+        self.base
+            .as_ref()
+            .is_some_and(|b| Arc::strong_count(b) > 1 || Arc::weak_count(b) > 0)
+    }
+
     /// The base tier, if the graph has one.
     #[inline]
     pub fn base(&self) -> Option<&Base> {

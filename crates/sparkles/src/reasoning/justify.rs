@@ -1066,6 +1066,17 @@ pub fn diagnose(
     let snapshot = analysis::view(&dataset.store().snapshot(), &analysis)?;
     let record = dataset.reasoning().record();
     let state = dataset.state();
+    let owned_options;
+    let options = if options.grant.is_none()
+        && let Some(pool) = &state.pool
+    {
+        let mut pooled = options.clone();
+        pooled.grant = Some(Arc::new(pool.empty_grant()));
+        owned_options = pooled;
+        &owned_options
+    } else {
+        options
+    };
     let diagnostics = super::run::diagnose_snapshot_with(
         dataset.store(),
         record.as_ref(),

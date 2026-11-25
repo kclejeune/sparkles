@@ -166,6 +166,9 @@ pub struct Rewritten {
     pub nodes: Vec<PlanInfo>,
     /// warnings for the response, such as axioms the rewriting ignored
     pub warnings: Vec<String>,
+    /// Opaque credit guard keeping rewritten algebra copies charged until dropped.
+    /// Declared last so `query`, `derive`, `nodes`, and `warnings` drop before credit returns.
+    pub memory_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// A reasoner that derives facts for queries (see the module documentation).
@@ -188,11 +191,12 @@ pub trait ReasoningProvider: Send + Sync {
         let _ = req;
         None
     }
-    /// Whether [`rewrite`](Self::rewrite) can rewrite a query. Providers that never
-    /// rewrite return `false` so callers avoid creating a child memory parent when no
-    /// rewriting runs.
+    /// Whether [`rewrite`](Self::rewrite) can rewrite a query. Defaults to `true` so
+    /// custom providers that override `rewrite` keep working without opting in.
+    /// Providers that never rewrite can return `false` so callers avoid creating a child
+    /// memory parent when no rewriting runs.
     fn rewrites(&self) -> bool {
-        false
+        true
     }
     /// The query rewritten before planning, for the snapshot and view of `req`, or
     /// `None` when the provider rewrites nothing (spec F17 §7). The rewriting reads the
@@ -1715,6 +1719,52 @@ mod tests {
         query(store.snapshot(), "SELECT * WHERE { ?s ?p ?o }", &opts).unwrap();
         assert_eq!(p_ql.rewrite_calls.load(Ordering::SeqCst), 1);
         assert_eq!(p_ql.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.granted(), 0);
+
+        // 3. Custom provider overriding `rewrite` without overriding `rewrites()` still runs.
+        struct CustomRewriteProvider {
+            expected_domain: sparkles_budget::DomainId,
+            rewrite_calls: AtomicUsize,
+        }
+        impl ReasoningProvider for CustomRewriteProvider {
+            fn label(&self) -> String {
+                "custom-rewrite".into()
+            }
+            fn rewrite(
+                &self,
+                query: &spargebra::Query,
+                _bound: &[(String, Term)],
+                req: &SessionRequest,
+            ) -> Result<Option<Rewritten>> {
+                self.rewrite_calls.fetch_add(1, Ordering::SeqCst);
+                let parent = req
+                    .memory_parent
+                    .as_ref()
+                    .expect("custom rewrite must receive ctx.memory_parent()");
+                assert_eq!(parent.domain(), self.expected_domain);
+                Ok(Some(Rewritten {
+                    query: query.clone(),
+                    derive: Vec::new(),
+                    nodes: Vec::new(),
+                    warnings: Vec::new(),
+                    memory_guard: None,
+                }))
+            }
+            fn start(&self, _req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
+                Ok(Box::new(ProbeSession))
+            }
+        }
+        let custom = Arc::new(CustomRewriteProvider {
+            expected_domain: pool.domain(),
+            rewrite_calls: AtomicUsize::new(0),
+        });
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            reasoning: Some(custom.clone()),
+            ..Default::default()
+        };
+        query(store.snapshot(), "SELECT * WHERE { ?s ?p ?o }", &opts).unwrap();
+        assert_eq!(custom.rewrite_calls.load(Ordering::SeqCst), 1);
         assert_eq!(pool.granted(), 0);
     }
 }

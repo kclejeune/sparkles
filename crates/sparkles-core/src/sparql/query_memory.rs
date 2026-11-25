@@ -1146,6 +1146,9 @@ mod tests {
             fn auto(&self) -> bool {
                 true
             }
+            fn rewrites(&self) -> bool {
+                false
+            }
             fn reads_all(&self, _req: &SessionRequest) -> Option<Materialization> {
                 Some(Materialization::Fresh)
             }

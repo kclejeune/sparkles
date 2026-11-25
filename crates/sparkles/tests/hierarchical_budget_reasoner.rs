@@ -261,7 +261,42 @@ fn concurrent_query_and_reasoner_overshoot_refused_with_server_memory() {
         held_before
     );
 
-    // 5. Dropping the concurrent grant returns pool credit to exact 0.
+    // 5. Diagnostics and justified diagnostics with `grant: None` MUST still pool
+    // their SPARQL check queries and refuse with ServerMemory under contention.
+    let err = ds
+        .reasoning()
+        .diagnostics(&DiagnoseOptions {
+            inferences: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(is_server_memory(&err), "diagnostics error: {err:?}");
+    assert_eq!(
+        (concurrent.used(), concurrent.granted(), pool.granted()),
+        held_before
+    );
+
+    let err = ds
+        .reasoning()
+        .diagnostics_justified(
+            &DiagnoseOptions {
+                inferences: true,
+                ..Default::default()
+            },
+            &AnalysisOptions::default(),
+            4,
+        )
+        .unwrap_err();
+    assert!(
+        is_server_memory(&err),
+        "diagnostics_justified error: {err:?}"
+    );
+    assert_eq!(
+        (concurrent.used(), concurrent.granted(), pool.granted()),
+        held_before
+    );
+
+    // 6. Dropping the concurrent grant returns pool credit to exact 0.
     drop(concurrent);
     assert_eq!(pool.granted(), 0);
 }

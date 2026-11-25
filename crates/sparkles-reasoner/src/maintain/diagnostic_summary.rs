@@ -31,12 +31,14 @@ pub fn literal_typings_controlled(
             .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX)),
         controls.memory_parent.clone(),
     );
-    if let Some(cache) = cache
-        && let Some(kept) = cache.kept.try_lock()
-        && let Some(kept) = kept
+    let kept = cache.and_then(|cache| {
+        let slot = cache.kept.try_lock()?;
+        slot.kept
             .as_ref()
             .filter(|kept| kept.dataset_id == store.dataset_id() && kept.commit == commit)
-    {
+            .cloned()
+    });
+    if let Some(kept) = kept {
         let mut found_held = Held::new(&budget);
         let mut found = Vec::new();
         let terms = &kept.closure.terms;
@@ -58,9 +60,11 @@ pub fn literal_typings_controlled(
                 found.push((literal, datatype));
             }
         }
+        let summary_held = (!found.is_empty()).then(|| Arc::new(found_held));
         return Ok(Some(LiteralTypings {
             commit,
             facts: found,
+            _held: summary_held,
         }));
     }
     let Some(root) = store.root() else {
@@ -111,9 +115,34 @@ pub fn literal_typings_controlled(
         }
         Ok(())
     })?;
-    Ok(consistent.then(|| LiteralTypings {
+    if !consistent {
+        return Ok(None);
+    }
+    if found.is_empty() {
+        return Ok(Some(LiteralTypings {
+            commit,
+            facts: Vec::new(),
+            _held: None,
+        }));
+    }
+    let mut summary_held = Held::new(&budget);
+    summary_held.try_grow(
+        found
+            .len()
+            .saturating_mul(std::mem::size_of::<(Literal, NamedNode)>()),
+    )?;
+    let mut facts = Vec::with_capacity(found.len());
+    for ((literal, datatype), mut entry_held) in found.into_values() {
+        let mut fact_held = entry_held.split(fact_bytes(&literal, &datatype));
+        summary_held.try_merge(&mut fact_held)?;
+        facts.push((literal, datatype));
+        drop(entry_held);
+    }
+    drop(_buf_held);
+    Ok(Some(LiteralTypings {
         commit,
-        facts: found.into_values().map(|(fact, _)| fact).collect(),
+        facts,
+        _held: Some(Arc::new(summary_held)),
     }))
 }
 

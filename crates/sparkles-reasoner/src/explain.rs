@@ -1288,11 +1288,15 @@ fn program_search(
             crate::ir::ProgramError::Memory(m) => anyhow::Error::from(m),
             e => anyhow::anyhow!("{e}"),
         })?;
-    let mut lowered = program.lower(&budget)?;
+    let mut lowered = program
+        .lower(&budget)
+        .map_err(crate::ir::lower::LowerError::into_anyhow)?;
     let (rules, infos) = flat_rules(program, &mut lowered, &mut held, &info.lines)?;
     let mut makes_terms = false;
     if let Some(part) = &part {
-        let lp = part.lower(&budget)?;
+        let lp = part
+            .lower(&budget)
+            .map_err(crate::ir::lower::LowerError::into_anyhow)?;
         makes_terms = lp
             .strata
             .iter()

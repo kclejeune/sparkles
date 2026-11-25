@@ -235,7 +235,11 @@ impl QueryReasoner {
             return Ok(None);
         }
         let parent = self.shared.resolve_memory_parent(req);
-        crate::qlrewrite::tbox(req, &self.shared.inputs, parent).map(Some)
+        let budget = crate::budget::Budget::with_parent(
+            req.max_memory.map(|m| m.min(usize::MAX as u64) as usize),
+            parent,
+        );
+        crate::qlrewrite::tbox_charged(req, &self.shared.inputs, &budget).map(|c| Some(c.tbox))
     }
 
     /// The limit of derived facts per query.
@@ -382,14 +386,17 @@ impl ReasoningProvider for QueryReasoner {
             return Ok(None);
         }
         let parent = self.shared.resolve_memory_parent(req);
-        let tbox = crate::qlrewrite::tbox(req, &self.shared.inputs, parent.clone())?;
-        crate::qlrewrite::rewrite_query_with_parent(
+        let budget = crate::budget::Budget::with_parent(
+            req.max_memory.map(|m| m.min(usize::MAX as u64) as usize),
+            parent,
+        );
+        let charged_tbox = crate::qlrewrite::tbox_charged(req, &self.shared.inputs, &budget)?;
+        crate::qlrewrite::rewrite_query_in_budget(
             query,
             bound,
-            &tbox,
+            &charged_tbox.tbox,
             self.shared.max_union,
-            req.max_memory,
-            parent,
+            &budget,
             &*req.stop,
         )
     }

@@ -200,6 +200,7 @@ impl AnalysisContext {
             LiteralTypings {
                 commit: 0,
                 facts: found,
+                _held: None,
             },
             held,
         ));
@@ -207,11 +208,13 @@ impl AnalysisContext {
         Ok(())
     }
 
-    /// Consume the summary independently of optional closure caching.
+    /// Consume the summary independently of optional closure caching, carrying its credit
+    /// guard until the returned summary drops.
     pub fn take_literal_typings(&self, commit: u64) -> Option<LiteralTypings> {
         let taken = self.typings.lock().unwrap().take();
-        taken.map(|(mut typings, _held)| {
+        taken.map(|(mut typings, held)| {
             typings.commit = commit;
+            typings._held = Some(Arc::new(held));
             typings
         })
     }
