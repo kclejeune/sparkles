@@ -1008,6 +1008,31 @@ mod tests {
     }
 
     #[test]
+    fn geojson_fractional_point_classifies_with_literal_reserved_keys() {
+        let valid = r#"{"type":"Point","coordinates":[2.25,48.84],"properties":{"$serde_json::private::Number":"not a number","extra":1}}"#;
+        check_geojson_parse_peak(valid, |slot| {
+            let Slot::Geom(entry) = slot else {
+                panic!("fractional Point with literal reserved foreign key must parse");
+            };
+            let Source::Parsed { geom, .. } = &entry.geom else {
+                panic!("newly classified geometry must be parsed");
+            };
+            assert_eq!(
+                geom.g,
+                georust::Geometry::Point(georust::Point::new(2.25, 48.84))
+            );
+            let bbox = entry.bbox84();
+            assert!(bbox[0] <= 2.25 && 2.25 <= bbox[2] && bbox[1] <= 48.84 && 48.84 <= bbox[3]);
+        });
+
+        let spoofed =
+            r#"{"type":"Point","coordinates":[{"$serde_json::private::Number":"2.25"},48.84]}"#;
+        check_geojson_parse_peak(spoofed, |slot| {
+            assert!(matches!(slot, Slot::Skipped(Skip::Malformed)));
+        });
+    }
+
+    #[test]
     fn classify_literals() {
         let cfg = GeoConfig::default();
         let Slot::Geom(e) = classify(&key("POINT(1 2)", WKT_LITERAL), &cfg) else {
