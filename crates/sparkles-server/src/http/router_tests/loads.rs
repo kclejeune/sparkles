@@ -130,3 +130,117 @@ async fn jsonld_streaming_profile_survives_graph_store_and_plain_upload() {
         assert!(response.status.is_success(), "{route}: {}", response.text());
     }
 }
+
+#[tokio::test]
+async fn sparql_load_uses_bulk_plan_over_http_update() {
+    const THRESHOLD: u64 = 10;
+    const BYTES_PER_QUAD: usize = 80;
+
+    let ntriples = |from: u64, n: u64| -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in from..from + n {
+            let head = format!("<http://ex.org/s{i}> <http://ex.org/p> \"");
+            let pad = BYTES_PER_QUAD - head.len() - "\" .\n".len();
+            out.extend_from_slice(head.as_bytes());
+            out.extend(std::iter::repeat_n(b'x', pad));
+            out.extend_from_slice(b"\" .\n");
+        }
+        out
+    };
+
+    let files = tempfile::tempdir().unwrap();
+    let small = files.path().join("small.nt");
+    let large = files.path().join("large.nt");
+    let broken = files.path().join("broken.nt");
+    std::fs::write(&small, ntriples(0, THRESHOLD)).unwrap();
+    std::fs::write(&large, ntriples(100, THRESHOLD + 2)).unwrap();
+    let mut bad = ntriples(200, THRESHOLD + 2);
+    bad.extend_from_slice(b"<urn:broken \n");
+    std::fs::write(&broken, bad).unwrap();
+
+    let server_with_threshold = || -> Server {
+        let dir = tempfile::tempdir().unwrap();
+        let store_opts = StoreOptions {
+            bulk_threshold: THRESHOLD,
+            ..StoreOptions::default()
+        };
+        let mut st = AppState::new(dir.path(), store_opts, Duration::from_secs(30)).unwrap();
+        st.file_loads = FileLoads::under(files.path()).unwrap();
+        let state = Arc::new(st);
+        state.attach("ds", DbType::Mem, None).unwrap();
+        let app = super::router(state.clone());
+        Server {
+            _dir: dir,
+            state,
+            app,
+        }
+    };
+
+    // Single-op small LOAD stays transactional.
+    let s = server_with_threshold();
+    let (r, _) = sparql_update(&s.app, &format!("LOAD <file://{}>", small.display()), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["inserted"], THRESHOLD);
+    assert!(!s.state.get("ds").unwrap().store.snapshot().delta.is_empty());
+
+    // Single-op large LOAD into default graph takes the bulk path.
+    let s = server_with_threshold();
+    let (r, _) = sparql_update(&s.app, &format!("LOAD <file://{}>", large.display()), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["inserted"], THRESHOLD + 2);
+    let snap = s.state.get("ds").unwrap().store.snapshot();
+    assert!(snap.delta.is_empty(), "bulk LOAD leaves an empty delta");
+    assert_eq!(snap.len(), THRESHOLD + 2);
+
+    // Single-op large LOAD INTO GRAPH takes the bulk path and places triples in the target graph.
+    let s = server_with_threshold();
+    let (r, _) = sparql_update(
+        &s.app,
+        &format!(
+            "LOAD <file://{}> INTO GRAPH <http://ex.org/g>",
+            large.display()
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["inserted"], THRESHOLD + 2);
+    let snap = s.state.get("ds").unwrap().store.snapshot();
+    assert!(snap.delta.is_empty());
+    let ask = send(
+        &s.app,
+        Request::post("/ds/sparql")
+            .header(header::CONTENT_TYPE, "application/sparql-query")
+            .header(header::ACCEPT, "application/sparql-results+json")
+            .body(Body::from(
+                "ASK { GRAPH <http://ex.org/g> { <http://ex.org/s100> ?p ?o } }",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(ask.status, StatusCode::OK, "{}", ask.text());
+    assert_eq!(ask.json()["boolean"], true);
+
+    // Multi-operation update with a large LOAD stays transactional.
+    let s = server_with_threshold();
+    let multi = format!(
+        "INSERT DATA {{ <http://ex.org/seed> <http://ex.org/p> 1 }} ; LOAD <file://{}>",
+        large.display()
+    );
+    let (r, _) = sparql_update(&s.app, &multi, None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["inserted"], THRESHOLD + 3);
+    assert!(!s.state.get("ds").unwrap().store.snapshot().delta.is_empty());
+
+    // LOAD SILENT of a large broken file suppresses the parse error and leaves nothing behind.
+    let s = server_with_threshold();
+    let (r, _) = sparql_update(
+        &s.app,
+        &format!("LOAD SILENT <file://{}>", broken.display()),
+        None,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["inserted"], 0);
+    assert_eq!(s.state.get("ds").unwrap().store.snapshot().len(), 0);
+}
