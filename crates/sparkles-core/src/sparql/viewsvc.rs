@@ -75,6 +75,9 @@ pub struct ViewRows {
     /// the reader's and not the view's, so that the rows come from the view's query
     /// and not its state
     pub evaluated_under: Option<super::AggregateErrors>,
+    /// optional reservation covering `rows` from fallback evaluation (`read_back` /
+    /// `evaluate_under`), declared last so `rows` drops strictly before credit returns
+    pub lease: Option<sparkles_budget::MemoryLease>,
 }
 
 /// What answers `SERVICE view:read`: a dataset's views.

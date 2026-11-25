@@ -849,6 +849,7 @@ impl Ann {
         };
         Ok(match m {
             Provenance::Lineage => {
+                r.charge_state(48)?;
                 let mut l = Lineage {
                     n: r.i64()?,
                     unknown: r.i64()?,
@@ -856,24 +857,37 @@ impl Ann {
                 };
                 for _ in 0..bounded(r.u64()?)? {
                     let a = atom(r)?;
-                    l.atoms.insert(a, r.i64()?);
+                    let c = r.i64()?;
+                    r.charge_state(40)?;
+                    l.atoms.insert(a, c);
                 }
                 Ann::Lineage(Box::new(l))
             }
             Provenance::Why { .. } => {
+                r.charge_state(40)?;
                 let mut x = Why {
                     unknown: r.i64()?,
                     supports: Vec::new(),
                 };
+                let atom_sz = std::mem::size_of::<Atom>() as u64;
                 for _ in 0..bounded(r.u64()?)? {
                     let n = bounded(r.u64()?)?;
-                    let atoms = (0..n).map(|_| atom(r)).collect::<Result<Vec<_>>>()?;
+                    r.charge_state(24)?;
+                    let mut atoms = Vec::new();
+                    for _ in 0..n {
+                        let a = atom(r)?;
+                        r.charge_state(atom_sz)?;
+                        atoms.push(a);
+                    }
                     let c = r.i64()?;
                     x.supports.push((Witness::new(atoms), c));
                 }
                 Ann::Why(Box::new(x))
             }
-            _ => Ann::Count(r.i64()?),
+            _ => {
+                r.charge_state(8)?;
+                Ann::Count(r.i64()?)
+            }
         })
     }
 }
@@ -895,8 +909,8 @@ pub fn load_map(r: &mut Reader, mode: Provenance) -> Result<AnnMap> {
     for _ in 0..n {
         let row = r.row()?;
         let width = row.len();
+        r.charge_state(super::zset::row_bytes(width))?;
         let a = Ann::load(r, mode)?;
-        r.charge_state(super::zset::row_bytes(width).saturating_add(a.bytes()))?;
         m.insert(row, a);
     }
     Ok(m)

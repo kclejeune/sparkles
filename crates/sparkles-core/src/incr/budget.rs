@@ -68,13 +68,14 @@ struct BudgetState {
     pool_scratch_bytes: u64,
     child_bytes: u64,
     peak: u64,
+    /// Optional leaf reclaim callback (e.g. evicting `Slot::history`) invoked when an
+    /// active reservation hits `local_limit` or the parent pool. Must never lock
+    /// `BudgetState`, `Runtime::reg`, or `Cell::state`. Declared before `parent`,
+    /// `credit`, and `retired` so any hook captures drop strictly before credit returns.
+    reclaim_external: Option<ReclaimHook>,
     parent: Option<ParentHandle>,
     credit: Option<LiveCredit>,
     retired: Vec<MemoryLease>,
-    /// Optional leaf reclaim callback (e.g. evicting `Slot::history`) invoked when an
-    /// active reservation hits `local_limit` or the parent pool. Must never lock
-    /// `BudgetState`, `Runtime::reg`, or `Cell::state`.
-    reclaim_external: Option<ReclaimHook>,
 }
 
 impl BudgetState {
@@ -89,10 +90,10 @@ impl BudgetState {
             pool_scratch_bytes: 0,
             child_bytes: 0,
             peak: 0,
+            reclaim_external: None,
             parent,
             credit,
             retired: Vec::new(),
-            reclaim_external: None,
         }
     }
 
@@ -120,6 +121,40 @@ impl BudgetState {
         let freed = hook(needed).min(self.external_bytes);
         self.external_bytes -= freed;
         freed
+    }
+
+    fn recycle_retired(&mut self, needed: u64) {
+        let Some(credit) = &mut self.credit else {
+            return;
+        };
+        let mut shortfall = credit
+            .live()
+            .saturating_add(needed)
+            .saturating_sub(credit.reserved());
+        if shortfall == 0 || self.retired.is_empty() {
+            return;
+        }
+        let mut i = self.retired.len();
+        while i > 0 && shortfall > 0 {
+            i -= 1;
+            let avail = self.retired[i].bytes();
+            if avail == 0 {
+                self.retired.swap_remove(i);
+                continue;
+            }
+            if avail <= shortfall {
+                if credit.try_absorb_lease(&mut self.retired[i]).is_ok() {
+                    shortfall -= avail;
+                    self.retired.swap_remove(i);
+                }
+            } else if let Ok(mut part) = self.retired[i].split(shortfall) {
+                if credit.try_absorb_lease(&mut part).is_ok() {
+                    shortfall = 0;
+                } else {
+                    let _ = self.retired[i].try_merge(&mut part);
+                }
+            }
+        }
     }
 
     fn reserve_raw_inner(
@@ -168,6 +203,7 @@ impl BudgetState {
             return Ok(());
         }
         let mut net_add = delta - freed_total;
+        self.recycle_retired(net_add);
         if let Some(credit) = &mut self.credit {
             match credit.try_add(net_add) {
                 Ok(()) => {}
@@ -190,6 +226,7 @@ impl BudgetState {
                         }
                     } else {
                         net_add -= more;
+                        self.recycle_retired(net_add);
                         if let Err(err2) = self.credit.as_mut().unwrap().try_add(net_add) {
                             self.release_raw(freed_total);
                             if self.total_live() == 0 {
@@ -338,6 +375,21 @@ impl BudgetHandle {
         if s.total_live() == 0 {
             s.trim_raw();
         }
+    }
+
+    /// Atomically transfer up to `bytes` from a [`ScratchLease`] into `pass_bytes`
+    /// without releasing or re-reserving credit on the upstream parent.
+    pub(crate) fn move_scratch_to_pass(&self, lease: &mut ScratchLease, bytes: u64) -> u64 {
+        let take = bytes.min(lease.bytes);
+        if take == 0 || lease.pool_only {
+            return 0;
+        }
+        let mut s = self.inner.lock();
+        let moved = take.min(s.scratch_bytes);
+        s.scratch_bytes -= moved;
+        s.pass_bytes = s.pass_bytes.saturating_add(moved);
+        lease.bytes -= moved;
+        moved
     }
 
     pub(crate) fn try_reserve_pool_scratch(&self, delta: u64) -> Result<()> {
@@ -592,6 +644,33 @@ impl ViewBudget {
 
     pub(crate) fn scratch_lease(&self) -> ScratchLease {
         ScratchLease::new(Some(self.handle()))
+    }
+
+    /// Split `lease`'s live scratch credit out of this budget's [`LiveCredit`] into a
+    /// standalone [`MemoryLease`] on the upstream parent (zero parent ops), disarming
+    /// `lease`. Used when returning materialized fallback rows that outlive a temporary
+    /// circuit.
+    pub(crate) fn detach_scratch_lease(&self, lease: &mut ScratchLease) -> Option<MemoryLease> {
+        let bytes = lease.take_bytes();
+        if bytes == 0 {
+            return None;
+        }
+        let mut s = self.inner.lock();
+        if lease.pool_only {
+            s.pool_scratch_bytes = s.pool_scratch_bytes.saturating_sub(bytes);
+        } else {
+            s.scratch_bytes = s.scratch_bytes.saturating_sub(bytes);
+        }
+        let detached = s.credit.as_mut().map(|credit| {
+            credit
+                .split_live(bytes)
+                .expect("detached scratch bytes cannot exceed live credit")
+                .into_lease()
+        });
+        if s.total_live() == 0 {
+            s.trim_raw();
+        }
+        detached
     }
 
     /// Atomically move `bytes` from persistent `state_bytes` to a [`ScratchLease`],
@@ -950,5 +1029,113 @@ mod tests {
         let ok = child.reserve(8 << 10).unwrap();
         drop(ok);
         handle.release_pass(24 << 10);
+    }
+
+    /// Proves that dropping a `Slot` with populated `Slot::history` (and its active
+    /// `history_reclaim_hook`) frees `HistoryBuf` strictly before `ViewBudget`'s
+    /// `LiveCredit` and `retired` leases return credit to the parent.
+    #[test]
+    fn slot_drop_frees_history_buf_before_parent_release() {
+        use crate::incr::runtime::{Runtime, RuntimeOptions};
+        use crate::incr::views::ViewDef;
+        use crate::sparql::pool::QueryPool;
+
+        let store = Store::in_memory(StoreOptions::default());
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:a> <urn:p> \"seed\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+
+        let history_dead_on_release = Arc::new(AtomicBool::new(false));
+        let release_seen = Arc::new(AtomicUsize::new(0));
+        let weak_hist: Arc<Mutex<Option<std::sync::Weak<Mutex<()>>>>> = Arc::new(Mutex::new(None));
+        let _ = weak_hist;
+
+        // Build a Circuit + HistoryBuf pair wired exactly like `Runtime::cell_for`,
+        // with a custom parent release callback that checks `HistoryBuf`'s strong count.
+        let domain = MemoryDomain::unpooled();
+        let hist = Arc::new(Mutex::new(Vec::<Vec<Option<oxrdf::Term>>>::new()));
+        let weak = Arc::downgrade(&hist);
+        let dead_flag = history_dead_on_release.clone();
+        let rel_count = release_seen.clone();
+        let parent = domain.parent(
+            |_| Ok(()),
+            move |bytes| {
+                if bytes > 0 {
+                    rel_count.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        weak.strong_count(),
+                        0,
+                        "HistoryBuf must drop strictly before parent release callback runs"
+                    );
+                    dead_flag.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+
+        struct MockSlot {
+            _history: Arc<Mutex<Vec<Vec<Option<oxrdf::Term>>>>>,
+            _circuit: Circuit,
+        }
+
+        let q = parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
+        let mut circuit = Circuit::new(compile(&q, None).unwrap(), None);
+        circuit.set_pool(None, Some(parent));
+        let hook_weak = Arc::downgrade(&hist);
+        circuit.set_reclaim_external(Some(Arc::new(move |_| {
+            let Some(h) = hook_weak.upgrade() else {
+                return 0;
+            };
+            h.lock().clear();
+            0
+        })));
+        circuit.build(store.snapshot(), &Control::none()).unwrap();
+        hist.lock().push(vec![Some(oxrdf::Term::from(
+            oxrdf::Literal::new_simple_literal("payload"),
+        ))]);
+        circuit.try_set_external(4096).unwrap();
+
+        let slot = MockSlot {
+            _history: hist,
+            _circuit: circuit,
+        };
+        drop(slot);
+        assert!(release_seen.load(Ordering::SeqCst) >= 1);
+        assert!(history_dead_on_release.load(Ordering::SeqCst));
+
+        // Also verify dropping a pooled `Runtime` with a populated named view (and
+        // non-empty `Slot::history`) without calling `close()` cleanly returns pool
+        // credit to exact 0 without leaking `HistoryBuf` through `reclaim_external`.
+        let pool = QueryPool::new(16 << 20);
+        let rt = Runtime::open_with_pool(
+            None,
+            store.dataset_id(),
+            RuntimeOptions::default(),
+            Some(pool.clone()),
+        );
+        rt.set_host(Arc::new(crate::incr::runtime::OpenHost));
+        rt.put(
+            &store,
+            "v",
+            ViewDef::table("SELECT ?s ?o WHERE { ?s <urn:p> ?o }"),
+        )
+        .unwrap();
+        rt.round(&store);
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:b> <urn:p> \"diff-row\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        rt.round(&store);
+        assert!(pool.granted() > 0);
+        drop(rt);
+        assert_eq!(
+            pool.granted(),
+            0,
+            "dropping Runtime without close() must free Slot::history and return credit to 0"
+        );
     }
 }

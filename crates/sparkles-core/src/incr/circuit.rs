@@ -259,6 +259,14 @@ pub enum Advance {
     Reset(Changes),
 }
 
+/// Like [`Advance`], carrying the [`ScratchLease`](super::budget::ScratchLease) that
+/// covers the returned [`Changes`] vector until the caller consumes and drops it.
+pub(crate) enum ChargedAdvance {
+    Skipped,
+    Changed(Changes, super::budget::ScratchLease),
+    Reset(Changes, super::budget::ScratchLease),
+}
+
 pub struct Circuit {
     pub kind: Kind,
     pub vars: Vec<String>,
@@ -783,8 +791,8 @@ impl Circuit {
             .budget
             .commit_pass_with_scratch(self.bytes(), &mut out_lease)
         {
-            drop(out_lease);
             self.clear_state();
+            drop(out_lease);
             return Err(e);
         }
         self.applied = snap.commit;
@@ -868,11 +876,23 @@ impl Circuit {
 
     /// Evaluate again at `d.snapshot` and return the change of the result.
     pub fn reset(&mut self, d: &DeltaSet, control: &Control) -> Result<Changes> {
+        let (diff, lease) = self.reset_charged(d, control)?;
+        drop(lease);
+        Ok(diff)
+    }
+
+    /// Like [`reset`](Self::reset), returning the [`ScratchLease`] covering the diff
+    /// vector so the caller keeps it charged while consuming it.
+    pub(crate) fn reset_charged(
+        &mut self,
+        d: &DeltaSet,
+        control: &Control,
+    ) -> Result<(Changes, super::budget::ScratchLease)> {
         let snap = d.snapshot.clone();
         if !self.keep_result {
             // no result to compare with: the change is not known
             self.build(snap, control)?;
-            return Ok(Vec::new());
+            return Ok((Vec::new(), self.budget.scratch_lease()));
         }
         // the old result in the new id space, to compare with
         if let Some(prev) = self.snap.clone()
@@ -932,9 +952,12 @@ impl Circuit {
             drop(remapped_lease);
             diff
         };
-        drop(diff_lease);
-        self.budget.try_set_state(self.bytes())?;
-        Ok(diff)
+        if let Err(e) = self.budget.try_set_state(self.bytes()) {
+            drop(diff);
+            drop(diff_lease);
+            return Err(e);
+        }
+        Ok((diff, diff_lease))
     }
 
     fn minus_budgeted(
@@ -978,10 +1001,31 @@ impl Circuit {
 
     /// Apply the net changes `d` (whose `after` must be the circuit's commit).
     pub fn advance(&mut self, d: &DeltaSet, control: &Control) -> Result<Advance> {
+        match self.advance_charged(d, control)? {
+            ChargedAdvance::Skipped => Ok(Advance::Skipped),
+            ChargedAdvance::Changed(out, lease) => {
+                drop(lease);
+                Ok(Advance::Changed(out))
+            }
+            ChargedAdvance::Reset(out, lease) => {
+                drop(lease);
+                Ok(Advance::Reset(out))
+            }
+        }
+    }
+
+    /// Like [`advance`](Self::advance), keeping the returned [`Changes`] vector covered
+    /// by its [`ScratchLease`] until the caller finishes consuming and drops it.
+    pub(crate) fn advance_charged(
+        &mut self,
+        d: &DeltaSet,
+        control: &Control,
+    ) -> Result<ChargedAdvance> {
         self.clear_moves();
         let snap = d.snapshot.clone();
         if !d.complete {
-            return Ok(Advance::Reset(self.reset(d, control)?));
+            let (diff, lease) = self.reset_charged(d, control)?;
+            return Ok(ChargedAdvance::Reset(diff, lease));
         }
         if let Some(prev) = self.snap.clone() {
             if prev.generation.uid != snap.generation.uid {
@@ -1016,7 +1060,7 @@ impl Circuit {
             if skip {
                 self.applied = snap.commit;
                 self.snap = Some(snap);
-                return Ok(Advance::Skipped);
+                return Ok(ChargedAdvance::Skipped);
             }
             let old = d.old()?;
             let (mut p, root) =
@@ -1024,7 +1068,7 @@ impl Circuit {
             p.full = true;
             let res = Self::run_delta(root, &mut p);
             let stats = p.stats;
-            let mut out_lease = p.take_output_lease();
+            let out_lease = p.take_output_lease();
             drop(p);
             let (out, ann) = match res {
                 Ok(v) => v,
@@ -1038,10 +1082,9 @@ impl Circuit {
                 self.result.apply(&out);
             }
             self.absorb(ann);
-            if let Err(e) = self
-                .budget
-                .commit_pass_with_scratch(self.bytes(), &mut out_lease)
-            {
+            // Keep `out_lease` intact while `out` is returned to the caller.
+            if let Err(e) = self.budget.commit_pass(self.bytes()) {
+                drop(out);
                 drop(out_lease);
                 self.budget.abort_pass(self.bytes());
                 return Err(e);
@@ -1049,7 +1092,7 @@ impl Circuit {
             self.applied = snap.commit;
             self.snap = Some(snap);
             self.last = stats;
-            return Ok(Advance::Changed(out));
+            return Ok(ChargedAdvance::Changed(out, out_lease));
         }
         let (added, removed): (Vec<[Id; 4]>, Vec<[Id; 4]>) = if vis.everything() {
             (d.added.clone(), d.removed.clone())
@@ -1078,13 +1121,13 @@ impl Circuit {
         if !touched {
             self.applied = snap.commit;
             self.snap = Some(snap);
-            return Ok(Advance::Skipped);
+            return Ok(ChargedAdvance::Skipped);
         }
         let old = d.old()?;
         let (mut p, root) = self.pass(snap.clone(), Some(old), &added, &removed, &vis, control);
         let res = Self::run_delta(root, &mut p);
         let stats = p.stats;
-        let mut out_lease = p.take_output_lease();
+        let out_lease = p.take_output_lease();
         drop(p);
         let (out, ann) = match res {
             Ok(v) => v,
@@ -1098,10 +1141,9 @@ impl Circuit {
             self.result.apply(&out);
         }
         self.absorb(ann);
-        if let Err(e) = self
-            .budget
-            .commit_pass_with_scratch(self.bytes(), &mut out_lease)
-        {
+        // Keep `out_lease` intact while `out` is returned to the caller.
+        if let Err(e) = self.budget.commit_pass(self.bytes()) {
+            drop(out);
             drop(out_lease);
             self.budget.abort_pass(self.bytes());
             return Err(e);
@@ -1109,59 +1151,54 @@ impl Circuit {
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.last = stats;
-        Ok(Advance::Changed(out))
+        Ok(ChargedAdvance::Changed(out, out_lease))
     }
 
     /// Decode `rows` into terms while charging the decoded copy against this circuit's
-    /// budget (for fallback reads where the circuit and decoded rows coexist).
+    /// budget, and split out a standalone [`MemoryLease`] so the returned rows stay
+    /// charged after this temporary circuit drops.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn rows_budgeted(&self) -> Result<Vec<(Vec<Option<Term>>, i64)>> {
+    pub(crate) fn rows_budgeted(
+        &self,
+    ) -> Result<(Vec<(Vec<Option<Term>>, i64)>, Option<MemoryLease>)> {
         let mut lease = self.budget.scratch_lease();
-        let rows = if let Some((w, cols)) = self.root.result_window()
+        let Some(snap) = &self.snap else {
+            return Ok((Vec::new(), None));
+        };
+        let slot_sz = std::mem::size_of::<(Vec<Option<Term>>, i64)>() as u64;
+        let mut out: Vec<(Vec<Option<Term>>, i64)> = Vec::new();
+        let mut payload_bytes = 0u64;
+        let mut push_decoded = |decoded: Vec<Option<Term>>, w: i64| -> Result<()> {
+            let next_cap =
+                sparkles_budget::sizes::vec_grown(out.capacity(), out.len(), 1, slot_sz as usize);
+            payload_bytes = payload_bytes.saturating_add(decoded_row_bytes(&decoded));
+            let need = (next_cap as u64)
+                .saturating_mul(slot_sz)
+                .saturating_add(payload_bytes);
+            if need > lease.bytes() {
+                lease.try_set(need)?;
+            }
+            out.push((decoded, w));
+            Ok(())
+        };
+        if let Some((w, cols)) = self.root.result_window()
             && w.positions
         {
-            let raw: Vec<(Row, i64)> = w
-                .rows()
-                .iter()
-                .map(|(r, n)| (Self::window_row(cols, r), *n))
-                .collect();
-            self.decode_rows_charged(&raw, &mut lease)?
+            for (r, n) in w.rows() {
+                let row = Self::window_row(cols, &r);
+                let decoded: Vec<Option<Term>> =
+                    row.iter().map(|&i| self.terms.term(snap, i)).collect();
+                push_decoded(decoded, n)?;
+            }
         } else {
-            let Some(snap) = &self.snap else {
-                return Ok(Vec::new());
-            };
-            let mut out = Vec::with_capacity(self.result.len());
-            let mut bytes = 0u64;
             for (r, w) in self.result.iter() {
                 let decoded: Vec<Option<Term>> =
                     r.iter().map(|&i| self.terms.term(snap, i)).collect();
-                bytes = bytes.saturating_add(decoded_row_bytes(&decoded));
-                lease.try_set(bytes)?;
-                out.push((decoded, w));
+                push_decoded(decoded, w)?;
             }
-            out
-        };
-        Ok(rows)
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn decode_rows_charged(
-        &self,
-        rows: &[(Row, i64)],
-        lease: &mut super::budget::ScratchLease,
-    ) -> Result<Vec<(Vec<Option<Term>>, i64)>> {
-        let Some(snap) = &self.snap else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::with_capacity(rows.len());
-        let mut bytes = 0u64;
-        for (r, w) in rows {
-            let decoded: Vec<Option<Term>> = r.iter().map(|&i| self.terms.term(snap, i)).collect();
-            bytes = bytes.saturating_add(decoded_row_bytes(&decoded));
-            lease.try_set(bytes)?;
-            out.push((decoded, *w));
         }
-        Ok(out)
+        let detached = self.budget.detach_scratch_lease(&mut lease);
+        Ok((out, detached))
     }
 
     /// The terms of rows of the result.

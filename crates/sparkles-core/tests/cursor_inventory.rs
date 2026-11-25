@@ -159,6 +159,7 @@ impl sparkles_core::sparql::viewsvc::ViewSource for Integers {
                 .collect(),
             commit: 0,
             evaluated_under: None,
+            lease: None,
         })
     }
 }

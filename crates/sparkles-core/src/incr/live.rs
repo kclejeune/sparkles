@@ -276,6 +276,10 @@ impl Shared {
         self.wake_all();
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.queue.lock().closed
+    }
+
     /// Wake every waiting reader, blocking or asynchronous, and the next one to wait.
     fn wake_all(&self) {
         self.cv.notify_all();

@@ -394,3 +394,61 @@ fn detached_remove_and_trim_defer_parent_release_until_lease_drop() {
     drop(trimmed);
     assert_eq!(c.reserved.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn live_credit_try_absorb_lease_recycles_detached_credit_and_enforces_parent() {
+    let domain = MemoryDomain::new();
+    let (p1, c1) = parent(&domain, 2 * LIVE_SLACK + LIVE_STEP);
+    let (p2, _c2) = parent(&domain, LIVE_SLACK);
+    let other_domain = MemoryDomain::new();
+    let (p_foreign, _cf) = parent(&other_domain, LIVE_SLACK);
+
+    let mut live = LiveCredit::new(p1);
+    live.try_add(2 * LIVE_SLACK + LIVE_STEP).unwrap();
+
+    // Detach > LIVE_SLACK so the pool is still at 100% capacity with zero free room.
+    let mut detached = live
+        .remove_detached(LIVE_SLACK + LIVE_STEP)
+        .unwrap()
+        .expect("shrink past LIVE_SLACK returns detached lease");
+    assert_eq!(detached.bytes(), LIVE_SLACK + LIVE_STEP);
+    assert_eq!(
+        c1.reserved.load(Ordering::SeqCst),
+        2 * LIVE_SLACK + LIVE_STEP
+    );
+
+    // Without recycling, trying to grow past LIVE_SLACK fails on the full parent.
+    assert!(matches!(
+        live.try_add(LIVE_STEP),
+        Err(ParentRefused::Limit { .. })
+    ));
+
+    // Absorbing a split slice from `detached` and then adding LIVE_STEP succeeds with
+    // zero additional parent reserve calls.
+    let reserves_before = c1.reserves.load(Ordering::SeqCst);
+    let mut part = detached.split(LIVE_STEP).unwrap();
+    live.try_absorb_lease(&mut part).unwrap();
+    assert_eq!(part.bytes(), 0);
+    assert_eq!(detached.bytes(), LIVE_SLACK);
+    live.try_add(LIVE_STEP).unwrap();
+    assert_eq!(c1.reserves.load(Ordering::SeqCst), reserves_before);
+    assert_eq!(live.live(), LIVE_SLACK + LIVE_STEP);
+
+    // Different parent in same domain and foreign domain are both refused.
+    let mut diff_parent = p2.reserve(LIVE_STEP).unwrap();
+    assert_eq!(
+        live.try_absorb_lease(&mut diff_parent),
+        Err(ParentRefused::DifferentParent)
+    );
+    let mut foreign = p_foreign.reserve(LIVE_STEP).unwrap();
+    assert_eq!(
+        live.try_absorb_lease(&mut foreign),
+        Err(ParentRefused::ForeignDomain)
+    );
+
+    drop(foreign);
+    drop(diff_parent);
+    drop(detached);
+    drop(live);
+    assert_eq!(c1.reserved.load(Ordering::SeqCst), 0);
+}

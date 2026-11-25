@@ -110,12 +110,17 @@ pub(crate) struct Slot {
 
 impl Slot {
     /// Leaf reclaim hook for `ViewBudget`: drops oldest replay diffs when active state
-    /// needs headroom under the local cap or parent pool.
+    /// needs headroom under the local cap or parent pool. Captures a `Weak` reference so
+    /// `Slot::history` remains the sole strong owner and drops strictly before
+    /// `Slot::circuit`'s credit returns to the pool.
     pub(super) fn history_reclaim_hook(
         history: &Arc<Mutex<HistoryBuf>>,
     ) -> crate::incr::budget::ReclaimHook {
-        let hist = history.clone();
+        let hist = Arc::downgrade(history);
         Arc::new(move |needed: u64| {
+            let Some(hist) = hist.upgrade() else {
+                return 0;
+            };
             let mut h = hist.lock();
             let mut freed = 0u64;
             while freed < needed {
@@ -140,6 +145,17 @@ impl Slot {
         self.view_limits.len()
     }
 
+    /// Prune dropped or explicitly closed live subscribers and recompute the effective
+    /// local limit when any subscriber left.
+    pub(super) fn prune_dead_subs(&mut self) {
+        let before = self.subs.len();
+        self.subs
+            .retain(|s| s.shared.upgrade().is_some_and(|sh| !sh.is_closed()));
+        if self.subs.len() != before {
+            self.recompute_local_limit();
+        }
+    }
+
     /// Recompute the shared circuit's local byte limit from its currently attached views
     /// and live subscribers so detaching a larger consumer lowers the ceiling.
     pub(super) fn recompute_local_limit(&mut self) {
@@ -147,7 +163,7 @@ impl Slot {
         let max_sub = self
             .subs
             .iter()
-            .filter(|s| s.shared.strong_count() > 0)
+            .filter(|s| s.shared.upgrade().is_some_and(|sh| !sh.is_closed()))
             .map(|s| s.budget)
             .max();
         let effective = match (max_view, max_sub) {
@@ -264,14 +280,17 @@ impl Slot {
     }
 
     /// Evaluate the query at `snap` from scratch. This is the first build, or a rebuild
-    /// whose change from the old result is returned for the live queries.
+    /// whose change from the old result is returned with its scratch lease for the live
+    /// queries.
     pub(super) fn evaluate(
         &mut self,
         snap: Arc<crate::store::Snapshot>,
         control: &Control,
-    ) -> Result<Option<Changes>> {
+    ) -> Result<Option<(Changes, crate::incr::budget::ScratchLease)>> {
         if self.circuit.snap.is_some() {
-            self.circuit.reset(&DeltaSet::at(snap), control).map(Some)
+            self.circuit
+                .reset_charged(&DeltaSet::at(snap), control)
+                .map(Some)
         } else {
             self.circuit.build(snap, control).map(|()| None)
         }
@@ -289,11 +308,7 @@ impl Slot {
     }
 
     pub(super) fn alive(&mut self) -> bool {
-        let before = self.subs.len();
-        self.subs.retain(|s| s.shared.strong_count() > 0);
-        if self.subs.len() != before {
-            self.recompute_local_limit();
-        }
+        self.prune_dead_subs();
         if self.subs.is_empty() && self.view_limits.is_empty() {
             self.clear_history();
         }
@@ -306,6 +321,20 @@ impl Slot {
         to: u64,
         rows: Arc<[(Vec<Option<Term>>, i64)]>,
         max: usize,
+    ) {
+        let mut empty = crate::incr::budget::ScratchLease::default();
+        self.remember_charged(from, to, rows, max, &mut empty);
+    }
+
+    /// Store `rows` in replay history while atomically handing off any pre-admitted
+    /// scratch `lease` into `external_bytes`, avoiding any uncharged gap or 2× peak.
+    pub(super) fn remember_charged(
+        &mut self,
+        from: u64,
+        to: u64,
+        rows: Arc<[(Vec<Option<Term>>, i64)]>,
+        max: usize,
+        lease: &mut crate::incr::budget::ScratchLease,
     ) {
         let max = if self.subs.is_empty() {
             if self.view_limits.is_empty() {
@@ -345,7 +374,11 @@ impl Slot {
         loop {
             let cur_bytes = self.history.lock().bytes;
             let next_bytes = cur_bytes.saturating_add(bytes);
-            if self.circuit.try_set_external(next_bytes).is_ok() {
+            if self
+                .circuit
+                .commit_external_from_scratch(next_bytes, lease)
+                .is_ok()
+            {
                 let mut h = self.history.lock();
                 h.rows = h.rows.saturating_add(new_rows);
                 h.bytes = h.bytes.saturating_add(bytes);
@@ -485,5 +518,81 @@ pub(super) fn diff_event(
         from,
         removed: removed.into(),
         added: added.into(),
+    }
+}
+
+#[cfg(test)]
+mod drop_order_tests {
+    use super::*;
+    use crate::sparql::parse_query;
+    use crate::store::StoreOptions;
+    use sparkles_budget::MemoryDomain;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Proves using the real `Slot` and `Slot::history_reclaim_hook` that dropping a
+    /// populated `Slot` destroys `HistoryBuf` strictly before `Slot::circuit`'s credit
+    /// returns to the parent.
+    #[test]
+    fn real_slot_drop_frees_history_buf_before_parent_release() {
+        let store = Store::in_memory(StoreOptions::default());
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:a> <urn:p> \"seed\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+
+        let history = Arc::new(Mutex::new(HistoryBuf::default()));
+        let weak_hist = Arc::downgrade(&history);
+        let saw_dead = Arc::new(AtomicBool::new(false));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let saw_dead_cb = saw_dead.clone();
+        let releases_cb = releases.clone();
+        let weak_cb = weak_hist.clone();
+        let parent = MemoryDomain::unpooled().parent(
+            |_| Ok(()),
+            move |bytes| {
+                if bytes > 0 {
+                    releases_cb.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        weak_cb.strong_count(),
+                        0,
+                        "Slot::history must be dropped before Slot::circuit returns parent credit"
+                    );
+                    saw_dead_cb.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+
+        let q = parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
+        let mut circuit = Circuit::new(compile(&q, None).unwrap(), None);
+        circuit.set_pool(None, Some(parent));
+        circuit.set_reclaim_external(Some(Slot::history_reclaim_hook(&history)));
+        circuit.build(store.snapshot(), &Control::none()).unwrap();
+        let vars: Arc<[String]> = circuit.columns().into();
+        let mut view_limits = FxHashMap::default();
+        view_limits.insert("v".to_string(), 1 << 20);
+        let mut slot = Slot {
+            query: q,
+            whole: None,
+            vars,
+            history,
+            subs: Vec::new(),
+            view_limits,
+            rebased: false,
+            circuit,
+        };
+        let rows: Arc<[(Vec<Option<Term>>, i64)]> = Arc::from(vec![(
+            vec![
+                Some(Term::NamedNode(oxrdf::NamedNode::new_unchecked("urn:a"))),
+                Some(Term::Literal(oxrdf::Literal::new_simple_literal("v"))),
+            ],
+            1,
+        )]);
+        slot.remember(0, 1, rows, VIEW_HISTORY_COMMITS);
+        assert_eq!(weak_hist.strong_count(), 1);
+        drop(slot);
+        assert!(releases.load(Ordering::SeqCst) >= 1);
+        assert!(saw_dead.load(Ordering::SeqCst));
     }
 }

@@ -617,7 +617,16 @@ impl Runtime {
                 );
             }
             if let Err(e) = Self::charge_tally(&st.circuit, t, &mut st.dirty, applied) {
-                return Some(e);
+                if matches!(e, Error::BudgetExceeded(_)) {
+                    // Counts alone exceeded the remaining budget: record commits through
+                    // `applied` as unavailable per F13 §3.6 without failing the circuit.
+                    t.discard_through(applied);
+                    t.clear_storage();
+                    st.circuit.set_external_best_effort(0);
+                    st.dirty = true;
+                } else {
+                    return Some(e);
+                }
             }
         }
         None
@@ -686,23 +695,91 @@ impl Runtime {
         } = st;
         let tally = tally.as_mut().expect("an accumulator");
         let max = circuit.max_memory_bytes.unwrap_or(u64::MAX);
+        let record_lost = |circuit: &Circuit,
+                           tally: &mut Tally,
+                           dirty: &mut bool,
+                           first: u64,
+                           last: u64|
+         -> Result<()> {
+            // Pre-admit any unknown-range growth before pushing; if counts cannot fit,
+            // advance `since` to `last` at zero bytes instead of failing the circuit.
+            let next_unknown_cap = sparkles_budget::sizes::vec_grown(
+                tally.unknown.capacity(),
+                tally.unknown.len(),
+                1,
+                16,
+            );
+            let est = tally
+                .bytes()
+                .saturating_sub(tally.unknown.capacity() as u64 * 16)
+                .saturating_add(next_unknown_cap as u64 * 16);
+            if circuit.try_set_external(est).is_ok() {
+                tally.lose(first, last);
+                *dirty = true;
+                let _ = circuit.try_set_external(tally.bytes());
+                return Ok(());
+            }
+            tally.lose(first, last);
+            *dirty = true;
+            if let Err(e) = Self::charge_tally(circuit, tally, dirty, last) {
+                if matches!(e, Error::BudgetExceeded(_)) {
+                    tally.discard_through(last);
+                    tally.clear_storage();
+                    circuit.set_external_best_effort(0);
+                    *dirty = true;
+                } else {
+                    return Err(e);
+                }
+            }
+            Ok(())
+        };
         let Some(mut steps) = DeltaSet::steps(store, from, control) else {
             let snap = store.snapshot();
-            circuit.reset(&DeltaSet::at(snap.clone()), control)?;
-            tally.lose(from + 1, snap.commit);
-            Self::charge_tally(circuit, tally, dirty, snap.commit)?;
+            let (diff, diff_lease) = circuit.reset_charged(&DeltaSet::at(snap.clone()), control)?;
+            drop(diff);
+            drop(diff_lease);
+            let state = circuit.bytes();
+            if state > max {
+                return Err(Error::BudgetExceeded(crate::error::Budget {
+                    kind: crate::error::BudgetKind::Memory,
+                    limit: max,
+                    requested: state,
+                }));
+            }
+            record_lost(circuit, tally, dirty, from + 1, snap.commit)?;
             return Ok(());
         };
         while let Some(d) = steps.next() {
             let d = d?;
             let at = d.snapshot.commit;
-            match circuit.advance(&d, control)? {
-                Advance::Skipped => {}
-                Advance::Changed(c) => {
+            match circuit.advance_charged(&d, control)? {
+                crate::incr::circuit::ChargedAdvance::Skipped => {}
+                crate::incr::circuit::ChargedAdvance::Changed(c, c_lease) => {
+                    // Check actual circuit state first: state over budget fails the circuit.
+                    let state = circuit.bytes();
+                    if state > max {
+                        drop(c);
+                        drop(c_lease);
+                        return Err(Error::BudgetExceeded(crate::error::Budget {
+                            kind: crate::error::BudgetKind::Memory,
+                            limit: max,
+                            requested: state,
+                        }));
+                    }
                     let snap = d.snapshot.clone();
                     let terms = &circuit.terms;
-                    tally.add_budgeted(at, &c, |i| terms.term(&snap, i), Some(circuit), dirty)?;
-                    // the budget holds after each commit of a run, not only at its end
+                    tally.add_budgeted_charged(
+                        at,
+                        c,
+                        c_lease,
+                        |i| terms.term(&snap, i),
+                        Some(circuit),
+                        dirty,
+                    )?;
+                }
+                crate::incr::circuit::ChargedAdvance::Reset(c, c_lease) => {
+                    drop(c);
+                    drop(c_lease);
                     let state = circuit.bytes();
                     if state > max {
                         return Err(Error::BudgetExceeded(crate::error::Budget {
@@ -711,14 +788,7 @@ impl Runtime {
                             requested: state,
                         }));
                     }
-                    if tally.shrink_to(max - state) {
-                        *dirty = true;
-                    }
-                    Self::charge_tally(circuit, tally, dirty, at)?;
-                }
-                Advance::Reset(_) => {
-                    tally.lose(d.after + 1, at);
-                    Self::charge_tally(circuit, tally, dirty, at)?;
+                    record_lost(circuit, tally, dirty, d.after + 1, at)?;
                 }
             }
         }
@@ -791,21 +861,23 @@ impl Runtime {
         let snap = store.snapshot();
         let id = &cell.spec.id;
         for (commit, path) in persist::list(dir) {
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
             let mut file_lease =
                 super::super::budget::ScratchLease::new_pool_only(Some(st.circuit.budget_handle()));
-            if let Err(e) = file_lease.try_reserve(meta.len()) {
-                tracing::warn!(
-                    target: "sparkles::incr::runtime",
-                    "internal circuit {id}: checkpoint {}: {e}; the circuit is built again",
-                    path.display()
-                );
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
+            let bytes = match super::attach::read_bounded_file(&path, &mut file_lease) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    drop(file_lease);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "sparkles::incr::runtime",
+                        "internal circuit {id}: checkpoint {}: {e}; the circuit is built again",
+                        path.display()
+                    );
+                    drop(file_lease);
+                    continue;
+                }
             };
             let (h, body) = match persist::decode_as(checkpoint_kind(&st.circuit), &bytes) {
                 Ok(x) => x,

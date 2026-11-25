@@ -609,6 +609,12 @@ impl LiveCredit {
         Ok(())
     }
 
+    /// Absorb a detached [`MemoryLease`] into this account's reserved headroom without
+    /// any parent operation, preserving `live()` unchanged.
+    pub fn try_absorb_lease(&mut self, other: &mut MemoryLease) -> Result<(), ParentRefused> {
+        self.lease.try_merge(other)
+    }
+
     pub fn try_move_to(&mut self, parent: ParentHandle) -> Result<(), ParentRefused> {
         self.lease.try_move_to(parent)
     }

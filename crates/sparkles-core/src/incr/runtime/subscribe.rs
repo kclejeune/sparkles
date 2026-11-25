@@ -341,4 +341,100 @@ mod resume_unwind_tests {
         rt.close(&store);
         assert_eq!(pool.granted(), 0);
     }
+
+    /// Exercises the actual `Runtime::live(..., after: Some(_))` -> `Runtime::resume`
+    /// fallback circuit path with an active `QueryPool` waker that re-acquires
+    /// `cell.state.lock()`, proving the temporary resume circuit drops strictly outside
+    /// `cell.state.lock()`.
+    #[test]
+    fn actual_runtime_resume_drops_fallback_circuit_outside_cell_state_lock() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut init = String::from("INSERT DATA { ");
+        for i in 0..200 {
+            init.push_str(&format!("<urn:r:{i}> <urn:p> \"{}\". ", "v".repeat(128)));
+        }
+        init.push('}');
+        crate::sparql::update::update(&store, &init, &crate::sparql::QueryOptions::default())
+            .unwrap();
+        let c1 = store.snapshot().commit;
+
+        let pool = QueryPool::new(16 << 20);
+        let rt = Runtime::open_with_pool(
+            None,
+            store.dataset_id(),
+            RuntimeOptions {
+                history_commits: 1,
+                ..RuntimeOptions::default()
+            },
+            Some(pool.clone()),
+        );
+        rt.set_host(Arc::new(OpenHost));
+        let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+        let live1 = rt.live(&store, q, None, &LiveOptions::default()).unwrap();
+
+        // Advance past `c1` and clear history so resuming after `c1` takes the fallback
+        // circuit path inside `Runtime::resume`.
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:r:extra> <urn:p> \"extra\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        rt.round(&store);
+        let cell = rt.reg.lock().cells.values().next().unwrap().clone();
+        {
+            let mut st = cell.state.lock();
+            st.clear_history();
+            let retired = st.circuit.drain_retired();
+            drop(st);
+            drop(retired);
+        }
+
+        let baseline = pool.granted();
+        assert!(baseline > 0);
+        // Pin all but 4 MiB so the fallback resume circuit can build and a 4 MiB waiter
+        // wakes synchronously when `deferred_state` drops the fallback circuit outside
+        // `cell.state.lock()`.
+        let filler = pool
+            .work_parent()
+            .reserve(pool.capacity() - (4 << 20) - baseline)
+            .unwrap();
+        let woke = Arc::new(AtomicUsize::new(0));
+        let woke_cb = woke.clone();
+        let cell_cb = cell.clone();
+        let waiter = pool.enter(
+            4 << 20,
+            Some(Arc::new(move || {
+                // Would deadlock if `Runtime::resume` dropped the fallback circuit under
+                // `cell.state.lock()`.
+                let _st = cell_cb.state.lock();
+                woke_cb.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+
+        let live2 = rt
+            .live(
+                &store,
+                q,
+                None,
+                &LiveOptions {
+                    after: Some(c1),
+                    ..LiveOptions::default()
+                },
+            )
+            .unwrap();
+        // The resumed subscriber received the diff for `<urn:r:extra>`, and the fallback
+        // circuit dropped cleanly outside `cell.state.lock()` waking our waiter.
+        assert!(matches!(live2.try_next(), Some(LiveEvent::Diff { .. })));
+        assert!(
+            woke.load(Ordering::SeqCst) >= 1,
+            "waker must acquire cell.state.lock() cleanly when Runtime::resume drops fallback circuit"
+        );
+        drop(waiter);
+        drop(filler);
+        drop(live2);
+        drop(live1);
+        rt.close(&store);
+        assert_eq!(pool.granted(), 0);
+    }
 }

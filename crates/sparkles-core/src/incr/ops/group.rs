@@ -900,6 +900,7 @@ impl Group {
 
     pub fn load(&mut self, r: &mut Reader) -> Result<()> {
         fn sum(r: &mut Reader) -> Result<SumState> {
+            r.charge_state(96)?;
             let mut s = SumState {
                 rows: r.i64()?,
                 errs: r.i64()?,
@@ -909,15 +910,21 @@ impl Group {
             };
             for _ in 0..r.u64()? {
                 let k = r.i128()?;
-                s.decs.insert(k, r.i64()?);
+                let c = r.i64()?;
+                r.charge_state(40)?;
+                s.decs.insert(k, c);
             }
             for _ in 0..r.u64()? {
                 let b = r.u64()? as u32;
-                s.floats.insert(b, r.i64()?);
+                let c = r.i64()?;
+                r.charge_state(24)?;
+                s.floats.insert(b, c);
             }
             for _ in 0..r.u64()? {
                 let b = r.u64()?;
-                s.doubles.insert(b, r.i64()?);
+                let c = r.i64()?;
+                r.charge_state(24)?;
+                s.doubles.insert(b, c);
             }
             Ok(s)
         }
@@ -960,10 +967,6 @@ impl Group {
                     }
                     AState::Sum(s) => {
                         *s = sum(r)?;
-                        r.charge_state(
-                            96 + (s.floats.len() + s.doubles.len()) as u64 * 24
-                                + s.decs.len() as u64 * 40,
-                        )?;
                     }
                     AState::Multi(m) => {
                         r.charge_state(40)?;

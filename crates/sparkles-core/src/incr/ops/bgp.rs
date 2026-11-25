@@ -554,6 +554,19 @@ impl Bgp {
 
     /// [`probe`](Self::probe) with annotations.
     pub fn probe_a(&self, p: &mut Pass, w: Which, seed: &[(usize, Id)]) -> Result<AChanges> {
+        let (out, lease) = self.probe_a_charged(p, w, seed)?;
+        drop(lease);
+        Ok(out)
+    }
+
+    /// Like [`probe_a`](Self::probe_a), keeping the probe's [`ScratchLease`] alive until
+    /// the caller consumes and drops the returned annotated rows.
+    pub(crate) fn probe_a_charged(
+        &self,
+        p: &mut Pass,
+        w: Which,
+        seed: &[(usize, Id)],
+    ) -> Result<(AChanges, super::super::budget::ScratchLease)> {
         let rps = self.resolve(p);
         let mut b = vec![Id::UNDEF; self.slots];
         for &(pos, v) in seed {
@@ -576,7 +589,7 @@ impl Bgp {
             &mut out_ann_bytes,
             &mut out_lease,
         )?;
-        Ok(out)
+        Ok((out, out_lease))
     }
 
     /// The stored quads of snapshot `w` that some pattern matches with its constants,
@@ -665,19 +678,32 @@ impl Bgp {
     /// The node's rows at snapshot `w` that agree with `seed` (schema positions and
     /// their values).
     pub fn probe(&self, p: &mut Pass, w: Which, seed: &[(usize, Id)]) -> Result<Changes> {
+        let (out, lease) = self.probe_charged(p, w, seed)?;
+        drop(lease);
+        Ok(out)
+    }
+
+    /// Like [`probe`](Self::probe), keeping the probe's [`ScratchLease`] alive until
+    /// the caller consumes and drops the returned rows.
+    pub(crate) fn probe_charged(
+        &self,
+        p: &mut Pass,
+        w: Which,
+        seed: &[(usize, Id)],
+    ) -> Result<(Changes, super::super::budget::ScratchLease)> {
         let rps = self.resolve(p);
-        self.probe_with(p, &rps, w, seed)
+        self.probe_with_charged(p, &rps, w, seed)
     }
 
     /// [`probe`](Self::probe) with the patterns that [`resolve`](Self::resolve) gave
     /// at this pass, for a caller that probes many times.
-    pub(crate) fn probe_with(
+    pub(crate) fn probe_with_charged(
         &self,
         p: &mut Pass,
         rps: &[RPat],
         w: Which,
         seed: &[(usize, Id)],
-    ) -> Result<Changes> {
+    ) -> Result<(Changes, super::super::budget::ScratchLease)> {
         let mut b = vec![Id::UNDEF; self.slots];
         for &(pos, v) in seed {
             b[self.out[pos]] = v;
@@ -686,7 +712,7 @@ impl Bgp {
         let mut out_lease = p.scratch_lease();
         let mut rest: Vec<usize> = (0..rps.len()).collect();
         self.extend(p, rps, &|_| w, &mut rest, &b, 1, &mut out, &mut out_lease)?;
-        Ok(out)
+        Ok((out, out_lease))
     }
 
     pub fn describe(&self) -> String {

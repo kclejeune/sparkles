@@ -3,6 +3,36 @@
 
 use super::*;
 
+/// Read `path` from an already-opened file descriptor, bounding both the `ScratchLease`
+/// reservation and the actual bytes read to the open file's metadata length so concurrent
+/// file growth cannot allocate past the reservation.
+pub(super) fn read_bounded_file(
+    path: &std::path::Path,
+    lease: &mut super::super::budget::ScratchLease,
+) -> std::result::Result<Option<Vec<u8>>, Error> {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
+    let Ok(meta) = file.metadata() else {
+        return Ok(None);
+    };
+    let len = meta.len();
+    lease.try_reserve(len)?;
+    let Ok(cap) = usize::try_from(len) else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::with_capacity(cap);
+    if file.by_ref().take(len).read_to_end(&mut bytes).is_err() {
+        return Ok(None);
+    }
+    let mut extra = [0u8; 1];
+    match file.read(&mut extra) {
+        Ok(0) => Ok(Some(bytes)),
+        _ => Ok(None),
+    }
+}
+
 impl Runtime {
     /// The cell of `q` read with `access`, created (and not built) when absent.
     pub(super) fn cell_for(
@@ -126,25 +156,24 @@ impl Runtime {
         let snap = store.snapshot();
         let kind = persist::view_kind(cell.state.lock().circuit.has_fixpoint());
         for (commit, path) in persist::list(dir) {
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
             let mut file_lease = super::super::budget::ScratchLease::new_pool_only(Some(
                 cell.state.lock().circuit.budget_handle(),
             ));
-            if let Err(e) = file_lease.try_reserve(meta.len()) {
-                tracing::warn!(
-                    target: "sparkles::incr::runtime",
-                    "view {name}: checkpoint {}: {e}; the view is built again",
-                    path.display()
-                );
-                retired.extend(cell.state.lock().circuit.drain_retired());
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
-                drop(file_lease);
-                retired.extend(cell.state.lock().circuit.drain_retired());
-                continue;
+            let bytes = match read_bounded_file(&path, &mut file_lease) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    drop(file_lease);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "sparkles::incr::runtime",
+                        "view {name}: checkpoint {}: {e}; the view is built again",
+                        path.display()
+                    );
+                    drop(file_lease);
+                    continue;
+                }
             };
             let (h, body) = match persist::decode_as(kind, &bytes) {
                 Ok(x) => x,
@@ -156,7 +185,6 @@ impl Runtime {
                     );
                     drop(bytes);
                     drop(file_lease);
-                    retired.extend(cell.state.lock().circuit.drain_retired());
                     continue;
                 }
             };
@@ -197,13 +225,15 @@ impl Runtime {
                 }
             }
             // Drop the raw checkpoint buffer strictly before releasing `file_lease`.
+            // Keep retired leases in `BudgetState::retired` across retry iterations so
+            // subsequent checkpoints can recycle freed credit without hitting `QueryPool`.
             drop(bytes);
             drop(file_lease);
-            retired.extend(cell.state.lock().circuit.drain_retired());
             if loaded {
-                return;
+                break;
             }
         }
+        retired.extend(cell.state.lock().circuit.drain_retired());
     }
 
     pub(super) fn attach_pending(&self, store: &Store) {

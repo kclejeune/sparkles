@@ -245,10 +245,9 @@ impl<'a> Reader<'a> {
             ids_lease,
         };
         let n = r.u64()?;
-        let mut terms_tracked = terms.bytes();
         for _ in 0..n {
             let k = r.bytes()?;
-            // Pre-admit id table growth and potential local-term insertion before allocating.
+            // Pre-admit id table growth and any new local-term storage before inserting.
             let next_ids_cap = sparkles_budget::sizes::vec_grown(
                 r.ids.capacity(),
                 r.ids.len(),
@@ -259,13 +258,7 @@ impl<'a> Reader<'a> {
             if next_ids_bytes > r.ids_lease.bytes() {
                 r.ids_lease.try_set(next_ids_bytes)?;
             }
-            let k_owned = k.to_vec();
-            let id = terms.intern_key(snap, &k_owned);
-            let now_terms = terms.bytes();
-            if now_terms > terms_tracked {
-                r.charge_state(now_terms - terms_tracked)?;
-                terms_tracked = now_terms;
-            }
+            let id = terms.intern_key_budgeted(snap, k, |delta| r.charge_state(delta))?;
             r.ids.push(id);
         }
         Ok(r)

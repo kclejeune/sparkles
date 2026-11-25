@@ -16,6 +16,7 @@ use rustc_hash::FxHashMap;
 pub struct Terms {
     keys: Vec<Box<[u8]>>,
     index: FxHashMap<Box<[u8]>, u64>,
+    bytes: u64,
 }
 
 impl Terms {
@@ -28,13 +29,44 @@ impl Terms {
     }
 
     pub fn bytes(&self) -> u64 {
-        self.keys.iter().map(|k| k.len() as u64 * 2 + 48).sum()
+        self.bytes
     }
 
     /// The id of the term with vocabulary key `key`.
     pub fn intern_key(&mut self, snap: &Snapshot, key: &[u8]) -> Id {
         let t = id::key_to_term(key);
         self.intern(snap, &t)
+    }
+
+    /// Like [`intern_key`](Self::intern_key), pre-admitting any newly inserted local key
+    /// via `reserve` before allocating and inserting it.
+    pub(crate) fn intern_key_budgeted(
+        &mut self,
+        snap: &Snapshot,
+        key: &[u8],
+        mut reserve: impl FnMut(u64) -> crate::error::Result<()>,
+    ) -> crate::error::Result<Id> {
+        let t = id::key_to_term(key);
+        if let Term::BlankNode(b) = &t
+            && let Some(id) = crate::store::parse_bnode_label(b.as_str())
+        {
+            return Ok(id);
+        }
+        if let Some(i) = id::inline_id(&t) {
+            return Ok(i);
+        }
+        let encoded = id::term_key(&t);
+        if !matches!(t, Term::BlankNode(_))
+            && let Some(i) = snap.lookup_key(&encoded)
+        {
+            return Ok(i);
+        }
+        if let Some(&n) = self.index.get(encoded.as_slice()) {
+            return Ok(Id::local(n));
+        }
+        let added = encoded.len() as u64 * 2 + 48;
+        reserve(added)?;
+        Ok(self.local(encoded))
     }
 
     /// The id of `t`: the store's when `snap` holds it, else a local one.
@@ -61,9 +93,11 @@ impl Terms {
             return Id::local(n);
         }
         let n = self.keys.len() as u64;
+        let added = key.len() as u64 * 2 + 48;
         let key: Box<[u8]> = key.into();
         self.keys.push(key.clone());
         self.index.insert(key, n);
+        self.bytes = self.bytes.saturating_add(added);
         Id::local(n)
     }
 

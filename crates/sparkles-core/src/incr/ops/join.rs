@@ -9,7 +9,7 @@ use super::super::pass::{Pass, Which};
 use super::super::persist::{Reader, Writer};
 use super::super::prov::{self, AChanges, AnnMap, Provenance};
 use super::super::zset::{Changes, consolidate, row_bytes};
-use super::{Arrangement, Merge, Node, side_matches, side_matches_a};
+use super::{Arrangement, Merge, Node, for_each_side_match, for_each_side_match_a};
 use crate::error::Result;
 use rustc_hash::FxHashMap;
 
@@ -72,58 +72,73 @@ impl Join {
         let mut tracked = self.bytes();
         let lw = self.left.schema.len();
         let rw = self.right.schema.len();
+        let key_w = self.m.key.len();
         let l = if let (Some(larr), Some(lann)) = (&mut self.larr, &mut self.lann) {
             let other = self.rarr.as_ref().map_or(0, |a| a.bytes())
                 + self.rann.as_ref().map_or(0, |m| prov::map_bytes(m, rw));
             larr.clear();
             lann.clear();
-            let mut eff = AChanges::with_capacity(l.len());
+            p.sync_op_state(&mut tracked, other)?;
+            let per_row = row_bytes(lw) * 2 + row_bytes(key_w);
+            let mut eff = AChanges::new();
+            let mut eff_lease = p.scratch_lease();
+            let mut eff_ann_bytes = 0u64;
             for (idx, (row, w, a)) in l.into_iter().enumerate() {
-                larr.add(&row, w);
-                let e = prov::absorb_row(lann, &row, a, mode);
-                eff.push((row, w, e));
                 if idx % 1024 == 1023 {
                     p.tick()?;
-                    p.sync_op_state(
-                        &mut tracked,
-                        other + larr.bytes() + prov::map_bytes(lann, lw),
-                    )?;
                 }
+                let est = other + larr.bytes() + prov::map_bytes(lann, lw) + per_row + a.bytes();
+                if est > tracked {
+                    p.sync_op_state(&mut tracked, est)?;
+                }
+                larr.add(&row, w);
+                let e = prov::absorb_row(lann, &row, a, mode);
+                p.preadmit_achanges_push(&eff, lw, &mut eff_ann_bytes, e.bytes(), &mut eff_lease)?;
+                eff.push((row, w, e));
             }
             p.sync_op_state(
                 &mut tracked,
                 other + larr.bytes() + prov::map_bytes(lann, lw),
             )?;
-            eff
+            drop(l_lease);
+            (eff, vec![eff_lease])
         } else {
-            l
+            (l, l_lease)
         };
+        let (l, l_lease) = l;
         let r = if let (Some(rarr), Some(rann)) = (&mut self.rarr, &mut self.rann) {
             let other = self.larr.as_ref().map_or(0, |a| a.bytes())
                 + self.lann.as_ref().map_or(0, |m| prov::map_bytes(m, lw));
             rarr.clear();
             rann.clear();
-            let mut eff = AChanges::with_capacity(r.len());
+            p.sync_op_state(&mut tracked, other)?;
+            let per_row = row_bytes(rw) * 2 + row_bytes(key_w);
+            let mut eff = AChanges::new();
+            let mut eff_lease = p.scratch_lease();
+            let mut eff_ann_bytes = 0u64;
             for (idx, (row, w, a)) in r.into_iter().enumerate() {
-                rarr.add(&row, w);
-                let e = prov::absorb_row(rann, &row, a, mode);
-                eff.push((row, w, e));
                 if idx % 1024 == 1023 {
                     p.tick()?;
-                    p.sync_op_state(
-                        &mut tracked,
-                        other + rarr.bytes() + prov::map_bytes(rann, rw),
-                    )?;
                 }
+                let est = other + rarr.bytes() + prov::map_bytes(rann, rw) + per_row + a.bytes();
+                if est > tracked {
+                    p.sync_op_state(&mut tracked, est)?;
+                }
+                rarr.add(&row, w);
+                let e = prov::absorb_row(rann, &row, a, mode);
+                p.preadmit_achanges_push(&eff, rw, &mut eff_ann_bytes, e.bytes(), &mut eff_lease)?;
+                eff.push((row, w, e));
             }
             p.sync_op_state(
                 &mut tracked,
                 other + rarr.bytes() + prov::map_bytes(rann, rw),
             )?;
-            eff
+            drop(r_lease);
+            (eff, vec![eff_lease])
         } else {
-            r
+            (r, r_lease)
         };
+        let (r, r_lease) = r;
         let mut by_key_lease = p.scratch_lease();
         let key_w = self.m.key.len();
         by_key_lease.try_reserve((r.len() as u64).saturating_mul(row_bytes(key_w) + 32))?;
@@ -180,29 +195,35 @@ impl Join {
         let mut tracked = self.bytes();
         let lw = self.left.schema.len();
         let rw = self.right.schema.len();
-        let dl = if let (Some(larr), Some(lann)) = (&mut self.larr, &mut self.lann) {
+        let key_w = self.m.key.len();
+        let (dl, dl_lease) = if let (Some(larr), Some(lann)) = (&mut self.larr, &mut self.lann) {
             let other = self.rarr.as_ref().map_or(0, |a| a.bytes())
                 + self.rann.as_ref().map_or(0, |m| prov::map_bytes(m, rw));
-            let mut eff = AChanges::with_capacity(dl.len());
+            let per_row = row_bytes(lw) * 2 + row_bytes(key_w);
+            let mut eff = AChanges::new();
+            let mut eff_lease = p.scratch_lease();
+            let mut eff_ann_bytes = 0u64;
             for (idx, (row, w, a)) in dl.into_iter().enumerate() {
-                larr.add(&row, w);
-                let e = prov::absorb_row(lann, &row, a, mode);
-                eff.push((row, w, e));
                 if idx % 1024 == 1023 {
                     p.tick()?;
-                    p.sync_op_state(
-                        &mut tracked,
-                        other + larr.bytes() + prov::map_bytes(lann, lw),
-                    )?;
                 }
+                let est = other + larr.bytes() + prov::map_bytes(lann, lw) + per_row + a.bytes();
+                if est > tracked {
+                    p.sync_op_state(&mut tracked, est)?;
+                }
+                larr.add(&row, w);
+                let e = prov::absorb_row(lann, &row, a, mode);
+                p.preadmit_achanges_push(&eff, lw, &mut eff_ann_bytes, e.bytes(), &mut eff_lease)?;
+                eff.push((row, w, e));
             }
             p.sync_op_state(
                 &mut tracked,
                 other + larr.bytes() + prov::map_bytes(lann, lw),
             )?;
-            eff
+            drop(dl_lease);
+            (eff, vec![eff_lease])
         } else {
-            dl
+            (dl, dl_lease)
         };
         let out_width = self.m.out.len();
         let mut out = AChanges::new();
@@ -213,7 +234,7 @@ impl Join {
             p.tick()?;
             let key = self.m.key_left(a);
             let seed = self.m.seed_right(a);
-            for (b, wb, ab) in side_matches_a(
+            for_each_side_match_a(
                 p,
                 &self.right,
                 self.rarr.as_ref(),
@@ -221,52 +242,59 @@ impl Join {
                 Which::Old,
                 &key,
                 &seed,
-            )? {
-                if self.m.compatible(a, &b) {
-                    let merged_ann = aa.mul(&ab);
-                    p.preadmit_achanges_push(
-                        &out,
-                        out_width,
-                        &mut out_ann_bytes,
-                        merged_ann.bytes(),
-                        &mut out_lease,
-                    )?;
-                    out.push((self.m.merge(a, &b), wa * wb, merged_ann));
-                }
-            }
+                |b, wb, ab, p| {
+                    if self.m.compatible(a, b) {
+                        let merged_ann = aa.mul(ab);
+                        p.preadmit_achanges_push(
+                            &out,
+                            out_width,
+                            &mut out_ann_bytes,
+                            merged_ann.bytes(),
+                            &mut out_lease,
+                        )?;
+                        out.push((self.m.merge(a, b), wa * wb, merged_ann));
+                    }
+                    Ok(())
+                },
+            )?;
         }
         drop(dl);
         drop(dl_lease);
-        let dr = if let (Some(rarr), Some(rann)) = (&mut self.rarr, &mut self.rann) {
+        let (dr, dr_lease) = if let (Some(rarr), Some(rann)) = (&mut self.rarr, &mut self.rann) {
             let other = self.larr.as_ref().map_or(0, |a| a.bytes())
                 + self.lann.as_ref().map_or(0, |m| prov::map_bytes(m, lw));
-            let mut eff = AChanges::with_capacity(dr.len());
+            let per_row = row_bytes(rw) * 2 + row_bytes(key_w);
+            let mut eff = AChanges::new();
+            let mut eff_lease = p.scratch_lease();
+            let mut eff_ann_bytes = 0u64;
             for (idx, (row, w, a)) in dr.into_iter().enumerate() {
-                rarr.add(&row, w);
-                let e = prov::absorb_row(rann, &row, a, mode);
-                eff.push((row, w, e));
                 if idx % 1024 == 1023 {
                     p.tick()?;
-                    p.sync_op_state(
-                        &mut tracked,
-                        other + rarr.bytes() + prov::map_bytes(rann, rw),
-                    )?;
                 }
+                let est = other + rarr.bytes() + prov::map_bytes(rann, rw) + per_row + a.bytes();
+                if est > tracked {
+                    p.sync_op_state(&mut tracked, est)?;
+                }
+                rarr.add(&row, w);
+                let e = prov::absorb_row(rann, &row, a, mode);
+                p.preadmit_achanges_push(&eff, rw, &mut eff_ann_bytes, e.bytes(), &mut eff_lease)?;
+                eff.push((row, w, e));
             }
             p.sync_op_state(
                 &mut tracked,
                 other + rarr.bytes() + prov::map_bytes(rann, rw),
             )?;
-            eff
+            drop(dr_lease);
+            (eff, vec![eff_lease])
         } else {
-            dr
+            (dr, dr_lease)
         };
         // A_new ⋈ ΔB
         for (b, wb, ab) in &dr {
             p.tick()?;
             let key = self.m.key_right(b);
             let seed = self.m.seed_left(b);
-            for (a, wa, aa) in side_matches_a(
+            for_each_side_match_a(
                 p,
                 &self.left,
                 self.larr.as_ref(),
@@ -274,19 +302,21 @@ impl Join {
                 Which::New,
                 &key,
                 &seed,
-            )? {
-                if self.m.compatible(&a, b) {
-                    let merged_ann = aa.mul(ab);
-                    p.preadmit_achanges_push(
-                        &out,
-                        out_width,
-                        &mut out_ann_bytes,
-                        merged_ann.bytes(),
-                        &mut out_lease,
-                    )?;
-                    out.push((self.m.merge(&a, b), wa * wb, merged_ann));
-                }
-            }
+                |a, wa, aa, p| {
+                    if self.m.compatible(a, b) {
+                        let merged_ann = aa.mul(ab);
+                        p.preadmit_achanges_push(
+                            &out,
+                            out_width,
+                            &mut out_ann_bytes,
+                            merged_ann.bytes(),
+                            &mut out_lease,
+                        )?;
+                        out.push((self.m.merge(a, b), wa * wb, merged_ann));
+                    }
+                    Ok(())
+                },
+            )?;
         }
         drop(dr);
         drop(dr_lease);
@@ -313,27 +343,38 @@ impl Join {
                 .rann
                 .as_ref()
                 .map_or(0, |m| prov::map_bytes(m, self.right.schema.len()));
+        let key_w = self.m.key.len();
         if let Some(larr) = &mut self.larr {
             let other = self.rarr.as_ref().map_or(0, |a| a.bytes()) + ann_other;
+            let per_row = row_bytes(self.left.schema.len()) + row_bytes(key_w);
             larr.clear();
+            p.sync_op_state(&mut tracked, other)?;
             for (idx, (row, w)) in l.iter().enumerate() {
-                larr.add(row, *w);
                 if idx % 1024 == 1023 {
                     p.tick()?;
-                    p.sync_op_state(&mut tracked, other + larr.bytes())?;
                 }
+                let est = other + larr.bytes() + per_row;
+                if est > tracked {
+                    p.sync_op_state(&mut tracked, est)?;
+                }
+                larr.add(row, *w);
             }
             p.sync_op_state(&mut tracked, other + larr.bytes())?;
         }
         if let Some(rarr) = &mut self.rarr {
             let other = self.larr.as_ref().map_or(0, |a| a.bytes()) + ann_other;
+            let per_row = row_bytes(self.right.schema.len()) + row_bytes(key_w);
             rarr.clear();
+            p.sync_op_state(&mut tracked, other)?;
             for (idx, (row, w)) in r.iter().enumerate() {
-                rarr.add(row, *w);
                 if idx % 1024 == 1023 {
                     p.tick()?;
-                    p.sync_op_state(&mut tracked, other + rarr.bytes())?;
                 }
+                let est = other + rarr.bytes() + per_row;
+                if est > tracked {
+                    p.sync_op_state(&mut tracked, est)?;
+                }
+                rarr.add(row, *w);
             }
             p.sync_op_state(&mut tracked, other + rarr.bytes())?;
         }
@@ -387,14 +428,21 @@ impl Join {
             p.tick()?;
             let key = self.m.key_left(a);
             let seed = self.m.seed_right(a);
-            for (b, wb) in
-                side_matches(p, &self.right, self.rarr.as_ref(), Which::Old, &key, &seed)?
-            {
-                if self.m.compatible(a, &b) {
-                    p.preadmit_changes_push(&out, out_width, &mut out_lease)?;
-                    out.push((self.m.merge(a, &b), wa * wb));
-                }
-            }
+            for_each_side_match(
+                p,
+                &self.right,
+                self.rarr.as_ref(),
+                Which::Old,
+                &key,
+                &seed,
+                |b, wb, p| {
+                    if self.m.compatible(a, b) {
+                        p.preadmit_changes_push(&out, out_width, &mut out_lease)?;
+                        out.push((self.m.merge(a, b), wa * wb));
+                    }
+                    Ok(())
+                },
+            )?;
         }
         let ann_other = self
             .lann
@@ -404,14 +452,19 @@ impl Join {
                 .rann
                 .as_ref()
                 .map_or(0, |m| prov::map_bytes(m, self.right.schema.len()));
+        let key_w = self.m.key.len();
         if let Some(larr) = &mut self.larr {
             let other = self.rarr.as_ref().map_or(0, |a| a.bytes()) + ann_other;
+            let per_row = row_bytes(self.left.schema.len()) + row_bytes(key_w);
             for (idx, (row, w)) in dl.iter().enumerate() {
-                larr.add(row, *w);
                 if idx % 1024 == 1023 {
                     p.tick()?;
-                    p.sync_op_state(&mut tracked, other + larr.bytes())?;
                 }
+                let est = other + larr.bytes() + per_row;
+                if est > tracked {
+                    p.sync_op_state(&mut tracked, est)?;
+                }
+                larr.add(row, *w);
             }
             p.sync_op_state(&mut tracked, other + larr.bytes())?;
         }
@@ -422,22 +475,34 @@ impl Join {
             p.tick()?;
             let key = self.m.key_right(b);
             let seed = self.m.seed_left(b);
-            for (a, wa) in side_matches(p, &self.left, self.larr.as_ref(), Which::New, &key, &seed)?
-            {
-                if self.m.compatible(&a, b) {
-                    p.preadmit_changes_push(&out, out_width, &mut out_lease)?;
-                    out.push((self.m.merge(&a, b), wa * wb));
-                }
-            }
+            for_each_side_match(
+                p,
+                &self.left,
+                self.larr.as_ref(),
+                Which::New,
+                &key,
+                &seed,
+                |a, wa, p| {
+                    if self.m.compatible(a, b) {
+                        p.preadmit_changes_push(&out, out_width, &mut out_lease)?;
+                        out.push((self.m.merge(a, b), wa * wb));
+                    }
+                    Ok(())
+                },
+            )?;
         }
         if let Some(rarr) = &mut self.rarr {
             let other = self.larr.as_ref().map_or(0, |a| a.bytes()) + ann_other;
+            let per_row = row_bytes(self.right.schema.len()) + row_bytes(key_w);
             for (idx, (row, w)) in dr.iter().enumerate() {
-                rarr.add(row, *w);
                 if idx % 1024 == 1023 {
                     p.tick()?;
-                    p.sync_op_state(&mut tracked, other + rarr.bytes())?;
                 }
+                let est = other + rarr.bytes() + per_row;
+                if est > tracked {
+                    p.sync_op_state(&mut tracked, est)?;
+                }
+                rarr.add(row, *w);
             }
             p.sync_op_state(&mut tracked, other + rarr.bytes())?;
         }

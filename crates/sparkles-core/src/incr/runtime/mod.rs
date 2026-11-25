@@ -12,7 +12,7 @@
 //! and the dataset's prefixes ([`Host`]). Until a host is set, views are not attached,
 //! so a view never reads with access its principal does not have.
 
-use super::circuit::{Advance, Circuit, DeltaSet};
+use super::circuit::{Circuit, DeltaSet};
 use super::compile::{Kind, compile};
 use super::inference::Inference;
 use super::live::{Count, LiveEvent, LiveOptions, LiveQuery, LiveRow, Shared};

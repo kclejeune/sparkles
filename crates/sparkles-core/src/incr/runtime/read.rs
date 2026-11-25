@@ -74,6 +74,7 @@ impl Runtime {
                                     rows: st.circuit.rows(),
                                     commit: st.circuit.applied,
                                     evaluated_under: None,
+                                    lease: None,
                                 });
                             }
                             if st.circuit.applied > r.at {
@@ -120,6 +121,7 @@ impl Runtime {
                 rows,
                 commit: r.at,
                 evaluated_under: None,
+                lease: None,
             });
         }
         let ahead = || {
@@ -160,12 +162,13 @@ impl Runtime {
             ..Control::none()
         };
         c.build(snap, &control)?;
-        let rows = c.rows_budgeted()?;
+        let (rows, lease) = c.rows_budgeted()?;
         Ok(ViewRows {
             columns,
             rows,
             commit: r.at,
             evaluated_under: None,
+            lease,
         })
     }
 
@@ -265,12 +268,13 @@ impl Runtime {
             ..Control::none()
         };
         c.build(snap.clone(), &control)?;
-        let rows = c.rows_budgeted()?;
+        let (rows, lease) = c.rows_budgeted()?;
         Ok(ViewRows {
             columns: c.columns(),
             rows,
             commit: snap.commit,
             evaluated_under: Some(m),
+            lease,
         })
     }
 }

@@ -38,6 +38,9 @@ impl Runtime {
             // the circuit and marks it `building` under that lock
             let retired = {
                 let mut st = cell.state.lock();
+                // Prune departed or explicitly closed live subscribers before admitting
+                // a build or advance pass so the first pass uses the exact active ceiling.
+                st.prune_dead_subs();
                 let status = cell.info.lock().status.clone();
                 match status {
                     Status::Building => {
@@ -66,6 +69,8 @@ impl Runtime {
         drop(internal);
         self.collect_internal(store);
         self.budgets(&over);
+        drop(over);
+        drop(cells);
         self.gc();
         if self.root.is_some() {
             let due = self.last_checkpoint.lock().elapsed()
@@ -138,6 +143,7 @@ impl Runtime {
                 });
             }
         }
+        st.recompute_local_limit();
         st.clear_history();
         st.circuit.clear_state();
         let mut info = cell.info.lock();
@@ -156,8 +162,8 @@ impl Runtime {
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(cell, st, t0.elapsed(), false);
                 self.live_budgets(st);
-                if let Some(c) = change {
-                    self.publish(st, before, c, true);
+                if let Some((c, c_lease)) = change {
+                    self.publish(st, before, c, c_lease, true);
                 }
                 if std::mem::take(&mut st.rebased) {
                     st.clear_history();
@@ -193,20 +199,20 @@ impl Runtime {
             cell.info.lock().status = Status::Building;
         }
         let t0 = Instant::now();
-        let r = st.circuit.advance(&d, &self.control());
+        let r = st.circuit.advance_charged(&d, &self.control());
         let took = t0.elapsed();
         match r {
-            Ok(Advance::Skipped) => {
+            Ok(crate::incr::circuit::ChargedAdvance::Skipped) => {
                 self.note_pass(cell, st, took, true);
                 let to = st.circuit.applied;
                 let max = self.opts.read().history_commits;
                 st.remember(from, to, Arc::from(Vec::new()), max);
             }
-            Ok(Advance::Changed(c)) => {
+            Ok(crate::incr::circuit::ChargedAdvance::Changed(c, c_lease)) => {
                 self.note_pass(cell, st, took, false);
-                self.publish(st, from, c, false);
+                self.publish(st, from, c, c_lease, false);
             }
-            Ok(Advance::Reset(c)) => {
+            Ok(crate::incr::circuit::ChargedAdvance::Reset(c, c_lease)) => {
                 self.counters.resets.fetch_add(1, Ordering::Relaxed);
                 if from > 0 {
                     tracing::info!(
@@ -217,7 +223,7 @@ impl Runtime {
                 }
                 cell.info.lock().status = Status::Ready;
                 self.note_pass(cell, st, took, false);
-                self.publish(st, from, c, true);
+                self.publish(st, from, c, c_lease, true);
             }
             Err(e) => {
                 self.fail(cell, st, &e);
@@ -263,53 +269,70 @@ impl Runtime {
         }
     }
 
-    /// Send the change `c` from commit `from` to the circuit's commit to the
-    /// subscribers.
-    pub(super) fn publish(&self, st: &mut Slot, from: u64, c: Changes, reset: bool) {
-        let before_subs = st.subs.len();
-        st.subs.retain(|s| s.shared.strong_count() > 0);
-        if st.subs.len() != before_subs {
-            st.recompute_local_limit();
+    /// Decode `c` incrementally under a `ScratchLease` for replay history admission.
+    /// Returns `Some((rows, lease))` when the decoded diff fits within the circuit's
+    /// budget, or `None` after dropping partial rows and releasing scratch.
+    #[allow(clippy::type_complexity)]
+    fn decode_history_charged(
+        st: &Slot,
+        c: &Changes,
+    ) -> Option<(
+        Arc<[(Vec<Option<Term>>, i64)]>,
+        crate::incr::budget::ScratchLease,
+    )> {
+        let mut lease = st.circuit.scratch_lease();
+        let mut decoded = Vec::new();
+        let mut bytes = 0u64;
+        if let Some(snap) = &st.circuit.snap {
+            for (r, w) in c {
+                let row: Vec<Option<Term>> =
+                    r.iter().map(|&i| st.circuit.terms.term(snap, i)).collect();
+                bytes = bytes.saturating_add(super::super::circuit::decoded_row_bytes(&row));
+                if lease.try_set(bytes).is_err() {
+                    drop(decoded);
+                    drop(lease);
+                    return None;
+                }
+                decoded.push((row, *w));
+            }
         }
+        Some((decoded.into(), lease))
+    }
+
+    /// Send the change `c` from commit `from` to the circuit's commit to the
+    /// subscribers, keeping `c` covered by `c_lease` until consumed and dropped.
+    pub(super) fn publish(
+        &self,
+        st: &mut Slot,
+        from: u64,
+        c: Changes,
+        c_lease: crate::incr::budget::ScratchLease,
+        reset: bool,
+    ) {
+        st.prune_dead_subs();
         let to = st.circuit.applied;
         if st.subs.is_empty() {
             if st.views_count() == 0 || (reset && c.len() > self.opts.read().reset_rows) {
+                drop(c);
+                drop(c_lease);
                 st.clear_history();
+            } else if let Some((rows, mut lease)) = Self::decode_history_charged(st, &c) {
+                drop(c);
+                drop(c_lease);
+                st.remember_charged(from, to, rows, VIEW_HISTORY_COMMITS, &mut lease);
+                drop(lease);
             } else {
-                // Decode incrementally under a scratch lease so an oversized diff for a
-                // view with no live subscribers is abandoned before unbounded allocation.
-                let mut lease = st.circuit.scratch_lease();
-                let mut decoded = Vec::new();
-                let mut bytes = 0u64;
-                let mut fits = true;
-                if let Some(snap) = &st.circuit.snap {
-                    for (r, w) in &c {
-                        let row: Vec<Option<Term>> =
-                            r.iter().map(|&i| st.circuit.terms.term(snap, i)).collect();
-                        bytes =
-                            bytes.saturating_add(super::super::circuit::decoded_row_bytes(&row));
-                        if lease.try_set(bytes).is_err() {
-                            fits = false;
-                            break;
-                        }
-                        decoded.push((row, *w));
-                    }
-                }
-                if fits {
-                    let rows: Arc<[(Vec<Option<Term>>, i64)]> = decoded.into();
-                    drop(lease);
-                    st.remember(from, to, rows, VIEW_HISTORY_COMMITS);
-                } else {
-                    drop(decoded);
-                    drop(lease);
-                    st.clear_history();
-                }
+                drop(c);
+                drop(c_lease);
+                st.clear_history();
             }
             return;
         }
         let max = self.opts.read().history_commits;
         let event = if st.circuit.kind == Kind::Ask {
             let delta: i64 = c.iter().map(|x| x.1).sum();
+            drop(c);
+            drop(c_lease);
             let now = st.circuit.result.total();
             st.remember(from, to, Arc::from(vec![(Vec::new(), delta)]), max);
             if (now - delta > 0) == (now > 0) {
@@ -324,27 +347,61 @@ impl Runtime {
             // an ordered window's evaluation has no positions to diff: the subscribers
             // replace their copy
             if c.len() > self.opts.read().reset_rows {
+                drop(c);
+                drop(c_lease);
                 st.clear_history();
+            } else if let Some((rows, mut lease)) = Self::decode_history_charged(st, &c) {
+                drop(c);
+                drop(c_lease);
+                st.remember_charged(from, to, rows, max, &mut lease);
+                drop(lease);
             } else {
-                let rows = st.circuit.decode_rows(&c).into();
-                st.remember(from, to, rows, max);
+                drop(c);
+                drop(c_lease);
+                st.clear_history();
             }
             st.event(true)
         } else if st.circuit.ordered() {
             // the positions come from the window: a row that moves nets out of `c`
-            let rows: Arc<[(Vec<Option<Term>>, i64)]> = st.circuit.decode_rows(&c).into();
-            st.remember(from, to, rows, max);
+            if let Some((rows, mut lease)) = Self::decode_history_charged(st, &c) {
+                drop(c);
+                drop(c_lease);
+                st.remember_charged(from, to, rows, max, &mut lease);
+                drop(lease);
+            } else {
+                drop(c);
+                drop(c_lease);
+                st.clear_history();
+            }
             match st.moves_event(from, to) {
                 Some(e) => e,
                 None => return,
             }
         } else {
-            let rows: Arc<[(Vec<Option<Term>>, i64)]> = st.circuit.decode_rows(&c).into();
-            st.remember(from, to, rows.clone(), max);
-            if rows.is_empty() {
-                return;
+            let event = if let Some((rows, mut lease)) = Self::decode_history_charged(st, &c) {
+                drop(c);
+                drop(c_lease);
+                let empty = rows.is_empty();
+                let ev = (!empty).then(|| diff_event(from, to, rows.iter().cloned()));
+                st.remember_charged(from, to, rows, max, &mut lease);
+                drop(lease);
+                ev
+            } else {
+                st.clear_history();
+                let ev = if c.is_empty() {
+                    None
+                } else {
+                    let rows = st.circuit.decode_rows(&c);
+                    Some(diff_event(from, to, rows.into_iter()))
+                };
+                drop(c);
+                drop(c_lease);
+                ev
+            };
+            match event {
+                Some(e) => e,
+                None => return,
             }
-            diff_event(from, to, rows.iter().cloned())
         };
         for s in &mut st.subs {
             if let Some(sh) = s.shared.upgrade() {

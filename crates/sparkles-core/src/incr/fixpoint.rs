@@ -132,6 +132,15 @@ pub trait FactStore<F, R> {
 
     /// Return a charge that [`reserve`](Self::reserve) made.
     fn release(&self, _bytes: u64) {}
+
+    /// Charge persistent state growth (e.g. held provenance annotations) that outlives
+    /// the pass's transient scratch buffers until the circuit commits pass bytes.
+    fn reserve_pass(&self, _bytes: u64) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Return a persistent pass-state charge made by [`reserve_pass`](Self::reserve_pass).
+    fn release_pass(&self, _bytes: u64) {}
 }
 
 /// Output changes of a fixed-point pass paired with the reserved store bytes held for the
@@ -1160,12 +1169,22 @@ impl<P: Program> FixedPoint<P> {
         };
         let mut out: Held<Vec<Change<P::Fact>>> = Held::default();
         self.room(charges, &mut out, order.len())?;
+        let mut out_ann_bytes = 0u64;
         for &f in order.iter() {
             let ann = match anns.as_ref() {
                 Some(m) => {
                     let a = m.get(&f).cloned().ok_or_else(|| {
                         Error::Corrupt("a fixed point did not annotate a fact it built".into())
                     })?;
+                    let ab = a.bytes();
+                    // Charge persistent `self.ann` growth and output `Change.ann`
+                    // payload residency independently before installing them.
+                    self.store.reserve_pass(ab.saturating_add(16))?;
+                    if ab > 0 {
+                        self.store.reserve(ab)?;
+                        charges.live = charges.live.saturating_add(ab);
+                        out_ann_bytes = out_ann_bytes.saturating_add(ab);
+                    }
                     self.store_ann(f, a.clone());
                     Some(a)
                 }
@@ -1178,7 +1197,7 @@ impl<P: Program> FixedPoint<P> {
             });
         }
         self.check(max_bytes, 0)?;
-        Ok((out.buf, out.bytes))
+        Ok((out.buf, out.bytes.saturating_add(out_ann_bytes)))
     }
 
     fn store_ann(&mut self, f: P::Fact, a: Ann) {
@@ -1620,10 +1639,23 @@ impl<P: Program> FixedPoint<P> {
         self.free(charges, queue);
         // 5. the candidates without a derivation
         let mut out: Held<Vec<Change<P::Fact>>> = Held::default();
+        let mut out_ann_bytes = 0u64;
         for f in candidates.iter() {
             if pending.contains(f) {
                 self.store.remove(f)?;
-                let ann = self.drop_ann(f).map(|a| a.scaled(-1));
+                let ann = self.drop_ann(f).map(|a| {
+                    let old_bytes = a.bytes();
+                    self.store.release_pass(old_bytes.saturating_add(16));
+                    a.scaled(-1)
+                });
+                if let Some(ref a) = ann {
+                    let ab = a.bytes();
+                    if ab > 0 {
+                        self.store.reserve(ab)?;
+                        charges.live = charges.live.saturating_add(ab);
+                        out_ann_bytes = out_ann_bytes.saturating_add(ab);
+                    }
+                }
                 self.room(charges, &mut out, 1)?;
                 out.buf.push(Change {
                     fact: *f,
@@ -1715,8 +1747,22 @@ impl<P: Program> FixedPoint<P> {
             if weight == 0 && d.is_zero() {
                 continue;
             }
-            self.store_ann(f, a);
+            let new_entry = a.bytes().saturating_add(16);
+            let old_entry = old.as_ref().map_or(0, |o| o.bytes().saturating_add(16));
+            if new_entry > old_entry {
+                self.store.reserve_pass(new_entry - old_entry)?;
+            }
+            let db = d.bytes();
+            if db > 0 {
+                self.store.reserve(db)?;
+                charges.live = charges.live.saturating_add(db);
+                out_ann_bytes = out_ann_bytes.saturating_add(db);
+            }
             self.room(charges, &mut out, 1)?;
+            self.store_ann(f, a);
+            if old_entry > new_entry {
+                self.store.release_pass(old_entry - new_entry);
+            }
             out.buf.push(Change {
                 fact: f,
                 weight,
@@ -1724,7 +1770,7 @@ impl<P: Program> FixedPoint<P> {
             });
         }
         self.check(max_bytes, 0)?;
-        Ok((out.buf, out.bytes))
+        Ok((out.buf, out.bytes.saturating_add(out_ann_bytes)))
     }
 
     /// Write the facts with their records, then their annotations in the same order.
@@ -1781,8 +1827,8 @@ impl<P: Program> FixedPoint<P> {
         }
         if !self.mode.is_none() {
             for f in order {
+                r.charge_state(16)?;
                 let a = Ann::load(r, self.mode)?;
-                r.charge_state(a.bytes().saturating_add(16))?;
                 self.store_ann(f, a);
             }
         }

@@ -333,6 +333,19 @@ impl<'a> Pass<'a> {
         }
     }
 
+    pub(crate) fn move_scratch_to_pass(&mut self, lease: &mut ScratchLease, bytes: u64) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
+        if let Some(budget) = &self.budget {
+            budget.move_scratch_to_pass(lease, bytes)
+        } else {
+            let take = bytes.min(lease.bytes());
+            lease.release(take);
+            take
+        }
+    }
+
     /// Reconcile an operator's tracked byte estimate during a pass so growth is
     /// pre-admitted against both the local budget and the parent pool.
     pub(crate) fn sync_op_state(&mut self, tracked: &mut u64, current: u64) -> Result<()> {

@@ -695,6 +695,80 @@ fn describe(n: &Node, vars: &[String]) -> String {
     line(&plan)
 }
 
+/// Visit matching rows of one join side without cloning arrangement buckets, keeping any
+/// BGP probe's [`ScratchLease`](super::budget::ScratchLease) alive until the callback
+/// finishes consuming the probe vector.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn for_each_side_match(
+    p: &mut Pass,
+    node: &Node,
+    arr: Option<&Arrangement>,
+    which: super::pass::Which,
+    key: &[Id],
+    seed: &[(usize, Id)],
+    mut f: impl FnMut(&Row, i64, &Pass) -> Result<()>,
+) -> Result<()> {
+    match arr {
+        Some(a) => {
+            for (r, w) in a.get(key) {
+                f(r, w, p)?;
+            }
+            Ok(())
+        }
+        None => match node.as_bgp() {
+            Some(b) => {
+                let (rows, lease) = b.probe_charged(p, which, seed)?;
+                for (r, w) in &rows {
+                    f(r, *w, p)?;
+                }
+                drop(rows);
+                drop(lease);
+                Ok(())
+            }
+            None => Err(crate::error::Error::Corrupt(
+                "a join side without an arrangement is not a pattern".into(),
+            )),
+        },
+    }
+}
+
+/// Annotated counterpart of [`for_each_side_match`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn for_each_side_match_a(
+    p: &mut Pass,
+    node: &Node,
+    arr: Option<&Arrangement>,
+    ann: Option<&AnnMap>,
+    which: super::pass::Which,
+    key: &[Id],
+    seed: &[(usize, Id)],
+    mut f: impl FnMut(&Row, i64, &prov::Ann, &Pass) -> Result<()>,
+) -> Result<()> {
+    match (arr, ann) {
+        (Some(a), Some(m)) => {
+            for (r, w) in a.get(key) {
+                let ann = prov::get(m, r, p.prov);
+                f(r, w, &ann, p)?;
+            }
+            Ok(())
+        }
+        _ => match node.as_bgp() {
+            Some(b) => {
+                let (rows, lease) = b.probe_a_charged(p, which, seed)?;
+                for (r, w, ann) in &rows {
+                    f(r, *w, ann, p)?;
+                }
+                drop(rows);
+                drop(lease);
+                Ok(())
+            }
+            None => Err(crate::error::Error::Corrupt(
+                "a join side without annotated state is not a pattern".into(),
+            )),
+        },
+    }
+}
+
 /// [`side_matches`] with annotations: an arrangement's rows carry the annotations of
 /// `ann`, and a pattern's rows the quads they matched.
 #[allow(clippy::too_many_arguments)]

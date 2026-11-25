@@ -305,7 +305,14 @@ impl Tally {
     #[cfg(test)]
     pub(crate) fn add(&mut self, commit: u64, c: &Changes, term: impl Fn(Id) -> Option<Term>) {
         let mut dirty = false;
-        let _ = self.add_budgeted(commit, c, term, None, &mut dirty);
+        let _ = self.add_budgeted_charged(
+            commit,
+            c.clone(),
+            super::budget::ScratchLease::default(),
+            term,
+            None,
+            &mut dirty,
+        );
     }
 
     /// Reserve `next_bytes` on `scratch`, evicting oldest tally commits in batches if
@@ -341,6 +348,7 @@ impl Tally {
                 if self.bytes() == cur {
                     if let Some(last_commit) = self.entries.back().map(|e| e.0) {
                         self.discard_through(last_commit);
+                        self.shrink_spare_capacity();
                         *dirty = true;
                     }
                     if self.bytes() == cur {
@@ -353,13 +361,31 @@ impl Tally {
         Ok(())
     }
 
-    /// Like [`add`](Self::add), pre-admitting transient per-key aggregation scratch and
-    /// key/entry growth against `circuit`'s budget before allocating unboundedly, while
-    /// evicting oldest commits in batches if needed.
-    pub(crate) fn add_budgeted(
+    fn abandon_oversized_commit(
         &mut self,
         commit: u64,
-        c: &Changes,
+        circuit: Option<&super::circuit::Circuit>,
+        dirty: &mut bool,
+    ) {
+        self.discard_through(commit);
+        self.clear_storage();
+        if let Some(circ) = circuit {
+            circ.set_external_best_effort(0);
+        }
+        *dirty = true;
+    }
+
+    /// Like [`add`](Self::add), taking ownership of `c` and its `c_lease` so `c` stays
+    /// charged while aggregated into `per` and is freed before decoding keys. Pre-admits
+    /// transient scratch and key/entry growth against `circuit`'s budget, evicting oldest
+    /// commits first. If a single commit's counts still exceed the remaining budget after
+    /// evicting prior counts, records `commit` as unavailable (`discard_through(commit)`)
+    /// per F13 §3.6 without failing the healthy circuit.
+    pub(crate) fn add_budgeted_charged(
+        &mut self,
+        commit: u64,
+        c: Changes,
+        c_lease: super::budget::ScratchLease,
         term: impl Fn(Id) -> Option<Term>,
         circuit: Option<&super::circuit::Circuit>,
         dirty: &mut bool,
@@ -367,16 +393,36 @@ impl Tally {
         let mut scratch = super::budget::ScratchLease::new(circuit.map(|c| c.budget_handle()));
         let mut per: FxHashMap<Box<[Id]>, u64> = FxHashMap::default();
         let key_slot = (self.key_cols.len() as u64) * 8 + 40;
-        for (row, w) in c {
+        for (row, w) in &c {
             let key: Box<[Id]> = self.key_cols.iter().map(|&i| row[i]).collect();
             if !per.contains_key(&key) {
                 let next_bytes = (per.len() as u64 + 1).saturating_mul(key_slot);
                 if next_bytes > scratch.bytes() {
-                    self.reserve_or_shrink(circuit, dirty, &mut scratch, next_bytes)?;
+                    match self.reserve_or_shrink(circuit, dirty, &mut scratch, next_bytes) {
+                        Ok(()) => {}
+                        Err(crate::error::Error::BudgetExceeded(_)) => {
+                            drop(per);
+                            drop(c);
+                            drop(c_lease);
+                            drop(scratch);
+                            self.abandon_oversized_commit(commit, circuit, dirty);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            drop(per);
+                            drop(c);
+                            drop(c_lease);
+                            drop(scratch);
+                            return Err(e);
+                        }
+                    }
                 }
             }
             *per.entry(key).or_insert(0) += w.unsigned_abs();
         }
+        // Release the input change buffer and its lease before decoding keys.
+        drop(c);
+        drop(c_lease);
         let per_bytes = scratch.bytes();
         // Decode keys and pre-admit both temporary `decoded` storage and any new keys /
         // entry growth BEFORE mutating `self.keys`/`self.index` so mid-loop eviction
@@ -384,7 +430,8 @@ impl Tally {
         let mut decoded: Vec<(Vec<Option<Term>>, u64)> = Vec::new();
         let mut decoded_bytes = 0u64;
         let mut added_tally = 0u64;
-        for (k, n) in per {
+        let mut per_iter = per.into_iter();
+        while let Some((k, n)) = per_iter.next() {
             if n == 0 {
                 continue;
             }
@@ -399,7 +446,24 @@ impl Tally {
                 .saturating_add(added_tally)
                 .saturating_add((decoded.len() as u64 + 1) * ENTRY_BYTES);
             if need > scratch.bytes() {
-                self.reserve_or_shrink(circuit, dirty, &mut scratch, need)?;
+                match self.reserve_or_shrink(circuit, dirty, &mut scratch, need) {
+                    Ok(()) => {}
+                    Err(crate::error::Error::BudgetExceeded(_)) => {
+                        drop(key);
+                        drop(per_iter);
+                        drop(decoded);
+                        drop(scratch);
+                        self.abandon_oversized_commit(commit, circuit, dirty);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        drop(key);
+                        drop(per_iter);
+                        drop(decoded);
+                        drop(scratch);
+                        return Err(e);
+                    }
+                }
             }
             decoded.push((key, n));
         }
@@ -422,7 +486,20 @@ impl Tally {
             .saturating_add(final_added)
             .saturating_add(entry_growth);
         if final_need > scratch.bytes() {
-            self.reserve_or_shrink(circuit, dirty, &mut scratch, final_need)?;
+            match self.reserve_or_shrink(circuit, dirty, &mut scratch, final_need) {
+                Ok(()) => {}
+                Err(crate::error::Error::BudgetExceeded(_)) => {
+                    drop(decoded);
+                    drop(scratch);
+                    self.abandon_oversized_commit(commit, circuit, dirty);
+                    return Ok(());
+                }
+                Err(e) => {
+                    drop(decoded);
+                    drop(scratch);
+                    return Err(e);
+                }
+            }
         }
         let mut counted: Vec<(u32, u64)> = Vec::with_capacity(decoded.len());
         for (key, n) in decoded {
@@ -432,7 +509,45 @@ impl Tally {
         for (k, n) in counted {
             self.entries.push_back((commit, k, n));
         }
-        drop(scratch);
+        // Atomically hand off `scratch` into external accounting so there is no uncharged
+        // gap or 2× peak between `add_budgeted_charged` and external charge reconciliation.
+        if let Some(circ) = circuit {
+            let max = circ.max_memory_bytes.unwrap_or(u64::MAX);
+            let state = circ.bytes();
+            if state <= max && self.shrink_to(max - state) {
+                *dirty = true;
+            }
+            if let Err(e) = circ.commit_external_from_scratch(self.bytes(), &mut scratch) {
+                drop(scratch);
+                if matches!(e, crate::error::Error::BudgetExceeded(_)) {
+                    // Try shrinking spare capacity or older commits before abandoning.
+                    loop {
+                        let cur = self.bytes();
+                        if cur > 0 && self.shrink_spare_capacity() {
+                            if circ.try_set_external(self.bytes()).is_ok() {
+                                break;
+                            }
+                            continue;
+                        }
+                        if cur > 0 && self.shrink_to(cur / 2) {
+                            *dirty = true;
+                        }
+                        if self.bytes() < cur {
+                            if circ.try_set_external(self.bytes()).is_ok() {
+                                break;
+                            }
+                            continue;
+                        }
+                        self.abandon_oversized_commit(commit, Some(circ), dirty);
+                        break;
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        } else {
+            drop(scratch);
+        }
         #[cfg(test)]
         {
             self.peak = self.peak.max(self.bytes());

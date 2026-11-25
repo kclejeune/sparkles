@@ -41,7 +41,19 @@ impl Recompute {
         let mark = p.output_lease_mark();
         let rows = p.evaluate(&self.pattern, schema, self.dataset.as_ref())?;
         let rows_leases = p.take_output_leases_since(mark);
-        self.prev = rows.iter().cloned().collect();
+        self.prev = ZSet::new();
+        p.sync_op_state(&mut tracked, 0)?;
+        let per_row = super::super::zset::row_bytes(schema.len());
+        for (r, w) in &rows {
+            p.tick()?;
+            if *w != 0 && self.prev.get(r) == 0 {
+                let next = (self.prev.len() as u64 + 1).saturating_mul(per_row);
+                if next > tracked {
+                    p.sync_op_state(&mut tracked, next)?;
+                }
+            }
+            self.prev.add(r.clone(), *w);
+        }
         p.sync_op_state(&mut tracked, self.bytes(schema.len()))?;
         for lease in rows_leases {
             p.push_output_lease(lease);
@@ -66,15 +78,51 @@ impl Recompute {
         let mark = p.output_lease_mark();
         let raw = p.evaluate(&self.pattern, schema, self.dataset.as_ref())?;
         let raw_leases = p.take_output_leases_since(mark);
-        let now: ZSet = raw.into_iter().collect();
-        let d = now.minus(&self.prev);
-        let mut out_lease = p.scratch_lease();
-        let out_bytes =
-            (d.len() as u64).saturating_mul(super::super::zset::row_bytes(schema.len()));
-        out_lease.try_set(out_bytes)?;
-        self.prev = now;
-        p.sync_op_state(&mut tracked, self.bytes(schema.len()))?;
+        let per_row = super::super::zset::row_bytes(schema.len());
+        let mut now_lease = p.scratch_lease();
+        let mut now = ZSet::new();
+        for (r, w) in raw {
+            p.tick()?;
+            if w != 0 && now.get(&r) == 0 {
+                let next = (now.len() as u64 + 1).saturating_mul(per_row);
+                if next > now_lease.bytes() {
+                    now_lease.try_set(next)?;
+                }
+            }
+            now.add(r, w);
+        }
         drop(raw_leases);
+        let mut out_lease = p.scratch_lease();
+        let mut d = Changes::new();
+        for (r, w) in now.iter() {
+            p.tick()?;
+            let diff = w - self.prev.get(r);
+            if diff != 0 {
+                p.preadmit_changes_push(&d, schema.len(), &mut out_lease)?;
+                d.push((r.clone(), diff));
+            }
+        }
+        for (r, w) in self.prev.iter() {
+            p.tick()?;
+            if now.get(r) == 0 {
+                p.preadmit_changes_push(&d, schema.len(), &mut out_lease)?;
+                d.push((r.clone(), -w));
+            }
+        }
+        let old_prev = std::mem::replace(&mut self.prev, now);
+        drop(old_prev);
+        let next_bytes = self.bytes(schema.len());
+        if next_bytes > tracked {
+            let need = next_bytes - tracked;
+            let moved = p.move_scratch_to_pass(&mut now_lease, need);
+            tracked = tracked.saturating_add(moved);
+            if next_bytes > tracked {
+                p.sync_op_state(&mut tracked, next_bytes)?;
+            }
+        } else {
+            p.sync_op_state(&mut tracked, next_bytes)?;
+        }
+        drop(now_lease);
         p.push_output_lease(out_lease);
         Ok(d)
     }
