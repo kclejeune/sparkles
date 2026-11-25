@@ -55,6 +55,9 @@ impl PathSearch {
     ) -> Result<Option<Buffer>> {
         let r = self.pull(ctx, children, options, cap);
         if r.is_err() {
+            if let (Kind::PathSearch(spec), Some(reader)) = (&self.node.kind, &self.reader) {
+                self.counters = Some(reader.counters(spec));
+            }
             self.release();
         }
         r
@@ -115,7 +118,10 @@ impl PathSearch {
                     .saturating_add(width as u64 * 4);
                 b.charge
                     .resize(b.charge.bytes().saturating_add(new_bytes))?;
-                for col in &mut b.table.cols {
+                for (idx, col) in b.table.cols.iter_mut().enumerate() {
+                    if idx > 0 && idx.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
                     if col.capacity() < target {
                         col.reserve_exact(target - col.len());
                     }

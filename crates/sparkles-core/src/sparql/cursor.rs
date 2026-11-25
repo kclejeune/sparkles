@@ -4725,12 +4725,12 @@ impl Operator {
                     b
                 }
                 State::PathSearch(ps) => {
-                    let b = ps.next(ctx, &mut self.children, options, cap)?;
+                    let b = ps.next(ctx, &mut self.children, options, cap);
                     if let Some(counters) = &ps.counters {
                         self.info.counters = Some(counters.clone());
                     }
                     self.done = ps.done();
-                    b
+                    b?
                 }
                 State::SpatialLeaf(sl) => {
                     let b = sl.next(ctx, cap)?;

@@ -1235,11 +1235,12 @@ fn path_search_r1_parity_cancellation_and_release() {
     drop(c);
     assert_eq!(meter.live_bytes(), 0);
 
-    // 3a-ii. True within-pull cancellation AFTER work has started inside `next_batch()`:
-    // `cancel` is false at entry; a watcher thread waits until `meter.live_bytes()` rises
-    // above its pre-pull value (proving `PathSearch` opened and started exploring paths on
-    // a dense K_12 graph whose incompatible length join yields no rows) before setting the
-    // flag.
+    // 3a-ii. True within-pull cancellation gated deterministically at a PathSearch
+    // traversal checkpoint (no VALUES group input, constant endpoints, 0 matching paths on
+    // K_12 with minLength=maxLength=12 so an uninterrupted traversal would run millions of
+    // DFS steps). Cancellation stays false until traversal poll #2, proving PathSearch
+    // itself observes cancellation and aborts mid-traversal rather than completing and
+    // failing at `QueryCursor::pull`'s post-operator check.
     let dense = Store::in_memory(StoreOptions::default());
     let mut dense_data = String::new();
     for i in 0..12 {
@@ -1251,7 +1252,7 @@ fn path_search_r1_parity_cancellation_and_release() {
     }
     load(&dense, &dense_data, RdfFormat::Turtle);
     let q_in_pull = format!(
-        "{P}SELECT ?s ?t ?l {{ VALUES (?s ?t ?l) {{ (<urn:k:0> <urn:k:11> 99) }} SERVICE path:search {{ [] path:source ?s ; path:target ?t ; path:predicate <urn:e> ; path:algorithm path:all ; path:maxLength 10 ; path:maxVisited 50000000 ; path:length ?l }} }}"
+        "{P}SELECT ?l {{ SERVICE path:search {{ [] path:source <urn:k:0> ; path:target <urn:k:11> ; path:predicate <urn:e> ; path:algorithm path:all ; path:minLength 12 ; path:maxLength 12 ; path:maxVisited 50000000 ; path:length ?l }} }}"
     );
     let in_pull_cancel = Arc::new(AtomicBool::new(false));
     let in_pull_opts = QueryOptions {
@@ -1262,29 +1263,42 @@ fn path_search_r1_parity_cancellation_and_release() {
     let mut c_in_pull =
         select_cursor(dense.snapshot(), &q_in_pull, &in_pull_opts, &strict).unwrap();
     let meter_in_pull = c_in_pull.memory_meter();
-    let watcher_meter = c_in_pull.memory_meter();
-    let open_bytes = meter_in_pull.live_bytes();
-    let watcher = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if watcher_meter.live_bytes() > open_bytes {
-                in_pull_cancel.store(true, Ordering::Release);
-                return true;
-            }
-            std::thread::yield_now();
+    let traversal_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let polls_for_hook = traversal_polls.clone();
+    let cancel_for_hook = in_pull_cancel.clone();
+    let _hook = sparkles_core::sparql::pathsearch::test_hooks::on_traversal_poll(move || {
+        let count = polls_for_hook.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 2 {
+            cancel_for_hook.store(true, Ordering::Release);
         }
-        in_pull_cancel.store(true, Ordering::Release);
-        false
     });
     let res = c_in_pull.next_batch().map(|b| b.is_some());
-    let observed_in_flight = watcher.join().unwrap();
-    assert!(
-        observed_in_flight,
-        "watcher must observe memory growth inside next_batch() before cancelling"
-    );
+    drop(_hook);
     assert!(
         matches!(res, Err(Error::Cancelled)),
-        "expected mid-pull cancellation inside next_batch(): {res:?}"
+        "expected mid-traversal cancellation inside next_batch(): {res:?}"
+    );
+    let observed_polls = traversal_polls.load(Ordering::Relaxed);
+    assert_eq!(
+        observed_polls, 2,
+        "PathSearch must abort immediately on traversal poll #2 instead of completing (saw {observed_polls} polls)"
+    );
+    fn find_ps_node(
+        p: &sparkles_core::sparql::CursorPlan,
+    ) -> Option<&sparkles_core::sparql::CursorPlan> {
+        if p.operator.operator == "PathSearch" {
+            return Some(p);
+        }
+        p.children.iter().find_map(find_ps_node)
+    }
+    let ps_visited = find_ps_node(c_in_pull.plan())
+        .and_then(|p| p.operator.counters.as_ref())
+        .and_then(|c| c.get("visited"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    assert!(
+        ps_visited > 0 && ps_visited < 50_000_000,
+        "expected partial mid-traversal visited count in cursor plan, got {ps_visited}"
     );
     drop(c_in_pull);
     assert_eq!(meter_in_pull.live_bytes(), 0);

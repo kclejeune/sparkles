@@ -3865,6 +3865,35 @@ impl ChargedPatternEdges {
     }
 }
 
+/// Prune an `HbMap` in place without extra heap allocation, polling `ctx.check()` every
+/// 4096 visited entries and stopping immediately on cancellation or timeout.
+fn retain_hb_map_checked<K: Eq + std::hash::Hash, V>(
+    map: &mut HbMap<K, V>,
+    ctx: &Ctx,
+    mut keep: impl FnMut(&K) -> bool,
+) -> Result<()> {
+    let mut visited = 0usize;
+    let err: Cell<Option<Error>> = Cell::new(None);
+    let mut iter = map.extract_if(|k, _| {
+        let check_now = visited.is_multiple_of(4096);
+        visited += 1;
+        if check_now && let Err(e) = ctx.check() {
+            err.set(Some(e));
+            return true;
+        }
+        !keep(k)
+    });
+    for _ in iter.by_ref() {
+        if let Some(e) = err.take() {
+            return Err(e);
+        }
+    }
+    if let Some(e) = err.into_inner() {
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Pre-admitted search tree with exact physical byte accounting.
 struct ChargedTree {
     root: u64,
@@ -3954,8 +3983,8 @@ impl ChargedTree {
         push_vec(&mut self.order, item, charge, base)
     }
 
-    fn retain_settled(&mut self, settled: &HbSet<u64>) {
-        self.first.retain(|k, _| settled.contains(k));
+    fn retain_settled(&mut self, ctx: &Ctx, settled: &HbSet<u64>) -> Result<()> {
+        retain_hb_map_checked(&mut self.first, ctx, |k| settled.contains(k))
     }
 
     fn build_ranks(
@@ -5693,8 +5722,10 @@ impl SearchContext {
                 .saturating_add(set_bytes(&missing));
             charge.resize(base)?;
         }
-        tree.retain_settled(&settled);
-        dist.retain(|k, _| settled.contains(k));
+        if settled.len() < dist.len() {
+            tree.retain_settled(ctx, &settled)?;
+            retain_hb_map_checked(&mut dist, ctx, |k| settled.contains(k))?;
+        }
         drop(settled);
         drop(heap);
         drop(missing);
@@ -6253,8 +6284,10 @@ impl SearchContext {
         }
         // `all == true`: retain settled nodes and compute optimal join edges.
         for i in 0..2 {
-            trees[i].retain_settled(&settled[i]);
-            dist[i].retain(|k, _| settled[i].contains(k));
+            if settled[i].len() < dist[i].len() {
+                trees[i].retain_settled(ctx, &settled[i])?;
+                retain_hb_map_checked(&mut dist[i], ctx, |k| settled[i].contains(k))?;
+            }
         }
         drop(settled);
         drop(heaps);
@@ -7322,6 +7355,57 @@ enum YenMode {
     },
 }
 
+fn ban_yen_prefix_edges(
+    ctx: &Ctx,
+    paths: &[(Vec<Edge>, Cost)],
+    i: usize,
+    banned_edges: &mut HbSet<Edge>,
+    charge: &mut super::ctx::OwnedCharge,
+    mut loop_base: u64,
+) -> Result<u64> {
+    let cur_edges = &paths.last().unwrap().0;
+    let root_slice = &cur_edges[..i];
+    let mut cmp_work = 0usize;
+    for (p, _) in paths {
+        if p.len() <= i {
+            cmp_work += 1;
+            if cmp_work >= 4096 {
+                cmp_work = 0;
+                ctx.check()?;
+            }
+            continue;
+        }
+        let mut same = true;
+        if i == 0 {
+            cmp_work += 1;
+            if cmp_work >= 4096 {
+                cmp_work = 0;
+                ctx.check()?;
+            }
+        } else {
+            let mut pos = 0usize;
+            while pos < i {
+                let chunk = (i - pos).min(4096 - cmp_work);
+                let eq = p[pos..pos + chunk] == root_slice[pos..pos + chunk];
+                cmp_work += chunk;
+                if cmp_work >= 4096 {
+                    cmp_work = 0;
+                    ctx.check()?;
+                }
+                if !eq {
+                    same = false;
+                    break;
+                }
+                pos += chunk;
+            }
+        }
+        if same {
+            (_, loop_base) = insert_hb_set(banned_edges, p[i], charge, loop_base)?;
+        }
+    }
+    Ok(loop_base)
+}
+
 struct YenJob {
     s: u64,
     t: u64,
@@ -7506,49 +7590,14 @@ impl YenJob {
                         .saturating_add(outer_bytes)
                         .saturating_add(self.retained_bytes())
                         .saturating_add(nodes_cap_bytes);
-                    {
-                        let cur_edges = &self.a.last().unwrap().0;
-                        let root_slice = &cur_edges[..i];
-                        let mut cmp_work = 0usize;
-                        for (p, _) in &self.a {
-                            if p.len() <= i {
-                                cmp_work += 1;
-                                if cmp_work >= 4096 {
-                                    cmp_work = 0;
-                                    ctx.check()?;
-                                }
-                                continue;
-                            }
-                            let mut same = true;
-                            if i == 0 {
-                                cmp_work += 1;
-                                if cmp_work >= 4096 {
-                                    cmp_work = 0;
-                                    ctx.check()?;
-                                }
-                            } else {
-                                let mut pos = 0usize;
-                                while pos < i {
-                                    let chunk = (i - pos).min(4096 - cmp_work);
-                                    let eq = p[pos..pos + chunk] == root_slice[pos..pos + chunk];
-                                    cmp_work += chunk;
-                                    if cmp_work >= 4096 {
-                                        cmp_work = 0;
-                                        ctx.check()?;
-                                    }
-                                    if !eq {
-                                        same = false;
-                                        break;
-                                    }
-                                    pos += chunk;
-                                }
-                            }
-                            if same {
-                                (_, loop_base) =
-                                    insert_hb_set(&mut banned_edges, p[i], charge, loop_base)?;
-                            }
-                        }
-                    }
+                    loop_base = ban_yen_prefix_edges(
+                        ctx,
+                        &self.a,
+                        i,
+                        &mut banned_edges,
+                        charge,
+                        loop_base,
+                    )?;
                     for (nd_idx, &nd) in nodes[..i].iter().enumerate() {
                         if nd_idx.is_multiple_of(4096) {
                             ctx.check()?;
@@ -7995,6 +8044,8 @@ impl AllPathsJob {
         while let Some(top) = self.stack.last_mut() {
             self.poll_ticks = self.poll_ticks.wrapping_add(1);
             if self.poll_ticks.is_multiple_of(1024) {
+                #[cfg(any(test, feature = "failpoints"))]
+                test_hooks::fire_traversal_poll();
                 ctx.check()?;
             }
             let (x, ns, i) = (top.0, top.1.clone(), top.2);
@@ -8317,6 +8368,74 @@ pub(crate) struct Reader {
     in_row: Vec<Id>,
     row_buf: Vec<Id>,
     charge: super::ctx::OwnedCharge,
+}
+
+fn fill_undef_checked(buf: &mut [Id], ctx: &Ctx, ticks: &mut usize) -> Result<()> {
+    let len = buf.len();
+    if *ticks + len < 4096 {
+        buf.fill(Id::UNDEF);
+        *ticks += len;
+        return Ok(());
+    }
+    let mut pos = 0usize;
+    while pos < len {
+        let chunk = (len - pos).min(4096 - *ticks);
+        buf[pos..pos + chunk].fill(Id::UNDEF);
+        *ticks += chunk;
+        if *ticks >= 4096 {
+            *ticks = 0;
+            ctx.check()?;
+        }
+        pos += chunk;
+    }
+    Ok(())
+}
+
+fn copy_slice_checked(dst: &mut [Id], src: &[Id], ctx: &Ctx, ticks: &mut usize) -> Result<()> {
+    debug_assert_eq!(dst.len(), src.len());
+    let len = dst.len();
+    if *ticks + len < 4096 {
+        dst.copy_from_slice(src);
+        *ticks += len;
+        return Ok(());
+    }
+    let mut pos = 0usize;
+    while pos < len {
+        let chunk = (len - pos).min(4096 - *ticks);
+        dst[pos..pos + chunk].copy_from_slice(&src[pos..pos + chunk]);
+        *ticks += chunk;
+        if *ticks >= 4096 {
+            *ticks = 0;
+            ctx.check()?;
+        }
+        pos += chunk;
+    }
+    Ok(())
+}
+
+fn push_row_checked(out: &mut Table, row: &[Id], ctx: &Ctx, ticks: &mut usize) -> Result<()> {
+    debug_assert_eq!(out.cols.len(), row.len());
+    let prev_len = out.len;
+    if *ticks + row.len() < 4096 {
+        out.push_row(row);
+        *ticks += row.len();
+        return Ok(());
+    }
+    for (c, &v) in row.iter().enumerate() {
+        *ticks += 1;
+        if *ticks >= 4096 {
+            *ticks = 0;
+            if let Err(e) = ctx.check() {
+                for col in &mut out.cols[..c] {
+                    col.truncate(prev_len);
+                }
+                return Err(e);
+            }
+        }
+        out.cols[c].push(v);
+    }
+    out.len = prev_len + 1;
+    Ok(())
 }
 
 impl Reader {
@@ -9159,7 +9278,7 @@ impl Reader {
             } else {
                 int(plen)
             };
-            self.path_row.fill(Id::UNDEF);
+            fill_undef_checked(&mut self.path_row, ctx, &mut ticks)?;
             set(self.cols.src_c, Id(start), &mut self.path_row);
             set(self.cols.tgt_c, Id(end), &mut self.path_row);
             set(self.cols.pi_c, int(pid as usize), &mut self.path_row);
@@ -9231,22 +9350,7 @@ impl Reader {
                         cur.edge_at += 1;
                         k
                     };
-                    if width <= 4096 {
-                        self.row_buf.copy_from_slice(&self.path_row);
-                    } else {
-                        let mut pos = 0usize;
-                        while pos < width {
-                            let chunk = (width - pos).min(4096 - ticks);
-                            self.row_buf[pos..pos + chunk]
-                                .copy_from_slice(&self.path_row[pos..pos + chunk]);
-                            ticks += chunk;
-                            if ticks >= 4096 {
-                                ticks = 0;
-                                ctx.check()?;
-                            }
-                            pos += chunk;
-                        }
-                    }
+                    copy_slice_checked(&mut self.row_buf, &self.path_row, ctx, &mut ticks)?;
                     if per_edge {
                         let edge_opt = self
                             .current
@@ -9318,15 +9422,10 @@ impl Reader {
                             }
                         }
                         if ok {
-                            out.push_row(&self.row_buf);
+                            push_row_checked(out, &self.row_buf, ctx, &mut ticks)?;
                         }
                     } else {
-                        ticks += width;
-                        if ticks >= 4096 {
-                            ticks = 0;
-                            ctx.check()?;
-                        }
-                        out.push_row(&self.row_buf);
+                        push_row_checked(out, &self.row_buf, ctx, &mut ticks)?;
                     }
                 }
                 let done_edges = self.current.as_ref().is_none_or(|c| c.edge_at >= n_rows);
@@ -9347,6 +9446,44 @@ impl Reader {
             }
         }
         Ok(false)
+    }
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "failpoints"))]
+pub mod test_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ON_TRAVERSAL_POLL: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// Restores the thread-local traversal poll hook when dropped.
+    pub struct TraversalPollGuard;
+
+    impl Drop for TraversalPollGuard {
+        fn drop(&mut self) {
+            ON_TRAVERSAL_POLL.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+        }
+    }
+
+    /// Register a callback invoked right before `ctx.check()` at traversal checkpoints.
+    #[must_use]
+    pub fn on_traversal_poll(f: impl FnMut() + 'static) -> TraversalPollGuard {
+        ON_TRAVERSAL_POLL.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(f));
+        });
+        TraversalPollGuard
+    }
+
+    pub(super) fn fire_traversal_poll() {
+        ON_TRAVERSAL_POLL.with(|slot| {
+            if let Some(f) = slot.borrow_mut().as_mut() {
+                f();
+            }
+        });
     }
 }
 
@@ -10208,7 +10345,7 @@ mod tree_tests {
             Err(Error::Cancelled)
         ));
 
-        // 2. Wide grouped emission column copy/join loops poll inside `Reader::next`.
+        // 2. Wide grouped emission column copy/join/reset/append loops poll inside `Reader::next`.
         let gstore = Store::in_memory(StoreOptions::default());
         gstore
             .load(&[Source::from_bytes(
@@ -10220,16 +10357,7 @@ mod tree_tests {
         let gsnap = gstore.snapshot();
         let gs = gsnap.lookup_iri("urn:g:s").unwrap();
         let gp = gsnap.lookup_iri("urn:g:p").unwrap();
-        let gctx = Arc::new(Ctx::new(gsnap));
-        let width = 200usize;
-        let vars: Vec<VarId> = (0..width as u32).collect();
-        let mut in_table = Table::new(vars.clone());
-        let mut row = vec![Id::from_i64(7).unwrap(); width];
-        row[0] = gs;
-        row[1] = Id::from_i64(99).unwrap(); // incompatible with length 1
-        for _ in 0..50 {
-            in_table.push_row(&row);
-        }
+        let gt = gsnap.lookup_iri("urn:g:t").unwrap();
         let gspec = PathSearchSpec {
             algorithm: Algorithm::Shortest,
             source: PathEnd::Var(0),
@@ -10258,29 +10386,75 @@ mod tree_tests {
             cost: None,
             graph: GraphFilter::Default,
         };
-        let in_charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
-        let charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
-        let mut reader = Reader::open(
-            &gctx,
-            &gspec,
-            &vars,
-            Some((in_table, in_charge)),
-            ChargedPatternEdges::new(),
-            charge,
-        )
-        .unwrap();
-        let mut out_table = Table::new(vars.clone());
-        let c_before = super::super::ctx::CHECKS.with(Cell::get);
-        let done = reader
-            .next(&gctx, &gspec, &vars, &mut out_table, 64)
+        let run_grouped = |width: usize, n_rows: usize, length_val: i64| -> (usize, Table, u64) {
+            let gctx = Arc::new(Ctx::new(gsnap.clone()));
+            let vars: Vec<VarId> = (0..width as u32).collect();
+            let mut in_table = Table::new(vars.clone());
+            let mut row = vec![Id::from_i64(7).unwrap(); width];
+            row[0] = gs;
+            row[1] = Id::from_i64(length_val).unwrap();
+            row[2] = gt;
+            for _ in 0..n_rows {
+                in_table.push_row(&row);
+            }
+            let in_charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
+            let charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
+            let mut reader = Reader::open(
+                &gctx,
+                &gspec,
+                &vars,
+                Some((in_table, in_charge)),
+                ChargedPatternEdges::new(),
+                charge,
+            )
             .unwrap();
-        let col_checks = super::super::ctx::CHECKS.with(Cell::get) - c_before;
-        assert!(done);
-        assert!(out_table.is_empty());
-        // 50 rows * (200 copy + 200 join) = 20,000 column operations -> >= 4 inner polls.
+            let mut out_table = Table::new(vars.clone());
+            let c_before = super::super::ctx::CHECKS.with(Cell::get);
+            let done = reader
+                .next(&gctx, &gspec, &vars, &mut out_table, 64)
+                .unwrap();
+            let checks = super::super::ctx::CHECKS.with(Cell::get) - c_before;
+            assert!(done);
+            let paths = reader
+                .counters(&gspec)
+                .get("paths")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            (checks, out_table, paths)
+        };
+
+        // 2a. Incompatible length join: verify the path reached emission (`paths == 1`)
+        //     and wide column loops add polls over the narrow baseline.
+        let (narrow_incompat, narrow_out, narrow_paths) = run_grouped(4, 50, 99);
+        let (wide_incompat, wide_out, wide_paths) = run_grouped(200, 50, 99);
+        assert_eq!(narrow_paths, 1);
+        assert_eq!(wide_paths, 1);
+        assert!(narrow_out.is_empty());
+        assert!(wide_out.is_empty());
+        // 50 rows * (200 input copy + 200 row_buf copy + 200 join) = 30,000 ops -> >= 7 extra polls.
         assert!(
-            col_checks >= 4,
-            "wide grouped copy/join must poll inside column loops, got {col_checks}"
+            wide_incompat >= narrow_incompat + 6,
+            "wide grouped incompatible join must poll more than narrow baseline: wide={wide_incompat}, narrow={narrow_incompat}"
+        );
+
+        // 2b. Wide compatible emission: exercises path_row reset, input copy, row_buf copy,
+        //     join, and checked row append across 5,000 columns.
+        let (narrow_compat, narrow_compat_out, narrow_compat_paths) = run_grouped(4, 4, 1);
+        let (wide_compat, wide_compat_out, wide_compat_paths) = run_grouped(5000, 4, 1);
+        assert_eq!(narrow_compat_paths, 1);
+        assert_eq!(wide_compat_paths, 1);
+        assert_eq!(narrow_compat_out.len(), 4);
+        assert_eq!(wide_compat_out.len(), 4);
+        for r in 0..4 {
+            assert_eq!(wide_compat_out.get(r, 0), gs);
+            assert_eq!(wide_compat_out.get(r, 1), Id::from_i64(1).unwrap());
+            assert_eq!(wide_compat_out.get(r, 2), gt);
+            assert_eq!(wide_compat_out.get(r, 4999), Id::from_i64(7).unwrap());
+        }
+        // 1 * 5,000 reset + 4 * (5,000 copy + 5,000 row_buf + 5,000 join + 5,000 append) = 85,000 ops -> >= 20 polls.
+        assert!(
+            wide_compat >= narrow_compat + 18,
+            "wide grouped compatible emission must poll across reset/copy/join/append: wide={wide_compat}, narrow={narrow_compat}"
         );
     }
 
@@ -10355,5 +10529,543 @@ mod tree_tests {
             search.exact_cost(&ctx_cost, &spec, &edges, |x| x, &mut held, 0),
             Err(Error::Cancelled)
         ));
+    }
+
+    #[test]
+    fn r3_weighted_finalization_pruning_polls_and_cancels() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        use oxrdfio::RdfFormat;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Arc::new(Ctx::new(store.snapshot()));
+
+        // 1. Direct `retain_hb_map_checked`: polls across both mostly-removed and mostly-kept
+        //    maps and stops immediately on cancellation without scanning the remaining table.
+        let mut mostly_removed: HbMap<u64, u64> = HbMap::default();
+        for k in 0..10_000u64 {
+            mostly_removed.insert(k, k);
+        }
+        let c0 = super::super::ctx::CHECKS.with(Cell::get);
+        retain_hb_map_checked(&mut mostly_removed, &ctx, |&k| k < 2).unwrap();
+        let removed_checks = super::super::ctx::CHECKS.with(Cell::get) - c0;
+        assert_eq!(mostly_removed.len(), 2);
+        assert!(mostly_removed.contains_key(&0) && mostly_removed.contains_key(&1));
+        assert!(
+            removed_checks >= 3,
+            "pruning 10,000 entries must poll every 4096 entries, got {removed_checks}"
+        );
+
+        let mut mostly_kept: HbMap<u64, u64> = HbMap::default();
+        for k in 0..10_000u64 {
+            mostly_kept.insert(k, k);
+        }
+        let mut pred_calls = 0usize;
+        let cancel_ctx = Arc::new(Ctx::new(store.snapshot()));
+        let err = retain_hb_map_checked(&mut mostly_kept, &cancel_ctx, |&k| {
+            pred_calls += 1;
+            if pred_calls == 100 {
+                cancel_ctx.cancel.store(true, Ordering::Relaxed);
+            }
+            k < 9999
+        });
+        assert!(matches!(err, Err(Error::Cancelled)));
+        assert!(
+            pred_calls <= 4096,
+            "mid-scan cancellation must stop at the 4096 boundary instead of scanning all 10,000 entries (visited {pred_calls})"
+        );
+
+        // 2. High-degree weighted source with cheap target: `run_dijkstra` and
+        //    `run_dijkstra_pair_all` (`all = true`) both prune large tentative tables with
+        //    polling and leave only settled entries.
+        let gstore = Store::in_memory(StoreOptions::default());
+        let mut nt = String::new();
+        nt.push_str("<urn:p:s> <urn:p:e> <urn:p:t> .\n");
+        for i in 0..8_192 {
+            nt.push_str(&format!("<urn:p:s> <urn:p:e> <urn:p:d:{i}> .\n"));
+        }
+        gstore
+            .load(&[Source::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = gstore.snapshot();
+        let s = snap.lookup_iri("urn:p:s").unwrap();
+        let p = snap.lookup_iri("urn:p:e").unwrap();
+        let t = snap.lookup_iri("urn:p:t").unwrap();
+        let spec = PathSearchSpec {
+            algorithm: Algorithm::AllShortest,
+            source: PathEnd::Const(s),
+            target: PathEnd::Const(t),
+            predicates: Some(vec![p.0]),
+            directions: vec![Direction::Forward],
+            direction: Direction::Forward,
+            exclude: Vec::new(),
+            max_degree: None,
+            edge_pattern: None,
+            min_len: 1,
+            max_len: None,
+            k: 1,
+            limit: None,
+            max_visited: 100_000,
+            weight: Some(Some(10)),
+            default_weight: 10.0,
+            reifies: Some(11),
+            path_index: None,
+            edge_index: None,
+            edge_s: None,
+            edge_p: None,
+            edge_o: None,
+            edge: None,
+            length: None,
+            cost: None,
+            graph: GraphFilter::Default,
+        };
+
+        // Single-source `run_dijkstra` with cheap target `t` (weight 1.0 vs default 10.0 for 8,192 decoys).
+        let run_ss = |prune: bool| -> (usize, usize, usize) {
+            let gctx = Arc::new(Ctx::new(snap.clone()));
+            let mut charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
+            let mut search =
+                SearchContext::open(&gctx, &spec, ChargedPatternEdges::new(), &mut charge).unwrap();
+            let base = search.retained_bytes();
+            let _ = insert_hb_map(&mut search.weights, (s.0, p.0, t.0), 1.0, &mut charge, base)
+                .unwrap();
+            for i in 0..8_192 {
+                let d = snap.lookup_iri(&format!("urn:p:d:{i}")).unwrap();
+                let b = search.retained_bytes();
+                let _ = insert_hb_map(&mut search.weights, (s.0, p.0, d.0), 10.0, &mut charge, b)
+                    .unwrap();
+            }
+            let targets = prune.then_some([t.0]);
+            let before = super::super::ctx::CHECKS.with(Cell::get);
+            let (tree, dist) = search
+                .run_dijkstra(
+                    &gctx,
+                    &spec,
+                    s.0,
+                    true,
+                    targets.as_ref().map(|a| a.as_slice()),
+                    true,
+                    false,
+                    None,
+                    None,
+                    s.0,
+                    &mut charge,
+                    0,
+                )
+                .unwrap();
+            let checks = super::super::ctx::CHECKS.with(Cell::get) - before;
+            (checks, tree.first.len(), dist.len())
+        };
+        let (prune_checks, first_len, dist_len) = run_ss(true);
+        assert_eq!(
+            first_len, 1,
+            "only settled target `t` remains in tree.first"
+        );
+        assert_eq!(dist_len, 2, "only settled `s` and `t` remain in dist");
+        assert!(
+            prune_checks >= 6,
+            "run_dijkstra with 8,192 tentative entries must poll during finalization pruning, got {prune_checks}"
+        );
+
+        // Bidirectional `run_dijkstra_pair_all` (`all = true`) on the same high-degree source.
+        let gctx = Arc::new(Ctx::new(snap.clone()));
+        let mut charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
+        let mut search =
+            SearchContext::open(&gctx, &spec, ChargedPatternEdges::new(), &mut charge).unwrap();
+        let base = search.retained_bytes();
+        let _ =
+            insert_hb_map(&mut search.weights, (s.0, p.0, t.0), 1.0, &mut charge, base).unwrap();
+        for i in 0..8_192 {
+            let d = snap.lookup_iri(&format!("urn:p:d:{i}")).unwrap();
+            let b = search.retained_bytes();
+            let _ =
+                insert_hb_map(&mut search.weights, (s.0, p.0, d.0), 10.0, &mut charge, b).unwrap();
+        }
+        let before = super::super::ctx::CHECKS.with(Cell::get);
+        let outcome = search
+            .run_dijkstra_pair_all(&gctx, &spec, s.0, t.0, true, false, &mut charge, 0)
+            .unwrap();
+        let bidi_checks = super::super::ctx::CHECKS.with(Cell::get) - before;
+        match outcome {
+            BidiWeightedOutcome::Stream(job) => {
+                // Only `s` settled on the forward side before `heaps[1]` emptied and
+                // `tops[0] + tops[1] > best` stopped the search, so all 8,193 tentative
+                // forward entries (`t` plus 8,192 decoys) were pruned away.
+                assert_eq!(job.trees[0].first.len(), 0);
+                assert_eq!(job.dist[0].len(), 1);
+            }
+            _ => panic!("expected BidiWeightedOutcome::Stream for tight weight ratio"),
+        }
+        assert!(
+            bidi_checks >= 6,
+            "run_dijkstra_pair_all must poll while pruning tentative tables, got {bidi_checks}"
+        );
+    }
+
+    #[test]
+    fn r3_wide_row_reset_and_append_poll_and_rollback() {
+        use crate::store::{Store, StoreOptions};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Arc::new(Ctx::new(store.snapshot()));
+        let width = 9_000usize;
+
+        // 1. `fill_undef_checked` polls across wide buffers and cancels.
+        let mut buf = vec![Id::from_i64(42).unwrap(); width];
+        let mut ticks = 0usize;
+        let c0 = super::super::ctx::CHECKS.with(Cell::get);
+        fill_undef_checked(&mut buf, &ctx, &mut ticks).unwrap();
+        let fill_checks = super::super::ctx::CHECKS.with(Cell::get) - c0;
+        assert!(
+            fill_checks >= 2,
+            "fill_undef_checked must poll on width={width}, got {fill_checks}"
+        );
+        assert!(buf.iter().all(|id| id.is_undef()));
+
+        // 2. `copy_slice_checked` polls across wide buffers.
+        let src = vec![Id::from_i64(7).unwrap(); width];
+        let mut dst = vec![Id::UNDEF; width];
+        ticks = 0;
+        let c1 = super::super::ctx::CHECKS.with(Cell::get);
+        copy_slice_checked(&mut dst, &src, &ctx, &mut ticks).unwrap();
+        let copy_checks = super::super::ctx::CHECKS.with(Cell::get) - c1;
+        assert!(
+            copy_checks >= 2,
+            "copy_slice_checked must poll on width={width}, got {copy_checks}"
+        );
+        assert_eq!(dst, src);
+
+        // 3. `push_row_checked` polls on wide rows and rolls back partial columns on error.
+        let vars: Vec<VarId> = (0..width as u32).collect();
+        let mut table = Table::new(vars);
+        let row0 = vec![Id::from_i64(11).unwrap(); width];
+        ticks = 0;
+        let c2 = super::super::ctx::CHECKS.with(Cell::get);
+        push_row_checked(&mut table, &row0, &ctx, &mut ticks).unwrap();
+        let push_checks = super::super::ctx::CHECKS.with(Cell::get) - c2;
+        assert!(
+            push_checks >= 2,
+            "push_row_checked must poll on width={width}, got {push_checks}"
+        );
+        assert_eq!(table.len(), 1);
+
+        // Start 6 ticks before the 4096 boundary with cancel=true so columns 0..5 are appended
+        // before column 5 triggers `ctx.check()?` and must roll back cleanly.
+        let row1 = vec![Id::from_i64(99).unwrap(); width];
+        ctx.cancel.store(true, Ordering::Relaxed);
+        let mut near_boundary = 4090usize;
+        assert!(matches!(
+            push_row_checked(&mut table, &row1, &ctx, &mut near_boundary),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(table.len(), 1);
+        assert!(
+            table
+                .cols
+                .iter()
+                .all(|col| col.len() == 1 && col[0] == Id::from_i64(11).unwrap()),
+            "mid-row cancellation must roll back every partially appended column"
+        );
+        ticks = 0;
+        assert!(matches!(
+            fill_undef_checked(&mut buf, &ctx, &mut ticks),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn r3_yen_prefix_comparison_and_stale_dijkstra_pops_poll() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        use oxrdfio::RdfFormat;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        // 1. Long Yen prefix comparison polls across chunks and cancels immediately.
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Arc::new(Ctx::new(store.snapshot()));
+        let prefix_len = 10_000usize;
+        let mut p0: Vec<Edge> = (0..prefix_len as u64)
+            .map(|k| Edge {
+                from: k + 1,
+                to: k + 2,
+                p: 1,
+                rev: false,
+            })
+            .collect();
+        let mut p1 = p0.clone();
+        let tail0 = Edge {
+            from: prefix_len as u64 + 1,
+            to: 900_001,
+            p: 1,
+            rev: false,
+        };
+        let tail1 = Edge {
+            from: prefix_len as u64 + 1,
+            to: 900_002,
+            p: 1,
+            rev: false,
+        };
+        p0.push(tail0);
+        p1.push(tail1);
+        let paths = vec![(p0, Cost::of(1.0)), (p1, Cost::of(2.0))];
+        let mut banned: HbSet<Edge> = HbSet::default();
+        let mut charge = super::super::ctx::OwnedCharge::new(&ctx, 0).unwrap();
+        let c0 = super::super::ctx::CHECKS.with(Cell::get);
+        let _ =
+            ban_yen_prefix_edges(&ctx, &paths, prefix_len, &mut banned, &mut charge, 0).unwrap();
+        let yen_checks = super::super::ctx::CHECKS.with(Cell::get) - c0;
+        assert_eq!(banned.len(), 2);
+        assert!(banned.contains(&tail0) && banned.contains(&tail1));
+        assert!(
+            yen_checks >= 4,
+            "comparing two 10,000-edge Yen prefixes must poll >= 4 times, got {yen_checks}"
+        );
+
+        ctx.cancel.store(true, Ordering::Relaxed);
+        let mut banned2: HbSet<Edge> = HbSet::default();
+        let c1 = super::super::ctx::CHECKS.with(Cell::get);
+        assert!(matches!(
+            ban_yen_prefix_edges(&ctx, &paths, prefix_len, &mut banned2, &mut charge, 0),
+            Err(Error::Cancelled)
+        ));
+        let cancel_checks = super::super::ctx::CHECKS.with(Cell::get) - c1;
+        assert_eq!(
+            cancel_checks, 1,
+            "cancelled Yen prefix comparison must abort on the first 4096-edge chunk"
+        );
+
+        // 2. Stale Dijkstra heap pops across `run_dijkstra`, `run_dijkstra_pair`, and
+        //    `run_dijkstra_pair_all`: compare decreasing-weight relaxations (~8,850 stale
+        //    pops on the forward side, 212 settled forward nodes) against an
+        //    identical-topology baseline with 0 stale pops and identical shortest cost.
+        //    9,500 heavy dead-end incoming edges on `t` keep `heaps[1].len() > heaps[0].len()`
+        //    throughout both runs so bidirectional search expands the exact same nodes in
+        //    both `base` and `stale`.
+        let n_u = 60usize;
+        let n_v = 150usize;
+        let n_dead = 9_500usize;
+        let gstore = Store::in_memory(StoreOptions::default());
+        let mut nt = String::new();
+        for i in 0..n_u {
+            nt.push_str(&format!("<urn:st:s> <urn:st:p> <urn:st:u:{i}> .\n"));
+            for j in 0..n_v {
+                nt.push_str(&format!("<urn:st:u:{i}> <urn:st:p> <urn:st:v:{j}> .\n"));
+            }
+        }
+        for j in 0..n_v {
+            nt.push_str(&format!("<urn:st:v:{j}> <urn:st:p> <urn:st:m> .\n"));
+        }
+        nt.push_str("<urn:st:m> <urn:st:p> <urn:st:t> .\n");
+        for k in 0..n_dead {
+            nt.push_str(&format!("<urn:st:dead:{k}> <urn:st:p> <urn:st:t> .\n"));
+        }
+        gstore
+            .load(&[Source::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = gstore.snapshot();
+        let s = snap.lookup_iri("urn:st:s").unwrap();
+        let p = snap.lookup_iri("urn:st:p").unwrap();
+        let m = snap.lookup_iri("urn:st:m").unwrap();
+        let t = snap.lookup_iri("urn:st:t").unwrap();
+        let us: Vec<u64> = (0..n_u)
+            .map(|i| snap.lookup_iri(&format!("urn:st:u:{i}")).unwrap().0)
+            .collect();
+        let vs: Vec<u64> = (0..n_v)
+            .map(|j| snap.lookup_iri(&format!("urn:st:v:{j}")).unwrap().0)
+            .collect();
+        let deads: Vec<u64> = (0..n_dead)
+            .map(|k| snap.lookup_iri(&format!("urn:st:dead:{k}")).unwrap().0)
+            .collect();
+
+        let spec = PathSearchSpec {
+            algorithm: Algorithm::Shortest,
+            source: PathEnd::Const(s),
+            target: PathEnd::Const(t),
+            predicates: Some(vec![p.0]),
+            directions: vec![Direction::Forward],
+            direction: Direction::Forward,
+            exclude: Vec::new(),
+            max_degree: None,
+            edge_pattern: None,
+            min_len: 1,
+            max_len: None,
+            k: 1,
+            limit: None,
+            max_visited: 100_000,
+            weight: Some(Some(10)),
+            default_weight: 1.0,
+            reifies: Some(11),
+            path_index: None,
+            edge_index: None,
+            edge_s: None,
+            edge_p: None,
+            edge_o: None,
+            edge: None,
+            length: None,
+            cost: None,
+            graph: GraphFilter::Default,
+        };
+
+        let build_search =
+            |stale: bool| -> (Arc<Ctx>, SearchContext, super::super::ctx::OwnedCharge) {
+                let gctx = Arc::new(Ctx::new(snap.clone()));
+                let mut charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
+                let mut search =
+                    SearchContext::open(&gctx, &spec, ChargedPatternEdges::new(), &mut charge)
+                        .unwrap();
+                let mut put_w = |from: u64, to: u64, w: f64| {
+                    let b = search.retained_bytes();
+                    let _ = insert_hb_map(&mut search.weights, (from, p.0, to), w, &mut charge, b)
+                        .unwrap();
+                };
+                // For `stale == true`: `s->u_i` has weight `i+1`, `u_i->v_j` has weight `500 - 2*i`
+                // so total distance to `v_j` strictly decreases from 501 down to 442 (`59*150 = 8,850`
+                // stale entries). For `stale == false`: `u_i->v_j` has weight `441 + 2*i`, giving
+                // the exact same optimal distance `442` via `u_0` with 0 stale heap entries.
+                for (i, &u) in us.iter().enumerate() {
+                    let w_end = (i + 1) as f64;
+                    let w_mid = if stale {
+                        (500 - 2 * i) as f64
+                    } else {
+                        (441 + 2 * i) as f64
+                    };
+                    put_w(s.0, u, w_end);
+                    for &v in &vs {
+                        put_w(u, v, w_mid);
+                    }
+                }
+                for &v in &vs {
+                    put_w(v, m.0, 200.0);
+                }
+                put_w(m.0, t.0, 1_000.0);
+                for &d in &deads {
+                    put_w(d, t.0, 2_000.0);
+                }
+                (gctx, search, charge)
+            };
+
+        // Warm the snapshot block cache on both directions before comparing `CHECKS`
+        // so cold block decodes do not inflate the baseline measurement.
+        {
+            let (ctx_w, mut search_w, mut ch_w) = build_search(false);
+            let _ = search_w
+                .run_dijkstra_pair(&ctx_w, &spec, s.0, t.0, None, None, &mut ch_w, 0)
+                .unwrap();
+        }
+
+        // 2a. Single-source `run_dijkstra`
+        let (ctx_b, mut search_b, mut ch_b) = build_search(false);
+        let cb = super::super::ctx::CHECKS.with(Cell::get);
+        let (_, dist_b) = search_b
+            .run_dijkstra(
+                &ctx_b,
+                &spec,
+                s.0,
+                true,
+                Some(&[m.0]),
+                false,
+                false,
+                None,
+                None,
+                s.0,
+                &mut ch_b,
+                0,
+            )
+            .unwrap();
+        let ss_base_checks = super::super::ctx::CHECKS.with(Cell::get) - cb;
+
+        let (ctx_s, mut search_s, mut ch_s) = build_search(true);
+        let cs = super::super::ctx::CHECKS.with(Cell::get);
+        let (_, dist_s) = search_s
+            .run_dijkstra(
+                &ctx_s,
+                &spec,
+                s.0,
+                true,
+                Some(&[m.0]),
+                false,
+                false,
+                None,
+                None,
+                s.0,
+                &mut ch_s,
+                0,
+            )
+            .unwrap();
+        let ss_stale_checks = super::super::ctx::CHECKS.with(Cell::get) - cs;
+        assert_eq!(dist_b.get(&m.0).unwrap().hi, 642.0);
+        assert_eq!(dist_s.get(&m.0).unwrap().hi, 642.0);
+        assert_eq!(search_b.visited, search_s.visited);
+        assert!(
+            ss_stale_checks >= ss_base_checks + 2,
+            "run_dijkstra stale heap pops must add polls: stale={ss_stale_checks}, base={ss_base_checks}"
+        );
+
+        // 2b. Bidirectional `run_dijkstra_pair`
+        let (ctx_b, mut search_b, mut ch_b) = build_search(false);
+        let cb = super::super::ctx::CHECKS.with(Cell::get);
+        let (_, cost_b) = search_b
+            .run_dijkstra_pair(&ctx_b, &spec, s.0, t.0, None, None, &mut ch_b, 0)
+            .unwrap()
+            .unwrap();
+        let pair_base_checks = super::super::ctx::CHECKS.with(Cell::get) - cb;
+
+        let (ctx_s, mut search_s, mut ch_s) = build_search(true);
+        let cs = super::super::ctx::CHECKS.with(Cell::get);
+        let (_, cost_s) = search_s
+            .run_dijkstra_pair(&ctx_s, &spec, s.0, t.0, None, None, &mut ch_s, 0)
+            .unwrap()
+            .unwrap();
+        let pair_stale_checks = super::super::ctx::CHECKS.with(Cell::get) - cs;
+        assert_eq!(cost_b, 1_642.0);
+        assert_eq!(cost_s, 1_642.0);
+        assert_eq!(search_b.visited, search_s.visited);
+        assert!(
+            pair_stale_checks >= pair_base_checks + 2,
+            "run_dijkstra_pair stale heap pops must add polls: stale={pair_stale_checks}, base={pair_base_checks}"
+        );
+
+        // 2c. Bidirectional `run_dijkstra_pair_all` (`all = false` and `all = true`)
+        for all in [false, true] {
+            let (ctx_b, mut search_b, mut ch_b) = build_search(false);
+            let cb = super::super::ctx::CHECKS.with(Cell::get);
+            let out_b = search_b
+                .run_dijkstra_pair_all(&ctx_b, &spec, s.0, t.0, all, false, &mut ch_b, 0)
+                .unwrap();
+            let all_base_checks = super::super::ctx::CHECKS.with(Cell::get) - cb;
+
+            let (ctx_s, mut search_s, mut ch_s) = build_search(true);
+            let cs = super::super::ctx::CHECKS.with(Cell::get);
+            let out_s = search_s
+                .run_dijkstra_pair_all(&ctx_s, &spec, s.0, t.0, all, false, &mut ch_s, 0)
+                .unwrap();
+            let all_stale_checks = super::super::ctx::CHECKS.with(Cell::get) - cs;
+            assert!(!matches!(
+                out_b,
+                BidiWeightedOutcome::Empty | BidiWeightedOutcome::FallbackSingleSource
+            ));
+            assert!(!matches!(
+                out_s,
+                BidiWeightedOutcome::Empty | BidiWeightedOutcome::FallbackSingleSource
+            ));
+            assert_eq!(search_b.visited, search_s.visited);
+            assert!(
+                all_stale_checks >= all_base_checks + 2,
+                "run_dijkstra_pair_all(all={all}) stale heap pops must add polls: stale={all_stale_checks}, base={all_base_checks}"
+            );
+        }
     }
 }
