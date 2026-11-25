@@ -393,7 +393,7 @@ impl Group {
         let mut gann = self.gann.take().unwrap_or_default();
         for (r, _, a) in c {
             let k = self.key_of(&r);
-            prov::absorb_row(&mut gann, &k, a, mode);
+            prov::absorb_row_state(&mut gann, &k, a, mode);
         }
         self.gann = Some(gann);
         let moved = if plain.is_empty() {

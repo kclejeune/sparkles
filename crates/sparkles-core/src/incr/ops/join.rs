@@ -5,7 +5,7 @@
 //! variables both sides always bind. Shared variables that a side may leave unbound are
 //! checked row by row, as SPARQL's compatible mappings ask.
 
-use super::super::pass::{Pass, Which};
+use super::super::pass::{EffectiveChanges, Pass, Which};
 use super::super::persist::{Reader, Writer};
 use super::super::prov::{self, AChanges, AnnMap, Provenance};
 use super::super::zset::{Changes, consolidate, row_bytes};
@@ -60,7 +60,6 @@ impl Join {
     /// [`init`](Self::init) with annotations: a merged row's annotation is the product
     /// of its sides' annotations as their states keep them.
     pub fn init_a(&mut self, p: &mut Pass) -> Result<AChanges> {
-        let mode = p.prov;
         let l_mark = p.output_lease_mark();
         let l_raw = self.left.init_a(p)?;
         let l_lease = p.take_output_leases_since(l_mark);
@@ -80,9 +79,7 @@ impl Join {
             lann.clear();
             p.sync_op_state(&mut tracked, other)?;
             let per_row = row_bytes(lw) * 2 + row_bytes(key_w);
-            let mut eff = AChanges::new();
-            let mut eff_lease = p.scratch_lease();
-            let mut eff_ann_bytes = 0u64;
+            let mut eff = EffectiveChanges::new(p);
             for (idx, (row, w, a)) in l.into_iter().enumerate() {
                 if idx % 1024 == 1023 {
                     p.tick()?;
@@ -92,15 +89,14 @@ impl Join {
                     p.sync_op_state(&mut tracked, est)?;
                 }
                 larr.add(&row, w);
-                let e = prov::absorb_row(lann, &row, a, mode);
-                p.preadmit_achanges_push(&eff, lw, &mut eff_ann_bytes, e.bytes(), &mut eff_lease)?;
-                eff.push((row, w, e));
+                eff.push(p, lw, lann, (row, w, a))?;
             }
             p.sync_op_state(
                 &mut tracked,
                 other + larr.bytes() + prov::map_bytes(lann, lw),
             )?;
             drop(l_lease);
+            let (eff, eff_lease) = eff.into_parts();
             (eff, vec![eff_lease])
         } else {
             (l, l_lease)
@@ -113,9 +109,7 @@ impl Join {
             rann.clear();
             p.sync_op_state(&mut tracked, other)?;
             let per_row = row_bytes(rw) * 2 + row_bytes(key_w);
-            let mut eff = AChanges::new();
-            let mut eff_lease = p.scratch_lease();
-            let mut eff_ann_bytes = 0u64;
+            let mut eff = EffectiveChanges::new(p);
             for (idx, (row, w, a)) in r.into_iter().enumerate() {
                 if idx % 1024 == 1023 {
                     p.tick()?;
@@ -125,15 +119,14 @@ impl Join {
                     p.sync_op_state(&mut tracked, est)?;
                 }
                 rarr.add(&row, w);
-                let e = prov::absorb_row(rann, &row, a, mode);
-                p.preadmit_achanges_push(&eff, rw, &mut eff_ann_bytes, e.bytes(), &mut eff_lease)?;
-                eff.push((row, w, e));
+                eff.push(p, rw, rann, (row, w, a))?;
             }
             p.sync_op_state(
                 &mut tracked,
                 other + rarr.bytes() + prov::map_bytes(rann, rw),
             )?;
             drop(r_lease);
+            let (eff, eff_lease) = eff.into_parts();
             (eff, vec![eff_lease])
         } else {
             (r, r_lease)
@@ -183,7 +176,6 @@ impl Join {
     /// into its state, and the effective change joins, so the output's change is the
     /// change of the product of the states.
     pub fn delta_a(&mut self, p: &mut Pass) -> Result<AChanges> {
-        let mode = p.prov;
         let l_mark = p.output_lease_mark();
         let dl_raw = self.left.delta_a(p)?;
         let dl_lease = p.take_output_leases_since(l_mark);
@@ -200,9 +192,7 @@ impl Join {
             let other = self.rarr.as_ref().map_or(0, |a| a.bytes())
                 + self.rann.as_ref().map_or(0, |m| prov::map_bytes(m, rw));
             let per_row = row_bytes(lw) * 2 + row_bytes(key_w);
-            let mut eff = AChanges::new();
-            let mut eff_lease = p.scratch_lease();
-            let mut eff_ann_bytes = 0u64;
+            let mut eff = EffectiveChanges::new(p);
             for (idx, (row, w, a)) in dl.into_iter().enumerate() {
                 if idx % 1024 == 1023 {
                     p.tick()?;
@@ -212,15 +202,14 @@ impl Join {
                     p.sync_op_state(&mut tracked, est)?;
                 }
                 larr.add(&row, w);
-                let e = prov::absorb_row(lann, &row, a, mode);
-                p.preadmit_achanges_push(&eff, lw, &mut eff_ann_bytes, e.bytes(), &mut eff_lease)?;
-                eff.push((row, w, e));
+                eff.push(p, lw, lann, (row, w, a))?;
             }
             p.sync_op_state(
                 &mut tracked,
                 other + larr.bytes() + prov::map_bytes(lann, lw),
             )?;
             drop(dl_lease);
+            let (eff, eff_lease) = eff.into_parts();
             (eff, vec![eff_lease])
         } else {
             (dl, dl_lease)
@@ -264,9 +253,7 @@ impl Join {
             let other = self.larr.as_ref().map_or(0, |a| a.bytes())
                 + self.lann.as_ref().map_or(0, |m| prov::map_bytes(m, lw));
             let per_row = row_bytes(rw) * 2 + row_bytes(key_w);
-            let mut eff = AChanges::new();
-            let mut eff_lease = p.scratch_lease();
-            let mut eff_ann_bytes = 0u64;
+            let mut eff = EffectiveChanges::new(p);
             for (idx, (row, w, a)) in dr.into_iter().enumerate() {
                 if idx % 1024 == 1023 {
                     p.tick()?;
@@ -276,15 +263,14 @@ impl Join {
                     p.sync_op_state(&mut tracked, est)?;
                 }
                 rarr.add(&row, w);
-                let e = prov::absorb_row(rann, &row, a, mode);
-                p.preadmit_achanges_push(&eff, rw, &mut eff_ann_bytes, e.bytes(), &mut eff_lease)?;
-                eff.push((row, w, e));
+                eff.push(p, rw, rann, (row, w, a))?;
             }
             p.sync_op_state(
                 &mut tracked,
                 other + rarr.bytes() + prov::map_bytes(rann, rw),
             )?;
             drop(dr_lease);
+            let (eff, eff_lease) = eff.into_parts();
             (eff, vec![eff_lease])
         } else {
             (dr, dr_lease)

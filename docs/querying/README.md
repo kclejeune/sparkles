@@ -135,10 +135,11 @@ Incremental views and live queries keep query results up to date after commits (
 * **Maintained table views and SSE live queries.** A `table` view compiles a `SELECT` or `CONSTRUCT` query into a Z-set operator circuit that joins each commit's net changes against the store indexes. Supported incremental operators include BGPs, `GRAPH`, `FILTER`, `BIND`, `UNION`, `OPTIONAL`, `MINUS`, correlated and uncorrelated `EXISTS`, `VALUES`, `DISTINCT`, subqueries, `GROUP BY` (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`), `HAVING`, and supported property paths; unsupported operators run as `recompute` nodes. `MIN`, `MAX`, `GROUP_CONCAT`, and `SAMPLE` store per-group values in an ordered multiset (16 bytes per distinct value), so `GROUP_CONCAT` orders values by `ORDER BY` order and `SAMPLE` keeps a value while it remains present. Commits that touch none of a view's patterns skip the view. Queries read views with `SERVICE view:read`, and `GET /{ds}/live` streams initial results and incremental diffs over server-sent events with `Last-Event-ID` resume. Identical queries under identical caller access share one circuit, and view state checkpoints and recovers from the change log. On datasets with RDFS on read or materialized inferences in the default graph, views automatically switch to whole-query `recompute` evaluation on relevant commits and switch back when inference is turned off. Exposed through `Dataset::views`, `Dataset::live`, `sparkles views`, `sparkles query --live`, and Python `Dataset.views` and `Dataset.live`.
 
   Each live query's memory limit also bounds its queue of decoded events. When the queue
-  would exceed the limit, the next read requests a fresh reset. If a diff or reset cannot
-  be admitted, the stream ends with `over-budget`. A snapshot that cannot be admitted
-  when opening the stream fails the request with the same error. Decoded rows can hit
-  these limits even when compact circuit state fits. Unread rows hold server pool credit
+  would exceed the limit, the next read requests a fresh reset. If the circuit cannot
+  admit initial snapshot decoding, the request fails with `over-budget`. A subscriber
+  joining a shared circuit can open a stream even if the decoded snapshot exceeds its
+  queue limit. The first read then requests a reset. If a later diff or a reset exceeds
+  its budget, the stream ends with `over-budget`. Unread rows hold server pool credit
   until delivery, overflow, or close.
 
 * **Maintained property paths.** Paths with `+` or `*` over IRIs, inverses, sequences, and alternatives run inside a fixed-point operator that tracks each reachable pair and its first derivation (about 40 bytes per reachable pair, checkpointed in `VIEW_STATE` format 2). Commits revisit only walks touching changed edges, and deletions remove only pairs with no alternative path, handling cycles without full recomputation. Zero-length `*` rows follow active graph nodes without extra state. Paths with `?`, negated property sets, nested closures, or closures inside sequences remain `recompute` nodes ([measurements](../benchmarks/writes/RESULTS.md#property-path-views)).

@@ -134,6 +134,58 @@ fn runtime_close_releases_unread_live_snapshot_with_handle_alive() {
 }
 
 #[test]
+fn initial_snapshot_decode_refusal_and_joining_queue_overflow_are_distinct() {
+    let store = Store::in_memory(StoreOptions::default());
+    load_rows(&store, "snapshot", 40, 4096);
+    let pool = QueryPool::new(16 * MB);
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    let query = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let narrow = LiveOptions {
+        max_memory_bytes: Some(48 * KB),
+        ..LiveOptions::default()
+    };
+    assert!(matches!(
+        rt.live(&store, query, None, &narrow),
+        Err(Error::BudgetExceeded(_))
+    ));
+
+    let wide = rt
+        .live(
+            &store,
+            query,
+            None,
+            &LiveOptions {
+                max_memory_bytes: Some(MB),
+                ..LiveOptions::default()
+            },
+        )
+        .unwrap();
+    let joining = rt.live(&store, query, None, &narrow).unwrap();
+    assert!(!joining.is_closed());
+    assert!(matches!(
+        joining.try_next(),
+        Some(LiveEvent::Error { code, .. }) if code == "over-budget"
+    ));
+    assert!(joining.is_closed());
+    assert!(joining.try_next().is_none());
+
+    assert!(matches!(
+        wide.try_next(),
+        Some(LiveEvent::Snapshot { rows, .. }) if rows.len() == 40
+    ));
+    upd(&store, "INSERT DATA { <urn:next> <urn:p> \"small\" }");
+    rt.round(&store);
+    assert!(matches!(wide.try_next(), Some(LiveEvent::Diff { .. })));
+    rt.close(&store);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
 fn live_query_and_internal_accumulator_return_exact_zero_on_drop_and_gc() {
     let store = Store::in_memory(StoreOptions::default());
     load_rows(&store, "l", 300, 16);

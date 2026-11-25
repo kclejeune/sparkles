@@ -874,6 +874,15 @@ impl Ann {
         }
     }
 
+    /// The effective annotation's charge includes unused WHY support slots.
+    pub(super) fn bytes_with_spare_supports(&self) -> u64 {
+        let spare = match self {
+            Ann::Why(w) => w.supports.capacity() - w.supports.len(),
+            _ => 0,
+        };
+        self.bytes() + (spare * std::mem::size_of::<(Witness, i64)>()) as u64
+    }
+
     pub fn save(&self, w: &mut Writer) {
         let atom = |w: &mut Writer, a: &Atom| match a {
             Atom::Fact(k) => {

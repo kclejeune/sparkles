@@ -13,7 +13,7 @@
 //! `recompute` node over its masked snapshot.
 
 use super::budget::{BudgetHandle, ScratchLease};
-use super::prov::AChanges;
+use super::prov::{self, AChanges, Ann, AnnMap};
 use super::terms::Terms;
 use super::zset::{Changes, Row, row_bytes};
 use crate::access::GraphAccess;
@@ -172,6 +172,50 @@ pub struct Pass<'a> {
     ctx: Option<Arc<Ctx>>,
     union_changes: Option<Vec<([Id; 3], i64)>>,
     work: u64,
+}
+
+/// Changes from absorbing annotations into an arrangement, with their live charge.
+pub(super) struct EffectiveChanges {
+    rows: AChanges,
+    ann_bytes: u64,
+    lease: ScratchLease,
+}
+
+impl EffectiveChanges {
+    pub(super) fn new(pass: &Pass<'_>) -> Self {
+        Self {
+            rows: AChanges::new(),
+            ann_bytes: 0,
+            lease: pass.scratch_lease(),
+        }
+    }
+
+    pub(super) fn push(
+        &mut self,
+        pass: &Pass<'_>,
+        width: usize,
+        state: &mut AnnMap,
+        (row, weight, ann): (Row, i64, Ann),
+    ) -> Result<()> {
+        let bound = ann.effective_bytes(state.get(&row), pass.prov.max_witnesses());
+        pass.preadmit_achanges_push(
+            &self.rows,
+            width,
+            &mut self.ann_bytes,
+            bound,
+            &mut self.lease,
+        )?;
+        let effective = prov::absorb_row(state, &row, ann, pass.prov);
+        let excess = bound - effective.bytes_with_spare_supports();
+        self.ann_bytes -= excess;
+        self.lease.release(excess);
+        self.rows.push((row, weight, effective));
+        Ok(())
+    }
+
+    pub(super) fn into_parts(self) -> (AChanges, ScratchLease) {
+        (self.rows, self.lease)
+    }
 }
 
 impl<'a> Pass<'a> {

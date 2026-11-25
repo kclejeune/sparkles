@@ -358,12 +358,13 @@ passes its budget is `suspended` with `over-budget`, and its reads fail with
 `503 view-suspended` until a rebuild with a larger budget.
 
 A live query's per-query budget bounds its circuit and the decoded events queued for
-that subscriber. When queued events would exceed the byte limit, the next read
-requests a fresh `reset`. If the circuit, a decoded event, or the reset cannot be
-admitted, the subscription ends with `over-budget`. An initial snapshot that cannot
-be admitted causes the subscription request to fail with `over-budget`. Unread
-decoded rows hold server pool credit until the queues release them on delivery,
-overflow, or close.
+that subscriber. A budget refusal during the initial build or snapshot decoding fails
+the subscription request with `over-budget`. A subscriber joining a shared circuit
+can open a stream even if the decoded snapshot exceeds its queue limit. The queue
+overflows, and the first read requests a fresh `reset`. Queue overflow during
+delivery follows the same rule. If a later circuit update or diff cannot be admitted,
+or the reset exceeds its budget, the subscription ends with `over-budget`. Unread
+decoded rows hold server pool credit until delivery, overflow, or close.
 
 ### 3.6 Internal circuits
 

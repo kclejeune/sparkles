@@ -366,15 +366,17 @@ impl Tally {
         self.entries.shrink_to_fit();
         self.unknown.shrink_to_fit();
         self.keys.shrink_to_fit();
-        self.index.shrink_to_fit();
-        if self.index.capacity() < self.index_capacity {
-            use sparkles_budget::sizes::buckets;
-            // Shrinking can leave the same backing allocation with tombstones.
-            // Only lower its charge when the requested minimum uses fewer buckets.
-            let min = sparkles_budget::sizes::table_capacity(self.index.len());
-            if buckets(min) < buckets(self.index_capacity) {
-                self.index_capacity = self.index.capacity();
+        use sparkles_budget::sizes::{buckets, table_capacity};
+        let slots = table_capacity(self.index.len());
+        if buckets(slots) < buckets(self.index_capacity) {
+            // Drop the table and its key copies before reusing their existing credit.
+            // The replacement uses fewer buckets and copies only the surviving keys.
+            drop(std::mem::take(&mut self.index));
+            self.index.reserve(self.keys.len());
+            for (i, key) in self.keys.iter().enumerate() {
+                self.index.insert(key.terms.clone(), i as u32);
             }
+            self.index_capacity = self.index.capacity();
         }
         self.bytes() < before
     }
@@ -449,12 +451,16 @@ impl Tally {
         use super::circuit::reserve_vec_slot;
         use sparkles_budget::sizes::{table_bytes, table_grown, vec_grown};
 
+        if c.is_empty() {
+            drop(c);
+            return Ok(());
+        }
         let budget = circuit.map(|c| c.budget_handle());
         let mut compact = super::budget::ScratchLease::new(budget.clone());
         let cols_bytes = (tally.lock().key_cols.len() * std::mem::size_of::<usize>()) as u64;
         compact.try_reserve(cols_bytes)?;
         let key_cols = tally.lock().key_cols.clone();
-        let key_payload = std::mem::size_of_val(key_cols.as_slice()) as u64;
+        let key_payload = (key_cols.len() * std::mem::size_of::<Id>()) as u64;
         let slot = std::mem::size_of::<(Box<[Id]>, u64)>();
         let mut per = FxHashMap::<Box<[Id]>, u64>::default();
         let mut projected = compact.sibling();
@@ -1040,6 +1046,79 @@ mod tests {
                 .get(&[iri(&format!("{payload}2048"))]),
             1
         );
+    }
+
+    #[test]
+    fn tally_compaction_frees_the_old_index_before_rebuilding_at_a_full_budget() {
+        use super::super::budget::ViewBudget;
+        use sparkles_budget::sizes::{table_bytes, table_capacity};
+
+        let mut t = Tally::new(vec![0], 0);
+        for commit in 1..=512 {
+            let key = t.intern(vec![iri(&format!("key{commit}"))]);
+            t.entries.push_back((commit, key, 1));
+        }
+        t.discard_prefix(256);
+        t.entries.shrink_to_fit();
+        t.keys.shrink_to_fit();
+
+        let original = table_bytes(table_capacity(t.index.len() + 4096), INDEX_SLOT) as u64;
+        let full = t.bytes() - table_bytes(t.index_capacity, INDEX_SLOT) as u64 + original;
+        let budget = ViewBudget::new(Some(full), None);
+        let peak = crate::test_alloc::record_peak(|| {
+            // The old index is allocated inside the observation so the peak includes it.
+            t.index.reserve(4096);
+            t.index_capacity = t.index.capacity();
+            assert_eq!(t.bytes(), full);
+            budget.try_set_external(full).unwrap();
+            assert_eq!(budget.handle().remaining_local(), Some(0));
+
+            assert!(t.shrink_spare_capacity());
+            assert!(t.bytes() < full);
+        });
+        assert!(
+            peak <= original,
+            "index compaction peaked at {peak} from {original}"
+        );
+        let counts = t.counts(256, 512);
+        assert!(counts.complete());
+        assert_eq!(counts.get(&[iri("key512")]), 1);
+        assert_eq!(t.index.get(&vec![iri("key512")]), Some(&255));
+    }
+
+    #[test]
+    fn empty_accumulator_change_keeps_exact_counts_at_a_full_budget() {
+        use super::super::budget::ScratchLease;
+        use super::super::circuit::Circuit;
+        use super::super::compile::compile;
+
+        let query = crate::sparql::parse_query("SELECT ?s WHERE { ?s ?p ?o }", None, &[]).unwrap();
+        let mut circuit = Circuit::new(compile(&query, None).unwrap(), None);
+        let t = tally();
+        let full = t.bytes();
+        circuit.max_memory_bytes = Some(full);
+        circuit.try_set_external(full).unwrap();
+        assert_eq!(circuit.budget_handle().remaining_local(), Some(0));
+        let tally = parking_lot::Mutex::new(t);
+        let mut dirty = false;
+
+        Tally::add_budgeted_charged_shared(
+            &tally,
+            8,
+            Changes::new(),
+            ScratchLease::default(),
+            |_, _| panic!("empty changes have no key to decode"),
+            Some(&circuit),
+            &mut dirty,
+        )
+        .unwrap();
+        assert!(!dirty);
+        assert_eq!(circuit.budget_handle().remaining_local(), Some(0));
+        let t = tally.lock();
+        assert_eq!(t.bytes(), full);
+        assert!(t.counts(7, 8).complete());
+        assert!(t.counts(3, 8).complete());
+        assert_eq!(t.counts(3, 8).get(&[iri("a")]), 3);
     }
 
     #[test]

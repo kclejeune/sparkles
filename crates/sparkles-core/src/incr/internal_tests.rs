@@ -800,6 +800,46 @@ fn accumulator_refuses_a_single_oversized_literal_before_decoding() {
     assert_eq!(counts(&c, after_large), BTreeMap::from([("key".into(), 1)]));
 }
 
+#[test]
+fn accumulator_decodes_long_language_tags_with_one_owned_buffer() {
+    use super::budget::{ScratchLease, ViewBudget};
+    use super::terms::Terms;
+    use crate::id::{self, Tag};
+
+    let store = Store::in_memory(StoreOptions::default());
+    let tag = format!("x{}", "-abcdefgh".repeat(4096));
+    for direction in ["", "--ltr"] {
+        upd(
+            &store,
+            &format!("INSERT DATA {{ :tag :p \"v\"@{tag}{direction} }}"),
+        );
+        let term = if direction.is_empty() {
+            oxrdf::Literal::new_language_tagged_literal_unchecked("v", tag.clone())
+        } else {
+            oxrdf::Literal::new_directional_language_tagged_literal_unchecked(
+                "v",
+                tag.clone(),
+                oxrdf::BaseDirection::Ltr,
+            )
+        };
+        let term = Term::Literal(term);
+        let snapshot = store.snapshot();
+        let id = snapshot.lookup_term(&term).unwrap();
+        assert_eq!(id.tag(), Tag::Delta);
+        let cap = id::term_key(&term).len() as u64;
+        let budget = ViewBudget::new(Some(cap), None);
+        let mut lease = ScratchLease::new(Some(budget.handle()));
+        let terms = Terms::default();
+        let mut decoded = None;
+        let peak = crate::test_alloc::record_peak(|| {
+            decoded = terms.term_budgeted(&snapshot, id, &mut lease).unwrap();
+        });
+        assert_eq!(decoded.as_ref(), Some(&term));
+        assert_eq!(lease.bytes(), cap);
+        assert!(peak <= cap, "decoded {peak} bytes with only {cap} admitted");
+    }
+}
+
 /// A run of commits that the worker applies at once is held to the budget after each
 /// commit, so the counts never grow far past it before the run ends.
 #[test]

@@ -8,7 +8,7 @@
 //! between the parts of the output: for `OPTIONAL` between the joined rows and the row
 //! alone, for `MINUS` and `NOT EXISTS` in or out, and for `EXISTS` out or in.
 
-use super::super::pass::{Pass, Which};
+use super::super::pass::{EffectiveChanges, Pass, Which};
 use super::super::persist::{Reader, Writer};
 use super::super::prov::{self, AChanges, Ann, AnnMap, Provenance};
 use super::super::zset::{Changes, Row, consolidate, row_bytes};
@@ -270,9 +270,7 @@ impl MatchOp {
             rann.clear();
             p.sync_op_state(&mut tracked, other)?;
             let per_row = row_bytes(rw) * 2 + row_bytes(self.m.key.len());
-            let mut eff = AChanges::new();
-            let mut eff_lease = p.scratch_lease();
-            let mut eff_ann_bytes = 0u64;
+            let mut eff = EffectiveChanges::new(p);
             for (idx, (row, w, a)) in r.into_iter().enumerate() {
                 if idx % 1024 == 1023 {
                     p.tick()?;
@@ -282,19 +280,14 @@ impl MatchOp {
                     p.sync_op_state(&mut tracked, est)?;
                 }
                 rarr.add(&row, w);
-                let bound = a.effective_bytes(rann.get(&row), mode.max_witnesses());
-                p.preadmit_achanges_push(&eff, rw, &mut eff_ann_bytes, bound, &mut eff_lease)?;
-                let e = prov::absorb_row(rann, &row, a, mode);
-                let actual = e.bytes();
-                eff_ann_bytes -= bound - actual;
-                eff_lease.release(bound - actual);
-                eff.push((row, w, e));
+                eff.push(p, rw, rann, (row, w, a))?;
             }
             p.sync_op_state(
                 &mut tracked,
                 other + rarr.bytes() + prov::map_bytes(rann, rw),
             )?;
             drop(r_leases);
+            let (eff, eff_lease) = eff.into_parts();
             (eff, vec![eff_lease])
         } else {
             (r, r_leases)
@@ -545,9 +538,7 @@ impl MatchOp {
             );
         }
         let mut dw: FxHashMap<Row, i64> = FxHashMap::default();
-        let mut dl_eff = AChanges::new();
-        let mut dl_eff_lease = p.scratch_lease();
-        let mut dl_eff_ann = 0u64;
+        let mut dl_eff = EffectiveChanges::new(p);
         for (a, wa, aa) in dl {
             let est = self.bytes()
                 + prov::map_bytes(&lann, lw)
@@ -565,19 +556,13 @@ impl MatchOp {
             }
             *dw.entry(a.clone()).or_insert(0) += wa;
             if lj {
-                let bound = aa.effective_bytes(lann.get(&a), mode.max_witnesses());
-                p.preadmit_achanges_push(&dl_eff, lw, &mut dl_eff_ann, bound, &mut dl_eff_lease)?;
-                let e = prov::absorb_row(&mut lann, &a, aa, mode);
-                let actual = e.bytes();
-                dl_eff_ann -= bound - actual;
-                dl_eff_lease.release(bound - actual);
-                dl_eff.push((a, wa, e));
+                dl_eff.push(p, lw, &mut lann, (a, wa, aa))?;
             } else {
                 prov::absorb_row_state(&mut lann, &a, aa, mode);
             }
         }
         drop(dl_leases);
-        let dl = dl_eff;
+        let (dl, dl_eff_lease) = dl_eff.into_parts();
         let out_width = if lj {
             self.m.out.len()
         } else {
@@ -611,9 +596,7 @@ impl MatchOp {
                 + prov::map_bytes(&lann, lw)
                 + sann.as_ref().map_or(0, |s| prov::map_bytes(s, lw));
             let per_row = row_bytes(rw) * 2 + row_bytes(self.m.key.len());
-            let mut eff = AChanges::new();
-            let mut eff_lease = p.scratch_lease();
-            let mut eff_ann = 0u64;
+            let mut eff = EffectiveChanges::new(p);
             for (idx, (row, w, a)) in dr.into_iter().enumerate() {
                 if idx % 1024 == 1023 {
                     p.tick()?;
@@ -623,19 +606,14 @@ impl MatchOp {
                     p.sync_op_state(&mut tracked, est)?;
                 }
                 rarr.add(&row, w);
-                let bound = a.effective_bytes(rann.get(&row), mode.max_witnesses());
-                p.preadmit_achanges_push(&eff, rw, &mut eff_ann, bound, &mut eff_lease)?;
-                let e = prov::absorb_row(rann, &row, a, mode);
-                let actual = e.bytes();
-                eff_ann -= bound - actual;
-                eff_lease.release(bound - actual);
-                eff.push((row, w, e));
+                eff.push(p, rw, rann, (row, w, a))?;
             }
             p.sync_op_state(
                 &mut tracked,
                 (other + rarr.bytes() + prov::map_bytes(rann, rw)).max(base),
             )?;
             drop(dr_leases);
+            let (eff, eff_lease) = eff.into_parts();
             (eff, vec![eff_lease])
         } else {
             (dr, dr_leases)
@@ -1434,5 +1412,88 @@ impl MatchOp {
             *m = prov::load_map(r, mode)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::incr::budget::ViewBudget;
+    use crate::incr::pass::Vis;
+    use crate::incr::prov::{Atom, FactKey, Key128, Witness};
+    use crate::incr::terms::Terms;
+    use crate::store::{Store, StoreOptions};
+    use crate::task::Control;
+
+    #[test]
+    fn matching_keeps_effective_why_support_capacity_charged_between_rows() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let vis = Vis::new(None, &snap);
+        let control = Control::none();
+        let mode = Provenance::Why { max_witnesses: 1 };
+        let fact = |n| Atom::Fact(FactKey(Key128::from_u128(n)));
+        let old = Ann::derivation(mode, (10..138).map(fact).collect());
+        let next = Ann::derivation(mode, vec![fact(1)]);
+        let old_witness = old.report(1).witnesses.pop().unwrap();
+        let support_slot = std::mem::size_of::<(Witness, i64)>() as u64;
+        let live_ann = old.bytes() + next.bytes() - Ann::zero_bytes(mode) + 2 * support_slot;
+        let rows = [
+            Box::from([Id::from_i64(1).unwrap()]) as Row,
+            Box::from([Id::from_i64(2).unwrap()]) as Row,
+        ];
+        let output_slots = 4 * std::mem::size_of::<(Row, i64, Ann)>() as u64;
+        let two_rows = output_slots + 16 + live_ann + next.effective_bytes(Some(&old), 1);
+
+        for headroom in [two_rows - 1, two_rows] {
+            let budget = ViewBudget::new(Some(headroom), None);
+            let mut terms = Terms::default();
+            let mut pass = Pass::new(
+                snap.clone(),
+                None,
+                &[],
+                &[],
+                &mut terms,
+                &vis,
+                None,
+                &control,
+                &[],
+            );
+            pass.prov = mode;
+            pass.budget = Some(budget.handle());
+            let mut state = AnnMap::default();
+            for row in &rows {
+                state.insert(row.clone(), old.clone());
+            }
+            let mut output = EffectiveChanges::new(&pass);
+            output
+                .push(&pass, 1, &mut state, (rows[0].clone(), 1, next.clone()))
+                .unwrap();
+            let first_charge = headroom - budget.handle().remaining_local().unwrap();
+            let second = output.push(&pass, 1, &mut state, (rows[1].clone(), 1, next.clone()));
+            if headroom < two_rows {
+                assert!(matches!(second, Err(crate::Error::BudgetExceeded(_))));
+            } else {
+                second.unwrap();
+            }
+            assert_eq!(first_charge, output_slots + 8 + live_ann);
+            let (output, lease) = output.into_parts();
+            assert_eq!(
+                lease.bytes(),
+                output_slots + output.len() as u64 * (8 + live_ann)
+            );
+            for (row, _, effective) in &output {
+                let mut prior = old.clone();
+                prior.add_assign(effective);
+                let actual = prior.report(1);
+                assert_eq!(actual.count, 2);
+                assert!(actual.truncated);
+                assert!(!actual.witnesses.contains(&old_witness));
+                assert_eq!(
+                    actual.witnesses,
+                    state.get(row).unwrap().report(1).witnesses
+                );
+            }
+        }
     }
 }
