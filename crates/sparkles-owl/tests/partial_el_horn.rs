@@ -555,7 +555,6 @@ fn phase3_worlds_partial_stop_keeps_completed_worlds() {
         }
         let total = polls_of(&ax, 1, false);
         let mut saw_phase3_partial = 0;
-        let mut saw_pre_world_absence = false;
         // Sweep across the tail of polls where Phase 3 worlds execute one by one.
         let start = total.saturating_sub(total / 2 + 20);
         for k in start..total {
@@ -579,9 +578,6 @@ fn phase3_worlds_partial_stop_keeps_completed_worlds() {
                             completed_world_with_subsumption = true;
                         }
                     }
-                    if incomplete_reaching == count {
-                        saw_pre_world_absence = true;
-                    }
                     if completed_world_with_subsumption && incomplete_reaching > 0 {
                         saw_phase3_partial += 1;
                     }
@@ -592,9 +588,6 @@ fn phase3_worlds_partial_stop_keeps_completed_worlds() {
             saw_phase3_partial > 0,
             "tier {tier:?}: expected Phase 3 partial stop with both a completed reaching class (world-only subsumption retained) and an incomplete reaching class (world-only subsumption absent)"
         );
-        // Also ensure at least one pre-world or mid-Phase-3 stop observed incomplete
-        // reaching classes lacking their world-only subsumptions (checked in the loop above).
-        let _ = saw_pre_world_absence;
     }
 }
 
@@ -1197,4 +1190,32 @@ fn el_only_and_tier_d_fallback_to_horn_and_non_partial_saturate() {
             d = d.mul_f64(1.2);
         }
     }
+}
+
+#[test]
+fn classification_public_fields_allow_literal_and_exhaustive_destructuring() {
+    let ax = axioms("SubClassOf(:A :B)");
+    let out = Classifier::of(&ax).classify(&Limits::default()).unwrap();
+    let Classification {
+        consistent,
+        taxonomy,
+        stats,
+        complete,
+        complete_for_taken,
+        incomplete,
+        consistency,
+        unmapped,
+    } = out;
+    let rebuilt = Classification {
+        consistent,
+        taxonomy,
+        stats,
+        complete,
+        complete_for_taken,
+        incomplete,
+        consistency,
+        unmapped,
+    };
+    assert!(rebuilt.complete && rebuilt.consistent);
+    assert_eq!(rebuilt.consistency, Consistency::Consistent);
 }

@@ -539,8 +539,10 @@ pub struct Limits {
     /// decided are incomplete ([`Stats::coverage_over`]); by default
     /// [`COVERAGE_WORK_PER_AXIOM`] for each axiom of the input
     pub coverage_work: Option<usize>,
-    /// leave the modules' pass to the caller, which calls [`Classification::cover`]
-    /// after the run with the axioms it did not give the run as well
+    /// leave the modules' pass to the caller, which calls [`Classification::cover`] (or
+    /// [`AdmittedClassification::cover`] via [`Saturation::classify_admitted`] /
+    /// [`Classifier::classify_admitted`] to keep memory admission bound to this run's cap
+    /// and pool grant) after the run with the axioms it did not give the run as well
     pub cover_later: bool,
     /// the expansion strategy of Tier D's Succ rule
     pub expansion: Expansion,
@@ -907,9 +909,89 @@ pub struct Classification {
     /// [`Stats::unmapped`] counts, in the order the input gave them, and whether there are
     /// more ([`Classification::leave_out_unmapped`])
     pub unmapped: Unmapped,
-    /// high-water mark already charged to the caller's pool for this classification, so
-    /// post-classification coverage admission charges only new growth
+}
+
+/// A [`Classification`] paired with the originating run's [`Limits`] and memory admission
+/// state, returned by [`Saturation::classify_admitted`] and
+/// [`Classifier::classify_admitted`].
+///
+/// Binding deferred [`cover`](Self::cover) and
+/// [`leave_out_unmapped`](Self::leave_out_unmapped) passes to the originating run ensures
+/// they enforce the same memory cap and pool grant without double-charging bytes already
+/// admitted during classification or reusing credit from a different grant.
+pub struct AdmittedClassification {
+    classification: Classification,
+    limits: Limits,
+    /// high-water mark already approved by `limits.charge` during this run (`0` when
+    /// `limits.charge` is `None`)
     paid_memory: usize,
+    /// bytes of `classification.incomplete` currently reflected in
+    /// `classification.stats.memory`
+    incomplete_memory: usize,
+}
+
+impl AdmittedClassification {
+    fn new(
+        classification: Classification,
+        limits: Limits,
+        paid_memory: usize,
+        incomplete_memory: usize,
+    ) -> AdmittedClassification {
+        let paid_memory = if limits.charge.is_some() {
+            paid_memory
+        } else {
+            0
+        };
+        AdmittedClassification {
+            classification,
+            limits,
+            paid_memory,
+            incomplete_memory,
+        }
+    }
+
+    /// The classification produced so far.
+    pub fn classification(&self) -> &Classification {
+        &self.classification
+    }
+
+    /// Consumes this admitted handle and returns the finished [`Classification`].
+    pub fn into_classification(self) -> Classification {
+        self.classification
+    }
+
+    /// Like [`Classification::cover`], but admits every expansion of
+    /// [`Classification::incomplete`] (both module-coverage subsets and signature-wide
+    /// fallbacks) against the originating run's `max_memory` and `charge` grant before
+    /// cloning or allocating class IRIs, reusing an already admitted full signature list
+    /// with zero allocations and zero extra charges.
+    pub fn cover(
+        &mut self,
+        axioms: &[&AxiomKind],
+        excluded: &[Excluded],
+        dropped: Option<&mut crate::transform::Dropped<'_>>,
+    ) -> Result<Option<Excluded>, Error> {
+        self.classification.cover_with_admission(
+            axioms,
+            excluded,
+            dropped,
+            &self.limits,
+            &mut self.paid_memory,
+            &mut self.incomplete_memory,
+        )
+    }
+
+    /// Like [`Classification::leave_out_unmapped`], but admits any expansion of
+    /// [`Classification::incomplete`] against the originating run's `max_memory` and
+    /// `charge` grant before allocating it.
+    pub fn leave_out_unmapped(&mut self, u: Unmapped) -> Result<(), Error> {
+        self.classification.leave_out_unmapped_with_admission(
+            u,
+            &self.limits,
+            &mut self.paid_memory,
+            &mut self.incomplete_memory,
+        )
+    }
 }
 
 /// The most triples that map to no axiom that a classification lists; it counts the rest.
@@ -981,7 +1063,6 @@ impl Classification {
         taxonomy: Option<Taxonomy>,
         stats: Stats,
         partial: Option<(Vec<Class>, Consistency)>,
-        paid_memory: usize,
     ) -> Classification {
         let (complete, incomplete, consistency) = match partial {
             Some((incomplete, consistency)) => (false, incomplete, consistency),
@@ -996,7 +1077,6 @@ impl Classification {
             incomplete,
             consistency,
             unmapped: Unmapped::default(),
-            paid_memory,
         }
     }
 
@@ -1014,6 +1094,9 @@ impl Classification {
     /// whole ontology too. A class that only a dropped axiom names is in no taxonomy, so
     /// it is not in `incomplete` and shows only through `complete` and that axiom. A run
     /// takes this pass itself unless [`Limits::cover_later`] leaves it to its caller.
+    /// Callers that need memory-admitted deferred coverage under the originating run's
+    /// memory cap and pool grant should use [`Saturation::classify_admitted`] or
+    /// [`Classifier::classify_admitted`] and [`AdmittedClassification::cover`].
     /// Costs nothing when nothing is left out or dropped, and one read of the dropped
     /// axioms up to the first with logical content when only they are.
     ///
@@ -1032,20 +1115,27 @@ impl Classification {
             charge: None,
             ..limits.clone()
         };
-        self.cover_admitted(axioms, excluded, dropped, &unbounded)
-            .expect("unbounded coverage cannot fail memory admission")
+        let mut paid_memory = 0;
+        let mut incomplete_memory = Self::incomplete_vec_bytes(&self.incomplete);
+        self.cover_with_admission(
+            axioms,
+            excluded,
+            dropped,
+            &unbounded,
+            &mut paid_memory,
+            &mut incomplete_memory,
+        )
+        .expect("unbounded coverage cannot fail memory admission")
     }
 
-    /// Like [`cover`](Self::cover), but admits any expansion of
-    /// [`incomplete`](Self::incomplete) to the full signature against `limits.max_memory`
-    /// and `limits.charge` before allocating it, reusing the existing list with zero
-    /// allocations when it already covers every class in the taxonomy.
-    pub fn cover_admitted(
+    fn cover_with_admission(
         &mut self,
         axioms: &[&AxiomKind],
         excluded: &[Excluded],
         dropped: Option<&mut crate::transform::Dropped<'_>>,
         limits: &Limits,
+        paid_memory: &mut usize,
+        incomplete_memory: &mut usize,
     ) -> Result<Option<Excluded>, Error> {
         if excluded.is_empty() && dropped.is_none() {
             return Ok(None);
@@ -1054,12 +1144,12 @@ impl Classification {
         if let Some(d) = dropped {
             let Ok(witness) = first_logical(d, limits) else {
                 self.stats.coverage = start.elapsed();
-                self.stopped_pass_admitted(limits)?;
+                self.stopped_pass_admitted(limits, paid_memory, incomplete_memory)?;
                 return Ok(None);
             };
             if let Some(w) = witness {
                 self.stats.coverage = start.elapsed();
-                self.not_all_read_admitted(limits)?;
+                self.not_all_read_admitted(limits, paid_memory, incomplete_memory)?;
                 return Ok(Some(not_read(w)));
             }
             if excluded.is_empty() {
@@ -1067,9 +1157,9 @@ impl Classification {
                 return Ok(None);
             }
         }
-        self.complete = false;
         // an inconsistency is sound, and every class's answer is then complete
         if self.consistency == Consistency::Inconsistent {
+            self.complete = false;
             return Ok(None);
         }
         // A partial answer that left the consistency unknown has every class open, and
@@ -1077,7 +1167,8 @@ impl Classification {
         // and neither does a run that asks for none: every class is then incomplete.
         if self.consistency == Consistency::Unknown || !self.complete_for_taken || !limits.coverage
         {
-            self.admit_all_incomplete(limits)?;
+            self.admit_all_incomplete(limits, paid_memory, incomplete_memory)?;
+            self.complete = false;
             if self.consistency == Consistency::Consistent {
                 self.consistency = Consistency::Unknown;
             }
@@ -1090,7 +1181,7 @@ impl Classification {
                 .max(COVERAGE_WORK_MIN)
         });
         let stop = || poll(limits).is_err();
-        let c = crate::transform::coverage(
+        let c = crate::transform::coverage_refs(
             axioms,
             &left,
             self.consistency == Consistency::Consistent,
@@ -1100,28 +1191,27 @@ impl Classification {
         );
         self.stats.coverage = start.elapsed();
         let Ok(c) = c else {
-            self.stopped_pass_admitted(limits)?;
+            self.stopped_pass_admitted(limits, paid_memory, incomplete_memory)?;
             return Ok(None);
         };
-        if !c.consistency_known {
+        let consistency_known = c.consistency_known;
+        let over_budget = c.over_budget;
+        if !c.incomplete.is_empty() {
+            admit_and_merge_incomplete(
+                &mut self.incomplete,
+                &self.taxonomy,
+                &mut self.stats,
+                limits,
+                paid_memory,
+                incomplete_memory,
+                c.incomplete,
+            )?;
+        }
+        self.complete = false;
+        if !consistency_known {
             self.consistency = Consistency::Unknown;
         }
-        self.stats.coverage_over = c.over_budget;
-        if !c.incomplete.is_empty() {
-            let mut all = std::mem::take(&mut self.incomplete);
-            all.extend(c.incomplete);
-            // The node of the unsatisfiable classes is exact only when every one of them
-            // is found, which an incomplete class may not be.
-            all.extend(
-                self.taxonomy
-                    .unsatisfiable()
-                    .filter(|k| k.as_str() != crate::vocab::OWL_NOTHING)
-                    .cloned(),
-            );
-            all.sort();
-            all.dedup();
-            self.incomplete = all;
-        }
+        self.stats.coverage_over = over_budget;
         Ok(None)
     }
 
@@ -1129,25 +1219,31 @@ impl Classification {
     /// the answer is not complete, every class is incomplete and a consistency the run
     /// found is unknown, since such a triple may carry any logical content. The count goes
     /// to [`Stats::unmapped`] and the list to [`Classification::unmapped`], as no axiom of
-    /// [`Excluded`] can name them.
+    /// [`Excluded`] can name them. Callers that need memory-admitted deferred unmapped
+    /// accounting under the originating run's memory cap and pool grant should use
+    /// [`AdmittedClassification::leave_out_unmapped`].
     pub fn leave_out_unmapped(&mut self, u: Unmapped) {
-        if u.count > 0 {
-            self.unmapped = std::mem::take(&mut self.unmapped).merge(&u);
-            self.stats.unmapped = self.unmapped.count;
-            self.not_all_read();
-        }
+        let unbounded = Limits::default();
+        let mut paid_memory = 0;
+        let mut incomplete_memory = Self::incomplete_vec_bytes(&self.incomplete);
+        self.leave_out_unmapped_with_admission(
+            u,
+            &unbounded,
+            &mut paid_memory,
+            &mut incomplete_memory,
+        )
+        .expect("unbounded leave_out_unmapped cannot fail memory admission");
     }
 
-    /// Like [`leave_out_unmapped`](Self::leave_out_unmapped), but admits any expansion of
-    /// [`incomplete`](Self::incomplete) against `limits.max_memory` and `limits.charge`
-    /// before allocating it.
-    pub fn leave_out_unmapped_admitted(
+    fn leave_out_unmapped_with_admission(
         &mut self,
         u: Unmapped,
         limits: &Limits,
+        paid_memory: &mut usize,
+        incomplete_memory: &mut usize,
     ) -> Result<(), Error> {
         if u.count > 0 {
-            self.admit_all_incomplete(limits)?;
+            self.admit_all_incomplete(limits, paid_memory, incomplete_memory)?;
             self.unmapped = std::mem::take(&mut self.unmapped).merge(&u);
             self.stats.unmapped = self.unmapped.count;
             self.complete = false;
@@ -1158,19 +1254,13 @@ impl Classification {
         Ok(())
     }
 
-    /// The answer when the run did not read part of the ontology that may carry any
-    /// logical content: not complete, every class incomplete, and an inconsistency kept,
-    /// as it holds for the whole ontology too, but a consistency unknown.
-    fn not_all_read(&mut self) {
-        self.complete = false;
-        self.all_incomplete();
-        if self.consistency == Consistency::Consistent {
-            self.consistency = Consistency::Unknown;
-        }
-    }
-
-    fn not_all_read_admitted(&mut self, limits: &Limits) -> Result<(), Error> {
-        self.admit_all_incomplete(limits)?;
+    fn not_all_read_admitted(
+        &mut self,
+        limits: &Limits,
+        paid_memory: &mut usize,
+        incomplete_memory: &mut usize,
+    ) -> Result<(), Error> {
+        self.admit_all_incomplete(limits, paid_memory, incomplete_memory)?;
         self.complete = false;
         if self.consistency == Consistency::Consistent {
             self.consistency = Consistency::Unknown;
@@ -1180,8 +1270,13 @@ impl Classification {
 
     /// The answer of a modules' pass that its deadline, its cancellation or its stream of
     /// dropped axioms stopped: every class incomplete and the consistency unknown.
-    fn stopped_pass_admitted(&mut self, limits: &Limits) -> Result<(), Error> {
-        self.admit_all_incomplete(limits)?;
+    fn stopped_pass_admitted(
+        &mut self,
+        limits: &Limits,
+        paid_memory: &mut usize,
+        incomplete_memory: &mut usize,
+    ) -> Result<(), Error> {
+        self.admit_all_incomplete(limits, paid_memory, incomplete_memory)?;
         self.stats.coverage_stopped = true;
         self.complete = false;
         self.consistency = Consistency::Unknown;
@@ -1227,32 +1322,54 @@ impl Classification {
             .unwrap_or(usize::MAX)
     }
 
+    fn incomplete_ref_bytes(xs: &[&Class]) -> usize {
+        let str_bytes: usize = xs.iter().map(|c| c.as_str().len()).sum();
+        xs.len()
+            .checked_mul(std::mem::size_of::<Class>())
+            .and_then(|n| n.checked_add(str_bytes))
+            .unwrap_or(usize::MAX)
+    }
+
     /// Admits and populates every class but `owl:Thing` and `owl:Nothing` in IRI order,
-    /// reusing `self.incomplete` with zero allocations when it already covers the full
-    /// signature and dropping the old list before allocating any replacement so the two
-    /// buffers never coexist.
-    fn admit_all_incomplete(&mut self, limits: &Limits) -> Result<(), Error> {
-        if self.has_all_taxonomy_classes() {
+    /// reusing `self.incomplete` with zero allocations only when it already covers the
+    /// full signature and its bytes are already reflected in `incomplete_memory`. Drops
+    /// the old list before allocating any replacement so the two buffers never coexist.
+    fn admit_all_incomplete(
+        &mut self,
+        limits: &Limits,
+        paid_memory: &mut usize,
+        incomplete_memory: &mut usize,
+    ) -> Result<(), Error> {
+        let has_all = self.has_all_taxonomy_classes();
+        if has_all && *incomplete_memory == Self::incomplete_vec_bytes(&self.incomplete) {
             return Ok(());
         }
         let (count, new_bytes) = self.all_incomplete_bytes();
-        let old_bytes = Self::incomplete_vec_bytes(&self.incomplete);
         let new_mem = self
             .stats
             .memory
-            .saturating_sub(old_bytes)
+            .saturating_sub(*incomplete_memory)
             .saturating_add(new_bytes);
         let charge = limits
             .charge
             .as_deref()
             .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
-        if !cover_memory(new_mem, limits.max_memory, charge, &mut self.paid_memory) {
+        if !cover_memory(new_mem, limits.max_memory, charge, paid_memory) {
             return Err(Error::Memory {
                 limit: limits.max_memory.unwrap_or(usize::MAX),
                 used: new_mem,
             });
         }
+        if has_all {
+            *incomplete_memory = new_bytes;
+            self.stats.memory = new_mem;
+            self.stats.peak_memory = self.stats.peak_memory.max(new_mem);
+            return Ok(());
+        }
+        let old_incomplete_memory = *incomplete_memory;
         self.incomplete = Vec::new();
+        self.stats.memory = self.stats.memory.saturating_sub(old_incomplete_memory);
+        *incomplete_memory = 0;
         let mut all: Vec<Class> = Vec::new();
         if all.try_reserve_exact(count).is_err() {
             return Err(Error::Memory {
@@ -1266,17 +1383,98 @@ impl Classification {
         all.sort_unstable();
         all.dedup();
         self.incomplete = all;
+        *incomplete_memory = new_bytes;
         self.stats.memory = new_mem;
         self.stats.peak_memory = self.stats.peak_memory.max(new_mem);
         Ok(())
     }
+}
 
-    /// Every class but owl:Thing and owl:Nothing incomplete, in IRI order.
-    fn all_incomplete(&mut self) {
-        let unbounded = Limits::default();
-        self.admit_all_incomplete(&unbounded)
-            .expect("unbounded all_incomplete cannot fail memory admission");
+/// Admits and merges module-coverage incomplete class references (plus non-`owl:Nothing`
+/// unsatisfiable classes) into `incomplete` before cloning any `Class` IRIs.
+fn admit_and_merge_incomplete(
+    incomplete: &mut Vec<Class>,
+    taxonomy: &Taxonomy,
+    stats: &mut Stats,
+    limits: &Limits,
+    paid_memory: &mut usize,
+    incomplete_memory: &mut usize,
+    module_incomplete: Vec<&Class>,
+) -> Result<(), Error> {
+    if module_incomplete.is_empty() {
+        return Ok(());
     }
+    // The node of the unsatisfiable classes is exact only when every one of them
+    // is found, which an incomplete class may not be.
+    let mut incoming: Vec<&Class> = module_incomplete;
+    incoming.extend(
+        taxonomy
+            .unsatisfiable()
+            .filter(|k| k.as_str() != crate::vocab::OWL_NOTHING),
+    );
+    incoming.sort_unstable();
+    incoming.dedup();
+
+    let existing_sorted = incomplete.windows(2).all(|w| w[0] < w[1]);
+    let mut to_add: Vec<&Class> = Vec::new();
+    for cls in incoming {
+        let already_present = if existing_sorted {
+            incomplete.binary_search(cls).is_ok()
+        } else {
+            incomplete.iter().any(|x| x == cls)
+        };
+        if !already_present {
+            to_add.push(cls);
+        }
+    }
+
+    let existing_bytes = Classification::incomplete_vec_bytes(incomplete);
+    let added_bytes = Classification::incomplete_ref_bytes(&to_add);
+    let new_bytes = existing_bytes.saturating_add(added_bytes);
+    let new_mem = stats
+        .memory
+        .saturating_sub(*incomplete_memory)
+        .saturating_add(new_bytes);
+    if !to_add.is_empty() || *incomplete_memory < new_bytes {
+        let charge = limits
+            .charge
+            .as_deref()
+            .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+        if !cover_memory(new_mem, limits.max_memory, charge, paid_memory) {
+            return Err(Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used: new_mem,
+            });
+        }
+        if !to_add.is_empty() {
+            if incomplete.try_reserve_exact(to_add.len()).is_err() {
+                return Err(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: new_mem,
+                });
+            }
+            for cls in to_add {
+                incomplete.push(cls.clone());
+            }
+            incomplete.sort_unstable();
+            incomplete.dedup();
+        } else if !existing_sorted {
+            incomplete.sort_unstable();
+            incomplete.dedup();
+        }
+        let final_bytes = Classification::incomplete_vec_bytes(incomplete);
+        let final_mem = stats
+            .memory
+            .saturating_sub(*incomplete_memory)
+            .saturating_add(final_bytes);
+        *incomplete_memory = final_bytes;
+        stats.memory = final_mem;
+        stats.peak_memory = stats.peak_memory.max(final_mem);
+    } else if !existing_sorted {
+        incomplete.sort_unstable();
+        incomplete.dedup();
+    }
+    Ok(())
 }
 
 /// The first dropped axiom with logical content, or `Err` when the stream could not
@@ -1517,8 +1715,13 @@ pub struct Saturation {
     /// what the last run's partial answer leaves open: the classes not complete and the
     /// consistency
     partial: Option<(Vec<Class>, Consistency)>,
-    /// total bytes charged to the caller's pool in the last completed run (or its
-    /// `peak_memory` when no pool callback was given)
+    /// finished classification produced by immediate coverage inside [`Saturation::run`]
+    covered: Option<Classification>,
+    /// high-water mark charged to `limits.charge` during the last [`Saturation::run_once`]
+    /// attempt (`0` when no pool callback was given)
+    attempt_paid: usize,
+    /// total bytes charged to the caller's pool in the last completed run (`0` when no
+    /// pool callback was given)
     last_paid: usize,
     /// what the last run whose saturation ended was, which decides whether the next
     /// run may keep its contexts (roadmap item 753)
@@ -2156,34 +2359,38 @@ impl Classifier {
     /// Classifies the axioms held, saturating again only what changed since the last
     /// run.
     pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
+        self.classify_admitted(limits)
+            .map(AdmittedClassification::into_classification)
+    }
+
+    /// Like [`classify`](Self::classify), returning an [`AdmittedClassification`] bound
+    /// to `limits` and this run's pool grant so deferred coverage and unmapped-triple
+    /// passes enforce the same memory cap and pool accounting.
+    pub fn classify_admitted(&mut self, limits: &Limits) -> Result<AdmittedClassification, Error> {
         let r = self.run_held(limits, true);
         let partial = self.sat.partial.take();
+        let covered = self.sat.covered.take();
         let paid_memory = self.sat.last_paid;
         let res = (|| {
-            let mut out = r.map(|(consistent, taxonomy, stats)| {
-                Classification::new(consistent, taxonomy, stats, partial, paid_memory)
+            let out = r.map(|(consistent, taxonomy, stats)| match covered {
+                Some(mut c) => {
+                    c.stats = stats;
+                    c
+                }
+                None => Classification::new(consistent, taxonomy, stats, partial),
             })?;
+            let incomplete_memory = Classification::incomplete_vec_bytes(&out.incomplete);
+            let admitted =
+                AdmittedClassification::new(out, limits.clone(), paid_memory, incomplete_memory);
             let excluded = self.sat.excluded();
-            if !excluded.is_empty() {
-                if limits.strict {
-                    return Err(Error::Incomplete(excluded.to_vec()));
-                }
-                let held: Vec<&AxiomKind> = self
-                    .axioms
-                    .iter()
-                    .filter(|(_, h)| h.count > 0)
-                    .map(|(k, _)| k)
-                    .collect();
-                if !limits.cover_later {
-                    out.cover_admitted(&held, excluded, None, limits)?;
-                }
-            }
-            if limits.strict && !out.complete {
+            if limits.strict && (!excluded.is_empty() || !admitted.classification.complete) {
                 return Err(Error::Incomplete(excluded.to_vec()));
             }
-            Ok(out)
+            Ok(admitted)
         })();
-        self.sat.emit_adaptive_classify_outcome(&res);
+        self.sat.emit_adaptive_classify_outcome(
+            res.as_ref().map(AdmittedClassification::classification),
+        );
         res
     }
 
@@ -2305,6 +2512,8 @@ impl Saturation {
             partial_over: false,
             numeric_halt: false,
             partial: None,
+            covered: None,
+            attempt_paid: 0,
             last_paid: 0,
             kept: None,
             reused: false,
@@ -2330,27 +2539,42 @@ impl Saturation {
         changes: Option<Changes<'_>>,
         limits: &Limits,
     ) -> Result<Classification, Error> {
+        self.classify_admitted(axioms, changes, limits)
+            .map(AdmittedClassification::into_classification)
+    }
+
+    /// Like [`classify`](Self::classify), returning an [`AdmittedClassification`] bound
+    /// to `limits` and this run's pool grant so deferred coverage and unmapped-triple
+    /// passes enforce the same memory cap and pool accounting.
+    pub fn classify_admitted(
+        &mut self,
+        axioms: &[&AxiomKind],
+        changes: Option<Changes<'_>>,
+        limits: &Limits,
+    ) -> Result<AdmittedClassification, Error> {
         let r = self.run_with(axioms, changes, 0, limits, true);
         let partial = self.partial.take();
+        let covered = self.covered.take();
         let paid_memory = self.last_paid;
         let res = (|| {
-            let mut out = r.map(|(consistent, taxonomy, stats)| {
-                Classification::new(consistent, taxonomy, stats, partial, paid_memory)
+            let out = r.map(|(consistent, taxonomy, stats)| match covered {
+                Some(mut c) => {
+                    c.stats = stats;
+                    c
+                }
+                None => Classification::new(consistent, taxonomy, stats, partial),
             })?;
-            if !self.excluded.is_empty() {
-                if limits.strict {
-                    return Err(Error::Incomplete(self.excluded.clone()));
-                }
-                if !limits.cover_later {
-                    out.cover_admitted(axioms, &self.excluded, None, limits)?;
-                }
-            }
-            if limits.strict && !out.complete {
+            let incomplete_memory = Classification::incomplete_vec_bytes(&out.incomplete);
+            let admitted =
+                AdmittedClassification::new(out, limits.clone(), paid_memory, incomplete_memory);
+            if limits.strict && (!self.excluded.is_empty() || !admitted.classification.complete) {
                 return Err(Error::Incomplete(self.excluded.clone()));
             }
-            Ok(out)
+            Ok(admitted)
         })();
-        self.emit_adaptive_classify_outcome(&res);
+        self.emit_adaptive_classify_outcome(
+            res.as_ref().map(AdmittedClassification::classification),
+        );
         res
     }
 
@@ -2429,12 +2653,13 @@ impl Saturation {
             None => limits,
         };
         let mut r = match kept {
-            None => self.run_with_all(axioms, changes, held_bytes, limits, with_taxonomy),
+            None => self.run_with_all(axioms, axioms, changes, held_bytes, limits, with_taxonomy),
             Some(kept) => {
                 let kept_bytes = kept.capacity() * std::mem::size_of::<&AxiomKind>();
                 // a run that reads them all counts the caller's axioms as added
                 self.source_len = Some(axioms.len());
                 let r = self.run_with_all(
+                    axioms,
                     &kept,
                     changes,
                     held_bytes + kept_bytes,
@@ -2450,7 +2675,7 @@ impl Saturation {
             self.last_paid = if limits.charge.is_some() {
                 paid_to_caller.load(Ordering::Relaxed)
             } else {
-                stats.peak_memory
+                0
             };
         }
         r
@@ -2459,6 +2684,7 @@ impl Saturation {
     /// [`run_with`](Saturation::run_with) over every axiom it is given.
     fn run_with_all(
         &mut self,
+        full_axioms: &[&AxiomKind],
         axioms: &[&AxiomKind],
         changes: Option<Changes<'_>>,
         held_bytes: usize,
@@ -2493,7 +2719,15 @@ impl Saturation {
         } else {
             AttemptProvenance::OriginalDefault
         };
-        let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy, attempt);
+        let mut r = self.run(
+            full_axioms,
+            axioms,
+            changes,
+            held_bytes,
+            first,
+            with_taxonomy,
+            attempt,
+        );
         if let Err(Error::Memory { .. }) = r
             && self.reused
         {
@@ -2529,7 +2763,15 @@ impl Saturation {
                 charge: counting,
                 ..limits.clone()
             };
-            r = self.run(axioms, None, held_bytes, &again, with_taxonomy, attempt);
+            r = self.run(
+                full_axioms,
+                axioms,
+                None,
+                held_bytes,
+                &again,
+                with_taxonomy,
+                attempt,
+            );
         }
         // a rooted run that withdrew its answer starts again without the rooted rules, here
         // and after each retry below that can run the rooted rules again
@@ -2537,6 +2779,7 @@ impl Saturation {
         self.restart_declined(
             &mut r,
             &mut declined,
+            full_axioms,
             axioms,
             held_bytes,
             limits,
@@ -2580,6 +2823,7 @@ impl Saturation {
                 ..limits.clone()
             };
             r = self.run(
+                full_axioms,
                 axioms,
                 None,
                 held_bytes,
@@ -2590,6 +2834,7 @@ impl Saturation {
             self.restart_declined(
                 &mut r,
                 &mut declined,
+                full_axioms,
                 axioms,
                 held_bytes,
                 limits,
@@ -2630,6 +2875,7 @@ impl Saturation {
                 ..limits.clone()
             };
             r = self.run(
+                full_axioms,
                 axioms,
                 None,
                 held_bytes,
@@ -2642,6 +2888,7 @@ impl Saturation {
             self.restart_declined(
                 &mut r,
                 &mut declined,
+                full_axioms,
                 axioms,
                 held_bytes,
                 limits,
@@ -2686,6 +2933,7 @@ impl Saturation {
                 ..limits.clone()
             };
             r = self.run(
+                full_axioms,
                 axioms,
                 None,
                 held_bytes,
@@ -2732,6 +2980,7 @@ impl Saturation {
                 ..limits.clone()
             };
             r = self.run(
+                full_axioms,
                 axioms,
                 None,
                 held_bytes,
@@ -2770,6 +3019,7 @@ impl Saturation {
             };
             r = self
                 .run(
+                    full_axioms,
                     axioms,
                     None,
                     held_bytes,
@@ -2822,10 +3072,10 @@ impl Saturation {
         r
     }
 
-    /// Emits `ADAPTIVE-OUTCOME` from the final `Result<Classification, Error>` returned by
+    /// Emits `ADAPTIVE-OUTCOME` from the final `Result<&Classification, &Error>` returned by
     /// `Classifier::classify` or `Saturation::classify`, after partial construction,
     /// exclusion coverage, and `limits.strict` checks have completed.
-    fn emit_adaptive_classify_outcome(&self, res: &Result<Classification, Error>) {
+    fn emit_adaptive_classify_outcome(&self, res: Result<&Classification, &Error>) {
         if self.adaptive_run_id == 0 {
             return;
         }
@@ -3067,6 +3317,7 @@ impl Saturation {
         &mut self,
         r: &mut Result<(bool, Option<Taxonomy>, Stats), Error>,
         declined: &mut Option<usize>,
+        full_axioms: &[&AxiomKind],
         axioms: &[&AxiomKind],
         held_bytes: usize,
         limits: &Limits,
@@ -3101,6 +3352,7 @@ impl Saturation {
             ..limits.clone()
         };
         *r = self.run(
+            full_axioms,
             axioms,
             None,
             held_bytes,
@@ -3120,6 +3372,8 @@ impl Saturation {
         self.disjoint = Vec::new();
         self.dynamic = None;
         self.dl_run = None;
+        self.covered = None;
+        self.attempt_paid = 0;
     }
 
     /// Normalizes the axioms inside OWL 2 EL and builds the index. `outside` names the
@@ -3622,11 +3876,57 @@ impl Saturation {
                 .is_none()
     }
 
+    /// Runs immediate coverage (`!limits.cover_later && !limits.strict`) inside the
+    /// attempt's own memory and pool budget so a memory refusal during coverage triggers
+    /// the same tier fallback (Tier D -> Horn -> EL) when `!limits.partial` and preserves
+    /// the requested tier (`partial_over = true`) when `limits.partial`.
+    fn finish_attempt(
+        &mut self,
+        full_axioms: &[&AxiomKind],
+        out: (bool, Option<Taxonomy>, Stats),
+        limits: &Limits,
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        if !with_taxonomy || limits.cover_later || limits.strict || self.excluded.is_empty() {
+            self.covered = None;
+            return Ok(out);
+        }
+        let (consistent, taxonomy, stats) = out;
+        let partial = self.partial.take();
+        let mut classification = Classification::new(consistent, taxonomy, stats, partial);
+        let mut paid_memory = if limits.charge.is_some() {
+            self.attempt_paid
+        } else {
+            0
+        };
+        let mut incomplete_memory =
+            Classification::incomplete_vec_bytes(&classification.incomplete);
+        if let Err(e) = classification.cover_with_admission(
+            full_axioms,
+            &self.excluded,
+            None,
+            limits,
+            &mut paid_memory,
+            &mut incomplete_memory,
+        ) {
+            if limits.partial && matches!(e, Error::Memory { .. }) {
+                self.partial_over = true;
+                self.dirty = true;
+            }
+            return Err(e);
+        }
+        let updated_stats = classification.stats.clone();
+        self.covered = Some(classification);
+        Ok((consistent, None, updated_stats))
+    }
+
     /// One run of the fallback chain of [`Saturation::run_with`]. A run with changes
     /// that finds, once its index is built, that it cannot keep the contexts of the
     /// last run starts again without them and with a new interner.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
+        full_axioms: &[&AxiomKind],
         axioms: &[&AxiomKind],
         changes: Option<Changes<'_>>,
         held_bytes: usize,
@@ -3676,7 +3976,7 @@ impl Saturation {
                     r.2.outside_el = red.outside_el(axioms, &chains, &self.excluded);
                     r.2.tier = tier;
                     self.reduced = true;
-                    return Ok(r);
+                    return self.finish_attempt(full_axioms, r, limits, with_taxonomy);
                 }
                 Err(e) => {
                     // the report of a run that stopped still names the original axioms
@@ -3699,7 +3999,9 @@ impl Saturation {
         let changes = changes.filter(|_| !was);
         let restart =
             match self.run_once(axioms, changes, held_bytes, limits, with_taxonomy, attempt)? {
-                ControlFlow::Continue(r) => return Ok(r),
+                ControlFlow::Continue(r) => {
+                    return self.finish_attempt(full_axioms, r, limits, with_taxonomy);
+                }
                 ControlFlow::Break(restart) => restart,
             };
         self.reset();
@@ -3725,7 +4027,7 @@ impl Saturation {
             unreachable!("a run without changes starts fresh");
         };
         r.2.peak_memory = r.2.peak_memory.max(discarded_peak);
-        Ok(r)
+        self.finish_attempt(full_axioms, r, limits, with_taxonomy)
     }
 
     /// [`Saturation::run`], with a reason when a run with changes must start again.
@@ -3757,6 +4059,8 @@ impl Saturation {
         self.dl_tried = false;
         self.partial_over = false;
         self.partial = None;
+        self.covered = None;
+        self.attempt_paid = 0;
         self.numeric_halt = false;
         // the profile check of each axiom, which depends on it alone
         let outside: Vec<(usize, (String, String))> =
@@ -5717,6 +6021,7 @@ impl Saturation {
         stats.peak_memory = totals.peak.max(stats.memory).max(paid.get());
         stats.taxonomy = t.elapsed();
         stats.contexts = contexts_count;
+        self.attempt_paid = if charge_fn.is_some() { paid.get() } else { 0 };
         if let Some(partial_answer) = partial_classes {
             self.partial = Some(partial_answer);
             return Ok(ControlFlow::Continue((consistent, Some(taxonomy), stats)));
@@ -7210,13 +7515,7 @@ mod admission_handoff_tests {
         assert_eq!(trace.taxonomy_checks, check + 1);
         assert!(taxonomy_run.partial_over && taxonomy_run.dirty);
 
-        let partial = Classification::new(
-            consistent,
-            taxonomy,
-            stats,
-            classifier.partial.take(),
-            classifier.last_paid,
-        );
+        let partial = Classification::new(consistent, taxonomy, stats, classifier.partial.take());
         assert!(!partial.complete && !partial.incomplete.is_empty());
         assert!(partial.stats.memory <= calibration.paid);
         assert_eq!(
@@ -9770,9 +10069,13 @@ mod tests {
         for k in (0..total_polls).step_by((total_polls / 40).max(1)) {
             let p = Arc::new(AtomicUsize::new(0));
             let charged = Arc::new(AtomicUsize::new(0));
+            let charge_calls = Arc::new(AtomicUsize::new(0));
+            let refuse_after = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let c = charged.clone();
+            let cc = charge_calls.clone();
+            let ra = refuse_after.clone();
             let mut sat = Saturation::new();
-            let res = sat.classify(
+            let res = sat.classify_admitted(
                 &kinds,
                 None,
                 &Limits {
@@ -9781,44 +10084,40 @@ mod tests {
                     dl_attempt_work: Some(1),
                     cancelled: Some(Arc::new(move || p.fetch_add(1, Ordering::Relaxed) >= k)),
                     charge: Some(Arc::new(move |bytes| {
+                        cc.fetch_add(1, Ordering::Relaxed);
+                        if ra.load(Ordering::Relaxed) {
+                            return false;
+                        }
                         c.fetch_add(bytes, Ordering::Relaxed);
                         true
                     })),
                     ..Limits::default()
                 },
             );
-            if let Ok(mut out) = res
-                && out.stats.dl_over_budget
-                && !out.complete_for_taken
+            if let Ok(mut admitted) = res
+                && admitted.classification().stats.dl_over_budget
+                && !admitted.classification().complete_for_taken
             {
+                let out = admitted.classification();
                 assert!(!out.complete);
                 assert_eq!(out.consistency, Consistency::Unknown);
                 assert!(out.has_all_taxonomy_classes());
                 let paid = charged.load(Ordering::Relaxed);
                 assert!(paid <= out.stats.peak_memory);
                 assert!(out.stats.memory <= out.stats.peak_memory);
-                // Re-running coverage or unmapped-triple fallback must reuse the already
-                // admitted full list without asking the pool for a single extra byte.
-                let extra_calls = Arc::new(AtomicUsize::new(0));
-                let ec = extra_calls.clone();
-                let strict_limits = Limits {
-                    max_memory: Some(out.stats.memory),
-                    charge: Some(Arc::new(move |_| {
-                        ec.fetch_add(1, Ordering::Relaxed);
-                        false
-                    })),
-                    ..Limits::default()
-                };
-                out.cover_admitted(&kinds, sat.excluded(), None, &strict_limits)
-                    .unwrap();
+                // Re-running coverage or unmapped-triple fallback on the same admitted
+                // handle must reuse the already admitted full list without asking the
+                // originating pool grant for a single extra byte.
+                refuse_after.store(true, Ordering::Relaxed);
+                let calls_before = charge_calls.load(Ordering::Relaxed);
+                admitted.cover(&kinds, sat.excluded(), None).unwrap();
                 let unmapped = Unmapped {
                     count: 1,
                     triples: Vec::new(),
                     truncated: false,
                 };
-                out.leave_out_unmapped_admitted(unmapped, &strict_limits)
-                    .unwrap();
-                assert_eq!(extra_calls.load(Ordering::Relaxed), 0);
+                admitted.leave_out_unmapped(unmapped).unwrap();
+                assert_eq!(charge_calls.load(Ordering::Relaxed), calls_before);
                 checked_fallback = true;
                 break;
             }
@@ -9829,9 +10128,10 @@ mod tests {
         );
 
         // Part B: With `cover_later: true`, expanding a strict subset `incomplete` list to
-        // the full signature must enforce `max_memory` and `charge` instead of rebuilding
-        // outside admission.
-        let mut el = String::from("Prefix(:=<urn:cov-subset:>)\nOntology(\n");
+        // the full signature via `AdmittedClassification` must enforce `max_memory` and
+        // the originating live `charge` grant obtained through `classify_admitted`.
+        let pad = "p".repeat(256);
+        let mut el = format!("Prefix(:=<urn:cov-subset-{pad}:>)\nOntology(\n");
         for i in 0..80 {
             let next = (i + 1) % 80;
             el.push_str(&format!(
@@ -9860,10 +10160,11 @@ mod tests {
             )
             .unwrap();
         let total = polls.load(Ordering::Relaxed);
-        let mut subset_out = None;
+        let mut chosen = None;
         for k in 0..total {
             let p = Arc::new(AtomicUsize::new(0));
-            if let Ok(out) = Saturation::new().classify(
+            let mut sat = Saturation::new();
+            if let Ok(out) = sat.classify(
                 &el_kinds,
                 None,
                 &Limits {
@@ -9877,65 +10178,392 @@ mod tests {
                 && out.consistency == Consistency::Consistent
                 && !out.has_all_taxonomy_classes()
             {
-                subset_out = Some(out);
-                break;
+                // A run without a pool callback must never save synthetic pool credit.
+                assert_eq!(sat.last_paid, 0);
+                let old_bytes = Classification::incomplete_vec_bytes(&out.incomplete);
+                let (_, full_bytes) = out.all_incomplete_bytes();
+                let expected_mem = out.stats.memory - old_bytes + full_bytes;
+                if full_bytes > old_bytes && expected_mem > out.stats.peak_memory {
+                    chosen = Some((k, expected_mem));
+                    break;
+                }
             }
         }
-        let mut base_out =
-            subset_out.expect("expected a consistent partial stop with a strict incomplete subset");
-        let old_bytes = Classification::incomplete_vec_bytes(&base_out.incomplete);
-        let (_, full_bytes) = base_out.all_incomplete_bytes();
-        assert!(full_bytes > old_bytes);
-        let expected_mem = base_out.stats.memory - old_bytes + full_bytes;
+        let (stop_k, expected_mem) = chosen.expect(
+            "expected a consistent partial stop with a strict incomplete subset whose expansion exceeds peak",
+        );
         let fake_excluded = vec![Excluded {
             axiom: el_kinds[0].clone(),
             gap: Gap::Partial("test"),
         }];
-        // Cap strictly below the expanded list refuses both `cover_admitted` and
-        // `leave_out_unmapped_admitted`.
-        let tight = Limits {
-            max_memory: Some(expected_mem - 1),
-            ..Limits::default()
-        };
-        assert!(matches!(
-            base_out
-                .clone()
-                .cover_admitted(&el_kinds, &fake_excluded, None, &tight),
-            Err(Error::Memory { limit, used }) if limit == expected_mem - 1 && used == expected_mem
-        ));
         let unmapped = Unmapped {
             count: 1,
             triples: Vec::new(),
             truncated: false,
         };
+        let run_at_k =
+            |max_memory: Option<usize>,
+             charge: Option<Arc<dyn Fn(usize) -> bool + Send + Sync>>| {
+                let p = Arc::new(AtomicUsize::new(0));
+                Saturation::new()
+                    .classify_admitted(
+                        &el_kinds,
+                        None,
+                        &Limits {
+                            threads: 1,
+                            partial: true,
+                            cover_later: true,
+                            max_memory,
+                            charge,
+                            cancelled: Some(Arc::new(move || {
+                                p.fetch_add(1, Ordering::Relaxed) >= stop_k
+                            })),
+                            ..Limits::default()
+                        },
+                    )
+                    .expect("classification at stop_k must fit within the cap/pool")
+            };
+        // Cap strictly below the expanded list refuses both `cover` and `leave_out_unmapped`.
+        let mut tight_cover = run_at_k(Some(expected_mem - 1), None);
         assert!(matches!(
-            base_out
-                .clone()
-                .leave_out_unmapped_admitted(unmapped.clone(), &tight),
+            tight_cover.cover(&el_kinds, &fake_excluded, None),
             Err(Error::Memory { limit, used }) if limit == expected_mem - 1 && used == expected_mem
         ));
-        // Pool refusal when `expected_mem > paid_memory` also refuses expansion.
-        let mut pool_out = base_out.clone();
-        pool_out.paid_memory = pool_out.stats.memory;
-        let refuse_pool = Limits {
-            charge: Some(Arc::new(|_| false)),
-            ..Limits::default()
-        };
+        let mut tight_unmapped = run_at_k(Some(expected_mem - 1), None);
         assert!(matches!(
-            pool_out.cover_admitted(&el_kinds, &fake_excluded, None, &refuse_pool),
+            tight_unmapped.leave_out_unmapped(unmapped.clone()),
+            Err(Error::Memory { limit, used }) if limit == expected_mem - 1 && used == expected_mem
+        ));
+        // Live pool grant obtained through the public `classify_admitted` entry point:
+        // budget `expected_mem - 1` admits classification and refuses the expansion delta.
+        let pool_used = Arc::new(AtomicUsize::new(0));
+        let pu = pool_used.clone();
+        let pool_cap = expected_mem - 1;
+        let mut pool_tight = run_at_k(
+            None,
+            Some(Arc::new(move |bytes| {
+                let prev = pu.load(Ordering::Relaxed);
+                if prev.saturating_add(bytes) > pool_cap {
+                    return false;
+                }
+                pu.store(prev + bytes, Ordering::Relaxed);
+                true
+            })),
+        );
+        let paid_during_classify = pool_used.load(Ordering::Relaxed);
+        assert!(paid_during_classify > 0 && paid_during_classify < expected_mem);
+        assert!(matches!(
+            pool_tight.cover(&el_kinds, &fake_excluded, None),
             Err(Error::Memory { used, .. }) if used == expected_mem
         ));
-        // Exact cap admits the expansion and updates `stats.memory` / `stats.peak_memory`.
-        let exact = Limits {
-            max_memory: Some(expected_mem),
-            ..Limits::default()
+        // Exact cap and exact live pool grant admit the expansion, charge only the delta
+        // up to `expected_mem`, update `stats.memory` / `stats.peak_memory`, and allow
+        // subsequent `leave_out_unmapped` with zero additional charges.
+        let pool_exact_used = Arc::new(AtomicUsize::new(0));
+        let pool_exact_calls = Arc::new(AtomicUsize::new(0));
+        let peu = pool_exact_used.clone();
+        let pec = pool_exact_calls.clone();
+        let mut exact = run_at_k(
+            Some(expected_mem),
+            Some(Arc::new(move |bytes| {
+                pec.fetch_add(1, Ordering::Relaxed);
+                let prev = peu.load(Ordering::Relaxed);
+                if prev.saturating_add(bytes) > expected_mem {
+                    return false;
+                }
+                peu.store(prev + bytes, Ordering::Relaxed);
+                true
+            })),
+        );
+        exact.cover(&el_kinds, &fake_excluded, None).unwrap();
+        assert!(exact.classification().has_all_taxonomy_classes());
+        assert_eq!(exact.classification().stats.memory, expected_mem);
+        assert!(exact.classification().stats.peak_memory >= expected_mem);
+        assert_eq!(pool_exact_used.load(Ordering::Relaxed), expected_mem);
+        let calls_after_cover = pool_exact_calls.load(Ordering::Relaxed);
+        exact.leave_out_unmapped(unmapped).unwrap();
+        assert_eq!(pool_exact_calls.load(Ordering::Relaxed), calls_after_cover);
+    }
+
+    #[test]
+    fn module_coverage_admits_subset_and_full_lists_under_tight_cap_and_pool() {
+        let pad = "m".repeat(512);
+        let unmapped = Unmapped {
+            count: 1,
+            triples: Vec::new(),
+            truncated: false,
         };
-        base_out
-            .cover_admitted(&el_kinds, &fake_excluded, None, &exact)
+
+        // 1. Module coverage returning a nonempty strict subset `S`, followed by
+        //    `leave_out_unmapped` requiring the full list `F`.
+        let subset_ofn = format!(
+            "Prefix(:=<urn:mod-subset-{pad}:>)\nOntology(\n\
+             SubClassOf(:A :B)\n\
+             SubClassOf(:B :C)\n\
+             SubClassOf(:C ObjectUnionOf(:D :E))\n\
+             SubClassOf(:X :B)\n\
+             SubClassOf(:P :Q)\n\
+             )"
+        );
+        let subset_doc = crate::ofn_read::parse(&subset_ofn).unwrap();
+        let subset_kinds: Vec<&AxiomKind> = subset_doc.axioms.iter().map(|a| &a.kind).collect();
+        let mut base_sat = Saturation::new();
+        let mut base_admitted = base_sat
+            .classify_admitted(
+                &subset_kinds,
+                None,
+                &Limits {
+                    threads: 1,
+                    el_only: true,
+                    cover_later: true,
+                    ..Limits::default()
+                },
+            )
             .unwrap();
-        assert!(base_out.has_all_taxonomy_classes());
-        assert_eq!(base_out.stats.memory, expected_mem);
-        assert!(base_out.stats.peak_memory >= expected_mem);
+        assert_eq!(base_sat.excluded().len(), 1);
+        assert!(base_admitted.classification().incomplete.is_empty());
+        let m = base_admitted.classification().stats.memory;
+        let peak = base_admitted.classification().stats.peak_memory;
+        let (_, f) = base_admitted.classification().all_incomplete_bytes();
+        base_admitted
+            .cover(&subset_kinds, base_sat.excluded(), None)
+            .unwrap();
+        let subset_out = base_admitted.into_classification();
+        assert_eq!(subset_out.consistency, Consistency::Consistent);
+        assert!(!subset_out.incomplete.is_empty());
+        assert!(!subset_out.has_all_taxonomy_classes());
+        let s = Classification::incomplete_vec_bytes(&subset_out.incomplete);
+        assert!(s > 0 && s < f);
+        assert_eq!(subset_out.stats.memory, m + s);
+        assert!(
+            peak < m + s,
+            "expected saturation/taxonomy peak ({peak}) < m + s ({})",
+            m + s
+        );
+
+        // 1a. Cap `m + s - 1` lets classification finish and refuses module coverage.
+        let mut sat = Saturation::new();
+        let mut admitted = sat
+            .classify_admitted(
+                &subset_kinds,
+                None,
+                &Limits {
+                    threads: 1,
+                    el_only: true,
+                    cover_later: true,
+                    max_memory: Some(m + s - 1),
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            admitted.cover(&subset_kinds, sat.excluded(), None),
+            Err(Error::Memory { limit, used }) if limit == m + s - 1 && used == m + s
+        ));
+
+        // 1b. Cap `m + f - 1` admits the nonempty module subset `S` (bringing memory to
+        //     `m + s`), then refuses `leave_out_unmapped` at `m + f` instead of
+        //     under-counting `m - s + f`.
+        let mut sat = Saturation::new();
+        let mut admitted = sat
+            .classify_admitted(
+                &subset_kinds,
+                None,
+                &Limits {
+                    threads: 1,
+                    el_only: true,
+                    cover_later: true,
+                    max_memory: Some(m + f - 1),
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        admitted.cover(&subset_kinds, sat.excluded(), None).unwrap();
+        assert_eq!(admitted.classification().stats.memory, m + s);
+        assert!(!admitted.classification().has_all_taxonomy_classes());
+        assert!(matches!(
+            admitted.leave_out_unmapped(unmapped.clone()),
+            Err(Error::Memory { limit, used }) if limit == m + f - 1 && used == m + f
+        ));
+
+        // 1c. Live pool budget `m + f - 1` admits classification and module coverage
+        //     (charging up to `m + s`) and refuses `leave_out_unmapped` (`used == m + f`).
+        let pool_used = Arc::new(AtomicUsize::new(0));
+        let pu = pool_used.clone();
+        let mut sat = Saturation::new();
+        let mut admitted = sat
+            .classify_admitted(
+                &subset_kinds,
+                None,
+                &Limits {
+                    threads: 1,
+                    el_only: true,
+                    cover_later: true,
+                    charge: Some(Arc::new(move |bytes| {
+                        let prev = pu.load(Ordering::Relaxed);
+                        if prev.saturating_add(bytes) > m + f - 1 {
+                            return false;
+                        }
+                        pu.store(prev + bytes, Ordering::Relaxed);
+                        true
+                    })),
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        admitted.cover(&subset_kinds, sat.excluded(), None).unwrap();
+        assert_eq!(pool_used.load(Ordering::Relaxed), m + s);
+        assert!(matches!(
+            admitted.leave_out_unmapped(unmapped.clone()),
+            Err(Error::Memory { used, .. }) if used == m + f
+        ));
+
+        // 1d. Exact cap and live pool budget `m + f` admit both steps and charge `m + f`.
+        let pool_used = Arc::new(AtomicUsize::new(0));
+        let pu = pool_used.clone();
+        let mut sat = Saturation::new();
+        let mut admitted = sat
+            .classify_admitted(
+                &subset_kinds,
+                None,
+                &Limits {
+                    threads: 1,
+                    el_only: true,
+                    cover_later: true,
+                    max_memory: Some(m + f),
+                    charge: Some(Arc::new(move |bytes| {
+                        let prev = pu.load(Ordering::Relaxed);
+                        if prev.saturating_add(bytes) > m + f {
+                            return false;
+                        }
+                        pu.store(prev + bytes, Ordering::Relaxed);
+                        true
+                    })),
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        admitted.cover(&subset_kinds, sat.excluded(), None).unwrap();
+        assert_eq!(admitted.classification().stats.memory, m + s);
+        assert_eq!(pool_used.load(Ordering::Relaxed), m + s);
+        admitted.leave_out_unmapped(unmapped.clone()).unwrap();
+        let out = admitted.into_classification();
+        assert!(out.has_all_taxonomy_classes());
+        assert_eq!(out.stats.memory, m + f);
+        assert!(out.stats.peak_memory >= m + f);
+        assert_eq!(pool_used.load(Ordering::Relaxed), m + f);
+
+        // 2. Module coverage directly returning every taxonomy class (base-module hit).
+        let full_ofn = format!(
+            "Prefix(:=<urn:mod-full-{pad}:>)\nOntology(\n\
+             SubClassOf(owl:Thing ObjectUnionOf(:B :C))\n\
+             SubClassOf(:X :Y)\n\
+             )"
+        );
+        let full_doc = crate::ofn_read::parse(&full_ofn).unwrap();
+        let full_kinds: Vec<&AxiomKind> = full_doc.axioms.iter().map(|a| &a.kind).collect();
+        let mut base_sat = Saturation::new();
+        let mut base_admitted = base_sat
+            .classify_admitted(
+                &full_kinds,
+                None,
+                &Limits {
+                    threads: 1,
+                    el_only: true,
+                    cover_later: true,
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        let m2 = base_admitted.classification().stats.memory;
+        let peak2 = base_admitted.classification().stats.peak_memory;
+        let (_, f2) = base_admitted.classification().all_incomplete_bytes();
+        base_admitted
+            .cover(&full_kinds, base_sat.excluded(), None)
+            .unwrap();
+        let full_out = base_admitted.into_classification();
+        assert_eq!(full_out.consistency, Consistency::Consistent);
+        assert!(full_out.has_all_taxonomy_classes());
+        assert_eq!(full_out.stats.memory, m2 + f2);
+        assert!(
+            peak2 < m2 + f2,
+            "expected saturation/taxonomy peak ({peak2}) < m2 + f2 ({})",
+            m2 + f2
+        );
+
+        // 2a. Deferred coverage refuses cap `m2 + f2 - 1` before cloning the full list.
+        let mut sat = Saturation::new();
+        let mut admitted = sat
+            .classify_admitted(
+                &full_kinds,
+                None,
+                &Limits {
+                    threads: 1,
+                    el_only: true,
+                    cover_later: true,
+                    max_memory: Some(m2 + f2 - 1),
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            admitted.cover(&full_kinds, sat.excluded(), None),
+            Err(Error::Memory { limit, used }) if limit == m2 + f2 - 1 && used == m2 + f2
+        ));
+
+        // 2b. Immediate coverage (`cover_later: false`) also refuses cap `m2 + f2 - 1`.
+        assert!(matches!(
+            Saturation::new().classify(
+                &full_kinds,
+                None,
+                &Limits {
+                    threads: 1,
+                    el_only: true,
+                    cover_later: false,
+                    max_memory: Some(m2 + f2 - 1),
+                    ..Limits::default()
+                },
+            ),
+            Err(Error::Memory { limit, used }) if limit == m2 + f2 - 1 && used == m2 + f2
+        ));
+
+        // 2c. Exact cap & live pool `m2 + f2` admit module coverage and allow subsequent
+        //     `leave_out_unmapped` to reuse the admitted full list with zero extra charges.
+        let pool_used = Arc::new(AtomicUsize::new(0));
+        let pool_calls = Arc::new(AtomicUsize::new(0));
+        let pu = pool_used.clone();
+        let pc = pool_calls.clone();
+        let mut sat = Saturation::new();
+        let mut admitted = sat
+            .classify_admitted(
+                &full_kinds,
+                None,
+                &Limits {
+                    threads: 1,
+                    el_only: true,
+                    cover_later: true,
+                    max_memory: Some(m2 + f2),
+                    charge: Some(Arc::new(move |bytes| {
+                        pc.fetch_add(1, Ordering::Relaxed);
+                        let prev = pu.load(Ordering::Relaxed);
+                        if prev.saturating_add(bytes) > m2 + f2 {
+                            return false;
+                        }
+                        pu.store(prev + bytes, Ordering::Relaxed);
+                        true
+                    })),
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        admitted.cover(&full_kinds, sat.excluded(), None).unwrap();
+        assert!(admitted.classification().has_all_taxonomy_classes());
+        assert_eq!(admitted.classification().stats.memory, m2 + f2);
+        assert_eq!(pool_used.load(Ordering::Relaxed), m2 + f2);
+        let calls_after_cover = pool_calls.load(Ordering::Relaxed);
+        admitted.leave_out_unmapped(unmapped).unwrap();
+        assert_eq!(pool_calls.load(Ordering::Relaxed), calls_after_cover);
+        assert_eq!(admitted.classification().stats.memory, m2 + f2);
     }
 
     #[test]
