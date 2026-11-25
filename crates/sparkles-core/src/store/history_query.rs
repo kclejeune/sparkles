@@ -270,7 +270,7 @@ impl ChangeLog {
         self.query_with(q, upto, false, None)
     }
 
-    fn query_with(
+    pub(super) fn query_with(
         &self,
         q: &HistoryQuery,
         upto: u64,
@@ -300,8 +300,12 @@ impl ChangeLog {
         let filter = q.filter();
         let access = q.access.as_ref().filter(|a| !a.reads_everything());
         let mut readable: FxHashMap<Arc<[u8]>, bool> = FxHashMap::default();
-        let mut changes = Vec::new();
-        let mut result_bytes = 0u64;
+        let mut changes: Vec<HistoryChange> = Vec::new();
+        let budget = max_bytes.map(super::changelog::MemoryBudget::new);
+        let mut memo_guard = budget.as_ref().map(super::changelog::MemoryBudget::guard);
+        let mut page_guard = budget.as_ref().map(super::changelog::MemoryBudget::guard);
+        let mut memo_content_bytes = 0u64;
+        let mut page_content_bytes = 0u64;
         let mut truncated = false;
         let mut n = 0u64;
         let mut check = || {
@@ -335,7 +339,7 @@ impl ChangeLog {
             q.descending,
             true,
             no_wait,
-            max_bytes,
+            budget.as_ref(),
             &mut check,
             None,
             &mut |c, add, k: &QuadKey| {
@@ -343,20 +347,76 @@ impl ChangeLog {
                 if q.op.is_some_and(|o| o != op) {
                     return Ok(true);
                 }
-                if access.is_some_and(|a| !visible_key(a, &mut readable, k)) {
-                    return Ok(true);
+                if let Some(a) = access {
+                    if let Some(guard) = memo_guard.as_mut()
+                        && !a.read.is_all()
+                        && !readable.contains_key(&k[0])
+                    {
+                        let next_content = memo_content_bytes
+                            .saturating_add(super::changelog::arc_slice_bytes(k[0].len()));
+                        if readable.len() == readable.capacity() {
+                            let old = super::changelog::memo_table_bytes(readable.capacity());
+                            let new = super::changelog::memo_table_bytes(readable.capacity() + 1);
+                            guard.resize(next_content.saturating_add(old).saturating_add(new))?;
+                            readable.try_reserve(1).map_err(|_| {
+                                Error::HistoryUnsupported(
+                                    "history access memo allocation was refused".into(),
+                                )
+                            })?;
+                        }
+                        memo_content_bytes = next_content;
+                        guard.resize(memo_content_bytes.saturating_add(
+                            super::changelog::memo_table_bytes(readable.capacity()),
+                        ))?;
+                    }
+                    if !visible_key(a, &mut readable, k) {
+                        return Ok(true);
+                    }
                 }
                 if q.limit > 0 && changes.len() >= q.limit {
                     truncated = true;
                     return Ok(false);
                 }
-                if let Some(limit) = max_bytes {
-                    let add_bytes = k.iter().map(|t| t.len() as u64).sum::<u64>()
-                        + std::mem::size_of::<HistoryChange>() as u64;
-                    result_bytes = result_bytes.saturating_add(add_bytes);
-                    if result_bytes > limit {
-                        return Err(super::changelog::memory_budget(limit, result_bytes));
+                if let Some(guard) = page_guard.as_mut() {
+                    let mut add_bytes = super::changelog::quad_bytes(k);
+                    if changes.last().is_none_or(|l| !Arc::ptr_eq(&l.commit, c)) {
+                        let commit_size = std::mem::size_of::<ChangeCommit>();
+                        add_bytes = add_bytes
+                            .saturating_add(super::changelog::arc_slice_bytes(commit_size))
+                            .saturating_add(
+                                [&c.author, &c.message]
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|s| super::changelog::arc_slice_bytes(s.len()))
+                                    .sum::<u64>(),
+                            );
                     }
+                    let elem_size = std::mem::size_of::<HistoryChange>() as u64;
+                    if changes.len() == changes.capacity() {
+                        let old_vec = (changes.capacity() as u64).saturating_mul(elem_size);
+                        let cap_more = if q.limit > 0 {
+                            q.limit.saturating_sub(changes.len()).max(1)
+                        } else {
+                            usize::MAX
+                        };
+                        let more = changes.capacity().max(64).min(cap_more);
+                        let new_vec = (changes.capacity().saturating_add(more) as u64)
+                            .saturating_mul(elem_size);
+                        guard.resize(
+                            page_content_bytes
+                                .saturating_add(old_vec)
+                                .saturating_add(new_vec),
+                        )?;
+                        changes.try_reserve_exact(more).map_err(|_| {
+                            Error::HistoryUnsupported(
+                                "history result allocation was refused".into(),
+                            )
+                        })?;
+                    }
+                    let vec_bytes = (changes.capacity() as u64).saturating_mul(elem_size);
+                    let next_content = page_content_bytes.saturating_add(add_bytes);
+                    guard.resize(next_content.saturating_add(vec_bytes))?;
+                    page_content_bytes = next_content;
                 }
                 if let Some(quad) = key_quad(k) {
                     changes.push(HistoryChange {
@@ -368,6 +428,8 @@ impl ChangeLog {
                 Ok(true)
             },
         )?;
+        drop(memo_guard);
+        drop(page_guard);
         Ok(HistoryResult {
             from,
             to,

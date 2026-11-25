@@ -192,37 +192,6 @@ impl Held<'_, '_> {
     }
 }
 
-/// The bytes a quad decoded from `k` can allocate, at most: each term's text is no
-/// longer than its key, a blank node's label is at most 64 bytes, and a triple term
-/// boxes its parts at each level of nesting.
-fn quad_bytes(k: &QuadKey) -> u64 {
-    k.iter()
-        .map(|t| {
-            let nested = if t.first() == Some(&b'(') {
-                t.len() as u64 * 64
-            } else {
-                0
-            };
-            t.len() as u64 + 64 + nested
-        })
-        .sum()
-}
-
-/// The bytes the table of a hash map from graph keys to a flag allocates for
-/// `capacity` entries: its buckets of entries and their control bytes, as the standard
-/// map sizes them.
-fn memo_table_bytes(capacity: usize) -> u64 {
-    if capacity == 0 {
-        return 0;
-    }
-    let buckets = match capacity {
-        0..4 => 4,
-        4..8 => 8,
-        n => (n.saturating_mul(8) / 7).next_power_of_two(),
-    } as u64;
-    buckets * (std::mem::size_of::<(Arc<[u8]>, bool)>() as u64 + 1) + 16
-}
-
 impl HistoryPages {
     /// Whether the range has been read to its end.
     pub(crate) fn done(&self) -> bool {

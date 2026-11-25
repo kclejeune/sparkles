@@ -3228,3 +3228,264 @@ fn post_commit_reconciliation_cancels_during_large_changelog_record_read() {
     assert!(held.contains(&local_orphan));
     assert!(held.contains(&proposed.hold.unwrap()));
 }
+
+#[test]
+fn post_commit_reconciliation_stops_during_warm_candidate_traversal() {
+    use sparkles::store::{ChangeLogReadEvent, StoreOptions, set_changelog_read_observer};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    struct ResetObserver;
+    impl Drop for ResetObserver {
+        fn drop(&mut self) {
+            set_changelog_read_observer(None);
+        }
+    }
+
+    for use_deadline in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = sparkles::Catalog::open(
+            dir.path(),
+            StoreOptions {
+                // Keep all commits inside a single warm/live open segment (no cold .idx loads).
+                change_log_segment_bytes: 64 << 20,
+                ..Default::default()
+            }
+            .into(),
+        )
+        .unwrap();
+        let origin = catalog.create("origin", &Default::default()).unwrap();
+        let target = catalog.create("target", &Default::default()).unwrap();
+        configured(&origin);
+        let fact = with_fact(&target);
+        let foreign_sparse = uuid::Uuid::from_u128(1);
+        let foreign_missing = uuid::Uuid::from_u128(2);
+        let local_orphan = uuid::Uuid::from_u128(3);
+        let sparse_op = evidence::operation_iri(foreign_sparse);
+
+        // Build a warm/live segment with frequent rdf:type commits and a sparse
+        // subject posting for foreign_sparse (no postings for foreign_missing).
+        for i in 0..40 {
+            origin
+                .update(&format!(
+                    "INSERT DATA {{ <urn:noise:{i}> a <urn:Thing> . }}"
+                ))
+                .unwrap();
+        }
+        origin
+            .update(&format!(
+                "INSERT DATA {{ <{}> <urn:other> \"sparse\" . }}",
+                sparse_op.as_str()
+            ))
+            .unwrap();
+        origin.store().flush_change_log().unwrap();
+
+        evidence::acquire_hold_for(
+            &target,
+            foreign_sparse,
+            &[evidence::CommitRef {
+                branch_id: target.dataset_id(),
+                seq: fact,
+            }],
+            Some(origin.dataset_id()),
+        )
+        .unwrap();
+        evidence::acquire_hold_for(
+            &target,
+            foreign_missing,
+            &[evidence::CommitRef {
+                branch_id: target.dataset_id(),
+                seq: fact,
+            }],
+            Some(origin.dataset_id()),
+        )
+        .unwrap();
+        evidence::acquire_hold(
+            &target,
+            local_orphan,
+            &[evidence::CommitRef {
+                branch_id: target.dataset_id(),
+                seq: fact,
+            }],
+        )
+        .unwrap();
+
+        let future =
+            target.store().head_commit().timestamp_ms + 2 * sparkles::holds::DEFAULT_GRACE_MS;
+        target.store().set_clock(Arc::new(move || future));
+
+        let deadline = use_deadline.then(|| Instant::now() + Duration::from_millis(300));
+        let control = Control {
+            deadline,
+            ..Control::none()
+        };
+        let cancel = control.cancel.clone();
+        let triggered = Arc::new(AtomicBool::new(false));
+        let checks_after = Arc::new(AtomicUsize::new(0));
+        let index_chunks = Arc::new(AtomicUsize::new(0));
+        let record_reads = Arc::new(AtomicUsize::new(0));
+        let t = triggered.clone();
+        let c_after = checks_after.clone();
+        let i_chunks = index_chunks.clone();
+        let r_reads = record_reads.clone();
+        let _reset = ResetObserver;
+        set_changelog_read_observer(Some(Arc::new(move |event| match event {
+            ChangeLogReadEvent::IndexReadChunk => {
+                i_chunks.fetch_add(1, Ordering::SeqCst);
+            }
+            ChangeLogReadEvent::CandidateCheck => {
+                if !t.swap(true, Ordering::SeqCst) {
+                    if let Some(limit) = deadline {
+                        while Instant::now() <= limit {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    } else {
+                        cancel.cancel();
+                    }
+                } else {
+                    c_after.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            ChangeLogReadEvent::RecordReadChunk | ChangeLogReadEvent::RecordDecode
+                if t.load(Ordering::SeqCst) =>
+            {
+                r_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        })));
+
+        let proposed = evidence::propose(
+            Some(&catalog),
+            &origin,
+            &origin,
+            &batch_for_fact(&target, target.dataset_id(), fact),
+            &options(),
+            &mut |_, _| all(),
+            &control,
+        )
+        .unwrap();
+        drop(_reset);
+
+        assert!(proposed.committed, "use_deadline={use_deadline}");
+        assert!(
+            triggered.load(Ordering::SeqCst),
+            "use_deadline={use_deadline}: warm candidate traversal was not reached"
+        );
+        assert_eq!(
+            index_chunks.load(Ordering::SeqCst),
+            0,
+            "use_deadline={use_deadline}: expected warm resident index without cold reads"
+        );
+        assert_eq!(
+            checks_after.load(Ordering::SeqCst),
+            0,
+            "use_deadline={use_deadline}: continued candidate traversal after stop"
+        );
+        assert_eq!(
+            record_reads.load(Ordering::SeqCst),
+            0,
+            "use_deadline={use_deadline}: read records after candidate traversal stop"
+        );
+        if use_deadline {
+            assert!(matches!(control.check(), Err(sparkles::Error::Timeout)));
+        } else {
+            assert!(matches!(control.check(), Err(sparkles::Error::Cancelled)));
+        }
+        let held: Vec<_> = evidence::holds(&target)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert!(
+            held.contains(&foreign_sparse),
+            "use_deadline={use_deadline}: sparse hold must remain in place after stop"
+        );
+        assert!(
+            held.contains(&local_orphan),
+            "use_deadline={use_deadline}: unchecked local hold must remain in place"
+        );
+        assert!(held.contains(&proposed.hold.unwrap()));
+    }
+
+    // Confirm that a missing operation subject with frequent rdf:type short-circuits
+    // cleanly on a warm segment without candidate traversal or record reads.
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = sparkles::Catalog::open(
+        dir.path(),
+        StoreOptions {
+            change_log_segment_bytes: 64 << 20,
+            ..Default::default()
+        }
+        .into(),
+    )
+    .unwrap();
+    let origin = catalog.create("origin", &Default::default()).unwrap();
+    let target = catalog.create("target", &Default::default()).unwrap();
+    configured(&origin);
+    let fact = with_fact(&target);
+    let foreign_missing = uuid::Uuid::from_u128(10);
+    for i in 0..40 {
+        origin
+            .update(&format!(
+                "INSERT DATA {{ <urn:noise:{i}> a <urn:Thing> . }}"
+            ))
+            .unwrap();
+    }
+    origin.store().flush_change_log().unwrap();
+    evidence::acquire_hold_for(
+        &target,
+        foreign_missing,
+        &[evidence::CommitRef {
+            branch_id: target.dataset_id(),
+            seq: fact,
+        }],
+        Some(origin.dataset_id()),
+    )
+    .unwrap();
+    let future = target.store().head_commit().timestamp_ms + 2 * sparkles::holds::DEFAULT_GRACE_MS;
+    target.store().set_clock(Arc::new(move || future));
+
+    let candidate_checks = Arc::new(AtomicUsize::new(0));
+    let record_reads = Arc::new(AtomicUsize::new(0));
+    let c_checks = candidate_checks.clone();
+    let r_reads = record_reads.clone();
+    let _reset = ResetObserver;
+    set_changelog_read_observer(Some(Arc::new(move |event| match event {
+        ChangeLogReadEvent::CandidateCheck => {
+            c_checks.fetch_add(1, Ordering::SeqCst);
+        }
+        ChangeLogReadEvent::RecordReadChunk | ChangeLogReadEvent::RecordDecode => {
+            r_reads.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    })));
+    let proposed = evidence::propose(
+        Some(&catalog),
+        &origin,
+        &origin,
+        &batch_for_fact(&target, target.dataset_id(), fact),
+        &options(),
+        &mut |_, _| all(),
+        &Control::none(),
+    )
+    .unwrap();
+    drop(_reset);
+
+    assert!(proposed.committed);
+    assert_eq!(
+        candidate_checks.load(Ordering::SeqCst),
+        0,
+        "missing subject must short-circuit before candidate traversal"
+    );
+    assert_eq!(
+        record_reads.load(Ordering::SeqCst),
+        0,
+        "missing subject must read zero changelog records"
+    );
+    let held: Vec<_> = evidence::holds(&target)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(held, [proposed.hold.unwrap()]);
+}

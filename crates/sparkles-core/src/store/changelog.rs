@@ -69,6 +69,7 @@ pub(crate) use pager::HistoryPages;
 pub enum ChangeLogReadEvent {
     IndexReadChunk,
     IndexDecode,
+    CandidateCheck,
     RecordReadChunk,
     RecordDecode,
 }
@@ -111,6 +112,114 @@ pub(super) fn memory_budget(limit: u64, requested: u64) -> Error {
         limit,
         requested,
     })
+}
+
+/// Tracks live bytes across overlapping allocations in a bounded history scan:
+/// accumulated results, access memo, unrecorded holes, cold index buffers,
+/// candidate cursor scratch, and the record currently being read or decoded.
+pub(crate) struct MemoryBudget {
+    limit: u64,
+    used: std::cell::Cell<u64>,
+}
+
+impl MemoryBudget {
+    pub(super) fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            used: std::cell::Cell::new(0),
+        }
+    }
+
+    pub(super) fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    pub(super) fn used(&self) -> u64 {
+        self.used.get()
+    }
+
+    pub(super) fn guard(&self) -> BudgetGuard<'_> {
+        BudgetGuard {
+            budget: self,
+            bytes: 0,
+        }
+    }
+
+    pub(super) fn charge(&self, bytes: u64) -> Result<()> {
+        let next = self.used.get().saturating_add(bytes);
+        if next > self.limit {
+            return Err(memory_budget(self.limit, next));
+        }
+        self.used.set(next);
+        Ok(())
+    }
+
+    pub(super) fn release(&self, bytes: u64) {
+        self.used.set(self.used.get().saturating_sub(bytes));
+    }
+
+    pub(super) fn reserve(&self, bytes: u64) -> Result<BudgetGuard<'_>> {
+        self.charge(bytes)?;
+        Ok(BudgetGuard {
+            budget: self,
+            bytes,
+        })
+    }
+}
+
+pub(super) struct BudgetGuard<'a> {
+    budget: &'a MemoryBudget,
+    bytes: u64,
+}
+
+impl BudgetGuard<'_> {
+    pub(super) fn resize(&mut self, new_bytes: u64) -> Result<()> {
+        if new_bytes > self.bytes {
+            self.budget.charge(new_bytes - self.bytes)?;
+            self.bytes = new_bytes;
+        } else if new_bytes < self.bytes {
+            self.budget.release(self.bytes - new_bytes);
+            self.bytes = new_bytes;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BudgetGuard<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+/// The bytes a quad decoded from `k` can allocate, at most: each term's text is no
+/// longer than its key, a blank node's label is at most 64 bytes, and a triple term
+/// boxes its parts at each level of nesting.
+pub(super) fn quad_bytes(k: &QuadKey) -> u64 {
+    k.iter()
+        .map(|t| {
+            let nested = if t.first() == Some(&b'(') {
+                t.len() as u64 * 64
+            } else {
+                0
+            };
+            t.len() as u64 + 64 + nested
+        })
+        .sum()
+}
+
+/// The bytes the table of a hash map from graph keys to a flag allocates for
+/// `capacity` entries: its buckets of entries and their control bytes, as the standard
+/// map sizes them.
+pub(super) fn memo_table_bytes(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = match capacity {
+        0..4 => 4,
+        4..8 => 8,
+        n => (n.saturating_mul(8) / 7).next_power_of_two(),
+    } as u64;
+    buckets * (std::mem::size_of::<(Arc<[u8]>, bool)>() as u64 + 1) + 16
 }
 
 /// The directory of a persistent store's change log.
@@ -491,7 +600,7 @@ fn decode(body: &[u8]) -> Option<Record> {
 }
 
 /// The bytes an `Arc<[u8]>` or `Arc<str>` of `len` bytes allocates.
-fn arc_slice_bytes(len: usize) -> u64 {
+pub(super) fn arc_slice_bytes(len: usize) -> u64 {
     (16 + len as u64).next_multiple_of(8)
 }
 
@@ -831,6 +940,149 @@ impl RecEntry {
     }
 }
 
+/// A sorted, deduplicated slice of record ordinals within a segment's `[lo, hi)`.
+#[derive(Clone, Copy)]
+enum PostingRun<'a> {
+    Sealed(&'a [(u64, u32)]),
+    Live(&'a [u32]),
+}
+
+impl<'a> PostingRun<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Sealed(s) => s.len(),
+            Self::Live(s) => s.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn pop(&mut self, descending: bool) -> Option<u32> {
+        match (self, descending) {
+            (Self::Sealed(s), false) => {
+                let (&(_, o), rest) = s.split_first()?;
+                *s = rest;
+                Some(o)
+            }
+            (Self::Sealed(s), true) => {
+                let (&(_, o), rest) = s.split_last()?;
+                *s = rest;
+                Some(o)
+            }
+            (Self::Live(s), false) => {
+                let (&o, rest) = s.split_first()?;
+                *s = rest;
+                Some(o)
+            }
+            (Self::Live(s), true) => {
+                let (&o, rest) = s.split_last()?;
+                *s = rest;
+                Some(o)
+            }
+        }
+    }
+
+    fn contains(&self, ord: u32) -> bool {
+        match self {
+            Self::Sealed(s) => s.binary_search_by_key(&ord, |&(_, o)| o).is_ok(),
+            Self::Live(s) => s.binary_search(&ord).is_ok(),
+        }
+    }
+}
+
+/// Streams distinct candidate record ordinals in ascending or descending order
+/// without copying posting lists.
+enum CandidateStream<'a> {
+    Range {
+        lo: u32,
+        hi: u32,
+        descending: bool,
+    },
+    Single {
+        run: PostingRun<'a>,
+        descending: bool,
+    },
+    Merge {
+        runs: Vec<PostingRun<'a>>,
+        heap: std::collections::BinaryHeap<(u32, usize)>,
+        descending: bool,
+        last: Option<u32>,
+    },
+}
+
+impl<'a> CandidateStream<'a> {
+    fn next_ord(
+        &mut self,
+        checked: bool,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<u32>> {
+        match self {
+            Self::Range { lo, hi, descending } => {
+                if *lo >= *hi {
+                    return Ok(None);
+                }
+                if *descending {
+                    *hi -= 1;
+                    Ok(Some(*hi))
+                } else {
+                    let o = *lo;
+                    *lo += 1;
+                    Ok(Some(o))
+                }
+            }
+            Self::Single { run, descending } => Ok(run.pop(*descending)),
+            Self::Merge {
+                runs,
+                heap,
+                descending,
+                last,
+            } => {
+                let mut dups = 0usize;
+                while let Some((key, idx)) = heap.pop() {
+                    if checked && dups != 0 && dups.is_multiple_of(CHECK_STRIDE) {
+                        check()?;
+                    }
+                    let ord = if *descending { key } else { u32::MAX - key };
+                    if let Some(next) = runs[idx].pop(*descending) {
+                        let next_key = if *descending { next } else { u32::MAX - next };
+                        heap.push((next_key, idx));
+                    }
+                    if *last != Some(ord) {
+                        *last = Some(ord);
+                        return Ok(Some(ord));
+                    }
+                    dups += 1;
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn push_hole(
+    holes: &mut Vec<Unrecorded>,
+    guard: Option<&mut BudgetGuard<'_>>,
+    hole: Unrecorded,
+) -> Result<()> {
+    if holes.len() == holes.capacity()
+        && let Some(guard) = guard
+    {
+        let size = std::mem::size_of::<Unrecorded>() as u64;
+        let old = (holes.capacity() as u64).saturating_mul(size);
+        let more = holes.capacity().max(16);
+        let new = (holes.capacity().saturating_add(more) as u64).saturating_mul(size);
+        guard.resize(old.saturating_add(new))?;
+        holes.try_reserve_exact(more).map_err(|_| {
+            Error::HistoryUnsupported("history unrecorded-range allocation was refused".into())
+        })?;
+        guard.resize((holes.capacity() as u64).saturating_mul(size))?;
+    }
+    holes.push(hole);
+    Ok(())
+}
+
 /// The index of one segment.
 #[derive(Clone, Default)]
 struct SegIndex {
@@ -880,18 +1132,30 @@ impl SegIndex {
         self.postings = p;
     }
 
-    /// The record numbers that may hold `hash`, ascending.
-    fn lookup(&self, hash: u64, out: &mut Vec<u32>) {
-        let lo = self.postings.partition_point(|p| p.0 < hash);
-        out.extend(
-            self.postings[lo..]
-                .iter()
-                .take_while(|p| p.0 == hash)
-                .map(|p| p.1),
-        );
-        if let Some(v) = self.live.get(&hash) {
-            out.extend_from_slice(v);
-        }
+    /// Sorted, deduplicated posting runs for `hash` restricted to `lo..hi`.
+    fn runs_in_range(&self, hash: u64, lo: u32, hi: u32) -> [PostingRun<'_>; 2] {
+        let p_lo = self
+            .postings
+            .partition_point(|&(h, o)| h < hash || (h == hash && o < lo));
+        let p_hi = if self
+            .postings
+            .get(p_lo)
+            .is_some_and(|&(h, o)| h == hash && o < hi)
+        {
+            p_lo + self.postings[p_lo..].partition_point(|&(h, o)| h == hash && o < hi)
+        } else {
+            p_lo
+        };
+        let sealed = PostingRun::Sealed(&self.postings[p_lo..p_hi]);
+        let live = match self.live.get(&hash) {
+            Some(v) => {
+                let l_lo = v.partition_point(|&o| o < lo);
+                let l_hi = l_lo + v[l_lo..].partition_point(|&o| o < hi);
+                PostingRun::Live(&v[l_lo..l_hi])
+            }
+            None => PostingRun::Live(&[]),
+        };
+        [sealed, live]
     }
 
     fn encode(&self, dataset_id: uuid::Uuid, first: u64, last: u64) -> Vec<u8> {
@@ -940,7 +1204,7 @@ impl SegIndex {
         b: &[u8],
         dataset_id: uuid::Uuid,
         mut check: Option<&mut dyn FnMut() -> Result<()>>,
-        max_bytes: Option<u64>,
+        budget: Option<&MemoryBudget>,
     ) -> Result<Option<(u64, u64, SegIndex)>> {
         if b.len() < IDX_HEADER || &b[0..8] != IDX_MAGIC {
             return Ok(None);
@@ -972,23 +1236,35 @@ impl SegIndex {
         }
         let mut c = Cur { b: body, i: 0 };
         let mut ix = SegIndex::default();
-        if let Some(limit) = max_bytes {
-            let decoded = (nrecs as u64)
-                .saturating_mul(std::mem::size_of::<RecEntry>() as u64)
+        let _decoded_guard = if let Some(budget) = budget {
+            let decoded = arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                .saturating_add(
+                    (nrecs as u64).saturating_mul(std::mem::size_of::<RecEntry>() as u64),
+                )
                 .saturating_add(
                     (nposts as u64).saturating_mul(std::mem::size_of::<(u64, u32)>() as u64),
                 );
-            let held = (b.len() as u64).saturating_add(decoded);
-            if held > limit {
-                return Err(memory_budget(limit, held));
-            }
+            let mut guard = budget.reserve(decoded)?;
             ix.recs.try_reserve_exact(nrecs).map_err(|_| {
                 Error::HistoryUnsupported("history-log index allocation was refused".into())
             })?;
             ix.postings.try_reserve_exact(nposts).map_err(|_| {
                 Error::HistoryUnsupported("history-log index allocation was refused".into())
             })?;
-        }
+            let actual = arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                .saturating_add(
+                    (ix.recs.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<RecEntry>() as u64),
+                )
+                .saturating_add(
+                    (ix.postings.capacity() as u64)
+                        .saturating_mul(std::mem::size_of::<(u64, u32)>() as u64),
+                );
+            guard.resize(actual)?;
+            Some(guard)
+        } else {
+            None
+        };
         #[cfg(test)]
         open_tests::observe(open_tests::Event::IndexRecords);
         #[cfg(feature = "failpoints")]
@@ -1006,6 +1282,7 @@ impl SegIndex {
             };
             ix.recs.push(entry);
         }
+        let mut prev_posting: Option<(u64, u32)> = None;
         for idx in 0..nposts {
             if idx.is_multiple_of(CHECK_STRIDE)
                 && let Some(check) = check.as_deref_mut()
@@ -1018,6 +1295,10 @@ impl SegIndex {
                 return Ok(None);
             };
             let o = u32::from_le_bytes(raw.try_into().unwrap());
+            if o as usize >= nrecs || prev_posting.is_some_and(|prev| prev >= (h, o)) {
+                return Ok(None);
+            }
+            prev_posting = Some((h, o));
             ix.postings.push((h, o));
         }
         if c.i != body.len() {
@@ -1627,7 +1908,7 @@ impl ChangeLog {
         inner: &mut Inner,
         i: usize,
         mut check: Option<&mut dyn FnMut() -> Result<()>>,
-        max_bytes: Option<u64>,
+        budget: Option<&MemoryBudget>,
     ) -> Result<Arc<SegIndex>> {
         if let Some(ix) = &inner.segs[i].index {
             return Ok(ix.clone());
@@ -1642,8 +1923,8 @@ impl ChangeLog {
         let path = inner.segs[i]
             .idx_path()
             .expect("a sealed persistent segment");
-        let b = match check.as_deref_mut() {
-            Some(check) => Self::read_index_checked(&path, check, max_bytes)?,
+        let (b, raw_guard) = match check.as_deref_mut() {
+            Some(check) => Self::read_index_checked(&path, check, budget)?,
             None => {
                 #[cfg(test)]
                 open_tests::observe(open_tests::Event::IndexReadAttempt);
@@ -1652,11 +1933,17 @@ impl ChangeLog {
                 open_tests::observe(open_tests::Event::IndexReadChunk);
                 #[cfg(feature = "failpoints")]
                 observe_changelog_read(ChangeLogReadEvent::IndexReadChunk);
-                bytes
+                let guard = match budget {
+                    Some(budget) => Some(budget.reserve(bytes.capacity() as u64)?),
+                    None => None,
+                };
+                (bytes, guard)
             }
         };
-        let (_, _, ix) = SegIndex::decode_with(&b, self.dataset_id, check, max_bytes)?
+        let (_, _, ix) = SegIndex::decode_with(&b, self.dataset_id, check, budget)?
             .ok_or_else(|| Error::Corrupt(format!("{}: damaged index", path.display())))?;
+        drop(b);
+        drop(raw_guard);
         let ix = Arc::new(ix);
         inner.cache.push_front((first, ix.clone()));
         inner.cache.truncate(INDEX_CACHE);
@@ -1664,37 +1951,55 @@ impl ChangeLog {
     }
 
     /// Read the entire sidecar, polling before each read and every interrupted retry.
-    fn read_index_checked(
+    fn read_index_checked<'a>(
         path: &Path,
         check: &mut dyn FnMut() -> Result<()>,
-        max_bytes: Option<u64>,
-    ) -> Result<Vec<u8>> {
+        budget: Option<&'a MemoryBudget>,
+    ) -> Result<(Vec<u8>, Option<BudgetGuard<'a>>)> {
         check()?;
         let mut file = File::open(path)?;
-        if let Some(limit) = max_bytes {
-            let len = file.metadata()?.len();
-            if len > limit {
-                return Err(memory_budget(limit, len));
-            }
-        }
+        let file_len = file.metadata()?.len();
         let mut bytes = Vec::new();
+        let mut guard = match budget {
+            Some(budget) => {
+                let cap = usize::try_from(file_len).map_err(|_| {
+                    memory_budget(budget.limit(), budget.used().saturating_add(file_len))
+                })?;
+                let mut guard = budget.reserve(file_len)?;
+                if cap > 0 {
+                    bytes.try_reserve_exact(cap).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+                    })?;
+                    guard.resize(bytes.capacity() as u64)?;
+                }
+                Some(guard)
+            }
+            None => None,
+        };
         let mut chunk = [0; 64 << 10];
         loop {
             check()?;
             #[cfg(test)]
             open_tests::observe(open_tests::Event::IndexReadAttempt);
             match file.read(&mut chunk) {
-                Ok(0) => return Ok(bytes),
+                Ok(0) => return Ok((bytes, guard)),
                 Ok(n) => {
-                    let next = (bytes.len() as u64).saturating_add(n as u64);
-                    if let Some(limit) = max_bytes
-                        && next > limit
-                    {
-                        return Err(memory_budget(limit, next));
+                    if bytes.capacity() - bytes.len() < n {
+                        let next_len = (bytes.len() as u64).saturating_add(n as u64);
+                        if let Some(guard) = guard.as_mut() {
+                            let old_cap = bytes.capacity() as u64;
+                            // Growing reallocates while holding both old and new buffers.
+                            guard.resize(old_cap.saturating_add(next_len))?;
+                            bytes.try_reserve_exact(n).map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+                            })?;
+                            guard.resize(bytes.capacity() as u64)?;
+                        } else {
+                            bytes.try_reserve(n).map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+                            })?;
+                        }
                     }
-                    bytes.try_reserve(n).map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
-                    })?;
                     bytes.extend_from_slice(&chunk[..n]);
                     #[cfg(test)]
                     open_tests::observe(open_tests::Event::IndexReadChunk);
@@ -1797,6 +2102,10 @@ impl ChangeLog {
         body.try_reserve_exact(len).map_err(|_| {
             Error::HistoryUnsupported("history-log record allocation was refused".into())
         })?;
+        if body.capacity() > len {
+            admit(8 + body.capacity() as u64)?;
+            check()?;
+        }
         let mut crc = flate2::Crc::new();
         while body.len() < len {
             check()?;
@@ -1817,7 +2126,7 @@ impl ChangeLog {
         if crc.sum() != expected_crc {
             return Err(damaged());
         }
-        let (r, held) = decode_admitted(&body, 8 + body.len() as u64, admit, check)?;
+        let (r, held) = decode_admitted(&body, 8 + body.capacity() as u64, admit, check)?;
         drop(body);
         admit(held)?;
         check()?;
@@ -2035,7 +2344,7 @@ impl ChangeLog {
         descending: bool,
         holes_after_stop: bool,
         no_wait: bool,
-        max_bytes: Option<u64>,
+        budget: Option<&MemoryBudget>,
         check: &mut dyn FnMut() -> Result<()>,
         mut paged: Option<&mut PageHooks<'_, '_>>,
         visit: &mut Visit<'_>,
@@ -2043,7 +2352,7 @@ impl ChangeLog {
         if let Some(reader) = &self.readonly {
             return reader.scan(from, to, filter, descending, check, visit);
         }
-        let checked = no_wait || paged.is_some() || max_bytes.is_some();
+        let checked = no_wait || paged.is_some() || budget.is_some();
         if checked {
             check()?;
         }
@@ -2056,41 +2365,50 @@ impl ChangeLog {
             check()?;
         }
         let mut holes: Vec<Unrecorded> = Vec::new();
+        let mut holes_guard = budget.map(MemoryBudget::guard);
         if from > to {
             return Ok(holes);
         }
         let Some(newest) = inner.last else {
-            holes.push(Unrecorded {
-                from,
-                to,
-                reason: UnrecordedReason::BeforeLog,
-            });
+            push_hole(
+                &mut holes,
+                holes_guard.as_mut(),
+                Unrecorded {
+                    from,
+                    to,
+                    reason: UnrecordedReason::BeforeLog,
+                },
+            )?;
             return Ok(holes);
         };
         let oldest = inner.segs.first().map_or(newest + 1, |s| s.first);
         if from < oldest {
-            holes.push(Unrecorded {
-                from,
-                to: to.min(oldest - 1),
-                reason: UnrecordedReason::BeforeLog,
-            });
+            push_hole(
+                &mut holes,
+                holes_guard.as_mut(),
+                Unrecorded {
+                    from,
+                    to: to.min(oldest - 1),
+                    reason: UnrecordedReason::BeforeLog,
+                },
+            )?;
         }
         if to > newest {
-            holes.push(Unrecorded {
-                from: from.max(newest + 1),
-                to,
-                reason: UnrecordedReason::Gap,
-            });
+            push_hole(
+                &mut holes,
+                holes_guard.as_mut(),
+                Unrecorded {
+                    from: from.max(newest + 1),
+                    to,
+                    reason: UnrecordedReason::Gap,
+                },
+            )?;
         }
         let hashes = filter.hashes();
         let n = inner.segs.len();
-        let order: Vec<usize> = if descending {
-            (0..n).rev().collect()
-        } else {
-            (0..n).collect()
-        };
         let mut stop = false;
-        'segs: for i in order {
+        'segs: for step in 0..n {
+            let i = if descending { n - 1 - step } else { step };
             if checked {
                 check()?;
             }
@@ -2102,11 +2420,15 @@ impl ChangeLog {
             if i > 0 && inner.segs[i - 1].last + 1 < sf {
                 let (a, b) = (inner.segs[i - 1].last + 1, sf - 1);
                 if a <= to && b >= from {
-                    holes.push(Unrecorded {
-                        from: a.max(from),
-                        to: b.min(to),
-                        reason: UnrecordedReason::Gap,
-                    });
+                    push_hole(
+                        &mut holes,
+                        holes_guard.as_mut(),
+                        Unrecorded {
+                            from: a.max(from),
+                            to: b.min(to),
+                            reason: UnrecordedReason::Gap,
+                        },
+                    )?;
                 }
             }
             // a full page stops before it loads the next segment's index; a commit is
@@ -2121,7 +2443,7 @@ impl ChangeLog {
                 break;
             }
             let ix = if checked {
-                self.index_with(&mut inner, i, Some(check), max_bytes)?
+                self.index_with(&mut inner, i, Some(check), budget)?
             } else {
                 self.index(&mut inner, i)?
             };
@@ -2141,55 +2463,185 @@ impl ChangeLog {
                     check()?;
                 }
                 if let Some((f, reason)) = r.hole {
-                    holes.push(Unrecorded {
-                        from: f.max(from),
-                        to: r.seq.min(to),
-                        reason,
-                    });
+                    push_hole(
+                        &mut holes,
+                        holes_guard.as_mut(),
+                        Unrecorded {
+                            from: f.max(from),
+                            to: r.seq.min(to),
+                            reason,
+                        },
+                    )?;
                 }
             }
             if stop {
                 continue;
             }
-            // the records that may match
-            let cands: Vec<u32> = match &hashes {
-                None => (lo as u32..hi as u32).collect(),
+            // Stream candidate ordinals without copying posting lists: short-circuit
+            // immediately if any constrained role has zero postings in lo..hi, and
+            // drive traversal from the smallest constrained role.
+            let mut cand_guard = budget.map(MemoryBudget::guard);
+            let mut cand_fixed_bytes = 0u64;
+            let (mut cands, other_roles) = match &hashes {
+                None => (
+                    CandidateStream::Range {
+                        lo: lo as u32,
+                        hi: hi as u32,
+                        descending,
+                    },
+                    Vec::new(),
+                ),
                 Some(roles) => {
-                    let mut acc: Option<Vec<u32>> = None;
-                    for hs in roles {
+                    let mut role_runs: Vec<Vec<PostingRun<'_>>> = Vec::new();
+                    if let Some(guard) = cand_guard.as_mut() {
+                        let outer = (roles.len() as u64)
+                            .saturating_mul(std::mem::size_of::<Vec<PostingRun<'_>>>() as u64);
+                        guard.resize(outer)?;
+                    }
+                    role_runs.try_reserve_exact(roles.len()).map_err(|_| {
+                        Error::HistoryUnsupported(
+                            "history candidate role allocation was refused".into(),
+                        )
+                    })?;
+                    if let Some(guard) = cand_guard.as_mut() {
+                        cand_fixed_bytes = (role_runs.capacity() as u64)
+                            .saturating_mul(std::mem::size_of::<Vec<PostingRun<'_>>>() as u64);
+                        guard.resize(cand_fixed_bytes)?;
+                    }
+                    let mut drive_idx = 0usize;
+                    let mut drive_count = usize::MAX;
+                    let mut empty_role = false;
+                    for (role_i, hs) in roles.iter().enumerate() {
                         if checked {
                             check()?;
                         }
-                        let mut v = Vec::new();
-                        for h in hs {
-                            if checked {
+                        let mut runs: Vec<PostingRun<'_>> = Vec::new();
+                        let mut count = 0usize;
+                        for (h_i, &h) in hs.iter().enumerate() {
+                            if checked && h_i != 0 && h_i.is_multiple_of(CHECK_STRIDE) {
                                 check()?;
                             }
-                            ix.lookup(*h, &mut v);
+                            for run in ix.runs_in_range(h, lo as u32, hi as u32) {
+                                if !run.is_empty() {
+                                    count = count.saturating_add(run.len());
+                                    if runs.len() == runs.capacity() {
+                                        let size = std::mem::size_of::<PostingRun<'_>>() as u64;
+                                        let old = (runs.capacity() as u64).saturating_mul(size);
+                                        let more = runs.capacity().max(4);
+                                        let new = (runs.capacity().saturating_add(more) as u64)
+                                            .saturating_mul(size);
+                                        if let Some(guard) = cand_guard.as_mut() {
+                                            guard.resize(
+                                                cand_fixed_bytes
+                                                    .saturating_add(old)
+                                                    .saturating_add(new),
+                                            )?;
+                                        }
+                                        runs.try_reserve_exact(more).map_err(|_| {
+                                            Error::HistoryUnsupported(
+                                                "history candidate cursor allocation was refused"
+                                                    .into(),
+                                            )
+                                        })?;
+                                        if let Some(guard) = cand_guard.as_mut() {
+                                            let actual =
+                                                (runs.capacity() as u64).saturating_mul(size);
+                                            guard
+                                                .resize(cand_fixed_bytes.saturating_add(actual))?;
+                                        }
+                                    }
+                                    runs.push(run);
+                                }
+                            }
                         }
-                        v.retain(|&o| (lo as u32..hi as u32).contains(&o));
-                        v.sort_unstable();
-                        v.dedup();
-                        if checked {
-                            check()?;
+                        if count == 0 {
+                            empty_role = true;
+                            break;
                         }
-                        acc = Some(match acc {
-                            None => v,
-                            Some(a) => a
-                                .into_iter()
-                                .filter(|o| v.binary_search(o).is_ok())
-                                .collect(),
-                        });
+                        cand_fixed_bytes = cand_fixed_bytes.saturating_add(
+                            (runs.capacity() as u64)
+                                .saturating_mul(std::mem::size_of::<PostingRun<'_>>() as u64),
+                        );
+                        if count < drive_count {
+                            drive_count = count;
+                            drive_idx = role_i;
+                        }
+                        role_runs.push(runs);
                     }
-                    acc.unwrap_or_default()
+                    if empty_role {
+                        continue 'segs;
+                    }
+                    let mut drive_runs = role_runs.swap_remove(drive_idx);
+                    let stream = if drive_runs.len() == 1 {
+                        CandidateStream::Single {
+                            run: drive_runs[0],
+                            descending,
+                        }
+                    } else {
+                        let mut entries: Vec<(u32, usize)> = Vec::new();
+                        let entry_size = std::mem::size_of::<(u32, usize)>() as u64;
+                        if let Some(guard) = cand_guard.as_mut() {
+                            let need = (drive_runs.len() as u64).saturating_mul(entry_size);
+                            guard.resize(cand_fixed_bytes.saturating_add(need))?;
+                        }
+                        entries.try_reserve_exact(drive_runs.len()).map_err(|_| {
+                            Error::HistoryUnsupported(
+                                "history candidate heap allocation was refused".into(),
+                            )
+                        })?;
+                        if let Some(guard) = cand_guard.as_mut() {
+                            let actual = (entries.capacity() as u64).saturating_mul(entry_size);
+                            guard.resize(cand_fixed_bytes.saturating_add(actual))?;
+                        }
+                        for (idx, run) in drive_runs.iter_mut().enumerate() {
+                            if checked && idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                                check()?;
+                            }
+                            if let Some(ord) = run.pop(descending) {
+                                let key = if descending { ord } else { u32::MAX - ord };
+                                entries.push((key, idx));
+                            }
+                        }
+                        CandidateStream::Merge {
+                            runs: drive_runs,
+                            heap: std::collections::BinaryHeap::from(entries),
+                            descending,
+                            last: None,
+                        }
+                    };
+                    (stream, role_runs)
                 }
             };
-            let iter: Box<dyn Iterator<Item = &u32>> = if descending {
-                Box::new(cands.iter().rev())
-            } else {
-                Box::new(cands.iter())
-            };
-            for &o in iter {
+            let mut cand_steps = 0usize;
+            while let Some(o) = cands.next_ord(checked, check)? {
+                if checked && cand_steps.is_multiple_of(CHECK_STRIDE) {
+                    #[cfg(feature = "failpoints")]
+                    observe_changelog_read(ChangeLogReadEvent::CandidateCheck);
+                    check()?;
+                }
+                cand_steps += 1;
+                if !other_roles.is_empty() {
+                    let mut matched = true;
+                    for other in &other_roles {
+                        let mut hit = false;
+                        for (r_idx, run) in other.iter().enumerate() {
+                            if checked && r_idx != 0 && r_idx.is_multiple_of(CHECK_STRIDE) {
+                                check()?;
+                            }
+                            if run.contains(o) {
+                                hit = true;
+                                break;
+                            }
+                        }
+                        if !hit {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        continue;
+                    }
+                }
                 check()?;
                 let e = ix.recs[o as usize];
                 if e.hole.is_some() {
@@ -2201,14 +2653,13 @@ impl ChangeLog {
                     stop = true;
                     break;
                 }
+                let mut record_guard = budget.map(MemoryBudget::guard);
                 let record = match paged.as_deref_mut() {
                     Some(p) => self.read_admitted(&inner, i, e.offset, p.admit, check)?,
                     None if checked => {
                         let mut admit = |bytes: u64| {
-                            if let Some(limit) = max_bytes
-                                && bytes > limit
-                            {
-                                Err(memory_budget(limit, bytes))
+                            if let Some(guard) = record_guard.as_mut() {
+                                guard.resize(bytes)
                             } else {
                                 Ok(())
                             }
@@ -2235,6 +2686,7 @@ impl ChangeLog {
                     }
                 }
                 drop(record);
+                drop(record_guard);
                 if let Some(p) = paged.as_deref_mut() {
                     (p.admit)(0)?;
                     check()?;
@@ -2246,11 +2698,14 @@ impl ChangeLog {
                     break;
                 }
             }
+            drop(cands);
+            drop(other_roles);
+            drop(cand_guard);
             if stop && !holes_after_stop {
                 break;
             }
         }
-        holes.sort_by_key(|h| h.from);
+        holes.sort_unstable_by_key(|h| (h.from, h.reason as u8, h.to));
         // a hole reported twice (a gap past the end and a gap record) is merged
         holes.dedup_by(|b, a| {
             if a.reason == b.reason && b.from <= a.to + 1 {
@@ -3561,5 +4016,531 @@ mod settings_format_tests {
             assert_eq!(res.changes.len(), 1, "no_wait={no_wait}");
             assert_eq!(res.changes[0].commit.seq, head, "no_wait={no_wait}");
         }
+    }
+
+    #[test]
+    fn cold_sidecar_capacity_and_overlap_memory_budget() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::rc::Rc;
+
+        // 1. Direct spare-capacity check: b.len() + decoded fits limit, while
+        //    b.capacity() + decoded exceeds limit.
+        let dataset_id = uuid::Uuid::new_v4();
+        let mut synth = SegIndex::default();
+        synth.recs.push(RecEntry {
+            seq: 1,
+            offset: SEG_HEADER as u64,
+            ts: 1,
+            hole: None,
+        });
+        for i in 0..4_000u64 {
+            synth.postings.push((i + 1, 0));
+        }
+        let encoded = synth.encode(dataset_id, 1, 1);
+        let decoded_bytes = arc_slice_bytes(std::mem::size_of::<SegIndex>())
+            + std::mem::size_of::<RecEntry>() as u64
+            + 4_000u64 * std::mem::size_of::<(u64, u32)>() as u64;
+        let mut raw_with_spare = Vec::with_capacity(encoded.len() + (64 << 10));
+        raw_with_spare.extend_from_slice(&encoded);
+        assert!(raw_with_spare.capacity() >= raw_with_spare.len() + (64 << 10));
+        let spare_limit = raw_with_spare.len() as u64 + decoded_bytes + 4096;
+        assert!(
+            raw_with_spare.capacity() as u64 + decoded_bytes > spare_limit,
+            "spare capacity must push total past spare_limit"
+        );
+        let decoded_events = Rc::new(Cell::new(0usize));
+        let witness = decoded_events.clone();
+        let observer = open_tests::Observe::new(move |event| {
+            if event == open_tests::Event::IndexRecords {
+                witness.set(witness.get() + 1);
+            }
+        });
+        let budget = MemoryBudget::new(spare_limit);
+        let _raw_guard = budget.reserve(raw_with_spare.capacity() as u64).unwrap();
+        let res = SegIndex::decode_with(&raw_with_spare, dataset_id, None, Some(&budget));
+        drop(observer);
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(_))),
+            "expected spare-capacity rejection, got {:?}",
+            res.as_ref().err()
+        );
+        assert_eq!(
+            decoded_events.get(),
+            0,
+            "allocated index records despite capacity overrun"
+        );
+        drop(_raw_guard);
+        assert_eq!(budget.used(), 0);
+
+        let exact_budget = MemoryBudget::new(raw_with_spare.capacity() as u64 + decoded_bytes);
+        let _raw_guard = exact_budget
+            .reserve(raw_with_spare.capacity() as u64)
+            .unwrap();
+        assert!(
+            SegIndex::decode_with(&raw_with_spare, dataset_id, None, Some(&exact_budget))
+                .unwrap()
+                .is_some()
+        );
+        drop(_raw_guard);
+        assert_eq!(exact_budget.used(), 0);
+
+        // 2. End-to-end persistent store:
+        //    - Segment 0 (commit 1): matching ~96 KiB literal for <urn:overlap>
+        //    - Segment 1 (commit 2): 6,000 triples -> cold .idx > 128 KiB
+        //    - Segment 2 (commit 3): second matching ~96 KiB literal for <urn:overlap>
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 4096,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts).unwrap();
+        store.change_log().unwrap().set_background(false);
+
+        let payload_a = "a".repeat(96 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:overlap> <urn:p> \"{payload_a}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c1 = store.head_commit().seq;
+
+        let mut triples = String::new();
+        use std::fmt::Write as _;
+        for i in 0..6_000 {
+            writeln!(&mut triples, "<urn:cap{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c2 = store.head_commit().seq;
+
+        let payload_b = "b".repeat(96 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:overlap> <urn:p> \"{payload_b}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let c3 = store.head_commit().seq;
+
+        let log = store.change_log().unwrap().clone();
+        let (seg1_idx_path, seg1_idx_len) = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs.len() >= 3);
+            assert!(inner.segs[1].sealed);
+            inner.cache.clear();
+            let path = inner.segs[1].idx_path().unwrap();
+            let len = path.metadata().unwrap().len();
+            (path, len)
+        };
+        assert!(
+            seg1_idx_len > (128 << 10),
+            "expected cold .idx > 128 KiB (non-power-of-two growth test), got {seg1_idx_len}"
+        );
+
+        // 2a. read_index_checked reserves exact capacity without geometric 2x jump past idx_len.
+        let exact_raw_budget = MemoryBudget::new(seg1_idx_len);
+        let (raw_bytes, raw_guard) =
+            ChangeLog::read_index_checked(&seg1_idx_path, &mut || Ok(()), Some(&exact_raw_budget))
+                .unwrap();
+        assert_eq!(raw_bytes.len() as u64, seg1_idx_len);
+        assert!(raw_bytes.capacity() as u64 <= seg1_idx_len);
+        let seg1_decoded_bytes = {
+            let (_, _, ix) = SegIndex::decode(&raw_bytes, log.dataset_id).unwrap();
+            arc_slice_bytes(std::mem::size_of::<SegIndex>())
+                + (ix.recs.len() as u64) * (std::mem::size_of::<RecEntry>() as u64)
+                + (ix.postings.len() as u64) * (std::mem::size_of::<(u64, u32)>() as u64)
+        };
+        drop(raw_bytes);
+        drop(raw_guard);
+        assert_eq!(exact_raw_budget.used(), 0);
+
+        // 2b. Cold sidecar whose file length fits limit, while raw capacity + decoded exceeds limit.
+        let len_only_limit = seg1_idx_len + 16_384;
+        assert!(seg1_idx_len + seg1_decoded_bytes > len_only_limit);
+        for no_wait in [true, false] {
+            log.inner.lock().cache.clear();
+            let stats = Rc::new(Cell::new((0usize, 0usize)));
+            let witness = stats.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                let (mut chunks, mut decodes) = witness.get();
+                match event {
+                    open_tests::Event::IndexReadChunk => chunks += 1,
+                    open_tests::Event::IndexRecords => decodes += 1,
+                    _ => {}
+                }
+                witness.set((chunks, decodes));
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(c2)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, len_only_limit)
+            } else {
+                store.published_history_changes(&q, len_only_limit)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: {res:?}"
+            );
+            let (chunks, decodes) = stats.get();
+            assert!(
+                chunks > 0,
+                "no_wait={no_wait}: file length fit limit so raw read should proceed"
+            );
+            assert_eq!(
+                decodes, 0,
+                "no_wait={no_wait}: decoded index must be rejected before allocating entries"
+            );
+            assert!(log.inner.lock().cache.is_empty());
+        }
+
+        // 2c. Live overlap between accumulated results (commit 1) and cold index load (commit 2).
+        let overlap_idx_limit = seg1_idx_len + seg1_decoded_bytes + (32 << 10);
+        for no_wait in [true, false] {
+            // Segment 1 alone fits overlap_idx_limit.
+            log.inner.lock().cache.clear();
+            let q_only_c2 = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                from: Some(HistoryBound::Commit(c2)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let solo = if no_wait {
+                store.try_published_history_changes(&q_only_c2, overlap_idx_limit)
+            } else {
+                store.published_history_changes(&q_only_c2, overlap_idx_limit)
+            }
+            .unwrap();
+            assert!(solo.changes.is_empty());
+
+            // Segment 0 (~96 KiB result) + cold Segment 1 index exceeds overlap_idx_limit.
+            log.inner.lock().cache.clear();
+            let q_c1_c2 = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c2)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q_c1_c2, overlap_idx_limit)
+            } else {
+                store.published_history_changes(&q_c1_c2, overlap_idx_limit)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: expected accumulated-result + cold-index overlap refusal, got {res:?}"
+            );
+        }
+
+        // 2d. Live overlap between accumulated results (commit 1) and record read (commit 3)
+        //     with warm indexes so no cold index load intervenes.
+        //     Single commit peak is ~201 KiB (frame + decoded or decoded + result);
+        //     overlapping commit 1 result (~96 KiB) with commit 3 read (~193 KiB) peaks near 297 KiB.
+        let single_record_limit = 240 << 10;
+        for no_wait in [true, false] {
+            // Warm all segment indexes first.
+            let warm_q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c3)),
+                ..Default::default()
+            };
+            store.published_history_changes(&warm_q, 16 << 20).unwrap();
+
+            // Commit 1 alone and commit 3 alone each fit single_record_limit.
+            for seq in [c1, c3] {
+                let q_one = HistoryQuery {
+                    subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                    from: Some(HistoryBound::Commit(seq)),
+                    to: Some(HistoryBound::Commit(seq)),
+                    ..Default::default()
+                };
+                let ok = if no_wait {
+                    store.try_published_history_changes(&q_one, single_record_limit)
+                } else {
+                    store.published_history_changes(&q_one, single_record_limit)
+                }
+                .unwrap();
+                assert_eq!(ok.changes.len(), 1);
+            }
+
+            // Combined commit 1..=3 overflows when commit 1's live results overlap commit 3's read.
+            let q_both = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:overlap"))],
+                from: Some(HistoryBound::Commit(c1)),
+                to: Some(HistoryBound::Commit(c3)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q_both, single_record_limit)
+            } else {
+                store.published_history_changes(&q_both, single_record_limit)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: expected accumulated-result + record overlap refusal, got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warm_segment_candidate_traversal_short_circuits_and_polls() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+
+        let store = Store::in_memory(StoreOptions {
+            change_log_segment_bytes: 64 << 20,
+            ..Default::default()
+        });
+        let log = store.change_log().unwrap().clone();
+        log.set_background(false);
+
+        // Populate one warm/live segment directly so we get > CHECK_STRIDE commits quickly:
+        // - 1,200 commits with rdf:type
+        // - 1,100 commits with <urn:sparse> and <urn:other> (none with rdf:type)
+        // - 1 commit with <urn:hit> and rdf:type
+        let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+        let hold_sets = NamedNode::new_unchecked("urn:x-sparkles:evidence:sourceHoldSets");
+        let other_pred = NamedNode::new_unchecked("urn:other");
+        let rdf_type_key: Arc<[u8]> = Arc::from(id::iri_key(rdf_type.as_str()));
+        let other_pred_key: Arc<[u8]> = Arc::from(id::iri_key(other_pred.as_str()));
+        let sparse_key: Arc<[u8]> = Arc::from(id::iri_key("urn:sparse"));
+        let hit_key: Arc<[u8]> = Arc::from(id::iri_key("urn:hit"));
+        let thing_key: Arc<[u8]> = Arc::from(id::iri_key("urn:Thing"));
+        let default_g: Arc<[u8]> = Arc::from(&[][..]);
+
+        let make_commit = |seq: u64| {
+            Arc::new(ChangeCommit {
+                seq,
+                timestamp_ms: seq as i64,
+                kind: CommitKind::Update,
+                bulk: false,
+                inserted: 1,
+                deleted: 0,
+                author: None,
+                message: None,
+            })
+        };
+
+        let mut seq = 0u64;
+        {
+            let mut inner = log.inner.lock();
+            for i in 0..1_200u64 {
+                seq += 1;
+                let s: Arc<[u8]> = Arc::from(id::iri_key(&format!("urn:noise:{i}")));
+                let q: QuadKey = [
+                    default_g.clone(),
+                    s,
+                    rdf_type_key.clone(),
+                    thing_key.clone(),
+                ];
+                log.append(
+                    &mut inner,
+                    Record::Changes(make_commit(seq), vec![(true, q)]),
+                )
+                .unwrap();
+            }
+            for i in 0..1_100u64 {
+                seq += 1;
+                let o: Arc<[u8]> = Arc::from(id::iri_key(&format!("urn:val:{i}")));
+                let q: QuadKey = [
+                    default_g.clone(),
+                    sparse_key.clone(),
+                    other_pred_key.clone(),
+                    o,
+                ];
+                log.append(
+                    &mut inner,
+                    Record::Changes(make_commit(seq), vec![(true, q)]),
+                )
+                .unwrap();
+            }
+            seq += 1;
+            let hit_q: QuadKey = [
+                default_g.clone(),
+                hit_key.clone(),
+                rdf_type_key.clone(),
+                thing_key.clone(),
+            ];
+            log.append(
+                &mut inner,
+                Record::Changes(make_commit(seq), vec![(true, hit_q)]),
+            )
+            .unwrap();
+            assert_eq!(inner.segs.len(), 1);
+            assert!(inner.segs[0].index.is_some());
+        }
+        let hit_seq = seq;
+
+        // 1. Missing subject with frequent rdf:type short-circuits with tiny max_bytes
+        //    (far below the ~4,800 bytes copying 1,200 rdf:type postings would require).
+        for descending in [false, true] {
+            let filter = LogFilter {
+                keys: [
+                    None,
+                    Some(vec![id::iri_key("urn:missing")]),
+                    Some(vec![
+                        id::iri_key(rdf_type.as_str()),
+                        id::iri_key(hold_sets.as_str()),
+                    ]),
+                    None,
+                ],
+            };
+            let budget = MemoryBudget::new(256);
+            let mut visited = 0usize;
+            let holes = log
+                .scan(
+                    1,
+                    hit_seq,
+                    &filter,
+                    descending,
+                    true,
+                    true,
+                    Some(&budget),
+                    &mut || Ok(()),
+                    None,
+                    &mut |_, _, _| {
+                        visited += 1;
+                        Ok(true)
+                    },
+                )
+                .unwrap();
+            assert!(holes.is_empty());
+            assert_eq!(visited, 0);
+            assert_eq!(budget.used(), 0);
+        }
+
+        // 2. Sparse matching subject with frequent rdf:type drives from the subject role
+        //    without copying rdf:type's 1,200 postings.
+        for descending in [false, true] {
+            let filter = LogFilter {
+                keys: [
+                    None,
+                    Some(vec![id::iri_key("urn:hit")]),
+                    Some(vec![
+                        id::iri_key(rdf_type.as_str()),
+                        id::iri_key(hold_sets.as_str()),
+                    ]),
+                    None,
+                ],
+            };
+            let budget = MemoryBudget::new(2048);
+            let mut found = Vec::new();
+            log.scan(
+                1,
+                hit_seq,
+                &filter,
+                descending,
+                true,
+                true,
+                Some(&budget),
+                &mut || Ok(()),
+                None,
+                &mut |c, _, _| {
+                    found.push(c.seq);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(found, [hit_seq]);
+            assert_eq!(budget.used(), 0);
+        }
+
+        // 3. Multi-run merge across two predicates matches unfiltered order both ways.
+        for descending in [false, true] {
+            let filter = LogFilter {
+                keys: [
+                    None,
+                    None,
+                    Some(vec![
+                        id::iri_key(rdf_type.as_str()),
+                        id::iri_key(other_pred.as_str()),
+                    ]),
+                    None,
+                ],
+            };
+            let mut merged = Vec::new();
+            log.scan(
+                1_195,
+                1_210,
+                &filter,
+                descending,
+                true,
+                true,
+                Some(&MemoryBudget::new(1 << 20)),
+                &mut || Ok(()),
+                None,
+                &mut |c, _, _| {
+                    merged.push(c.seq);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            let mut expected: Vec<u64> = (1_195..=1_210).collect();
+            if descending {
+                expected.reverse();
+            }
+            assert_eq!(merged, expected, "descending={descending}");
+        }
+
+        // 4. Cooperative polling inside candidate traversal stops at CHECK_STRIDE
+        //    even when no record matches.
+        let filter = LogFilter {
+            keys: [
+                None,
+                Some(vec![id::iri_key("urn:sparse")]),
+                Some(vec![
+                    id::iri_key(rdf_type.as_str()),
+                    id::iri_key(hold_sets.as_str()),
+                ]),
+                None,
+            ],
+        };
+        let mut polls = 0usize;
+        let res = log.scan(
+            1,
+            hit_seq,
+            &filter,
+            false,
+            true,
+            true,
+            Some(&MemoryBudget::new(4096)),
+            &mut || {
+                polls += 1;
+                // Polls before candidate loop: entry, post-lock, seg, role0, role1,
+                // then steps==0, then steps==CHECK_STRIDE. Cancel on the 2nd traversal poll.
+                if polls >= 7 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            None,
+            &mut |_, _, _| Ok(true),
+        );
+        assert!(matches!(res, Err(Error::Cancelled)), "{res:?}");
+        assert_eq!(polls, 7);
+
+        // Also exercise published_history_changes against the real HistoryQuery wrapper.
+        let q = HistoryQuery {
+            subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+            predicates: vec![rdf_type, hold_sets],
+            from: Some(HistoryBound::Commit(1)),
+            to: Some(HistoryBound::Commit(hit_seq)),
+            ..Default::default()
+        };
+        let res = log.query_with(&q, hit_seq, true, Some(256)).unwrap();
+        assert!(res.changes.is_empty());
     }
 }
