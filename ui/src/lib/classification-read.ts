@@ -79,7 +79,7 @@ export type KeptClassification = {
     iri: string;
     present: boolean;
     unsatisfiable: boolean | null;
-    incomplete?: boolean | null;
+    incomplete: boolean | null;
     representative?: string | null;
     equivalenceCount?: number | null;
     children?: number | null;

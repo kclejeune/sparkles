@@ -48,7 +48,7 @@ function available(overrides: Partial<KeptClassification> = {}): KeptClassificat
       incompleteCount: 0,
       unmappedCount: 0,
     },
-    entity: { iri: 'urn:A', present: true, unsatisfiable: false },
+    entity: { iri: 'urn:A', present: true, unsatisfiable: false, incomplete: false },
     activity: null,
     staleCommit: null,
     page: null,
@@ -316,5 +316,32 @@ describe('one pinned class frame', () => {
       incomplete: true,
     });
     expect(controller.parts.parents.items).toEqual([name('urn:Parent')]);
+  });
+  it('keeps per-class incomplete on a retained finished result across refresh and language change', async () => {
+    const retainedIncomplete = {
+      outcome: {
+        tier: 'el' as const,
+        partial: false,
+        complete: false,
+        consistency: 'unknown' as const,
+        excludedCount: 1,
+        incompleteCount: 2,
+        unmappedCount: 0,
+      },
+      entity: { iri: 'urn:A', present: true, unsatisfiable: false, incomplete: true },
+    };
+    const calls = server((c) => page(c, retainedIncomplete));
+    const controller = new ClassificationFrame();
+    await controller.reset(view);
+    expect(controller.reply?.outcome?.partial).toBe(false);
+    expect(controller.reply?.outcome?.complete).toBe(false);
+    expect(controller.reply?.entity?.incomplete).toBe(true);
+    await controller.refresh();
+    expect(controller.reply?.outcome?.partial).toBe(false);
+    expect(controller.reply?.entity?.incomplete).toBe(true);
+    await controller.reset({ ...view, languages: ['fr'] });
+    expect(controller.reply?.outcome?.partial).toBe(false);
+    expect(controller.reply?.entity?.incomplete).toBe(true);
+    expect(calls.every((c) => c.init.method !== 'POST')).toBe(true);
   });
 });

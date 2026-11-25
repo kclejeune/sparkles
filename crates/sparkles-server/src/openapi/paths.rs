@@ -840,9 +840,10 @@ fn ontology(p: &mut Paths) {
             )
             .resp(
                 "200",
-                "The classification, with the receipt when a write asked for one.",
+                "The classification, or the receipt-bearing classification under `application/x-sparkles+json` when a `target` write asks for a receipt.",
                 Some(json!({
                     "application/json": { "schema": { "oneOf": [sref("OntologyClassification"), sref("OntologyFrameClassification")] } },
+                    "application/x-sparkles+json": { "schema": sref("OntologyClassificationReceipt") },
                     "text/owl-functional": { "schema": { "type": "string" } }
                 })),
             )

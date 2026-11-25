@@ -631,6 +631,7 @@ class OntologyTest {
                         return@use false
                     } finally {
                         canceller.interrupt()
+                        canceller.join()
                     }
                     answered++
                     assertEquals(full.getNumber("classes"), r.getNumber("classes"))

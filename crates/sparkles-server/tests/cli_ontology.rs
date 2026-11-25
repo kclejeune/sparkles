@@ -510,6 +510,7 @@ fn classify_answers_in_part_under_a_deadline() {
         / 1000.0;
     let limit = ((took * 20000.0) as u64).max(2000);
     let saw_partial_text = std::cell::Cell::new(false);
+    let answered = std::cell::Cell::new(0usize);
     let run_text = |ms: u64| -> bool {
         let timeout = format!("{}", ms as f64 / 1000.0);
         let o = sparkles(
@@ -540,10 +541,15 @@ fn classify_answers_in_part_under_a_deadline() {
                     "{text}"
                 );
             }
+            answered.set(answered.get() + 1);
             saw_partial_text.set(true);
             return true;
         }
-        o.status.code() == Some(0)
+        if o.status.code() == Some(0) {
+            answered.set(answered.get() + 1);
+            return true;
+        }
+        false
     };
     let after = |ms: u64| ms + (ms * 8 / 100).max(1);
     let (mut lo, mut ms) = (0u64, 2u64);
@@ -559,6 +565,10 @@ fn classify_answers_in_part_under_a_deadline() {
         } else {
             lo = mid;
         }
+    }
+    while !saw_partial_text.get() && answered.get() < 20 && ms < limit {
+        ms = after(ms);
+        run_text(ms);
     }
     assert!(
         saw_partial_text.get(),
@@ -628,6 +638,7 @@ fn a_classification_that_leaves_an_axiom_out_is_incomplete_or_refused() {
             "text",
         ],
     );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert!(
         out(&o).contains("incomplete http://example.org/irl#K"),
         "{}",

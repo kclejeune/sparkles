@@ -744,7 +744,7 @@ export interface OntologyClassification extends OntologyState {
   class?: OntologyTaxonomyNode & {
     iri: string;
     unsatisfiable: boolean;
-    incomplete?: boolean;
+    incomplete: boolean;
     childClasses: string[];
     superClasses: string[];
   };

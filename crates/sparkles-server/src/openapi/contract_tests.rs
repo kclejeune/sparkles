@@ -158,6 +158,7 @@ async fn kept_classification_and_projection_responses_match_typed_schemas() {
     )
     .await;
     assert_eq!(status["status"], "available");
+    assert_eq!(status["entity"]["incomplete"], false);
     for part in ["parents", "equivalents", "sources", "excluded"] {
         let about = if matches!(part, "parents" | "equivalents") {
             "&about=urn%3AA"
@@ -174,6 +175,36 @@ async fn kept_classification_and_projection_responses_match_typed_schemas() {
         )
         .await;
     }
+    let full = checked(
+        &doc,
+        &app,
+        "POST",
+        "/$/ontology/{ds}/classify",
+        "/$/ontology/kept/classify",
+        Some(json!({"about":"urn:A","nodes":true,"limit":10})),
+    )
+    .await;
+    assert_eq!(full["class"]["incomplete"], false);
+    assert!(full["nodes"].is_array());
+    assert!(full["stats"]["unmapped"].is_u64());
+    let (code, receipt_body) = call_as(
+        &app,
+        "POST",
+        "/$/ontology/kept/classify?receipt=true",
+        Some(json!({"target":"urn:kept:tax","about":"urn:A"})),
+        Some("application/x-sparkles+json"),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{receipt_body}");
+    let receipt_schema = &doc["paths"]["/$/ontology/{ds}/classify"]["post"]["responses"]["200"]["content"]
+        ["application/x-sparkles+json"]["schema"];
+    assert_eq!(
+        mismatch(&doc, receipt_schema, &receipt_body, "$"),
+        None,
+        "{receipt_body}"
+    );
+    assert!(receipt_body["commit"].is_object());
+    assert!(receipt_body["written"]["committed"].is_boolean());
 }
 
 #[test]

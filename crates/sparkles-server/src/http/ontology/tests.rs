@@ -855,6 +855,9 @@ async fn kept_classification_get_is_fresh_read_only_and_pins_pages() {
     )
     .await;
     assert_eq!(parents.status, StatusCode::OK, "{}", parents.text());
+    assert_eq!(parents.json()["outcome"]["partial"], false);
+    assert_eq!(parents.json()["entity"]["present"], true);
+    assert_eq!(parents.json()["entity"]["incomplete"], true);
     assert_eq!(
         parents.json()["page"]["items"][0]["iri"],
         "http://ex.org/Person"
@@ -876,6 +879,7 @@ async fn kept_classification_get_is_fresh_read_only_and_pins_pages() {
     )
     .await;
     assert_eq!(missing.json()["entity"]["present"], false);
+    assert!(missing.json()["entity"]["incomplete"].is_null());
 }
 
 #[tokio::test]

@@ -2268,8 +2268,11 @@ options. A DL query may advance the mutable saturation without relabeling a prev
 published result. `outcome` gives the actual tier, consistency, partial and completeness flags
 and excluded, incomplete and unmapped counts. Unknown outcomes are null. A completed run with exclusions
 or unmapped triples has `partial: false` and `complete: false`. Stopped partial taxonomies are never retained.
-An available result with an unknown class returns `entity.present: false`, not an empty
-inference success.
+An available result with an unknown class returns `entity.present: false`, with
+`entity.unsatisfiable` and `entity.incomplete` set to null, not an empty inference success.
+For a present class, `entity.incomplete` reports whether that class is in the retained
+classification's incomplete set and may miss inferred clauses because excluded axioms or
+unmapped triples could affect it.
 
 `part` is `status` by default, or `parents`, `children`, `roots`, `equivalents`, `sources`
 or `excluded`. `about` is an absolute named-class IRI, required for parents, children and
@@ -2308,13 +2311,15 @@ read, classification, write flush or cache warming. A live dataset with `Ontolog
 reads a retained committed view on its bound branch. Full wrapper-source integration
 remains in item 588; legacy ontology methods keep their existing behavior.
 
-`POST /$/ontology/{ds}/classify` classifies the ontology by OWL 2 EL, in the manner of
-the ELK reasoner. It takes `graph`, `imports` and `mode` in the body and `at` as a query
-parameter, and answers the inferred class hierarchy and the unsatisfiable classes.
+`POST /$/ontology/{ds}/classify` classifies the ontology's terminology, choosing the OWL 2 EL,
+Horn or disjunctive rules that the axioms need. It takes `graph`, `imports` and `mode` in the
+body and `at` as a query parameter, and answers the inferred class hierarchy and the
+unsatisfiable classes.
 An optional `projection: "frame"` requires a valid `about` and returns bounded direct
 parents, equivalents, source/warning samples and exclusion samples with totals and
 truncation flags, exact immutable result/source identity, outcome and `frame.incomplete`
-to report whether the queried class remained open and may miss inferred clauses. `limit` is from
+to report whether the queried class is in the incomplete set and may miss inferred clauses
+because the run stopped early or excluded axioms or unmapped triples could affect it. `limit` is from
 1 to 1,000 for this projection. It branches before constructing legacy ancestor or
 whole-equivalence arrays. It accepts harmless `nodes: false`, null/zero offset and null
 target defaults, but refuses `nodes: true`, nonzero offset, an effective write target or
@@ -2353,12 +2358,16 @@ in `incomplete` and a consistent verdict `unknown` until the ontology is classif
 `assertions: true`. `strict: true` in the body or query string refuses an incomplete
 answer with `422` and code `classification-incomplete`, naming the left-out axioms and any
 unmapped triples, before writing a target graph.
+
 The answer counts the classes, the nodes of the taxonomy, the unsatisfiable classes and
 the excluded axioms, lists at most `limit` of the last two, 100 by default and at most
 10,000, and gives the times of the run under `stats`. `about` names a class and answers
 its node under `class`, with its equivalent classes, direct superclasses and subclasses,
 all its superclasses and `incomplete` to report whether that class is in the incomplete set
-even when `limit` truncates the top-level `incomplete` list. An unsatisfiable class is a subclass of every class, so its
+and may miss inferred clauses because the run stopped early or excluded axioms or unmapped
+triples could affect it, even when `limit` truncates the top-level `incomplete` list.
+
+An unsatisfiable class is a subclass of every class, so its
 node lists no superclasses and `unsatisfiable` is true. An `about` class that the
 taxonomy does not have is `404`, and a run that would write then writes nothing.
 `nodes: true` lists the taxonomy's nodes, `limit` from `offset`, each with its classes

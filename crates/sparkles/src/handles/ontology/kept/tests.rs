@@ -1460,3 +1460,65 @@ fn a_stopped_coverage_pass_keeps_the_saturation_and_publishes_nothing() {
         .unwrap();
     assert!(third.reused);
 }
+
+#[test]
+fn kept_entity_status_reports_per_class_incomplete_on_retained_finished_result() {
+    // An unread assertion leaves the terminology-only run finished (`partial: false`)
+    // and retained (`complete_for_taken: true`), while marking classes incomplete.
+    let dataset = ds(":A a owl:Class ; rdfs:subClassOf :B . :B a owl:Class . :a a :A .");
+    let c = dataset
+        .ontology()
+        .classify(&req(), &ClassifyRequest::default(), &opts())
+        .unwrap();
+    assert!(c.retained);
+    assert!(c.classification.complete_for_taken);
+    assert!(!c.complete());
+
+    let read_a = read(
+        &dataset,
+        &req(),
+        &KeptQuery {
+            about: Some("http://ex.org/A".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(read_a.status, Status::Available);
+    let outcome = read_a.outcome.as_ref().unwrap();
+    assert!(!outcome.partial);
+    assert!(!outcome.complete);
+    assert_eq!(outcome.excluded_count, 1);
+    let entity_a = read_a.entity.as_ref().unwrap();
+    assert!(entity_a.present);
+    assert_eq!(entity_a.incomplete, Some(true));
+
+    let read_missing = read(
+        &dataset,
+        &req(),
+        &KeptQuery {
+            about: Some("http://ex.org/Missing".into()),
+            ..Default::default()
+        },
+    );
+    let entity_missing = read_missing.entity.as_ref().unwrap();
+    assert!(!entity_missing.present);
+    assert_eq!(entity_missing.incomplete, None);
+
+    // A complete classification retains `incomplete: Some(false)` for present classes.
+    let clean = ds(":A a owl:Class ; rdfs:subClassOf :B . :B a owl:Class .");
+    let done = clean
+        .ontology()
+        .classify(&req(), &ClassifyRequest::default(), &opts())
+        .unwrap();
+    assert!(done.retained && done.complete());
+    let read_clean = read(
+        &clean,
+        &req(),
+        &KeptQuery {
+            about: Some("http://ex.org/A".into()),
+            ..Default::default()
+        },
+    );
+    let entity_clean = read_clean.entity.as_ref().unwrap();
+    assert!(entity_clean.present);
+    assert_eq!(entity_clean.incomplete, Some(false));
+}

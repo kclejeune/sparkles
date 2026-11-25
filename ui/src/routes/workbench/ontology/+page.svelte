@@ -1896,7 +1896,7 @@
                         </p>{/if}
                       {#if classifyError}<p class="error-box" role="alert">{classifyError}</p>{/if}
                       {#if inferred}
-                        {#if classification && (classification.consistency === 'inconsistent' || !classification.consistent)}
+                        {#if classification && (classification.consistency === 'inconsistent' || (!classification.consistency && !classification.consistent))}
                           <p class="error-box" role="alert">
                             The ontology is inconsistent, so every class is unsatisfiable.
                           </p>

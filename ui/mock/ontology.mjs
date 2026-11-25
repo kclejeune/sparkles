@@ -1783,6 +1783,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
               iri: about,
               present,
               unsatisfiable: present ? false : null,
+              incomplete: present ? false : null,
               representative: entityNode?.classes[0] ?? null,
               equivalenceCount: entityNode?.classes.length ?? null,
               children: entityNode?.children ?? null,

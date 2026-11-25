@@ -6280,7 +6280,9 @@ export interface components {
         };
         ClassificationExcluded: {
             /** @description An OWL axiom in the public structural JSON form. */
-            axiom: Record<string, never>;
+            axiom: {
+                [key: string]: unknown;
+            };
             gap: {
                 /** @constant */
                 kind: "omitted";
@@ -9399,6 +9401,7 @@ export interface components {
             entity: null | {
                 children?: number | null;
                 equivalenceCount?: number | null;
+                incomplete: boolean | null;
                 iri: string;
                 parents?: number | null;
                 present: boolean;
@@ -10924,24 +10927,64 @@ export interface components {
             consistency: "consistent" | "inconsistent" | "unknown";
             consistent: boolean;
             dataset: string;
-            excluded: Record<string, never>[];
+            excluded: ({
+                /** @description An OWL axiom in the public structural JSON form. */
+                axiom: {
+                    [key: string]: unknown;
+                };
+                message?: string;
+                ofn: string;
+                partial?: string;
+                rule?: string;
+                type: string;
+            } & {
+                [key: string]: unknown;
+            })[];
             excludedCount: number;
             graphs: string[];
-            imports: Record<string, never>[];
+            imports: ({
+                graph: string | null;
+                iri: string;
+            } & {
+                [key: string]: unknown;
+            })[];
             incomplete: string[];
             incompleteCount: number;
             /** @enum {string} */
             mode: "lenient" | "strict";
             next?: number;
             nodeCount: number;
-            nodes?: Record<string, never>[];
+            nodes?: {
+                children: number;
+                classes: string[];
+                node: number;
+                parentClasses: string[];
+                parents: number[];
+            }[];
             offset?: number;
             partial: boolean;
-            receipt?: Record<string, never>;
             /** Format: uuid */
             resultId: string;
             reused: boolean;
-            stats: Record<string, never>;
+            stats: {
+                added: number;
+                cleared: number;
+                conclusions: number;
+                contexts: number;
+                coverageMs: number;
+                coverageOver: boolean;
+                coverageStopped: boolean;
+                estimatedBytes: number;
+                incremental: boolean;
+                indexMs: number;
+                removed: number;
+                saturationMs: number;
+                taxonomyMs: number;
+                threads: number;
+                unmapped: number;
+            } & {
+                [key: string]: unknown;
+            };
             /** @enum {string} */
             tier: "el" | "horn" | "disjunctive";
             /** @description The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed. */
@@ -10955,7 +10998,165 @@ export interface components {
             unsatisfiable: string[];
             unsatisfiableCount: number;
             warnings: string[];
-            written?: Record<string, never>;
+            written?: {
+                absent: string[];
+                added: number;
+                addedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+                axiomsTruncated: boolean;
+                committed: boolean;
+                declared: string[];
+                deleted: number;
+                inserted: number;
+                kept: number;
+                present: number;
+                removed: number;
+                removedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+            } & {
+                [key: string]: unknown;
+            };
+        };
+        OntologyClassificationReceipt: {
+            class?: {
+                childClasses: string[];
+                children: number;
+                classes: string[];
+                incomplete: boolean;
+                iri: string;
+                node: number;
+                parentClasses: string[];
+                parents: number[];
+                superClasses: string[];
+                unsatisfiable: boolean;
+            };
+            classes: number;
+            classificationSource: components["schemas"]["ClassificationSourceIdentity"];
+            commit: components["schemas"]["Commit"];
+            committed: boolean;
+            /** @description Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way. */
+            complete: boolean;
+            /** @description Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer. */
+            completeForTaken: boolean;
+            /** @enum {string} */
+            consistency: "consistent" | "inconsistent" | "unknown";
+            consistent: boolean;
+            dataset: string;
+            datasetId: string;
+            excluded: ({
+                /** @description An OWL axiom in the public structural JSON form. */
+                axiom: {
+                    [key: string]: unknown;
+                };
+                message?: string;
+                ofn: string;
+                partial?: string;
+                rule?: string;
+                type: string;
+            } & {
+                [key: string]: unknown;
+            })[];
+            excludedCount: number;
+            graphs: string[];
+            imports: ({
+                graph: string | null;
+                iri: string;
+            } & {
+                [key: string]: unknown;
+            })[];
+            incomplete: string[];
+            incompleteCount: number;
+            /** @enum {string} */
+            mode: "lenient" | "strict";
+            next?: number;
+            nodeCount: number;
+            nodes?: {
+                children: number;
+                classes: string[];
+                node: number;
+                parentClasses: string[];
+                parents: number[];
+            }[];
+            offset?: number;
+            partial: boolean;
+            /** Format: uuid */
+            resultId: string;
+            reused: boolean;
+            stats: {
+                added: number;
+                cleared: number;
+                conclusions: number;
+                contexts: number;
+                coverageMs: number;
+                coverageOver: boolean;
+                coverageStopped: boolean;
+                estimatedBytes: number;
+                incremental: boolean;
+                indexMs: number;
+                removed: number;
+                saturationMs: number;
+                taxonomyMs: number;
+                threads: number;
+                unmapped: number;
+            } & {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            tier: "el" | "horn" | "disjunctive";
+            /** @description The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed. */
+            unmappedTriples: {
+                object: string;
+                predicate: string;
+                subject: string;
+            }[];
+            /** @description Whether `stats.unmapped` counts more triples than `unmappedTriples` lists. */
+            unmappedTruncated: boolean;
+            unsatisfiable: string[];
+            unsatisfiableCount: number;
+            validation?: components["schemas"]["ValidationSummary"];
+            warnings: string[];
+            written: {
+                absent: string[];
+                added: number;
+                addedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+                axiomsTruncated: boolean;
+                committed: boolean;
+                declared: string[];
+                deleted: number;
+                inserted: number;
+                kept: number;
+                present: number;
+                removed: number;
+                removedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+            } & {
+                [key: string]: unknown;
+            };
         };
         OntologyFrameClassification: {
             classificationSource: components["schemas"]["ClassificationSourceIdentity"];
@@ -20025,13 +20226,14 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The classification, with the receipt when a write asked for one. */
+            /** @description The classification, or the receipt-bearing classification under `application/x-sparkles+json` when a `target` write asks for a receipt. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["OntologyClassification"] | components["schemas"]["OntologyFrameClassification"];
+                    "application/x-sparkles+json": components["schemas"]["OntologyClassificationReceipt"];
                     "text/owl-functional": string;
                 };
             };
