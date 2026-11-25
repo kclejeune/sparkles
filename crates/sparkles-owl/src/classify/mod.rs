@@ -2164,8 +2164,9 @@ fn held_bytes_of(ax: &AxiomKind) -> usize {
     bytes
 }
 
-/// Rough additional ownership of a retained copy of exclusions. This uses the
-/// classifier's held-axiom estimate and is not a process RSS bound.
+/// Exact allocation-free estimate of heap bytes owned by a retained copy of `excluded`,
+/// including anonymous blank-node labels, literals, containers, repeated AST payloads,
+/// and `Gap::Outside` strings. This is not a process RSS bound.
 pub fn excluded_copy_bytes(excluded: &Vec<Excluded>) -> usize {
     use std::mem::size_of;
     excluded
@@ -2175,7 +2176,7 @@ pub fn excluded_copy_bytes(excluded: &Vec<Excluded>) -> usize {
             excluded
                 .iter()
                 .map(|e| {
-                    held_bytes_of(&e.axiom).saturating_add(match &e.gap {
+                    dl_reduce::axiom_retained_heap_bytes(&e.axiom).saturating_add(match &e.gap {
                         Gap::Outside { rule, message } => {
                             rule.capacity().saturating_add(message.capacity())
                         }
@@ -2891,6 +2892,10 @@ impl Saturation {
                     }
                     self.merge.spent = stop.spent;
                     self.merge.restarts += 1;
+                    #[cfg(test)]
+                    admission_test::emit_merge_phase(admission_test::MergePhase::MergeRestart {
+                        restarts: self.merge.restarts,
+                    });
                     self.merge.frozen_bound.get_or_insert(stop.bound);
                     if merge_trace() {
                         eprintln!(
@@ -3833,6 +3838,8 @@ impl Saturation {
                 }
                 ok
             };
+            #[cfg(test)]
+            let _plan_guard = admission_test::enter_plan(self.merge.restarts);
             let planned = match dl_reduce::plan_budgeted(
                 axioms,
                 reduce_mem,
@@ -3841,12 +3848,30 @@ impl Saturation {
                 &mut || poll(limits),
                 &mut plan_admit,
             ) {
-                Ok(p) => p,
+                Ok(p) => {
+                    #[cfg(test)]
+                    admission_test::emit_merge_phase(admission_test::MergePhase::PlanDone {
+                        restarts: self.merge.restarts,
+                        outcome: match &p {
+                            dl_reduce::Plan::NotNeeded => admission_test::PlanKind::NotNeeded,
+                            dl_reduce::Plan::Declined => admission_test::PlanKind::Declined,
+                            dl_reduce::Plan::Ready(_) => admission_test::PlanKind::Ready,
+                        },
+                    });
+                    p
+                }
                 Err(e) => {
+                    #[cfg(test)]
+                    admission_test::emit_merge_phase(admission_test::MergePhase::PlanDone {
+                        restarts: self.merge.restarts,
+                        outcome: admission_test::PlanKind::PollErr,
+                    });
                     self.dirty = true;
                     return Err(e);
                 }
             };
+            #[cfg(test)]
+            drop(_plan_guard);
             let mut declined = false;
             match planned {
                 dl_reduce::Plan::NotNeeded => {}

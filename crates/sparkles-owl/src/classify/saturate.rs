@@ -740,11 +740,11 @@ pub struct Bounds<'a> {
 }
 
 const STOP_NONE: u8 = 0;
-const STOP_CANCEL: u8 = 1;
+pub(super) const STOP_CANCEL: u8 = 1;
 const STOP_TIMEOUT: u8 = 2;
 const STOP_MEMORY: u8 = 3;
 const STOP_WORK: u8 = 4;
-const STOP_MERGE: u8 = 5;
+pub(super) const STOP_MERGE: u8 = 5;
 
 /// The conclusions a worker applies between checks of the bounds.
 const CHECK_EVERY: usize = 4096;
@@ -876,6 +876,8 @@ struct Run<'a> {
     started: &'static AtomicU64,
     #[cfg(test)]
     always_congested: bool,
+    #[cfg(test)]
+    helper_ran: AtomicBool,
 }
 
 /// What the workers of a run in steps share ([`Run::steps`]).
@@ -1515,6 +1517,8 @@ pub fn saturate_counted(
         started: STARTED_IN.get().unwrap_or(&STARTED_NS),
         #[cfg(test)]
         always_congested: ALWAYS_CONGESTED.get(),
+        #[cfg(test)]
+        helper_ran: AtomicBool::new(false),
     };
     // An empty pooled round still holds its inherited tables and queued messages.
     if bounds.charge.is_none()
@@ -1562,7 +1566,13 @@ pub fn saturate_counted(
         paid: run.paid.into_inner(),
         merged: run.merged.load(Ordering::Relaxed),
     };
-    let stop = match run.stop.load(Ordering::SeqCst) {
+    let raw_stop = run.stop.load(Ordering::SeqCst);
+    #[cfg(test)]
+    super::admission_test::emit_merge_phase(super::admission_test::MergePhase::SatStop {
+        stop: raw_stop,
+        helper_ran: run.helper_ran.load(Ordering::Relaxed),
+    });
+    let stop = match raw_stop {
         STOP_CANCEL => Some(Stop::Cancelled),
         STOP_TIMEOUT => Some(Stop::Timeout),
         // the most counted, waiting messages included, which is what passed the limit
@@ -2683,7 +2693,10 @@ impl<'a> Run<'a> {
                 for _ in 1..threads {
                     s.spawn(move || {
                         #[cfg(test)]
-                        WORKER.with(|w| w.set(HELPER));
+                        {
+                            self.helper_ran.store(true, Ordering::Relaxed);
+                            WORKER.with(|w| w.set(HELPER));
+                        }
                         self.worker::<R>(None)
                     });
                 }
@@ -4218,6 +4231,7 @@ pub(super) fn test_concurrent_commit_dl_no_double_count() -> (bool, usize, usize
         bounds: &bounds,
         started: &STARTED_NS,
         always_congested: false,
+        helper_ran: AtomicBool::new(false),
     };
     let done = Arc::new(AtomicBool::new(false));
     let done_obs = done.clone();
@@ -4531,6 +4545,7 @@ mod horn_accounting_tests {
             bounds,
             started: &STARTED_NS,
             always_congested: false,
+            helper_ran: AtomicBool::new(false),
         }
     }
 

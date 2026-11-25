@@ -5468,13 +5468,83 @@ fn collect_same_refusal_under_max_memory_does_not_inflate_peak_memory() {
     );
 }
 
-/// Sol P2 #4: Item 805 `dl_reduce::plan_budgeted` must pre-admit actual mapped-signature
-/// and key-expansion bytes (including repeated long individual IRIs) while the partition
-/// is live, decline cleanly on caller refusal without allocating the refused key
-/// expansion, and cooperatively poll cancellation inside key expansion.
+/// Sol P2 #2 (r2): `excluded_copy_bytes` must perform zero heap allocations and cover
+/// retained anonymous blank-node labels, repeated AST payloads, containers, and
+/// `Gap::Outside` strings.
+#[test]
+fn excluded_copy_bytes_is_allocation_free_and_covers_anonymous_and_repeated_ast() {
+    let b0 = AnonymousIndividual::new(format!("b0_{}", "a".repeat(4096)));
+    let b1 = AnonymousIndividual::new(format!("b1_{}", "b".repeat(4096)));
+    let repeated_cls = Class::new(format!("urn:tierd1291:rep_{}", "c".repeat(2048)));
+    let repeated_prop = ObjectProperty::new(format!("urn:tierd1291:p_{}", "p".repeat(1024)));
+    let repeated_branches: std::collections::BTreeSet<ClassExpression> = (0..8usize)
+        .map(|i| {
+            let tag = Class::new(format!("urn:tierd1291:t{i}"));
+            ClassExpression::ObjectSomeValuesFrom(
+                ObjectPropertyExpression::Property(repeated_prop.clone()),
+                Box::new(ClassExpression::ObjectIntersectionOf(
+                    [
+                        ClassExpression::Class(repeated_cls.clone()),
+                        ClassExpression::Class(tag),
+                    ]
+                    .into(),
+                )),
+            )
+        })
+        .collect();
+    let template = vec![
+        Excluded {
+            axiom: AxiomKind::DifferentIndividuals(
+                [Individual::Anonymous(b0), Individual::Anonymous(b1)].into(),
+            ),
+            gap: index::Gap::Outside {
+                rule: "anonymous-rule".to_owned(),
+                message: "x".repeat(512),
+            },
+        },
+        Excluded {
+            axiom: AxiomKind::SubClassOf(
+                ClassExpression::Class(repeated_cls.clone()),
+                ClassExpression::ObjectUnionOf(repeated_branches),
+            ),
+            gap: index::Gap::Partial("repeated-ast"),
+        },
+    ];
+
+    // Keep the cloned `Vec<Excluded>` alive through `measure` to observe its true live heap.
+    let (cloned, clone_sample) = measure(|| template.clone());
+    assert!(
+        clone_sample.live > 24 * 1024,
+        "expected substantial excluded payload, got {} B",
+        clone_sample.live
+    );
+
+    let (estimated, est_sample) = measure(|| excluded_copy_bytes(&cloned));
+    assert_eq!(
+        est_sample.peak, 0,
+        "excluded_copy_bytes must not allocate while estimating (allocated {} B)",
+        est_sample.peak
+    );
+    assert!(
+        estimated >= clone_sample.live,
+        "excluded_copy_bytes ({estimated}) undercounted retained excluded heap ({})",
+        clone_sample.live
+    );
+}
+
+/// Sol P2 #1/#3 & P3 #4 (r2): Item 805 `dl_reduce::plan_budgeted` must pre-admit actual
+/// mapped-signature, key-expansion, and retarget payloads without uncharged scratch clones
+/// (keeping `Reduction` alive through live-bytes sampling), decline cleanly on post-merge
+/// replan `charge` refusal (verified via phase probe, never accepting an error), and
+/// cooperatively poll cancellation and deadline expiry inside wide axioms after a merge
+/// restart.
 #[test]
 fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
-    // 1. Direct counting-allocator check on `dl_reduce::plan_budgeted` with long IRIs.
+    use super::admission_test::{MergePhase, PlanKind, with_merge_probe};
+    use parking_lot::Mutex;
+
+    // 1. Direct counting-allocator check on `dl_reduce::plan_budgeted` with long IRIs,
+    //    keeping `Reduction` alive through `measure` so `sample.live` measures its heap.
     let mut direct_body = String::from(
         "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
          HasKey(:K (:r) ())\n",
@@ -5488,7 +5558,7 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
     let direct_ax = axioms(&direct_body);
     let direct_refs: Vec<&AxiomKind> = direct_ax.iter().map(|a| &a.kind).collect();
     let mut admitted_peak = 0usize;
-    let ((planned_ok, retained), sample) = measure(|| {
+    let (red_opt, sample) = measure(|| {
         let p = super::dl_reduce::plan_budgeted(
             &direct_refs,
             None,
@@ -5502,11 +5572,17 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
         )
         .unwrap();
         match p {
-            super::dl_reduce::Plan::Ready(red) => (true, red.retained_bytes()),
-            _ => (false, 0),
+            super::dl_reduce::Plan::Ready(red) => Some(red),
+            _ => None,
         }
     });
-    assert!(planned_ok);
+    let red = red_opt.expect("direct plan_budgeted must succeed");
+    let retained = red.retained_bytes();
+    assert!(
+        sample.live > 64 * 1024,
+        "expected Reduction live bytes > 64 KiB while alive, got {}",
+        sample.live
+    );
     assert!(
         admitted_peak >= sample.peak,
         "plan_budgeted admitted peak ({admitted_peak}) undercounted measured peak ({})",
@@ -5517,18 +5593,174 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
         "Reduction::retained_bytes ({retained}) undercounted measured live ({})",
         sample.live
     );
+    drop(red);
 
-    // 2. End-to-end post-merge replan with long individual IRIs under a caller `charge`
-    //    callback that lets Pass 0 finish and refuses Pass 1 key expansion growth.
-    let mut body = String::from(
+    // 1b. Sol P2 #1: wide `DifferentIndividuals` with 200 long IRIs (400 KiB total) must
+    //     NOT clone IRIs before admission; a tight cap declines with tiny measured peak.
+    let mut diff_inds = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         HasKey(:K (:r) ())\n\
+         DifferentIndividuals(",
+    );
+    for i in 0..200usize {
+        diff_inds.push_str(&format!(" :d{i:03}_{}", "x".repeat(2048)));
+    }
+    diff_inds.push_str(")\n");
+    let diff_ax = axioms(&diff_inds);
+    let diff_refs: Vec<&AxiomKind> = diff_ax.iter().map(|a| &a.kind).collect();
+    let (diff_plan, diff_sample) = measure(|| {
+        super::dl_reduce::plan_budgeted(
+            &diff_refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| used <= 2048,
+        )
+        .unwrap()
+    });
+    assert!(
+        matches!(diff_plan, super::dl_reduce::Plan::Declined),
+        "tight cap on wide DifferentIndividuals must decline"
+    );
+    assert!(
+        diff_sample.peak < 32 * 1024,
+        "borrowed signature visitor must not clone 400 KiB DifferentIndividuals IRIs before admission (peak={})",
+        diff_sample.peak
+    );
+
+    // 1c. Sol P2 #1: retargeting `EquivalentObjectProperties` with `owl:topObjectProperty`
+    //     and 120 long-IRI roles must pre-admit inclusions before constructing them, and
+    //     keep `admitted_peak >= sample.peak` and `retained_bytes >= sample.live`.
+    let mut eqop = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         EquivalentObjectProperties(owl:topObjectProperty",
+    );
+    for i in 0..120usize {
+        eqop.push_str(&format!(" :rp{i:03}_{}", "q".repeat(2048)));
+    }
+    eqop.push_str(")\n");
+    let eqop_ax = axioms(&eqop);
+    let eqop_refs: Vec<&AxiomKind> = eqop_ax.iter().map(|a| &a.kind).collect();
+    let mut eqop_admitted = 0usize;
+    let (eqop_red, eqop_sample) = measure(|| {
+        match super::dl_reduce::plan_budgeted(
+            &eqop_refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                eqop_admitted = eqop_admitted.max(used);
+                true
+            },
+        )
+        .unwrap()
+        {
+            super::dl_reduce::Plan::Ready(r) => Some(r),
+            _ => None,
+        }
+    });
+    let eqop_red = eqop_red.expect("EquivalentObjectProperties retarget must succeed");
+    assert!(eqop_sample.live > 200 * 1024);
+    assert!(
+        eqop_admitted >= eqop_sample.peak,
+        "retarget admitted peak ({eqop_admitted}) undercounted measured peak ({})",
+        eqop_sample.peak
+    );
+    assert!(
+        eqop_red.retained_bytes() >= eqop_sample.live,
+        "retarget retained_bytes ({}) undercounted measured live ({})",
+        eqop_red.retained_bytes(),
+        eqop_sample.live
+    );
+    drop(eqop_red);
+
+    let (eqop_refused, eqop_refused_sample) = measure(|| {
+        super::dl_reduce::plan_budgeted(
+            &eqop_refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| used <= 16 * 1024,
+        )
+        .unwrap()
+    });
+    assert!(matches!(eqop_refused, super::dl_reduce::Plan::Declined));
+    assert!(
+        eqop_refused_sample.peak <= 32 * 1024,
+        "refused EquivalentObjectProperties retarget overshot 16 KiB grant (peak={})",
+        eqop_refused_sample.peak
+    );
+
+    // 1d. Sol P2 #1: `HasKey` with a complex rewritten `ClassExpression` (using
+    //     `owl:topObjectProperty` and long IRIs) and many long-IRI roles must pre-admit
+    //     both the rewritten class expression and role uses before construction.
+    let mut complex_key = format!(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         ClassAssertion(:A :ck0)\n\
+         ClassAssertion(:A :ck1)\n\
+         HasKey(ObjectIntersectionOf(:A ObjectSomeValuesFrom(owl:topObjectProperty :LongC_{})) (",
+        "c".repeat(4096)
+    );
+    for i in 0..20usize {
+        complex_key.push_str(&format!(" :kr_{i:02}_{}", "r".repeat(1024)));
+    }
+    complex_key.push_str(") ())\n");
+    let ckey_ax = axioms(&complex_key);
+    let ckey_refs: Vec<&AxiomKind> = ckey_ax.iter().map(|a| &a.kind).collect();
+    let mut ckey_admitted = 0usize;
+    let (ckey_red, ckey_sample) = measure(|| {
+        match super::dl_reduce::plan_budgeted(
+            &ckey_refs,
+            None,
+            None,
+            0,
+            &mut || Ok::<(), ()>(()),
+            &mut |used| {
+                ckey_admitted = ckey_admitted.max(used);
+                true
+            },
+        )
+        .unwrap()
+        {
+            super::dl_reduce::Plan::Ready(r) => Some(r),
+            _ => None,
+        }
+    });
+    let ckey_red = ckey_red.expect("complex HasKey plan must succeed");
+    assert!(ckey_sample.live > 32 * 1024);
+    assert!(
+        ckey_admitted >= ckey_sample.peak,
+        "complex HasKey admitted peak ({ckey_admitted}) undercounted measured peak ({})",
+        ckey_sample.peak
+    );
+    assert!(
+        ckey_red.retained_bytes() >= ckey_sample.live,
+        "complex HasKey retained_bytes ({}) undercounted measured live ({})",
+        ckey_red.retained_bytes(),
+        ckey_sample.live
+    );
+    drop(ckey_red);
+
+    // 2. Phase-specific post-merge replan `charge` refusal: Pass 0 succeeds, merges two
+    //    large anonymous witnesses (`_:w0 ≈ _:w1`, 512 KiB labels each so `UF + Canon`
+    //    exceeds Pass 0's index/context overhead and Pass 1's `plan_budgeted` strictly
+    //    exceeds Pass 0's `paid` credit and invokes `charge`), Pass 1's `charge` refuses,
+    //    `plan_budgeted` declines, and Horn fallback succeeds (`Ok(out)`, never accepting
+    //    an error!).
+    let w0 = format!("w0_{}", "a".repeat(512 * 1024));
+    let w1 = format!("w1_{}", "b".repeat(512 * 1024));
+    let mut body = format!(
         "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
          SubClassOf(:Z1 :OnlyDisj)\n\
          SubClassOf(:Z2 :OnlyDisj)\n\
-         SubClassOf(ObjectOneOf(_:w0) :Bridge)\n\
-         SubClassOf(:Bridge ObjectOneOf(_:w1))\n\
-         HasKey(:K (:r) ())\n",
+         SubClassOf(ObjectOneOf(_:{w0}) :Bridge)\n\
+         SubClassOf(:Bridge ObjectOneOf(_:{w1}))\n\
+         HasKey(:K (:r) ())\n"
     );
-    for i in 0..10usize {
+    for i in 0..8usize {
         body.push_str(&format!(
             "ClassAssertion(:K :long{i:02}_{})\n",
             "k".repeat(2048)
@@ -5536,20 +5768,6 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
     }
     let input = axioms(&body);
 
-    // Baseline unrestricted run confirms Pass 0 reduces, derives `_:w0 ≈ _:w1`, and restarts.
-    let mut base_k = Classifier::of(&input);
-    let base_out = base_k
-        .classify(&Limits {
-            threads: 1,
-            rooted: true,
-            rooted_merge: true,
-            ..Limits::default()
-        })
-        .expect("unrestricted baseline");
-    assert!(base_out.complete);
-    assert_eq!(base_out.stats.dl_rooted_restarts, 1);
-
-    // Fresh Horn baseline (original axioms without rooted reduction) to compare fallback.
     let mut fresh_horn_k = Classifier::of(&input);
     let fresh_horn = fresh_horn_k
         .classify(&Limits {
@@ -5559,105 +5777,339 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
         })
         .expect("fresh Horn");
 
-    // Charge callback with a tight cap below the post-merge replan's actual key-expansion
-    // peak (with long IRIs) while comfortably above Horn fallback.
-    let cap = base_out.stats.peak_memory / 2;
-    let granted = Arc::new(AtomicUsize::new(0));
-    let refused = Arc::new(AtomicBool::new(false));
-    let granted_cb = granted.clone();
-    let refused_cb = refused.clone();
-    let charge = Arc::new(move |bytes: usize| -> bool {
-        let cur = granted_cb.load(Ordering::SeqCst);
-        if cur.saturating_add(bytes) > cap {
+    let in_replan = Arc::new(AtomicBool::new(false));
+    let refused_in_replan = Arc::new(AtomicBool::new(false));
+    let phases: Arc<Mutex<Vec<MergePhase>>> = Arc::new(Mutex::new(Vec::new()));
+    let in_replan_probe = in_replan.clone();
+    let phases_probe = phases.clone();
+    let in_replan_cb = in_replan.clone();
+    let refused_cb = refused_in_replan.clone();
+    let charge = Arc::new(move |_bytes: usize| -> bool {
+        if in_replan_cb.load(Ordering::SeqCst) {
             refused_cb.store(true, Ordering::SeqCst);
             return false;
         }
-        granted_cb.fetch_add(bytes, Ordering::SeqCst);
         true
     });
     let mut k_refuse = Classifier::of(&input);
-    let (res, refuse_sample) = measure(|| {
-        k_refuse.classify(&Limits {
-            threads: 1,
-            rooted: true,
-            rooted_merge: true,
-            charge: Some(charge),
-            ..Limits::default()
-        })
-    });
-    assert!(refused.load(Ordering::SeqCst), "charge refusal must be hit");
+    let out = with_merge_probe(
+        move |phase| {
+            match phase {
+                MergePhase::PlanStart { restarts: 1 } => {
+                    in_replan_probe.store(true, Ordering::SeqCst);
+                }
+                MergePhase::PlanDone { restarts: 1, .. } => {
+                    in_replan_probe.store(false, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            phases_probe.lock().push(phase);
+        },
+        || {
+            k_refuse.classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                charge: Some(charge),
+                ..Limits::default()
+            })
+        },
+    )
+    .expect("post-merge replan charge refusal must fall back cleanly to Horn Ok(out)");
     assert!(
-        refuse_sample.peak <= cap + (1 << 20),
-        "refused key expansion overshot cap: measured {} vs cap {cap}",
-        refuse_sample.peak
+        refused_in_replan.load(Ordering::SeqCst),
+        "charge callback must be refused specifically during Pass 1 replan"
     );
-    if let Ok(out) = res {
-        assert_eq!(out.stats.dl_rooted_merged, 0);
-        assert_eq!(out.consistent, fresh_horn.consistent);
-        assert_eq!(k_refuse.excluded(), fresh_horn_k.excluded());
+    let trace = phases.lock().clone();
+    let pos_p0_ready = trace
+        .iter()
+        .position(|p| {
+            matches!(
+                p,
+                MergePhase::PlanDone {
+                    restarts: 0,
+                    outcome: PlanKind::Ready
+                }
+            )
+        })
+        .expect("Pass 0 plan must succeed");
+    let pos_merge_stop = trace
+        .iter()
+        .position(|p| {
+            matches!(
+                p,
+                MergePhase::SatStop {
+                    stop,
+                    ..
+                } if *stop == super::saturate::STOP_MERGE
+            )
+        })
+        .expect("Pass 0 must stop with STOP_MERGE");
+    let pos_restart = trace
+        .iter()
+        .position(|p| matches!(p, MergePhase::MergeRestart { restarts: 1 }))
+        .expect("MergeRestart(1) must occur");
+    let pos_p1_declined = trace
+        .iter()
+        .position(|p| {
+            matches!(
+                p,
+                MergePhase::PlanDone {
+                    restarts: 1,
+                    outcome: PlanKind::Declined
+                }
+            )
+        })
+        .expect("Pass 1 replan must decline on charge refusal");
+    assert!(
+        pos_p0_ready < pos_merge_stop
+            && pos_merge_stop < pos_restart
+            && pos_restart < pos_p1_declined,
+        "unexpected phase order: {trace:?}"
+    );
+    assert!(!out.complete);
+    assert_eq!(out.stats.dl_rooted_merged, 0);
+    assert_eq!(out.consistent, fresh_horn.consistent);
+    assert_eq!(k_refuse.excluded(), fresh_horn_k.excluded());
+
+    // 3. Sol P2 #3 & P3 #4: Phase-specific cooperative cancellation and deadline expiry
+    //    AFTER the merge restart enters each wide-axiom planner loop.
+
+    // 3a. Cancellation inside wide `DifferentIndividuals` borrowed signature scan on Pass 1.
+    let mut wide_diff = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(ObjectOneOf(_:w0) :Bridge)\n\
+         SubClassOf(:Bridge ObjectOneOf(_:w1))\n\
+         SubClassOf(:Q ObjectSomeValuesFrom(owl:topObjectProperty :Tag))\n\
+         DifferentIndividuals(",
+    );
+    for i in 0..300usize {
+        wide_diff.push_str(&format!(" :wi{i:03}"));
+    }
+    wide_diff.push_str(")\n");
+    let wide_diff_ax = axioms(&wide_diff);
+    {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let polls_after = Arc::new(AtomicUsize::new(0));
+        let polls_after_cb = polls_after.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let mut k = Classifier::of(&wide_diff_ax);
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanBlockedScan { restarts: 1 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    cancelled: Some(Arc::new(move || {
+                        let armed = cancel_cb.load(Ordering::SeqCst);
+                        if armed {
+                            polls_after_cb.fetch_add(1, Ordering::SeqCst);
+                        }
+                        armed
+                    })),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("must cancel inside wide DifferentIndividuals blocked scan on Pass 1");
+        assert_eq!(err, Error::Cancelled);
+        assert!(polls_after.load(Ordering::SeqCst) <= 2);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanBlockedScan { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanDone {
+            restarts: 1,
+            outcome: PlanKind::PollErr
+        }));
+        let rec = k
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .expect("recovery after wide DifferentIndividuals cancel");
+        assert!(rec.complete);
+        assert_eq!(rec.stats.dl_rooted_restarts, 1);
     }
 
-    // 3. Cooperative cancellation inside `key_budgeted` during post-merge replan.
-    let total_polls = Arc::new(AtomicUsize::new(0));
-    let tp_cb = total_polls.clone();
-    let mut k_count = Classifier::of(&input);
-    let _ = k_count
-        .classify(&Limits {
-            threads: 1,
-            rooted: true,
-            rooted_merge: true,
-            cancelled: Some(Arc::new(move || {
-                tp_cb.fetch_add(1, Ordering::SeqCst);
-                false
-            })),
-            ..Limits::default()
-        })
-        .expect("poll counting run");
-    let polls_total = total_polls.load(Ordering::SeqCst);
-    assert!(
-        polls_total >= 10,
-        "expected key expansion to poll multiple times, got {polls_total}"
+    // 3b. Cancellation AND deadline expiry inside wide `EquivalentObjectProperties` retarget
+    //     expansion on Pass 1.
+    let mut wide_eqop = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(ObjectOneOf(_:w0) :Bridge)\n\
+         SubClassOf(:Bridge ObjectOneOf(_:w1))\n\
+         EquivalentObjectProperties(owl:topObjectProperty",
     );
-    // Cancel partway through key expansion (both Pass 0 and post-merge Pass 1).
-    let cancel_at = polls_total / 2;
-    let seen = Arc::new(AtomicUsize::new(0));
-    let seen_cb = seen.clone();
-    let mut k_cancel = Classifier::of(&input);
-    let err = k_cancel
-        .classify(&Limits {
-            threads: 1,
-            rooted: true,
-            rooted_merge: true,
-            cancelled: Some(Arc::new(move || {
-                seen_cb.fetch_add(1, Ordering::SeqCst) >= cancel_at
-            })),
-            ..Limits::default()
-        })
-        .expect_err("must cancel inside key expansion");
-    assert_eq!(err, Error::Cancelled);
-    assert!(
-        seen.load(Ordering::SeqCst) <= cancel_at + 4,
-        "cancellation did not stop promptly (polled {} times, cancel_at={cancel_at})",
-        seen.load(Ordering::SeqCst)
+    for i in 0..300usize {
+        wide_eqop.push_str(&format!(" :wr{i:03}"));
+    }
+    wide_eqop.push_str(")\n");
+    let wide_eqop_ax = axioms(&wide_eqop);
+    {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let mut k = Classifier::of(&wide_eqop_ax);
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanRetarget { restarts: 1 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    cancelled: Some(Arc::new(move || cancel_cb.load(Ordering::SeqCst))),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("must cancel inside wide EquivalentObjectProperties retarget on Pass 1");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanRetarget { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanDone {
+            restarts: 1,
+            outcome: PlanKind::PollErr
+        }));
+    }
+    {
+        // Deadline expiry after Pass 1 enters wide retarget expansion.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(80);
+        let slept = Arc::new(AtomicBool::new(false));
+        let slept_probe = slept.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let mut k = Classifier::of(&wide_eqop_ax);
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanRetarget { restarts: 1 })
+                    && !slept_probe.swap(true, Ordering::SeqCst)
+                {
+                    let now = std::time::Instant::now();
+                    if deadline > now {
+                        std::thread::sleep(deadline - now + std::time::Duration::from_millis(5));
+                    }
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    deadline: Some(deadline),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("must time out inside wide EquivalentObjectProperties retarget on Pass 1");
+        assert_eq!(err, Error::Timeout);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanRetarget { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanDone {
+            restarts: 1,
+            outcome: PlanKind::PollErr
+        }));
+        let rec = k
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .expect("recovery after wide retarget timeout");
+        assert!(rec.complete);
+        assert_eq!(rec.stats.dl_rooted_restarts, 1);
+    }
+
+    // 3c. Cancellation inside final key-body construction on Pass 1 for a wide `HasKey`
+    //     with 200 object properties.
+    let mut wide_key = String::from(
+        "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
+         SubClassOf(ObjectOneOf(_:w0) :Bridge)\n\
+         SubClassOf(:Bridge ObjectOneOf(_:w1))\n\
+         ClassAssertion(:K :ka)\n\
+         ClassAssertion(:K :kb)\n\
+         HasKey(:K (",
     );
-    // Clean recovery on follow-up unrestricted call.
-    let recovered = k_cancel
-        .classify(&Limits {
-            threads: 1,
-            rooted: true,
-            rooted_merge: true,
-            ..Limits::default()
-        })
-        .expect("follow-up classify after cancel");
-    assert!(recovered.complete);
-    assert_eq!(recovered.stats.dl_rooted_restarts, 1);
+    for i in 0..200usize {
+        wide_key.push_str(&format!(" :kr{i:03}"));
+    }
+    wide_key.push_str(") ())\n");
+    let wide_key_ax = axioms(&wide_key);
+    {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_probe = cancel_flag.clone();
+        let cancel_cb = cancel_flag.clone();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let trace_probe = trace.clone();
+        let mut k = Classifier::of(&wide_key_ax);
+        let err = with_merge_probe(
+            move |phase| {
+                if matches!(phase, MergePhase::PlanKeyBody { restarts: 1 }) {
+                    cancel_probe.store(true, Ordering::SeqCst);
+                }
+                trace_probe.lock().push(phase);
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    cancelled: Some(Arc::new(move || cancel_cb.load(Ordering::SeqCst))),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("must cancel inside wide HasKey final key-body construction on Pass 1");
+        assert_eq!(err, Error::Cancelled);
+        let t = trace.lock().clone();
+        assert!(t.contains(&MergePhase::MergeRestart { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanKeyBody { restarts: 1 }));
+        assert!(t.contains(&MergePhase::PlanDone {
+            restarts: 1,
+            outcome: PlanKind::PollErr
+        }));
+        let rec = k
+            .classify(&Limits {
+                threads: 1,
+                rooted: true,
+                rooted_merge: true,
+                ..Limits::default()
+            })
+            .expect("recovery after wide key-body cancel");
+        assert!(rec.complete);
+        assert_eq!(rec.stats.dl_rooted_restarts, 1);
+    }
 }
 
-/// Neon N4: end-to-end cancellation-vs-`STOP_MERGE` stop-race test exercising cancellation
-/// both winning before `STOP_MERGE` and losing to `STOP_MERGE` (then caught at the restart
-/// boundary), plus multi-thread `dl_steps = false` concurrent race trials.
+/// Neon N4 / Sol P3 #4 (r2): end-to-end cancellation-vs-`STOP_MERGE` stop-race test
+/// explicitly observing both stop winners (`STOP_CANCEL` and `STOP_MERGE`, including
+/// `STOP_MERGE` winning followed by cancellation at the restart boundary) and verifying
+/// helper thread participation in multi-thread `dl_steps = false` trials.
 #[test]
 fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
+    use super::admission_test::{MergePhase, with_merge_probe};
+    use parking_lot::Mutex;
+
     let mut body = String::from(
         "SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n\
          SubClassOf(:C0 ObjectOneOf(:a2))\n\
@@ -5666,13 +6118,14 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
          SubClassOf(:Probe ObjectSomeValuesFrom(:r ObjectOneOf(:a0)))\n\
          SubClassOf(ObjectSomeValuesFrom(:r :Tag) :Hit)\n",
     );
-    for i in 0..40usize {
+    // >= EAGER_ROOTS (64 in test) named classes ensure multi-thread runs spawn helpers.
+    for i in 0..80usize {
         body.push_str(&format!("SubClassOf(:P{i} :Q{i})\n"));
     }
     let input = axioms(&body);
 
     // 1. Deterministic 1-thread sweep across every poll point from pre-merge saturation
-    //    through the STOP_MERGE restart boundary and Pass 1.
+    //    through the STOP_MERGE restart boundary and Pass 1, observing stop winners.
     let count_polls = Arc::new(AtomicUsize::new(0));
     let cp_cb = count_polls.clone();
     let mut k_probe = Classifier::of(&input);
@@ -5693,9 +6146,10 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
     let total_polls = count_polls.load(Ordering::SeqCst);
     assert!(total_polls >= 4);
 
-    let mut saw_cancelled = 0usize;
+    let mut saw_cancel_winner = 0usize;
+    let mut saw_merge_winner_then_cancel = 0usize;
     let mut saw_cancelled_dirty = 0usize;
-    let mut saw_ok = 0usize;
+    let mut saw_merge_winner_then_ok = 0usize;
     let expected_instances = vec![
         NamedIndividual::new("urn:tierd1291:a0"),
         NamedIndividual::new("urn:tierd1291:a2"),
@@ -5703,19 +6157,36 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
     for cancel_at in 1..=(total_polls + 2) {
         let polls = Arc::new(AtomicUsize::new(0));
         let polls_cb = polls.clone();
+        let stops = Arc::new(Mutex::new(Vec::new()));
+        let stops_probe = stops.clone();
         let mut k = Classifier::of(&input);
-        let res = k.classify(&Limits {
-            threads: 1,
-            rooted: true,
-            rooted_merge: true,
-            cancelled: Some(Arc::new(move || {
-                polls_cb.fetch_add(1, Ordering::SeqCst) >= cancel_at
-            })),
-            ..Limits::default()
-        });
+        let res = with_merge_probe(
+            move |phase| {
+                if let MergePhase::SatStop { stop, .. } = phase {
+                    stops_probe.lock().push(stop);
+                }
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_merge: true,
+                    cancelled: Some(Arc::new(move || {
+                        polls_cb.fetch_add(1, Ordering::SeqCst) >= cancel_at
+                    })),
+                    ..Limits::default()
+                })
+            },
+        );
+        let sat_stops = stops.lock().clone();
         match res {
             Err(Error::Cancelled) => {
-                saw_cancelled += 1;
+                if sat_stops.contains(&super::saturate::STOP_CANCEL) {
+                    saw_cancel_winner += 1;
+                }
+                if sat_stops.contains(&super::saturate::STOP_MERGE) {
+                    saw_merge_winner_then_cancel += 1;
+                }
                 assert!(
                     !k.sat.dl_worked.load(Ordering::Relaxed),
                     "cancel_at={cancel_at}: cancelled race must not set dl_worked"
@@ -5723,16 +6194,12 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
                 match k.describe(&Class::new("urn:tierd1291:Tag")) {
                     None => saw_cancelled_dirty += 1,
                     Some(d) => {
-                        // Once Pass 1 saturation completes (`self.dirty = false`), a
-                        // cancellation during taxonomy construction keeps the complete
-                        // saturated state, which must already be sound and complete.
                         assert_eq!(
                             d.instances, expected_instances,
                             "cancel_at={cancel_at}: post-saturation describe() must be complete"
                         );
                     }
                 }
-                // Follow-up unrestricted call must recover cleanly.
                 let after = k
                     .classify(&Limits {
                         threads: 1,
@@ -5749,7 +6216,9 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
                 ));
             }
             Ok(out) => {
-                saw_ok += 1;
+                if sat_stops.contains(&super::saturate::STOP_MERGE) {
+                    saw_merge_winner_then_ok += 1;
+                }
                 assert!(out.complete);
                 assert_eq!(out.stats.dl_rooted_restarts, 1);
                 assert!(!out.stats.dl_rooted_over);
@@ -5763,25 +6232,91 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
             }
         }
     }
-    assert!(saw_cancelled >= 2 && saw_cancelled_dirty >= 2 && saw_ok >= 1);
+    assert!(
+        saw_cancel_winner >= 1,
+        "1-thread sweep must observe STOP_CANCEL winning"
+    );
+    assert!(
+        saw_merge_winner_then_cancel >= 1,
+        "1-thread sweep must observe STOP_MERGE winning followed by cancellation"
+    );
+    assert!(
+        saw_cancelled_dirty >= 2 && saw_merge_winner_then_ok >= 1,
+        "1-thread sweep must observe dirty cancellation and completed merge restart"
+    );
 
-    // 2. Multi-thread (`threads: 4, dl_steps: false`) concurrent cancellation vs STOP_MERGE.
-    for cancel_at in [1usize, 2, 3, 4, 5, 8, 12] {
-        let polls = Arc::new(AtomicUsize::new(0));
-        let polls_cb = polls.clone();
-        let mut k = Classifier::of(&input);
-        let res = k.classify(&Limits {
+    // 2. Multi-thread (`threads: 4, dl_steps: false`) concurrent cancellation vs STOP_MERGE,
+    //    observing helper thread participation and BOTH stop winners (`STOP_CANCEL` and
+    //    `STOP_MERGE`, including `STOP_MERGE` followed by restart-boundary cancellation).
+    let mt_count_polls = Arc::new(AtomicUsize::new(0));
+    let mt_cp_cb = mt_count_polls.clone();
+    let mut k_mt_probe = Classifier::of(&input);
+    let mt_base = k_mt_probe
+        .classify(&Limits {
             threads: 4,
             rooted: true,
             rooted_merge: true,
             dl_steps: false,
             cancelled: Some(Arc::new(move || {
-                polls_cb.fetch_add(1, Ordering::SeqCst) >= cancel_at
+                mt_cp_cb.fetch_add(1, Ordering::SeqCst);
+                false
             })),
             ..Limits::default()
-        });
+        })
+        .expect("mt unrestricted run");
+    assert!(mt_base.complete);
+    assert_eq!(mt_base.stats.dl_rooted_restarts, 1);
+    let mt_total_polls = mt_count_polls.load(Ordering::SeqCst);
+
+    let mut saw_mt_helper = false;
+    let mut saw_mt_cancel_winner = false;
+    let mut saw_mt_merge_winner = false;
+    let mut saw_mt_merge_then_cancel = false;
+
+    // 2a. Sweep every poll point across the 4-thread `dl_steps: false` run.
+    for cancel_at in 1..=(mt_total_polls + 4) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let polls_cb = polls.clone();
+        let stops = Arc::new(Mutex::new(Vec::new()));
+        let stops_probe = stops.clone();
+        let mut k = Classifier::of(&input);
+        let res = with_merge_probe(
+            move |phase| {
+                if let MergePhase::SatStop { stop, helper_ran } = phase {
+                    stops_probe.lock().push((stop, helper_ran));
+                }
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 4,
+                    rooted: true,
+                    rooted_merge: true,
+                    dl_steps: false,
+                    cancelled: Some(Arc::new(move || {
+                        polls_cb.fetch_add(1, Ordering::SeqCst) >= cancel_at
+                    })),
+                    ..Limits::default()
+                })
+            },
+        );
+        let sat_stops = stops.lock().clone();
+        for &(stop, helper_ran) in &sat_stops {
+            saw_mt_helper |= helper_ran;
+            if stop == super::saturate::STOP_CANCEL {
+                saw_mt_cancel_winner = true;
+            }
+            if stop == super::saturate::STOP_MERGE {
+                saw_mt_merge_winner = true;
+            }
+        }
         match res {
             Err(Error::Cancelled) => {
+                if sat_stops
+                    .iter()
+                    .any(|&(s, _)| s == super::saturate::STOP_MERGE)
+                {
+                    saw_mt_merge_then_cancel = true;
+                }
                 assert!(!k.sat.dl_worked.load(Ordering::Relaxed));
                 let after = k
                     .classify(&Limits {
@@ -5806,4 +6341,103 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
             Err(other) => panic!("mt cancel_at={cancel_at}: unexpected error {other:?}"),
         }
     }
+
+    // 2b. Deterministic 4-thread `STOP_CANCEL` winner inside `saturate_counted`: arm
+    //     cancellation specifically when a saturation worker thread polls `cancelled`.
+    {
+        let stops = Arc::new(Mutex::new(Vec::new()));
+        let stops_probe = stops.clone();
+        let mut k = Classifier::of(&input);
+        let err = with_merge_probe(
+            move |phase| {
+                if let MergePhase::SatStop { stop, helper_ran } = phase {
+                    stops_probe.lock().push((stop, helper_ran));
+                }
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 4,
+                    rooted: true,
+                    rooted_merge: true,
+                    dl_steps: false,
+                    cancelled: Some(Arc::new(|| super::saturate::WORKER.get() != 0)),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("worker-thread cancellation must stop saturation");
+        assert_eq!(err, Error::Cancelled);
+        assert!(!k.sat.dl_worked.load(Ordering::Relaxed));
+        for &(stop, helper_ran) in stops.lock().iter() {
+            saw_mt_helper |= helper_ran;
+            if stop == super::saturate::STOP_CANCEL {
+                saw_mt_cancel_winner = true;
+            }
+            if stop == super::saturate::STOP_MERGE {
+                saw_mt_merge_winner = true;
+                saw_mt_merge_then_cancel = true;
+            }
+        }
+    }
+
+    // 2c. Deterministic 4-thread `STOP_MERGE` winner followed immediately by cancellation
+    //     at the restart boundary (`run_merging` poll).
+    {
+        let cancel_after_merge = Arc::new(AtomicBool::new(false));
+        let cam_probe = cancel_after_merge.clone();
+        let cam_cb = cancel_after_merge.clone();
+        let stops = Arc::new(Mutex::new(Vec::new()));
+        let stops_probe = stops.clone();
+        let mut k = Classifier::of(&input);
+        let err = with_merge_probe(
+            move |phase| {
+                if let MergePhase::SatStop { stop, helper_ran } = phase {
+                    stops_probe.lock().push((stop, helper_ran));
+                    if stop == super::saturate::STOP_MERGE {
+                        cam_probe.store(true, Ordering::SeqCst);
+                    }
+                }
+            },
+            || {
+                k.classify(&Limits {
+                    threads: 4,
+                    rooted: true,
+                    rooted_merge: true,
+                    dl_steps: false,
+                    cancelled: Some(Arc::new(move || cam_cb.load(Ordering::SeqCst))),
+                    ..Limits::default()
+                })
+            },
+        )
+        .expect_err("cancellation armed right after STOP_MERGE must cancel at restart");
+        assert_eq!(err, Error::Cancelled);
+        assert!(!k.sat.dl_worked.load(Ordering::Relaxed));
+        let sat_stops = stops.lock().clone();
+        assert!(
+            sat_stops
+                .iter()
+                .any(|&(s, _)| s == super::saturate::STOP_MERGE),
+            "expected STOP_MERGE winner before restart cancellation: {sat_stops:?}"
+        );
+        for &(stop, helper_ran) in &sat_stops {
+            saw_mt_helper |= helper_ran;
+            if stop == super::saturate::STOP_MERGE {
+                saw_mt_merge_winner = true;
+                saw_mt_merge_then_cancel = true;
+            }
+        }
+    }
+
+    assert!(
+        saw_mt_helper,
+        "4-thread dl_steps=false trials must observe helper thread participation"
+    );
+    assert!(
+        saw_mt_cancel_winner,
+        "4-thread dl_steps=false trials must observe STOP_CANCEL winning"
+    );
+    assert!(
+        saw_mt_merge_winner && saw_mt_merge_then_cancel,
+        "4-thread dl_steps=false trials must observe STOP_MERGE winning and restart cancellation"
+    );
 }

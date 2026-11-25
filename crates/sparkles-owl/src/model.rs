@@ -1198,6 +1198,289 @@ impl Signature {
     }
 }
 
+/// Borrowed entity or leaf visited during an allocation-free walk of an axiom's
+/// structure. Matches [`Signature::axiom`] entity classification while also visiting
+/// anonymous individuals and simple literals so callers can poll cooperatively inside
+/// wide n-ary axioms.
+pub(crate) enum EntityRef<'a> {
+    Class(&'a Class),
+    Datatype(&'a str),
+    ObjectProperty(&'a ObjectProperty),
+    DataProperty(&'a DataProperty),
+    AnnotationProperty(&'a AnnotationProperty),
+    NamedIndividual(&'a NamedIndividual),
+    AnonymousIndividual,
+    OtherLeaf,
+}
+
+impl EntityRef<'_> {
+    #[inline]
+    pub(crate) fn iri_str(&self) -> Option<&str> {
+        match self {
+            EntityRef::Class(e) => Some(e.as_str()),
+            EntityRef::Datatype(s) => Some(s),
+            EntityRef::ObjectProperty(e) => Some(e.as_str()),
+            EntityRef::DataProperty(e) => Some(e.as_str()),
+            EntityRef::AnnotationProperty(e) => Some(e.as_str()),
+            EntityRef::NamedIndividual(e) => Some(e.as_str()),
+            EntityRef::AnonymousIndividual | EntityRef::OtherLeaf => None,
+        }
+    }
+}
+
+fn visit_entity<'a, E>(
+    e: &'a Entity,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    match e {
+        Entity::Class(c) => f(EntityRef::Class(c)),
+        Entity::Datatype(d) => f(EntityRef::Datatype(d.as_str())),
+        Entity::ObjectProperty(p) => f(EntityRef::ObjectProperty(p)),
+        Entity::DataProperty(p) => f(EntityRef::DataProperty(p)),
+        Entity::AnnotationProperty(p) => f(EntityRef::AnnotationProperty(p)),
+        Entity::NamedIndividual(i) => f(EntityRef::NamedIndividual(i)),
+    }
+}
+
+fn visit_ind<'a, E>(
+    i: &'a Individual,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    match i {
+        Individual::Named(n) => f(EntityRef::NamedIndividual(n)),
+        Individual::Anonymous(_) => f(EntityRef::AnonymousIndividual),
+    }
+}
+
+fn visit_lit<'a, E>(
+    l: &'a Literal,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    if l.language().is_none() && l.datatype() != vocab::XSD_STRING {
+        f(EntityRef::Datatype(l.datatype()))
+    } else {
+        f(EntityRef::OtherLeaf)
+    }
+}
+
+fn visit_dr<'a, E>(
+    r: &'a DataRange,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    match r {
+        DataRange::Datatype(d) => f(EntityRef::Datatype(d.as_str())),
+        DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => {
+            for r in rs {
+                visit_dr(r, f)?;
+            }
+            Ok(())
+        }
+        DataRange::ComplementOf(r) => visit_dr(r, f),
+        DataRange::OneOf(ls) => {
+            for l in ls {
+                visit_lit(l, f)?;
+            }
+            Ok(())
+        }
+        DataRange::DatatypeRestriction(d, fs) => {
+            f(EntityRef::Datatype(d.as_str()))?;
+            for fr in fs {
+                visit_lit(&fr.value, f)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn visit_ce<'a, E>(
+    c: &'a ClassExpression,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    use ClassExpression as C;
+    match c {
+        C::Class(c) => f(EntityRef::Class(c)),
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+            for c in cs {
+                visit_ce(c, f)?;
+            }
+            Ok(())
+        }
+        C::ObjectComplementOf(c) => visit_ce(c, f),
+        C::ObjectOneOf(is) => {
+            for i in is {
+                visit_ind(i, f)?;
+            }
+            Ok(())
+        }
+        C::ObjectSomeValuesFrom(p, c) | C::ObjectAllValuesFrom(p, c) => {
+            f(EntityRef::ObjectProperty(p.named()))?;
+            visit_ce(c, f)
+        }
+        C::ObjectHasValue(p, i) => {
+            f(EntityRef::ObjectProperty(p.named()))?;
+            visit_ind(i, f)
+        }
+        C::ObjectHasSelf(p) => f(EntityRef::ObjectProperty(p.named())),
+        C::ObjectMinCardinality(_, p, c)
+        | C::ObjectMaxCardinality(_, p, c)
+        | C::ObjectExactCardinality(_, p, c) => {
+            f(EntityRef::ObjectProperty(p.named()))?;
+            if let Some(c) = c {
+                visit_ce(c, f)?;
+            }
+            Ok(())
+        }
+        C::DataSomeValuesFrom(ps, r) | C::DataAllValuesFrom(ps, r) => {
+            for p in ps {
+                f(EntityRef::DataProperty(p))?;
+            }
+            visit_dr(r, f)
+        }
+        C::DataHasValue(p, l) => {
+            f(EntityRef::DataProperty(p))?;
+            visit_lit(l, f)
+        }
+        C::DataMinCardinality(_, p, r)
+        | C::DataMaxCardinality(_, p, r)
+        | C::DataExactCardinality(_, p, r) => {
+            f(EntityRef::DataProperty(p))?;
+            if let Some(r) = r {
+                visit_dr(r, f)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Walks every entity and leaf in `k` without allocating or cloning IRIs.
+pub(crate) fn visit_axiom_entities<'a, E>(
+    k: &'a AxiomKind,
+    f: &mut impl FnMut(EntityRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    use AxiomKind as K;
+    match k {
+        K::Declaration(e) => visit_entity(e, f),
+        K::SubClassOf(a, b) => {
+            visit_ce(a, f)?;
+            visit_ce(b, f)
+        }
+        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
+            for c in cs {
+                visit_ce(c, f)?;
+            }
+            Ok(())
+        }
+        K::DisjointUnion(c, cs) => {
+            f(EntityRef::Class(c))?;
+            for c in cs {
+                visit_ce(c, f)?;
+            }
+            Ok(())
+        }
+        K::SubObjectPropertyOf(sub, sup) => {
+            match sub {
+                SubObjectPropertyExpression::Expression(p) => {
+                    f(EntityRef::ObjectProperty(p.named()))?;
+                }
+                SubObjectPropertyExpression::Chain(ps) => {
+                    for p in ps {
+                        f(EntityRef::ObjectProperty(p.named()))?;
+                    }
+                }
+            }
+            f(EntityRef::ObjectProperty(sup.named()))
+        }
+        K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
+            for p in ps {
+                f(EntityRef::ObjectProperty(p.named()))?;
+            }
+            Ok(())
+        }
+        K::InverseObjectProperties(a, b) => {
+            f(EntityRef::ObjectProperty(a.named()))?;
+            f(EntityRef::ObjectProperty(b.named()))
+        }
+        K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => {
+            f(EntityRef::ObjectProperty(p.named()))?;
+            visit_ce(c, f)
+        }
+        K::FunctionalObjectProperty(p)
+        | K::InverseFunctionalObjectProperty(p)
+        | K::ReflexiveObjectProperty(p)
+        | K::IrreflexiveObjectProperty(p)
+        | K::SymmetricObjectProperty(p)
+        | K::AsymmetricObjectProperty(p)
+        | K::TransitiveObjectProperty(p) => f(EntityRef::ObjectProperty(p.named())),
+        K::SubDataPropertyOf(a, b) => {
+            f(EntityRef::DataProperty(a))?;
+            f(EntityRef::DataProperty(b))
+        }
+        K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
+            for p in ps {
+                f(EntityRef::DataProperty(p))?;
+            }
+            Ok(())
+        }
+        K::DataPropertyDomain(p, c) => {
+            f(EntityRef::DataProperty(p))?;
+            visit_ce(c, f)
+        }
+        K::DataPropertyRange(p, r) => {
+            f(EntityRef::DataProperty(p))?;
+            visit_dr(r, f)
+        }
+        K::FunctionalDataProperty(p) => f(EntityRef::DataProperty(p)),
+        K::DatatypeDefinition(d, r) => {
+            f(EntityRef::Datatype(d.as_str()))?;
+            visit_dr(r, f)
+        }
+        K::HasKey(c, ops, dps) => {
+            visit_ce(c, f)?;
+            for p in ops {
+                f(EntityRef::ObjectProperty(p.named()))?;
+            }
+            for p in dps {
+                f(EntityRef::DataProperty(p))?;
+            }
+            Ok(())
+        }
+        K::SameIndividual(is) | K::DifferentIndividuals(is) => {
+            for i in is {
+                visit_ind(i, f)?;
+            }
+            Ok(())
+        }
+        K::ClassAssertion(c, i) => {
+            visit_ce(c, f)?;
+            visit_ind(i, f)
+        }
+        K::ObjectPropertyAssertion(p, a, b) | K::NegativeObjectPropertyAssertion(p, a, b) => {
+            f(EntityRef::ObjectProperty(p.named()))?;
+            visit_ind(a, f)?;
+            visit_ind(b, f)
+        }
+        K::DataPropertyAssertion(p, a, l) | K::NegativeDataPropertyAssertion(p, a, l) => {
+            f(EntityRef::DataProperty(p))?;
+            visit_ind(a, f)?;
+            visit_lit(l, f)
+        }
+        K::AnnotationAssertion(p, _, v) => {
+            f(EntityRef::AnnotationProperty(p))?;
+            if let AnnotationValue::Literal(l) = v {
+                visit_lit(l, f)?;
+            }
+            Ok(())
+        }
+        K::SubAnnotationPropertyOf(a, b) => {
+            f(EntityRef::AnnotationProperty(a))?;
+            f(EntityRef::AnnotationProperty(b))
+        }
+        K::AnnotationPropertyDomain(p, _) | K::AnnotationPropertyRange(p, _) => {
+            f(EntityRef::AnnotationProperty(p))
+        }
+    }
+}
+
 /// The ontology header (structural specification §3): IRI, version IRI, direct imports
 /// and ontology annotations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
