@@ -368,16 +368,19 @@ uses the reference's spelling for expressions that select rows or aggregate valu
 An ordered or sliced answer must follow an order that ORDER BY allows. The comparison
 uses the engine's spelling for a key it can recover from the returned bindings.
 A key stops before the first open value or spelling it cannot recover. This includes
-a hidden aggregate key that depends on spelling, or a variable whose BIND may be
-unbound under a different spelling. Metadata reads such as LANG keep their place when
-the input can change only lexically, as with UCASE on a computed string. Earlier
-conditions can still rule out an order or slice.
+a hidden aggregate key whose inputs, selection or distinct solution count depend on
+spelling, or a variable whose BIND may be unbound under a different spelling.
+Metadata reads such as LANG and DATATYPE keep their place when the input can change
+only lexically, as with UCASE on a computed string or a selection aggregate whose
+candidates share their RDF metadata. Earlier conditions can still rule out an order
+or slice.
 
 When several reference rows match a returned row, the comparison uses the observed
 keys of those candidates to check for inversions. A slice must have room on either side
-for omitted rows whose order is forced across the candidate keys. The comparison reports
-the order unchecked when it cannot establish the order from these constraints and
-leaves a slice of it uncompared. It also leaves an answer with open rows uncompared.
+for omitted rows whose order is forced across the candidate keys, counting each
+returned row at most once across the groups it can match. The comparison reports the
+order unchecked when it cannot establish the order from these constraints and leaves a
+slice of it uncompared. It also leaves an answer with open rows uncompared.
 A slice that passes the checks against each other row is compared when the reference's
 other rows, placed around it in their own order, complete it to an order that ORDER BY
 allows. Otherwise the slice is left uncompared. DISTINCT retains the common sort key

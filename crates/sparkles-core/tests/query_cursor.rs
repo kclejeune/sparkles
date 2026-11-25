@@ -7478,6 +7478,186 @@ fn reference_str_1093_keeps_order_after_spelling_invariant_metadata() {
     ));
 }
 
+#[test]
+fn reference_str_1093_r4_shared_candidate_capacity_rejects_forced_omissions() {
+    use reference::check::Outcome;
+    let first = &[r#""first""#][..];
+    let two = &[r#""02""#][..];
+    let last = &[r#""last""#][..];
+
+    let leading = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("last" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 2"#;
+    assert!(check_str_1093(leading, &[two, last]).is_err());
+    assert!(matches!(
+        check_str_1093(leading, &[two, two]),
+        Ok(Outcome::Partial(_))
+    ));
+
+    let tail = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("first" 0) ("02" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(1 AS ?k) }
+    } ORDER BY ?k ?s OFFSET 1 LIMIT 2"#;
+    assert!(check_str_1093(tail, &[first, two]).is_err());
+    assert!(matches!(
+        check_str_1093(tail, &[two, two]),
+        Ok(Outcome::Partial(_))
+    ));
+
+    let between = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("first" 0) ("02" 1) ("last" 2) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(1 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 3"#;
+    assert!(check_str_1093(between, &[first, two, last]).is_err());
+
+    let spare_unresolved = r#"SELECT ?s {
+        { VALUES (?s ?k) { ("02" 0) ("02" 0) ("last" 1) } }
+        UNION { BIND(STR(2 + 0) AS ?s) BIND(0 AS ?k) }
+    } ORDER BY ?k ?s LIMIT 2"#;
+    assert!(matches!(
+        check_str_1093(spare_unresolved, &[two, two]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+#[test]
+fn reference_str_1093_r4_tracks_selection_aggregate_dependencies() {
+    use reference::check::Outcome;
+    let query = r#"SELECT ?n ?s {
+        VALUES (?n ?copy) { (2 true) (2 false) (10 true) (10 false) }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ?s"#;
+    let two_exact = &["2", r#""2""#][..];
+    let two_padded3 = &["2", r#""002""#][..];
+    let two_padded4 = &["2", r#""0002""#][..];
+    let ten = &["10", r#""10""#][..];
+
+    for aggregate in [
+        "MAX(DISTINCT IF(?copy, IF(?n = 2, 2, 3), STRLEN(?s)))",
+        "MAX(IF(?copy, IF(?n = 2, 2, 3), STRLEN(?s))) ?n",
+    ] {
+        let ordered = format!("{query} ORDER BY {aggregate}");
+        assert!(
+            matches!(
+                check_str_1093(&ordered, &[ten, two_padded4]),
+                Ok(Outcome::OrderUnchecked(_))
+            ),
+            "{ordered}"
+        );
+    }
+
+    let min_overtaken = format!(r#"{query} ORDER BY MIN(IF(?copy, IF(?n = 2, "05", "03"), ?s))"#);
+    assert!(matches!(
+        check_str_1093(&min_overtaken, &[two_padded3, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let min_metadata =
+        format!("{query} ORDER BY DATATYPE(MIN(DISTINCT IF(?copy, 1.5, STRLEN(?s)))) ?n");
+    assert!(matches!(
+        check_str_1093(&min_metadata, &[two_padded3, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let sample = format!(r#"{query} ORDER BY SAMPLE(IF(?copy, IF(?n = 2, "2", "10"), ?s))"#);
+    assert!(matches!(
+        check_str_1093(&sample, &[two_padded3, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let fixed_metadata = format!("{query} ORDER BY DATATYPE(MIN(IF(?copy, 2, STRLEN(?s)))) ?n");
+    assert!(check_str_1093(&fixed_metadata, &[ten, two_exact]).is_err());
+    assert_eq!(
+        check_str_1093(&fixed_metadata, &[two_exact, ten]),
+        Ok(Outcome::Compared)
+    );
+
+    let leading_key =
+        format!("{query} ORDER BY ?n MAX(DISTINCT IF(?copy, IF(?n = 2, 2, 3), STRLEN(?s)))");
+    assert!(check_str_1093(&leading_key, &[ten, two_padded4]).is_err());
+}
+
+#[test]
+fn reference_str_1093_r4_tracks_count_distinct_star_dependencies() {
+    use reference::check::Outcome;
+    let two = &["2"][..];
+    let ten = &["10"][..];
+
+    let lexical = r#"SELECT ?n {
+        { VALUES (?n ?s) { (2 "02") (10 "10") } }
+        UNION { VALUES ?n { 2 10 } BIND(STR(?n + 0) AS ?s) }
+    } GROUP BY ?n"#;
+    assert!(matches!(
+        check_str_1093(
+            &format!("{lexical} ORDER BY COUNT(DISTINCT *)"),
+            &[two, ten]
+        ),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    assert!(
+        check_str_1093(
+            &format!("{lexical} ORDER BY DATATYPE(COUNT(DISTINCT *)) ?n"),
+            &[ten, two]
+        )
+        .is_err()
+    );
+    assert_eq!(
+        check_str_1093(
+            &format!("{lexical} ORDER BY DATATYPE(COUNT(DISTINCT *)) ?n"),
+            &[two, ten]
+        ),
+        Ok(Outcome::Compared)
+    );
+
+    let unbound_bind = r#"SELECT ?n {
+        { VALUES (?n ?k) { (2 1) (10 1) (10 2) } }
+        UNION {
+            SELECT ?n ?k {
+                BIND(2 AS ?n)
+                BIND(STR(2 + 0) AS ?s)
+                BIND(IF(?s = "2", 1 / 0, 1) AS ?k)
+            }
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) DESC(?n)"#;
+    assert!(matches!(
+        check_str_1093(unbound_bind, &[two, ten]),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+
+    let plain_count = r#"SELECT ?n {
+        { VALUES (?n ?s) { (2 "02") (10 "10") (10 "20") } }
+        UNION { VALUES ?n { 2 10 } BIND(STR(?n + 0) AS ?s) }
+    } GROUP BY ?n ORDER BY COUNT(*)"#;
+    assert!(check_str_1093(plain_count, &[ten, two]).is_err());
+    assert_eq!(
+        check_str_1093(plain_count, &[two, ten]),
+        Ok(Outcome::Compared)
+    );
+
+    let singleton = r#"SELECT ?n {
+        VALUES ?n { 2 10 }
+        BIND(STR(?n + 0) AS ?s)
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *) ?n"#;
+    assert!(check_str_1093(singleton, &[ten, two]).is_err());
+    assert_eq!(
+        check_str_1093(singleton, &[two, ten]),
+        Ok(Outcome::Compared)
+    );
+
+    let projected_out = r#"SELECT ?n {
+        SELECT ?n ?tag {
+            VALUES (?n ?tag) { (2 "a") (2 "b") (10 "a") (10 "a") }
+            BIND(STR(?n + 0) AS ?s)
+        }
+    } GROUP BY ?n ORDER BY COUNT(DISTINCT *)"#;
+    assert!(check_str_1093(projected_out, &[two, ten]).is_err());
+    assert_eq!(
+        check_str_1093(projected_out, &[ten, two]),
+        Ok(Outcome::Compared)
+    );
+}
+
 /// The reference evaluator's own cases: the choices that it notes, the scope of the
 /// solution that LATERAL substitutes, BNODE across a join and its sort order.
 #[test]

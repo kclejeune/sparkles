@@ -555,52 +555,92 @@ fn check_alternative_keys(
         }
     }
     if sliced {
-        let mut possible_returns = vec![0; matching.groups.len()];
-        for &g in matching.candidates.iter().flatten() {
-            possible_returns[g] += 1;
+        let mut group_returns = vec![Vec::new(); matching.groups.len()];
+        for (r, options) in matching.candidates.iter().enumerate() {
+            for &g in options {
+                group_returns[g].push(r);
+            }
         }
-        let mut forced_before = 0;
-        let mut forced_after = 0;
-        for (group, max_returned) in matching.groups.iter().zip(possible_returns) {
-            if group.expected.len() <= max_returned {
+        let mut can_omit = vec![false; matching.groups.len()];
+        let mut visited_group = vec![false; matching.groups.len()];
+        let mut visited_return = vec![false; got.len()];
+        for start in 0..matching.groups.len() {
+            if visited_group[start] {
                 continue;
             }
-            let mut before = 0;
-            let mut after = 0;
-            let mut both = 0;
-            for &i in &group.expected {
-                let outside = observed(order.items[i].1.as_ref(), None);
-                let outside = std::slice::from_ref(&outside);
-                let mut is_before = false;
-                let mut is_after = false;
-                for returned in &alternatives {
-                    if !is_before {
-                        let Some(forced) = all_before(outside, returned) else {
-                            return unchecked();
-                        };
-                        is_before = forced;
-                    }
-                    if !is_after {
-                        let Some(forced) = all_before(returned, outside) else {
-                            return unchecked();
-                        };
-                        is_after = forced;
+            let mut component = Vec::new();
+            let mut queue = VecDeque::from([start]);
+            visited_group[start] = true;
+            let mut expected = 0;
+            let mut returns = 0;
+            while let Some(g) = queue.pop_front() {
+                component.push(g);
+                expected += matching.groups[g].expected.len();
+                for &r in &group_returns[g] {
+                    if !visited_return[r] {
+                        visited_return[r] = true;
+                        returns += 1;
+                        for &next in &matching.candidates[r] {
+                            if !visited_group[next] {
+                                visited_group[next] = true;
+                                queue.push_back(next);
+                            }
+                        }
                     }
                 }
-                before += usize::from(is_before);
-                after += usize::from(is_after);
-                both += usize::from(is_before && is_after);
             }
-            // At most this many rows in the group can be used by any matching.
-            // A larger set of forced rows must leave some outside the slice.
-            if both > max_returned {
-                return Err(
-                    "an omitted reference row belongs both before and after returned rows".into(),
-                );
+            if expected > returns {
+                for g in component {
+                    can_omit[g] = true;
+                }
             }
-            forced_before += before.saturating_sub(max_returned);
-            forced_after += after.saturating_sub(max_returned);
         }
+        let mut before = vec![0; matching.groups.len()];
+        let mut after = vec![0; matching.groups.len()];
+        let mut both = vec![0; matching.groups.len()];
+        let mut verdict: HashMap<Option<KeyTerms>, (bool, bool)> = HashMap::new();
+        for (g, group) in matching.groups.iter().enumerate() {
+            if !can_omit[g] {
+                continue;
+            }
+            for &i in &group.expected {
+                let outside = observed(order.items[i].1.as_ref(), None);
+                let (is_before, is_after) = match verdict.get(&outside) {
+                    Some(&v) => v,
+                    None => {
+                        let key = std::slice::from_ref(&outside);
+                        let mut is_before = false;
+                        let mut is_after = false;
+                        for returned in &alternatives {
+                            if !is_before {
+                                let Some(forced) = all_before(key, returned) else {
+                                    return unchecked();
+                                };
+                                is_before = forced;
+                            }
+                            if !is_after {
+                                let Some(forced) = all_before(returned, key) else {
+                                    return unchecked();
+                                };
+                                is_after = forced;
+                            }
+                        }
+                        verdict.insert(outside, (is_before, is_after));
+                        (is_before, is_after)
+                    }
+                };
+                before[g] += usize::from(is_before);
+                after[g] += usize::from(is_after);
+                both[g] += usize::from(is_before && is_after);
+            }
+        }
+        if mandatory_omissions(&both, &matching.candidates, &group_returns) > 0 {
+            return Err(
+                "an omitted reference row belongs both before and after returned rows".into(),
+            );
+        }
+        let forced_before = mandatory_omissions(&before, &matching.candidates, &group_returns);
+        let forced_after = mandatory_omissions(&after, &matching.candidates, &group_returns);
         let n = order.items.len();
         check_slice_capacity(
             order.offset.min(n),
@@ -612,6 +652,49 @@ fn check_alternative_keys(
     Ok(Outcome::OrderUnchecked(format!(
         "equal rows can have different sort keys, and the first matching found {message}"
     )))
+}
+
+/// Lower bound on omitted rows in `counts` across all valid matchings.
+/// Connected components of the forced groups have disjoint candidate returned rows,
+/// so consumption in each component is bounded both by its distinct eligible returns
+/// and by the sum of its per-group capacities.
+fn mandatory_omissions(
+    counts: &[usize],
+    candidates: &[Vec<usize>],
+    group_returns: &[Vec<usize>],
+) -> usize {
+    let mut visited_group = vec![false; counts.len()];
+    let mut visited_return = vec![false; candidates.len()];
+    let mut omitted = 0;
+    for start in 0..counts.len() {
+        if counts[start] == 0 || visited_group[start] {
+            continue;
+        }
+        let mut queue = VecDeque::from([start]);
+        visited_group[start] = true;
+        let mut forced = 0;
+        let mut per_group_cap = 0;
+        let mut returns = 0;
+        while let Some(g) = queue.pop_front() {
+            forced += counts[g];
+            per_group_cap += counts[g].min(group_returns[g].len());
+            for &r in &group_returns[g] {
+                if !visited_return[r] {
+                    visited_return[r] = true;
+                    returns += 1;
+                    for &next in &candidates[r] {
+                        if counts[next] > 0 && !visited_group[next] {
+                            visited_group[next] = true;
+                            queue.push_back(next);
+                        }
+                    }
+                }
+            }
+        }
+        let cap = returns.min(per_group_cap);
+        omitted += forced.saturating_sub(cap);
+    }
+    omitted
 }
 
 /// Check that `got` is a slice, at the query's offset, of an order of the reference's

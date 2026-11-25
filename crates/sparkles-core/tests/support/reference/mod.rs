@@ -170,6 +170,16 @@ impl Solution {
         self.origins.retain(|v, _| variables.contains(v));
         self.spelling.retain(|v, _| variables.contains(v));
     }
+
+    fn has_visible_spelling(&self) -> bool {
+        self.origins
+            .iter()
+            .any(|(v, o)| !is_hidden(v) && matches!(o, Origin::NumericLexical(_)))
+            || self
+                .spelling
+                .iter()
+                .any(|(v, &s)| !is_hidden(v) && s != SpellingDependency::None)
+    }
 }
 
 /// Why a query got no answer.
@@ -764,6 +774,20 @@ fn visible(s: &Solution) -> BTreeMap<Variable, Term> {
         .filter(|(k, _)| !is_hidden(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+fn same_metadata(a: &Term, b: &Term) -> bool {
+    match (a, b) {
+        (Term::NamedNode(_), Term::NamedNode(_))
+        | (Term::BlankNode(_), Term::BlankNode(_))
+        | (Term::Triple(_), Term::Triple(_)) => true,
+        (Term::Literal(x), Term::Literal(y)) => {
+            x.datatype() == y.datatype()
+                && x.language() == y.language()
+                && x.direction() == y.direction()
+        }
+        _ => false,
+    }
 }
 
 /// The solutions of `right` that can be compatible with a solution of `left`, found by
@@ -1905,7 +1929,7 @@ impl<'a> Evaluator<'a> {
         use value::*;
         let (name, expr, distinct) = match a {
             AggregateExpression::CountSolutions { distinct } => {
-                let n = if *distinct {
+                let binding = if *distinct {
                     if members
                         .iter()
                         .any(|m| m.keys().any(|k| k.as_str().starts_with(":bnode:")))
@@ -1918,11 +1942,16 @@ impl<'a> Evaluator<'a> {
                     if inner_open {
                         self.mark_open(out);
                     }
-                    members.iter().map(visible).collect::<HashSet<_>>().len()
+                    let n = members.iter().map(visible).collect::<HashSet<_>>().len();
+                    let mut binding = Binding::number(int_term(n as i128));
+                    if members.len() > 1 && members.iter().any(Solution::has_visible_spelling) {
+                        binding.spelling = Spelling::Lexical;
+                    }
+                    binding
                 } else {
-                    members.len()
+                    Binding::number(int_term(members.len() as i128))
                 };
-                return Ok(Some(Binding::number(int_term(n as i128))));
+                return Ok(Some(binding));
             }
             AggregateExpression::FunctionCall {
                 name,
@@ -2148,6 +2177,22 @@ impl<'a> Evaluator<'a> {
                     Spelling::Lexical
                 }
                 AggregateFunction::Sum | AggregateFunction::Avg if reads_spelling => Spelling::Term,
+                AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::Sample => {
+                    if spelling_error || inputs == Spelling::Term {
+                        Spelling::Term
+                    } else if inputs == Spelling::Lexical {
+                        let mixed_metadata = terms
+                            .first()
+                            .is_some_and(|first| terms.iter().any(|t| !same_metadata(first, t)));
+                        if mixed_metadata {
+                            Spelling::Term
+                        } else {
+                            Spelling::Lexical
+                        }
+                    } else {
+                        Spelling::None
+                    }
+                }
                 AggregateFunction::GroupConcat { .. } if !spelling_error => inputs,
                 _ if spelling_error => Spelling::Term,
                 _ => Spelling::None,
