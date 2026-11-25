@@ -7069,7 +7069,7 @@ impl HeapRows<usize> for EagerHeapRows<'_> {
     fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<usize> {
         let added = Self::entry_bytes(keys);
         let next = self.bytes.saturating_add(added);
-        self.charge.cover(next, self.step)?;
+        self.charge.cover(next, self.step.min(next / 4))?;
         self.bytes = next;
         Ok(i)
     }
@@ -7079,7 +7079,8 @@ impl HeapRows<usize> for EagerHeapRows<'_> {
         // Drop the evicted entry's payloads before releasing their credit.
         drop(entry);
         self.bytes = self.bytes.saturating_sub(freed);
-        if self.charge.bytes() > self.bytes.saturating_add(self.step) {
+        let slack = self.step.min(self.bytes / 4).max(256);
+        if self.charge.bytes() > self.bytes.saturating_add(slack) {
             self.charge.resize(self.bytes)?;
         }
         Ok(())
@@ -7400,7 +7401,7 @@ fn key_rows_admitted(
                         if p > 0 {
                             bytes = bytes.saturating_add(p);
                             if bytes > covered {
-                                let ahead = bytes.saturating_add(step);
+                                let ahead = bytes.saturating_add(step.min(bytes / 4));
                                 match part.add(ahead - covered) {
                                     Ok(()) => covered = ahead,
                                     Err(_) => {
@@ -7460,7 +7461,7 @@ fn key_rows_admitted(
             if p > 0 {
                 bytes = bytes.saturating_add(p);
                 if bytes > covered {
-                    let ahead = bytes.saturating_add(step);
+                    let ahead = bytes.saturating_add(step.min(bytes / 4));
                     match part.add(ahead - covered) {
                         Ok(()) => covered = ahead,
                         Err(_) => {
@@ -7557,7 +7558,7 @@ pub(super) fn key_rows_charged(
         };
         bytes = bytes.saturating_add(key_payload(&value));
         if let Some(charge) = &mut charge {
-            charge.cover(bytes, step)?;
+            charge.cover(bytes, step.min(bytes / 4))?;
         }
         values.push(value);
     }
@@ -11792,16 +11793,29 @@ mod paid_eager_producer_tests {
 
         // Generic top-k filter entry point (`topk_read_keys_last` with non-empty `spec.filter`):
         // verify exact scalar results on ID refusal, on block-index refusal, and when both
-        // prefetch vectors are admitted.
+        // prefetch vectors are admitted. Pre-admit the parallel decode envelope for the
+        // decimal keys so strict eager decode accounting fits regardless of host thread count
+        // while `mem_limit` pins the exact remaining headroom around prefetch scratch.
         let filter_scratch = (n as u64).saturating_add(
             (probe.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
         );
+        let warm_decode = |ctx: &Ctx| -> u64 {
+            rayon::join(
+                || {
+                    let _ = ctx.value(neg_sample);
+                    let _ = ctx.value(pos_sample);
+                },
+                || (),
+            );
+            ctx.live_bytes()
+        };
 
         // Generic top-k case 1: 1 byte below `ids_bytes` skips prefetch and keeps exact scalar
         // results within budget.
         let mut tight_ids_topk = make_ctx();
+        let decode_bytes = warm_decode(&tight_ids_topk);
         tight_ids_topk.opt.prefetch_terms = true;
-        tight_ids_topk.mem_limit = raw_bytes + filter_scratch + ids_bytes - 1;
+        tight_ids_topk.mem_limit = decode_bytes + raw_bytes + filter_scratch + ids_bytes - 1;
         let (before_ids, before_blocks) = (ids_count(), blocks_count());
         let (filtered, scanned) =
             topk_read(&tight_ids_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
@@ -11817,8 +11831,10 @@ mod paid_eager_producer_tests {
         // Generic top-k case 2: room for `ids_bytes` alone admits IDs, refuses the mapped
         // block-index resize, and still returns exact scalar results.
         let mut ids_only_topk = make_ctx();
+        let decode_bytes = warm_decode(&ids_only_topk);
         ids_only_topk.opt.prefetch_terms = true;
-        ids_only_topk.mem_limit = raw_bytes + filter_scratch + ids_bytes + blocks_bytes - 1;
+        ids_only_topk.mem_limit =
+            decode_bytes + raw_bytes + filter_scratch + ids_bytes + blocks_bytes - 1;
         let (before_ids, before_blocks) = (ids_count(), blocks_count());
         let (filtered, scanned) =
             topk_read(&ids_only_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
@@ -11827,7 +11843,9 @@ mod paid_eager_producer_tests {
         if io_hints {
             assert_eq!(ids_count(), before_ids + 1);
             assert_eq!(blocks_count(), before_blocks);
-            assert!(ids_only_topk.mem_peak() >= raw_bytes + filter_scratch + ids_bytes);
+            assert!(
+                ids_only_topk.mem_peak() >= decode_bytes + raw_bytes + filter_scratch + ids_bytes
+            );
             assert!(ids_only_topk.mem_peak() <= ids_only_topk.mem_limit);
         } else {
             assert_eq!(ids_count(), before_ids);
@@ -11840,8 +11858,9 @@ mod paid_eager_producer_tests {
         // Generic top-k case 3: exact room for both ID and mapped block-index vectors admits
         // both through `topk_read` -> `apply_filter` -> `decode_for` -> `prefetch_column_terms`.
         let mut both_topk = make_ctx();
+        let decode_bytes = warm_decode(&both_topk);
         both_topk.opt.prefetch_terms = true;
-        both_topk.mem_limit = raw_bytes + filter_scratch + ids_bytes + blocks_bytes;
+        both_topk.mem_limit = decode_bytes + raw_bytes + filter_scratch + ids_bytes + blocks_bytes;
         let (before_ids, before_blocks) = (ids_count(), blocks_count());
         let (filtered, scanned) =
             topk_read(&both_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
@@ -11852,7 +11871,7 @@ mod paid_eager_producer_tests {
             assert_eq!(blocks_count(), before_blocks + 1);
             assert_eq!(
                 both_topk.mem_peak(),
-                raw_bytes + filter_scratch + ids_bytes + blocks_bytes
+                decode_bytes + raw_bytes + filter_scratch + ids_bytes + blocks_bytes
             );
         } else {
             assert_eq!(ids_count(), before_ids);

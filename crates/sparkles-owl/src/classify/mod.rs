@@ -13491,7 +13491,6 @@ impl<'a> WorldBudget<'a> {
                 return false;
             }
         }
-        let _panic = WorldChargePanic(self, std::thread::panicking());
         let why = if limits.deadline.is_some_and(deadline_passed) {
             WORLD_TIMEOUT
         } else if limits.cancelled.as_ref().is_some_and(|f| f()) {
@@ -21939,7 +21938,14 @@ mod tests {
 
     #[test]
     fn taxonomy_admission_reclaims_freed_expression_buffer() {
-        let mut text = String::from("Prefix(:=<urn:tax-reclaim:>)\nOntology(\n");
+        // Use a non-kept Horn ontology (individuals disable incremental root retention)
+        // so `roots` is freed before taxonomy admission and its bytes are reclaimed.
+        let mut text = String::from(
+            "Prefix(:=<urn:tax-reclaim:>)\nOntology(\n\
+             InverseObjectProperties(:r :rinv)\n\
+             SubClassOf(:C0000 ObjectAllValuesFrom(:r :Super0000))\n\
+             ClassAssertion(:C0000 :ind)\n",
+        );
         for i in 0..400 {
             text.push_str(&format!("SubClassOf(:C{i:04} :Super{i:04})\n"));
         }
@@ -22001,6 +22007,40 @@ mod tests {
             post_drop + bounded.stats.taxonomy_memory
         );
         assert!(bounded.stats.peak_memory >= conversion_held);
+
+        // Kept EL runs intentionally retain `self.last_roots` for incremental dead-root
+        // invalidation, so `stats.memory` retains `root_bytes`.
+        let mut el_text = String::from("Prefix(:=<urn:tax-keep:>)\nOntology(\n");
+        for i in 0..400 {
+            el_text.push_str(&format!("SubClassOf(:C{i:04} :Super{i:04})\n"));
+        }
+        el_text.push(')');
+        let el_doc = crate::ofn_read::parse(&el_text).unwrap();
+        let el_kinds: Vec<&AxiomKind> = el_doc.axioms.iter().map(|a| &a.kind).collect();
+        let el_observed = Arc::new(parking_lot::Mutex::new(None));
+        let el_obs = el_observed.clone();
+        let el_out = admission_test::with_attempt(
+            None,
+            false,
+            move |attempt| {
+                if let admission_test::Attempt::Retained {
+                    bytes, root_bytes, ..
+                } = attempt
+                {
+                    *el_obs.lock() = Some((bytes, root_bytes));
+                }
+            },
+            || {
+                Saturation::new()
+                    .classify(&el_kinds, None, &limits)
+                    .unwrap()
+            },
+        );
+        let (el_held, el_root_bytes) = el_observed
+            .lock()
+            .expect("expected Retained observation for kept EL run");
+        assert!(el_root_bytes > 0);
+        assert_eq!(el_out.stats.memory, el_held + el_out.stats.taxonomy_memory);
     }
 
     #[test]

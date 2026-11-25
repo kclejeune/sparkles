@@ -1555,6 +1555,113 @@ impl QueryMemoryLedger {
             }
         }
     }
+    fn reserve_decode_to_once(&self, owner: &MemoryOwner, limit: u64, target: u64) -> Result<()> {
+        let mut admission = UpstreamAdmission::new(self);
+        loop {
+            let mut guard = self.lock();
+            let state = &mut *guard;
+            let Some(bytes) = target.checked_sub(state.decode_total).filter(|&b| b > 0) else {
+                admission.finish_locked(&mut guard);
+                return Ok(());
+            };
+            // Promote idle optional prefetch bytes on the same owner into non-reclaimable
+            // decode bytes so decoding does not double-charge or fail against idle prefetch.
+            let promote = if self.prefetch_active.load(Ordering::SeqCst) == 0 {
+                state
+                    .owners
+                    .iter()
+                    .find(|a| a.owner.id == owner.id)
+                    .expect("live owner")
+                    .prefetch
+                    .min(bytes)
+            } else {
+                0
+            };
+            let additional = bytes - promote;
+            if additional > 0 {
+                match self.admit_with_credit(
+                    state,
+                    owner,
+                    limit,
+                    additional,
+                    true,
+                    &mut admission,
+                )? {
+                    AdmitStep::Done => {}
+                    AdmitStep::WaitUpstream => {
+                        self.wait_for_upstream_growth(&mut guard);
+                        continue;
+                    }
+                    AdmitStep::NeedUpstream(req) => {
+                        let return_epoch = self.upstream_return_epoch.load(Ordering::Acquire);
+                        drop(guard);
+                        let return_scope = UpstreamReturnScope::enter(self, return_epoch);
+                        if let Err(err) = reserve_more_credit(&mut admission.credit, &req)
+                            && !self.revalidate_upstream_refusal(
+                                owner.id,
+                                RefusalDemand::Bytes {
+                                    bytes,
+                                    decode: true,
+                                },
+                                req.min_delta,
+                                &return_scope,
+                                &err,
+                                &mut admission,
+                            )
+                        {
+                            return Err(parent_error(err));
+                        }
+                        continue;
+                    }
+                }
+            }
+            if promote > 0 {
+                let account = state
+                    .owners
+                    .iter_mut()
+                    .find(|a| a.owner.id == owner.id)
+                    .expect("live owner");
+                account.prefetch -= promote;
+                account.decode = account
+                    .decode
+                    .checked_add(promote)
+                    .expect("promoted decode bytes fit live");
+                state.prefetch_total -= promote;
+                state.decode_total = state
+                    .decode_total
+                    .checked_add(promote)
+                    .expect("promoted decode total fits live");
+                self.prefetch_bytes
+                    .store(state.prefetch_total, Ordering::Release);
+                self.envelope_reserved.store(
+                    state.decode_total.saturating_add(state.prefetch_total),
+                    Ordering::Release,
+                );
+            }
+            admission.finish_locked(&mut guard);
+            return Ok(());
+        }
+    }
+    /// Ensure the ledger's non-reclaimable decode envelope holds at least `target` bytes,
+    /// promoting any idle optional prefetch headroom on `owner` before admitting more.
+    pub(crate) fn reserve_decode_to(
+        &self,
+        owner: &MemoryOwner,
+        limit: u64,
+        target: u64,
+    ) -> Result<()> {
+        if target == 0 {
+            return Ok(());
+        }
+        loop {
+            let epoch = self.reclaim_epoch.load(Ordering::Acquire);
+            match self.reserve_decode_to_once(owner, limit, target) {
+                Ok(()) => return Ok(()),
+                Err(Error::BudgetExceeded(_)) if self.reclaim_idle_prefetch_since(epoch) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
     fn reserve_decode_once(&self, owner: &MemoryOwner, limit: u64, bytes: u64) -> Result<()> {
         let mut admission = UpstreamAdmission::new(self);
         loop {

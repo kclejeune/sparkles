@@ -75,7 +75,7 @@ impl HeapRows<u32> for Offer<'_> {
                 .bytes(self.base_entries, self.keys_len)
                 .saturating_sub(self.slots.key_bytes)
             + next_key_bytes;
-        self.charge.cover(need, self.step)?;
+        self.charge.cover(need, self.step.min(need / 4))?;
         let w = self.slots.width();
         let slot = match self.slots.free.pop() {
             Some(slot) => slot,

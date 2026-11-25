@@ -10315,9 +10315,15 @@ fn split_round5_retained_exclusions_reduce_taxonomy_headroom() {
         None,
         false,
         move |event| {
-            if let admission_test::Attempt::Retained { bytes, pending, .. } = event {
+            if let admission_test::Attempt::Retained {
+                bytes,
+                root_bytes,
+                pending,
+                ..
+            } = event
+            {
                 assert_eq!(pending, 0);
-                observed.store(bytes, Ordering::Relaxed);
+                observed.store(bytes - root_bytes, Ordering::Relaxed);
             }
         },
         || sat.classify(&refs, None, &limits).unwrap(),

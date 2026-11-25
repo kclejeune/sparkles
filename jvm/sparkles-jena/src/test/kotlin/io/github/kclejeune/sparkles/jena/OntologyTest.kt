@@ -546,6 +546,11 @@ class OntologyTest {
                 answered++
                 assertEquals(full.getNumber("classes"), r.getNumber("classes"))
                 if (!r.getBoolean("partial")) {
+                    if (r.get("stats").asObject.getBoolean("coverageStopped")) {
+                        assertFalse(r.getBoolean("complete"))
+                        assertEquals("unknown", r.getString("consistency"))
+                        return@use true
+                    }
                     assertTrue(r.getBoolean("complete"))
                     assertEquals(want, r.getString("consistency"))
                     return@use true
@@ -636,6 +641,11 @@ class OntologyTest {
                     answered++
                     assertEquals(full.getNumber("classes"), r.getNumber("classes"))
                     if (!r.getBoolean("partial")) {
+                        if (r.get("stats").asObject.getBoolean("coverageStopped")) {
+                            assertFalse(r.getBoolean("complete"))
+                            assertEquals("unknown", r.getString("consistency"))
+                            return@use true
+                        }
                         assertTrue(r.getBoolean("complete"))
                         assertEquals("consistent", r.getString("consistency"))
                         return@use true

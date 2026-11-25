@@ -2352,14 +2352,13 @@ impl Ctx {
         min_bytes: u64,
         eager_bytes: u64,
     ) -> Result<PrefetchScratch<'_>> {
-        if !self.streams() {
+        let Some(ledger) = self.memory.get() else {
             return Ok(PrefetchScratch::Eager(self.charge(min_bytes)?));
-        }
+        };
         self.check_memory_failure()?;
         let workers = Self::decode_workers();
         let min_need = min_bytes.saturating_mul(workers);
         let eager_need = eager_bytes.saturating_mul(workers);
-        let ledger = self.memory();
         ledger.begin_prefetch();
         let covered = ledger.envelope_reserved();
         if covered >= min_need {
@@ -2447,6 +2446,30 @@ impl Ctx {
         // A refused charge is dropped after the guard, since even an empty cursor
         // charge can synchronously wake pool waiters.
         let charge = self.charge(0)?;
+        if let Some(ledger) = self.memory.get() {
+            // Reserve decode bytes directly on the ledger's decode envelope while
+            // `envelope.state` is unlocked so synchronous pool wakes can re-enter safely
+            // and optional cursor prefetch shares the envelope with zero extra ledger ops.
+            let eager_paid: u64 = {
+                let state = envelope.state.lock();
+                if need <= state.0 {
+                    drop(state);
+                    drop(charge);
+                    return self.check_memory_failure();
+                }
+                state.1.iter().map(|&(_, owned)| owned).sum()
+            };
+            let account = ledger.owner(self.grant.as_ref())?;
+            ledger.reserve_decode_to(&account, self.mem_limit, need.saturating_sub(eager_paid))?;
+            let mut state = envelope.state.lock();
+            if need > state.0 {
+                state.0 = need;
+                envelope.reserved.store(need, Ordering::Release);
+            }
+            drop(state);
+            drop(charge);
+            return self.check_memory_failure();
+        }
         let mut state = envelope.state.lock();
         let (peak, owners) = &mut *state;
         if need > *peak {

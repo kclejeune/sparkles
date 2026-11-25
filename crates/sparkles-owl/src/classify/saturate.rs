@@ -1235,8 +1235,7 @@ impl Drop for Taken<'_, '_> {
             let tags = tag_count(suffix);
             run.credit(tags * CONCLUSION_BYTES);
             if tags != suffix.len() {
-                run.queued
-                    .fetch_sub((suffix.len() - tags) as isize, Ordering::Relaxed);
+                run.sub_queued((suffix.len() - tags) as isize);
             }
         }
     }
@@ -1267,7 +1266,7 @@ impl Drop for OutboxRetirement<'_, '_> {
         // balance and subtract one ordinary row for each abandoned destination use.
         let queued = self.tally.queued - (uses - tags) as isize;
         if queued != 0 {
-            self.run.queued.fetch_add(queued, Ordering::Relaxed);
+            self.run.adjust_queued(queued);
         }
     }
 }
@@ -2006,7 +2005,7 @@ pub fn saturate_counted(
                         raw_stop = STOP_MEMORY;
                     } else if bounds.dl.is_some_and(|d| d.over_work()) {
                         raw_stop = STOP_WORK;
-                    } else if bounds.deadline.is_some_and(|d| Instant::now() >= d) {
+                    } else if bounds.deadline.is_some_and(super::deadline_passed) {
                         raw_stop = STOP_TIMEOUT;
                     } else if bounds.cancelled.is_some_and(|f| f()) {
                         raw_stop = STOP_CANCEL;
@@ -2559,6 +2558,9 @@ impl<'r, 'a> Out<'r, 'a> {
             }
         };
         if !memory_only {
+            if !self.run.batch.load(Ordering::Relaxed) {
+                self.run.batch_if_congested();
+            }
             let b = self.run.bounds;
             if !self.run.steps && b.dl.is_some_and(|d| d.over_work()) {
                 let won = self.run.publish_stop(STOP_WORK);
@@ -2568,7 +2570,7 @@ impl<'r, 'a> Out<'r, 'a> {
                 }
                 return false;
             }
-            if b.deadline.is_some_and(|d| Instant::now() >= d) {
+            if b.deadline.is_some_and(super::deadline_passed) {
                 let won = self.run.publish_stop(STOP_TIMEOUT);
                 drop(guard);
                 if won {
@@ -4279,6 +4281,22 @@ impl<'a> Run<'a> {
         self.queued.fetch_sub(dropped, Ordering::Relaxed);
     }
 
+    /// Adjusts waiting message count by a signed delta during teardown, keeping the
+    /// serialized ledger and atomic mirror in sync.
+    fn adjust_queued(&self, delta: isize) {
+        if delta < 0 {
+            self.sub_queued(-delta);
+        } else if delta > 0 {
+            if self.serialized_admission {
+                let mut ledger = super::lock_admission(&self.admission);
+                ledger.queued = ledger.queued.saturating_add(delta);
+                self.queued.store(ledger.queued, Ordering::Relaxed);
+                return;
+            }
+            self.queued.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
     /// Initial pooled check before starting workers so an empty round still covers its
     /// inherited tables and queued messages under the serialized ledger.
     fn check_initial_memory(&self) -> bool {
@@ -4301,6 +4319,8 @@ impl<'a> Run<'a> {
         };
         ledger.committed_peak = ledger.committed_peak.max(used);
         self.peak.fetch_max(used, Ordering::Relaxed);
+        #[cfg(test)]
+        super::admission_test::hit(super::admission_test::Point::Observed);
         if self.stopped() {
             return false;
         }
@@ -4411,7 +4431,7 @@ impl<'a> Run<'a> {
             self.halt(STOP_WORK);
             return (true, false);
         }
-        if b.deadline.is_some_and(|d| Instant::now() >= d) {
+        if b.deadline.is_some_and(super::deadline_passed) {
             self.halt(STOP_TIMEOUT);
             return (true, false);
         }
@@ -5797,6 +5817,11 @@ mod horn_accounting_tests {
         let bounds = paid_bounds(2, &charge);
         let mut run = run(ix, &ctx, &bounds);
         run.queued.store(2, Ordering::Relaxed);
+        {
+            let ledger = run.admission.get_mut();
+            ledger.queued = 2;
+            ledger.committed_peak = baseline;
+        }
         run.always_congested = true;
         let mut mine = VecDeque::new();
         let mut outbox = Outbox::default();
@@ -6105,6 +6130,11 @@ mod horn_accounting_tests {
             let bounds = paid_bounds(0, &charge);
             let mut run = run(ix, &ctx, &bounds);
             run.queued.store(0, Ordering::Relaxed);
+            {
+                let ledger = run.admission.get_mut();
+                ledger.queued = 0;
+                ledger.committed_peak = BASE;
+            }
             run.always_congested = true;
             let mut tally = Tally::default();
             let mut mine = VecDeque::new();

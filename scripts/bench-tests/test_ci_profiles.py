@@ -9,8 +9,12 @@ import tomllib
 import unittest
 
 # scripts/ci.sh --changed narrows the lint and test tasks through this variable. The
-# task commands below run as a full run would, whatever the caller narrowed.
+# task commands below run as a full run would, whatever the caller narrowed. Gate JUnit
+# retention runs are covered by test_ci_junit.py and must not leak from an enclosing gate
+# into these mock task shells.
 os.environ.pop("SPARKLES_CHANGED_PACKAGES", None)
+os.environ.pop("SPARKLES_CI_GATE_RUN", None)
+os.environ.pop("SPARKLES_CI_GATE_RUNS", None)
 
 ROOT = Path(__file__).resolve().parents[2]
 

@@ -86,6 +86,9 @@ pub(crate) fn peak_of<R>(f: impl FnOnce() -> R) -> (R, usize) {
 /// The result of `f`, the peak live bytes beyond the start of `f`, and the largest single
 /// allocation or reallocation made on this thread while `f` ran.
 pub(crate) fn peak_and_largest_of<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
+    // Initialize the process-global Rayon pool before measuring so one-time worker
+    // setup in a fresh test process does not contaminate per-operation heap peaks.
+    let _ = rayon::current_num_threads();
     let start = NOW.with(Cell::get);
     PEAK.with(|p| p.set(start));
     LARGEST.with(|l| l.set(0));
