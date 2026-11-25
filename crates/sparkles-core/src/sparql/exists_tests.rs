@@ -703,3 +703,104 @@ fn an_eager_exists_memo_is_charged() {
         "{distinct} bytes with distinct keys against {shared} with one"
     );
 }
+
+#[test]
+fn admission_does_not_pollute_explain_and_deep_exists_reports_decorrelation() {
+    let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..1000 {
+        ttl.push_str(&format!("ex:s{i} ex:e0 ex:n0_{} .\n", i % 50));
+    }
+    for level in 0..8 {
+        for j in 0..50 {
+            if level < 7 || j % 2 == 0 {
+                ttl.push_str(&format!(
+                    "ex:n{level}_{j} ex:e{} ex:n{}_{j} .\n",
+                    level + 1,
+                    level + 1
+                ));
+            }
+        }
+    }
+    let s = store(&ttl);
+    // Automatic admission runs `streams_natively` / `keyed_exists` over nested EXISTS
+    // patterns via `PlanCache` without mutating `Decor::reason`, so an unreached EXISTS
+    // (empty input, or inspected directly after `auto_streaming`) carries no spurious
+    // `[EXISTS per row: ...]` note in EXPLAIN.
+    let unreached = format!(
+        "{PREFIXES}SELECT (COUNT(*) AS ?n) WHERE {{ ?s ex:absent ?v0 FILTER EXISTS {{ ?v0 ex:e1 ?v1 OPTIONAL {{ ?v1 ex:e2 ?v2 }} }} }}"
+    );
+    let parsed = super::parse_query(&unreached, None, &[]).unwrap();
+    let mut prepared =
+        super::prepare_query(s.snapshot(), &parsed, &opts(Optimizations::ALL), None, None).unwrap();
+    {
+        let mut group = &mut prepared.node;
+        while !matches!(group.kind, plan::Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = cursor::AUTO_GROUP_ROWS;
+    }
+    assert!(
+        cursor::auto_streaming(
+            &prepared.ctx,
+            &prepared.node,
+            prepared.kind,
+            &CursorOptions::default(),
+        )
+        .unwrap()
+    );
+    let mut group = &prepared.node;
+    while !matches!(group.kind, plan::Kind::Group { .. }) {
+        group = &group.children[0];
+    }
+    let plan::Kind::Filter(ref exprs) = group.children[0].kind else {
+        panic!("expected Filter below Group");
+    };
+    assert_eq!(
+        exists::explain(&prepared.ctx, exprs),
+        (None, None),
+        "auto_streaming must not populate Decor::reason"
+    );
+    let exec = query_execution(
+        s.snapshot(),
+        &unreached,
+        &opts(Optimizations::ALL),
+        &CursorOptions::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap();
+    let QueryExecution::Eager(res) = exec else {
+        panic!("empty-input unreached-EXISTS query should remain eager");
+    };
+    let result = res.into_result();
+    assert_eq!(result.len(), 1);
+    assert!(
+        !has_desc(result.plan(), "[EXISTS per row:"),
+        "admission must not pollute EXPLAIN on unreached EXISTS: {:#?}",
+        result.plan()
+    );
+
+    // Depth-8 nested FILTER EXISTS matches per-row evaluation and reports decorrelation cleanly.
+    let mut deep = String::from("SELECT ?s WHERE { ?s ex:e0 ?v0");
+    for level in 0..8 {
+        deep.push_str(&format!(
+            " FILTER EXISTS {{ ?v{level} ex:e{} ?v{}",
+            level + 1,
+            level + 1
+        ));
+    }
+    for _ in 0..8 {
+        deep.push_str(" }");
+    }
+    deep.push_str(" }");
+    let on = explain_of(&s, &deep, Optimizations::ALL);
+    let off = explain_of(&s, &deep, without());
+    assert_eq!(rows(&on, false), rows(&off, false));
+    assert_eq!(on.len(), 500);
+    assert!(
+        has_desc(on.plan(), "[EXISTS decorrelated on ?v0:"),
+        "depth-8 EXISTS should decorrelate cleanly: {:#?}",
+        on.plan()
+    );
+    assert_eq!(counter(on.plan(), "existsProbed"), Some(1000));
+    assert_eq!(counter(on.plan(), "existsPerRow"), Some(0));
+}

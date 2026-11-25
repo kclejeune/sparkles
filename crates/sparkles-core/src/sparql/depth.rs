@@ -377,6 +377,12 @@ pub fn with_stack<R>(depth: usize, f: impl FnOnce() -> R) -> R {
     stacker::maybe_grow(need, need, f)
 }
 
+/// Ensure at least 256 KiB of stack headroom before recursing across nested `EXISTS`
+/// planning, strict-cursor validation, key-set draining, or per-row evaluation.
+pub(super) fn guard_exists<R>(f: impl FnOnce() -> R) -> R {
+    stacker::maybe_grow(256 << 10, 1 << 20, f)
+}
+
 /// The depth of a query's algebra, or `limit + 1` once it is deeper than `limit`.
 pub fn query_depth(q: &Query, limit: usize) -> usize {
     Walk::new(limit, false).query(q)

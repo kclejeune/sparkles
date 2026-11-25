@@ -1321,7 +1321,7 @@ pub(super) fn auto_streaming(
     node: &Node,
     kind: QueryKind,
     options: &CursorOptions,
-) -> bool {
+) -> Result<bool> {
     fn scan(ctx: &Ctx, node: &Node) -> bool {
         match &node.kind {
             Kind::Scan(spec) => {
@@ -1341,29 +1341,33 @@ pub(super) fn auto_streaming(
             _ => false,
         }
     }
+    ctx.check()?;
     // An ASK pulls one row through the cursor, which stops at it, unless the planner
     // found its input small enough to run whole (item 827).
     if kind == QueryKind::Ask {
-        return !super::demand::whole_slice(node);
+        return Ok(!super::demand::whole_slice(node));
     }
     // A plan expected to pass the row budgets stays eager, so that it fails before the
     // first byte of output with an error status rather than partway through a stream.
     if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
-        return false;
+        return Ok(false);
     }
-    if spill_admitted(ctx, node, kind) || memory_admitted(ctx, node, kind, options) {
-        return true;
+    let admission = ctx.charge(0)?;
+    if spill_admitted(ctx, node, kind, Some(&admission))?
+        || memory_admitted(ctx, node, kind, options, Some(&admission))?
+    {
+        return Ok(true);
     }
     let scanned = node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node);
-    if !(scanned || grouped(ctx, node)) {
-        return false;
+    if !(scanned || grouped(ctx, node, Some(&admission))?) {
+        return Ok(false);
     }
     let headroom = cursor_headroom(ctx, node, options, true);
-    kind == QueryKind::Select
+    Ok(kind == QueryKind::Select
         && ctx.snap.delta.is_empty()
         && batches_admitted(options)
         && headroom < u64::MAX
-        && ctx.memory_remaining() >= headroom
+        && ctx.memory_remaining() >= headroom)
 }
 
 /// Whether the cursor's batches are large enough for automatic admission to pay off.
@@ -1414,7 +1418,7 @@ pub(super) const AUTO_GROUP_ROWS: f64 = 20_000.0;
 /// the cursor aggregates column-wise over an estimated [`AUTO_GROUP_ROWS`] input rows
 /// or more, with a cursor implementation for every operator. This covers counts over
 /// OPTIONAL and MINUS, which the cursor now joins and counts with branch-free kernels.
-fn grouped(ctx: &Ctx, node: &Node) -> bool {
+fn grouped(ctx: &Ctx, node: &Node, admission: Option<&super::ctx::Charge<'_>>) -> Result<bool> {
     let mut group = node;
     while matches!(
         group.kind,
@@ -1430,9 +1434,11 @@ fn grouped(ctx: &Ctx, node: &Node) -> bool {
     let rows = match &group.kind {
         Kind::Group { .. } if group::eligible(ctx, group) => group.children[0].est,
         Kind::GroupCountScan { .. } => group.est,
-        _ => return false,
+        _ => return Ok(false),
     };
-    rows.is_finite() && rows >= AUTO_GROUP_ROWS && streams_natively(ctx, node)
+    Ok(rows.is_finite()
+        && rows >= AUTO_GROUP_ROWS
+        && streams_natively_with_admission(ctx, node, admission)?)
 }
 
 /// Whether automatic execution runs `node` as a cursor because eager execution is
@@ -1440,15 +1446,20 @@ fn grouped(ctx: &Ctx, node: &Node) -> bool {
 /// spill, read an immutable snapshot, and have a cursor implementation for every
 /// operator, and the largest operator output the plan estimates must exceed half of
 /// the memory left.
-fn spill_admitted(ctx: &Ctx, node: &Node, kind: QueryKind) -> bool {
-    kind == QueryKind::Select
-        && ctx.spill.is_some()
-        && ctx.snap.delta.is_empty()
-        && streams_natively(ctx, node)
-        && {
-            let bytes = largest_output_bytes(node);
-            bytes.is_finite() && bytes * 2.0 > admission_room(ctx)
-        }
+fn spill_admitted(
+    ctx: &Ctx,
+    node: &Node,
+    kind: QueryKind,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<bool> {
+    if kind != QueryKind::Select || ctx.spill.is_none() || !ctx.snap.delta.is_empty() {
+        return Ok(false);
+    }
+    if !streams_natively_with_admission(ctx, node, admission)? {
+        return Ok(false);
+    }
+    let bytes = largest_output_bytes(node);
+    Ok(bytes.is_finite() && bytes * 2.0 > admission_room(ctx))
 }
 
 /// Whether automatic execution runs `node` as a cursor because eager execution is
@@ -1457,11 +1468,18 @@ fn spill_admitted(ctx: &Ctx, node: &Node, kind: QueryKind) -> bool {
 /// 96). A `FILTER NOT EXISTS` over a Cartesian product under a grouping is the measured
 /// case: eager execution holds the whole product, and the cursor holds the product's
 /// smaller input, the key set of the NOT EXISTS and one row per group.
-fn memory_admitted(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions) -> bool {
+fn memory_admitted(
+    ctx: &Ctx,
+    node: &Node,
+    kind: QueryKind,
+    options: &CursorOptions,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<bool> {
     let eager = largest_output_bytes(node);
-    eager.is_finite()
-        && eager * 2.0 > admission_room(ctx)
-        && cursor_fits(ctx, node, kind, options, true)
+    if !eager.is_finite() || eager * 2.0 <= admission_room(ctx) {
+        return Ok(false);
+    }
+    cursor_fits(ctx, node, kind, options, true, admission)
 }
 
 /// Whether a cursor over `node` can run without spill: the query is a SELECT over an
@@ -1480,16 +1498,18 @@ fn cursor_fits(
     kind: QueryKind,
     options: &CursorOptions,
     shared_block: bool,
-) -> bool {
-    kind == QueryKind::Select
-        && ctx.snap.delta.is_empty()
-        && batches_admitted(options)
-        && streams_natively(ctx, node)
-        && {
-            let state = cursor_state_bytes(ctx, node);
-            let headroom = cursor_headroom(ctx, node, options, shared_block) as f64;
-            state.is_finite() && state * 2.0 + headroom <= admission_room(ctx)
-        }
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<bool> {
+    if kind != QueryKind::Select
+        || !ctx.snap.delta.is_empty()
+        || !batches_admitted(options)
+        || !streams_natively_with_admission(ctx, node, admission)?
+    {
+        return Ok(false);
+    }
+    let state = cursor_state_bytes(ctx, node, admission)?;
+    let headroom = cursor_headroom(ctx, node, options, shared_block) as f64;
+    Ok(state.is_finite() && state * 2.0 + headroom <= admission_room(ctx))
 }
 
 /// The memory automatic admission compares a plan's estimates with: what the query's
@@ -1517,7 +1537,12 @@ const GENERATED_TERM_BYTES: f64 = 128.0;
 /// Operators the estimate does not know count their whole output, and state whose size
 /// does not follow from the row estimates, such as the text of a GROUP_CONCAT, makes the
 /// estimate infinite so that the plan is not admitted on it.
-fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
+fn cursor_state_bytes(
+    ctx: &Ctx,
+    node: &Node,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<f64> {
+    ctx.check()?;
     let width = |n: &Node| (n.vars.len().max(1) * 8) as f64;
     // rows kept in a growing vector, which may hold twice their bytes while it grows
     let rows = |n: &Node, est: f64| est.max(0.0) * width(n) * 2.0;
@@ -1553,7 +1578,7 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
                     agg.func,
                     spargebra::algebra::AggregateFunction::GroupConcat { .. }
                 ) {
-                    return f64::INFINITY;
+                    return Ok(f64::INFINITY);
                 }
                 // a DISTINCT aggregate keeps every distinct input row of its group
                 if agg.distinct {
@@ -1566,7 +1591,7 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
         Kind::Sort(_) => rows(node, node.est),
         Kind::OrderBy { limit: Some(k), .. } => rows(node, (*k as f64).min(node.est)),
         Kind::OrderBy { limit: None, .. } => rows(node, node.est),
-        Kind::Filter(_) if node.children.len() == 1 => keyed_exists_bytes(ctx, node),
+        Kind::Filter(_) if node.children.len() == 1 => keyed_exists_bytes(ctx, node, admission)?,
         // a variable or a constant generates no term
         Kind::Extend(_, Expr::Var(_) | Expr::Const(_) | Expr::Lit(..)) => 0.0,
         Kind::Extend(..) => node.est.max(0.0) * GENERATED_TERM_BYTES,
@@ -1577,15 +1602,16 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
     // an OPTIONAL condition, beside the operator's own state
     let keyed = match &node.kind {
         Kind::Filter(_) => 0.0,
-        kind if own_exprs(kind).iter().any(|e| e.has_exists()) => keyed_exists_bytes(ctx, node),
+        kind if own_exprs(kind).iter().any(|e| e.has_exists()) => {
+            keyed_exists_bytes(ctx, node, admission)?
+        }
         _ => 0.0,
     };
-    own + keyed
-        + node
-            .children
-            .iter()
-            .map(|c| cursor_state_bytes(ctx, c))
-            .sum::<f64>()
+    let mut total = own + keyed;
+    for child in &node.children {
+        total += cursor_state_bytes(ctx, child, admission)?;
+    }
+    Ok(total)
 }
 
 /// The estimated bytes of the key sets that answer the EXISTS patterns of `node`, with
@@ -1593,7 +1619,11 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
 /// distinct outer key, and its memo holds one entry per key up to its entry cap and an
 /// eighth of the memory budget. A pattern that shares no variable with the rows it tests
 /// keeps one answer.
-fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
+fn keyed_exists_bytes(
+    ctx: &Ctx,
+    node: &Node,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<f64> {
     let hashed = |n: &Node| {
         let est = n.est.max(0.0);
         let entries = est.min(usize::MAX as f64) as usize;
@@ -1606,15 +1636,16 @@ fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
     for e in own_exprs(&node.kind) {
         e.exists_specs(&mut specs);
     }
-    specs
-        .into_iter()
-        .map(|spec| {
-            keyed_exists(ctx, node, spec).map_or_else(
-                || per_key_exists_bytes(ctx, node, spec),
-                |planned| hashed(&planned) + cursor_state_bytes(ctx, &planned),
-            )
-        })
-        .sum()
+    let mut total = 0.0;
+    for spec in specs {
+        if let Some(planned) = keyed_exists(ctx, node, spec, admission)? {
+            total += hashed(&planned)
+                + super::depth::guard_exists(|| cursor_state_bytes(ctx, &planned, admission))?;
+        } else {
+            total += per_key_exists_bytes(ctx, node, spec);
+        }
+    }
+    Ok(total)
 }
 
 /// The estimated bytes of the memo of an EXISTS that `node` evaluates once per distinct
@@ -1642,7 +1673,12 @@ fn per_key_exists_bytes(ctx: &Ctx, node: &Node, spec: &super::expr::ExistsSpec) 
 /// a FILTER, a BIND, an ORDER BY key, an aggregate argument or an OPTIONAL condition. The
 /// rows the first four test are their input's, and those an OPTIONAL condition tests are
 /// the pairs of its two sides, which bind every variable that either side always binds.
-fn keyed_exists(ctx: &Ctx, node: &Node, spec: &super::expr::ExistsSpec) -> Option<Node> {
+fn keyed_exists(
+    ctx: &Ctx,
+    node: &Node,
+    spec: &super::expr::ExistsSpec,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<Option<Arc<Node>>> {
     match (&node.kind, node.children.as_slice()) {
         (
             Kind::Filter(_)
@@ -1651,15 +1687,15 @@ fn keyed_exists(ctx: &Ctx, node: &Node, spec: &super::expr::ExistsSpec) -> Optio
             | Kind::Sort(_)
             | Kind::Group { .. },
             [input],
-        ) => super::exists::keyed_plan(ctx, spec, &input.vars, &input.certain),
+        ) => super::exists::keyed_plan(ctx, spec, &input.vars, &input.certain, admission),
         (Kind::LeftJoin { .. }, [left, right]) => {
             let mut vars = left.vars.clone();
             vars.extend(right.vars.iter().filter(|v| !left.vars.contains(v)));
             let mut certain = left.certain.clone();
             certain.extend(right.certain.iter().filter(|v| !left.certain.contains(v)));
-            super::exists::keyed_plan(ctx, spec, &vars, &certain)
+            super::exists::keyed_plan(ctx, spec, &vars, &certain, admission)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -1673,62 +1709,122 @@ fn largest_output_bytes(node: &Node) -> f64 {
         .fold(own, f64::max)
 }
 
-/// How deep automatic admission follows EXISTS patterns nested in EXISTS patterns. A
-/// deeper nesting keeps the plan eager.
-const AUTO_EXISTS_DEPTH: usize = 4;
-
 /// Whether every operator of `node` has a cursor implementation, so that a cursor over
 /// it runs no eager subtree. An EXISTS that a FILTER, a BIND, an ORDER BY key or an
 /// aggregate argument evaluates also counts, alone or inside a larger expression such as
-/// IF or OR, when the plan of its pattern counts in turn. Its pattern is answered from a
-/// key set filled by a child cursor under the query's charges where the key set can
-/// answer it, and otherwise evaluated once per distinct outer key with a charged memo,
-/// as eager execution evaluates it. A pattern that calls a SERVICE keeps the plan eager,
-/// and so does an OPTIONAL whose condition holds an EXISTS. The cursor merges such an
-/// OPTIONAL and tests the condition on each batch's pairs, which matches eager execution
-/// where a left row has about one pair. On an Intel host at 1M people, where a left row
-/// has about 2.5 pairs, it took 1.18 to 1.36 times as long as eager execution, which
-/// tests the condition inside the merge. The patterns are planned here only to read
-/// their operators. Planning interns their variables in `ctx` and runs no part of them.
-pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
-    fn pattern(ctx: &Ctx, node: &Node, e: &Expr, depth: usize) -> bool {
+/// IF or OR, when the plan of its pattern counts in turn, to any nesting depth. Its
+/// pattern is answered from a key set filled by a child cursor under the query's charges
+/// where the key set can answer it, and otherwise evaluated once per distinct outer key
+/// with a charged memo, as eager execution evaluates it. A pattern that calls a SERVICE
+/// keeps the plan eager, and so does an OPTIONAL whose condition holds an EXISTS. The
+/// cursor merges such an OPTIONAL and tests the condition on each batch's pairs, which
+/// matches eager execution where a left row has about one pair. On an Intel host at 1M
+/// people, where a left row has about 2.5 pairs, it took 1.18 to 1.36 times as long as
+/// eager execution, which tests the condition inside the merge. Each EXISTS pattern is
+/// planned at most once and cached on its [`super::expr::ExistsSpec`] for reuse by
+/// strict operator construction and key-set building.
+#[allow(dead_code)]
+pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> Result<bool> {
+    streams_natively_with_admission(ctx, node, None)
+}
+
+fn streams_natively_with_admission(
+    ctx: &Ctx,
+    node: &Node,
+    admission: Option<&super::ctx::Charge<'_>>,
+) -> Result<bool> {
+    /// `Ok(Some(b))` is a deterministic verdict; `Ok(None)` means planning hit a memory
+    /// budget limit and must stay uncached while keeping the query eager.
+    fn pattern(
+        ctx: &Ctx,
+        e: &Expr,
+        admission: Option<&super::ctx::Charge<'_>>,
+    ) -> Result<Option<bool>> {
         let mut specs = Vec::new();
         e.exists_specs(&mut specs);
-        specs.into_iter().all(|spec| {
-            depth < AUTO_EXISTS_DEPTH
-                && ctx.opt.decorrelate_exists
-                && !spec.calls_service()
-                && keyed_exists(ctx, node, spec)
-                    .or_else(|| {
-                        super::plan::Planner::for_exists(ctx, spec)
-                            .plan(spec.pattern(), &spec.graph, Vec::new())
-                            .ok()
-                    })
-                    .is_some_and(|planned| at(ctx, &planned, depth + 1))
-        })
+        for spec in specs {
+            ctx.check()?;
+            if !ctx.opt.decorrelate_exists || spec.calls_service() {
+                return Ok(Some(false));
+            }
+            if let Some(cached) = spec.plan_cache.native() {
+                if !cached {
+                    return Ok(Some(false));
+                }
+                continue;
+            }
+            let planned =
+                match super::exists::unsubstituted_plan_with_admission(ctx, spec, admission) {
+                    Ok(planned) => planned,
+                    Err(e @ (Error::Cancelled | Error::Timeout)) => return Err(e),
+                    Err(Error::BudgetExceeded(_)) => return Ok(None),
+                    Err(_) => {
+                        spec.plan_cache.set_native(false);
+                        return Ok(Some(false));
+                    }
+                };
+            match super::depth::guard_exists(|| at(ctx, &planned, admission))? {
+                Some(ok) => {
+                    spec.plan_cache.set_native(ok);
+                    if !ok {
+                        return Ok(Some(false));
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(true))
     }
-    fn at(ctx: &Ctx, node: &Node, depth: usize) -> bool {
+    fn at(
+        ctx: &Ctx,
+        node: &Node,
+        admission: Option<&super::ctx::Charge<'_>>,
+    ) -> Result<Option<bool>> {
+        ctx.check()?;
         let exists = match &node.kind {
             Kind::Filter(_)
             | Kind::Extend(..)
             | Kind::OrderBy { .. }
             | Kind::Sort(_)
-            | Kind::Group { .. } => own_exprs(&node.kind)
-                .into_iter()
-                .all(|e| !e.has_exists() || pattern(ctx, node, e, depth)),
-            kind => !own_exprs(kind).iter().any(|e| e.has_exists()),
+            | Kind::Group { .. } => {
+                let mut verdict = Some(true);
+                for e in own_exprs(&node.kind) {
+                    if e.has_exists() {
+                        match pattern(ctx, e, admission)? {
+                            Some(true) => {}
+                            other => {
+                                verdict = other;
+                                break;
+                            }
+                        }
+                    }
+                }
+                verdict
+            }
+            kind => Some(!own_exprs(kind).iter().any(|e| e.has_exists())),
         };
-        exists
-            && (supported(&node.kind)
-                || binary::eligible(node)
-                || group::eligible(ctx, node)
-                || expand::auto_eligible(node)
-                || walk::eligible(node)
-                || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
-                    && node.children.len() == 1))
-            && node.children.iter().all(|child| at(ctx, child, depth))
+        let Some(true) = exists else {
+            return Ok(exists);
+        };
+        if !(supported(&node.kind)
+            || binary::eligible(node)
+            || group::eligible(ctx, node)
+            || expand::auto_eligible(node)
+            || walk::eligible(node)
+            || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
+                && node.children.len() == 1))
+        {
+            return Ok(Some(false));
+        }
+        for child in &node.children {
+            match at(ctx, child, admission)? {
+                Some(true) => {}
+                other => return Ok(other),
+            }
+        }
+        Ok(Some(true))
     }
-    at(ctx, node, 0)
+    Ok(at(ctx, node, admission)? == Some(true))
 }
 
 /// Whether nothing in `node` has effects that running it twice would repeat or
@@ -1977,7 +2073,7 @@ pub fn query_execution_with_plan(
                                     options,
                                     cursor,
                                     started,
-                                )) =>
+                                )?) =>
                     {
                         return retry_as_cursor(retry_snapshot, query, options, cursor, started);
                     }
@@ -2005,10 +2101,14 @@ fn fits_without_spill(
     options: &QueryOptions,
     cursor: &CursorOptions,
     started: Instant,
-) -> bool {
+) -> Result<bool> {
     let options = within_first_deadline(options, started);
-    super::prepare_query(snapshot.clone(), parsed, &options, None, None)
-        .is_ok_and(|p| cursor_fits(&p.ctx, &p.node, p.kind, cursor, false))
+    let p = match super::prepare_query(snapshot.clone(), parsed, &options, None, None) {
+        Ok(p) => p,
+        Err(e @ (Error::Cancelled | Error::Timeout)) => return Err(e),
+        Err(_) => return Ok(false),
+    };
+    cursor_fits(&p.ctx, &p.node, p.kind, cursor, false, None)
 }
 
 /// `options` with a relative timeout turned into the deadline of the run that started
@@ -2685,7 +2785,13 @@ fn pull_planned<'ctx>(
     // The operators keep a copy of the plan, such as its tables of values, until they
     // drop, which they do before this charge.
     let _plan = OwnedCharge::new(&shared, plan_bytes(node))?;
-    let mut root = Operator::build(&shared, node.clone(), FallbackPolicy::AllowMaterialization)?;
+    let mut root = Operator::build_for_internal(
+        &shared,
+        node.clone(),
+        FallbackPolicy::AllowMaterialization,
+        true,
+        planned,
+    )?;
     let mut out = Buffer::new(&shared, &root.vars, 0)?;
     let ran = (|| {
         while out.table.len < want {
@@ -3361,7 +3467,7 @@ fn supported(kind: &Kind) -> bool {
 }
 
 /// The expressions an operator evaluates itself, not those of its inputs.
-fn own_exprs(kind: &Kind) -> Vec<&Expr> {
+pub(super) fn own_exprs(kind: &Kind) -> Vec<&Expr> {
     match kind {
         Kind::Filter(exprs)
         | Kind::RangeScan(_, RangeSpec { filter: exprs, .. })
@@ -3390,34 +3496,44 @@ fn own_exprs(kind: &Kind) -> Vec<&Expr> {
 }
 
 /// Whether every EXISTS that an operator evaluates itself runs without an eager
-/// fallback. Each pattern is planned as the key set plans it, and that plan is built as
-/// cursor operators under the strict policy. A row evaluated on its own runs the same
-/// pattern with its values substituted and a limit of one solution.
+/// fallback. Each pattern is planned once (reusing its cached unsubstituted plan) and
+/// built once as cursor operators under the strict policy, memoizing the verdict on its
+/// [`super::expr::ExistsSpec`] so nested key-set drains do not repeat strict checks.
 fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
     let mut specs = Vec::new();
     for expr in own_exprs(kind) {
         expr.exists_specs(&mut specs);
     }
     for spec in specs {
-        let planned = super::plan::Planner::for_exists(ctx, spec).plan(
-            spec.pattern(),
-            &spec.graph,
-            Vec::new(),
-        );
+        ctx.check()?;
+        if let Some(cached) = spec.plan_cache.strict() {
+            if !cached {
+                return Ok(false);
+            }
+            continue;
+        }
+        let planned = super::exists::unsubstituted_plan(ctx, spec);
         if let Err(error) = &planned
             && super::extensions::is_unconfigured(error)
         {
             // This pattern needs no materialization. Its refusal matters only if it is evaluated.
+            spec.plan_cache.set_strict(true);
             continue;
         }
-        let built = planned
-            .and_then(|node| Operator::build(ctx, node, FallbackPolicy::RejectMaterialization));
+        let built = planned.and_then(|node| {
+            super::depth::guard_exists(|| {
+                Operator::build(ctx, (*node).clone(), FallbackPolicy::RejectMaterialization)
+            })
+        });
         match built {
-            Ok(_) => {}
+            Ok(_) => spec.plan_cache.set_strict(true),
             Err(error @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
                 return Err(error);
             }
-            Err(_) => return Ok(false),
+            Err(_) => {
+                spec.plan_cache.set_strict(false);
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -3599,12 +3715,24 @@ impl Operator {
         fallback: FallbackPolicy,
         needed: bool,
     ) -> Result<Self> {
+        Self::build_for_internal(ctx, node, fallback, needed, true)
+    }
+
+    fn build_for_internal(
+        ctx: &Arc<Ctx>,
+        node: Node,
+        fallback: FallbackPolicy,
+        needed: bool,
+        check_exists: bool,
+    ) -> Result<Self> {
+        debug_assert!(check_exists || fallback == FallbackPolicy::AllowMaterialization);
         ctx.check()?;
         if let Kind::GraphBranches(plans) = &node.kind
             && let [branch] = plans.inputs.as_slice()
         {
             let charge = reserve_graph_branch_copy(ctx, branch, size_of::<SingletonGraph>())?;
-            let mut operator = Self::build_for(ctx, branch.clone(), fallback, needed)?;
+            let mut operator =
+                Self::build_for_internal(ctx, branch.clone(), fallback, needed, check_exists)?;
             let inner = operator.singleton_graph.take();
             operator.singleton_graph = Some(Box::new(SingletonGraph {
                 _inner: inner,
@@ -3623,7 +3751,7 @@ impl Operator {
         // materializes does not depend on the order its children turn out to have.
         // An operator that evaluates EXISTS streams when every EXISTS pattern does.
         let exists = own_exprs(&node.kind).iter().any(|e| e.has_exists());
-        let exists_streams = !exists || exists_streams(ctx, &node.kind)?;
+        let exists_streams = !exists || !check_exists || exists_streams(ctx, &node.kind)?;
         let joins = exists_streams && binary::eligible(&node);
         let incremental_group = exists_streams && group::eligible(ctx, &node);
         // FOLD and registered aggregates read each group's rows from key runs.
@@ -3788,7 +3916,8 @@ impl Operator {
                         child.est,
                         child.cost,
                     );
-                    Self::build_for(ctx, child, fallback, needed).map(|op| (shell, op))
+                    Self::build_for_internal(ctx, child, fallback, needed, check_exists)
+                        .map(|op| (shell, op))
                 })
                 .collect::<Result<Vec<_>>>()?;
             // Join operators read their children's shape from the node. Leave each
@@ -6808,7 +6937,7 @@ mod tests {
             ),
             (
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER EXISTS {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c FILTER EXISTS {?c <urn:p> ?d FILTER EXISTS {?d <urn:p> ?e FILTER EXISTS {?e <urn:p> ?f}}}}}}",
-                false,
+                true,
             ),
         ];
         for (q, streams) in cases {
@@ -6841,7 +6970,7 @@ mod tests {
                     scale(&mut group.children[0], est);
                     group.est = 10.0;
                     assert_eq!(
-                        auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()),
+                        auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap(),
                         streams && large,
                         "{q}: no_cache {no_cache}, {est} rows"
                     );
@@ -6872,58 +7001,52 @@ mod tests {
         };
         let p = prepare(store.snapshot(), &Default::default());
         let options = CursorOptions::default();
-        assert!(auto_streaming(&p.ctx, &p.node, p.kind, &options));
+        assert!(auto_streaming(&p.ctx, &p.node, p.kind, &options).unwrap());
         // a scan streams from the measured size on
         let mut small = prepare(store.snapshot(), &Default::default());
         small.node.est = AUTO_SCAN_ROWS;
-        assert!(auto_streaming(
-            &small.ctx,
-            &small.node,
-            small.kind,
-            &options
-        ));
+        assert!(auto_streaming(&small.ctx, &small.node, small.kind, &options).unwrap());
         small.node.est = AUTO_SCAN_ROWS - 1.0;
-        assert!(!auto_streaming(
-            &small.ctx,
-            &small.node,
-            small.kind,
-            &options
-        ));
+        assert!(!auto_streaming(&small.ctx, &small.node, small.kind, &options).unwrap());
         small.node.est = f64::INFINITY;
-        assert!(!auto_streaming(
-            &small.ctx,
-            &small.node,
-            small.kind,
-            &options
-        ));
-        assert!(!auto_streaming(
-            &p.ctx,
-            &p.node,
-            p.kind,
-            &CursorOptions {
-                batch_rows: 1,
-                ..options.clone()
-            }
-        ));
-        assert!(!auto_streaming(
-            &p.ctx,
-            &p.node,
-            p.kind,
-            &CursorOptions {
-                batch_bytes: 8,
-                ..options.clone()
-            }
-        ));
-        assert!(!auto_streaming(
-            &p.ctx,
-            &p.node,
-            p.kind,
-            &CursorOptions {
-                batch_rows: usize::MAX,
-                batch_bytes: usize::MAX,
-                ..options
-            }
-        ));
+        assert!(!auto_streaming(&small.ctx, &small.node, small.kind, &options).unwrap());
+        assert!(
+            !auto_streaming(
+                &p.ctx,
+                &p.node,
+                p.kind,
+                &CursorOptions {
+                    batch_rows: 1,
+                    ..options.clone()
+                }
+            )
+            .unwrap()
+        );
+        assert!(
+            !auto_streaming(
+                &p.ctx,
+                &p.node,
+                p.kind,
+                &CursorOptions {
+                    batch_bytes: 8,
+                    ..options.clone()
+                }
+            )
+            .unwrap()
+        );
+        assert!(
+            !auto_streaming(
+                &p.ctx,
+                &p.node,
+                p.kind,
+                &CursorOptions {
+                    batch_rows: usize::MAX,
+                    batch_bytes: usize::MAX,
+                    ..options
+                }
+            )
+            .unwrap()
+        );
         let low = prepare(
             store.snapshot(),
             &QueryOptions {
@@ -6931,12 +7054,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!auto_streaming(
-            &low.ctx,
-            &low.node,
-            low.kind,
-            &Default::default()
-        ));
+        assert!(!auto_streaming(&low.ctx, &low.node, low.kind, &Default::default()).unwrap());
         // A scan expected to pass a row budget stays eager, so that the budget fails it
         // before any output.
         for budget in [
@@ -6950,12 +7068,10 @@ mod tests {
             },
         ] {
             let capped = prepare(store.snapshot(), &budget);
-            assert!(!auto_streaming(
-                &capped.ctx,
-                &capped.node,
-                capped.kind,
-                &Default::default()
-            ));
+            assert!(
+                !auto_streaming(&capped.ctx, &capped.node, capped.kind, &Default::default())
+                    .unwrap()
+            );
         }
         let roomy = prepare(
             store.snapshot(),
@@ -6965,12 +7081,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(auto_streaming(
-            &roomy.ctx,
-            &roomy.node,
-            roomy.kind,
-            &Default::default()
-        ));
+        assert!(auto_streaming(&roomy.ctx, &roomy.node, roomy.kind, &Default::default()).unwrap());
         super::super::update::update(
             &store,
             "INSERT DATA {<urn:new> <urn:p> 2}",
@@ -6978,14 +7089,17 @@ mod tests {
         )
         .unwrap();
         let changed = prepare(store.snapshot(), &Default::default());
-        assert!(!auto_streaming(
-            &changed.ctx,
-            &changed.node,
-            changed.kind,
-            &Default::default()
-        ));
+        assert!(
+            !auto_streaming(
+                &changed.ctx,
+                &changed.node,
+                changed.kind,
+                &Default::default()
+            )
+            .unwrap()
+        );
         // A retained immutable context stays admissible after a concurrent write.
-        assert!(auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()));
+        assert!(auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap());
     }
 
     /// The decision table of spill admission (X08 §6.8): a query streams when it may
@@ -7036,7 +7150,7 @@ mod tests {
             let mut p =
                 super::super::prepare_query(store.snapshot(), &q, &options, None, None).unwrap();
             estimate(&mut p.node);
-            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default())
+            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap()
         };
         // a product of a million rows is about 24 MB eagerly, more than half of 32 MiB,
         // while the cursor keeps a thousand features, the key set and the groups
@@ -7058,7 +7172,7 @@ mod tests {
             let mut p =
                 super::super::prepare_query(store.snapshot(), &q, &options, None, None).unwrap();
             estimate(&mut p.node);
-            memory_admitted(&p.ctx, &p.node, p.kind, &Default::default())
+            memory_admitted(&p.ctx, &p.node, p.kind, &Default::default(), None).unwrap()
         };
         let counted = "SELECT ?f (COUNT(?o) AS ?n) { ?s <urn:p> ?o . ?x <urn:q> ?f } GROUP BY ?f";
         assert!(memory(counted));
@@ -7120,7 +7234,7 @@ mod tests {
                 }
             }
             scale(&mut p.node, est);
-            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default())
+            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap()
         };
         let sort = "SELECT ?s ?o { ?s <urn:p> ?o } ORDER BY ?o";
         let group = "SELECT ?o (COUNT(?s) AS ?n) { ?s <urn:p> ?o } GROUP BY ?o";
@@ -7832,5 +7946,299 @@ mod retained_variable_tests {
         assert!(retained.variables().is_empty());
         drop(retained);
         assert_eq!(pool.granted(), 0);
+    }
+
+    fn nested_exists_body(depth: usize, alternating: bool, inner_tail: &str) -> String {
+        let mut s = String::new();
+        for level in 0..depth {
+            let kw = if alternating && level % 2 == 1 {
+                "FILTER NOT EXISTS"
+            } else {
+                "FILTER EXISTS"
+            };
+            s.push_str(&format!(
+                " {kw} {{ ?v{level} <urn:e{}> ?v{}",
+                level + 1,
+                level + 1
+            ));
+        }
+        if !inner_tail.is_empty() {
+            s.push(' ');
+            s.push_str(inner_tail);
+        }
+        for _ in 0..depth {
+            s.push_str(" }");
+        }
+        s
+    }
+
+    #[test]
+    fn deep_exists_admission_and_exclusions() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::from("<urn:s0> <urn:e0> <urn:n0> .\n");
+        for level in 0..17 {
+            ttl.push_str(&format!(
+                "<urn:n{level}> <urn:e{}> <urn:n{}> .\n",
+                level + 1,
+                level + 1
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let decide = |q: &str, opts: &QueryOptions| -> bool {
+            let parsed = super::super::parse_query(q, None, &[]).unwrap();
+            let mut p =
+                super::super::prepare_query(store.snapshot(), &parsed, opts, None, None).unwrap();
+            let mut group = &mut p.node;
+            while !matches!(group.kind, Kind::Group { .. } | Kind::GroupCountScan { .. }) {
+                group = &mut group.children[0];
+            }
+            fn scale(node: &mut Node, est: f64) {
+                node.est = est;
+                for child in &mut node.children {
+                    scale(child, est);
+                }
+            }
+            if matches!(group.kind, Kind::GroupCountScan { .. }) {
+                group.est = AUTO_GROUP_ROWS;
+            } else {
+                scale(&mut group.children[0], AUTO_GROUP_ROWS);
+                group.est = 10.0;
+            }
+            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap()
+        };
+        let default_opts = QueryOptions::default();
+        for depth in [5, 8, 16] {
+            let chain = nested_exists_body(depth, false, "");
+            let alt = nested_exists_body(depth, true, "");
+            assert!(
+                decide(
+                    &format!("SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{chain} }}"),
+                    &default_opts
+                ),
+                "depth {depth} FILTER EXISTS should admit streaming"
+            );
+            assert!(
+                decide(
+                    &format!("SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{alt} }}"),
+                    &default_opts
+                ),
+                "depth {depth} alternating NOT EXISTS should admit streaming"
+            );
+        }
+        // Depth 8 inside IF, OR, BIND, SUM, ORDER BY.
+        let inner8 = nested_exists_body(7, false, "");
+        let exists8 = format!("EXISTS {{ ?v0 <urn:e1> ?v1{inner8} }}");
+        for q in [
+            format!(
+                "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 FILTER(?s = <urn:s0> || {exists8}) }}"
+            ),
+            format!(
+                "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 FILTER(IF({exists8}, true, false)) }}"
+            ),
+            format!(
+                "SELECT ?b (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 BIND({exists8} AS ?b) }} GROUP BY ?b"
+            ),
+            format!("SELECT (SUM(IF({exists8}, 1, 0)) AS ?n) {{ ?s <urn:e0> ?v0 }}"),
+            format!(
+                "SELECT ?v0 (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 }} GROUP BY ?v0 ORDER BY DESC({exists8})"
+            ),
+        ] {
+            assert!(
+                decide(&q, &default_opts),
+                "expected streaming admission: {q}"
+            );
+        }
+        // Preserved exclusions at depth 8: SERVICE, OPTIONAL condition (item 570), and decorrelate_exists=false.
+        let service8 = nested_exists_body(
+            8,
+            false,
+            "FILTER EXISTS { SERVICE <http://example.org/sparql> { ?v8 ?p ?o } }",
+        );
+        assert!(
+            !decide(
+                &format!("SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{service8} }}"),
+                &default_opts
+            ),
+            "depth-8 SERVICE inside EXISTS must stay eager"
+        );
+        let opt8 = nested_exists_body(8, false, "");
+        assert!(
+            !decide(
+                &format!(
+                    "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 OPTIONAL {{ ?s <urn:e1> ?v1{opt8} }} }}"
+                ),
+                &default_opts
+            ),
+            "OPTIONAL condition holding depth-8 EXISTS must stay eager"
+        );
+        let no_decor = QueryOptions {
+            optimizations: Some(super::super::Optimizations {
+                decorrelate_exists: false,
+                ..super::super::Optimizations::ALL
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !decide(
+                &format!(
+                    "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+                    nested_exists_body(8, false, "")
+                ),
+                &no_decor
+            ),
+            "decorrelate_exists=false must keep depth-8 EXISTS eager"
+        );
+    }
+
+    #[test]
+    fn deep_exists_reuses_plans_linearly_and_releases_charges() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::new();
+        for i in 0..75_000 {
+            ttl.push_str(&format!("<urn:s:{i}> <urn:e0> <urn:n0:{}> .\n", i % 16));
+        }
+        for level in 0..16 {
+            for j in 0..16 {
+                if level < 15 || j % 2 == 0 {
+                    ttl.push_str(&format!(
+                        "<urn:n{level}:{j}> <urn:e{}> <urn:n{}:{j}> .\n",
+                        level + 1,
+                        level + 1
+                    ));
+                }
+            }
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        for depth in [8usize, 12, 16] {
+            let q = format!(
+                "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+                nested_exists_body(depth, false, "")
+            );
+            let pool = super::super::pool::QueryPool::new(64 << 20);
+            let opts = QueryOptions {
+                pool: Some(pool.clone()),
+                ..Default::default()
+            };
+            super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.set(0));
+            let started = Instant::now();
+            let exec = query_execution(
+                store.snapshot(),
+                &q,
+                &opts,
+                &CursorOptions::default(),
+                ExecutionMode::Auto,
+            )
+            .unwrap();
+            let open_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let QueryExecution::Select(mut c) = exec else {
+                panic!("depth {depth}: expected automatic streaming");
+            };
+            assert!(
+                !c.plan().has_materialization(),
+                "depth {depth}: streamed plan must not materialize"
+            );
+            let ctx = c.ctx.clone();
+            let mut rows = Vec::new();
+            while let Some(batch) = c.next_batch().unwrap() {
+                for row in 0..batch.len() {
+                    rows.push(batch.row(row).unwrap().values().to_vec());
+                }
+            }
+            let plans_built = super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.get());
+            let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "depth={depth} plans_built={plans_built} open_ms={open_ms:.3} total_ms={total_ms:.3}"
+            );
+            assert_eq!(
+                plans_built, depth as u64,
+                "depth {depth}: each ExistsSpec must be planned at most once (got {plans_built})"
+            );
+            let expected_count = if depth == 16 { 75_000 / 2 } else { 75_000 };
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0][0],
+                Some(Term::Literal(oxrdf::Literal::from(expected_count as i64)))
+            );
+            drop(rows);
+            drop(c);
+            assert_eq!(ctx.live_bytes(), 0, "depth {depth}: live bytes leaked");
+            drop(ctx);
+            assert_eq!(pool.granted(), 0, "depth {depth}: pool grant leaked");
+        }
+    }
+
+    #[test]
+    fn deep_exists_admission_propagates_cancellation() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::from("<urn:s0> <urn:e0> <urn:n0> .\n");
+        for level in 0..16 {
+            ttl.push_str(&format!(
+                "<urn:n{level}> <urn:e{}> <urn:n{}> .\n",
+                level + 1,
+                level + 1
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+            nested_exists_body(16, false, "")
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let opts = QueryOptions {
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let mut p =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let mut group = &mut p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        cancel.store(true, Ordering::SeqCst);
+        let err = auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()).unwrap_err();
+        assert!(
+            matches!(err, Error::Cancelled),
+            "expected Cancelled, got {err}"
+        );
+        let err = query_execution(
+            store.snapshot(),
+            &q,
+            &opts,
+            &CursorOptions::default(),
+            ExecutionMode::Auto,
+        )
+        .err()
+        .expect("cancelled query_execution must fail");
+        assert!(
+            matches!(err, Error::Cancelled),
+            "expected Cancelled, got {err}"
+        );
     }
 }

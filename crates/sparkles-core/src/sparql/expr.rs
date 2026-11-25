@@ -43,6 +43,9 @@ pub struct ExistsSpec {
     memo_charge: Mutex<Option<super::ctx::RetainedCharge>>,
     /// the key set answering the EXISTS for every outer row (see [`super::exists`])
     pub decor: super::exists::Decor,
+    /// Cached unsubstituted plan and streaming verdicts, separate from `decor` so
+    /// admission never mutates EXPLAIN notes or runtime decorrelation state.
+    pub(super) plan_cache: super::exists::PlanCache,
     /// Native REDUCED / VALUES occurrences projected onto this spec's heap-pinned pattern.
     view_patterns: Option<Arc<RetainedViewPatterns>>,
     _held: BackingCredit,
@@ -194,6 +197,7 @@ impl ExistsSpec {
             unbound: Default::default(),
             memo_charge: Mutex::new(None),
             decor: Default::default(),
+            plan_cache: Default::default(),
             view_patterns,
             _held: held,
         }

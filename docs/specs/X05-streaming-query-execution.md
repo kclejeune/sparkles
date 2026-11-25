@@ -1955,5 +1955,50 @@ Item 570 remains partial because all three arms used forced streaming. Finishing
 requires measuring the shipping candidate's streamed-to-eager ratio on all three
 `knows-*` queries against the under-1.10 threshold in every round, and then admitting
 eligible EXISTS conditions in automatic execution once item 1105 gives admission and the
-cursor build the same guaranteed merge order. Item 1081 remains open for nested EXISTS
-beyond four levels.
+cursor build the same guaranteed merge order.
+
+### Arbitrary EXISTS nesting depth (2026-11-24)
+
+Item 1081 removed the four-level `AUTO_EXISTS_DEPTH` cap in automatic streaming admission
+so nested `EXISTS` and `NOT EXISTS` patterns stream at any depth accepted by the parser
+and plan-depth bounds. Each `ExistsSpec` now carries a `PlanCache` that is separate from
+`Decor`, caching its unsubstituted plan, structural variable classification, native
+streaming verdict, and strict-cursor verdict without mutating `EXPLAIN` notes or runtime
+decorrelation state.
+
+Before this change, automatic admission discarded the unsubstituted plans it built and
+re-planned patterns across `keyed_exists`, `streams_natively`, and `cursor_state_bytes`,
+while `Operator::build_for` re-ran `exists_streams` at every nested key-set drain in
+quadratic $O(D^2)$ work. With `PlanCache`, `unsubstituted_plan` plans each `ExistsSpec`
+at most once per query execution and shares the resulting `Arc<Node>` across admission,
+strict-cursor validation, and key-set building. During `auto_streaming` before
+`ctx.attach_owner()`, newly cached plans charge a transient `Charge` on the query context
+so peak admission memory stays bounded without retaining a strong `Arc<Ctx>`. When
+automatic admission chooses streaming, `charge_cached_plans` upgrades every cached plan
+to a `RetainedCharge` after `ctx.attach_owner()`, and `prepare` drops the cached plan and
+its charge as soon as a key set transitions to `State::Built` or `State::Rejected`. When
+automatic admission keeps a query eager, `clear_cached_plans` drops all admission-cached
+plans before execution so unreached branches retain no memory.
+
+Automatic admission and state estimation now propagate cancellation and timeout errors
+instead of swallowing them into eager fallback. Per-row substitution through
+`cursor::has_solution` skips speculative `exists_streams` preflight checks under
+`AllowMaterialization` so deeply nested correlated `EXISTS` patterns do not re-plan
+unreached inner levels per outer key. Recursive transitions across `streams_natively`,
+`exists_streams`, `cursor_state_bytes`, `exists::build`, `exists::build_streaming`, and
+`plan::eval_exists` run inside `depth::guard_exists` (`stacker::maybe_grow`) so deep
+nesting executes safely on 2 MiB threads in both debug and release builds. Existing
+admission exclusions for `SERVICE` inside `EXISTS`, `OPTIONAL` conditions holding
+`EXISTS` (item 570), and `decorrelate_exists: false` remain unchanged.
+
+In unit tests on Boat worker `bx_4xarzecx` (debug build, 75,000-subject chain), end-to-end
+automatic streaming at depths 8, 12, and 16 built exactly 8, 12, and 16 unsubstituted
+plans in 4.5 to 6.9 ms of open time, releasing all `Ctx` live bytes and `QueryPool`
+grants on cursor drop. `tests/exists_auto.rs` verifies automatic streaming, strict
+non-materializing cursors at batch sizes 1, 64, and 4096, and exact parity with eager and
+per-key evaluation at depths 5, 8, and 16 across pure `EXISTS`, alternating `NOT EXISTS`,
+deeply correlated outer variables, `UNION`, `OPTIONAL`, named and variable `GRAPH`, empty
+and non-empty branches, `BIND`, `SUM`, and `ORDER BY`, as well as tight memory budgets
+from 256 KiB to 16 MiB and cancellation during both admission and execution.
+`crates/sparkles/tests/nesting.rs` verifies depth-16 and depth-32 streamed execution on a
+2 MiB stack.

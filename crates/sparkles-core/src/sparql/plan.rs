@@ -8632,36 +8632,38 @@ pub fn short(t: &Term) -> String {
 
 /// Evaluate `EXISTS { pattern }` for one outer binding (substitution semantics).
 pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -> Result<bool> {
-    let mut p = Planner::for_exists(ctx, spec);
-    if ctx.calls_extensions {
-        p.property_inputs.extend(schema.iter().copied());
-    }
-    for (v, id) in spec.vars.iter().zip(key) {
-        if !id.is_undef() {
-            p.subst.insert(*v, *id);
+    super::depth::guard_exists(|| {
+        let mut p = Planner::for_exists(ctx, spec);
+        if ctx.calls_extensions {
+            p.property_inputs.extend(schema.iter().copied());
         }
-    }
-    let graph = match &spec.graph {
-        ActiveGraph::Var(v) => match p.subst.get(v) {
-            Some(id) => ActiveGraph::Named(*id),
-            None => spec.graph.clone(),
-        },
-        g => g.clone(),
-    };
-    let node = p.plan(spec.pattern(), &graph, Vec::new())?;
-    // A substituted pattern of one triple or a table of values reads its first row
-    // directly, as the per-row evaluation of EXISTS stays eager until item 829. A larger
-    // pattern pulls its first solution through cursor operators, as a LIMIT does, or
-    // runs whole when it is small enough that a LIMIT would.
-    if let Some((rows, _, _)) = super::exec::leaf_rows(ctx, &node, 1)? {
-        return Ok(!rows.table.is_empty());
-    }
-    if super::demand::runs_whole(ctx, &node, 1)
-        && let Some((rows, _)) = super::exec::whole_or_refused(ctx, &node)?
-    {
-        return Ok(!rows.table.is_empty());
-    }
-    super::cursor::has_solution(ctx, &node)
+        for (v, id) in spec.vars.iter().zip(key) {
+            if !id.is_undef() {
+                p.subst.insert(*v, *id);
+            }
+        }
+        let graph = match &spec.graph {
+            ActiveGraph::Var(v) => match p.subst.get(v) {
+                Some(id) => ActiveGraph::Named(*id),
+                None => spec.graph.clone(),
+            },
+            g => g.clone(),
+        };
+        let node = p.plan(spec.pattern(), &graph, Vec::new())?;
+        // A substituted pattern of one triple or a table of values reads its first row
+        // directly, as the per-row evaluation of EXISTS stays eager until item 829. A larger
+        // pattern pulls its first solution through cursor operators, as a LIMIT does, or
+        // runs whole when it is small enough that a LIMIT would.
+        if let Some((rows, _, _)) = super::exec::leaf_rows(ctx, &node, 1)? {
+            return Ok(!rows.table.is_empty());
+        }
+        if super::demand::runs_whole(ctx, &node, 1)
+            && let Some((rows, _)) = super::exec::whole_or_refused(ctx, &node)?
+        {
+            return Ok(!rows.table.is_empty());
+        }
+        super::cursor::has_solution(ctx, &node)
+    })
 }
 
 /// Literal helper for tests.

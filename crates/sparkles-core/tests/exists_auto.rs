@@ -506,3 +506,381 @@ fn order_keys_with_exists_stream_from_the_key_set() {
         }
     }
 }
+
+/// 75,000 subjects connected through a 16-level chain (`<urn:e0>` .. `<urn:e16>`) with
+/// selective breaks, named graphs, and optional/union side edges so deep EXISTS queries
+/// trigger `AUTO_GROUP_ROWS` (even after 0.3 default filter selectivity) and exercise
+/// both empty and non-empty branches at every depth.
+fn deep_chain_store() -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..75_000 {
+        data.push_str(&format!("<urn:s:{i}> <urn:e0> <urn:n0:{}> .\n", i % 64));
+    }
+    for level in 0..16 {
+        for j in 0..64 {
+            // Drop a distinct subset at depths 3, 5, 8, 12, and 15 so every level changes truth values.
+            let keep = match level {
+                3 => j % 5 != 0,
+                5 => j % 7 != 0,
+                8 => j % 3 != 0,
+                12 => j % 4 != 0,
+                15 => j % 2 == 0,
+                _ => true,
+            };
+            if keep {
+                data.push_str(&format!(
+                    "<urn:n{level}:{j}> <urn:e{}> <urn:n{}:{j}> .\n",
+                    level + 1,
+                    level + 1
+                ));
+            }
+            if level == 3 && j % 5 == 0 && j % 2 == 0 {
+                data.push_str(&format!("<urn:n3:{j}> <urn:alt4> <urn:n4:{j}> .\n"));
+            }
+            if level == 3 && j % 2 == 0 {
+                data.push_str(&format!(
+                    "<urn:g:{}> {{ <urn:n3:{j}> <urn:e4> <urn:n4:{j}> . }}\n",
+                    j % 2
+                ));
+            }
+        }
+    }
+    s.load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+    s
+}
+
+fn deep_exists_chain(depth: usize, alternating: bool, inner_tail: &str) -> String {
+    let mut q = String::new();
+    for level in 0..depth {
+        let kw = if alternating && level % 2 == 1 {
+            "FILTER NOT EXISTS"
+        } else {
+            "FILTER EXISTS"
+        };
+        q.push_str(&format!(
+            " {kw} {{ ?v{level} <urn:e{}> ?v{}",
+            level + 1,
+            level + 1
+        ));
+    }
+    if !inner_tail.is_empty() {
+        q.push(' ');
+        q.push_str(inner_tail);
+    }
+    for _ in 0..depth {
+        q.push_str(" }");
+    }
+    q
+}
+
+#[test]
+fn deep_exists_streams_and_matches_eager_and_per_key() {
+    use sparkles_core::sparql::{FallbackPolicy, select_cursor};
+    let s = deep_chain_store();
+    let per_key = QueryOptions {
+        optimizations: Some(sparkles_core::sparql::Optimizations {
+            decorrelate_exists: false,
+            ..sparkles_core::sparql::Optimizations::ALL
+        }),
+        ..Default::default()
+    };
+
+    let mut queries: Vec<(&str, String)> = Vec::new();
+    for depth in [5usize, 8, 16] {
+        queries.push((
+            "pure FILTER EXISTS",
+            format!(
+                "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+                deep_exists_chain(depth, false, "")
+            ),
+        ));
+        queries.push((
+            "alternating NOT EXISTS",
+            format!(
+                "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+                deep_exists_chain(depth, true, "")
+            ),
+        ));
+    }
+    // Correlated outer variable `?flag` bound at depth 0 and referenced only in a FILTER at
+    // depth 8 (forces per-row `eval_exists` across all 8 levels while keeping 64 distinct
+    // outer keys so the debug test stays fast).
+    queries.push((
+        "depth-8 correlated outer variable in inner FILTER",
+        format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 BIND(IF(?v0 = <urn:n0:0>, 0, 1) AS ?flag){} }}",
+            deep_exists_chain(8, false, "FILTER(?flag = 1)")
+        ),
+    ));
+    // Mixed decorrelated + non-decorrelated (UNION and OPTIONAL at depth 4 inside depth 8).
+    let tail4 = deep_exists_chain(4, false, "");
+    let tail4_shifted = tail4
+        .replace("?v4", "?v8")
+        .replace("?v3", "?v7")
+        .replace("?v2", "?v6")
+        .replace("?v1", "?v5")
+        .replace("?v0", "?v4")
+        .replace("<urn:e4>", "<urn:e8>")
+        .replace("<urn:e3>", "<urn:e7>")
+        .replace("<urn:e2>", "<urn:e6>")
+        .replace("<urn:e1>", "<urn:e5>");
+    queries.push((
+        "depth-8 with UNION at depth 4",
+        format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 \
+             FILTER EXISTS {{ ?v0 <urn:e1> ?v1 \
+             FILTER EXISTS {{ ?v1 <urn:e2> ?v2 \
+             FILTER EXISTS {{ ?v2 <urn:e3> ?v3 \
+             FILTER EXISTS {{ {{ ?v3 <urn:e4> ?v4 }} UNION {{ ?v3 <urn:alt4> ?v4 }}{tail4_shifted} }} }} }} }} }}"
+        ),
+    ));
+    queries.push((
+        "depth-8 with OPTIONAL at depth 4",
+        format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 \
+             FILTER EXISTS {{ ?v0 <urn:e1> ?v1 \
+             FILTER EXISTS {{ ?v1 <urn:e2> ?v2 \
+             FILTER EXISTS {{ ?v2 <urn:e3> ?v3 \
+             FILTER EXISTS {{ ?v3 <urn:e4> ?v4 OPTIONAL {{ ?v3 <urn:alt4> ?opt }}{tail4_shifted} }} }} }} }} }}"
+        ),
+    ));
+    // GRAPH (named and variable) inside depth-8 EXISTS.
+    queries.push((
+        "depth-8 with constant GRAPH at depth 4",
+        format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 \
+             FILTER EXISTS {{ ?v0 <urn:e1> ?v1 \
+             FILTER EXISTS {{ ?v1 <urn:e2> ?v2 \
+             FILTER EXISTS {{ ?v2 <urn:e3> ?v3 \
+             FILTER EXISTS {{ GRAPH <urn:g:0> {{ ?v3 <urn:e4> ?v4 }}{tail4_shifted} }} }} }} }} }}"
+        ),
+    ));
+    queries.push((
+        "depth-8 with variable GRAPH at depth 4",
+        format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 \
+             FILTER EXISTS {{ ?v0 <urn:e1> ?v1 \
+             FILTER EXISTS {{ ?v1 <urn:e2> ?v2 \
+             FILTER EXISTS {{ ?v2 <urn:e3> ?v3 \
+             FILTER EXISTS {{ GRAPH ?g {{ ?v3 <urn:e4> ?v4 }}{tail4_shifted} }} }} }} }} }}"
+        ),
+    ));
+    // Empty and non-empty branches at depth 8.
+    queries.push((
+        "depth-8 empty innermost branch (EXISTS)",
+        format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+            deep_exists_chain(7, false, "FILTER EXISTS { ?v7 <urn:absent> ?z }")
+        ),
+    ));
+    queries.push((
+        "depth-8 empty innermost branch (NOT EXISTS)",
+        format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+            deep_exists_chain(7, false, "FILTER NOT EXISTS { ?v7 <urn:absent> ?z }")
+        ),
+    ));
+    // Deep EXISTS inside BIND, SUM, and ORDER BY.
+    let inner7 = deep_exists_chain(7, false, "");
+    let exists8 = format!("EXISTS {{ ?v0 <urn:e1> ?v1{inner7} }}");
+    queries.push((
+        "depth-8 inside BIND(IF(...))",
+        format!(
+            "SELECT ?b (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 BIND(IF({exists8}, 1, 0) AS ?b) }} GROUP BY ?b ORDER BY ?b"
+        ),
+    ));
+    queries.push((
+        "depth-8 inside SUM(IF(...))",
+        format!("SELECT (SUM(IF({exists8}, 1, 0)) AS ?n) {{ ?s <urn:e0> ?v0 }}"),
+    ));
+    queries.push((
+        "depth-8 inside ORDER BY DESC(...)",
+        format!(
+            "SELECT ?v0 (COUNT(?q) AS ?n) {{ ?s <urn:e0> ?v0 OPTIONAL {{ ?v0 <urn:e1> ?q }} }} GROUP BY ?v0 ORDER BY DESC({exists8}) ?v0"
+        ),
+    ));
+
+    for (label, q) in &queries {
+        let eager = query(s.snapshot(), q, &Default::default())
+            .unwrap_or_else(|e| panic!("{label}: eager failed: {e}"))
+            .rows()
+            .unwrap();
+        let reference = query(s.snapshot(), q, &per_key)
+            .unwrap_or_else(|e| panic!("{label}: per-key failed: {e}"))
+            .rows()
+            .unwrap();
+        let is_ordered = q.contains("ORDER BY");
+        let norm = |rows: Vec<Vec<Option<Term>>>| {
+            if is_ordered { ordered(rows) } else { bag(rows) }
+        };
+        let eager_rows: Vec<Vec<Option<Term>>> =
+            eager.iter().map(|r| r.values().to_vec()).collect();
+        let ref_rows: Vec<Vec<Option<Term>>> =
+            reference.iter().map(|r| r.values().to_vec()).collect();
+        assert_eq!(
+            norm(eager_rows.clone()),
+            norm(ref_rows),
+            "{label}: eager vs per-key mismatch"
+        );
+
+        let (auto_rows, streamed) =
+            automatic(&s, q, &Default::default(), &CursorOptions::default())
+                .unwrap_or_else(|e| panic!("{label}: auto failed: {e}"));
+        assert!(streamed, "{label}: expected automatic execution to stream");
+        assert_eq!(
+            norm(auto_rows),
+            norm(eager_rows.clone()),
+            "{label}: auto vs eager mismatch"
+        );
+
+        for batch_rows in [1, 64, 4096] {
+            let cursor_opts = CursorOptions {
+                batch_rows,
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            };
+            let mut c = select_cursor(s.snapshot(), q, &Default::default(), &cursor_opts)
+                .unwrap_or_else(|e| panic!("{label}: strict cursor ({batch_rows}) failed: {e}"));
+            assert!(
+                !c.plan().has_materialization(),
+                "{label}: strict cursor ({batch_rows}) unexpectedly materialized"
+            );
+            let mut got = Vec::new();
+            while let Some(b) = c.next_batch().unwrap() {
+                for i in 0..b.len() {
+                    got.push(b.row(i).unwrap().values().to_vec());
+                }
+            }
+            assert_eq!(
+                norm(got),
+                norm(eager_rows.clone()),
+                "{label}: strict cursor ({batch_rows}) mismatch"
+            );
+        }
+    }
+}
+
+#[test]
+fn deep_exists_enforces_tight_memory_budget_and_cancellation() {
+    let s = deep_chain_store();
+    let depth8_decor = format!(
+        "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+        deep_exists_chain(8, false, "")
+    );
+    let depth16_decor = format!(
+        "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+        deep_exists_chain(16, false, "")
+    );
+    let depth8_corr = format!(
+        "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 BIND(IF(?v0 = <urn:n0:0>, 0, 1) AS ?flag){} }}",
+        deep_exists_chain(8, false, "FILTER(?flag = 1)")
+    );
+
+    for (label, q) in [
+        ("depth-8 decorrelated", &depth8_decor),
+        ("depth-16 decorrelated", &depth16_decor),
+        ("depth-8 correlated", &depth8_corr),
+    ] {
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .rows()
+            .unwrap();
+        for memory in [256 << 10, 512 << 10, 2 << 20, 16 << 20] {
+            let opts = QueryOptions {
+                max_memory_bytes: Some(memory),
+                ..Default::default()
+            };
+            match query_execution(
+                s.snapshot(),
+                q,
+                &opts,
+                &Default::default(),
+                ExecutionMode::Auto,
+            ) {
+                Ok(QueryExecution::Select(mut c)) => {
+                    let mut rows = Vec::new();
+                    let outcome = loop {
+                        match c.next_batch() {
+                            Ok(Some(batch)) => {
+                                for row in 0..batch.len() {
+                                    rows.push(batch.row(row).unwrap().values().to_vec());
+                                }
+                            }
+                            Ok(None) => break Ok(()),
+                            Err(e) => break Err(e),
+                        }
+                    };
+                    match outcome {
+                        Ok(()) => assert_eq!(bag(rows), bag(expected.clone()), "{label}; {memory}"),
+                        Err(Error::BudgetExceeded(sparkles_core::error::Budget {
+                            kind: BudgetKind::Memory,
+                            ..
+                        })) => {}
+                        Err(e) => panic!("{label}; {memory}: unexpected error: {e}"),
+                    }
+                    assert!(
+                        c.stats().mem_peak_bytes <= memory,
+                        "{label}; {memory}: peak {} > {memory}",
+                        c.stats().mem_peak_bytes
+                    );
+                }
+                Ok(QueryExecution::Eager(r)) => {
+                    let r = r.into_result();
+                    assert!(
+                        r.mem_peak_bytes <= memory,
+                        "{label}; {memory}: eager peak {} > {memory}",
+                        r.mem_peak_bytes
+                    );
+                    assert_eq!(
+                        bag(r.rows().unwrap()),
+                        bag(expected.clone()),
+                        "{label}; {memory}"
+                    );
+                }
+                Err(Error::BudgetExceeded(sparkles_core::error::Budget {
+                    kind: BudgetKind::Memory,
+                    ..
+                })) => {}
+                Err(e) => panic!("{label}; {memory}: unexpected open error: {e}"),
+                Ok(_) => panic!("{label}: not a SELECT"),
+            }
+        }
+    }
+
+    // Pre-cancelled admission at depth 16 returns Cancelled (never falls back to eager).
+    let pre_cancel = Arc::new(AtomicBool::new(true));
+    let err = query_execution(
+        s.snapshot(),
+        &depth16_decor,
+        &QueryOptions {
+            cancel: Some(pre_cancel),
+            ..Default::default()
+        },
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .err()
+    .expect("pre-cancelled depth-16 query must fail");
+    assert!(matches!(err, Error::Cancelled), "got {err}");
+
+    // Cancellation after opening streamed depth-16 cursor stops execution cleanly.
+    let mid_cancel = Arc::new(AtomicBool::new(false));
+    let exec = query_execution(
+        s.snapshot(),
+        &depth16_decor,
+        &QueryOptions {
+            cancel: Some(mid_cancel.clone()),
+            ..Default::default()
+        },
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap();
+    let QueryExecution::Select(mut c) = exec else {
+        panic!("depth-16 query should stream under Auto");
+    };
+    mid_cancel.store(true, Ordering::SeqCst);
+    assert!(matches!(c.next_batch(), Err(Error::Cancelled)));
+}
