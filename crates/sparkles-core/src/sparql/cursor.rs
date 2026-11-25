@@ -804,23 +804,67 @@ fn capacity_bytes(table: &Table) -> u64 {
         .saturating_add(128)
 }
 
+fn capacity_bytes_checked(ctx: &Ctx, table: &Table) -> Result<u64> {
+    let mut columns = 0u64;
+    for (chunk_idx, chunk) in table.cols.chunks(4096).enumerate() {
+        if chunk_idx > 0 {
+            ctx.check()?;
+        }
+        for c in chunk {
+            columns = columns.saturating_add(c.capacity() as u64 * 8);
+        }
+    }
+    Ok(columns
+        .max(table.len as u64 * 8 * u64::from(table.width() == 0))
+        .saturating_add(table.vars.capacity() as u64 * 4)
+        .saturating_add(table.sorted.capacity() as u64 * 4)
+        .saturating_add(table.cols.capacity() as u64 * 24)
+        .saturating_add(128))
+}
+
 impl Buffer {
     fn new(ctx: &Arc<Ctx>, vars: &[VarId], rows: usize) -> Result<Self> {
         let bytes = super::ctx::table_bytes(rows, vars.len())
             .saturating_add(vars.len() as u64 * 40)
             .saturating_add(128);
-        let charge = OwnedCharge::new(ctx, bytes)?;
-        let mut table = Table::new(vars.to_vec());
-        for col in &mut table.cols {
-            col.reserve_exact(rows);
+        let mut charge = OwnedCharge::new(ctx, bytes)?;
+        let mut cols = Vec::with_capacity(vars.len());
+        let mut col_bytes = 0u64;
+        for (chunk_idx, chunk) in vars.chunks(4096).enumerate() {
+            if chunk_idx > 0 {
+                ctx.check()?;
+            }
+            for _ in chunk {
+                let mut col = Vec::new();
+                if rows > 0 {
+                    col.reserve_exact(rows);
+                    col_bytes = col_bytes.saturating_add(col.capacity() as u64 * 8);
+                }
+                cols.push(col);
+            }
         }
-        let mut buffer = Self { table, charge };
-        buffer.reconcile()?;
-        Ok(buffer)
+        let table = Table {
+            vars: vars.to_vec(),
+            cols,
+            len: 0,
+            sorted: Vec::new(),
+        };
+        let exact = col_bytes
+            .saturating_add(table.vars.capacity() as u64 * 4)
+            .saturating_add(table.sorted.capacity() as u64 * 4)
+            .saturating_add(table.cols.capacity() as u64 * 24)
+            .saturating_add(128);
+        charge.resize(exact)?;
+        Ok(Self { table, charge })
     }
 
     fn reconcile(&mut self) -> Result<()> {
         self.charge.resize(capacity_bytes(&self.table))
+    }
+
+    fn reconcile_checked(&mut self, ctx: &Ctx) -> Result<()> {
+        self.charge
+            .resize(capacity_bytes_checked(ctx, &self.table)?)
     }
 
     fn set_order(&mut self, order: &[VarId]) -> Result<()> {
@@ -4729,8 +4773,9 @@ impl Operator {
                     if let Some(counters) = &ps.counters {
                         self.info.counters = Some(counters.clone());
                     }
+                    let b = b?;
                     self.done = ps.done();
-                    b?
+                    b
                 }
                 State::SpatialLeaf(sl) => {
                     let b = sl.next(ctx, cap)?;
@@ -7672,5 +7717,252 @@ mod retained_variable_tests {
         assert!(retained.variables().is_empty());
         drop(retained);
         assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn r4_wide_pathsearch_cursor_initial_reservation_and_reconcile_poll() {
+        use super::super::pathsearch::{Algorithm, Direction, PathSearchSpec};
+        use super::super::plan::{GraphFilter, PathEnd};
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        use oxrdfio::RdfFormat;
+        use std::cell::Cell;
+        use std::sync::atomic::Ordering;
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:w:s> <urn:w:p> <urn:w:t1> .\n<urn:w:s> <urn:w:p> <urn:w:t2> .\n".to_vec(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let s = snap.lookup_iri("urn:w:s").unwrap();
+        let p = snap.lookup_iri("urn:w:p").unwrap();
+        let t1 = snap.lookup_iri("urn:w:t1").unwrap();
+        let width = 9_000usize;
+        let wide_vars: Vec<VarId> = (0..width as u32).collect();
+
+        // 1. Direct `Buffer::new` and `reconcile_checked` poll every 4,096 columns,
+        //    preserve exact byte accounting, refuse tight budgets before allocation,
+        //    and abort cleanly on cancellation.
+        let ctx = Arc::new(Ctx::new(snap.clone()));
+        let before = super::super::ctx::CHECKS.with(Cell::get);
+        let mut buf = Buffer::new(&ctx, &wide_vars, 16).unwrap();
+        let new_checks = super::super::ctx::CHECKS.with(Cell::get) - before;
+        assert!(
+            new_checks >= 2,
+            "Buffer::new must poll across width={width} columns, got {new_checks}"
+        );
+        assert_eq!(buf.charge.bytes(), capacity_bytes(&buf.table));
+
+        let before = super::super::ctx::CHECKS.with(Cell::get);
+        buf.reconcile_checked(&ctx).unwrap();
+        let rec_checks = super::super::ctx::CHECKS.with(Cell::get) - before;
+        assert!(
+            rec_checks >= 2,
+            "Buffer::reconcile_checked must poll across width={width} columns, got {rec_checks}"
+        );
+
+        ctx.cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(buf.reconcile_checked(&ctx), Err(Error::Cancelled)));
+        drop(buf);
+        assert_eq!(ctx.live_bytes(), 0);
+        assert!(matches!(
+            Buffer::new(&ctx, &wide_vars, 16),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(ctx.live_bytes(), 0);
+
+        let mut tight = Ctx::new(snap.clone());
+        tight.mem_limit = 64 * 1024;
+        let tight = Arc::new(tight);
+        assert!(matches!(
+            Buffer::new(&tight, &wide_vars, 16),
+            Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+        ));
+        assert_eq!(tight.live_bytes(), 0);
+
+        // 2. Cursor-boundary `PathSearch` pull under default 1 MiB `batch_bytes`:
+        //    for width = 9,000, `Operator::next` caps `cap = (1 MiB / (9,000 * 8)) = 14 <= 64`,
+        //    so initial `Buffer::new` covers the whole batch and the growth loop never runs.
+        //    An empty search isolates initial reservation + final reconciliation polling.
+        let make_spec = |source: PathEnd, target: PathEnd, max_visited: u64| {
+            Box::new(PathSearchSpec {
+                algorithm: Algorithm::Shortest,
+                source,
+                target,
+                predicates: Some(vec![p.0]),
+                directions: vec![Direction::Forward],
+                direction: Direction::Forward,
+                exclude: Vec::new(),
+                max_degree: None,
+                edge_pattern: None,
+                min_len: 1,
+                max_len: None,
+                k: 1,
+                limit: None,
+                max_visited,
+                weight: None,
+                default_weight: 1.0,
+                reifies: None,
+                path_index: None,
+                edge_index: None,
+                edge_s: None,
+                edge_p: None,
+                edge_o: None,
+                edge: None,
+                length: Some(1),
+                cost: None,
+                graph: GraphFilter::Default,
+            })
+        };
+        let options = CursorOptions::default();
+
+        let run_empty_cursor = |w: usize| -> usize {
+            let gctx = Arc::new(Ctx::new(snap.clone()));
+            let vars: Vec<VarId> = (0..w).map(|i| gctx.var(&format!("v{i}"))).collect();
+            // Start at `t1` (no outgoing edges) so `reader.next` emits 0 rows and returns `true`.
+            let node = Node::leaf(
+                Kind::PathSearch(make_spec(PathEnd::Const(t1), PathEnd::Var(2), 100)),
+                vars,
+                1.0,
+                "PathSearch".into(),
+            );
+            let mut op =
+                Operator::build(&gctx, node, FallbackPolicy::RejectMaterialization).unwrap();
+            let before = super::super::ctx::CHECKS.with(Cell::get);
+            let batch = op.next(&gctx, &options, options.batch_rows).unwrap();
+            let checks = super::super::ctx::CHECKS.with(Cell::get) - before;
+            assert!(batch.is_none());
+            assert!(op.done);
+            assert_eq!(gctx.live_bytes(), 0);
+            checks
+        };
+        let narrow_empty = run_empty_cursor(4);
+        let wide_empty = run_empty_cursor(width);
+        assert!(
+            wide_empty >= narrow_empty + 4,
+            "wide PathSearch cursor pull (cap <= 64) must poll during initial Buffer::new and final reconcile_checked: wide={wide_empty}, narrow={narrow_empty}"
+        );
+
+        // 3. Grouped 1-row wide emission through `Operator::next` under default 1 MiB `batch_bytes`.
+        let run_grouped_cursor = |w: usize| -> usize {
+            let gctx = Arc::new(Ctx::new(snap.clone()));
+            let vars: Vec<VarId> = (0..w).map(|i| gctx.var(&format!("v{i}"))).collect();
+            let mut in_table = Table::new(vars.clone());
+            let mut row = vec![Id::from_i64(7).unwrap(); w];
+            row[0] = s;
+            row[1] = Id::from_i64(1).unwrap();
+            row[2] = t1;
+            in_table.push_row(&row);
+            let values_node =
+                Node::leaf(Kind::Values(in_table), vars.clone(), 1.0, "Values".into());
+            let mut ps_node = Node::leaf(
+                Kind::PathSearch(make_spec(PathEnd::Var(0), PathEnd::Var(2), 100)),
+                vars,
+                1.0,
+                "PathSearch".into(),
+            );
+            ps_node.children.push(values_node);
+            let mut op =
+                Operator::build(&gctx, ps_node, FallbackPolicy::RejectMaterialization).unwrap();
+            let before = super::super::ctx::CHECKS.with(Cell::get);
+            let batch = op
+                .next(&gctx, &options, options.batch_rows)
+                .unwrap()
+                .expect("one grouped row");
+            let checks = super::super::ctx::CHECKS.with(Cell::get) - before;
+            assert_eq!(batch.table.len(), 1);
+            assert_eq!(batch.table.width(), w);
+            assert_eq!(batch.charge.bytes(), capacity_bytes(&batch.table));
+            drop(batch);
+            assert!(
+                op.next(&gctx, &options, options.batch_rows)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(op.done);
+            assert_eq!(gctx.live_bytes(), 0);
+            checks
+        };
+        let narrow_grouped = run_grouped_cursor(4);
+        let wide_grouped = run_grouped_cursor(width);
+        assert!(
+            wide_grouped >= narrow_grouped + 4,
+            "wide grouped PathSearch cursor pull must poll across initial reservation, emission and reconciliation: wide={wide_grouped}, narrow={narrow_grouped}"
+        );
+
+        // 4. Direct `Operator::next_inner` failure on `State::PathSearch` keeps `op.done == false`
+        //    (without relying on `Operator::next`'s outer error guard) while preserving counters.
+        let err_ctx = Arc::new(Ctx::new(snap.clone()));
+        let err_vars: Vec<VarId> = (0..3).map(|i| err_ctx.var(&format!("v{i}"))).collect();
+        let err_node = Node::leaf(
+            Kind::PathSearch(make_spec(PathEnd::Const(s), PathEnd::Var(2), 1)),
+            err_vars,
+            1.0,
+            "PathSearch".into(),
+        );
+        let mut err_op =
+            Operator::build(&err_ctx, err_node, FallbackPolicy::RejectMaterialization).unwrap();
+        let err_res = err_op.next_inner(&err_ctx, &options, 16);
+        assert!(err_res.is_err(), "maxVisited=1 must fail on 2-edge graph");
+        assert!(
+            !err_op.done,
+            "failed PathSearch must not mark Operator::done = true inside next_inner"
+        );
+        assert!(err_op.info.counters.is_some());
+        drop(err_op);
+        assert_eq!(err_ctx.live_bytes(), 0);
+
+        // 5. Tight-budget pre-allocation refusal on wide `PathSearch::next` and pull-#2
+        //    cancellation inside `Buffer::new` on a wide pull (`cap = 14 <= 64`).
+        let mut mem_ctx = Ctx::new(snap.clone());
+        mem_ctx.mem_limit = 350 * 1024;
+        let mem_ctx = Arc::new(mem_ctx);
+        let mem_vars: Vec<VarId> = (0..width).map(|i| mem_ctx.var(&format!("v{i}"))).collect();
+        let wide_node = Node::leaf(
+            Kind::PathSearch(make_spec(PathEnd::Const(s), PathEnd::Var(2), 100)),
+            mem_vars,
+            2.0,
+            "PathSearch".into(),
+        );
+        let mut mem_op = Operator::build(
+            &mem_ctx,
+            wide_node.clone(),
+            FallbackPolicy::RejectMaterialization,
+        )
+        .unwrap();
+        let mem_res = mem_op
+            .next(&mem_ctx, &options, options.batch_rows)
+            .map(|b| b.is_some());
+        assert!(
+            matches!(mem_res, Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory),
+            "expected pre-allocation budget refusal on wide PathSearch output buffer: {mem_res:?}"
+        );
+        assert!(!mem_op.done);
+        drop(mem_op);
+        assert_eq!(mem_ctx.live_bytes(), 0);
+
+        // Pull #1 opens the reader and yields 1 of 2 paths (`cap = 1`); pull #2 cancels
+        // directly inside `PathSearch::pull`'s `Buffer::new` on width = 9,000, cap = 14.
+        let c_ctx = Arc::new(Ctx::new(snap));
+        let mut ps = pathsearch::PathSearch::new(wide_node);
+        let first = ps
+            .next(&c_ctx, &mut [], &options, 1)
+            .unwrap()
+            .expect("first of two paths");
+        assert_eq!(first.table.len(), 1);
+        assert!(!ps.done());
+        drop(first);
+        c_ctx.cancel.store(true, Ordering::Relaxed);
+        let second = ps.next(&c_ctx, &mut [], &options, 14).map(|b| b.is_some());
+        assert!(
+            matches!(second, Err(Error::Cancelled)),
+            "second pull must cancel inside Buffer::new on width={width}: {second:?}"
+        );
+        drop(ps);
+        assert_eq!(c_ctx.live_bytes(), 0);
     }
 }

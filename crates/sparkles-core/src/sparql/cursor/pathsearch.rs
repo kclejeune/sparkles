@@ -118,15 +118,17 @@ impl PathSearch {
                     .saturating_add(width as u64 * 4);
                 b.charge
                     .resize(b.charge.bytes().saturating_add(new_bytes))?;
-                for (idx, col) in b.table.cols.iter_mut().enumerate() {
-                    if idx > 0 && idx.is_multiple_of(4096) {
+                for (chunk_idx, chunk) in b.table.cols.chunks_mut(4096).enumerate() {
+                    if chunk_idx > 0 {
                         ctx.check()?;
                     }
-                    if col.capacity() < target {
-                        col.reserve_exact(target - col.len());
+                    for col in chunk {
+                        if col.capacity() < target {
+                            col.reserve_exact(target - col.len());
+                        }
                     }
                 }
-                b.reconcile()?;
+                b.reconcile_checked(ctx)?;
             }
             ended = reader.next(ctx, spec, &self.node.vars, &mut b.table, target)?;
             if ended {
@@ -137,7 +139,7 @@ impl PathSearch {
         if ended {
             self.reader = None;
         }
-        b.reconcile()?;
+        b.reconcile_checked(ctx)?;
         Ok((b.table.len > 0).then_some(b))
     }
 }

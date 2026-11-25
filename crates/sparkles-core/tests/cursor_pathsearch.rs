@@ -1291,8 +1291,15 @@ fn path_search_r1_parity_cancellation_and_release() {
         }
         p.children.iter().find_map(find_ps_node)
     }
-    let ps_visited = find_ps_node(c_in_pull.plan())
-        .and_then(|p| p.operator.counters.as_ref())
+    let ps_node = find_ps_node(c_in_pull.plan()).expect("PathSearch node in cursor plan");
+    assert!(
+        !ps_node.complete,
+        "cancelled PathSearch must remain incomplete in cursor plan"
+    );
+    let ps_visited = ps_node
+        .operator
+        .counters
+        .as_ref()
         .and_then(|c| c.get("visited"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);

@@ -3877,9 +3877,13 @@ fn retain_hb_map_checked<K: Eq + std::hash::Hash, V>(
     let mut iter = map.extract_if(|k, _| {
         let check_now = visited.is_multiple_of(4096);
         visited += 1;
-        if check_now && let Err(e) = ctx.check() {
-            err.set(Some(e));
-            return true;
+        if check_now {
+            #[cfg(test)]
+            test_hooks::fire_prune_poll();
+            if let Err(e) = ctx.check() {
+                err.set(Some(e));
+                return true;
+            }
         }
         !keep(k)
     });
@@ -9456,6 +9460,8 @@ pub mod test_hooks {
 
     thread_local! {
         static ON_TRAVERSAL_POLL: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+        #[cfg(test)]
+        static ON_PRUNE_POLL: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
     }
 
     /// Restores the thread-local traversal poll hook when dropped.
@@ -9480,6 +9486,36 @@ pub mod test_hooks {
 
     pub(super) fn fire_traversal_poll() {
         ON_TRAVERSAL_POLL.with(|slot| {
+            if let Some(f) = slot.borrow_mut().as_mut() {
+                f();
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) struct PrunePollGuard;
+
+    #[cfg(test)]
+    impl Drop for PrunePollGuard {
+        fn drop(&mut self) {
+            ON_PRUNE_POLL.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn on_prune_poll(f: impl FnMut() + 'static) -> PrunePollGuard {
+        ON_PRUNE_POLL.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(f));
+        });
+        PrunePollGuard
+    }
+
+    #[cfg(test)]
+    pub(super) fn fire_prune_poll() {
+        ON_PRUNE_POLL.with(|slot| {
             if let Some(f) = slot.borrow_mut().as_mut() {
                 f();
             }
@@ -10627,7 +10663,7 @@ mod tree_tests {
         };
 
         // Single-source `run_dijkstra` with cheap target `t` (weight 1.0 vs default 10.0 for 8,192 decoys).
-        let run_ss = |prune: bool| -> (usize, usize, usize) {
+        let run_ss = |cancel_on_poll: Option<usize>| -> (Result<(usize, usize)>, usize) {
             let gctx = Arc::new(Ctx::new(snap.clone()));
             let mut charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
             let mut search =
@@ -10641,15 +10677,23 @@ mod tree_tests {
                 let _ = insert_hb_map(&mut search.weights, (s.0, p.0, d.0), 10.0, &mut charge, b)
                     .unwrap();
             }
-            let targets = prune.then_some([t.0]);
-            let before = super::super::ctx::CHECKS.with(Cell::get);
-            let (tree, dist) = search
+            let targets = [t.0];
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let polls_hook = polls.clone();
+            let cancel_hook = gctx.cancel.clone();
+            let _guard = test_hooks::on_prune_poll(move || {
+                let n = polls_hook.fetch_add(1, Ordering::Relaxed) + 1;
+                if cancel_on_poll == Some(n) {
+                    cancel_hook.store(true, Ordering::Release);
+                }
+            });
+            let res = search
                 .run_dijkstra(
                     &gctx,
                     &spec,
                     s.0,
                     true,
-                    targets.as_ref().map(|a| a.as_slice()),
+                    Some(&targets),
                     true,
                     false,
                     None,
@@ -10658,54 +10702,94 @@ mod tree_tests {
                     &mut charge,
                     0,
                 )
-                .unwrap();
-            let checks = super::super::ctx::CHECKS.with(Cell::get) - before;
-            (checks, tree.first.len(), dist.len())
+                .map(|(tree, dist)| (tree.first.len(), dist.len()));
+            drop(_guard);
+            (res, polls.load(Ordering::Relaxed))
         };
-        let (prune_checks, first_len, dist_len) = run_ss(true);
+        let (ss_res, ss_prune_polls) = run_ss(None);
+        let (first_len, dist_len) = ss_res.unwrap();
         assert_eq!(
             first_len, 1,
             "only settled target `t` remains in tree.first"
         );
         assert_eq!(dist_len, 2, "only settled `s` and `t` remain in dist");
-        assert!(
-            prune_checks >= 6,
-            "run_dijkstra with 8,192 tentative entries must poll during finalization pruning, got {prune_checks}"
+        // 8,193 entries in `tree.first` (3 polls at 0, 4096, 8192) + 8,194 entries in `dist`
+        // (3 polls at 0, 4096, 8192) = 6 finalization pruning checkpoints.
+        assert_eq!(
+            ss_prune_polls, 6,
+            "run_dijkstra must poll 3 times in tree.first and 3 times in dist during finalization pruning"
         );
+        for (cancel_at, label) in [(1, "tree.first"), (4, "dist")] {
+            let (res, observed) = run_ss(Some(cancel_at));
+            assert!(
+                matches!(res, Err(Error::Cancelled)),
+                "run_dijkstra must cancel at finalization pruning checkpoint #{cancel_at} ({label}): {res:?}"
+            );
+            assert_eq!(
+                observed, cancel_at,
+                "run_dijkstra must abort immediately at finalization pruning checkpoint #{cancel_at} ({label})"
+            );
+        }
 
         // Bidirectional `run_dijkstra_pair_all` (`all = true`) on the same high-degree source.
-        let gctx = Arc::new(Ctx::new(snap.clone()));
-        let mut charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
-        let mut search =
-            SearchContext::open(&gctx, &spec, ChargedPatternEdges::new(), &mut charge).unwrap();
-        let base = search.retained_bytes();
-        let _ =
-            insert_hb_map(&mut search.weights, (s.0, p.0, t.0), 1.0, &mut charge, base).unwrap();
-        for i in 0..8_192 {
-            let d = snap.lookup_iri(&format!("urn:p:d:{i}")).unwrap();
-            let b = search.retained_bytes();
-            let _ =
-                insert_hb_map(&mut search.weights, (s.0, p.0, d.0), 10.0, &mut charge, b).unwrap();
-        }
-        let before = super::super::ctx::CHECKS.with(Cell::get);
-        let outcome = search
-            .run_dijkstra_pair_all(&gctx, &spec, s.0, t.0, true, false, &mut charge, 0)
-            .unwrap();
-        let bidi_checks = super::super::ctx::CHECKS.with(Cell::get) - before;
-        match outcome {
-            BidiWeightedOutcome::Stream(job) => {
-                // Only `s` settled on the forward side before `heaps[1]` emptied and
-                // `tops[0] + tops[1] > best` stopped the search, so all 8,193 tentative
-                // forward entries (`t` plus 8,192 decoys) were pruned away.
-                assert_eq!(job.trees[0].first.len(), 0);
-                assert_eq!(job.dist[0].len(), 1);
+        let run_bidi = |cancel_on_poll: Option<usize>| -> (Result<(usize, usize)>, usize) {
+            let gctx = Arc::new(Ctx::new(snap.clone()));
+            let mut charge = super::super::ctx::OwnedCharge::new(&gctx, 0).unwrap();
+            let mut search =
+                SearchContext::open(&gctx, &spec, ChargedPatternEdges::new(), &mut charge).unwrap();
+            let base = search.retained_bytes();
+            let _ = insert_hb_map(&mut search.weights, (s.0, p.0, t.0), 1.0, &mut charge, base)
+                .unwrap();
+            for i in 0..8_192 {
+                let d = snap.lookup_iri(&format!("urn:p:d:{i}")).unwrap();
+                let b = search.retained_bytes();
+                let _ = insert_hb_map(&mut search.weights, (s.0, p.0, d.0), 10.0, &mut charge, b)
+                    .unwrap();
             }
-            _ => panic!("expected BidiWeightedOutcome::Stream for tight weight ratio"),
-        }
+            let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let polls_hook = polls.clone();
+            let cancel_hook = gctx.cancel.clone();
+            let _guard = test_hooks::on_prune_poll(move || {
+                let n = polls_hook.fetch_add(1, Ordering::Relaxed) + 1;
+                if cancel_on_poll == Some(n) {
+                    cancel_hook.store(true, Ordering::Release);
+                }
+            });
+            let res = search
+                .run_dijkstra_pair_all(&gctx, &spec, s.0, t.0, true, false, &mut charge, 0)
+                .map(|outcome| match outcome {
+                    BidiWeightedOutcome::Stream(job) => {
+                        (job.trees[0].first.len(), job.dist[0].len())
+                    }
+                    _ => panic!("expected BidiWeightedOutcome::Stream for tight weight ratio"),
+                });
+            drop(_guard);
+            (res, polls.load(Ordering::Relaxed))
+        };
+        let (bidi_res, bidi_prune_polls) = run_bidi(None);
+        let (bidi_first_len, bidi_dist_len) = bidi_res.unwrap();
+        // Only `s` settled on the forward side before `heaps[1]` emptied and
+        // `tops[0] + tops[1] > best` stopped the search, so all 8,193 tentative
+        // forward entries (`t` plus 8,192 decoys) were pruned away.
+        assert_eq!(bidi_first_len, 0);
+        assert_eq!(bidi_dist_len, 1);
+        // 8,193 entries in `trees[0].first` (3 polls) + 8,194 entries in `dist[0]` (3 polls),
+        // plus any backward tentative entries pruned on side 1.
         assert!(
-            bidi_checks >= 6,
-            "run_dijkstra_pair_all must poll while pruning tentative tables, got {bidi_checks}"
+            bidi_prune_polls >= 6,
+            "run_dijkstra_pair_all must poll at least 6 times across trees[0].first and dist[0] during finalization pruning, got {bidi_prune_polls}"
         );
+        for (cancel_at, label) in [(1, "trees[0].first"), (4, "dist[0]")] {
+            let (res, observed) = run_bidi(Some(cancel_at));
+            assert!(
+                matches!(res, Err(Error::Cancelled)),
+                "run_dijkstra_pair_all must cancel at finalization pruning checkpoint #{cancel_at} ({label}): {res:?}"
+            );
+            assert_eq!(
+                observed, cancel_at,
+                "run_dijkstra_pair_all must abort immediately at finalization pruning checkpoint #{cancel_at} ({label})"
+            );
+        }
     }
 
     #[test]
