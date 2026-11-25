@@ -48,7 +48,7 @@ use crate::error::{Error, Result};
 use crate::id::Id;
 use oxrdf::Term;
 use rustc_hash::FxHashMap;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// The directory of internal circuits' checkpoints under a dataset's root.
@@ -219,12 +219,14 @@ pub(crate) struct Tally {
     pub(crate) since: u64,
     /// ranges `(first, last)` of commits whose changes were not counted per key
     pub(crate) unknown: Vec<(u64, u64)>,
-    keys: Vec<Vec<Option<Term>>>,
+    keys: Vec<TallyKey>,
     index: FxHashMap<Vec<Option<Term>>, u32>,
     /// `(commit, key, count)` in commit order
     entries: VecDeque<(u64, u32, u64)>,
-    /// the memory of `keys` and `index` together ([`key_bytes`])
+    /// The heap owned by the two copies of each key, excluding their backing tables.
     key_bytes: u64,
+    /// The index allocation can outlive deletions that lower its reported capacity.
+    index_capacity: usize,
     /// the most memory the counts took right after a commit was counted
     #[cfg(test)]
     pub(crate) peak: u64,
@@ -240,18 +242,52 @@ pub(crate) struct Tally {
 const ENTRY_BYTES: u64 = 24;
 const RANGE_BYTES: u64 = 16;
 
-/// The approximate memory of one key, held once in the list of keys and once in the
-/// index: each term's vocabulary key and the term's own size, and the map's slot.
-fn key_bytes(key: &[Option<Term>]) -> u64 {
-    let terms: u64 = key
-        .iter()
-        .map(|t| {
-            t.as_ref()
-                .map_or(0, |t| crate::id::term_key(t).len() as u64)
-                + 32
-        })
-        .sum();
-    2 * (terms + 24) + 16
+const KEY_SLOT: usize = std::mem::size_of::<TallyKey>();
+const INDEX_SLOT: usize = std::mem::size_of::<(Vec<Option<Term>>, u32)>();
+const TERM_SLOT: usize = std::mem::size_of::<Option<Term>>();
+const UNUSED_KEY: u32 = u32::MAX;
+
+#[derive(Clone, Debug, PartialEq)]
+struct TallyKey {
+    terms: Vec<Option<Term>>,
+    bytes: u64,
+    /// Used during pruning to mark live keys and remap their old indices in place.
+    remap: u32,
+}
+
+fn key_copy_bytes(key: &[Option<Term>]) -> u64 {
+    use oxrdf::TermRef;
+    fn heap_bytes(term: TermRef<'_>) -> u64 {
+        match term {
+            TermRef::NamedNode(n) => n.as_str().len() as u64,
+            TermRef::BlankNode(b) => b.as_str().len() as u64,
+            TermRef::Literal(l) => {
+                let suffix = l.language().map_or_else(
+                    || {
+                        if l.datatype() == oxrdf::vocab::xsd::STRING {
+                            0
+                        } else {
+                            l.datatype().as_str().len()
+                        }
+                    },
+                    str::len,
+                );
+                (l.value().len() + suffix) as u64
+            }
+            TermRef::Triple(t) => {
+                std::mem::size_of::<oxrdf::Triple>() as u64
+                    + heap_bytes(t.subject.as_ref().into())
+                    + heap_bytes(t.predicate.as_ref().into())
+                    + heap_bytes(t.object.as_ref())
+            }
+        }
+    }
+    std::mem::size_of_val(key) as u64
+        + key
+            .iter()
+            .flatten()
+            .map(|term| heap_bytes(term.as_ref()))
+            .sum::<u64>()
 }
 
 impl Tally {
@@ -264,9 +300,35 @@ impl Tally {
     }
 
     pub(crate) fn bytes(&self) -> u64 {
+        self.buffer_bytes() + self.key_bytes
+    }
+
+    fn buffer_bytes(&self) -> u64 {
         self.entries.capacity() as u64 * ENTRY_BYTES
-            + self.key_bytes
             + self.unknown.capacity() as u64 * RANGE_BYTES
+            + (self.keys.capacity() * KEY_SLOT) as u64
+            + sparkles_budget::sizes::table_bytes(self.index_capacity, INDEX_SLOT) as u64
+    }
+
+    fn key_slot_growth(&self, add: usize) -> u64 {
+        use sparkles_budget::sizes::{table_bytes, table_grown, vec_grown};
+        let cap = self.keys.capacity();
+        let keys = vec_grown(cap, self.keys.len(), add, KEY_SLOT).saturating_sub(cap) * KEY_SLOT;
+        let want = self.index.len() + add;
+        let index_growth = if want <= self.index.capacity() || want <= self.index_capacity / 2 {
+            0
+        } else {
+            // Include the replacement allocation while the old table is still alive.
+            // Reserve against the backing capacity because tombstones can make the
+            // table report fewer usable slots than it actually allocated.
+            let cap = table_grown(
+                self.index_capacity,
+                self.index_capacity,
+                want.saturating_sub(self.index_capacity).max(1),
+            );
+            table_bytes(cap, INDEX_SLOT) as u64
+        };
+        keys as u64 + index_growth
     }
 
     fn intern(&mut self, key: Vec<Option<Term>>) -> u32 {
@@ -274,9 +336,15 @@ impl Tally {
             return n;
         }
         let n = self.keys.len() as u32;
-        self.key_bytes += key_bytes(&key);
-        self.keys.push(key.clone());
-        self.index.insert(key, n);
+        let bytes = 2 * key_copy_bytes(&key);
+        self.key_bytes += bytes;
+        self.index.insert(key.clone(), n);
+        self.index_capacity = self.index_capacity.max(self.index.capacity());
+        self.keys.push(TallyKey {
+            terms: key,
+            bytes,
+            remap: UNUSED_KEY,
+        });
         n
     }
 
@@ -288,6 +356,7 @@ impl Tally {
         self.keys = Vec::new();
         self.index = FxHashMap::default();
         self.key_bytes = 0;
+        self.index_capacity = 0;
     }
 
     /// Release spare backing capacity without dropping any commits' counts.
@@ -296,50 +365,50 @@ impl Tally {
         let before = self.bytes();
         self.entries.shrink_to_fit();
         self.unknown.shrink_to_fit();
+        self.keys.shrink_to_fit();
+        self.index.shrink_to_fit();
+        if self.index.capacity() < self.index_capacity {
+            use sparkles_budget::sizes::buckets;
+            // Shrinking can leave the same backing allocation with tombstones.
+            // Only lower its charge when the requested minimum uses fewer buckets.
+            let min = sparkles_budget::sizes::table_capacity(self.index.len());
+            if buckets(min) < buckets(self.index_capacity) {
+                self.index_capacity = self.index.capacity();
+            }
+        }
         self.bytes() < before
     }
 
-    /// Reclaim up to `needed` bytes for `ViewBudget`'s external reclaim hook, shedding
-    /// spare capacity first and then evicting oldest commits' counts. Returns
-    /// `(freed_bytes, evicted_commits)`.
+    /// Reclaim under the budget mutex without growing or reallocating any buffers.
+    /// Evict a prefix to free key payloads. If the backing buffers alone would exceed
+    /// the target, drop the storage as a unit and mark its range unavailable.
     pub(crate) fn evict_for_reclaim(&mut self, needed: u64) -> (u64, bool) {
         let before = self.bytes();
         if before == 0 || needed == 0 {
             return (0, false);
         }
+        let old_since = self.since;
         let target = before.saturating_sub(needed);
-        let mut evicted = false;
-        if self.shrink_spare_capacity() && self.bytes() <= target {
-            return (before - self.bytes(), false);
-        }
-        if self.shrink_to(target) {
-            evicted = true;
+        if let Some(payload) = target.checked_sub(self.buffer_bytes()) {
+            let through = self.through_for(payload - payload / 4, false);
+            self.discard_prefix(through);
         }
         if self.bytes() > target {
-            self.shrink_spare_capacity();
+            self.since = self.since.max(self.last_counted_commit());
+            self.clear_storage();
         }
-        while self.bytes() > target {
-            let prev = self.bytes();
-            if let Some(last_commit) = self.entries.back().map(|e| e.0) {
-                self.discard_through(last_commit);
-                self.shrink_spare_capacity();
-                evicted = true;
-            } else if let Some(&(_, last_unk)) = self.unknown.last() {
-                self.discard_through(last_unk);
-                self.shrink_spare_capacity();
-                evicted = true;
-            } else {
-                self.clear_storage();
-                evicted = true;
-                break;
-            }
-            if self.bytes() >= prev {
-                self.clear_storage();
-                evicted = true;
-                break;
-            }
+        #[cfg(test)]
+        {
+            self.drops += u64::from(self.since > old_since);
         }
-        (before.saturating_sub(self.bytes()), evicted)
+        (before - self.bytes(), self.since > old_since)
+    }
+
+    fn last_counted_commit(&self) -> u64 {
+        self.entries
+            .back()
+            .map_or(self.since, |e| e.0)
+            .max(self.unknown.last().map_or(self.since, |r| r.1))
     }
 
     /// Count one commit with the compact input and decoded keys admitted separately.
@@ -349,140 +418,119 @@ impl Tally {
         commit: u64,
         c: Changes,
         c_lease: super::budget::ScratchLease,
-        term: impl Fn(Id) -> Option<Term>,
+        term: impl Fn(Id, &mut super::budget::ScratchLease) -> Result<Option<Term>>,
         circuit: Option<&super::circuit::Circuit>,
         dirty: &mut bool,
     ) -> Result<()> {
-        let key_cols = tally.lock().key_cols.clone();
-        let mut scratch = super::budget::ScratchLease::new(circuit.map(|c| c.budget_handle()));
-        let mut per: FxHashMap<Box<[Id]>, u64> = FxHashMap::default();
-        let key_slot = (key_cols.len() as u64) * 8 + 40;
-        let abandon = |tally: &parking_lot::Mutex<Tally>, dirty: &mut bool| {
+        let result = Self::try_count(tally, commit, c, c_lease, term, circuit);
+        if matches!(result, Err(Error::BudgetExceeded(_))) {
             {
                 let mut t = tally.lock();
-                t.discard_through(commit);
+                t.since = t.since.max(commit);
                 t.clear_storage();
             }
-            if let Some(circ) = circuit {
-                circ.set_external_best_effort(0);
+            if let Some(circuit) = circuit {
+                circuit.set_external_best_effort(0);
             }
             *dirty = true;
-        };
+            return Ok(());
+        }
+        result
+    }
+
+    fn try_count(
+        tally: &parking_lot::Mutex<Tally>,
+        commit: u64,
+        c: Changes,
+        c_lease: super::budget::ScratchLease,
+        term: impl Fn(Id, &mut super::budget::ScratchLease) -> Result<Option<Term>>,
+        circuit: Option<&super::circuit::Circuit>,
+    ) -> Result<()> {
+        use super::circuit::reserve_vec_slot;
+        use sparkles_budget::sizes::{table_bytes, table_grown, vec_grown};
+
+        let budget = circuit.map(|c| c.budget_handle());
+        let mut compact = super::budget::ScratchLease::new(budget.clone());
+        let cols_bytes = (tally.lock().key_cols.len() * std::mem::size_of::<usize>()) as u64;
+        compact.try_reserve(cols_bytes)?;
+        let key_cols = tally.lock().key_cols.clone();
+        let key_payload = std::mem::size_of_val(key_cols.as_slice()) as u64;
+        let slot = std::mem::size_of::<(Box<[Id]>, u64)>();
+        let mut per = FxHashMap::<Box<[Id]>, u64>::default();
+        let mut projected = compact.sibling();
         for (row, w) in &c {
+            projected.try_set(key_payload)?;
             let key: Box<[Id]> = key_cols.iter().map(|&i| row[i]).collect();
-            if !per.contains_key(&key) {
-                let next_bytes = (per.len() as u64 + 1).saturating_mul(key_slot);
-                if next_bytes > scratch.bytes() {
-                    match scratch.try_set(next_bytes) {
-                        Ok(()) => {}
-                        Err(crate::error::Error::BudgetExceeded(_)) => {
-                            drop(per);
-                            drop(c);
-                            drop(c_lease);
-                            drop(scratch);
-                            abandon(tally, dirty);
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            drop(per);
-                            drop(c);
-                            drop(c_lease);
-                            drop(scratch);
-                            return Err(e);
-                        }
-                    }
+            if let Some(n) = per.get_mut(&key) {
+                *n += w.unsigned_abs();
+            } else {
+                let old_cap = per.capacity();
+                let new_cap = table_grown(old_cap, per.len(), 1);
+                if new_cap > old_cap {
+                    compact.try_reserve(table_bytes(new_cap, slot) as u64)?;
+                }
+                projected.transfer_to(&mut compact, key_payload);
+                per.insert(key, w.unsigned_abs());
+                if new_cap > old_cap {
+                    compact.release(table_bytes(old_cap, slot) as u64);
                 }
             }
-            *per.entry(key).or_insert(0) += w.unsigned_abs();
         }
-        // Release the input change buffer and its lease before decoding keys.
+        drop(projected);
         drop(c);
         drop(c_lease);
-        let per_bytes = scratch.bytes();
-        let mut decoded: Vec<(Vec<Option<Term>>, u64)> = Vec::new();
-        let mut decoded_bytes = 0u64;
-        let mut added_tally = 0u64;
-        let mut per_iter = per.into_iter();
-        while let Some((k, n)) = per_iter.next() {
+
+        let mut decoded_lease = super::budget::ScratchLease::new(budget);
+        let mut decoded = Vec::new();
+        for (ids, n) in per {
             if n == 0 {
                 continue;
             }
-            let key: Vec<Option<Term>> = k.iter().map(|&i| term(i)).collect();
-            let kb = key_bytes(&key);
-            decoded_bytes = decoded_bytes.saturating_add(kb / 2 + 16);
-            if !tally.lock().index.contains_key(&key) {
-                added_tally = added_tally.saturating_add(kb);
-            }
-            let need = per_bytes
-                .saturating_add(decoded_bytes)
-                .saturating_add(added_tally)
-                .saturating_add((decoded.len() as u64 + 1) * ENTRY_BYTES);
-            if need > scratch.bytes() {
-                match scratch.try_set(need) {
-                    Ok(()) => {}
-                    Err(crate::error::Error::BudgetExceeded(_)) => {
-                        drop(key);
-                        drop(per_iter);
-                        drop(decoded);
-                        drop(scratch);
-                        abandon(tally, dirty);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        drop(key);
-                        drop(per_iter);
-                        drop(decoded);
-                        drop(scratch);
-                        return Err(e);
-                    }
-                }
+            reserve_vec_slot(&decoded, &mut decoded_lease)?;
+            decoded_lease.try_reserve((ids.len() * TERM_SLOT) as u64)?;
+            let mut key = Vec::with_capacity(ids.len());
+            for &i in &ids {
+                key.push(term(i, &mut decoded_lease)?);
             }
             decoded.push((key, n));
         }
-        // Recompute new-key and entry growth after any reclaim-hook evictions during
-        // decoding; loop until `scratch` covers the post-eviction requirements.
-        loop {
-            let final_need = {
-                let t = tally.lock();
-                let final_added: u64 = decoded
-                    .iter()
-                    .filter(|(key, _)| !t.index.contains_key(key))
-                    .map(|(key, _)| key_bytes(key))
-                    .sum();
-                let entry_next = sparkles_budget::sizes::vec_grown(
-                    t.entries.capacity(),
-                    t.entries.len(),
-                    decoded.len(),
-                    ENTRY_BYTES as usize,
-                );
-                let entry_growth =
-                    (entry_next.saturating_sub(t.entries.capacity()) as u64) * ENTRY_BYTES;
-                decoded_bytes
-                    .saturating_add(final_added)
-                    .saturating_add(entry_growth)
-                    .saturating_add((decoded.len() * std::mem::size_of::<(u32, u64)>()) as u64)
-            };
-            if final_need <= scratch.bytes() {
-                break;
-            }
-            match scratch.try_set(final_need) {
-                Ok(()) => {}
-                Err(crate::error::Error::BudgetExceeded(_)) => {
-                    drop(decoded);
-                    drop(scratch);
-                    abandon(tally, dirty);
-                    return Ok(());
-                }
-                Err(e) => {
-                    drop(decoded);
-                    drop(scratch);
-                    return Err(e);
-                }
-            }
+        drop(key_cols);
+        drop(compact);
+        if decoded.is_empty() {
+            return Ok(());
         }
-        let final_bytes = {
+
+        let counted_bytes = (decoded.len() * std::mem::size_of::<(u32, u64)>()) as u64;
+        let mut retained = decoded_lease.sibling();
+        let final_bytes = loop {
             let mut t = tally.lock();
-            let mut counted: Vec<(u32, u64)> = Vec::with_capacity(decoded.len());
+            let mut new_keys = 0;
+            let mut copy_bytes = 0;
+            for (key, _) in &decoded {
+                if !t.index.contains_key(key) {
+                    new_keys += 1;
+                    copy_bytes += key_copy_bytes(key);
+                }
+            }
+            let cap = t.entries.capacity();
+            let next = vec_grown(cap, t.entries.len(), decoded.len(), ENTRY_BYTES as usize);
+            let need = copy_bytes
+                + t.key_slot_growth(new_keys)
+                + (next.saturating_sub(cap) as u64) * ENTRY_BYTES
+                + counted_bytes;
+            if need > retained.bytes() {
+                // Admission can evict counts. Inspect the remaining keys again before
+                // allocating or interning anything.
+                drop(t);
+                retained.try_set(need)?;
+                continue;
+            }
+            let mut counted = Vec::with_capacity(decoded.len());
+            // Reserve the batch as estimated above. Repeated pushes could otherwise
+            // take a different capacity path than one reservation.
+            t.entries.reserve(decoded.len());
+            t.keys.reserve(new_keys);
+            t.index.reserve(new_keys);
             for (key, n) in decoded {
                 counted.push((t.intern(key), n));
             }
@@ -490,54 +538,16 @@ impl Tally {
             for (k, n) in counted {
                 t.entries.push_back((commit, k, n));
             }
-            if let Some(circ) = circuit {
-                let max = circ.max_memory_bytes.unwrap_or(u64::MAX);
-                let state = circ.bytes();
-                if state <= max && t.shrink_to(max - state) {
-                    *dirty = true;
-                }
-            }
+            let bytes = t.bytes();
             #[cfg(test)]
             {
-                let b = t.bytes();
-                t.peak = t.peak.max(b);
+                t.peak = t.peak.max(bytes);
             }
-            t.bytes()
+            break bytes;
         };
-        if let Some(circ) = circuit {
-            if let Err(e) = circ.commit_external_from_scratch(final_bytes, &mut scratch) {
-                drop(scratch);
-                if matches!(e, crate::error::Error::BudgetExceeded(_)) {
-                    loop {
-                        let (shrunk, next_bytes) = {
-                            let mut t = tally.lock();
-                            let cur = t.bytes();
-                            if cur > 0 && t.shrink_spare_capacity() {
-                                (true, t.bytes())
-                            } else if cur > 0 {
-                                if t.shrink_to(cur / 2) {
-                                    *dirty = true;
-                                }
-                                (t.bytes() < cur, t.bytes())
-                            } else {
-                                (false, 0)
-                            }
-                        };
-                        if shrunk {
-                            if circ.try_set_external(next_bytes).is_ok() {
-                                break;
-                            }
-                            continue;
-                        }
-                        abandon(tally, dirty);
-                        break;
-                    }
-                } else {
-                    return Err(e);
-                }
-            }
-        } else {
-            drop(scratch);
+        decoded_lease.transfer_to(&mut retained, decoded_lease.bytes());
+        if let Some(circuit) = circuit {
+            circuit.commit_external_from_scratch(final_bytes, &mut retained)?;
         }
         Ok(())
     }
@@ -552,7 +562,7 @@ impl Tally {
             commit,
             c.clone(),
             super::budget::ScratchLease::default(),
-            term,
+            |i, _| Ok(term(i)),
             None,
             &mut dirty,
         )
@@ -595,18 +605,36 @@ impl Tally {
         if commit <= self.since {
             return;
         }
+        self.discard_prefix(commit);
+        if self.entries.capacity() > self.entries.len() + self.entries.len() / 4 + 64
+            || self.unknown.capacity() > self.unknown.len() + self.unknown.len() / 4 + 16
+            || self.keys.capacity() > self.keys.len() + self.keys.len() / 4 + 16
+        {
+            self.shrink_spare_capacity();
+        }
+    }
+
+    fn discard_prefix(&mut self, commit: u64) {
+        if commit <= self.since {
+            return;
+        }
         self.since = commit;
         while self.entries.front().is_some_and(|e| e.0 <= commit) {
             self.entries.pop_front();
         }
         self.unknown.retain(|r| r.1 > commit);
-        if self.entries.capacity() > self.entries.len() + self.entries.len() / 4 + 64 {
-            self.entries.shrink_to_fit();
+        if self.entries.is_empty() {
+            self.entries = VecDeque::new();
+            self.keys = Vec::new();
+            self.index = FxHashMap::default();
+            self.key_bytes = 0;
+            self.index_capacity = 0;
+        } else {
+            self.compact_keys();
         }
-        if self.unknown.capacity() > self.unknown.len() + self.unknown.len() / 4 + 16 {
-            self.unknown.shrink_to_fit();
+        if self.unknown.is_empty() {
+            self.unknown = Vec::new();
         }
-        self.compact_keys();
     }
 
     /// Drop the oldest commits' counts until the counts take at most `bytes`, keys and
@@ -615,118 +643,125 @@ impl Tally {
         if self.bytes() <= bytes {
             return false;
         }
-        let mut dropped = false;
-        // the counts may take seven eighths of the budget, and the rest is the storage's
-        // room to grow; a drop goes a quarter below the budget, so that counts at the
-        // budget are dropped in batches and not one commit after each commit
+        let old_since = self.since;
+        // Leave room for future counts so that eviction works in batches.
+        let target = bytes - bytes / 4;
         if self.used() > bytes - bytes / 8 {
-            let target = bytes - bytes / 4;
-            #[cfg(test)]
-            {
-                self.drops += 1;
-            }
-            loop {
-                let through = self.through_for(target);
-                if through <= self.since {
-                    break;
-                }
-                self.discard_through(through);
-                dropped = true;
-                if self.used() <= target {
-                    break;
-                }
-            }
+            let through = self.through_for(target, true);
+            self.discard_prefix(through);
         }
         self.fit(bytes);
-        dropped
+        if self.bytes() > bytes {
+            self.since = self.since.max(self.last_counted_commit());
+            self.clear_storage();
+        }
+        #[cfg(test)]
+        {
+            self.drops += u64::from(self.since > old_since);
+        }
+        self.since > old_since
     }
 
-    /// The memory the counts hold, without the storage's spare capacity.
+    /// The estimated bytes once the backing tables have been compacted.
     fn used(&self) -> u64 {
         self.entries.len() as u64 * ENTRY_BYTES
             + self.key_bytes
             + self.unknown.len() as u64 * RANGE_BYTES
+            + (self.keys.len() * KEY_SLOT) as u64
+            + sparkles_budget::sizes::table_bytes(
+                sparkles_budget::sizes::table_capacity(self.index.len()),
+                INDEX_SLOT,
+            ) as u64
     }
 
-    /// Fit the storage to `bytes`: the counts' storage keeps room to grow within it, an
-    /// eighth of it left for new keys, so that counts arriving after a drop need no
-    /// reallocation until the budget is reached again.
+    /// Fit the storage to `bytes`, keeping room for incoming counts.
     fn fit(&mut self, bytes: u64) {
         #[cfg(test)]
         {
             self.resizes += 1;
         }
-        self.unknown.shrink_to_fit();
-        self.entries.shrink_to_fit();
-        let fixed = self.key_bytes + self.unknown.capacity() as u64 * RANGE_BYTES;
-        let room = (bytes.saturating_sub(bytes / 8).saturating_sub(fixed) / ENTRY_BYTES) as usize;
+        let admitted = self.entries.capacity();
+        self.shrink_spare_capacity();
+        let fixed = self.bytes() - self.entries.capacity() as u64 * ENTRY_BYTES;
+        let room = ((bytes.saturating_sub(bytes / 8).saturating_sub(fixed) / ENTRY_BYTES) as usize)
+            .min(admitted);
+        // Growing entry capacity is only useful when there are retained entries and
+        // the allocation is smaller than the capacity we admitted before shrinking.
         if room > self.entries.len() {
             self.entries.reserve_exact(room - self.entries.len());
-            if self.bytes() > bytes {
-                self.entries.shrink_to_fit();
+        }
+    }
+
+    /// Walk complete commits from the newest back, finding the longest suffix that
+    /// fits. The reclaim hook counts only key payloads since its backing allocations
+    /// stay as they are. Normal pruning also estimates the compacted buffers.
+    fn through_for(&mut self, limit: u64, compact_buffers: bool) -> u64 {
+        for key in &mut self.keys {
+            key.remap = UNUSED_KEY;
+        }
+        let mut entries = self.entries.iter().rev().peekable();
+        let mut unknown = self.unknown.iter().rev().peekable();
+        let mut payload = 0u64;
+        let (mut keys, mut counts, mut ranges) = (0, 0, 0);
+        loop {
+            let commit = entries
+                .peek()
+                .map_or(self.since, |e| e.0)
+                .max(unknown.peek().map_or(self.since, |r| r.1));
+            if commit <= self.since {
+                return self.since;
+            }
+            while let Some(&(_, k, _)) = entries.next_if(|e| e.0 == commit) {
+                counts += 1;
+                let key = &mut self.keys[k as usize];
+                if key.remap == UNUSED_KEY {
+                    key.remap = 0;
+                    payload += key.bytes;
+                    keys += 1;
+                }
+            }
+            ranges += u64::from(unknown.next_if(|r| r.1 == commit).is_some());
+            let mut bytes = payload;
+            if compact_buffers {
+                use sparkles_budget::sizes::{table_bytes, table_capacity};
+                bytes += counts * ENTRY_BYTES
+                    + ranges * RANGE_BYTES
+                    + (keys * KEY_SLOT + table_bytes(table_capacity(keys), INDEX_SLOT)) as u64;
+            }
+            if bytes > limit {
+                return commit;
             }
         }
     }
 
-    /// The commit through which dropping the counts leaves at most `bytes`, keys and
-    /// unknown ranges that only those counts hold included.
-    fn through_for(&self, bytes: u64) -> u64 {
-        // the commit of each key's latest count: dropping the counts through that
-        // commit frees the key
-        let mut last = vec![0u64; self.keys.len()];
-        for &(c, k, _) in &self.entries {
-            last[k as usize] = c;
-        }
-        let mut freed_by: BTreeMap<u64, u64> = BTreeMap::new();
-        for (k, &c) in last.iter().enumerate() {
-            *freed_by.entry(c).or_insert(0) += key_bytes(&self.keys[k]);
-        }
-        for &(c, _, _) in &self.entries {
-            *freed_by.entry(c).or_insert(0) += ENTRY_BYTES;
-        }
-        for &(_, end) in &self.unknown {
-            *freed_by.entry(end).or_insert(0) += RANGE_BYTES;
-        }
-        // what stays once the discard has shrunk the storage to what it holds
-        let mut left = self.entries.len() as u64 * ENTRY_BYTES
-            + self.key_bytes
-            + self.unknown.len() as u64 * RANGE_BYTES;
-        let mut through = self.since;
-        for (c, b) in freed_by {
-            left = left.saturating_sub(b);
-            through = through.max(c);
-            if left <= bytes {
-                break;
-            }
-        }
-        through
-    }
-
-    /// Forget the keys no entry names.
+    /// Forget keys no retained entry names, updating the stored indices in place.
     fn compact_keys(&mut self) {
-        let mut used = vec![u32::MAX; self.keys.len()];
-        let mut keys = Vec::new();
-        for e in self.entries.iter_mut() {
-            let n = &mut used[e.1 as usize];
-            if *n == u32::MAX {
-                *n = keys.len() as u32;
-                keys.push(std::mem::take(&mut self.keys[e.1 as usize]));
-            }
-            e.1 = *n;
+        for key in &mut self.keys {
+            key.remap = UNUSED_KEY;
         }
-        self.index.retain(|_, index| {
-            let next = used[*index as usize];
-            if next == u32::MAX {
-                false
-            } else {
-                *index = next;
-                true
+        for &(_, k, _) in &self.entries {
+            self.keys[k as usize].remap = 0;
+        }
+        let mut next = 0;
+        self.key_bytes = 0;
+        for key in &mut self.keys {
+            if key.remap != UNUSED_KEY {
+                key.remap = next;
+                next += 1;
+                self.key_bytes += key.bytes;
             }
+        }
+        for (_, k, _) in &mut self.entries {
+            *k = self.keys[*k as usize].remap;
+        }
+        self.index.retain(|_, k| {
+            *k = self.keys[*k as usize].remap;
+            *k != UNUSED_KEY
         });
-        self.index.shrink_to_fit();
-        self.key_bytes = keys.iter().map(|k| key_bytes(k)).sum();
-        keys.shrink_to_fit();
-        self.keys = keys;
+        self.keys.retain(|key| key.remap != UNUSED_KEY);
+        for key in &mut self.keys {
+            key.remap = UNUSED_KEY;
+        }
     }
 
     /// The totals per key of the commits after `after` up to `through`.
@@ -763,7 +798,7 @@ impl Tally {
             unknown,
             keys: totals
                 .into_iter()
-                .map(|(k, n)| (self.keys[k as usize].clone(), n))
+                .map(|(k, n)| (self.keys[k as usize].terms.clone(), n))
                 .collect(),
         }
     }
@@ -777,8 +812,8 @@ impl Tally {
         }
         out.u64(self.keys.len() as u64);
         for k in &self.keys {
-            out.u64(k.len() as u64);
-            for t in k {
+            out.u64(k.terms.len() as u64);
+            for t in &k.terms {
                 match t {
                     None => out.u64(0),
                     Some(t) => {
@@ -819,9 +854,8 @@ impl Tally {
                 1,
                 RANGE_BYTES as usize,
             );
-            let need = (next_cap as u64) * RANGE_BYTES
-                + t.key_bytes
-                + t.entries.capacity() as u64 * ENTRY_BYTES;
+            let need = (next_cap as u64) * RANGE_BYTES + t.bytes()
+                - t.unknown.capacity() as u64 * RANGE_BYTES;
             if need > lease.bytes() {
                 lease.try_set(need)?;
             }
@@ -832,24 +866,26 @@ impl Tally {
             if n != width {
                 return Err(corrupt("a key of another width"));
             }
+            let before = t.bytes();
+            let mut decode_bytes = (n * TERM_SLOT) as u64;
+            lease.try_set(before.saturating_add(decode_bytes))?;
             let mut key = Vec::with_capacity(n);
             for _ in 0..n {
                 let len = d.u64()? as usize;
                 key.push(if len == 0 {
                     None
                 } else {
-                    Some(crate::id::key_to_term(d.raw(len - 1)?))
+                    let encoded = d.raw(len - 1)?;
+                    decode_bytes += super::terms::decoded_key_heap_bytes(encoded);
+                    lease.try_set(before.saturating_add(decode_bytes))?;
+                    Some(crate::id::key_to_term(encoded))
                 });
             }
-            let kb = key_bytes(&key);
-            let need = t.bytes().saturating_add(kb);
-            if need > lease.bytes() {
-                lease.try_set(need)?;
+            if t.index.contains_key(&key) {
+                return Err(corrupt("a duplicate key"));
             }
-            let n = t.keys.len() as u32;
-            t.key_bytes += kb;
-            t.index.insert(key.clone(), n);
-            t.keys.push(key);
+            lease.try_set(before + decode_bytes + key_copy_bytes(&key) + t.key_slot_growth(1))?;
+            t.intern(key);
         }
         let mut last = 0;
         for _ in 0..d.count()? {
@@ -866,9 +902,8 @@ impl Tally {
                 1,
                 ENTRY_BYTES as usize,
             );
-            let need = (next_cap as u64) * ENTRY_BYTES
-                + t.key_bytes
-                + t.unknown.capacity() as u64 * RANGE_BYTES;
+            let need = (next_cap as u64) * ENTRY_BYTES + t.bytes()
+                - t.entries.capacity() as u64 * ENTRY_BYTES;
             if need > lease.bytes() {
                 lease.try_set(need)?;
             }
@@ -962,16 +997,49 @@ mod tests {
 
     fn tally() -> Tally {
         let mut t = Tally::new(vec![0], 3);
-        t.keys = vec![vec![iri("a")], vec![iri("b")]];
-        t.index = t
-            .keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| (k.clone(), i as u32))
-            .collect();
+        t.intern(vec![iri("a")]);
+        t.intern(vec![iri("b")]);
         t.entries = [(4, 0, 2), (5, 1, 1), (7, 0, 1)].into_iter().collect();
-        t.key_bytes = t.keys.iter().map(|k| key_bytes(k)).sum();
         t
+    }
+
+    #[test]
+    fn reclaim_does_not_allocate_with_full_credit_and_many_keys() {
+        use super::super::budget::ViewBudget;
+        use std::sync::Arc;
+
+        let mut t = Tally::new(vec![0], 0);
+        let payload = "p".repeat(256);
+        for commit in 1..=2048 {
+            let key = t.intern(vec![iri(&format!("{payload}{commit}"))]);
+            t.entries.push_back((commit, key, 1));
+        }
+        t.shrink_spare_capacity();
+        let full = t.bytes();
+        let tally = Arc::new(parking_lot::Mutex::new(t));
+        let budget = ViewBudget::new(Some(full), None);
+        budget.try_set_external(full).unwrap();
+        budget.set_reclaim_external(Some(Arc::new({
+            let tally = tally.clone();
+            move |needed| tally.lock().evict_for_reclaim(needed).0
+        })));
+        let previous = budget.handle().remaining_local();
+        assert_eq!(previous, Some(0));
+        let mut admitted = None;
+        let largest = crate::test_alloc::record_largest(|| {
+            admitted = Some(budget.handle().try_reserve_pass(full / 8));
+        });
+        admitted.unwrap().unwrap();
+        assert_eq!(largest, 0, "reclaim allocated a {largest}-byte buffer");
+        let tally = tally.lock();
+        assert!(tally.since > 0 && tally.since < 2048);
+        assert!(tally.counts(tally.since, 2048).complete());
+        assert_eq!(
+            tally
+                .counts(2047, 2048)
+                .get(&[iri(&format!("{payload}2048"))]),
+            1
+        );
     }
 
     #[test]
@@ -1001,6 +1069,8 @@ mod tests {
         for c in 1..=4 {
             t.entries.push_back((c, k, 1));
         }
+        // A one-entry reduction can only force eviction if there is no spare capacity.
+        t.shrink_spare_capacity();
         let budget = t.bytes() - ENTRY_BYTES;
         assert!(t.shrink_to(budget));
         assert!(t.bytes() <= budget, "{} over {budget}", t.bytes());
@@ -1099,8 +1169,7 @@ mod tests {
     fn the_encoding_round_trips() {
         let mut t = tally();
         t.lose(6, 6);
-        t.keys.push(vec![None]);
-        t.index.insert(vec![None], 2);
+        t.intern(vec![None]);
         t.entries.push_back((8, 2, 5));
         let mut e = Enc::default();
         t.encode(&mut e);

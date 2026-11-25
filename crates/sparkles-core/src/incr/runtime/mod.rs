@@ -349,7 +349,7 @@ impl Runtime {
 
     fn ensure_subscription(&self, store: &Store) {
         let mut s = self.subscription.lock();
-        if s.is_none() {
+        if s.is_none() && !self.is_closed() {
             *s = Some(store.subscribe_deltas());
         }
     }

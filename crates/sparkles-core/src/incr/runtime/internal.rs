@@ -862,7 +862,7 @@ impl Runtime {
                         at,
                         c,
                         c_lease,
-                        |i| terms.term(&snap, i),
+                        |i, lease| terms.term_budgeted(&snap, i, lease),
                         Some(circuit),
                         dirty,
                     )?;

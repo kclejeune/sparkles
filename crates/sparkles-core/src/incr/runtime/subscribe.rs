@@ -22,6 +22,7 @@ impl Runtime {
         let budget = o
             .max_memory_bytes
             .unwrap_or(self.opts.read().live_memory_bytes);
+        let shared = Arc::new(Shared::new(budget));
         let mut deferred_reg = DeferredDrops::default();
         let cell = {
             let mut reg = self.reg.lock();
@@ -35,6 +36,13 @@ impl Runtime {
             let res = self.cell_for(&mut reg, q, query, access, Some(budget));
             if let Ok((cell, _)) = &res {
                 cell.pending.fetch_add(1, Ordering::AcqRel);
+                if reg.live.len() == reg.live.capacity() {
+                    reg.live.retain(|entry| entry.queue.strong_count() > 0);
+                }
+                reg.live.push(LiveRegistration {
+                    cell: Arc::downgrade(cell),
+                    queue: Arc::downgrade(&shared),
+                });
             }
             res
         };
@@ -42,7 +50,6 @@ impl Runtime {
         let (cell, _) = cell?;
         let joining = Joining(&cell);
         self.ensure_subscription(store);
-        let shared = Arc::new(Shared::new(budget));
         // Declared outside `cell.state.lock()` so any temporary circuit built by `resume`
         // and any retired leases drop strictly after the state lock releases (even on
         // panic unwind), with circuits freeing payloads strictly before retired leases.
@@ -60,6 +67,12 @@ impl Runtime {
             // constructing its initial event; `LimitGuard` restores the exact
             // active-consumer ceiling on exit or unwind.
             let result = (|| {
+                if self.is_closed() {
+                    return Err(crate::incr::error(
+                        "views-unavailable",
+                        "the dataset is closing",
+                    ));
+                }
                 let next_limit = st
                     .circuit
                     .local_limit()

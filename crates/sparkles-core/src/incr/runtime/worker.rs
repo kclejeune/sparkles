@@ -1,6 +1,7 @@
 //! The worker thread, shutdown, and the operations a thread runs on the runtime.
 
 use super::*;
+use crate::incr::live::QueuedEvent;
 
 struct Operations {
     depth: usize,
@@ -115,34 +116,35 @@ impl Runtime {
             self.deferred_close.store(true, Ordering::Release);
             return;
         }
+        // Drop queued event credit after the worker gate and all metadata locks.
+        let mut queued = Vec::new();
         let _worker = self.worker.lock();
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         // Guarantee registry teardown, circuit clearing, and lock-free credit release
         // even if `checkpoint(store)` unwinds on a failpoint or panic.
-        struct CloseCleanup<'a>(&'a Runtime);
+        struct CloseCleanup<'a> {
+            runtime: &'a Runtime,
+            queued: &'a mut Vec<VecDeque<QueuedEvent>>,
+        }
         impl Drop for CloseCleanup<'_> {
             fn drop(&mut self) {
                 let mut retired = Vec::new();
-                let (cells, view_cells, internal) = {
-                    let mut reg = self.0.reg.lock();
+                let (mut cells, internal, live) = {
+                    let mut reg = self.runtime.reg.lock();
                     let internal = std::mem::take(&mut reg.internal);
-                    let cells: Vec<Arc<Cell>> = reg.cells.drain().map(|(_, c)| c).collect();
-                    let view_cells: Vec<Arc<Cell>> = reg
-                        .views
-                        .values_mut()
-                        .filter_map(|e| e.cell.take())
-                        .collect();
-                    (cells, view_cells, internal)
+                    let mut cells: Vec<Arc<Cell>> = reg.cells.drain().map(|(_, c)| c).collect();
+                    cells.extend(reg.views.values_mut().filter_map(|e| e.cell.take()));
+                    let live = std::mem::take(&mut reg.live);
+                    (cells, internal, live)
                 };
+                cells.extend(live.iter().filter_map(|entry| entry.cell.upgrade()));
+                cells.sort_unstable_by_key(Arc::as_ptr);
+                cells.dedup_by(|a, b| Arc::ptr_eq(a, b));
                 for c in &cells {
                     let mut st = c.state.lock();
-                    for s in st.subs.drain(..) {
-                        if let Some(sh) = s.shared.upgrade() {
-                            sh.close();
-                        }
-                    }
+                    st.subs.clear();
                     st.clear_history();
                     st.circuit.clear_state();
                     retired.extend(st.circuit.drain_retired());
@@ -154,16 +156,23 @@ impl Runtime {
                     st.circuit.clear_state();
                     retired.extend(st.circuit.drain_retired());
                 }
+                for entry in live {
+                    if let Some(shared) = entry.queue.upgrade() {
+                        self.queued.push(shared.close(true));
+                    }
+                }
                 drop(cells);
-                drop(view_cells);
                 drop(internal);
                 drop(retired);
-                *self.0.subscription.lock() = None;
-                self.0.kick();
-                self.0.cv.notify_all();
+                *self.runtime.subscription.lock() = None;
+                self.runtime.kick();
+                self.runtime.cv.notify_all();
             }
         }
-        let _cleanup = CloseCleanup(self);
+        let _cleanup = CloseCleanup {
+            runtime: self,
+            queued: &mut queued,
+        };
         self.checkpoint(store);
     }
 

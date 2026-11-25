@@ -765,6 +765,41 @@ fn a_build_at_commit_zero_is_checkpointed() {
     assert_eq!(counts(&c, 0), feed_counts(&s, 0));
 }
 
+#[test]
+fn accumulator_refuses_a_single_oversized_literal_before_decoding() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s, None);
+    let before = s.snapshot().commit;
+    let c = rt
+        .attach_internal(
+            &s,
+            InternalSpec::accumulator(
+                "literal",
+                "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }",
+                ["o"],
+            )
+            .with_memory(32 << 10),
+            InternalAccess::everything(),
+        )
+        .unwrap();
+    let literal = "q".repeat(256 << 10);
+    upd(&s, &format!("INSERT DATA {{ :large :p \"{literal}\" }}"));
+    let after_large = s.snapshot().commit;
+    let largest = crate::test_alloc::record_largest(|| {
+        rt.round(&s);
+    });
+    assert!(
+        largest < literal.len(),
+        "the tally allocated a {largest}-byte buffer"
+    );
+    assert_eq!(c.commit(), after_large);
+    assert!(!c.counts(before).unwrap().complete());
+
+    upd(&s, "INSERT DATA { :small :p :key }");
+    rt.round(&s);
+    assert_eq!(counts(&c, after_large), BTreeMap::from([("key".into(), 1)]));
+}
+
 /// A run of commits that the worker applies at once is held to the budget after each
 /// commit, so the counts never grow far past it before the run ends.
 #[test]

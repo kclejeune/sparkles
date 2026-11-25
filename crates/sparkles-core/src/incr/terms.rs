@@ -19,6 +19,27 @@ pub struct Terms {
     bytes: u64,
 }
 
+/// The heap estimate for decoding a vocabulary key into an owned term.
+pub(super) fn decoded_key_heap_bytes(key: &[u8]) -> u64 {
+    match key.first() {
+        Some(b'(') => {
+            let mut pos = 1;
+            let mut bytes =
+                (std::mem::size_of::<oxrdf::Triple>() + 3 * std::mem::size_of::<Term>()) as u64;
+            for _ in 0..3 {
+                let len = crate::vocab::read_varint(key, &mut pos) as usize;
+                bytes = bytes.saturating_add(decoded_key_heap_bytes(&key[pos..pos + len]));
+                pos += len;
+            }
+            bytes
+        }
+        Some(b'_') => 32,
+        // The row's slots are already admitted. Encoded scalar keys cover
+        // the value, language and datatype strings that decoding owns.
+        _ => key.len() as u64,
+    }
+}
+
 impl Terms {
     pub fn len(&self) -> usize {
         self.index.len()
@@ -120,32 +141,12 @@ impl Terms {
         i: Id,
         lease: &mut super::budget::ScratchLease,
     ) -> crate::error::Result<Option<Term>> {
-        fn key_bytes(key: &[u8]) -> u64 {
-            match key.first() {
-                Some(b'(') => {
-                    let mut pos = 1;
-                    let mut bytes = (std::mem::size_of::<oxrdf::Triple>()
-                        + 3 * std::mem::size_of::<Term>())
-                        as u64;
-                    for _ in 0..3 {
-                        let len = crate::vocab::read_varint(key, &mut pos) as usize;
-                        bytes = bytes.saturating_add(key_bytes(&key[pos..pos + len]));
-                        pos += len;
-                    }
-                    bytes
-                }
-                Some(b'_') => 32,
-                // The row's slots are already admitted. Encoded scalar keys cover
-                // the value, language and datatype strings that decoding owns.
-                _ => key.len() as u64,
-            }
-        }
         if matches!(i.tag(), Tag::Undef | Tag::Special) {
             return Ok(None);
         }
         let mut scratch = lease.sibling();
         let mut decode = |key: &[u8]| {
-            lease.try_reserve(key_bytes(key))?;
+            lease.try_reserve(decoded_key_heap_bytes(key))?;
             Ok::<_, crate::error::Error>(id::key_to_term(key))
         };
         match i.tag() {

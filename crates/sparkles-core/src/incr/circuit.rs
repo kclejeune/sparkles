@@ -971,7 +971,7 @@ impl Circuit {
                 handle.try_reserve_pass(needed - pass_reserved)?;
                 pass_reserved = needed;
             }
-            prov::absorb_row(&mut self.ann, &r, d, self.prov);
+            prov::absorb_row_state(&mut self.ann, &r, d, self.prov);
             let needed = prov::map_bytes(&self.ann, width).saturating_sub(base);
             if needed < pass_reserved {
                 handle.release_pass(pass_reserved - needed);
@@ -1658,5 +1658,57 @@ impl Circuit {
         if had {
             self.budget.shrink_state_to(self.bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sparql::{QueryOptions, parse_query, update};
+
+    #[test]
+    fn root_absorbs_long_property_path_witness_without_an_effective_copy() {
+        let store = Store::in_memory(crate::store::StoreOptions::default());
+        let mut seed = String::from("INSERT DATA { ");
+        for i in 0..128 {
+            seed.push_str(&format!("<urn:n{i}> <urn:step> <urn:n{}> . ", i + 1));
+        }
+        seed.push('}');
+        update::update(&store, &seed, &QueryOptions::default()).unwrap();
+        let query = parse_query(
+            "SELECT * WHERE { <urn:n0> <urn:step>+ <urn:n128> }",
+            None,
+            &[],
+        )
+        .unwrap();
+        let compiled = || super::super::compile::compile(&query, None).unwrap();
+        let mode = Provenance::why();
+        let mut source = Circuit::new(compiled(), None);
+        source.set_provenance(mode).unwrap();
+        source.build(store.snapshot(), &Control::none()).unwrap();
+        let (_, _, Some(ann)) = source.raw_annotations().pop().unwrap() else {
+            panic!("the property path must produce a WHY annotation");
+        };
+        let witness_bytes = 128 * std::mem::size_of::<prov::Atom>();
+        assert_eq!(ann.report(1).witnesses[0].len(), 128);
+
+        let mut target = Circuit::new(compiled(), None);
+        target.set_provenance(mode).unwrap();
+        let input_bytes = ann.bytes() + std::mem::size_of::<(Row, i64, prov::Ann)>() as u64;
+        target.set_local_limit(Some(
+            input_bytes + ann.bytes() + super::super::zset::row_bytes(0),
+        ));
+        let mut input = target.budget.scratch_lease();
+        input.try_set(input_bytes).unwrap();
+        let row: Row = Box::default();
+        let change = Some(vec![(row.clone(), 1, ann)]);
+        let largest = crate::test_alloc::record_largest(|| {
+            target.absorb_budgeted(change).unwrap();
+        });
+        assert_eq!(target.annotation(&row).unwrap().witnesses[0].len(), 128);
+        assert!(
+            largest < witness_bytes,
+            "absorption allocated a {largest}-byte buffer"
+        );
     }
 }

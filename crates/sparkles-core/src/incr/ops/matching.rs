@@ -282,8 +282,12 @@ impl MatchOp {
                     p.sync_op_state(&mut tracked, est)?;
                 }
                 rarr.add(&row, w);
+                let bound = a.effective_bytes(rann.get(&row), mode.max_witnesses());
+                p.preadmit_achanges_push(&eff, rw, &mut eff_ann_bytes, bound, &mut eff_lease)?;
                 let e = prov::absorb_row(rann, &row, a, mode);
-                p.preadmit_achanges_push(&eff, rw, &mut eff_ann_bytes, e.bytes(), &mut eff_lease)?;
+                let actual = e.bytes();
+                eff_ann_bytes -= bound - actual;
+                eff_lease.release(bound - actual);
                 eff.push((row, w, e));
             }
             p.sync_op_state(
@@ -333,7 +337,7 @@ impl MatchOp {
             if ann_est > tracked {
                 p.sync_op_state(&mut tracked, ann_est)?;
             }
-            prov::absorb_row(&mut lann, &a, aa, mode);
+            prov::absorb_row_state(&mut lann, &a, aa, mode);
             if wa == 0 {
                 continue;
             }
@@ -431,7 +435,7 @@ impl MatchOp {
                     if est > tracked {
                         p.sync_op_state(&mut tracked, est)?;
                     }
-                    prov::absorb_row(s, &a, sum, mode);
+                    prov::absorb_row_state(s, &a, sum, mode);
                     prov::get(s, &a, mode)
                 }
                 None => sum,
@@ -519,21 +523,26 @@ impl MatchOp {
         }
         let mut lann = std::mem::take(&mut self.lann).unwrap_or_default();
         let mut sann = std::mem::take(&mut self.sann);
-        // the annotations before the changes
+        // Read the retained sizes before cloning either annotation into scratch.
         let mut before: FxHashMap<Row, (Ann, Ann)> = FxHashMap::default();
+        let zero_bytes = Ann::zero_bytes(mode);
         for a in touched.keys() {
-            let la = prov::get(&lann, a, mode);
-            let sa = sann
-                .as_ref()
-                .map_or_else(|| Ann::zero(mode), |s| prov::get(s, a, mode));
+            let la = lann.get(a);
+            let sa = sann.as_ref().and_then(|s| s.get(a));
             scratch_bytes = scratch_bytes
                 .saturating_add(row_bytes(lw))
-                .saturating_add(la.bytes())
-                .saturating_add(sa.bytes());
+                .saturating_add(la.map_or(zero_bytes, Ann::bytes))
+                .saturating_add(sa.map_or(zero_bytes, Ann::bytes));
             if scratch_bytes > scratch_lease.bytes() {
                 scratch_lease.try_set(scratch_bytes)?;
             }
-            before.insert(a.clone(), (la, sa));
+            before.insert(
+                a.clone(),
+                (
+                    la.cloned().unwrap_or_else(|| Ann::zero(mode)),
+                    sa.cloned().unwrap_or_else(|| Ann::zero(mode)),
+                ),
+            );
         }
         let mut dw: FxHashMap<Row, i64> = FxHashMap::default();
         let mut dl_eff = AChanges::new();
@@ -555,9 +564,17 @@ impl MatchOp {
                 }
             }
             *dw.entry(a.clone()).or_insert(0) += wa;
-            let e = prov::absorb_row(&mut lann, &a, aa, mode);
-            p.preadmit_achanges_push(&dl_eff, lw, &mut dl_eff_ann, e.bytes(), &mut dl_eff_lease)?;
-            dl_eff.push((a, wa, e));
+            if lj {
+                let bound = aa.effective_bytes(lann.get(&a), mode.max_witnesses());
+                p.preadmit_achanges_push(&dl_eff, lw, &mut dl_eff_ann, bound, &mut dl_eff_lease)?;
+                let e = prov::absorb_row(&mut lann, &a, aa, mode);
+                let actual = e.bytes();
+                dl_eff_ann -= bound - actual;
+                dl_eff_lease.release(bound - actual);
+                dl_eff.push((a, wa, e));
+            } else {
+                prov::absorb_row_state(&mut lann, &a, aa, mode);
+            }
         }
         drop(dl_leases);
         let dl = dl_eff;
@@ -606,8 +623,12 @@ impl MatchOp {
                     p.sync_op_state(&mut tracked, est)?;
                 }
                 rarr.add(&row, w);
+                let bound = a.effective_bytes(rann.get(&row), mode.max_witnesses());
+                p.preadmit_achanges_push(&eff, rw, &mut eff_ann, bound, &mut eff_lease)?;
                 let e = prov::absorb_row(rann, &row, a, mode);
-                p.preadmit_achanges_push(&eff, rw, &mut eff_ann, e.bytes(), &mut eff_lease)?;
+                let actual = e.bytes();
+                eff_ann -= bound - actual;
+                eff_lease.release(bound - actual);
                 eff.push((row, w, e));
             }
             p.sync_op_state(
@@ -624,7 +645,7 @@ impl MatchOp {
         let hits_bytes = (hits.len() as u64).saturating_mul(row_bytes(lw) + 16);
         let mut dm_bytes = 0u64;
         let mut ds_bytes = 0u64;
-        let zero_ann_bytes = Ann::zero(mode).bytes();
+        let zero_ann_bytes = Ann::zero_bytes(mode);
         for (a, i) in hits {
             let (_, wb, ab) = &dr[i];
             if !dm.contains_key(&a) {
@@ -691,7 +712,7 @@ impl MatchOp {
                     if est > tracked {
                         p.sync_op_state(&mut tracked, est)?;
                     }
-                    prov::absorb_row(s, &a, d, mode);
+                    prov::absorb_row_state(s, &a, d, mode);
                     let drop_b = row_bytes(lw).saturating_add(d_b);
                     ds_bytes = ds_bytes.saturating_sub(drop_b);
                     scratch_bytes = scratch_bytes.saturating_sub(drop_b);
@@ -729,7 +750,7 @@ impl MatchOp {
                         p.sync_op_state(&mut tracked, est)?;
                     }
                     s.remove(&a);
-                    prov::absorb_row(s, &a, sum_a, mode);
+                    prov::absorb_row_state(s, &a, sum_a, mode);
                 }
                 drop(sum_lease);
                 sum_w

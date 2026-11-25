@@ -16,9 +16,17 @@ pub(super) struct ViewEntry {
     pub(super) paused: bool,
 }
 
+/// A subscription can keep its queue and circuit alive after the registry drops
+/// the circuit. Shutdown needs access to both until the handle is dropped.
+pub(super) struct LiveRegistration {
+    pub(super) cell: Weak<Cell>,
+    pub(super) queue: Weak<Shared>,
+}
+
 #[derive(Default)]
 pub(super) struct Registry {
     pub(super) cells: FxHashMap<u64, Arc<Cell>>,
+    pub(super) live: Vec<LiveRegistration>,
     /// the dataset's inference that every circuit is compiled for
     pub(super) inference: Option<Arc<Inference>>,
     /// the dataset's reading of errors in aggregates, which every circuit runs with

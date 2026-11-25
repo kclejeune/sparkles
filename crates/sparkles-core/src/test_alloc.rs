@@ -669,14 +669,18 @@ struct AllocationObserver;
 // returned pointers. A selected test-thread watch retains its actual Preparation until
 // cleared. The hooks read atomics and update Copy TLS and the observation, which lives
 // in System memory: no allocation, callback, borrow, panic or reentry.
+fn observe_largest(size: usize) {
+    let _ = LARGEST.try_with(|cell| {
+        let (on, largest) = cell.get();
+        if on {
+            cell.set((on, largest.max(size)));
+        }
+    });
+}
+
 unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let _ = LARGEST.try_with(|cell| {
-            let (on, largest) = cell.get();
-            if on {
-                cell.set((on, largest.max(layout.size())));
-            }
-        });
+        observe_largest(layout.size());
         admitted(layout.size());
         let pointer = unsafe { std::alloc::System.alloc(layout) };
         allocated(pointer, layout.size());
@@ -697,6 +701,7 @@ unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
     unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // Watched staging byte vectors are complete and never grow after arm. A
         // reallocation to the selected size acquires storage of that size.
+        observe_largest(size);
         admitted(size);
         let new = unsafe { std::alloc::System.realloc(pointer, layout, size) };
         reallocated(pointer, new, size);

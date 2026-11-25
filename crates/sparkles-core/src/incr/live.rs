@@ -221,7 +221,7 @@ pub struct LiveOptions {
     /// it to the circuit's commit when the runtime can compute it, and a `reset`
     /// otherwise
     pub after: Option<u64>,
-    /// the budget of the circuit's state (the runtime's default when `None`)
+    /// the budget of the circuit and the decoded event queue (the runtime's default when `None`)
     pub max_memory_bytes: Option<u64>,
     /// the principal the per-principal limit counts against
     pub principal: Option<String>,
@@ -358,9 +358,26 @@ impl Shared {
         displaced
     }
 
-    pub(crate) fn close(&self) {
-        self.queue.lock().closed = true;
+    /// End the stream and take its data events. A terminal error can still be read
+    /// after runtime shutdown, and it carries no event lease.
+    pub(crate) fn close(&self, keep_error: bool) -> VecDeque<QueuedEvent> {
+        let mut q = self.queue.lock();
+        q.closed = true;
+        let mut drained = std::mem::take(&mut q.events);
+        q.rows = 0;
+        q.bytes = 0;
+        q.overflow = false;
+        if keep_error
+            && drained
+                .back()
+                .is_some_and(|e| matches!(e.event, LiveEvent::Error { .. }))
+        {
+            q.events.push_back(drained.pop_back().unwrap());
+            q.rows = 1;
+        }
+        drop(q);
         self.wake_all();
+        drained
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -543,17 +560,7 @@ impl LiveQuery {
     /// End the subscription and wake every thread waiting for its next event.
     /// Events still queued are dropped.
     pub fn close(&self) {
-        let drained = {
-            let mut q = self.shared.queue.lock();
-            q.closed = true;
-            let drained = std::mem::take(&mut q.events);
-            q.rows = 0;
-            q.bytes = 0;
-            q.overflow = false;
-            drained
-        };
-        drop(drained);
-        self.shared.wake_all();
+        drop(self.shared.close(false));
     }
 
     /// Whether the subscription has ended and its queue is empty.

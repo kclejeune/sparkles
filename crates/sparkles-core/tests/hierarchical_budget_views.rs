@@ -103,6 +103,37 @@ fn named_view_charges_pool_and_returns_exact_zero_on_delete_and_close() {
 }
 
 #[test]
+fn runtime_close_releases_unread_live_snapshot_with_handle_alive() {
+    let store = Store::in_memory(StoreOptions::default());
+    load_rows(&store, "unread", 32, 128);
+    let pool = QueryPool::new(16 * MB);
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    let live = rt
+        .live(
+            &store,
+            "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+            None,
+            &LiveOptions::default(),
+        )
+        .unwrap();
+
+    assert!(pool.granted() > 0);
+    rt.close(&store);
+    assert_eq!(
+        pool.granted(),
+        0,
+        "the unread snapshot must release its credit"
+    );
+    assert!(live.is_closed());
+    assert!(live.try_next().is_none());
+}
+
+#[test]
 fn live_query_and_internal_accumulator_return_exact_zero_on_drop_and_gc() {
     let store = Store::in_memory(StoreOptions::default());
     load_rows(&store, "l", 300, 16);
@@ -1661,7 +1692,7 @@ fn live_subscriber_drop_and_runtime_fail_lower_shared_circuit_limit() {
     rt2.put(&store2, "narrow2", narrow2).unwrap();
     rt2.round(&store2);
 
-    let _wide2 = rt2
+    let wide2 = rt2
         .live(
             &store2,
             q2,
@@ -1680,8 +1711,8 @@ fn live_subscriber_drop_and_runtime_fail_lower_shared_circuit_limit() {
     load_rows(&store2, "rf_more", 600, 32);
     rt2.round(&store2);
     drop(blocker);
-    // `Runtime::fail` drained `_wide2`. Now rebuild `narrow2`: `narrow2`'s 24 KiB cap
-    // must be enforced (not `_wide2`'s departed 8 MiB cap).
+    // `Runtime::fail` drained `wide2`. Now rebuild `narrow2`: `narrow2`'s 24 KiB cap
+    // must be enforced (not `wide2`'s departed 8 MiB cap).
     rt2.rebuild("narrow2").unwrap();
     rt2.round(&store2);
     let info2 = rt2.get(&store2, "narrow2").unwrap();
@@ -1693,9 +1724,16 @@ fn live_subscriber_drop_and_runtime_fail_lower_shared_circuit_limit() {
 
     rt.close(&store);
     rt2.close(&store2);
-    drop(_wide2);
     assert_eq!(pool.granted(), 0);
-    assert_eq!(pool2.granted(), 0);
+    assert_eq!(
+        pool2.granted(),
+        0,
+        "a failed live queue must release its unread snapshot"
+    );
+    assert!(
+        matches!(wide2.try_next(), Some(LiveEvent::Error { code, .. }) if code == "over-budget")
+    );
+    assert!(wide2.is_closed());
 }
 
 /// Proves Finding 1: when a compact diff fits in the circuit's budget while its decoded
