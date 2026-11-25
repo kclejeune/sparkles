@@ -97,6 +97,11 @@ impl Runtime {
         info.applied = st.circuit.applied;
         info.rows = st.circuit.result.total().max(0) as u64;
         info.bytes = st.circuit.bytes();
+        info.published_bytes = st
+            .circuit
+            .version
+            .as_ref()
+            .map_or(0, |v| v.published_bytes());
         if skipped {
             info.skipped += 1;
             self.counters.skipped.fetch_add(1, Ordering::Relaxed);
@@ -324,14 +329,20 @@ impl Runtime {
     /// Suspend the views whose circuit passed their budget or the pool's.
     pub(super) fn budgets(&self, cells: &[(Arc<Cell>, u64)]) {
         let mut reg = self.reg.lock();
-        let mut total: u64 = reg
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut state: u64 = reg
             .views
             .values()
             .filter_map(|e| e.cell.as_ref())
-            .map(|c| c.info.lock().bytes)
+            .filter(|cell| seen.insert(cell.key))
+            .map(|cell| {
+                let info = cell.info.lock();
+                info.bytes.saturating_sub(info.published_bytes)
+            })
             .sum();
         let pool = self.opts.read().views_memory;
         for (cell, bytes) in cells {
+            let total = state.saturating_add(self.published_views.load(Ordering::Relaxed));
             let names: Vec<String> = reg
                 .views
                 .iter()
@@ -357,7 +368,8 @@ impl Runtime {
                 if let Some(c) = e.cell.take()
                     && c.release_view() == 0
                 {
-                    total = total.saturating_sub(*bytes);
+                    let info = c.info.lock();
+                    state = state.saturating_sub(info.bytes.saturating_sub(info.published_bytes));
                 }
             }
         }

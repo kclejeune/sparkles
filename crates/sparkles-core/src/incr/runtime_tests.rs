@@ -2383,3 +2383,83 @@ fn a_window_cancelled_while_refilling_publishes_nothing() {
     };
     a_failed_window_pass_publishes_nothing(&setup, &change, None, arm, "pass-timeout");
 }
+
+/// A checkpoint written by the previous compiler before shared-variable EXISTS slices
+/// switched from `Op::Match` to substitution is skipped at the fingerprint check before
+/// decoding, and the rebuilt view matches the direct query.
+#[test]
+fn shared_exists_window_skips_old_compiler_checkpoint() {
+    const QUERY: &str = "SELECT ?outer WHERE {
+        VALUES ?outer { 1 2 }
+        FILTER EXISTS {
+            { SELECT REDUCED ?outer ?x WHERE { VALUES (?outer ?x) { (1 10) (2 20) } } ORDER BY ?x LIMIT 1 }
+        }
+    }";
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = persistent(dir.path(), true);
+        load(&s);
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.put(&s, "shared_exists", ViewDef::table(QUERY)).unwrap();
+        rt.round(&s);
+        assert_eq!(
+            read(&rt, &s, "shared_exists", None).unwrap(),
+            oracle(&s, QUERY, None)
+        );
+        rt.close(&s);
+    }
+
+    // Rewrite the checkpoint's header to the old compiler's fingerprint while keeping
+    // the valid decodable body and CRC32: if recovery did not skip on fingerprint before
+    // `Circuit::decode`, the body would decode and increment `loaded`.
+    let files = super::persist::list(&dir.path().join("views/shared_exists/main"));
+    assert_eq!(files.len(), 1, "expected one checkpoint");
+    let raw = std::fs::read(&files[0].1).unwrap();
+    let (header, body) = super::persist::decode_as(super::persist::VIEW, &raw).unwrap();
+    let parsed = spargebra::SparqlParser::new().parse_query(QUERY).unwrap();
+    let old_fp =
+        super::runtime::checkpoint_fingerprint_for_compiler("f13-phase2-3", &parsed, QUERY);
+    let new_fp =
+        super::runtime::checkpoint_fingerprint_for_compiler("f13-phase2-4", &parsed, QUERY);
+    assert_eq!(header.fingerprint, new_fp);
+    assert_ne!(old_fp, new_fp);
+    let old_bytes = super::persist::encode_as(
+        super::persist::VIEW,
+        &super::persist::Header {
+            fingerprint: old_fp,
+            ..header
+        },
+        body,
+    );
+    std::fs::write(&files[0].1, &old_bytes).unwrap();
+
+    {
+        let s = persistent(dir.path(), true);
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.round(&s);
+        assert_eq!(
+            rt.stats(&s).loaded,
+            0,
+            "old-compiler checkpoint must be skipped before decoding"
+        );
+        let got = read(&rt, &s, "shared_exists", None).unwrap();
+        let want = oracle(&s, QUERY, None);
+        assert_eq!(got, want);
+        assert_eq!(got, vec!["1".to_string(), "2".to_string()]);
+        rt.close(&s);
+    }
+
+    // The replacement checkpoint written under the new compiler loads on the next restart.
+    {
+        let s = persistent(dir.path(), true);
+        let rt = runtime(&s, Some(dir.path().to_path_buf()));
+        rt.round(&s);
+        assert_eq!(rt.stats(&s).loaded, 1, "new-compiler checkpoint loads");
+        assert_eq!(
+            read(&rt, &s, "shared_exists", None).unwrap(),
+            oracle(&s, QUERY, None)
+        );
+        rt.close(&s);
+    }
+}

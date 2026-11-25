@@ -793,6 +793,16 @@ impl GraphAccess {
         triples::controlled::prepare(self, snap, preparation)
     }
 
+    /// Keep the rebuilt mask and its charge together without installing a raw
+    /// snapshot alias in the legacy cache.
+    pub(crate) fn prepare_view_rebuild(
+        &self,
+        snap: &Arc<Snapshot>,
+        preparation: &Preparation,
+    ) -> Result<PreparedView> {
+        triples::controlled::prepare_rebuild(self, snap, preparation)
+    }
+
     /// The error of a write outside the write graphs.
     pub fn refused(term: Option<&Term>) -> Error {
         Error::NotPermitted(match term {

@@ -1019,7 +1019,7 @@ fn admit(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<Plan, String> {
     if keys.len() > 64 {
         return Err("it has more than 64 variables".into());
     }
-    let node = Planner::new(ctx)
+    let node = Planner::for_exists(ctx, spec)
         .plan(spec.pattern(), &spec.graph, Vec::new())
         .map_err(|e| format!("planning it failed ({e})"))?;
     if let Some(v) = keys.iter().find(|v| !node.vars.contains(v)) {

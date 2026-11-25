@@ -12,6 +12,7 @@ use crate::id::Id;
 use crate::index::{Key, pad};
 use crate::store::{Chunk, Snapshot};
 use oxrdf::Term;
+use rustc_hash::FxHashSet;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -39,6 +40,7 @@ mod service;
 mod spatial;
 mod text;
 mod topk;
+mod view;
 mod walk;
 mod whole;
 
@@ -827,6 +829,53 @@ fn capacity_bytes_checked(ctx: &Ctx, table: &Table) -> Result<u64> {
         .saturating_add(128))
 }
 
+/// Materialize the native view reader for eager execution. Rebuilds therefore
+/// spend the same request work budget in both execution modes.
+pub(super) fn eager_view(
+    ctx: &Arc<Ctx>,
+    node: &Node,
+    held: &super::ctx::Charge<'_>,
+) -> Result<Table> {
+    let options = CursorOptions {
+        batch_rows: 256,
+        ..Default::default()
+    };
+    let mut view = view::View::new(node.clone());
+    let mut table = Table::new(node.vars.clone());
+    held.resize(capacity_bytes(&table))?;
+    while let Some(batch) = view.next(ctx, &options, options.batch_rows)? {
+        let rows = table.len.saturating_add(batch.table.len);
+        ctx.check_rows(rows)?;
+        let old = capacity_bytes(&table);
+        let growth = table
+            .cols
+            .iter()
+            .map(|col| {
+                let next = sparkles_budget::sizes::vec_grown(
+                    col.capacity(),
+                    col.len(),
+                    batch.table.len,
+                    8,
+                );
+                if next > col.capacity() {
+                    next as u64 * 8
+                } else {
+                    0
+                }
+            })
+            .sum::<u64>();
+        let empty_width = if table.width() == 0 {
+            rows as u64 * 8
+        } else {
+            0
+        };
+        held.resize(old.saturating_add(growth).saturating_add(empty_width))?;
+        table.append(batch.table);
+        held.resize(capacity_bytes(&table))?;
+    }
+    Ok(table)
+}
+
 impl Buffer {
     fn new(ctx: &Arc<Ctx>, vars: &[VarId], rows: usize) -> Result<Self> {
         let bytes = super::ctx::table_bytes(rows, vars.len())
@@ -1012,6 +1061,44 @@ pub(super) fn call_cursor(
     .map(|(cursor, _, _)| cursor)
 }
 
+/// Open a view's saved parsed query with caller-owned accounting and controls.
+fn call_parsed_cursor(
+    snapshot: Arc<Snapshot>,
+    parsed: &spargebra::Query,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    parent: sparkles_budget::ParentHandle,
+    inherited: &super::ViewExecution,
+) -> Result<(QueryCursor, Option<graph::Spec>)> {
+    let (snapshot, source, parent) = if let Some(access) = &options.graphs {
+        let preparation = crate::access::Preparation::for_view_rebuild(
+            options,
+            parent,
+            inherited.preparation.as_ref(),
+        )?;
+        let snapshot = super::with_union_default(snapshot, options);
+        let view = access.prepare_view_rebuild(&snapshot, &preparation)?;
+        let source = view.read_source();
+        (source.query_input().0.clone(), Some(source), None)
+    } else {
+        (snapshot, None, Some(parent))
+    };
+    open_parsed_cursor_input(
+        snapshot,
+        parsed,
+        "",
+        options,
+        cursor,
+        None,
+        source,
+        parent,
+        Instant::now(),
+        0.0,
+        Some(inherited),
+    )
+    .map(|(cursor, graph, _)| (cursor, graph))
+}
+
 fn open_pattern_cursor_input(
     snapshot: Arc<Snapshot>,
     query: &str,
@@ -1035,50 +1122,71 @@ fn open_pattern_cursor_input(
         .min(depth::MAX_ALGEBRA_DEPTH);
     depth::with_stack(parser_depth, || {
         let parsed = super::parse_query(query, options.base_iri.as_deref(), &options.prefixes)?;
-        let kind = match &parsed {
-            spargebra::Query::Select { .. } => QueryKind::Select,
-            spargebra::Query::Ask { .. } => QueryKind::Ask,
-            spargebra::Query::Construct { .. } => QueryKind::Construct,
-            spargebra::Query::Describe { .. } => QueryKind::Describe,
-        };
-        if expected.is_some_and(|expected| {
-            kind != expected && !(expected == QueryKind::Construct && kind == QueryKind::Describe)
-        }) {
-            return Err(Error::Unsupported(format!(
-                "a {expected:?} cursor requires a {expected:?} query"
-            )));
-        }
         let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let levels = depth::check_query(&parsed)?;
-        depth::with_stack(levels, || {
-            let planning = Instant::now();
-            // The public strict boundary validated the original invocation Arc.
-            // Pass only its retained already-bound policy internally; guards
-            // must not be rebound against the masked physical snapshot.
-            // This owner is declared before the policy alias, so on a setup
-            // refusal the alias drops before the last source returns its credit.
-            let _retained = source.clone();
-            let bound_policy = source
-                .as_ref()
-                .and_then(|source| source.query_input().1)
-                .cloned();
-            let prepared = super::prepare_query_input_policy(
-                snapshot,
-                &parsed,
-                options,
-                Some(started),
-                None,
-                source,
-                bound_policy.as_ref(),
-                parent,
-                None,
-            )?;
-            let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
-            let levels = levels.max(prepared.plan_depth);
-            from_prepared(
-                prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels, kind,
-            )
-        })
+        open_parsed_cursor_input(
+            snapshot, &parsed, query, options, cursor, expected, source, parent, started, parse_ms,
+            None,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_parsed_cursor_input(
+    snapshot: Arc<Snapshot>,
+    parsed: &spargebra::Query,
+    query: &str,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    expected: Option<QueryKind>,
+    source: Option<crate::store::BoundReadSource>,
+    parent: Option<sparkles_budget::ParentHandle>,
+    started: Instant,
+    parse_ms: f64,
+    inherited: Option<&super::ViewExecution>,
+) -> Result<(QueryCursor, Option<graph::Spec>, QueryKind)> {
+    let kind = match parsed {
+        spargebra::Query::Select { .. } => QueryKind::Select,
+        spargebra::Query::Ask { .. } => QueryKind::Ask,
+        spargebra::Query::Construct { .. } => QueryKind::Construct,
+        spargebra::Query::Describe { .. } => QueryKind::Describe,
+    };
+    if expected.is_some_and(|expected| {
+        kind != expected && !(expected == QueryKind::Construct && kind == QueryKind::Describe)
+    }) {
+        return Err(Error::Unsupported(format!(
+            "a {expected:?} cursor requires a {expected:?} query"
+        )));
+    }
+    let levels = depth::check_query(parsed)?;
+    depth::with_stack(levels, || {
+        let planning = Instant::now();
+        // The public strict boundary validated the original invocation Arc.
+        // Pass only its retained already-bound policy internally; guards
+        // must not be rebound against the masked physical snapshot.
+        // This owner is declared before the policy alias, so on a setup
+        // refusal the alias drops before the last source returns its credit.
+        let _retained = source.clone();
+        let bound_policy = source
+            .as_ref()
+            .and_then(|source| source.query_input().1)
+            .cloned();
+        let prepared = super::prepare_query_input_policy(
+            snapshot,
+            parsed,
+            options,
+            Some(started),
+            None,
+            source,
+            bound_policy.as_ref(),
+            parent,
+            None,
+            inherited,
+        )?;
+        let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
+        let levels = levels.max(prepared.plan_depth);
+        from_prepared(
+            prepared, parsed, query, options, cursor, started, parse_ms, plan_ms, levels, kind,
+        )
     })
 }
 
@@ -1643,7 +1751,7 @@ pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
                 && !spec.calls_service()
                 && keyed_exists(ctx, node, spec)
                     .or_else(|| {
-                        super::plan::Planner::new(ctx)
+                        super::plan::Planner::for_exists(ctx, spec)
                             .plan(spec.pattern(), &spec.graph, Vec::new())
                             .ok()
                     })
@@ -2722,15 +2830,207 @@ fn pull_planned<'ctx>(
 }
 
 pub(super) fn plan_bytes(node: &Node) -> u64 {
-    let values = match &node.kind {
-        Kind::Values(t) => capacity_bytes(t),
-        _ => 0,
-    };
-    (node.desc.len() as u64)
-        .saturating_add(node.vars.len() as u64 * 32)
-        .saturating_add(1024)
-        .saturating_add(values)
-        .saturating_add(node.children.iter().map(plan_bytes).sum::<u64>())
+    fn expr_exists_bytes(
+        expr: &Expr,
+        seen_specs: &mut FxHashSet<usize>,
+        seen_patterns: &mut FxHashSet<usize>,
+        seen_view_patterns: &mut FxHashSet<usize>,
+    ) -> u64 {
+        match expr {
+            Expr::Exists(spec) => {
+                if seen_specs.insert(Arc::as_ptr(spec) as usize) {
+                    spec.uncharged_retained_bytes(seen_patterns, seen_view_patterns)
+                } else {
+                    0
+                }
+            }
+            Expr::Or(a, b)
+            | Expr::And(a, b)
+            | Expr::Eq(a, b)
+            | Expr::SameTerm(a, b)
+            | Expr::Cmp(a, b, _)
+            | Expr::Arith(a, b, _) => {
+                expr_exists_bytes(a, seen_specs, seen_patterns, seen_view_patterns).saturating_add(
+                    expr_exists_bytes(b, seen_specs, seen_patterns, seen_view_patterns),
+                )
+            }
+            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => {
+                expr_exists_bytes(a, seen_specs, seen_patterns, seen_view_patterns)
+            }
+            Expr::If(a, b, c) => {
+                expr_exists_bytes(a, seen_specs, seen_patterns, seen_view_patterns)
+                    .saturating_add(expr_exists_bytes(
+                        b,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+                    .saturating_add(expr_exists_bytes(
+                        c,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+            }
+            Expr::In(a, list) => list.iter().fold(
+                expr_exists_bytes(a, seen_specs, seen_patterns, seen_view_patterns),
+                |acc, e| {
+                    acc.saturating_add(expr_exists_bytes(
+                        e,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+                },
+            ),
+            Expr::Coalesce(list) | Expr::Call(_, list) => list.iter().fold(0u64, |acc, e| {
+                acc.saturating_add(expr_exists_bytes(
+                    e,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => 0,
+        }
+    }
+
+    fn walk_node(
+        node: &Node,
+        charge_node: bool,
+        seen_specs: &mut FxHashSet<usize>,
+        seen_patterns: &mut FxHashSet<usize>,
+        seen_view_patterns: &mut FxHashSet<usize>,
+    ) -> u64 {
+        let mut extra = match &node.kind {
+            Kind::Values(t) if charge_node => capacity_bytes(t),
+            Kind::Filter(exprs) | Kind::CountFilterScan { filter: exprs, .. } => {
+                exprs.iter().fold(0u64, |acc, e| {
+                    acc.saturating_add(expr_exists_bytes(
+                        e,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+                })
+            }
+            Kind::Extend(_, e)
+            | Kind::Assign(_, e)
+            | Kind::Unfold { expr: e, .. }
+            | Kind::KeyedLeftJoin { expr: e, .. }
+            | Kind::KeyedJoin { expr: e, .. } => {
+                expr_exists_bytes(e, seen_specs, seen_patterns, seen_view_patterns)
+            }
+            Kind::LeftJoin { expr: Some(e) } => {
+                expr_exists_bytes(e, seen_specs, seen_patterns, seen_view_patterns)
+            }
+            Kind::RangeScan(_, range) => range.filter.iter().fold(0u64, |acc, e| {
+                acc.saturating_add(expr_exists_bytes(
+                    e,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            Kind::OrderedTopK(top) => top
+                .filter
+                .iter()
+                .chain(&top.range_filter)
+                .fold(0u64, |acc, e| {
+                    acc.saturating_add(expr_exists_bytes(
+                        e,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ))
+                })
+                .saturating_add(walk_node(
+                    &top.fallback,
+                    charge_node,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                )),
+            Kind::OrderBy { keys, .. } => keys.iter().fold(0u64, |acc, (e, _)| {
+                acc.saturating_add(expr_exists_bytes(
+                    e,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            Kind::Group { aggs, .. } => aggs.iter().fold(0u64, |acc, (_, agg)| {
+                let mut total = acc;
+                if let Some(e) = &agg.expr {
+                    total = total.saturating_add(expr_exists_bytes(
+                        e,
+                        seen_specs,
+                        seen_patterns,
+                        seen_view_patterns,
+                    ));
+                }
+                if let Some(fold) = &agg.fold {
+                    if let Some(v) = &fold.value {
+                        total = total.saturating_add(expr_exists_bytes(
+                            v,
+                            seen_specs,
+                            seen_patterns,
+                            seen_view_patterns,
+                        ));
+                    }
+                    for (e, _) in &fold.order {
+                        total = total.saturating_add(expr_exists_bytes(
+                            e,
+                            seen_specs,
+                            seen_patterns,
+                            seen_view_patterns,
+                        ));
+                    }
+                }
+                total
+            }),
+            // PreparedGraphBranches already reserves retained branch nodes and VALUES tables
+            // inside `_held`; walk branch plans only to cover any uncharged EXISTS backing.
+            Kind::GraphBranches(branches) => branches.inputs.iter().fold(0u64, |acc, branch| {
+                acc.saturating_add(walk_node(
+                    branch,
+                    false,
+                    seen_specs,
+                    seen_patterns,
+                    seen_view_patterns,
+                ))
+            }),
+            _ => 0,
+        };
+        for child in &node.children {
+            extra = extra.saturating_add(walk_node(
+                child,
+                charge_node,
+                seen_specs,
+                seen_patterns,
+                seen_view_patterns,
+            ));
+        }
+        if charge_node {
+            (node.desc.len() as u64)
+                .saturating_add(node.vars.len() as u64 * 32)
+                .saturating_add(1024)
+                .saturating_add(extra)
+        } else {
+            extra
+        }
+    }
+
+    let mut seen_specs = FxHashSet::default();
+    let mut seen_patterns = FxHashSet::default();
+    let mut seen_view_patterns = FxHashSet::default();
+    walk_node(
+        node,
+        true,
+        &mut seen_specs,
+        &mut seen_patterns,
+        &mut seen_view_patterns,
+    )
 }
 
 enum State {
@@ -2820,6 +3120,8 @@ enum State {
     SpatialJoin(Box<spatial::SpatialJoin>),
     /// A streaming k-nearest-neighbour search with cursor-executed template batches.
     SpatialKnn(Box<spatial::SpatialKnn>),
+    /// A `SERVICE view:read` leaf, streamed from an immutable shared view version.
+    View(Box<view::View>),
 }
 
 /// An eager kernel's node, its answer once it has run, and how far its consumer has
@@ -3162,7 +3464,11 @@ fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
         expr.exists_specs(&mut specs);
     }
     for spec in specs {
-        let planned = super::plan::Planner::new(ctx).plan(spec.pattern(), &spec.graph, Vec::new());
+        let planned = super::plan::Planner::for_exists(ctx, spec).plan(
+            spec.pattern(),
+            &spec.graph,
+            Vec::new(),
+        );
         if let Err(error) = &planned
             && super::extensions::is_unconfigured(error)
         {
@@ -3219,6 +3525,7 @@ fn ranked(kind: &Kind) -> bool {
             | Kind::HybridSearch(_)
             | Kind::SpatialKnn(_)
             | Kind::Service { .. }
+            | Kind::ViewRead(_)
             | Kind::PathSearch(_)
             | Kind::AlgoCall(_)
     )
@@ -3415,6 +3722,8 @@ impl Operator {
         let spatial_leaf = spatial::leaf_eligible(&node);
         let spatial_join = spatial::join_eligible(&node);
         let spatial_knn = spatial::knn_eligible(&node);
+        // A view read streams from an immutable shared view version without copying.
+        let view_reader = view::eligible(ctx, &node);
         // A native sort consumes cursor batches into charged state. It blocks before
         // its first output but is not an eager fallback, so strict policy admits it.
         let materializes = !(exists_streams && supported(&node.kind))
@@ -3433,6 +3742,7 @@ impl Operator {
             && !spatial_leaf
             && !spatial_join
             && !spatial_knn
+            && !view_reader
             && !pattern_counts
             && (!native_blocking || !exists_streams);
         // A kernel that answers whole tables runs as a native operator when its form is
@@ -3629,7 +3939,8 @@ impl Operator {
             || path_reader
             || spatial_leaf
             || spatial_join
-            || spatial_knn;
+            || spatial_knn
+            || view_reader;
         let mut order = output_order(
             &node,
             &children,
@@ -3701,9 +4012,15 @@ impl Operator {
             || path_reader
             || spatial_leaf
             || spatial_join
-            || spatial_knn)
+            || spatial_knn
+            || view_reader)
             .then(|| {
-                if history_reader {
+                if view_reader {
+                    format!(
+                        "{} reads the view's immutable shared version a batch at a time under the memory budget",
+                        node.operator()
+                    )
+                } else if history_reader {
                     format!(
                         "{} reads the change log a page of whole commits at a time under the memory budget, pinning the commits it has still to read",
                         node.operator()
@@ -3838,6 +4155,8 @@ impl Operator {
             State::SpatialKnn(Box::new(spatial::SpatialKnn::new(node, template, fallback)))
         } else if vector_order {
             State::VectorOrder(Box::new(topk::VectorOrder::new(node)))
+        } else if view_reader {
+            State::View(Box::new(view::View::new(node)))
         } else if index_topk {
             State::IndexTopK(Box::new(topk::IndexTopK::new(node, fallback)))
         } else if heap {
@@ -4044,6 +4363,7 @@ impl Operator {
             State::SpatialLeaf(sl) => sl.release(),
             State::SpatialJoin(sj) => sj.release(),
             State::SpatialKnn(sk) => sk.release(),
+            State::View(view) => view.release(),
             _ => {}
         }
         if let Some(ahead) = &mut self.ahead {
@@ -4305,6 +4625,12 @@ impl Operator {
         }
         if let State::GraphBranches(branches) = &mut self.state {
             branches.update_plan(plan);
+        }
+        if let State::View(view) = &self.state
+            && let Some(child) = view.rebuild_plan()
+        {
+            plan.children.clear();
+            plan.children.push(child.clone());
         }
         for (child, plan) in self.children.iter_mut().zip(&mut plan.children) {
             child.update_plan(plan);
@@ -4753,6 +5079,11 @@ impl Operator {
                 State::History(history) => {
                     let b = history.next(ctx, cap)?;
                     self.done = history.done();
+                    b
+                }
+                State::View(view) => {
+                    let b = view.next(ctx, options, cap)?;
+                    self.done = view.done();
                     b
                 }
                 State::TopK(topk) => {

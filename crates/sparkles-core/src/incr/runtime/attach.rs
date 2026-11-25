@@ -22,6 +22,8 @@ impl Runtime {
         let mode = whole
             .clone()
             .or_else(|| inference.as_ref().map(|i| i.reason().to_string()));
+        // Compile the same allocation that a rebuild will plan from.
+        let q = Arc::new(q);
         let compiled = compile(&q, mode.as_deref())?;
         let mut circuit = Circuit::new(compiled, access);
         circuit.max_memory_bytes = max_memory_bytes;
@@ -32,6 +34,7 @@ impl Runtime {
             applied: 0,
             rows: 0,
             bytes: 0,
+            published_bytes: 0,
             passes: 0,
             skipped: 0,
             pass_time: Duration::ZERO,
@@ -46,6 +49,7 @@ impl Runtime {
             state: Mutex::new(Slot {
                 circuit,
                 query: q,
+                query_text_bytes: text.len(),
                 whole,
                 vars,
                 history: VecDeque::new(),
@@ -82,13 +86,27 @@ impl Runtime {
         let q = self.parse(host.as_ref(), &text)?;
         let access = host.access(def.principal.as_deref())?;
         let (cell, new) = self.cell_for(reg, q, &text, access.clone(), None)?;
+        {
+            let mut st = cell.state.lock();
+            if st.views == 0 {
+                st.circuit
+                    .set_version_pool(Some(self.published_views.clone()));
+                let mut info = cell.info.lock();
+                info.bytes = st.circuit.bytes();
+                info.published_bytes = st
+                    .circuit
+                    .version
+                    .as_ref()
+                    .map_or(0, |v| v.published_bytes());
+            }
+            st.views += 1;
+        }
         if new {
             self.ensure_subscription(store);
             if let Some(root) = &self.root {
                 self.recover(store, &cell, &views::dir(root, name).join(BRANCH), name);
             }
         }
-        cell.state.lock().views += 1;
         let entry = reg.views.get_mut(name).expect("checked above");
         entry.cell = Some(cell);
         entry.access = access;
@@ -124,7 +142,7 @@ impl Runtime {
             }
             match st.circuit.decode(body, &snap) {
                 Ok(()) => {
-                    st.circuit.applied = h.commit;
+                    st.circuit.set_applied(h.commit);
                     self.seen.fetch_max(h.commit, Ordering::AcqRel);
                     self.counters.loaded.fetch_add(1, Ordering::Relaxed);
                     let mut info = cell.info.lock();
@@ -132,6 +150,11 @@ impl Runtime {
                     info.applied = h.commit;
                     info.rows = st.circuit.result.total().max(0) as u64;
                     info.bytes = st.circuit.bytes();
+                    info.published_bytes = st
+                        .circuit
+                        .version
+                        .as_ref()
+                        .map_or(0, |v| v.published_bytes());
                     tracing::info!(
                         target: "sparkles::incr::runtime",
                         "view {name}: loaded its state at commit {}; {} commits to apply",
@@ -230,6 +253,7 @@ impl Runtime {
             c.terms = std::mem::take(&mut old.terms);
             c.snap = old.snap.take();
             c.applied = old.applied;
+            c.version = old.version.take();
             st.circuit = c;
             // diffs of the old mode do not lead to rows of the new one
             st.clear_history();

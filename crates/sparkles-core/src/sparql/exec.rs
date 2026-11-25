@@ -1784,7 +1784,20 @@ fn run_node<'ctx>(
             output_lease = t.lease;
             t.table
         }
-        Kind::ViewRead(spec) => super::viewsvc::run(ctx, spec, &n.vars)?,
+        Kind::ViewRead(spec) => {
+            if let Some(shared) = ctx.shared()
+                && ctx
+                    .views
+                    .as_ref()
+                    .is_some_and(|source| source.streams_views())
+            {
+                let table = super::cursor::eager_view(&shared, n, &held)?;
+                output_lease = Some(held.output_lease(super::algosvc::table_capacity(&table)?)?);
+                table
+            } else {
+                super::viewsvc::run(ctx, spec, &n.vars)?
+            }
+        }
         Kind::HistoryChanges(spec) => {
             let input = match n.children.len() {
                 0 => None,

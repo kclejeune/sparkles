@@ -83,7 +83,6 @@ pub(super) fn form(node: &Node) -> Option<Form> {
         Kind::AlgoCall(_) => Some(usize::MAX),
         Kind::SpatialScan(_)
         | Kind::SpatialRelate(_)
-        | Kind::ViewRead(_)
         | Kind::Service { .. }
         | Kind::PropertyFn(_) => None,
         // These read their input whatever their arguments.

@@ -59,6 +59,67 @@ impl Spec {
             Self::Describe { .. } => QueryKind::Describe,
         }
     }
+
+    fn retained_bytes(&self) -> u64 {
+        fn named_bytes(pattern: &spargebra::term::NamedNodePattern) -> u64 {
+            match pattern {
+                spargebra::term::NamedNodePattern::NamedNode(n) => n.as_str().len() as u64,
+                spargebra::term::NamedNodePattern::Variable(v) => v.as_str().len() as u64,
+            }
+        }
+        fn term_bytes(pattern: &spargebra::term::TermPattern) -> u64 {
+            use spargebra::term::TermPattern as T;
+            match pattern {
+                T::NamedNode(n) => n.as_str().len() as u64,
+                T::BlankNode(b) => b.as_str().len() as u64,
+                T::Variable(v) => v.as_str().len() as u64,
+                T::Literal(l) => (l.value().len() as u64)
+                    .saturating_add(l.datatype().as_str().len() as u64)
+                    .saturating_add(l.language().map_or(0, |s| s.len() as u64)),
+                T::Triple(tp) => {
+                    (std::mem::size_of::<TriplePattern>() as u64).saturating_add(triple_bytes(tp))
+                }
+            }
+        }
+        fn triple_bytes(tp: &TriplePattern) -> u64 {
+            term_bytes(&tp.subject)
+                .saturating_add(named_bytes(&tp.predicate))
+                .saturating_add(term_bytes(&tp.object))
+        }
+        match self {
+            Self::Construct { template, graphs } => {
+                let mut bytes = (template
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<TriplePattern>())
+                    as u64)
+                    .saturating_add(
+                        graphs
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<GraphTemplate>())
+                            as u64,
+                    );
+                for tp in template {
+                    bytes = bytes.saturating_add(triple_bytes(tp));
+                }
+                for graph in graphs {
+                    bytes = bytes
+                        .saturating_add(term_bytes(&graph.name))
+                        .saturating_add(
+                            graph
+                                .triples
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<TriplePattern>())
+                                as u64,
+                        );
+                    for tp in &graph.triples {
+                        bytes = bytes.saturating_add(triple_bytes(tp));
+                    }
+                }
+                bytes
+            }
+            Self::Describe { .. } => 0,
+        }
+    }
 }
 
 /// Immutable decoded graph terms. Retained batches remain on the query budget
@@ -91,6 +152,76 @@ struct Pending {
     _charge: OwnedCharge,
 }
 
+/// CONSTRUCT views number repeated solutions before minting their template blanks.
+struct ViewBlanks {
+    columns: Vec<Option<usize>>,
+    counts: rustc_hash::FxHashMap<Vec<crate::id::Id>, i64>,
+    charge: OwnedCharge,
+}
+
+impl ViewBlanks {
+    fn occurrence(
+        &mut self,
+        ctx: &crate::sparql::ctx::Ctx,
+        table: &crate::sparql::table::Table,
+        row: usize,
+        scratch: &crate::sparql::ctx::Charge<'_>,
+    ) -> Result<(Vec<Vec<u8>>, Option<i64>)> {
+        use crate::id::{Id, Tag};
+        use sparkles_budget::sizes::{table_bytes, table_grown};
+        let width = self.columns.len();
+        scratch
+            .add((width * (std::mem::size_of::<Id>() + std::mem::size_of::<Vec<u8>>())) as u64)?;
+        let ids = self
+            .columns
+            .iter()
+            .map(|c| c.map_or(Id::UNDEF, |c| table.cols[c][row]))
+            .collect::<Vec<_>>();
+        let occurrence;
+        if let Some(n) = self.counts.get_mut(&ids) {
+            occurrence = *n;
+            *n = n
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid("template multiplicity overflows"))?;
+        } else {
+            let capacity = self.counts.capacity();
+            let grown = table_grown(capacity, self.counts.len(), 1);
+            let slot = std::mem::size_of::<(Vec<Id>, i64)>();
+            let old = table_bytes(capacity, slot) as u64;
+            let new = table_bytes(grown, slot) as u64;
+            let bytes = self
+                .charge
+                .bytes()
+                .saturating_add((width * std::mem::size_of::<Id>()) as u64);
+            self.charge.resize(if grown == capacity {
+                bytes
+            } else {
+                bytes.saturating_add(new)
+            })?;
+            self.counts.insert(ids.clone(), 1);
+            if grown != capacity {
+                self.charge
+                    .resize(self.charge.bytes().saturating_sub(old))?;
+            }
+            occurrence = 0;
+        }
+        let mut keys = Vec::with_capacity(width);
+        for id in ids {
+            ctx.check()?;
+            let key = match id.tag() {
+                Tag::Undef | Tag::Special => Vec::new(),
+                _ => {
+                    scratch.add(ctx.decoded_bytes(id)?.saturating_mul(2))?;
+                    ctx.reserved_batch_term(id)?
+                        .map_or_else(Vec::new, |term| crate::id::term_key(&term))
+                }
+            };
+            keys.push(key);
+        }
+        Ok((keys, (occurrence > 0).then_some(occurrence)))
+    }
+}
+
 pub struct GraphCursor {
     where_cursor: QueryCursor,
     spec: Spec,
@@ -99,6 +230,7 @@ pub struct GraphCursor {
     map: Vec<Option<usize>>,
     pending: Option<Pending>,
     seen: FxHashSet<Quad>,
+    view_blanks: Option<ViewBlanks>,
     seen_charge: OwnedCharge,
     seen_bytes: u64,
     base_bytes: u64,
@@ -141,6 +273,7 @@ pub(super) fn from_pattern(
             ._plan_charge
             .bytes()
             .saturating_mul(2)
+            .saturating_add(spec.retained_bytes())
             .saturating_add(where_cursor.ctx.nvars() as u64 * 16 + 4096);
         let seen_charge = OwnedCharge::new(&where_cursor.ctx, base_bytes)?;
         let map = where_cursor.variables.ids.iter().enumerate().fold(
@@ -171,6 +304,7 @@ pub(super) fn from_pattern(
             map,
             pending: None,
             seen: Default::default(),
+            view_blanks: None,
             seen_charge,
             seen_bytes: base_bytes,
             base_bytes,
@@ -191,6 +325,46 @@ impl GraphCursor {
     pub fn kind(&self) -> QueryKind {
         self.spec.kind()
     }
+    pub(super) fn for_view(
+        where_cursor: QueryCursor,
+        mut spec: Spec,
+        template_columns: Option<&[String]>,
+    ) -> Result<Self> {
+        use spargebra::term::TermPattern;
+        if let Spec::Construct { template, .. } = &mut spec {
+            // The maintained template does not instantiate nested triple patterns.
+            template.retain(|t| {
+                !matches!(t.subject, TermPattern::Triple(_))
+                    && !matches!(t.object, TermPattern::Triple(_))
+            });
+            template.shrink_to_fit();
+        }
+        let mut graph = from_pattern(where_cursor, spec, 0)?;
+        if let Some(template_columns) = template_columns {
+            let charge = OwnedCharge::new(
+                &graph.where_cursor.ctx,
+                (template_columns.len() * std::mem::size_of::<Option<usize>>()) as u64,
+            )?;
+            let columns = template_columns
+                .iter()
+                .map(|name| {
+                    graph
+                        .where_cursor
+                        .variables
+                        .names
+                        .iter()
+                        .position(|v| v == name)
+                })
+                .collect();
+            graph.view_blanks = Some(ViewBlanks {
+                columns,
+                counts: Default::default(),
+                charge,
+            });
+        }
+        Ok(graph)
+    }
+
     pub fn status(&self) -> CursorStatus {
         self.status
     }
@@ -342,6 +516,21 @@ impl GraphCursor {
                     let mut pending_charge = OwnedCharge::new(&ctx, 0)?;
                     let mut pending = Vec::new();
                     let mut pending_storage = 0u64;
+                    let scratch = ctx.charge(0)?;
+                    let skolem = self
+                        .view_blanks
+                        .as_mut()
+                        .map(|blanks| {
+                            blanks.occurrence(&ctx, batch.owned_table(), self.row, &scratch)
+                        })
+                        .transpose()?;
+                    let mint = |label: &str| {
+                        let (keys, occurrence) = skolem.as_ref().expect("view blank solution");
+                        let b = crate::incr::ops::template::skolem("", label, keys, *occurrence);
+                        crate::store::bnode_for(crate::id::Id::bnode(crate::id::default_bnode_id(
+                            &b,
+                        )))
+                    };
                     crate::sparql::construct_row(
                         &ctx,
                         batch.owned_table(),
@@ -349,6 +538,9 @@ impl GraphCursor {
                         self.row,
                         template,
                         graphs,
+                        skolem
+                            .as_ref()
+                            .map(|_| &mint as &dyn Fn(&str) -> oxrdf::BlankNode),
                         &mut self.template_work,
                         &mut |quad, incoming| {
                             if self.seen.contains(&quad) {
@@ -413,6 +605,7 @@ impl GraphCursor {
         depth::with_stack(self.where_cursor.depth, || {
             self.input = None;
             self.pending = None;
+            self.view_blanks = None;
             self.seen.clear();
             self.seen.shrink_to_fit();
             // what a DESCRIBE kept, with its charge; `truncated` stays

@@ -10,7 +10,7 @@
 
 use super::ctx::Ctx;
 use super::exec::PlanPattern;
-use super::expr::{Compiler, ExistsSpec, Expr};
+use super::expr::{ExistsSpec, Expr};
 use super::table::{Table, VarId};
 use crate::access::{
     Preparation, PreparationBuffer, PreparationMap, PreparationText, Reservation, sort_by_prepared,
@@ -983,6 +983,7 @@ pub struct Planner<'a> {
     pub scoped: FxHashSet<VarId>,
     pub(super) property_inputs: FxHashSet<VarId>,
     bnode_scope: u32,
+    pub(super) view_patterns: Option<&'a super::viewsvc::ViewPatterns>,
     /// RDF 1.2 triple-term patterns created while translating triple patterns
     unpacks: std::cell::RefCell<Vec<UnpackItem>>,
     /// the whole query being planned, if known: a search output it mentions nowhere else
@@ -1056,12 +1057,19 @@ impl<'a> Planner<'a> {
             scoped: FxHashSet::default(),
             property_inputs: FxHashSet::default(),
             bnode_scope: 0,
+            view_patterns: None,
             unpacks: Default::default(),
             source: None,
             source_sse: Default::default(),
             seen: Default::default(),
             source_counts: Default::default(),
         }
+    }
+
+    pub(super) fn for_exists(ctx: &'a Ctx, spec: &'a ExistsSpec) -> Self {
+        let mut planner = Self::new(ctx);
+        planner.view_patterns = spec.view_patterns();
+        planner
     }
 
     /// Whether the variable or blank node `t`, which a property function call binds,
@@ -1092,32 +1100,46 @@ impl<'a> Planner<'a> {
         mentions != 1
     }
 
-    pub fn compile(&self, e: &Expression, graph: &ActiveGraph) -> Expr {
+    pub fn compile(&self, e: &Expression, graph: &ActiveGraph) -> Result<Expr> {
         let ctx = self.ctx;
         let subst = &self.subst;
-        let exists = |p: &GraphPattern| -> Arc<ExistsSpec> {
+        let exists = |p: &GraphPattern| -> Result<Arc<ExistsSpec>> {
             let mut names = Vec::new();
             collect_pattern_vars(p, &mut names);
-            let mut vars: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
-            vars.sort_unstable();
-            vars.dedup();
-            let bound = vars
-                .iter()
-                .filter_map(|v| subst.get(v).map(|id| (*v, *id)))
-                .collect();
-            Arc::new(ExistsSpec::new(p.clone(), graph.clone(), vars, bound))
+            let mut deduped: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
+            deduped.sort_unstable();
+            deduped.dedup();
+            let mut vars = Vec::with_capacity(deduped.len());
+            vars.extend_from_slice(&deduped);
+            let bound_len = vars.iter().filter(|v| subst.contains_key(v)).count();
+            let mut bound = Vec::with_capacity(bound_len);
+            for &v in &vars {
+                if let Some(&id) = subst.get(&v) {
+                    bound.push((v, id));
+                }
+            }
+            Ok(Arc::new(ExistsSpec::new_ordinary_charged(
+                ctx,
+                p,
+                self.view_patterns,
+                graph.clone(),
+                vars,
+                bound,
+            )?))
         };
-        Compiler {
+        super::expr::compile_expression(
             ctx,
             subst,
-            exists: &exists,
-        }
-        .compile(e)
+            &exists,
+            &|_| Ok(()),
+            &|name| Ok(ctx.var(name)),
+            e,
+        )
     }
 
     fn compile_in_branch(&self, e: &Expression, graph: &ActiveGraph) -> Result<Expr> {
         if self.checked_exists.borrow().is_none() {
-            return Ok(self.compile(e, graph));
+            return self.compile(e, graph);
         }
         let ctx = self.ctx;
         let subst = &self.subst;
@@ -1146,6 +1168,16 @@ impl<'a> Planner<'a> {
             ids.dedup();
             let bound_len = ids.iter().filter(|id| subst.contains_key(id)).count();
             let held = ExistsSpec::reserve_checked(preparation, ids.len(), bound_len)?;
+            let view_patterns = match self.view_patterns {
+                Some(vp) => vp.project_checked(p, &pattern.syntax, preparation)?.map(
+                    |(projected, charge)| {
+                        Arc::new(super::expr::RetainedViewPatterns::from_reservation(
+                            projected, charge,
+                        ))
+                    },
+                ),
+                None => None,
+            };
             let mut vars = Vec::with_capacity(ids.len());
             let mut bound = Vec::with_capacity(bound_len);
             for &id in &*ids {
@@ -1160,6 +1192,7 @@ impl<'a> Planner<'a> {
                 graph.clone(),
                 vars,
                 bound,
+                view_patterns,
                 held,
             )))
         };
@@ -1522,12 +1555,18 @@ impl<'a> Planner<'a> {
                             .count()
                     })
                 };
-                if let Some(pushed) =
-                    super::valuespush::rewrite(gp, &|patterns| calls(self.ctx, patterns), &graphs)
+                // These rewrites clone algebra. View rebuilds plan the saved occurrences
+                // whose semantics the incremental compiler recorded.
+                if self.view_patterns.is_none()
+                    && let Some(pushed) = super::valuespush::rewrite(
+                        gp,
+                        &|patterns| calls(self.ctx, patterns),
+                        &graphs,
+                    )
                 {
                     return self.plan(&pushed, g, filters);
                 }
-                let consider_union = !self.ctx.calls_extensions
+                let consider_union = self.view_patterns.is_none() && !self.ctx.calls_extensions
                     // Preserve outer filters' ordinary evaluation boundary, including
                     // extension aliases and dynamic calls that might be volatile.
                     && filters.is_empty();
@@ -1808,8 +1847,11 @@ impl<'a> Planner<'a> {
                 variables,
                 bindings,
             } => {
+                let native = self
+                    .view_patterns
+                    .is_some_and(|patterns| patterns.contains(gp));
                 if self.branch_payload.borrow().is_some() {
-                    let values = self.checked_values(variables, bindings)?;
+                    let values = self.checked_values(variables, bindings, native)?;
                     return self.apply_filters(values, filters);
                 }
                 let vars: Vec<VarId> = variables.iter().map(|v| self.ctx.var(v.as_str())).collect();
@@ -1825,8 +1867,10 @@ impl<'a> Planner<'a> {
                                 GroundTerm::NamedNode(n) => {
                                     self.ctx.intern_term(&Term::NamedNode(n.clone()))
                                 }
-                                GroundTerm::Literal(l) => self.ctx.intern_query_literal(l),
-                                GroundTerm::Triple(_) => self.ctx.intern_term(&ground_term(t)),
+                                GroundTerm::Literal(l) if !native => {
+                                    self.ctx.intern_query_literal(l)
+                                }
+                                _ => self.ctx.intern_term(&ground_term(t)),
                             }),
                         })
                         .collect();
@@ -1940,7 +1984,15 @@ impl<'a> Planner<'a> {
                 let n = self.project_for_branch(child?, vars)?;
                 self.apply_filters(n, filters)
             }
-            GP::Distinct { inner } => {
+            GP::Reduced { inner }
+                if self
+                    .view_patterns
+                    .is_none_or(|patterns| !patterns.contains(gp)) =>
+            {
+                let child = self.plan(inner, g, Vec::new())?;
+                self.apply_filters(child, filters)
+            }
+            GP::Distinct { inner } | GP::Reduced { inner } => {
                 // SELECT DISTINCT ?p over ?s ?p ?o: the predicates the patterns list
                 if let GP::Project {
                     inner: pinner,
@@ -1961,10 +2013,6 @@ impl<'a> Planner<'a> {
                     n = super::demand::distinct_below_order(self.ctx, n);
                 }
                 self.apply_filters(n, filters)
-            }
-            GP::Reduced { inner } => {
-                let child = self.plan(inner, g, Vec::new())?;
-                self.apply_filters(child, filters)
             }
             GP::Slice {
                 inner,
@@ -3581,6 +3629,7 @@ impl<'a> Planner<'a> {
         &self,
         variables: &[oxrdf::Variable],
         bindings: &[Vec<Option<GroundTerm>>],
+        native: bool,
     ) -> Result<Node> {
         let preparation = self.ctx.source_preparation.as_ref().expect("checked GRAPH");
         let mut layout = super::checked_layout::Layout::new(preparation);
@@ -3632,7 +3681,9 @@ impl<'a> Planner<'a> {
                         layout.ground(term)?;
                         let _term = preparation.reserve(layout.bytes())?;
                         let id = match term {
-                            GroundTerm::Literal(literal) => self.ctx.intern_query_literal(literal),
+                            GroundTerm::Literal(literal) if !native => {
+                                self.ctx.intern_query_literal(literal)
+                            }
                             _ => self.ctx.intern_term(&ground_term(term)),
                         };
                         self.ctx.check()?;
@@ -8581,7 +8632,7 @@ pub fn short(t: &Term) -> String {
 
 /// Evaluate `EXISTS { pattern }` for one outer binding (substitution semantics).
 pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -> Result<bool> {
-    let mut p = Planner::new(ctx);
+    let mut p = Planner::for_exists(ctx, spec);
     if ctx.calls_extensions {
         p.property_inputs.extend(schema.iter().copied());
     }

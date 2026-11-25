@@ -38,7 +38,36 @@ pub struct Template {
     pub counts: ZSet,
 }
 
+pub(crate) fn skolem(
+    seed: &str,
+    label: &str,
+    keys: &[Vec<u8>],
+    occurrence: Option<i64>,
+) -> BlankNode {
+    let mut h = Sha256::new();
+    h.update(seed.as_bytes());
+    h.update([0]);
+    h.update(label.as_bytes());
+    for k in keys {
+        h.update((k.len() as u64).to_le_bytes());
+        h.update(k);
+    }
+    if let Some(n) = occurrence {
+        h.update([1]);
+        h.update(n.to_le_bytes());
+    }
+    let d = h.finalize();
+    let hex: String = d[..16].iter().map(|b| format!("{b:02x}")).collect();
+    BlankNode::new_unchecked(format!("v{hex}"))
+}
+
 impl Template {
+    pub(crate) fn has_blanks(&self) -> bool {
+        self.triples
+            .iter()
+            .any(|t| t.iter().any(|s| matches!(s, TSlot::Blank(_))))
+    }
+
     fn kind(p: &Pass, i: Id) -> TermKind {
         match i.tag() {
             Tag::Local => match p.terms.term(&p.new, i) {
@@ -54,10 +83,7 @@ impl Template {
 
     fn apply(&mut self, p: &mut Pass, c: Changes) -> Result<Changes> {
         let mut out = Changes::new();
-        let blanks = self
-            .triples
-            .iter()
-            .any(|t| t.iter().any(|s| matches!(s, TSlot::Blank(_))));
+        let blanks = self.has_blanks();
         for (row, w) in c {
             p.tick()?;
             if !blanks {
@@ -108,23 +134,8 @@ impl Template {
                         TSlot::Blank(label) => match minted.iter().find(|m| &m.0 == label) {
                             Some(m) => m.1,
                             None => {
-                                let mut h = Sha256::new();
-                                h.update(self.seed.as_bytes());
-                                h.update([0]);
-                                h.update(label.as_bytes());
-                                for k in keys {
-                                    h.update((k.len() as u64).to_le_bytes());
-                                    h.update(k);
-                                }
-                                if let Some(n) = occurrence {
-                                    h.update([1]);
-                                    h.update(n.to_le_bytes());
-                                }
-                                let d = h.finalize();
-                                let hex: String =
-                                    d[..16].iter().map(|b| format!("{b:02x}")).collect();
                                 let b =
-                                    Term::BlankNode(BlankNode::new_unchecked(format!("v{hex}")));
+                                    Term::BlankNode(skolem(&self.seed, label, keys, occurrence));
                                 let i = p.intern(&b);
                                 minted.push((label.clone(), i));
                                 i
@@ -154,10 +165,7 @@ impl Template {
     /// such triples have unknown atoms.
     fn apply_a(&mut self, p: &mut Pass, c: AChanges) -> Result<AChanges> {
         let mode = p.prov;
-        let blanks = self
-            .triples
-            .iter()
-            .any(|t| t.iter().any(|s| matches!(s, TSlot::Blank(_))));
+        let blanks = self.has_blanks();
         let mut out = AChanges::new();
         for (row, w, a) in c {
             p.tick()?;

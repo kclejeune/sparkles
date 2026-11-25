@@ -928,34 +928,15 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
     }
 }
 
-/// A view source with one `table` view whose column ?x holds the integers below `.0`.
-/// A view read has no resumable cursor, so it is the remaining eager fallback leaf.
-#[derive(Debug)]
-struct IntegersView(i64);
-impl sparkles_core::sparql::viewsvc::ViewSource for IntegersView {
-    fn read_view(
-        &self,
-        _: &sparkles_core::sparql::viewsvc::ViewRead<'_>,
-    ) -> sparkles_core::Result<sparkles_core::sparql::viewsvc::ViewRows> {
-        Ok(sparkles_core::sparql::viewsvc::ViewRows {
-            columns: vec!["x".into()],
-            rows: (0..self.0)
-                .map(|i| (vec![Some(Term::Literal(oxrdf::Literal::from(i)))], 1))
-                .collect(),
-            commit: 0,
-            evaluated_under: None,
-        })
-    }
+/// Constant ARQ property function split leaf, refused by decision Q1 and used to test
+/// eager fallback visibility and laziness.
+fn split_leaf(n: usize) -> String {
+    let items: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+    format!(
+        "?x <http://jena.apache.org/ARQ/property#strSplit> (\"{}\" \",\")",
+        items.join(",")
+    )
 }
-
-fn with_view(rows: i64) -> QueryOptions {
-    QueryOptions {
-        views: Some(Arc::new(IntegersView(rows))),
-        ..Default::default()
-    }
-}
-
-const VIEW_READ: &str = "SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"ints\" ; <urn:x-sparkles:view#bind> ?x }";
 
 #[test]
 fn eager_fallback_is_visible_lazy_and_budgeted() {
@@ -969,28 +950,28 @@ fn eager_fallback_is_visible_lazy_and_budgeted() {
         None,
     )])
     .unwrap();
-    let q = &format!("SELECT ?x WHERE {{ {VIEW_READ} }}");
-    let views = with_view(100);
+    let q = &format!("SELECT ?x WHERE {{ {} }}", split_leaf(100));
+    let opts_q = QueryOptions::default();
     assert!(matches!(
-        select_cursor(s.snapshot(), q, &views, &options(2)),
+        select_cursor(s.snapshot(), q, &opts_q, &options(2)),
         Err(Error::Unsupported(_))
     ));
     let opts = CursorOptions {
         batch_rows: 2,
         ..Default::default()
     };
-    let mut c = select_cursor(s.snapshot(), q, &views, &opts).unwrap();
+    let mut c = select_cursor(s.snapshot(), q, &opts_q, &opts).unwrap();
     assert!(c.plan().has_materialization());
     assert_eq!(c.stats().rows_produced, 0);
     let b = c.next_batch().unwrap().unwrap();
     assert_eq!(
         b.row(0).unwrap().values().to_vec(),
-        query(s.snapshot(), q, &views).unwrap().application_rows()[0]
+        query(s.snapshot(), q, &opts_q).unwrap().application_rows()[0]
     );
     assert!(c.stats().rows_produced >= 100);
     assert_eq!(
-        all(select_cursor(s.snapshot(), q, &views, &opts).unwrap()),
-        query(s.snapshot(), q, &views).unwrap().application_rows()
+        all(select_cursor(s.snapshot(), q, &opts_q, &opts).unwrap()),
+        query(s.snapshot(), q, &opts_q).unwrap().application_rows()
     );
 }
 
@@ -2516,8 +2497,8 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            &format!("SELECT ?x {{ {VIEW_READ} }}"),
-            &with_view(3),
+            &format!("SELECT ?x {{ {} }}", split_leaf(3)),
+            &Default::default(),
             &strict,
             ExecutionMode::Auto,
         ),
@@ -4095,26 +4076,27 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
             fallbacks(child, out);
         }
     }
-    let views = with_view(30);
+    let split = split_leaf(30);
+    let opts_q = QueryOptions::default();
     for q in [
         format!(
-            "SELECT ?s ?o WHERE {{ ?s <urn:p> ?o FILTER EXISTS {{ {VIEW_READ} FILTER(?x = ?o) }} }}"
+            "SELECT ?s ?o WHERE {{ ?s <urn:p> ?o FILTER EXISTS {{ {split} FILTER(?x = STR(?o)) }} }}"
         ),
         format!(
-            "SELECT ?s WHERE {{ ?s <urn:q> ?t FILTER NOT EXISTS {{ {VIEW_READ} FILTER(?x = 3) }} }}"
+            "SELECT ?s WHERE {{ ?s <urn:q> ?t FILTER NOT EXISTS {{ {split} FILTER(?x = \"3\") }} }}"
         ),
         // a BIND over an EXISTS that does not stream reads its whole input, and that
         // input streams into it
         "SELECT ?s ?e WHERE { ?s <urn:p> ?o FILTER(?o < 5) BIND(EXISTS { ?t <http://jena.apache.org/ARQ/property#strSplit> (\"a b\" \" \") } AS ?e) }".to_string(),
     ] {
         let q = q.as_str();
-        let expected = bag(query(s.snapshot(), q, &views).unwrap().application_rows());
+        let expected = bag(query(s.snapshot(), q, &opts_q).unwrap().application_rows());
         for rows in [1, 2, 3, 4096] {
             let opts = CursorOptions {
                 batch_rows: rows,
                 ..Default::default()
             };
-            let c = select_cursor(s.snapshot(), q, &views, &opts).unwrap();
+            let c = select_cursor(s.snapshot(), q, &opts_q, &opts).unwrap();
             let mut found = Vec::new();
             fallbacks(c.plan(), &mut found);
             assert!(!found.is_empty(), "{q}");

@@ -27,7 +27,7 @@ use crate::access::GraphAccess;
 use crate::dataset::{DatasetState, StoreHandle};
 use crate::error::{Error, Result};
 use crate::incr::{Host, Inference, Kind, LiveOptions, LiveQuery, PlanNode, ViewDef, ViewInfo};
-use crate::sparql::viewsvc::{ViewRead, ViewRows, ViewSource};
+use crate::sparql::viewsvc::{OpenedView, ViewOpen, ViewRead, ViewRows, ViewSource};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Weak;
@@ -107,6 +107,24 @@ impl ViewSource for Source {
         let rt = state.views.clone();
         drop(state);
         rt.read(r)
+    }
+    fn streams_views(&self) -> bool {
+        true
+    }
+    fn open_view(
+        &self,
+        open: &ViewOpen<'_>,
+        check: &dyn Fn() -> Result<()>,
+        admit: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<OpenedView> {
+        let state = self
+            .state
+            .try_upgrade()?
+            .ok_or_else(|| Error::invalid("the dataset is closed"))?;
+        start(&state, None);
+        let rt = state.views.clone();
+        drop(state);
+        rt.open_view(open, check, admit)
     }
     fn view_reading(
         &self,

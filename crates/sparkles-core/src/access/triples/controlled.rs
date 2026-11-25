@@ -13,6 +13,14 @@ pub(crate) fn prepare(
     prepare_input(Input::Legacy { original, snap }, preparation)
 }
 
+pub(crate) fn prepare_rebuild(
+    original: &GraphAccess,
+    snap: &Arc<Snapshot>,
+    preparation: &Preparation,
+) -> Result<PreparedView> {
+    prepare_input(Input::Rebuild { original, snap }, preparation)
+}
+
 pub(crate) fn prepare_selected(
     selected: crate::store::bound_read_source::PreparedRead,
     preparation: &Preparation,
@@ -49,6 +57,10 @@ enum Input<'a> {
         original: &'a GraphAccess,
         snap: &'a Arc<Snapshot>,
     },
+    Rebuild {
+        original: &'a GraphAccess,
+        snap: &'a Arc<Snapshot>,
+    },
     Selected(crate::store::bound_read_source::PreparedRead),
     Evidence {
         evidence: crate::store::BoundEvidenceView,
@@ -64,7 +76,9 @@ enum Input<'a> {
 impl Input<'_> {
     fn original(&self) -> &GraphAccess {
         match self {
-            Self::Legacy { original, .. } | Self::Transaction { original, .. } => original,
+            Self::Legacy { original, .. }
+            | Self::Rebuild { original, .. }
+            | Self::Transaction { original, .. } => original,
             Self::Selected(selected) => selected.policy(),
             Self::Evidence { policy, .. } => policy,
         }
@@ -72,7 +86,7 @@ impl Input<'_> {
 
     fn snapshot(&self) -> &Arc<Snapshot> {
         match self {
-            Self::Legacy { snap, .. } => snap,
+            Self::Legacy { snap, .. } | Self::Rebuild { snap, .. } => snap,
             Self::Selected(selected) => selected.snapshot(),
             Self::Evidence { evidence, .. } => evidence.shared_snapshot(),
             Self::Transaction { txn, .. } => txn.snapshot(),
@@ -88,7 +102,7 @@ impl Input<'_> {
         Option<crate::store::bound_read_source::PreparedTxn>,
     ) {
         match self {
-            Self::Legacy { .. } => (None, None, None, None),
+            Self::Legacy { .. } | Self::Rebuild { .. } => (None, None, None, None),
             Self::Selected(selected) => (Some(selected.into_identity()), None, None, None),
             Self::Evidence {
                 evidence, identity, ..

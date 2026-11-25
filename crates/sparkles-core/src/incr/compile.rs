@@ -21,6 +21,7 @@ use super::ops::window::Window;
 use super::ops::{Node, Op};
 use super::zset::ZSet;
 use crate::error::{ComponentError, Error, Result};
+use crate::sparql::viewsvc::ViewPatterns;
 use oxrdf::{NamedNode, Term, Variable};
 use rustc_hash::FxHashMap;
 use spargebra::Query;
@@ -59,6 +60,7 @@ pub struct Compiled {
     /// its footprint from
     pub pattern: GP,
     pub dataset: Option<QueryDataset>,
+    pub(crate) rebuild_patterns: ViewPatterns,
 }
 
 /// The footprint of `gp` read in the default graph.
@@ -841,22 +843,153 @@ fn mentioned(gp: &GP, out: &mut Vec<String>) {
             inner, aggregates, ..
         } => {
             for (_, a) in aggregates {
-                if let AggregateExpression::FunctionCall { expr: e, .. } = a {
-                    expr(e, out);
+                match a {
+                    AggregateExpression::FunctionCall { expr: e, .. } => expr(e, out),
+                    AggregateExpression::Fold {
+                        expr: e,
+                        value,
+                        order,
+                        ..
+                    } => {
+                        expr(e, out);
+                        if let Some(v) = value {
+                            expr(v, out);
+                        }
+                        for o in order {
+                            let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                            expr(e, out);
+                        }
+                    }
+                    AggregateExpression::CountSolutions { .. } => {}
                 }
             }
             mentioned(inner, out);
         }
-        GP::OrderBy { inner, .. }
-        | GP::Graph { inner, .. }
+        GP::OrderBy { inner, expression } => {
+            for o in expression {
+                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                expr(e, out);
+            }
+            mentioned(inner, out);
+        }
+        GP::Assign {
+            inner, expression, ..
+        }
+        | GP::Unfold {
+            inner, expression, ..
+        } => {
+            expr(expression, out);
+            mentioned(inner, out);
+        }
+        GP::Graph { inner, .. }
         | GP::Project { inner, .. }
         | GP::Distinct { inner }
         | GP::Reduced { inner }
         | GP::Slice { inner, .. }
-        | GP::Assign { inner, .. }
-        | GP::Unfold { inner, .. }
         | GP::Service { inner, .. } => mentioned(inner, out),
         _ => {}
+    }
+}
+
+/// Whether `gp` contains a `LIMIT` / `OFFSET` slice whose inner pattern mentions a
+/// variable in `outer`.
+///
+/// Join semantics (`Op::Match`) evaluate the slice over all right-hand rows before
+/// matching against the outer row, while SPARQL `EXISTS` substitution prunes the
+/// inner pattern to the outer row's bindings before deduplication and slicing.
+fn slice_uses_outer(gp: &GP, outer: &[String]) -> bool {
+    fn expr(e: &Expression, outer: &[String]) -> bool {
+        use Expression as E;
+        match e {
+            E::Exists(p) => slice_uses_outer(p, outer),
+            E::Or(a, b)
+            | E::And(a, b)
+            | E::Equal(a, b)
+            | E::SameTerm(a, b)
+            | E::Greater(a, b)
+            | E::GreaterOrEqual(a, b)
+            | E::Less(a, b)
+            | E::LessOrEqual(a, b)
+            | E::Add(a, b)
+            | E::Subtract(a, b)
+            | E::Multiply(a, b)
+            | E::Divide(a, b) => expr(a, outer) || expr(b, outer),
+            E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr(a, outer),
+            E::In(a, l) => expr(a, outer) || l.iter().any(|x| expr(x, outer)),
+            E::If(a, b, c) => expr(a, outer) || expr(b, outer) || expr(c, outer),
+            E::Coalesce(l) | E::FunctionCall(_, l) => l.iter().any(|x| expr(x, outer)),
+            _ => false,
+        }
+    }
+    if outer.is_empty() {
+        return false;
+    }
+    match gp {
+        GP::Slice { inner, .. } => {
+            let mut vars = Vec::new();
+            mentioned(inner, &mut vars);
+            vars.iter().any(|v| outer.contains(v)) || slice_uses_outer(inner, outer)
+        }
+        GP::Filter { expr: e, inner } => expr(e, outer) || slice_uses_outer(inner, outer),
+        GP::Extend {
+            inner, expression, ..
+        }
+        | GP::Assign {
+            inner, expression, ..
+        }
+        | GP::Unfold {
+            inner, expression, ..
+        } => expr(expression, outer) || slice_uses_outer(inner, outer),
+        GP::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            expression.as_ref().is_some_and(|e| expr(e, outer))
+                || slice_uses_outer(left, outer)
+                || slice_uses_outer(right, outer)
+        }
+        GP::Join { left, right }
+        | GP::Union { left, right }
+        | GP::Minus { left, right }
+        | GP::Lateral { left, right }
+        | GP::SemiJoin { left, right }
+        | GP::AntiJoin { left, right } => {
+            slice_uses_outer(left, outer) || slice_uses_outer(right, outer)
+        }
+        GP::Group {
+            inner, aggregates, ..
+        } => {
+            aggregates.iter().any(|(_, a)| match a {
+                AggregateExpression::FunctionCall { expr: e, .. } => expr(e, outer),
+                AggregateExpression::Fold {
+                    expr: e,
+                    value,
+                    order,
+                    ..
+                } => {
+                    expr(e, outer)
+                        || value.as_ref().is_some_and(|v| expr(v, outer))
+                        || order.iter().any(|o| {
+                            let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                            expr(e, outer)
+                        })
+                }
+                AggregateExpression::CountSolutions { .. } => false,
+            }) || slice_uses_outer(inner, outer)
+        }
+        GP::OrderBy { inner, expression } => {
+            expression.iter().any(|o| {
+                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = o;
+                expr(e, outer)
+            }) || slice_uses_outer(inner, outer)
+        }
+        GP::Graph { inner, .. }
+        | GP::Project { inner, .. }
+        | GP::Distinct { inner }
+        | GP::Reduced { inner }
+        | GP::Service { inner, .. } => slice_uses_outer(inner, outer),
+        GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => false,
     }
 }
 
@@ -884,13 +1017,13 @@ fn has_exists(e: &Expression) -> bool {
     }
 }
 
-fn conjuncts(e: &Expression, out: &mut Vec<Expression>) {
+fn conjuncts<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
     match e {
         Expression::And(a, b) => {
             conjuncts(a, out);
             conjuncts(b, out);
         }
-        e => out.push(e.clone()),
+        e => out.push(e),
     }
 }
 
@@ -956,6 +1089,7 @@ struct C {
     vars: Vec<String>,
     index: FxHashMap<String, u32>,
     hidden: usize,
+    native_patterns: Vec<usize>,
 }
 
 impl C {
@@ -1315,6 +1449,15 @@ impl C {
     }
 
     fn compile(&mut self, gp: &GP, scope: &Scope) -> Node {
+        let mark = self.native_patterns.len();
+        let node = self.compile_pattern(gp, scope);
+        if matches!(node.op, Op::Recompute(_)) {
+            self.native_patterns.truncate(mark);
+        }
+        node
+    }
+
+    fn compile_pattern(&mut self, gp: &GP, scope: &Scope) -> Node {
         if matches!(
             gp,
             GP::Bgp { .. } | GP::Join { .. } | GP::Graph { .. } | GP::Path { .. }
@@ -1447,19 +1590,7 @@ impl C {
                     return self.recompute(gp, scope, "EXISTS in BIND", None);
                 }
                 let i = self.compile(inner, scope);
-                let var = self.var(variable.as_str());
-                let mut schema = i.schema.clone();
-                schema.push(var);
-                let certain = i.certain.clone();
-                Node {
-                    op: Op::Extend(Box::new(Extend {
-                        inner: i,
-                        var,
-                        expr: expression.clone(),
-                    })),
-                    schema,
-                    certain,
-                }
+                self.extend(i, variable, expression.clone())
             }
             GP::Values {
                 variables,
@@ -1467,6 +1598,12 @@ impl C {
             } => {
                 if matches!(scope, Scope::Var(_)) {
                     return self.recompute(gp, scope, "VALUES under GRAPH ?g", None);
+                }
+                if bindings.iter().flatten().any(|term| {
+                    matches!(term, Some(GroundTerm::Literal(l))
+                        if crate::sparql::cdt::is_cdt(l.datatype().as_str()))
+                }) {
+                    self.native_patterns.push(std::ptr::from_ref(gp) as usize);
                 }
                 let names: Vec<String> = variables.iter().map(|v| v.as_str().to_string()).collect();
                 let schema = self.vars_of(&names);
@@ -1499,37 +1636,17 @@ impl C {
                     return self.recompute(gp, scope, "a subquery under GRAPH ?g", None);
                 }
                 let i = self.compile(inner, scope);
-                let names: Vec<String> = variables.iter().map(|v| v.as_str().to_string()).collect();
-                let schema = self.vars_of(&names);
-                let cols = schema
-                    .iter()
-                    .map(|v| i.schema.iter().position(|x| x == v))
-                    .collect();
-                let certain = schema
-                    .iter()
-                    .filter(|v| i.certain.contains(v))
-                    .copied()
-                    .collect();
-                Node {
-                    op: Op::Project(Box::new(Project { inner: i, cols })),
-                    schema,
-                    certain,
-                }
+                self.project(i, variables)
             }
             GP::Distinct { inner } | GP::Reduced { inner } => {
                 if matches!(scope, Scope::Var(_)) {
                     return self.recompute(gp, scope, "DISTINCT under GRAPH ?g", None);
                 }
-                let i = self.compile(inner, scope);
-                let (schema, certain) = (i.schema.clone(), i.certain.clone());
-                Node {
-                    op: Op::Distinct(Box::new(Distinct {
-                        inner: i,
-                        weights: ZSet::new(),
-                    })),
-                    schema,
-                    certain,
+                if matches!(gp, GP::Reduced { .. }) {
+                    self.native_patterns.push(std::ptr::from_ref(gp) as usize);
                 }
+                let i = self.compile(inner, scope);
+                Self::distinct(i)
             }
             GP::Slice {
                 inner,
@@ -1552,6 +1669,48 @@ impl C {
                 self.recompute(gp, scope, "an ARQ extension", None)
             }
             GP::Service { .. } => self.recompute(gp, scope, "SERVICE", None),
+        }
+    }
+
+    fn extend(&mut self, inner: Node, variable: &Variable, expr: Expression) -> Node {
+        let var = self.var(variable.as_str());
+        let mut schema = inner.schema.clone();
+        schema.push(var);
+        let certain = inner.certain.clone();
+        Node {
+            op: Op::Extend(Box::new(Extend { inner, var, expr })),
+            schema,
+            certain,
+        }
+    }
+
+    fn project(&mut self, inner: Node, variables: &[Variable]) -> Node {
+        let schema: Vec<_> = variables.iter().map(|v| self.var(v.as_str())).collect();
+        let cols = schema
+            .iter()
+            .map(|v| inner.schema.iter().position(|x| x == v))
+            .collect();
+        let certain = schema
+            .iter()
+            .filter(|v| inner.certain.contains(v))
+            .copied()
+            .collect();
+        Node {
+            op: Op::Project(Box::new(Project { inner, cols })),
+            schema,
+            certain,
+        }
+    }
+
+    fn distinct(inner: Node) -> Node {
+        let (schema, certain) = (inner.schema.clone(), inner.certain.clone());
+        Node {
+            op: Op::Distinct(Box::new(Distinct {
+                inner,
+                weights: ZSet::new(),
+            })),
+            schema,
+            certain,
         }
     }
 
@@ -1583,7 +1742,7 @@ impl C {
                 .map(Variable::new_unchecked)
                 .collect()
         });
-        let mut keyed = (**base).clone();
+        let mut expressions = Vec::new();
         let mut keys: Vec<(Variable, bool)> = Vec::new();
         for o in expression {
             let (e, asc) = match o {
@@ -1620,11 +1779,7 @@ impl C {
                     // a name no query can write, so it never meets a query's variable
                     self.hidden += 1;
                     let v = Variable::new_unchecked(format!("#ord{}", self.hidden));
-                    keyed = GP::Extend {
-                        inner: Box::new(keyed),
-                        variable: v.clone(),
-                        expression: e.clone(),
-                    };
+                    expressions.push((v.clone(), e.clone()));
                     v
                 }
             };
@@ -1636,16 +1791,18 @@ impl C {
                 cols.push(v.clone());
             }
         }
-        let mut below = GP::Project {
-            inner: Box::new(keyed),
-            variables: cols.clone(),
-        };
-        if distinct {
-            below = GP::Distinct {
-                inner: Box::new(below),
-            };
+        if matches!(inner, GP::Reduced { .. }) {
+            self.native_patterns
+                .push(std::ptr::from_ref(inner) as usize);
         }
-        let i = self.compile(&below, scope);
+        let mut i = self.compile(base, scope);
+        for (variable, expression) in expressions {
+            i = self.extend(i, &variable, expression);
+        }
+        i = self.project(i, &cols);
+        if distinct {
+            i = Self::distinct(i);
+        }
         let key_cols = keys
             .iter()
             .map(|(v, asc)| {
@@ -1723,18 +1880,18 @@ impl C {
         let mut cs = Vec::new();
         conjuncts(expr, &mut cs);
         let mut plain: Vec<Expression> = Vec::new();
-        let mut exists: Vec<(GP, MatchMode)> = Vec::new();
+        let mut exists: Vec<(&GP, MatchMode)> = Vec::new();
         // conjuncts evaluated by substitution: a correlated EXISTS, and an EXISTS inside
         // an expression
         let mut correlated: Vec<Expression> = Vec::new();
         for c in cs {
-            match &c {
-                Expression::Exists(p) => exists.push(((**p).clone(), MatchMode::Exists)),
+            match c {
+                Expression::Exists(p) => exists.push((p.as_ref(), MatchMode::Exists)),
                 Expression::Not(e) if matches!(**e, Expression::Exists(_)) => {
                     let Expression::Exists(p) = &**e else {
                         unreachable!()
                     };
-                    exists.push(((**p).clone(), MatchMode::NotExists));
+                    exists.push((p.as_ref(), MatchMode::NotExists));
                 }
                 e if has_exists(e) => {
                     if !matches!(scope, Scope::Default) {
@@ -1745,9 +1902,9 @@ impl C {
                             None,
                         );
                     }
-                    correlated.push(c);
+                    correlated.push(c.clone());
                 }
-                _ => plain.push(c),
+                _ => plain.push(c.clone()),
             }
         }
         let mut node = self.compile(inner, scope);
@@ -1768,8 +1925,9 @@ impl C {
         }
         for (p, mode) in exists {
             // join semantics equal substitution only when the pattern shares nothing but
-            // variables both sides always bind, its expressions read only its own, and
-            // no path of it that matches the empty path ends at an outer variable
+            // variables both sides always bind, its expressions read only its own, no
+            // path of it that matches the empty path ends at an outer variable, and no
+            // LIMIT/OFFSET slice inside it mentions an outer variable
             let outer: Vec<String> = node
                 .schema
                 .iter()
@@ -1778,25 +1936,29 @@ impl C {
             let mut own: Vec<String> = Vec::new();
             p.on_in_scope_variable(|v| own.push(v.as_str().to_string()));
             let mut all = Vec::new();
-            mentioned(&p, &mut all);
+            mentioned(p, &mut all);
             let free_outer = all.iter().any(|v| !own.contains(v) && outer.contains(v));
             let mut ends = Vec::new();
-            nullable_ends(&p, &mut ends);
+            nullable_ends(p, &mut ends);
             let nullable_outer = ends.iter().any(|v| outer.contains(v));
-            let right = self.compile(&p, scope);
+            let slice_outer = slice_uses_outer(p, &outer);
+            let mark = self.native_patterns.len();
+            let right = self.compile(p, scope);
             let shared_ok = right.schema.iter().all(|v| {
                 !node.schema.contains(v) || (node.certain.contains(v) && right.certain.contains(v))
             });
             if free_outer
                 || !shared_ok
                 || nullable_outer
+                || slice_outer
                 || right.has_recompute() && matches!(scope, Scope::Var(_))
             {
+                self.native_patterns.truncate(mark);
                 // substitution semantics: the engine evaluates the pattern per row
                 if !matches!(scope, Scope::Default) {
                     return self.recompute(gp, scope, "a correlated EXISTS under GRAPH", None);
                 }
-                let e = Expression::Exists(Box::new(p));
+                let e = Expression::Exists(Box::new(p.clone()));
                 correlated.push(match mode {
                     MatchMode::Exists => e,
                     _ => Expression::Not(Box::new(e)),
@@ -1953,6 +2115,7 @@ pub fn compile(q: &Query, whole: Option<&str>) -> Result<Compiled> {
         vars: Vec::new(),
         index: FxHashMap::default(),
         hidden: 0,
+        native_patterns: Vec::new(),
     };
     let mut footprint = Footprint::default();
     footprint_of(pattern, &Scope::Default, &mut footprint);
@@ -2052,5 +2215,8 @@ pub fn compile(q: &Query, whole: Option<&str>) -> Result<Compiled> {
         base,
         pattern: pattern.clone(),
         dataset: dataset.cloned(),
+        rebuild_patterns: ViewPatterns {
+            native: c.native_patterns.into_iter().collect(),
+        },
     })
 }

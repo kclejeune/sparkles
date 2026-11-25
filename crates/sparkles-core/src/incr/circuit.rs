@@ -4,7 +4,7 @@
 use super::compile::{Compiled, Kind};
 use super::footprint::{Footprint, Resolved};
 use super::inference::{Inference, InferredFootprint};
-use super::ops::{Node, PlanNode};
+use super::ops::{Node, Op, PlanNode};
 use super::pass::{Pass, PassStats, Vis};
 use super::persist::{Reader, Writer};
 use super::prov::{self, AChanges, AnnMap, Annotation, FactCache, FactKey, Provenance};
@@ -13,10 +13,12 @@ use super::zset::{Changes, Row, ZSet, consolidate};
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
 use crate::id::Id;
+use crate::sparql::viewsvc::{PublishedBytes, ViewPatterns, ViewTable, ViewVersion};
 use crate::store::{ChangesOptions, Snapshot, Store};
 use crate::task::Control;
 use oxrdf::Term;
 use rustc_hash::FxHashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 
 /// The most net changes a pass applies; more are cheaper to evaluate from scratch.
@@ -260,6 +262,8 @@ pub enum Advance {
 pub struct Circuit {
     pub kind: Kind,
     pub vars: Vec<String>,
+    pub(crate) template_columns: Option<Arc<[String]>>,
+    pub(crate) rebuild_patterns: Option<Arc<ViewPatterns>>,
     pub root: Node,
     pub footprint: Footprint,
     resolved: Option<Resolved>,
@@ -291,6 +295,10 @@ pub struct Circuit {
     /// such as an internal circuit's accumulator, sets it to `false`: the result then
     /// stays empty, and the operators keep only the state they need.
     pub keep_result: bool,
+    /// The latest immutable shared view version, replaced whenever a pass updates the
+    /// result so streaming cursors read without holding the circuit's lock.
+    pub(crate) version: Option<Arc<ViewVersion>>,
+    pub(crate) version_pool: Option<Arc<AtomicU64>>,
     /// the annotation the circuit keeps besides the weights (spec F13 §5)
     prov: Provenance,
     /// the annotations of the result's rows
@@ -317,8 +325,26 @@ impl Circuit {
     /// commit.
     pub fn new(c: Compiled, access: Option<Arc<GraphAccess>>) -> Circuit {
         let access = access.map(|a| a.settled());
+        let template_columns = if let Op::Distinct(distinct) = &c.root.op
+            && let Op::Template(template) = &distinct.inner.op
+            && template.has_blanks()
+        {
+            Some(
+                template
+                    .inner
+                    .schema
+                    .iter()
+                    .map(|&i| c.vars[i as usize].clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
         Circuit {
             kind: c.kind,
+            template_columns,
+            rebuild_patterns: (!c.rebuild_patterns.native.is_empty())
+                .then(|| Arc::new(c.rebuild_patterns)),
             vars: c.vars,
             root: c.root,
             footprint: c.footprint,
@@ -337,6 +363,8 @@ impl Circuit {
             dataset: c.dataset,
             inferred: InferredFootprint::default(),
             keep_result: true,
+            version: None,
+            version_pool: None,
             prov: Provenance::None,
             ann: AnnMap::default(),
             facts: FactCache::default(),
@@ -546,8 +574,164 @@ impl Circuit {
         self.root.bytes()
             + self.result.bytes(self.root.schema.len())
             + self.terms.bytes()
+            + self.version.as_ref().map_or(0, |v| {
+                v.retained_bytes()
+                    .saturating_sub(v.terms.key_storage_bytes())
+            })
             + prov::map_bytes(&self.ann, self.root.schema.len())
             + self.facts.bytes()
+    }
+
+    /// Build a flat immutable [`ViewTable`] from the current result (in window order when
+    /// the query orders it).
+    fn build_view_table(&self) -> ViewTable {
+        let width = self.root.schema.len();
+        if let Some((w, cols)) = self.root.result_window()
+            && w.positions
+        {
+            let rows = w.rows();
+            let mut ids = Vec::with_capacity(rows.len() * width);
+            let mut weights = Vec::with_capacity(rows.len());
+            let mut total_rows = 0u64;
+            for (r, n) in rows {
+                if n > 0 {
+                    match cols {
+                        None => ids.extend_from_slice(&r),
+                        Some(cols) => {
+                            ids.extend(cols.iter().map(|c| c.map_or(Id::UNDEF, |i| r[i])));
+                        }
+                    }
+                    weights.push(n);
+                    total_rows = total_rows.saturating_add(n as u64);
+                }
+            }
+            return ViewTable {
+                width,
+                ids,
+                weights,
+                total_rows,
+                published: None,
+            };
+        }
+        let mut ids = Vec::with_capacity(self.result.len() * width);
+        let mut weights = Vec::with_capacity(self.result.len());
+        let mut total_rows = 0u64;
+        for (r, w) in self.result.iter() {
+            if w > 0 {
+                ids.extend_from_slice(r);
+                weights.push(w);
+                total_rows = total_rows.saturating_add(w as u64);
+            }
+        }
+        ViewTable {
+            width,
+            ids,
+            weights,
+            total_rows,
+            published: None,
+        }
+    }
+
+    fn publish_fresh_version(&mut self) {
+        self.publish_version(false);
+    }
+
+    fn publish_updated_version(&mut self, remapped: bool) {
+        self.publish_version(!remapped);
+    }
+
+    fn publish_version(&mut self, reuse_terms: bool) {
+        let Some(snap) = self.snap.clone().filter(|_| self.keep_result) else {
+            self.version = None;
+            return;
+        };
+        let pool = self.version_pool.as_ref();
+        let (columns, published_columns) = if let Some(prev) = &self.version {
+            (prev.columns.clone(), prev.published_columns.clone())
+        } else {
+            let columns: Arc<[String]> = self.columns().into();
+            let bytes = columns.len() * std::mem::size_of::<String>()
+                + columns.iter().map(String::capacity).sum::<usize>()
+                + 32
+                + std::mem::size_of::<PublishedBytes>();
+            (
+                columns,
+                pool.map(|p| Arc::new(PublishedBytes::new(p, bytes as u64))),
+            )
+        };
+        let terms = match self.version.as_ref() {
+            Some(prev) if reuse_terms && prev.terms.len() == self.terms.key_count() => {
+                prev.terms.clone()
+            }
+            _ => {
+                let mut terms = self.terms.snapshot_in(pool);
+                terms.published = pool.map(|p| PublishedBytes::new(p, terms.table_bytes() + 16));
+                Arc::new(terms)
+            }
+        };
+        let mut table = self.build_view_table();
+        table.published = pool.map(|p| PublishedBytes::new(p, table.retained_bytes() + 16));
+        let published = self.version_charge();
+        self.version = Some(Arc::new(ViewVersion {
+            columns,
+            commit: self.applied,
+            snap,
+            terms,
+            table: Arc::new(table),
+            evaluated_under: None,
+            published,
+            published_columns,
+        }));
+    }
+
+    fn version_charge(&self) -> Option<Arc<PublishedBytes>> {
+        self.version_pool.as_ref().map(|p| {
+            Arc::new(PublishedBytes::new(
+                p,
+                (std::mem::size_of::<ViewVersion>()
+                    + 16
+                    + std::mem::size_of::<PublishedBytes>()
+                    + 16) as u64,
+            ))
+        })
+    }
+
+    pub(crate) fn set_version_pool(&mut self, pool: Option<Arc<AtomicU64>>) {
+        self.version_pool = pool;
+        self.version = None;
+        if self.version_pool.is_some() && self.snap.is_some() {
+            self.publish_fresh_version();
+        }
+    }
+
+    /// Advance the version's commit and snapshot without copying rows or terms.
+    fn bump_version(&mut self, commit: u64, snap: Arc<Snapshot>) {
+        if !self.keep_result {
+            self.version = None;
+            return;
+        }
+        if let Some(prev) = self.version.as_ref() {
+            let mut version = (**prev).clone();
+            version.commit = commit;
+            version.snap = snap;
+            version.published = self.version_charge();
+            self.version = Some(Arc::new(version));
+        } else {
+            self.publish_fresh_version();
+        }
+    }
+
+    /// Update the published commit after checkpoint recovery.
+    pub(crate) fn set_applied(&mut self, commit: u64) {
+        self.applied = commit;
+        if let Some(snap) = &self.snap
+            && self
+                .version
+                .as_ref()
+                .is_none_or(|version| version.commit != commit)
+        {
+            self.bump_version(commit, snap.clone());
+        }
     }
 
     fn pass<'a>(
@@ -639,6 +823,7 @@ impl Circuit {
         self.applied = snap.commit;
         self.snap = Some(snap);
         self.last = stats;
+        self.publish_fresh_version();
         Ok(())
     }
 
@@ -678,6 +863,7 @@ impl Circuit {
         self.snap = Some(snap.clone());
         self.resolved = None;
         self.inferred = InferredFootprint::default();
+        self.publish_fresh_version();
         Ok(())
     }
 
@@ -725,14 +911,17 @@ impl Circuit {
         if !d.complete {
             return Ok(Advance::Reset(self.reset(d, control)?));
         }
+        let mut remapped = false;
         if let Some(prev) = self.snap.clone() {
             if prev.generation.uid != snap.generation.uid {
                 self.remap(&prev, &snap)?;
+                remapped = true;
             } else if snap.dvocab_len > prev.dvocab_len
                 && !self.terms.absorbed(&snap, prev.dvocab_len).is_empty()
             {
                 // the store now holds terms the circuit kept as local ids
                 self.remap(&prev, &snap)?;
+                remapped = true;
             }
         }
         let vis = Vis::new(self.access.as_ref(), &snap);
@@ -756,8 +945,14 @@ impl Circuit {
                 _ => d.added.is_empty() && d.removed.is_empty(),
             };
             if skip {
-                self.applied = snap.commit;
-                self.snap = Some(snap);
+                let commit = snap.commit;
+                self.applied = commit;
+                self.snap = Some(snap.clone());
+                if remapped {
+                    self.set_applied(commit);
+                } else {
+                    self.bump_version(commit, snap);
+                }
                 return Ok(Advance::Skipped);
             }
             let old = d.old()?;
@@ -771,9 +966,15 @@ impl Circuit {
                 self.result.apply(&out);
             }
             self.absorb(ann);
-            self.applied = snap.commit;
-            self.snap = Some(snap);
+            let commit = snap.commit;
+            self.applied = commit;
+            self.snap = Some(snap.clone());
             self.last = stats;
+            if out.is_empty() && !remapped && !self.ordered() {
+                self.bump_version(commit, snap);
+            } else {
+                self.publish_updated_version(remapped);
+            }
             return Ok(Advance::Changed(out));
         }
         let (added, removed): (Vec<[Id; 4]>, Vec<[Id; 4]>) = if vis.everything() {
@@ -801,8 +1002,14 @@ impl Circuit {
             .expect("resolved above")
             .touches(added.iter().chain(removed.iter()));
         if !touched {
-            self.applied = snap.commit;
-            self.snap = Some(snap);
+            let commit = snap.commit;
+            self.applied = commit;
+            self.snap = Some(snap.clone());
+            if remapped {
+                self.set_applied(commit);
+            } else {
+                self.bump_version(commit, snap);
+            }
             return Ok(Advance::Skipped);
         }
         let old = d.old()?;
@@ -814,9 +1021,15 @@ impl Circuit {
             self.result.apply(&out);
         }
         self.absorb(ann);
-        self.applied = snap.commit;
-        self.snap = Some(snap);
+        let commit = snap.commit;
+        self.applied = commit;
+        self.snap = Some(snap.clone());
         self.last = stats;
+        if out.is_empty() && !remapped && !self.ordered() {
+            self.bump_version(commit, snap);
+        } else {
+            self.publish_updated_version(remapped);
+        }
         Ok(Advance::Changed(out))
     }
 

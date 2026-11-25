@@ -1245,7 +1245,7 @@ run the eager kernel through `execute_with_inputs` or `execute_owned`, so the me
 move them. EXPLAIN gives each operator a reason that names what it reads whole or what
 bounds its answer.
 
-The strict policy refuses the unbounded forms, which are a SERVICE, a view read, a
+The strict policy originally refused the unbounded forms, which included SERVICE and view reads, a
 spatial scan or relation over constants, a search without a bound, a path search between
 constants without a limit, a spatial join, a property function over constants and a
 registered property function without prefix output. They are the second part of the item, whose [readers](#streamed-service-text-and-history-readers) serve a SERVICE without SILENT, a text search without a bound and a history query without a limit. Automatic execution keeps its base
@@ -1398,10 +1398,25 @@ multiset, `pathIndex` numbering, per-node search counters and work counts at eve
 size while allowing row order across group rows that share an endpoint to vary when no
 `ORDER BY` is present.
 
-View reads stay refused under the strict policy, since a view's result is decoded under
-its lock against the circuit's latest pass, and [item 1121](../../ROADMAP.md) keeps a
-versioned result that a cursor can page through. The inventory test
-`cursor_inventory.rs` lists every form as native or refused with its decision or row.
+A maintained view read streams from the immutable version published by its circuit.
+Current and stale readers release the circuit lock after taking a reference. A published
+row table and frozen term table count toward the view memory pool while readers still
+hold them. A local term key has one charge across the circuit and all frozen tables that
+share its backing. When the circuit has advanced
+within the retained history, the reader admits and folds history slices and applies the
+net change while streaming the shared table.
+
+When history has expired or the reader asks for another aggregate-errors reading, a
+child query runs under the caller's memory, row-work, spill, cancellation and deadline
+controls. Rebuilds admit the principal's permission mask before allocating it. The child
+retains the mask's charge and releases temporary planning credit before it streams.
+SELECT rebuilds preserve the maintained treatment of each REDUCED occurrence. CONSTRUCT
+rebuilds use the maintained VALUES terms for template blank-node identity and charge
+distinct graph state as the graph streams. Strict policy also
+applies inside the child. A custom source that only implements eager view reads requires
+the permissive policy. The cursor inventory and heap audit cover the maintained readers.
+The inventory test `cursor_inventory.rs` lists every form as native or refused with
+its decision or row.
 
 Tests compare each reader with eager answers at batch sizes down to one row, refuse the
 budget and row limits where eager execution refuses, measure each reader's heap against

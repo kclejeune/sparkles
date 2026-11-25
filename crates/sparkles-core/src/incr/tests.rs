@@ -1301,3 +1301,23 @@ fn a_view_asks_a_correlated_exists_for_its_first_solution() {
     step(&s, &mut c);
     assert_eq!(result(&c).len(), 2);
 }
+
+#[test]
+fn exists_with_ordered_reduced_slice_on_shared_var_matches_oracle() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, &format!("{PREFIX}INSERT DATA {{ :a :p 1 . :b :p 2 }}")).unwrap();
+    for q in [
+        "SELECT ?x WHERE { ?s :p ?x FILTER EXISTS { { SELECT REDUCED ?x WHERE { VALUES ?x { 1 2 2 } } ORDER BY ?x LIMIT 1 OFFSET 1 } } }",
+        "SELECT ?x WHERE { ?s :p ?x FILTER NOT EXISTS { { SELECT REDUCED ?x WHERE { VALUES ?x { 1 2 2 } } ORDER BY ?x LIMIT 1 OFFSET 1 } } }",
+        "SELECT ?x WHERE { ?s :p ?x FILTER EXISTS { { SELECT DISTINCT ?x WHERE { VALUES ?x { 1 2 2 } } ORDER BY ?x LIMIT 1 OFFSET 1 } } }",
+    ] {
+        let mut c = circuit(&s, q);
+        check(&s, &c, q, "after build");
+        upd(&s, &format!("{PREFIX}INSERT DATA {{ :c :p 3 }}")).unwrap();
+        step(&s, &mut c);
+        check(&s, &c, q, "after insert");
+        upd(&s, &format!("{PREFIX}DELETE DATA {{ :b :p 2 }}")).unwrap();
+        step(&s, &mut c);
+        check(&s, &c, q, "after delete");
+    }
+}

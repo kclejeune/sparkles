@@ -401,6 +401,13 @@ fn allowance(name: &str) -> Allowance {
             under: 64 * K,
             ..exact
         },
+        // item 1184: a rebuilt SELECT view streams through a child cursor whose in-memory
+        // leaf scan charges for blocks the in-memory store never allocates
+        "view rebuilt" => Allowance {
+            over: 256 * K,
+            peak: 256 * K,
+            ..exact
+        },
         _ => exact,
     }
 }
@@ -696,6 +703,147 @@ fn the_text_reader_holds_its_ledger_and_no_more() {
         print("text", if granted { "granted" } else { "local" }, &a);
         assert!(a.rows > 0);
         found.extend(a.check("text", &allowance("text")));
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// The view reader (item 1121), over current, stale, history-rewound and rebuilt reads.
+#[test]
+fn the_view_reader_holds_its_ledger_and_no_more() {
+    use sparkles_core::incr::{OpenHost, Runtime, RuntimeOptions, ViewDef};
+    use sparkles_core::sparql::FallbackPolicy;
+
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..2000 {
+        data.push_str(&format!("<urn:s:{i}> <urn:p> \"val-{i}\" .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    rt.set_host(Arc::new(OpenHost));
+    rt.put(
+        &s,
+        "items",
+        ViewDef::table("SELECT ?s ?o WHERE { ?s <urn:p> ?o }"),
+    )
+    .unwrap();
+    rt.round(&s);
+    let snap_base = s.snapshot();
+
+    let run_view = |snap: &Arc<sparkles_core::store::Snapshot>,
+                    q: &str,
+                    granted: bool,
+                    batch: usize|
+     -> Audit {
+        heap::audit(|| {
+            let pool = QueryPool::new(1 << 40);
+            let opts = QueryOptions {
+                no_cache: true,
+                max_memory_bytes: Some(256 << 20),
+                grant: granted.then(|| Arc::new(pool.try_grant(0).unwrap())),
+                views: Some(rt.clone()),
+                ..Default::default()
+            };
+            let cursor = CursorOptions {
+                batch_rows: batch,
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            };
+            select_cursor(snap.clone(), q, &opts, &cursor).unwrap()
+        })
+    };
+
+    let q_cur = "PREFIX view: <urn:x-sparkles:view#> SELECT ?s ?o ?c { SERVICE view:read { [] view:name \"items\" ; view:bind ?s, ?o ; view:commit ?c } }";
+    let q_stale = "PREFIX view: <urn:x-sparkles:view#> SELECT ?s ?o ?c { SERVICE view:read { [] view:name \"items\" ; view:bind ?s, ?o ; view:commit ?c ; view:allowStale true } }";
+
+    let mut found = Vec::new();
+    // 1) Current shared read.
+    for granted in [false, true] {
+        for batch in [64, 4096] {
+            let mut a = run_view(&snap_base, q_cur, granted, batch);
+            for _ in 0..2 {
+                a = run_view(&snap_base, q_cur, granted, batch);
+            }
+            print(
+                "view current",
+                &format!("{}/{batch}", if granted { "granted" } else { "local" }),
+                &a,
+            );
+            assert_eq!(a.rows, 2000);
+            found.extend(a.check("view current", &allowance("view")));
+        }
+    }
+    // 2) History rewind read (view ahead within history).
+    let mut del = String::from("DELETE DATA { ");
+    for i in 0..200 {
+        del.push_str(&format!("<urn:s:{i}> <urn:p> \"val-{i}\" . "));
+    }
+    del.push('}');
+    update(&s, &del, &QueryOptions::default()).unwrap();
+    rt.round(&s);
+    // Stale read ahead of snap_base before introducing new terms.
+    for granted in [false, true] {
+        let mut a = run_view(&snap_base, q_stale, granted, 256);
+        for _ in 0..2 {
+            a = run_view(&snap_base, q_stale, granted, 256);
+        }
+        print("view stale", if granted { "granted" } else { "local" }, &a);
+        assert_eq!(a.rows, 1800);
+        found.extend(a.check("view stale", &allowance("view")));
+    }
+    let snap_before_add = s.snapshot();
+    let mut add = String::from("INSERT DATA { ");
+    for i in 0..200 {
+        add.push_str(&format!(
+            "<urn:added:{i}> <urn:p> \"{}-{i}\" . ",
+            "added".repeat(20)
+        ));
+    }
+    add.push('}');
+    update(&s, &add, &QueryOptions::default()).unwrap();
+    rt.round(&s);
+    for (label, snap, rows) in [
+        ("view history (mixed)", &snap_base, 2000),
+        ("view history (inserts)", &snap_before_add, 1800),
+    ] {
+        for granted in [false, true] {
+            let mut a = run_view(snap, q_cur, granted, 256);
+            for _ in 0..2 {
+                a = run_view(snap, q_cur, granted, 256);
+            }
+            print(label, if granted { "granted" } else { "local" }, &a);
+            assert_eq!(a.rows, rows);
+            found.extend(a.check(label, &allowance("view")));
+        }
+    }
+    // 4) Rebuilt read (history expired > 16 commits).
+    for i in 0..18 {
+        update(
+            &s,
+            &format!("INSERT DATA {{ <urn:e:{i}> <urn:p> \"e-{i}\" }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        rt.round(&s);
+    }
+    for granted in [false, true] {
+        let mut a = run_view(&snap_base, q_cur, granted, 256);
+        for _ in 0..2 {
+            a = run_view(&snap_base, q_cur, granted, 256);
+        }
+        print(
+            "view rebuilt",
+            if granted { "granted" } else { "local" },
+            &a,
+        );
+        assert_eq!(a.rows, 2000);
+        found.extend(a.check("view rebuilt", &allowance("view rebuilt")));
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
 }
@@ -1353,4 +1501,42 @@ fn native_path_search_1122_1123_forms_hold_exact_ledger() {
         }
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+#[test]
+fn a_rebuilt_construct_does_not_build_its_whole_circuit_for_one_row() {
+    use sparkles_core::incr::{OpenHost, Runtime, RuntimeOptions, ViewDef};
+    use sparkles_core::sparql::{AggregateErrors, FallbackPolicy};
+    let _serial = heap::serial();
+    let s = store(12_000);
+    let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+    rt.set_host(Arc::new(OpenHost));
+    rt.put(
+        &s,
+        "graph",
+        ViewDef::table("CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }"),
+    )
+    .unwrap();
+    rt.round(&s);
+    let snap = s.snapshot();
+    let opts = QueryOptions {
+        views: Some(rt),
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        max_memory_bytes: Some(1 << 20),
+        pool: Some(QueryPool::new(1 << 20)),
+        no_cache: true,
+        ..Default::default()
+    };
+    let cursor = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let q = "PREFIX view: <urn:x-sparkles:view#> SELECT ?subject { SERVICE view:read { [] view:name \"graph\" ; view:bind ?subject } } LIMIT 1";
+    let (rows, peak) = heap::peak(|| {
+        let mut c = select_cursor(snap, q, &opts, &cursor).unwrap();
+        c.next_batch().unwrap().unwrap().len()
+    });
+    assert_eq!(rows, 1);
+    assert!(peak < 1 << 20, "the first pull allocated {peak} bytes");
 }

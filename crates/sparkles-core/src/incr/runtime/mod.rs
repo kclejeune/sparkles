@@ -22,7 +22,10 @@ use super::views::{self, ViewDef, ViewInfo, ViewState};
 use super::zset::Changes;
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
-use crate::sparql::viewsvc::{ViewRead, ViewRows, ViewSource};
+use crate::sparql::viewsvc::{
+    OpenedView, RewoundView, ViewOpen, ViewRead, ViewRebuild, ViewRows, ViewSource, ViewVersion,
+    row_retained_bytes,
+};
 use crate::store::definitions::{self, DefinitionFile, DefinitionSource};
 use crate::store::{DeltaSubscription, Store};
 use crate::task::Control;
@@ -62,6 +65,16 @@ pub(crate) use cell::{Cell, Slot};
 use internal::InternalCell;
 pub use internal::InternalCircuit;
 pub use key::{access_fingerprint, covers, whole_reason};
+#[cfg(test)]
+pub(crate) fn checkpoint_fingerprint_for_compiler(compiler: &str, q: &Query, text: &str) -> u64 {
+    let key = key::key_with_compiler(compiler, q, text, None, None);
+    let mut h = Sha256::new();
+    h.update(key.to_le_bytes());
+    h.update(b"\0aggregate-errors\0");
+    let errors = crate::sparql::AggregateErrors::default();
+    h.update(errors.as_str().as_bytes());
+    u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
+}
 use stats::Counters;
 pub use stats::{RuntimeStats, ViewStat};
 pub use worker::WorkerPause;
@@ -181,6 +194,7 @@ pub struct Runtime {
     live_total: Arc<AtomicUsize>,
     live_by: Arc<Mutex<FxHashMap<String, usize>>>,
     counters: Counters,
+    published_views: Arc<AtomicU64>,
     last_checkpoint: Mutex<Instant>,
     closed: AtomicBool,
     /// the host's epoch the attached views resolved their principals under
@@ -226,6 +240,7 @@ impl Runtime {
             live_total: Arc::new(AtomicUsize::new(0)),
             live_by: Default::default(),
             counters: Counters::default(),
+            published_views: Arc::new(AtomicU64::new(0)),
             last_checkpoint: Mutex::new(Instant::now()),
             closed: AtomicBool::new(false),
             host_epoch: AtomicU64::new(0),
