@@ -279,7 +279,7 @@ pub(super) enum FloorMaskPlan {
 /// The first table is sized from an estimate of the distinct repeating strings in the
 /// first eligible mask (or [`FLOOR_TABLE_FIRST`] for direct callers), clamped to the
 /// vocabulary's strings and the cache's cap. A mask asks before each part of its rows
-/// whether the table should grow ([`Ctx::grow_floor_cache`]), which it does when its
+/// whether the table should grow or pause ([`Ctx::begin_floor_mask`]), growing when its
 /// estimate of the floors it evicted that had been read again passes
 /// [`FLOOR_TABLE_EVICTIONS`]. A query whose strings rarely repeat, whose evictions cost
 /// nothing, therefore keeps its first table, and while the table's hit rate stays below
@@ -326,9 +326,12 @@ struct FloorTables {
     full: bool,
     /// saved initial slot estimate when the first eligible mask deferred table allocation
     deferred_slots: usize,
+    /// remaining lookups before a freshly pre-sized table (`len > FLOOR_TABLE_FIRST`)
+    /// is evaluated for low-hit-rate bypass
+    warmup_lookups: usize,
     /// whether low hit rate has currently paused floor-table use
     bypass: bool,
-    /// consecutive bypassed masks since the last floor probe
+    /// consecutive bypassed masks or parts since the last floor probe
     bypass_streak: u32,
 }
 
@@ -418,6 +421,13 @@ impl FloorTable {
         }
         let delta = (word >> 1) & self.none;
         Some((delta != self.none).then(|| p - delta))
+    }
+
+    /// Read-only cache lookup: `Some(Some(floor))` on a simple-literal hit, `Some(None)`
+    /// on a cached non-simple literal, `None` on a miss.
+    #[inline]
+    pub(super) fn get_cached(&self, p: u64) -> Option<Option<u64>> {
+        self.decode(p, self.slot(p).load(Ordering::Relaxed))
     }
 
     /// The floor of `p`, when the table holds it (for tests).
@@ -2408,8 +2418,29 @@ impl Ctx {
     /// `f` of the key of base vocabulary id `id`, with its reconstruction and its
     /// decoding inside the envelope. A refusal records a failure and gives `None`.
     #[inline]
-    fn with_vocab_key<T>(&self, id: u64, f: impl FnMut(&[u8]) -> T) -> Option<T> {
-        self.with_vocab_key_in(id, &mut Vec::new(), f)
+    fn with_vocab_key<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
+        if !self.envelope_refuses() {
+            return self
+                .snap
+                .generation
+                .vocab
+                .get_with(id, |k| self.reserve_decode(k.len()).then(|| f(k)))
+                .flatten();
+        }
+        if self.check_memory_failure().is_err() {
+            return None;
+        }
+        match self.snap.generation.vocab.get_with_checked(
+            id,
+            |need| self.reserve_decode_checked(need),
+            |k| f(k),
+        ) {
+            Ok(found) => found,
+            Err(error) => {
+                self.fail_memory(&error);
+                None
+            }
+        }
     }
 
     /// [`Ctx::with_vocab_key`] reusing the caller's scratch buffer across calls.
@@ -3783,13 +3814,10 @@ impl Ctx {
     pub(super) fn floor_map_for(&self, first_slots: usize) -> FloorMap<'_> {
         let mut tables = self.floors.tables.lock();
         if tables.cur.is_none() && !tables.full {
-            #[cfg(test)]
             let first = match self.floors.first_slots.load(Ordering::Relaxed) {
                 0 => first_slots,
                 slots => slots,
             };
-            #[cfg(not(test))]
-            let first = first_slots;
             self.install_floor_table(&mut tables, first);
             self.floors.initialized.store(true, Ordering::Release);
         }
@@ -3843,6 +3871,11 @@ impl Ctx {
             let first = slots;
             if worth_caching {
                 self.install_floor_table(&mut tables, first);
+                if let Some(cur) = &tables.cur
+                    && cur.len() > FLOOR_TABLE_FIRST
+                {
+                    tables.warmup_lookups = cur.len() / 2;
+                }
                 self.floors.initialized.store(true, Ordering::Release);
                 return FloorMaskPlan::Floors(tables.cur.clone());
             }
@@ -3857,6 +3890,17 @@ impl Ctx {
         self.begin_floor_mask_locked(&mut tables)
     }
 
+    /// Inspect the current floor mode and table without advancing growth or bypass state,
+    /// so a subsequent mask can validate its sample before mutating [`FloorCache`].
+    pub(super) fn peek_floor_plan(&self) -> FloorMaskPlan {
+        let tables = self.floors.tables.lock();
+        if tables.bypass {
+            FloorMaskPlan::Direct
+        } else {
+            FloorMaskPlan::Floors(tables.cur.clone())
+        }
+    }
+
     /// Choose whether the next mask or eager part runs against the shared floor table
     /// (growing it when read-again evictions crossed the threshold) or bypasses the table
     /// for direct key comparison while its hit rate stays low.
@@ -3869,17 +3913,25 @@ impl Ctx {
         if !tables.bypass {
             if tables.cur.is_some() {
                 let grew = self.maybe_grow_floor_table(tables);
-                if !grew && let Some(cur) = &tables.cur {
+                if grew {
+                    tables.warmup_lookups = 0;
+                } else if let Some(cur) = &tables.cur {
                     let lookups = cur.lookups.swap(0, Ordering::Relaxed);
                     let hits = cur.hits.swap(0, Ordering::Relaxed);
-                    if lookups >= FLOOR_BYPASS_MIN_LOOKUPS
-                        && hits.saturating_mul(FLOOR_BYPASS_HIT_DENOM) < lookups
-                    {
-                        tables.bypass = true;
-                        tables.bypass_streak = 1;
-                        #[cfg(test)]
-                        self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
-                        return FloorMaskPlan::Direct;
+                    if lookups >= FLOOR_BYPASS_MIN_LOOKUPS {
+                        let low_hit = hits.saturating_mul(FLOOR_BYPASS_HIT_DENOM) < lookups;
+                        if !low_hit {
+                            tables.warmup_lookups = 0;
+                        } else if tables.warmup_lookups > lookups {
+                            tables.warmup_lookups -= lookups;
+                        } else {
+                            tables.warmup_lookups = 0;
+                            tables.bypass = true;
+                            tables.bypass_streak = 1;
+                            #[cfg(test)]
+                            self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+                            return FloorMaskPlan::Direct;
+                        }
                     }
                 }
             }
@@ -3911,15 +3963,6 @@ impl Ctx {
             cur.hits.store(0, Ordering::Relaxed);
         }
         FloorMaskPlan::Floors(tables.cur.clone())
-    }
-
-    /// Grow the floor table between parts of one large eager mask when read-again evictions
-    /// crossed the threshold, returning the current table snapshot without evaluating the
-    /// mid-table warm-up hit rate against the per-mask bypass threshold.
-    pub(super) fn grow_floor_table_snapshot(&self) -> Option<Arc<FloorTable>> {
-        let mut tables = self.floors.tables.lock();
-        let _ = self.maybe_grow_floor_table(&mut tables);
-        tables.cur.clone()
     }
 
     /// Replace the floor cache's table by a larger one when the floors it evicted that
@@ -5828,6 +5871,92 @@ mod charge_tests {
             assert!(
                 matches!(ctx.check(), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
                 "{codec:?}: left decode refusal must be recorded"
+            );
+            drop(held);
+        }
+    }
+
+    #[test]
+    fn cursor_fsst_lookup_succeeds_when_optional_room_is_refused() {
+        use oxrdf::Literal;
+
+        let pad = "alpha_beta_gamma_delta_".repeat(6);
+        let literals: Vec<oxrdf::Term> = (0..160u32)
+            .map(|i| Literal::new_simple_literal(format!("m{i:04}-{pad}tail")).into())
+            .collect();
+        let store = store_with_floor_literals(&literals, VocabCodec::Fsst);
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.is_fsst());
+
+        // Pick a verified FSST-coded simple literal whose full vocab key fits in 192 bytes
+        // while `key.len() + 64` exceeds 192 bytes.
+        let (target_term, target_id) = literals
+            .iter()
+            .find_map(|term| {
+                let id = snap.lookup_term(term).unwrap();
+                let p = id.payload();
+                let key = snap.generation.vocab.get(p).unwrap();
+                (key.len() > 128
+                    && key.len() <= 192
+                    && !(p as usize).is_multiple_of(crate::vocab::FC_BLOCK)
+                    && snap.generation.vocab.is_entry_coded(p))
+                .then(|| (term.clone(), id))
+            })
+            .expect("fixture must contain a verified FSST-coded simple literal in (128, 192]");
+
+        // Outside Rayon, `Ctx::decode_workers() == 1`, so 192 bytes needs
+        // `(192 * 8 + 1024) = 2560` bytes while optional 64-byte FSST headroom exceeds it.
+        let room_for_192 = (192u64 * 8 + 1024) * Ctx::decode_workers();
+        // (a) `string_floor_in` via `with_vocab_key_prefix_in`
+        {
+            let mut ctx = Ctx::new(snap.clone());
+            ctx.mem_limit = MIB;
+            ctx.enable_cursor_accounting().unwrap();
+            let held = ctx.charge(MIB - ctx.live_bytes() - room_for_192).unwrap();
+            let mut scratch = FloorScratch::default();
+            assert_eq!(
+                ctx.string_floor_in(target_id, &mut scratch),
+                Some(target_id.payload()),
+                "string_floor_in must succeed when 192-byte scratch fits and extra FSST headroom is refused"
+            );
+            assert!(
+                ctx.check().is_ok(),
+                "string_floor_in must not record a memory failure when required capacity fits"
+            );
+            drop(held);
+        }
+        // (b) `simple_literal_cmp_in` via `with_vocab_key_in`
+        {
+            let mut ctx = Ctx::new(snap.clone());
+            ctx.mem_limit = MIB;
+            ctx.enable_cursor_accounting().unwrap();
+            let held = ctx.charge(MIB - ctx.live_bytes() - room_for_192).unwrap();
+            let mut scratch = FloorScratch::default();
+            assert_eq!(
+                ctx.simple_literal_cmp_in(target_id, target_id, &mut scratch),
+                Some(std::cmp::Ordering::Equal),
+                "simple_literal_cmp_in must succeed when 192-byte scratch fits"
+            );
+            assert!(
+                ctx.check().is_ok(),
+                "simple_literal_cmp_in must not record a memory failure"
+            );
+            drop(held);
+        }
+        // (c) scalar `term` via fresh-buffer `with_vocab_key`
+        {
+            let mut ctx = Ctx::new(snap.clone());
+            ctx.mem_limit = MIB;
+            ctx.enable_cursor_accounting().unwrap();
+            let held = ctx.charge(MIB - ctx.live_bytes() - room_for_192).unwrap();
+            assert_eq!(
+                ctx.term(target_id),
+                Some(target_term.clone()),
+                "scalar term lookup must succeed when 192-byte scratch fits"
+            );
+            assert!(
+                ctx.check().is_ok(),
+                "scalar term lookup must not record a memory failure"
             );
             drop(held);
         }

@@ -1134,6 +1134,23 @@ impl Vocab {
         out
     }
 
+    /// Whether entry `id` is stored with an FSST-coded suffix (for regression tests).
+    #[cfg(test)]
+    pub(crate) fn is_entry_coded(&self, id: u64) -> bool {
+        if id >= self.len || self.fsst.is_none() {
+            return false;
+        }
+        let b = (id as usize) / FC_BLOCK;
+        let want = (id as usize) % FC_BLOCK;
+        let data = self.data.as_slice();
+        let mut pos = self.block_offset_at::<false>(b);
+        let mut e = self.entry::<true>(data, &mut pos, true);
+        for _ in 1..=want {
+            e = self.entry::<true>(data, &mut pos, false);
+        }
+        e.coded
+    }
+
     /// [`Vocab::get_with_shared_prefix`] with scratch admitted before the walk and
     /// every subsequent growth admitted before allocation.
     #[cfg(test)]
@@ -1146,10 +1163,10 @@ impl Vocab {
         self.get_with_shared_prefix_checked_impl::<false, T, E>(id, &mut Vec::new(), reserve, f)
     }
 
-    /// [`Vocab::get_with_shared_prefix_checked`] reusing the caller's scratch buffer
-    /// across calls. Initial scratch capacity and every subsequent growth are admitted
-    /// before allocation, and the reused buffer retains `FSST_ROOM` bytes of room so
-    /// coded suffixes take the branchless fast path.
+    /// [`Vocab::get_with_shared_prefix`] reusing the caller's scratch buffer across calls,
+    /// with initial scratch capacity and every subsequent growth admitted before allocation.
+    /// Preserves the required capacity so optional `FSST_ROOM` headroom never fails a
+    /// lookup that fits in the admitted buffer.
     pub(crate) fn get_with_shared_prefix_checked_in<T, E>(
         &self,
         id: u64,
@@ -1157,7 +1174,7 @@ impl Vocab {
         reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         f: impl FnOnce(Option<usize>, &[u8]) -> T,
     ) -> std::result::Result<Option<T>, E> {
-        self.get_with_shared_prefix_checked_impl::<true, T, E>(id, key, reserve, f)
+        self.get_with_shared_prefix_checked_impl::<false, T, E>(id, key, reserve, f)
     }
 
     #[inline(always)]
@@ -1239,9 +1256,10 @@ impl Vocab {
         self.get_sorted_checked_in::<false, E>(ids, &mut Vec::new(), reserve, f)
     }
 
-    /// With `ROOM`, a coded step always has [`FSST_ROOM`] admitted bytes of room past
-    /// the key, so FSST decodes it with its fast loops. A reused buffer keeps that
-    /// room, and a fresh buffer per call would reallocate for it.
+    /// With `ROOM`, a coded step of at most eight codes prefers [`FSST_ROOM`] admitted
+    /// bytes of room past the key for FSST's branchless loop, falling back to the
+    /// required capacity when extra room is refused. A reused buffer keeps that room, and
+    /// a fresh buffer per call would reallocate for it.
     fn get_sorted_checked_in<const ROOM: bool, E>(
         &self,
         ids: &[u64],
@@ -1436,24 +1454,41 @@ impl Vocab {
                     (nd - e.shared).min(e.most())
                 };
                 let total = key.len().min(e.shared).saturating_add(add);
-                let room = if ROOM && e.coded { FSST_ROOM } else { 0 };
+                let fast_room = e.coded && e.len <= 8;
+                let room = if ROOM && fast_room { FSST_ROOM } else { 0 };
                 if total.saturating_add(room) > cap {
-                    // an FSST suffix decodes fastest with room for eight symbols
-                    // past the key (`fsst::Table::decode_at`). The buffer starts at the
-                    // unchecked decoder's size, so that a block's short keys, each
-                    // decoded up to the next key's shared prefix, do not grow it one
-                    // step at a time.
-                    let total = total
-                        .saturating_add(FSST_ROOM * usize::from(e.coded))
-                        .max(self.scratch_capacity());
-                    reserve(total)?;
-                    key.reserve_exact(total - key.len());
-                    cap = key.capacity();
-                    #[cfg(any(test, feature = "failpoints"))]
-                    crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
-                        "checked-vocab-scratch-allocated",
-                        key.capacity(),
-                    ));
+                    // An FSST suffix of at most eight codes decodes fastest with room for
+                    // eight symbols (`fsst::Table::decode_at`). That headroom is optional:
+                    // if admitting it is refused, fall back to the required capacity (or
+                    // keep the already-admitted buffer when `total <= cap`) so checked
+                    // lookups never fail over optional headroom.
+                    let min_cap = total.max(self.scratch_capacity());
+                    let target = if fast_room {
+                        let preferred =
+                            total.saturating_add(FSST_ROOM).max(self.scratch_capacity());
+                        if reserve(preferred).is_ok() {
+                            Some(preferred)
+                        } else if total > cap {
+                            reserve(min_cap)?;
+                            Some(min_cap)
+                        } else {
+                            None
+                        }
+                    } else {
+                        reserve(min_cap)?;
+                        Some(min_cap)
+                    };
+                    if let Some(target) = target {
+                        key.reserve_exact(target - key.len());
+                        cap = key.capacity();
+                        #[cfg(any(test, feature = "failpoints"))]
+                        crate::algo::observe_projection(
+                            crate::algo::ProjectionEvent::Materialized(
+                                "checked-vocab-scratch-allocated",
+                                key.capacity(),
+                            ),
+                        );
+                    }
                 }
             }
             self.step::<F>(data, e, id, nd, key, true);
@@ -5003,6 +5038,100 @@ mod tests {
             assert_eq!(refused_init, Err(cap));
             assert_eq!(empty_buf.capacity(), 0);
         }
+    }
+
+    #[test]
+    fn checked_fsst_lookup_succeeds_when_optional_room_is_refused() {
+        let mut keys = Vec::new();
+        let mid_pad = "alpha_beta_gamma_delta_".repeat(6);
+        let long_pad = "alpha_beta_gamma_delta_".repeat(9);
+        for i in 0..160u32 {
+            keys.push(format!("\"m{i:04}-{mid_pad}tail\"\x7f").into_bytes());
+        }
+        for i in 0..32u32 {
+            keys.push(format!("\"z-{long_pad}suffix_{i:02}\"\x7f").into_bytes());
+        }
+        keys.sort();
+        keys.dedup();
+
+        let dir = tempfile::tempdir().unwrap();
+        write_codec(dir.path(), &keys, true);
+        let v = Vocab::open(dir.path()).unwrap();
+        assert!(v.is_fsst());
+        let cap = v.scratch_capacity();
+        assert_eq!(cap, 192);
+
+        // (a) A verified FSST-coded entry whose key fits in `cap` (192) while `len + FSST_ROOM`
+        // exceeds `cap`: refusing admissions above `cap` must still succeed.
+        let fit_id = (0..keys.len())
+            .find(|&i| {
+                let len = keys[i].len();
+                len > cap - FSST_ROOM && len <= cap && v.is_entry_coded(i as u64)
+            })
+            .expect("fixture must contain a verified FSST-coded entry in (cap - FSST_ROOM, cap]")
+            as u64;
+        let expected_shared = (!(fit_id as usize).is_multiple_of(FC_BLOCK)).then(|| {
+            keys[fit_id as usize - 1]
+                .iter()
+                .zip(&keys[fit_id as usize])
+                .take_while(|(a, b)| a == b)
+                .count()
+        });
+        let admit_cap = |need: usize| if need <= cap { Ok(()) } else { Err(need) };
+
+        let mut shared_buf = Vec::new();
+        let got_shared = v.get_with_shared_prefix_checked_in(
+            fit_id,
+            &mut shared_buf,
+            admit_cap,
+            |shared, key| (shared, key.to_vec()),
+        );
+        assert_eq!(
+            got_shared,
+            Ok(Some((expected_shared, keys[fit_id as usize].clone()))),
+            "reused checked shared-prefix walk must succeed within admitted required capacity"
+        );
+
+        let mut reused_buf = Vec::new();
+        let got_reused =
+            v.get_with_checked_in(fit_id, &mut reused_buf, admit_cap, |key| key.to_vec());
+        assert_eq!(
+            got_reused,
+            Ok(Some(keys[fit_id as usize].clone())),
+            "reused checked walk must succeed within admitted required capacity"
+        );
+
+        let got_fresh = v.get_with_checked(fit_id, admit_cap, |key| key.to_vec());
+        assert_eq!(
+            got_fresh,
+            Ok(Some(keys[fit_id as usize].clone())),
+            "fresh checked walk must succeed within admitted required capacity"
+        );
+
+        // (b) A verified FSST-coded entry longer than `cap`: admitting exact key length while
+        // refusing `len + FSST_ROOM` must still succeed.
+        let grown_id = (0..keys.len())
+            .find(|&i| keys[i].len() > cap && v.is_entry_coded(i as u64))
+            .expect("fixture must contain a verified FSST-coded entry longer than cap")
+            as u64;
+        let need_len = keys[grown_id as usize].len();
+        let admit_exact = |need: usize| if need <= need_len { Ok(()) } else { Err(need) };
+
+        let mut grown_shared = Vec::new();
+        assert_eq!(
+            v.get_with_shared_prefix_checked_in(
+                grown_id,
+                &mut grown_shared,
+                admit_exact,
+                |_, k| k.to_vec()
+            ),
+            Ok(Some(keys[grown_id as usize].clone()))
+        );
+        let mut grown_reused = Vec::new();
+        assert_eq!(
+            v.get_with_checked_in(grown_id, &mut grown_reused, admit_exact, |k| k.to_vec()),
+            Ok(Some(keys[grown_id as usize].clone()))
+        );
     }
 
     #[test]
