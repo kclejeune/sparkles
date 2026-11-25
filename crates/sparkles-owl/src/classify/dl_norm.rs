@@ -455,6 +455,12 @@ impl Norm<'_, '_> {
             return Ok(TOP);
         };
         let b = self.neg(f, d)?;
+        if self.order {
+            // Committed R2 shadow canonicalization replaces negative existentials and
+            // bridges compound conjunction qualifiers in one pass after all axioms
+            // commit, avoiding any tentative-Out rollback cache hazard.
+            return Ok(b);
+        }
         Ok(match self.it.nodes[b as usize] {
             Node::Conj(..) => {
                 let e = self.named(b);
@@ -1550,27 +1556,47 @@ fn normalize_within(
             _ => None,
         })
         .collect();
-    // a range of r holds of the predecessors of the links that run against r: ∃r⁻.⊤ ⊑ c
+    // a range of r holds of the predecessors of the links that run against r: ∃r⁻.⊤ ⊑ c.
+    // With `order`, emit `⊤ ⊑ ∀r.c` directly so no negative `Node::Exist(r⁻, ⊤)` is
+    // created while preserving the unit range/core path and non-simple unfolding
+    // (item 896, R2).
     let mut back: Vec<(Ex, Ex)> = Vec::new();
     for &(r, c) in &ax.ranges {
-        if let Some(&i) = inv.get(r as usize)
+        if order {
+            if c != TOP {
+                back.push((TOP, it.node(Node::Forall(r, c))));
+            }
+        } else if let Some(&i) = inv.get(r as usize)
             && i != NO_ROLE
         {
             back.push((it.node(Node::Exist(i, TOP)), c));
         }
     }
+    let orig_ranges_len = ax.ranges.len();
     ax.ranges.extend(domains);
     ax.subs.extend(back);
     // a range of a role that a chain reaches holds along the chain's paths too
-    let nonsimple_ranges: Vec<(Role, Ex)> = ax
-        .ranges
+    let nonsimple_start = if order { orig_ranges_len } else { 0 };
+    let nonsimple_ranges: Vec<(Role, Ex)> = ax.ranges[nonsimple_start..]
         .iter()
         .copied()
-        .filter(|&(r, _)| !rb.simple(r))
+        .filter(|&(r, c)| c != TOP && !rb.simple(r))
         .collect();
     for (r, c) in nonsimple_ranges {
         let e = it.node(Node::Forall(r, c));
         ax.subs.push((TOP, e));
+    }
+    if order {
+        shadow_negative(
+            it,
+            ax,
+            &mut all.clauses,
+            &mut all.atmost,
+            &mut all.lazy,
+            &inv,
+            &rb,
+            stop,
+        )?;
     }
     let (blockers, spared, skip_weaken) = if order {
         number_order(it, ax, &all.least, &all.atmost, relations, stop)?
@@ -1614,6 +1640,232 @@ fn normalize_within(
         dl.root = Some(it.fresh_class());
     }
     Ok(Some((taken, dl)))
+}
+
+/// Canonical conjunction over `it`, sorting and deduplicating conjuncts and folding `⊤`/`⊥`.
+fn conj_in(it: &mut Interner, mut es: Vec<Ex>) -> Ex {
+    es.sort_unstable();
+    es.dedup();
+    es.retain(|&e| e != TOP);
+    if es.contains(&BOTTOM) {
+        return BOTTOM;
+    }
+    match es.len() {
+        0 => TOP,
+        1 => es[0],
+        _ => {
+            let mut acc = es[0];
+            for &e in &es[1..] {
+                acc = it.conj(acc, e);
+            }
+            acc
+        }
+    }
+}
+
+/// Committed one-way negative structural transformation for `order` runs (item 896, R2).
+///
+/// Replaces every negative existential restriction over a simple role (and every
+/// existential inside an `atmost`/`lazy` qualifier, simple or non-simple, unifying item
+/// 897's qualifier naming) by a canonical shadow name `N` with `g ⊑ ∀r⁻.N` (or `∃r.g ⊑ N`
+/// if `r` lacks an inverse). Non-simple outer negative existentials still recurse into
+/// their fillers and rebuild so inner simple existentials never reach `ix.exist_of`.
+/// Compound conjunction qualifiers keep item 897's canonical bridge `(e, n)`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn shadow_negative(
+    it: &mut Interner,
+    ax: &mut Axioms,
+    clauses: &mut Vec<(Vec<Ex>, Vec<Ex>)>,
+    atmost: &mut [(Ex, u32, Role, Ex)],
+    lazy: &mut [(u32, Role, Ex, Vec<Ex>)],
+    inv: &[Role],
+    rb: &RoleBox,
+    stop: &dyn Fn() -> bool,
+) -> Result<(), Halt> {
+    struct Ctx<'a> {
+        it: &'a mut Interner,
+        inv: &'a [Role],
+        rb: &'a RoleBox,
+        stop: &'a dyn Fn() -> bool,
+        steps: usize,
+        shadow: FxHashMap<(Role, Ex), Ex>,
+        conj_qual: FxHashMap<Ex, Ex>,
+        memo_general: FxHashMap<Ex, Ex>,
+        memo_qual: FxHashMap<Ex, Ex>,
+        new_subs: Vec<(Ex, Ex)>,
+    }
+
+    impl Ctx<'_> {
+        fn poll(&mut self, n: usize) -> Result<(), Halt> {
+            self.steps += n;
+            if self.steps >= 1 << 16 {
+                self.steps = 0;
+                if (self.stop)() {
+                    return Err(Halt::Stopped);
+                }
+            }
+            Ok(())
+        }
+
+        fn rewrite(&mut self, e: Ex, in_qual: bool) -> Result<Ex, Halt> {
+            self.poll(1)?;
+            let cached = if in_qual {
+                self.memo_qual.get(&e).copied()
+            } else {
+                self.memo_general.get(&e).copied()
+            };
+            if let Some(res) = cached {
+                return Ok(res);
+            }
+            let res = match self.it.nodes[e as usize] {
+                Node::Conj(..) => {
+                    let mut parts = Vec::new();
+                    let mut todo = vec![e];
+                    while let Some(x) = todo.pop() {
+                        self.poll(1)?;
+                        match self.it.nodes[x as usize] {
+                            Node::Conj(a, b) => todo.extend([a, b]),
+                            _ => parts.push(x),
+                        }
+                    }
+                    let mut mapped = Vec::with_capacity(parts.len());
+                    for p in parts {
+                        mapped.push(self.rewrite(p, in_qual)?);
+                    }
+                    conj_in(self.it, mapped)
+                }
+                Node::Exist(r, f) => {
+                    let g = self.rewrite(f, in_qual)?;
+                    if g == BOTTOM {
+                        BOTTOM
+                    } else if in_qual || self.rb.simple(r) {
+                        if let Some(&n) = self.shadow.get(&(r, g)) {
+                            n
+                        } else {
+                            let n = self.it.fresh_class();
+                            let i = self.inv.get(r as usize).copied().unwrap_or(NO_ROLE);
+                            if i != NO_ROLE {
+                                let all = self.it.node(Node::Forall(i, n));
+                                self.new_subs.push((g, all));
+                            } else {
+                                let some = self.it.node(Node::Exist(r, g));
+                                self.new_subs.push((some, n));
+                            }
+                            self.shadow.insert((r, g), n);
+                            n
+                        }
+                    } else if g == f {
+                        e
+                    } else {
+                        self.it.node(Node::Exist(r, g))
+                    }
+                }
+                _ => e,
+            };
+            if in_qual {
+                self.memo_qual.insert(e, res);
+            } else {
+                self.memo_general.insert(e, res);
+            }
+            Ok(res)
+        }
+
+        fn rewrite_qual(&mut self, b: Ex) -> Result<Ex, Halt> {
+            let e = self.rewrite(b, true)?;
+            if matches!(self.it.nodes[e as usize], Node::Conj(..)) {
+                if let Some(&n) = self.conj_qual.get(&e) {
+                    Ok(n)
+                } else {
+                    let n = self.it.fresh_class();
+                    self.new_subs.push((e, n));
+                    self.conj_qual.insert(e, n);
+                    Ok(n)
+                }
+            } else {
+                Ok(e)
+            }
+        }
+    }
+
+    // Drop any trivial identities before one-way LHS rewriting so `E ⊑ E` can never become
+    // `N ⊑ E` (which would be unsound because `N` only satisfies `E ⊑ N`).
+    ax.subs.retain(|&(a, c)| a != c);
+    clauses.retain(|(b, h)| !h.iter().any(|x| b.contains(x)));
+
+    let mut ctx = Ctx {
+        it,
+        inv,
+        rb,
+        stop,
+        steps: 0,
+        shadow: FxHashMap::default(),
+        conj_qual: FxHashMap::default(),
+        memo_general: FxHashMap::default(),
+        memo_qual: FxHashMap::default(),
+        new_subs: Vec::new(),
+    };
+
+    for (a, _) in &mut ax.subs {
+        *a = ctx.rewrite(*a, false)?;
+    }
+    let mut keep_disj = Vec::with_capacity(ax.disjoint.len());
+    for mut set in std::mem::take(&mut ax.disjoint) {
+        let mut changed = false;
+        for e in &mut set {
+            let r = ctx.rewrite(*e, false)?;
+            if r != *e {
+                *e = r;
+                changed = true;
+            }
+        }
+        if changed {
+            set.sort_unstable();
+            let mut last_empty = None;
+            for w in set.windows(2) {
+                if w[0] == w[1] && w[0] != BOTTOM && last_empty != Some(w[0]) {
+                    ctx.new_subs.push((w[0], BOTTOM));
+                    last_empty = Some(w[0]);
+                }
+            }
+            set.dedup();
+            set.retain(|&e| e != BOTTOM);
+        }
+        if set.len() >= 2 {
+            keep_disj.push(set);
+        }
+    }
+    ax.disjoint = keep_disj;
+
+    let mut keep_clauses = Vec::with_capacity(clauses.len());
+    for (mut body, head) in std::mem::take(clauses) {
+        let mut changed = false;
+        for e in &mut body {
+            let r = ctx.rewrite(*e, false)?;
+            if r != *e {
+                *e = r;
+                changed = true;
+            }
+        }
+        if changed {
+            if body.contains(&BOTTOM) {
+                continue;
+            }
+            body.retain(|&e| e != TOP);
+            body.sort_unstable();
+            body.dedup();
+        }
+        keep_clauses.push((body, head));
+    }
+    *clauses = keep_clauses;
+
+    for (_, _, _, b) in atmost.iter_mut() {
+        *b = ctx.rewrite_qual(*b)?;
+    }
+    for (_, _, b, _) in lazy.iter_mut() {
+        *b = ctx.rewrite_qual(*b)?;
+    }
+    ax.subs.extend(ctx.new_subs);
+    Ok(())
 }
 
 /// The most told inclusions, disjointness sets and blockers that [`number_order`] adds.
