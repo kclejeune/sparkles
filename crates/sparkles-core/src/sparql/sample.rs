@@ -66,9 +66,14 @@ const WHOLE_RANGE: u64 = 4096;
 /// Measure the selectivity of the conjuncts in `filters` that one triple pattern of the
 /// group binds (`leaves` are the patterns' access paths), keeping it in the query's
 /// context for the planner.
-pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) {
+pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) -> Result<()> {
+    ctx.check()?;
+    if leaves.iter().any(|l| matches!(l[0].kind, Kind::Empty)) {
+        return Ok(());
+    }
     for f in filters {
-        if f.has_exists() {
+        ctx.check()?;
+        if super::exprcache::impurity(f).is_some() {
             continue;
         }
         let vars = f.var_set();
@@ -98,33 +103,42 @@ pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) {
             })
             .min_by_key(|s| s.cols.first().is_some_and(|(_, v)| vars.contains(v)));
         let Some(spec) = spec else { continue };
-        match selectivity(ctx, spec, f, &vars, &text) {
-            Ok(Some(s)) => ctx.set_sampled(text, s),
+        let Some(cols) = vars
+            .iter()
+            .map(|v| spec.cols.iter().find(|(_, x)| x == v).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let key = sample_key(ctx, spec, &cols, &text);
+        if let Some(s) = ctx.snap.counts.sampled(&key) {
+            ctx.check()?;
+            ctx.set_sampled(text, s);
+            continue;
+        }
+        match ctx.with_sampling_trial(|trial| selectivity(trial, spec, f, &vars, &cols)) {
+            Ok(Some(s)) => {
+                ctx.snap.counts.set_sampled(key, s);
+                ctx.set_sampled(text, s);
+            }
             Ok(None) => {}
             Err(e) => {
-                tracing::debug!(target: "sparkles::sparql::sample", "no sampled selectivity for {text}: {e}")
+                ctx.check()?;
+                tracing::debug!(target: "sparkles::sparql::sample", "no sampled selectivity for {text}: {e}");
+                if matches!(
+                    e,
+                    crate::error::Error::Cancelled | crate::error::Error::Timeout
+                ) {
+                    return Err(e);
+                }
             }
         }
     }
+    Ok(())
 }
 
-/// The selectivity of `f` (with variables `vars`, shown as `text`) on a sample of the
-/// rows of `spec`, from the snapshot's cache or measured now.
-fn selectivity(
-    ctx: &Ctx,
-    spec: &ScanSpec,
-    f: &Expr,
-    vars: &[VarId],
-    text: &str,
-) -> Result<Option<Sampled>> {
-    let mut cols = Vec::with_capacity(vars.len());
-    for v in vars {
-        match spec.cols.iter().find(|(_, x)| x == v) {
-            Some(&(kc, _)) => cols.push((kc, *v)),
-            None => return Ok(None),
-        }
-    }
-    let key = format!(
+fn sample_key(ctx: &Ctx, spec: &ScanSpec, cols: &[(usize, VarId)], text: &str) -> String {
+    format!(
         "{}|{:?}|{:?}|{:?}|{}|{}",
         spec.perm.name(),
         spec.prefix,
@@ -135,12 +149,19 @@ fn selectivity(
             .collect::<Vec<_>>()
             .join(","),
         text
-    );
-    if let Some(s) = ctx.snap.counts.sampled(&key) {
-        return Ok(Some(s));
-    }
+    )
+}
+
+/// Measure the selectivity of `f` on a sample of the rows of `spec`.
+fn selectivity(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    f: &Expr,
+    vars: &[VarId],
+    cols: &[(usize, VarId)],
+) -> Result<Option<Sampled>> {
     let mut mask: ColMask = 0;
-    for &(kc, _) in &cols {
+    for &(kc, _) in cols {
         mask |= 1 << kc;
     }
     for &(a, b) in &spec.eqs {
@@ -163,7 +184,7 @@ fn selectivity(
     if rows.is_empty() {
         return Ok(None);
     }
-    let pass = test(ctx, &rows, &cols, f)?;
+    let pass = test(ctx, &rows, cols, f)?;
     let total: f64 = rows.iter().map(|(_, w)| w).sum();
     let kept: f64 = rows
         .iter()
@@ -177,12 +198,10 @@ fn selectivity(
     } else {
         0.5 / n as f64
     };
-    let s = Sampled {
+    Ok(Some(Sampled {
         sel,
         rows: n as u32,
-    };
-    ctx.snap.counts.set_sampled(key, s);
-    Ok(Some(s))
+    }))
 }
 
 /// Whether each sampled row passes `f`, whose variables are in the key columns `cols`.
@@ -390,5 +409,110 @@ fn round(x: f64) -> String {
     } else {
         let digits = (-x.log10()).ceil() as usize + 2;
         format!("{x:.digits$}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{G, O, Perm};
+    use crate::io::{RdfFormat, Source};
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{Literal, NamedNode, Term};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn fixture() -> (Ctx, ScanSpec, VarId) {
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s> <urn:p> \"v\" .".to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let ctx = Ctx::new(store.snapshot());
+        let v = ctx.var("v");
+        let pred = ctx
+            .snap
+            .lookup_term(&Term::NamedNode(NamedNode::new_unchecked("urn:p")))
+            .unwrap();
+        let col = |c| Perm::Pos.order().iter().position(|&x| x == c).unwrap();
+        let scan = ScanSpec {
+            perm: Perm::Pos,
+            prefix: vec![pred.0],
+            cols: vec![(col(O), v)],
+            eqs: Vec::new(),
+            graph: super::super::plan::GraphFilter::Default,
+            graph_col: col(G),
+            dedup: false,
+            src: None,
+        };
+        (ctx, scan, v)
+    }
+
+    #[test]
+    fn snapshot_filter_sample_hit_does_not_open_a_trial() {
+        let (ctx, scan, v) = fixture();
+        let leaves = [vec![Node::leaf(
+            Kind::Scan(scan),
+            vec![v],
+            1.0,
+            String::new(),
+        )]];
+        let filter = Expr::Bound(v);
+        let text = filter.display(&ctx);
+        prepare(&ctx, &leaves, std::slice::from_ref(&filter)).unwrap();
+        let cached = ctx.sampled(&text).expect("pure FILTER was sampled");
+
+        let mut next = Ctx::new(ctx.snap.clone());
+        assert_eq!(next.var("v"), v);
+        const SETUP: usize = 256 * 1024;
+        next.var(&"padding".repeat(SETUP / 7));
+        next.mem_limit = 16 * 1024;
+        let peak = crate::test_alloc::record_peak_live(|| {
+            prepare(&next, &leaves, std::slice::from_ref(&filter)).unwrap();
+        });
+        assert_eq!(next.sampled(&text), Some(cached));
+        assert!(peak < SETUP / 2, "cache hit allocated {peak} bytes");
+        let miss = Expr::Not(Box::new(filter));
+        let text = miss.display(&next);
+        prepare(&next, &leaves, &[miss]).unwrap();
+        assert_eq!(next.sampled(&text), None);
+    }
+
+    #[test]
+    fn registered_filter_is_ineligible_for_sampling() {
+        use super::super::expr::Func;
+        use super::super::extensions::{ScalarContext, ScalarDescriptor};
+
+        let (ctx, scan, v) = fixture();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let output = calls.clone();
+        let descriptor = ScalarDescriptor::new(
+            "urn:registered",
+            1..=1,
+            move |_: &ScalarContext<'_>, _: &[Term]| {
+                output.fetch_add(1, Ordering::Relaxed);
+                Ok(Term::Literal(Literal::from(true)))
+            },
+        )
+        .unwrap();
+        let filter = Expr::Call(Func::Registered(Arc::new(descriptor)), vec![Expr::Var(v)]);
+        let text = filter.display(&ctx);
+        // An estimate from the snapshot cache must not make this expression eligible.
+        let key = sample_key(&ctx, &scan, &scan.cols, &text);
+        ctx.snap
+            .counts
+            .set_sampled(key, Sampled { sel: 1.0, rows: 1 });
+        let leaves = [vec![Node::leaf(
+            Kind::Scan(scan),
+            vec![v],
+            1.0,
+            String::new(),
+        )]];
+        prepare(&ctx, &leaves, &[filter]).unwrap();
+        assert_eq!(ctx.sampled(&text), None);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 }

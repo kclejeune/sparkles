@@ -9,7 +9,7 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::sparql::ctx::OwnedCharge;
-use crate::sparql::describe::DescribeOptions;
+use crate::sparql::describe::{DescribeOptions, DescribedBatch};
 use crate::sparql::{QueryKind, QueryOptions, depth};
 use crate::store::Snapshot;
 use oxrdf::{GraphName, Quad};
@@ -219,6 +219,40 @@ impl ViewBlanks {
             keys.push(key);
         }
         Ok((keys, (occurrence > 0).then_some(occurrence)))
+    }
+}
+
+impl Pending {
+    fn from_description(
+        mut described: DescribedBatch,
+        #[cfg(test)] ctx: &crate::sparql::ctx::Ctx,
+    ) -> Result<Self> {
+        let mut pending_bytes = 128u64;
+        for triple in &described.triples {
+            pending_bytes = pending_bytes
+                .saturating_add(crate::sparql::graph_triple_bytes(triple).saturating_add(256));
+        }
+        let quad_slots =
+            (described.triples.len() as u64).saturating_mul(std::mem::size_of::<Quad>() as u64);
+        // Keep the producer's charge while admitting the additional Quad slots.
+        let peak = described
+            .charge
+            .bytes()
+            .max(pending_bytes)
+            .saturating_add(quad_slots);
+        described.charge.resize(peak)?;
+        #[cfg(test)]
+        ctx.chunk_event("describe-quad-handoff", described.triples.len());
+        let pending = described
+            .triples
+            .into_iter()
+            .map(|triple| triple.in_graph(GraphName::DefaultGraph))
+            .collect::<Vec<_>>();
+        described.charge.resize(pending_bytes)?;
+        Ok(Self {
+            quads: pending.into_iter(),
+            _charge: described.charge,
+        })
     }
 }
 
@@ -476,7 +510,7 @@ impl GraphCursor {
                         Some(buffer) => buffer,
                         None => Buffer::new(&ctx, &self.where_cursor.variables.ids, 0)?,
                     };
-                    let triples = crate::sparql::describe::describe_batch(
+                    let described = crate::sparql::describe::describe_batch(
                         &ctx,
                         &table.table,
                         options,
@@ -487,21 +521,11 @@ impl GraphCursor {
                     drop(table);
                     self.truncated = self.described.truncated();
                     self.described_all = last || self.truncated;
-                    let mut pending_bytes = 128u64;
-                    for triple in &triples {
-                        pending_bytes = pending_bytes.saturating_add(
-                            crate::sparql::graph_triple_bytes(triple).saturating_add(256),
-                        );
-                    }
-                    let pending_charge = OwnedCharge::new(&ctx, pending_bytes.saturating_mul(2))?;
-                    let pending = triples
-                        .into_iter()
-                        .map(|triple| triple.in_graph(GraphName::DefaultGraph))
-                        .collect::<Vec<_>>();
-                    self.pending = Some(Pending {
-                        quads: pending.into_iter(),
-                        _charge: pending_charge,
-                    });
+                    self.pending = Some(Pending::from_description(
+                        described,
+                        #[cfg(test)]
+                        &ctx,
+                    )?);
                 }
                 Spec::Construct { template, graphs } => {
                     if self.input.as_ref().is_none_or(|b| self.row == b.len()) {
@@ -635,6 +659,104 @@ impl GraphCursor {
         if self.status == CursorStatus::Open {
             self.finish(CursorStatus::Stopped);
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn describe_handoff_credits_triples_and_refuses_extra_quad_slots() {
+    use crate::io::{RdfFormat, Source};
+    use crate::sparql::ctx::Ctx;
+    use crate::sparql::describe::{Streamed, describe_batch};
+    use crate::sparql::table::Table;
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{NamedNode, Term};
+    use std::fmt::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const ROWS: usize = 64;
+    let store = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::new();
+    for i in 0..ROWS {
+        writeln!(ttl, "<urn:s> <urn:p> \"value{i}\" .").unwrap();
+    }
+    store
+        .load(&[Source::from_bytes(
+            ttl.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let mut ctx = Ctx::new(store.snapshot());
+    ctx.mem_limit = 1 << 20;
+    ctx.enable_cursor_accounting().unwrap();
+    let subject = ctx
+        .snap
+        .lookup_term(&Term::NamedNode(NamedNode::new_unchecked("urn:s")))
+        .unwrap();
+    let mut table = Table::new(vec![0]);
+    table.push_row(&[subject]);
+    let ctx = ctx.into_shared();
+
+    for refuse in [true, false] {
+        let mut state = Streamed::default();
+        let described = describe_batch(
+            &ctx,
+            &table,
+            &DescribeOptions::default(),
+            false,
+            &mut state,
+            true,
+        )
+        .unwrap();
+        assert_eq!(described.triples.len(), ROWS);
+        let producer_bytes = described.charge.bytes();
+        assert!(producer_bytes > 0);
+        let state_bytes = ctx.live_bytes() - producer_bytes;
+        let pending_bytes = 128
+            + described
+                .triples
+                .iter()
+                .map(|triple| crate::sparql::graph_triple_bytes(triple) + 256)
+                .sum::<u64>();
+        let held_at_conversion =
+            producer_bytes.max(pending_bytes) + (ROWS * std::mem::size_of::<Quad>()) as u64;
+        let observed = Arc::new(AtomicU64::new(0));
+        let output = observed.clone();
+        let weak = Arc::downgrade(&ctx);
+        *ctx.chunk_hook.lock() = Some(Arc::new(move |stage, count| {
+            if stage == "describe-quad-handoff" {
+                assert_eq!(count, ROWS);
+                output.store(weak.upgrade().unwrap().live_bytes(), Ordering::Relaxed);
+            }
+        }));
+        if refuse {
+            let hold = ctx
+                .charge(ctx.mem_limit - state_bytes - held_at_conversion + 1)
+                .unwrap();
+            let live = ctx.live_bytes();
+            let Err(err) = Pending::from_description(described, &ctx) else {
+                panic!("quad slots must refuse after triple decode");
+            };
+            assert!(
+                matches!(err, Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory && b.requested == ctx.mem_limit + 1)
+            );
+            assert_eq!(observed.load(Ordering::Relaxed), 0);
+            assert_eq!(ctx.live_bytes(), live - producer_bytes);
+            drop(hold);
+        } else {
+            let pending = Pending::from_description(described, &ctx).unwrap();
+            assert_eq!(
+                observed.load(Ordering::Relaxed),
+                state_bytes + held_at_conversion
+            );
+            assert_eq!(pending.quads.len(), ROWS);
+            assert_eq!(ctx.live_bytes(), state_bytes + pending_bytes);
+            drop(pending);
+            assert_eq!(ctx.live_bytes(), state_bytes);
+        }
+        *ctx.chunk_hook.lock() = None;
+        drop(state);
     }
 }
 impl Drop for GraphCursor {

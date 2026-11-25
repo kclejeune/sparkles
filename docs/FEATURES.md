@@ -33,6 +33,9 @@ the [command line](querying/README.md#command-line) and
 [formatting and editor support](querying/README.md#formatter-and-editor-support).
 How MIN, MAX, AVG and GROUP_CONCAT treat errors is a setting with Jena's answers as its
 default, described under [aggregate errors](querying/README.md#aggregate-errors).
+Eager and streaming query operators apply memory limits to vocabulary decoding and
+preserve a refused decode's original error.
+
 
 ### Storage and history
 

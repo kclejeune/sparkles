@@ -34,7 +34,12 @@ pub struct ColumnEntry {
 
 /// Where an entry's geometry is.
 enum Source {
-    Parsed(GeomRef),
+    Parsed {
+        geom: GeomRef,
+        // Query-parsed entries keep their admission even when a hit is cloned out of
+        // the search's memo. Store-owned entries have no query charge.
+        _charge: Option<Box<crate::sparql::query_memory::QueryMemoryLease>>,
+    },
     /// entry `i` of a column file, decoded on first use
     Mapped {
         file: Arc<ColumnFile>,
@@ -48,7 +53,10 @@ impl ColumnEntry {
     pub(crate) fn new(geom: GeomRef, bbox84: [f64; 4]) -> ColumnEntry {
         ColumnEntry {
             bbox: round_out(bbox84),
-            geom: Source::Parsed(geom),
+            geom: Source::Parsed {
+                geom,
+                _charge: None,
+            },
         }
     }
 
@@ -66,7 +74,7 @@ impl ColumnEntry {
     pub fn geom(&self, snap: &Snapshot) -> Result<GeomRef, GeomError> {
         let _ = snap;
         match &self.geom {
-            Source::Parsed(g) => Ok(g.clone()),
+            Source::Parsed { geom: g, .. } => Ok(g.clone()),
             Source::Mapped { file, i, cell } => cell
                 .get_or_init(|| file.decode(*i as usize))
                 .clone()
@@ -77,7 +85,7 @@ impl ColumnEntry {
     /// The geometry's CRS (without decoding it).
     pub(crate) fn crs(&self) -> CrsRef {
         match &self.geom {
-            Source::Parsed(g) => g.crs.clone(),
+            Source::Parsed { geom: g, .. } => g.crs.clone(),
             Source::Mapped { file, i, .. } => file.crs_of(*i as usize),
         }
     }
@@ -86,7 +94,7 @@ impl ColumnEntry {
     /// alone; geometries decoded from files are counted by the file).
     pub(crate) fn bytes(&self) -> u64 {
         let g = match &self.geom {
-            Source::Parsed(g) => g.mem_size(),
+            Source::Parsed { geom: g, .. } => g.mem_size(),
             Source::Mapped { .. } => 0,
         };
         (std::mem::size_of::<ColumnEntry>() + g) as u64
@@ -95,7 +103,7 @@ impl ColumnEntry {
     /// Vertices of the geometry (without decoding it).
     fn vertices(&self) -> u32 {
         match &self.geom {
-            Source::Parsed(g) => g.vertices,
+            Source::Parsed { geom: g, .. } => g.vertices,
             Source::Mapped { file, i, .. } => file.entry(*i as usize).vertices,
         }
     }
@@ -103,7 +111,7 @@ impl ColumnEntry {
     /// Bytes of the entry's record in a column file.
     fn record_len(&self) -> usize {
         match &self.geom {
-            Source::Parsed(g) => persist::encoded_len(g),
+            Source::Parsed { geom: g, .. } => persist::encoded_len(g),
             Source::Mapped { file, i, .. } => file.record(*i as usize).map_or(0, <[u8]>::len),
         }
     }
@@ -172,45 +180,57 @@ fn crs_iri(c: &CrsRef) -> Arc<str> {
     }
 }
 
-/// Classify the literal with vocabulary key `key` under the limits of `cfg`.
-pub(crate) fn classify(key: &[u8], cfg: &GeoConfig) -> Slot {
-    classify_with(key, cfg, false)
+/// Result of pure borrowed inspection of a vocabulary key before any geometry parsing.
+pub(crate) enum KeyInspection {
+    /// No parsing needed: not a geometry literal, too large, or invalid UTF-8.
+    Done(Slot),
+    /// Valid UTF-8 geometry literal ready to copy and parse outside vocabulary locks.
+    Parse { dt: &'static str, lex_len: usize },
 }
 
-/// The geometry of a [`Slot::rechecked`] literal, parsed as functions parse it (no
-/// length limit); an envelope off the globe becomes the whole world, so every window
-/// meets it.
-pub(crate) fn recheck(key: &[u8], cfg: &GeoConfig) -> Option<Arc<ColumnEntry>> {
-    match classify_with(key, cfg, true) {
-        Slot::Geom(e) => Some(e),
-        _ => None,
-    }
-}
-
-fn classify_with(key: &[u8], cfg: &GeoConfig, recheck: bool) -> Slot {
+/// Inspect a borrowed vocabulary key without allocating or parsing. Safe to run under
+/// delta/local vocabulary read locks.
+pub(crate) fn inspect_key(key: &[u8], cfg: &GeoConfig, recheck: bool) -> KeyInspection {
     if key.first() != Some(&b'"') {
-        return Slot::Other;
+        return KeyInspection::Done(Slot::Other);
     }
     let Some(sep) = key.iter().rposition(|&b| b == KEY_SEP) else {
-        return Slot::Other;
+        return KeyInspection::Done(Slot::Other);
     };
     let suffix = &key[sep + 1..];
     let Some(dt) = suffix.strip_prefix(b"^") else {
-        return Slot::Other;
+        return KeyInspection::Done(Slot::Other);
     };
     let Some(dt) = [WKT_LITERAL, GEOJSON_LITERAL, GML_LITERAL, KML_LITERAL]
         .into_iter()
         .find(|d| d.as_bytes() == dt)
     else {
-        return Slot::Other;
+        return KeyInspection::Done(Slot::Other);
     };
     let lex = &key[1..sep];
     if lex.len() > cfg.max_geometry_bytes && !recheck {
-        return Slot::Skipped(Skip::TooLarge);
+        return KeyInspection::Done(Slot::Skipped(Skip::TooLarge));
     }
-    let Ok(lex) = std::str::from_utf8(lex) else {
-        return Slot::Skipped(Skip::Malformed);
-    };
+    if std::str::from_utf8(lex).is_err() {
+        return KeyInspection::Done(Slot::Skipped(Skip::Malformed));
+    }
+    KeyInspection::Parse {
+        dt,
+        lex_len: lex.len(),
+    }
+}
+
+/// Extract the UTF-8 lexical form of a literal key previously accepted by [`inspect_key`].
+pub(crate) fn extract_lex(key: &[u8]) -> Option<&str> {
+    if key.first() != Some(&b'"') {
+        return None;
+    }
+    let sep = key.iter().rposition(|&b| b == KEY_SEP)?;
+    std::str::from_utf8(&key[1..sep]).ok()
+}
+
+/// Parse an already-extracted geometry literal lexical form outside any vocabulary lock.
+pub(crate) fn parse_slot(lex: &str, dt: &'static str, cfg: &GeoConfig, recheck: bool) -> Slot {
     // the parser is not trusted with arbitrary input: a panic is a malformed literal
     let parsed = std::panic::catch_unwind(|| super::parse::parse(lex, dt));
     let g = match parsed {
@@ -235,6 +255,84 @@ fn classify_with(key: &[u8], cfg: &GeoConfig, recheck: bool) -> Slot {
             [-180.0, -90.0, 180.0, 90.0],
         ))),
         _ => Slot::Skipped(Skip::UnknownCrs(crs_iri(&g.crs))),
+    }
+}
+
+/// Estimated retained bytes of one cached `Slot`.
+pub(crate) fn slot_bytes(slot: &Slot) -> u64 {
+    match slot {
+        Slot::Skipped(Skip::UnknownCrs(iri)) => (iri.len() as u64).saturating_add(64),
+        _ => 64,
+    }
+}
+
+/// Classify and parse literal `id` under query memory controls without holding delta or
+/// local vocabulary locks across geometry parsing. Admits parse working memory onto
+/// `parse_charge` before copying the lexical form or invoking the parser.
+pub(crate) fn classify_controlled(
+    ctx: &crate::sparql::ctx::Ctx,
+    id: Id,
+    cfg: &GeoConfig,
+    recheck: bool,
+    parse_charge: &crate::sparql::ctx::Charge<'_>,
+) -> crate::error::Result<Slot> {
+    let inspection = ctx.with_controlled_key(id, |k| Ok(inspect_key(k, cfg, recheck)))?;
+    let (dt, lex_len) = match inspection {
+        None => return Ok(Slot::Other),
+        Some(KeyInspection::Done(slot)) => return Ok(slot),
+        Some(KeyInspection::Parse { dt, lex_len }) => (dt, lex_len),
+    };
+    let work_bytes = (lex_len as u64).saturating_mul(4).saturating_add(256);
+    parse_charge.add(work_bytes)?;
+    ctx.check()?;
+    let lex = ctx
+        .with_controlled_key(id, |k| Ok(extract_lex(k).map(str::to_owned)))?
+        .flatten();
+    let Some(lex) = lex else {
+        return Ok(Slot::Other);
+    };
+    if dt == GEOJSON_LITERAL {
+        parse_charge.add(super::parse::geojson_structure_bytes(&lex))?;
+        ctx.check()?;
+    }
+    let mut slot = parse_slot(&lex, dt, cfg, recheck);
+    drop(lex);
+    ctx.check()?;
+    if let Slot::Geom(entry) = &mut slot {
+        let entry = Arc::get_mut(entry).expect("newly parsed geometry");
+        let bytes = entry.bytes()
+            + std::mem::size_of::<crate::sparql::query_memory::QueryMemoryLease>() as u64;
+        let Source::Parsed { _charge, .. } = &mut entry.geom else {
+            unreachable!("newly parsed geometry");
+        };
+        *_charge = Some(Box::new(parse_charge.output_lease(bytes)?));
+    }
+    Ok(slot)
+}
+
+/// Classify the literal with vocabulary key `key` under the limits of `cfg`.
+pub(crate) fn classify(key: &[u8], cfg: &GeoConfig) -> Slot {
+    classify_with(key, cfg, false)
+}
+
+/// The geometry of a [`Slot::rechecked`] literal, parsed as functions parse it (no
+/// length limit); an envelope off the globe becomes the whole world, so every window
+/// meets it.
+#[cfg(test)]
+fn recheck(key: &[u8], cfg: &GeoConfig) -> Option<Arc<ColumnEntry>> {
+    match classify_with(key, cfg, true) {
+        Slot::Geom(e) => Some(e),
+        _ => None,
+    }
+}
+
+fn classify_with(key: &[u8], cfg: &GeoConfig, recheck: bool) -> Slot {
+    match inspect_key(key, cfg, recheck) {
+        KeyInspection::Done(slot) => slot,
+        KeyInspection::Parse { dt, .. } => match extract_lex(key) {
+            Some(lex) => parse_slot(lex, dt, cfg, recheck),
+            None => Slot::Skipped(Skip::Malformed),
+        },
     }
 }
 
@@ -580,7 +678,7 @@ impl Column {
                 for &o in &ids {
                     if let Slot::Geom(e) = &self.base[&o] {
                         match &e.geom {
-                            Source::Parsed(g) => {
+                            Source::Parsed { geom: g, .. } => {
                                 buf.clear();
                                 persist::encode(g, &mut buf);
                                 sink.put(&buf)?;
@@ -791,6 +889,147 @@ mod tests {
         k.push(b'^');
         k.extend_from_slice(dt.as_bytes());
         k
+    }
+
+    #[test]
+    fn compact_geojson_refuses_before_allocating_the_value_tree() {
+        use crate::error::{BudgetKind, Error};
+        use crate::sparql::ctx::Ctx;
+        use crate::store::{Store, StoreOptions};
+        use oxrdf::{Literal, NamedNode, Term};
+
+        let positions = 8192;
+        let lex = format!(
+            r#"{{"type":"LineString","coordinates":[{}[1,1]]}}"#,
+            "[0,0],".repeat(positions - 1)
+        );
+        let term = Term::Literal(Literal::new_typed_literal(
+            &lex,
+            NamedNode::new_unchecked(GEOJSON_LITERAL),
+        ));
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        let id = ctx.intern_term(&term);
+        let baseline = ctx.live_bytes_for_tests();
+        // The old lexical allowance and retained coordinate array both fit here.
+        // Three JSON value slots per position already exceed the remaining budget.
+        ctx.mem_limit = baseline + 256 * 1024;
+        let mut result = None;
+        let peak = crate::test_alloc::record_peak_live(|| {
+            let charge = ctx.charge(0).unwrap();
+            result = Some(classify_controlled(
+                &ctx,
+                id,
+                &GeoConfig::default(),
+                true,
+                &charge,
+            ));
+        });
+        assert!(
+            peak < 2 * lex.len(),
+            "parser allocated {peak} bytes before refusing"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+        ));
+        assert_eq!(ctx.live_bytes_for_tests(), baseline);
+
+        let control = Ctx::new(store.snapshot());
+        let id = control.intern_term(&term);
+        let baseline = control.live_bytes_for_tests();
+        let charge = control.charge(0).unwrap();
+        let slot = classify_controlled(&control, id, &GeoConfig::default(), true, &charge).unwrap();
+        let Slot::Geom(entry) = slot else {
+            panic!("compact GeoJSON control must parse");
+        };
+        assert_eq!(
+            entry.geom(&control.snap).unwrap().vertices,
+            positions as u32
+        );
+        assert!(control.live_bytes_for_tests() >= baseline + entry.bytes());
+        drop(entry);
+        assert_eq!(control.live_bytes_for_tests(), baseline);
+    }
+
+    fn check_geojson_parse_peak(lex: &str, check: impl FnOnce(&Slot)) {
+        use crate::sparql::ctx::Ctx;
+        use crate::store::{Store, StoreOptions};
+        use oxrdf::{Literal, NamedNode, Term};
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        let id = ctx.intern_term(&Term::Literal(Literal::new_typed_literal(
+            lex,
+            NamedNode::new_unchecked(GEOJSON_LITERAL),
+        )));
+        let baseline = ctx.live_bytes_for_tests();
+        const HEADROOM: usize = 320 * 1024;
+        ctx.mem_limit = baseline + HEADROOM as u64;
+        let mut slot = None;
+        let peak = crate::test_alloc::record_peak_live(|| {
+            let charge = ctx.charge(0).unwrap();
+            slot =
+                Some(classify_controlled(&ctx, id, &GeoConfig::default(), true, &charge).unwrap());
+        });
+        assert!(peak <= HEADROOM, "GeoJSON parse allocated {peak} bytes");
+        let slot = slot.unwrap();
+        check(&slot);
+        if let Slot::Geom(entry) = &slot {
+            assert!(ctx.live_bytes_for_tests() >= baseline + entry.bytes());
+        }
+        drop(slot);
+        assert_eq!(ctx.live_bytes_for_tests(), baseline);
+    }
+
+    #[test]
+    fn geojson_foreign_member_does_not_parse_a_value_tree_inside_a_string() {
+        // The escaped spelling tests the decoded key. Its array text must
+        // stay a string even when this is the first key of a nested object.
+        let lex = format!(
+            r#"{{"type":"Point","coordinates":[1,2],"properties":{{"$serde_json::private::\u0052awValue":"[{}0]"}}}}"#,
+            "0,".repeat(32767)
+        );
+        check_geojson_parse_peak(&lex, |slot| {
+            let Slot::Geom(entry) = slot else {
+                panic!("the foreign member must not affect the point");
+            };
+            assert_eq!(entry.bbox84(), [1.0, 2.0, 1.0, 2.0]);
+        });
+    }
+
+    #[test]
+    fn geojson_unknown_type_diagnostic_stays_in_the_parse_budget() {
+        // JSON allows raw DEL, which Rust's Debug can expand to six bytes.
+        let lex = format!(r#"{{"type":"{}"}}"#, "\x7f".repeat(65536));
+        check_geojson_parse_peak(&lex, |slot| {
+            assert!(matches!(slot, Slot::Skipped(Skip::Malformed)));
+        });
+    }
+
+    #[test]
+    fn geojson_fractional_point_classifies_with_literal_reserved_keys() {
+        let valid = r#"{"type":"Point","coordinates":[2.25,48.84],"properties":{"$serde_json::private::Number":"not a number","extra":1}}"#;
+        check_geojson_parse_peak(valid, |slot| {
+            let Slot::Geom(entry) = slot else {
+                panic!("fractional Point with literal reserved foreign key must parse");
+            };
+            let Source::Parsed { geom, .. } = &entry.geom else {
+                panic!("newly classified geometry must be parsed");
+            };
+            assert_eq!(
+                geom.g,
+                georust::Geometry::Point(georust::Point::new(2.25, 48.84))
+            );
+            let bbox = entry.bbox84();
+            assert!(bbox[0] <= 2.25 && 2.25 <= bbox[2] && bbox[1] <= 48.84 && 48.84 <= bbox[3]);
+        });
+
+        let spoofed =
+            r#"{"type":"Point","coordinates":[{"$serde_json::private::Number":"2.25"},48.84]}"#;
+        check_geojson_parse_peak(spoofed, |slot| {
+            assert!(matches!(slot, Slot::Skipped(Skip::Malformed)));
+        });
     }
 
     #[test]

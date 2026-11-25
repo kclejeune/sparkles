@@ -872,6 +872,9 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
             if x == Ok(true) {
                 return Ok(b(true));
             }
+            if x.is_err() && ctx.has_memory_failure() {
+                return Err(TypeError);
+            }
             let y = ebv(c, row, ctx);
             match (x, y) {
                 (_, Ok(true)) => Ok(b(true)),
@@ -883,6 +886,9 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
             let x = ebv(a, row, ctx);
             if x == Ok(false) {
                 return Ok(b(false));
+            }
+            if x.is_err() && ctx.has_memory_failure() {
+                return Err(TypeError);
             }
             let y = ebv(c, row, ctx);
             match (x, y) {
@@ -899,7 +905,13 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         }
         Expr::SameTerm(a, c) => {
             let x = eval(a, row, ctx)?.into_id(ctx);
+            if ctx.has_memory_failure() {
+                return Err(TypeError);
+            }
             let y = eval(c, row, ctx)?.into_id(ctx);
+            if ctx.has_memory_failure() {
+                return Err(TypeError);
+            }
             Ok(b(x == y))
         }
         Expr::Cmp(a, c, op) => {
@@ -923,7 +935,12 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
                 match eval(e, row, ctx).and_then(|y| val_eq(x.clone(), y, ctx)) {
                     Ok(true) => return Ok(b(true)),
                     Ok(false) => {}
-                    Err(_) => err = true,
+                    Err(_) => {
+                        if ctx.has_memory_failure() {
+                            return Err(TypeError);
+                        }
+                        err = true;
+                    }
                 }
             }
             if err { Err(TypeError) } else { Ok(b(false)) }
@@ -1037,8 +1054,10 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         }
         Expr::Coalesce(l) => {
             for e in l {
-                if let Ok(v) = eval(e, row, ctx) {
-                    return Ok(v);
+                match eval(e, row, ctx) {
+                    Ok(v) => return Ok(v),
+                    Err(_) if ctx.has_memory_failure() => return Err(TypeError),
+                    Err(_) => {}
                 }
             }
             Err(TypeError)
@@ -1165,6 +1184,9 @@ fn val_cmp(x: Val, y: Val, ctx: &Ctx) -> EvalResult<Option<Ordering>> {
             (Tag::Vocab, Tag::Vocab) if matches!((&x, &y), (Val::Id(_), Val::Id(_))) => {
                 if let Some(o) = ctx.simple_literal_cmp(a, c) {
                     return Ok(Some(o));
+                }
+                if ctx.has_memory_failure() {
+                    return Err(TypeError);
                 }
             }
             _ => {}
@@ -1328,11 +1350,20 @@ fn registered(
         .map_err(|e| fail(e.into()))?;
     let mut terms = Vec::with_capacity(args.len());
     let mut bytes = 0u64;
+    let mut target = input.bytes();
     for arg in args {
         let val = eval(arg, row, ctx)?;
         let term = match val {
-            Val::Id(id) | Val::Dec(id, _) => ctx.term(id).ok_or(TypeError)?,
-            Val::V(v) => v.to_term(),
+            Val::Id(id) | Val::Dec(id, _) => ctx
+                .term_checked_into(id, &input)
+                .map_err(|e| fail(e.into()))?
+                .ok_or(TypeError)?,
+            Val::V(v) => {
+                input
+                    .add(super::ctx::ValueCache::entry_bytes(&v))
+                    .map_err(|e| fail(e.into()))?;
+                v.to_term()
+            }
         };
         let cost = super::extensions::term_bytes(&term).map_err(fail)?;
         bytes = bytes.saturating_add(cost);
@@ -1341,9 +1372,8 @@ fn registered(
                 "callback input exceeds batch byte ceiling".into(),
             )));
         }
-        input
-            .add(cost.saturating_sub(std::mem::size_of::<Term>() as u64))
-            .map_err(|e| fail(e.into()))?;
+        target = target.saturating_add(cost.saturating_sub(std::mem::size_of::<Term>() as u64));
+        input.resize(target).map_err(|e| fail(e.into()))?;
         terms.push(term);
     }
     let context = ScalarContext { ctx };
@@ -1373,6 +1403,7 @@ fn registered(
     let id = ctx
         .intern_callback_term(&term, &arguments[0])
         .map_err(|e| fail(e.into()))?;
+    drop(arguments);
     drop(input);
     Ok(Val::Id(id))
 }
@@ -1382,15 +1413,22 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
     let a0 = || arg(args, 0, row, ctx);
     let a1 = || arg(args, 1, row, ctx);
     let a2 = || arg(args, 2, row, ctx);
-    let id0 =
-        || -> EvalResult<Id> { Ok(eval(args.first().ok_or(TypeError)?, row, ctx)?.into_id(ctx)) };
+    let id0 = || -> EvalResult<Id> {
+        let id = eval(args.first().ok_or(TypeError)?, row, ctx)?.into_id(ctx);
+        if ctx.has_memory_failure() {
+            return Err(TypeError);
+        }
+        Ok(id)
+    };
     Ok(match f {
         F::Str => {
             let v = eval(&args[0], row, ctx)?;
-            if let Some(id) = v.id()
-                && let Some(Term::Literal(l)) = ctx.term(id)
-            {
-                return Ok(s(l.value()));
+            if let Some(id) = v.id() {
+                match ctx.term(id) {
+                    Some(Term::Literal(l)) => return Ok(s(l.value())),
+                    None if ctx.has_memory_failure() => return Err(TypeError),
+                    _ => {}
+                }
             }
             s(v.value(ctx)?.lexical()?)
         }
@@ -1449,7 +1487,11 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                             && id.payload() & Id::LOCAL_BNODE_BIT != 0)
                     })
                     .collect();
-                Val::Id(ctx.bnode_for_row(key, st))
+                let id = ctx.bnode_for_row(key, st);
+                if ctx.has_memory_failure() {
+                    return Err(TypeError);
+                }
+                Val::Id(id)
             }
         }
         F::Rand => Val::V(Value::Double(rand::random::<f64>().into())),
@@ -1752,11 +1794,30 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
         F::Custom(iri) => return extension(iri.as_str(), args, row, ctx),
         // ---- SPARQL 1.2 -------------------------------------------------------------
         F::Triple => {
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
             let term = |i: usize| -> EvalResult<Term> {
                 let v = eval(&args[i], row, ctx)?;
                 match v.id() {
-                    Some(id) => ctx.term(id).ok_or(TypeError),
-                    None => Ok(v.value(ctx)?.to_term()),
+                    Some(id) => ctx
+                        .term_checked_into(id, &decode)
+                        .map_err(|e| {
+                            ctx.fail_memory(&e);
+                            TypeError
+                        })?
+                        .ok_or(TypeError),
+                    None => {
+                        let val = v.value(ctx)?;
+                        decode
+                            .add(super::ctx::ValueCache::entry_bytes(&val))
+                            .map_err(|e| {
+                                ctx.fail_memory(&e);
+                                TypeError
+                            })?;
+                        Ok(val.to_term())
+                    }
                 }
             };
             let s = match term(0)? {
@@ -1768,12 +1829,27 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 return Err(TypeError);
             };
             let o = term(2)?;
-            Val::V(Value::Triple(Arc::new(oxrdf::Triple::new(s, p, o))))
+            let tr = Arc::new(oxrdf::Triple::new(s, p, o));
+            let bytes = super::graph_triple_bytes(&tr);
+            if !ctx.reserve_decode(usize::try_from(bytes).unwrap_or(usize::MAX)) {
+                drop(tr);
+                drop(decode);
+                return Err(TypeError);
+            }
+            drop(decode);
+            Val::V(Value::Triple(tr))
         }
         F::Subject | F::Predicate | F::Object => {
             let v = eval(&args[0], row, ctx)?;
+            let decode = ctx.charge(0).map_err(|e| {
+                ctx.fail_memory(&e);
+                TypeError
+            })?;
             let t = match v.id() {
-                Some(id) => match ctx.term(id) {
+                Some(id) => match ctx.term_checked_into(id, &decode).map_err(|e| {
+                    ctx.fail_memory(&e);
+                    TypeError
+                })? {
                     Some(Term::Triple(t)) => *t,
                     _ => return Err(TypeError),
                 },
@@ -1787,7 +1863,13 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 F::Predicate => Term::NamedNode(t.predicate),
                 _ => t.object,
             };
-            Val::Id(ctx.intern_term(&c))
+            let id = ctx.intern_term(&c);
+            drop(c);
+            drop(decode);
+            if ctx.has_memory_failure() {
+                return Err(TypeError);
+            }
+            Val::Id(id)
         }
         F::IsTriple => {
             let v = eval(&args[0], row, ctx)?;

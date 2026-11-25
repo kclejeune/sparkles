@@ -18,7 +18,7 @@
 //! them.
 
 use super::GeomRef;
-use super::column::{Slot, classify};
+use super::column::{Slot, classify_controlled};
 use super::exec::{Counters, config, state};
 use super::geom::Geom;
 use super::ops::in_crs;
@@ -120,22 +120,38 @@ impl Runner<'_, '_> {
             self.runs.push(info);
         }
         let map = res.var_map(self.ctx.nvars());
-        let keys = (0..res.len())
-            .map(|i| {
-                let row = Row {
-                    table: res,
-                    i,
-                    map: &map,
-                    dec: None,
-                    exists: None,
-                };
-                eval(&spec.order, &row, self.ctx)
-                    .ok()
-                    .and_then(|v| v.value(self.ctx).ok())
-                    .as_ref()
-                    .and_then(number)
-            })
-            .collect::<Vec<_>>();
+        let mut keys = Vec::with_capacity(res.len());
+        for i in 0..res.len() {
+            if i.is_multiple_of(1024) {
+                self.ctx.check()?;
+            }
+            let row = Row {
+                table: res,
+                i,
+                map: &map,
+                dec: None,
+                exists: None,
+            };
+            let k = match eval(&spec.order, &row, self.ctx) {
+                Ok(v) => match v.value(self.ctx) {
+                    Ok(val) => number(&val),
+                    Err(_) => {
+                        if self.ctx.has_memory_failure() {
+                            self.ctx.check()?;
+                        }
+                        None
+                    }
+                },
+                Err(_) => {
+                    if self.ctx.has_memory_failure() {
+                        self.ctx.check()?;
+                    }
+                    None
+                }
+            };
+            keys.push(k);
+        }
+        self.ctx.check()?;
         self.keyed += keys.len() as u64;
         let projected = input.project(self.ctx, self.vars)?;
         self.out.append_copy(self.ctx, &projected)?;
@@ -188,7 +204,13 @@ pub(crate) fn spatial_knn_materialized<'ctx>(
     let mut taken: FxHashSet<Id> = FxHashSet::default();
     if spec.errors {
         let rows;
-        (rows, taken) = rows_without_distance(ctx, spec, subj)?;
+        (rows, taken) = rows_without_distance(
+            ctx,
+            spec,
+            subj,
+            #[cfg(test)]
+            |_| {},
+        )?;
         error_rows = rows.len();
         for chunk in rows.chunks(ERROR_BATCH) {
             errors += run.run(chunk)?.iter().filter(|k| k.is_none()).count();
@@ -264,6 +286,7 @@ pub(crate) fn rows_without_distance(
     ctx: &Ctx,
     spec: &SpatialKnnSpec,
     subj: Option<Id>,
+    #[cfg(test)] observe: impl Fn(&Geom),
 ) -> Result<(Vec<[Id; 3]>, FxHashSet<Id>)> {
     let mut held = ctx.retained_charge(0)?;
     rows_without_distance_charged(ctx, spec, subj, &mut |bytes| {
@@ -302,8 +325,9 @@ pub(crate) fn rows_without_distance_charged(
         op_vertices: ctx.geo.op_vertices(),
         crs: FxHashMap::default(),
     };
-    let mut rechecked = Rechecked::new(snap);
+    let mut rechecked = Rechecked::new(ctx)?;
     // literal → whether its distance is an error
+    let memo_charge = ctx.charge(0)?;
     let mut memo: FxHashMap<u64, bool> = FxHashMap::default();
     let mut out = Vec::new();
     let mut bad_lits = 0usize;
@@ -341,8 +365,8 @@ pub(crate) fn rows_without_distance_charged(
         if subj.is_some_and(|x| x != s) {
             return Ok(());
         }
-        let bad = if let Some(&v) = memo.get(&o.0) {
-            v
+        let bad = if let Some(&cached) = memo.get(&o.0) {
+            cached
         } else {
             if memo.len() == memo.capacity() {
                 admit(bytes_for(
@@ -352,17 +376,15 @@ pub(crate) fn rows_without_distance_charged(
                     0,
                 ))?;
             }
-            let v = if !matches!(o.tag(), Tag::Vocab | Tag::Delta) {
+            let is_bad = if !matches!(o.tag(), Tag::Vocab | Tag::Delta) {
                 true
             } else {
-                let slot = base
-                    .as_ref()
-                    .and_then(|b| b.column.get(o.0))
-                    .unwrap_or_else(|| match snap.key(o) {
-                        Some(key) => classify(&key, &cfg),
-                        None => Slot::Other,
-                    });
-                let geom = match slot {
+                let parse_charge = ctx.charge(0)?;
+                let slot = match base.as_ref().and_then(|b| b.column.get(o.0)) {
+                    Some(slot) => slot,
+                    None => classify_controlled(ctx, o, &cfg, false, &parse_charge)?,
+                };
+                let geom = match &slot {
                     Slot::Geom(e) => e.geom(snap).ok(),
                     s if s.rechecked() => {
                         if rechecked.needs_growth(o.0) {
@@ -373,17 +395,24 @@ pub(crate) fn rows_without_distance_charged(
                                 0,
                             ))?;
                         }
-                        rechecked.entry(o.0).and_then(|e| e.geom(snap).ok())
+                        rechecked.entry(o.0)?.and_then(|e| e.geom(snap).ok())
                     }
                     _ => None,
                 };
-                geom.is_none_or(|g| !test.measurable(&g))
+                let bad = geom.is_none_or(|g| {
+                    #[cfg(test)]
+                    observe(&g);
+                    !test.measurable(&g)
+                });
+                drop(parse_charge);
+                bad
             };
-            memo.insert(o.0, v);
-            if v {
+            memo_charge.add(32)?;
+            memo.insert(o.0, is_bad);
+            if is_bad {
                 bad_lits += 1;
             }
-            v
+            is_bad
         };
         if bad {
             if out.len() == out.capacity() {
@@ -471,4 +500,80 @@ impl Measurable<'_> {
             geographic || in_crs(g, &self.q.crs).is_ok()
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn fallback_knn_keeps_geometry_credit_during_measurement() {
+    use crate::index::Perm;
+    use crate::io::{RdfFormat, Source};
+    use crate::sparql::expr::Expr;
+    use crate::sparql::plan::{GraphFilter, ScanSpec};
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{NamedNode, Term};
+
+    let store = Store::in_memory(StoreOptions::default());
+    let line = format!(
+        "<http://www.opengis.net/def/crs/EPSG/0/3857> LINESTRING({}1 1)",
+        "0 0,".repeat(255)
+    );
+    let data = format!(
+        "<urn:feature> <urn:geometry> \"{line}\"^^<{}> .",
+        super::WKT_LITERAL
+    );
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let ctx = Ctx::new(store.snapshot());
+    assert!(
+        ctx.snap
+            .geo
+            .as_ref()
+            .and_then(|v| v.base.as_ref())
+            .is_none()
+    );
+    let pred = ctx
+        .snap
+        .lookup_term(&Term::NamedNode(NamedNode::new_unchecked("urn:geometry")))
+        .unwrap();
+    let order = Perm::Pos.order();
+    let col = |c| order.iter().position(|&x| x == c).unwrap();
+    let spec = SpatialKnnSpec {
+        scan: ScanSpec {
+            perm: Perm::Pos,
+            prefix: vec![pred.0],
+            cols: vec![(col(O), 0), (col(S), 1)],
+            eqs: Vec::new(),
+            graph: GraphFilter::Default,
+            graph_col: col(G),
+            dedup: false,
+            src: None,
+        },
+        pred,
+        geom_var: 0,
+        subj_var: Some(1),
+        graph_var: None,
+        q: std::sync::Arc::new(super::parse("POINT(0 0)", super::WKT_LITERAL).unwrap()),
+        k: 1,
+        metres_per_unit: 1.0,
+        errors: true,
+        placeholder: Vec::new(),
+        key: 0,
+        order: Expr::Var(0),
+        w_first: false,
+    };
+    let observations = std::cell::Cell::new(0);
+    let (rows, skipped) = rows_without_distance(&ctx, &spec, None, |g| {
+        assert_eq!(g.vertices, 256);
+        assert!(ctx.live_bytes_for_tests() >= g.mem_size() as u64);
+        observations.set(observations.get() + 1);
+    })
+    .unwrap();
+    assert_eq!(observations.get(), 1);
+    assert!(rows.is_empty() && skipped.is_empty());
+    assert_eq!(ctx.live_bytes_for_tests(), 0);
 }

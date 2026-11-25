@@ -448,6 +448,7 @@ fn answers(
             }
         });
     }
+    ctx.check()?;
     drop(held);
     Ok(Some(keep))
 }

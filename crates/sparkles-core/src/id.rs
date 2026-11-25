@@ -673,6 +673,16 @@ pub fn key_decode_bytes(key: &[u8]) -> crate::error::Result<u64> {
     })
 }
 
+/// Validate RDF 1.2 triple-term key framing and nesting depth without allocating.
+/// Ordinary non-triple keys pass immediately; truncated, overflowing, trailing or
+/// over-depth triple-term keys return `Error::Corrupt`.
+pub(crate) fn validate_key_framing(key: &[u8]) -> crate::error::Result<()> {
+    if key.first() == Some(&b'(') {
+        key_decode_bytes(key)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn key_decode_bytes_with(
     key: &[u8],
     overflow: impl Fn() -> crate::error::Error,

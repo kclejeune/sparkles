@@ -284,18 +284,6 @@ pub struct PerValue<T> {
 }
 
 impl<T> PerValue<T> {
-    /// Charge `bytes` more to these values until they are dropped, such as the heap
-    /// payloads of their results.
-    pub(super) fn retain(&mut self, ctx: &Ctx, bytes: u64) -> Result<()> {
-        match &mut self._charge {
-            Some(charge) => charge.resize(charge.bytes().saturating_add(bytes)),
-            None => {
-                self._charge = ctx.retained_charge(bytes)?;
-                Ok(())
-            }
-        }
-    }
-
     #[inline]
     pub fn get(&self, row: usize) -> &T {
         match &self.slot {
@@ -421,6 +409,20 @@ pub fn per_value<T: Send>(
     report: &mut Report,
     eval: impl FnOnce(&Table) -> Result<Vec<T>>,
 ) -> Result<Option<PerValue<T>>> {
+    per_value_charged(ctx, t, exprs, always, report, |values, _| eval(values))
+}
+
+/// Like [`per_value`], passing the retained charge into `eval` so expression results
+/// with heap payloads (such as ORDER BY strings) admit their payload as values are
+/// produced rather than after materializing the entire vector.
+pub(super) fn per_value_charged<T: Send>(
+    ctx: &Ctx,
+    t: &Table,
+    exprs: &[&Expr],
+    always: bool,
+    report: &mut Report,
+    eval: impl FnOnce(&Table, &mut Option<super::ctx::RetainedCharge>) -> Result<Vec<T>>,
+) -> Result<Option<PerValue<T>>> {
     let Some(d) = distinct(ctx, t, exprs, always, report)? else {
         return Ok(None);
     };
@@ -430,20 +432,22 @@ pub fn per_value<T: Send>(
         .saturating_mul(4)
         .saturating_add(d.values.mem_bytes());
     let size = std::mem::size_of::<T>() as u64;
+    let base = held.saturating_add((d.values.len() as u64).saturating_mul(size));
     // Reuse is optional, so a charge that does not fit, before or after the evaluation,
     // leaves the rows to the caller instead of failing the query.
-    let Ok(mut charge) =
-        ctx.retained_charge(held.saturating_add((d.values.len() as u64).saturating_mul(size)))
-    else {
+    let Ok(mut charge) = ctx.retained_charge(base) else {
         return Ok(None);
     };
-    let vals = eval(&d.values)?;
+    let vals = eval(&d.values, &mut charge)?;
     debug_assert_eq!(vals.len(), d.values.len());
-    if let Some(charge) = &mut charge
+    let cap_extra = (vals.capacity().saturating_sub(d.values.len()) as u64).saturating_mul(size);
+    if cap_extra > 0
+        && let Some(charge) = &mut charge
         && charge
-            .resize(held.saturating_add((vals.capacity() as u64).saturating_mul(size)))
+            .resize(charge.bytes().saturating_add(cap_extra))
             .is_err()
     {
+        drop(vals);
         return Ok(None);
     }
     ctx.check()?;

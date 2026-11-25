@@ -378,6 +378,20 @@ pub(crate) fn by_id(ctx: &Ctx, id: Id, decoded: Option<&Value>) -> EvalResult<Ge
     if id.is_undef() {
         return Err(TypeError);
     }
+    let Some(v) = decoded else {
+        return match by_id_checked(ctx, id) {
+            Ok(Some(g)) => Ok(g),
+            Ok(None) => Err(TypeError),
+            Err(error) => {
+                ctx.fail_memory(&error);
+                Err(TypeError)
+            }
+        };
+    };
+    if let Err(error) = ctx.check() {
+        ctx.fail_memory(&error);
+        return Err(TypeError);
+    }
     if let Some(g) = from_column(ctx, id) {
         note_crs(ctx, &g);
         return Ok(g);
@@ -386,10 +400,7 @@ pub(crate) fn by_id(ctx: &Ctx, id: Id, decoded: Option<&Value>) -> EvalResult<Ge
     noted(
         ctx,
         ctx.geo
-            .get_or_parse_charged(ctx, MemoKey::Id(id), || match decoded {
-                Some(v) => parse_value(v, max),
-                None => parse_value(&ctx.value(id)?, max),
-            })
+            .get_or_parse_charged(ctx, MemoKey::Id(id), || parse_value(v, max))
             .ok_or(TypeError),
     )
 }

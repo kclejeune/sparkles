@@ -1109,8 +1109,28 @@ pub struct SpillReader {
 }
 
 impl SpillReader {
+    /// Bytes currently retained in this reader's reusable compressed-frame buffer.
+    pub(crate) fn buffer_capacity(&self) -> u64 {
+        self.payload.capacity() as u64
+    }
+
+    /// Free the reusable compressed-frame buffer (for example at EOF before dropping credit).
+    pub(crate) fn release_buffer(&mut self) {
+        self.payload = Vec::new();
+    }
+
     /// The next frame as one column of ids per file column, or `None` after the last.
     pub fn next_frame(&mut self) -> Result<Option<(Vec<Vec<Id>>, usize)>> {
+        self.next_frame_with(|_| Ok(()))
+    }
+
+    /// Like [`SpillReader::next_frame`], validating the frame header and invoking `admit`
+    /// with the total required bytes (reader buffer + decoded column vectors + transient
+    /// column-decode scratch) before resizing the reader buffer or decoding any column.
+    pub(crate) fn next_frame_with(
+        &mut self,
+        mut admit: impl FnMut(u64) -> Result<()>,
+    ) -> Result<Option<(Vec<Vec<Id>>, usize)>> {
         if self.frames == self.run.frames {
             return Ok(None);
         }
@@ -1124,6 +1144,23 @@ impl SpillReader {
         }
         if self.offset + (FRAME_HEADER_BYTES + len) as u64 > self.run.bytes {
             return Err(Error::Corrupt("spill frame runs past its file".into()));
+        }
+        let reader_bytes = self.payload.capacity().max(len) as u64;
+        let col_meta =
+            (self.run.columns as u64).saturating_mul(std::mem::size_of::<Vec<Id>>() as u64);
+        let col_ids = (self.run.columns as u64)
+            .saturating_mul(rows as u64)
+            .saturating_mul(8);
+        let decode_scratch = (rows as u64).saturating_mul(8);
+        admit(
+            reader_bytes
+                .saturating_add(col_meta)
+                .saturating_add(col_ids)
+                .saturating_add(decode_scratch)
+                .saturating_add(256),
+        )?;
+        if len > self.payload.capacity() {
+            self.payload.reserve_exact(len - self.payload.len());
         }
         self.payload.resize(len, 0);
         read_at(

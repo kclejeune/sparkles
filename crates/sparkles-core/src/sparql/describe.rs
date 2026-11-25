@@ -19,7 +19,7 @@
 //! (`?r rdf:subject s ; rdf:predicate p ; rdf:object o`). Options add the labels of the
 //! IRIs the description links to, and bound its depth and its size.
 
-use super::ctx::{Charge, Ctx, OutputCredit, PlanWarning, RetainedCharge, TermKind};
+use super::ctx::{Charge, Ctx, OutputCredit, OwnedCharge, PlanWarning, RetainedCharge, TermKind};
 use super::plan::GraphFilter;
 use super::table::Table;
 use crate::error::{Error, Result};
@@ -265,17 +265,7 @@ impl Described<'_> {
             .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
         for triple in &self.triples {
             ctx.check()?;
-            // The outer Triple slots are already included above. This envelope
-            // conservatively includes each owned lexical allocation and nested box.
-            let subject = match &triple.subject {
-                oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
-                oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
-            };
-            let payload = super::output::term_bytes(&triple.object)
-                .and_then(|n| n.checked_add(subject as u64))
-                .and_then(|n| n.checked_add(triple.predicate.as_str().len() as u64))
-                .and_then(|n| n.checked_add(256))
-                .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+            let payload = described_triple_bytes(ctx, triple)?;
             bytes = bytes
                 .checked_add(payload)
                 .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
@@ -358,9 +348,13 @@ struct Describer<'a> {
     bytes: u64,
     /// the triples earlier batches of a streamed DESCRIBE returned
     emitted: u64,
-    /// The bytes of `bytes` that the output and the queue hold, which a streamed
-    /// DESCRIBE releases once it hands its batch on, keeping only the traversal state.
+    /// The bytes of `bytes` that the queue holds, which a streamed DESCRIBE releases once
+    /// it hands its batch on, keeping only the traversal state.
     transient: u64,
+    /// Dedicated credit for `out` during streamed `describe_batch`, transferred intact to
+    /// the graph cursor without any zero-credit release gap.
+    out_charge: Option<OwnedCharge>,
+    out_bytes: u64,
 }
 
 /// Where a description reads: the graphs of the dataset and the reification
@@ -452,6 +446,20 @@ fn resources(ctx: &Ctx, t: &Table, seen: &mut FxHashSet<Id>) -> Vec<Id> {
     resources
 }
 
+/// Conservative retained byte envelope for one described triple's owned terms,
+/// shared between [`Describer::emit`] and [`Described::into_output`].
+fn described_triple_bytes(ctx: &Ctx, triple: &Triple) -> Result<u64> {
+    let subject = match &triple.subject {
+        oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+        oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+    };
+    super::output::term_bytes(&triple.object)
+        .and_then(|n| n.checked_add(subject as u64))
+        .and_then(|n| n.checked_add(triple.predicate.as_str().len() as u64))
+        .and_then(|n| n.checked_add(256))
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))
+}
+
 impl Describer<'_> {
     /// Describe `resources` in turn, and add the labels when `last` says no resources
     /// follow.
@@ -507,20 +515,30 @@ impl Streamed {
     }
 }
 
+/// One batch of triples from a streamed DESCRIBE together with the live credit covering
+/// them. `triples` is declared before `charge` so triples always drop before their credit.
+pub(super) struct DescribedBatch {
+    pub(super) triples: Vec<Triple>,
+    pub(super) charge: OwnedCharge,
+}
+
 /// The triples that describe the resources of the solutions `t` that no earlier batch
 /// named, after those that earlier batches returned. `last` says that no batch follows,
 /// so the labels of the linked IRIs come last. Only a cursor streams a DESCRIBE, and the
 /// state it keeps holds a retained charge.
 pub(super) fn describe_batch(
-    ctx: &Ctx,
+    ctx: &Arc<Ctx>,
     t: &Table,
     opts: &DescribeOptions,
     explicit: bool,
     state: &mut Streamed,
     last: bool,
-) -> Result<Vec<Triple>> {
+) -> Result<DescribedBatch> {
     if state.truncated {
-        return Ok(Vec::new());
+        return Ok(DescribedBatch {
+            triples: Vec::new(),
+            charge: OwnedCharge::new(ctx, 0)?,
+        });
     }
     let setup = match &state.setup {
         Some(setup) => setup.clone(),
@@ -540,6 +558,7 @@ pub(super) fn describe_batch(
                 .ok_or_else(|| Error::invalid("a streamed DESCRIBE runs in a cursor"))?
         }
     };
+    let out_charge = OwnedCharge::new(ctx, 0)?;
     let mut d = Describer {
         ctx,
         opts,
@@ -562,6 +581,8 @@ pub(super) fn describe_batch(
         bytes: state.bytes,
         emitted: state.emitted,
         transient: 0,
+        out_charge: Some(out_charge),
+        out_bytes: 0,
     };
     // the resources this batch added, in the set of described resources
     let added = (state.described.len() - before) as u64 * 48;
@@ -577,15 +598,25 @@ pub(super) fn describe_batch(
     state.linked = std::mem::take(&mut d.linked);
     state.truncated = d.truncated;
     state.emitted = d.emitted.saturating_add(d.out.len() as u64);
-    // The triples go to the caller, which charges them itself, and the queue is empty.
+    // The queue may still contain work on truncation or refusal. Free its allocation
+    // before returning its credit. The triples carry their own credit to the cursor.
+    drop(std::mem::take(&mut d.queue));
     state.bytes = d.bytes.saturating_sub(d.transient).max(4096);
     let DescriptionCharge { inner, .. } = d.charge;
     if let DescriptionChargeKind::Cursor(mut charge) = inner {
         let _ = charge.resize(state.bytes);
         state.charge = Some(charge);
     }
-    result?;
-    Ok(d.out)
+    if let Err(err) = result {
+        // Drop partial triples before their `out_charge`.
+        drop(d.out);
+        drop(d.out_charge);
+        return Err(err);
+    }
+    Ok(DescribedBatch {
+        triples: d.out,
+        charge: d.out_charge.expect("streamed DESCRIBE batch charge"),
+    })
 }
 
 /// Describe the IRIs and blank nodes of the solutions `t`. `explicit` says whether the
@@ -621,6 +652,8 @@ pub(super) fn describe<'a>(
         bytes: 4096,
         emitted: 0,
         transient: 0,
+        out_charge: None,
+        out_bytes: 0,
     };
     d.describe_all(resources, true)?;
     if d.truncated {
@@ -792,6 +825,30 @@ impl<'a> Describer<'a> {
         Ok(())
     }
 
+    fn decode_triple_checked(
+        &self,
+        s: Id,
+        p: Id,
+        o: Id,
+        credit: &crate::sparql::ctx::Charge<'_>,
+    ) -> Result<Option<Triple>> {
+        let Some(s) = self.ctx.term_checked_into(s, credit)? else {
+            return Ok(None);
+        };
+        let s = match s {
+            Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
+            Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
+            _ => return Ok(None),
+        };
+        let Some(Term::NamedNode(p)) = self.ctx.term_checked_into(p, credit)? else {
+            return Ok(None);
+        };
+        let Some(o) = self.ctx.term_checked_into(o, credit)? else {
+            return Ok(None);
+        };
+        Ok(Some(Triple::new(s, p, o)))
+    }
+
     /// Add a triple to the result, unless it is there already.
     fn emit(&mut self, s: Id, p: Id, o: Id, src: Source) -> Result<()> {
         if self.opts.labels {
@@ -817,14 +874,24 @@ impl<'a> Describer<'a> {
             self.truncated = true;
             return Ok(());
         }
-        let bytes = [s, p, o].iter().try_fold(512u64, |bytes, id| {
-            Ok::<_, Error>(bytes.saturating_add(self.ctx.decoded_bytes(*id)?.saturating_mul(4)))
-        })?;
-        self.reserve(bytes)?;
-        self.transient = self.transient.saturating_add(bytes);
-        if let Some(q) = self.ctx.snap.quad_to_terms(&[s, p, o, Id::DEFAULT_GRAPH]) {
-            self.out.push(Triple::new(q.subject, q.predicate, q.object));
+        let decode = self.ctx.charge(0)?;
+        if let Some(triple) = self.decode_triple_checked(s, p, o, &decode)? {
+            let payload = described_triple_bytes(self.ctx, &triple)?;
+            // Admit both the triple's owned payload and the Vec<Triple> growth slot
+            // envelope so `Described::into_output` never exceeds its original admission.
+            let slot_envelope = (std::mem::size_of::<Triple>() as u64).saturating_mul(2);
+            let bytes = payload.saturating_add(slot_envelope);
+            if let Some(out_charge) = &mut self.out_charge {
+                let next = self.out_bytes.saturating_add(bytes);
+                out_charge.resize(next)?;
+                self.out_bytes = next;
+            } else {
+                self.reserve(bytes)?;
+                self.transient = self.transient.saturating_add(bytes);
+            }
+            self.out.push(triple);
         }
+        drop(decode);
         Ok(())
     }
 
@@ -832,16 +899,17 @@ impl<'a> Describer<'a> {
     /// and RDF 1.1's `?r rdf:subject s ; rdf:predicate p ; rdf:object o`.
     fn reifiers_of(&mut self, s: Id, p: Id, o: Id, src: Source) -> Result<Vec<Id>> {
         if !self.reifiers.contains_key(&(s, p, o)) {
-            let bytes = [s, p, o].iter().try_fold(1024u64, |bytes, id| {
-                Ok::<_, Error>(bytes.saturating_add(self.ctx.decoded_bytes(*id)?.saturating_mul(8)))
-            })?;
-            let _decode_charge = DescriptionCharge::new(self.ctx, bytes)?;
             let mut found: Vec<(Id, u64)> = Vec::new();
-            if let Some(reifies) = self.reifies
-                && let Some(q) = self.ctx.snap.quad_to_terms(&[s, p, o, Id::DEFAULT_GRAPH])
-            {
-                let tt = Term::Triple(Box::new(Triple::new(q.subject, q.predicate, q.object)));
-                if let Some(tt) = self.ctx.snap.lookup_term(&tt) {
+            if let Some(reifies) = self.reifies {
+                let decode = self.ctx.charge(0)?;
+                let tt_id = if let Some(triple) = self.decode_triple_checked(s, p, o, &decode)? {
+                    let tt = Term::Triple(Box::new(triple));
+                    self.ctx.snap.lookup_term(&tt)
+                } else {
+                    None
+                };
+                drop(decode);
+                if let Some(tt) = tt_id {
                     for [r, _, _, g] in self.quads(Perm::Pos, &[reifies.0, tt.0])? {
                         self.reserve(128)?;
                         found.push((r, g.0));

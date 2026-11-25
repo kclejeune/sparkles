@@ -1883,3 +1883,22 @@ gates passed on `726563ad`: `mise run test:w3c:streaming` passed 1,274 of 1,274 
 with zero regressions and 24 unchanged fallbacks, and `py:test`, `jvm:test`, `node:test`
 and `bench:bindings` across all five Sparkles engines passed with zero answer
 discrepancies.
+
+### Strict decoding across non-SELECT callers
+
+Item 1308 Wave 2 closed the eager decode bypass in `Ctx` by removing `envelope_refuses`
+and unifying `DecodeEnvelope` across both accounting modes, which lowered the
+bounded-reads check from seven to six sites. Eager and streaming execution now enforce
+the same memory budget and live request controls across expression combinators, batch
+loops, executor operators, ORDER BY and top-k heaps, external sort frame reloads,
+streaming and eager group accumulators, DESCRIBE, SERVICE, text highlighting, dataset
+restriction, incremental passes, SHACL embedded query results and GeoSPARQL execution.
+Optional FILTER selectivity sampling skips impure expressions and uses a disposable
+trial on a snapshot cache miss. The trial admits copies of query setup before cloning
+them, including the local vocabulary's backing buckets, and releases its decode,
+cache and local-term state before execution starts.
+Triple keys validate their framing and nesting depth before recursive decoding, and
+vocabulary read locks are released before memory admission or geometry parsing.
+GeoJSON fallback and recheck paths admit the JSON value tree before parsing. The parser
+reads object keys as ordinary strings and bounds the unknown-type diagnostic. The
+nearest-neighbour fallback keeps parsed entry credit through distance measurement.

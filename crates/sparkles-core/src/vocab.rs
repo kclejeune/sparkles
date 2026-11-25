@@ -2901,6 +2901,33 @@ impl AppendVocab {
     pub fn len(&self) -> u64 {
         self.keys.len() as u64
     }
+
+    /// Bytes allocated by cloning a dictionary that has grown only by appending.
+    /// Key bodies are shared by the cloned Arcs.
+    pub(crate) fn append_only_clone_bytes(&self) -> u64 {
+        let vector = self
+            .len()
+            .saturating_mul(std::mem::size_of::<Arc<[u8]>>() as u64);
+        let capacity = self.map.capacity() as u64;
+        let index = if let Some(cold) = &self.cold {
+            cold.bytes()
+        } else if capacity == 0 {
+            0
+        } else {
+            // Without deletions, the pinned std HashMap capacity is at least
+            // half the backing bucket count and strictly below it. Its clone
+            // keeps that power-of-two bucket count. Allow one control byte per
+            // bucket and slack for the alignment and trailing control group.
+            let buckets = capacity
+                .saturating_add(1)
+                .checked_next_power_of_two()
+                .unwrap_or(u64::MAX);
+            let slot = std::mem::size_of::<(Arc<[u8]>, u64)>() as u64 + 1;
+            buckets.saturating_mul(slot).saturating_add(64)
+        };
+        vector.saturating_add(index)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }

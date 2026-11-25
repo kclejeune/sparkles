@@ -65,18 +65,8 @@ pub(crate) fn malformed(dt: &str, e: &GeomError) -> String {
     }
 }
 
-/// The IRI of a graph id (the default graph by its Jena name).
-pub(crate) fn graph_iri(ctx: &Ctx, g: Id) -> Option<String> {
-    if g == Id::DEFAULT_GRAPH {
-        return Some(crate::text::DEFAULT_GRAPH_IRI.to_string());
-    }
-    match ctx.term(g)? {
-        Term::NamedNode(n) => Some(n.into_string()),
-        _ => None,
-    }
-}
-
-/// Checked variant of [`graph_iri`], propagating any memory or control refusal.
+/// Checked graph IRI lookup (the default graph by its Jena name), propagating any
+/// memory or control refusal.
 pub(crate) fn graph_iri_checked(ctx: &Ctx, g: Id) -> Result<Option<String>> {
     if g == Id::DEFAULT_GRAPH {
         ctx.check()?;
@@ -346,19 +336,18 @@ fn holds(
 /// The geometry of a candidate literal: the index's column, or the literal parsed as
 /// functions parse it (through the query's memo; a literal too long for the index is
 /// read all the same, as the index's searches hand it out too).
-fn load(ctx: &Ctx, id: Id, src: &Src) -> Option<GeomRef> {
-    use super::memo::{MemoKey, max_vertices, note_crs, parse_value};
-    let g = match src {
-        Src::Entry(e) => e.geom(&ctx.snap).ok(),
-        Src::Literal => {
-            let v = ctx.value(id)?;
-            let max = max_vertices(ctx);
-            ctx.geo
-                .get_or_parse_charged(ctx, MemoKey::Id(id), || parse_value(&v, max))
+fn load(ctx: &Ctx, id: Id, src: &Src) -> Result<Option<GeomRef>> {
+    match src {
+        Src::Entry(e) => {
+            ctx.check()?;
+            let g = e.geom(&ctx.snap).ok();
+            if let Some(g) = &g {
+                super::memo::note_crs(ctx, g);
+            }
+            Ok(g)
         }
-    }?;
-    note_crs(ctx, &g);
-    Some(g)
+        Src::Literal => super::memo::by_id_checked(ctx, id),
+    }
 }
 
 /// Test each distinct candidate literal once (in parallel for many); `None` where it
@@ -376,7 +365,7 @@ fn refine(
             if i % CHECK_EVERY == CHECK_EVERY - 1 {
                 ctx.check()?;
             }
-            out.push(load(ctx, *id, src).and_then(|g| t.check(&g)));
+            out.push(load(ctx, *id, src)?.and_then(|g| t.check(&g)));
         }
         Ok(out)
     };
@@ -445,15 +434,16 @@ impl<'a> Scope<'a> {
         }
     }
 
-    pub(crate) fn contains(&mut self, ctx: &Ctx, g: u64) -> bool {
+    pub(crate) fn contains(&mut self, ctx: &Ctx, g: u64) -> Result<bool> {
         if self.all {
-            return true;
+            return Ok(true);
         }
-        let cfg = self.cfg;
-        *self
-            .memo
-            .entry(g)
-            .or_insert_with(|| graph_iri(ctx, Id(g)).is_some_and(|i| cfg.graph_in_scope(&i)))
+        if let Some(&cached) = self.memo.get(&g) {
+            return Ok(cached);
+        }
+        let in_scope = graph_iri_checked(ctx, Id(g))?.is_some_and(|i| self.cfg.graph_in_scope(&i));
+        self.memo.insert(g, in_scope);
+        Ok(in_scope)
     }
 }
 
@@ -567,20 +557,38 @@ pub fn spatial_scan(
     if !spec.filter.is_empty() {
         use crate::sparql::expr::{Row, ebv};
         let map = t.var_map(ctx.nvars());
-        let keep: Vec<bool> = (0..t.len())
-            .map(|i| {
-                let row = Row {
-                    table: &t,
-                    i,
-                    map: &map,
-                    dec: None,
-                    exists: None,
-                };
-                spec.filter
-                    .iter()
-                    .all(|e| ebv(e, &row, ctx).unwrap_or(false))
-            })
-            .collect();
+        let mut keep = Vec::with_capacity(t.len());
+        for i in 0..t.len() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let row = Row {
+                table: &t,
+                i,
+                map: &map,
+                dec: None,
+                exists: None,
+            };
+            let mut ok = true;
+            for e in &spec.filter {
+                match ebv(e, &row, ctx) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        ok = false;
+                        break;
+                    }
+                    Err(_) => {
+                        if ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            keep.push(ok);
+        }
+        ctx.check()?;
         t.filter_rows(&keep);
         st.matched = t.len() as u64;
     }
@@ -690,14 +698,27 @@ pub fn spatial_pf(
     for key in order {
         ctx.check()?;
         let rows = groups.remove(&key).unwrap_or_default();
-        let Some(vals) = key
-            .iter()
-            .map(|id| ctx.value(*id))
-            .collect::<Option<Vec<_>>>()
-        else {
+        let args_credit = ctx.charge(0)?;
+        let mut vals = Vec::with_capacity(key.len());
+        let mut complete = true;
+        for id in &key {
+            match ctx.value_checked_into(*id, &args_credit)? {
+                Some(v) => vals.push(v),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            drop(vals);
+            drop(args_credit);
             continue;
-        };
-        let Ok(a) = crate::sparql::geopf::decode_values(spec.func, &vals, &cfg) else {
+        }
+        let decoded = crate::sparql::geopf::decode_values(spec.func, &vals, &cfg);
+        drop(vals);
+        drop(args_credit);
+        let Ok(a) = decoded else {
             continue;
         };
         if a.empty {
@@ -809,7 +830,7 @@ fn spatial_pf_once(ctx: &Ctx, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<(T
                         for p in &preds {
                             scan_keys(ctx, Perm::Spo, &[geom, p.0], |k2| {
                                 let g = k2[3];
-                                if spec.graph.accepts(g) && scope.contains(ctx, g) {
+                                if spec.graph.accepts(g) && scope.contains(ctx, g)? {
                                     cands.push(ctx, Id(geom), Id(k2[2]), Id(g), || Src::Literal)?;
                                 }
                                 Ok(())
@@ -824,7 +845,7 @@ fn spatial_pf_once(ctx: &Ctx, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<(T
                     let mut n = 0;
                     scan_keys(ctx, Perm::Spo, &[f.0, lat.0], |k| {
                         let (lat_o, g) = (k[2], k[3]);
-                        if !spec.graph.accepts(g) || !scope.contains(ctx, g) {
+                        if !spec.graph.accepts(g) || !scope.contains(ctx, g)? {
                             return Ok(());
                         }
                         let Some(y) = super::wgs84::number(&ctx.snap, Id(lat_o)) else {

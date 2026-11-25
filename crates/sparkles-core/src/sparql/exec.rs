@@ -61,7 +61,7 @@ pub(super) fn map_rows<T: Send>(
             .saturating_mul(2)
             .saturating_add(rayon::current_num_threads() as u64 * 1024);
         if let Ok(_scratch) = ctx.charge(bytes) {
-            return (0..n)
+            let out: Vec<T> = (0..n)
                 .into_par_iter()
                 .with_min_len(MAP_POLL_ROWS)
                 .map(|i| {
@@ -70,7 +70,9 @@ pub(super) fn map_rows<T: Send>(
                     }
                     Ok(f(i))
                 })
-                .collect();
+                .collect::<Result<Vec<T>>>()?;
+            ctx.check()?;
+            return Ok(out);
         }
     }
     // Without the collector's charge, a parallel map runs in pieces that each collect
@@ -88,6 +90,7 @@ pub(super) fn map_rows<T: Send>(
         }
         start = end;
     }
+    ctx.check()?;
     Ok(out)
 }
 
@@ -145,6 +148,7 @@ pub(super) fn map_batch_with<S, T: Send>(
     let may_split = par && batch_may_split(n) && rayon::current_num_threads() > 1;
     let t0 = may_split.then(Instant::now);
     out.extend((0..sample).map(|i| f(&mut state, i)));
+    ctx.check()?;
     if let Some(t0) = t0
         && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
     {
@@ -171,6 +175,7 @@ pub(super) fn map_batch_with<S, T: Send>(
             for piece in pieces {
                 out.extend(piece?);
             }
+            ctx.check()?;
             return Ok(out);
         }
     }
@@ -181,6 +186,7 @@ pub(super) fn map_batch_with<S, T: Send>(
         out.extend((start..end).map(|i| f(&mut state, i)));
         start = end;
     }
+    ctx.check()?;
     Ok(out)
 }
 
@@ -3455,21 +3461,39 @@ fn lexical_check(
     };
     let vocab = &ctx.snap.generation.vocab;
     let last = run.lo - 1;
-    let Some(key) = vocab.get(Id(last).payload()) else {
-        return Ok(Lexical::Step);
-    };
-    let lex = match key.split_first() {
-        Some((b'"', rest)) => match rest.iter().position(|&b| b == crate::id::KEY_SEP) {
-            Some(end) => &rest[..end],
-            None => return Ok(Lexical::Step),
-        },
-        _ => return Ok(Lexical::Step),
-    };
-    if s.as_bytes() > lex {
-        return Ok(Lexical::Step);
-    }
-    let Ok(lex) = std::str::from_utf8(lex) else {
-        return Ok(Lexical::Step);
+    // Reconstruct the last key with controlled scratch admission and live controls,
+    // copying only the bounded prefix needed for prefix lookups.
+    let prefix = match ctx.with_controlled_vocab_key(Id(last).payload(), |key| {
+        let lex = match key.split_first() {
+            Some((b'"', rest)) => match rest.iter().position(|&b| b == crate::id::KEY_SEP) {
+                Some(end) => &rest[..end],
+                None => return Ok(Err(Lexical::Step)),
+            },
+            _ => return Ok(Err(Lexical::Step)),
+        };
+        if s.as_bytes() > lex {
+            return Ok(Err(Lexical::Step));
+        }
+        let Ok(lex_str) = std::str::from_utf8(lex) else {
+            return Ok(Err(Lexical::Step));
+        };
+        // Retain only the characters needed to enumerate the eligible prefixes.
+        let mut take = 0usize;
+        for (end, c) in lex_str.char_indices() {
+            let p = &lex_str[..end];
+            if p > &**s {
+                break;
+            }
+            if end > LEXICAL_PREFIX_BYTES {
+                return Ok(Err(Lexical::Generic));
+            }
+            take = end + c.len_utf8();
+        }
+        Ok(Ok(lex_str[..take].to_owned()))
+    })? {
+        Some(Ok(prefix)) => prefix,
+        Some(Err(verdict)) => return Ok(verdict),
+        None => return Ok(Lexical::Step),
     };
     let scan = &spec.scan;
     let bound = |v: u64, fill: u64| {
@@ -3478,23 +3502,27 @@ fn lexical_check(
         k
     };
     let mut read = Vec::new();
+    let find_scratch = ctx.charge(0)?;
+    let mut find_reserved = 0u64;
     // the key of the prefix, grown a character at a time, without its 0xFF
     let mut probe = vec![b'"'];
     // the proper prefixes, shortest first: once one is greater than the k-th
     // candidate, so are the longer ones
-    for (n, (end, c)) in lex.char_indices().enumerate() {
-        let p = &lex[..end];
-        if p > &**s {
-            break;
-        }
-        if end > LEXICAL_PREFIX_BYTES {
-            return Ok(Lexical::Generic);
-        }
+    for (n, c) in prefix.chars().enumerate() {
         if n % 32 == 31 {
             ctx.check()?;
         }
         probe.push(crate::id::KEY_SEP);
-        let found = vocab.find(&probe);
+        let found = vocab.find_with_controlled(
+            &probe,
+            |need| {
+                let bytes = (need as u64).saturating_mul(2);
+                find_scratch.add(bytes.saturating_sub(find_reserved))?;
+                find_reserved = find_reserved.max(bytes);
+                Ok(())
+            },
+            |_| ctx.check(),
+        )?;
         probe.pop();
         let mut utf8 = [0; 4];
         probe.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
@@ -3518,6 +3546,92 @@ fn lexical_check(
     } else {
         Lexical::Read(read)
     })
+}
+
+#[cfg(test)]
+#[test]
+fn ordered_lexical_check_refuses_oversized_probe_after_candidate_decode() {
+    use crate::io::{RdfFormat, Source};
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{Literal, NamedNode, Term};
+
+    let store = Store::in_memory(StoreOptions::default());
+    let oversized = format!("ab{}", "x".repeat(32 * 1024));
+    let data = format!("<urn:s> <urn:p> \"a\", \"abc\", \"{oversized}\" .");
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    store.compact().unwrap();
+    let snap = store.snapshot();
+    let literal = |s| {
+        snap.lookup_term(&Term::Literal(Literal::new_simple_literal(s)))
+            .unwrap()
+    };
+    let candidate = literal("a");
+    let short = literal("abc");
+    let long = literal(oversized.as_str());
+    let pred = snap
+        .lookup_term(&Term::NamedNode(NamedNode::new_unchecked("urn:p")))
+        .unwrap();
+    let scan = super::plan::ScanSpec {
+        perm: crate::index::Perm::Pos,
+        prefix: vec![pred.0],
+        cols: vec![(1, 0)],
+        eqs: Vec::new(),
+        graph: super::plan::GraphFilter::Default,
+        graph_col: 3,
+        dedup: false,
+        src: None,
+    };
+    let spec = OrderedTopK {
+        fallback: Box::new(Node::empty(vec![0])),
+        scan,
+        var: 0,
+        asc: true,
+        k: 1,
+        pieces: Vec::new(),
+        filter: Vec::new(),
+        range_filter: Vec::new(),
+        tie_order: vec![0],
+    };
+    let run = |last: Id| TopKRun {
+        lo: last.0 + 1,
+        hi: candidate.0,
+        exact: true,
+        best_high: false,
+        kept: Table::new(vec![0]),
+        want: 1,
+        done: false,
+        lexical: true,
+        extra: Vec::new(),
+        hold: false,
+    };
+
+    let control = Ctx::new(snap.clone());
+    let kth = control.value(candidate).expect("short candidate decodes");
+    assert!(matches!(
+        lexical_check(&control, &spec, &run(short), Some(&kth)).unwrap(),
+        Lexical::Read(ids) if ids == [candidate.0]
+    ));
+    assert!(matches!(
+        lexical_check(&control, &spec, &run(long), Some(&kth)).unwrap(),
+        Lexical::Read(ids) if ids == [candidate.0]
+    ));
+
+    let mut target = Ctx::new(snap);
+    target.mem_limit = 24 * 1024;
+    let kth = target
+        .value(candidate)
+        .expect("candidate fits tight budget");
+    target.check().unwrap();
+    assert!(matches!(
+        lexical_check(&target, &spec, &run(long), Some(&kth)),
+        Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+    ));
 }
 
 /// Rows of an [`OrderedTopK`] scan whose order-column ids lie in `[lo, hi]`, in key order,
@@ -3732,13 +3846,15 @@ fn topk_step(
 /// Whether ORDER BY's comparison of `id` with other values is a total order (it is not
 /// for NaN, which compares with numbers by its lexical form, nor for partially ordered
 /// dates, times and durations).
-fn totally_ordered(ctx: &Ctx, id: Id) -> bool {
+fn totally_ordered(ctx: &Ctx, id: Id) -> Result<bool> {
     use crate::id::Tag;
     match id.tag() {
-        Tag::Double => !id.as_f64().is_nan(),
-        Tag::DateTime | Tag::Date => false,
-        Tag::Vocab | Tag::Delta => value_totally_ordered(ctx.value(id).as_ref()),
-        _ => true,
+        Tag::Double => Ok(!id.as_f64().is_nan()),
+        Tag::DateTime | Tag::Date => Ok(false),
+        Tag::Vocab | Tag::Delta | Tag::Local => {
+            Ok(value_totally_ordered(ctx.value_checked(id)?.as_ref()))
+        }
+        _ => Ok(true),
     }
 }
 
@@ -3788,11 +3904,38 @@ fn topk_rest<'ctx>(
     let total = match &decoded {
         Some(values) => rest_total(ctx, &rest.table, values)?,
         None => {
-            let total = |id: &Id| totally_ordered(ctx, *id);
             if rest.table.len() > PAR_THRESHOLD / 4 {
-                rest.table.cols[0].par_iter().all(total)
+                let not_total = std::sync::atomic::AtomicBool::new(false);
+                rest.table.cols[0]
+                    .par_iter()
+                    .enumerate()
+                    .try_for_each(|(i, &id)| -> Result<()> {
+                        if not_total.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Ok(());
+                        }
+                        if i.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        if !totally_ordered(ctx, id)? {
+                            not_total.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Ok(())
+                    })?;
+                ctx.check()?;
+                !not_total.load(std::sync::atomic::Ordering::Relaxed)
             } else {
-                rest.table.cols[0].iter().all(total)
+                let mut ok = true;
+                for (i, &id) in rest.table.cols[0].iter().enumerate() {
+                    if i.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    if !totally_ordered(ctx, id)? {
+                        ok = false;
+                        break;
+                    }
+                }
+                ctx.check()?;
+                ok
             }
         }
     };
@@ -3847,7 +3990,7 @@ fn rest_total(
         if !matches!(
             id.tag(),
             crate::id::Tag::Vocab | crate::id::Tag::Delta | crate::id::Tag::Local
-        ) && !totally_ordered(ctx, id)
+        ) && !totally_ordered(ctx, id)?
         {
             return Ok(false);
         }
@@ -4102,7 +4245,20 @@ fn morsel_best<'ctx>(
         Some(values) => rest_total(ctx, &t.table, values)?,
         // without a decoded column, values are read one at a time, as eager execution
         // reads them
-        None => t.table.cols[0].iter().all(|&id| totally_ordered(ctx, id)),
+        None => {
+            let mut ok = true;
+            for (i, &id) in t.table.cols[0].iter().enumerate() {
+                if i.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                if !totally_ordered(ctx, id)? {
+                    ok = false;
+                    break;
+                }
+            }
+            ctx.check()?;
+            ok
+        }
     };
     if !total {
         return Ok(None);
@@ -4118,9 +4274,7 @@ fn morsel_best<'ctx>(
     }
     drop(decoded);
     if t.table.len() > spec.k {
-        let row_bytes = size_of::<Entry<usize>>() + size_of::<SortKey>() + size_of::<usize>();
-        let _ranked =
-            ctx.charge((spec.k.saturating_add(1) as u64).saturating_mul(2 * row_bytes as u64))?;
+        let mut heap_rows = EagerHeapRows::new(ctx)?;
         let mut heap: TopK<usize> = TopK::new(spec.k, vec![spec.asc]);
         offer_rows(
             ctx,
@@ -4128,9 +4282,10 @@ fn morsel_best<'ctx>(
             &t.table,
             keys,
             &mut ExprReport::default(),
-            &mut RowIndex,
+            &mut heap_rows,
         )?;
         let mut rows: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
+        drop(heap_rows);
         rows.sort_unstable();
         t = topk_take_rows(ctx, &t.table, &rows)?;
     }
@@ -4286,7 +4441,8 @@ fn ordered_topk_run(
         if top.len() == spec.k {
             // a piece is finished once the k-th row is strictly better than its best
             // unread value, and so than every unread value
-            let kth = ctx.value(top.cols[0][spec.k - 1]);
+            let kth_credit = ctx.charge(0)?;
+            let kth = ctx.value_checked_into(top.cols[0][spec.k - 1], &kth_credit)?;
             for run in runs.iter_mut().filter(|r| !r.done) {
                 if run.lexical {
                     match lexical_check(ctx, spec, run, kth.as_ref())? {
@@ -4306,10 +4462,16 @@ fn ordered_topk_run(
                     continue;
                 }
                 let best = Id(if run.best_high { run.hi } else { run.lo });
-                if order_cmp(kth.as_ref(), ctx.value(best).as_ref()) == better {
+                let best_credit = ctx.charge(0)?;
+                let best_v = ctx.value_checked_into(best, &best_credit)?;
+                if order_cmp(kth.as_ref(), best_v.as_ref()) == better {
                     run.done = true;
                 }
+                drop(best_v);
+                drop(best_credit);
             }
+            drop(kth);
+            drop(kth_credit);
         }
         if runs.iter().all(|r| r.done) {
             finish(top)?;
@@ -4922,7 +5084,9 @@ fn unpack(
             ctx.check()?;
         }
         let Some(tc) = tc else { break };
-        let Some(oxrdf::Term::Triple(tr)) = ctx.term(input.cols[tc][i]) else {
+        let decode = ctx.charge(0)?;
+        let Some(oxrdf::Term::Triple(tr)) = ctx.term_checked_into(input.cols[tc][i], &decode)?
+        else {
             continue;
         };
         let comps = [
@@ -4930,6 +5094,9 @@ fn unpack(
             ctx.intern_term(&oxrdf::Term::NamedNode(tr.predicate.clone())),
             ctx.intern_term(&tr.object),
         ];
+        drop(tr);
+        drop(decode);
+        ctx.check()?;
         for (j, m) in map.iter().enumerate() {
             row[j] = m.map_or(Id::UNDEF, |c| input.cols[c][i]);
         }
@@ -4954,6 +5121,7 @@ fn unpack(
             out.push_row(&row);
         }
     }
+    ctx.check()?;
     Ok(out)
 }
 
@@ -5185,11 +5353,7 @@ fn string_cross(
         if j.is_multiple_of(1024) {
             ctx.check()?;
         }
-        let key = with_string_lexical(ctx, id, |s| {
-            index_charge.add(s.len() as u64)?;
-            Ok(Box::<str>::from(s))
-        })?
-        .expect("proved string domain");
+        let key = string_lexical_boxed(ctx, id, &index_charge)?.expect("proved string domain");
         index.push((key, j));
     }
     // One array, no extra sort scratch. Including row numbers in the key keeps
@@ -5208,12 +5372,10 @@ fn string_cross(
         if i.is_multiple_of(1024) {
             ctx.check()?;
         }
-        with_string_lexical(ctx, id, |s| {
-            let (begin, end) = range(s);
-            rows = rows.saturating_add(end - begin);
-            ctx.check_output_rows(rows)
-        })?
-        .expect("proved string domain");
+        let (begin, end) =
+            with_string_lexical(ctx, id, |s| Ok(range(s)))?.expect("proved string domain");
+        rows = rows.saturating_add(end - begin);
+        ctx.check_output_rows(rows)?;
     }
     // Includes the pair array while the matching table is materialized, with all
     // lexical index payloads and the input tables still charged and alive.
@@ -5227,17 +5389,14 @@ fn string_cross(
         if i.is_multiple_of(1024) {
             ctx.check()?;
         }
-        with_string_lexical(ctx, id, |s| {
-            let (begin, end) = range(s);
-            for (_, j) in &index[begin..end] {
-                if pairs.len().is_multiple_of(1024) {
-                    ctx.check()?;
-                }
-                pairs.push((i as u32, *j as u32));
+        let (begin, end) =
+            with_string_lexical(ctx, id, |s| Ok(range(s)))?.expect("proved string domain");
+        for (_, j) in &index[begin..end] {
+            if pairs.len().is_multiple_of(1024) {
+                ctx.check()?;
             }
-            Ok(())
-        })?
-        .expect("proved string domain");
+            pairs.push((i as u32, *j as u32));
+        }
     }
     ctx.check()?;
     // Pair capacity is already live; admit only the output columns here.
@@ -5262,28 +5421,49 @@ fn string_lexical_key(key: &[u8]) -> Option<&str> {
     std::str::from_utf8(&key[1..sep]).ok()
 }
 
-/// Read a borrowed lexical key with the existing charged vocabulary scratch.
-/// Unlike Ctx::value this does not populate the eager decoded-value cache.
+/// Read a borrowed lexical key with controlled vocabulary scratch and live request
+/// controls. `f` must only inspect the borrowed string without calling `ctx.charge()`.
+/// Unlike `Ctx::value` this does not populate the eager decoded-value cache.
 fn with_string_lexical<T>(
     ctx: &Ctx,
     id: Id,
     mut f: impl FnMut(&str) -> Result<T>,
 ) -> Result<Option<T>> {
-    use crate::id::Tag;
-    let mut read = |key: &[u8]| match string_lexical_key(key) {
+    ctx.with_controlled_key(id, |key| match string_lexical_key(key) {
         Some(s) => f(s).map(Some),
         None => Ok(None),
-    };
+    })
+    .map(Option::flatten)
+}
+
+/// Copy one string lexical form into a boxed string, admitting its bytes onto `credit`
+/// before allocating and never calling `credit.add` while holding a delta or local lock.
+fn string_lexical_boxed(
+    ctx: &Ctx,
+    id: Id,
+    credit: &super::ctx::Charge<'_>,
+) -> Result<Option<Box<str>>> {
+    use crate::id::Tag;
+    ctx.check()?;
     match id.tag() {
         Tag::Vocab => ctx
-            .with_cursor_vocab_key(id.payload(), &mut read)?
-            .unwrap_or(Ok(None)),
-        Tag::Delta => ctx
-            .snap
-            .generation
-            .dvocab
-            .with(|v| v.get(id.payload()).map(&mut read).unwrap_or(Ok(None))),
-        Tag::Local => ctx.with_local_key(id.payload(), read).unwrap_or(Ok(None)),
+            .with_controlled_vocab_key(id.payload(), |key| {
+                let Some(s) = string_lexical_key(key) else {
+                    return Ok(None);
+                };
+                credit.add(s.len() as u64)?;
+                ctx.check()?;
+                Ok(Some(Box::<str>::from(s)))
+            })
+            .map(Option::flatten),
+        Tag::Delta | Tag::Local => {
+            let Some(len) = with_string_lexical(ctx, id, |s| Ok(s.len()))? else {
+                return Ok(None);
+            };
+            credit.add(len as u64)?;
+            ctx.check()?;
+            with_string_lexical(ctx, id, |s| Ok(Box::<str>::from(s)))
+        }
         _ => Ok(None),
     }
 }
@@ -5562,11 +5742,15 @@ fn assign(ctx: &Ctx, t: &mut Table, v: VarId, col: Vec<Id>) -> Result<()> {
             t.cols[c][i] = new;
             continue;
         }
-        keep[i] = match (ctx.term(old), ctx.term(new)) {
+        let decode = ctx.charge(0)?;
+        let a = ctx.term_checked_into(old, &decode)?;
+        let b = ctx.term_checked_into(new, &decode)?;
+        keep[i] = match (a, b) {
             (Some(a), Some(b)) => super::cdt::same_value(&a, &b).unwrap_or(false),
             _ => false,
         };
     }
+    ctx.check()?;
     if keep.iter().any(|k| !k) {
         let sorted = t.sorted.clone();
         t.filter_rows(&keep);
@@ -5595,23 +5779,44 @@ fn unfold(
     let mut out = Table::new(vars);
     let mut row: Vec<Id> = Vec::with_capacity(out.width());
     // the elements of each distinct literal, interned once
+    let seen_charge = ctx.charge(0)?;
     let mut seen: FxHashMap<Id, Option<Vec<(Id, Id)>>> = FxHashMap::default();
     for (i, id) in col.into_iter().enumerate() {
         if i % 4096 == 0 {
             ctx.check()?;
             ctx.check_output(out.len(), out.width())?;
         }
-        let elems = seen.entry(id).or_insert_with(|| {
-            let t = ctx.term(id)?;
-            let parts = super::cdt::unfold(&t)?;
-            let intern = |x: Option<oxrdf::Term>| x.map_or(Id::UNDEF, |x| ctx.intern_term(&x));
-            Some(
-                parts
-                    .into_iter()
-                    .map(|(a, b)| (intern(a), intern(b)))
-                    .collect(),
-            )
-        });
+        if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(id) {
+            let decode = ctx.charge(0)?;
+            let entry = match ctx.term_checked_into(id, &decode)? {
+                Some(t) => match super::cdt::unfold(&t) {
+                    Some(parts) => {
+                        let entry_bytes =
+                            (parts.len() as u64).saturating_mul(16).saturating_add(64);
+                        seen_charge.add(entry_bytes)?;
+                        let mut pairs = Vec::with_capacity(parts.len());
+                        for (a, b) in parts {
+                            let ia = a.map_or(Id::UNDEF, |x| ctx.intern_term(&x));
+                            let ib = b.map_or(Id::UNDEF, |x| ctx.intern_term(&x));
+                            ctx.check()?;
+                            pairs.push((ia, ib));
+                        }
+                        Some(pairs)
+                    }
+                    None => {
+                        seen_charge.add(64)?;
+                        None
+                    }
+                },
+                None => {
+                    seen_charge.add(64)?;
+                    None
+                }
+            };
+            e.insert(entry);
+            drop(decode);
+        }
+        let elems = &seen[&id];
         row.clear();
         row.extend(t.cols.iter().map(|c| c[i]));
         match elems {
@@ -5634,6 +5839,10 @@ fn unfold(
             }
         }
     }
+    ctx.check()?;
+    ctx.check_output(out.len(), out.width())?;
+    drop(seen);
+    drop(seen_charge);
     Ok(out)
 }
 
@@ -6686,10 +6895,10 @@ fn topk_candidates(
     } else {
         map_rows(ctx, t.len(), false, approximate)?
     };
+    ctx.check()?;
     let Some(numbers) = approximate.into_iter().collect::<Option<Vec<f64>>>() else {
         return Ok(None);
     };
-    ctx.check()?;
     let mut sorted = numbers.clone();
     let (_, kth, _) = sorted.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
     let threshold = *kth;
@@ -6776,10 +6985,13 @@ fn order_by(
         && heap_eligible(ctx)
     {
         let n = t.len();
+        // Declare heap credit BEFORE `heap` so entries drop before their credit on unwind.
+        let mut rows = EagerHeapRows::new(ctx)?;
         let mut heap = TopK::new(k, keys.iter().map(|(_, asc)| *asc).collect());
-        let ranked = offer_rows(ctx, &mut heap, &t, keys, report, &mut RowIndex)?;
+        let ranked = offer_rows(ctx, &mut heap, &t, keys, report, &mut rows)?;
         ctx.check()?;
         let idx: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
+        drop(rows);
         ctx.check_output(idx.len(), t.width())?;
         notes.push(format!(
             "[top-k heap kept {} of {n} rows, {ranked} ranked on every key]",
@@ -6808,10 +7020,14 @@ enum HeapKey<'a> {
     Expr(&'a Expr),
 }
 
-/// The key of a variable's id. Inline numbers need no decoding.
+/// The key of a variable's id, propagating any latched decode refusal.
 #[inline]
-fn id_key(ctx: &Ctx, id: Id) -> SortKey {
-    SortKey::new(ctx.value(id))
+fn id_key(ctx: &Ctx, id: Id) -> Result<SortKey> {
+    let v = ctx.value(id);
+    if v.is_none() && ctx.has_memory_failure() {
+        ctx.check()?;
+    }
+    Ok(SortKey::new(v))
 }
 
 /// Where [`offer_rows`] keeps the rows that may enter a [`TopK`].
@@ -6822,14 +7038,49 @@ pub(super) trait HeapRows<P> {
     fn release(&mut self, entry: Entry<P>) -> Result<()>;
 }
 
-/// Eager execution keeps the input table, so an entry is a row index.
-struct RowIndex;
+/// Eager execution keeps the input table, so an entry is a row index plus live credit
+/// for the `SortKey` payloads retained inside the heap until eviction or drop.
+struct EagerHeapRows<'a> {
+    charge: super::ctx::Charge<'a>,
+    bytes: u64,
+    step: u64,
+}
 
-impl HeapRows<usize> for RowIndex {
-    fn keep(&mut self, i: usize, _: &[SortKey]) -> Result<usize> {
+impl<'a> EagerHeapRows<'a> {
+    fn new(ctx: &'a Ctx) -> Result<Self> {
+        Ok(Self {
+            charge: ctx.charge(0)?,
+            bytes: 0,
+            step: ctx.reservation_step(),
+        })
+    }
+
+    fn entry_bytes(keys: &[SortKey]) -> u64 {
+        (std::mem::size_of::<Entry<usize>>() as u64)
+            .saturating_add(
+                (keys.len() as u64).saturating_mul(std::mem::size_of::<SortKey>() as u64),
+            )
+            .saturating_add(keys.iter().map(SortKey::payload_bytes).sum::<u64>())
+    }
+}
+
+impl HeapRows<usize> for EagerHeapRows<'_> {
+    fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<usize> {
+        let added = Self::entry_bytes(keys);
+        let next = self.bytes.saturating_add(added);
+        self.charge.cover(next, self.step)?;
+        self.bytes = next;
         Ok(i)
     }
-    fn release(&mut self, _: Entry<usize>) -> Result<()> {
+
+    fn release(&mut self, entry: Entry<usize>) -> Result<()> {
+        let freed = Self::entry_bytes(&entry.keys);
+        // Drop the evicted entry's payloads before releasing their credit.
+        drop(entry);
+        self.bytes = self.bytes.saturating_sub(freed);
+        if self.charge.bytes() > self.bytes.saturating_add(self.step) {
+            self.charge.resize(self.bytes)?;
+        }
         Ok(())
     }
 }
@@ -6851,30 +7102,6 @@ pub(super) fn offer_rows<P>(
     let mut sources = Vec::with_capacity(keys.len());
     for (i, (e, _)) in keys.iter().enumerate() {
         sources.push(match e {
-            // A large first key is decoded in parallel through the value cache. A smaller
-            // one decodes each dictionary value once, in key order.
-            Expr::Var(v) if i == 0 && t.len() > PAR_THRESHOLD => match t.col_of(*v) {
-                Some(c) => {
-                    let col = &t.cols[c];
-                    let vals: Vec<SortKey> = col
-                        .par_iter()
-                        .with_min_len(PAR_MIN_LEN)
-                        .map(|&id| id_key(ctx, id))
-                        .collect();
-                    // The keys' decoded payloads stay with the column until the heap
-                    // is done, whatever the value cache keeps.
-                    let payload: u64 = vals
-                        .par_iter()
-                        .with_min_len(PAR_MIN_LEN)
-                        .map(SortKey::payload_bytes)
-                        .sum();
-                    HeapKey::Column(super::exprcache::Column::Rows {
-                        vals,
-                        _charge: ctx.retained_charge(payload)?,
-                    })
-                }
-                None => HeapKey::Var(None),
-            },
             Expr::Var(v) if i > 0 => HeapKey::Var(t.col_of(*v).map(|c| t.cols[c].as_slice())),
             _ if i == 0 => HeapKey::Column(key_column(ctx, t, e, report)?.map(SortKey::new)),
             _ => HeapKey::Expr(e),
@@ -6884,13 +7111,13 @@ pub(super) fn offer_rows<P>(
     let nested = super::exists::nested(ctx, t, &later)?;
     let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
-    let key_of = |i: usize, k: usize| -> SortKey {
+    let key_of = |i: usize, k: usize| -> Result<SortKey> {
         match &sources[k] {
             HeapKey::Var(Some(col)) => id_key(ctx, col[i]),
-            HeapKey::Var(None) => SortKey::NULL,
-            HeapKey::Column(c) => c.get(i).clone(),
-            HeapKey::Expr(e) => SortKey::new(
-                eval(
+            HeapKey::Var(None) => Ok(SortKey::NULL),
+            HeapKey::Column(c) => Ok(c.get(i).clone()),
+            HeapKey::Expr(e) => {
+                let val = match eval(
                     e,
                     &Row {
                         table: t,
@@ -6900,13 +7127,24 @@ pub(super) fn offer_rows<P>(
                         exists,
                     },
                     ctx,
-                )
-                .ok()
-                .and_then(|v| match v {
-                    Val::Id(id) => ctx.value(id),
-                    Val::V(v) | Val::Dec(_, v) => Some(v),
-                }),
-            ),
+                ) {
+                    Ok(Val::Id(id)) => {
+                        let v = ctx.value(id);
+                        if v.is_none() && ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
+                        v
+                    }
+                    Ok(Val::V(v) | Val::Dec(_, v)) => Some(v),
+                    Err(_) => {
+                        if ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
+                        None
+                    }
+                };
+                Ok(SortKey::new(val))
+            }
         }
     };
     let mut ranked = 0;
@@ -6952,7 +7190,7 @@ pub(super) fn offer_rows<P>(
                 c.get(i).clone()
             }
             _ => {
-                let first = key_of(i, 0);
+                let first = key_of(i, 0)?;
                 if heap.screen(&first) == Screen::Reject {
                     heap.skip();
                     continue;
@@ -6960,17 +7198,34 @@ pub(super) fn offer_rows<P>(
                 first
             }
         };
+        let row_decode = ctx.charge(0)?;
         let mut row = Vec::with_capacity(keys.len());
         row.push(first);
-        for k in 1..keys.len() {
-            row.push(key_of(i, k));
+        for (k, source) in sources.iter().enumerate().skip(1) {
+            let sk = match source {
+                HeapKey::Var(Some(col)) => {
+                    SortKey::new(ctx.value_checked_into(col[i], &row_decode)?)
+                }
+                _ => {
+                    let sk = key_of(i, k)?;
+                    let p = sk.payload_bytes();
+                    if p > 0 {
+                        row_decode.add(p)?;
+                    }
+                    sk
+                }
+            };
+            row.push(sk);
         }
         ranked += 1;
         let payload = rows.keep(i, &row)?;
-        if let Some(out) = heap.offer(row, payload) {
+        let evicted = heap.offer(row, payload);
+        drop(row_decode);
+        if let Some(out) = evicted {
             rows.release(out)?;
         }
     }
+    ctx.check()?;
     Ok(ranked)
 }
 
@@ -7029,12 +7284,6 @@ fn first_key_candidates(
     Ok((cand.len() < t.len()).then_some(cand))
 }
 
-/// The value of an ORDER BY key on each row of `t`, for a merge that compares rows
-/// read back from disk. Values the key computes are not interned.
-pub(super) fn key_values(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Option<Value>>> {
-    key_rows(ctx, t, e, None)
-}
-
 fn key_rows(
     ctx: &Ctx,
     t: &Table,
@@ -7078,11 +7327,173 @@ fn key_payload(value: &Option<Value>) -> u64 {
     }
 }
 
+/// Evaluate an ORDER BY expression over `t`, admitting each row's heap payload BEFORE
+/// retaining it in the result vector. Large parallel inputs evaluate in chunks, each
+/// holding a `RetainedCharge::part` (or local `Charge` when unowned) that transfers to
+/// `charge` without any release gap; on refusal every allocated value drops before its
+/// credit.
+fn key_rows_admitted(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    dec: Option<&super::expr::DecodedCols>,
+    charge: &mut Option<super::ctx::RetainedCharge>,
+) -> Result<Vec<Option<Value>>> {
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    let exists = nested.as_ref().map(|n| &n.answers);
+    let map = t.var_map(ctx.nvars());
+    let step = ctx.reservation_step();
+    let eval_row = |i: usize| -> Result<Option<Value>> {
+        match eval(
+            e,
+            &Row {
+                table: t,
+                i,
+                map: &map,
+                dec,
+                exists,
+            },
+            ctx,
+        ) {
+            Ok(Val::Id(id)) => {
+                let v = ctx.value(id);
+                if v.is_none() && ctx.has_memory_failure() {
+                    ctx.check()?;
+                }
+                Ok(v)
+            }
+            Ok(Val::V(v) | Val::Dec(_, v)) => Ok(Some(v)),
+            Err(_) => {
+                if ctx.has_memory_failure() {
+                    ctx.check()?;
+                }
+                Ok(None)
+            }
+        }
+    };
+    let mut out: Vec<Option<Value>> = vec![None; t.len()];
+    if t.len() > PAR_THRESHOLD && e.parallel() {
+        let owner = charge.as_ref();
+        let mut pieces: Vec<_> = out
+            .par_chunks_mut(PAR_MIN_LEN)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let part = match owner {
+                    Some(c) => c.part(ctx),
+                    None => match ctx.charge(0) {
+                        Ok(c) => c,
+                        Err(e) => return (Err(e), 0u64, 0u64, None),
+                    },
+                };
+                let mut bytes = 0u64;
+                let mut covered = 0u64;
+                let start = chunk_idx * PAR_MIN_LEN;
+                let res = (|| -> Result<()> {
+                    ctx.check()?;
+                    for (offset, slot) in chunk.iter_mut().enumerate() {
+                        if offset.is_multiple_of(1024) {
+                            ctx.check()?;
+                        }
+                        let val = eval_row(start + offset)?;
+                        let p = key_payload(&val);
+                        if p > 0 {
+                            bytes = bytes.saturating_add(p);
+                            if bytes > covered {
+                                let ahead = bytes.saturating_add(step);
+                                match part.add(ahead - covered) {
+                                    Ok(()) => covered = ahead,
+                                    Err(_) => {
+                                        part.add(bytes - covered)?;
+                                        covered = bytes;
+                                    }
+                                }
+                            }
+                        }
+                        *slot = val;
+                    }
+                    ctx.check()
+                })();
+                (res, bytes, covered, Some(part))
+            })
+            .collect();
+        if let Some(at) = pieces.iter().position(|(res, ..)| res.is_err()) {
+            let (res, _, _, part) = pieces.swap_remove(at);
+            // Values drop before the charges that admitted them.
+            out.par_iter_mut()
+                .with_min_len(PAR_MIN_LEN)
+                .for_each(|v| *v = None);
+            drop((part, pieces));
+            return Err(res.unwrap_err());
+        }
+        let mut slack = 0u64;
+        for (_, bytes, covered, part) in pieces {
+            if let Some(part) = part {
+                if let Some(charge) = charge.as_mut() {
+                    slack = slack.saturating_add(covered.saturating_sub(bytes));
+                    charge.absorb(part);
+                } else {
+                    drop(part);
+                }
+            }
+        }
+        if let Some(charge) = charge.as_mut()
+            && slack > 0
+        {
+            charge.resize(charge.bytes().saturating_sub(slack))?;
+        }
+        return Ok(out);
+    }
+    let part = match charge.as_ref() {
+        Some(c) => c.part(ctx),
+        None => ctx.charge(0)?,
+    };
+    let mut bytes = 0u64;
+    let mut covered = 0u64;
+    let res = (|| -> Result<()> {
+        for (i, slot) in out.iter_mut().enumerate() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let val = eval_row(i)?;
+            let p = key_payload(&val);
+            if p > 0 {
+                bytes = bytes.saturating_add(p);
+                if bytes > covered {
+                    let ahead = bytes.saturating_add(step);
+                    match part.add(ahead - covered) {
+                        Ok(()) => covered = ahead,
+                        Err(_) => {
+                            part.add(bytes - covered)?;
+                            covered = bytes;
+                        }
+                    }
+                }
+            }
+            *slot = val;
+        }
+        ctx.check()
+    })();
+    if let Err(err) = res {
+        drop(out);
+        drop(part);
+        return Err(err);
+    }
+    if let Some(charge) = charge.as_mut() {
+        let slack = covered.saturating_sub(bytes);
+        charge.absorb(part);
+        if slack > 0 {
+            charge.resize(charge.bytes().saturating_sub(slack))?;
+        }
+    } else {
+        drop(part);
+    }
+    Ok(out)
+}
+
 /// The value of an ORDER key on every row, charged until the sort releases it. An input
 /// of at most [`PAR_THRESHOLD`] rows is evaluated on this thread, each value admitted
-/// before the column keeps it. A larger input is evaluated in parallel, with `dec`'s
-/// decoded columns, after its slots are charged, and its values' payload is charged
-/// once they are made, so a query over its budget fails after one column's payload.
+/// before the column keeps it. A larger input is evaluated in parallel chunks, admitting
+/// each chunk's payload onto an owned charge before retaining values.
 fn key_column_charged(
     ctx: &Ctx,
     t: &Table,
@@ -7094,15 +7505,7 @@ fn key_column_charged(
     }
     let slots = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
     let mut charge = ctx.retained_charge(slots)?;
-    let vals = key_rows(ctx, t, e, dec)?;
-    let payload: u64 = vals
-        .par_iter()
-        .with_min_len(PAR_MIN_LEN)
-        .map(key_payload)
-        .sum();
-    if let Some(charge) = &mut charge {
-        charge.resize(slots.saturating_add(payload))?;
-    }
+    let vals = key_rows_admitted(ctx, t, e, dec, &mut charge)?;
     Ok(super::exprcache::Column::Rows {
         vals,
         _charge: charge,
@@ -7112,7 +7515,7 @@ fn key_column_charged(
 /// Own decoded ORDER keys until the sort releases them. The current evaluated
 /// value is transient expression memory; admit its payload before retaining it
 /// in the column, rather than retaining an uncharged whole-answer value array.
-fn key_rows_charged(
+pub(super) fn key_rows_charged(
     ctx: &Ctx,
     t: &Table,
     e: &Expr,
@@ -7141,12 +7544,15 @@ fn key_rows_charged(
                 exists,
             },
             ctx,
-        )
-        .ok()
-        {
-            Some(Val::Id(id)) => ctx.cursor_value_checked(id)?,
-            Some(Val::V(v) | Val::Dec(_, v)) => Some(v),
-            None => None,
+        ) {
+            Ok(Val::Id(id)) => ctx.cursor_value_checked(id)?,
+            Ok(Val::V(v) | Val::Dec(_, v)) => Some(v),
+            Err(_) => {
+                if ctx.has_memory_failure() {
+                    ctx.check()?;
+                }
+                None
+            }
         };
         bytes = bytes.saturating_add(key_payload(&value));
         if let Some(charge) = &mut charge {
@@ -7159,6 +7565,64 @@ fn key_rows_charged(
         vals: values,
         _charge: charge,
     })
+}
+
+#[cfg(test)]
+#[test]
+fn order_keys_refuse_before_accumulating_an_oversized_payload() {
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{Literal, Term};
+    use spargebra::algebra::Function;
+
+    let store = Store::in_memory(StoreOptions::default());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        // An allocation probe on this worker observes the parallel chunks, too.
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 4 << 20;
+        let ctx = ctx.into_shared();
+        let a = ctx.var("a");
+        let b = ctx.var("b");
+        let x = ctx.intern_term(&Term::Literal(Literal::new_simple_literal("a".repeat(512))));
+        let y = ctx.intern_term(&Term::Literal(Literal::new_simple_literal("b".repeat(512))));
+        let n = PAR_THRESHOLD + 1;
+        let mut table = Table::new(vec![a, b]);
+        table.cols = vec![vec![x; n], vec![y; n]];
+        table.len = n;
+        let expr = Expr::Call(
+            super::expr::Func::Builtin(Function::Concat),
+            (0..4).flat_map(|_| [Expr::Var(a), Expr::Var(b)]).collect(),
+        );
+
+        let peak = crate::test_alloc::record_peak_live(|| {
+            let error = key_column_charged(&ctx, &table, &expr, None).err();
+            assert!(
+                matches!(error, Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory),
+                "large ORDER expression column returned {error:?}"
+            );
+        });
+        assert!(peak < 8 << 20, "sort allocated {peak} bytes before refusing");
+
+        let keys = [(Expr::Const(Id::from_bool(true)), true), (expr, true)];
+        let peak = crate::test_alloc::record_peak_live(|| {
+            let error = order_by(
+                &ctx,
+                table,
+                &keys,
+                Some(3_000),
+                &mut ExprReport::default(),
+            )
+            .err();
+            assert!(
+                matches!(error, Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory),
+                "eager top-k returned {error:?}"
+            );
+        });
+        assert!(peak < 8 << 20, "heap allocated {peak} bytes before refusing");
+    });
 }
 
 /// The value of an ORDER BY key once per distinct input value, where the key is pure
@@ -7191,20 +7655,10 @@ fn key_per_value(
     if t.len() < super::exprcache::MIN_ROWS {
         return Ok(None);
     }
-    let mut values = super::exprcache::per_value(ctx, t, &[e], false, report, |v| {
-        key_rows(ctx, v, e, Decoded::cols(&decode_for(ctx, v, &[e])?))
-    })?;
-    // The distinct keys' payloads stay with them until the sort is done.
-    if let Some(values) = &mut values {
-        let payload: u64 = values
-            .vals
-            .par_iter()
-            .with_min_len(PAR_MIN_LEN)
-            .map(key_payload)
-            .sum();
-        values.retain(ctx, payload)?;
-    }
-    Ok(values)
+    super::exprcache::per_value_charged(ctx, t, &[e], false, report, |v, charge| {
+        let dec = decode_for(ctx, v, &[e])?;
+        key_rows_admitted(ctx, v, e, Decoded::cols(&dec), charge)
+    })
 }
 
 /// The value of an ORDER BY key on every row, per distinct value where it can be.
@@ -7361,7 +7815,7 @@ fn group_or_spill(
     report: &mut ExprReport,
     note: &mut Option<String>,
 ) -> Result<Table> {
-    let charged = ctx.spill.is_some();
+    let charged = ctx.spill.is_some() || ctx.mem_limit < u64::MAX || ctx.grant().is_some();
     match super::group::whole(ctx, &t, keys, aggs, charged, true, report) {
         Err(error) if hash::spills(ctx, &error) && super::group::hashable(ctx, aggs) => {
             let Some(shared) = ctx.shared() else {
@@ -7442,8 +7896,15 @@ impl AggState {
     }
 
     /// Add one row; `id` is the aggregated column's value (`None` for COUNT(*)).
+    /// `on_best` admits any retained `MIN`/`MAX` payload before replacing `best_v`.
     #[inline(always)]
-    pub(super) fn add(&mut self, ctx: &Ctx, agg: &Agg, id: Option<Id>) {
+    pub(super) fn add(
+        &mut self,
+        ctx: &Ctx,
+        agg: &Agg,
+        id: Option<Id>,
+        on_best: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         match self {
             AggState::Count(n) => *n += id.is_none_or(|id| !id.is_undef()) as u64,
             AggState::Sum {
@@ -7457,27 +7918,31 @@ impl AggState {
                 let id = id.unwrap_or(Id::UNDEF);
                 *errs += u64::from(id.is_undef());
                 if !*ok {
-                    return;
+                    return Ok(());
                 }
                 if generic.is_none()
                     && id.tag() == crate::id::Tag::Int
                     && let Some(s) = int.checked_add(id.as_i64().into())
                 {
                     *int = s;
-                    return;
+                    return Ok(());
                 }
-                let value = (!id.is_undef()).then(|| ctx.value(id)).flatten();
+                let value = if id.is_undef() {
+                    None
+                } else {
+                    ctx.value_checked(id)?
+                };
                 // An integer too large to be inlined joins the exact sum as well.
                 if generic.is_none()
                     && let Some(Value::Integer(i)) = &value
                     && let Some(s) = int.checked_add(i64::from(*i).into())
                 {
                     *int = s;
-                    return;
+                    return Ok(());
                 }
                 let Some(acc) = generic.take().or_else(|| super::value::exact_sum(*int)) else {
                     *ok = false;
-                    return;
+                    return Ok(());
                 };
                 match value {
                     Some(v) => match arith(NumOp::Add, &acc, &v) {
@@ -7490,9 +7955,10 @@ impl AggState {
             AggState::Best(best, best_v, errs) => {
                 let Some(id) = id.filter(|id| !id.is_undef()) else {
                     *errs += 1;
-                    return;
+                    return Ok(());
                 };
-                let v = ctx.value(id);
+                let decode = ctx.charge(0)?;
+                let v = ctx.value_checked_into(id, &decode)?;
                 let better = match best_v {
                     None => best.is_none(),
                     Some(b) => {
@@ -7505,17 +7971,22 @@ impl AggState {
                     }
                 };
                 if better {
+                    on_best(key_payload(&v))?;
                     *best = Some(id);
                     *best_v = v;
+                } else {
+                    drop(v);
                 }
+                drop(decode);
             }
             AggState::Sample(x) => {
                 if x.is_none() {
                     *x = id.filter(|id| !id.is_undef());
                 }
             }
-            AggState::Stat(_, acc) => acc.add(ctx, id),
+            AggState::Stat(_, acc) => acc.add(ctx, id)?,
         }
+        Ok(())
     }
 
     /// Fold `other`, the state of the same aggregate over rows that come after this
@@ -7697,30 +8168,46 @@ pub(super) fn aggregate(
     agg: &Agg,
     arg: Option<&[Id]>,
     exists: Option<&super::exists::Answers<'_>>,
-) -> Id {
+) -> Result<Id> {
     if let (Some(spec), Some(e)) = (&agg.fold, &agg.expr) {
         return fold(ctx, t, map, rows, (e, spec, agg.distinct), exists);
     }
     let Some(e) = &agg.expr else {
         // COUNT(*)
         let n = if agg.distinct {
-            rows.iter()
-                .map(|&i| t.row(i as usize))
-                .collect::<FxHashSet<_>>()
-                .len()
+            let _seen_charge = ctx.charge(
+                (rows.len() as u64)
+                    .saturating_mul((t.cols.len() as u64).saturating_mul(8).saturating_add(64))
+                    .saturating_add(64),
+            )?;
+            let mut seen = FxHashSet::default();
+            for (idx, &i) in rows.iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                seen.insert(t.row(i as usize));
+            }
+            seen.len()
         } else {
             rows.len()
         };
-        return Id::from_i64(n as i64).unwrap_or(Id::UNDEF);
+        return Ok(Id::from_i64(n as i64).unwrap_or(Id::UNDEF));
     };
-    let mut vals: Vec<Result<Id, ()>> = rows
-        .iter()
-        .map(|&i| {
-            if let Some(a) = arg {
-                let id = a[i as usize];
-                return if id.is_undef() { Err(()) } else { Ok(id) };
-            }
-            eval(
+    let _vals_charge = ctx.charge(
+        (rows.len() as u64)
+            .saturating_mul(std::mem::size_of::<std::result::Result<Id, ()>>() as u64)
+            .saturating_add(64),
+    )?;
+    let mut vals: Vec<std::result::Result<Id, ()>> = Vec::with_capacity(rows.len());
+    for (idx, &i) in rows.iter().enumerate() {
+        if idx.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        let item = if let Some(a) = arg {
+            let id = a[i as usize];
+            if id.is_undef() { Err(()) } else { Ok(id) }
+        } else {
+            match eval(
                 e,
                 &Row {
                     table: t,
@@ -7730,45 +8217,62 @@ pub(super) fn aggregate(
                     exists,
                 },
                 ctx,
-            )
-            .map(|v| v.into_id(ctx))
-            .map_err(|_| ())
-        })
-        .collect();
+            ) {
+                Ok(v) => {
+                    let id = v.into_id(ctx);
+                    ctx.check()?;
+                    Ok(id)
+                }
+                Err(_) => {
+                    if ctx.has_memory_failure() {
+                        ctx.check()?;
+                    }
+                    Err(())
+                }
+            }
+        };
+        vals.push(item);
+    }
+    ctx.check()?;
     if agg.distinct {
+        let _seen_charge = ctx.charge((vals.len() as u64).saturating_mul(32).saturating_add(64))?;
         let mut seen = FxHashSet::default();
         vals.retain(|v| match v {
             Ok(id) => seen.insert(*id),
             Err(_) => true,
         });
     }
-    let values = || {
-        vals.iter()
-            .filter_map(|v| v.ok())
-            .filter_map(|id| ctx.value(id))
-    };
-    let result: Option<Value> = match &agg.func {
+    match &agg.func {
         AggregateFunction::Count => {
-            return Id::from_i64(vals.iter().filter(|v| v.is_ok()).count() as i64)
-                .unwrap_or(Id::UNDEF);
+            Ok(Id::from_i64(vals.iter().filter(|v| v.is_ok()).count() as i64).unwrap_or(Id::UNDEF))
         }
         // The running sum finds an integer sum in every order of the rows.
         AggregateFunction::Sum | AggregateFunction::Avg => {
             let mut state = AggState::new(agg);
-            for v in &vals {
-                state.add(ctx, agg, Some(v.unwrap_or(Id::UNDEF)));
+            for (idx, v) in vals.iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                state.add(ctx, agg, Some(v.unwrap_or(Id::UNDEF)), &mut |_| Ok(()))?;
             }
-            return state.finish(ctx, agg);
+            let id = state.finish(ctx, agg);
+            ctx.check()?;
+            Ok(id)
         }
         AggregateFunction::Min | AggregateFunction::Max => {
             let is_min = matches!(agg.func, AggregateFunction::Min);
             if vals.iter().any(|v| v.is_err()) && ctx.aggregate_errors.best_errs(is_min) {
-                return Id::UNDEF;
+                return Ok(Id::UNDEF);
             }
+            let mut best_credit = ctx.charge(0)?;
             let mut best: Option<Id> = None;
             let mut best_v: Option<Value> = None;
-            for id in vals.iter().filter_map(|v| v.ok()) {
-                let v = ctx.value(id);
+            for (idx, id) in vals.iter().filter_map(|v| v.ok()).enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let decode = ctx.charge(0)?;
+                let v = ctx.value_checked_into(id, &decode)?;
                 let better = match &best_v {
                     None => best.is_none(),
                     Some(b) => {
@@ -7782,41 +8286,82 @@ pub(super) fn aggregate(
                 };
                 if better {
                     best = Some(id);
+                    // Drop the old decoded value while its old credit is still live,
+                    // then swap in the new credit before storing the new value.
+                    drop(best_v.take());
+                    best_credit = decode;
                     best_v = v;
+                } else {
+                    drop(v);
+                    drop(decode);
                 }
             }
-            return best.unwrap_or(Id::UNDEF);
+            drop(best_v);
+            drop(best_credit);
+            Ok(best.unwrap_or(Id::UNDEF))
         }
-        AggregateFunction::Sample => return vals.iter().find_map(|v| v.ok()).unwrap_or(Id::UNDEF),
+        AggregateFunction::Sample => Ok(vals.iter().find_map(|v| v.ok()).unwrap_or(Id::UNDEF)),
         AggregateFunction::GroupConcat { separator } => {
             if agg.distinct
                 && rows.is_empty()
                 && ctx.aggregate_errors.distinct_concat_of_nothing_unbound()
             {
-                return Id::UNDEF;
-            }
-            let sep = separator.as_deref().unwrap_or(" ");
-            let mut parts = Vec::new();
-            let strings = ctx.aggregate_errors.concat_strings_only();
-            for v in values() {
-                // CONCAT takes only strings
-                if strings && !v.is_string() {
-                    return Id::UNDEF;
-                }
-                let Ok(s) = v.lexical() else { return Id::UNDEF };
-                parts.push(s.to_string());
+                return Ok(Id::UNDEF);
             }
             if vals.iter().any(|v| v.is_err()) {
-                return Id::UNDEF;
+                return Ok(Id::UNDEF);
+            }
+            let sep = separator.as_deref().unwrap_or(" ");
+            let strings = ctx.aggregate_errors.concat_strings_only();
+            let out_charge = ctx.charge(0)?;
+            let mut out = String::new();
+            let mut first = true;
+            for (idx, id) in vals.iter().filter_map(|v| v.ok()).enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let decode = ctx.charge(0)?;
+                let Some(v) = ctx.value_checked_into(id, &decode)? else {
+                    continue;
+                };
+                // CONCAT takes only strings
+                if strings && !v.is_string() {
+                    return Ok(Id::UNDEF);
+                }
+                let Ok(s) = v.lexical() else {
+                    return Ok(Id::UNDEF);
+                };
+                let add_len = s.len().saturating_add(if first { 0 } else { sep.len() });
+                if out.len().saturating_add(add_len) > out.capacity() {
+                    let before = out.capacity();
+                    let needed = out.len().saturating_add(add_len);
+                    let next_cap = needed.max(before.saturating_mul(2));
+                    let delta = (next_cap.saturating_sub(before) as u64).saturating_mul(2);
+                    if out_charge.add(delta).is_err() {
+                        let exact = (needed.saturating_sub(before) as u64).saturating_mul(2);
+                        out_charge.add(exact)?;
+                        out.reserve_exact(add_len);
+                    } else {
+                        out.reserve(next_cap - out.len());
+                    }
+                }
+                if !first {
+                    out.push_str(sep);
+                }
+                out.push_str(&s);
+                first = false;
+                drop(s);
+                drop(v);
+                drop(decode);
             }
             // SPARQL 1.1: the result is a simple literal (language tags are dropped)
-            Some(Value::Str(parts.join(sep).into()))
+            let id = ctx.intern_value(&Value::Str(out.into()));
+            drop(out_charge);
+            ctx.check()?;
+            Ok(id)
         }
-        AggregateFunction::Custom(iri) => {
-            return super::aggext::aggregate(ctx, iri.as_str(), &vals);
-        }
-    };
-    result.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
+        AggregateFunction::Custom(iri) => super::aggext::aggregate(ctx, iri.as_str(), &vals),
+    }
 }
 
 /// ARQ's `FOLD` of one group (`AggFoldList`, `AggFoldMap`): the values of `e` in the
@@ -7832,7 +8377,7 @@ fn fold(
     rows: &[u32],
     (e, fold, distinct): (&Expr, &super::plan::Fold, bool),
     exists: Option<&super::exists::Answers<'_>>,
-) -> Id {
+) -> Result<Id> {
     use super::cdt::{Elem, Map, map_put};
     let row = |i: u32| Row {
         table: t,
@@ -7841,17 +8386,40 @@ fn fold(
         dec: None,
         exists,
     };
+    let fold_charge = ctx.charge((rows.len() as u64).saturating_mul(4).saturating_add(64))?;
     let mut order: Vec<u32> = rows.to_vec();
     if !fold.order.is_empty() {
-        let keys: Vec<Vec<Option<Value>>> = rows
-            .iter()
-            .map(|&i| {
-                fold.order
-                    .iter()
-                    .map(|(k, _)| eval(k, &row(i), ctx).ok().and_then(|v| v.value(ctx).ok()))
-                    .collect()
-            })
-            .collect();
+        let key_slots = (rows.len() as u64)
+            .saturating_mul(fold.order.len() as u64)
+            .saturating_mul(std::mem::size_of::<Option<Value>>() as u64)
+            .saturating_add((rows.len() as u64).saturating_mul(8))
+            .saturating_add(64);
+        fold_charge.add(key_slots)?;
+        let mut keys: Vec<Vec<Option<Value>>> = Vec::with_capacity(rows.len());
+        for (r_idx, &i) in rows.iter().enumerate() {
+            if r_idx.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let mut row_keys = Vec::with_capacity(fold.order.len());
+            for (k, _) in &fold.order {
+                let val = match eval(k, &row(i), ctx) {
+                    Ok(Val::Id(id)) => ctx.value_checked_into(id, &fold_charge)?,
+                    Ok(Val::V(v) | Val::Dec(_, v)) => {
+                        let opt = Some(v);
+                        fold_charge.add(key_payload(&opt))?;
+                        opt
+                    }
+                    Err(_) => {
+                        if ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
+                        None
+                    }
+                };
+                row_keys.push(val);
+            }
+            keys.push(row_keys);
+        }
         let mut idx: Vec<usize> = (0..rows.len()).collect();
         idx.sort_by(|&a, &b| {
             for (k, (_, asc)) in fold.order.iter().enumerate() {
@@ -7863,28 +8431,56 @@ fn fold(
             }
             Ordering::Equal
         });
+        drop(keys);
         order = idx.into_iter().map(|j| rows[j]).collect();
     }
-    let term = |x: &Expr, i: u32| {
-        eval(x, &row(i), ctx)
-            .ok()
-            .and_then(|v| ctx.term(v.into_id(ctx)))
+    let eval_term = |x: &Expr, i: u32| -> Result<Option<oxrdf::Term>> {
+        match eval(x, &row(i), ctx) {
+            Ok(v) => {
+                let id = v.into_id(ctx);
+                ctx.check()?;
+                ctx.term_checked_into(id, &fold_charge)
+            }
+            Err(_) => {
+                if ctx.has_memory_failure() {
+                    ctx.check()?;
+                }
+                Ok(None)
+            }
+        }
     };
     let value = match &fold.value {
         None => {
+            fold_charge.add(
+                (order.len() as u64)
+                    .saturating_mul(std::mem::size_of::<Elem>() as u64)
+                    .saturating_add(64),
+            )?;
             let mut list = Vec::with_capacity(order.len());
             let mut seen = FxHashSet::default();
             let mut null = false;
-            for i in order {
+            for (idx, i) in order.into_iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
                 match eval(e, &row(i), ctx) {
                     Ok(v) => {
                         let id = v.into_id(ctx);
-                        if distinct && !seen.insert(id) {
-                            continue;
+                        ctx.check()?;
+                        if distinct {
+                            if seen.contains(&id) {
+                                continue;
+                            }
+                            fold_charge.add(32)?;
+                            seen.insert(id);
                         }
-                        list.push(ctx.term(id).map_or(Elem::Null, Elem::Term));
+                        let term = ctx.term_checked_into(id, &fold_charge)?;
+                        list.push(term.map_or(Elem::Null, Elem::Term));
                     }
                     Err(_) => {
+                        if ctx.has_memory_failure() {
+                            ctx.check()?;
+                        }
                         if distinct && null {
                             continue;
                         }
@@ -7897,17 +8493,29 @@ fn fold(
         }
         Some(v) => {
             let mut m = Map::new();
-            for i in order {
-                let Some(k @ (oxrdf::Term::NamedNode(_) | oxrdf::Term::Literal(_))) = term(e, i)
+            for (idx, i) in order.into_iter().enumerate() {
+                if idx.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let Some(k @ (oxrdf::Term::NamedNode(_) | oxrdf::Term::Literal(_))) =
+                    eval_term(e, i)?
                 else {
                     continue;
                 };
-                map_put(&mut m, k, term(v, i).map_or(Elem::Null, Elem::Term));
+                let val_elem = eval_term(v, i)?.map_or(Elem::Null, Elem::Term);
+                fold_charge.add(64)?;
+                map_put(&mut m, k, val_elem);
             }
             super::cdt::map_value(&m)
         }
     };
-    ctx.intern_value(&value)
+    let opt = Some(value);
+    fold_charge.add(key_payload(&opt))?;
+    let id = ctx.intern_value(opt.as_ref().expect("folded value"));
+    drop(opt);
+    drop(fold_charge);
+    ctx.check()?;
+    Ok(id)
 }
 
 // ------------------------------------------------------------------ paths ------
@@ -9197,9 +9805,8 @@ pub(super) fn entity_vector(
     match found.as_slice() {
         [] => Ok(None),
         [o] => ctx
-            .snap
-            .key(*o)
-            .and_then(|k| crate::vector::from_key(&k))
+            .with_controlled_key(*o, |k| Ok(crate::vector::from_key(k)))?
+            .flatten()
             .map(Some)
             .ok_or_else(|| Error::invalid("the entity's vector is not a valid spk:vector")),
         many => Err(Error::invalid(format!(
@@ -9214,29 +9821,30 @@ pub(super) fn entity_vector(
 pub(super) const MAX_QUERY_VECTORS: usize = 1000;
 
 /// The IRI of a search's predicate.
-fn pred_iri(ctx: &Ctx, pred: Id) -> Option<String> {
-    match ctx.snap.term(pred) {
+fn pred_iri(ctx: &Ctx, pred: Id) -> Result<Option<String>> {
+    let decode = ctx.charge(0)?;
+    Ok(match ctx.term_checked_into(pred, &decode)? {
         Some(oxrdf::Term::NamedNode(n)) => Some(n.into_string()),
         _ => None,
-    }
+    })
 }
 
 /// Whether the index of `pred` embeds query text.
-fn text_queries(ctx: &Ctx, pred: Id) -> bool {
-    pred_iri(ctx, pred).is_some_and(|iri| {
+fn text_queries(ctx: &Ctx, pred: Id) -> Result<bool> {
+    Ok(pred_iri(ctx, pred)?.is_some_and(|iri| {
         ctx.snap
             .generation
             .vectors
             .configured()
             .values()
             .any(|c| c.predicate == iri && c.embedding.as_ref().is_some_and(|e| e.query_text))
-    })
+    }))
 }
 
 /// The vector of a search's text, from the provider of the predicate's index.
 fn text_vector(ctx: &Ctx, pred: Id, text: &str) -> Result<std::sync::Arc<[f32]>> {
     ctx.check()?;
-    let iri = pred_iri(ctx, pred)
+    let iri = pred_iri(ctx, pred)?
         .ok_or_else(|| Error::invalid("spk:vectorSearch: the predicate is not an IRI"))?;
     crate::store::embed_query_text(&ctx.snap, &iri, text)
 }
@@ -9383,7 +9991,8 @@ fn text_bound(
     let (mut searches, mut restricted) = (0u64, 0u64);
     for id in order {
         ctx.check()?;
-        let Some(oxrdf::Term::Literal(l)) = ctx.term(id) else {
+        let decode = ctx.charge(0)?;
+        let Some(oxrdf::Term::Literal(l)) = ctx.term_checked_into(id, &decode)? else {
             continue;
         };
         let lang = match l.language() {
@@ -9391,8 +10000,10 @@ fn text_bound(
             None if l.datatype() == oxrdf::vocab::xsd::STRING => None,
             None => continue,
         };
+        decode.add(l.value().len() as u64)?;
         let mut one = spec.clone();
         one.query = l.value().to_string();
+        drop(l);
         one.query_var = None;
         one.lang = spec.lang.clone().or(lang);
         let subjects = subject_col.and_then(|c| {
@@ -9401,6 +10012,8 @@ fn text_bound(
         });
         restricted += subjects.is_some() as u64;
         let mut t = crate::text::search_in(ctx, &one, &svars, subjects.as_deref(), true)?;
+        drop(one);
+        drop(decode);
         searches += 1;
         t.vars.push(qv);
         t.cols.push(vec![id; t.len()]);
@@ -9505,24 +10118,36 @@ pub(super) fn vector_search(
             }
             for id in order {
                 ctx.check()?;
-                let v = match ctx.term(id) {
+                let decode = ctx.charge(0)?;
+                let v = match ctx.term_checked_into(id, &decode)? {
                     Some(oxrdf::Term::Literal(l))
                         if (l.datatype() == oxrdf::vocab::xsd::STRING
                             || l.datatype() == oxrdf::vocab::rdf::LANG_STRING)
-                            && text_queries(ctx, pred) =>
+                            && text_queries(ctx, pred)? =>
                     {
-                        Some(text_vector(ctx, pred, l.value())?.to_vec())
+                        let vec = text_vector(ctx, pred, l.value())?.to_vec();
+                        drop(l);
+                        drop(decode);
+                        Some(vec)
                     }
                     Some(oxrdf::Term::Literal(l)) => {
                         match vector::parse_typed(l.value(), l.datatype().as_str())
                             .and_then(|v| v.ok())
                         {
-                            Some(v) => Some(v),
+                            Some(v) => {
+                                drop(l);
+                                drop(decode);
+                                Some(v)
+                            }
                             // a literal that is not a vector matches nothing
                             None => continue,
                         }
                     }
-                    _ => entity_vector(ctx, spec, pred, id)?,
+                    other => {
+                        drop(other);
+                        drop(decode);
+                        entity_vector(ctx, spec, pred, id)?
+                    }
                 };
                 runs.push((v, by_value.remove(&id).unwrap_or_default()));
             }
@@ -9825,7 +10450,8 @@ fn service(
     let PathEnd::Const(id) = endpoint else {
         return Err(Error::unsupported("SERVICE with a variable endpoint"));
     };
-    let Some(oxrdf::Term::NamedNode(url)) = ctx.term(*id) else {
+    let endpoint_credit = ctx.charge(0)?;
+    let Some(oxrdf::Term::NamedNode(url)) = ctx.term_checked_into(*id, &endpoint_credit)? else {
         return Err(Error::Service("invalid SERVICE endpoint".into()));
     };
     let store = &ctx.snap.results.service;
@@ -9836,7 +10462,15 @@ fn service(
         && !is_local(ctx, url.as_str())
     {
         // the whole result under one key: a SERVICE without `loop` has one input
-        let key = super::svccache::key(&ctx.service_scope, url.as_str(), query, &[]);
+        let key_credit = ctx.charge(0)?;
+        let mut key_reserved = 0usize;
+        let key = super::svccache::try_key(&ctx.service_scope, url.as_str(), query, &[], |need| {
+            if need > key_reserved {
+                key_credit.add((need - key_reserved) as u64)?;
+                key_reserved = need;
+            }
+            Ok::<_, Error>(())
+        })?;
         let hit = if cache == CacheMode::Default {
             store.get(&key)
         } else {
@@ -9844,10 +10478,15 @@ fn service(
             None
         };
         let rows = match hit {
-            Some(rows) => rows,
+            Some(rows) => {
+                drop(key);
+                drop(key_credit);
+                rows
+            }
             None => {
                 let rows = std::sync::Arc::new(super::enhancer::fetch_rows(ctx, &url, query)?);
                 store.put(key, rows.clone());
+                drop(key_credit);
                 rows
             }
         };
@@ -9868,6 +10507,7 @@ fn service(
                         .map_or(Id::UNDEF, |term| ctx.intern_remote_term(term, &mut bnodes))
                 })
                 .collect();
+            ctx.check()?;
             t.push_row(&row);
         }
         return Ok(t);
@@ -9883,9 +10523,11 @@ fn service(
                     .map_or(Id::UNDEF, |term| ctx.intern_remote_term(term, &mut bnodes))
             })
             .collect();
+        ctx.check()?;
         t.push_row(&row);
         Ok(())
     })?;
+    ctx.check()?;
     Ok(t)
 }
 
@@ -12611,8 +13253,8 @@ mod string_order_tests {
         }
     }
 
-    /// A cursor reserves the keys its floors read, so a string longer than the budget
-    /// fails the mask with a memory refusal, while an eager table reads it unchecked.
+    /// Both accounting modes reserve the keys their floors read, so a string longer than
+    /// the budget fails the mask with a memory refusal in eager and cursor modes alike.
     #[test]
     fn a_refused_floor_fails_the_cursor_mask() {
         use super::super::expr::CmpOp;
@@ -12627,14 +13269,10 @@ mod string_order_tests {
             let (t, x, y) = product(&ctx, &ids);
             let e = cmp(x, y, CmpOp::Lt);
             let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
-            if cursor {
-                assert!(
-                    matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
-                    "{outcome:?}"
-                );
-            } else {
-                assert!(outcome.unwrap().is_some());
-            }
+            assert!(
+                matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                "cursor={cursor}: {outcome:?}"
+            );
         }
     }
 
