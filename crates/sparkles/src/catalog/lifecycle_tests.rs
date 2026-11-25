@@ -534,6 +534,7 @@ fn failed_delete_rollback_keeps_original_bytes_unavailable_without_a_new_root() 
         DELETE_FAIL.set(0);
         let error = failed.unwrap_err().to_string();
         assert!(error.contains(&id.to_string()));
+        assert!(!dir.path().join("delete.json").exists());
         assert!(cat.get("source").is_none());
         assert!(reference.upgrade().is_none());
         let bytes = if point == DELETE_ROLLBACK_MOVE {

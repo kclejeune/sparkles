@@ -550,6 +550,15 @@ closed links. Recovery checks a known original UUID before and under process exc
 and cannot create a missing root or empty generation. A failed delete move is synchronized
 back before reopen, or remains unavailable with its original bytes and reported path.
 Uncertain moved data uses the existing retained `.kept-<name>-<token>` convention.
+Managed persistent deletes persist a versioned `delete.json` intent, format 1 in
+`formats::SETTINGS`, before updating `config.json` and moving the root aside, and clear it
+once the move into disposable trash is synchronized, the directory is removed or rollback
+completes. On catalog startup, recovery refuses unknown or malformed `delete.json` versions
+before touching files, removes interrupted `.kept-<name>-<token>` directories and
+unmoved roots backed by a matching intent UUID when the dataset is absent from
+`config.json` or replaced by another UUID, never follows symlinks, leaves live datasets
+and `keepReplaced` copies untouched, and logs a structured warning with the path and
+retained bytes for any unremovable or unrecognized `.kept-*` entry without failing startup.
 Catalog startup refuses only a registered root that lacks its directory or CURRENT,
 names the expected path and serves the other datasets. Restore publication
 checks the restored identity separately from original-identity rollback. Existing roots

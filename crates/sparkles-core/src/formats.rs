@@ -822,6 +822,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     named(ds("graphrag/ledger.json", 1), "version"),
     // the data directory
     server("config.json", 1),
+    server("delete.json", 1),
     server("models.json", 1),
     server("notifications.json", 1),
     server("notifications-state.json", 1),

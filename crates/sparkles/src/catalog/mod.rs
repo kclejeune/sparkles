@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod delete;
 mod gate;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -232,6 +233,9 @@ pub(crate) struct Inner {
     expected: Mutex<BTreeSet<String>>,
     /// Serializes management calls (see the `gate` module).
     manage: gate::ManageGate,
+    /// Serializes reads and writes of `delete.json` (leaf lock, also taken by post-delete
+    /// cleanup after `manage` is released).
+    delete_intents: Mutex<()>,
     #[cfg(feature = "backup")]
     pub(crate) repositories: Mutex<Option<crate::backup::Repositories>>,
     // Drop the lock only after the stores have closed.
@@ -306,6 +310,7 @@ impl Catalog {
         rename::recover(&dir)?;
         #[cfg(feature = "backup")]
         restore::recover(&dir).map_err(component)?;
+        delete::recover(&dir)?;
         for e in std::fs::read_dir(dir.join("databases"))? {
             let e = e?;
             let name = e.file_name().to_string_lossy().into_owned();
@@ -329,6 +334,7 @@ impl Catalog {
                 opening: Mutex::new(BTreeSet::new()),
                 expected: Mutex::new(BTreeSet::new()),
                 manage: gate::ManageGate::new(),
+                delete_intents: Mutex::new(()),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
                 _lock: Some(lock),
@@ -518,6 +524,7 @@ impl Catalog {
                 opening: Mutex::new(BTreeSet::new()),
                 expected: Mutex::new(BTreeSet::new()),
                 manage: gate::ManageGate::new(),
+                delete_intents: Mutex::new(()),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
                 _lock: None,
@@ -876,6 +883,11 @@ impl Catalog {
                     "dataset /{name} still has live handles"
                 )));
             }
+            if managed {
+                let dir = self.dir().expect("persistent catalog");
+                let _intent_lock = self.inner.delete_intents.lock();
+                delete::check_prepare(dir)?;
+            }
             #[cfg(test)]
             lifecycle_tests::before_close_hook();
             let entry = map
@@ -918,17 +930,78 @@ impl Catalog {
                         )));
                     }
                 };
+                let dir = self.dir().expect("persistent catalog");
+                let token = Uuid::new_v4();
+                let intent = root.as_ref().map(|_| delete::DeleteIntent {
+                    name: name.into(),
+                    id,
+                    token,
+                });
+                if let Some(intent) = &intent {
+                    let recorded = {
+                        let _intent_lock = self.inner.delete_intents.lock();
+                        delete::record(dir, intent)
+                    };
+                    if let Err(error) = recorded {
+                        return Err(self.reopen_closed_locked(name, id, reasoning, error));
+                    }
+                    delete::crash_point(delete::CRASH_AFTER_INTENT)?;
+                }
                 if let Err(error) = self.save_locked() {
+                    if let Some(intent) = &intent {
+                        let _intent_lock = self.inner.delete_intents.lock();
+                        let _ = delete::clear(dir, intent.token);
+                    }
                     return Err(self.reopen_closed_locked(name, id, reasoning, error));
                 }
-                match root.map(|root| move_to_trash(&root)).transpose() {
-                    Ok(trash) => trash,
-                    Err(failure) => {
-                        return Err(if failure.reopen {
+                if intent.is_some() {
+                    delete::crash_point(delete::CRASH_AFTER_SAVE)?;
+                }
+                match root.map(|root| move_to_trash(&root, token)).transpose() {
+                    Ok(Some(moved)) => {
+                        if moved.synchronized_as_trash
+                            && let Some(intent) = &intent
+                        {
+                            let cleared = {
+                                let _intent_lock = self.inner.delete_intents.lock();
+                                delete::clear(dir, intent.token)
+                            };
+                            if let Err(error) = cleared {
+                                tracing::warn!(
+                                    target: "sparkles::catalog",
+                                    path = %dir.join(delete::INTENT_FILE).display(),
+                                    %error,
+                                    "could not clear delete intent after trash rename; next startup will clean it up"
+                                );
+                            }
+                        }
+                        let pending = intent.filter(|_| !moved.synchronized_as_trash);
+                        Some((moved, pending))
+                    }
+                    Ok(None) => None,
+                    #[cfg(test)]
+                    Err(MoveError::Crash(error)) => return Err(error),
+                    Err(MoveError::Rollback(failure)) => {
+                        let err = if failure.reopen {
                             self.reopen_closed_locked(name, id, reasoning, failure.error)
                         } else {
                             self.keep_closed_locked(name, id, reasoning, failure.error)
-                        });
+                        };
+                        if let Some(intent) = &intent {
+                            let cleared = {
+                                let _intent_lock = self.inner.delete_intents.lock();
+                                delete::clear(dir, intent.token)
+                            };
+                            if let Err(error) = cleared {
+                                tracing::warn!(
+                                    target: "sparkles::catalog",
+                                    path = %dir.join(delete::INTENT_FILE).display(),
+                                    %error,
+                                    "could not clear delete intent after delete rollback"
+                                );
+                            }
+                        }
+                        return Err(err);
                     }
                 }
             } else {
@@ -941,11 +1014,45 @@ impl Catalog {
             }
         };
         delete_hook();
-        if let Some(trash) = trash
-            && let Err(error) = std::fs::remove_dir_all(&trash)
-        {
-            tracing::warn!(path=%trash.display(), %error,
-                "deleted dataset cleanup failed; trash is retried on catalog open and retained paths require operator recovery");
+        if let Some((moved, pending_intent)) = trash {
+            match std::fs::remove_dir_all(&moved.path) {
+                Ok(()) => {
+                    if let Some(intent) = pending_intent
+                        && let Some(dir) = self.dir()
+                    {
+                        let synced = moved.path.parent().map(sync_dir).transpose().map(|_| ());
+                        match synced {
+                            Ok(()) => {
+                                let _intent_lock = self.inner.delete_intents.lock();
+                                if let Err(error) = delete::clear(dir, intent.token) {
+                                    tracing::warn!(
+                                        target: "sparkles::catalog",
+                                        path = %dir.join(delete::INTENT_FILE).display(),
+                                        %error,
+                                        "could not clear delete intent after removing retained cleanup path"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "sparkles::catalog",
+                                    path = %moved.path.display(),
+                                    %error,
+                                    "deleted dataset removal was not synchronized; keeping delete intent"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "sparkles::catalog",
+                        path = %moved.path.display(),
+                        %error,
+                        "deleted dataset cleanup failed; next catalog open will retry recorded delete cleanup"
+                    );
+                }
+            }
         }
         Ok(true)
     }
@@ -1635,10 +1742,25 @@ struct DeleteMoveError {
     reopen: bool,
 }
 
+enum MoveError {
+    Rollback(DeleteMoveError),
+    #[cfg(test)]
+    Crash(Error),
+}
+
+struct MovedToTrash {
+    path: PathBuf,
+    /// `true` only when `kept` was renamed to `.deleted-<token>` and `sync_dir(parent)`
+    /// succeeded, so startup `.deleted-*` cleanup owns the directory without `delete.json`.
+    synchronized_as_trash: bool,
+}
+
 const DELETE_BEFORE_MOVE: u8 = 1;
 const DELETE_STAGE_SYNC: u8 = 2;
 const DELETE_ROLLBACK_MOVE: u8 = 3;
 const DELETE_ROLLBACK_SYNC: u8 = 4;
+const DELETE_TRASH_RENAME: u8 = 5;
+const DELETE_TRASH_SYNC: u8 = 6;
 #[cfg(test)]
 thread_local! {
     static DELETE_FAIL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -1655,64 +1777,85 @@ fn delete_fail_point(point: u8) -> Result<()> {
 
 /// Keep the actual moved source across uncertain directory synchronization.
 /// Only synchronized original-name removal may become disposable trash.
-fn move_to_trash(root: &Path) -> std::result::Result<PathBuf, DeleteMoveError> {
+fn move_to_trash(root: &Path, token: Uuid) -> std::result::Result<MovedToTrash, MoveError> {
     let parent = root.parent().expect("database parent");
-    let token = Uuid::new_v4();
     // The dataset name lets an operator match retained bytes to a refused entry.
     let name = root
         .file_name()
         .expect("dataset directory")
         .to_string_lossy();
     let kept = parent.join(format!("{KEPT_PREFIX}{name}-{token}"));
-    delete_fail_point(DELETE_BEFORE_MOVE).map_err(|error| DeleteMoveError {
-        error,
-        reopen: true,
+    delete_fail_point(DELETE_BEFORE_MOVE).map_err(|error| {
+        MoveError::Rollback(DeleteMoveError {
+            error,
+            reopen: true,
+        })
     })?;
-    std::fs::rename(root, &kept).map_err(|error| DeleteMoveError {
-        error: error.into(),
-        reopen: true,
+    std::fs::rename(root, &kept).map_err(|error| {
+        MoveError::Rollback(DeleteMoveError {
+            error: error.into(),
+            reopen: true,
+        })
     })?;
     let synchronized = delete_fail_point(DELETE_STAGE_SYNC).and_then(|()| sync_dir(parent));
     if let Err(error) = synchronized {
         let restored = delete_fail_point(DELETE_ROLLBACK_MOVE)
             .and_then(|()| std::fs::rename(&kept, root).map_err(Error::from));
         if let Err(rollback) = restored {
-            return Err(DeleteMoveError {
+            return Err(MoveError::Rollback(DeleteMoveError {
                 error: Error::Corrupt(format!(
                     "deletion could not synchronize: {error}; restoring {} failed: {rollback}; original bytes remain at {}",
                     root.display(),
                     kept.display()
                 )),
                 reopen: false,
-            });
+            }));
         }
         if let Err(rollback) =
             delete_fail_point(DELETE_ROLLBACK_SYNC).and_then(|()| sync_dir(parent))
         {
-            return Err(DeleteMoveError {
+            return Err(MoveError::Rollback(DeleteMoveError {
                 error: Error::Corrupt(format!(
                     "deletion could not synchronize: {error}; original bytes returned to {} but rollback sync failed: {rollback}",
                     root.display()
                 )),
                 reopen: false,
-            });
+            }));
         }
-        return Err(DeleteMoveError {
+        return Err(MoveError::Rollback(DeleteMoveError {
             error,
             reopen: true,
-        });
+        }));
+    }
+    #[cfg(test)]
+    if let Err(error) = delete::crash_point(delete::CRASH_AFTER_KEPT_RENAME) {
+        return Err(MoveError::Crash(error));
     }
     // Registry removal and original-name removal are durable. Remaining names
     // concern cleanup, not the acknowledged dataset identity.
     let trash = parent.join(format!("{TRASH_PREFIX}{token}"));
-    if let Err(error) = std::fs::rename(&kept, &trash) {
+    if let Err(error) = delete_fail_point(DELETE_TRASH_RENAME)
+        .and_then(|()| std::fs::rename(&kept, &trash).map_err(Error::from))
+    {
         tracing::warn!(path=%kept.display(), %error, "deleted dataset remains at its retained cleanup path");
-        return Ok(kept);
+        return Ok(MovedToTrash {
+            path: kept,
+            synchronized_as_trash: false,
+        });
     }
-    if let Err(error) = sync_dir(parent) {
-        tracing::warn!(path=%trash.display(), %error, "deleted dataset cleanup rename was not synchronized");
-    }
-    Ok(trash)
+    let synchronized_as_trash = match delete_fail_point(DELETE_TRASH_SYNC)
+        .and_then(|()| sync_dir(parent))
+    {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(path=%trash.display(), %error, "deleted dataset cleanup rename was not synchronized");
+            false
+        }
+    };
+    Ok(MovedToTrash {
+        path: trash,
+        synchronized_as_trash,
+    })
 }
 
 #[cfg(test)]
