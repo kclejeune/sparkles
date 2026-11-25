@@ -2449,20 +2449,24 @@ holds of it for certain, with a context of that conjunction when it is more than
 successor's core. Both strategies give the same answers on the fixtures and the random
 tests.
 
-`Limits::partial` makes a run of the disjunctive rules that its deadline, its cancellation
-or its memory budget stops answer with what it proved instead of failing. The answer's
-`Classification::complete` is false, `incomplete` lists the classes whose subsumers it may
-miss, and `consistency` is `Consistent`, `Inconsistent` or `Unknown`. A stopped worker gives
-back the conclusions it did not apply and delivers the messages it holds, and an inference
-the stop cut off marks its context, so that every context with work left shows as open. A
-class is complete when every context it reaches is closed, none of its candidates is left
-untested and the ontology is consistent. Consistency is decided when `owl:Thing`'s context
+`Limits::partial` makes a classification that its deadline, its cancellation or its memory
+budget stops after saturation begins answer with what it proved instead of failing. The
+flag was introduced for the disjunctive rules and is now shared across the EL, Horn and
+disjunctive tiers (item 714; see the Outcome subsection below and
+[the reasoning guide](../../reasoning/README.md) for the EL and Horn phase-by-phase
+recording and memory-admission details). The answer's `Classification::complete` is false,
+`incomplete` lists the classes whose subsumers it may miss, and `consistency` is
+`Consistent`, `Inconsistent` or `Unknown`. A stopped worker gives back the conclusions it
+did not apply and delivers the messages it holds, and an inference the stop cut off marks
+its context, so that every context with work left shows as open. In the disjunctive rules,
+a class is complete when every context it reaches is closed, none of its candidates is left
+untested and the ontology is consistent; consistency is decided when `owl:Thing`'s context
 is unsatisfiable, or when it and every context it reaches are closed, and when it is unknown
 no class is complete. The taxonomy of a partial answer is built from its proved subsumptions
-closed transitively, after the clause stores are freed. A partial answer that passes the
-budget fails with the memory error, and the next run starts again. Runs of the other tiers
-ignore the flag and fail on a stop as before, item 714. A class whose context the stop came
-before is open too, and so is the consistency while `owl:Thing` has no context.
+closed transitively, after non-taxonomy saturation state is freed. A partial answer that
+still exceeds the memory budget fails with the memory error without downgrading to a weaker
+tier, and the next run starts again. A class whose context the stop came before is open too,
+and so is the consistency while `owl:Thing` has no context.
 
 Phase 7's surfaces give the partial answer to every caller of a classification.
 `ClassifyRequest::partial` and `ClassifyRequest::expansion` carry the flag and the

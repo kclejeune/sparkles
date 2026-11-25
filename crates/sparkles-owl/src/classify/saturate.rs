@@ -7099,15 +7099,40 @@ mod horn_accounting_tests {
             work: 0,
             kept: 0,
         };
+        let queued_before = run.queued.load(Ordering::Relaxed);
         let flushed = run.flush_links(&st, &mut out, &mut tally);
+        let unflushed_sent = out.sent;
+        drop(out);
+        drop(st);
         assert!(
             !flushed,
             "flush_links must break on STOP_MEMORY past SEND_EVERY"
         );
+        // `flush_sends` calls `self.flush(tally)` which moves `tally.queued` into `run.queued`
+        // and resets `tally`, so measure actual fanout across `outbox.total`, `local`, and
+        // the `run.queued` delta.
+        let total_sent = (run.queued.load(Ordering::Relaxed) - queued_before)
+            + unflushed_sent as isize
+            + tally.queued;
         assert!(
-            tally.queued < 2 * SEND_EVERY as isize,
-            "flush_links fanned out unbounded messages: {}",
-            tally.queued
+            total_sent >= SEND_EVERY as isize && total_sent < 2 * SEND_EVERY as isize,
+            "flush_links fanout out of bounds: total_sent={total_sent}, outbox.total={}",
+            outbox.total
+        );
+        assert_eq!((outbox.total + local.len()) as isize, total_sent);
+
+        // Verify `Run::process` records `st.interrupted = true` when `flush_links` breaks.
+        run.process::<Plain>(
+            f.root,
+            &mut mine,
+            &mut tally,
+            &mut local,
+            &mut outbox,
+            &mut marks,
+        );
+        assert!(
+            root.st.lock().interrupted,
+            "Run::process must mark context interrupted when flush_links stops early"
         );
     }
 

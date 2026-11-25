@@ -235,6 +235,9 @@ fn el_full_ontology(n: usize, inconsistent_via_individual: bool) -> String {
              SubClassOf(:Mid{i} ObjectSomeValuesFrom(:link :Wit{i}))\n\
              SubClassOf(:Wit{i} ObjectOneOf(:a0))\n\
              SubClassOf(:Wit{i} :Tag{i})\n\
+             SubClassOf(ObjectIntersectionOf(:IndBase :Tag{i}) :IndHit{i})\n\
+             SubClassOf(ObjectSomeValuesFrom(:link :IndHit{i}) :MidHit{i})\n\
+             SubClassOf(ObjectSomeValuesFrom(:link :MidHit{i}) :WorldDerived{i})\n\
              SubClassOf(:Chain{i} :Chain{next})\n\
              SubClassOf(:Chain{i} ObjectSomeValuesFrom(:chain :Chain{next}))\n",
         ));
@@ -315,7 +318,9 @@ fn horn_full_ontology(n: usize, inconsistent: bool) -> String {
              SubClassOf(:HF{i} ObjectAllValuesFrom(:r :HA{next}))\n\
              SubClassOf(:HM{i} ObjectOneOf(:hub))\n\
              SubClassOf(:HM{i} :Tag{i})\n\
-             SubClassOf(:HM{i} ObjectAllValuesFrom(:rinv :Back{i}))\n",
+             SubClassOf(:HM{i} ObjectAllValuesFrom(:rinv :Back{i}))\n\
+             SubClassOf(ObjectIntersectionOf(:HubProp :Tag{i}) :HIndHit{i})\n\
+             SubClassOf(ObjectSomeValuesFrom(:r :HIndHit{i}) :HWorldDerived{i})\n",
         ));
     }
     s.push_str("SubClassOf(:Pure0 :Pure1)\n");
@@ -414,8 +419,8 @@ fn sweep_cancel(body: &str, tier: Tier, inconsistent: bool, el_only: bool) {
     assert!(partials > 0, "tier {tier:?}: no stop gave a partial answer");
     if inconsistent {
         assert!(
-            saw_unknown > 0 || saw_inconsistent > 0,
-            "tier {tier:?}: inconsistent partial stops saw neither Unknown nor Inconsistent"
+            saw_inconsistent > 0,
+            "tier {tier:?}: inconsistent partial stops never observed Pass 0 Consistency::Inconsistent"
         );
     } else {
         assert!(
@@ -508,37 +513,219 @@ fn el_and_horn_universal_and_keys_partial_stops_are_sound() {
 #[test]
 fn phase3_worlds_partial_stop_keeps_completed_worlds() {
     // Many classes reaching a non-real witness so Phase 3 runs many worlds and polls
-    // cancellation inside Phase 3, preserving completed worlds and marking only
-    // unfinished reaching classes incomplete with Consistency::Consistent.
-    for (body, tier) in [
-        (el_full_ontology(40, false), Tier::El),
-        (horn_full_ontology(25, false), Tier::Horn),
-    ] {
+    // cancellation inside Phase 3, preserving completed worlds (with their world-only
+    // subsumptions absent from global saturation) and marking only unfinished reaching
+    // classes incomplete with Consistency::Consistent.
+    let cases = [
+        (
+            el_full_ontology(40, false),
+            40usize,
+            "W",
+            "WorldDerived",
+            Tier::El,
+        ),
+        (
+            horn_full_ontology(25, false),
+            25usize,
+            "HF",
+            "HWorldDerived",
+            Tier::Horn,
+        ),
+    ];
+    for (body, count, reach_prefix, derived_prefix, tier) in cases {
         let ax = axioms(&body);
         let cs = classes(&ax);
         let full = Classifier::of(&ax).classify(&Limits::default()).unwrap();
         assert!(full.complete && full.consistent);
         assert_eq!(full.stats.tier, tier);
+        // Verify each reaching class's world-only subsumption holds in the full taxonomy.
+        for i in 0..count {
+            let reach = Class::new(format!("{EX}{reach_prefix}{i}"));
+            let derived = Class::new(format!("{EX}{derived_prefix}{i}"));
+            assert!(
+                full.taxonomy.is_subclass(&reach, &derived),
+                "tier {tier:?}: expected world-only subsumption {reach:?} ⊑ {derived:?} in full"
+            );
+        }
         let total = polls_of(&ax, 1, false);
         let mut saw_phase3_partial = 0;
-        // Sweep near the end of polls where Phase 3 worlds execute.
+        // Sweep across the tail of polls where Phase 3 worlds execute one by one.
         let start = total.saturating_sub(total / 2 + 20);
         for k in start..total {
             if let Ok(out) = Classifier::of(&ax).classify(&cancelled_at(k, 1, false)) {
                 check_partial(&out, &full, &cs);
-                if !out.complete_for_taken
-                    && out.consistency == Consistency::Consistent
-                    && out.incomplete.len() + 2 < cs.len()
-                {
-                    saw_phase3_partial += 1;
+                if !out.complete_for_taken && out.consistency == Consistency::Consistent {
+                    let open: BTreeSet<&Class> = out.incomplete.iter().collect();
+                    let mut completed_world_with_subsumption = false;
+                    let mut incomplete_reaching = false;
+                    for i in 0..count {
+                        let reach = Class::new(format!("{EX}{reach_prefix}{i}"));
+                        let derived = Class::new(format!("{EX}{derived_prefix}{i}"));
+                        if open.contains(&reach) {
+                            incomplete_reaching = true;
+                        } else if out.taxonomy.is_subclass(&reach, &derived) {
+                            completed_world_with_subsumption = true;
+                        }
+                    }
+                    if completed_world_with_subsumption && incomplete_reaching {
+                        saw_phase3_partial += 1;
+                    }
                 }
             }
         }
         assert!(
             saw_phase3_partial > 0,
-            "tier {tier:?}: expected Phase 3 partial answer with Consistent and some complete classes"
+            "tier {tier:?}: expected Phase 3 partial stop with both a completed reaching class (world-only subsumption retained) and an incomplete reaching class"
         );
     }
+}
+
+#[test]
+fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
+    // 1. Build a Horn ontology whose pre-saturation `horn::normalize` / `Index::build` cost
+    //    greatly exceeds EL's full classification cost (using Horn-only `InverseObjectProperties`,
+    //    `ObjectAllValuesFrom`, and inverse property chains that EL excludes), so there is a
+    //    cap above EL's peak where `horn::normalize` / `Index::build` hits `Halt::Memory`.
+    let mut horn_body = String::from("SubClassOf(:Seed0 :Seed1)\n");
+    for i in 0..36 {
+        let next = (i + 1) % 36;
+        let next2 = (i + 2) % 36;
+        horn_body.push_str(&format!(
+            "InverseObjectProperties(:r{i} :ri{i})\n\
+             TransitiveObjectProperty(:r{i})\n\
+             SubObjectPropertyOf(ObjectPropertyChain(ObjectInverseOf(:r{i}) :r{next}) :r{next2})\n"
+        ));
+        for j in 0..8 {
+            let d = (i * 5 + j) % 36;
+            horn_body.push_str(&format!(
+                "SubClassOf(:C{i} ObjectAllValuesFrom(:r{next} :D{d}))\n"
+            ));
+        }
+    }
+    let horn_ax = axioms(&horn_body);
+    let el_full = Classifier::of(&horn_ax)
+        .classify(&Limits {
+            threads: 1,
+            el_only: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    let horn_full = Classifier::of(&horn_ax)
+        .classify(&Limits {
+            threads: 1,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert_eq!(horn_full.stats.tier, Tier::Horn);
+    assert!(
+        horn_full.stats.peak_memory > el_full.stats.peak_memory,
+        "expected Horn peak ({}) > EL peak ({})",
+        horn_full.stats.peak_memory,
+        el_full.stats.peak_memory
+    );
+
+    // Find a cap above EL's full peak where non-partial Horn downgrades to EL
+    // (`horn_over_budget == true`), and verify `partial: true` refuses with `Error::Memory`
+    // rather than silently downgrading to EL.
+    let lo = el_full.stats.peak_memory + 1;
+    let hi = horn_full.stats.peak_memory;
+    let mut checked_horn_refusal = false;
+    for step in 0..=40 {
+        let cap = lo + (hi - lo) * step / 40;
+        let non_partial = Classifier::of(&horn_ax).classify(&Limits {
+            threads: 1,
+            partial: false,
+            max_memory: Some(cap),
+            ..Limits::default()
+        });
+        if let Ok(downgraded) = non_partial
+            && downgraded.stats.horn_over_budget
+        {
+            let partial_res = Classifier::of(&horn_ax).classify(&Limits {
+                threads: 1,
+                partial: true,
+                max_memory: Some(cap),
+                ..Limits::default()
+            });
+            match partial_res {
+                Err(Error::Memory { limit, used }) => {
+                    assert_eq!(limit, cap);
+                    assert!(used > cap);
+                    checked_horn_refusal = true;
+                    break;
+                }
+                Ok(out) => {
+                    assert!(
+                        !out.stats.horn_over_budget,
+                        "cap={cap}: partial: true silently downgraded Horn to EL"
+                    );
+                }
+                Err(e) => panic!("cap={cap}: unexpected error {e:?}"),
+            }
+        }
+    }
+    assert!(
+        checked_horn_refusal,
+        "expected a pre-saturation cap between EL ({lo}) and Horn ({hi}) where partial: false downgrades to EL and partial: true returns Err(Memory)"
+    );
+
+    // 2. Verify Tier D pre-saturation memory refusal preserves Tier D under `partial: true`
+    //    (never silently downgrading to Horn), while `dl_attempt_work` still falls back.
+    let mut dl_body = String::new();
+    for i in 0..40 {
+        dl_body.push_str(&format!(
+            "SubClassOf(:U{i} ObjectUnionOf(:V{i} :W{i} :X{i}))\n\
+             SubClassOf(:V{i} :Z{i})\n\
+             SubClassOf(:W{i} :Z{i})\n\
+             SubClassOf(:X{i} :Z{i})\n",
+        ));
+    }
+    let dl_ax = axioms(&dl_body);
+    let dl_full = Classifier::of(&dl_ax)
+        .classify(&Limits {
+            threads: 1,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert_eq!(dl_full.stats.tier, Tier::Disjunctive);
+    let el_dl = Classifier::of(&dl_ax)
+        .classify(&Limits {
+            threads: 1,
+            el_only: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    let mut saw_dl_refusal = false;
+    for step in 0..=40 {
+        let cap = el_dl.stats.peak_memory
+            + dl_full
+                .stats
+                .peak_memory
+                .saturating_sub(el_dl.stats.peak_memory)
+                * step
+                / 40;
+        let res = Classifier::of(&dl_ax).classify(&Limits {
+            threads: 1,
+            partial: true,
+            max_memory: Some(cap),
+            ..Limits::default()
+        });
+        match res {
+            Err(Error::Memory { limit, used }) => {
+                assert_eq!(limit, cap);
+                assert!(used > cap);
+                saw_dl_refusal = true;
+            }
+            Ok(out) => {
+                assert!(
+                    !out.stats.dl_over_budget && !out.stats.horn_over_budget,
+                    "cap={cap}: partial: true silently downgraded Tier D"
+                );
+            }
+            Err(e) => panic!("cap={cap}: unexpected error {e:?}"),
+        }
+    }
+    assert!(saw_dl_refusal, "expected Tier D memory refusal under cap");
 }
 
 #[test]

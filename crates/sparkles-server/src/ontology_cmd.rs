@@ -127,9 +127,10 @@ pub enum OntologyCmd {
         /// Stop the run after this many seconds (fractions allowed)
         #[arg(long)]
         timeout: Option<f64>,
-        /// When the deadline stops a run with the disjunctive rules, answer what it
-        /// proved, with the classes it left open and the consistency it knows, and exit
-        /// with status 2. Not with --target, --format ofn or a chain
+        /// When the deadline, cancellation or memory budget stops a classification after
+        /// saturation begins, answer what the active EL, Horn or disjunctive tier proved,
+        /// with the classes it left open and the consistency it knows, and exit with
+        /// status 2. Not with --target, --format ofn or a chain
         #[arg(long)]
         partial: bool,
         /// Refuse with an error, as HermiT does, when the classifier would leave an

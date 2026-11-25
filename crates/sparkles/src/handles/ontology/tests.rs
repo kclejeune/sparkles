@@ -3000,7 +3000,16 @@ mod classification {
                 got.is_subset(&want),
                 "{tier}: partial answer added unentailed pairs"
             );
-            // Non-retention: partial answer is not cached, so next full call runs fresh.
+            // Non-retention: partial answer is not published or cached.
+            let kept_read = ds
+                .ontology()
+                .kept_classification(&req, &super::kept::KeptQuery::default(), &opts())
+                .unwrap();
+            assert_eq!(
+                kept_read.status,
+                super::kept::Status::Unavailable,
+                "{tier}: partial answer must not be published to kept classification"
+            );
             let next = ds
                 .ontology()
                 .classify(&req, &ClassifyRequest::default(), &opts())
@@ -3016,19 +3025,54 @@ mod classification {
                 ds.ontology().classify(&req, &writes, &opts()),
                 Err(Error::Invalid(_))
             ));
-            // Assertions + partial completes cleanly on an EL/Horn dataset.
-            let with_assertions = ds
+            // Assertions + partial stops cleanly under a tight memory budget without
+            // publishing a kept classification.
+            let assert_body = format!(
+                "{body}\n:ind0 a :{}0 .\n",
+                if tier == "el" { "A" } else { "H" }
+            );
+            let assert_req = ClassifyRequest {
+                assertions: true,
+                ..partial_request()
+            };
+            let full_assert = dataset(&assert_body)
                 .ontology()
-                .classify(
-                    &req,
-                    &ClassifyRequest {
-                        assertions: true,
-                        ..partial_request()
-                    },
-                    &opts(),
-                )
+                .classify(&req, &assert_req, &opts())
                 .unwrap();
-            assert!(with_assertions.complete());
+            assert!(full_assert.complete());
+            let assert_peak = full_assert.classification.stats.peak_memory as u64;
+            let (assert_ds, part_assert) = (1..20)
+                .find_map(|k| {
+                    let ds = dataset(&assert_body);
+                    let o = QueryOptions {
+                        max_memory_bytes: Some(assert_peak * k / 20),
+                        ..opts()
+                    };
+                    match ds.ontology().classify(&req, &assert_req, &o) {
+                        Ok(c) if !c.classification.complete_for_taken => Some((ds, c)),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| {
+                    panic!("{tier}: no budget produced a partial answer with assertions=true")
+                });
+            assert!(!part_assert.complete());
+            assert_eq!(part_assert.classification.stats.tier.as_str(), tier);
+            assert!(!part_assert.classification.stats.horn_over_budget);
+            assert!(
+                pairs(&part_assert.classification.taxonomy)
+                    .is_subset(&pairs(&full_assert.classification.taxonomy)),
+                "{tier}: partial assertions answer added unentailed pairs"
+            );
+            assert_eq!(
+                assert_ds
+                    .ontology()
+                    .kept_classification(&req, &super::kept::KeptQuery::default(), &opts())
+                    .unwrap()
+                    .status,
+                super::kept::Status::Unavailable,
+                "{tier}: partial assertions answer must not be published"
+            );
         }
     }
 

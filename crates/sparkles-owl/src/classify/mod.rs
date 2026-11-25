@@ -3736,15 +3736,26 @@ impl Saturation {
         // the normalized premises of the changed axioms, which stay until the
         // invalidation
         let premises_bytes = premises.as_ref().map_or(0, |p| p.bytes());
-        let (mut ax, mut ix, mut normalized_peak, outside_el, visible_named_classes) = self.build(
-            axioms,
-            &outside,
-            threads,
-            held_bytes + old_bytes + sets_bytes + premises_bytes,
-            kept_bytes,
-            limits,
-            attempt,
-        )?;
+        let partial = limits.partial && with_taxonomy;
+        let (mut ax, mut ix, mut normalized_peak, outside_el, visible_named_classes) = self
+            .build(
+                axioms,
+                &outside,
+                threads,
+                held_bytes + old_bytes + sets_bytes + premises_bytes,
+                kept_bytes,
+                limits,
+                attempt,
+            )
+            .inspect_err(|e| {
+                // Preserve the active tier on pre-saturation memory refusals when a partial
+                // answer was requested, so Horn does not silently downgrade to EL and Tier D
+                // does not silently downgrade to Horn. Same-tier fresh restart (`self.reused`)
+                // is unaffected.
+                if partial && matches!(e, Error::Memory { .. }) {
+                    self.partial_over = true;
+                }
+            })?;
         if kept.is_some() && ix.top_chain.is_some() {
             #[cfg(test)]
             admission_test::hit(admission_test::Point::TopChainKeptPlan);
@@ -4126,6 +4137,9 @@ impl Saturation {
                 .and_then(|n| n.checked_add(dl_before))
                 .and_then(|n| n.checked_add(adaptive_bytes))
             else {
+                if partial {
+                    self.partial_over = true;
+                }
                 return Err(Error::Memory {
                     limit: max_memory.unwrap_or(usize::MAX),
                     used: usize::MAX,
@@ -4140,7 +4154,6 @@ impl Saturation {
         } else {
             limits.max_memory
         };
-        let partial = limits.partial && with_taxonomy;
         // the pool has been charged for the peak of a parallel normalization
         let more = pre_sat.saturating_sub(normalized_peak);
         #[cfg(test)]
@@ -4392,16 +4405,24 @@ impl Saturation {
                     });
                 }
                 let pending_count = self.pending_messages(dynamic.as_ref());
-                let live_now = self.live_record_bytes(
-                    &ix,
-                    held_bytes,
-                    ax.bytes(),
-                    roots.capacity() * 4,
-                    dynamic.as_ref(),
-                    dl_run.as_ref(),
-                    0,
-                    pending_count,
-                );
+                let refuted_bytes = if refuted.capacity() == 0 {
+                    0
+                } else {
+                    saturate::table_bytes(refuted.capacity(), std::mem::size_of::<(Ex, Ex)>())
+                        .max(4 * (std::mem::size_of::<(Ex, Ex)>() + 1) + 16)
+                };
+                let live_now = self
+                    .live_record_bytes(
+                        &ix,
+                        held_bytes,
+                        ax.bytes(),
+                        roots.capacity() * 4,
+                        dynamic.as_ref(),
+                        dl_run.as_ref(),
+                        0,
+                        pending_count,
+                    )
+                    .saturating_add(refuted_bytes);
                 let memory_stop = matches!(halted, Some(Error::Memory { .. }));
                 let mut record_admit = |scratch: usize| -> bool {
                     let Some(used) = live_now.checked_add(scratch) else {
@@ -4442,6 +4463,7 @@ impl Saturation {
         } else {
             None
         };
+        drop(refuted);
         // A non-work stop already won and a partial answer is being constructed: disarm
         // adaptive work-bound enforcement on `dl_run` before the individual-marking round
         // so a previously latched adaptive guard cannot abort the partial answer with a
@@ -4552,6 +4574,10 @@ impl Saturation {
                         halted = Some(stopped(s));
                         break;
                     }
+                    if partial && matches!(s, Stop::Memory { .. }) {
+                        self.partial_over = true;
+                        self.dirty = true;
+                    }
                     return Err(stopped(s));
                 }
                 pending = pending_messages(open.is_some());
@@ -4566,7 +4592,13 @@ impl Saturation {
                         halted = Some(e);
                         break;
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        if partial && matches!(e, Error::Memory { .. }) {
+                            self.partial_over = true;
+                            self.dirty = true;
+                        }
+                        return Err(e);
+                    }
                 };
                 let key_budget = match WorldBudget::start(limits, charge_fn, key_base, &mut totals)
                 {
@@ -4575,7 +4607,13 @@ impl Saturation {
                         halted = Some(e);
                         break;
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        if partial && matches!(e, Error::Memory { .. }) {
+                            self.partial_over = true;
+                            self.dirty = true;
+                        }
+                        return Err(e);
+                    }
                 };
                 let key_bound = |delta: isize| key_budget.tell(delta);
                 let merges = match world::key_merges(&ix, &view, &key_bound) {
@@ -4595,6 +4633,10 @@ impl Saturation {
                         if partial && !disj {
                             halted = Some(err);
                             break;
+                        }
+                        if partial && matches!(err, Error::Memory { .. }) {
+                            self.partial_over = true;
+                            self.dirty = true;
                         }
                         return Err(err);
                     }
@@ -4628,17 +4670,28 @@ impl Saturation {
         // real, each in a world of its own
         let mut world_bytes = 0usize;
         let mut world_live = 0usize;
-        let mut world_open: Option<(Vec<Ex>, Consistency)> = None;
+        let mut world_open: Option<(partial::OpenClasses, Consistency)> = None;
+        let mut phase12_consistent: Option<bool> = None;
         if entangled && (disj || halted.is_none()) {
-            let phase12_consistent = self.consistent(&ax, &ix.nominals, rooted);
-            let skip_worlds = partial && !disj && !phase12_consistent;
+            let skip_worlds = if partial && !disj {
+                let c = self.consistent(&ax, &ix.nominals, rooted);
+                phase12_consistent = Some(c);
+                !c
+            } else {
+                false
+            };
             let witnesses = if skip_worlds {
                 Vec::new()
             } else {
                 world::witnesses(&ix, &self.ctx, dynamic.as_ref(), &universal)
             };
             if !witnesses.is_empty() {
-                let classes = world::reaching(&ix, &self.ctx, dynamic.as_ref(), &witnesses);
+                let mut classes = Some(world::reaching(
+                    &ix,
+                    &self.ctx,
+                    dynamic.as_ref(),
+                    &witnesses,
+                ));
                 let mut real: Vec<Ex> = (0..self.ctx.len() as Ex)
                     .filter(|&e| self.ctx[e as usize].get().is_some_and(|c| c.st.lock().real))
                     .collect();
@@ -4658,12 +4711,22 @@ impl Saturation {
                     Ok(b) => Some(b),
                     Err(e) if partial && !disj => {
                         halted = Some(e);
-                        world_open = Some((classes.clone(), Consistency::Consistent));
+                        world_open = Some((
+                            partial::OpenClasses::Some(classes.take().expect("reaching classes")),
+                            Consistency::Consistent,
+                        ));
                         None
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        if partial && matches!(e, Error::Memory { .. }) {
+                            self.partial_over = true;
+                            self.dirty = true;
+                        }
+                        return Err(e);
+                    }
                 };
                 if let Some(budget) = budget {
+                    let mut classes = classes.expect("reaching classes");
                     if partial && !disj {
                         let bound = |delta: isize| budget.tell(delta);
                         let chunks: Vec<(FoundWorldChunk<'_, '_>, Option<index::Halt>)> =
@@ -4758,11 +4821,11 @@ impl Saturation {
                         }
                         if let Some(err) = world_err {
                             halted = Some(err);
-                            let incomplete: Vec<Ex> = classes
-                                .into_iter()
-                                .filter(|d| !self.worlds.contains_key(d))
-                                .collect();
-                            world_open = Some((incomplete, Consistency::Consistent));
+                            classes.retain(|d| !self.worlds.contains_key(d));
+                            world_open = Some((
+                                partial::OpenClasses::Some(classes),
+                                Consistency::Consistent,
+                            ));
                         }
                     } else {
                         #[cfg(test)]
@@ -4873,12 +4936,23 @@ impl Saturation {
                         if let Some(test) = mixed_test.as_deref() {
                             test.collected(&budget, found.as_ref().err().copied());
                         }
-                        budget.stopped()?;
+                        budget.stopped().inspect_err(|e| {
+                            if partial && matches!(e, Error::Memory { .. }) {
+                                self.partial_over = true;
+                                self.dirty = true;
+                            }
+                        })?;
                         let found = found.map_err(|h| match h {
-                            index::Halt::Memory(used) => Error::Memory {
-                                limit: limits.max_memory.unwrap_or(usize::MAX),
-                                used,
-                            },
+                            index::Halt::Memory(used) => {
+                                if partial {
+                                    self.partial_over = true;
+                                    self.dirty = true;
+                                }
+                                Error::Memory {
+                                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                                    used,
+                                }
+                            }
                             index::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
                         })?;
                         budget.finish(&mut totals);
@@ -4892,12 +4966,17 @@ impl Saturation {
                         for FoundWorldChunk { rows, mut debit } in found {
                             // The iterator and each yielded row drop before the debit.
                             for (d, f, kept) in rows {
-                                let next_bytes = world_bytes.checked_add(kept as usize).ok_or(
-                                    Error::Memory {
-                                        limit: limits.max_memory.unwrap_or(usize::MAX),
-                                        used: usize::MAX,
-                                    },
-                                )?;
+                                let next_bytes =
+                                    world_bytes.checked_add(kept as usize).ok_or_else(|| {
+                                        if partial {
+                                            self.partial_over = true;
+                                            self.dirty = true;
+                                        }
+                                        Error::Memory {
+                                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                                            used: usize::MAX,
+                                        }
+                                    })?;
                                 let remaining = debit.outstanding - kept;
                                 #[cfg(test)]
                                 if let Some(test) = row_test.as_deref() {
@@ -5163,6 +5242,10 @@ impl Saturation {
                     return Err(e);
                 }
                 if !ok {
+                    if partial {
+                        self.partial_over = true;
+                        self.dirty = true;
+                    }
                     return Err(Error::Memory {
                         limit: max_memory.unwrap_or(usize::MAX),
                         used: refused.unwrap_or(held),
@@ -5318,17 +5401,60 @@ impl Saturation {
         let t = Instant::now();
         let consistent = match &open {
             Some((_, c)) => *c != Consistency::Inconsistent,
-            None => self.consistent(&ax, &ix_nominals, rooted),
+            None => {
+                phase12_consistent.unwrap_or_else(|| self.consistent(&ax, &ix_nominals, rooted))
+            }
         };
         if open.is_none() {
             self.consistent = consistent;
         }
+        // Drop `roots` before retained admission when `open` already holds its explicit
+        // subset of incomplete root expressions so the two buffers never overlap.
+        if matches!(open, Some((partial::OpenClasses::Some(_), _))) {
+            roots = Vec::new();
+        }
         // The saturation charges fixed allowances for new contexts/conclusions;
         // reuse counts their retained tables instead. Reconcile once the workers
         // have stopped so both paths report the same retained-state estimate.
-        let root_bytes = roots.capacity() * 4;
-        let retained = self.retained_bytes(held_bytes, root_bytes, world_bytes);
-        let held = retained + pending * std::mem::size_of::<saturate::Concl>();
+        let root_bytes = match &open {
+            Some((partial::OpenClasses::Some(v), _)) => v.capacity() * std::mem::size_of::<Ex>(),
+            _ => roots.capacity() * std::mem::size_of::<Ex>(),
+        };
+        // Pre-compute the exact size of the partial answer's `Vec<Class>` (including
+        // cloned IRI buffers) with zero allocations so retained admission and taxonomy
+        // construction cover both the conversion overlap and the retained output list.
+        let (incomplete_count, incomplete_bytes) = match &open {
+            Some((kind, _)) => {
+                let ids: &[Ex] = match kind {
+                    partial::OpenClasses::All => &roots,
+                    partial::OpenClasses::Some(v) => v,
+                };
+                let mut count = 0usize;
+                let mut str_bytes = 0usize;
+                for &e in ids {
+                    if e == TOP {
+                        continue;
+                    }
+                    if let Some(&Node::Class(id)) = self.interner.nodes.get(e as usize) {
+                        let cls = &self.interner.classes[id as usize];
+                        if !self.hide_internal || !cls.as_str().starts_with(dl_reduce::PREFIX) {
+                            count += 1;
+                            str_bytes = str_bytes.saturating_add(cls.as_str().len());
+                        }
+                    }
+                }
+                let bytes = count
+                    .checked_mul(std::mem::size_of::<Class>())
+                    .and_then(|n| n.checked_add(str_bytes))
+                    .unwrap_or(usize::MAX);
+                (count, bytes)
+            }
+            None => (0, 0),
+        };
+        let retained = self
+            .retained_bytes(held_bytes, root_bytes, world_bytes)
+            .saturating_add(incomplete_bytes);
+        let held = retained.saturating_add(pending * std::mem::size_of::<saturate::Concl>());
         #[cfg(test)]
         if admission_test::observing() {
             admission_test::observe(admission_test::Attempt::Retained {
@@ -5346,6 +5472,43 @@ impl Saturation {
                 self.dirty = true;
             }
         })?;
+        // Materialize and sort the admitted partial-result class list in place before
+        // dropping `roots` and the `OpenClasses` buffer so no un-admitted allocation
+        // occurs after `taxonomy::build` or `stats.memory`.
+        let partial_classes = if let Some((kind, consistency)) = open.take() {
+            let ids: &[Ex] = match &kind {
+                partial::OpenClasses::All => &roots,
+                partial::OpenClasses::Some(v) => v,
+            };
+            let mut classes: Vec<Class> = Vec::new();
+            if classes.try_reserve_exact(incomplete_count).is_err() {
+                self.partial_over = true;
+                self.dirty = true;
+                return Err(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: held,
+                });
+            }
+            for &e in ids {
+                if e == TOP {
+                    continue;
+                }
+                if let Some(&Node::Class(id)) = self.interner.nodes.get(e as usize) {
+                    let cls = &self.interner.classes[id as usize];
+                    if !self.hide_internal || !cls.as_str().starts_with(dl_reduce::PREFIX) {
+                        classes.push(cls.clone());
+                    }
+                }
+            }
+            classes.sort_unstable();
+            drop(kind);
+            drop(roots);
+            Some((classes, consistency))
+        } else {
+            drop(roots);
+            None
+        };
+        let is_partial = partial_classes.is_some();
         if !with_taxonomy {
             stats.memory = held;
             stats.peak_memory = totals.peak.max(held);
@@ -5354,12 +5517,12 @@ impl Saturation {
             return Ok(ControlFlow::Continue((consistent, None, stats)));
         }
         // a partial answer builds its taxonomy past the deadline that stopped it
-        let stop = || open.is_none() && poll(limits).is_err();
+        let stop = || !is_partial && poll(limits).is_err();
         // Taxonomy asks again as its estimate grows. The observed saturation peak
         // may include a refusal, so only the paid peak offsets these requests.
         let paid = std::cell::Cell::new(totals.paid);
         let budget = Self::taxonomy_budget(held, &paid, limits.max_memory, charge_fn);
-        let built = taxonomy::build(self, consistent, threads, open.is_some(), &stop, &budget);
+        let built = taxonomy::build(self, consistent, threads, is_partial, &stop, &budget);
         let (taxonomy, tax_bytes) = built.map_err(|h| match h {
             taxonomy::Halt::Stopped => poll(limits).err().unwrap_or(Error::Cancelled),
             taxonomy::Halt::Memory(bytes) => {
@@ -5379,17 +5542,8 @@ impl Saturation {
         stats.peak_memory = totals.peak.max(stats.memory).max(paid.get());
         stats.taxonomy = t.elapsed();
         stats.contexts = contexts_count;
-        if let Some((incomplete, consistency)) = open {
-            let mut classes: Vec<Class> = incomplete
-                .into_iter()
-                .filter_map(|e| match self.interner.nodes[e as usize] {
-                    Node::Class(id) => Some(self.interner.classes[id as usize].clone()),
-                    _ => None,
-                })
-                .filter(|k| !self.hide_internal || !k.as_str().starts_with(dl_reduce::PREFIX))
-                .collect();
-            classes.sort();
-            self.partial = Some((classes, consistency));
+        if let Some(partial_answer) = partial_classes {
+            self.partial = Some(partial_answer);
             return Ok(ControlFlow::Continue((consistent, Some(taxonomy), stats)));
         }
         poll(limits)?;

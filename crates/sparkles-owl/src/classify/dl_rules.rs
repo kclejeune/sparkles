@@ -1729,11 +1729,13 @@ pub(super) fn has_pending_candidate(
     }
     let cs_bytes = eligible.checked_mul(std::mem::size_of::<((u8, Ex), &Clause)>());
     let max_bytes = max_head.checked_mul(std::mem::size_of::<Lit>());
-    // Conservative hash-table estimate for `FxHashSet<Ex>` holding up to `eligible` entries.
+    // Conservative hash-table estimate for `FxHashSet<Ex>` holding up to `eligible` entries,
+    // clamping hashbrown's 4-bucket minimum for small non-empty tables.
     let model_bytes = eligible
         .checked_mul(8)
         .and_then(|n| n.checked_div(7))
         .and_then(|n| n.checked_next_power_of_two())
+        .map(|b| b.max(4))
         .and_then(|b| b.checked_mul(std::mem::size_of::<Ex>() + 1))
         .and_then(|b| b.checked_add(16));
     let Some(scratch) = cs_bytes
@@ -1764,7 +1766,10 @@ pub(super) fn has_pending_candidate(
             cs.push((super::dl_clause::rank(ix, m.atom()), &s.c));
         }
     }
-    cs.sort_by_key(|&(k, _)| k);
+    // Allocation-free sort: every clause in `cs` has a single strictly maximal literal
+    // `a = k.1`, so all other head literals have strictly smaller rank and equal-key
+    // clauses share the same `a`, making tie order irrelevant to `model` and the result.
+    cs.sort_unstable_by_key(|&(k, _)| k);
     let mut model: FxHashSet<Ex> = FxHashSet::default();
     if model.try_reserve(cs.len()).is_err() {
         return true;

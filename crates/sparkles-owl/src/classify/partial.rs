@@ -58,6 +58,16 @@ impl BitSet {
     }
 }
 
+/// Representation of incomplete root expressions from [`record`] or Phase 3 worlds.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum OpenClasses {
+    /// Zero-allocation marker meaning every non-`TOP` root is incomplete (used on
+    /// `Consistency::Unknown`, rooted Tier D, universal/keys stops, and admission refusal).
+    All,
+    /// Explicit subset of incomplete root expressions (empty when `Inconsistent`).
+    Some(Vec<Ex>),
+}
+
 /// Which tier and phase stopped and requires dependency recording.
 pub(super) enum RecordKind<'a> {
     ElHorn {
@@ -75,11 +85,8 @@ pub(super) enum RecordKind<'a> {
 }
 
 #[inline]
-fn all_open(roots: &[Ex]) -> (Vec<Ex>, Consistency) {
-    (
-        roots.iter().copied().filter(|&r| r != TOP).collect(),
-        Consistency::Unknown,
-    )
+fn all_open() -> (OpenClasses, Consistency) {
+    (OpenClasses::All, Consistency::Unknown)
 }
 
 /// Visits every forward dependency edge `e -> to` stored on `st` that is not already
@@ -143,7 +150,7 @@ pub(super) fn record(
     roots: &[Ex],
     kind: RecordKind<'_>,
     admit: &mut dyn FnMut(usize) -> bool,
-) -> (Vec<Ex>, Consistency) {
+) -> (OpenClasses, Consistency) {
     let n = ctx.len();
     debug_assert!(dynamic.is_none_or(|d| d.base() as usize == n));
     let total = n + dynamic.map_or(0, |d| d.len());
@@ -159,11 +166,11 @@ pub(super) fn record(
     };
 
     // Pass 0 (zero allocations): check whether inconsistency is already proved, and handle
-    // regimes that require a conservative `(all_open, Unknown)` answer without a CSR walk.
+    // regimes that require a conservative `(OpenClasses::All, Unknown)` answer without a CSR walk.
     if matches!(kind, RecordKind::Disj { rooted: true, .. }) {
         // Rooted Tier D cannot track work across the root context's propagations, so it
         // always leaves every class open and consistency unknown.
-        return all_open(roots);
+        return all_open();
     }
 
     let is_bottom = |e: Ex| get(e).is_some_and(|c| c.st.lock().bottom);
@@ -189,7 +196,7 @@ pub(super) fn record(
         RecordKind::Disj { rooted: true, .. } => unreachable!(),
     };
     if inconsistent {
-        return (Vec::new(), Consistency::Inconsistent);
+        return (OpenClasses::Some(Vec::new()), Consistency::Inconsistent);
     }
 
     if let RecordKind::ElHorn {
@@ -199,32 +206,32 @@ pub(super) fn record(
     {
         // Pending universal-role facts or key merges can affect any context or cause
         // inconsistency until Phase 2 reaches a fixpoint.
-        return all_open(roots);
+        return all_open();
     }
 
     // Step 1 admission: `bad_bits` (dense BitSet) + CSR `offsets` (length `total + 1`).
     let Some(bits_bytes) = BitSet::byte_len(total) else {
-        return all_open(roots);
+        return all_open();
     };
     let Some(offsets_len) = total.checked_add(1) else {
-        return all_open(roots);
+        return all_open();
     };
     let Some(offsets_bytes) = offsets_len.checked_mul(std::mem::size_of::<u32>()) else {
-        return all_open(roots);
+        return all_open();
     };
     let Some(step1_bytes) = bits_bytes.checked_add(offsets_bytes) else {
-        return all_open(roots);
+        return all_open();
     };
     if !admit(step1_bytes) {
-        return all_open(roots);
+        return all_open();
     }
 
     let Some(mut bad_bits) = BitSet::try_new(total) else {
-        return all_open(roots);
+        return all_open();
     };
     let mut offsets: Vec<u32> = Vec::new();
     if offsets.try_reserve_exact(offsets_len).is_err() {
-        return all_open(roots);
+        return all_open();
     }
     offsets.resize(offsets_len, 0);
 
@@ -297,14 +304,14 @@ pub(super) fn record(
             }
         });
         if count_overflow {
-            return all_open(roots);
+            return all_open();
         }
     }
 
     // Prefix-sum `offsets` in place.
     for i in 1..offsets_len {
         let Some(sum) = offsets[i - 1].checked_add(offsets[i]) else {
-            return all_open(roots);
+            return all_open();
         };
         offsets[i] = sum;
     }
@@ -312,30 +319,30 @@ pub(super) fn record(
 
     // Step 2 admission: `rev_edges` (`edge_count * 4`) + `stack` (`total * 4`).
     let Some(edges_bytes) = edge_count.checked_mul(std::mem::size_of::<Ex>()) else {
-        return all_open(roots);
+        return all_open();
     };
     let Some(stack_bytes) = total.checked_mul(std::mem::size_of::<Ex>()) else {
-        return all_open(roots);
+        return all_open();
     };
     let Some(step2_bytes) = step1_bytes
         .checked_add(edges_bytes)
         .and_then(|b| b.checked_add(stack_bytes))
     else {
-        return all_open(roots);
+        return all_open();
     };
     if !admit(step2_bytes) {
-        return all_open(roots);
+        return all_open();
     }
 
     let mut rev_edges: Vec<Ex> = Vec::new();
     if rev_edges.try_reserve_exact(edge_count).is_err() {
-        return all_open(roots);
+        return all_open();
     }
     rev_edges.resize(edge_count, 0);
 
     let mut stack: Vec<Ex> = Vec::new();
     if stack.try_reserve_exact(total).is_err() {
-        return all_open(roots);
+        return all_open();
     }
 
     // Pass 2: populate CSR `rev_edges` using `offsets[to]` as the write cursor.
@@ -412,45 +419,65 @@ pub(super) fn record(
         }
     };
     if mandatory_open {
-        return all_open(roots);
+        return all_open();
     }
 
-    // Ontology is proved consistent; collect incomplete non-TOP roots.
-    let incomplete: Vec<Ex> = match &kind {
-        RecordKind::ElHorn { .. } => roots
-            .iter()
-            .copied()
-            .filter(|&r| r != TOP && ((r as usize) >= total || bad_bits.contains(r as usize)))
-            .collect(),
-        RecordKind::Disj { refuted, .. } => {
-            // Re-account `bad_bits` live while checking per-root pending candidates.
-            let mut cand_admit = |cand_scratch: usize| {
-                bits_bytes
-                    .checked_add(cand_scratch)
-                    .is_some_and(&mut *admit)
-            };
-            roots
-                .iter()
-                .copied()
-                .filter(|&r| {
-                    if r == TOP {
-                        return false;
-                    }
-                    if (r as usize) >= total || bad_bits.contains(r as usize) {
-                        return true;
-                    }
-                    dl_rules::has_pending_candidate(ix, ctx, r, refuted, &mut cand_admit)
-                })
-                .collect()
+    // For non-rooted Tier D, mark roots with pending candidates directly in `bad_bits`
+    // while keeping `bad_bits` live in the admission budget.
+    if let RecordKind::Disj { refuted, .. } = &kind {
+        let mut cand_admit = |cand_scratch: usize| {
+            bits_bytes
+                .checked_add(cand_scratch)
+                .is_some_and(&mut *admit)
+        };
+        for &r in roots {
+            if r != TOP
+                && (r as usize) < total
+                && !bad_bits.contains(r as usize)
+                && dl_rules::has_pending_candidate(ix, ctx, r, refuted, &mut cand_admit)
+            {
+                bad_bits.insert(r as usize);
+            }
         }
-    };
+    }
 
-    (incomplete, Consistency::Consistent)
+    // Ontology is proved consistent; pre-admit the output `Vec<Ex>` while `bad_bits` is
+    // still live, then drop `bad_bits` before returning.
+    let open_count = roots
+        .iter()
+        .copied()
+        .filter(|&r| r != TOP && ((r as usize) >= total || bad_bits.contains(r as usize)))
+        .count();
+    let Some(out_bytes) = open_count.checked_mul(std::mem::size_of::<Ex>()) else {
+        return all_open();
+    };
+    if out_bytes > 0 {
+        let Some(final_bytes) = bits_bytes.checked_add(out_bytes) else {
+            return all_open();
+        };
+        if !admit(final_bytes) {
+            return all_open();
+        }
+    }
+    let mut incomplete = Vec::new();
+    if incomplete.try_reserve_exact(open_count).is_err() {
+        return all_open();
+    }
+    for &r in roots {
+        if r != TOP && ((r as usize) >= total || bad_bits.contains(r as usize)) {
+            incomplete.push(r);
+        }
+    }
+    drop(bad_bits);
+
+    (OpenClasses::Some(incomplete), Consistency::Consistent)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classify::index::{Axioms, Interner, Role};
+    use std::sync::OnceLock;
 
     #[test]
     fn bitset_insert_and_contains_roundtrip() {
@@ -471,5 +498,126 @@ mod tests {
         assert!(bs.contains(64));
         assert!(bs.contains(129));
         assert!(!bs.contains(1));
+    }
+
+    fn record_fixture() -> (Index, Contexts, Vec<Ex>, Ex, Ex) {
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<urn:partial-csr:>)
+             Ontology(
+                 SubClassOf(:Closed :ClosedSup)
+                 SubClassOf(:OpenSrc ObjectSomeValuesFrom(:r :OpenDst))
+             )",
+        )
+        .unwrap();
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        for a in &doc.axioms {
+            super::super::index::normalize(&a.kind, &mut it, &mut ax);
+        }
+        ax.classes.extend(it.met_classes());
+        let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+        let n = it.len();
+        let ctx: Contexts = (0..n).map(|_| OnceLock::new()).collect();
+        let mut closed = None;
+        let mut open_src = None;
+        let mut open_dst = None;
+        for &c in &ax.classes {
+            if let Node::Class(id) = ix.head(c).node {
+                match it.classes[id as usize].as_str() {
+                    "urn:partial-csr:Closed" => closed = Some(c),
+                    "urn:partial-csr:OpenSrc" => open_src = Some(c),
+                    "urn:partial-csr:OpenDst" => open_dst = Some(c),
+                    _ => {}
+                }
+            }
+        }
+        let closed = closed.unwrap();
+        let open_src = open_src.unwrap();
+        let open_dst = open_dst.unwrap();
+
+        // Mark every expression's context as initialized and closed except `open_dst`,
+        // and add a forward edge `open_src -> open_dst` so CSR has `edge_count > 0` and
+        // `step2_bytes > step1_bytes`.
+        for e in 0..n as Ex {
+            let c = ctx[e as usize].get_or_init(Box::default);
+            c.started.store(true, Ordering::Release);
+            let mut st = c.st.lock();
+            st.init = true;
+            if e == open_src {
+                st.fwd.insert((0 as Role, open_dst));
+            }
+            if e == open_dst {
+                st.interrupted = true;
+            }
+        }
+        let mut roots = ax.classes;
+        roots.push(TOP);
+        roots.sort_unstable();
+        roots.dedup();
+        (ix, ctx, roots, closed, open_src)
+    }
+
+    #[test]
+    fn csr_admission_refusal_falls_back_at_step1_step2_and_output() {
+        let (ix, ctx, roots, closed, open_src) = record_fixture();
+        let kind = || RecordKind::ElHorn {
+            individuals: false,
+            has_universal_or_keys: false,
+            horn: false,
+            phase2_started: false,
+            individuals_list: &[],
+            nominals: &[],
+        };
+
+        // 1. Unconstrained admission succeeds with exact incomplete set and records
+        //    three admission requests: step1 (bits+offsets), step2 (+rev_edges+stack),
+        //    and final output (bits+incomplete Vec<Ex>).
+        let mut requests = Vec::new();
+        let (open, cons) = record(&ix, &ctx, None, &roots, kind(), &mut |bytes| {
+            requests.push(bytes);
+            true
+        });
+        assert_eq!(cons, Consistency::Consistent);
+        let OpenClasses::Some(inc) = open else {
+            panic!("expected exact incomplete list, got {open:?}");
+        };
+        assert!(inc.contains(&open_src), "open_src must be incomplete");
+        assert!(!inc.contains(&closed), "closed must be complete");
+        assert_eq!(requests.len(), 3, "expected step1, step2, output requests");
+        let (step1, step2, final_out) = (requests[0], requests[1], requests[2]);
+        assert!(step2 > step1, "step2 ({step2}) must exceed step1 ({step1})");
+        assert!(final_out > 0);
+
+        // 2. Refusing `step1_bytes` returns zero-alloc `(OpenClasses::All, Unknown)` immediately.
+        let mut calls = Vec::new();
+        let (open, cons) = record(&ix, &ctx, None, &roots, kind(), &mut |bytes| {
+            calls.push(bytes);
+            false
+        });
+        assert_eq!(open, OpenClasses::All);
+        assert_eq!(cons, Consistency::Unknown);
+        assert_eq!(calls, vec![step1]);
+
+        // 3. Accepting `step1_bytes` and refusing `step2_bytes` drops step1 buffers and
+        //    returns `(OpenClasses::All, Unknown)` without allocating CSR edge arrays.
+        let mut calls = Vec::new();
+        let (open, cons) = record(&ix, &ctx, None, &roots, kind(), &mut |bytes| {
+            calls.push(bytes);
+            calls.len() < 2
+        });
+        assert_eq!(open, OpenClasses::All);
+        assert_eq!(cons, Consistency::Unknown);
+        assert_eq!(calls, vec![step1, step2]);
+
+        // 4. Accepting `step1_bytes` and `step2_bytes` but refusing the output `Vec<Ex>`
+        //    falls back cleanly to `(OpenClasses::All, Unknown)`.
+        let mut calls = Vec::new();
+        let (open, cons) = record(&ix, &ctx, None, &roots, kind(), &mut |bytes| {
+            calls.push(bytes);
+            calls.len() < 3
+        });
+        assert_eq!(open, OpenClasses::All);
+        assert_eq!(cons, Consistency::Unknown);
+        assert_eq!(calls, vec![step1, step2, final_out]);
     }
 }
