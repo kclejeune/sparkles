@@ -6,7 +6,7 @@
 //! thread a product of more choices than its limit ends the attempt too (roadmap item
 //! 1011).
 
-use sparkles_owl::classify::{Classification, Classifier, Excluded, Limits, Tier};
+use sparkles_owl::classify::{Classification, Classifier, Excluded, Expansion, Limits, Tier};
 use sparkles_owl::model::*;
 use sparkles_owl::ofn_read;
 
@@ -432,4 +432,75 @@ fn kept_and_fresh_runs_agree_on_the_attempt_at_every_bound() {
         // both answers occur
         assert!(fell[0] > 0 && fell[1] > 0, "{fell:?}");
     }
+}
+
+#[test]
+fn eager_kept_run_past_attempt_work_and_width_starts_again_in_full() {
+    let eager = |bound: Option<usize>, width: Option<usize>| Limits {
+        threads: 1,
+        expansion: Expansion::Eager,
+        dl_attempt_work: bound,
+        dl_attempt_width: width,
+        ..Limits::default()
+    };
+    let unbounded = eager(Some(UNREACHED), None);
+    let mut k = Classifier::of(&axioms(UNIONS));
+    let first = k.classify(&unbounded).unwrap().stats.dl_work;
+    k.add(&axioms(EDIT));
+    let added = k.classify(&unbounded).unwrap();
+    assert!(added.stats.incremental);
+    k.remove(&axioms(EDIT));
+    k.add(&axioms(SWAP));
+    let swapped = k.classify(&unbounded).unwrap();
+    assert!(swapped.stats.incremental);
+    let (added, swapped) = (added.stats.dl_work, swapped.stats.dl_work);
+    let mut held = axioms(UNIONS);
+    held.extend(axioms(SWAP));
+    let fresh = Classifier::of(&held)
+        .classify(&unbounded)
+        .unwrap()
+        .stats
+        .dl_work;
+
+    let bound = (first + added).max(fresh);
+    assert!(
+        bound < first + added + swapped,
+        "{first} {added} {swapped} {fresh}"
+    );
+    let mut k = Classifier::of(&axioms(UNIONS));
+    let out = k.classify(&eager(Some(bound), None)).unwrap();
+    assert!(!out.stats.dl_attempt_over);
+    k.add(&axioms(EDIT));
+    let out = k.classify(&eager(Some(bound), None)).unwrap();
+    assert!(out.stats.incremental && !out.stats.dl_attempt_over);
+    assert!(out.taxonomy.is_subclass(&c("M"), &c("L")));
+    k.remove(&axioms(EDIT));
+    k.add(&axioms(SWAP));
+    let out = k.classify(&eager(Some(bound), None)).unwrap();
+    assert!(
+        !out.stats.incremental,
+        "eager kept run past work bound did not start again"
+    );
+    assert!(!out.stats.dl_attempt_over);
+    assert_eq!(out.stats.dl_work, fresh);
+    let mut f = Classifier::of(&held);
+    let want = f.classify(&eager(Some(bound), None)).unwrap();
+    assert_eq!(answer(&out, &k), answer(&want, &f));
+    assert_eq!(out.taxonomy, want.taxonomy);
+
+    // 1-thread width limit under Expansion::Eager on a kept run.
+    let mut kw = Classifier::of(&axioms(UNIONS));
+    let out = kw.classify(&eager(None, Some(3))).unwrap();
+    assert!(!out.stats.dl_attempt_over);
+    kw.add(&axioms(WIDE));
+    let out = kw.classify(&eager(None, Some(3))).unwrap();
+    let mut held_w = axioms(UNIONS);
+    held_w.extend(axioms(WIDE));
+    let mut fw = Classifier::of(&held_w);
+    let want = fw.classify(&eager(None, Some(3))).unwrap();
+    assert_eq!(answer(&out, &kw), answer(&want, &fw));
+    kw.remove(&axioms(WIDE));
+    let out = kw.classify(&eager(None, Some(3))).unwrap();
+    assert!(!out.stats.dl_attempt_over && !out.stats.dl_over_budget);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
 }
