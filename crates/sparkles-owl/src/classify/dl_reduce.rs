@@ -33,6 +33,7 @@
 //! the run's report.
 
 use super::Excluded;
+use super::ScratchBudget;
 use super::dl;
 use super::index::Gap;
 use crate::model::*;
@@ -126,36 +127,120 @@ impl Reduction {
         *excluded = out;
     }
 
+    /// Whether the run left out or used only in part any axiom that the rewriting made.
+    /// The lookup holds only the report's axioms, so it costs memory in proportion to
+    /// the report and not to the rewriting.
+    pub fn excludes_rewritten(&self, excluded: &[Excluded]) -> bool {
+        if excluded.is_empty() {
+            return false;
+        }
+        let left: FxHashSet<&AxiomKind> = excluded.iter().map(|e| &e.axiom).collect();
+        self.axioms.iter().any(|k| left.contains(k))
+    }
+
     /// What the original axioms outside OWL 2 EL need, for the run's statistics, with the
     /// report of the axioms the run left out.
-    /// `chains` are the original chains outside OWL 2 EL for their ranges alone, which are
-    /// Horn, as the run without the rewriting counts them.
-    pub fn outside_el(
-        &self,
+    /// Original chains outside OWL 2 EL for their ranges alone are determined from the
+    /// original axioms with the ordinary range check and counted as Horn.
+    pub(super) fn outside_el(
         axioms: &[&AxiomKind],
-        chains: &[&AxiomKind],
         excluded: &[Excluded],
-    ) -> dl::OutsideEl {
+        budget: &mut impl super::ScratchBudget,
+    ) -> Result<dl::OutsideEl, super::Error> {
+        let mut work = super::ScopedScratch::new(budget);
+        work.poll()?;
         let mut out = dl::OutsideEl::default();
-        let mut seen: BTreeSet<&AxiomKind> = BTreeSet::new();
-        for k in axioms {
-            if super::logical(k) && super::el_break(k).is_some() && seen.insert(k) {
-                out.add(dl::shape(k));
+        let mut seen: super::polled::PolledSet<'_, AxiomKind> = super::polled::PolledSet::new();
+        let mut chains: Vec<&AxiomKind> = Vec::new();
+        let mut is_outside_bits: Vec<u64> = Vec::new();
+        let bit_words = axioms.len().div_ceil(64);
+        if bit_words > 0 {
+            super::vec_reserve(&mut is_outside_bits, bit_words, &mut work)?;
+            is_outside_bits.resize(bit_words, 0);
+        }
+        let mut steps = 0usize;
+        for (i, &k) in axioms.iter().enumerate() {
+            if i.is_multiple_of(super::RANGE_POLL_STEP) {
+                work.poll()?;
+            }
+            if super::logical(k) && super::el_breaks_polled(k, &work)? {
+                is_outside_bits[i / 64] |= 1u64 << (i % 64);
+                if seen.insert_polled(k, &mut steps, &mut work)? {
+                    #[cfg(test)]
+                    super::admission_test::hit(super::admission_test::Point::OutsideElBeforeShape);
+                    out.add(dl::shape_polled(k, super::RANGE_POLL_STEP, &mut || {
+                        work.poll()
+                    })?);
+                }
+            } else if matches!(
+                k,
+                AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
+            ) && !super::index::top_inclusion(k)
+            {
+                super::vec_reserve(&mut chains, 1, &mut work)?;
+                chains.push(k);
             }
         }
-        for k in chains {
-            if seen.insert(k) {
-                out.horn += 1;
+        if !chains.is_empty() {
+            let missing = super::check_chain_ranges(
+                axioms,
+                |i, _| (is_outside_bits[i / 64] >> (i % 64)) & 1 != 0,
+                &chains,
+                false,
+                &mut work,
+            )?;
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElBeforeDropBits);
+            let bits_bytes = super::vec_bytes(&is_outside_bits);
+            drop(is_outside_bits);
+            work.release(bits_bytes);
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElAfterDropBits);
+            let missing_bytes = super::vec_bytes(&missing);
+            for (i, (&k, miss)) in chains.iter().zip(missing.iter()).enumerate() {
+                if i.is_multiple_of(super::RANGE_POLL_STEP) {
+                    work.poll()?;
+                }
+                if miss.is_some() && seen.insert_polled(k, &mut steps, &mut work)? {
+                    out.horn += 1;
+                }
+            }
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElBeforeDropMissing);
+            drop(missing);
+            work.release(missing_bytes);
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElAfterDropMissing);
+        } else {
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElBeforeDropBits);
+            let bits_bytes = super::vec_bytes(&is_outside_bits);
+            drop(is_outside_bits);
+            work.release(bits_bytes);
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElAfterDropBits);
+        }
+        #[cfg(test)]
+        super::admission_test::hit(super::admission_test::Point::OutsideElBeforeDropChains);
+        let chains_bytes = super::vec_bytes(&chains);
+        drop(chains);
+        work.release(chains_bytes);
+        #[cfg(test)]
+        super::admission_test::hit(super::admission_test::Point::OutsideElAfterDropChains);
+        let mut left: super::polled::PolledSet<'_, AxiomKind> = super::polled::PolledSet::new();
+        for (i, e) in excluded.iter().enumerate() {
+            if i.is_multiple_of(super::RANGE_POLL_STEP) {
+                work.poll()?;
+            }
+            if matches!(e.gap, Gap::Outside { .. })
+                && seen.contains_polled(&e.axiom, &mut steps, &work)?
+            {
+                left.insert_polled(&e.axiom, &mut steps, &mut work)?;
             }
         }
-        let left: BTreeSet<&AxiomKind> = excluded
-            .iter()
-            .filter(|e| matches!(e.gap, Gap::Outside { .. }))
-            .map(|e| &e.axiom)
-            .filter(|k| seen.contains(k))
-            .collect();
+        work.poll()?;
         out.taken = seen.len() - left.len();
-        out
+        Ok(out)
     }
 }
 

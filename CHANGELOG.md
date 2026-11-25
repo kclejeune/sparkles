@@ -53,6 +53,17 @@ repeated `DisjointClasses` and `DisjointUnion` members without escalating Horn o
 to Tier D. In Rust, callers that construct the five `AxiomKind` variants directly from a
 typed `BTreeSet<T>` now convert with `.into()`, and `Ontology::disjoint_unions` now returns
 `Vec<Multiset<ClassExpression>>`; `Axiom::disjoint_classes` keeps its generic signature.
+### Rooted rewriting kept when an ontology becomes Horn or EL
+
+When item 805's rooted rewriting turns every non-Horn axiom into Horn or OWL 2 EL axioms,
+such as a one-image `DisjointUnion` or two complemented disjointness members that merge to
+one image, `Saturation::run` now keeps the lower-tier classification whenever every rewritten
+axiom is taken (roadmap item 1313). Previously it discarded the result whenever Tier D did
+not run and reported the original axiom outside the supported fragment. Kept rewritten
+results preserve original-axiom counts, compute outside-EL statistics and chain range checks
+from the original ontology, restore unchanged exclusions and hide all internal fresh classes
+and the hub individual. When Tier D does not take the rewritten ontology, runs that stay
+disjunctive or leave out any rewritten axiom still fall back to the original axioms.
 
 ### One result writer per format, with the engine's own SPARQL encoders
 

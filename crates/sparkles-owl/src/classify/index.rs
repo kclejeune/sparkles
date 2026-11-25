@@ -1544,10 +1544,11 @@ impl Axioms {
                 .sum::<usize>()
             + self.disjoint.capacity() * 24
             + self.role_subs.capacity() * 8
+            + self.chains.capacity() * std::mem::size_of::<(Vec<Role>, Role)>()
             + self
                 .chains
                 .iter()
-                .map(|(c, _)| 32 + c.capacity() * 4)
+                .map(|(c, _)| c.capacity() * std::mem::size_of::<Role>())
                 .sum::<usize>()
             + self.reflexive.capacity() * 4
             + self.ranges.capacity() * 8
