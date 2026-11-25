@@ -441,29 +441,53 @@ impl Expr {
     /// Deeper expressions are evaluated on the query's thread, whose stack
     /// [`super::depth::with_stack`] sized for the whole algebra.
     pub fn parallel(&self) -> bool {
-        !self.has_exists() && self.within(PARALLEL_DEPTH)
+        self.within(PARALLEL_DEPTH, &|_| true)
     }
 
-    /// Whether this expression nests at most `levels` levels (recursing no deeper).
-    fn within(&self, levels: usize) -> bool {
+    /// Geometry constructors charge the query even if the resulting key is
+    /// discarded, and worker scratch can make the constructor fail with a type
+    /// error. Evaluate keys that can call them in the serial loop.
+    pub(super) fn parallel_order_key(&self) -> bool {
+        #[cfg(feature = "geo")]
+        {
+            self.within(PARALLEL_DEPTH, &|f| {
+                let iri = match f {
+                    Func::Ext(iri) => iri.as_str(),
+                    Func::Builtin(Function::Custom(iri)) => iri.as_str(),
+                    _ => return true,
+                };
+                // These calls can select a geometry constructor at runtime.
+                iri.strip_prefix(FN) != Some("apply")
+                    && iri.strip_prefix(AFN) != Some("eval")
+                    && !crate::geo::functions::charges_geometry_result(iri)
+            })
+        }
+        #[cfg(not(feature = "geo"))]
+        self.parallel()
+    }
+
+    /// Whether this expression fits within the stack depth and call restrictions
+    /// for a parallel evaluation.
+    fn within(&self, levels: usize, allowed: &impl Fn(&Func) -> bool) -> bool {
         if levels == 0 {
             return false;
         }
         let n = levels - 1;
+        let within = |e: &Expr| e.within(n, allowed);
         match self {
-            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) | Expr::Exists(_) => {
-                true
-            }
+            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => true,
+            Expr::Exists(_) => false,
             Expr::Or(a, b)
             | Expr::And(a, b)
             | Expr::Eq(a, b)
             | Expr::SameTerm(a, b)
             | Expr::Cmp(a, b, _)
-            | Expr::Arith(a, b, _) => a.within(n) && b.within(n),
-            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => a.within(n),
-            Expr::In(a, l) => a.within(n) && l.iter().all(|e| e.within(n)),
-            Expr::If(a, b, c) => a.within(n) && b.within(n) && c.within(n),
-            Expr::Coalesce(l) | Expr::Call(_, l) => l.iter().all(|e| e.within(n)),
+            | Expr::Arith(a, b, _) => within(a) && within(b),
+            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => within(a),
+            Expr::In(a, l) => within(a) && l.iter().all(within),
+            Expr::If(a, b, c) => within(a) && within(b) && within(c),
+            Expr::Coalesce(l) => l.iter().all(within),
+            Expr::Call(f, args) => allowed(f) && args.iter().all(within),
         }
     }
 

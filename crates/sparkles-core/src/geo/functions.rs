@@ -78,6 +78,34 @@ pub const FUNCTIONS: &[&str] = &[
     "maxZ",
 ];
 
+/// Whether the dispatch below can charge a serialized geometry for the rest of
+/// the query through `Call::geometry`, including Jena's spatial functions.
+pub(crate) fn charges_geometry_result(iri: &str) -> bool {
+    matches!(
+        iri.strip_prefix(GEOF),
+        Some(
+            "buffer"
+                | "metricBuffer"
+                | "convexHull"
+                | "boundingCircle"
+                | "concaveHull"
+                | "envelope"
+                | "boundary"
+                | "centroid"
+                | "intersection"
+                | "union"
+                | "difference"
+                | "symDifference"
+                | "transform"
+                | "asWKT"
+                | "asGeoJSON"
+                | "asGML"
+                | "asKML"
+                | "geometryN"
+        )
+    ) || super::spatialf::charges_geometry_result(iri)
+}
+
 /// Evaluate the GeoSPARQL function `iri`; `None` when `iri` is not one.
 pub fn call(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> Option<EvalResult<Val>> {
     if iri.starts_with(super::vocab::SPATIALF) {

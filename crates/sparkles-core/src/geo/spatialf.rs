@@ -49,6 +49,20 @@ pub const FUNCTIONS: &[&str] = &[
     "transformSRS",
 ];
 
+/// Whether the dispatch below can charge a serialized geometry through `Call::geometry`.
+pub(super) fn charges_geometry_result(iri: &str) -> bool {
+    matches!(
+        iri.strip_prefix(SPATIALF),
+        Some(
+            "convertLatLon"
+                | "convertLatLonBox"
+                | "transform"
+                | "transformDatatype"
+                | "transformSRS"
+        )
+    )
+}
+
 /// Evaluate the Jena filter function `iri`; `None` when `iri` is not one.
 pub fn call(iri: &str, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> Option<EvalResult<Val>> {
     let local = iri.strip_prefix(SPATIALF)?;
