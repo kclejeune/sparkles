@@ -533,15 +533,24 @@ pub fn call(iri: &str, args: &[Vec<String>]) -> Result<Vec<Cell<'static>>, Strin
             "REPLACE" => {
                 let flags = a(3).unwrap_or("");
                 for f in flags.chars() {
-                    if !matches!(f, 'i' | 's' | 'm' | 'x') {
-                        return Err(format!("REPLACE flag {f:?} is not i, s, m or x"));
+                    if !matches!(f, 'i' | 's' | 'm' | 'x' | 'q') {
+                        return Err(format!("REPLACE flag {f:?} is not i, s, m, x or q"));
                     }
                 }
                 let pat = need(1)?;
-                let re = crate::sparql::expr::compile_regex(pat, flags)
-                    .map_err(|_| format!("REPLACE pattern {pat:?} is invalid"))?;
-                let rep = xpath_replacement(need(2)?)?;
-                vec![text(re.replace_all(s0()?, rep.as_str()).into_owned())]
+                let translated = crate::sparql::expr::translate_xpath_pattern(pat, flags)
+                    .ok_or_else(|| format!("REPLACE pattern {pat:?} is invalid"))?;
+                let re = regex::RegexBuilder::new(&translated)
+                    .build()
+                    .map_err(|e| format!("REPLACE pattern: {e}"))?;
+                let out = if flags.contains('q') {
+                    re.replace_all(s0()?, regex::NoExpand(need(2)?))
+                        .into_owned()
+                } else {
+                    let rep = xpath_replacement(need(2)?)?;
+                    re.replace_all(s0()?, rep.as_str()).into_owned()
+                };
+                vec![text(out)]
             }
             "STRBEFORE" => {
                 let s = s0()?;
@@ -690,5 +699,42 @@ mod tests {
         assert_eq!(one(&format!("{SPK}ABS"), &[&["-2"]]), ["2"]);
         assert!(lookup(&g("toUpperCase")).is_some());
         assert!(lookup("http://ex.org/nope").is_none());
+    }
+
+    #[test]
+    fn replace_xpath_dot_x_q_and_diagnostics() {
+        let rep = format!("{SPK}REPLACE");
+        // Without `s`, `.` excludes `\r` and `\n`; with `s`, it matches both.
+        assert_eq!(one(&rep, &[&["a\rb\nc"], &["."], &["X"]]), ["X\rX\nX"]);
+        assert_eq!(
+            one(&rep, &[&["a\rb\nc"], &["."], &["X"], &["s"]]),
+            ["XXXXX"]
+        );
+        // XPath `x` preserves literal space in `[ ]` while still excluding `\r` from `.`.
+        assert_eq!(
+            one(&rep, &[&[" axb a\rb"], &["[ ] a . b"], &["Y"], &["x"]]),
+            ["Y a\rb"]
+        );
+        // `q` treats both pattern and replacement literally (`$` and `\` are ordinary).
+        assert_eq!(one(&rep, &[&["a.b"], &["."], &["$"], &["q"]]), ["a$b"]);
+        assert_eq!(
+            one(&rep, &[&["a.b"], &["."], &[r"\$1\"], &["q"]]),
+            [r"a\$1\b"]
+        );
+        // Underlying regex compiler diagnostic is preserved.
+        let err = call(
+            &rep,
+            &[vec!["a".into()], vec!["[".into()], vec!["x".into()]],
+        )
+        .unwrap_err();
+        assert!(err.contains("REPLACE pattern:"), "{err}");
+        assert!(err.contains("unclosed"), "{err}");
+        // Preserves the regex crate's default 10 MiB NFA limit above expr::compile_regex's 4 MiB.
+        let big = [150usize, 200, 250, 300, 400, 500]
+            .into_iter()
+            .map(|n| format!(r"\w{{{n}}}"))
+            .find(|pat| crate::sparql::expr::compile_regex(pat, "").is_err())
+            .expect("large repetition exceeds 4 MiB query helper limit");
+        assert_eq!(one(&rep, &[&["a"], &[big.as_str()], &["X"]]), ["a"]);
     }
 }

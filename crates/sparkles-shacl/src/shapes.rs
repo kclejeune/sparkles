@@ -1550,8 +1550,11 @@ pub(crate) fn compile_regex(pattern: &str, flags: Option<&str>) -> Result<regex:
             bail!("unsupported regex flag '{f}'");
         }
     }
-    sparkles_core::sparql::expr::compile_regex(pattern, flags)
-        .map_err(|_| anyhow::anyhow!("invalid sh:pattern {pattern:?}"))
+    let translated = sparkles_core::sparql::expr::translate_xpath_pattern(pattern, flags)
+        .ok_or_else(|| anyhow::anyhow!("invalid sh:pattern {pattern:?}"))?;
+    regex::RegexBuilder::new(&translated)
+        .build()
+        .with_context(|| format!("invalid sh:pattern {pattern:?}"))
 }
 
 #[cfg(test)]
@@ -1741,6 +1744,42 @@ mod graph_read_tests {
             merged.len(),
             2,
             "missing graphs do not discard valid graph or file sources"
+        );
+    }
+
+    #[test]
+    fn shacl_pattern_xpath_dot_flags_and_compiler_limits() {
+        let re = compile_regex("^a.b$", None).unwrap();
+        assert!(re.is_match("axb"));
+        assert!(!re.is_match("a\rb"));
+        assert!(!re.is_match("a\nb"));
+
+        let re_s = compile_regex("^a.b$", Some("s")).unwrap();
+        assert!(re_s.is_match("a\rb"));
+        assert!(re_s.is_match("a\nb"));
+
+        let re_x = compile_regex("^[ ]a.b$", Some("x")).unwrap();
+        assert!(re_x.is_match(" axb"));
+        assert!(!re_x.is_match(" a\rb"));
+
+        let scoped_on = compile_regex("^(?s:.)$", None).unwrap();
+        assert!(scoped_on.is_match("\r"));
+        let scoped_off = compile_regex("^(?-s:.)$", Some("s")).unwrap();
+        assert!(!scoped_off.is_match("\r"));
+
+        // Preserves underlying regex compiler diagnostic.
+        let err = compile_regex("[", None).unwrap_err();
+        assert!(format!("{err:#}").contains("unclosed"), "{err:#}");
+
+        // Preserves the regex crate's default 10 MiB NFA limit above expr::compile_regex's 4 MiB.
+        let big = [150usize, 200, 250, 300, 400, 500]
+            .into_iter()
+            .map(|n| format!(r"\w{{{n}}}"))
+            .find(|pat| sparkles_core::sparql::expr::compile_regex(pat, "").is_err())
+            .expect("large repetition exceeds 4 MiB query helper limit");
+        assert!(
+            compile_regex(&big, None).is_ok(),
+            "SHACL keeps the default 10 MiB regex compilation limit for {big}"
         );
     }
 }

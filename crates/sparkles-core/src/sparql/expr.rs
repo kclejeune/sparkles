@@ -1048,11 +1048,17 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Translate an XPath pattern and SPARQL `REGEX` / `REPLACE` flags into a Rust `regex`
+/// pattern string. Returns `None` if `flags` contains an unsupported flag.
+pub fn translate_xpath_pattern(pattern: &str, flags: &str) -> Option<String> {
+    super::query_regex::translate_xpath_pattern(pattern, flags)
+}
+
 /// Compile an XPath pattern with SPARQL `REGEX` flags into a `regex::Regex`, for
-/// callers outside query evaluation, such as SHACL and ShEx shapes, which compile each
-/// pattern once. Query evaluation uses the query's own programs instead.
+/// callers outside query evaluation, such as ShEx shapes, which compile each pattern
+/// once. Query evaluation uses the query's own programs instead.
 pub fn compile_regex(pattern: &str, flags: &str) -> EvalResult<regex::Regex> {
-    let b = super::query_regex::translate_xpath_pattern(pattern, flags).ok_or(TypeError)?;
+    let b = translate_xpath_pattern(pattern, flags).ok_or(TypeError)?;
     regex::RegexBuilder::new(&b)
         .size_limit(1 << 22)
         .build()
@@ -1360,7 +1366,12 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 .as_deref()
                 .map_or(Some(""), Value::as_str)
                 .ok_or(TypeError)?;
-            let rep = xpath_replacement(r.as_str().ok_or(TypeError)?)?;
+            let rep_str = r.as_str().ok_or(TypeError)?;
+            let rep = if flags.contains('q') {
+                rep_str.replace('$', "$$")
+            } else {
+                xpath_replacement(rep_str)?
+            };
             let output = ctx
                 .with_regex(p.as_str().ok_or(TypeError)?, flags, |re| {
                     if re.matches_empty() {
@@ -1738,7 +1749,8 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
     let lex = v.lexical()?;
     let from_str = matches!(v, Value::Str(_) | Value::Other { .. });
     let parsed = |dt: NamedNodeRef<'_>| -> EvalResult<Val> {
-        let val = Value::from_literal(&Literal::new_typed_literal(lex.trim(), dt));
+        let trimmed = lex.trim_matches([' ', '\t', '\n', '\r']);
+        let val = Value::from_literal(&Literal::new_typed_literal(trimmed, dt));
         if matches!(val, Value::Other { .. }) {
             Err(TypeError)
         } else {

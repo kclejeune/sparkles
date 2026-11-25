@@ -341,45 +341,196 @@ impl Matcher<'_> {
     }
 }
 
-/// Rewrite unescaped `.` outside character classes to `[^\n\r]`, matching XPath F&O 3.1
-/// §5.6.1 where `.` excludes both `\n` (`#x0A`) and `\r` (`#x0D`) unless the `s` flag is set.
-fn rewrite_xpath_dot(pattern: &str, out: &mut String) {
+#[derive(Clone, Copy)]
+struct FlagState {
+    /// Whether `.` matches `\r` and `\n`.
+    dot_all: bool,
+    /// Whether Rust's inline `(?x)` mode is active (whitespace and `#...\n` comments are
+    /// ignored both outside and inside character classes).
+    rust_x: bool,
+    /// Whether XPath's external `x` flag is active (XML whitespace is removed outside
+    /// character classes, while spaces inside classes and `#` stay literal).
+    xpath_x: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClassStart {
+    None,
+    /// Immediately after `[` (so `^` negates and `]` is a literal member).
+    AfterOpen,
+    /// Immediately after `[^` (so `]` is a literal member).
+    AfterNegation,
+}
+
+#[inline]
+fn is_xml_ws(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
+/// Translate `pattern` into Rust `regex` syntax under the effective flag state:
+/// - Under XPath `x` (`xpath_x && !rust_x`), strip XML whitespace (`#x9`, `#xA`, `#xD`,
+///   `#x20`) outside character classes while preserving whitespace inside classes and
+///   keeping `#` literal.
+/// - Under inline Rust `(?x)` (`rust_x`), copy `#...\n` comments verbatim without
+///   altering class/group state and keep `ClassStart` across whitespace/comments inside
+///   character classes.
+/// - Track inline Rust flag directives `(?flags)` and scoped flag groups `(?flags:...)`
+///   across parenthesized groups so effective `s` and `x` are respected at each `.`.
+/// - Rewrite unescaped `.` outside character classes to `[^\n\r]` whenever effective `s`
+///   is disabled, matching XPath F&O 3.1 §5.6.1.
+fn rewrite_xpath_pattern(pattern: &str, initial: FlagState, out: &mut String) {
     let mut chars = pattern.chars().peekable();
+    let mut state = initial;
+    let mut stack: Vec<FlagState> = Vec::new();
     let mut class_depth: usize = 0;
-    // Immediately after `[` or `[^`, `]` is a literal character in Rust regex syntax
-    // rather than closing the class.
-    let mut class_start = false;
+    let mut class_start = ClassStart::None;
+
     while let Some(c) = chars.next() {
+        if state.rust_x && c == '#' {
+            out.push('#');
+            for cc in chars.by_ref() {
+                out.push(cc);
+                if cc == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if state.rust_x && c.is_whitespace() {
+            out.push(c);
+            continue;
+        }
+        if class_depth == 0 && state.xpath_x && !state.rust_x && is_xml_ws(c) {
+            continue;
+        }
         match c {
             '\\' => {
                 out.push('\\');
                 if let Some(next) = chars.next() {
                     out.push(next);
                 }
-                class_start = false;
+                class_start = ClassStart::None;
             }
             '[' => {
                 class_depth += 1;
                 out.push('[');
-                if chars.peek() == Some(&'^') {
-                    out.push(chars.next().unwrap());
-                }
-                class_start = true;
+                class_start = ClassStart::AfterOpen;
+            }
+            '^' if class_start == ClassStart::AfterOpen => {
+                out.push('^');
+                class_start = ClassStart::AfterNegation;
             }
             ']' if class_depth > 0 => {
                 out.push(']');
-                if class_start {
-                    class_start = false;
+                if class_start != ClassStart::None {
+                    class_start = ClassStart::None;
                 } else {
                     class_depth -= 1;
                 }
             }
+            '(' if class_depth == 0 => {
+                out.push('(');
+                let strip_ws = state.xpath_x && !state.rust_x;
+                let mut probe = chars.clone();
+                let mut skipped_ws = 0usize;
+                if strip_ws {
+                    while probe.peek().is_some_and(|&ch| is_xml_ws(ch)) {
+                        probe.next();
+                        skipped_ws += 1;
+                    }
+                }
+                if probe.peek() == Some(&'?') {
+                    probe.next();
+                    let mut next_state = state;
+                    let mut neg = false;
+                    let mut saw_flag = false;
+                    let mut valid = true;
+                    let mut consumed = skipped_ws + 1; // skipped ws + '?'
+                    let mut terminator = None;
+                    for fc in probe {
+                        consumed += 1;
+                        if strip_ws && is_xml_ws(fc) {
+                            continue;
+                        }
+                        match fc {
+                            'i' | 'm' | 'R' | 'U' | 'u' => {
+                                saw_flag = true;
+                            }
+                            's' => {
+                                saw_flag = true;
+                                next_state.dot_all = !neg;
+                            }
+                            'x' => {
+                                saw_flag = true;
+                                if neg {
+                                    next_state.rust_x = false;
+                                    next_state.xpath_x = false;
+                                } else {
+                                    next_state.rust_x = true;
+                                }
+                            }
+                            '-' if !neg => {
+                                neg = true;
+                            }
+                            ':' => {
+                                terminator = Some(':');
+                                break;
+                            }
+                            ')' if saw_flag => {
+                                terminator = Some(')');
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if valid {
+                        match terminator {
+                            Some(')') => {
+                                for _ in 0..consumed {
+                                    let ch = chars.next().unwrap();
+                                    if !(strip_ws && is_xml_ws(ch)) {
+                                        out.push(ch);
+                                    }
+                                }
+                                state = next_state;
+                                continue;
+                            }
+                            Some(':') => {
+                                for _ in 0..consumed {
+                                    let ch = chars.next().unwrap();
+                                    if !(strip_ws && is_xml_ws(ch)) {
+                                        out.push(ch);
+                                    }
+                                }
+                                stack.push(state);
+                                state = next_state;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                stack.push(state);
+            }
+            ')' if class_depth == 0 => {
+                out.push(')');
+                if let Some(prev) = stack.pop() {
+                    state = prev;
+                }
+            }
             '.' if class_depth == 0 => {
-                out.push_str("[^\\n\\r]");
+                if state.dot_all {
+                    out.push('.');
+                } else {
+                    out.push_str("[^\\n\\r]");
+                }
             }
             _ => {
                 out.push(c);
-                class_start = false;
+                class_start = ClassStart::None;
             }
         }
     }
@@ -417,13 +568,18 @@ pub(super) fn translate_xpath_pattern(pattern: &str, flags: &str) -> Option<Stri
     if multi_line {
         text.push_str("(?m)");
     }
-    if ignore_ws {
-        text.push_str("(?x)");
-    }
-    if dot_all || !pattern.contains('.') {
+    if !ignore_ws && !pattern.contains('.') {
         text.push_str(pattern);
     } else {
-        rewrite_xpath_dot(pattern, &mut text);
+        rewrite_xpath_pattern(
+            pattern,
+            FlagState {
+                dot_all,
+                rust_x: false,
+                xpath_x: ignore_ws,
+            },
+            &mut text,
+        );
     }
     Some(text)
 }
@@ -1048,5 +1204,97 @@ mod tests {
         let qi = RegexState::compile(None, "A.B", "qi").unwrap().unwrap();
         assert!(qi.is_match("a.b"));
         assert!(!qi.is_match("axb"));
+    }
+
+    #[test]
+    fn xpath_x_flag_preserves_class_spaces_and_handles_inline_rust_flags() {
+        // XPath F&O 3.1 `x` flag strips XML whitespace outside character classes while
+        // preserving literal whitespace inside character classes and literal `#`.
+        let cls_space_and_dot = RegexState::compile(None, "^[ ]a.b$", "x").unwrap().unwrap();
+        assert!(cls_space_and_dot.is_match(" axb"));
+        assert!(!cls_space_and_dot.is_match(" a\rb"));
+        assert!(!cls_space_and_dot.is_match(" a\nb"));
+        assert!(!cls_space_and_dot.is_match("axb"));
+
+        let spaced_outside = RegexState::compile(None, "^ [ ] a . b $", "x")
+            .unwrap()
+            .unwrap();
+        assert!(spaced_outside.is_match(" axb"));
+        assert!(!spaced_outside.is_match(" a\rb"));
+
+        let quant_space = RegexState::compile(None, "^a{ 2 }$", "x").unwrap().unwrap();
+        assert!(quant_space.is_match("aa"));
+        assert!(!quant_space.is_match("a"));
+
+        let literal_hash = RegexState::compile(None, "^a # b$", "x").unwrap().unwrap();
+        assert!(literal_hash.is_match("a#b"));
+        assert!(!literal_hash.is_match("a"));
+
+        // Under XPath `x`, `[ ]` is a space class closed by the first `]`, never matching "ax".
+        let bracket_dot = RegexState::compile(None, "^[ ].].$", "x").unwrap().unwrap();
+        assert!(!bracket_dot.is_match("ax"));
+        assert!(bracket_dot.is_match(" x]y"));
+        assert!(!bracket_dot.is_match(" \r]y"));
+        assert!(!bracket_dot.is_match(" x]\r"));
+
+        // Inline Rust `(?x)` honors `#...\n` comments and ignores spaces after `[`/`[^`.
+        let rust_x_comment_open = RegexState::compile(None, "(?x)# [note\n^a.b$", "")
+            .unwrap()
+            .unwrap();
+        assert!(rust_x_comment_open.is_match("axb"));
+        assert!(!rust_x_comment_open.is_match("a\rb"));
+
+        let rust_x_comment_in_class = RegexState::compile(None, "^(?x)[a # comment ]\n .]$", "")
+            .unwrap()
+            .unwrap();
+        assert!(rust_x_comment_in_class.is_match("a"));
+        assert!(rust_x_comment_in_class.is_match("."));
+        assert!(!rust_x_comment_in_class.is_match("x"));
+        assert!(!rust_x_comment_in_class.is_match("\r"));
+
+        let rust_x_space_before_rbracket = RegexState::compile(None, "^(?x)[ ].].$", "")
+            .unwrap()
+            .unwrap();
+        assert!(rust_x_space_before_rbracket.is_match("]x"));
+        assert!(rust_x_space_before_rbracket.is_match(".x"));
+        assert!(!rust_x_space_before_rbracket.is_match("ax"));
+        assert!(!rust_x_space_before_rbracket.is_match("]\r"));
+
+        let rust_x_neg_space_before_rbracket = RegexState::compile(None, "^(?x)[^ ].].$", "")
+            .unwrap()
+            .unwrap();
+        assert!(rust_x_neg_space_before_rbracket.is_match("ax"));
+        assert!(!rust_x_neg_space_before_rbracket.is_match("]x"));
+        assert!(!rust_x_neg_space_before_rbracket.is_match(".x"));
+        assert!(!rust_x_neg_space_before_rbracket.is_match("a\r"));
+
+        // Scoped and inline `s` / `-s` flags control effective `.` semantics.
+        let scoped_enable = RegexState::compile(None, "^(?s:.)$", "").unwrap().unwrap();
+        assert!(scoped_enable.is_match("\r"));
+        assert!(scoped_enable.is_match("\n"));
+        assert!(scoped_enable.is_match("x"));
+
+        let scoped_disable = RegexState::compile(None, "^(?-s:.)$", "s")
+            .unwrap()
+            .unwrap();
+        assert!(scoped_disable.is_match("x"));
+        assert!(!scoped_disable.is_match("\r"));
+        assert!(!scoped_disable.is_match("\n"));
+
+        let scoped_then_outer = RegexState::compile(None, "^(?s:.).$", "").unwrap().unwrap();
+        assert!(scoped_then_outer.is_match("\rx"));
+        assert!(!scoped_then_outer.is_match("\r\r"));
+
+        let inline_toggle = RegexState::compile(None, "^(?s).(?-s).$", "")
+            .unwrap()
+            .unwrap();
+        assert!(inline_toggle.is_match("\rx"));
+        assert!(!inline_toggle.is_match("\r\r"));
+
+        let group_scoped_toggle = RegexState::compile(None, "^(a(?s).)b.$", "")
+            .unwrap()
+            .unwrap();
+        assert!(group_scoped_toggle.is_match("a\rbx"));
+        assert!(!group_scoped_toggle.is_match("a\rb\r"));
     }
 }
