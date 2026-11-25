@@ -2245,7 +2245,6 @@ impl SpatialRelateReader {
                         }
                     }
                     self.update_charge()?;
-                    self.update_charge()?;
                 }
                 RelateStage::EnterDerived => {
                     self.enter_derived(ctx)?;

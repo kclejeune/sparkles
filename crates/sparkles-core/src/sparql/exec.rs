@@ -5836,10 +5836,16 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Result<Option<Decoded>> 
     }))
 }
 
-/// Count of admitted `prefetch_column_terms` allocations (for tests that verify
-/// budget-checked admission and scalar fallback).
 #[cfg(test)]
-static PREFETCH_COLUMN_TERMS_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Count of admitted `prefetch_column_terms` ID-vector allocations on this thread
+    /// (for tests that verify budget-checked admission and scalar fallback).
+    static PREFETCH_COLUMN_TERMS_ALLOCATED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Count of admitted `prefetch_column_terms` mapped block-index resizes on this thread.
+    static PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Ask for the vocabulary pages of the terms in the columns of `vars` of a small table
 /// (see [`decode_for`]). The optional scratch vector is admitted first and skipped if
@@ -5868,7 +5874,7 @@ fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
         return;
     };
     #[cfg(test)]
-    PREFETCH_COLUMN_TERMS_ALLOCATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PREFETCH_COLUMN_TERMS_ALLOCATED.with(|n| n.set(n.get() + 1));
     let mut ids = Vec::with_capacity(count);
     ids.extend(
         vars.iter()
@@ -5885,7 +5891,10 @@ fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
             .generation
             .vocab
             .prefetch_value_pages_checked(&ids, |block_bytes| {
-                scratch.resize(ids_bytes.saturating_add(block_bytes as u64))
+                scratch.resize(ids_bytes.saturating_add(block_bytes as u64))?;
+                #[cfg(test)]
+                PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED.with(|n| n.set(n.get() + 1));
+                Ok(())
             });
     }
     drop(ids);
@@ -10545,20 +10554,28 @@ mod paid_eager_producer_tests {
         use crate::sparql::expr::CmpOp;
         use crate::vocab::numeric::Numeric;
         use oxrdfio::RdfFormat;
-        use std::sync::atomic::Ordering;
 
         let n = 2048usize;
-        let store = Store::in_memory(StoreOptions::default());
+        let half = n / 2;
+        let dir = tempfile::tempdir().unwrap();
+        // Use a disk-backed store so the base vocabulary is file-mapped (`Bytes::Map`)
+        // and exercises `prefetch_sorted_checked`'s block-index admission callback.
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
         // Include one packed float on an unrelated predicate so `vocab.num` is built, plus
-        // 2,048 21-digit decimals that exceed both inline Tag::Decimal and vocab.num's 58-bit
-        // packed mantissa so they remain Tag::Vocab + Numeric::Unknown and reach the residual
-        // filter + prefetch path.
+        // 2,048 21-digit decimals (half negative, half positive) that exceed both inline
+        // Tag::Decimal and vocab.num's 58-bit packed mantissa so they remain Tag::Vocab +
+        // Numeric::Unknown and reach the residual filter + prefetch path.
         let mut data = String::from(
             "<urn:base> <urn:other> \"999999.5\"^^<http://www.w3.org/2001/XMLSchema#float> .\n",
         );
-        for i in 0..n {
+        for i in 0..half {
             data.push_str(&format!(
-                "<urn:dec:{i}> <urn:p> \"100000000000000000000.{i:04}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n"
+                "<urn:dec:neg:{i}> <urn:p> \"-100000000000000000000.{i:04}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n"
+            ));
+        }
+        for i in 0..(n - half) {
+            data.push_str(&format!(
+                "<urn:dec:pos:{i}> <urn:p> \"100000000000000000000.{i:04}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n"
             ));
         }
         store
@@ -10574,102 +10591,229 @@ mod paid_eager_producer_tests {
             .vocab
             .numeric()
             .expect("base vocab numeric column");
-        let sample = snap
+        let decimal_dt =
+            oxrdf::NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#decimal");
+        let neg_sample = snap
             .lookup_term(
                 &oxrdf::Literal::new_typed_literal(
-                    "100000000000000000000.0000",
-                    oxrdf::NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#decimal"),
+                    "-100000000000000000000.0000",
+                    decimal_dt.clone(),
                 )
                 .into(),
             )
             .unwrap();
-        assert_eq!(sample.tag(), crate::id::Tag::Vocab);
-        assert_eq!(num.get_many(&[sample.payload()]), vec![Numeric::Unknown]);
+        let pos_sample = snap
+            .lookup_term(
+                &oxrdf::Literal::new_typed_literal("100000000000000000000.0000", decimal_dt).into(),
+            )
+            .unwrap();
+        assert_eq!(neg_sample.tag(), crate::id::Tag::Vocab);
+        assert_eq!(pos_sample.tag(), crate::id::Tag::Vocab);
+        assert_eq!(
+            num.get_many(&[neg_sample.payload(), pos_sample.payload()]),
+            vec![Numeric::Unknown, Numeric::Unknown]
+        );
 
-        let probe = Ctx::new(snap.clone());
+        let make_ctx = || {
+            let ctx = Ctx::new(snap.clone());
+            assert_eq!(ctx.var("v"), 0);
+            assert_eq!(ctx.var("s"), 1);
+            ctx
+        };
+        let probe = make_ctx();
         let pred = probe.snap.lookup_iri("urn:p").unwrap();
-        let [lo, hi] = [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(sample.tag(), payload).0);
+        let [lo, hi] =
+            [0, crate::id::PAYLOAD_MASK].map(|payload| Id::new(pos_sample.tag(), payload).0);
         let threshold = Id::from_i64(0).unwrap();
-        let spec = OrderedTopK {
-            scan: ScanSpec {
-                perm: Perm::Pos,
-                prefix: vec![pred.0],
-                cols: vec![(1, 0), (2, 1)],
-                eqs: Vec::new(),
-                graph: GraphFilter::Default,
-                graph_col: 3,
-                dedup: false,
-                src: None,
-            },
+        let filter_expr = Expr::Cmp(
+            Box::new(Expr::Var(0)),
+            Box::new(Expr::Const(threshold)),
+            CmpOp::Ge,
+        );
+        let base_scan = || ScanSpec {
+            perm: Perm::Pos,
+            prefix: vec![pred.0],
+            cols: vec![(1, 0), (2, 1)],
+            eqs: Vec::new(),
+            graph: GraphFilter::Default,
+            graph_col: 3,
+            dedup: false,
+            src: None,
+        };
+        let raw_spec = OrderedTopK {
+            scan: base_scan(),
             var: 0,
             asc: true,
             k: 2,
             pieces: Vec::new(),
             filter: Vec::new(),
-            range_filter: vec![Expr::Cmp(
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Const(threshold)),
-                CmpOp::Ge,
-            )],
+            range_filter: Vec::new(),
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+        let generic_spec = OrderedTopK {
+            scan: base_scan(),
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: vec![filter_expr.clone()],
+            range_filter: Vec::new(),
+            tie_order: vec![1],
+            fallback: Box::new(Node::empty(vec![0, 1])),
+        };
+        let range_spec = OrderedTopK {
+            scan: base_scan(),
+            var: 0,
+            asc: true,
+            k: 2,
+            pieces: Vec::new(),
+            filter: Vec::new(),
+            range_filter: vec![filter_expr],
             tie_order: vec![1],
             fallback: Box::new(Node::empty(vec![0, 1])),
         };
 
-        let (raw, scanned) = topk_read(&probe, &spec, lo, hi, true, &[0, 1]).unwrap();
+        let (raw, scanned) = topk_read(&probe, &raw_spec, lo, hi, true, &[0, 1]).unwrap();
         assert_eq!(scanned, n);
         let raw_bytes = probe.live_bytes();
+        assert_eq!(probe.mem_peak(), raw_bytes);
 
-        // Direct check: 1 byte below the `n * 8` prefetch vector skips allocation (scalar fallback).
+        // Compute the expected surviving rows once under an unconstrained budget.
+        let baseline_ctx = make_ctx();
+        let (baseline, scanned) =
+            topk_read(&baseline_ctx, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        let expected_kept = baseline.table.cols[0].clone();
+        assert_eq!(expected_kept.len(), n - half);
+        assert!(expected_kept.contains(&pos_sample));
+        assert!(!expected_kept.contains(&neg_sample));
+        drop(baseline);
+
+        let ids_count = || PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        let blocks_count = || PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED.with(|c| c.get());
+        let io_hints = crate::index::io_hints();
         let ids_bytes = (n * size_of::<u64>()) as u64;
-        let mut tight_direct = Ctx::new(snap.clone());
-        tight_direct.mem_limit = ids_bytes - 1;
-        let before = PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed);
-        prefetch_column_terms(&tight_direct, &raw.table, &[0]);
-        assert_eq!(
-            PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed),
-            before
-        );
-        assert_eq!(tight_direct.live_bytes(), 0);
+        let blocks_bytes = (n * size_of::<usize>()) as u64;
 
-        // With room for `ids_bytes`, prefetch admits, allocates, and releases cleanly.
-        let mut ok_direct = Ctx::new(snap.clone());
-        ok_direct.mem_limit = ids_bytes * 2;
-        let before = PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed);
-        prefetch_column_terms(&ok_direct, &raw.table, &[0]);
-        assert_eq!(
-            PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed),
-            before + 1
-        );
-        assert_eq!(ok_direct.live_bytes(), 0);
-        // Generic `apply_filter` (`topk_read_keys_last` `spec.filter` path) with a budget
-        // 1 byte below `raw_bytes + filter_scratch + ids_bytes` skips the optional 16 KiB
-        // prefetch vector via scalar fallback and still evaluates all 2,048 rows within budget.
-        let filter_scratch = (n as u64).saturating_add(
-            (probe.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
-        );
-        let mut tight_filter = Ctx::new(snap.clone());
-        tight_filter.opt.prefetch_terms = true;
-        tight_filter.mem_limit = raw_bytes + filter_scratch + ids_bytes - 1;
-        let held = tight_filter.charge(raw_bytes + filter_scratch).unwrap();
-        let mut tbl = raw.table.clone();
-        let before = PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed);
-        apply_filter(&tight_filter, &mut tbl, &spec.range_filter).unwrap();
-        assert_eq!(
-            PREFETCH_COLUMN_TERMS_ALLOCATED.load(Ordering::Relaxed),
-            before
-        );
-        assert_eq!(tbl.len(), n);
-        assert!(tight_filter.mem_peak() <= tight_filter.mem_limit);
-        drop(held);
+        // Direct check 1: 1 byte below `ids_bytes` skips the ID vector and block-index hint.
+        let mut tight_ids = make_ctx();
+        tight_ids.mem_limit = ids_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        prefetch_column_terms(&tight_ids, &raw.table, &[0]);
+        assert_eq!(ids_count(), before_ids);
+        assert_eq!(blocks_count(), before_blocks);
+        assert_eq!(tight_ids.mem_peak(), 0);
+        assert_eq!(tight_ids.live_bytes(), 0);
+
+        // Direct check 2: room for `ids_bytes` alone (1 byte below `ids_bytes + blocks_bytes`)
+        // admits the ID vector, refuses the mapped block-index vector, and releases cleanly.
+        let mut ids_only = make_ctx();
+        ids_only.mem_limit = ids_bytes + blocks_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        prefetch_column_terms(&ids_only, &raw.table, &[0]);
+        assert_eq!(ids_count(), before_ids + 1);
+        assert_eq!(blocks_count(), before_blocks);
+        assert_eq!(ids_only.mem_peak(), ids_bytes);
+        assert_eq!(ids_only.live_bytes(), 0);
+
+        // Direct check 3: exact room for both ID and mapped block-index vectors admits both
+        // (when I/O hints are enabled) and releases cleanly.
+        let mut both_direct = make_ctx();
+        both_direct.mem_limit = ids_bytes + blocks_bytes;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        prefetch_column_terms(&both_direct, &raw.table, &[0]);
+        assert_eq!(ids_count(), before_ids + 1);
+        if io_hints {
+            assert_eq!(blocks_count(), before_blocks + 1);
+            assert_eq!(both_direct.mem_peak(), ids_bytes + blocks_bytes);
+        } else {
+            assert_eq!(blocks_count(), before_blocks);
+            assert_eq!(both_direct.mem_peak(), ids_bytes);
+        }
+        assert_eq!(both_direct.live_bytes(), 0);
+
         drop(raw);
         assert_eq!(probe.live_bytes(), 0);
 
-        // End-to-end `topk_read` (`exact = false`) over the 2,048 `Numeric::Unknown` base
-        // decimals keeps every row and releases the table charge cleanly.
-        let ok_topk = Ctx::new(snap);
-        let (filtered, scanned) = topk_read(&ok_topk, &spec, lo, hi, false, &[0, 1]).unwrap();
+        // Generic top-k filter entry point (`topk_read_keys_last` with non-empty `spec.filter`):
+        // verify exact scalar results on ID refusal, on block-index refusal, and when both
+        // prefetch vectors are admitted.
+        let filter_scratch = (n as u64).saturating_add(
+            (probe.nvars() as u64).saturating_mul(size_of::<Option<usize>>() as u64),
+        );
+
+        // Generic top-k case 1: 1 byte below `ids_bytes` skips prefetch and keeps exact scalar
+        // results within budget.
+        let mut tight_ids_topk = make_ctx();
+        tight_ids_topk.opt.prefetch_terms = true;
+        tight_ids_topk.mem_limit = raw_bytes + filter_scratch + ids_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        let (filtered, scanned) =
+            topk_read(&tight_ids_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
         assert_eq!(scanned, n);
-        assert_eq!(filtered.table.len(), n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
+        assert_eq!(ids_count(), before_ids);
+        assert_eq!(blocks_count(), before_blocks);
+        assert!(tight_ids_topk.mem_peak() <= tight_ids_topk.mem_limit);
+        let before_drop = tight_ids_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - tight_ids_topk.live_bytes(), raw_bytes);
+
+        // Generic top-k case 2: room for `ids_bytes` alone admits IDs, refuses the mapped
+        // block-index resize, and still returns exact scalar results.
+        let mut ids_only_topk = make_ctx();
+        ids_only_topk.opt.prefetch_terms = true;
+        ids_only_topk.mem_limit = raw_bytes + filter_scratch + ids_bytes + blocks_bytes - 1;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        let (filtered, scanned) =
+            topk_read(&ids_only_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
+        if io_hints {
+            assert_eq!(ids_count(), before_ids + 1);
+            assert_eq!(blocks_count(), before_blocks);
+            assert!(ids_only_topk.mem_peak() >= raw_bytes + filter_scratch + ids_bytes);
+            assert!(ids_only_topk.mem_peak() <= ids_only_topk.mem_limit);
+        } else {
+            assert_eq!(ids_count(), before_ids);
+            assert_eq!(blocks_count(), before_blocks);
+        }
+        let before_drop = ids_only_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - ids_only_topk.live_bytes(), raw_bytes);
+
+        // Generic top-k case 3: exact room for both ID and mapped block-index vectors admits
+        // both through `topk_read` -> `apply_filter` -> `decode_for` -> `prefetch_column_terms`.
+        let mut both_topk = make_ctx();
+        both_topk.opt.prefetch_terms = true;
+        both_topk.mem_limit = raw_bytes + filter_scratch + ids_bytes + blocks_bytes;
+        let (before_ids, before_blocks) = (ids_count(), blocks_count());
+        let (filtered, scanned) =
+            topk_read(&both_topk, &generic_spec, lo, hi, true, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
+        if io_hints {
+            assert_eq!(ids_count(), before_ids + 1);
+            assert_eq!(blocks_count(), before_blocks + 1);
+            assert_eq!(
+                both_topk.mem_peak(),
+                raw_bytes + filter_scratch + ids_bytes + blocks_bytes
+            );
+        } else {
+            assert_eq!(ids_count(), before_ids);
+            assert_eq!(blocks_count(), before_blocks);
+        }
+        let before_drop = both_topk.live_bytes();
+        drop(filtered);
+        assert_eq!(before_drop - both_topk.live_bytes(), raw_bytes);
+
+        // End-to-end `topk_read` (`exact = false`) over the 2,048 `Numeric::Unknown` base
+        // decimals keeps the exact positive half and releases the table charge cleanly.
+        let ok_topk = make_ctx();
+        let (filtered, scanned) = topk_read(&ok_topk, &range_spec, lo, hi, false, &[0, 1]).unwrap();
+        assert_eq!(scanned, n);
+        assert_eq!(filtered.table.cols[0], expected_kept);
         let before_drop = ok_topk.live_bytes();
         drop(filtered);
         assert_eq!(before_drop - ok_topk.live_bytes(), raw_bytes);
