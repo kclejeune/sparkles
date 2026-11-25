@@ -859,6 +859,17 @@ pub(super) struct CallerFence {
     pub(super) drift: crate::settings::evidence::DriftFence,
 }
 
+impl CallerFence {
+    /// Previews, replays and no-op writes can return without publishing.
+    pub(super) fn check_uncommitted(&self, committed: bool) -> sparkles::Result<()> {
+        if !committed {
+            let _declared = self.st.settings.hold_evidence_declarations();
+            self.drift.check(&self.st)?;
+        }
+        Ok(())
+    }
+}
+
 impl sparkles::evidence::AuthorityFence for CallerFence {
     fn enter(&self) -> sparkles::Result<Box<dyn std::any::Any>> {
         let declared = self.st.settings.hold_evidence_declarations();
@@ -1001,11 +1012,12 @@ pub(super) fn propose_now(
     let drift = crate::settings::evidence::DriftFence::capture(&st, &main)?;
     #[cfg(test)]
     main.store.failpoint("evidence-admitted");
-    options.authority = Some(Arc::new(CallerFence {
+    let fence = Arc::new(CallerFence {
         st: st.clone(),
         p: p.clone(),
         drift,
-    }));
+    });
+    options.authority = Some(fence.clone());
     type Policy = Option<Arc<sparkles::access::GraphAccess>>;
     let mut policies: std::collections::HashMap<(uuid::Uuid, String), Policy> =
         std::collections::HashMap::new();
@@ -1051,5 +1063,6 @@ pub(super) fn propose_now(
             "error": preview.error(),
         });
     }
+    fence.check_uncommitted(proposed.committed)?;
     Ok(out)
 }

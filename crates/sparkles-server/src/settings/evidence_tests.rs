@@ -933,6 +933,52 @@ async fn disabled_declared_template_needs_no_recording() {
 }
 
 #[tokio::test]
+async fn unconfigured_disabled_template_refuses_nonempty_runtime_overrides() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    let template = json!({"decisions": ["urn:ev:decisions"]});
+    std::fs::write(&f, json!({"defaults": {"evidence": template}}).to_string()).unwrap();
+    let st = state_with_settings(&dir.path().join("data"), Some(&f));
+    st.attach("ev", DbType::Memory, None).unwrap();
+    let app = crate::http::router(st);
+    let path = "/$/settings/ev/evidence";
+    let (s, before, etag) = send(&app, req("GET", path, None)).await;
+    assert_eq!(s, StatusCode::OK, "{before}");
+    let etag = etag.unwrap();
+    assert_eq!(before["runtime"], json!({}));
+    assert_eq!(before["effective"]["decisions"], template["decisions"]);
+    assert!(before["recorded"]["digest"].is_null(), "{before}");
+
+    let mut rejected = Vec::new();
+    for (method, uri, body) in [
+        ("PUT", path, json!({})),
+        ("PUT", path, json!({"enabled": false})),
+        ("PATCH", path, json!({"decisions": []})),
+        ("PUT", "/$/evidence/ev/settings", evidence::defaults_value()),
+    ] {
+        let (status, _, rejected_etag) =
+            send(&app, req_if_match(method, uri, &etag, Some(body))).await;
+        rejected.push((status, rejected_etag));
+        let (s, v, current_etag) = send(&app, req("GET", path, None)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v, before);
+        assert_eq!(current_etag.as_deref(), Some(etag.as_str()));
+    }
+    assert_eq!(rejected, vec![(StatusCode::BAD_REQUEST, None); 4]);
+
+    for (method, body) in [
+        ("PATCH", Some(json!({}))),
+        ("PUT", Some(template)),
+        ("DELETE", None),
+    ] {
+        let (s, v, current_etag) = send(&app, req_if_match(method, path, &etag, body)).await;
+        assert_eq!(s, StatusCode::OK, "{method} {v}");
+        assert_eq!(v, before);
+        assert_eq!(current_etag.as_deref(), Some(etag.as_str()));
+    }
+}
+
+#[tokio::test]
 async fn policy_null_resets_to_declaration() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("settings.json");
@@ -995,6 +1041,51 @@ async fn version_and_nested_policy_lock_refusals() {
         .remove("conflicts");
     let (s, v, _) = send(&app, req("PUT", path, Some(same))).await;
     assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+async fn put_with_overlapping_policy_locks(ancestor: &str, mut body: Value) {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    let declared = full_settings();
+    let settings = json!({
+        "defaults": {
+            "evidence": declared,
+            "locked": ["evidence.policies.advisories.conflicts"]
+        },
+        "datasets": {"ev": {"locked": [ancestor]}}
+    });
+    std::fs::write(&f, settings.to_string()).unwrap();
+    let st = state_with_settings(&dir.path().join("data"), Some(&f));
+    st.attach("ev", DbType::Memory, None).unwrap();
+    let app = crate::http::router(st);
+    let path = "/$/settings/ev/evidence";
+    let (s, v, _) = send(&app, req("PUT", path, Some(body.clone()))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["runtime"], json!({}));
+    assert_eq!(
+        v["effective"],
+        (evidence::EVIDENCE.normalize)(&declared).unwrap()
+    );
+    assert_eq!(v["recorded"]["drift"], false);
+
+    body["policies"] = json!({"advisories": null});
+    let (s, v, _) = send(&app, req("PUT", path, Some(body))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "locked-by-config", "{v}");
+}
+
+#[tokio::test]
+async fn put_inherits_omitted_policy_map_with_overlapping_locks() {
+    let mut body = full_settings();
+    body.as_object_mut().unwrap().remove("policies");
+    put_with_overlapping_policy_locks("evidence.policies", body).await;
+}
+
+#[tokio::test]
+async fn put_inherits_omitted_named_policy_with_overlapping_locks() {
+    let mut body = full_settings();
+    body["policies"] = json!({});
+    put_with_overlapping_policy_locks("evidence.policies.advisories", body).await;
 }
 
 #[tokio::test]
@@ -1103,6 +1194,28 @@ async fn interruption_after_registry_commit_and_reset_survive_reopen() {
 
 #[tokio::test]
 async fn fenced_proposal_refuses_recording_after_admission() {
+    let mut proposal = sample_proposal();
+    proposal["proposalGraph"] = json!("urn:ev:extra");
+    proposal_refuses_recording_after_admission(proposal, false).await;
+}
+
+#[tokio::test]
+async fn fenced_proposal_refuses_preview_after_admission() {
+    let mut proposal = sample_proposal();
+    proposal["proposalGraph"] = json!("urn:ev:extra");
+    proposal["dryRun"] = json!(true);
+    proposal_refuses_recording_after_admission(proposal, false).await;
+}
+
+#[tokio::test]
+async fn fenced_proposal_refuses_replay_after_admission() {
+    let mut proposal = sample_proposal();
+    proposal["proposalGraph"] = json!("urn:ev:claims");
+    proposal["idempotencyKey"] = json!("fenced-replay");
+    proposal_refuses_recording_after_admission(proposal, true).await;
+}
+
+async fn proposal_refuses_recording_after_admission(proposal: Value, replay: bool) {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("settings.json");
     declared_evidence(&f, full_settings(), &[]);
@@ -1111,6 +1224,13 @@ async fn fenced_proposal_refuses_recording_after_admission() {
     let app = crate::http::router(st.clone());
     let (s, v, _) = send(&app, req("DELETE", "/$/settings/ev/evidence", None)).await;
     assert_eq!(s, StatusCode::OK, "{v}");
+    if replay {
+        for field in ["committed", "replayed"] {
+            let (s, v, _) = send(&app, req("POST", "/ev/claims", Some(proposal.clone()))).await;
+            assert_eq!(s, StatusCode::OK, "{v}");
+            assert_eq!(v[field], true, "{v}");
+        }
+    }
 
     let mut changed = full_settings();
     changed["proposals"] = json!(["urn:ev:claims", "urn:ev:extra"]);
@@ -1126,8 +1246,6 @@ async fn fenced_proposal_refuses_recording_after_admission() {
         })),
     );
     let head = ds.store.head_commit().seq;
-    let mut proposal = sample_proposal();
-    proposal["proposalGraph"] = json!("urn:ev:extra");
     let (s, v, _) = send(&app, req("POST", "/ev/claims", Some(proposal))).await;
     ds.store.set_failpoint("evidence-admitted", None);
     assert_eq!(s, StatusCode::CONFLICT, "{v}");

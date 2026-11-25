@@ -338,10 +338,13 @@ fn configure_recorded(
         )));
     }
     if current.is_none() && !settings.enabled {
-        let defaults = Settings::default().canonical(control)?;
-        let disabled_template =
-            matches!(&overrides, OverrideUpdate::Replace(Some(patch)) if patch.is_empty());
-        if canonical.bytes() != defaults.bytes() && !disabled_template {
+        let allowed_noop = match &overrides {
+            OverrideUpdate::Replace(Some(patch)) => patch.is_empty(),
+            OverrideUpdate::Preserve | OverrideUpdate::Replace(None) => {
+                canonical.bytes() == Settings::default().canonical(control)?.bytes()
+            }
+        };
+        if !allowed_noop {
             return Err(Error::invalid(
                 "the evidence profile is not enabled; enable it before storing disabled settings",
             ));

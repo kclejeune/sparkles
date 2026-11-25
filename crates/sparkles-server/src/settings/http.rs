@@ -169,31 +169,37 @@ pub(crate) fn plan(
                 // `GET /$/assistant/{ds}` adds it
                 m.remove("status");
             }
-            let locked_values = if super::evidence::is(kind) {
-                let omitted_policies: Vec<_> = cur
-                    .locked
-                    .iter()
-                    .filter(|l| {
-                        l.len() == 3
-                            && at(&cur.base, l).is_some()
-                            && !at(&body, &l[..2]).is_some_and(Value::is_object)
-                    })
-                    .map(|l| path_string(l))
-                    .collect();
-                if !omitted_policies.is_empty() {
-                    return Err(locked_error_of(kind.name, &omitted_policies, owner));
-                }
+            let evidence = super::evidence::is(kind);
+            let mut locked: Vec<_> = cur.locked.iter().collect();
+            let locked_values = if evidence {
+                // An omitted map or named policy inherits the whole value when locked.
+                locked.sort_by_key(|l| l.len());
                 &cur.base
             } else {
                 &cur.effective
             };
-            // a locked field left out keeps its value
-            for l in &cur.locked {
-                if at(&body, l).is_none()
-                    && let Some(v) = at(locked_values, l)
-                {
+            let mut omitted_policies = Vec::new();
+            for l in locked {
+                let Some(v) = at(locked_values, l) else {
+                    continue;
+                };
+                if evidence {
+                    // A field lock alone cannot supply a complete missing policy.
+                    if l.len() == 3 && !at(&body, &l[..2]).is_some_and(Value::is_object) {
+                        omitted_policies.push(path_string(l));
+                        continue;
+                    }
+                    // Leave an explicitly supplied non-object map for validation.
+                    if l.len() == 2 && at(&body, &l[..1]).is_some_and(|m| !m.is_object()) {
+                        continue;
+                    }
+                }
+                if at(&body, l).is_none() {
                     set_at(&mut body, l, v.clone());
                 }
+            }
+            if !omitted_policies.is_empty() {
+                return Err(locked_error_of(kind.name, &omitted_policies, owner));
             }
             let target = (kind.normalize)(&body).map_err(|e| {
                 if super::evidence::is(kind) {
