@@ -3140,7 +3140,7 @@ mod numeric_resource_tests {
     #[test]
     fn activation_flush_guard_drop_transfers_data_growth_before_message_refund_panic() {
         use super::super::saturate::Totals;
-        use super::super::{Error, Limits, Saturation, WorldBudget};
+        use super::super::{Limits, Saturation, WorldBudget};
         use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
         use std::sync::atomic::AtomicBool;
 
@@ -3228,7 +3228,9 @@ mod numeric_resource_tests {
             64,
             "dropping world must release the 96 B local debit and return to exact starting balance"
         );
-        assert_eq!(budget.stopped(), Err(Error::Cancelled));
+        // Cancellation-poll panics occur outside `admit_pooled` admission and leave `halt` unset,
+        // matching `shared_world_found_row_tests::poll_panic_after_second_row_payment`.
+        assert_eq!(budget.stopped(), Ok(()));
     }
 
     /// Design v12 §4.3.4 / r10 #3 / r11: exercises `WorldSink::conjunction` against the
@@ -3530,6 +3532,18 @@ mod numeric_resource_tests {
                 first_bytes.get() as isize,
                 "in-flight delta must roll back while earlier insertion stays tracked on world"
             );
+            assert_eq!(
+                budget.stopped(),
+                if panic_in_charge {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                },
+                "charge panics inside admit_pooled publish Cancelled; cancellation-poll panics outside admission leave halt unset"
+            );
+            // Disarm before the non-unwinding post-catch drop; during unwind above,
+            // `WorldDeltaGuard` and `ActivationFlushGuard` already ran with `arm == 1`.
+            arm.store(0, Ordering::SeqCst);
             drop(world);
             assert_eq!(
                 budget.held.load(Ordering::Relaxed),

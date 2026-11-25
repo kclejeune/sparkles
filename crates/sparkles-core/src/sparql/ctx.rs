@@ -4052,11 +4052,24 @@ impl Ctx {
         if used <= reserved {
             return Ok(());
         }
+        let need = used - reserved;
         let step = self.reservation_step();
-        let ahead = used.next_multiple_of(step).min(cap).max(used);
+        // When a required (`exact`) reservation grows under tight remaining budget, cap
+        // speculative lookahead slack so a small interning charge cannot swallow the
+        // headroom left for batch publication or row decoding.
+        let ahead = if exact && self.mem_limit < u64::MAX {
+            let avail = self.mem_limit.saturating_sub(self.live_bytes());
+            let slack = step.min(avail.saturating_sub(need) / 4);
+            used.next_multiple_of(step)
+                .min(used.saturating_add(slack))
+                .min(cap)
+                .max(used)
+        } else {
+            used.next_multiple_of(step).min(cap).max(used)
+        };
         let (charge, admitted) = match self.charge(ahead - reserved) {
             Ok(charge) => (charge, ahead),
-            Err(_) if exact && ahead > used => (self.charge(used - reserved)?, used),
+            Err(_) if exact && ahead > used => (self.charge(need)?, used),
             Err(error) => return Err(error),
         };
         let id = charge.disarm();
@@ -5746,6 +5759,34 @@ mod charge_tests {
                 assert_text(ctx.value(*id), text);
             }
             assert_eq!(ctx.values.reserved(), 0, "cursor {cursor}");
+            assert!(ctx.check().is_ok(), "cursor {cursor}");
+            drop(held);
+        }
+    }
+
+    /// A required (`exact`) reservation under tight remaining budget caps its speculative
+    /// lookahead slack so a small retained charge leaves headroom for batch publication
+    /// and row decoding instead of taking a full `reservation_step()`.
+    #[test]
+    fn tight_retained_reservation_caps_speculative_slack() {
+        let store = Store::in_memory(StoreOptions::default());
+        for cursor in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 1100 << 10;
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let step = ctx.reservation_step();
+            let headroom = step + 800;
+            let held = ctx
+                .charge(ctx.mem_limit - ctx.live_bytes() - headroom)
+                .unwrap();
+            assert!(ctx.retain_bytes(148), "cursor {cursor}");
+            let remaining = ctx.mem_limit - ctx.live_bytes();
+            assert!(
+                remaining >= headroom / 2,
+                "cursor {cursor}: remaining {remaining} must keep at least half of {headroom}"
+            );
             assert!(ctx.check().is_ok(), "cursor {cursor}");
             drop(held);
         }

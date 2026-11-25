@@ -13466,9 +13466,9 @@ impl<'a> WorldBudget<'a> {
 
     fn check_post(&self, delta: isize, previous: isize) -> bool {
         let now = previous + delta;
-        // Negative rollback during panic unwind retires the in-flight delta cleanly
-        // without re-invoking a potentially panicking cancellation callback.
-        if delta < 0 && std::thread::panicking() {
+        // Non-growing rollback or teardown during panic unwind retires the in-flight delta
+        // cleanly without re-invoking a potentially panicking cancellation callback.
+        if delta <= 0 && std::thread::panicking() {
             return false;
         }
         #[cfg(test)]
