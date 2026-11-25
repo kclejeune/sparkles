@@ -3809,6 +3809,7 @@ mod tests {
             Format::Rdf(RdfFormat::RdfXml),
             Format::Rdf(RdfFormat::Turtle),
             Format::Rdf(RdfFormat::TriG),
+            Format::Rdf(RdfFormat::N3),
         ] {
             let open_graph = || match query_execution(
                 store.snapshot(),
@@ -3960,12 +3961,22 @@ mod tests {
         assert_eq!(slot.unwrap(), expected);
 
         // Untyped non-empty RDF/XML closing `\n\t</rdf:Description>\n</rdf:RDF>` (31 bytes)
-        // must pause before finish() when only 30 bytes remain.
-        let non_empty = sample_store();
-        let non_empty_q = "CONSTRUCT { ?s <urn:ex:num> ?o } WHERE { ?s <urn:ex:num> ?o } LIMIT 1";
-        let open_one = || match query_execution(
+        // must pause before finish() when only 30 bytes remain and complete in place at 31.
+        let non_empty = Store::in_memory(Default::default());
+        let pad = "a".repeat(2048);
+        let nt = format!("<urn:s> <urn:ex:a> \"1\" .\n<urn:s> <urn:ex:b> \"{pad}\" .\n");
+        non_empty
+            .load(&[LoadSource::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let one_q = "CONSTRUCT { <urn:s> ?p ?o } WHERE { <urn:s> ?p ?o } ORDER BY ?p LIMIT 1";
+        let two_q = "CONSTRUCT { <urn:s> ?p ?o } WHERE { <urn:s> ?p ?o } ORDER BY ?p";
+        let open_q = |q: &str| match query_execution(
             non_empty.snapshot(),
-            non_empty_q,
+            q,
             &QueryOptions::default(),
             &CursorOptions::default(),
             ExecutionMode::Streaming,
@@ -3977,30 +3988,74 @@ mod tests {
         };
         let mut full_one = Vec::new();
         write(
-            Source::Graph(&mut open_one()),
+            Source::Graph(&mut open_q(one_q)),
             WriteOptions::new(format, &RowCount::new()),
             &mut full_one,
         )
         .unwrap();
-        let tight = (full_one.len() - 1) as u64;
-        let mut writer = CursorWriter::graph(
-            open_one(),
-            CursorWriteOptions {
-                format,
-                send: None,
-                prefixes: Vec::new(),
-                metadata: None,
-                ledger: None,
-            },
+        assert!(
+            full_one.ends_with(b"\n\t</rdf:Description>\n</rdf:RDF>"),
+            "locked untyped RDF/XML closing sequence"
         );
-        let mut slot = Some(Vec::new());
+        let prepare_open_untyped = || {
+            let mut writer = CursorWriter::graph(
+                open_q(two_q),
+                CursorWriteOptions {
+                    format,
+                    send: None,
+                    prefixes: Vec::new(),
+                    metadata: None,
+                    ledger: None,
+                },
+            );
+            let mut slot = Some(Vec::new());
+            assert!(
+                matches!(
+                    writer.write_until(&mut slot, 1024).unwrap(),
+                    WriteStep::Paused
+                ),
+                "fixture must write quad 1 in place and pause before quad 2"
+            );
+            let written = match &mut writer {
+                CursorWriter::Graph(g) => {
+                    assert_eq!(g.sent, 1, "first untyped quad must be written in place");
+                    assert!(!g.rows_done && !g.finished);
+                    let written = sink_progress(&g.state);
+                    assert_eq!(
+                        written,
+                        (full_one.len() - 31) as u64,
+                        "written prefix must leave exactly the 31-byte untyped footer"
+                    );
+                    g.send = Some(1);
+                    written
+                }
+                _ => unreachable!(),
+            };
+            (writer, slot, written)
+        };
+
+        let (mut writer, mut slot, written) = prepare_open_untyped();
+        let tight = written + 30;
         assert!(
             matches!(
                 writer.write_until(&mut slot, tight).unwrap(),
                 WriteStep::Paused
             ),
-            "untyped RDF/XML footer must pause at limit {tight}"
+            "untyped RDF/XML footer must pause at 30 remaining bytes (limit {tight})"
         );
+        if let CursorWriter::Graph(g) = &writer {
+            assert_eq!(g.sent, 1);
+            assert!(g.rows_done, "must reach footer guard after quad 1");
+            assert!(
+                !g.finished,
+                "untyped RDF/XML must pause before finish() with 30 remaining bytes"
+            );
+            assert_eq!(
+                sink_progress(&g.state),
+                written,
+                "untyped RDF/XML must not emit closing tags before pause"
+            );
+        }
         let prefix_len = slot.as_ref().unwrap().len();
         assert!(
             prefix_len <= tight as usize,
@@ -4013,5 +4068,16 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(output, full_one);
+
+        let (mut writer, mut slot, written) = prepare_open_untyped();
+        let exact = written + 31;
+        assert!(
+            matches!(
+                writer.write_until(&mut slot, exact).unwrap(),
+                WriteStep::Done(_)
+            ),
+            "untyped RDF/XML footer must complete in place at exact 31 remaining bytes (limit {exact})"
+        );
+        assert_eq!(slot.unwrap(), full_one);
     }
 }
