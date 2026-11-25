@@ -4062,7 +4062,7 @@ impl Saturation {
             let inv_peak = live_base
                 .saturating_add(old.changed_bytes())
                 .saturating_add(inv_closure_peak);
-            let changed_scratch = ix.changed_scratch(&old);
+            let changed_scratch = ix.changed_scratch(&old, &|| poll(limits))?;
             let held = live_base
                 .saturating_add(old_ix_bytes)
                 .saturating_add(changed_scratch)
@@ -4088,20 +4088,7 @@ impl Saturation {
                 });
             }
             normalized_peak = normalized_peak.max(held);
-            // the stop the comparison saw, which a cancellation polled once does not
-            // repeat
-            let stopped = std::cell::RefCell::new(None);
-            let changed = ix.changed(&old, &|| {
-                let r = poll(limits);
-                let stop = r.is_err();
-                if let Err(e) = r {
-                    *stopped.borrow_mut() = Some(e);
-                }
-                stop
-            });
-            let Some(changed) = changed else {
-                return Err(stopped.into_inner().unwrap_or(Error::Cancelled));
-            };
+            let changed = ix.changed(&old, &|| poll(limits))?;
             drop(old);
             stats.cleared = self.invalidate_changed(
                 changed,
@@ -10049,7 +10036,7 @@ mod tests {
         let dl_seed = "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\nSubClassOf(:Q :R)\n";
 
         // Build two consecutive indexes on the same `Interner` and verify actual peak heap
-        // bytes during `Index::changed` never exceed `ix.changed_scratch(&old)`.
+        // bytes during `Index::changed` never exceed the scratch estimate.
         let assert_changed_within_scratch = |label: &str, base: &[Axiom], updated: &[Axiom]| {
             let mut sat = Saturation::default();
             let build_ix = |sat: &mut Saturation, axioms: &[Axiom]| {
@@ -10081,8 +10068,9 @@ mod tests {
                 new_ix.same_tables(&old_ix),
                 "{label}: fixture must remain eligible for index comparison"
             );
-            let estimate = new_ix.changed_scratch(&old_ix);
-            let (changed, sample) = numeric::tests::measure(|| new_ix.changed(&old_ix, &|| false));
+            let poll = || Ok::<(), Error>(());
+            let estimate = new_ix.changed_scratch(&old_ix, &poll).unwrap();
+            let (changed, sample) = numeric::tests::measure(|| new_ix.changed(&old_ix, &poll));
             let changed = changed.expect("uncancelled comparison must return marks");
             assert!(
                 changed.iter().any(|&c| c),
@@ -10832,6 +10820,79 @@ mod tests {
         let recovered = k.classify(&eager).unwrap();
         assert!(!recovered.stats.incremental);
         assert_eq!(recovered.taxonomy, want.taxonomy);
+    }
+
+    #[test]
+    fn tier_d_comparison_scratch_polls_before_admission() {
+        let eager = Limits {
+            threads: 1,
+            expansion: Expansion::Eager,
+            ..Limits::default()
+        };
+        let parse = |body: &str| {
+            crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
+                .unwrap()
+                .axioms
+        };
+        let mut body = String::from(
+            "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\n\
+             SubClassOf(:Q :R)\nDisjointClasses(:Left :Right)\n",
+        );
+        for i in 0..4200 {
+            body.push_str(&format!("SubClassOf(:A{i} :B{i})\n"));
+        }
+        let base = parse(&body);
+        let edit = parse("SubClassOf(:P :Q)");
+
+        for expire in [false, true] {
+            let mut classifier = Classifier::of(&base);
+            assert_eq!(
+                classifier.classify(&eager).unwrap().stats.tier,
+                Tier::Disjunctive
+            );
+            classifier.add(&edit);
+            let stop = Arc::new(AtomicBool::new(false));
+            let deadline = Arc::new(admission_test::TestDeadline::future());
+            let stop_in_scan = Arc::clone(&stop);
+            let deadline_in_scan = Arc::clone(&deadline);
+            let result = admission_test::with_hook(
+                move |point| match point {
+                    admission_test::Point::CompareScratchHeadChunk(1) => {
+                        stop_in_scan.store(true, Ordering::SeqCst);
+                        if expire {
+                            deadline_in_scan.expire();
+                        }
+                    }
+                    admission_test::Point::CompareScratchHeadChunk(2) => {
+                        panic!("scratch accounting entered another head chunk after the stop");
+                    }
+                    admission_test::Point::CompareAdmit { .. } => {
+                        panic!("comparison reached admission after the stop");
+                    }
+                    _ => {}
+                },
+                || {
+                    let mut limits = eager.clone();
+                    if expire {
+                        limits.deadline = Some(deadline.instant());
+                    } else {
+                        let stop = Arc::clone(&stop);
+                        limits.cancelled = Some(Arc::new(move || stop.load(Ordering::SeqCst)));
+                    }
+                    classifier.classify(&limits)
+                },
+            );
+            assert!(
+                stop.load(Ordering::SeqCst),
+                "scratch head scan was not reached"
+            );
+            let err = result.unwrap_err();
+            if expire {
+                assert!(matches!(err, Error::Timeout), "{err:?}");
+            } else {
+                assert!(matches!(err, Error::Cancelled), "{err:?}");
+            }
+        }
     }
 
     /// Renumbered `DisjointClasses` pre-admission under `Expansion::Eager` (Item 753 Phase 1):

@@ -41,7 +41,7 @@ use super::dl_clause::{
     hash_table_bytes, map_vec_bytes, map_vec_push, map_vec_push_bound, next_hash_table_bytes,
     next_vec_cap, set_insert_bound, set_insert_delta, vec_grow_bound, vec_push_delta,
 };
-use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
+use super::index::{BOTTOM, Ex, Index, Node, POLL_CHANGED, Role, TOP};
 use super::saturate::{Concl, Guard, Sink, State, flatten, table_bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
@@ -310,20 +310,25 @@ impl DlIx {
     /// Upper bound on peak scratch bytes that [`DlIx::changed`] allocates for the
     /// comparison with `old`: both pre-sized clause-key hash sets and their sorted head
     /// copies.
-    pub fn changed_scratch(&self, old: &DlIx) -> usize {
-        let keys = |d: &DlIx| {
-            let table = super::dl_clause::hash_table_bytes(
+    pub fn changed_scratch<E>(
+        &self,
+        old: &DlIx,
+        poll: &impl Fn() -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let keys = |d: &DlIx| -> Result<usize, E> {
+            let mut bytes = super::dl_clause::hash_table_bytes(
                 d.clauses.len(),
                 std::mem::size_of::<(&[Ex], Vec<Ex>)>(),
             );
-            let heads: usize = d
-                .clauses
-                .iter()
-                .map(|(_, h)| h.len().saturating_mul(std::mem::size_of::<Ex>()))
-                .sum();
-            table.saturating_add(heads)
+            for clauses in d.clauses.chunks(POLL_CHANGED) {
+                poll()?;
+                for (_, head) in clauses {
+                    bytes = bytes.saturating_add(std::mem::size_of_val(&**head));
+                }
+            }
+            Ok(bytes)
         };
-        keys(old).saturating_add(keys(self))
+        Ok(keys(old)?.saturating_add(keys(self)?))
     }
 
     /// Marks in `changed`, which covers the expressions of `old`, each expression that

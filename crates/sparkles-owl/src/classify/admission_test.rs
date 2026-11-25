@@ -52,6 +52,7 @@ pub(super) enum Point {
     RebaseShift,
     RebaseDynamicStart,
     RebaseDynamicEnd,
+    CompareScratchHeadChunk(usize),
     CompareAdmit {
         live_base: usize,
         old_ix_bytes: usize,

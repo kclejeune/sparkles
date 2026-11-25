@@ -349,7 +349,7 @@ pub enum Scope {
 const SCOPE_BYTES: usize = 48;
 
 /// The expressions that [`Index::changed`] compares between two polls of its stop.
-const POLL_CHANGED: usize = 4096;
+pub(super) const POLL_CHANGED: usize = 4096;
 
 struct ValueInsertionPlan {
     vector_capacity: usize,
@@ -2641,12 +2641,13 @@ impl Index {
             }
     }
 
-    fn disjoint_set_count(&self) -> usize {
-        self.disjoint
-            .iter()
-            .copied()
-            .max()
-            .map_or(0, |s| s as usize + 1)
+    fn disjoint_set_count<E>(&self, poll: &impl Fn() -> Result<(), E>) -> Result<usize, E> {
+        let mut max_set = None;
+        for memberships in self.disjoint.chunks(POLL_CHANGED) {
+            poll()?;
+            max_set = max_set.max(memberships.iter().copied().max());
+        }
+        Ok(max_set.map_or(0, |s| s as usize + 1))
     }
 
     /// For each expression of `old`, whether a context that holds it reads other rules
@@ -2655,37 +2656,54 @@ impl Index {
     /// disjointness sets, as sets, or other flags of the Horn rules, on the expression
     /// or, for a universal restriction, on its filler, and in a run of Tier D other
     /// clauses with the expression in their body or another hypothetical successor.
-    /// `stop` is asked before each [`POLL_CHANGED`] expressions, and the answer is `None`
-    /// once it says to stop.
-    pub fn changed(&self, old: &Index, stop: &dyn Fn() -> bool) -> Option<Vec<bool>> {
+    /// `poll` can stop disjointness numbering and the scan of the old expressions.
+    pub fn changed<E>(
+        &self,
+        old: &Index,
+        poll: &impl Fn() -> Result<(), E>,
+    ) -> Result<Vec<bool>, E> {
         let n = old.heads.len();
         debug_assert!(self.heads.len() >= n);
+        poll()?;
         // Scope the disjointness numbering table so it drops before `changed` is allocated.
         let (old_sets, new_sets) = if old.disjoint.is_empty() && self.disjoint.is_empty() {
             (Vec::new(), Vec::new())
         } else {
-            let old_n = old.disjoint_set_count();
-            let new_n = self.disjoint_set_count();
+            let old_n = old.disjoint_set_count(poll)?;
+            let new_n = self.disjoint_set_count(poll)?;
             // The disjointness sets of each index by their members, pre-sized to avoid
             // amortized doubling during the comparison.
-            let members = |ix: &Index, n_sets: usize| -> Vec<Vec<Ex>> {
+            let members = |ix: &Index, n_sets: usize| -> Result<Vec<Vec<Ex>>, E> {
                 if n_sets == 0 {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
                 let mut counts = vec![0u32; n_sets];
-                for &s in &ix.disjoint {
-                    counts[s as usize] += 1;
-                }
-                let mut sets: Vec<Vec<Ex>> = counts
-                    .into_iter()
-                    .map(|c| Vec::with_capacity(c as usize))
-                    .collect();
-                for (e, h) in ix.heads.iter().enumerate() {
-                    for &s in ix.disjoint_of(h) {
-                        sets[s as usize].push(e as Ex);
+                for memberships in ix.disjoint.chunks(POLL_CHANGED) {
+                    poll()?;
+                    for &s in memberships {
+                        counts[s as usize] += 1;
                     }
                 }
-                sets
+                let mut sets: Vec<Vec<Ex>> = Vec::with_capacity(n_sets);
+                for counts in counts.chunks(POLL_CHANGED) {
+                    poll()?;
+                    sets.extend(counts.iter().map(|&c| Vec::with_capacity(c as usize)));
+                }
+                drop(counts);
+                let mut memberships = 0usize;
+                for (e, h) in ix.heads.iter().enumerate() {
+                    if e.is_multiple_of(POLL_CHANGED) {
+                        poll()?;
+                    }
+                    for &s in ix.disjoint_of(h) {
+                        sets[s as usize].push(e as Ex);
+                        memberships += 1;
+                        if memberships.is_multiple_of(POLL_CHANGED) {
+                            poll()?;
+                        }
+                    }
+                }
+                Ok(sets)
             };
             // Each set has one number in both indexes, so that an expression's sets compare
             // without their members.
@@ -2693,16 +2711,19 @@ impl Index {
                 old_n.saturating_add(new_n),
                 Default::default(),
             );
-            let mut numbered = |sets: Vec<Vec<Ex>>| -> Vec<u32> {
+            let mut numbered = |sets: Vec<Vec<Ex>>| -> Result<Vec<u32>, E> {
                 let mut out = Vec::with_capacity(sets.len());
-                for members in sets {
+                for (i, members) in sets.into_iter().enumerate() {
+                    if i.is_multiple_of(POLL_CHANGED) {
+                        poll()?;
+                    }
                     let next = numbers.len() as u32;
                     out.push(*numbers.entry(members).or_insert(next));
                 }
-                out
+                Ok(out)
             };
-            let old_sets = numbered(members(old, old_n));
-            let new_sets = numbered(members(self, new_n));
+            let old_sets = numbered(members(old, old_n)?)?;
+            let new_sets = numbered(members(self, new_n)?)?;
             (old_sets, new_sets)
         };
         let flag = |ix: &Index, e: usize| -> u8 {
@@ -2713,8 +2734,8 @@ impl Index {
         };
         let mut changed = vec![false; n];
         for (e, changed) in changed.iter_mut().enumerate() {
-            if e % POLL_CHANGED == 0 && stop() {
-                return None;
+            if e.is_multiple_of(POLL_CHANGED) {
+                poll()?;
             }
             let (a, b) = (&old.heads[e], &self.heads[e]);
             debug_assert_eq!(a.node, b.node);
@@ -2746,13 +2767,11 @@ impl Index {
         }
         drop(old_sets);
         drop(new_sets);
-        if stop() {
-            return None;
-        }
+        poll()?;
         if let (Some(a), Some(b)) = (&old.dl, &self.dl) {
             b.changed(a, &mut changed);
         }
-        Some(changed)
+        Ok(changed)
     }
 
     /// The bytes of the `Vec<bool>` returned by [`Index::changed`] for this `old` index.
@@ -2765,9 +2784,13 @@ impl Index {
     /// `changed` mark vector with per-head disjointness comparison (dropped before Tier D),
     /// and the `changed` mark vector with Tier D's clause-key sets. Per-head `told`, `conj`
     /// and `exist` slices are pre-sorted in [`Index::build`] and compared without allocation.
-    pub fn changed_scratch(&self, old: &Index) -> usize {
-        let old_sets = old.disjoint_set_count();
-        let new_sets = self.disjoint_set_count();
+    pub fn changed_scratch<E>(
+        &self,
+        old: &Index,
+        poll: &impl Fn() -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let old_sets = old.disjoint_set_count(poll)?;
+        let new_sets = self.disjoint_set_count(poll)?;
         let sets = old_sets.saturating_add(new_sets);
         let memberships = old.disjoint.len().saturating_add(self.disjoint.len());
         let numbering_bytes = sets.saturating_mul(std::mem::size_of::<u32>());
@@ -2781,27 +2804,41 @@ impl Index {
                         .saturating_mul(std::mem::size_of::<Vec<Ex>>()),
                 );
         // Only equal-length spans can allocate both comparison buffers.
-        let max_span = if old_sets != 0 && new_sets != 0 {
-            old.heads
-                .iter()
-                .zip(&self.heads)
-                .filter(|(a, b)| a.disj.len == b.disj.len)
-                .map(|(a, _)| a.disj.len as usize)
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let mut max_span = 0;
+        if old_sets != 0 && new_sets != 0 {
+            let chunks = old
+                .heads
+                .chunks(POLL_CHANGED)
+                .zip(self.heads.chunks(POLL_CHANGED));
+            #[cfg(test)]
+            let chunks = chunks
+                .enumerate()
+                .inspect(|&(i, _)| {
+                    super::admission_test::hit(
+                        super::admission_test::Point::CompareScratchHeadChunk(i),
+                    );
+                })
+                .map(|(_, pair)| pair);
+            for (old_heads, new_heads) in chunks {
+                poll()?;
+                for (a, b) in old_heads.iter().zip(new_heads) {
+                    if a.disj.len == b.disj.len {
+                        max_span = max_span.max(a.disj.len as usize);
+                    }
+                }
+            }
+        }
         let scan_phase = old
             .heads
             .len()
             .saturating_add(numbering_bytes)
             .saturating_add(max_span.saturating_mul(2 * std::mem::size_of::<u32>()));
         let dl_phase = old.heads.len().saturating_add(match (&old.dl, &self.dl) {
-            (Some(a), Some(b)) => b.changed_scratch(a),
+            (Some(a), Some(b)) => b.changed_scratch(a, poll)?,
             _ => 0,
         });
-        disj_phase.max(scan_phase).max(dl_phase)
+        poll()?;
+        Ok(disj_phase.max(scan_phase).max(dl_phase))
     }
 
     /// The bytes the index takes, roughly, the role table included.
