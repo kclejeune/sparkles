@@ -6379,6 +6379,76 @@ fn probe_initial_floor_sample(
     Ok(Some(InitialFloorSample { rows, keep }))
 }
 
+/// Trial-compute string floors for a sample already validated by direct key comparison,
+/// without recording a sticky memory failure on decoding-envelope refusal. Returns
+/// `Ok(true)` when every sampled operand's floor was admitted (populating `sample_rows`),
+/// `Ok(false)` when floor-only decoding refused admission, or `Err` if a sticky memory
+/// failure was already recorded on `ctx`.
+fn try_sample_floors(
+    ctx: &Ctx,
+    table_ref: Option<&super::ctx::FloorTable>,
+    xs: &[Id],
+    ys: &[Id],
+    sample: usize,
+    scratch: &mut super::ctx::FloorScratch,
+    sample_rows: &mut [(u64, u64, bool, bool); STRING_ORDER_SAMPLE],
+) -> Result<bool> {
+    const SEEN_SLOTS: usize = 256;
+    const _: () = assert!(SEEN_SLOTS >= 2 * STRING_ORDER_SAMPLE);
+    let mut seen: Option<[(u64, u64); SEEN_SLOTS]> = None;
+    let mut lookup = |id: Id| -> Result<Option<(u64, bool)>> {
+        if let Some(cur) = table_ref
+            && let Some(cached) = cur.get_cached(id.payload())
+        {
+            return Ok(cached.map(|floor| (floor, false)));
+        }
+        if let Some(seen_table) = seen.as_mut() {
+            let mut slot = (id.payload() as usize) & (SEEN_SLOTS - 1);
+            loop {
+                let (k, v) = seen_table[slot];
+                if k == id.0 {
+                    return Ok(Some((v, false)));
+                }
+                if k == Id::UNDEF.0 {
+                    let Some(floor) = ctx.try_string_floor_in(id, scratch)? else {
+                        return Ok(None);
+                    };
+                    seen_table[slot] = (id.0, floor);
+                    return Ok(Some((floor, true)));
+                }
+                slot = (slot + 1) & (SEEN_SLOTS - 1);
+            }
+        }
+        let Some(floor) = ctx.try_string_floor_in(id, scratch)? else {
+            return Ok(None);
+        };
+        let mut seen_table = [(Id::UNDEF.0, 0u64); SEEN_SLOTS];
+        seen_table[(id.payload() as usize) & (SEEN_SLOTS - 1)] = (id.0, floor);
+        seen = Some(seen_table);
+        Ok(Some((floor, true)))
+    };
+    for i in 0..sample {
+        let fa = match lookup(xs[i]) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(false),
+            Err(_) => {
+                ctx.check_memory_failure()?;
+                return Ok(false);
+            }
+        };
+        let fb = match lookup(ys[i]) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(false),
+            Err(_) => {
+                ctx.check_memory_failure()?;
+                return Ok(false);
+            }
+        };
+        sample_rows[i] = (fa.0, fb.0, fa.1, fb.1);
+    }
+    Ok(true)
+}
+
 /// `FILTER(?x < ?y)`, or `<=`, `>` or `>=`, over a table whose values of both variables
 /// are stored simple literals. Their order is read from their base-vocabulary ids and
 /// each string's floor ([`Ctx::string_floor`]), which the query's floor cache keeps for
@@ -6398,7 +6468,7 @@ fn string_order_mask(
     op: super::expr::CmpOp,
     expr: &Expr,
 ) -> Result<Option<Vec<bool>>> {
-    use super::ctx::{FloorMaskPlan, FloorScratch};
+    use super::ctx::{DirectCommitPlan, FloorMaskPlan, FloorScratch};
     use super::expr::CmpOp;
     let n = t.len();
     let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
@@ -6433,7 +6503,7 @@ fn string_order_mask(
     // The sample's rows keep the order their floors or direct comparisons give, so that
     // no row is looked up twice, which would mark floors as read again without a repeat
     // and grow the cache for strings that do not recur.
-    let (sample_keep, plan, start) = if ctx.floor_cache_needs_init() {
+    let (sample_keep, plan) = if ctx.floor_cache_needs_init() {
         let Some(probed) = probe_initial_floor_sample(ctx, xs, ys, sample, order)? else {
             return Ok(None);
         };
@@ -6446,7 +6516,7 @@ fn string_order_mask(
                 floors.record_floor(ys[i], fb, b_new);
             }
         }
-        (probed.keep, plan, sample)
+        (probed.keep, plan)
     } else {
         if !ctx.may_be_base_literal(ys[0]) {
             // Check `xs[0]` first so a refused floor decode still reports its failure,
@@ -6458,12 +6528,12 @@ fn string_order_mask(
         let peek = ctx.peek_floor_plan();
         let mut sample_keep = [false; STRING_ORDER_SAMPLE];
         let mut sample_rows = [(0u64, 0u64, false, false); STRING_ORDER_SAMPLE];
+        let mut scratch = FloorScratch::default();
         let mut has_floors = false;
         let strings = match &peek {
             FloorMaskPlan::Floors(table) => {
                 has_floors = true;
                 let table_ref = table.as_deref();
-                let mut scratch = FloorScratch::default();
                 const SEEN_SLOTS: usize = 256;
                 const _: () = assert!(SEEN_SLOTS >= 2 * STRING_ORDER_SAMPLE);
                 let mut seen: Option<[(u64, u64); SEEN_SLOTS]> = None;
@@ -6512,46 +6582,53 @@ fn string_order_mask(
                     true
                 })
             }
-            FloorMaskPlan::Direct => {
-                let mut scratch = FloorScratch::default();
-                (0..sample).all(|i| {
-                    let Some(ord) = ctx.simple_literal_cmp_in(xs[i], ys[i], &mut scratch) else {
-                        return false;
-                    };
-                    sample_keep[i] = cmp_op(ord);
-                    true
-                })
-            }
+            FloorMaskPlan::Direct => (0..sample).all(|i| {
+                let Some(ord) = ctx.simple_literal_cmp_in(xs[i], ys[i], &mut scratch) else {
+                    return false;
+                };
+                sample_keep[i] = cmp_op(ord);
+                true
+            }),
         };
         if !strings {
             // a refused decode is not another kind of value
             ctx.check_memory_failure()?;
             return Ok(None);
         }
-        let plan = ctx.begin_floor_mask();
-        let start = if has_floors {
-            if let FloorMaskPlan::Floors(ref table) = plan {
-                let mut floors = ctx.floor_map_borrowed(table.as_deref(), first_triple);
-                for (i, &(fa, fb, a_new, b_new)) in sample_rows[..sample].iter().enumerate() {
-                    floors.record_floor(xs[i], fa, a_new);
-                    floors.record_floor(ys[i], fb, b_new);
+        let plan = if has_floors {
+            ctx.begin_floor_mask()
+        } else {
+            match ctx.begin_floor_mask_after_direct() {
+                DirectCommitPlan::Direct => FloorMaskPlan::Direct,
+                DirectCommitPlan::NeedsFloorTrial(trial_table) => {
+                    if try_sample_floors(
+                        ctx,
+                        trial_table.as_deref(),
+                        xs,
+                        ys,
+                        sample,
+                        &mut scratch,
+                        &mut sample_rows,
+                    )? {
+                        has_floors = true;
+                        ctx.begin_floor_mask()
+                    } else {
+                        ctx.begin_floor_mask_after_refused_floor_trial()
+                    }
                 }
             }
-            sample
-        } else if matches!(plan, FloorMaskPlan::Floors(_)) {
-            // The sample validated directly because low-hit bypass was pending, while
-            // `begin_floor_mask` grew the table and committed `Floors`. Run the committed
-            // floor pass from row 0 so the sampled rows are cached and counted once.
-            0
-        } else {
-            sample
         };
-        (sample_keep, plan, start)
+        if has_floors && let FloorMaskPlan::Floors(ref table) = plan {
+            let mut floors = ctx.floor_map_borrowed(table.as_deref(), first_triple);
+            for (i, &(fa, fb, a_new, b_new)) in sample_rows[..sample].iter().enumerate() {
+                floors.record_floor(xs[i], fa, a_new);
+                floors.record_floor(ys[i], fb, b_new);
+            }
+        }
+        (sample_keep, plan)
     };
     let mut keep = vec![false; n];
-    if start > 0 {
-        keep[..start].copy_from_slice(&sample_keep[..start]);
-    }
+    keep[..sample].copy_from_slice(&sample_keep[..sample]);
     let threads = rayon::current_num_threads().max(1);
     let map = t.var_map(ctx.nvars());
     let generic = |i: usize| {
@@ -6618,8 +6695,8 @@ fn string_order_mask(
                 let table_ref = table.as_deref();
                 fill_batch_with(
                     ctx,
-                    &mut keep[start..],
-                    start,
+                    &mut keep[sample..],
+                    sample,
                     || ctx.floor_map_borrowed(table_ref, first_triple),
                     order_of,
                 )?;
@@ -6627,8 +6704,8 @@ fn string_order_mask(
             FloorMaskPlan::Direct => {
                 fill_batch_with(
                     ctx,
-                    &mut keep[start..],
-                    start,
+                    &mut keep[sample..],
+                    sample,
                     FloorScratch::default,
                     direct_of,
                 )?;
@@ -6640,9 +6717,9 @@ fn string_order_mask(
         // can grow, bypass low-hit-rate parts, and probe periodically between parts as it
         // does between a cursor's batches.
         let mut plan = plan;
-        let mut lo = start;
+        let mut lo = sample;
         while lo < n {
-            if lo > start {
+            if lo > sample {
                 plan = ctx.begin_floor_mask();
             }
             let hi = n.min(lo + lo.max(PAR_THRESHOLD));
@@ -14851,6 +14928,244 @@ mod string_order_tests {
                 );
                 assert!(ctx.check().is_ok());
             }
+
+            // (c) When room stays at 132 KiB after direct sample validation, a sampled
+            // block-start literal whose 1 MiB predecessor cannot fit even before growth
+            // must be refused non-stickily during the floor trial so growth is skipped
+            // and the mask finishes cleanly on Direct.
+            {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 4 << 20;
+                ctx.enable_cursor_accounting().unwrap();
+                ctx.floor_cache().set_first_slots(FLOOR_TABLE_FEWEST);
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let e = cmp(x, y, CmpOp::Gt);
+
+                let mut warm = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    warm.push_row(&[n_ids[i % n_ids.len()], n_ids[(i + 7) % n_ids.len()]]);
+                }
+                string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("warm mask applies");
+
+                let mut low_hit = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    low_hit.push_row(&[z_ids[2 * i], z_ids[2 * i + 1]]);
+                }
+                string_order_mask(&ctx, &low_hit, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("low-hit mask applies");
+
+                let initial_room = 132 << 10;
+                let _hold = ctx.charge(ctx.memory_room() - initial_room).unwrap();
+                assert_eq!(ctx.memory_room(), initial_room);
+
+                let mut transition = Table::new(vec![x, y]);
+                for i in 0..STRING_ORDER_ROWS {
+                    let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+                    transition.push_row(&[m_id, rhs]);
+                }
+                let mask = string_order_mask(&ctx, &transition, (x, y), CmpOp::Gt, &e)
+                    .unwrap()
+                    .expect("transition mask applies on Direct after refused floor trial");
+                let generic =
+                    evaluate_mask(&ctx, &transition, std::slice::from_ref(&e), None).unwrap();
+                assert_eq!(mask, generic);
+                assert_eq!(
+                    ctx.floor_cache().slots(),
+                    FLOOR_TABLE_FEWEST,
+                    "growth to 8,192 slots must be skipped when sample floor trial refuses"
+                );
+                assert_eq!(
+                    ctx.floor_cache().bypassed(),
+                    1,
+                    "refused floor trial must preserve Direct without sticky memory failure"
+                );
+                assert!(ctx.check().is_ok());
+            }
+        });
+    }
+
+    /// When both floor-table growth (1,024 -> 8,192 slots) and low-hit bypass are pending,
+    /// direct sample validation does not decode a block-start operand's predecessor. Before
+    /// spending 64 KiB on optional table growth, the mask must account for the sample's
+    /// floor decode: if a 6 KiB predecessor fits in the 132 KiB pre-growth room but would
+    /// exceed the 68 KiB left after growth, reserving it first makes growth ineligible so
+    /// the mask enters `Direct` and succeeds without a sticky memory failure.
+    #[test]
+    fn pending_growth_and_bypass_accounts_for_sampled_floor_before_growth() {
+        use super::super::ctx::FLOOR_TABLE_FEWEST;
+        use super::super::expr::CmpOp;
+        use crate::builder::{BuildOptions, VocabCodec};
+        use oxrdf::Literal;
+
+        let mut nt = String::new();
+        // IDs 0..=14: 15 short simple literals sorting before "l..." and "m".
+        let mut a_terms = Vec::with_capacity(15);
+        for i in 0..15usize {
+            let term: oxrdf::Term = Literal::new_simple_literal(format!("a{i:02}")).into();
+            nt.push_str(&format!("<urn:s> <urn:p> {term} .\n"));
+            a_terms.push(term);
+        }
+        // ID 15: a 6 KiB simple literal starting with "l", immediately preceding block-start
+        // "m" at ID 16 without extending it.
+        let pred_term: oxrdf::Term =
+            Literal::new_simple_literal(format!("l{}", "x".repeat(6143))).into();
+        nt.push_str(&format!("<urn:s> <urn:p> {pred_term} .\n"));
+        // ID 16: short simple literal "m" at block start (`16 % FC_BLOCK == 0`).
+        let m_term: oxrdf::Term = Literal::new_simple_literal("m").into();
+        nt.push_str(&format!("<urn:s> <urn:p> {m_term} .\n"));
+        // 64 short simple literals sorting after "m" to mark >= 64 read-again slots.
+        let mut n_terms = Vec::with_capacity(64);
+        for i in 0..64usize {
+            let term: oxrdf::Term = Literal::new_simple_literal(format!("n{i:02}")).into();
+            nt.push_str(&format!("<urn:s> <urn:p> {term} .\n"));
+            n_terms.push(term);
+        }
+        // Cheap distinct simple literals sorting after "n..." to drive low-hit evictions.
+        let distinct_count = 3 * STRING_ORDER_ROWS;
+        for i in 0..distinct_count {
+            nt.push_str(&format!("<urn:s> <urn:p> \"z{i:06}\" .\n"));
+        }
+
+        let s = Store::in_memory(StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Front),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.generation.vocab_codec(), VocabCodec::Front);
+        let a_ids: Vec<Id> = a_terms
+            .iter()
+            .map(|t| snap.lookup_term(t).unwrap())
+            .collect();
+        let pred_id = snap.lookup_term(&pred_term).unwrap();
+        let m_id = snap.lookup_term(&m_term).unwrap();
+        let n_ids: Vec<Id> = n_terms
+            .iter()
+            .map(|t| snap.lookup_term(t).unwrap())
+            .collect();
+        assert_eq!(pred_id.payload(), 15);
+        assert_eq!(m_id.payload(), 16);
+        assert!((m_id.payload() as usize).is_multiple_of(crate::vocab::FC_BLOCK));
+        let z_ids: Vec<Id> = (0..distinct_count)
+            .map(|i| {
+                snap.lookup_term(&Literal::new_simple_literal(format!("z{i:06}")).into())
+                    .unwrap()
+            })
+            .collect();
+        drop(snap);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let initial_room = 132 << 10;
+            let growth_step = 64 << 10;
+
+            // Sanity check 1: ID 16's 6 KiB predecessor fits within 132 KiB pre-growth room
+            // (under the two-worker allowance) and leaves less than 128 KiB remaining.
+            {
+                let mut probe = Ctx::new(s.snapshot());
+                probe.mem_limit = 4 << 20;
+                probe.enable_cursor_accounting().unwrap();
+                let _hold = probe.charge(probe.memory_room() - initial_room).unwrap();
+                assert_eq!(probe.string_floor(m_id), Some(m_id.payload()));
+                assert!(probe.check().is_ok());
+                assert!(
+                    probe.memory_room() < (2 * growth_step),
+                    "decoding 6 KiB predecessor must leave room below 2 * 64 KiB growth threshold: room={}",
+                    probe.memory_room()
+                );
+            }
+
+            // Sanity check 2: after spending 64 KiB on table growth (68 KiB left), decoding
+            // ID 16's 6 KiB predecessor exceeds the remaining room.
+            {
+                let mut probe = Ctx::new(s.snapshot());
+                probe.mem_limit = 4 << 20;
+                probe.enable_cursor_accounting().unwrap();
+                let _hold = probe
+                    .charge(probe.memory_room() - (initial_room - growth_step))
+                    .unwrap();
+                assert_eq!(probe.string_floor(m_id), None);
+                assert!(
+                    matches!(
+                        probe.check(),
+                        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                    ),
+                    "decoding 6 KiB predecessor must exceed the 68 KiB left after 64 KiB growth"
+                );
+            }
+
+            let mut ctx = Ctx::new(s.snapshot());
+            ctx.mem_limit = 4 << 20;
+            ctx.enable_cursor_accounting().unwrap();
+            ctx.floor_cache().set_first_slots(FLOOR_TABLE_FEWEST);
+            let (x, y) = (ctx.var("x"), ctx.var("y"));
+            let e = cmp(x, y, CmpOp::Gt);
+
+            // Batch 1: install a 1,024-slot table and mark 64 distinct slots as read-again.
+            let mut warm = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                warm.push_row(&[n_ids[i % n_ids.len()], n_ids[(i + 7) % n_ids.len()]]);
+            }
+            string_order_mask(&ctx, &warm, (x, y), CmpOp::Gt, &e)
+                .unwrap()
+                .expect("warm mask applies");
+            assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+            assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+            // Batch 2: drive >= 32 read-again evictions and 0% hit rate over 8,192 lookups.
+            let mut low_hit = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                low_hit.push_row(&[z_ids[2 * i], z_ids[2 * i + 1]]);
+            }
+            string_order_mask(&ctx, &low_hit, (x, y), CmpOp::Gt, &e)
+                .unwrap()
+                .expect("low-hit mask applies");
+            assert_eq!(ctx.floor_cache().slots(), FLOOR_TABLE_FEWEST);
+            assert_eq!(ctx.floor_cache().bypassed(), 0);
+
+            // Leave 132 KiB of room (64 KiB growth step <= 66 KiB half-room).
+            let _hold = ctx.charge(ctx.memory_room() - initial_room).unwrap();
+            assert_eq!(ctx.memory_room(), initial_room);
+
+            // Batch 3: compare short block-start "m" with short literals from row 0 (no 1 KiB
+            // operand). Direct validation fits in the existing short-key envelope, so the mask
+            // must account for "m"'s floor decode before spending 64 KiB on optional growth.
+            let mut transition = Table::new(vec![x, y]);
+            for i in 0..STRING_ORDER_ROWS {
+                let rhs = if i % 2 == 0 { a_ids[0] } else { z_ids[0] };
+                transition.push_row(&[m_id, rhs]);
+            }
+            let mask = string_order_mask(&ctx, &transition, (x, y), CmpOp::Gt, &e)
+                .unwrap()
+                .expect("transition mask must succeed on Direct without sticky memory failure");
+            let generic =
+                evaluate_mask(&ctx, &transition, std::slice::from_ref(&e), None).unwrap();
+            assert_eq!(mask, generic);
+            assert_eq!(
+                ctx.floor_cache().slots(),
+                FLOOR_TABLE_FEWEST,
+                "reserving 6 KiB predecessor before growth must make 64 KiB growth ineligible"
+            );
+            assert_eq!(
+                ctx.floor_cache().bypassed(),
+                1,
+                "mask must enter Direct cleanly without sticky memory failure"
+            );
+            assert!(ctx.check().is_ok());
         });
     }
 }

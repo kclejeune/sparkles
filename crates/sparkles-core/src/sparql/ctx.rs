@@ -272,6 +272,16 @@ pub(super) enum FloorMaskPlan {
     Direct,
 }
 
+/// Result of committing a mask whose sample validated via direct key comparison.
+pub(super) enum DirectCommitPlan {
+    /// Stay on direct key comparison without allocating or growing a floor table.
+    Direct,
+    /// Committing would consider optional table growth or enter `Floors`. `FloorTables`
+    /// was left unchanged so the caller can run a non-sticky floor trial on the validated
+    /// sample before optional table memory is spent.
+    NeedsFloorTrial(Option<Arc<FloorTable>>),
+}
+
 /// The query's cache of string floors ([`Ctx::string_floor`]). It lasts the query, so the
 /// batches of a cursor share it as the rows of an eager table do, and every worker of a
 /// mask reads and writes the same [`FloorTable`] without a lock.
@@ -2482,6 +2492,42 @@ impl Ctx {
         }
     }
 
+    /// [`Ctx::with_vocab_key_in`] without recording a sticky memory failure on refusal.
+    #[inline]
+    fn try_with_vocab_key_in<T>(
+        &self,
+        id: u64,
+        key: &mut Vec<u8>,
+        mut f: impl FnMut(&[u8]) -> T,
+    ) -> Result<Option<T>> {
+        if !self.envelope_refuses() {
+            let mut err = None;
+            let found = self
+                .snap
+                .generation
+                .vocab
+                .get_with_in(id, key, |k| match self.reserve_decode_checked(k.len()) {
+                    Ok(()) => Some(f(k)),
+                    Err(e) => {
+                        err = Some(e);
+                        None
+                    }
+                })
+                .flatten();
+            return match err {
+                Some(e) => Err(e),
+                None => Ok(found),
+            };
+        }
+        self.check_memory_failure()?;
+        self.snap.generation.vocab.get_with_checked_in(
+            id,
+            key,
+            |need| self.reserve_decode_checked(need),
+            |k| f(k),
+        )
+    }
+
     /// The row limit of intermediate results.
     #[inline]
     pub fn check_rows(&self, n: usize) -> Result<()> {
@@ -3707,75 +3753,104 @@ impl Ctx {
         self.string_floor_in(id, &mut FloorScratch::default())
     }
 
-    /// [`Ctx::string_floor`] reusing the caller's scratch buffers across calls.
+    /// Compute [`Ctx::string_floor`] reusing the caller's scratch buffers without recording
+    /// a sticky memory failure on decoding-envelope refusal. Returns `Ok(Some(floor))` for a
+    /// base-vocabulary simple literal, `Ok(None)` for any other id, or `Err` when the
+    /// cursor's decoding envelope refuses reconstruction or a prior memory failure is
+    /// already recorded.
     #[inline]
-    pub(super) fn string_floor_in(&self, id: Id, scratch: &mut FloorScratch) -> Option<u64> {
+    pub(super) fn try_string_floor_in(
+        &self,
+        id: Id,
+        scratch: &mut FloorScratch,
+    ) -> Result<Option<u64>> {
         if id.tag() != Tag::Vocab {
-            return None;
+            return Ok(None);
         }
         let v = &self.snap.generation.vocab;
         let p = id.payload();
         if p >= v.first_triple() {
-            return None;
+            return Ok(None);
         }
         let FloorScratch { key, other } = scratch;
-        self.with_vocab_key_prefix_in(p, key, |shared, key| {
-            if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
-                return None;
-            }
-            let prefix = &key[..key.len() - 1];
-            // Within a block, the stored common prefix tells whether the preceding
-            // key extends this simple literal. Across blocks, compare the keys.
-            let extended = match shared {
-                Some(len) => len >= prefix.len(),
-                None if p == 0 => false,
-                None => self.with_vocab_key_in(p - 1, other, |k| k.starts_with(prefix))?,
-            };
-            if !extended {
-                return Some(p);
-            }
-            self.vocab_lower_bound(prefix)
-        })
-        .flatten()
+        let Some(res) =
+            self.try_with_vocab_key_prefix_in(p, key, |shared, key| -> Result<Option<u64>> {
+                if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
+                    return Ok(None);
+                }
+                let prefix = &key[..key.len() - 1];
+                // Within a block, the stored common prefix tells whether the preceding
+                // key extends this simple literal. Across blocks, compare the keys.
+                let extended = match shared {
+                    Some(len) => len >= prefix.len(),
+                    None if p == 0 => false,
+                    None => {
+                        match self.try_with_vocab_key_in(p - 1, other, |k| k.starts_with(prefix))? {
+                            Some(ext) => ext,
+                            None => return Ok(None),
+                        }
+                    }
+                };
+                if !extended {
+                    return Ok(Some(p));
+                }
+                self.try_vocab_lower_bound(prefix).map(Some)
+            })?
+        else {
+            return Ok(None);
+        };
+        res
     }
 
-    /// Read a vocabulary key and, within its block, its common prefix length with
-    /// the preceding key, reusing `key` across calls. A cursor admits scratch through the
-    /// decoding envelope before allocation and records any refusal for the next check.
+    /// [`Ctx::string_floor`] reusing the caller's scratch buffers across calls.
     #[inline]
-    fn with_vocab_key_prefix_in<T>(
-        &self,
-        id: u64,
-        key: &mut Vec<u8>,
-        f: impl FnOnce(Option<usize>, &[u8]) -> T,
-    ) -> Option<T> {
-        let vocab = &self.snap.generation.vocab;
-        if !self.envelope_refuses() {
-            let mut f = Some(f);
-            return vocab
-                .get_with_shared_prefix_in(id, key, |shared, key| {
-                    if !self.reserve_decode(key.len()) {
-                        return None;
-                    }
-                    f.take().map(|f| f(shared, key))
-                })
-                .flatten();
-        }
-        if self.check_memory_failure().is_err() {
-            return None;
-        }
-        match vocab.get_with_shared_prefix_checked_in(
-            id,
-            key,
-            |need| self.reserve_decode_checked(need),
-            f,
-        ) {
-            Ok(found) => found,
+    pub(super) fn string_floor_in(&self, id: Id, scratch: &mut FloorScratch) -> Option<u64> {
+        match self.try_string_floor_in(id, scratch) {
+            Ok(floor) => floor,
             Err(error) => {
                 self.fail_memory(&error);
                 None
             }
         }
+    }
+
+    /// Read a vocabulary key and, within its block, its common prefix length with
+    /// the preceding key, reusing `key` across calls. A cursor admits scratch through the
+    /// decoding envelope before allocation and returns any refusal without recording it.
+    #[inline]
+    fn try_with_vocab_key_prefix_in<T>(
+        &self,
+        id: u64,
+        key: &mut Vec<u8>,
+        f: impl FnOnce(Option<usize>, &[u8]) -> T,
+    ) -> Result<Option<T>> {
+        let vocab = &self.snap.generation.vocab;
+        if !self.envelope_refuses() {
+            let mut f = Some(f);
+            let mut err = None;
+            let found = vocab
+                .get_with_shared_prefix_in(id, key, |shared, key| {
+                    match self.reserve_decode_checked(key.len()) {
+                        Ok(()) => f.take().map(|f| f(shared, key)),
+                        Err(e) => {
+                            err = Some(e);
+                            None
+                        }
+                    }
+                })
+                .flatten();
+            return match err {
+                Some(e) => Err(e),
+                None => Ok(found),
+            };
+        }
+        self.check_memory_failure()?;
+        vocab.get_with_shared_prefix_checked_in(
+            id,
+            key,
+            |need| self.reserve_decode_checked(need),
+            f,
+        )
     }
 
     /// The query's floor cache.
@@ -3935,6 +4010,78 @@ impl Ctx {
         self.begin_floor_mask_locked(&mut tables)
     }
 
+    /// Commit a mask whose sample validated through direct key comparison. If the mask
+    /// commits `Direct` without allocating or growing a floor table, applies the state
+    /// transition and returns [`DirectCommitPlan::Direct`]. Otherwise leaves `FloorTables`
+    /// unchanged and returns [`DirectCommitPlan::NeedsFloorTrial`] so the caller can account
+    /// for the sample's floor decodes non-stickily before optional table memory is spent.
+    pub(super) fn begin_floor_mask_after_direct(&self) -> DirectCommitPlan {
+        let mut tables = self.floors.tables.lock();
+        if !tables.bypass {
+            if let Some(cur) = &tables.cur {
+                let growth_pending = !tables.full
+                    && cur.evicted.load(Ordering::Relaxed) >= cur.len() / FLOOR_TABLE_EVICTIONS;
+                if growth_pending && self.can_grow_floor_table_locked(cur) {
+                    return DirectCommitPlan::NeedsFloorTrial(Some(cur.clone()));
+                }
+                let bypass = Self::low_hit_bypass_pending(&tables, cur);
+                if bypass {
+                    let _ = cur.lookups.swap(0, Ordering::Relaxed);
+                    let _ = cur.hits.swap(0, Ordering::Relaxed);
+                }
+                if growth_pending {
+                    tables.full = true;
+                }
+                if bypass {
+                    tables.warmup_lookups = 0;
+                    tables.bypass = true;
+                    tables.bypass_streak = 1;
+                    #[cfg(test)]
+                    self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+                    return DirectCommitPlan::Direct;
+                }
+            }
+            return DirectCommitPlan::NeedsFloorTrial(tables.cur.clone());
+        }
+        if tables.bypass_streak + 1 < FLOOR_BYPASS_PROBE_INTERVAL {
+            tables.bypass_streak += 1;
+            #[cfg(test)]
+            self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+            return DirectCommitPlan::Direct;
+        }
+        DirectCommitPlan::NeedsFloorTrial(tables.cur.clone())
+    }
+
+    /// Commit a mask to direct comparison after a fallible floor trial on its validated
+    /// sample refused decoding-envelope admission, skipping optional table growth and
+    /// deferred table allocation so the validated direct path succeeds cleanly.
+    pub(super) fn begin_floor_mask_after_refused_floor_trial(&self) -> FloorMaskPlan {
+        let mut tables = self.floors.tables.lock();
+        if !tables.bypass {
+            let bypass = tables.cur.as_ref().is_some_and(|cur| {
+                if Self::low_hit_bypass_pending(&tables, cur) {
+                    let _ = cur.lookups.swap(0, Ordering::Relaxed);
+                    let _ = cur.hits.swap(0, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            });
+            if bypass {
+                tables.warmup_lookups = 0;
+                tables.bypass = true;
+                tables.bypass_streak = 1;
+            }
+        } else if tables.bypass_streak + 1 < FLOOR_BYPASS_PROBE_INTERVAL {
+            tables.bypass_streak += 1;
+        } else {
+            tables.bypass_streak = 1;
+        }
+        #[cfg(test)]
+        self.floors.bypassed.fetch_add(1, Ordering::Relaxed);
+        FloorMaskPlan::Direct
+    }
+
     fn begin_floor_mask_locked(&self, tables: &mut FloorTables) -> FloorMaskPlan {
         if !tables.bypass {
             if tables.cur.is_some() {
@@ -4022,6 +4169,26 @@ impl Ctx {
         Some(wanted.min(room))
     }
 
+    fn can_grow_floor_table_locked(&self, cur: &FloorTable) -> bool {
+        let cap = FloorCache::cap(self.mem_limit);
+        let requested = cur.len().saturating_mul(FLOOR_TABLE_GROWTH);
+        let Some(slots) = self.clamped_floor_slots(requested, cap) else {
+            return false;
+        };
+        if slots <= cur.len() {
+            return false;
+        }
+        let step = self.reservation_step();
+        let used = self
+            .floors
+            .used
+            .load(Ordering::Acquire)
+            .saturating_add(FloorTable::bytes(slots));
+        let ahead = used.next_multiple_of(step).min(cap).max(used);
+        let delta = ahead.saturating_sub(self.floors.charge.reserved());
+        used <= cap && (delta == 0 || delta <= self.memory_room() / 2)
+    }
+
     fn maybe_grow_floor_table(&self, tables: &mut FloorTables) -> bool {
         let Some(cur) = &tables.cur else {
             return false;
@@ -4095,20 +4262,17 @@ impl Ctx {
     }
 
     /// The first base id whose key is not below `key`, searched inside the decoding
-    /// envelope. A refusal records a failure and gives `None`.
-    fn vocab_lower_bound(&self, key: &[u8]) -> Option<u64> {
+    /// envelope without recording a sticky refusal.
+    fn try_vocab_lower_bound(&self, key: &[u8]) -> Result<u64> {
         let v = &self.snap.generation.vocab;
         if !self.envelope_refuses() {
             let (Ok(i) | Err(i)) = v.find(key);
-            return Some(i);
+            return Ok(i);
         }
-        match v.find_with_checked(key, |need| self.reserve_decode_checked(need)) {
-            Ok(Ok(i) | Err(i)) => Some(i),
-            Err(error) => {
-                self.fail_memory(&error);
-                None
-            }
-        }
+        self.check_memory_failure()?;
+        let (Ok(i) | Err(i)) =
+            v.find_with_checked(key, |need| self.reserve_decode_checked(need))?;
+        Ok(i)
     }
 
     pub fn local_len(&self) -> u64 {
@@ -5980,7 +6144,7 @@ mod charge_tests {
         // `(n * 8 + 1024)` bytes while optional 64-byte FSST headroom exceeds it.
         let room_for = |bytes: usize| (bytes as u64 * 8 + 1024) * Ctx::decode_workers();
         let room_for_192 = room_for(192);
-        // (a) `string_floor_in` via `with_vocab_key_prefix_in`
+        // (a) `string_floor_in` via `try_with_vocab_key_prefix_in`
         {
             let mut ctx = Ctx::new(snap.clone());
             ctx.mem_limit = MIB;
