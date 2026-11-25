@@ -80,30 +80,29 @@ pub struct DlAx {
 }
 
 impl DlAx {
-    pub fn bytes(&self) -> usize {
-        self.clauses
-            .iter()
-            .map(|(b, h)| 48 + (b.capacity() + h.capacity()) * 4)
-            .sum::<usize>()
-            + super::saturate::table_bytes(self.hyp.capacity(), 8)
+    pub fn bytes_poll<E>(&self, tick: &mut impl FnMut(usize) -> Result<(), E>) -> Result<usize, E> {
+        let mut total = super::saturate::table_bytes(self.hyp.capacity(), 8)
             + self.atmost.capacity() * 16
             + self.rdis.capacity() * 8
             + self.ne.capacity() * std::mem::size_of::<(Ex, Vec<Ex>)>()
-            + self
-                .ne
-                .iter()
-                .map(|(_, es)| es.capacity() * 4)
-                .sum::<usize>()
             + self.least.capacity() * std::mem::size_of::<(Ex, Option<Ex>)>()
             + super::saturate::table_bytes(
                 self.blockers.capacity(),
                 std::mem::size_of::<(Ex, Vec<Ex>)>(),
-            )
-            + self
-                .blockers
-                .values()
-                .map(|v| v.capacity() * 4)
-                .sum::<usize>()
+            );
+        for (b, h) in &self.clauses {
+            tick(1)?;
+            total += 48 + (b.capacity() + h.capacity()) * 4;
+        }
+        for (_, es) in &self.ne {
+            tick(1)?;
+            total += es.capacity() * 4;
+        }
+        for v in self.blockers.values() {
+            tick(1)?;
+            total += v.capacity() * 4;
+        }
+        Ok(total)
     }
 
     pub fn logical_bytes(&self) -> usize {

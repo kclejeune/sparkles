@@ -2040,45 +2040,13 @@ fn eager_kept_run_memory_budget_charge_cancellation_and_partial() {
             "no eager run was cancelled on {threads} threads"
         );
 
-        // Measure the poll count of an incremental eager edit on `padded`, then arm a future
-        // deadline and cross it mid-run (after entry polls pass) via a non-cancelling poll hook
-        // so the stop is a genuine mid-incremental `Error::Timeout`.
-        let (mut k_probe, _) = started_eager(&padded, threads);
-        k_probe.add(&axioms("SubClassOf(:A :N) SubClassOf(:N :N2)"));
-        let probe_polls = Arc::new(AtomicUsize::new(0));
-        let pp = probe_polls.clone();
-        let probe_out = k_probe
-            .classify(&Limits {
-                cancelled: Some(Arc::new(move || {
-                    pp.fetch_add(1, Ordering::Relaxed);
-                    false
-                })),
-                ..lim.clone()
-            })
-            .unwrap();
-        assert!(probe_out.stats.incremental);
-        let total_polls = probe_polls.load(Ordering::Relaxed);
-        assert!(
-            total_polls >= 4,
-            "expected >= 4 polls on incremental eager run ({threads}t), got {total_polls}"
-        );
-        let trigger = total_polls / 2;
-
+        // Public-API deadline timeout and clean fresh recovery on 1 and 4 threads.
+        // Phase-isolated mid-invalidation and mid-saturation deadline stops with a
+        // controlled clock live in `classify::tests::eager_kept_phase_deadline_stops_and_recovers`.
         let (mut k, mut held) = started_eager(&padded, threads);
         add(&mut k, &mut held, "SubClassOf(:A :N) SubClassOf(:N :N2)");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(80);
-        let seen = Arc::new(AtomicUsize::new(0));
-        let s = seen.clone();
         let late = Limits {
-            deadline: Some(deadline),
-            cancelled: Some(Arc::new(move || {
-                if s.fetch_add(1, Ordering::Relaxed) == trigger {
-                    while std::time::Instant::now() < deadline {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                }
-                false
-            })),
+            deadline: Some(std::time::Instant::now()),
             ..lim.clone()
         };
         let err = k.classify(&late).unwrap_err();
@@ -2086,15 +2054,11 @@ fn eager_kept_run_memory_budget_charge_cancellation_and_partial() {
             matches!(err, sparkles_owl::classify::Error::Timeout),
             "expected Timeout on {threads} threads, got {err:?}"
         );
-        assert!(
-            seen.load(Ordering::Relaxed) > trigger,
-            "deadline expired before reaching mid-incremental poll {trigger} on {threads} threads"
-        );
         let out = same_as_fresh_with(
             &mut k,
             &held,
             &lim,
-            &format!("eager after mid-incremental deadline on {threads} threads"),
+            &format!("eager after deadline on {threads} threads"),
         );
         assert!(!out.stats.incremental);
         assert!(out.taxonomy.is_subclass(&c("A"), &c("N2")));

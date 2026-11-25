@@ -1157,34 +1157,32 @@ pub const LINEAR_CHAINS_ENV: &str = "SPARKLES_LINEAR_CHAINS";
 pub const NO_ROLE: Role = Role::MAX;
 
 impl Roles {
-    /// The bytes the tables take, roughly.
-    pub fn bytes(&self) -> usize {
-        self.sup
-            .iter()
-            .map(|v| 24 + v.capacity() * 4)
-            .sum::<usize>()
-            + self
-                .comp
-                .values()
-                .map(|v| 40 + v.capacity() * 4)
-                .sum::<usize>()
-            + self.right.len()
+    /// The bytes the tables take, roughly, polling `tick` across each per-role table walk.
+    pub fn bytes_poll<E>(&self, tick: &mut impl FnMut(usize) -> Result<(), E>) -> Result<usize, E> {
+        let mut total = self.right.len()
             + self.left.len()
             + self.reflexive.len() * 4
             + self.range.len() * 8
             + self.data_range.len() * 8
-            + self
-                .functional
-                .iter()
-                .map(|v| 24 + v.capacity() * 4)
-                .sum::<usize>()
             + self.empty.len()
-            + self.linear.len()
-            + self
-                .comp_fwd
-                .values()
-                .map(|v| 40 + v.capacity() * 4)
-                .sum::<usize>()
+            + self.linear.len();
+        for v in &self.sup {
+            tick(1)?;
+            total += 24 + v.capacity() * 4;
+        }
+        for v in self.comp.values() {
+            tick(1)?;
+            total += 40 + v.capacity() * 4;
+        }
+        for v in &self.functional {
+            tick(1)?;
+            total += 24 + v.capacity() * 4;
+        }
+        for v in self.comp_fwd.values() {
+            tick(1)?;
+            total += 40 + v.capacity() * 4;
+        }
+        Ok(total)
     }
 
     pub fn logical_bytes(&self) -> usize {
@@ -1536,34 +1534,42 @@ impl Axioms {
 
     /// The bytes the normalized axioms take.
     pub fn bytes(&self) -> usize {
-        self.subs.capacity() * 8
-            + self
-                .disjoint
-                .iter()
-                .map(|d| 24 + d.capacity() * 4)
-                .sum::<usize>()
+        self.bytes_poll(&mut |_| Ok::<(), std::convert::Infallible>(()))
+            .unwrap_or_else(|e| match e {})
+    }
+
+    /// Like [`Axioms::bytes`], polling `tick` across variable-length tables.
+    pub fn bytes_poll<E>(&self, tick: &mut impl FnMut(usize) -> Result<(), E>) -> Result<usize, E> {
+        let mut total = self.subs.capacity() * 8
             + self.disjoint.capacity() * 24
             + self.role_subs.capacity() * 8
-            + self
-                .chains
-                .iter()
-                .map(|(c, _)| 32 + c.capacity() * 4)
-                .sum::<usize>()
             + self.reflexive.capacity() * 4
             + self.ranges.capacity() * 8
             + self.data_ranges.capacity() * 8
             + self.dt_ranges.capacity() * 8
             + self.dt_disjoint.capacity() * 8
             + self.functional.capacity() * 4
-            + self
-                .keys
-                .iter()
-                .map(|k| 56 + (k.objects.len() + k.data.len()) * 4)
-                .sum::<usize>()
             + self.individuals.capacity() * 4
-            + self.classes.capacity() * 4
-            + self.horn.as_ref().map_or(0, |h| h.bytes())
-            + self.dl.as_ref().map_or(0, |d| d.bytes())
+            + self.classes.capacity() * 4;
+        for d in &self.disjoint {
+            tick(1)?;
+            total += 24 + d.capacity() * 4;
+        }
+        for (c, _) in &self.chains {
+            tick(1)?;
+            total += 32 + c.capacity() * 4;
+        }
+        for k in &self.keys {
+            tick(1)?;
+            total += 56 + (k.objects.len() + k.data.len()) * 4;
+        }
+        if let Some(h) = &self.horn {
+            total += h.bytes_poll(tick)?;
+        }
+        if let Some(d) = &self.dl {
+            total += d.bytes_poll(tick)?;
+        }
+        Ok(total)
     }
 
     /// Logical input-size measure of the normalized axioms, independent of vector
@@ -2727,8 +2733,13 @@ impl Index {
 
     /// The bytes the index takes, roughly, the role table included.
     pub fn bytes(&self) -> usize {
-        let top_chain = self.top_chain.as_ref().map_or(0, |rules| rules.bytes());
-        top_chain
+        self.bytes_poll(&mut |_| Ok::<(), std::convert::Infallible>(()))
+            .unwrap_or_else(|e| match e {})
+    }
+
+    /// Like [`Index::bytes`], polling `tick` across variable-length tables and the Tier D index.
+    pub fn bytes_poll<E>(&self, tick: &mut impl FnMut(usize) -> Result<(), E>) -> Result<usize, E> {
+        let mut total = self.top_chain.as_ref().map_or(0, |rules| rules.bytes())
             + self.heads.capacity() * std::mem::size_of::<Head>()
             + self.told.capacity() * 4
             + self.conj.capacity() * 8
@@ -2736,19 +2747,24 @@ impl Index {
             + self.disjoint.capacity() * 4
             + self.selfs.capacity() * 8
             + self.vals.capacity() * std::mem::size_of::<DataVal>()
-            + self.vals.iter().map(DataVal::owned_bytes).sum::<usize>()
-            + self
-                .neg_data
-                .values()
-                .map(|v| 48 + v.capacity() * 8)
-                .sum::<usize>()
             + self.universal.capacity() * 8
             + self.nominals.capacity() * 4
             + self.anonymous.capacity() * 4
-            + self.roles.bytes()
             + self.horn.as_ref().map_or(0, |h| h.bytes())
-            + self.dl.as_ref().map_or(0, |d| d.bytes())
-            + self.dt.as_ref().map_or(0, |d| d.bytes())
+            + self.dt.as_ref().map_or(0, |d| d.bytes());
+        for v in &self.vals {
+            tick(1)?;
+            total += v.owned_bytes();
+        }
+        for v in self.neg_data.values() {
+            tick(1)?;
+            total += 48 + v.capacity() * 8;
+        }
+        total += self.roles.bytes_poll(tick)?;
+        if let Some(d) = &self.dl {
+            total += d.bytes_poll(tick)?;
+        }
+        Ok(total)
     }
 
     /// Logical input-size measure of the index, independent of allocator capacities.

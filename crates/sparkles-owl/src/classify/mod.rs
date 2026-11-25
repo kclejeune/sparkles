@@ -3696,7 +3696,20 @@ impl Saturation {
             Some(k) if k.tier != KeptTier::El => self.index.take(),
             _ => None,
         };
-        let old_ix_bytes = old_ix.as_ref().map_or(0, |ix| ix.bytes());
+        let old_ix_bytes = match &old_ix {
+            Some(ix) => {
+                let mut since_poll = 0usize;
+                ix.bytes_poll(&mut |work| {
+                    since_poll = since_poll.saturating_add(work);
+                    if since_poll >= POLL_INVALIDATE {
+                        poll(limits)?;
+                        since_poll = 0;
+                    }
+                    Ok(())
+                })?
+            }
+            None => 0,
+        };
         let dyn_retained_bytes = self.dynamic.as_ref().map_or(0, |d| d.retained_bytes());
         let old_bytes = old_ix_bytes
             + dyn_retained_bytes
@@ -3845,6 +3858,32 @@ impl Saturation {
             }
         }
         debug_assert!(ix.horn.as_ref().is_none_or(|h| h.base as usize == n));
+        // Measure the rebuilt index and normalized axioms once with cooperative polling.
+        // Neither `self.interner`, `self.disjoint`, `ix`, nor `ax` changes from here
+        // through saturation, so rebase pre-admission, invalidation, and saturation
+        // reuse these exact sizes without unpolled rescans.
+        let (rebuilt_ix_bytes, rebuilt_ax_bytes) = {
+            #[cfg(test)]
+            if reuse {
+                admission_test::hit(admission_test::Point::RebaseAccountStart);
+            }
+            let mut since_poll = 0usize;
+            let mut tick = |work: usize| -> Result<(), Error> {
+                since_poll = since_poll.saturating_add(work);
+                if since_poll >= POLL_INVALIDATE {
+                    poll(limits)?;
+                    since_poll = 0;
+                }
+                Ok(())
+            };
+            let ix_bytes = self.index_bytes_poll(&ix, &mut tick)?;
+            let ax_bytes = ax.bytes_poll(&mut tick)?;
+            #[cfg(test)]
+            if reuse {
+                admission_test::hit(admission_test::Point::RebaseAccountEnd);
+            }
+            (ix_bytes, ax_bytes)
+        };
         let dl_run = ix.dl.as_ref().map(|_| match self.dl_run.take() {
             // the kept contexts name the clauses of the last run's table by id
             Some(mut d) if reuse => {
@@ -3896,15 +3935,15 @@ impl Saturation {
                             rebase_scratch = rebase_scratch.max(s);
                         }
                     }
-                    // Reuse retained static, dynamic, and old-index byte sizes measured
-                    // before normalization (adjusting for any `self.ctx` slot growth from
-                    // `resize_with`) to avoid an unpolled rescan of the context tables.
+                    // Reuse precomputed rebuilt index/axiom sizes and retained static,
+                    // dynamic, and old-index sizes (adjusting for any `self.ctx` slot
+                    // growth from `resize_with`) so pre-admission performs no unpolled scan.
                     let slot = std::mem::size_of::<OnceLock<Box<saturate::Ctx>>>();
                     let rebase_ctx_bytes =
                         kept_bytes + self.ctx.capacity().saturating_sub(kept_capacity) * slot;
-                    let rebase_live = self.index_bytes(&ix)
+                    let rebase_live = rebuilt_ix_bytes
                         + held_bytes
-                        + ax.bytes()
+                        + rebuilt_ax_bytes
                         + rebase_ctx_bytes
                         + dyn_retained_bytes
                         + dl_run.as_ref().map_or(0, |r| r.bytes())
@@ -3982,9 +4021,9 @@ impl Saturation {
             let kept_bytes = kept_bytes + self.ctx.capacity().saturating_sub(kept_capacity) * slot;
             let mut budget = Scratch {
                 limits,
-                held: self.index_bytes(&ix)
+                held: rebuilt_ix_bytes
                     + held_bytes
-                    + ax.bytes()
+                    + rebuilt_ax_bytes
                     + kept_bytes
                     + premises_bytes
                     + bits,
@@ -4008,14 +4047,14 @@ impl Saturation {
             // invalidation, which count against the budget as the kept state does; a
             // run that passes it starts again in full (`run_with`)
             let inv_scratch = (self.ctx.len() + d.len()) * 16;
-            let live_without_old = self.index_bytes(&ix)
+            let live_without_old = rebuilt_ix_bytes
                 + held_bytes
-                + ax.bytes()
+                + rebuilt_ax_bytes
                 + self.context_bytes()
                 + d.retained_bytes()
                 + dl_run.as_ref().map_or(0, |d| d.bytes())
                 + inv_scratch;
-            let held = live_without_old + old.bytes() + ix.changed_scratch(&old);
+            let held = live_without_old + old_ix_bytes + ix.changed_scratch(&old);
             let more = held.saturating_sub(normalized_peak);
             if limits.max_memory.is_some_and(|m| held > m)
                 || limits
@@ -4069,9 +4108,9 @@ impl Saturation {
         stats.index = start.elapsed();
         // the index, the caller's copy of the axioms, the normalized axioms and the roots,
         // and the contexts kept from the last run
-        let base = self.index_bytes(&ix)
+        let base = rebuilt_ix_bytes
             + held_bytes
-            + ax.bytes()
+            + rebuilt_ax_bytes
             + roots.capacity() * 4
             + self.context_bytes()
             // the states of the conjunctions' contexts kept from the last run, whose
@@ -4297,8 +4336,18 @@ impl Saturation {
         // the stop to the caller's deadline, cancellation or memory refusal does not count
         let mut over_work = false;
         let partial = bounds.partial;
+        #[cfg(test)]
+        if stats.incremental {
+            admission_test::hit(admission_test::Point::KeptSaturationStart);
+        }
         let (sat_totals, sat_stop) =
             saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds);
+        #[cfg(test)]
+        if stats.incremental {
+            admission_test::hit(admission_test::Point::KeptSaturationEnd {
+                stopped_by_timeout: matches!(sat_stop, Some(Stop::Timeout)),
+            });
+        }
         // Capture saturation counters, heap occupancy oracle, and winning stop reason
         // immediately after `saturate_counted`, before error translation, `partial=true`
         // routing, marker decline, or partial store teardown.
@@ -5228,8 +5277,17 @@ impl Saturation {
     }
 
     fn index_bytes(&self, ix: &Index) -> usize {
+        self.index_bytes_poll(ix, &mut |_| Ok::<(), std::convert::Infallible>(()))
+            .unwrap_or_else(|e| match e {})
+    }
+
+    fn index_bytes_poll<E>(
+        &self,
+        ix: &Index,
+        tick: &mut impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<usize, E> {
         // each class's IRI is held once, beside its hash and its entry in the table
-        self.interner.len() * 40
+        let mut total = self.interner.len() * 40
             + self.interner.classes.bytes()
             + self.interner.classes.name_bytes()
             + self.interner.data_bytes()
@@ -5237,14 +5295,14 @@ impl Saturation {
                 .as_ref()
                 .or(self.interner.ranges.ledger.as_ref())
                 .map_or(0, |l| l.bytes())
-            + ix.bytes()
+            + ix.bytes_poll(tick)?
             + self.interner.scope_bytes()
-            + self.disjoint.capacity() * 24
-            + self
-                .disjoint
-                .iter()
-                .map(|d| d.capacity() * 4)
-                .sum::<usize>()
+            + self.disjoint.capacity() * 24;
+        for d in &self.disjoint {
+            tick(1)?;
+            total += d.capacity() * 4;
+        }
+        Ok(total)
     }
 
     fn logical_index_bytes(&self, ix: &Index) -> usize {
@@ -5428,6 +5486,7 @@ impl Saturation {
         };
         let all = (0..ctx.len() as Ex).chain((0..count).map(|i| base + i));
         let mut affected: FxHashSet<Ex> = FxHashSet::default();
+        let mut queue: Vec<Ex> = Vec::new();
         #[cfg(test)]
         admission_test::hit(admission_test::Point::InvalidateInitialStart);
         for e in all.clone() {
@@ -5466,8 +5525,8 @@ impl Saturation {
             {
                 hit = true;
             }
-            if hit {
-                affected.insert(e);
+            if hit && affected.insert(e) {
+                queue.push(e);
             }
         }
         #[cfg(test)]
@@ -5479,7 +5538,6 @@ impl Saturation {
         // context that registered with one as its predecessor, which took its clauses
         // over the predecessor, and the class whose subsumer a test that held gave
         let tests = ix.dl.is_some();
-        let mut queue: Vec<Ex> = affected.iter().copied().collect();
         #[cfg(test)]
         admission_test::hit(admission_test::Point::InvalidateClosureStart);
         while let Some(e) = queue.pop() {
@@ -5487,19 +5545,35 @@ impl Saturation {
             let Some(c) = ctx_of(e) else { continue };
             let st = c.st.lock();
             for (_, srcs) in &st.back {
+                #[cfg(test)]
+                if srcs.list.len() > POLL_INVALIDATE {
+                    admission_test::hit(admission_test::Point::InvalidateBackListStart);
+                }
                 for &s in &srcs.list {
                     if affected.insert(s) {
                         queue.push(s);
                     }
                     tick(1)?;
                 }
+                #[cfg(test)]
+                if srcs.list.len() > POLL_INVALIDATE {
+                    admission_test::hit(admission_test::Point::InvalidateBackListEnd);
+                }
             }
             if let Some(d) = dl_rules::dl(&st) {
+                #[cfg(test)]
+                if d.dpreds.len() > POLL_INVALIDATE {
+                    admission_test::hit(admission_test::Point::InvalidateDlPredsStart);
+                }
                 for &(u, _) in &d.dpreds {
                     if affected.insert(u) {
                         queue.push(u);
                     }
                     tick(1)?;
+                }
+                #[cfg(test)]
+                if d.dpreds.len() > POLL_INVALIDATE {
+                    admission_test::hit(admission_test::Point::InvalidateDlPredsEnd);
                 }
             }
             if tests
@@ -6357,7 +6431,7 @@ impl<'a> WorldBudget<'a> {
                 return false;
             }
         }
-        let why = if limits.deadline.is_some_and(|d| Instant::now() >= d) {
+        let why = if limits.deadline.is_some_and(deadline_passed) {
             WORLD_TIMEOUT
         } else if limits.cancelled.as_ref().is_some_and(|f| f()) {
             WORLD_CANCEL
@@ -6464,8 +6538,17 @@ pub(super) fn last_adaptive_preadmit() -> Option<(usize, usize, usize)> {
     LAST_ADAPTIVE_PREADMIT.with(|c| c.get())
 }
 
+#[inline]
+pub(super) fn deadline_passed(deadline: Instant) -> bool {
+    #[cfg(test)]
+    if admission_test::is_deadline_expired(deadline) {
+        return true;
+    }
+    Instant::now() >= deadline
+}
+
 fn poll(limits: &Limits) -> Result<(), Error> {
-    if limits.deadline.is_some_and(|d| Instant::now() >= d) {
+    if limits.deadline.is_some_and(deadline_passed) {
         return Err(Error::Timeout);
     }
     if limits.cancelled.as_ref().is_some_and(|f| f()) {
@@ -9492,10 +9575,15 @@ mod tests {
         assert_eq!(recovered.taxonomy, want.taxonomy);
     }
 
-    /// Cooperative polling in `invalidate_changed` (Item 753 Phase 1): both a reverse-dependency
-    /// chain with 1 edge per context (`edges == 1`, > 4096 nodes) and a single high-fan-in
-    /// successor (> 4096 predecessors) poll inside the BFS closure itself, cancel before
-    /// `InvalidateClosureEnd`, and recover cleanly.
+    /// Cooperative polling in `invalidate_changed` (Item 753 Phase 1):
+    /// 1. A 4500-node reverse-dependency chain (`edges == 1`) cancels inside the BFS closure
+    ///    loop (`InvalidateClosureStart..InvalidateClosureEnd`).
+    /// 2. A single high-fan-in successor (`:Hub`, 4500 predecessors in `st.back`) cancels
+    ///    strictly inside `InvalidateBackListStart..InvalidateBackListEnd`.
+    /// 3. A single high-fan-in eager DL successor (4500 predecessors in `d.dpreds`) cancels
+    ///    strictly inside `InvalidateDlPredsStart..InvalidateDlPredsEnd`.
+    /// 4. A 4500-context seed set cancels inside `InvalidateInitialStart..InvalidateInitialEnd`
+    ///    with no unpolled seed-copy pass before `InvalidateClosureStart`.
     #[test]
     fn invalidate_changed_polls_chain_and_high_fan_in_and_recovers() {
         let eager = Limits {
@@ -9509,7 +9597,11 @@ mod tests {
                 .axioms
         };
 
-        let assert_closure_cancels = |base: &[Axiom], edit: &[Axiom], label: &str| {
+        let assert_point_window_cancels = |base: &[Axiom],
+                                           edit: &[Axiom],
+                                           start_pt: admission_test::Point,
+                                           end_pt: admission_test::Point,
+                                           label: &str| {
             let mut k_ok = Classifier::of(base);
             let base_out = k_ok.classify(&eager).unwrap();
             assert_eq!(base_out.stats.tier, Tier::Disjunctive);
@@ -9525,32 +9617,30 @@ mod tests {
             let mut k = Classifier::of(base);
             k.classify(&eager).unwrap();
             k.add(edit);
-            let in_closure = Arc::new(AtomicBool::new(false));
+            let in_window = Arc::new(AtomicBool::new(false));
             let saw_start = Arc::new(AtomicBool::new(false));
             let saw_end = Arc::new(AtomicBool::new(false));
-            let closure_polls = Arc::new(AtomicUsize::new(0));
-            let ic_hook = in_closure.clone();
-            let ic_poll = in_closure.clone();
+            let window_polls = Arc::new(AtomicUsize::new(0));
+            let iw_hook = in_window.clone();
+            let iw_poll = in_window.clone();
             let ss = saw_start.clone();
             let se = saw_end.clone();
-            let cp = closure_polls.clone();
+            let wp = window_polls.clone();
             let err = admission_test::with_hook(
-                move |pt| match pt {
-                    admission_test::Point::InvalidateClosureStart => {
+                move |pt| {
+                    if pt == start_pt {
                         ss.store(true, Ordering::SeqCst);
-                        ic_hook.store(true, Ordering::SeqCst);
-                    }
-                    admission_test::Point::InvalidateClosureEnd => {
-                        ic_hook.store(false, Ordering::SeqCst);
+                        iw_hook.store(true, Ordering::SeqCst);
+                    } else if pt == end_pt {
+                        iw_hook.store(false, Ordering::SeqCst);
                         se.store(true, Ordering::SeqCst);
                     }
-                    _ => {}
                 },
                 || {
                     k.classify(&Limits {
                         cancelled: Some(Arc::new(move || {
-                            if ic_poll.load(Ordering::SeqCst) {
-                                cp.fetch_add(1, Ordering::SeqCst);
+                            if iw_poll.load(Ordering::SeqCst) {
+                                wp.fetch_add(1, Ordering::SeqCst);
                                 true
                             } else {
                                 false
@@ -9564,22 +9654,23 @@ mod tests {
             assert!(matches!(err, Error::Cancelled), "{label}: {err:?}");
             assert!(
                 saw_start.load(Ordering::SeqCst),
-                "{label}: InvalidateClosureStart was not reached"
+                "{label}: {start_pt:?} was not reached"
             );
             assert!(
-                closure_polls.load(Ordering::SeqCst) > 0,
-                "{label}: no cooperative poll ran inside BFS closure"
+                window_polls.load(Ordering::SeqCst) > 0,
+                "{label}: no cooperative poll ran between {start_pt:?} and {end_pt:?}"
             );
             assert!(
                 !saw_end.load(Ordering::SeqCst),
-                "{label}: BFS closure finished without stopping on cancellation"
+                "{label}: reached {end_pt:?} without stopping on cancellation"
             );
             let recovered = k.classify(&eager).unwrap();
             assert!(!recovered.stats.incremental);
             assert_eq!(recovered.taxonomy, ok.taxonomy);
         };
 
-        // Case 1: 4500-node reverse-dependency chain with 1 backward edge per context.
+        // Case 1: 4500-node reverse-dependency chain with 1 backward edge per context
+        // (verifies polling across closure queue pops).
         let mut chain_body = String::from(
             "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\nSubClassOf(:Q :R)\n",
         );
@@ -9591,9 +9682,16 @@ mod tests {
         }
         let chain_base = parse(&chain_body);
         let chain_edit = parse("SubClassOf(:C4500 :Target)");
-        assert_closure_cancels(&chain_base, &chain_edit, "4500-node chain");
+        assert_point_window_cancels(
+            &chain_base,
+            &chain_edit,
+            admission_test::Point::InvalidateClosureStart,
+            admission_test::Point::InvalidateClosureEnd,
+            "4500-node chain",
+        );
 
-        // Case 2: Single high-fan-in successor `:Hub` with 4500 predecessors in `st.back`.
+        // Case 2: Single high-fan-in successor `:Hub` with 4500 predecessors in `st.back`:
+        // cancellation is armed strictly inside `:Hub`'s predecessor list walk.
         let mut fan_body = String::from(
             "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\nSubClassOf(:Q :R)\n",
         );
@@ -9604,7 +9702,52 @@ mod tests {
         }
         let fan_base = parse(&fan_body);
         let fan_edit = parse("SubClassOf(:Hub :Target)");
-        assert_closure_cancels(&fan_base, &fan_edit, "4500-predecessor fan-in");
+        assert_point_window_cancels(
+            &fan_base,
+            &fan_edit,
+            admission_test::Point::InvalidateBackListStart,
+            admission_test::Point::InvalidateBackListEnd,
+            "4500-predecessor st.back fan-in",
+        );
+
+        // Case 3: Single high-fan-in eager DL successor (`:HubA ⊓ :HubB`) with 4500
+        // predecessors in `d.dpreds`: cancellation is armed strictly inside `d.dpreds`.
+        let mut dl_fan_body = String::from(
+            "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\nSubClassOf(:Q :R)\n",
+        );
+        for i in 0..4500usize {
+            dl_fan_body.push_str(&format!(
+                "SubClassOf(:D{i} ObjectSomeValuesFrom(:r :HubA))\n\
+                 SubClassOf(:D{i} ObjectAllValuesFrom(:r :HubB))\n"
+            ));
+        }
+        let dl_fan_base = parse(&dl_fan_body);
+        let dl_fan_edit = parse("SubClassOf(:HubA :Target)");
+        assert_point_window_cancels(
+            &dl_fan_base,
+            &dl_fan_edit,
+            admission_test::Point::InvalidateDlPredsStart,
+            admission_test::Point::InvalidateDlPredsEnd,
+            "4500-predecessor d.dpreds fan-in",
+        );
+
+        // Case 4: 4500 seed-affected contexts all holding `:Seed`; initial scan enqueues
+        // hits directly without an unpolled post-scan `.collect()` copy.
+        let mut seed_body = String::from(
+            "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\nSubClassOf(:Q :R)\n",
+        );
+        for i in 0..4500usize {
+            seed_body.push_str(&format!("SubClassOf(:S{i} :Seed)\n"));
+        }
+        let seed_base = parse(&seed_body);
+        let seed_edit = parse("SubClassOf(:Seed :Target)");
+        assert_point_window_cancels(
+            &seed_base,
+            &seed_edit,
+            admission_test::Point::InvalidateInitialStart,
+            admission_test::Point::InvalidateInitialEnd,
+            "4500-seed initial scan",
+        );
     }
 
     /// Cooperative polling inside `invalidate_changed` for large dynamic cores and large
@@ -9738,8 +9881,10 @@ mod tests {
         assert_eq!(recovered.taxonomy, core_want.taxonomy);
 
         // End-to-end kept context whose subsumer `:M` belongs to 4500 unchanged disjoint sets:
-        // an unrelated `DisjointClasses(:Z0 :Z1)` renumbers sets and triggers `reindex_disjoint_poll`,
-        // which cancels strictly inside `DisjointReindex..DisjointReindexEnd` and recovers.
+        // an unrelated `DisjointClasses(:Z0 :Z1)` renumbers sets and triggers
+        // `reindex_disjoint_poll`, which cancels strictly inside `:M`'s 4500-membership loop
+        // (`DisjointMembersStart..DisjointMembersEnd`), not in short `:D{i}` contexts or
+        // subsumer loops, and recovers cleanly.
         let mut disj_body = String::from(
             "SubClassOf(:U ObjectUnionOf(:P :Q))\n\
              SubClassOf(:P :R)\nSubClassOf(:Q :R)\n\
@@ -9753,33 +9898,76 @@ mod tests {
         let mut kd = Classifier::of(&disj_base);
         let base_out = kd.classify(&eager).unwrap();
         assert_eq!(base_out.stats.tier, Tier::Disjunctive);
+
+        // Direct unit check on `State::reindex_disjoint_poll`: a single-subsumer state whose
+        // subsumer `:M` belongs to 4500 disjoint sets ticks only 2 times across the two outer
+        // subsumer loops, so crossing `POLL_INVALIDATE` must happen inside the membership loop.
+        {
+            let m_id = kd
+                .sat
+                .interner
+                .get(&Node::Class(
+                    kd.sat
+                        .interner
+                        .classes
+                        .iter()
+                        .position(|c| c.as_str() == "http://ex.org/M")
+                        .unwrap() as u32,
+                ))
+                .unwrap();
+            let ix_ref = kd.sat.index.as_ref().expect("classified index");
+            assert!(ix_ref.disjoint(m_id).len() >= 4500);
+            let mut st = saturate::State {
+                init: true,
+                ..Default::default()
+            };
+            st.subs.insert(m_id);
+            let mut ticks = 0usize;
+            let err = st
+                .reindex_disjoint_poll(ix_ref, &mut |w| {
+                    ticks += w;
+                    if ticks >= POLL_INVALIDATE {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert!(matches!(err, Error::Cancelled));
+            assert_eq!(ticks, POLL_INVALIDATE);
+            assert!(
+                st.disj.len() < 4500,
+                "expected membership loop to stop before inserting all 4500 disjoint entries"
+            );
+        }
+
         kd.add(&disj_edit);
-        let in_reindex = Arc::new(AtomicBool::new(false));
-        let reindex_starts = Arc::new(AtomicUsize::new(0));
-        let reindex_ends = Arc::new(AtomicUsize::new(0));
-        let reindex_polls = Arc::new(AtomicUsize::new(0));
-        let ir_hook = in_reindex.clone();
-        let ir_poll = in_reindex.clone();
-        let rs = reindex_starts.clone();
-        let re = reindex_ends.clone();
-        let rp = reindex_polls.clone();
+        let in_members = Arc::new(AtomicBool::new(false));
+        let saw_members_start = Arc::new(AtomicBool::new(false));
+        let saw_members_end = Arc::new(AtomicBool::new(false));
+        let member_polls = Arc::new(AtomicUsize::new(0));
+        let im_hook = in_members.clone();
+        let im_poll = in_members.clone();
+        let sms = saw_members_start.clone();
+        let sme = saw_members_end.clone();
+        let mp = member_polls.clone();
         let err = admission_test::with_hook(
             move |pt| match pt {
-                admission_test::Point::DisjointReindex => {
-                    rs.fetch_add(1, Ordering::SeqCst);
-                    ir_hook.store(true, Ordering::SeqCst);
+                admission_test::Point::DisjointMembersStart => {
+                    sms.store(true, Ordering::SeqCst);
+                    im_hook.store(true, Ordering::SeqCst);
                 }
-                admission_test::Point::DisjointReindexEnd => {
-                    ir_hook.store(false, Ordering::SeqCst);
-                    re.fetch_add(1, Ordering::SeqCst);
+                admission_test::Point::DisjointMembersEnd => {
+                    im_hook.store(false, Ordering::SeqCst);
+                    sme.store(true, Ordering::SeqCst);
                 }
                 _ => {}
             },
             || {
                 kd.classify(&Limits {
                     cancelled: Some(Arc::new(move || {
-                        if ir_poll.load(Ordering::SeqCst) {
-                            rp.fetch_add(1, Ordering::SeqCst);
+                        if im_poll.load(Ordering::SeqCst) {
+                            mp.fetch_add(1, Ordering::SeqCst);
                             true
                         } else {
                             false
@@ -9792,21 +9980,16 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Cancelled), "{err:?}");
         assert!(
-            reindex_starts.load(Ordering::SeqCst) > 0,
-            "DisjointReindex was not reached"
+            saw_members_start.load(Ordering::SeqCst),
+            "DisjointMembersStart was not reached on :M's 4500-membership list"
         );
         assert!(
-            reindex_polls.load(Ordering::SeqCst) > 0,
-            "no cooperative poll ran inside reindex_disjoint_poll over 4500 memberships"
+            member_polls.load(Ordering::SeqCst) > 0,
+            "no cooperative poll ran inside the 4500-entry disjoint membership loop"
         );
         assert!(
-            in_reindex.load(Ordering::SeqCst),
-            "cancellation did not terminate an active reindex_disjoint_poll before DisjointReindexEnd"
-        );
-        assert_eq!(
-            reindex_starts.load(Ordering::SeqCst),
-            reindex_ends.load(Ordering::SeqCst) + 1,
-            "expected active reindex_disjoint_poll to stop before DisjointReindexEnd"
+            !saw_members_end.load(Ordering::SeqCst),
+            "disjoint membership loop completed without stopping on cancellation"
         );
         let mut disj_held = disj_base.clone();
         disj_held.extend(disj_edit);
@@ -10273,6 +10456,299 @@ mod tests {
             &Class::new("http://ex.org/A"),
             &Class::new("http://ex.org/D")
         ));
+    }
+
+    /// Polled rebuilt index and normalized-axiom accounting (Item 753 Phase 1):
+    /// `index_bytes_poll` and `Axioms::bytes_poll` match `index_bytes`/`Axioms::bytes` exactly,
+    /// stop cooperatively inside `RebaseAccountStart..RebaseAccountEnd` on >4096 Tier D clauses
+    /// before `RebaseScratchStart`/`RebaseAdmit`/`RebaseShift`, and recover cleanly.
+    #[test]
+    fn rebase_pre_account_polls_and_matches_bytes() {
+        let eager = Limits {
+            threads: 1,
+            expansion: Expansion::Eager,
+            ..Limits::default()
+        };
+        let mut body = String::new();
+        for i in 0..4200usize {
+            body.push_str(&format!("SubClassOf(:C{i} ObjectUnionOf(:P{i} :Q{i}))\n"));
+        }
+        let base =
+            crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
+                .unwrap()
+                .axioms;
+        let edit = crate::ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)\nOntology(\nSubClassOf(:FreshAccount :P0)\n)",
+        )
+        .unwrap()
+        .axioms;
+
+        let mut k = Classifier::of(&base);
+        let first = k.classify(&eager).unwrap();
+        assert_eq!(first.stats.tier, Tier::Disjunctive);
+        let ix_ref = k.sat.index.as_ref().expect("classified index");
+        let exact = k.sat.index_bytes(ix_ref);
+        let mut noop_ticks = 0usize;
+        let polled = k
+            .sat
+            .index_bytes_poll(ix_ref, &mut |w| {
+                noop_ticks += w;
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+        assert_eq!(polled, exact);
+        assert!(
+            noop_ticks > POLL_INVALIDATE,
+            "expected > {POLL_INVALIDATE} accounting ticks, got {noop_ticks}"
+        );
+        let mut stop_ticks = 0usize;
+        let err = k
+            .sat
+            .index_bytes_poll(ix_ref, &mut |w| {
+                stop_ticks += w;
+                if stop_ticks >= POLL_INVALIDATE {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::Cancelled));
+        assert_eq!(stop_ticks, POLL_INVALIDATE);
+
+        k.add(&edit);
+        let in_account = Arc::new(AtomicBool::new(false));
+        let saw_start = Arc::new(AtomicBool::new(false));
+        let saw_end = Arc::new(AtomicBool::new(false));
+        let saw_scratch = Arc::new(AtomicBool::new(false));
+        let saw_admit = Arc::new(AtomicBool::new(false));
+        let saw_shift = Arc::new(AtomicBool::new(false));
+        let account_polls = Arc::new(AtomicUsize::new(0));
+        let ia_hook = in_account.clone();
+        let ia_poll = in_account.clone();
+        let ss = saw_start.clone();
+        let se = saw_end.clone();
+        let sscr = saw_scratch.clone();
+        let sadm = saw_admit.clone();
+        let ssh = saw_shift.clone();
+        let ap = account_polls.clone();
+        let err = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::RebaseAccountStart => {
+                    ss.store(true, Ordering::SeqCst);
+                    ia_hook.store(true, Ordering::SeqCst);
+                }
+                admission_test::Point::RebaseAccountEnd => {
+                    ia_hook.store(false, Ordering::SeqCst);
+                    se.store(true, Ordering::SeqCst);
+                }
+                admission_test::Point::RebaseScratchStart => sscr.store(true, Ordering::SeqCst),
+                admission_test::Point::RebaseAdmit { .. } => sadm.store(true, Ordering::SeqCst),
+                admission_test::Point::RebaseShift => ssh.store(true, Ordering::SeqCst),
+                _ => {}
+            },
+            || {
+                k.classify(&Limits {
+                    cancelled: Some(Arc::new(move || {
+                        if ia_poll.load(Ordering::SeqCst) {
+                            ap.fetch_add(1, Ordering::SeqCst);
+                            true
+                        } else {
+                            false
+                        }
+                    })),
+                    ..eager.clone()
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(saw_start.load(Ordering::SeqCst));
+        assert!(
+            account_polls.load(Ordering::SeqCst) > 0,
+            "no cooperative poll ran inside rebuilt index/axiom accounting"
+        );
+        assert!(
+            !saw_end.load(Ordering::SeqCst),
+            "RebaseAccountEnd ran despite cancellation inside accounting"
+        );
+        assert!(!saw_scratch.load(Ordering::SeqCst));
+        assert!(!saw_admit.load(Ordering::SeqCst));
+        assert!(!saw_shift.load(Ordering::SeqCst));
+
+        let mut held = base.clone();
+        held.extend(edit);
+        let want = Classifier::of(&held).classify(&eager).unwrap();
+        let recovered = k.classify(&eager).unwrap();
+        assert!(!recovered.stats.incremental);
+        assert_eq!(recovered.taxonomy, want.taxonomy);
+    }
+
+    /// Phase-verified deadline timeouts under `Expansion::Eager` (Item 753 Phase 1): using a
+    /// controlled future deadline (`TestDeadline::future()`, immune to runner scheduling delays),
+    /// prove `Error::Timeout` and clean fresh recovery when the deadline expires strictly inside:
+    /// 1. kept invalidation (`InvalidateClosureStart..InvalidateClosureEnd`), and
+    /// 2. kept saturation (`KeptSaturationStart..KeptSaturationEnd`, after the first in-saturation
+    ///    poll passes unexpired) on both 1 and 4 threads.
+    #[test]
+    fn eager_kept_phase_deadline_stops_and_recovers() {
+        let parse = |body: &str| {
+            crate::ofn_read::parse(&format!("Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n)"))
+                .unwrap()
+                .axioms
+        };
+
+        // 1. Deadline crossing strictly inside kept invalidation closure.
+        let mut inv_body = String::from(
+            "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\nSubClassOf(:Q :R)\n",
+        );
+        for i in 0..4500usize {
+            inv_body.push_str(&format!(
+                "SubClassOf(:C{i} ObjectSomeValuesFrom(:r :C{}))\n",
+                i + 1
+            ));
+        }
+        let inv_base = parse(&inv_body);
+        let inv_edit = parse("SubClassOf(:C4500 :Target)");
+        let eager_1t = Limits {
+            threads: 1,
+            expansion: Expansion::Eager,
+            ..Limits::default()
+        };
+        let mut k_inv = Classifier::of(&inv_base);
+        k_inv.classify(&eager_1t).unwrap();
+        k_inv.add(&inv_edit);
+
+        let clock = Arc::new(admission_test::TestDeadline::future());
+        let deadline = clock.instant();
+        let clk_hook = clock.clone();
+        let saw_start = Arc::new(AtomicBool::new(false));
+        let saw_end = Arc::new(AtomicBool::new(false));
+        let ss = saw_start.clone();
+        let se = saw_end.clone();
+        let err = admission_test::with_hook(
+            move |pt| match pt {
+                admission_test::Point::InvalidateClosureStart => {
+                    ss.store(true, Ordering::SeqCst);
+                    clk_hook.expire();
+                }
+                admission_test::Point::InvalidateClosureEnd => {
+                    se.store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            },
+            || {
+                k_inv.classify(&Limits {
+                    deadline: Some(deadline),
+                    ..eager_1t.clone()
+                })
+            },
+        )
+        .unwrap_err();
+        drop(clock);
+        assert!(
+            matches!(err, Error::Timeout),
+            "expected Timeout, got {err:?}"
+        );
+        assert!(saw_start.load(Ordering::SeqCst));
+        assert!(
+            !saw_end.load(Ordering::SeqCst),
+            "invalidation closure completed despite deadline expiring at entry"
+        );
+        let mut inv_held = inv_base.clone();
+        inv_held.extend(inv_edit);
+        let inv_want = Classifier::of(&inv_held).classify(&eager_1t).unwrap();
+        let inv_rec = k_inv.classify(&eager_1t).unwrap();
+        assert!(!inv_rec.stats.incremental);
+        assert_eq!(inv_rec.taxonomy, inv_want.taxonomy);
+
+        // 2. Deadline crossing strictly inside kept saturation on 1 and 4 threads.
+        // A 350-class transitive chain invalidated at its top triggers >60,000 kept-saturation
+        // conclusions so worker threads hit `CHECK_EVERY = 4096` multiple times on 1 and 4 threads.
+        let mut sat_body = String::from(
+            "SubClassOf(:U ObjectUnionOf(:P :Q))\nSubClassOf(:P :R)\nSubClassOf(:Q :R)\n",
+        );
+        for i in 0..350usize {
+            sat_body.push_str(&format!("SubClassOf(:T{i} :T{})\n", i + 1));
+        }
+        let sat_base = parse(&sat_body);
+        let sat_edit = parse("SubClassOf(:T350 :Done)");
+        let mut sat_held = sat_base.clone();
+        sat_held.extend(sat_edit.clone());
+
+        for threads in [1usize, 4] {
+            let lim = Limits {
+                threads,
+                expansion: Expansion::Eager,
+                ..Limits::default()
+            };
+            let want = Classifier::of(&sat_held).classify(&lim).unwrap();
+            let mut k = Classifier::of(&sat_base);
+            let first = k.classify(&lim).unwrap();
+            assert_eq!(first.stats.tier, Tier::Disjunctive);
+            k.add(&sat_edit);
+
+            let clock = Arc::new(admission_test::TestDeadline::future());
+            let deadline = clock.instant();
+            let in_sat = Arc::new(AtomicBool::new(false));
+            let saw_sat_start = Arc::new(AtomicBool::new(false));
+            let saw_sat_timeout = Arc::new(AtomicBool::new(false));
+            let sat_polls = Arc::new(AtomicUsize::new(0));
+            let is_hook = in_sat.clone();
+            let is_poll = in_sat.clone();
+            let sss = saw_sat_start.clone();
+            let sst = saw_sat_timeout.clone();
+            let sp = sat_polls.clone();
+            let clk_poll = clock.clone();
+            let err = admission_test::with_hook(
+                move |pt| match pt {
+                    admission_test::Point::KeptSaturationStart => {
+                        sss.store(true, Ordering::SeqCst);
+                        is_hook.store(true, Ordering::SeqCst);
+                    }
+                    admission_test::Point::KeptSaturationEnd { stopped_by_timeout } => {
+                        is_hook.store(false, Ordering::SeqCst);
+                        sst.store(stopped_by_timeout, Ordering::SeqCst);
+                    }
+                    _ => {}
+                },
+                || {
+                    k.classify(&Limits {
+                        deadline: Some(deadline),
+                        cancelled: Some(Arc::new(move || {
+                            if is_poll.load(Ordering::SeqCst) {
+                                sp.fetch_add(1, Ordering::SeqCst);
+                                clk_poll.expire();
+                            }
+                            false
+                        })),
+                        ..lim.clone()
+                    })
+                },
+            )
+            .unwrap_err();
+            drop(clock);
+            assert!(
+                matches!(err, Error::Timeout),
+                "expected Timeout during kept saturation ({threads}t), got {err:?}"
+            );
+            assert!(
+                saw_sat_start.load(Ordering::SeqCst),
+                "KeptSaturationStart was not reached ({threads}t)"
+            );
+            assert!(
+                sat_polls.load(Ordering::SeqCst) > 0,
+                "expected at least one in-saturation poll before expiring deadline ({threads}t)"
+            );
+            assert!(
+                saw_sat_timeout.load(Ordering::SeqCst),
+                "saturate_counted did not stop with Stop::Timeout ({threads}t)"
+            );
+            let recovered = k.classify(&lim).unwrap();
+            assert!(!recovered.stats.incremental);
+            assert_eq!(recovered.taxonomy, want.taxonomy);
+            assert_eq!(recovered.consistency, want.consistency);
+        }
     }
 }
 

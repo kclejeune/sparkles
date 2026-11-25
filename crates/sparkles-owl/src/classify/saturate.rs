@@ -728,9 +728,18 @@ impl State {
         }
         for &d in &self.subs {
             tick(1)?;
-            for &s in ix.disjoint(d) {
+            let members = ix.disjoint(d);
+            #[cfg(test)]
+            if members.len() > super::POLL_INVALIDATE {
+                super::admission_test::hit(super::admission_test::Point::DisjointMembersStart);
+            }
+            for &s in members {
                 tick(1)?;
                 self.disj.entry(s).or_insert(d);
+            }
+            #[cfg(test)]
+            if members.len() > super::POLL_INVALIDATE {
+                super::admission_test::hit(super::admission_test::Point::DisjointMembersEnd);
             }
         }
         Ok(())
@@ -3541,7 +3550,7 @@ impl<'a> Run<'a> {
             self.halt(STOP_WORK);
             return false;
         }
-        if b.deadline.is_some_and(|d| Instant::now() >= d) {
+        if b.deadline.is_some_and(super::deadline_passed) {
             self.halt(STOP_TIMEOUT);
             return false;
         }

@@ -409,34 +409,9 @@ impl DlIx {
         !self.counting || self.carry.get(t as usize).copied().unwrap_or(false)
     }
 
-    pub fn bytes(&self) -> usize {
-        self.clauses
-            .iter()
-            .map(|(b, h)| 40 + (b.len() + h.len()) * 4)
-            .sum::<usize>()
-            + self
-                .by_body
-                .values()
-                .map(|v| 48 + v.capacity() * 4)
-                .sum::<usize>()
-            + self
-                .sets
-                .iter()
-                .map(|s| 24 + s.capacity() * 4)
-                .sum::<usize>()
-            + table_bytes(self.hyp.capacity(), 8) * 2
-            + self.cores.values().map(|c| 24 + c.len() * 4).sum::<usize>()
-            + self
-                .by_succ
-                .values()
-                .map(|v| 32 + v.capacity() * 4)
-                .sum::<usize>()
+    pub fn bytes_poll<E>(&self, tick: &mut impl FnMut(usize) -> Result<(), E>) -> Result<usize, E> {
+        let mut total = table_bytes(self.hyp.capacity(), 8) * 2
             + self.reach.len()
-            + self
-                .below
-                .iter()
-                .map(|v| 24 + v.capacity() * 4)
-                .sum::<usize>()
             + self.quals.capacity() * 8
             + table_bytes(self.quals_of.capacity(), 32)
             + table_bytes(self.atmost.capacity(), 12)
@@ -445,11 +420,42 @@ impl DlIx {
             + self.carry.capacity()
             + self.consts.capacity() * 8
             + table_bytes(self.ne_of.capacity(), 32)
-            + self.ne_of.values().map(|v| v.capacity() * 4).sum::<usize>()
             + table_bytes(self.blockers.capacity(), 24)
-            + self.blockers.values().map(|v| v.len() * 4).sum::<usize>()
             + table_bytes(self.witnesses.capacity(), 8)
-            + self.least.capacity()
+            + self.least.capacity();
+        for (b, h) in &self.clauses {
+            tick(1)?;
+            total += 40 + (b.len() + h.len()) * 4;
+        }
+        for v in self.by_body.values() {
+            tick(1)?;
+            total += 48 + v.capacity() * 4;
+        }
+        for s in &self.sets {
+            tick(1)?;
+            total += 24 + s.capacity() * 4;
+        }
+        for c in self.cores.values() {
+            tick(1)?;
+            total += 24 + c.len() * 4;
+        }
+        for v in self.by_succ.values() {
+            tick(1)?;
+            total += 32 + v.capacity() * 4;
+        }
+        for v in &self.below {
+            tick(1)?;
+            total += 24 + v.capacity() * 4;
+        }
+        for v in self.ne_of.values() {
+            tick(1)?;
+            total += v.capacity() * 4;
+        }
+        for v in self.blockers.values() {
+            tick(1)?;
+            total += v.len() * 4;
+        }
+        Ok(total)
     }
 
     pub fn logical_bytes(&self) -> usize {

@@ -57,14 +57,13 @@ pub struct HornAx {
 }
 
 impl HornAx {
-    pub fn bytes(&self) -> usize {
-        self.clash.capacity() * 8
-            + self.premises.capacity() * 4
-            + self
-                .autos
-                .values()
-                .map(|a| 64 + a.trans.capacity() * 16)
-                .sum::<usize>()
+    pub fn bytes_poll<E>(&self, tick: &mut impl FnMut(usize) -> Result<(), E>) -> Result<usize, E> {
+        let mut total = self.clash.capacity() * 8 + self.premises.capacity() * 4;
+        for a in self.autos.values() {
+            tick(1)?;
+            total += 64 + a.trans.capacity() * 16;
+        }
+        Ok(total)
     }
 
     pub fn logical_bytes(&self) -> usize {
