@@ -3242,23 +3242,28 @@ impl Store {
             let mut m = limit.read_limit().lock(mem)?;
             return match m.get_with(seq, &limit)? {
                 Some(snap) => {
+                    // Pins and the retention window can release this delta while a
+                    // prepared view still holds it. No shared history budget backs it.
+                    let delta_bytes = if C::ACCOUNTS {
+                        history_limited::preparation_delta_bytes(&snap.delta)
+                            .max(history_limited::SHARED_SNAPSHOT_BYTES)
+                    } else {
+                        history_limited::SHARED_SNAPSHOT_BYTES
+                    };
+                    let read_limit = limit.read_limit().holding(delta_bytes)?;
                     let generation_bytes =
                         if C::ACCOUNTS && !Arc::ptr_eq(&snap.generation, &live.generation) {
-                            snap.generation
-                                .retained_bytes_limited(&limit.read_limit())?
+                            snap.generation.retained_bytes_limited(&read_limit)?
                         } else {
                             0
                         };
-                    limit
-                        .read_limit()
-                        .holding(generation_bytes)?
-                        .check(history_limited::SHARED_SNAPSHOT_BYTES)?;
+                    read_limit.check(generation_bytes)?;
                     m.hits += 1;
                     Ok((
                         snap,
                         r,
                         history_limited::SnapshotCharge {
-                            delta_bytes: history_limited::SHARED_SNAPSHOT_BYTES,
+                            delta_bytes,
                             generation_bytes,
                         },
                     ))

@@ -307,7 +307,7 @@ fn shared_live_state_with_large_uncompacted_delta_resolves_within_allowance() {
 
 #[test]
 fn shared_cached_historical_state_resolves_while_private_replay_still_refuses() {
-    // 1. Persistent store: commit 1 has 50,000 uncompacted delta quads; commit 2
+    // Commit 1 has 50,000 uncompacted delta quads; commit 2
     //    advances head so commit 1 is historical.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
@@ -388,26 +388,21 @@ fn shared_cached_historical_state_resolves_while_private_replay_still_refuses() 
         Err(sparkles_core::Error::Timeout)
     ));
 
-    // 2. In-memory store with a retained historical snapshot in mem_history.
+    // In-memory pins can be removed while an admitted view still holds the delta.
     let mem = Store::in_memory(StoreOptions::default());
     let mc1 = insert_delta_quads(&mem, 0, 50_000, false);
     mem.create_snapshot("pinned", &At::Head, None).unwrap();
     let _mc2 = insert_delta_quads(&mem, 50_000, 1, false);
     let mut mem_r = Resolver::new(Control::none(), MEMORY_BYTES).unwrap();
-    let verified = mem_r
+    let err = mem_r
         .stored_fact(
-            "mem-cached",
+            "mem-pinned",
             &mem,
             Some(&all()),
             &fact(&mem, mc1, "urn:s49999", "urn:p", "v49999"),
         )
-        .unwrap();
-    assert_eq!(verified.commit, mc1);
-    assert!(
-        used(&mem_r) <= 16 << 10,
-        "in-memory retained snapshot over-charged: used={}",
-        used(&mem_r)
-    );
+        .unwrap_err();
+    assert_eq!(err.code(), "incomplete-evidence");
 }
 
 #[test]
@@ -599,6 +594,72 @@ fn evicted_cached_state_stays_accounted_in_history_budget_while_pinned_by_resolv
 }
 
 #[test]
+fn unpinned_memory_history_deltas_stay_charged_to_the_resolver() {
+    let store = Store::in_memory(StoreOptions::default());
+    assert_eq!(store.retention(), Default::default());
+    const QUADS: usize = 600;
+    const CAP: u64 = 2 << 20;
+    let make_past = |pin| {
+        let commit = insert_delta_quads(&store, 0, QUADS, false);
+        store.create_snapshot(pin, &At::Head, None).unwrap();
+
+        let mut txn = store.write();
+        let p = txn.intern(&Term::NamedNode(iri("urn:p"))).unwrap();
+        for i in 0..QUADS {
+            let s = txn
+                .intern(&Term::NamedNode(iri(&format!("urn:s{i}"))))
+                .unwrap();
+            let o = txn
+                .intern(&Term::Literal(Literal::new_simple_literal(format!("v{i}"))))
+                .unwrap();
+            assert!(txn.delete([s, p, o, Id::DEFAULT_GRAPH]).unwrap());
+        }
+        txn.commit().unwrap();
+        assert_eq!(store.snapshot().len(), 0);
+        commit
+    };
+
+    let access = all();
+    let mut r = Resolver::new(Control::none(), CAP).unwrap();
+    let c1 = make_past("first");
+    let first = fact(&store, c1, "urn:s0", "urn:p", "v0");
+    assert_eq!(
+        r.stored_fact("first", &store, Some(&access), &first)
+            .unwrap()
+            .commit,
+        c1
+    );
+    assert!(store.delete_snapshot("first").unwrap());
+    assert!(matches!(
+        store.snapshot_at(&At::Commit(c1), &HistoryOptions::default()),
+        Err(Error::HistoryGone(_))
+    ));
+    assert_eq!(
+        r.stored_fact("first-again", &store, Some(&access), &first)
+            .unwrap()
+            .commit,
+        c1
+    );
+
+    // Rebuilding from empty with the same quad IDs creates a distinct delta in the
+    // same generation. Each delta fits the cap by itself.
+    let c2 = make_past("second");
+    let second = fact(&store, c2, "urn:s0", "urn:p", "v0");
+    let err = r
+        .stored_fact("second", &store, Some(&access), &second)
+        .unwrap_err();
+    assert_eq!(err.code(), "incomplete-evidence");
+    let mut fresh = Resolver::new(Control::none(), CAP).unwrap();
+    assert_eq!(
+        fresh
+            .stored_fact("second", &store, Some(&access), &second)
+            .unwrap()
+            .commit,
+        c2
+    );
+}
+
+#[test]
 fn non_live_generation_cached_hits_charge_retained_generation_bytes() {
     for persistent in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -607,16 +668,16 @@ fn non_live_generation_cached_hits_charge_retained_generation_bytes() {
         } else {
             Store::in_memory(StoreOptions::default())
         };
-        // Insert 600 quads with 1,536-byte literals so the pre-compaction
-        // generation's DeltaVocab exceeds 900 KiB.
+        // Hold 1 MiB of literal payload in the pre-compaction dictionary with
+        // only 64 delta quads, whose retained charge fits in 512 KiB.
         let mut txn = store.write();
         let p = txn.intern(&Term::NamedNode(iri("urn:payload"))).unwrap();
         let mut first_val = String::new();
-        for i in 0..600 {
+        for i in 0..64 {
             let s = txn
                 .intern(&Term::NamedNode(iri(&format!("urn:item:{i}"))))
                 .unwrap();
-            let val = format!("{i:0>1536}");
+            let val = format!("{i:0>16384}");
             if i == 0 {
                 first_val = val.clone();
             }
@@ -644,9 +705,9 @@ fn non_live_generation_cached_hits_charge_retained_generation_bytes() {
 
         let target = fact(&store, c1, "urn:item:0", "urn:payload", &first_val);
 
-        // 128 KiB exceeds the 4 KiB delta handle plus read metadata, but is far
-        // below the non-live generation's >900 KiB dictionary and must refuse.
-        let mut tight = Resolver::new(Control::none(), 128 << 10).unwrap();
+        // The cap fits a delta handle or the full in-memory delta estimate
+        // plus view metadata. The dictionary must force the refusal.
+        let mut tight = Resolver::new(Control::none(), 512 << 10).unwrap();
         let err = tight
             .stored_fact("non-live-tight", &store, Some(&all()), &target)
             .unwrap_err();
@@ -663,8 +724,8 @@ fn non_live_generation_cached_hits_charge_retained_generation_bytes() {
             .unwrap();
         assert_eq!(verified.commit, c1);
         assert!(
-            used(&wide) >= 900_000,
-            "expected non-live generation charge >= 900 KiB, got {} (persistent={persistent})",
+            used(&wide) >= 1 << 20,
+            "expected at least 1 MiB for the non-live dictionary, got {} (persistent={persistent})",
             used(&wide)
         );
     }
@@ -730,6 +791,8 @@ fn prepare_read_and_evidence_view_charge_shared_live_delta_by_handle() {
 
 #[test]
 fn unopened_cold_branch_resolver_charges_private_delta_and_cold_generation() {
+    const PAYLOAD_QUADS: u64 = 64;
+    const PAYLOAD_BYTES: u64 = 16 << 10;
     let dir = tempfile::tempdir().unwrap();
     let (dataset_id, small_id, c_small, large_id, c_large) = {
         let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
@@ -738,7 +801,22 @@ fn unopened_cold_branch_resolver_charges_private_delta_and_cold_generation() {
             .create_branch("cold-small", &Default::default())
             .unwrap();
         let small_branch = store.branch("cold-small").unwrap();
-        let c_small = insert_delta_quads(&small_branch, 10, 200, false);
+        insert_delta_quads(&small_branch, 10, 1, false);
+        let mut txn = small_branch.write();
+        let p = txn.intern(&Term::NamedNode(iri("urn:payload"))).unwrap();
+        for i in 0..PAYLOAD_QUADS {
+            let s = txn
+                .intern(&Term::NamedNode(iri(&format!("urn:payload:{i}"))))
+                .unwrap();
+            let literal = Literal::new_simple_literal(format!(
+                "{i:0>width$}",
+                width = PAYLOAD_BYTES as usize
+            ));
+            let o = txn.intern(&Term::Literal(literal)).unwrap();
+            txn.insert([s, p, o, Id::DEFAULT_GRAPH]).unwrap();
+        }
+        txn.commit().unwrap();
+        let c_small = small_branch.head_commit().seq;
         let small_id = small_branch.branch_id();
         drop(small_branch);
 
@@ -775,10 +853,13 @@ fn unopened_cold_branch_resolver_charges_private_delta_and_cold_generation() {
         .unwrap();
     assert_eq!(verified.served_by, small_id);
     assert_eq!(verified.commit, c_small);
-    // 200 quads private delta (~528 KiB) + cold generation charge.
+    // The linked seed contributes one quad. The full private delta and view
+    // metadata alone are smaller than the dictionary's known literal payload.
+    let delta_bytes = (2 + PAYLOAD_QUADS) * 2048 + (128 << 10);
+    let generation_payload_bytes = PAYLOAD_QUADS * PAYLOAD_BYTES;
     assert!(
-        used(&r) >= 400_000,
-        "unopened cold branch replay must retain private delta + generation charge, got {}",
+        used(&r) >= delta_bytes + generation_payload_bytes,
+        "cold read must retain both the private delta and its dictionary, got {}",
         used(&r)
     );
 

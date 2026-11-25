@@ -922,8 +922,9 @@ pub(crate) struct HistoryState {
     /// the durable source holds on this store's commits, read when collecting
     pub(crate) held: Option<crate::holds::HeldView>,
     /// the byte budget the cached states are charged to, shared with other stores when
-    /// the server shares its caches. Individual cached snapshots own a [`BudgetHold`]
-    /// against this budget so evicted states stay accounted while any view pins them.
+    /// the server shares its caches. Individual cached snapshots own a
+    /// [`BudgetHold`](crate::store::caches::BudgetHold) against this budget so evicted
+    /// states stay accounted while any view pins them.
     pub budget: Arc<crate::store::caches::ByteBudget>,
 }
 

@@ -528,8 +528,8 @@ impl Resolver {
         }
         let (snapshot, served_by, charge) = read(&self.preparation)?;
         // The read was checked against the remaining allowance; what the request
-        // retains (a shared handle, or a freshly materialized private delta and any
-        // non-live sealed generation) stays charged while the view lives.
+        // retains (a shared handle or size-based delta charge, plus any non-live
+        // generation charge) stays charged while the view lives.
         let retained = self.preparation.reserve(charge.total())?;
         let view = access.masked_controlled(&snapshot, &self.preparation)?;
         drop(snapshot);

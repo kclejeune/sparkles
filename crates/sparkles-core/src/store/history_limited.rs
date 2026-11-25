@@ -468,8 +468,9 @@ pub(crate) const SHARED_SNAPSHOT_BYTES: u64 = 4096;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SnapshotCharge {
     /// Delta or shared-handle bytes the caller retains: [`SHARED_SNAPSHOT_BYTES`] for a
-    /// shared live or cached snapshot, or `preparation_delta_bytes(&delta)` (at least
-    /// [`SHARED_SNAPSHOT_BYTES`]) for a freshly materialized private historical snapshot.
+    /// shared live or cache-budgeted snapshot. A private replay or an in-memory
+    /// historical snapshot charges `preparation_delta_bytes(&delta)` with
+    /// [`SHARED_SNAPSHOT_BYTES`] as a minimum.
     pub(crate) delta_bytes: u64,
     /// Non-live sealed generation bytes retained by a cold or sealed historical snapshot
     /// (`0` when the snapshot shares the store's live generation).

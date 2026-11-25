@@ -241,9 +241,10 @@ published benchmark results.
 Bounded history reads and their callers (`snapshot_at_limited`,
 `snapshot_at_with_branch_limited`, `snapshot_of_branch_limited`, `evidence_view`,
 `prepare_read` and clean `WriteTxn::prepare_read_view`) distinguish already-resident
-shared snapshots from freshly materialized private replays. A live snapshot, an
-in-memory retained snapshot or a persistent history-cache hit charges a fixed 4 KiB
-handle cost for its shared delta rather than 2 KiB per delta quad, while still checking
+shared snapshots from states that need size-based delta accounting. A live snapshot
+or a persistent history-cache hit charges a fixed 4 KiB handle for its shared delta.
+An in-memory historical view charges its retained delta by size because it can
+outlive the last store pin or retention-window entry. Bounded reads still check
 cancellation, deadlines, the effective shared history capacity and any non-live sealed
 or pre-compaction generation's owned dictionary. A cached snapshot's store-level
 history-budget hold stays attached to the snapshot and any derived triple-masked
