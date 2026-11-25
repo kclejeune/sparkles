@@ -960,11 +960,687 @@ fn sparql_load_plans_and_semantics() {
     assert_eq!(s.snapshot().len(), 0);
 }
 
-/// Measures wall time, writer-lock hold time, concurrent reader latency, and peak RSS
-/// (`VmHWM`) for a large single-operation SPARQL `LOAD` (`file:` and `http:`) under the
-/// default bulk threshold versus forced transactional (`bulk_threshold = u64::MAX`).
-/// Filter with `SPARQL_LOAD_MODE=bulk|txn`, `SPARQL_LOAD_KIND=persistent|memory`, and
-/// `SPARQL_LOAD_SOURCE=file|http` so each arm can run in its own process for an exact
+#[test]
+fn sparql_load_silent_provenance_and_write_errors() {
+    use crate::error::Error;
+    use crate::guard::{
+        Candidate, CommitGuard, GuardMode, GuardStatus, PublishHook, Severity, ValidationSummary,
+    };
+    use crate::sparql::{QueryOptions, update::update};
+
+    struct InvalidGuard;
+    impl CommitGuard for InvalidGuard {
+        fn check(&self, _: &Candidate<'_>) -> crate::error::Result<ValidationSummary> {
+            Err(Error::invalid("guard configuration invalid"))
+        }
+        fn describe(&self) -> String {
+            "invalid-guard".into()
+        }
+    }
+
+    struct RejectGuard;
+    impl CommitGuard for RejectGuard {
+        fn check(&self, _: &Candidate<'_>) -> crate::error::Result<ValidationSummary> {
+            Ok(ValidationSummary::empty(
+                GuardStatus::Rejected,
+                GuardMode::Reject,
+                Severity::Violation,
+            ))
+        }
+        fn describe(&self) -> String {
+            "reject-guard".into()
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let small_file = tmp.path().join("small.nt");
+    let large_file = tmp.path().join("large.nt");
+    std::fs::write(&small_file, ntriples(100, E)).unwrap();
+    std::fs::write(&large_file, ntriples(200, E + 1)).unwrap();
+    let file_url = |p: &std::path::Path| format!("file://{}", p.display());
+
+    // 1. A write guard returning Error::Invalid MUST NOT be suppressed by LOAD SILENT on
+    // either the transactional or bulk plan.
+    for (label, path) in [("txn", &small_file), ("bulk", &large_file)] {
+        let s = seeded(2);
+        s.set_guard(Some(Arc::new(InvalidGuard)));
+        let err = update(
+            &s,
+            &format!("LOAD SILENT <{}>", file_url(path)),
+            &QueryOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid(ref m) if m.contains("guard configuration invalid")),
+            "{label}: {err:?}"
+        );
+        assert_eq!(s.snapshot().len(), 2, "{label}");
+    }
+
+    // 2. A write guard returning Rejected MUST NOT be suppressed by LOAD SILENT on bulk.
+    let s = seeded(2);
+    s.set_guard(Some(Arc::new(RejectGuard)));
+    let err = update(
+        &s,
+        &format!("LOAD SILENT <{}>", file_url(&large_file)),
+        &QueryOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Rejected(_)), "{err:?}");
+    assert_eq!(s.snapshot().len(), 2);
+
+    // 3. A before_publish hook returning Error::Invalid MUST NOT be suppressed by LOAD
+    // SILENT on either the transactional or bulk plan.
+    for (label, path) in [("txn", &small_file), ("bulk", &large_file)] {
+        let s = seeded(2);
+        let mut opts = QueryOptions::default();
+        opts.write.before_publish = Some(PublishHook::new(|| {
+            Err(Error::invalid("publish hook refused"))
+        }));
+        let err = update(&s, &format!("LOAD SILENT <{}>", file_url(path)), &opts).unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid(ref m) if m.contains("publish hook refused")),
+            "{label}: {err:?}"
+        );
+        assert_eq!(s.snapshot().len(), 2, "{label}");
+    }
+
+    // 4. Corrupt compressed file (.nt.zst with valid magic header and corrupt payload,
+    // which zstd reports as io::ErrorKind::Other) fails on LOAD and IS suppressed by
+    // LOAD SILENT on both small and large files.
+    #[cfg(feature = "zstd")]
+    {
+        for (label, pad) in [("small", 32usize), ("large", (E as usize + 10) * 80)] {
+            let corrupt = tmp.path().join(format!("corrupt_{label}.nt.zst"));
+            let mut data = vec![0x28u8, 0xb5, 0x2f, 0xfd]; // valid zstd frame magic
+            data.extend(std::iter::repeat_n(0xffu8, pad));
+            std::fs::write(&corrupt, data).unwrap();
+            let s = seeded(2);
+            let err = update(
+                &s,
+                &format!("LOAD <{}>", file_url(&corrupt)),
+                &QueryOptions::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Io(_)), "{label} LOAD: {err:?}");
+            let st = update(
+                &s,
+                &format!("LOAD SILENT <{}>", file_url(&corrupt)),
+                &QueryOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(st.inserted, 0, "{label} SILENT");
+            assert!(!st.commit.as_ref().unwrap().committed, "{label} SILENT");
+            assert_eq!(s.snapshot().len(), 2, "{label} SILENT");
+        }
+    }
+
+    // 5. LOAD SILENT with dry_run on a broken source preserves Error::DryRun via noop.
+    let broken = tmp.path().join("broken.nt");
+    std::fs::write(&broken, "<urn:broken \n").unwrap();
+    let s = seeded(2);
+    let mut dry = QueryOptions::default();
+    dry.write.dry_run = Some(Default::default());
+    let preview = crate::preview::catch(
+        update(&s, &format!("LOAD SILENT <{}>", file_url(&broken)), &dry)
+            .map(|st| st.commit.unwrap()),
+    )
+    .unwrap();
+    assert!(preview.commit.is_none());
+    assert_eq!(s.snapshot().len(), 2);
+}
+
+#[test]
+fn sparql_load_silent_preserves_outbound_limits_and_write_controls() {
+    use crate::error::Error;
+    use crate::outbound::OutboundPolicy;
+    use crate::sparql::{QueryOptions, update::update};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    type Handler = Arc<dyn Fn(&str, &mut std::net::TcpStream) + Send + Sync>;
+    let spawn_server = |handler: Handler| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let conns_bg = Arc::clone(&conns);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                conns_bg.fetch_add(1, Ordering::SeqCst);
+                let h = Arc::clone(&handler);
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut head = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && stream.read(&mut b).unwrap_or(0) == 1 {
+                        head.push(b[0]);
+                    }
+                    let req = String::from_utf8_lossy(&head);
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    h(&path, &mut stream);
+                });
+            }
+        });
+        (port, conns)
+    };
+
+    let big_nt = ntriples(0, 200); // 16,000 bytes
+    let mut gz_enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    gz_enc.write_all(&big_nt).unwrap();
+    let big_gz = gz_enc.finish().unwrap();
+
+    let big_nt_srv = big_nt.clone();
+    let big_gz_srv = big_gz.clone();
+    let (port, conns) = spawn_server(Arc::new(move |path, stream| match path {
+        "/declared.nt" => {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/n-triples\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                big_nt_srv.len()
+            );
+            let _ = stream.write_all(&big_nt_srv);
+        }
+        "/streamed.nt" => {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/n-triples\r\nconnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(&big_nt_srv);
+        }
+        "/big.nt.gz" => {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/n-triples\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                big_gz_srv.len()
+            );
+            let _ = stream.write_all(&big_gz_srv);
+        }
+        "/slow-headers.nt" => {
+            std::thread::sleep(Duration::from_millis(700));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/n-triples\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+        }
+        "/trickle.nt" => {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/n-triples\r\nconnection: close\r\n\r\n"
+            );
+            for _ in 0..20 {
+                if stream.write_all(b" ").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        }
+        "/trickle.nt.gz" => {
+            // Send valid gzip header bytes immediately, then trickle trailing bytes slowly
+            // so the gzip decoder blocks on raw HTTP body reads.
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/n-triples\r\nconnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(&big_gz_srv[..10.min(big_gz_srv.len())]);
+            for chunk in big_gz_srv[10.min(big_gz_srv.len())..].chunks(1) {
+                std::thread::sleep(Duration::from_millis(50));
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+            }
+        }
+        _ => {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/n-triples\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                big_nt_srv.len()
+            );
+            let _ = stream.write_all(&big_nt_srv);
+        }
+    }));
+    let url = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    // 1. Outbound raw response ceiling (both declared Content-Length and streamed) is NOT
+    // suppressed by LOAD SILENT.
+    for path in ["/declared.nt", "/streamed.nt"] {
+        let s = seeded(2);
+        let opts = QueryOptions {
+            outbound: OutboundPolicy {
+                allow_private: true,
+                max_response_bytes: 2048,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = update(&s, &format!("LOAD SILENT <{}>", url(path)), &opts).unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid(ref m) if m.contains("larger than the outbound limit")),
+            "{path}: {err:?}"
+        );
+        assert_eq!(s.snapshot().len(), 2, "{path}");
+    }
+
+    // 2. Outbound timeouts (headers and body trickle) are NOT suppressed by LOAD SILENT.
+    for path in ["/slow-headers.nt", "/trickle.nt"] {
+        let s = seeded(2);
+        let opts = QueryOptions {
+            outbound: OutboundPolicy {
+                allow_private: true,
+                timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = update(&s, &format!("LOAD SILENT <{}>", url(path)), &opts).unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid(ref m) if m.contains("no complete response within")),
+            "{path}: {err:?}"
+        );
+        assert_eq!(s.snapshot().len(), 2, "{path}");
+    }
+
+    // 3. Compressed decompression ceiling & request byte budget are NOT suppressed by LOAD SILENT.
+    let s = seeded(2);
+    let decomp_opts = QueryOptions {
+        outbound: OutboundPolicy {
+            allow_private: true,
+            max_response_bytes: (big_gz.len() as u64) + 64,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = update(
+        &s,
+        &format!("LOAD SILENT <{}>", url("/big.nt.gz")),
+        &decomp_opts,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::BudgetExceeded(_)), "decomp: {err:?}");
+
+    let budget_opts = QueryOptions {
+        outbound: OutboundPolicy {
+            allow_private: true,
+            max_request_bytes: 2048,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = update(
+        &s,
+        &format!("LOAD SILENT <{}>", url("/streamed.nt")),
+        &budget_opts,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::BudgetExceeded(_)), "budget: {err:?}");
+
+    // 4. Write-only cancel, cancellation and expired deadline stop LOAD before contacting
+    // the HTTP server (0 new connections).
+    let before = conns.load(Ordering::SeqCst);
+    let mut w_cancel = QueryOptions {
+        outbound: OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    w_cancel.write.cancel = Some(Arc::new(AtomicBool::new(true)));
+    let err = update(
+        &s,
+        &format!("LOAD SILENT <{}>", url("/declared.nt")),
+        &w_cancel,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Cancelled), "write.cancel: {err:?}");
+
+    let mut w_deadline = QueryOptions {
+        outbound: OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    w_deadline.write.deadline = Some(Instant::now() - Duration::from_secs(1));
+    let err = update(
+        &s,
+        &format!("LOAD SILENT <{}>", url("/declared.nt")),
+        &w_deadline,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Timeout), "write.deadline: {err:?}");
+
+    // 5. Stricter opts.write.graphs when opts.graphs is ALSO set rejects before fetching.
+    let mut stricter = QueryOptions {
+        outbound: OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+        graphs: Some(Arc::new(GraphAccess::graphs(
+            Graphs::All,
+            Graphs::Only(GraphRule::new(["http://ex.org/g"], &[])),
+        ))),
+        ..Default::default()
+    };
+    stricter.write.graphs = Some(Arc::new(GraphAccess::graphs(
+        Graphs::All,
+        Graphs::Only(GraphRule::new(["default"], &[])),
+    )));
+    let err = update(
+        &s,
+        &format!(
+            "LOAD SILENT <{}> INTO GRAPH <http://ex.org/g>",
+            url("/declared.nt")
+        ),
+        &stricter,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::NotPermitted(_)),
+        "stricter write.graphs: {err:?}"
+    );
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        before,
+        "pre-lock write controls and stricter write.graphs must reject before HTTP fetch"
+    );
+
+    // 6. A write-only deadline bounds slow HTTP headers AND a trickling compressed stream
+    // beneath the gzip decoder, returning Error::Timeout even under LOAD SILENT.
+    for path in ["/slow-headers.nt", "/trickle.nt.gz"] {
+        let mut opts = QueryOptions {
+            outbound: OutboundPolicy {
+                allow_private: true,
+                timeout: Duration::from_secs(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        opts.write.deadline = Some(Instant::now() + Duration::from_millis(180));
+        let t0 = Instant::now();
+        let err = update(&s, &format!("LOAD SILENT <{}>", url(path)), &opts).unwrap_err();
+        assert!(matches!(err, Error::Timeout), "{path}: {err:?}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "{path}: {:?}",
+            t0.elapsed()
+        );
+    }
+}
+
+#[test]
+fn sparql_load_repeat_ground_default_graph_flag_and_protected_preview() {
+    use crate::error::Error;
+    use crate::sparql::{
+        QueryOptions, query,
+        update::{update, update_in},
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file_url = |p: &std::path::Path| format!("file://{}", p.display());
+    let ask = |s: &Store, q: &str| {
+        query(s.snapshot(), q, &QueryOptions::default())
+            .unwrap()
+            .boolean
+    };
+
+    // 1. Repeat above-threshold ground LOAD preserves head commit and returns committed=false.
+    let large_nt = tmp.path().join("large.nt");
+    std::fs::write(&large_nt, ntriples(0, E + 2)).unwrap();
+    let s = store();
+    let first = update(
+        &s,
+        &format!("LOAD <{}>", file_url(&large_nt)),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let first_r = first.commit.as_ref().unwrap();
+    assert!(first_r.committed);
+    assert!(first_r.commit.bulk);
+    assert_eq!(first.inserted, E + 2);
+    let head_after_first = first_r.commit.seq;
+
+    let repeat = update(
+        &s,
+        &format!("LOAD <{}>", file_url(&large_nt)),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let repeat_r = repeat.commit.as_ref().unwrap();
+    assert!(
+        !repeat_r.committed,
+        "repeat ground LOAD must not allocate a commit"
+    );
+    assert_eq!(repeat_r.commit.seq, head_after_first);
+    assert_eq!(repeat.inserted, 0);
+    assert_eq!(s.snapshot().len(), E + 2);
+
+    // Dry run of the repeat duplicate-only LOAD reports commit: None.
+    let mut dry = QueryOptions::default();
+    dry.write.dry_run = Some(Default::default());
+    let p = crate::preview::catch(
+        update(&s, &format!("LOAD <{}>", file_url(&large_nt)), &dry).map(|st| st.commit.unwrap()),
+    )
+    .unwrap();
+    assert!(p.commit.is_none());
+    assert!(p.graphs.is_empty());
+
+    // 2. Bulk LOAD of N-Quads with default-graph AND named-graph quads INTO GRAPH <target>
+    // remaps default quads to <target>, keeps named quads in their graph, and sets
+    // commit.default_graph == false (and store.default_graph_changed == false).
+    let mut nq = String::new();
+    for i in 0..(E + 2) {
+        nq.push_str(&format!(
+            "<http://ex.org/def{i}> <http://ex.org/p> \"{i:0>40}\" .\n"
+        ));
+    }
+    nq.push_str("<http://ex.org/ns0> <http://ex.org/p> \"named\" <http://ex.org/named> .\n");
+    let nq_path = tmp.path().join("dataset.nq");
+    std::fs::write(&nq_path, &nq).unwrap();
+
+    let s = seeded(2);
+    let before_seq = s.snapshot().commit;
+    let st = update(
+        &s,
+        &format!(
+            "LOAD <{}> INTO GRAPH <http://ex.org/target>",
+            file_url(&nq_path)
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let r = st.commit.as_ref().unwrap();
+    assert!(r.committed);
+    assert!(r.commit.bulk);
+    assert!(
+        !r.commit.default_graph,
+        "bulk LOAD INTO GRAPH must keep default_graph flag false"
+    );
+    assert!(!s.default_graph_changed(before_seq, r.commit.seq));
+    assert!(ask(
+        &s,
+        "ASK { GRAPH <http://ex.org/target> { <http://ex.org/def0> ?p ?o } }"
+    ));
+    assert!(ask(
+        &s,
+        "ASK { GRAPH <http://ex.org/named> { <http://ex.org/ns0> ?p \"named\" } }"
+    ));
+    assert!(!ask(&s, "ASK { <http://ex.org/def0> ?p ?o }"));
+
+    // 3. Bulk LOAD <file.nq> (without INTO GRAPH) containing a managed named graph is refused
+    // by Builder::with_graph_fence even under LOAD SILENT.
+    let s = seeded(2);
+    let managed_graph = "http://ex.org/named";
+    let settings = br#"{"format":1,"profile":1}"#;
+    let owner =
+        crate::managed::OwnerEntry::for_settings(1, vec![managed_graph.to_string()], settings);
+    let _managed = s
+        .enable_managed(crate::managed::OwnerKind::Evidence, owner, settings)
+        .unwrap();
+    let err = update(
+        &s,
+        &format!("LOAD SILENT <{}>", file_url(&nq_path)),
+        &QueryOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Managed(_)), "{err:?}");
+
+    // 4. Bulk dry-run LOAD with preview_as_new_branch succeeds on a protected persistent head.
+    let db_dir = tempfile::tempdir().unwrap();
+    let persistent = Store::open(
+        &db_dir.path().join("db"),
+        StoreOptions {
+            bulk_threshold: E,
+            ..StoreOptions::default()
+        },
+    )
+    .unwrap();
+    persistent.load(&[bytes(1000, 2)]).unwrap();
+    persistent.set_branch_protected("main", true).unwrap();
+    let mut blocked_dry = QueryOptions::default();
+    blocked_dry.write.dry_run = Some(Default::default());
+    let err = update(
+        &persistent,
+        &format!("LOAD <{}>", file_url(&large_nt)),
+        &blocked_dry,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::Branch(_)),
+        "protected dry run without flag: {err:?}"
+    );
+
+    let mut preview_branch = QueryOptions::default();
+    preview_branch.write.dry_run = Some(Default::default());
+    preview_branch.write.preview_as_new_branch = true;
+    let p = crate::preview::catch(
+        update(
+            &persistent,
+            &format!("LOAD <{}>", file_url(&large_nt)),
+            &preview_branch,
+        )
+        .map(|st| st.commit.unwrap()),
+    )
+    .unwrap();
+    assert!(p.commit.as_ref().unwrap().bulk);
+    assert_eq!(persistent.snapshot().len(), 2);
+
+    // 5. Caller-owned WriteTxn via update_in keeps a large LOAD transactional and rolls back
+    // when dropped uncommitted.
+    let s = seeded(2);
+    {
+        let mut txn = s.write();
+        let st = update_in(
+            &mut txn,
+            &format!("LOAD <{}>", file_url(&large_nt)),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(st.inserted, E + 2);
+        // Drop txn uncommitted.
+    }
+    assert_eq!(s.snapshot().len(), 2);
+}
+
+#[test]
+fn reader_source_read_ahead_caps_allocation_capacity() {
+    let data = vec![b'a'; 300_000];
+    let src = crate::io::ReaderSource::new(std::io::Cursor::new(data));
+    let want = 200_001;
+    let held = src.read_ahead(want, &|| Ok(())).unwrap();
+    assert_eq!(held, want);
+    assert!(
+        src.head_capacity() <= want,
+        "probe buffer capacity {} exceeded requested bound {want}",
+        src.head_capacity()
+    );
+}
+
+#[test]
+fn sparql_load_transactional_refusal_drains_group_commit() {
+    use crate::error::Error;
+    use crate::sparql::{QueryOptions, update::update};
+    use std::sync::mpsc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let small_file = tmp.path().join("small.nt");
+    std::fs::write(&small_file, ntriples(100, 2)).unwrap();
+    let file_url = format!("file://{}", small_file.display());
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let s = Arc::new(
+        Store::open(
+            &db_dir.path().join("db"),
+            StoreOptions {
+                bulk_threshold: E,
+                group_commit: true,
+                group_commit_idle_direct: false,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+    s.load(&[bytes(0, 1)]).unwrap();
+
+    // Hold a group-commit fence in flight while a single-op transactional LOAD starts from
+    // the speculative head and fails on a graph restriction; when the fence sync fails,
+    // after_refusal must surface Error::Poisoned instead of the speculative NotPermitted.
+    let (sealed_tx, sealed_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+    let go_rx = Arc::new(parking_lot::Mutex::new(go_rx));
+    s.set_failpoint(
+        "group-sealed",
+        Some(Arc::new(move |_| {
+            let _ = sealed_tx.send(());
+            let _ = go_rx.lock().recv();
+        })),
+    );
+    let s_bg = Arc::clone(&s);
+    let first = std::thread::spawn(move || {
+        update(
+            &s_bg,
+            "INSERT DATA { <http://ex.org/gc1> <http://ex.org/p> 1 }",
+            &QueryOptions::default(),
+        )
+    });
+    sealed_rx.recv().unwrap();
+
+    let s_load = Arc::clone(&s);
+    let load_url = file_url.clone();
+    let restricted_load = std::thread::spawn(move || {
+        let mut opts = QueryOptions::default();
+        // Allow only named graph <http://ex.org/ok>, so LOAD into default graph fails inside
+        // transactional txn.insert() after taking the speculative head.
+        opts.write.graphs = Some(Arc::new(GraphAccess::graphs(
+            Graphs::All,
+            Graphs::Only(GraphRule::new(["http://ex.org/ok"], &[])),
+        )));
+        update(&s_load, &format!("LOAD <{load_url}>"), &opts)
+    });
+    // Wait briefly for the second writer to enter the refusal drain, then fail the fence.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    s.fail_next_group_sync();
+    let _ = go_tx.send(());
+    s.set_failpoint("group-sealed", None);
+
+    let first_res = first.join().unwrap();
+    let load_res = restricted_load.join().unwrap();
+    assert!(
+        matches!(first_res, Err(Error::Poisoned)),
+        "first: {first_res:?}"
+    );
+    assert!(
+        matches!(load_res, Err(Error::Poisoned)),
+        "transactional load refusal must drain via after_refusal and report Poisoned: {load_res:?}"
+    );
+}
+
+/// Measures wall time, 1 ms lock-probe samples (`first_busy_ms` estimating pre-lock time
+/// and `busy_span_ms` spanning first-to-last observed `WriterBusy`), concurrent reader
+/// latency, and peak RSS (`VmHWM`) for a large single-operation SPARQL `LOAD` (`file:` and
+/// `http:`) under the default bulk threshold versus forced transactional (`bulk_threshold =
+/// u64::MAX`). Filter with `SPARQL_LOAD_MODE=bulk|txn`, `SPARQL_LOAD_KIND=persistent|memory`,
+/// and `SPARQL_LOAD_SOURCE=file|http` so each arm can run in its own process for an exact
 /// `VmHWM` reading.
 /// Run with:
 /// `SPARQL_LOAD_QUADS=300000 mbx test --release -p sparkles-core --lib -- --ignored sparql_load_profile --nocapture`
@@ -1030,6 +1706,7 @@ fn sparql_load_profile() {
             let t_start = Instant::now();
             let lock_handle = std::thread::spawn(move || {
                 let mut first_busy: Option<Duration> = None;
+                let mut last_busy: Option<Duration> = None;
                 let mut busy_samples = 0u64;
                 let mut total_samples = 0u64;
                 let probe_opts = WriteOptions {
@@ -1040,9 +1717,11 @@ fn sparql_load_profile() {
                     total_samples += 1;
                     match s_lock.try_write_with(CommitKind::Update, probe_opts.clone()) {
                         Err(crate::error::Error::WriterBusy) => {
+                            let now = t_start.elapsed();
                             if first_busy.is_none() {
-                                first_busy = Some(t_start.elapsed());
+                                first_busy = Some(now);
                             }
+                            last_busy = Some(now);
                             busy_samples += 1;
                         }
                         Ok(txn) => drop(txn),
@@ -1050,7 +1729,7 @@ fn sparql_load_profile() {
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                (first_busy, busy_samples, total_samples)
+                (first_busy, last_busy, busy_samples, total_samples)
             });
 
             let t0 = Instant::now();
@@ -1058,7 +1737,11 @@ fn sparql_load_profile() {
             let elapsed = t0.elapsed();
             done.store(true, Ordering::Relaxed);
             let (reads, max_read_us) = reader_handle.join().unwrap();
-            let (first_busy, busy_samples, total_samples) = lock_handle.join().unwrap();
+            let (first_busy, last_busy, busy_samples, total_samples) = lock_handle.join().unwrap();
+            let busy_span_ms = match (first_busy, last_busy) {
+                (Some(a), Some(b)) => b.saturating_sub(a).as_secs_f64() * 1000.0,
+                _ => 0.0,
+            };
             let bulk = st.commit.as_ref().unwrap().commit.bulk;
             (
                 elapsed,
@@ -1066,6 +1749,7 @@ fn sparql_load_profile() {
                 reads,
                 max_read_us,
                 first_busy.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                busy_span_ms,
                 busy_samples,
                 total_samples,
             )
@@ -1111,9 +1795,16 @@ fn sparql_load_profile() {
                     });
                     s.load(&[bytes(10 * n, 1000)]).unwrap();
 
-                    let (elapsed, bulk, reads, max_read_us, pre_lock_ms, busy, total) = if src_kind
-                        == "file"
-                    {
+                    let (
+                        elapsed,
+                        bulk,
+                        reads,
+                        max_read_us,
+                        first_busy_ms,
+                        busy_span_ms,
+                        busy,
+                        total,
+                    ) = if src_kind == "file" {
                         run_with_probes(&s, &|st| {
                             update(st, &format!("LOAD <{file_url}>"), &QueryOptions::default())
                                 .unwrap()
@@ -1161,7 +1852,7 @@ fn sparql_load_profile() {
                     };
                     drop(s);
                     println!(
-                        "round {round} | {kind:10} | {src_kind:4} | {label:4} | {n} quads | wall {:.3}s | bulk={bulk} | pre_lock={pre_lock_ms:.1}ms | lock_busy={busy}/{total} | reads={reads} max={max_read_us}us | VmHWM={} MiB",
+                        "round {round} | {kind:10} | {src_kind:4} | {label:4} | {n} quads | wall {:.3}s | bulk={bulk} | first_busy={first_busy_ms:.1}ms | busy_span={busy_span_ms:.1}ms | lock_busy={busy}/{total} | reads={reads} max={max_read_us}us | VmHWM={} MiB",
                         elapsed.as_secs_f64(),
                         vm_hwm_kib() / 1024
                     );

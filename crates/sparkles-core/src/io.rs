@@ -119,7 +119,12 @@ impl ReaderState {
         while head.len() < n {
             check()?;
             let start = head.len();
-            head.resize(start + (n - start).min(INPUT_BUFFER_BYTES), 0);
+            let target = start + (n - start).min(INPUT_BUFFER_BYTES);
+            if target > head.capacity() {
+                let cap = head.capacity().saturating_mul(2).max(target).min(n);
+                head.reserve_exact(cap - head.len());
+            }
+            head.resize(target, 0);
             match reader.read(&mut head[start..]) {
                 Ok(k) => {
                     head.truncate(start + k);
@@ -218,6 +223,11 @@ impl ReaderSource {
 
     pub(crate) fn decoded(&self) -> bool {
         self.0.lock().decoded
+    }
+
+    #[cfg(test)]
+    pub(crate) fn head_capacity(&self) -> usize {
+        self.0.lock().head.capacity()
     }
 
     /// The whole stream, from its first byte. A second call fails.

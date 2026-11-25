@@ -183,14 +183,24 @@ async fn sparql_load_uses_bulk_plan_over_http_update() {
     assert_eq!(r.json()["inserted"], THRESHOLD);
     assert!(!s.state.get("ds").unwrap().store.snapshot().delta.is_empty());
 
-    // Single-op large LOAD into default graph takes the bulk path.
+    // Single-op large LOAD into default graph takes the bulk path, and repeating the same
+    // ground LOAD preserves the commit head with committed=false and inserted=0.
     let s = server_with_threshold();
     let (r, _) = sparql_update(&s.app, &format!("LOAD <file://{}>", large.display()), None).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["inserted"], THRESHOLD + 2);
+    let head1 = s.state.get("ds").unwrap().store.snapshot().commit;
     let snap = s.state.get("ds").unwrap().store.snapshot();
     assert!(snap.delta.is_empty(), "bulk LOAD leaves an empty delta");
     assert_eq!(snap.len(), THRESHOLD + 2);
+    let (r2, _) = sparql_update(&s.app, &format!("LOAD <file://{}>", large.display()), None).await;
+    assert_eq!(r2.status, StatusCode::OK, "{}", r2.text());
+    assert_eq!(r2.json()["inserted"], 0);
+    assert_eq!(
+        s.state.get("ds").unwrap().store.snapshot().commit,
+        head1,
+        "repeat large LOAD must preserve commit head"
+    );
 
     // Single-op large LOAD INTO GRAPH takes the bulk path and places triples in the target graph.
     let s = server_with_threshold();

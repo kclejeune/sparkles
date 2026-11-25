@@ -365,6 +365,57 @@ impl fmt::Display for Failure {
     }
 }
 
+/// An outbound timeout or raw response-size ceiling hit while fetching a response.
+/// Carried as a distinct internal error so `LOAD SILENT` does not suppress it while
+/// non-silent callers keep the same `Error::Invalid` message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LimitError {
+    Timeout(String),
+    ResponseTooLarge(String),
+}
+
+impl fmt::Display for LimitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LimitError::Timeout(m) | LimitError::ResponseTooLarge(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for LimitError {}
+
+/// Internal classification of [`OutboundPolicy::send_classified`], distinguishing
+/// outbound policy limits (timeouts and over-limit `Content-Length`) from other fetch
+/// failures without changing the public [`Failure`] enum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SendFailure {
+    Refused(String),
+    Budget(crate::error::Budget),
+    Limit(LimitError),
+    Failed(String),
+}
+
+impl From<Failure> for SendFailure {
+    fn from(f: Failure) -> Self {
+        match f {
+            Failure::Refused(m) => SendFailure::Refused(m),
+            Failure::Failed(m) => SendFailure::Failed(m),
+            Failure::Budget(b) => SendFailure::Budget(b),
+        }
+    }
+}
+
+impl SendFailure {
+    fn into_failure(self) -> Failure {
+        match self {
+            SendFailure::Refused(m) => Failure::Refused(m),
+            SendFailure::Budget(b) => Failure::Budget(b),
+            SendFailure::Limit(l) => Failure::Failed(l.to_string()),
+            SendFailure::Failed(m) => Failure::Failed(m),
+        }
+    }
+}
+
 impl Failure {
     /// The engine error of a failed `what` (`SERVICE <url>`, `LOAD <url>`): a refusal is
     /// [`Error::NotPermitted`](crate::Error::NotPermitted), a spent budget
@@ -569,15 +620,32 @@ impl OutboundPolicy {
         timeout: Duration,
         build: impl FnOnce(&reqwest::blocking::Client, Url) -> reqwest::blocking::RequestBuilder,
     ) -> Result<Response, Failure> {
+        self.send_classified(budget, url, timeout, build)
+            .map_err(SendFailure::into_failure)
+    }
+
+    /// [`send`](Self::send) preserving whether a failure was an outbound timeout or
+    /// over-limit `Content-Length` rather than a general fetch error.
+    pub(crate) fn send_classified(
+        &self,
+        budget: &Arc<RequestBudget>,
+        url: &str,
+        timeout: Duration,
+        build: impl FnOnce(&reqwest::blocking::Client, Url) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<Response, SendFailure> {
         #[cfg(any(test, feature = "failpoints"))]
         if probe::intercept(url) {
-            return Err(Failure::Failed("owned test refused outbound send".into()));
+            return Err(SendFailure::Failed(
+                "owned test refused outbound send".into(),
+            ));
         }
         let u = self.check_url(url)?;
         let own = timeout.min(self.timeout);
         let left = budget.remaining_time();
         if left.is_zero() {
-            return Err(Failure::Failed(out_of_time(budget.max_time)));
+            return Err(SendFailure::Limit(LimitError::Timeout(out_of_time(
+                budget.max_time,
+            ))));
         }
         let timeout = own.min(left);
         // the message of a timeout: this request's, or the whole SPARQL request's
@@ -592,7 +660,7 @@ impl OutboundPolicy {
             // a client that cannot be built is a local configuration error (such as an
             // `SSL_CERT_FILE` that names no file), so its cause is safe to show
             .map_err(|e| {
-                Failure::Failed(format!(
+                SendFailure::Failed(format!(
                     "{}: {}",
                     hidden(url, "the HTTP client could not be built", &e),
                     chain(&e)
@@ -606,14 +674,14 @@ impl OutboundPolicy {
                 budget.spend_time(start.elapsed());
                 // a refused or unresolvable name, in words fit for the caller
                 if let Some(f) = failed.lock().take() {
-                    return Err(f);
+                    return Err(f.into());
                 }
                 if e.is_timeout() || start.elapsed() >= timeout {
-                    return Err(Failure::Failed(late));
+                    return Err(SendFailure::Limit(LimitError::Timeout(late)));
                 }
                 // redirect errors are the policy's own words (hops, schemes)
                 if e.is_redirect() {
-                    return Err(Failure::Failed(chain(&e)));
+                    return Err(SendFailure::Failed(chain(&e)));
                 }
                 let what = if e.is_connect() && chain(&e).contains("invalid peer certificate") {
                     "cannot connect: the server's TLS certificate is not trusted"
@@ -622,7 +690,7 @@ impl OutboundPolicy {
                 } else {
                     "the request failed"
                 };
-                return Err(Failure::Failed(hidden(url, what, &e)));
+                return Err(SendFailure::Failed(hidden(url, what, &e)));
             }
         };
         let limit = self.max_response_bytes;
@@ -638,10 +706,12 @@ impl OutboundPolicy {
         };
         if let Some(n) = body.resp.content_length() {
             if n > limit {
-                return Err(Failure::Failed(too_large(limit)));
+                return Err(SendFailure::Limit(LimitError::ResponseTooLarge(too_large(
+                    limit,
+                ))));
             }
             if n > budget.remaining_bytes() {
-                return Err(Failure::Budget(budget.exceeded(budget.bytes() + n)));
+                return Err(SendFailure::Budget(budget.exceeded(budget.bytes() + n)));
             }
         }
         let content_type = body
@@ -1015,12 +1085,18 @@ impl Read for Body {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let late = |d: Instant| Instant::now() >= d;
         if late(self.deadline) {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, self.late.clone()));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                LimitError::Timeout(self.late.clone()),
+            ));
         }
         let n = match self.resp.read(buf) {
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::TimedOut || late(self.deadline) => {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, self.late.clone()));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    LimitError::Timeout(self.late.clone()),
+                ));
             }
             Err(e) => {
                 let url = self.resp.url().to_string();
@@ -1032,7 +1108,9 @@ impl Read for Body {
         };
         self.read += n as u64;
         if self.read > self.limit {
-            return Err(io::Error::other(too_large(self.limit)));
+            return Err(io::Error::other(LimitError::ResponseTooLarge(too_large(
+                self.limit,
+            ))));
         }
         if let Some(b) = &self.budget {
             b.spend_bytes(n as u64)

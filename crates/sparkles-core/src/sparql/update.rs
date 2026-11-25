@@ -244,9 +244,7 @@ fn run_update(
     let mut wopts = opts.write.clone();
     if wopts.graphs.is_none() {
         wopts.graphs = opts.graphs.clone();
-    } else if opts.graphs.is_none()
-        && let Some(access) = wopts.graphs.as_ref()
-    {
+    } else if let Some(access) = wopts.graphs.as_ref() {
         for op in &parsed.operations {
             check_constant_graphs(access, op)?;
         }
@@ -959,9 +957,71 @@ fn resolve_http_format(url: &str, ct: &str) -> Result<RdfSyntax> {
         .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))
 }
 
-/// Wraps an HTTP `LOAD` body reader so plain I/O failures (connection drops, response
-/// timeouts, uncompressed response ceilings) become `Error::Invalid("LOAD <url>: …")`
-/// while typed engine errors (budgets, cancellation, timeout) keep their own variants.
+/// Wraps an HTTP `LOAD` [`outbound::Body`](crate::outbound::Body) beneath codec sniffing
+/// and decompression so write cancellation and deadlines stop raw socket reads inside
+/// decoders, and outbound timeouts, raw response-size ceilings and budgets are recorded
+/// directly even if a decompressor wraps or replaces the underlying `io::Error`.
+struct LoadHttpBody {
+    inner: crate::outbound::Body,
+    url: String,
+    opts: crate::guard::WriteOptions,
+    fatal: Arc<parking_lot::Mutex<Option<Error>>>,
+}
+
+impl LoadHttpBody {
+    fn uncounted(self) -> (Self, Arc<RequestBudget>) {
+        let (inner, budget) = self.inner.uncounted();
+        (
+            Self {
+                inner,
+                url: self.url,
+                opts: self.opts,
+                fatal: self.fatal,
+            },
+            budget,
+        )
+    }
+}
+
+impl Read for LoadHttpBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Err(e) = self.opts.check() {
+            let saved = match &e {
+                Error::Cancelled => Error::Cancelled,
+                Error::Timeout => Error::Timeout,
+                other => Error::invalid(other.to_string()),
+            };
+            self.fatal.lock().get_or_insert(saved);
+            return Err(std::io::Error::other(e));
+        }
+        self.inner.read(buf).inspect_err(|e| {
+            if let Some(limit) = e
+                .get_ref()
+                .and_then(|i| i.downcast_ref::<crate::outbound::LimitError>())
+            {
+                let saved = if matches!(limit, crate::outbound::LimitError::Timeout(_)) {
+                    match self.opts.check() {
+                        Err(control) => control,
+                        Ok(()) => Error::invalid(format!("LOAD {}: {limit}", self.url)),
+                    }
+                } else {
+                    Error::invalid(format!("LOAD {}: {limit}", self.url))
+                };
+                self.fatal.lock().get_or_insert(saved);
+                return;
+            }
+            if let Some(Error::BudgetExceeded(b)) =
+                e.get_ref().and_then(|i| i.downcast_ref::<Error>())
+            {
+                self.fatal.lock().get_or_insert(Error::BudgetExceeded(*b));
+            }
+        })
+    }
+}
+
+/// Wraps an HTTP `LOAD` body reader so plain I/O failures (connection drops, corrupt
+/// compressed payloads) become `Error::Invalid("LOAD <url>: …")` while typed engine
+/// errors (budgets, cancellation, timeout) keep their own variants.
 struct LoadHttpReader<R> {
     inner: R,
     url: String,
@@ -980,34 +1040,23 @@ impl<R: Read> Read for LoadHttpReader<R> {
     }
 }
 
-/// Whether `LOAD SILENT` hides `e` from the load path: source, fetch, format and parse
-/// failures are hidden, while permissions, budgets, cancellation, write guards,
-/// preconditions, storage limits, managed-graph boundaries, dry runs and store failures
-/// are not.
-fn silent_suppresses(e: &Error) -> bool {
-    matches!(
-        e,
-        Error::RdfParse(_) | Error::Invalid(_) | Error::Unsupported(_)
-    ) || matches!(
-        e,
-        Error::Io(io)
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::NotFound
-                    | std::io::ErrorKind::InvalidData
-                    | std::io::ErrorKind::InvalidInput
-                    | std::io::ErrorKind::UnexpectedEof
-            )
-    )
-}
+type PreparedLoad = (
+    crate::io::Source,
+    Option<Arc<parking_lot::Mutex<Option<Error>>>>,
+);
 
 /// Build a [`crate::io::Source`] for a single-operation SPARQL `LOAD`, checking file or
-/// outbound permissions before the writer lock is acquired.
+/// outbound permissions and write controls before the writer lock is acquired.
 fn prepare_load_source(
     source: &NamedNode,
     dest: &GraphName,
     req: &Request<'_>,
-) -> Result<crate::io::Source> {
+    wopts: &crate::guard::WriteOptions,
+) -> std::result::Result<PreparedLoad, crate::store::SparqlLoadError> {
+    use crate::outbound::{LimitError, SendFailure};
+    use crate::store::SparqlLoadError;
+
+    wopts.check().map_err(SparqlLoadError::Store)?;
     let opts = req.opts;
     let url = source.as_str();
     let graph = match dest {
@@ -1016,45 +1065,85 @@ fn prepare_load_source(
     };
     if url.starts_with("file:") {
         if opts.forbid_file_load {
-            return Err(Error::NotPermitted(
+            return Err(SparqlLoadError::Store(Error::NotPermitted(
                 "LOAD <file:…> requires server-admin".into(),
-            ));
+            )));
         }
-        let path = opts.file_loads.check(url)?;
-        let mut src = crate::io::Source::from_path(&path, graph)?;
+        let path = opts.file_loads.check(url).map_err(|e| match e {
+            Error::NotPermitted(_) => SparqlLoadError::Store(e),
+            other => SparqlLoadError::Source(other),
+        })?;
+        let mut src =
+            crate::io::Source::from_path(&path, graph).map_err(SparqlLoadError::Source)?;
         src.base = Some(url.to_string());
         src.name = path.display().to_string();
         // Open and inspect the file's magic bytes before taking the writer lock, so a
         // missing file or unsupported codec fails here as a source error.
-        let _ = src.codec()?;
-        return Ok(src);
+        let _ = src.codec().map_err(SparqlLoadError::Source)?;
+        return Ok((src, None));
     }
     if opts.forbid_remote_load {
-        return Err(Error::NotPermitted(
+        return Err(SparqlLoadError::Store(Error::NotPermitted(
             "LOAD <http…> requires the federate permission".into(),
-        ));
+        )));
     }
     let policy = &opts.outbound;
-    let timeout = req.deadline.map_or(policy.timeout, |d| {
+    let timeout = wopts.deadline.map_or(policy.timeout, |d| {
         d.saturating_duration_since(Instant::now())
     });
     let resp = policy
-        .send(&req.budget, url, timeout, |client, u| {
+        .send_classified(&req.budget, url, timeout, |client, u| {
             client.get(u).header("Accept", LOAD_ACCEPT)
         })
-        .map_err(|f| {
-            f.into_error(&format!("LOAD <{url}>"), |m| {
-                Error::invalid(format!("LOAD {url}: {m}"))
-            })
+        .map_err(|f| match f {
+            SendFailure::Refused(m) => {
+                SparqlLoadError::Store(Error::NotPermitted(format!("LOAD <{url}>: {m}")))
+            }
+            SendFailure::Budget(b) => SparqlLoadError::Store(Error::BudgetExceeded(b)),
+            SendFailure::Limit(LimitError::Timeout(m)) => {
+                if let Err(control) = wopts.check() {
+                    SparqlLoadError::Store(control)
+                } else {
+                    SparqlLoadError::Store(Error::invalid(format!("LOAD {url}: {m}")))
+                }
+            }
+            SendFailure::Limit(LimitError::ResponseTooLarge(m)) => {
+                SparqlLoadError::Store(Error::invalid(format!("LOAD {url}: {m}")))
+            }
+            SendFailure::Failed(m) => {
+                if let Err(control) = wopts.check() {
+                    SparqlLoadError::Store(control)
+                } else {
+                    SparqlLoadError::Source(Error::invalid(format!("LOAD {url}: {m}")))
+                }
+            }
         })?;
     if !resp.status.is_success() {
-        return Err(Error::invalid(format!("LOAD {url}: {}", resp.status)));
+        return Err(SparqlLoadError::Source(Error::invalid(format!(
+            "LOAD {url}: {}",
+            resp.status
+        ))));
     }
-    let format = resolve_http_format(url, &resp.content_type)?;
+    let format = resolve_http_format(url, &resp.content_type).map_err(SparqlLoadError::Source)?;
     let url_path = std::path::Path::new(url);
-    let mut body = resp.body;
-    let (codec, head) =
-        crate::io::sniff_codec(&mut body, Some(url_path), url).map_err(|e| read_error(url, e))?;
+    let fatal = Arc::new(parking_lot::Mutex::new(None));
+    let mut body = LoadHttpBody {
+        inner: resp.body,
+        url: url.to_string(),
+        opts: wopts.clone(),
+        fatal: Arc::clone(&fatal),
+    };
+    let (codec, head) = crate::io::sniff_codec(&mut body, Some(url_path), url).map_err(|e| {
+        if let Some(f) = fatal.lock().take() {
+            return SparqlLoadError::Store(f);
+        }
+        match e {
+            Error::BudgetExceeded(_) | Error::Cancelled | Error::Timeout => {
+                SparqlLoadError::Store(e)
+            }
+            other => SparqlLoadError::Source(read_error(url, other)),
+        }
+    })?;
     // Compressed data counts in the request's budget once decompressed, and is held to
     // the response ceiling then too.
     let (body, count) = if codec == crate::codec::Codec::None {
@@ -1063,10 +1152,17 @@ fn prepare_load_source(
         let (body, budget) = body.uncounted();
         (body, Some(budget))
     };
-    let r = codec.reader_send(
-        std::io::Cursor::new(head).chain(body),
-        Some(policy.max_response_bytes),
-    )?;
+    let r = codec
+        .reader_send(
+            std::io::Cursor::new(head).chain(body),
+            Some(policy.max_response_bytes),
+        )
+        .map_err(|e| {
+            if let Some(f) = fatal.lock().take() {
+                return SparqlLoadError::Store(f);
+            }
+            SparqlLoadError::Source(e)
+        })?;
     let r: Box<dyn Read + Send> = match count {
         Some(budget) => Box::new(crate::outbound::Counted { inner: r, budget }),
         None => r,
@@ -1082,7 +1178,7 @@ fn prepare_load_source(
     src.base = Some(url.to_string());
     src.name = url.to_string();
     src.max_decompressed = Some(policy.max_response_bytes);
-    Ok(src)
+    Ok((src, Some(fatal)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1097,22 +1193,31 @@ fn run_single_load(
     parse_ms: f64,
     t1: Instant,
 ) -> Result<UpdateStats> {
-    req.check()?;
+    use crate::store::SparqlLoadError;
+
+    wopts.check()?;
     if let Some(m) = &wopts.message {
         crate::annotations::validate_message(m)?;
     }
     let noop = |wopts: crate::guard::WriteOptions| -> Result<crate::commit::Receipt> {
-        req.check()?;
+        wopts.check()?;
         store.try_write_with(kind, wopts)?.commit()
     };
-    let receipt = match prepare_load_source(source, destination, req) {
-        Ok(src) => match store.load_sparql(&src, kind, &wopts) {
+    let receipt = match prepare_load_source(source, destination, req, &wopts) {
+        Ok((src, fatal)) => match store.load_sparql(&src, kind, &wopts) {
             Ok(r) => r,
-            Err(e) if silent && silent_suppresses(&e) => noop(wopts)?,
-            Err(e) => return Err(e),
+            Err(e) => {
+                if let Some(f) = fatal.as_ref().and_then(|slot| slot.lock().take()) {
+                    return Err(f);
+                }
+                match e {
+                    SparqlLoadError::Source(_) if silent => noop(wopts)?,
+                    other => return Err(other.into_inner()),
+                }
+            }
         },
-        Err(e) if silent && (silent_suppresses(&e) || matches!(e, Error::Io(_))) => noop(wopts)?,
-        Err(e) => return Err(e),
+        Err(SparqlLoadError::Source(_)) if silent => noop(wopts)?,
+        Err(other) => return Err(other.into_inner()),
     };
     let inserted = if receipt.committed {
         receipt.commit.inserted

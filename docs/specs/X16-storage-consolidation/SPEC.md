@@ -770,30 +770,39 @@ avoids the rebuild's fixed cost, while an unrestricted file whose estimate excee
 update inside an open write transaction stay transactional so that per-quad graph checks,
 triple protections and multi-operation atomicity are unchanged. `LOAD <uri>` and
 `LOAD <uri> INTO GRAPH <g>` keep their default-graph remapping and named-graph retention
-across all RDF, Jena and OWL functional-style syntaxes. `LOAD SILENT` hides source, fetch,
-format and parse failures and returns an unchanged-head receipt while still surfacing
-permission refusals, outbound and decompression budgets, cancellation, timeouts,
-preconditions, write guards, dry runs, managed-graph boundaries, storage limits and store
-failures.
+across all RDF, Jena and OWL functional-style syntaxes, and a bulk `LOAD INTO GRAPH`
+leaves the commit's default-graph change flag false. Repeating an above-threshold `LOAD` of
+already-present ground quads preserves the head commit and returns `committed: false`.
+`LOAD SILENT` carries source-error provenance through preparation, probing and parsing so
+it hides only source, fetch, format and parse failures (returning an unchanged-head
+receipt) while preserving permission refusals, outbound timeouts and response-size
+ceilings, outbound and decompression budgets, cancellation, deadlines, preconditions, write
+guards, publish hooks, dry runs, managed-graph boundaries, storage limits and store or
+builder failures.
 
 File permission checks, codec detection, outbound HTTP requests and the stream size probe
 now run before the exclusive writer lock is acquired, so network latency and stream
 probing no longer block concurrent writers. Once the plan is chosen, the bulk path holds
 the exclusive writer lock across the generation build, write-guard validation and atomic
 `CURRENT` switch while concurrent readers continue lock-free against the previous
-snapshot. For an HTTP `LOAD`, stream probing holds at most `bulk_threshold * 80` decoded
-bytes in memory before the parse starts and releases that prefix buffer once replayed; a
-file `LOAD` buffers nothing to choose its plan. On a single 8-vCPU 16 GiB Boat worker in
-release builds at 1,000,000 N-Triples quads (~80 MiB) loaded into a 1,000-quad seeded
-store, one process per arm measured the following wall time, pre-lock time, peak resident
-set (`VmHWM`) and maximum concurrent snapshot read latency. A persistent file load took
-1.811 s and 575 MiB peak RSS on the bulk path against 3.009 s and 1,011 MiB transactional,
-and a persistent loopback HTTP load took 1.376 s with 12.8 ms pre-lock and 560 MiB peak
-RSS against 2.287 s and 1,014 MiB transactional. An in-memory file load took 1.192 s and
-798 MiB against 2.090 s and 1,013 MiB, and an in-memory HTTP load took 1.750 s with
-13.8 ms pre-lock and 778 MiB against 2.190 s and 1,016 MiB. Maximum concurrent snapshot
-read latency stayed within 5 to 27 µs during all bulk rebuilds, and each bulk load left an
-empty delta. Durability, the write-ahead log and the on-disk formats did not change.
+snapshot. For an HTTP `LOAD`, stream probing holds at most `bulk_threshold * 80 + 1`
+decoded bytes in memory (with buffer capacity capped at that limit) before the parse starts
+and releases that prefix buffer once replayed; a file `LOAD` buffers nothing to choose its
+plan. An approximate directional profile on an 8-vCPU, 16 GiB Boat worker in release builds
+at 1,000,000 N-Triples quads (~80 MiB) loaded into a 1,000-quad seeded store (one process
+per arm; Boat timings are approximate rather than a quiet Intel host A/B, recorded in the
+[loading report](../../benchmarks/loading/RESULTS.md#bulk-sparql-load)) measured wall time,
+peak resident set (`VmHWM`), maximum concurrent snapshot read latency and the first
+observed `WriterBusy` probe sample (`first_busy`, polled every 1 ms to estimate pre-lock
+time at millisecond resolution rather than the writer's full hold interval). A persistent
+file load took 1.811 s and 575 MiB peak RSS on the bulk path against 3.009 s and 1,011 MiB
+transactional, and a persistent loopback HTTP load took 1.376 s with a 12.8 ms first busy
+sample and 560 MiB peak RSS against 2.287 s and 1,014 MiB transactional. An in-memory file
+load took 1.192 s and 798 MiB against 2.090 s and 1,013 MiB, and an in-memory HTTP load
+took 1.750 s with a 13.8 ms first busy sample and 778 MiB against 2.190 s and 1,016 MiB.
+Maximum concurrent snapshot read latency stayed within 5 to 27 µs during all bulk rebuilds,
+and each bulk load left an empty delta. Durability, the write-ahead log and the on-disk
+formats did not change.
 
 Phase 5 is built apart from the `imbl` maps. `index::encode_deltas` writes the zig-zag
 delta varints of an index column frame and of a run block's column, and

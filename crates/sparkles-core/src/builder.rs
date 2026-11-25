@@ -375,6 +375,22 @@ impl LabelScope {
     }
 }
 
+/// Provenance of a failure during [`Builder::add_source_classified`].
+pub(crate) enum AddSourceError {
+    /// Failed while reading, decoding or parsing the input source.
+    Source(Error),
+    /// Failed inside the builder's sink (graph fence, interrupt, spill or batch I/O).
+    Sink(Error),
+}
+
+impl AddSourceError {
+    pub(crate) fn into_inner(self) -> Error {
+        match self {
+            AddSourceError::Source(e) | AddSourceError::Sink(e) => e,
+        }
+    }
+}
+
 pub struct Builder {
     dir: PathBuf,
     tmp: PathBuf,
@@ -517,9 +533,50 @@ impl Builder {
 
     /// Parse and encode a source (in parallel where the format allows it).
     pub fn add_source(&self, src: &Source) -> Result<()> {
+        self.add_source_classified(src)
+            .map_err(AddSourceError::into_inner)
+    }
+
+    /// [`add_source`](Self::add_source), keeping errors from the builder sink (graph
+    /// fences, interrupts, batch spill I/O) distinct from errors reading or parsing `src`.
+    pub(crate) fn add_source_classified(
+        &self,
+        src: &Source,
+    ) -> std::result::Result<(), AddSourceError> {
+        struct TrackedSink<S> {
+            inner: S,
+            sink_err: Arc<Mutex<Option<Error>>>,
+        }
+        impl<S: QuadSink> QuadSink for TrackedSink<S> {
+            fn quad(&mut self, q: Quad) -> Result<()> {
+                self.inner.quad(q).map_err(|e| {
+                    self.sink_err.lock().get_or_insert(e);
+                    Error::Cancelled
+                })
+            }
+            fn finish(self) -> Result<()> {
+                let sink_err = self.sink_err;
+                self.inner.finish().map_err(|e| {
+                    sink_err.lock().get_or_insert(e);
+                    Error::Cancelled
+                })
+            }
+        }
         let scope = Arc::new(LabelScope::new());
+        let sink_err: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
         self.report(&format!("parsing {}", src.name));
-        let prefixes = parse_source(src, self.opts.threads, || self.encoder(scope.clone()))?;
+        let prefixes = match parse_source(src, self.opts.threads, || TrackedSink {
+            inner: self.encoder(scope.clone()),
+            sink_err: Arc::clone(&sink_err),
+        }) {
+            Ok(prefixes) => prefixes,
+            Err(e) => {
+                if let Some(se) = sink_err.lock().take() {
+                    return Err(AddSourceError::Sink(se));
+                }
+                return Err(AddSourceError::Source(e));
+            }
+        };
         self.add_prefixes(prefixes);
         Ok(())
     }

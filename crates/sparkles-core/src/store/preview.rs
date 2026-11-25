@@ -109,7 +109,8 @@ pub(super) struct BulkPreview<'a> {
     pub view: &'a Snapshot,
     /// the state on the built generation
     pub candidate: &'a Snapshot,
-    pub commit: CommitInfo,
+    pub commit: Option<CommitInfo>,
+    pub kind: CommitKind,
     pub changes: Changes<'a>,
     /// graphs the rebuild left out (a replace)
     pub drop_graphs: &'a [Id],
@@ -224,8 +225,8 @@ impl Store {
             dataset_id: self.owner_dataset_id(),
             branch_id: self.branch_id(),
             head: b.head,
-            commit: Some(b.commit),
-            kind: b.commit.kind,
+            commit: b.commit,
+            kind: b.kind,
             message: b.message,
             graphs,
             changes,

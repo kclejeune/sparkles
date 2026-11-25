@@ -1723,6 +1723,9 @@ struct BulkCommit {
     /// the commit may change the default graph
     default_graph: bool,
     admission: Option<managed::AdmittedManaged>,
+    /// when true, a rebuild with zero deletions and zero net insertions preserves the
+    /// head commit and returns `committed: false` instead of publishing an empty commit
+    skip_if_unchanged: bool,
 }
 
 /// What [`Store::build_generation`] builds a bulk commit's generation from.
@@ -1789,12 +1792,38 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// Whether loading `sources` may write to the default graph: a quad format may hold
-/// default-graph quads, a triple format writes there unless a target graph is set.
+/// Whether loading `sources` may write to the default graph: every syntax remaps
+/// default-graph quads to `s.graph` when set and keeps named graphs as named graphs, so
+/// only a source without a target graph can write to the default graph.
 fn sources_reach_default_graph(sources: &[Source]) -> bool {
-    sources
-        .iter()
-        .any(|s| s.graph.is_none() || s.format.supports_datasets())
+    sources.iter().any(|s| s.graph.is_none())
+}
+
+/// Error provenance from [`Store::load_sparql`], separating failures while reading,
+/// decoding or parsing the `LOAD` source (which `LOAD SILENT` hides) from store, builder,
+/// guard, publish-hook, control, budget and commit failures (which `LOAD SILENT` never
+/// hides).
+pub(crate) enum SparqlLoadError {
+    Source(Error),
+    Store(Error),
+}
+
+impl SparqlLoadError {
+    pub(crate) fn into_inner(self) -> Error {
+        match self {
+            SparqlLoadError::Source(e) | SparqlLoadError::Store(e) => e,
+        }
+    }
+}
+
+fn classify_source_error(e: Error, allow_io: bool) -> SparqlLoadError {
+    match e {
+        Error::RdfParse(_) | Error::Invalid(_) | Error::Unsupported(_) => {
+            SparqlLoadError::Source(e)
+        }
+        Error::Io(_) if allow_io => SparqlLoadError::Source(e),
+        other => SparqlLoadError::Store(other),
+    }
 }
 
 type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -5432,19 +5461,21 @@ impl Store {
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
     ) -> Result<Receipt> {
-        self.load_with_entry(load_plan::Entry::Load, sources, kind, o)
+        self.load_with_entry_classified(load_plan::Entry::Load, sources, kind, o)
+            .map_err(SparqlLoadError::into_inner)
     }
 
     /// Execute a single-operation SPARQL `LOAD` through [`LoadPlan::choose`]: a large
     /// unrestricted load takes the bulk rebuild path and smaller or graph-restricted
-    /// loads stay transactional (spec X16, item 846).
+    /// loads stay transactional (spec X16, item 846). Returns [`SparqlLoadError`] so the
+    /// caller can suppress only source read/decode/parse failures under `LOAD SILENT`.
     pub(crate) fn load_sparql(
         &self,
         source: &Source,
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
-    ) -> Result<Receipt> {
-        self.load_with_entry(
+    ) -> std::result::Result<Receipt, SparqlLoadError> {
+        self.load_with_entry_classified(
             load_plan::Entry::SparqlLoad,
             std::slice::from_ref(source),
             kind,
@@ -5452,18 +5483,23 @@ impl Store {
         )
     }
 
-    fn load_with_entry(
+    fn load_with_entry_classified(
         &self,
         entry: load_plan::Entry,
         sources: &[Source],
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
-    ) -> Result<Receipt> {
-        let plan = self.source_plan(entry, sources, o)?;
+    ) -> std::result::Result<Receipt, SparqlLoadError> {
+        let allow_source_io = sources
+            .iter()
+            .all(|s| matches!(s.data, crate::io::SourceData::File(_)));
+        let plan = self
+            .source_plan(entry, sources, o)
+            .map_err(|e| classify_source_error(e, allow_source_io))?;
         if plan == LoadPlan::Bulk {
-            let mut w = self.lock_writer(o)?;
+            let mut w = self.lock_writer(o).map_err(SparqlLoadError::Store)?;
             if w.poisoned {
-                return Err(Error::Poisoned);
+                return Err(SparqlLoadError::Store(Error::Poisoned));
             }
             let snap = self.snapshot();
             let bulk = BulkCommit {
@@ -5472,40 +5508,59 @@ impl Store {
                 start_len: snap.len(),
                 default_graph: sources_reach_default_graph(sources),
                 admission: None,
+                skip_if_unchanged: entry == load_plan::Entry::SparqlLoad,
             };
             let check = (crate::guard::Changes::Unknown, o);
             Ok(self
-                .rebuild_locked(&mut w, &snap, sources, &[], &[], bulk, check)?
+                .rebuild_locked_classified(&mut w, &snap, sources, &[], &[], bulk, check)?
                 .1)
         } else {
-            let mut txn = self.try_write_with(kind, o.clone())?;
+            let mut txn = self
+                .try_write_with(kind, o.clone())
+                .map_err(SparqlLoadError::Store)?;
             let mut prefixes = BTreeMap::new();
             let mut parsed = 0;
             let mut early = None;
-            let prepared = (|| -> Result<()> {
+            let prepared = (|| -> std::result::Result<(), SparqlLoadError> {
                 for s in sources {
-                    o.check()?;
+                    o.check().map_err(SparqlLoadError::Store)?;
                     let mut labels = std::collections::HashMap::new();
-                    let p = crate::io::parse_source_into(s, |q| {
-                        parsed += 1;
-                        if parsed % 65_536 == 1 {
-                            o.check()?;
+                    let mut sink_err: Option<Error> = None;
+                    let res = crate::io::parse_source_into(s, |q| {
+                        let step = (|| -> Result<()> {
+                            parsed += 1;
+                            if parsed % 65_536 == 1 {
+                                o.check()?;
+                            }
+                            self.check_memory_before(
+                                parsed,
+                                o,
+                                crate::preview::RefusalStage::Parse,
+                                &mut early,
+                            )?;
+                            let ids = txn.encode_quad(&q, &mut labels)?;
+                            txn.insert(ids)?;
+                            Ok(())
+                        })();
+                        if let Err(e) = step {
+                            sink_err = Some(e);
+                            return Err(Error::Cancelled);
                         }
-                        self.check_memory_before(
-                            parsed,
-                            o,
-                            crate::preview::RefusalStage::Parse,
-                            &mut early,
-                        )?;
-                        let ids = txn.encode_quad(&q, &mut labels)?;
-                        txn.insert(ids)?;
                         Ok(())
+                    });
+                    if let Some(e) = sink_err {
+                        return Err(SparqlLoadError::Store(e));
+                    }
+                    let p = res.map_err(|e| {
+                        classify_source_error(e, matches!(s.data, crate::io::SourceData::File(_)))
                     })?;
                     prefixes.extend(p);
                 }
                 Ok(())
             })();
-            if let Err(error) = prepared {
+            if let Err(load_error) = prepared {
+                let is_source = matches!(load_error, SparqlLoadError::Source(_));
+                let error = load_error.into_inner();
                 // No uncommitted views escape this loader. Remove its terms while
                 // holding the writer lock; earlier group-commit terms precede mark.
                 if let Err(rollback_error) = txn.base.generation.dvocab.rollback(&txn.mark) {
@@ -5513,13 +5568,20 @@ impl Store {
                     // Refuse subsequent writes until the store is reopened.
                     txn.guard.poisoned = true;
                     tracing::error!(target: "sparkles::store", "failed load ({error}) could not remove its terms: {rollback_error}");
-                    return Err(rollback_error);
+                    return Err(SparqlLoadError::Store(rollback_error));
                 }
                 txn.guard.next_bnode = txn.start_bnode;
-                return Err(error);
+                let drained = self.after_refusal(error, Some(o));
+                if is_source
+                    && !matches!(drained, Error::Poisoned | Error::Cancelled | Error::Timeout)
+                {
+                    return Err(SparqlLoadError::Source(drained));
+                }
+                return Err(SparqlLoadError::Store(drained));
             }
-            let r = with_early_refusal(txn.commit(), early)?;
-            self.add_prefixes(prefixes)?;
+            let r = with_early_refusal(txn.commit(), early).map_err(SparqlLoadError::Store)?;
+            self.add_prefixes(prefixes)
+                .map_err(SparqlLoadError::Store)?;
             Ok(r)
         }
     }
@@ -5732,6 +5794,7 @@ impl Store {
             default_graph: graphs.contains(&Id::DEFAULT_GRAPH)
                 || sources_reach_default_graph(sources),
             admission: None,
+            skip_if_unchanged: false,
         };
         let check = (crate::guard::Changes::Unknown, o);
         // the quads parsed, as a transactional replace counts them
@@ -5763,20 +5826,43 @@ impl Store {
         bulk: BulkCommit,
         check: (crate::guard::Changes<'_>, &crate::guard::WriteOptions),
     ) -> Result<(u64, Receipt)> {
+        self.rebuild_locked_classified(w, snap, extra, extra_quads, drop_graphs, bulk, check)
+            .map_err(SparqlLoadError::into_inner)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rebuild_locked_classified(
+        &self,
+        w: &mut WriterState,
+        snap: &Snapshot,
+        extra: &[Source],
+        extra_quads: &[[Id; 4]],
+        drop_graphs: &[Id],
+        bulk: BulkCommit,
+        check: (crate::guard::Changes<'_>, &crate::guard::WriteOptions),
+    ) -> std::result::Result<(u64, Receipt), SparqlLoadError> {
         let (changes, o) = check;
         // The graphs it drops are checked here, and its sources are checked quad by quad
         // while the build reads them.
-        self.check_protected(bulk.kind)?;
+        let as_new_branch = o.preview_as_new_branch && o.dry_run.is_some();
+        if !as_new_branch {
+            self.check_protected(bulk.kind)
+                .map_err(SparqlLoadError::Store)?;
+        }
         let admitted = match bulk.admission {
             Some(admitted) => admitted,
-            None => self.capture_managed_admission(None)?,
+            None => self
+                .capture_managed_admission(None)
+                .map_err(SparqlLoadError::Store)?,
         };
-        admitted.admit_ids(snap, drop_graphs.iter().copied(), None)?;
+        admitted
+            .admit_ids(snap, drop_graphs.iter().copied(), None)
+            .map_err(SparqlLoadError::Store)?;
         let configuration = admitted.configuration;
         let fence = if extra.is_empty() {
             None
         } else {
-            admitted.fence()?
+            admitted.fence().map_err(SparqlLoadError::Store)?
         };
         let started = std::time::Instant::now();
         // the head state before the bulk commit, whose changes the change log records
@@ -5786,7 +5872,7 @@ impl Store {
         self.compaction.rebuilding.store(true, Ordering::Relaxed);
         let _rebuilding = compaction::Rebuilding(&self.compaction.rebuilding);
         let message = match o.message.as_ref() {
-            Some(m) => crate::annotations::validate_message(m)?,
+            Some(m) => crate::annotations::validate_message(m).map_err(SparqlLoadError::Store)?,
             None => None,
         };
         // a dry run builds and checks the generation, then removes it (see `preview`)
@@ -5794,9 +5880,9 @@ impl Store {
         if dry.is_none() {
             // the old generation's WAL is the only other copy of the recent commits' ids:
             // the catalog must be durable before it is discarded
-            self.catalog.lock().sync()?;
+            self.catalog.lock().sync().map_err(SparqlLoadError::Store)?;
             // and so must the change log, which recovers its tail from that WAL
-            self.sync_change_log()?;
+            self.sync_change_log().map_err(SparqlLoadError::Store)?;
             // and so must the full-text index, which could otherwise only catch up from it
             #[cfg(feature = "text")]
             if let Some(ti) = self.text.load_full() {
@@ -5808,7 +5894,7 @@ impl Store {
                     self.group.as_ref().is_some_and(|g| g.failed())
                         || ti.applied() <= self.current.load().commit
                 );
-                ti.checkpoint()?;
+                ti.checkpoint().map_err(SparqlLoadError::Store)?;
             }
         }
         // What a bulk commit into a dataset that is not empty changes: the quads of its
@@ -5828,7 +5914,7 @@ impl Store {
             sourced,
             dropped,
             parsed,
-        } = self.build_generation(
+        } = self.build_generation_classified(
             w,
             snap,
             GenerationInput {
@@ -5841,12 +5927,10 @@ impl Store {
                 dry: dry.is_some(),
             },
         )?;
-        let mut gen_ = Generation::open(&dir, &name, self.root.is_some())?;
+        let mut gen_ =
+            Generation::open(&dir, &name, self.root.is_some()).map_err(SparqlLoadError::Store)?;
         gen_._tmp = tmp;
         let gen_ = Arc::new(gen_);
-        if dry.is_none() {
-            w.next_bnode = w.next_bnode.max(meta.next_bnode);
-        }
         let head_seq = w.head.seq;
         // not a committed state: its result cache is its own and empty
         let candidate = || {
@@ -5857,6 +5941,53 @@ impl Store {
                     .build(),
             )
         };
+        let unchanged = bulk.skip_if_unchanged && bulk.net_del == 0 && meta.quads == bulk.start_len;
+        if unchanged {
+            if let Some(dr) = &dry {
+                let preview = self.preview_bulk(crate::store::preview::BulkPreview {
+                    head: w.head,
+                    view: snap,
+                    candidate: &candidate(),
+                    commit: None,
+                    kind: bulk.kind,
+                    changes,
+                    drop_graphs,
+                    opts: o,
+                    dr,
+                    validation: None,
+                    storage: crate::preview::StorageCheck::default(),
+                    message: None,
+                });
+                drop(gen_);
+                if self.root.is_some() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                self.quota.invalidate();
+                return Err(SparqlLoadError::Store(Error::DryRun(Box::new(
+                    preview.map_err(SparqlLoadError::Store)?,
+                ))));
+            }
+            let checked = o.check();
+            drop(gen_);
+            if self.root.is_some() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            self.quota.invalidate();
+            checked.map_err(SparqlLoadError::Store)?;
+            return Ok((
+                parsed,
+                Receipt {
+                    dataset_id: self.owner_dataset_id(),
+                    committed: false,
+                    commit: w.head,
+                    validation: None,
+                    annotation: self.annotation(w.head.seq).unwrap_or_default(),
+                },
+            ));
+        }
+        if dry.is_none() {
+            w.next_bnode = w.next_bnode.max(meta.next_bnode);
+        }
         // the bulk commit is validated on the built generation, before anything is published
         let validation = match self.run_guard(snap, candidate, bulk.kind, changes, o, head_seq) {
             Ok(v) => v,
@@ -5866,7 +5997,7 @@ impl Store {
                 if self.root.is_some() {
                     let _ = std::fs::remove_dir_all(&dir);
                 }
-                return Err(e);
+                return Err(SparqlLoadError::Store(e));
             }
         };
         let head = CommitInfo {
@@ -5890,7 +6021,8 @@ impl Store {
                 head: w.head,
                 view: snap,
                 candidate: &candidate(),
-                commit: head,
+                commit: Some(head),
+                kind: head.kind,
                 changes,
                 drop_graphs,
                 opts: o,
@@ -5905,7 +6037,9 @@ impl Store {
             }
             // a walk of the directory during the build counted the candidate
             self.quota.invalidate();
-            return Err(Error::DryRun(Box::new(preview?)));
+            return Err(SparqlLoadError::Store(Error::DryRun(Box::new(
+                preview.map_err(SparqlLoadError::Store)?,
+            ))));
         }
         // the last check of the bulk commit, before anything of it becomes durable
         if let Err(e) = o.check_publish() {
@@ -5913,7 +6047,7 @@ impl Store {
             if self.root.is_some() {
                 let _ = std::fs::remove_dir_all(&dir);
             }
-            return Err(e);
+            return Err(SparqlLoadError::Store(e));
         }
         let annotation;
         if let Some(root) = &self.root {
@@ -5929,17 +6063,24 @@ impl Store {
                     self.configuration_activated(),
                     configuration,
                 ),
-            )?;
+            )
+            .map_err(SparqlLoadError::Store)?;
             let wal = wal::open_for_append(
                 &dir.join("wal.log"),
                 wal::version_with(self.configuration_activated(), self.control_enabled()),
-            )?;
-            let wal_size = wal.metadata()?.len();
-            sync_dir(&dir)?;
-            sync_dir(root)?;
+            )
+            .map_err(|e| SparqlLoadError::Store(e.into()))?;
+            let wal_size = wal
+                .metadata()
+                .map_err(|e| SparqlLoadError::Store(e.into()))?
+                .len();
+            sync_dir(&dir).map_err(SparqlLoadError::Store)?;
+            sync_dir(root).map_err(SparqlLoadError::Store)?;
             // the commit's message is durable before the switch (no digest: its change
             // set is not at hand)
-            annotation = self.annotate(&head, message.clone(), || None)?;
+            annotation = self
+                .annotate(&head, message.clone(), || None)
+                .map_err(SparqlLoadError::Store)?;
             if let Err(f) = self.switch_generation(w, root, &name) {
                 // Unless CURRENT may name the new generation, in which case the next open
                 // may bring the bulk commit back with its annotation, the annotation goes.
@@ -5949,7 +6090,7 @@ impl Store {
                 {
                     w.poisoned = true;
                 }
-                return Err(f.error);
+                return Err(SparqlLoadError::Store(f.error));
             }
             self.adopt_generation_log(
                 w,
@@ -5964,14 +6105,16 @@ impl Store {
                 },
             );
         } else {
-            annotation = self.annotate(&head, message.clone(), || None)?;
+            annotation = self
+                .annotate(&head, message.clone(), || None)
+                .map_err(SparqlLoadError::Store)?;
         }
         // the switch is the commit point: a failure after it leaves the published state
         // behind the durable one, so later writes are refused
         w.head = head;
         if let Err(e) = self.add_prefixes(meta.prefixes.clone()) {
             w.poisoned = true;
-            return Err(e);
+            return Err(SparqlLoadError::Store(e));
         }
         self.compaction
             .bulk_committed(head.seq, head.timestamp_ms, started.elapsed());
@@ -6073,12 +6216,12 @@ impl Store {
     /// build that fails removes its directory. A bulk commit also checks the built
     /// generation's size against the memory limit and quota, which a dry run records
     /// in the returned storage check instead of failing.
-    fn build_generation(
+    fn build_generation_classified(
         &self,
         w: &WriterState,
         snap: &Snapshot,
         input: GenerationInput<'_>,
-    ) -> Result<BuiltGeneration> {
+    ) -> std::result::Result<BuiltGeneration, SparqlLoadError> {
         let GenerationInput {
             extra,
             extra_quads,
@@ -6102,12 +6245,15 @@ impl Store {
                 let name = format!("gen-{n:04}");
                 let dir = root.join(&name);
                 if dir.exists() {
-                    std::fs::remove_dir_all(&dir)?;
+                    std::fs::remove_dir_all(&dir).map_err(|e| SparqlLoadError::Store(e.into()))?;
                 }
                 (dir, name, None)
             }
             None => {
-                let t = tempfile::Builder::new().prefix("sparkles-mem-").tempdir()?;
+                let t = tempfile::Builder::new()
+                    .prefix("sparkles-mem-")
+                    .tempdir()
+                    .map_err(|e| SparqlLoadError::Store(e.into()))?;
                 (t.path().to_path_buf(), "mem".to_string(), Some(t))
             }
         };
@@ -6118,8 +6264,8 @@ impl Store {
         let mut dropped: Vec<[Id; 4]> = Vec::new();
         let mut dropped_over = false;
         let mut parsed = 0;
-        let built = (|| {
-            let mut builder = Builder::new(&dir, bopts)?;
+        let built = (|| -> std::result::Result<_, SparqlLoadError> {
+            let mut builder = Builder::new(&dir, bopts).map_err(SparqlLoadError::Store)?;
             if let Some(i) = interrupt.clone() {
                 builder = builder.with_interrupt(i);
             }
@@ -6147,18 +6293,24 @@ impl Store {
                     Ok(false)
                 },
                 extra_quads,
-            )?;
+            )
+            .map_err(SparqlLoadError::Store)?;
             let before = builder.input_quads();
             for s in extra {
-                builder.add_source(s)?;
+                builder.add_source_classified(s).map_err(|e| match e {
+                    crate::builder::AddSourceError::Source(e) => {
+                        classify_source_error(e, matches!(s.data, crate::io::SourceData::File(_)))
+                    }
+                    crate::builder::AddSourceError::Sink(e) => SparqlLoadError::Store(e),
+                })?;
             }
             parsed = builder.input_quads() - before;
             sourced = builder.take_tapped();
             builder.add_prefixes(self.prefixes());
-            let meta = builder.finish()?;
+            let meta = builder.finish().map_err(SparqlLoadError::Store)?;
             // a write stopped while it was built publishes nothing
             if let Some(i) = &interrupt {
-                i()?;
+                i().map_err(SparqlLoadError::Store)?;
             }
             let mut storage = crate::preview::StorageCheck::default();
             let old = snap.generation.dir.as_deref();
@@ -6170,7 +6322,7 @@ impl Store {
                 .and_then(|_| self.quota.check_rebuild(old, &dir));
             match fits {
                 Err(e) if dry => storage.refused = Some(e),
-                r => r?,
+                r => r.map_err(SparqlLoadError::Store)?,
             }
             Ok((meta, storage))
         })();
@@ -7370,6 +7522,7 @@ impl WriteTxn<'_> {
             default_graph: self.log.iter().any(|(_, q)| q[3] == Id::DEFAULT_GRAPH)
                 || bulk.iter().any(|q| q[3] == Id::DEFAULT_GRAPH),
             admission: self.managed_admission.take(),
+            skip_if_unchanged: false,
         };
         let log = std::mem::take(&mut self.log);
         let check = (
