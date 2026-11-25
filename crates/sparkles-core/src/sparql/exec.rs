@@ -5850,10 +5850,11 @@ thread_local! {
 /// Ask for the vocabulary pages of the terms in the columns of `vars` of a small table
 /// (see [`decode_for`]). Skips without charging or allocating when neither the base
 /// vocabulary nor its numeric column has unhinted mapped pages for these ids. In cursor
-/// mode, transient prefetch scratch is admitted through the context's decoding envelope
-/// so repeated batches take no per-batch ledger locks; in eager mode, it is charged and
-/// released directly on the fast account. If the remaining budget cannot hold the scratch,
-/// prefetching is skipped cleanly.
+/// mode, transient prefetch scratch reuses the paid decoding envelope and admits any
+/// extra optional headroom as reclaimable ledger bytes so repeated batches take no
+/// per-batch ledger locks while required charges can reclaim idle headroom before
+/// failing; in eager mode, it is charged and released directly on the fast account. If
+/// the remaining budget cannot hold the scratch, prefetching is skipped cleanly.
 fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
     let vocab = &ctx.snap.generation.vocab;
     let ids_iter = || {
@@ -5885,34 +5886,13 @@ fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
     else {
         return;
     };
-    if ctx.streams() {
-        let max_blocks = count
-            .checked_mul(size_of::<usize>())
-            .and_then(|b| u64::try_from(b).ok())
-            .unwrap_or(0);
-        let eager_total = ids_bytes.saturating_add(max_blocks);
-        if ctx.reserve_decode_scratch(eager_total).is_err()
-            && ctx.reserve_decode_scratch(ids_bytes).is_err()
-        {
-            return;
-        }
-        #[cfg(test)]
-        PREFETCH_COLUMN_TERMS_ALLOCATED.with(|n| n.set(n.get() + 1));
-        let mut ids = Vec::with_capacity(count);
-        ids.extend(ids_iter());
-        ids.sort_unstable();
-        ids.dedup();
-        if ids.len() >= 2 {
-            let _ = vocab.prefetch_value_pages_checked(&ids, |block_bytes| {
-                ctx.reserve_decode_scratch(ids_bytes.saturating_add(block_bytes as u64))?;
-                #[cfg(test)]
-                PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED.with(|n| n.set(n.get() + 1));
-                Ok(())
-            });
-        }
-        return;
-    }
-    let Ok(scratch) = ctx.charge(ids_bytes) else {
+    let max_blocks = count
+        .checked_mul(size_of::<usize>())
+        .and_then(|b| u64::try_from(b).ok())
+        .unwrap_or(0);
+    let Ok(mut scratch) =
+        ctx.admit_prefetch_scratch(ids_bytes, ids_bytes.saturating_add(max_blocks))
+    else {
         return;
     };
     #[cfg(test)]
@@ -5923,7 +5903,7 @@ fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
     ids.dedup();
     if ids.len() >= 2 {
         let _ = vocab.prefetch_value_pages_checked(&ids, |block_bytes| {
-            scratch.resize(ids_bytes.saturating_add(block_bytes as u64))?;
+            scratch.grow(ids_bytes.saturating_add(block_bytes as u64))?;
             #[cfg(test)]
             PREFETCH_COLUMN_TERMS_BLOCKS_ADMITTED.with(|n| n.set(n.get() + 1));
             Ok(())
@@ -11249,7 +11229,7 @@ mod paid_eager_producer_tests {
             data.push_str(&format!("ex:s{i} ex:p \"word {i:04}\" .\n"));
         }
         disk.load(&[Source::from_bytes(
-            data.into_bytes(),
+            data.as_bytes().to_vec(),
             RdfFormat::Turtle,
             None,
         )])
@@ -11267,10 +11247,12 @@ mod paid_eager_producer_tests {
         };
         let batch1 = make_batch(0..64);
         let batch2 = make_batch(64..128);
+        let batch3 = make_batch(128..192);
         let ids_bytes = (64 * size_of::<u64>()) as u64;
 
-        // Under a tight cursor budget below `ids_bytes`, prefetch skips cleanly without
-        // allocating scratch or poisoning `ctx.check()`.
+        // Under a tight cursor budget below `ids_bytes`, repeated cold batches skip
+        // cleanly without allocating scratch, poisoning `ctx.check()`, or repeating
+        // failed ledger operations.
         let mut tight = Ctx::new(snap.clone());
         tight.mem_limit = ids_bytes - 1;
         tight.enable_cursor_accounting().unwrap();
@@ -11282,6 +11264,50 @@ mod paid_eager_producer_tests {
         );
         assert!(tight.check().is_ok());
         assert_eq!(tight.live_bytes(), 0);
+
+        let before_tight2_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        let before_tight2_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        prefetch_column_terms(&tight, &batch1, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_tight2_allocs
+        );
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before_tight2_ops,
+            "second tight-budget cold call must not repeat failed ledger admissions"
+        );
+        assert!(tight.check().is_ok());
+        assert_eq!(tight.live_bytes(), 0);
+
+        // When only `ids_bytes` fits (below the upper bound `ids_bytes + max_blocks`),
+        // the first cold batch admits only `ids_bytes`, and a second cold batch reuses
+        // it without repeating failed upper-bound or block-vector ledger admissions.
+        let mut ids_only = Ctx::new(snap.clone());
+        ids_only.mem_limit = ids_bytes;
+        ids_only.enable_cursor_accounting().unwrap();
+        let before_ids1 = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        prefetch_column_terms(&ids_only, &batch1, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_ids1 + 1
+        );
+        assert_eq!(ids_only.live_bytes(), ids_bytes);
+
+        let before_ids2_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        let before_ids2_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        prefetch_column_terms(&ids_only, &batch3, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_ids2_allocs + 1
+        );
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before_ids2_ops,
+            "second ID-only tight-budget cold call must not repeat failed ledger growth"
+        );
+        ids_only.release_cursor_work();
+        assert_eq!(ids_only.live_bytes(), 0);
 
         // Under a normal cursor budget, the first cold batch admits its scratch once on
         // the decode envelope; subsequent cold batches of the same size take 0 ledger
@@ -11328,6 +11354,174 @@ mod paid_eager_producer_tests {
         ctx.release_cursor_work();
         assert_eq!(ctx.live_bytes(), 0);
         assert!(ctx.check().is_ok());
+    }
+
+    #[test]
+    fn prefetch_column_terms_optional_reservation_reclaimed_by_required_cursor_work() {
+        use crate::io::Source;
+        use oxrdfio::RdfFormat;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..16 {
+            data.push_str(&format!("ex:s{i} ex:p \"short {i:02}\" .\n"));
+        }
+        disk.load(&[Source::from_bytes(
+            data.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        let snap = disk.snapshot();
+        let id0 = snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 00").into())
+            .unwrap();
+        let id1 = snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 01").into())
+            .unwrap();
+
+        // 1,024 cells containing two distinct short strings reserve an upper bound of
+        // `1024 * (size_of::<u64>() + size_of::<usize>())` bytes (16 KiB on 64-bit).
+        let mut big_batch = Table::new(vec![0]);
+        for i in 0..1024 {
+            big_batch.push_row(&[if i % 2 == 0 { id0 } else { id1 }]);
+        }
+        let ids_bytes = (1024 * size_of::<u64>()) as u64;
+        let max_blocks = (1024 * size_of::<usize>()) as u64;
+        let eager_total = ids_bytes + max_blocks;
+
+        // 1) Prefetch succeeds on a cold batch, filling the entire budget, and subsequent
+        // required cursor work (`ctx.charge` and `OwnedCharge::resize` as used for BIND
+        // column reservations) reclaims that idle optional reservation instead of failing
+        // with `BudgetExceeded`.
+        let mut ctx = Ctx::new(snap.clone());
+        ctx.mem_limit = eager_total;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        let before_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        prefetch_column_terms(&ctx, &big_batch, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_allocs + 1
+        );
+        assert_eq!(ctx.live_bytes(), eager_total);
+
+        let required = ctx
+            .charge(eager_total)
+            .expect("required ctx.charge must reclaim idle optional prefetch reservation");
+        assert_eq!(ctx.live_bytes(), eager_total);
+        drop(required);
+        assert_eq!(ctx.live_bytes(), 0);
+
+        // Fresh cold store so prefetch runs again before an `OwnedCharge::resize` (the
+        // cursor's fallible BIND column reservation path).
+        let dir2 = tempfile::tempdir().unwrap();
+        let disk2 = Store::open(dir2.path(), StoreOptions::default()).unwrap();
+        disk2
+            .load(&[Source::from_bytes(
+                data.as_bytes().to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap2 = disk2.snapshot();
+        let id2_0 = snap2
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 00").into())
+            .unwrap();
+        let id2_1 = snap2
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 01").into())
+            .unwrap();
+        let mut big_batch2 = Table::new(vec![0]);
+        for i in 0..1024 {
+            big_batch2.push_row(&[if i % 2 == 0 { id2_0 } else { id2_1 }]);
+        }
+        let mut small_batch2 = Table::new(vec![0]);
+        for i in 0..32 {
+            small_batch2.push_row(&[if i % 2 == 0 { id2_0 } else { id2_1 }]);
+        }
+
+        let mut ctx2 = Ctx::new(snap2);
+        ctx2.mem_limit = eager_total;
+        ctx2.enable_cursor_accounting().unwrap();
+        let ctx2 = Arc::new(ctx2);
+
+        // Pay a non-reclaimable decode envelope first by decoding one short term.
+        assert!(ctx2.term(id2_0).is_some());
+        let decode_peak = ctx2.live_bytes();
+        assert!(decode_peak > 0 && decode_peak < eager_total);
+
+        // A small cold batch that fits inside the paid decode envelope reuses it with
+        // zero ledger ops and zero extra bytes.
+        let before_reuse_ops = super::super::query_memory::LEDGER_OPS.with(|n| n.get());
+        prefetch_column_terms(&ctx2, &small_batch2, &[0]);
+        assert_eq!(
+            super::super::query_memory::LEDGER_OPS.with(|n| n.get()),
+            before_reuse_ops,
+            "prefetch within paid decode envelope must take zero ledger ops"
+        );
+        assert_eq!(ctx2.live_bytes(), decode_peak);
+
+        // A larger cold batch grows the optional prefetch reservation above `decode_peak`.
+        let dir3 = tempfile::tempdir().unwrap();
+        let disk3 = Store::open(dir3.path(), StoreOptions::default()).unwrap();
+        disk3
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap3 = disk3.snapshot();
+        let id3_0 = snap3
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 00").into())
+            .unwrap();
+        let id3_1 = snap3
+            .lookup_term(&oxrdf::Literal::new_simple_literal("short 01").into())
+            .unwrap();
+        let mut big_batch3 = Table::new(vec![0]);
+        for i in 0..1024 {
+            big_batch3.push_row(&[if i % 2 == 0 { id3_0 } else { id3_1 }]);
+        }
+        let mut ctx3 = Ctx::new(snap3);
+        ctx3.mem_limit = eager_total;
+        ctx3.enable_cursor_accounting().unwrap();
+        let ctx3 = Arc::new(ctx3);
+        assert!(ctx3.term(id3_0).is_some());
+        let decode_peak3 = ctx3.live_bytes();
+        assert!(decode_peak3 > 0 && decode_peak3 < eager_total);
+
+        let before_grow_allocs = PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get());
+        prefetch_column_terms(&ctx3, &big_batch3, &[0]);
+        assert_eq!(
+            PREFETCH_COLUMN_TERMS_ALLOCATED.with(|c| c.get()),
+            before_grow_allocs + 1
+        );
+        assert_eq!(ctx3.live_bytes(), eager_total);
+
+        // Required `OwnedCharge::resize` (as in cursor BIND column reservation) reclaims
+        // the extra optional prefetch bytes above `decode_peak3`, while preserving the
+        // non-reclaimable `decode_peak3` envelope.
+        let mut bind_charge = super::super::ctx::OwnedCharge::new(&ctx3, 0).unwrap();
+        let headroom = eager_total - decode_peak3;
+        bind_charge
+            .resize(headroom)
+            .expect("OwnedCharge::resize must reclaim idle optional prefetch excess");
+        assert_eq!(ctx3.live_bytes(), eager_total);
+        assert!(
+            ctx3.charge(1).is_err(),
+            "non-reclaimable decode envelope must stay accounted"
+        );
+        drop(bind_charge);
+        assert_eq!(ctx3.live_bytes(), decode_peak3);
+        ctx3.release_cursor_work();
+        assert_eq!(ctx3.live_bytes(), 0);
+
+        // Unused bindings from the reuse check above.
+        drop(big_batch2);
+        ctx2.release_cursor_work();
+        assert_eq!(ctx2.live_bytes(), 0);
     }
 
     #[test]

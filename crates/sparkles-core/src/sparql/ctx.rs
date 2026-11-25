@@ -2089,14 +2089,18 @@ impl Ctx {
         let (bytes, owner) = std::mem::take(&mut *state);
         envelope.reserved.store(0, Ordering::Release);
         drop(state);
-        if bytes == 0 {
-            return;
-        }
         match owner {
             // An eager envelope is a charge of its own.
-            Some(owner) => self.release_live(Some(owner), bytes),
-            // A cursor's is decode bytes on the ledger.
-            None => self.memory().release_decode(),
+            Some(owner) if bytes != 0 => self.release_live(Some(owner), bytes),
+            Some(_) => {}
+            // A cursor's decode and optional prefetch envelope live on the ledger.
+            None => {
+                if let Some(ledger) = self.memory.get()
+                    && (bytes != 0 || ledger.has_envelope())
+                {
+                    ledger.release_decode();
+                }
+            }
         }
     }
 
@@ -2158,25 +2162,83 @@ impl Ctx {
         }
     }
 
-    /// Admit `bytes` of transient dictionary decoding or prefetch scratch within the
-    /// query's decoding envelope. When the envelope already covers `bytes` (scaled by
-    /// active worker threads when called inside a Rayon pool), this is a single atomic
-    /// load and takes no ledger lock. A refusal is returned to the caller without
-    /// poisoning the context so optional prefetching or fallible operations can handle
-    /// it cleanly.
     #[inline]
-    pub(super) fn reserve_decode_scratch(&self, bytes: u64) -> Result<()> {
-        self.check_memory_failure()?;
-        let workers = if rayon::current_thread_index().is_some() {
+    fn decode_workers() -> u64 {
+        if rayon::current_thread_index().is_some() {
             rayon::current_num_threads() as u64 + 1
         } else {
             1
-        };
-        let need = bytes.saturating_mul(workers);
-        if self.decode.reserved.load(Ordering::Acquire) >= need {
-            return Ok(());
         }
-        self.grow_decode(need)
+    }
+
+    /// Admit optional vocabulary prefetch scratch. In cursor mode, prefetch reuses the
+    /// query's paid decode envelope and admits any extra optional headroom on the ledger
+    /// as reclaimable bytes (skipping ledger entry when the additional bytes cannot fit
+    /// current local headroom). The returned guard pins those bytes while the scratch
+    /// vectors are live; once it drops, any required charge that would fail with
+    /// `BudgetExceeded` reclaims the idle optional excess first. In eager mode, prefetch
+    /// charges and releases directly on the fast account.
+    pub(super) fn admit_prefetch_scratch(
+        &self,
+        min_bytes: u64,
+        eager_bytes: u64,
+    ) -> Result<PrefetchScratch<'_>> {
+        if !self.envelope_refuses() {
+            return Ok(PrefetchScratch::Eager(self.charge(min_bytes)?));
+        }
+        self.check_memory_failure()?;
+        let workers = Self::decode_workers();
+        let min_need = min_bytes.saturating_mul(workers);
+        let eager_need = eager_bytes.saturating_mul(workers);
+        let ledger = self.memory();
+        ledger.begin_prefetch();
+        let covered = ledger.envelope_reserved();
+        if covered >= min_need {
+            if eager_need > covered {
+                let extra = eager_need - covered;
+                if extra <= self.memory_remaining() {
+                    let _ = ledger.grow_active_prefetch(
+                        self.grant.as_ref(),
+                        self.mem_limit,
+                        eager_need,
+                    );
+                }
+            }
+            return Ok(PrefetchScratch::Cursor {
+                ctx: self,
+                ledger,
+                workers,
+            });
+        }
+        ledger.end_prefetch();
+
+        let remaining = self.memory_remaining();
+        if eager_need > min_need && eager_need - covered <= remaining {
+            if ledger
+                .admit_prefetch(self.grant.as_ref(), self.mem_limit, eager_need)
+                .is_ok()
+            {
+                return Ok(PrefetchScratch::Cursor {
+                    ctx: self,
+                    ledger,
+                    workers,
+                });
+            }
+            let covered = ledger.envelope_reserved();
+            if covered < min_need && min_need - covered > self.memory_remaining() {
+                return Err(
+                    self.memory_exceeded(self.live_bytes().saturating_add(min_need - covered))
+                );
+            }
+        } else if min_need - covered > remaining {
+            return Err(self.memory_exceeded(self.live_bytes().saturating_add(min_need - covered)));
+        }
+        ledger.admit_prefetch(self.grant.as_ref(), self.mem_limit, min_need)?;
+        Ok(PrefetchScratch::Cursor {
+            ctx: self,
+            ledger,
+            workers,
+        })
     }
 
     /// Admit transient decoding of a key of `bytes` bytes for an explicitly fallible
@@ -2186,8 +2248,15 @@ impl Ctx {
     /// common path is one atomic load.
     #[inline]
     pub(super) fn reserve_decode_checked(&self, bytes: usize) -> Result<()> {
-        let need = (bytes as u64).saturating_mul(8).saturating_add(1024);
-        self.reserve_decode_scratch(need)
+        self.check_memory_failure()?;
+        let need = (bytes as u64)
+            .saturating_mul(8)
+            .saturating_add(1024)
+            .saturating_mul(Self::decode_workers());
+        if self.decode.reserved.load(Ordering::Acquire) >= need {
+            return Ok(());
+        }
+        self.grow_decode(need)
     }
 
     /// Whether the decode envelope can refuse a key before it is rebuilt. A cursor's
@@ -4071,6 +4140,53 @@ impl<'a> RowCredit<'a> {
 impl Drop for Charge<'_> {
     fn drop(&mut self) {
         self.ctx.release_live(self.owner.get(), self.bytes.get());
+    }
+}
+
+/// Guard for optional vocabulary prefetch scratch admitted by
+/// [`Ctx::admit_prefetch_scratch`]. In eager mode it holds a direct [`Charge`]; in
+/// cursor mode it pins the ledger's active prefetch scope until dropped so idle
+/// optional headroom can be reclaimed by required charges once scratch vectors are
+/// freed.
+pub(super) enum PrefetchScratch<'a> {
+    Eager(Charge<'a>),
+    Cursor {
+        ctx: &'a Ctx,
+        ledger: &'a QueryMemoryLedger,
+        workers: u64,
+    },
+}
+
+impl PrefetchScratch<'_> {
+    pub(super) fn grow(&mut self, total_bytes: u64) -> Result<()> {
+        match self {
+            Self::Eager(charge) => charge.resize(total_bytes),
+            Self::Cursor {
+                ctx,
+                ledger,
+                workers,
+            } => {
+                ctx.check_memory_failure()?;
+                let need = total_bytes.saturating_mul(*workers);
+                let covered = ledger.envelope_reserved();
+                if covered >= need {
+                    return Ok(());
+                }
+                let extra = need - covered;
+                if extra > ctx.memory_remaining() {
+                    return Err(ctx.memory_exceeded(ctx.live_bytes().saturating_add(extra)));
+                }
+                ledger.grow_active_prefetch(ctx.grant.as_ref(), ctx.mem_limit, need)
+            }
+        }
+    }
+}
+
+impl Drop for PrefetchScratch<'_> {
+    fn drop(&mut self) {
+        if let Self::Cursor { ledger, .. } = self {
+            ledger.end_prefetch();
+        }
     }
 }
 
