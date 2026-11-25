@@ -13391,8 +13391,10 @@ An evidence reference names a commit of a dataset branch by the branch's identit
 durable source hold keeps such commits readable. History trimming, the retention window
 and its limits, compaction and generation retirement keep the generations that serve a
 held commit, and an in-memory dataset keeps the held states. The holds of a dataset and
-all its branches are kept in `<db>/holds.json` as format 1, and in the process for an
-in-memory dataset. Together they name at most 65,536 commits. The design is in
+all its branches are kept in `<db>/holds.json`. The file uses format 1 for local holds
+and format 2 when a hold names another dataset through `forDatasetId`. An in-memory
+dataset keeps its holds in the process. Together a dataset's holds name at most
+65,536 commits. The design is in
 [C25 §7](specs/C25-evidence-and-assessments.md#7-configuration-access-and-retention).
 
 | Method and path | Needs | Effect |
@@ -13406,15 +13408,17 @@ name commits of any branch and decide what history is retained. A grant without 
 branch list or with the branch pattern `*` reaches every branch. A grant limited to
 some branches or graphs does not give it.
 
-A hold is `{id, owner, created, commits}`, and each commit is `{branch, branchId,
-commit}`, where `branch` is `null` once the branch is deleted. A request names each
+A hold is `{id, owner, created, forDatasetId?, commits}`. The optional `forDatasetId`
+identifies the dataset whose proposal acquired the hold when it differs from the dataset
+holding the commits. Each commit is `{branch, branchId, commit}`. The `branch` field is
+`null` once the branch is deleted. A request names each
 commit's branch by `branch`, by `branchId` as an evidence reference does, or by neither
 for `main`. A commit at or below a branch's starting point is held in its upstream's
 history, and a read of the starting commit on the branch is served there once the
 branch no longer keeps its own copy. A hold without an `id` gets a random one. The hold is durable when the answer
 arrives, and the first hold raises the dataset reader to 7. The same `id` with the same
-commits answers `200` with the existing hold. Other commits under that `id` are a `409`
-with code `hold-conflict`, and more than 65,536 held commits in the dataset are a `409`
+commits answers `200` with the existing local hold. Other commits or an originating
+dataset under that `id` produce `409 hold-conflict`, and more than 65,536 held commits in the dataset are a `409`
 with code `holds-limit`. A commit that is no longer readable is `410 history-gone`, and
 a branch that is not listed is `404 no-such-branch`. An acquisition refused for one of
 these reasons records nothing. An acquisition that fails with a `5xx` error while it
@@ -13605,9 +13609,10 @@ the commit's own time. The operation is an `ev:Operation` and `prov:Activity` wh
 `prov:wasAssociatedWith` is the caller, `urn:x-sparkles:principal:` followed by its
 log name. It records the dataset, branch and commit, the payload digest, the
 idempotency key, the source hold and each written graph's protection nonce. The stored
-facts of this dataset that the batch references are kept by a durable
-[source hold](#evidence-holds) named by the operation before the commit. Stored facts of
-other datasets are verified but not held.
+facts that the batch references stay readable through durable source holds. Before
+publishing, the proposal acquires one hold per referenced dataset under the same
+operation UUID. A hold in another dataset records the proposing dataset's UUID as
+`forDatasetId`. See [Evidence holds](#evidence-holds).
 
 The answer `200` is `{operation, committed, replayed, commit, branchId,
 firstAvailableAt, hold, records}`, and each record is `{key, kind, iri, graph,
@@ -13629,13 +13634,16 @@ deleted, error}`, and holds nothing.
 | `422` | A reference does not verify, with the codes of evidence resolution. A passage of an existing rendition and a structured value outside a retained JSON revision of the batch are `incomplete-evidence`. |
 | `503 authority-changed` | The caller's credential was revoked, expired or the access policy changed before the commit published. |
 
-A refusal writes nothing. A failure after the hold was acquired leaves the hold without
-an operation. The next published proposal releases such a hold once it is an hour
-old and no graph describes its operation, and a retry with the same idempotency key
-acquires it again meanwhile. Releasing a hold waits for a commit that is publishing a
-reference to it, and a commit whose hold was released before it published is a `409
-hold-conflict`. Capability discovery is in `GET /$/server`, whose `capabilities.claims`
-lists the profile versions this build serves.
+A refusal publishes no proposal records. A failure between hold acquisition and
+publication can leave orphaned holds. After a successful proposal, the server checks holds in the proposing
+dataset and every dataset the proposal held. Reconciliation releases a hold at least
+an hour old when it can check the originating dataset and no graph there describes the
+operation. A hold stays while either dataset is unavailable or the origin's identity
+is ambiguous in the catalog. A retry with the
+same idempotency key can reacquire the same holds. Releasing a hold waits for a commit
+that is publishing a reference to it. Publication answers `409 hold-conflict` if a
+required hold was already released. `GET /$/server` lists the supported profile
+versions under `capabilities.claims`.
 
 ### Evidence reviews
 

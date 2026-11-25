@@ -11,20 +11,24 @@
 //!    is the same, and conflicts otherwise.
 //! 4. The references to existing records and stored facts are resolved under the
 //!    caller's read access, so a reference it cannot read answers as a missing one.
-//! 5. The stored facts of this dataset are held durably under a hold named by the
-//!    operation, before the commit that refers to them.
+//! 5. The referenced stored facts of this dataset and of other datasets in `catalog`
+//!    are held durably under a hold named by the operation, before the commit that
+//!    refers to them.
 //! 6. Under the branch writer the expected head, the idempotency key again and the
 //!    identity of every record are checked, the commit is stamped, the server sets the
 //!    receipt, the first availability, each record digest and the operation marker,
-//!    and right before publication the caller's authority and the hold are checked.
+//!    and right before publication the caller's authority and every hold are checked
+//!    in ascending dataset-UUID order.
 //!
-//! A failure after step 5 leaves the hold without an operation that records it. It is
-//! an orphan that [`reconcile_operation_holds`] releases once its grace period has
-//! passed, which every published proposal runs, and a retry with the same idempotency
-//! key acquires the same hold again.
+//! A failure after step 5 leaves the holds without an operation that records them. They
+//! are orphans that [`reconcile_operation_holds_in`] (and [`reconcile_operation_holds`]
+//! for local holds) releases once their grace period has passed, which every published
+//! proposal runs on its own dataset and on each other dataset it held, and a retry with
+//! the same idempotency key acquires the same holds again.
 
 use super::resolve::{Reference, Resolution};
 use crate::access::GraphAccess;
+use crate::branch::CommitRef;
 use crate::managed::{ManagedError, ManagedErrorKind, OwnerKind};
 use crate::task::Control;
 use crate::{Catalog, Dataset, Error, Result};
@@ -37,6 +41,7 @@ use sparkles_core::evidence::{
     EvidenceInput, EvidenceRefTarget, RecordKind, RecordRef, RenditionContent,
     ResolutionRequirement, Settings, Sha256Digest,
 };
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -206,7 +211,8 @@ pub struct Proposed {
     /// The commit's time, the first availability of its source revisions, as an
     /// `xsd:dateTime` lexical form. `None` for a dry run.
     pub first_available_at: Option<String>,
-    /// The source hold of the operation's stored facts in this dataset.
+    /// The source hold of the operation's referenced stored facts, across this dataset
+    /// and any other datasets of the catalog.
     pub hold: Option<Uuid>,
     pub records: Vec<ProposedRecord>,
     /// A dry run's preview.
@@ -301,7 +307,6 @@ fn replay(
     found: write::RecordedOperation,
     reads: &mut Reads<'_>,
     branch: Uuid,
-    hold: Option<Uuid>,
 ) -> Result<Proposed> {
     if !found.authenticated {
         return Err(managed(
@@ -335,7 +340,7 @@ fn replay(
         commit: found.commit.unwrap_or_default(),
         branch: found.branch.unwrap_or(branch),
         first_available_at: found.ended_at.map(|l| l.value().to_string()),
-        hold: (!plan.held.is_empty()).then_some(hold).flatten(),
+        hold: found.source_hold,
         records: result(plan, &existing),
         preview: None,
     })
@@ -479,8 +484,10 @@ fn references(
 /// Publish `input` as one commit of the evidence owner on `logical`, which is `main` or
 /// one of its branches, in the order the [module](self) describes. `read` is asked what
 /// the caller may read on a dataset and branch, by their current names, as
-/// [`Resolution::all`] describes. Stored facts in other datasets of `catalog` are
-/// verified but not held.
+/// [`Resolution::all`] describes. Stored facts of this dataset and of other datasets of
+/// `catalog` are verified and held under the operation's id. Cross-dataset holds
+/// require the proposing dataset and the referenced datasets to be registered by
+/// distinct identities in the same catalog.
 ///
 /// Refusals: a malformed or inconsistent input is invalid, `unsupported-profile` when
 /// the profile is not enabled or a written graph is detached, `head-changed` when
@@ -596,53 +603,115 @@ pub fn propose(
         let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
         let mut reads = Reads::new(&preparation, &head);
         if let Some(found) = reads.operation(&plan.operation_iri, &records)? {
-            return replay(&plan, found, &mut reads, branch, hold);
+            return replay(&plan, found, &mut reads, branch);
         }
     }
-    // The caller's reads decide every reference, before anything is written.
+    // Retain the same dataset handles the resolver read. Reopening by UUID could
+    // find a dataset restored in the meantime with different history at that commit.
     let refs = references(input, &plan, prepared.requirements())?;
+    let mut resolved_datasets = HashMap::new();
     if !refs.is_empty() {
-        let mut resolution = Resolution::new(control.clone())?;
-        resolution.all(catalog, main, logical, &refs, read)?;
+        Resolution::new(control.clone())?.all(
+            catalog,
+            main,
+            logical,
+            &refs,
+            &mut |ds, branch| {
+                let granted = read(ds, branch)?;
+                if ds.dataset_id() != main.dataset_id() {
+                    let resolved: &Dataset = resolved_datasets
+                        .entry(ds.dataset_id())
+                        .or_insert_with(|| ds.clone());
+                    if !std::ptr::eq(resolved.store(), ds.store()) {
+                        return None;
+                    }
+                }
+                Some(granted)
+            },
+        )?;
     }
-    // The hold is durable before the commit that records it.
-    let commits: Vec<crate::branch::CommitRef> = plan
-        .held
-        .iter()
-        .map(|h| crate::branch::CommitRef {
-            branch_id: h.branch,
-            seq: h.commit,
-        })
-        .collect();
+    // The plan is sorted by dataset UUID, which also orders the publication guards.
+    let mut held_targets = Vec::new();
     if let Some(id) = hold
         && !options.dry_run
     {
-        main.store()
-            .acquire_hold(OwnerKind::Evidence, id, &commits)
-            .map_err(|e| match e {
-                Error::HistoryGone(_) => managed(
-                    ManagedErrorKind::EvidenceUnavailable,
-                    "a referenced commit is no longer retained",
-                ),
-                e => e,
-            })?;
+        if !resolved_datasets.is_empty()
+            && !catalog.is_some_and(|catalog| {
+                catalog.matches_unique_datasets(
+                    std::iter::once(main).chain(resolved_datasets.values()),
+                )
+            })
+        {
+            return Err(managed(
+                ManagedErrorKind::EvidenceUnavailable,
+                "cross-dataset holds require unambiguous datasets in the proposal catalog",
+            ));
+        }
+        for commits in plan.held.chunk_by(|a, b| a.dataset == b.dataset) {
+            control.check()?;
+            let dataset_id = commits[0].dataset;
+            let (dataset, for_dataset) = if dataset_id == main.dataset_id() {
+                (main.clone(), None)
+            } else {
+                let dataset = resolved_datasets.remove(&dataset_id).ok_or_else(|| {
+                    managed(
+                        ManagedErrorKind::EvidenceUnavailable,
+                        "a referenced dataset is no longer available",
+                    )
+                })?;
+                (dataset, Some(main.dataset_id()))
+            };
+            let commits = commits
+                .iter()
+                .map(|commit| CommitRef {
+                    branch_id: commit.branch,
+                    seq: commit.commit,
+                })
+                .collect::<Vec<_>>();
+            dataset
+                .store()
+                .acquire_hold_for(OwnerKind::Evidence, id, &commits, for_dataset)
+                .map_err(|e| match e {
+                    Error::HistoryGone(_) => managed(
+                        ManagedErrorKind::EvidenceUnavailable,
+                        "a referenced commit is no longer retained",
+                    ),
+                    Error::Branch(ref b) if b.code == "no-such-branch" => managed(
+                        ManagedErrorKind::EvidenceUnavailable,
+                        "a referenced branch is no longer available",
+                    ),
+                    e => e,
+                })?;
+            if for_dataset.is_some() {
+                dataset.store().failpoint("evidence-held-foreign");
+            }
+            held_targets.push((dataset, commits, for_dataset));
+        }
         main.store().failpoint("evidence-held");
     }
-    // The hook runs on this thread, inside the commit, and keeps the authority guard
-    // in this thread's slot until the commit returns.
+    // The hook runs on this thread, inside the commit, and keeps the hold and authority
+    // guards in this thread's slot until the commit returns.
     let (release, before_publish) = {
-        let held_by = main.clone();
+        let held = held_targets.clone();
         let dry_run = options.dry_run;
         publish_hook(options.authority.clone(), move || {
             // An administrator's release leaves the references unheld: refuse rather
-            // than record a hold that no longer protects them. The guard keeps every
-            // release waiting until this commit has published or been refused.
+            // than record a hold that no longer protects them. The guards keep every
+            // release waiting until this commit has published or been refused, and are
+            // taken in ascending dataset-UUID order to stay acyclic across datasets.
             match hold.filter(|_| !dry_run) {
-                Some(id) => Ok(Some(Box::new(held_by.store().hold_publication(
-                    OwnerKind::Evidence,
-                    id,
-                    &commits,
-                )?))),
+                Some(id) => {
+                    let mut guards = Vec::with_capacity(held.len());
+                    for (target_ds, commits, for_dataset) in &held {
+                        guards.push(target_ds.store().hold_publication_for(
+                            OwnerKind::Evidence,
+                            id,
+                            commits,
+                            *for_dataset,
+                        )?);
+                    }
+                    Ok(Some(Box::new(guards)))
+                }
                 None => Ok(None),
             }
         })
@@ -676,7 +745,7 @@ pub fn propose(
     if options.idempotency_key.is_some()
         && let Some(found) = reads.operation(&plan.operation_iri, &records)?
     {
-        return replay(&plan, found, &mut reads, branch, hold);
+        return replay(&plan, found, &mut reads, branch);
     }
     // An identity already published with equal content is not written again. Any other
     // content under the identity, or content that is not an authenticated record, is
@@ -758,9 +827,23 @@ pub fn propose(
         Ok(receipt) => {
             main.store().failpoint("evidence-committed");
             // Orphaned holds of earlier operations past their grace period are released
-            // after a publication. This housekeeping never fails the proposal.
-            if let Err(e) = reconcile_operation_holds(main, crate::holds::DEFAULT_GRACE_MS) {
+            // after a publication, on this dataset and on any other dataset this
+            // operation held. This housekeeping never fails the proposal.
+            if let Err(e) =
+                reconcile_operation_holds_in(catalog, main, crate::holds::DEFAULT_GRACE_MS)
+            {
                 tracing::warn!(target: "sparkles::evidence", "orphaned evidence holds were not reconciled: {e}");
+            }
+            for (target_ds, _, for_dataset) in &held_targets {
+                if for_dataset.is_some()
+                    && let Err(e) = reconcile_operation_holds_in(
+                        catalog,
+                        target_ds,
+                        crate::holds::DEFAULT_GRACE_MS,
+                    )
+                {
+                    tracing::warn!(target: "sparkles::evidence", "orphaned cross-dataset evidence holds were not reconciled: {e}");
+                }
             }
             Ok(Proposed {
                 operation: plan.operation_iri.clone(),
@@ -798,52 +881,110 @@ pub fn operation_recorded(main: &Dataset, id: Uuid, control: &Control) -> Result
     Ok(false)
 }
 
-/// Release the evidence holds acquired at least `grace_ms` milliseconds ago whose
-/// operation never published, as after a failure or crash between a hold and its
-/// commit. The grace period must exceed the longest request deadline, so that an
-/// operation still on its way to its commit keeps its hold. Returns the released ids.
-///
-/// The stores are found at the first question, after the store chose its candidates,
-/// so nothing is opened when no hold is old enough. A commit that passed its hold
-/// check before then published on one of them, and one that passes it later renews
-/// the hold, which the store then does not release. The store asks again under the
-/// lock that every release takes, and that second answer reads only current
-/// snapshots of those stores and takes no writer or branch table, since a commit
-/// waiting for the lock may hold its writer. A branch that is renamed, deleted or
-/// replaced under its name while the stores are found keeps every hold.
+/// The stores to scan in both passes of reconciliation, and the branch identities
+/// whose membership must still match when the operation is found absent.
+struct OperationStores {
+    datasets: Vec<Dataset>,
+    branches: Vec<Uuid>,
+}
+
+impl OperationStores {
+    fn open(main: &Dataset) -> Result<Option<Self>> {
+        let branches = main.store().listed_branch_ids();
+        let mut datasets = vec![main.clone()];
+        for &id in &branches {
+            let name = main.store().listed_branch_name(id, &Default::default())?;
+            match name.map(|n| main.branch(&n)) {
+                Some(Ok(ds)) if ds.store().branch_id() == id => datasets.push(ds),
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(Self { datasets, branches }))
+    }
+
+    fn branches_match(&self) -> bool {
+        self.datasets[0]
+            .store()
+            .matches_listed_branch_ids(&self.branches)
+    }
+}
+
+/// Release the local evidence holds of `main` acquired at least `grace_ms` milliseconds
+/// ago whose operation never published, as after a failure or crash between a hold and
+/// its commit. Cross-dataset holds (whose `for_dataset` names another dataset) are kept
+/// because no catalog is supplied to verify their originating dataset; use
+/// [`reconcile_operation_holds_in`] to reconcile those across a catalog.
 pub fn reconcile_operation_holds(main: &Dataset, grace_ms: i64) -> Result<Vec<Uuid>> {
+    reconcile_operation_holds_in(None, main, grace_ms)
+}
+
+/// Release evidence holds of `main` acquired at least `grace_ms` milliseconds ago
+/// whose operation is absent from its originating dataset. A foreign hold is kept
+/// while either dataset cannot be identified unambiguously in `catalog`. The grace
+/// period must exceed the longest request deadline. Returns the released ids.
+///
+/// The first check opens the origin's branches. The second runs under the hold's
+/// publication lock, reads snapshots of the stores already found and uses nonblocking
+/// checks for catalog and branch membership. Every publication renews its hold, so a
+/// reconciliation that selected it earlier leaves it in place. A change in the listed
+/// branches or their heads during either pass keeps the hold until the next check.
+pub fn reconcile_operation_holds_in(
+    catalog: Option<&Catalog>,
+    main: &Dataset,
+    grace_ms: i64,
+) -> Result<Vec<Uuid>> {
     let control = Control::none();
-    let mut stores: Option<Vec<Dataset>> = None;
-    // A branch renamed while it is found may open another branch under its name, so
-    // the stores found may miss one: then every hold is kept.
-    let mut unsure = false;
+    let mut origins = HashMap::new();
     super::reconcile_holds(main, grace_ms, &mut |hold| {
-        let stores = match &mut stores {
-            Some(s) => s,
-            None => {
-                // the listed branches, found without their heads, so without writers
-                let mut found = vec![main.clone()];
-                for id in main.store().listed_branch_ids() {
-                    let name = main.store().listed_branch_name(id, &Default::default())?;
-                    match name.map(|n| main.branch(&n)) {
-                        Some(Ok(ds)) if ds.store().branch_id() == id => found.push(ds),
-                        _ => unsure = true,
-                    }
-                }
-                stores.insert(found)
+        let origin_id = hold.for_dataset.unwrap_or_else(|| main.dataset_id());
+        let stores = match origins.entry(origin_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let origin = if origin_id == main.dataset_id() {
+                    Some(main.clone())
+                } else {
+                    catalog
+                        .filter(|catalog| catalog.matches_unique_datasets([main]))
+                        .and_then(|catalog| catalog.unique_by_id(origin_id))
+                };
+                let stores = match origin {
+                    Some(origin) => OperationStores::open(&origin)?,
+                    None => None,
+                };
+                main.store().failpoint("evidence-reconcile-origin-opened");
+                entry.insert(stores)
             }
         };
-        if unsure {
+        let Some(stores) = stores else {
+            return Ok(true);
+        };
+        let still_listed = || {
+            stores.branches_match()
+                && (hold.for_dataset.is_none()
+                    || catalog.is_some_and(|catalog| {
+                        catalog.matches_unique_datasets([main, &stores.datasets[0]])
+                    }))
+        };
+        if !still_listed() {
             return Ok(true);
         }
+        let heads: Vec<_> = stores
+            .datasets
+            .iter()
+            .map(|ds| ds.store().snapshot())
+            .collect();
         let op = operation_iri(hold.id);
         let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
-        for ds in stores.iter() {
-            let head = ds.store().snapshot();
-            if Reads::new(&preparation, &head).described_anywhere(&op)? {
+        for head in &heads {
+            if Reads::new(&preparation, head).described_anywhere(&op)? {
                 return Ok(true);
             }
         }
-        Ok(false)
+        let unchanged = stores
+            .datasets
+            .iter()
+            .zip(heads)
+            .all(|(ds, head)| Arc::ptr_eq(&head, &ds.store().snapshot()));
+        Ok(!unchanged || !still_listed())
     })
 }

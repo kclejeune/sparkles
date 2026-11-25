@@ -96,6 +96,7 @@ pub mod review;
 pub use propose::{
     AuthorityFence, Options as ProposeOptions, OrdinaryChanges, Proposed, ProposedRecord,
     operation_id, operation_iri, operation_recorded, propose, reconcile_operation_holds,
+    reconcile_operation_holds_in,
 };
 pub use review::claims::{
     self, ClaimOccurrence, ClaimOrigin, ClaimState, MAX_CLAIM_SCAN, MAX_CLAIMS, MEM_INSTRUCTIONS,
@@ -361,9 +362,21 @@ pub fn holds(dataset: &Dataset) -> Result<Vec<SourceHold>> {
 /// commits, so repeat the acquisition, release it or reconcile it. The first hold raises
 /// the dataset reader to 7.
 pub fn acquire_hold(dataset: &Dataset, id: uuid::Uuid, commits: &[CommitRef]) -> Result<Acquired> {
+    acquire_hold_for(dataset, id, commits, None)
+}
+
+/// [`acquire_hold`] for an operation in `for_dataset`, when it differs from `dataset`.
+/// A `for_dataset` equal to `dataset`'s id is normalized to `None`. Any hold naming
+/// another dataset writes `holds.json` as format 2.
+pub fn acquire_hold_for(
+    dataset: &Dataset,
+    id: uuid::Uuid,
+    commits: &[CommitRef],
+    for_dataset: Option<uuid::Uuid>,
+) -> Result<Acquired> {
     dataset
         .store()
-        .acquire_hold(OwnerKind::Evidence, id, commits)
+        .acquire_hold_for(OwnerKind::Evidence, id, commits, for_dataset)
 }
 
 /// Release the evidence hold `id`, returning whether it existed. Its commits can be

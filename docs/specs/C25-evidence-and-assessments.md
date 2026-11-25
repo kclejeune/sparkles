@@ -913,17 +913,17 @@ A proposal runs in this order.
 4. The references to existing records and stored facts are resolved under the caller's
    read access with the L4 resolver, so a reference the caller cannot read answers as a
    missing one.
-5. The stored facts of this dataset are held under a hold whose id is the operation
-   UUID, and the hold is durable before step 6 starts.
+5. Each dataset that serves a referenced stored fact acquires a durable hold under
+   the operation UUID before step 6 starts.
 6. Under the branch writer, `ifHead` is checked as `409 head-changed`, the key is checked
    again, every record identity is checked, the commit is stamped and the record and
    operation quads are built. An existing identity in the same graph whose authenticated
    record has an equal digest is reported as `existing` and not written again, and any
    other existing identity is `409 immutable-record-conflict`. A publish hook then runs
-   on the committing thread inside the commit. It takes the holds' publication lock
-   shared, refuses when the hold is gone or holds other commits, and enters the host's
-   authority fence. The thread keeps both guards until the commit has published or been
-   refused.
+   on the committing thread inside the commit. It takes the referenced datasets'
+   publication locks in ascending dataset UUID order and checks the holds before entering
+   the host's authority fence. The thread keeps the guards until the commit has
+   published or been refused.
 
 The hold comes before the commit because a reference recorded without a durable hold
 could lose its commit to retention before any hold existed. With this order a crash at
@@ -991,8 +991,8 @@ reconciliation and a retry.
    existing passage and a structured value outside a retained JSON revision of the
    same batch answer `incomplete-evidence`, because this step cannot yet verify them
    against retained content. Roadmap item 551 tracks their verification.
-2. **Holds in other datasets.** A stored fact of another dataset is verified but not held.
-   Roadmap item 550 tracks holding it under the operation.
+2. **Holds in other datasets.** A proposal verifies the fact and holds its commit
+   under the operation in the referenced dataset.
 3. **Records of an earlier protection.** A detach and a new protection invalidate the
    records written before them, which then answer `origin-not-reproduced`. Roadmap item
    552 tracks an administered re-authentication.
@@ -2301,6 +2301,36 @@ graph, the state, the head commit, the model requests and the task list unchange
 also covers a withdrawal behind a cited claim and a state left behind the reports graph
 at the next server start, each of which starts one refresh. A hidden superseding decision
 under a triple protection has no test of the check.
+
+### Holds for stored facts of other datasets
+
+Item 550 extends proposal holds to every catalog dataset that serves a referenced
+stored fact. The proposing and referenced datasets must each have a distinct identity
+in the same catalog. The proposal acquires a hold in each referenced dataset before
+it publishes and records their shared operation UUID as `ev:sourceHold`. The publication
+hook checks all the holds under shared guards in ascending dataset UUID order and
+keeps them through publication. A dry run acquires no holds. A replay returns the
+hold recorded in the original receipt, including an empty hold field for older
+proposals that referenced only other datasets.
+
+A foreign hold records the proposing dataset's UUID as `forDatasetId`. Its presence
+requires `holds.json` format 2. A file that holds only local commits for local
+operations uses format 1. Readers that support only format 1 refuse a format 2 file,
+and readers that support format 2 refuse files with higher versions.
+`GET /$/evidence/{ds}/holds` includes `forDatasetId` on foreign holds.
+
+`reconcile_operation_holds_in` checks the proposing dataset and its listed branches
+for the operation after the grace period. The first pass opens the origin's stores
+and the second reads their snapshots under the held dataset's publication lock.
+Nonblocking checks keep the hold when catalog membership is uncertain or a branch
+or head changes during the check. A proposal renews each hold as it enters publication,
+so an earlier reconciliation leaves it in place. A hold stays while either dataset
+is unavailable or ambiguously registered. An administrator can release it explicitly. After publication, a proposal checks for
+orphaned holds in its own dataset and every dataset it held.
+
+Tests cover both file versions, retained history under compaction, an explicit
+release, cancellation after hold acquisition, crash recovery with an idempotent
+retry, and reconciliation across dataset renames, new branch creation and branch deletion.
 
 ### Scope changes
 

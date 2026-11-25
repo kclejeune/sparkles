@@ -669,6 +669,33 @@ impl Catalog {
             .map(|e| e.dataset.clone())
     }
 
+    /// Look up an identity that names exactly one open dataset in this catalog.
+    pub(crate) fn unique_by_id(&self, id: Uuid) -> Option<Dataset> {
+        Self::unique_entry(&self.inner.entries.read(), id).map(|entry| entry.dataset.clone())
+    }
+
+    /// Check that each dataset is the sole open instance of its identity. Returns false
+    /// if the registry is busy, so callers under a publication lock never wait for it.
+    pub(crate) fn matches_unique_datasets<'a>(
+        &self,
+        datasets: impl IntoIterator<Item = &'a Dataset>,
+    ) -> bool {
+        self.inner.entries.try_read().is_some_and(|entries| {
+            datasets.into_iter().all(|ds| {
+                Self::unique_entry(&entries, ds.dataset_id())
+                    .is_some_and(|entry| std::ptr::eq(ds.store(), entry.dataset.store()))
+            })
+        })
+    }
+
+    fn unique_entry(entries: &BTreeMap<String, Entry>, id: Uuid) -> Option<&Entry> {
+        let mut matches = entries
+            .values()
+            .filter(|entry| entry.dataset.dataset_id() == id);
+        let entry = matches.next()?;
+        matches.next().is_none().then_some(entry)
+    }
+
     /// Clone an already registered dataset by exact identity with controlled waiting.
     /// This never opens a dataset and grants no permission to read it.
     pub fn try_get_by_id(

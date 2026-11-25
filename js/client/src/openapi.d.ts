@@ -7299,6 +7299,11 @@ export interface components {
             created: string;
             /**
              * Format: uuid
+             * @description The dataset whose operation acquired this hold, when it differs from this dataset.
+             */
+            forDatasetId?: string;
+            /**
+             * Format: uuid
              * @description The hold's identity.
              */
             id: string;
@@ -7663,7 +7668,7 @@ export interface components {
                         key?: string;
                     };
                 };
-                /** @description A stored fact in the form of `EvidenceResolveRequest`. A fact of this dataset is held for the operation. */
+                /** @description A stored fact in the form of `EvidenceResolveRequest`. Its commit is held for the operation. */
                 storedFact?: Record<string, never>;
                 structured?: {
                     method: {
@@ -7779,7 +7784,7 @@ export interface components {
             };
             /** @description The commit's time, the first availability of its source revisions. `null` for a dry run. */
             firstAvailableAt: string | null;
-            /** @description The source hold of the stored facts of this dataset that the batch references. */
+            /** @description The UUID shared by the source holds of this operation in the referenced datasets. */
             hold: string | null;
             /** @description The operation, which is every record's availability receipt. */
             operation: string;

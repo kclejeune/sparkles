@@ -157,7 +157,7 @@ fn hold_json(
     h: &sparkles::evidence::SourceHold,
     names: &std::collections::HashMap<uuid::Uuid, String>,
 ) -> J {
-    json!({
+    let mut out = json!({
         "id": h.id,
         "owner": h.owner.as_str(),
         "created": sparkles::commit::rfc3339_ms(h.created_ms),
@@ -166,7 +166,11 @@ fn hold_json(
             "branchId": c.branch_id,
             "commit": c.seq,
         })).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(ds) = h.for_dataset {
+        out["forDatasetId"] = json!(ds);
+    }
+    out
 }
 
 #[derive(Deserialize)]

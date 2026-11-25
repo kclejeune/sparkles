@@ -115,6 +115,20 @@ impl Store {
         id: uuid::Uuid,
         commits: &[CommitRef],
     ) -> Result<Acquired> {
+        self.acquire_hold_for(owner, id, commits, None)
+    }
+
+    /// [`Store::acquire_hold`] for an operation in `for_dataset`, when it differs from
+    /// this dataset. A `for_dataset` equal to this dataset's id is normalized to `None`.
+    /// Acquiring an existing hold with a different `for_dataset` is a `hold-conflict`.
+    /// Any hold that names another dataset writes `holds.json` as format 2.
+    pub fn acquire_hold_for(
+        &self,
+        owner: OwnerKind,
+        id: uuid::Uuid,
+        commits: &[CommitRef],
+        for_dataset: Option<uuid::Uuid>,
+    ) -> Result<Acquired> {
         self.holds_main()?;
         if commits.is_empty() {
             return Err(Error::invalid("a source hold names at least one commit"));
@@ -122,6 +136,7 @@ impl Store {
         if commits.len() > holds::MAX_COMMITS {
             return Err(holds::limit(0, commits.len()));
         }
+        let for_dataset = for_dataset.filter(|&d| d != self.owner_dataset_id());
         let mut commits = commits.to_vec();
         commits.sort_unstable();
         commits.dedup();
@@ -157,7 +172,10 @@ impl Store {
         };
         let touch = self.family.holds.touches.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(existing) = records.get_mut(&id) {
-            if existing.hold.owner == owner && existing.hold.commits == commits {
+            if existing.hold.owner == owner
+                && existing.hold.commits == commits
+                && existing.hold.for_dataset == for_dataset
+            {
                 // a reconciliation that looked before this no longer releases it
                 existing.touch = touch;
                 existing.acquired_ms = existing.acquired_ms.max(self.now_ms());
@@ -186,6 +204,7 @@ impl Store {
             owner,
             created_ms: now,
             commits: commits.clone(),
+            for_dataset,
         };
         next.insert(
             id,
@@ -261,13 +280,30 @@ impl Store {
         id: uuid::Uuid,
         commits: &[CommitRef],
     ) -> Result<HoldPublication> {
+        self.hold_publication_for(owner, id, commits, None)
+    }
+
+    /// [`Store::hold_publication`] for a hold whose originating dataset is `for_dataset`
+    /// (`None` or this dataset's id for local holds).
+    pub fn hold_publication_for(
+        &self,
+        owner: OwnerKind,
+        id: uuid::Uuid,
+        commits: &[CommitRef],
+        for_dataset: Option<uuid::Uuid>,
+    ) -> Result<HoldPublication> {
         let guard = self.family.holds.publishing.read_arc();
+        let for_dataset = for_dataset.filter(|&d| d != self.owner_dataset_id());
         let mut commits = commits.to_vec();
         commits.sort_unstable();
         commits.dedup();
         match &mut *self.family.holds.state.lock() {
             HoldsState::Ready(r) => match r.get_mut(&id) {
-                Some(rec) if rec.hold.owner == owner && rec.hold.commits == commits => {
+                Some(rec)
+                    if rec.hold.owner == owner
+                        && rec.hold.commits == commits
+                        && rec.hold.for_dataset == for_dataset =>
+                {
                     // a reconciliation that looked before this no longer releases it
                     rec.touch = self.family.holds.touches.fetch_add(1, Ordering::Relaxed) + 1;
                 }

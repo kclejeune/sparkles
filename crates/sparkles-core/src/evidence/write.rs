@@ -168,9 +168,10 @@ pub struct PlannedRecord {
     pub(super) triples: Vec<Triple>,
 }
 
-/// A stored fact of the plan's dataset that the operation keeps readable.
+/// A stored fact commit that the operation keeps readable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HeldCommit {
+    pub dataset: Uuid,
     pub branch: Uuid,
     pub commit: u64,
 }
@@ -186,7 +187,8 @@ pub struct Plan {
     pub records: Vec<PlannedRecord>,
     /// The distinct graphs the operation writes, sorted.
     pub graphs: Vec<NamedNode>,
-    /// The stored facts of this dataset that the operation's references name.
+    /// The stored facts that the operation's references name, sorted by dataset, branch
+    /// and commit.
     pub held: Vec<HeldCommit>,
     principal: NamedNode,
     idempotency_key: Option<String>,
@@ -668,12 +670,11 @@ pub fn plan<'i>(
         control.check()?;
         let (scope, mut r_fields): (String, Vec<(NamedNode, Term)>) = match &reference.target {
             EvidenceRefTarget::StoredFact(fact) => {
-                if fact.dataset == dataset {
-                    held.push(HeldCommit {
-                        branch: fact.branch,
-                        commit: fact.commit,
-                    });
-                }
+                held.push(HeldCommit {
+                    dataset: fact.dataset,
+                    branch: fact.branch,
+                    commit: fact.commit,
+                });
                 let mut fields = vec![
                     (ev("datasetId"), string(&fact.dataset.to_string())),
                     (ev("branchId"), string(&fact.branch.to_string())),
@@ -1149,6 +1150,8 @@ pub struct RecordedOperation {
     pub payload_digest: Option<Sha256Digest>,
     pub branch: Option<Uuid>,
     pub commit: Option<u64>,
+    /// The source hold recorded on the operation, when it has one.
+    pub source_hold: Option<Uuid>,
     /// When the operation published, as recorded.
     pub ended_at: Option<Literal>,
 }
@@ -1622,6 +1625,9 @@ impl<'a> Reads<'a> {
                 }
                 _ => None,
             };
+            let source_hold = self
+                .one_string(op.as_str(), &format!("{EV}sourceHold"), g.as_str())?
+                .and_then(|hold| Uuid::parse_str(&hold).ok());
             let ended_at = match self.one(op.as_str(), &format!("{PROV}endedAtTime"), g.as_str())? {
                 Some(Term::Literal(l)) => Some(l),
                 _ => None,
@@ -1631,6 +1637,7 @@ impl<'a> Reads<'a> {
                 payload_digest,
                 branch,
                 commit,
+                source_hold,
                 ended_at,
             };
             found = Some(match found {
@@ -1642,6 +1649,7 @@ impl<'a> Reads<'a> {
                         .filter(|d| Some(*d) == this.payload_digest),
                     branch: prev.branch.filter(|b| Some(*b) == this.branch),
                     commit: prev.commit.filter(|c| Some(*c) == this.commit),
+                    source_hold: prev.source_hold.filter(|h| Some(*h) == this.source_hold),
                     ended_at: prev.ended_at,
                 },
             });

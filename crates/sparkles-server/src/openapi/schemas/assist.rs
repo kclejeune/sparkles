@@ -527,6 +527,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                     "id": uuid("The hold's identity."),
                     "owner": with_desc(string_enum(&["evidence"]), "The profile that holds the commits."),
                     "created": with_desc(json!({ "type": "string", "format": "date-time" }), "When the hold was acquired."),
+                    "forDatasetId": uuid("The dataset whose operation acquired this hold, when it differs from this dataset."),
                     "commits": with_desc(array(closed(
                         &["branch", "branchId", "commit"],
                         json!({
@@ -876,7 +877,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                         json!({
                             "key": key("The record's key in this batch."),
                             "occurrenceKey": key("The reference's key within what it references."),
-                            "storedFact": with_desc(json!({ "type": "object" }), "A stored fact in the form of `EvidenceResolveRequest`. A fact of this dataset is held for the operation."),
+                            "storedFact": with_desc(json!({ "type": "object" }), "A stored fact in the form of `EvidenceResolveRequest`. Its commit is held for the operation."),
                             "passage": closed(
                                 &["revision", "rendition", "passage"],
                                 json!({
@@ -980,7 +981,7 @@ pub(super) fn evidence(put: &mut dyn FnMut(&str, J)) {
                     "commit": commit("The publishing commit, the first one for a replay, or the head for a dry run."),
                     "branchId": uuid("The branch the commit published on."),
                     "firstAvailableAt": with_desc(or_null(string()), "The commit's time, the first availability of its source revisions. `null` for a dry run."),
-                    "hold": with_desc(or_null(json!({ "type": "string", "format": "uuid" })), "The source hold of the stored facts of this dataset that the batch references."),
+                    "hold": with_desc(or_null(json!({ "type": "string", "format": "uuid" })), "The UUID shared by the source holds of this operation in the referenced datasets."),
                     "records": array(closed(
                         &["key", "kind", "iri", "graph", "recordDigest", "existing"],
                         json!({

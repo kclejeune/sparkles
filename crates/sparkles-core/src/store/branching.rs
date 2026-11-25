@@ -1648,11 +1648,6 @@ impl Store {
         Ok(self.owned_set()?.entry(name)?.id)
     }
 
-    /// The current name of the listed branch whose identity is `id`, `main` for the
-    /// dataset id, through the dataset's main store. `None` for a deleted, retired or
-    /// unknown identity. Reads only the branch table, so no branch store is opened, and
-    /// waits for the table under the cancellation, deadline and no-wait choice of
-    /// `options`.
     /// The ids of the listed branches, read from the branch table without taking any
     /// writer. Empty for a store without branches.
     pub fn listed_branch_ids(&self) -> Vec<uuid::Uuid> {
@@ -1662,6 +1657,27 @@ impl Store {
         set.table.lock().branches.iter().map(|b| b.id).collect()
     }
 
+    /// Check that the listed branch identities still match a previous enumeration.
+    /// Returns false if the branch table is busy, so this can be used under a source
+    /// hold's publication lock without waiting for another dataset's branch table.
+    pub fn matches_listed_branch_ids(&self, ids: &[uuid::Uuid]) -> bool {
+        let SetRef::Owner(set) = &self.branching.set else {
+            return ids.is_empty();
+        };
+        set.table.try_lock().is_some_and(|table| {
+            table
+                .branches
+                .iter()
+                .map(|branch| branch.id)
+                .eq(ids.iter().copied())
+        })
+    }
+
+    /// The current name of the listed branch whose identity is `id`, `main` for the
+    /// dataset id, through the dataset's main store. `None` for a deleted, retired or
+    /// unknown identity. Reads only the branch table, so no branch store is opened, and
+    /// waits for the table under the cancellation, deadline and no-wait choice of
+    /// `options`.
     pub fn listed_branch_name(
         &self,
         id: uuid::Uuid,

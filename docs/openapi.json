@@ -8299,6 +8299,11 @@
             "format": "date-time",
             "type": "string"
           },
+          "forDatasetId": {
+            "description": "The dataset whose operation acquired this hold, when it differs from this dataset.",
+            "format": "uuid",
+            "type": "string"
+          },
           "id": {
             "description": "The hold's identity.",
             "format": "uuid",
@@ -9372,7 +9377,7 @@
                   "type": "object"
                 },
                 "storedFact": {
-                  "description": "A stored fact in the form of `EvidenceResolveRequest`. A fact of this dataset is held for the operation.",
+                  "description": "A stored fact in the form of `EvidenceResolveRequest`. Its commit is held for the operation.",
                   "type": "object"
                 },
                 "structured": {
@@ -9724,7 +9729,7 @@
             ]
           },
           "hold": {
-            "description": "The source hold of the stored facts of this dataset that the batch references.",
+            "description": "The UUID shared by the source holds of this operation in the referenced datasets.",
             "oneOf": [
               {
                 "format": "uuid",

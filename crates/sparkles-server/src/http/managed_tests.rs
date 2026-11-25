@@ -1224,3 +1224,138 @@ async fn identities_are_proposed_reviewed_and_resolved_over_http() {
         "/{ds}/claims/dependents"
     );
 }
+
+#[tokio::test]
+async fn cross_dataset_claims_proposal_holds_referenced_dataset_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap(),
+    );
+    state.attach("ev", DbType::Persistent, None).unwrap();
+    state.attach("inv", DbType::Persistent, None).unwrap();
+    let ev = state.get("ev").unwrap();
+    let inv = state.get("inv").unwrap();
+    let app = router(state.clone());
+    // configure evidence only on ev; inv stays an ordinary dataset
+    let (status, j) = call(
+        &app,
+        "PUT",
+        "/$/evidence/ev/settings",
+        Some("application/json"),
+        &json!({
+            "format": 1,
+            "profile": 1,
+            "enabled": true,
+            "sourceRecords": ["urn:ev:sources"],
+            "proposals": ["urn:ev:claims"],
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    // Record a fact at a past commit before tightening retention.
+    inv.dataset
+        .update("INSERT DATA { GRAPH <urn:inv> { <urn:host> <urn:runs> <urn:release> } }")
+        .unwrap();
+    let fact_commit = inv.store.head_commit().seq;
+    inv.dataset
+        .update("DELETE DATA { GRAPH <urn:inv> { <urn:host> <urn:runs> <urn:release> } }")
+        .unwrap();
+    let digest =
+        sparkles::evidence::Sha256Digest::of_bytes(b"note", &sparkles::task::Control::none())
+            .unwrap()
+            .to_string();
+    let body = json!({
+        "revisions": [{"key": "rev", "source": "urn:src", "sourceKey": "s1",
+                       "content": {"digest": digest}}],
+        "references": [{"key": "ref", "occurrenceKey": "r1", "storedFact": {
+            "datasetId": inv.store.dataset_id(),
+            "branchId": inv.store.dataset_id(),
+            "commit": fact_commit,
+            "graph": "urn:inv",
+            "triple": "<urn:host> <urn:runs> <urn:release>",
+        }}],
+        "claims": [{"key": "c", "occurrenceKey": "c1", "revision": {"key": "rev"},
+                    "proposition": "<urn:host> <urn:runs> <urn:release>",
+                    "kind": "reported", "polarity": "positive", "author": "urn:a"}],
+        "links": [{"key": "l", "occurrenceKey": "l1", "target": {"key": "c"},
+                   "evidence": {"key": "ref"}, "relation": "supports", "author": "urn:a"}],
+    });
+    let (status, proposed) = call(
+        &app,
+        "POST",
+        "/ev/claims",
+        Some("application/json"),
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{proposed}");
+    assert_eq!(proposed["committed"], true);
+    let hold_id = proposed["hold"].as_str().expect("hold uuid").to_string();
+    // GET /$/evidence/inv/holds lists the cross-dataset hold with forDatasetId = ev
+    let (status, listed) = call(&app, "GET", "/$/evidence/inv/holds", None, "").await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let holds = listed["holds"].as_array().unwrap();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0]["id"], hold_id);
+    assert_eq!(holds[0]["forDatasetId"], ev.store.dataset_id().to_string());
+    inv.store
+        .set_retention(sparkles::history::Retention {
+            keep_commits: Some(1),
+            keep_age_ms: None,
+            max_bytes: Some(1),
+        })
+        .unwrap();
+    // compact inv repeatedly; the held fact stays resolvable
+    for i in 0..3 {
+        inv.dataset
+            .update(&format!("INSERT DATA {{ <urn:n> <urn:v> {i} }}"))
+            .unwrap();
+        inv.store.compact().unwrap();
+    }
+    inv.store.history_tick().unwrap();
+    let (status, resolved) = call(
+        &app,
+        "POST",
+        "/ev/claims/resolve",
+        Some("application/json"),
+        &json!({"references": [{"key": "f", "storedFact": {
+            "datasetId": inv.store.dataset_id(),
+            "branchId": inv.store.dataset_id(),
+            "commit": fact_commit,
+            "graph": "urn:inv",
+            "triple": "<urn:host> <urn:runs> <urn:release>",
+        }}]})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resolved}");
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!("/$/evidence/inv/holds/{hold_id}"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    inv.store.compact().unwrap();
+    inv.store.history_tick().unwrap();
+    let (status, gone) = call(
+        &app,
+        "POST",
+        "/ev/claims/resolve",
+        Some("application/json"),
+        &json!({"references": [{"key": "f", "storedFact": {
+            "datasetId": inv.store.dataset_id(),
+            "branchId": inv.store.dataset_id(),
+            "commit": fact_commit,
+            "graph": "urn:inv",
+            "triple": "<urn:host> <urn:runs> <urn:release>",
+        }}]})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{gone}");
+    assert_eq!(gone["code"], "evidence-unavailable");
+}
