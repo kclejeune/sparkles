@@ -15,7 +15,7 @@ use super::dtcheck::comp::Comps;
 use super::dtcheck::range::{Ranges, Rid, map_backing_bytes, map_buckets_for, map_growth};
 use super::dtcheck::rule::{self, Group, Units};
 use super::dtcheck::solve::{Atom, Bounds, Problem, Prop, Why};
-use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
+use super::index::{BOTTOM, Ex, Index, Node, RefireMap, Role, TOP};
 use super::saturate::{Concl, Contexts, Dynamic, Sink, State};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -55,7 +55,7 @@ pub struct DtIx {
     /// the run's components
     pub comps: Comps,
     /// for each told subsumer of a body atom, the components it re-evaluates
-    refire: FxHashMap<Ex, Vec<u32>>,
+    refire: RefireMap,
     /// the worst last evaluation of each component in the states of worlds, which go
     /// when their world does
     sticky: Mutex<Vec<u8>>,
@@ -158,7 +158,7 @@ impl DtIx {
         disjoint: Vec<(Role, Role)>,
         ranges: Ranges,
         comps: Comps,
-        refire: FxHashMap<Ex, Vec<u32>>,
+        refire: RefireMap,
     ) -> DtIx {
         for ri in roles.values_mut() {
             ri.ranges.sort_unstable();
@@ -255,13 +255,7 @@ impl DtIx {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(Role, Role)>()),
             )
-            .saturating_add(map_backing_bytes(&self.refire))
-            .saturating_add(
-                self.refire
-                    .values()
-                    .map(|v| v.capacity().saturating_mul(std::mem::size_of::<u32>()))
-                    .sum::<usize>(),
-            )
+            .saturating_add(self.refire.bytes())
             .saturating_add(self.sticky.lock().capacity())
             .saturating_add(self.comps.bytes())
             .saturating_add(self.ranges.lock().bytes())
@@ -317,17 +311,7 @@ impl DtIx {
                     .len()
                     .saturating_mul(std::mem::size_of::<(Role, Role)>()),
             )
-            .saturating_add(
-                self.refire
-                    .len()
-                    .saturating_mul(std::mem::size_of::<(u32, Vec<u32>)>()),
-            )
-            .saturating_add(
-                self.refire
-                    .values()
-                    .map(|v| v.len().saturating_mul(std::mem::size_of::<u32>()))
-                    .sum::<usize>(),
-            )
+            .saturating_add(self.refire.logical_bytes())
             .saturating_add(self.sticky.lock().len())
     }
 
@@ -664,7 +648,7 @@ pub fn refire<S: Sink>(ix: &Index, st: &mut State, t: Ex, out: &mut S) {
     let Some(dt) = ix.dt.as_deref() else {
         return;
     };
-    let Some(comps) = dt.refire.get(&t) else {
+    let Some(comps) = dt.refire_of(t) else {
         return;
     };
     for &c in comps {
@@ -1097,7 +1081,7 @@ mod tests {
             Vec::new(),
             Ranges::new(),
             Comps::default(),
-            FxHashMap::default(),
+            RefireMap::default(),
         );
         let key: Key = (0, vec![1u32, 2].into_boxed_slice(), Box::new([]));
         let make_ans = || {
@@ -1279,7 +1263,7 @@ mod tests {
             Vec::new(),
             Ranges::new(),
             Comps::default(),
-            FxHashMap::default(),
+            RefireMap::default(),
         );
         // Pre-populate cache with the exact key that `evaluate` would build.
         let key: Key = (
@@ -1455,7 +1439,7 @@ mod tests {
             Vec::new(),
             Ranges::new(),
             Comps::default(),
-            FxHashMap::default(),
+            RefireMap::default(),
         );
         let key513: Key = (
             0,
@@ -1626,7 +1610,7 @@ mod tests {
             Vec::new(),
             Ranges::new(),
             Comps::default(),
-            FxHashMap::default(),
+            RefireMap::default(),
         );
         // Fill `cache` to exact capacity boundary 896 (1024 buckets -> next insert rehashes to 2048).
         {
@@ -1687,7 +1671,7 @@ mod tests {
         // Build a `DtIx` with 897 roles (2048 buckets), 897 refire keys (2048 buckets),
         // 256 components (outer `body` Vec + `sticky` Vec) and spare inner `body` capacity.
         let mut roles = FxHashMap::default();
-        let mut refire = FxHashMap::default();
+        let mut refire = RefireMap::default();
         for i in 0..897u32 {
             roles.insert(
                 i,
@@ -1706,11 +1690,9 @@ mod tests {
             + map_backing_bytes(&roles)
             + body.capacity() * std::mem::size_of::<Vec<Body>>()
             + body[0].capacity() * std::mem::size_of::<Body>()
-            + map_backing_bytes(&refire)
-            + refire
-                .values()
-                .map(|v| v.capacity() * std::mem::size_of::<u32>())
-                .sum::<usize>()
+            + map_buckets_for(897) * (std::mem::size_of::<(Ex, Vec<u32>)>() + 1)
+            + 16
+            + 897 * std::mem::size_of::<u32>()
             + 256; // sticky
         // Build `DtIx` with `body.len() == 256`; `sticky` has length `comps.len()`.
         let dt = DtIx::new(

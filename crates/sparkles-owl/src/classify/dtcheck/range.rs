@@ -1130,12 +1130,16 @@ pub(in super::super) fn map_buckets_for(cap: usize) -> usize {
 
 /// Backing bucket + control byte allocation of a hashbrown `FxHashMap` (preserved by `clone`).
 pub(in super::super) fn map_backing_bytes<K, V>(m: &FxHashMap<K, V>) -> usize {
-    let buckets = map_buckets_for(m.capacity());
+    table_backing_bytes::<(K, V)>(m.capacity())
+}
+
+pub(in super::super) fn table_backing_bytes<T>(capacity: usize) -> usize {
+    let buckets = map_buckets_for(capacity);
     if buckets == 0 {
         0
     } else {
         buckets
-            .saturating_mul(std::mem::size_of::<(K, V)>() + 1)
+            .saturating_mul(std::mem::size_of::<T>() + 1)
             .saturating_add(16)
     }
 }
@@ -1143,10 +1147,14 @@ pub(in super::super) fn map_backing_bytes<K, V>(m: &FxHashMap<K, V>) -> usize {
 /// Worst-case allocation when inserting into `m` at its capacity boundary (covers the
 /// doubled destination table during rehash).
 pub(in super::super) fn map_growth<K, V>(m: &FxHashMap<K, V>) -> usize {
-    if m.len() == m.capacity() {
-        let next_buckets = map_buckets_for(m.capacity()).saturating_mul(2).max(8);
+    table_growth::<(K, V)>(m.len(), m.capacity())
+}
+
+pub(in super::super) fn table_growth<T>(len: usize, capacity: usize) -> usize {
+    if len == capacity {
+        let next_buckets = map_buckets_for(capacity).saturating_mul(2).max(8);
         next_buckets
-            .saturating_mul(std::mem::size_of::<(K, V)>() + 1)
+            .saturating_mul(std::mem::size_of::<T>() + 1)
             .saturating_add(16)
     } else {
         0
