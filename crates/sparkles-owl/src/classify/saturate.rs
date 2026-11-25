@@ -905,6 +905,8 @@ struct Run<'a> {
     always_congested: bool,
     #[cfg(test)]
     helper_ran: AtomicBool,
+    #[cfg(test)]
+    helper_worked: AtomicBool,
 }
 
 /// What the workers of a run in steps share ([`Run::steps`]).
@@ -1588,6 +1590,8 @@ pub fn saturate_counted(
         always_congested: ALWAYS_CONGESTED.get(),
         #[cfg(test)]
         helper_ran: AtomicBool::new(false),
+        #[cfg(test)]
+        helper_worked: AtomicBool::new(false),
     };
     // An empty pooled round still holds its inherited tables and queued messages.
     if bounds.charge.is_none() || run.check_initial_memory() {
@@ -1681,6 +1685,7 @@ pub fn saturate_counted(
     super::admission_test::emit_merge_phase(super::admission_test::MergePhase::SatStop {
         stop: raw_stop,
         helper_ran: run.helper_ran.load(Ordering::Relaxed),
+        helper_worked: run.helper_worked.load(Ordering::Relaxed),
     });
     let stop = match raw_stop {
         STOP_CANCEL => Some(Stop::Cancelled),
@@ -3394,6 +3399,10 @@ impl<'a> Run<'a> {
                 }
                 return;
             }
+            #[cfg(test)]
+            if WORKER.with(|w| w.get() == HELPER) {
+                self.helper_worked.store(true, Ordering::Relaxed);
+            }
             self.process::<R>(
                 next,
                 &mut mine,
@@ -5059,6 +5068,7 @@ pub(super) fn test_concurrent_commit_dl_no_double_count() -> (bool, usize, usize
         started: &STARTED_NS,
         always_congested: false,
         helper_ran: AtomicBool::new(false),
+        helper_worked: AtomicBool::new(false),
     };
     let done = Arc::new(AtomicBool::new(false));
     let done_obs = done.clone();
@@ -5385,6 +5395,7 @@ mod horn_accounting_tests {
             started: &STARTED_NS,
             always_congested: false,
             helper_ran: AtomicBool::new(false),
+            helper_worked: AtomicBool::new(false),
         }
     }
 

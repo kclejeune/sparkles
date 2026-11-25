@@ -458,11 +458,21 @@ fn next_value_capacity(len: usize, capacity: usize) -> Option<usize> {
 }
 
 impl Interner {
+    /// Bytes allocated by [`Interner::ensure_top_bottom`] (`nodes` initial capacity 4 × 40).
+    pub const EMPTY_INIT_BYTES: usize = 4 * 40;
+
     pub fn new() -> Interner {
         let mut i = Interner::default();
-        i.node(Node::Top);
-        i.node(Node::Bottom);
+        i.ensure_top_bottom();
         i
+    }
+
+    /// Initialises `Node::Top` and `Node::Bottom` on a zero-allocation default interner.
+    pub fn ensure_top_bottom(&mut self) {
+        if self.nodes.is_empty() {
+            self.node(Node::Top);
+            self.node(Node::Bottom);
+        }
     }
 
     /// The interner of a chunk of a parallel normalization, with the datatype

@@ -1464,9 +1464,10 @@ struct MergeStop {
 }
 
 /// Payload transferred from a winning `Stop::Split` out of `run_once` into `run_splitting`.
+/// Carries only interner individual IDs so no IRI string is cloned while the branch is live.
 struct SplitStop {
-    u: NamedIndividual,
-    v: NamedIndividual,
+    u_id: u32,
+    v_id: u32,
     spent: usize,
     bound: usize,
     peak: usize,
@@ -3161,7 +3162,7 @@ impl Saturation {
             lock: parking_lot::Mutex<()>,
         }
         impl SplitLedger<'_> {
-            fn delta(&self, d: isize) -> Result<(), usize> {
+            fn delta_checked(&self, d: isize) -> Result<usize, usize> {
                 let _g = self.lock.lock();
                 if d >= 0 {
                     let add = d as usize;
@@ -3178,36 +3179,65 @@ impl Saturation {
                         self.peak.fetch_max(usize::MAX, Ordering::Relaxed);
                         return Err(usize::MAX);
                     };
-                    let mut paid = self.admitted.load(Ordering::Relaxed);
+                    let paid_before = self.admitted.load(Ordering::Relaxed);
+                    let mut paid = paid_before;
                     let charge_fn = self
                         .limits
                         .charge
                         .as_deref()
                         .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
-                    if !cover_memory(used, self.limits.max_memory, charge_fn, &mut paid) {
+                    let ok = cover_memory(used, self.limits.max_memory, charge_fn, &mut paid);
+                    #[cfg(test)]
+                    admission_test::emit_merge_phase(admission_test::MergePhase::LedgerCharge {
+                        source: admission_test::LedgerChargeSource::Delta,
+                        used,
+                        paid_before,
+                        paid_after: if ok { paid } else { paid_before },
+                        delta: if ok {
+                            paid.saturating_sub(paid_before)
+                        } else {
+                            0
+                        },
+                        admitted: ok,
+                    });
+                    if !ok {
                         self.peak.fetch_max(used, Ordering::Relaxed);
                         return Err(used);
                     }
                     self.admitted.store(paid, Ordering::Relaxed);
                     self.live.store(next, Ordering::Relaxed);
                     self.peak.fetch_max(used, Ordering::Relaxed);
-                    Ok(())
+                    Ok(used)
                 } else {
                     let sub = d.unsigned_abs();
                     let cur = self.live.load(Ordering::Relaxed);
-                    self.live.store(cur.saturating_sub(sub), Ordering::Relaxed);
-                    Ok(())
+                    let next = cur.saturating_sub(sub);
+                    self.live.store(next, Ordering::Relaxed);
+                    Ok(self
+                        .held_base
+                        .saturating_add(next)
+                        .saturating_add(self.canon.load(Ordering::Relaxed)))
                 }
             }
-            fn add(&self, bytes: usize) -> Result<(), usize> {
+            fn delta(&self, d: isize) -> Result<(), usize> {
+                self.delta_checked(d).map(|_| ())
+            }
+            fn add_checked(&self, bytes: usize) -> Result<usize, usize> {
                 if bytes == 0 {
-                    return Ok(());
+                    let _g = self.lock.lock();
+                    return Ok(self
+                        .held_base
+                        .saturating_add(self.live.load(Ordering::Relaxed))
+                        .saturating_add(self.canon.load(Ordering::Relaxed)));
                 }
                 let Ok(d) = isize::try_from(bytes) else {
                     self.peak.fetch_max(usize::MAX, Ordering::Relaxed);
                     return Err(usize::MAX);
                 };
-                self.delta(d)
+                self.delta_checked(d)
+            }
+            fn add(&self, bytes: usize) -> Result<(), usize> {
+                self.add_checked(bytes).map(|_| ())
             }
             fn sub(&self, bytes: usize) {
                 if bytes == 0 {
@@ -3254,13 +3284,27 @@ impl Saturation {
             fn cover(&self, used: usize) -> bool {
                 let _g = self.lock.lock();
                 self.peak.fetch_max(used, Ordering::Relaxed);
-                let mut paid = self.admitted.load(Ordering::Relaxed);
+                let paid_before = self.admitted.load(Ordering::Relaxed);
+                let mut paid = paid_before;
                 let charge_fn = self
                     .limits
                     .charge
                     .as_deref()
                     .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
                 let ok = cover_memory(used, self.limits.max_memory, charge_fn, &mut paid);
+                #[cfg(test)]
+                admission_test::emit_merge_phase(admission_test::MergePhase::LedgerCharge {
+                    source: admission_test::LedgerChargeSource::Cover,
+                    used,
+                    paid_before,
+                    paid_after: if ok { paid } else { paid_before },
+                    delta: if ok {
+                        paid.saturating_sub(paid_before)
+                    } else {
+                        0
+                    },
+                    admitted: ok,
+                });
                 if ok {
                     self.admitted.store(paid, Ordering::Relaxed);
                 }
@@ -3386,13 +3430,13 @@ impl Saturation {
             stack_debit: &mut usize,
             additional: usize,
             ledger: &SplitLedger<'_>,
-        ) -> Result<(), usize> {
+        ) -> Result<Option<usize>, usize> {
             let Some(need_len) = stack.len().checked_add(additional) else {
                 ledger.note_peak(usize::MAX);
                 return Err(usize::MAX);
             };
             if need_len <= stack.capacity() {
-                return Ok(());
+                return Ok(None);
             }
             let elem = std::mem::size_of::<SplitFrame>();
             let mut next_cap = stack.capacity();
@@ -3408,7 +3452,7 @@ impl Saturation {
                 return Err(usize::MAX);
             };
             let old_b = *stack_debit;
-            ledger.add(new_b)?;
+            let mut proposed = ledger.add_checked(new_b)?;
             stack.reserve_exact(next_cap - stack.len());
             let Some(actual_new) = stack.capacity().checked_mul(elem) else {
                 ledger.sub(old_b);
@@ -3422,10 +3466,10 @@ impl Saturation {
                 ledger.sub(new_b - actual_new);
                 *stack_debit = actual_new;
             } else if actual_new > new_b {
-                ledger.add(actual_new - new_b)?;
+                proposed = proposed.max(ledger.add_checked(actual_new - new_b)?);
                 *stack_debit = actual_new;
             }
-            Ok(())
+            Ok(Some(proposed))
         }
 
         // Establish the full live entry baseline before collecting the original signature:
@@ -3486,7 +3530,14 @@ impl Saturation {
                             sig_mem_err.set(Some(usize::MAX));
                             return;
                         };
-                        if let Err(used) = ledger.add(need) {
+                        let cls_admit = ledger.add_checked(need);
+                        #[cfg(test)]
+                        admission_test::emit_merge_phase(admission_test::MergePhase::SplitAlloc {
+                            site: admission_test::SplitAllocSite::OrigSigTable,
+                            proposed: cls_admit.unwrap_or_else(|u| u),
+                            admitted: cls_admit.is_ok(),
+                        });
+                        if let Err(used) = cls_admit {
                             sig_mem_err.set(Some(used));
                             return;
                         }
@@ -3524,7 +3575,14 @@ impl Saturation {
                             sig_mem_err.set(Some(usize::MAX));
                             return;
                         };
-                        if let Err(used) = ledger.add(need) {
+                        let cls_admit = ledger.add_checked(need);
+                        #[cfg(test)]
+                        admission_test::emit_merge_phase(admission_test::MergePhase::SplitAlloc {
+                            site: admission_test::SplitAllocSite::OrigSigTable,
+                            proposed: cls_admit.unwrap_or_else(|u| u),
+                            admitted: cls_admit.is_ok(),
+                        });
+                        if let Err(used) = cls_admit {
                             sig_mem_err.set(Some(used));
                             return;
                         }
@@ -3626,7 +3684,14 @@ impl Saturation {
                     used: usize::MAX,
                 }
             })?;
-        if let Err(used) = ledger.add(orig_sig_bytes) {
+        let orig_sig_admit = ledger.add_checked(orig_sig_bytes);
+        #[cfg(test)]
+        admission_test::emit_merge_phase(admission_test::MergePhase::SplitAlloc {
+            site: admission_test::SplitAllocSite::OrigSig,
+            proposed: orig_sig_admit.unwrap_or_else(|u| u),
+            admitted: orig_sig_admit.is_ok(),
+        });
+        if let Err(used) = orig_sig_admit {
             drop((raw_classes, raw_inds));
             ledger.sub(raw_classes_debit.saturating_add(raw_inds_debit));
             *call_peak = (*call_peak).max(ledger.peak.load(Ordering::Relaxed));
@@ -3662,7 +3727,20 @@ impl Saturation {
         // whose `root_uf_bytes` is already debited in `ledger` from entry.
         let mut stack: Vec<SplitFrame> = Vec::new();
         let mut stack_debit = 0usize;
-        if let Err(used) = ensure_stack_cap(&mut stack, &mut stack_debit, 1, &ledger) {
+        let root_stack_admit = ensure_stack_cap(&mut stack, &mut stack_debit, 1, &ledger);
+        #[cfg(test)]
+        if let Some(proposed) = match root_stack_admit {
+            Ok(Some(p)) => Some(p),
+            Ok(None) => None,
+            Err(u) => Some(u),
+        } {
+            admission_test::emit_merge_phase(admission_test::MergePhase::SplitAlloc {
+                site: admission_test::SplitAllocSite::RootStack,
+                proposed,
+                admitted: root_stack_admit.is_ok(),
+            });
+        }
+        if let Err(used) = root_stack_admit {
             drop((orig_classes, orig_individuals, orig_ind_names_arc));
             *call_peak = (*call_peak)
                 .max(ledger.peak.load(Ordering::Relaxed))
@@ -3706,23 +3784,23 @@ impl Saturation {
 
         enum LoopExit {
             Done,
-            NoForkResult(bool, Option<Taxonomy>, Box<Stats>),
             ExcludedAbort,
             Error(Error),
         }
 
         let mut exit = LoopExit::Done;
 
-        // Remaps every disequality in `neq` through `merge`. Returns `Ok(true)` if any
-        // pair collapsed to `a == b` (proving the branch inconsistent), `Ok(false)` on
-        // surviving deduplicated pairs, or `Err(used)` on memory admission failure.
+        // Remaps every disequality in `neq` through `merge`. Returns `Ok((true, None))` if
+        // any pair collapsed to `a == b` (proving the branch inconsistent),
+        // `Ok((false, proposed))` on surviving deduplicated pairs, or `Err(used)` on memory
+        // admission failure.
         let remap_neq = |merge: &Merge,
                          neq: &mut Vec<(NamedIndividual, NamedIndividual)>,
                          neq_bytes: &mut usize,
                          ledger: &SplitLedger<'_>|
-         -> Result<bool, usize> {
+         -> Result<(bool, Option<usize>), usize> {
             if neq.is_empty() {
-                return Ok(false);
+                return Ok((false, None));
             }
             let Some(mut new_bytes) = neq
                 .len()
@@ -3735,7 +3813,7 @@ impl Saturation {
                 let ra = merge.rep_of_named_ref(a);
                 let rb = merge.rep_of_named_ref(b);
                 if ra == rb {
-                    return Ok(true);
+                    return Ok((true, None));
                 }
                 let (lo, hi) = if ra.as_str() <= rb.as_str() {
                     (ra, rb)
@@ -3751,7 +3829,7 @@ impl Saturation {
                 };
                 new_bytes = next;
             }
-            ledger.add(new_bytes)?;
+            let proposed = ledger.add_checked(new_bytes)?;
             let mut remapped: Vec<(NamedIndividual, NamedIndividual)> =
                 Vec::with_capacity(neq.len());
             for (a, b) in neq.iter() {
@@ -3781,7 +3859,7 @@ impl Saturation {
             } else if exact_new > total_before {
                 ledger.add_already_paid(exact_new - total_before);
             }
-            Ok(false)
+            Ok((false, Some(proposed)))
         };
 
         'dfs: while let Some(mut frame) = stack.pop() {
@@ -3840,7 +3918,14 @@ impl Saturation {
                         });
                         break 'dfs;
                     };
-                    if let Err(used) = ledger.add(sb) {
+                    let synth_admit = ledger.add_checked(sb);
+                    #[cfg(test)]
+                    admission_test::emit_merge_phase(admission_test::MergePhase::SplitAlloc {
+                        site: admission_test::SplitAllocSite::SynthAxioms,
+                        proposed: synth_admit.unwrap_or_else(|u| u),
+                        admitted: synth_admit.is_ok(),
+                    });
+                    if let Err(used) = synth_admit {
                         ledger.note_peak(used);
                         exit = LoopExit::Error(Error::Memory {
                             limit: limits.max_memory.unwrap_or(usize::MAX),
@@ -3940,7 +4025,8 @@ impl Saturation {
                 match r {
                     Ok((consistent, taxonomy, mut stats)) => {
                         if !forked {
-                            // No-fork fast path: preserve normal `index`, `dirty = false`, and `describe`.
+                            // No-fork fast path: preserve normal `index`, `dirty = false`, and `describe`,
+                            // returning directly without boxing `Stats` outside the ledger.
                             stats.dl_rooted_merged =
                                 self.interner.canon.as_ref().map_or(0, |c| c.len());
                             stats.dl_rooted_spent = dl_rooted_spent;
@@ -3952,8 +4038,7 @@ impl Saturation {
                             *call_peak = (*call_peak).max(stats.peak_memory);
                             self.merge.clear();
                             self.canon_want = None;
-                            exit = LoopExit::NoForkResult(consistent, taxonomy, Box::new(stats));
-                            break 'dfs;
+                            return Ok((consistent, taxonomy, stats));
                         }
                         // Forked terminal leaf finished saturation!
                         leaf_work = leaf_work.saturating_add(stats.dl_work);
@@ -3979,23 +4064,45 @@ impl Saturation {
                                     leaves, frame.depth, stats.dl_work, dl_rooted_spent
                                 );
                             }
-                            self.reset();
+                            self.reset_empty();
                             self.canon_want = None;
                             #[cfg(test)]
                             admission_test::emit_merge_phase(
                                 admission_test::MergePhase::SplitPostLeafReset {
                                     canon_want_none: self.canon_want.is_none(),
                                     leaf_inds_cap: self.leaf_individuals.capacity(),
+                                    interner_bytes: self.interner.bytes(),
+                                    residual_bytes: self.residual_outer_bytes(),
                                 },
                             );
                             break 'branch;
                         }
                         // Complete leaf consistency check + original-signature S2 export.
-                        // Include the live saturated leaf state in every export admission
-                        // until `self.reset()` frees it, keeping one owner for shared maps
-                        // and `frame.merge`.
+                        // Include the full live saturated leaf state (including interner
+                        // individual-name storage) in every export admission until
+                        // `self.reset_empty()` frees it with zero replacement allocation.
                         let leaf_live = self.leaf_live_bytes_without_canon_and_merge();
-                        ledger.add_already_paid(leaf_live);
+                        let leaf_live_admit = ledger.add_checked(leaf_live);
+                        #[cfg(test)]
+                        admission_test::emit_merge_phase(admission_test::MergePhase::SplitAlloc {
+                            site: admission_test::SplitAllocSite::LeafLive,
+                            proposed: leaf_live_admit.unwrap_or_else(|u| u),
+                            admitted: leaf_live_admit.is_ok(),
+                        });
+                        if let Err(used) = leaf_live_admit {
+                            self.reset_empty();
+                            self.canon_want = None;
+                            ledger.set_canon(distinct_canon_bytes(
+                                &stack,
+                                &[frame.merge.shared.as_ref()],
+                            ));
+                            ledger.note_peak(used);
+                            exit = LoopExit::Error(Error::Memory {
+                                limit: limits.max_memory.unwrap_or(usize::MAX),
+                                used,
+                            });
+                            break 'dfs;
+                        }
                         #[cfg(test)]
                         admission_test::emit_merge_phase(
                             admission_test::MergePhase::SplitLeafExportStart { leaves },
@@ -4019,7 +4126,7 @@ impl Saturation {
                             ),
                             Err(_) => {}
                         }
-                        self.reset();
+                        self.reset_empty();
                         self.canon_want = None;
                         ledger.sub(leaf_live);
                         ledger.set_canon(distinct_canon_bytes(
@@ -4031,6 +4138,8 @@ impl Saturation {
                             admission_test::MergePhase::SplitPostLeafReset {
                                 canon_want_none: self.canon_want.is_none(),
                                 leaf_inds_cap: self.leaf_individuals.capacity(),
+                                interner_bytes: self.interner.bytes(),
+                                residual_bytes: self.residual_outer_bytes(),
                             },
                         );
                         match exported {
@@ -4145,7 +4254,7 @@ impl Saturation {
                             }
                             let old_inds = std::mem::take(&mut self.interner.individuals);
                             let old_inds_bytes = old_inds.exact_bytes();
-                            self.reset();
+                            self.reset_empty();
                             self.reduced = false;
                             self.canon_want = None;
                             frame.merge.shared = None;
@@ -4238,13 +4347,28 @@ impl Saturation {
                             );
                             attempt_bound.get_or_insert(stop.bound);
                             // Mandatory full disequality remapping after derived unit merge!
-                            match remap_neq(
+                            let merge_remap = remap_neq(
                                 &frame.merge,
                                 &mut frame.neq,
                                 &mut frame.neq_bytes,
                                 &ledger,
-                            ) {
-                                Ok(true) => {
+                            );
+                            #[cfg(test)]
+                            if let Some(proposed) = match merge_remap {
+                                Ok((_, Some(p))) => Some(p),
+                                Ok((_, None)) => None,
+                                Err(u) => Some(u),
+                            } {
+                                admission_test::emit_merge_phase(
+                                    admission_test::MergePhase::SplitAlloc {
+                                        site: admission_test::SplitAllocSite::MergeRemap,
+                                        proposed,
+                                        admitted: merge_remap.is_ok(),
+                                    },
+                                );
+                            }
+                            match merge_remap {
+                                Ok((true, _)) => {
                                     // Self-disequality collision proves branch inconsistent immediately!
                                     leaves += 1;
                                     if split_trace() {
@@ -4255,7 +4379,7 @@ impl Saturation {
                                     }
                                     break 'branch;
                                 }
-                                Ok(false) => {}
+                                Ok((false, _)) => {}
                                 Err(used) => {
                                     ledger.note_peak(used);
                                     self.dl_worked.store(false, Ordering::Relaxed);
@@ -4275,7 +4399,40 @@ impl Saturation {
                                 });
                                 break 'dfs;
                             };
-                            match frame.merge.build_canon(canon_base, limits, &mut admit_fn) {
+                            #[cfg(test)]
+                            let mut merge_canon_peak = canon_base;
+                            let mut merge_canon_admit = |used: usize| -> bool {
+                                #[cfg(test)]
+                                {
+                                    merge_canon_peak = merge_canon_peak.max(used);
+                                }
+                                admit_fn(used)
+                            };
+                            let merge_canon =
+                                frame
+                                    .merge
+                                    .build_canon(canon_base, limits, &mut merge_canon_admit);
+                            #[cfg(test)]
+                            match &merge_canon {
+                                Ok(_) => admission_test::emit_merge_phase(
+                                    admission_test::MergePhase::SplitAlloc {
+                                        site: admission_test::SplitAllocSite::MergeCanon,
+                                        proposed: merge_canon_peak,
+                                        admitted: true,
+                                    },
+                                ),
+                                Err(BuildCanonErr::Memory(used)) => {
+                                    admission_test::emit_merge_phase(
+                                        admission_test::MergePhase::SplitAlloc {
+                                            site: admission_test::SplitAllocSite::MergeCanon,
+                                            proposed: *used,
+                                            admitted: false,
+                                        },
+                                    );
+                                }
+                                Err(BuildCanonErr::Poll(_)) => {}
+                            }
+                            match merge_canon {
                                 Ok(_) => {
                                     ledger.set_canon(distinct_canon_bytes(
                                         &stack,
@@ -4308,25 +4465,73 @@ impl Saturation {
                                 exit = LoopExit::Error(pe);
                                 break 'dfs;
                             }
-                            self.reset();
+                            // Move the two winning individual IRIs directly out of the still-live
+                            // interner table with zero heap allocation BEFORE resetting the branch.
+                            let mut old_inds = std::mem::take(&mut self.interner.individuals);
+                            let (mut old_items, old_hashes) = old_inds.take();
+                            drop((old_inds, old_hashes));
+                            let extracted = if stop.u_id != stop.v_id
+                                && (stop.u_id as usize) < old_items.len()
+                                && (stop.v_id as usize) < old_items.len()
+                            {
+                                let u = std::mem::replace(
+                                    &mut old_items[stop.u_id as usize],
+                                    NamedIndividual::new(String::new()),
+                                );
+                                let v = std::mem::replace(
+                                    &mut old_items[stop.v_id as usize],
+                                    NamedIndividual::new(String::new()),
+                                );
+                                Some((u, v))
+                            } else {
+                                None
+                            };
+                            drop(old_items);
+                            self.reset_empty();
                             self.reduced = false;
                             self.canon_want = None;
                             ledger.set_canon(distinct_canon_bytes(
                                 &stack,
                                 &[frame.merge.shared.as_ref()],
                             ));
+                            let Some((stop_u, stop_v)) = extracted else {
+                                self.dl_worked.store(false, Ordering::Relaxed);
+                                exit = LoopExit::Error(Error::Memory {
+                                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                                    used: ledger.peak.load(Ordering::Relaxed),
+                                });
+                                break 'dfs;
+                            };
                             dl_rooted_spent = stop.spent.saturating_sub(leaf_work);
                             attempt_bound.get_or_insert(stop.bound);
 
                             let stop_bytes =
-                                stop.u.as_str().len().saturating_add(stop.v.as_str().len());
-                            ledger.add_already_paid(stop_bytes);
+                                stop_u.as_str().len().saturating_add(stop_v.as_str().len());
+                            let stop_admit = ledger.add_checked(stop_bytes);
+                            #[cfg(test)]
+                            admission_test::emit_merge_phase(
+                                admission_test::MergePhase::SplitAlloc {
+                                    site: admission_test::SplitAllocSite::StopHandoff,
+                                    proposed: stop_admit.unwrap_or_else(|u| u),
+                                    admitted: stop_admit.is_ok(),
+                                },
+                            );
+                            if let Err(used) = stop_admit {
+                                drop((stop_u, stop_v));
+                                ledger.note_peak(used);
+                                self.dl_worked.store(false, Ordering::Relaxed);
+                                exit = LoopExit::Error(Error::Memory {
+                                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                                    used,
+                                });
+                                break 'dfs;
+                            }
 
                             // Inspect canonical representatives by reference (zero allocation)
                             // before checking termination or admitting child structures.
                             let (lo_len, hi_len, already_decided) = {
-                                let ru = frame.merge.rep_of_named_ref(&stop.u);
-                                let rv = frame.merge.rep_of_named_ref(&stop.v);
+                                let ru = frame.merge.rep_of_named_ref(&stop_u);
+                                let rv = frame.merge.rep_of_named_ref(&stop_v);
                                 let (lo, hi) = if ru.as_str() <= rv.as_str() {
                                     (ru, rv)
                                 } else {
@@ -4352,7 +4557,7 @@ impl Saturation {
                             if already_decided {
                                 // Candidate is already decided or caps reached; finish this branch
                                 // without further splitting.
-                                drop(stop);
+                                drop((stop_u, stop_v));
                                 ledger.sub(stop_bytes);
                                 force_no_split = true;
                                 continue 'branch;
@@ -4363,16 +4568,32 @@ impl Saturation {
                             planned_leaves += 1;
                             let next_depth = frame.depth + 1;
                             #[cfg(test)]
-                            admission_test::emit_merge_phase(
-                                admission_test::MergePhase::SplitFork {
+                            {
+                                let ru = frame.merge.rep_of_named_ref(&stop_u);
+                                let rv = frame.merge.rep_of_named_ref(&stop_v);
+                                let (lo, hi) = if ru.as_str() <= rv.as_str() {
+                                    (ru, rv)
+                                } else {
+                                    (rv, ru)
+                                };
+                                admission_test::emit_split_pair(
                                     splits,
-                                    depth: next_depth,
-                                    prio: stop.prio,
-                                },
-                            );
+                                    next_depth,
+                                    stop.prio,
+                                    lo.as_str(),
+                                    hi.as_str(),
+                                );
+                                admission_test::emit_merge_phase(
+                                    admission_test::MergePhase::SplitFork {
+                                        splits,
+                                        depth: next_depth,
+                                        prio: stop.prio,
+                                    },
+                                );
+                            }
                             if split_trace() {
-                                let ru = frame.merge.rep_of_named_ref(&stop.u);
-                                let rv = frame.merge.rep_of_named_ref(&stop.v);
+                                let ru = frame.merge.rep_of_named_ref(&stop_u);
+                                let rv = frame.merge.rep_of_named_ref(&stop_v);
                                 let (lo, hi) = if ru.as_str() <= rv.as_str() {
                                     (ru, rv)
                                 } else {
@@ -4392,10 +4613,24 @@ impl Saturation {
 
                             // Pre-admit DFS stack growth for both child pushes before
                             // allocating child state or consuming `frame`.
-                            if let Err(used) =
-                                ensure_stack_cap(&mut stack, &mut stack_debit, 2, &ledger)
-                            {
-                                drop(stop);
+                            let fork_stack_admit =
+                                ensure_stack_cap(&mut stack, &mut stack_debit, 2, &ledger);
+                            #[cfg(test)]
+                            if let Some(proposed) = match fork_stack_admit {
+                                Ok(Some(p)) => Some(p),
+                                Ok(None) => None,
+                                Err(u) => Some(u),
+                            } {
+                                admission_test::emit_merge_phase(
+                                    admission_test::MergePhase::SplitAlloc {
+                                        site: admission_test::SplitAllocSite::ForkStack,
+                                        proposed,
+                                        admitted: fork_stack_admit.is_ok(),
+                                    },
+                                );
+                            }
+                            if let Err(used) = fork_stack_admit {
+                                drop((stop_u, stop_v));
                                 ledger.sub(stop_bytes);
                                 ledger.note_peak(used);
                                 self.dl_worked.store(false, Ordering::Relaxed);
@@ -4406,11 +4641,11 @@ impl Saturation {
                                 break 'dfs;
                             }
 
-                            let mut admit_fn = |used: usize| -> bool { ledger.cover(used) };
+                            let admit_fn = |used: usize| -> bool { ledger.cover(used) };
 
                             // Clone parent Merge for B_eq before moving parent into B_ne.
                             let Some(clone_base) = ledger.base_with_canon(0) else {
-                                drop(stop);
+                                drop((stop_u, stop_v));
                                 ledger.sub(stop_bytes);
                                 ledger.note_peak(usize::MAX);
                                 self.dl_worked.store(false, Ordering::Relaxed);
@@ -4420,23 +4655,44 @@ impl Saturation {
                                 });
                                 break 'dfs;
                             };
-                            let mut eq_merge =
-                                match frame.merge.clone_admitted(clone_base, &mut admit_fn) {
-                                    Ok(m) => m,
-                                    Err(used) => {
-                                        drop(stop);
-                                        ledger.sub(stop_bytes);
-                                        ledger.note_peak(used);
-                                        self.dl_worked.store(false, Ordering::Relaxed);
-                                        exit = LoopExit::Error(poll(limits).err().unwrap_or(
-                                            Error::Memory {
-                                                limit: limits.max_memory.unwrap_or(usize::MAX),
-                                                used,
-                                            },
-                                        ));
-                                        break 'dfs;
-                                    }
-                                };
+                            #[cfg(test)]
+                            let mut clone_peak = clone_base;
+                            let mut clone_admit = |used: usize| -> bool {
+                                #[cfg(test)]
+                                {
+                                    clone_peak = clone_peak.max(used);
+                                }
+                                admit_fn(used)
+                            };
+                            let cloned_merge =
+                                frame.merge.clone_admitted(clone_base, &mut clone_admit);
+                            #[cfg(test)]
+                            admission_test::emit_merge_phase(
+                                admission_test::MergePhase::SplitAlloc {
+                                    site: admission_test::SplitAllocSite::ForkMergeClone,
+                                    proposed: match &cloned_merge {
+                                        Ok(_) => clone_peak,
+                                        Err(used) => *used,
+                                    },
+                                    admitted: cloned_merge.is_ok(),
+                                },
+                            );
+                            let mut eq_merge = match cloned_merge {
+                                Ok(m) => m,
+                                Err(used) => {
+                                    drop((stop_u, stop_v));
+                                    ledger.sub(stop_bytes);
+                                    ledger.note_peak(used);
+                                    self.dl_worked.store(false, Ordering::Relaxed);
+                                    exit = LoopExit::Error(poll(limits).err().unwrap_or(
+                                        Error::Memory {
+                                            limit: limits.max_memory.unwrap_or(usize::MAX),
+                                            used,
+                                        },
+                                    ));
+                                    break 'dfs;
+                                }
+                            };
                             let mut eq_uf_bytes = eq_merge.uf_bytes();
                             ledger.add_already_paid(eq_uf_bytes);
 
@@ -4459,7 +4715,7 @@ impl Saturation {
                                 .and_then(|b| b.checked_add(lo_len))
                                 .and_then(|b| b.checked_add(hi_len));
                             let Some(ne_add) = ne_add else {
-                                drop(stop);
+                                drop((stop_u, stop_v));
                                 ledger.sub(stop_bytes.saturating_add(eq_uf_bytes));
                                 ledger.note_peak(usize::MAX);
                                 self.dl_worked.store(false, Ordering::Relaxed);
@@ -4469,8 +4725,17 @@ impl Saturation {
                                 });
                                 break 'dfs;
                             };
-                            if let Err(used) = ledger.add(ne_add) {
-                                drop(stop);
+                            let ne_admit = ledger.add_checked(ne_add);
+                            #[cfg(test)]
+                            admission_test::emit_merge_phase(
+                                admission_test::MergePhase::SplitAlloc {
+                                    site: admission_test::SplitAllocSite::ForkNeq,
+                                    proposed: ne_admit.unwrap_or_else(|u| u),
+                                    admitted: ne_admit.is_ok(),
+                                },
+                            );
+                            if let Err(used) = ne_admit {
+                                drop((stop_u, stop_v));
                                 ledger.sub(stop_bytes.saturating_add(eq_uf_bytes));
                                 ledger.note_peak(used);
                                 self.dl_worked.store(false, Ordering::Relaxed);
@@ -4486,8 +4751,8 @@ impl Saturation {
                                     .push((index::exact_individual(a), index::exact_individual(b)));
                             }
                             {
-                                let ru = frame.merge.rep_of_named_ref(&stop.u);
-                                let rv = frame.merge.rep_of_named_ref(&stop.v);
+                                let ru = frame.merge.rep_of_named_ref(&stop_u);
+                                let rv = frame.merge.rep_of_named_ref(&stop_v);
                                 let (lo, hi) = if ru.as_str() <= rv.as_str() {
                                     (ru, rv)
                                 } else {
@@ -4526,7 +4791,7 @@ impl Saturation {
 
                             // Prepare left branch B_eq (u == v): union + mandatory full disequality remap.
                             let Some(eq_base) = ledger.base_with_canon(eq_uf_bytes) else {
-                                drop(stop);
+                                drop((stop_u, stop_v));
                                 ledger.sub(
                                     stop_bytes
                                         .saturating_add(eq_uf_bytes)
@@ -4540,10 +4805,32 @@ impl Saturation {
                                 });
                                 break 'dfs;
                             };
-                            match eq_merge.union_named(&stop.u, &stop.v, eq_base, &mut admit_fn) {
+                            #[cfg(test)]
+                            let mut union_peak = eq_base;
+                            let mut union_admit = |used: usize| -> bool {
+                                #[cfg(test)]
+                                {
+                                    union_peak = union_peak.max(used);
+                                }
+                                admit_fn(used)
+                            };
+                            let union_res =
+                                eq_merge.union_named(&stop_u, &stop_v, eq_base, &mut union_admit);
+                            #[cfg(test)]
+                            admission_test::emit_merge_phase(
+                                admission_test::MergePhase::SplitAlloc {
+                                    site: admission_test::SplitAllocSite::ForkEqUnion,
+                                    proposed: match &union_res {
+                                        Ok(_) => union_peak,
+                                        Err(used) => *used,
+                                    },
+                                    admitted: union_res.is_ok(),
+                                },
+                            );
+                            match union_res {
                                 Ok(_) => {}
                                 Err(used) => {
-                                    drop(stop);
+                                    drop((stop_u, stop_v));
                                     ledger.sub(
                                         stop_bytes
                                             .saturating_add(eq_uf_bytes)
@@ -4560,7 +4847,7 @@ impl Saturation {
                                     break 'dfs;
                                 }
                             }
-                            drop(stop);
+                            drop((stop_u, stop_v));
                             ledger.sub(stop_bytes);
                             let new_eq_uf = eq_merge.uf_bytes();
                             if new_eq_uf > eq_uf_bytes {
@@ -4573,8 +4860,24 @@ impl Saturation {
                                 &stack,
                                 &[eq_merge.shared.as_ref()],
                             ));
-                            match remap_neq(&eq_merge, &mut eq_neq, &mut eq_neq_bytes, &ledger) {
-                                Ok(true) => {
+                            let eq_remap =
+                                remap_neq(&eq_merge, &mut eq_neq, &mut eq_neq_bytes, &ledger);
+                            #[cfg(test)]
+                            if let Some(proposed) = match eq_remap {
+                                Ok((_, Some(p))) => Some(p),
+                                Ok((_, None)) => None,
+                                Err(u) => Some(u),
+                            } {
+                                admission_test::emit_merge_phase(
+                                    admission_test::MergePhase::SplitAlloc {
+                                        site: admission_test::SplitAllocSite::ForkEqRemap,
+                                        proposed,
+                                        admitted: eq_remap.is_ok(),
+                                    },
+                                );
+                            }
+                            match eq_remap {
+                                Ok((true, _)) => {
                                     // B_eq immediately inconsistent via disequality collision!
                                     leaves += 1;
                                     ledger.sub(eq_uf_bytes.saturating_add(eq_neq_bytes));
@@ -4582,7 +4885,7 @@ impl Saturation {
                                     ledger.set_canon(distinct_canon_bytes(&stack, &[]));
                                     break 'branch;
                                 }
-                                Ok(false) => {}
+                                Ok((false, _)) => {}
                                 Err(used) => {
                                     ledger.sub(eq_uf_bytes.saturating_add(eq_neq_bytes));
                                     ledger.note_peak(used);
@@ -4604,7 +4907,38 @@ impl Saturation {
                                 });
                                 break 'dfs;
                             };
-                            match eq_merge.build_canon(canon_base, limits, &mut admit_fn) {
+                            #[cfg(test)]
+                            let mut eq_canon_peak = canon_base;
+                            let mut eq_canon_admit = |used: usize| -> bool {
+                                #[cfg(test)]
+                                {
+                                    eq_canon_peak = eq_canon_peak.max(used);
+                                }
+                                admit_fn(used)
+                            };
+                            let eq_canon =
+                                eq_merge.build_canon(canon_base, limits, &mut eq_canon_admit);
+                            #[cfg(test)]
+                            match &eq_canon {
+                                Ok(_) => admission_test::emit_merge_phase(
+                                    admission_test::MergePhase::SplitAlloc {
+                                        site: admission_test::SplitAllocSite::ForkEqCanon,
+                                        proposed: eq_canon_peak,
+                                        admitted: true,
+                                    },
+                                ),
+                                Err(BuildCanonErr::Memory(used)) => {
+                                    admission_test::emit_merge_phase(
+                                        admission_test::MergePhase::SplitAlloc {
+                                            site: admission_test::SplitAllocSite::ForkEqCanon,
+                                            proposed: *used,
+                                            admitted: false,
+                                        },
+                                    );
+                                }
+                                Err(BuildCanonErr::Poll(_)) => {}
+                            }
+                            match eq_canon {
                                 Ok(_) => {}
                                 Err(BuildCanonErr::Poll(pe)) => {
                                     ledger.sub(eq_uf_bytes.saturating_add(eq_neq_bytes));
@@ -4655,7 +4989,6 @@ impl Saturation {
 
         // Handle non-completion exits cleanly before assembling `SplitAnswer`.
         match exit {
-            LoopExit::NoForkResult(c, t, s) => return Ok((c, t, *s)),
             LoopExit::Error(e) => {
                 *call_peak = (*call_peak).max(ledger.peak.load(Ordering::Relaxed));
                 drop((
@@ -4669,7 +5002,7 @@ impl Saturation {
                 self.canon_want = None;
                 self.split_cfg = None;
                 self.split_stop = None;
-                self.reset();
+                self.reset_empty();
                 self.invalidate_for_error();
                 return Err(e);
             }
@@ -4695,7 +5028,7 @@ impl Saturation {
                 self.canon_want = None;
                 self.split_cfg = None;
                 self.split_stop = None;
-                self.reset();
+                self.reset_empty();
                 self.invalidate_for_error();
                 let remaining = bound.saturating_sub(spent_so_far);
                 #[cfg(test)]
@@ -4862,6 +5195,7 @@ impl Saturation {
         drop((orig_classes, orig_ind_names_arc));
 
         self.index = None;
+        self.interner = Interner::default();
         self.ctx = Vec::new();
         self.disjoint = Vec::new();
         self.worlds = FxHashMap::default();
@@ -6169,10 +6503,11 @@ impl Saturation {
         declined.get_or_insert(used);
     }
 
-    /// Drops the state of a run that stopped part way, since the next run starts again.
-    fn reset(&mut self) {
+    /// Drops all run state without allocating a replacement interner; the next
+    /// [`Saturation::build`] pre-admits and initializes `Node::Top` / `Node::Bottom`.
+    fn reset_empty(&mut self) {
         self.index = None;
-        self.interner = Interner::new();
+        self.interner = Interner::default();
         self.worlds = FxHashMap::default();
         self.chain_ranged = Vec::new();
         self.partial = None;
@@ -6183,6 +6518,12 @@ impl Saturation {
         self.dl_run = None;
         self.split_answer = None;
         self.leaf_individuals = Vec::new();
+    }
+
+    /// Drops the state of a run that stopped part way, since the next run starts again.
+    fn reset(&mut self) {
+        self.reset_empty();
+        self.interner.ensure_top_bottom();
     }
 
     /// Normalizes the axioms inside OWL 2 EL and builds the index. `outside` names the
@@ -6204,7 +6545,18 @@ impl Saturation {
             held_bytes + kept_bytes,
             self.interner.ranges.ledger.clone(),
         );
-        budget.baseline(self.interner.bytes() + self.merge_extra_bytes())?;
+        let init_interner = if self.interner.len() == 0 {
+            Interner::EMPTY_INIT_BYTES
+        } else {
+            0
+        };
+        budget.baseline(
+            self.interner
+                .bytes()
+                .saturating_add(init_interner)
+                .saturating_add(self.merge_extra_bytes()),
+        )?;
+        self.interner.ensure_top_bottom();
         self.interner.ranges.begin(budget.clone());
         let result = self.build_inner(axioms, outside, threads, held_bytes, limits);
         // the run's components and definitions end with its normalization, on every exit
@@ -6676,7 +7028,7 @@ impl Saturation {
             None
         };
         if !same_canon(&self.interner.canon, &want_canon) {
-            self.reset();
+            self.reset_empty();
         }
         self.canon_want = want_canon;
         let reduce_mem = limits.max_memory.map(|m| {
@@ -6754,7 +7106,7 @@ impl Saturation {
                     } else {
                         // the interner of an earlier run holds names and individuals that
                         // decide the tiers, so the rewritten axioms start from nothing
-                        self.reset();
+                        self.reset_empty();
                         self.hide_internal = true;
                         self.active_hub = red.hub.take();
                         // item 805: keys over object properties and the universal property
@@ -6871,7 +7223,7 @@ impl Saturation {
         if let Some(r) = self.run_once(axioms, changes, held_bytes, &step_limits, with_taxonomy)? {
             return Ok(r);
         }
-        self.reset();
+        self.reset_empty();
         let retry_limits = Limits {
             charge: Self::charge_drawing_on(limits, admitted),
             ..limits.clone()
@@ -6981,7 +7333,7 @@ impl Saturation {
         let kept = kept.filter(|_| !full);
         self.worlds = FxHashMap::default();
         if full {
-            self.interner = Interner::new();
+            self.interner = Interner::default();
             self.interner.canon = self.canon_want.clone();
             self.ctx = Vec::new();
             self.disjoint = Vec::new();
@@ -6998,10 +7350,9 @@ impl Saturation {
         };
         let old_bytes = old_ix.as_ref().map_or(0, |ix| ix.bytes())
             + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes())
-            + self
-                .dl_run
-                .as_ref()
-                .map_or(0, |d| d.table.bytes() + d.lits.bytes());
+            + self.dl_run.as_ref().map_or(0, |d| {
+                d.table.bytes() + d.lits.bytes() + d.split_meta_bytes()
+            });
         // from here on a stop on the memory budget may be the kept state's, which a run
         // that starts again does not hold, whatever the tier of the kept contexts
         self.reused = kept.is_some();
@@ -7616,8 +7967,8 @@ impl Saturation {
                     {
                         self.dl_worked.store(false, Ordering::Relaxed);
                         self.split_stop = Some(SplitStop {
-                            u: u.clone(),
-                            v: v.clone(),
+                            u_id: cand.u_id,
+                            v_id: cand.v_id,
                             spent,
                             bound,
                             peak: used,
@@ -8619,24 +8970,28 @@ impl Saturation {
                         .map_or(0, |d| d.table.bytes() + d.lits.bytes()),
                 )
         } else {
-            base.saturating_add(self.merge.uf_bytes())
-                .saturating_add(self.canon_live_bytes())
-                .saturating_add(self.active_hub.as_ref().map_or(0, |h| h.as_str().len()))
+            base.saturating_add(
+                self.interner
+                    .bytes()
+                    .saturating_sub(self.interner.canon_bytes()),
+            )
+            .saturating_add(self.merge.uf_bytes())
+            .saturating_add(self.canon_live_bytes())
+            .saturating_add(self.active_hub.as_ref().map_or(0, |h| h.as_str().len()))
         }
     }
 
     fn index_bytes(&self, ix: &Index) -> usize {
-        // each class's IRI is held once, beside its hash and its entry in the table
-        self.interner.len() * 40
-            + self.interner.classes.bytes()
-            + self.interner.classes.name_bytes()
-            + self.interner.data_bytes()
+        // Every interner-owned table (nodes, class and individual names/IRIs, roles,
+        // data values, scopes), deduplicating `canon` via `canon_live_bytes()`.
+        self.interner
+            .bytes()
+            .saturating_sub(self.interner.canon_bytes())
             + ix.numeric_ledger
                 .as_ref()
                 .or(self.interner.ranges.ledger.as_ref())
                 .map_or(0, |l| l.bytes())
             + ix.bytes()
-            + self.interner.scope_bytes()
             + self.canon_live_bytes()
             + self.merge.uf_bytes()
             + self.active_hub.as_ref().map_or(0, |h| h.as_str().len())
@@ -8733,10 +9088,9 @@ impl Saturation {
             + root_bytes
             + self.context_bytes()
             + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes())
-            + self
-                .dl_run
-                .as_ref()
-                .map_or(0, |d| d.table.bytes() + d.lits.bytes())
+            + self.dl_run.as_ref().map_or(0, |d| {
+                d.table.bytes() + d.lits.bytes() + d.split_meta_bytes()
+            })
             + self
                 .leaf_individuals
                 .capacity()
@@ -12878,9 +13232,11 @@ mod tests {
         );
     }
 
-    /// Sol r2 P2 #2: four-thread unstepped (`dl_steps = false`) `shoi-042` sweep verifying
-    /// actual helper-thread participation (`helper_ran == true`), `STOP_SPLIT` checkpoints,
-    /// `SplitFork` events, clean post-leaf resets, and exact taxonomy + `describe` parity.
+    /// Sol r2 P2 #2 + Sol r3 P2 #2: four-thread unstepped (`dl_steps = false`) `shoi-042`
+    /// sweep verifying for EACH expansion mode that a helper worker actually processes work
+    /// inside a `STOP_SPLIT`-producing saturation (`SatStop { stop: STOP_SPLIT, helper_worked: true }`),
+    /// capturing and validating the selected canonical fork pairs `(u, v)`, checking zero-residual
+    /// post-leaf resets, and verifying exact taxonomy + `describe` parity.
     #[test]
     fn four_thread_unstepped_shoi042_records_helper_activity_and_split_checkpoints() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
@@ -12888,6 +13244,16 @@ mod tests {
             crate::ofn_read::parse(&std::fs::read_to_string(dir.join("shoi-042.ofn")).unwrap())
                 .unwrap()
                 .axioms;
+        let mut valid_inds: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for a in &shoi042 {
+            crate::model::Signature::visit_classes_and_individuals(
+                &a.kind,
+                &mut |_| {},
+                &mut |n| {
+                    valid_inds.insert(n.as_str().to_owned());
+                },
+            );
+        }
         let lim_ref = Limits {
             threads: 1,
             rooted: true,
@@ -12896,78 +13262,157 @@ mod tests {
             dl_steps: true,
             ..Limits::default()
         };
+        let ref_pairs = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<(
+            usize,
+            usize,
+            u8,
+            String,
+            String,
+        )>::new()));
+        let rp_cb = ref_pairs.clone();
         let mut k_ref = Classifier::of(&shoi042);
-        let out_ref = k_ref.classify(&lim_ref).unwrap();
+        let out_ref = admission_test::with_split_pair_probe(
+            move |splits, depth, prio, u, v| {
+                rp_cb
+                    .lock()
+                    .push((splits, depth, prio, u.to_owned(), v.to_owned()));
+            },
+            || k_ref.classify(&lim_ref).unwrap(),
+        );
+        let ref_pairs = ref_pairs.lock().clone();
+        assert!(
+            !ref_pairs.is_empty(),
+            "reference 1-thread shoi-042 must emit at least one split pair"
+        );
         let c0 = Class::new("http://example.org/d#C0");
         let ref_c0 = k_ref.describe(&c0).unwrap().instances;
 
-        let mut saw_helper_any = false;
         for expansion in [Expansion::Cautious, Expansion::Eager] {
-            let mut saw_split_stop = false;
-            let mut saw_fork = false;
+            let mut saw_split_with_helper_work = false;
+            let mut saw_fork_pairs = false;
             let mut saw_post_leaf_reset = false;
-            // Run up to 4 attempts if scheduler jitter keeps all work on one thread in a run.
-            for attempt in 0..4 {
+            // Retry up to 6 full runs if OS scheduler jitter keeps all work on worker 0
+            // during the split-producing saturation of one run; never accumulate across runs.
+            for _attempt in 0..6 {
                 let events = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
                 let ev_cb = events.clone();
+                let run_pairs = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<(
+                    usize,
+                    usize,
+                    u8,
+                    String,
+                    String,
+                )>::new(
+                )));
+                let pair_cb = run_pairs.clone();
                 let mut k = Classifier::of(&shoi042);
-                let out = admission_test::with_merge_probe(
-                    move |p| ev_cb.lock().push(p),
+                let out = admission_test::with_split_pair_probe(
+                    move |splits, depth, prio, u, v| {
+                        pair_cb
+                            .lock()
+                            .push((splits, depth, prio, u.to_owned(), v.to_owned()));
+                    },
                     || {
-                        k.classify(&Limits {
-                            threads: 4,
-                            expansion,
-                            rooted: true,
-                            rooted_merge: true,
-                            rooted_eq_split: true,
-                            dl_steps: false,
-                            ..Limits::default()
-                        })
-                        .unwrap()
+                        admission_test::with_merge_probe(
+                            move |p| ev_cb.lock().push(p),
+                            || {
+                                k.classify(&Limits {
+                                    threads: 4,
+                                    expansion,
+                                    rooted: true,
+                                    rooted_merge: true,
+                                    rooted_eq_split: true,
+                                    dl_steps: false,
+                                    ..Limits::default()
+                                })
+                                .unwrap()
+                            },
+                        )
                     },
                 );
                 assert!(out.complete && !out.stats.dl_rooted_over && !out.stats.dl_rooted_declined);
                 assert_eq!(out.taxonomy, out_ref.taxonomy);
                 assert_eq!(k.describe(&c0).unwrap().instances, ref_c0);
+
+                let pairs = run_pairs.lock().clone();
+                assert!(
+                    !pairs.is_empty(),
+                    "4-thread {expansion:?} must capture selected split pairs"
+                );
+                for (splits, depth, prio, u, v) in &pairs {
+                    assert!(*splits >= 1 && *depth >= 1 && *prio >= 1);
+                    assert!(
+                        u < v,
+                        "selected fork pair must be canonically ordered: ({u}, {v})"
+                    );
+                    assert!(
+                        valid_inds.contains(u) && valid_inds.contains(v),
+                        "selected fork pair must name original individuals: ({u}, {v})"
+                    );
+                }
+                assert!(
+                    pairs.iter().any(|(_, _, _, u, v)| ref_pairs
+                        .iter()
+                        .any(|(_, _, _, ru, rv)| ru == u && rv == v)),
+                    "4-thread {expansion:?} fork pairs {pairs:?} should overlap stepped reference pairs {ref_pairs:?}"
+                );
+                saw_fork_pairs = true;
+
+                let mut this_run_split_with_helper = false;
+                let mut this_run_fork = false;
+                let mut this_run_reset = false;
                 let ev = events.lock();
                 for p in ev.iter() {
                     match *p {
-                        admission_test::MergePhase::SatStop { stop, helper_ran } => {
-                            if helper_ran {
-                                saw_helper_any = true;
-                            }
-                            if stop == saturate::STOP_SPLIT {
-                                saw_split_stop = true;
+                        admission_test::MergePhase::SatStop {
+                            stop,
+                            helper_worked,
+                            ..
+                        } => {
+                            if stop == saturate::STOP_SPLIT && helper_worked {
+                                this_run_split_with_helper = true;
                             }
                         }
                         admission_test::MergePhase::SplitFork { splits, depth, .. } => {
                             assert!(splits >= 1 && depth >= 1);
-                            saw_fork = true;
+                            this_run_fork = true;
                         }
                         admission_test::MergePhase::SplitPostLeafReset {
                             canon_want_none,
                             leaf_inds_cap,
+                            interner_bytes,
+                            residual_bytes,
                         } => {
                             assert!(canon_want_none, "leaf reset must drop canon_want");
                             assert_eq!(leaf_inds_cap, 0, "leaf reset must free leaf_individuals");
-                            saw_post_leaf_reset = true;
+                            assert_eq!(
+                                interner_bytes, 0,
+                                "leaf reset must leave zero replacement interner bytes"
+                            );
+                            assert_eq!(
+                                residual_bytes, 0,
+                                "leaf reset must leave zero residual outer bytes"
+                            );
+                            this_run_reset = true;
                         }
                         _ => {}
                     }
                 }
-                if saw_helper_any && attempt == 0 {
+                assert!(
+                    this_run_fork && this_run_reset,
+                    "every 4-thread {expansion:?} run must fork and reset cleanly"
+                );
+                saw_post_leaf_reset = true;
+                if this_run_split_with_helper {
+                    saw_split_with_helper_work = true;
                     break;
                 }
             }
             assert!(
-                saw_split_stop && saw_fork && saw_post_leaf_reset,
-                "4-thread unstepped {expansion:?} must observe STOP_SPLIT, SplitFork, and clean leaf resets"
+                saw_split_with_helper_work && saw_fork_pairs && saw_post_leaf_reset,
+                "4-thread unstepped {expansion:?} must observe helper work inside a STOP_SPLIT saturation, captured fork pairs, and zero-residual leaf resets"
             );
         }
-        assert!(
-            saw_helper_any,
-            "4-thread unstepped shoi-042 sweep must exercise at least one helper worker"
-        );
     }
 }
 

@@ -5426,8 +5426,8 @@ fn collect_same_refusal_under_max_memory_does_not_inflate_peak_memory() {
     for i in 0..200usize {
         body.push_str(&format!(
             "SameIndividual(:p{i:03}a_{} :p{i:03}b_{})\n",
-            "x".repeat(1024),
-            "y".repeat(1024)
+            "x".repeat(4096),
+            "y".repeat(4096)
         ));
     }
     let input = axioms(&body);
@@ -6545,7 +6545,10 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
         let mut k = Classifier::of(&input);
         let res = with_merge_probe(
             move |phase| {
-                if let MergePhase::SatStop { stop, helper_ran } = phase {
+                if let MergePhase::SatStop {
+                    stop, helper_ran, ..
+                } = phase
+                {
                     stops_probe.lock().push((stop, helper_ran));
                 }
             },
@@ -6612,7 +6615,10 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
         let mut k = Classifier::of(&input);
         let err = with_merge_probe(
             move |phase| {
-                if let MergePhase::SatStop { stop, helper_ran } = phase {
+                if let MergePhase::SatStop {
+                    stop, helper_ran, ..
+                } = phase
+                {
                     stops_probe.lock().push((stop, helper_ran));
                 }
             },
@@ -6652,7 +6658,10 @@ fn merge_stop_vs_cancellation_race_agrees_on_result_and_flags() {
         let mut k = Classifier::of(&input);
         let err = with_merge_probe(
             move |phase| {
-                if let MergePhase::SatStop { stop, helper_ran } = phase {
+                if let MergePhase::SatStop {
+                    stop, helper_ran, ..
+                } = phase
+                {
                     stops_probe.lock().push((stop, helper_ran));
                     if stop == super::saturate::STOP_MERGE {
                         cam_probe.store(true, Ordering::SeqCst);
@@ -7414,20 +7423,35 @@ fn split_leaf_export_overlap_allocation_sites_nested_forks_and_parallel_inconsis
         );
     }
 
-    // 3. Nested-frame pool refusal (Sol r2 P2 #2):
-    //    Two independent binary splits over 8 KiB individual IRIs with `probe = 0`:
-    //    depth-2 saturation carries two live sibling frames (`B_ne_1`, `B_ne_2`) and two
-    //    distinct `Arc<CanonMap>`s in `outer_held` alongside the branch's own index/contexts,
-    //    so its watermark strictly exceeds depth-0 and depth-1. Arm pool refusal strictly
-    //    AFTER `SplitFork { splits >= 2, depth >= 2 }` and verify clean refusal + recovery.
+    // 3. Nested-frame pool refusal with derived `MergeRestart` (Sol r2 P2 #2 + Sol r3 P2 #2):
+    //    Two independent binary splits over 16 KiB individual IRIs using pure-EL singleton
+    //    nominals (so `scope_bytes` stays free of long IRIs) plus a pure-EL conditional
+    //    merge (`a == b => :BothAB(:a) => :Trigger(:x) => x == y` inside `B_eq_1`) with
+    //    `probe = 0`. Depth-1 `B_eq` triggers a real `MergeRestart`, then depth-2 `SplitFork`
+    //    carries live sibling frames and distinct `Arc<CanonMap>`s whose child `Union`/`Canon`
+    //    admissions strictly exceed every earlier watermark. Arm pool refusal strictly AFTER
+    //    both `MergeRestart` and `SplitFork { splits >= 2, depth >= 2 }` and assert the exact
+    //    nested `SplitAlloc { site, proposed, admitted: false }` event plus clean recovery.
     {
-        use super::admission_test::{MergePhase, with_merge_probe};
-        let pad = "p".repeat(8192);
+        use super::admission_test::{MergePhase, SplitAllocSite, with_merge_probe};
+        let pad = "p".repeat(16 * 1024);
         let ofn = format!(
             "Prefix(:=<http://example.org/nest#>)\n\
              Ontology(<http://example.org/nest>\n\
-               ClassAssertion(ObjectOneOf(:b_{pad} :c_{pad}) :a_{pad})\n\
-               ClassAssertion(ObjectOneOf(:e_{pad} :f_{pad}) :d_{pad})\n\
+               SubClassOf(:X1 ObjectUnionOf(:B1 :C1))\n\
+               SubClassOf(:B1 ObjectOneOf(:b_{pad}))\n\
+               SubClassOf(:C1 ObjectOneOf(:c_{pad}))\n\
+               ClassAssertion(:X1 :a_{pad})\n\
+               SubClassOf(:X2 ObjectUnionOf(:E2 :F2))\n\
+               SubClassOf(:E2 ObjectOneOf(:e_{pad}))\n\
+               SubClassOf(:F2 ObjectOneOf(:f_{pad}))\n\
+               ClassAssertion(:X2 :d_{pad})\n\
+               ClassAssertion(:IsA :a_{pad})\n\
+               ClassAssertion(:IsB :b_{pad})\n\
+               SubClassOf(ObjectIntersectionOf(:IsA :IsB) :BothAB)\n\
+               ObjectPropertyAssertion(:inv :x_{pad} :a_{pad})\n\
+               SubClassOf(ObjectSomeValuesFrom(:inv :BothAB) :Trigger)\n\
+               SubClassOf(:Trigger ObjectOneOf(:y_{pad}))\n\
                ClassAssertion(:P :b_{pad})\n\
                ClassAssertion(:P :c_{pad})\n\
                ClassAssertion(:Q :e_{pad})\n\
@@ -7449,11 +7473,22 @@ fn split_leaf_export_overlap_allocation_sites_nested_forks_and_parallel_inconsis
         let ok = super::with_split_knobs(Some(0), Some(true), Some(4), Some(16), || {
             sat.classify(&refs, None, &lim_base).unwrap()
         });
-        assert!(ok.complete && ok.stats.dl_rooted_splits >= 2 && ok.stats.dl_rooted_leaves >= 3);
+        assert!(
+            ok.complete
+                && ok.stats.dl_rooted_splits >= 2
+                && ok.stats.dl_rooted_leaves >= 3
+                && ok.stats.dl_rooted_restarts >= 1,
+            "nested fixture must exercise both splits>=2 and derived merge restarts>=1: {:?}",
+            ok.stats
+        );
 
+        let saw_merge_restart = Arc::new(AtomicBool::new(false));
         let saw_nested_fork = Arc::new(AtomicBool::new(false));
         let armed = Arc::new(AtomicBool::new(false));
         let pool_refused = Arc::new(AtomicBool::new(false));
+        let refused_sites = Arc::new(parking_lot::Mutex::new(
+            Vec::<(SplitAllocSite, usize)>::new(),
+        ));
         let armed_cb = armed.clone();
         let pr = pool_refused.clone();
         let lim_pool = Limits {
@@ -7467,17 +7502,27 @@ fn split_leaf_export_overlap_allocation_sites_nested_forks_and_parallel_inconsis
             ..lim_base.clone()
         };
         let mut sat_pool = Saturation::new();
+        let smr = saw_merge_restart.clone();
         let sf = saw_nested_fork.clone();
         let arm_probe = armed.clone();
+        let rs = refused_sites.clone();
         let pool_out = with_merge_probe(
-            move |phase| {
-                if let MergePhase::SplitFork { splits, depth, .. } = phase
-                    && splits >= 2
-                    && depth >= 2
-                {
+            move |phase| match phase {
+                MergePhase::MergeRestart { restarts } if restarts >= 1 => {
+                    smr.store(true, Ordering::Release);
+                }
+                MergePhase::SplitFork { splits, depth, .. } if splits >= 2 && depth >= 2 => {
                     sf.store(true, Ordering::Release);
                     arm_probe.store(true, Ordering::Release);
                 }
+                MergePhase::SplitAlloc {
+                    site,
+                    proposed,
+                    admitted: false,
+                } => {
+                    rs.lock().push((site, proposed));
+                }
+                _ => {}
             },
             || {
                 super::with_split_knobs(Some(0), Some(true), Some(4), Some(16), || {
@@ -7486,12 +7531,28 @@ fn split_leaf_export_overlap_allocation_sites_nested_forks_and_parallel_inconsis
             },
         );
         assert!(
+            saw_merge_restart.load(Ordering::Acquire),
+            "nested-frame fixture must observe a real MergeRestart before nested refusal"
+        );
+        assert!(
             saw_nested_fork.load(Ordering::Acquire),
             "nested-frame fixture must reach splits>=2, depth>=2 before refusing"
         );
         assert!(
             pool_refused.load(Ordering::Acquire),
             "armed nested-frame pool callback must have refused"
+        );
+        let ref_sites = refused_sites.lock().clone();
+        assert!(
+            ref_sites.iter().any(|&(site, proposed)| matches!(
+                site,
+                SplitAllocSite::ForkStack
+                    | SplitAllocSite::ForkMergeClone
+                    | SplitAllocSite::ForkNeq
+                    | SplitAllocSite::ForkEqUnion
+                    | SplitAllocSite::ForkEqCanon
+            ) && proposed > 64 * 1024),
+            "nested refusal must anchor to a nested fork SplitAlloc refusal, got {ref_sites:?}"
         );
         match pool_out {
             Ok(fb) => {
@@ -7653,18 +7714,29 @@ fn split_leaf_export_overlap_allocation_sites_nested_forks_and_parallel_inconsis
     }
 }
 
-/// Round-2 regression suite covering Neon B1 (no stale-`paid` pool double-charge / regression),
-/// Sol P1 #1 (live entry baseline for asserted `SameIndividual` and reused `Saturation`),
-/// Sol P1 #2 (post-leaf `canon_want` and `leaf_individuals` cleanup), and Sol P1 #3
-/// (DFS `stack`, synthetic `BTreeSet`, and moved `leaf_individuals` pre-admission).
+/// Round-2 + Round-3 regression suite covering:
+/// 1. Neon B1 + Sol r3 P2 #2c: monotonic `SplitLedger` watermark & accepted deltas around
+///    `ledger.add`/`remap_neq` -> `ledger.cover` in real `SplitFork` and `MergeRestart`.
+/// 2. Sol r2 P1 #1a + Sol r3 P2 #2b: asserted `SameIndividual` UF + signature overlap refusal
+///    anchored to `SplitAlloc { site: OrigSig, admitted: false }`.
+/// 3. Sol r3 P1 #2: reused `Saturation` with LONG individual names (no asserted `SameIndividual`)
+///    AND forked leaf export overlap with long individual names, verifying `interner.individuals`
+///    storage is counted in both entry baseline and `leaf_live`.
+/// 4. Sol r2 P1 #2 + Sol r3 P1 #2: post-leaf reset and `SplitAnswer` publication drop
+///    `canon_want`, free `leaf_individuals`, and leave `interner.bytes() == 0` and
+///    `residual_outer_bytes() == 0`.
+/// 5. Sol r2 P1 #3 + Sol r3 P2 #2b: site-anchored `RootStack` refusal AND separate
+///    `SynthAxioms` (`DifferentIndividuals` `BTreeSet`) admission refusal.
+/// 6. Sol r3 P1 #1: long-IRI (2 × 64 KiB) `STOP_SPLIT` handoff refusal with counting-allocator
+///    assertion proving zero unbudgeted IRI clones occur before admission.
 #[test]
 fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
-    use super::admission_test::{MergePhase, with_merge_probe};
+    use super::admission_test::{LedgerChargeSource, MergePhase, SplitAllocSite, with_merge_probe};
 
-    // 1. Neon B1: cumulative pool charges across nested `STOP_SPLIT` + `STOP_MERGE` with
-    //    active `neq` pairs (`shoi-042` with `rooted_merge = true`) must NEVER exceed
-    //    `stats.peak_memory`, and a pool capped at exact `stats.peak_memory` must SUCCEED
-    //    with zero spurious double-charge refusal!
+    // 1. Neon B1 + Sol r3 P2 #2c: capture every `LedgerCharge` watermark and accepted delta
+    //    around real `Delta -> Cover` sequences inside both `SplitFork` and `MergeRestart`
+    //    on `shoi-042`, proving monotonic watermark progression even at intermediate levels
+    //    strictly below the final peak!
     {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
         let doc =
@@ -7673,32 +7745,125 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
         let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
         let total_charged = Arc::new(AtomicUsize::new(0));
         let tc = total_charged.clone();
+        let phases = Arc::new(parking_lot::Mutex::new(Vec::<MergePhase>::new()));
+        let ph_cb = phases.clone();
         let mut sat = Saturation::new();
-        let out = sat
-            .classify(
-                &refs,
-                None,
-                &Limits {
-                    threads: 1,
-                    rooted: true,
-                    rooted_merge: true,
-                    rooted_eq_split: true,
-                    charge: Some(Arc::new(move |more: usize| {
-                        tc.fetch_add(more, Ordering::AcqRel);
-                        true
-                    })),
-                    ..Limits::default()
-                },
-            )
-            .unwrap();
+        let out = with_merge_probe(
+            move |p| ph_cb.lock().push(p),
+            || {
+                sat.classify(
+                    &refs,
+                    None,
+                    &Limits {
+                        threads: 1,
+                        rooted: true,
+                        rooted_merge: true,
+                        rooted_eq_split: true,
+                        charge: Some(Arc::new(move |more: usize| {
+                            tc.fetch_add(more, Ordering::AcqRel);
+                            true
+                        })),
+                        ..Limits::default()
+                    },
+                )
+                .unwrap()
+            },
+        );
         assert!(
             out.complete && out.stats.dl_rooted_splits >= 2 && out.stats.dl_rooted_restarts >= 1
         );
+        let recorded = phases.lock().clone();
+        let mut prev_paid_after = 0usize;
+        let mut in_fork = false;
+        let mut in_merge = false;
+        let mut last_source: Option<LedgerChargeSource> = None;
+        let mut saw_fork_delta_to_cover = false;
+        let mut saw_merge_delta_to_cover = false;
+        let mut ledger_deltas_sum = 0usize;
+        for p in &recorded {
+            match *p {
+                MergePhase::SplitFork { .. } => {
+                    in_fork = true;
+                    in_merge = false;
+                    last_source = None;
+                }
+                MergePhase::MergeRestart { .. } => {
+                    in_merge = true;
+                    in_fork = false;
+                    last_source = None;
+                }
+                MergePhase::SatStop { .. } => {
+                    in_fork = false;
+                    in_merge = false;
+                    last_source = None;
+                }
+                MergePhase::LedgerCharge {
+                    source,
+                    used,
+                    paid_before,
+                    paid_after,
+                    delta,
+                    admitted,
+                } => {
+                    assert!(admitted, "unbounded shoi-042 charge must succeed");
+                    assert!(
+                        paid_after >= paid_before,
+                        "watermark must not decrease within one charge: before={paid_before}, after={paid_after}"
+                    );
+                    assert_eq!(
+                        delta,
+                        paid_after - paid_before,
+                        "accepted delta must equal watermark advance"
+                    );
+                    assert!(
+                        paid_before >= prev_paid_after,
+                        "watermark regressed across consecutive charges (stale paid cache!): prev_after={prev_paid_after}, cur_before={paid_before}, source={source:?}, used={used}"
+                    );
+                    if last_source == Some(LedgerChargeSource::Delta)
+                        && source == LedgerChargeSource::Cover
+                    {
+                        if in_fork {
+                            saw_fork_delta_to_cover = true;
+                        }
+                        if in_merge {
+                            saw_merge_delta_to_cover = true;
+                        }
+                    }
+                    prev_paid_after = paid_after;
+                    last_source = Some(source);
+                    ledger_deltas_sum = ledger_deltas_sum.saturating_add(delta);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_fork_delta_to_cover,
+            "shoi-042 must exercise Delta -> Cover inside a real SplitFork"
+        );
+        assert!(
+            saw_merge_delta_to_cover,
+            "shoi-042 must exercise Delta -> Cover inside a real MergeRestart"
+        );
         let charged = total_charged.load(Ordering::Acquire);
         assert!(
-            charged <= out.stats.peak_memory,
-            "cumulative pool charges ({charged}) must never exceed peak_memory ({}) via stale-paid double-charging",
+            charged <= out.stats.peak_memory && ledger_deltas_sum <= charged,
+            "cumulative pool charges ({charged}, ledger_deltas={ledger_deltas_sum}) must never exceed peak_memory ({})",
             out.stats.peak_memory
+        );
+        assert_eq!(
+            sat.interner.bytes(),
+            0,
+            "completed SplitAnswer must leave zero replacement interner bytes"
+        );
+        assert_eq!(
+            sat.residual_outer_bytes(),
+            0,
+            "completed SplitAnswer must leave zero residual outer bytes"
+        );
+        assert!(
+            out.stats.memory <= charged,
+            "final reported memory ({}) must not exceed admitted pool watermark ({charged})",
+            out.stats.memory
         );
         // Exact-peak pool budget must complete without spurious refusal.
         let exact_cap = out.stats.peak_memory;
@@ -7729,11 +7894,8 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
         assert_eq!(exact_out.taxonomy, out.taxonomy);
     }
 
-    // 2. Sol P1 #1a: Asserted `SameIndividual` UF + signature overlap refusal.
-    //    Large asserted `SameIndividual` partition leaves a substantial `self.merge` UF live
-    //    at entry to `run_splitting`. Under a cap/pool strictly above the UF+canon prepass
-    //    alone and strictly above the signature alone, but below `UF + canon + signature`,
-    //    signature admission MUST refuse!
+    // 2. Sol r2 P1 #1a + Sol r3 P2 #2b: Asserted `SameIndividual` UF + signature overlap refusal,
+    //    anchored specifically to `SplitAlloc { site: OrigSig, admitted: false }`.
     {
         let mut ax = Vec::new();
         let pad = "x".repeat(256);
@@ -7745,7 +7907,6 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             )));
         }
         let refs: Vec<&AxiomKind> = ax.iter().map(|x| &x.kind).collect();
-        // Measure prepass UF + canon bytes via `collect_same` on a fresh `Saturation`.
         let mut sat_probe = Saturation::new();
         let admitted_probe = Arc::new(AtomicUsize::new(0));
         let mut peak_probe = 0usize;
@@ -7768,8 +7929,7 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             "expected substantial prepass UF+canon: {prepass_live}"
         );
 
-        // Measure signature-only cost (with `rooted_merge = false` so UF is empty at entry).
-        let cap_overlap = prepass_live.saturating_add(2048);
+        let cap_overlap = prepass_live.saturating_add(16 * 1024);
         let mut sat_cap = Saturation::new();
         let admitted_cap = Arc::new(AtomicUsize::new(0));
         let mut peak_cap = 0usize;
@@ -7780,25 +7940,44 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             max_memory: Some(cap_overlap),
             ..lim_unlim.clone()
         };
-        let err_cap = sat_cap
-            .run_splitting(&refs, None, 0, &lim_cap, &admitted_cap, &mut peak_cap, true)
-            .unwrap_err();
+        let cap_orig_sig = Arc::new(parking_lot::Mutex::new(None::<(usize, bool)>));
+        let cos = cap_orig_sig.clone();
+        let err_cap = with_merge_probe(
+            move |p| {
+                if let MergePhase::SplitAlloc {
+                    site: SplitAllocSite::OrigSig,
+                    proposed,
+                    admitted,
+                } = p
+                {
+                    *cos.lock() = Some((proposed, admitted));
+                }
+            },
+            || {
+                sat_cap
+                    .run_splitting(&refs, None, 0, &lim_cap, &admitted_cap, &mut peak_cap, true)
+                    .unwrap_err()
+            },
+        );
         assert!(
             matches!(err_cap, Error::Memory { used, .. } if used > cap_overlap),
             "signature admission must include live asserted-SameIndividual UF+canon ({prepass_live}) against cap {cap_overlap}, got {err_cap:?}"
         );
+        let cap_site = *cap_orig_sig.lock();
+        assert!(
+            matches!(cap_site, Some((proposed, false)) if proposed > cap_overlap),
+            "refusal must occur specifically at OrigSig with proposed > {cap_overlap}, got {cap_site:?}"
+        );
 
-        // Same overlap refusal through a `Limits::charge` pool!
+        // Same overlap refusal through a `Limits::charge` pool, anchored to OrigSig!
         let mut sat_pool = Saturation::new();
         let admitted_pool = Arc::new(AtomicUsize::new(0));
         let mut peak_pool = 0usize;
         sat_pool
             .collect_same(&refs, 0, &lim_unlim, &admitted_pool, &mut peak_pool)
             .unwrap();
-        // Reset admitted watermark to `prepass_live` as if the pool granted the prepass, and
-        // allow only 2048 additional bytes beyond `prepass_live`.
         admitted_pool.store(prepass_live, Ordering::Relaxed);
-        let pool_rem = Arc::new(AtomicUsize::new(2048));
+        let pool_rem = Arc::new(AtomicUsize::new(16 * 1024));
         let pr = pool_rem.clone();
         let lim_pool = Limits {
             charge: Some(Arc::new(move |more: usize| {
@@ -7811,39 +7990,67 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             })),
             ..lim_unlim
         };
-        let err_pool = sat_pool
-            .run_splitting(
-                &refs,
-                None,
-                0,
-                &lim_pool,
-                &admitted_pool,
-                &mut peak_pool,
-                true,
-            )
-            .unwrap_err();
+        let pool_orig_sig = Arc::new(parking_lot::Mutex::new(None::<(usize, bool)>));
+        let pos = pool_orig_sig.clone();
+        let err_pool = with_merge_probe(
+            move |p| {
+                if let MergePhase::SplitAlloc {
+                    site: SplitAllocSite::OrigSig,
+                    proposed,
+                    admitted,
+                } = p
+                {
+                    *pos.lock() = Some((proposed, admitted));
+                }
+            },
+            || {
+                sat_pool
+                    .run_splitting(
+                        &refs,
+                        None,
+                        0,
+                        &lim_pool,
+                        &admitted_pool,
+                        &mut peak_pool,
+                        true,
+                    )
+                    .unwrap_err()
+            },
+        );
         assert!(
             matches!(err_pool, Error::Memory { used, .. } if used > cap_overlap),
             "pool signature admission must include live prepass UF+canon, got {err_pool:?}"
         );
+        let pool_site = *pool_orig_sig.lock();
+        assert!(
+            matches!(pool_site, Some((proposed, false)) if proposed > cap_overlap),
+            "pool refusal must occur specifically at OrigSig with proposed > {cap_overlap}, got {pool_site:?}"
+        );
     }
 
-    // 3. Sol P1 #1b: Reused `Saturation` (`index` + `ctx` live, NO asserted `SameIndividual`
-    //    so `collect_same` returns early without resetting) + signature overlap refusal.
+    // 3. Sol r3 P1 #2: Reused `Saturation` with LONG named individual IRIs (NO asserted
+    //    `SameIndividual`, so `collect_same` returns early without resetting) + forked leaf
+    //    export overlap with LONG named individual IRIs.
     {
-        let mut big_ax = Vec::new();
-        for i in 0..300usize {
-            let ci = Class::new(format!("http://example.org/reuse#BigC{i:03}"));
-            if i + 1 < 300 {
-                let cj = Class::new(format!("http://example.org/reuse#BigC{:03}", i + 1));
-                big_ax.push(crate::model::Axiom::sub_class_of(ci, cj));
-            }
+        // 3a. Reused saturation with 100 individuals carrying 2 KiB IRIs (~200 KiB in
+        //     `sat.interner.individuals`) and tiny class count.
+        let mut ind_ax = Vec::new();
+        let pad = "i".repeat(2048);
+        let cls_c = Class::new("http://example.org/indreuse#C");
+        for i in 0..100usize {
+            let ind = crate::model::Individual::named(format!(
+                "http://example.org/indreuse#x{i:03}_{pad}"
+            ));
+            ind_ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
+                crate::model::ClassExpression::Class(cls_c.clone()),
+                ind,
+            )));
         }
-        let big_refs: Vec<&AxiomKind> = big_ax.iter().map(|x| &x.kind).collect();
+        let ind_refs: Vec<&AxiomKind> = ind_ax.iter().map(|x| &x.kind).collect();
         let mut sat = Saturation::new();
         let first = sat
             .classify(
-                &big_refs,
+                &ind_refs,
                 None,
                 &Limits {
                     threads: 1,
@@ -7852,15 +8059,23 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             )
             .unwrap();
         assert!(first.complete && sat.index.is_some());
+        let inds_storage = sat
+            .interner
+            .individuals
+            .bytes()
+            .saturating_add(sat.interner.individuals.name_bytes());
+        assert!(
+            inds_storage > 200 * 1024,
+            "expected >200 KiB in interner.individuals: {inds_storage}"
+        );
         let entry_live = sat.leaf_live_bytes_without_canon_and_merge();
         assert!(
-            entry_live > 16 * 1024,
-            "expected substantial retained entry state: {entry_live}"
+            entry_live > inds_storage,
+            "entry baseline ({entry_live}) must include interner.individuals storage ({inds_storage})"
         );
 
         // Second ontology has NO `SameIndividual` (so `collect_same` returns early without
-        // resetting `sat`), and a modest signature (~4 KiB) that fits easily on a fresh `sat`
-        // under `cap_reuse`, but exceeds `cap_reuse` alongside `entry_live`.
+        // resetting `sat`) and a modest ~6 KiB signature.
         let mut small_ax = Vec::new();
         let a = crate::model::Individual::named("http://example.org/reuse2#a");
         let b = crate::model::Individual::named("http://example.org/reuse2#b");
@@ -7880,7 +8095,7 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             )));
         }
         let small_refs: Vec<&AxiomKind> = small_ax.iter().map(|x| &x.kind).collect();
-        let cap_reuse = entry_live.saturating_add(512);
+        let cap_reuse = entry_live.saturating_add(3072);
         let lim_reuse = Limits {
             threads: 1,
             rooted: true,
@@ -7896,21 +8111,185 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             "fresh saturation must fit easily under cap_reuse={cap_reuse}"
         );
 
-        let reuse_err = sat.classify(&small_refs, None, &lim_reuse).unwrap_err();
+        let reuse_orig_sig = Arc::new(parking_lot::Mutex::new(None::<(usize, bool)>));
+        let ros = reuse_orig_sig.clone();
+        let reuse_err = with_merge_probe(
+            move |p| {
+                if let MergePhase::SplitAlloc {
+                    site: SplitAllocSite::OrigSig,
+                    proposed,
+                    admitted,
+                } = p
+                {
+                    *ros.lock() = Some((proposed, admitted));
+                }
+            },
+            || sat.classify(&small_refs, None, &lim_reuse).unwrap_err(),
+        );
         assert!(
             matches!(reuse_err, Error::Memory { used, .. } if used > cap_reuse),
-            "reused saturation signature admission must count live entry state ({entry_live}) against cap {cap_reuse}, got {reuse_err:?}"
+            "reused saturation signature admission must count live interner.individuals ({inds_storage}) in entry_live ({entry_live}) against cap {cap_reuse}, got {reuse_err:?}"
         );
+        let ros_val = *reuse_orig_sig.lock();
+        assert!(
+            matches!(ros_val, Some((proposed, false)) if proposed > cap_reuse),
+            "reused long-individual refusal must occur at OrigSig with proposed > {cap_reuse}, got {ros_val:?}"
+        );
+
+        // 3b. Forked leaf export overlap with LONG individual names:
+        //     10 unmerged individuals with 32 KiB IRIs (`ClassAssertion(:Tag :x_i)`) keep
+        //     >320 KiB live in `sat.interner.individuals` with minimal saturation overhead,
+        //     while 300 classes × 400 aliased instances keep saturation small and expand
+        //     `leaf_insts` (~480 KiB) past `pre_w` so `export_split_leaf` must refuse under
+        //     `lf_cap` ONLY when `leaf_live` counts those >320 KiB of `interner.individuals`!
+        let mut lf_ax = Vec::new();
+        let pad32k = "j".repeat(32 * 1024);
+        let a_lf = crate::model::Individual::named("http://example.org/lf#a");
+        let b_lf = crate::model::Individual::named("http://example.org/lf#b");
+        let c_lf = crate::model::Individual::named("http://example.org/lf#c");
+        let rep_lf = crate::model::Individual::named("http://example.org/lf#rep");
+        let root_lf = Class::new("http://example.org/lf#Root");
+        let tag_lf = Class::new("http://example.org/lf#Tag");
+        lf_ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
+            crate::model::ClassExpression::ObjectOneOf(std::collections::BTreeSet::from([
+                b_lf.clone(),
+                c_lf.clone(),
+            ])),
+            a_lf.clone(),
+        )));
+        lf_ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
+            crate::model::ClassExpression::Class(root_lf.clone()),
+            rep_lf.clone(),
+        )));
+        for i in 0..300usize {
+            let ci = Class::new(format!("http://example.org/lf#C{i:03}"));
+            lf_ax.push(crate::model::Axiom::sub_class_of(root_lf.clone(), ci));
+        }
+        for i in 0..400usize {
+            let alias = crate::model::Individual::named(format!("http://example.org/lf#i{i:03}"));
+            lf_ax.push(crate::model::Axiom::new(AxiomKind::SameIndividual(
+                std::collections::BTreeSet::from([rep_lf.clone(), alias]),
+            )));
+        }
+        for i in 0..10usize {
+            let ind =
+                crate::model::Individual::named(format!("http://example.org/lf#x{i:02}_{pad32k}"));
+            lf_ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
+                crate::model::ClassExpression::Class(tag_lf.clone()),
+                ind,
+            )));
+        }
+        let lf_refs: Vec<&AxiomKind> = lf_ax.iter().map(|x| &x.kind).collect();
+        let lim_lf = Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            rooted_eq_split: true,
+            ..Limits::default()
+        };
+        let leaf_live_proposed = Arc::new(AtomicUsize::new(0));
+        let pre_exp_wm = Arc::new(AtomicUsize::new(0));
+        let post_exp_wm = Arc::new(AtomicUsize::new(0));
+        let ch_tot = Arc::new(AtomicUsize::new(0));
+        let llp = leaf_live_proposed.clone();
+        let pre_p = pre_exp_wm.clone();
+        let post_p = post_exp_wm.clone();
+        let ch_probe = ch_tot.clone();
+        let ch_cb = ch_tot.clone();
+        let mut sat_lf = Saturation::new();
+        let lf_ok = with_merge_probe(
+            move |phase| match phase {
+                MergePhase::SplitAlloc {
+                    site: SplitAllocSite::LeafLive,
+                    proposed,
+                    admitted: true,
+                } if llp.load(Ordering::Acquire) == 0 => {
+                    llp.store(proposed, Ordering::Release);
+                }
+                MergePhase::SplitLeafExportStart { leaves: 0 } => {
+                    pre_p.store(ch_probe.load(Ordering::Acquire), Ordering::Release);
+                }
+                MergePhase::SplitLeafExportDone { leaves: 0 } => {
+                    post_p.store(ch_probe.load(Ordering::Acquire), Ordering::Release);
+                }
+                _ => {}
+            },
+            || {
+                super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
+                    sat_lf
+                        .classify(
+                            &lf_refs,
+                            None,
+                            &Limits {
+                                charge: Some(Arc::new(move |more: usize| {
+                                    ch_cb.fetch_add(more, Ordering::AcqRel);
+                                    true
+                                })),
+                                ..lim_lf.clone()
+                            },
+                        )
+                        .unwrap()
+                })
+            },
+        );
+        assert!(lf_ok.complete && lf_ok.stats.dl_rooted_splits >= 1);
+        let ll_prop = leaf_live_proposed.load(Ordering::Acquire);
+        // `orig_sig` holds 2 copies (~640 KiB) and the saturated leaf's `interner.individuals`
+        // holds another ~320 KiB simultaneously (`> 960 KiB` total at `LeafLive`).
+        assert!(
+            ll_prop > 960 * 1024,
+            "LeafLive proposed total ({ll_prop}) must include both orig_sig and live interner.individuals (>960 KiB)"
+        );
+        let pre_w = pre_exp_wm.load(Ordering::Acquire);
+        let post_w = post_exp_wm.load(Ordering::Acquire);
+        assert!(
+            post_w > pre_w + 512,
+            "long-individual leaf export watermark ({post_w}) must exceed pre-export ({pre_w})"
+        );
+        let lf_cap = pre_w + (post_w - pre_w) / 2;
+        let saw_lf_ref = Arc::new(AtomicBool::new(false));
+        let slr = saw_lf_ref.clone();
+        let mut sat_lf_cap = Saturation::new();
+        let lf_cap_res = with_merge_probe(
+            move |p| {
+                if matches!(p, MergePhase::SplitLeafExportRefused) {
+                    slr.store(true, Ordering::Release);
+                }
+            },
+            || {
+                super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
+                    sat_lf_cap.classify(
+                        &lf_refs,
+                        None,
+                        &Limits {
+                            max_memory: Some(lf_cap),
+                            ..lim_lf
+                        },
+                    )
+                })
+            },
+        );
+        assert!(
+            saw_lf_ref.load(Ordering::Acquire),
+            "long-individual leaf export must refuse under overlap cap {lf_cap}"
+        );
+        match lf_cap_res {
+            Ok(fb) => assert!(!fb.complete && fb.stats.dl_over_budget),
+            Err(Error::Memory { used, .. }) => assert!(used > lf_cap),
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
     }
 
-    // 4. Sol P1 #2: Leaf cleanup drops `canon_want` and frees `leaf_individuals` capacity
-    //    immediately after `reset()` (before unequal sibling synthetic axioms and before
-    //    final taxonomy/answer construction) and after `SplitAnswer` publication.
+    // 4. Sol r2 P1 #2 + Sol r3 P1 #2: Leaf cleanup drops `canon_want`, frees `leaf_individuals`,
+    //    and leaves `interner.bytes() == 0` and `residual_outer_bytes() == 0` at every leaf
+    //    reset and after `SplitAnswer` publication.
     {
         let ofn = "Prefix(:=<http://example.org/lc#>)\nOntology(<http://example.org/lc>\n  ClassAssertion(ObjectOneOf(:b :c) :a)\n  ClassAssertion(:P :b)\n  ClassAssertion(:P :c)\n  SubClassOf(:A ObjectOneOf(:a))\n  Declaration(NamedIndividual(:d1))\n  Declaration(NamedIndividual(:d2))\n  Declaration(NamedIndividual(:d3))\n  Declaration(NamedIndividual(:d4))\n)";
         let doc = crate::ofn_read::parse(ofn).unwrap();
         let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
-        let resets = Arc::new(parking_lot::Mutex::new(Vec::<(bool, usize)>::new()));
+        let resets = Arc::new(parking_lot::Mutex::new(
+            Vec::<(bool, usize, usize, usize)>::new(),
+        ));
         let r_cb = resets.clone();
         let mut sat = Saturation::new();
         let out = with_merge_probe(
@@ -7918,9 +8297,16 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
                 if let MergePhase::SplitPostLeafReset {
                     canon_want_none,
                     leaf_inds_cap,
+                    interner_bytes,
+                    residual_bytes,
                 } = phase
                 {
-                    r_cb.lock().push((canon_want_none, leaf_inds_cap));
+                    r_cb.lock().push((
+                        canon_want_none,
+                        leaf_inds_cap,
+                        interner_bytes,
+                        residual_bytes,
+                    ));
                 }
             },
             || {
@@ -7946,7 +8332,7 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             observed.len() >= 2,
             "expected post-leaf reset events for both forked leaves, got {observed:?}"
         );
-        for &(canon_none, inds_cap) in observed.iter() {
+        for &(canon_none, inds_cap, interner_b, residual_b) in observed.iter() {
             assert!(
                 canon_none,
                 "canon_want must be cleared immediately on leaf reset"
@@ -7954,6 +8340,14 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             assert_eq!(
                 inds_cap, 0,
                 "leaf_individuals capacity must be freed on leaf reset"
+            );
+            assert_eq!(
+                interner_b, 0,
+                "leaf reset must defer replacement interner init (interner_bytes == 0)"
+            );
+            assert_eq!(
+                residual_b, 0,
+                "leaf reset must leave zero residual outer bytes"
             );
         }
         assert!(
@@ -7965,76 +8359,361 @@ fn split_round2_single_ledger_entry_baseline_and_cleanup_regressions() {
             0,
             "leaf_individuals capacity must be 0 after SplitAnswer publication"
         );
+        assert_eq!(
+            sat.interner.bytes(),
+            0,
+            "interner.bytes() must be 0 after SplitAnswer publication"
+        );
+        assert_eq!(
+            sat.residual_outer_bytes(),
+            0,
+            "residual_outer_bytes() must be 0 after SplitAnswer publication"
+        );
     }
 
-    // 5. Sol P1 #3: Root DFS stack pre-admission refusal & synthetic BTreeSet admission.
-    //    Choose a cap strictly above `orig_sig_bytes` (so signature collection succeeds) and
-    //    strictly below `orig_sig_bytes + size_of::<SplitFrame>()` (so root `stack` allocation
-    //    refuses cleanly before pushing the root frame!).
+    // 5. Sol r2 P1 #3 + Sol r3 P2 #2b: Site-anchored `RootStack` pre-admission refusal AND
+    //    separate `SynthAxioms` (`DifferentIndividuals` `BTreeSet`) admission refusal.
     {
-        let ofn = "Prefix(:=<http://example.org/st#>)\nOntology(<http://example.org/st>\n  ClassAssertion(ObjectOneOf(:b :c) :a)\n  SubClassOf(:A :B)\n)";
+        let ofn = "Prefix(:=<http://example.org/st#>)\nOntology(<http://example.org/st>\n  ClassAssertion(ObjectOneOf(:b :c) :a)\n  ClassAssertion(:P :b)\n  ClassAssertion(:P :c)\n  SubClassOf(:A ObjectOneOf(:a))\n)";
         let doc = crate::ofn_read::parse(ofn).unwrap();
         let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
-        // Record pool charge increments during entry of `run_splitting`:
-        // charge 1 = raw_classes, charge 2 = raw_inds, charge 3 = orig_sig_bytes,
-        // charge 4 = root DFS stack buffer (`ensure_stack_cap`).
-        let milestones = Arc::new(parking_lot::Mutex::new(Vec::<usize>::new()));
-        let ms = milestones.clone();
-        let total = Arc::new(AtomicUsize::new(0));
-        let tt = total.clone();
-        let mut sat_meas = Saturation::new();
-        let _ = sat_meas
-            .classify(
-                &refs,
-                None,
-                &Limits {
-                    threads: 1,
-                    rooted: true,
-                    rooted_merge: true,
-                    rooted_eq_split: true,
-                    charge: Some(Arc::new(move |more: usize| {
-                        let cur = tt.fetch_add(more, Ordering::AcqRel) + more;
-                        ms.lock().push(cur);
-                        true
-                    })),
-                    ..Limits::default()
-                },
-            )
-            .unwrap();
-        let recorded = milestones.lock().clone();
-        assert!(
-            recorded.len() >= 4,
-            "expected >=4 entry milestones, got {recorded:?}"
-        );
-        // Refusing the 4th charge (root DFS stack allocation) must abort `run_splitting`
-        // with `Error::Memory` before entering saturation (`dl_tried == false`).
+        let lim_base = Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            rooted_eq_split: true,
+            ..Limits::default()
+        };
+
+        // 5a. Root DFS stack refusal: arm pool immediately after `OrigSig` succeeds and
+        //     assert `SplitAlloc { site: RootStack, admitted: false }` fires before saturation.
+        let armed_root = Arc::new(AtomicBool::new(false));
+        let root_refused_site = Arc::new(parking_lot::Mutex::new(None::<(usize, bool)>));
+        let ar_cb = armed_root.clone();
+        let ar_probe = armed_root.clone();
+        let rrs = root_refused_site.clone();
         let mut sat_ref = Saturation::new();
-        let charges_seen = Arc::new(AtomicUsize::new(0));
-        let cs = charges_seen.clone();
-        let err = sat_ref
-            .classify(
-                &refs,
-                None,
-                &Limits {
-                    threads: 1,
-                    rooted: true,
-                    rooted_merge: true,
-                    rooted_eq_split: true,
-                    charge: Some(Arc::new(move |_more: usize| {
-                        let n = cs.fetch_add(1, Ordering::AcqRel) + 1;
-                        n < 4
-                    })),
-                    ..Limits::default()
-                },
-            )
-            .unwrap_err();
+        let err = with_merge_probe(
+            move |p| match p {
+                MergePhase::SplitAlloc {
+                    site: SplitAllocSite::OrigSig,
+                    admitted: true,
+                    ..
+                } => {
+                    ar_probe.store(true, Ordering::Release);
+                }
+                MergePhase::SplitAlloc {
+                    site: SplitAllocSite::RootStack,
+                    proposed,
+                    admitted,
+                } => {
+                    *rrs.lock() = Some((proposed, admitted));
+                }
+                _ => {}
+            },
+            || {
+                sat_ref
+                    .classify(
+                        &refs,
+                        None,
+                        &Limits {
+                            charge: Some(Arc::new(move |_more: usize| {
+                                !ar_cb.load(Ordering::Acquire)
+                            })),
+                            ..lim_base.clone()
+                        },
+                    )
+                    .unwrap_err()
+            },
+        );
         assert!(
             matches!(err, Error::Memory { .. }),
             "refusing root DFS stack allocation must return Error::Memory, got {err:?}"
+        );
+        let root_site = *root_refused_site.lock();
+        assert!(
+            matches!(root_site, Some((proposed, false)) if proposed > 0),
+            "refusal must anchor specifically to SplitAlloc {{ site: RootStack, admitted: false }}, got {root_site:?}"
         );
         assert!(
             !sat_ref.dl_tried,
             "root DFS stack refusal must occur before branch saturation starts"
         );
+
+        // 5b. Separate synthetic `DifferentIndividuals` `BTreeSet` admission refusal:
+        //     Keep `:a` long (256 KiB) and `:b1..:b5` short so `:a` appears once in
+        //     `interner.individuals` (~256 KiB), whereas each `B_ne` depth adds another
+        //     `(:a, :bk)` pair (+256 KiB in `frame.neq` and +512 KiB in `SynthAxioms`),
+        //     so `SynthAxioms` strictly exceeds every prior watermark and `max_memory`
+        //     refuses specifically at `SplitAlloc { site: SynthAxioms, admitted: false }`.
+        let pad256 = "z".repeat(256 * 1024);
+        let ofn_sy = format!(
+            "Prefix(:=<http://example.org/sy3#>)\n\
+             Ontology(<http://example.org/sy3>\n\
+               ClassAssertion(ObjectOneOf(:b1 :b2 :b3 :b4 :b5) :a_{pad256})\n\
+               ClassAssertion(:P :b1)\n\
+               ClassAssertion(:P :b2)\n\
+               ClassAssertion(:P :b3)\n\
+               ClassAssertion(:P :b4)\n\
+               ClassAssertion(:P :b5)\n\
+               SubClassOf(:A ObjectOneOf(:a_{pad256}))\n\
+             )"
+        );
+        let doc_sy = crate::ofn_read::parse(&ofn_sy).unwrap();
+        let refs_sy: Vec<&AxiomKind> = doc_sy.axioms.iter().map(|a| &a.kind).collect();
+        let sy_events = Arc::new(parking_lot::Mutex::new(Vec::<MergePhase>::new()));
+        let se_cb = sy_events.clone();
+        let mut sat_sy = Saturation::new();
+        let sy_ok = with_merge_probe(
+            move |p| se_cb.lock().push(p),
+            || {
+                super::with_split_knobs(Some(0), Some(true), Some(6), Some(16), || {
+                    sat_sy
+                        .classify(
+                            &refs_sy,
+                            None,
+                            &Limits {
+                                charge: Some(Arc::new(|_more: usize| true)),
+                                ..lim_base.clone()
+                            },
+                        )
+                        .unwrap()
+                })
+            },
+        );
+        assert!(sy_ok.complete && sy_ok.stats.dl_rooted_splits >= 3);
+        let evs = sy_events.lock().clone();
+        let mut best_sy_before = 0usize;
+        let mut best_sy_prop = 0usize;
+        let mut last_paid_before = 0usize;
+        for p in &evs {
+            match *p {
+                MergePhase::LedgerCharge { paid_before, .. } => {
+                    last_paid_before = paid_before;
+                }
+                MergePhase::SplitAlloc {
+                    site: SplitAllocSite::SynthAxioms,
+                    proposed,
+                    admitted: true,
+                } if proposed > best_sy_prop => {
+                    best_sy_prop = proposed;
+                    best_sy_before = last_paid_before;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            best_sy_prop > best_sy_before + 1024,
+            "SynthAxioms proposed ({best_sy_prop}) must strictly exceed prior watermark ({best_sy_before})"
+        );
+        let sy_cap = best_sy_before + (best_sy_prop - best_sy_before) / 2;
+        let saw_sy_refused = Arc::new(parking_lot::Mutex::new(None::<(usize, bool)>));
+        let ssr = saw_sy_refused.clone();
+        let mut sat_sy_cap = Saturation::new();
+        let sy_res = with_merge_probe(
+            move |p| {
+                if let MergePhase::SplitAlloc {
+                    site: SplitAllocSite::SynthAxioms,
+                    proposed,
+                    admitted: false,
+                } = p
+                {
+                    *ssr.lock() = Some((proposed, false));
+                }
+            },
+            || {
+                super::with_split_knobs(Some(0), Some(true), Some(6), Some(16), || {
+                    sat_sy_cap.classify(
+                        &refs_sy,
+                        None,
+                        &Limits {
+                            max_memory: Some(sy_cap),
+                            ..lim_base.clone()
+                        },
+                    )
+                })
+            },
+        );
+        let ssr_val = *saw_sy_refused.lock();
+        assert!(
+            matches!(ssr_val, Some((proposed, false)) if proposed > sy_cap),
+            "synthetic DifferentIndividuals BTreeSet refusal must fire at SplitAlloc {{ site: SynthAxioms, admitted: false }}, got {ssr_val:?}"
+        );
+        match sy_res {
+            Ok(fb) => assert!(!fb.complete && fb.stats.dl_over_budget),
+            Err(Error::Memory { used, .. }) => assert!(used > sy_cap),
+            Err(other) => panic!("unexpected error on SynthAxioms refusal: {other:?}"),
+        }
+    }
+
+    // 6. Sol r3 P1 #1: Long-IRI `STOP_SPLIT` handoff refusal fixture with counting-allocator
+    //    assertion proving ZERO unbudgeted long-IRI copies occur in `run_once` or the
+    //    `STOP_SPLIT` handoff before admission at `ForkNeq`.
+    //    `SubClassOf(:X ObjectUnionOf(:B :C))` (zero individuals in `scope_bytes`) combined
+    //    with pure-EL singleton nominals `SubClassOf(:B ObjectOneOf(:b))` and
+    //    `SubClassOf(:C ObjectOneOf(:c))` plus `ClassAssertion(:X :a)` over 512 KiB IRIs
+    //    derives `:a = :b ∨ :a = :c` with ZERO long IRIs in `scope_bytes`. Root saturation
+    //    peaks at `orig_sig (6L) + interner (3L) + ~0.1 MiB ≈ 4.6 MiB` while `ForkNeq`
+    //    proposes `orig_sig (6L) + stop_bytes (2L) + ne_add (2L) ≈ 5.0 MiB`.
+    //    Under `max_memory = neq_prop - 128 KiB`, root saturation reaches `STOP_SPLIT`,
+    //    `StopHandoff` allocates <4 KiB (zero 1 MiB IRI clone), and `ForkNeq` refuses BEFORE
+    //    cloning the two 512 KiB IRIs!
+    {
+        let pad512 = "k".repeat(512 * 1024);
+        let ofn = format!(
+            "Prefix(:=<http://example.org/handoff#>)\n\
+             Ontology(<http://example.org/handoff>\n\
+               SubClassOf(:X ObjectUnionOf(:B :C))\n\
+               SubClassOf(:B ObjectOneOf(:b_{pad512}))\n\
+               SubClassOf(:C ObjectOneOf(:c_{pad512}))\n\
+               ClassAssertion(:X :a_{pad512})\n\
+               ClassAssertion(:P :b_{pad512})\n\
+               ClassAssertion(:P :c_{pad512})\n\
+               SubClassOf(:A ObjectOneOf(:a_{pad512}))\n\
+             )"
+        );
+        let doc = crate::ofn_read::parse(&ofn).unwrap();
+        let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let lim_base = Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            rooted_eq_split: true,
+            ..Limits::default()
+        };
+
+        // Measure the exact pre-`ForkNeq` ledger max vs `ForkNeq` proposed live total.
+        let fork_neq_prop = Arc::new(AtomicUsize::new(0));
+        let pre_neq_max = Arc::new(AtomicUsize::new(0));
+        let past_clone = Arc::new(AtomicBool::new(false));
+        let fnp = fork_neq_prop.clone();
+        let pnm = pre_neq_max.clone();
+        let pc = past_clone.clone();
+        let mut sat_meas = Saturation::new();
+        let meas_out = with_merge_probe(
+            move |phase| match phase {
+                MergePhase::SplitAlloc {
+                    site: SplitAllocSite::ForkMergeClone,
+                    admitted: true,
+                    ..
+                } => {
+                    pc.store(true, Ordering::Release);
+                }
+                MergePhase::SplitAlloc {
+                    site: SplitAllocSite::ForkNeq,
+                    proposed,
+                    admitted: true,
+                } if fnp.load(Ordering::Acquire) == 0 => {
+                    fnp.store(proposed, Ordering::Release);
+                }
+                MergePhase::LedgerCharge { used, .. } if !pc.load(Ordering::Acquire) => {
+                    pnm.fetch_max(used, Ordering::AcqRel);
+                }
+                _ => {}
+            },
+            || {
+                super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
+                    sat_meas.classify(&refs, None, &lim_base).unwrap()
+                })
+            },
+        );
+        assert!(meas_out.complete && meas_out.stats.dl_rooted_splits >= 1);
+        let neq_prop = fork_neq_prop.load(Ordering::Acquire);
+        // Root saturation's live peak is `orig_sig (3 MiB) + interner (1.5 MiB) + ~0.1 MiB`,
+        // well below `neq_prop` (~5 MiB); pick a hard cap 128 KiB below `neq_prop`.
+        assert!(
+            neq_prop > 4 * 1024 * 1024,
+            "expected ForkNeq proposed > 4 MiB with 512 KiB IRIs, got {neq_prop}"
+        );
+        let handoff_cap = neq_prop - 128 * 1024;
+        assert!(
+            handoff_cap > pre_neq_max.load(Ordering::Acquire),
+            "handoff_cap ({handoff_cap}) must exceed pre-ForkNeq ledger charges ({})",
+            pre_neq_max.load(Ordering::Acquire)
+        );
+
+        let alloc_at_sat_stop = Arc::new(AtomicUsize::new(0));
+        let alloc_at_handoff = Arc::new(AtomicUsize::new(0));
+        let alloc_at_neq_refusal = Arc::new(AtomicUsize::new(0));
+        let neq_refused = Arc::new(parking_lot::Mutex::new(None::<(usize, bool)>));
+
+        let a_sat = alloc_at_sat_stop.clone();
+        let a_ho = alloc_at_handoff.clone();
+        let a_neq = alloc_at_neq_refusal.clone();
+        let nr_p = neq_refused.clone();
+
+        let mut sat = Saturation::new();
+        let (res, _sample) = measure(|| {
+            with_merge_probe(
+                move |phase| match phase {
+                    MergePhase::SatStop { stop, .. } if stop == super::saturate::STOP_SPLIT => {
+                        a_sat.store(sample().requested_alloc_bytes, Ordering::Release);
+                    }
+                    MergePhase::SplitAlloc {
+                        site: SplitAllocSite::StopHandoff,
+                        admitted: true,
+                        ..
+                    } => {
+                        a_ho.store(sample().requested_alloc_bytes, Ordering::Release);
+                    }
+                    MergePhase::SplitAlloc {
+                        site: SplitAllocSite::ForkNeq,
+                        proposed,
+                        admitted: false,
+                    } => {
+                        a_neq.store(sample().requested_alloc_bytes, Ordering::Release);
+                        *nr_p.lock() = Some((proposed, false));
+                    }
+                    _ => {}
+                },
+                || {
+                    super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
+                        sat.classify(
+                            &refs,
+                            None,
+                            &Limits {
+                                max_memory: Some(handoff_cap),
+                                ..lim_base
+                            },
+                        )
+                    })
+                },
+            )
+        });
+
+        let sat_bytes = alloc_at_sat_stop.load(Ordering::Acquire);
+        let ho_bytes = alloc_at_handoff.load(Ordering::Acquire);
+        let neq_bytes = alloc_at_neq_refusal.load(Ordering::Acquire);
+        assert!(
+            sat_bytes > 0 && ho_bytes >= sat_bytes,
+            "must observe SatStop(STOP_SPLIT) followed by StopHandoff: sat={sat_bytes}, ho={ho_bytes}"
+        );
+        // Before our fix, `run_once` cloned two 512 KiB IRIs (>1 MiB) right after `SatStop`!
+        assert!(
+            ho_bytes - sat_bytes < 4096,
+            "STOP_SPLIT handoff must not clone the two 512 KiB IRIs before admission (allocated {} bytes between SatStop and StopHandoff)",
+            ho_bytes - sat_bytes
+        );
+        let nr_val = *neq_refused.lock();
+        assert!(
+            matches!(nr_val, Some((proposed, false)) if proposed > handoff_cap),
+            "refusal at ForkNeq must fire before cloning the two 512 KiB IRIs, got {nr_val:?}"
+        );
+        assert!(
+            neq_bytes - sat_bytes < 8192,
+            "refused ForkNeq must allocate neither the handoff copies nor the ne_neq copies (allocated {} bytes)",
+            neq_bytes - sat_bytes
+        );
+        match res {
+            Ok(fb) => {
+                assert!(!fb.complete && fb.stats.dl_over_budget);
+                assert!(sat.split_answer.is_none());
+            }
+            Err(Error::Memory { used, .. }) => {
+                assert!(used > handoff_cap);
+                assert!(sat.split_answer.is_none());
+            }
+            Err(other) => panic!("unexpected error on long-IRI STOP_SPLIT refusal: {other:?}"),
+        }
     }
 }

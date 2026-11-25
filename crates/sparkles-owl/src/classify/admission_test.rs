@@ -397,6 +397,32 @@ pub(super) enum PlanKind {
     PollErr,
 }
 
+/// Named allocation sites inside `Saturation::run_splitting` for site-specific refusal tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SplitAllocSite {
+    OrigSigTable,
+    OrigSig,
+    RootStack,
+    SynthAxioms,
+    LeafLive,
+    StopHandoff,
+    ForkStack,
+    ForkMergeClone,
+    ForkNeq,
+    ForkEqUnion,
+    ForkEqRemap,
+    ForkEqCanon,
+    MergeRemap,
+    MergeCanon,
+}
+
+/// Which `SplitLedger` entry point invoked `cover_memory`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LedgerChargeSource {
+    Delta,
+    Cover,
+}
+
 /// Phase-specific events emitted during rooted constant merging and post-merge replanning
 /// so regression tests can verify exact phases, stop winners, and helper participation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -441,6 +467,7 @@ pub(super) enum MergePhase {
     SatStop {
         stop: u8,
         helper_ran: bool,
+        helper_worked: bool,
     },
     MergeRestart {
         restarts: usize,
@@ -451,6 +478,19 @@ pub(super) enum MergePhase {
         splits: usize,
         depth: usize,
         prio: u8,
+    },
+    SplitAlloc {
+        site: SplitAllocSite,
+        proposed: usize,
+        admitted: bool,
+    },
+    LedgerCharge {
+        source: LedgerChargeSource,
+        used: usize,
+        paid_before: usize,
+        paid_after: usize,
+        delta: usize,
+        admitted: bool,
     },
     SplitLeafExportStart {
         leaves: usize,
@@ -467,13 +507,17 @@ pub(super) enum MergePhase {
     SplitPostLeafReset {
         canon_want_none: bool,
         leaf_inds_cap: usize,
+        interner_bytes: usize,
+        residual_bytes: usize,
     },
 }
 
 type MergeProbe = Box<dyn FnMut(MergePhase)>;
+type SplitPairProbe = Box<dyn FnMut(usize, usize, u8, &str, &str)>;
 
 thread_local! {
     static MERGE_PROBE: RefCell<Option<MergeProbe>> = const { RefCell::new(None) };
+    static SPLIT_PAIR_PROBE: RefCell<Option<SplitPairProbe>> = const { RefCell::new(None) };
     static PLAN_RESTARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -501,6 +545,33 @@ pub(super) fn emit_merge_phase(phase: MergePhase) {
     MERGE_PROBE.with(|slot| {
         if let Some(hook) = slot.borrow_mut().as_mut() {
             hook(phase);
+        }
+    });
+}
+
+pub(super) fn with_split_pair_probe<T>(
+    observe: impl FnMut(usize, usize, u8, &str, &str) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SPLIT_PAIR_PROBE.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    SPLIT_PAIR_PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none());
+        *slot = Some(Box::new(observe));
+    });
+    let _reset = Reset;
+    run()
+}
+
+pub(super) fn emit_split_pair(splits: usize, depth: usize, prio: u8, u: &str, v: &str) {
+    SPLIT_PAIR_PROBE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(splits, depth, prio, u, v);
         }
     });
 }
