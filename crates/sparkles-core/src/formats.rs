@@ -228,10 +228,10 @@ pub const VOCAB_FSST: FileKind = FileKind {
 pub const NUMERIC_COLUMN: FileKind = FileKind {
     id: "numeric-column",
     files: "gen-*/vocab.num",
-    marker: "magic `SPKVNUM2`",
+    marker: "magic `SPKVNUM3`",
     class: Class::Primary,
-    writes: 2,
-    reads: &[2],
+    writes: 3,
+    reads: &[3],
 };
 
 /// A generation's predicate patterns (X11 Phase 1). Derived from the generation's SPO

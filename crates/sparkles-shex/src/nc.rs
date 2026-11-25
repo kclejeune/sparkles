@@ -1559,4 +1559,25 @@ mod tests {
         drop(value);
         assert_eq!(pool.granted(), 0);
     }
+
+    #[test]
+    fn compile_pattern_xpath_dot_and_flags() {
+        let re = compile_pattern("^a.b$", None).unwrap();
+        assert!(re.is_match("axb"));
+        assert!(!re.is_match("a\rb"));
+        assert!(!re.is_match("a\nb"));
+
+        let re_s = compile_pattern("^a.b$", Some("s")).unwrap();
+        assert!(re_s.is_match("a\rb"));
+        assert!(re_s.is_match("a\nb"));
+
+        let re_x = compile_pattern("^[ ]a.b$", Some("x")).unwrap();
+        assert!(re_x.is_match(" axb"));
+        assert!(!re_x.is_match(" a\rb"));
+
+        let scoped_on = compile_pattern("^(?s:.)$", None).unwrap();
+        assert!(scoped_on.is_match("\r"));
+        let scoped_off = compile_pattern("^(?-s:.)$", Some("s")).unwrap();
+        assert!(!scoped_off.is_match("\r"));
+    }
 }

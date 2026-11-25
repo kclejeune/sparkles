@@ -6863,3 +6863,801 @@ fn a_refused_decode_mid_answer_keeps_the_budget_error_in_every_writer() {
         }
     }
 }
+
+/// Regression tests for roadmap item 1077: strict XSD 1.1 float/double lexical forms,
+/// canonical XPath F&O `xsd:string` casts of floats/doubles, and XPath `.` excluding `\r`
+/// without the `s` flag across eager, cursor/streaming, `NumColumn`, and `KeyFilter` paths.
+#[test]
+fn xsd_float_double_lexical_forms_string_casts_and_xpath_regex_dot() {
+    use oxrdf::Literal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let ttl = r#"
+@prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:d_inf_upper ex:num "INF"^^xsd:double .
+ex:d_pinf_upper ex:num "+INF"^^xsd:double .
+ex:d_ninf_upper ex:num "-INF"^^xsd:double .
+ex:d_nan_upper ex:num "NaN"^^xsd:double .
+ex:d_inf_lower ex:num "inf"^^xsd:double .
+ex:d_ninf_lower ex:num "-inf"^^xsd:double .
+ex:d_pinf_lower ex:num "+inf"^^xsd:double .
+ex:d_infinity ex:num "infinity"^^xsd:double .
+ex:d_nan_lower ex:num "nan"^^xsd:double .
+ex:d_nnan ex:num "-NaN"^^xsd:double .
+ex:d_pnan ex:num "+NaN"^^xsd:double .
+
+ex:f_inf_upper ex:num "INF"^^xsd:float .
+ex:f_pinf_upper ex:num "+INF"^^xsd:float .
+ex:f_ninf_upper ex:num "-INF"^^xsd:float .
+ex:f_nan_upper ex:num "NaN"^^xsd:float .
+ex:f_inf_lower ex:num "inf"^^xsd:float .
+ex:f_ninf_lower ex:num "-inf"^^xsd:float .
+ex:f_infinity ex:num "infinity"^^xsd:float .
+ex:f_nan_lower ex:num "nan"^^xsd:float .
+ex:f_nnan ex:num "-NaN"^^xsd:float .
+
+ex:c_d_1e6 ex:cast "1e6"^^xsd:double .
+ex:c_d_1000000 ex:cast "1000000"^^xsd:double .
+ex:c_d_n1e6 ex:cast "-1e6"^^xsd:double .
+ex:c_d_1_5e6 ex:cast "1.5e6"^^xsd:double .
+ex:c_d_1_23e6 ex:cast "1.23e6"^^xsd:double .
+ex:c_d_1e_6 ex:cast "1e-6"^^xsd:double .
+ex:c_d_n1e_6 ex:cast "-1e-6"^^xsd:double .
+ex:c_d_1e_7 ex:cast "1e-7"^^xsd:double .
+ex:c_d_n1e_7 ex:cast "-1e-7"^^xsd:double .
+ex:c_d_999999 ex:cast "999999.0e0"^^xsd:double .
+ex:c_d_1_0 ex:cast "1.0e0"^^xsd:double .
+ex:c_d_1_5 ex:cast "1.5e0"^^xsd:double .
+ex:c_d_0_1 ex:cast "0.1"^^xsd:double .
+ex:c_d_0 ex:cast "0.0e0"^^xsd:double .
+ex:c_d_n0 ex:cast "-0.0e0"^^xsd:double .
+ex:c_d_inf ex:cast "INF"^^xsd:double .
+ex:c_d_ninf ex:cast "-INF"^^xsd:double .
+ex:c_d_nan ex:cast "NaN"^^xsd:double .
+
+ex:c_f_1e6 ex:cast "1e6"^^xsd:float .
+ex:c_f_n1e6 ex:cast "-1e6"^^xsd:float .
+ex:c_f_1_5e6 ex:cast "1.5e6"^^xsd:float .
+ex:c_f_1e_6 ex:cast "1e-6"^^xsd:float .
+ex:c_f_above_1e_6 ex:cast "1.0000001e-6"^^xsd:float .
+ex:c_f_1e_7 ex:cast "1e-7"^^xsd:float .
+ex:c_f_0_1 ex:cast "0.1"^^xsd:float .
+ex:c_f_0 ex:cast "0.0"^^xsd:float .
+ex:c_f_n0 ex:cast "-0.0"^^xsd:float .
+ex:c_f_inf ex:cast "INF"^^xsd:float .
+ex:c_f_ninf ex:cast "-INF"^^xsd:float .
+ex:c_f_nan ex:cast "NaN"^^xsd:float .
+
+ex:r_cr ex:txt "a\rb" .
+ex:r_lf ex:txt "a\nb" .
+ex:r_crlf ex:txt "a\r\nb" .
+ex:r_x ex:txt "axb" .
+ex:r_dot ex:txt "a.b" .
+ex:r_bs_x ex:txt "a\\xb" .
+ex:r_bs_cr ex:txt "a\\\rb" .
+ex:r_br_x ex:txt "a]xb" .
+ex:r_br_cr ex:txt "a]\rb" .
+ex:r_lines ex:txt "first\rline\nsecond" .
+"#;
+    store
+        .load(&[Source::from_bytes(
+            ttl.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    // Also add delta triples so both compacted base (`vocab.num`) and delta paths are exercised.
+    sparkles_core::sparql::update::update(
+        &store,
+        r#"
+        PREFIX ex: <http://ex.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        INSERT DATA {
+            ex:delta_d_inf_lower ex:num "inf"^^xsd:double .
+            ex:delta_d_inf_upper ex:num "INF"^^xsd:double .
+            ex:delta_r_cr ex:txt "a\rb" .
+        }
+        "#,
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(
+        store.snapshot().generation.vocab.numeric().is_some(),
+        "compacted store builds vocab.num"
+    );
+
+    let run_both = |q: &str| -> Vec<Vec<Option<Term>>> {
+        let opts = QueryOptions::default();
+        let eager = query(store.snapshot(), q, &opts)
+            .unwrap()
+            .application_rows();
+        for batch in [1, 4096] {
+            let streamed = all(open(&store, q, batch));
+            assert_eq!(
+                bag(streamed),
+                bag(eager.clone()),
+                "batch {batch} diverged for: {q}"
+            );
+        }
+        eager
+    };
+    let iri_names = |rows: Vec<Vec<Option<Term>>>| -> Vec<String> {
+        let mut names: Vec<String> = rows
+            .into_iter()
+            .map(|r| match &r[0] {
+                Some(Term::NamedNode(n)) => n
+                    .as_str()
+                    .strip_prefix("http://ex.org/")
+                    .unwrap()
+                    .to_string(),
+                other => panic!("expected ex: IRI, got {other:?}"),
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let str_pairs = |rows: Vec<Vec<Option<Term>>>| -> Vec<(String, Option<String>)> {
+        let mut pairs: Vec<(String, Option<String>)> = rows
+            .into_iter()
+            .map(|r| {
+                let k = match &r[0] {
+                    Some(Term::NamedNode(n)) => n
+                        .as_str()
+                        .strip_prefix("http://ex.org/")
+                        .unwrap()
+                        .to_string(),
+                    other => panic!("expected ex: IRI, got {other:?}"),
+                };
+                let v = r[1].as_ref().map(|t| match t {
+                    Term::Literal(l) => l.value().to_string(),
+                    other => panic!("expected literal, got {other:?}"),
+                });
+                (k, v)
+            })
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    };
+
+    // 1. Strict XSD 1.1 float/double lexical forms
+    let numeric = iri_names(run_both(
+        "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:num ?v FILTER(isNumeric(?v)) }",
+    ));
+    assert_eq!(
+        numeric,
+        vec![
+            "d_inf_upper",
+            "d_nan_upper",
+            "d_ninf_upper",
+            "d_pinf_upper",
+            "delta_d_inf_upper",
+            "f_inf_upper",
+            "f_nan_upper",
+            "f_ninf_upper",
+            "f_pinf_upper",
+        ]
+    );
+
+    let gt_zero = iri_names(run_both(
+        "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:num ?v FILTER(?v > 0) }",
+    ));
+    assert_eq!(
+        gt_zero,
+        vec![
+            "d_inf_upper",
+            "d_pinf_upper",
+            "delta_d_inf_upper",
+            "f_inf_upper",
+            "f_pinf_upper",
+        ]
+    );
+
+    // Arithmetic on valid vs ill-typed float/double literals.
+    let arith_ok = iri_names(run_both(
+        "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:num ?v BIND(?v + 1 AS ?sum) FILTER(BOUND(?sum)) }",
+    ));
+    assert_eq!(
+        arith_ok,
+        vec![
+            "d_inf_upper",
+            "d_nan_upper",
+            "d_ninf_upper",
+            "d_pinf_upper",
+            "delta_d_inf_upper",
+            "f_inf_upper",
+            "f_nan_upper",
+            "f_ninf_upper",
+            "f_pinf_upper",
+        ]
+    );
+
+    // Casting an ill-typed float/double literal to xsd:string preserves its lexical form.
+    let ill_typed_cast = run_both(
+        "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+         SELECT (xsd:string(?v) AS ?out) WHERE { ex:d_inf_lower ex:num ?v }",
+    );
+    assert_eq!(
+        ill_typed_cast,
+        vec![vec![Some(Term::Literal(Literal::new_simple_literal(
+            "inf"
+        )))]]
+    );
+
+    // String-to-float/double casts reject non-XSD spellings and Unicode whitespace
+    // (U+00A0), while accepting XML whitespace around INF/+INF/-INF/NaN.
+    let cast_checks = run_both(
+        r#"
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?in (BOUND(?d) AS ?d_ok) (BOUND(?f) AS ?f_ok)
+        WHERE {
+            VALUES ?in { "INF" "+INF" "-INF" "NaN" " INF " "\tINF\r\n" "\u00A0INF\u00A0" "\u00A01.5\u00A0" "inf" "-inf" "+inf" "infinity" "nan" "-NaN" "+NaN" }
+            BIND(xsd:double(?in) AS ?d)
+            BIND(xsd:float(?in) AS ?f)
+        }
+        "#,
+    );
+    let expected_cast_ok = [
+        ("INF", true),
+        ("+INF", true),
+        ("-INF", true),
+        ("NaN", true),
+        (" INF ", true),
+        ("\tINF\r\n", true),
+        ("\u{00A0}INF\u{00A0}", false),
+        ("\u{00A0}1.5\u{00A0}", false),
+        ("inf", false),
+        ("-inf", false),
+        ("+inf", false),
+        ("infinity", false),
+        ("nan", false),
+        ("-NaN", false),
+        ("+NaN", false),
+    ];
+    assert_eq!(cast_checks.len(), expected_cast_ok.len());
+    let mut got_casts = std::collections::BTreeMap::new();
+    for row in &cast_checks {
+        let got_in = match &row[0] {
+            Some(Term::Literal(l)) => l.value().to_string(),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(
+            got_casts
+                .insert(got_in.clone(), (row[1].clone(), row[2].clone()))
+                .is_none(),
+            "duplicate input {got_in:?}"
+        );
+    }
+    for (input, want) in expected_cast_ok {
+        let want_term = Some(Term::Literal(Literal::from(want)));
+        let (d_ok, f_ok) = got_casts
+            .get(input)
+            .unwrap_or_else(|| panic!("missing cast check row for {input:?}"));
+        assert_eq!(d_ok, &want_term, "xsd:double({input:?})");
+        assert_eq!(f_ok, &want_term, "xsd:float({input:?})");
+    }
+
+    // 2. XPath F&O canonical xsd:string casts of xsd:double and xsd:float
+    let casts = str_pairs(run_both(
+        "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+         SELECT ?s (xsd:string(?v) AS ?out) WHERE { ?s ex:cast ?v }",
+    ));
+    let expected_casts: Vec<(&str, &str)> = vec![
+        ("c_d_0", "0"),
+        ("c_d_0_1", "0.1"),
+        ("c_d_1000000", "1.0E6"),
+        ("c_d_1_0", "1"),
+        ("c_d_1_23e6", "1.23E6"),
+        ("c_d_1_5", "1.5"),
+        ("c_d_1_5e6", "1.5E6"),
+        ("c_d_1e6", "1.0E6"),
+        ("c_d_1e_6", "0.000001"),
+        ("c_d_1e_7", "1.0E-7"),
+        ("c_d_999999", "999999"),
+        ("c_d_inf", "INF"),
+        ("c_d_n0", "-0"),
+        ("c_d_n1e6", "-1.0E6"),
+        ("c_d_n1e_6", "-0.000001"),
+        ("c_d_n1e_7", "-1.0E-7"),
+        ("c_d_nan", "NaN"),
+        ("c_d_ninf", "-INF"),
+        ("c_f_0", "0"),
+        ("c_f_0_1", "0.1"),
+        ("c_f_1_5e6", "1.5E6"),
+        ("c_f_1e6", "1.0E6"),
+        ("c_f_1e_6", "1.0E-6"),
+        ("c_f_1e_7", "1.0E-7"),
+        ("c_f_above_1e_6", "0.0000010000001"),
+        ("c_f_inf", "INF"),
+        ("c_f_n0", "-0"),
+        ("c_f_n1e6", "-1.0E6"),
+        ("c_f_nan", "NaN"),
+        ("c_f_ninf", "-INF"),
+    ];
+    let mut expected_casts: Vec<(String, Option<String>)> = expected_casts
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), Some(v.to_string())))
+        .collect();
+    expected_casts.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(casts, expected_casts);
+
+    // STR() preserves the original lexical form while xsd:string() uses XPath canonical form.
+    let str_vs_cast = run_both(
+        "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+         SELECT (STR(?v) AS ?lex) (xsd:string(?v) AS ?cast) WHERE { ex:c_d_1e6 ex:cast ?v }",
+    );
+    assert_eq!(
+        str_vs_cast,
+        vec![vec![
+            Some(Term::Literal(Literal::new_simple_literal("1e6"))),
+            Some(Term::Literal(Literal::new_simple_literal("1.0E6"))),
+        ]]
+    );
+
+    // 3. XPath REGEX / REPLACE `.` excludes `\r` without the `s` flag (including KeyFilter pushdown)
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a.b$")) }"#
+        )),
+        vec!["r_dot", "r_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a.b$", "s")) }"#
+        )),
+        vec!["delta_r_cr", "r_cr", "r_dot", "r_lf", "r_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(STR(?v), "^a.b$")) }"#
+        )),
+        vec!["r_dot", "r_x"]
+    );
+    // Escaped `\.`, `[.]`, `[^.]`, `\\.` and `[\]].`
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a\\.b$")) }"#
+        )),
+        vec!["r_dot"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[.]b$")) }"#
+        )),
+        vec!["r_dot"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[^.]b$")) }"#
+        )),
+        vec!["delta_r_cr", "r_cr", "r_lf", "r_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a\\\\.b$")) }"#
+        )),
+        vec!["r_bs_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a\\\\.b$", "s")) }"#
+        )),
+        vec!["r_bs_cr", "r_bs_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[\\]].b$")) }"#
+        )),
+        vec!["r_br_x"]
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^a[\\]].b$", "s")) }"#
+        )),
+        vec!["r_br_cr", "r_br_x"]
+    );
+    // `m` flag without `s` still excludes `\r` from `.`; `ms` includes both `\r` and `\n`.
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^first.line$", "m")) }"#
+        )),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        iri_names(run_both(
+            r#"PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:txt ?v FILTER(REGEX(?v, "^first.line$", "ms")) }"#
+        )),
+        vec!["r_lines"]
+    );
+    // REPLACE without `s` leaves `\r` and `\n` untouched; with `s` replaces them too;
+    // with `q` treats both pattern and replacement (`$` and `\`) literally.
+    let replaced = run_both(
+        r#"
+        SELECT
+            (REPLACE("a\rb\nc", ".", "X") AS ?no_s)
+            (REPLACE("a\rb\nc", ".", "X", "s") AS ?with_s)
+            (REPLACE("a\rb", "a.b", "X") AS ?no_match)
+            (REPLACE("a\rb", "a.b", "X", "s") AS ?match_s)
+            (REPLACE("a.b", ".", "$", "q") AS ?q_dollar)
+            (REPLACE("a.b", ".", "\\$1\\", "q") AS ?q_bs_dollar)
+            (REGEX(" axb", "^[ ]a.b$", "x") AS ?x_space_ok)
+            (REGEX(" a\rb", "^[ ]a.b$", "x") AS ?x_space_cr)
+            (REGEX("hello world", "hello\\ sworld", "x") AS ?x_esc_ws)
+            (REGEX("\n", "(?x)^( ?s:.)$") AS ?rx_ws_scoped_s)
+            (REGEX("\r", "(?x)^(# comment\n ?-s:.)$", "s") AS ?rx_comment_scoped_no_s)
+            (REGEX("x", "^(?-s:(?P<a.b>.))$", "s") AS ?named_dot_ok)
+            (REGEX("\r", "^(?-s:(?P<a.b>.))$", "s") AS ?named_dot_cr)
+            (REGEX("\r", "^(?s:.)$") AS ?scoped_s_on)
+            (REGEX("\r", "^(?-s:.)$", "s") AS ?scoped_s_off)
+        WHERE {}
+        "#,
+    );
+    assert_eq!(
+        replaced,
+        vec![vec![
+            Some(Term::Literal(Literal::new_simple_literal("X\rX\nX"))),
+            Some(Term::Literal(Literal::new_simple_literal("XXXXX"))),
+            Some(Term::Literal(Literal::new_simple_literal("a\rb"))),
+            Some(Term::Literal(Literal::new_simple_literal("X"))),
+            Some(Term::Literal(Literal::new_simple_literal("a$b"))),
+            Some(Term::Literal(Literal::new_simple_literal(r"a\$1\b"))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(false))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(false))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(false))),
+            Some(Term::Literal(Literal::from(true))),
+            Some(Term::Literal(Literal::from(false))),
+        ]]
+    );
+
+    // Dollar-heavy literal `q` replacement stays within a tight query memory budget.
+    let hay = "a".repeat(4096);
+    let dollars = "$".repeat(4096);
+    let q_budget =
+        format!(r#"SELECT (REPLACE("{hay}", "{hay}", "{dollars}", "q") AS ?out) WHERE {{}}"#);
+    let tight_opts = QueryOptions {
+        max_memory_bytes: Some(8 << 20),
+        ..QueryOptions::default()
+    };
+    let eager_q = query(store.snapshot(), &q_budget, &tight_opts)
+        .unwrap()
+        .application_rows();
+    assert_eq!(
+        eager_q,
+        vec![vec![Some(Term::Literal(Literal::new_simple_literal(
+            &dollars
+        )))]]
+    );
+    let cur_q =
+        all(select_cursor(store.snapshot(), &q_budget, &tight_opts, &options(4096)).unwrap());
+    assert_eq!(cur_q, eager_q);
+}
+
+/// Regression test for upgrading a store whose compacted generation still carries a legacy
+/// `SPKVNUM2` numeric column written under pre-1077 rules (which classified `"inf"^^xsd:double`
+/// and `"-inf"^^xsd:float` as IEEE infinities): reopening ignores `SPKVNUM2` cleanly,
+/// `sparkles check --full` warns rather than failing, both query modes decode from keys with
+/// strict XSD 1.1 semantics, and `add_numeric_column` upgrades the file to `SPKVNUM3`.
+#[test]
+fn legacy_spkvnum2_column_falls_back_cleanly_on_reopen() {
+    use sparkles_core::check::{CheckOptions, Status, check};
+    use sparkles_core::id::Id;
+    use sparkles_core::vocab::numeric::{DOUBLE, FILE, FLOAT, NOT_NUMERIC};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ttl = r#"
+@prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:d_inf_lower ex:v "inf"^^xsd:double .
+ex:f_ninf_lower ex:v "-inf"^^xsd:float .
+ex:d_pinf_upper ex:v "+INF"^^xsd:double .
+ex:d_num ex:v "1.50"^^xsd:double .
+"#;
+    {
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        store
+            .load(&[Source::from_bytes(
+                ttl.as_bytes().to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.numeric().is_some());
+        let gen_dir = snap.generation.dir.as_ref().unwrap().clone();
+        let vocab_len = snap.generation.vocab.len();
+
+        // Build a valid SPKVNUM2 file using the pre-1077 classification rules where
+        // `"inf"^^xsd:double` and `"-inf"^^xsd:float` were stored as numeric values.
+        let mut covered = 0u64;
+        let mut kinds = Vec::new();
+        let mut values = Vec::new();
+        for id in 0..vocab_len {
+            let Some(Term::Literal(lit)) = snap.term(Id::vocab(id)) else {
+                break;
+            };
+            covered += 1;
+            let dt = lit.datatype().as_str();
+            let (kind, bits) = if dt == oxrdf::vocab::xsd::DOUBLE.as_str() {
+                match lit.value().parse::<f64>() {
+                    Ok(v) => (DOUBLE, v.to_bits()),
+                    Err(_) => (NOT_NUMERIC, 0),
+                }
+            } else if dt == oxrdf::vocab::xsd::FLOAT.as_str() {
+                match lit.value().parse::<f32>() {
+                    Ok(v) => (FLOAT, v.to_bits() as u64),
+                    Err(_) => (NOT_NUMERIC, 0),
+                }
+            } else {
+                (NOT_NUMERIC, 0)
+            };
+            kinds.push(kind);
+            if kind & 8 != 0 {
+                values.push(bits);
+            }
+        }
+        assert!(
+            values.len() >= 4,
+            "all four non-inlined literals are in vocab: {values:?}"
+        );
+        let positions = covered;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"SPKVNUM2");
+        bytes.extend_from_slice(&vocab_len.to_le_bytes());
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&positions.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // 1 segment covering 0..covered
+        let mut word = 0u64;
+        for (i, &k) in kinds.iter().enumerate() {
+            word |= (k as u64) << ((i % 16) * 4);
+            if (i + 1) % 16 == 0 {
+                bytes.extend_from_slice(&word.to_le_bytes());
+                word = 0;
+            }
+        }
+        if !kinds.len().is_multiple_of(16) {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        // Rank array (positions < 128 -> 1 u32 entry = 0, padded to 8 bytes).
+        assert!(positions <= 128);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        for bits in &values {
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        // Segment (lo=0, hi=covered, base=0).
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        std::fs::write(gen_dir.join(FILE), &bytes).unwrap();
+    }
+
+    let report = check(dir.path(), &CheckOptions { quick: false }).unwrap();
+    assert_eq!(
+        report.status,
+        Status::Warning,
+        "legacy SPKVNUM2 should warn, not error: {}",
+        report.to_text()
+    );
+
+    let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    assert!(
+        store.snapshot().generation.vocab.numeric().is_none(),
+        "legacy SPKVNUM2 must not be loaded"
+    );
+
+    let verify_queries = |store: &Store| {
+        let run_both = |q: &str| -> Vec<Vec<Option<Term>>> {
+            let opts = QueryOptions::default();
+            let eager = query(store.snapshot(), q, &opts)
+                .unwrap()
+                .application_rows();
+            for batch in [1, 4096] {
+                let streamed = all(open(store, q, batch));
+                assert_eq!(
+                    bag(streamed),
+                    bag(eager.clone()),
+                    "batch {batch} diverged for: {q}"
+                );
+            }
+            eager
+        };
+        let names = |q: &str| -> Vec<String> {
+            let mut out: Vec<String> = run_both(q)
+                .into_iter()
+                .map(|r| match &r[0] {
+                    Some(Term::NamedNode(n)) => n
+                        .as_str()
+                        .strip_prefix("http://ex.org/")
+                        .unwrap()
+                        .to_string(),
+                    other => panic!("expected IRI, got {other:?}"),
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            names(
+                "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:v ?v FILTER(isNumeric(?v)) }"
+            ),
+            vec!["d_num", "d_pinf_upper"]
+        );
+        assert_eq!(
+            names("PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:v ?v FILTER(?v > 0) }"),
+            vec!["d_num", "d_pinf_upper"]
+        );
+        assert_eq!(
+            names(
+                "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s ex:v ?v BIND(?v + 1 AS ?n) FILTER(BOUND(?n)) }"
+            ),
+            vec!["d_num", "d_pinf_upper"]
+        );
+        let mut lex_and_cast: Vec<(String, String, String)> = run_both(
+            "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             SELECT ?s (STR(?v) AS ?lex) (xsd:string(?v) AS ?cast) WHERE { ?s ex:v ?v }",
+        )
+        .into_iter()
+        .map(|r| {
+            let s = match &r[0] {
+                Some(Term::NamedNode(n)) => n
+                    .as_str()
+                    .strip_prefix("http://ex.org/")
+                    .unwrap()
+                    .to_string(),
+                other => panic!("{other:?}"),
+            };
+            let lex = match &r[1] {
+                Some(Term::Literal(l)) => l.value().to_string(),
+                other => panic!("{other:?}"),
+            };
+            let cast = match &r[2] {
+                Some(Term::Literal(l)) => l.value().to_string(),
+                other => panic!("{other:?}"),
+            };
+            (s, lex, cast)
+        })
+        .collect();
+        lex_and_cast.sort();
+        assert_eq!(
+            lex_and_cast,
+            vec![
+                ("d_inf_lower".into(), "inf".into(), "inf".into()),
+                ("d_num".into(), "1.50".into(), "1.5".into()),
+                ("d_pinf_upper".into(), "+INF".into(), "INF".into()),
+                ("f_ninf_lower".into(), "-inf".into(), "-inf".into()),
+            ]
+        );
+    };
+
+    verify_queries(&store);
+
+    // Rebuilding upgrades vocab.num to SPKVNUM3 (holding only the 2 valid numbers),
+    // and a second call on the same handle returns None without rewriting the file.
+    assert_eq!(store.add_numeric_column().unwrap(), Some(2));
+    assert_eq!(store.add_numeric_column().unwrap(), None);
+    drop(store);
+
+    let clean = check(dir.path(), &CheckOptions { quick: false }).unwrap();
+    assert_eq!(clean.status, Status::Ok, "{}", clean.to_text());
+
+    let reopened = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    assert!(reopened.snapshot().generation.vocab.numeric().is_some());
+    assert_eq!(reopened.add_numeric_column().unwrap(), None);
+    verify_queries(&reopened);
+}
+
+/// Upgrading a legacy `SPKVNUM2` column whose only numeric entries were invalid spellings
+/// (`"inf"^^xsd:double` and `"-inf"^^xsd:float`) returns `Some(0)`, removes the stale
+/// `vocab.num` file, and leaves `check --full` clean.
+#[test]
+fn legacy_spkvnum2_invalid_only_column_removed_on_upgrade() {
+    use sparkles_core::check::{CheckOptions, Status, check};
+    use sparkles_core::id::Id;
+    use sparkles_core::vocab::numeric::{DOUBLE, FILE, FLOAT, NOT_NUMERIC};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ttl = r#"
+@prefix ex: <http://ex.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:d_inf_lower ex:v "inf"^^xsd:double .
+ex:f_ninf_lower ex:v "-inf"^^xsd:float .
+"#;
+    let gen_dir;
+    {
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        store
+            .load(&[Source::from_bytes(
+                ttl.as_bytes().to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.numeric().is_none());
+        gen_dir = snap.generation.dir.as_ref().unwrap().clone();
+        let vocab_len = snap.generation.vocab.len();
+
+        let mut covered = 0u64;
+        let mut kinds = Vec::new();
+        let mut values = Vec::new();
+        for id in 0..vocab_len {
+            let Some(Term::Literal(lit)) = snap.term(Id::vocab(id)) else {
+                break;
+            };
+            covered += 1;
+            let dt = lit.datatype().as_str();
+            let (kind, bits) = if dt == oxrdf::vocab::xsd::DOUBLE.as_str() {
+                match lit.value().parse::<f64>() {
+                    Ok(v) => (DOUBLE, v.to_bits()),
+                    Err(_) => (NOT_NUMERIC, 0),
+                }
+            } else if dt == oxrdf::vocab::xsd::FLOAT.as_str() {
+                match lit.value().parse::<f32>() {
+                    Ok(v) => (FLOAT, v.to_bits() as u64),
+                    Err(_) => (NOT_NUMERIC, 0),
+                }
+            } else {
+                (NOT_NUMERIC, 0)
+            };
+            kinds.push(kind);
+            if kind & 8 != 0 {
+                values.push(bits);
+            }
+        }
+        assert_eq!(values.len(), 2);
+        let positions = covered;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"SPKVNUM2");
+        bytes.extend_from_slice(&vocab_len.to_le_bytes());
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&positions.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let mut word = 0u64;
+        for (i, &k) in kinds.iter().enumerate() {
+            word |= (k as u64) << ((i % 16) * 4);
+            if (i + 1) % 16 == 0 {
+                bytes.extend_from_slice(&word.to_le_bytes());
+                word = 0;
+            }
+        }
+        if !kinds.len().is_multiple_of(16) {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        assert!(positions <= 128);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        for bits in &values {
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&covered.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        std::fs::write(gen_dir.join(FILE), &bytes).unwrap();
+    }
+
+    let report = check(dir.path(), &CheckOptions { quick: false }).unwrap();
+    assert_eq!(report.status, Status::Warning, "{}", report.to_text());
+
+    let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    assert_eq!(store.add_numeric_column().unwrap(), Some(0));
+    assert!(
+        !gen_dir.join(FILE).exists(),
+        "stale SPKVNUM2 file must be removed when zero valid numbers remain"
+    );
+    drop(store);
+
+    let clean = check(dir.path(), &CheckOptions { quick: false }).unwrap();
+    assert_eq!(clean.status, Status::Ok, "{}", clean.to_text());
+}

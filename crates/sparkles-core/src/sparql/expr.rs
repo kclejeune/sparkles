@@ -1048,27 +1048,17 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Translate an XPath pattern and SPARQL `REGEX` / `REPLACE` flags into a Rust `regex`
+/// pattern string. Returns `None` if `flags` contains an unsupported flag.
+pub fn translate_xpath_pattern(pattern: &str, flags: &str) -> Option<String> {
+    super::query_regex::translate_xpath_pattern(pattern, flags)
+}
+
 /// Compile an XPath pattern with SPARQL `REGEX` flags into a `regex::Regex`, for
-/// callers outside query evaluation, such as SHACL and ShEx shapes, which compile each
-/// pattern once. Query evaluation uses the query's own programs instead.
+/// callers outside query evaluation, such as ShEx shapes, which compile each pattern
+/// once. Query evaluation uses the query's own programs instead.
 pub fn compile_regex(pattern: &str, flags: &str) -> EvalResult<regex::Regex> {
-    let mut b = String::new();
-    let mut literal = false;
-    for f in flags.chars() {
-        match f {
-            'i' => b.push_str("(?i)"),
-            's' => b.push_str("(?s)"),
-            'm' => b.push_str("(?m)"),
-            'x' => b.push_str("(?x)"),
-            'q' => literal = true,
-            _ => return Err(TypeError),
-        }
-    }
-    if literal {
-        b.push_str(&regex::escape(pattern));
-    } else {
-        b.push_str(pattern);
-    }
+    let b = translate_xpath_pattern(pattern, flags).ok_or(TypeError)?;
     regex::RegexBuilder::new(&b)
         .size_limit(1 << 22)
         .build()
@@ -1376,13 +1366,23 @@ fn builtin(f: &Function, args: &[Expr], row: &Row<'_>, ctx: &Ctx) -> EvalResult<
                 .as_deref()
                 .map_or(Some(""), Value::as_str)
                 .ok_or(TypeError)?;
-            let rep = xpath_replacement(r.as_str().ok_or(TypeError)?)?;
+            let rep_str = r.as_str().ok_or(TypeError)?;
+            let literal_rep = flags.contains('q');
+            let rep: Cow<'_, str> = if literal_rep {
+                Cow::Borrowed(rep_str)
+            } else {
+                Cow::Owned(xpath_replacement(rep_str)?)
+            };
             let output = ctx
                 .with_regex(p.as_str().ok_or(TypeError)?, flags, |re| {
                     if re.matches_empty() {
                         return Ok(None);
                     }
-                    re.replace(ctx, st, &rep).map(Some)
+                    if literal_rep {
+                        re.replace_literal(ctx, st, &rep).map(Some)
+                    } else {
+                        re.replace(ctx, st, &rep).map(Some)
+                    }
                 })
                 .and_then(|output| output.transpose())
                 .map_err(|error| {
@@ -1744,10 +1744,18 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
             Err(TypeError)
         };
     }
+    if local == "string" {
+        return Ok(match &v {
+            Value::Float(f) => s(super::value::float_to_xpath_string(f32::from(*f))),
+            Value::Double(d) => s(super::value::double_to_xpath_string(f64::from(*d))),
+            _ => s(v.lexical()?),
+        });
+    }
     let lex = v.lexical()?;
     let from_str = matches!(v, Value::Str(_) | Value::Other { .. });
     let parsed = |dt: NamedNodeRef<'_>| -> EvalResult<Val> {
-        let val = Value::from_literal(&Literal::new_typed_literal(lex.trim(), dt));
+        let trimmed = lex.trim_matches([' ', '\t', '\n', '\r']);
+        let val = Value::from_literal(&Literal::new_typed_literal(trimmed, dt));
         if matches!(val, Value::Other { .. }) {
             Err(TypeError)
         } else {
@@ -1757,7 +1765,6 @@ pub fn cast(dt: &NamedNode, v: Value, ctx: &Ctx) -> EvalResult<Val> {
     use oxrdf::NamedNodeRef;
     let num = Num::of(&v).ok();
     Ok(match local {
-        "string" => s(lex),
         "boolean" => match (&v, num) {
             (Value::Bool(x), _) => b(*x),
             (_, Some(n)) => b(Value::Double(n.to_double()).ebv().unwrap_or(false)),

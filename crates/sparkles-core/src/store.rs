@@ -6602,17 +6602,17 @@ impl Store {
         Ok(path)
     }
 
-    /// Write the numeric column (`vocab.num`) of the current generation when it has
-    /// none, because an older version built it. The store opened next uses it. Returns
-    /// the number of values in it, or `None` when the generation already has one or the
-    /// store is in memory.
+    /// Write or rebuild the numeric column (`vocab.num`) of the current generation when
+    /// it has none in the current format, because an older version built it. The store
+    /// opened next uses it. Returns the number of values in it, or `None` when the
+    /// generation already uses a current numeric column or the store is in memory.
     pub fn add_numeric_column(&self) -> Result<Option<u64>> {
         let _w = self.guarded_writer();
         let snap = self.snapshot();
         let Some(dir) = snap.generation.dir.as_ref() else {
             return Ok(None);
         };
-        if dir.join(crate::vocab::numeric::FILE).exists() {
+        if snap.generation.vocab.has_current_numeric_column(dir) {
             return Ok(None);
         }
         crate::vocab::add_numeric_column(dir).map(Some)

@@ -1544,33 +1544,16 @@ impl<'g> Parser<'g> {
 
 /// Compile an XPath-style regular expression with `sh:flags` / SPARQL REGEX flags.
 pub(crate) fn compile_regex(pattern: &str, flags: Option<&str>) -> Result<regex::Regex> {
-    let mut b = regex::RegexBuilder::new(pattern);
-    let mut literal = false;
-    for f in flags.unwrap_or("").chars() {
-        match f {
-            'i' => {
-                b.case_insensitive(true);
-            }
-            'm' => {
-                b.multi_line(true);
-            }
-            's' => {
-                b.dot_matches_new_line(true);
-            }
-            'x' => {
-                b.ignore_whitespace(true);
-            }
-            'q' => literal = true,
-            _ => bail!("unsupported regex flag '{f}'"),
+    let flags = flags.unwrap_or("");
+    for f in flags.chars() {
+        if !matches!(f, 'i' | 'm' | 's' | 'x' | 'q') {
+            bail!("unsupported regex flag '{f}'");
         }
     }
-    if literal {
-        let escaped = regex::escape(pattern);
-        let mut b2 = regex::RegexBuilder::new(&escaped);
-        b2.case_insensitive(flags.unwrap_or("").contains('i'));
-        return Ok(b2.build()?);
-    }
-    b.build()
+    let translated = sparkles_core::sparql::expr::translate_xpath_pattern(pattern, flags)
+        .ok_or_else(|| anyhow::anyhow!("invalid sh:pattern {pattern:?}"))?;
+    regex::RegexBuilder::new(&translated)
+        .build()
         .with_context(|| format!("invalid sh:pattern {pattern:?}"))
 }
 
@@ -1761,6 +1744,42 @@ mod graph_read_tests {
             merged.len(),
             2,
             "missing graphs do not discard valid graph or file sources"
+        );
+    }
+
+    #[test]
+    fn shacl_pattern_xpath_dot_flags_and_compiler_limits() {
+        let re = compile_regex("^a.b$", None).unwrap();
+        assert!(re.is_match("axb"));
+        assert!(!re.is_match("a\rb"));
+        assert!(!re.is_match("a\nb"));
+
+        let re_s = compile_regex("^a.b$", Some("s")).unwrap();
+        assert!(re_s.is_match("a\rb"));
+        assert!(re_s.is_match("a\nb"));
+
+        let re_x = compile_regex("^[ ]a.b$", Some("x")).unwrap();
+        assert!(re_x.is_match(" axb"));
+        assert!(!re_x.is_match(" a\rb"));
+
+        let scoped_on = compile_regex("^(?s:.)$", None).unwrap();
+        assert!(scoped_on.is_match("\r"));
+        let scoped_off = compile_regex("^(?-s:.)$", Some("s")).unwrap();
+        assert!(!scoped_off.is_match("\r"));
+
+        // Preserves underlying regex compiler diagnostic.
+        let err = compile_regex("[", None).unwrap_err();
+        assert!(format!("{err:#}").contains("unclosed"), "{err:#}");
+
+        // Preserves the regex crate's default 10 MiB NFA limit above expr::compile_regex's 4 MiB.
+        let big = [150usize, 200, 250, 300, 400, 500]
+            .into_iter()
+            .map(|n| format!(r"\w{{{n}}}"))
+            .find(|pat| sparkles_core::sparql::expr::compile_regex(pat, "").is_err())
+            .expect("large repetition exceeds 4 MiB query helper limit");
+        assert!(
+            compile_regex(&big, None).is_ok(),
+            "SHACL keeps the default 10 MiB regex compilation limit for {big}"
         );
     }
 }
