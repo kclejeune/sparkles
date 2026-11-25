@@ -1961,6 +1961,49 @@ impl Ctx {
         Ok(Some(RetainedCharge { owner, id, bytes }))
     }
 
+    /// Split `bytes` out of a live [`QueryMemoryLease`] belonging to this attached context
+    /// into a [`RetainedCharge`] without releasing or re-acquiring from the pool. If the
+    /// lease holds fewer than `bytes`, only the shortfall is reserved.
+    pub(super) fn retained_charge_from_lease(
+        &self,
+        lease: &mut QueryMemoryLease,
+        bytes: u64,
+    ) -> Result<Option<RetainedCharge>> {
+        if lease.service.is_some() || !self.owns_ledger(&lease.ledger) {
+            return Err(Error::invalid(
+                "admission lease belongs to another query account",
+            ));
+        }
+        let owner = self.owner.lock().clone();
+        if owner.strong_count() == 0 {
+            if !self.streams {
+                return Ok(None);
+            }
+            return Err(Error::invalid("cursor context owner has not been attached"));
+        }
+        if bytes == 0 {
+            return Ok(Some(RetainedCharge {
+                owner,
+                id: None,
+                bytes: 0,
+            }));
+        }
+        if bytes <= lease.bytes {
+            lease.bytes -= bytes;
+        } else {
+            let extra = bytes - lease.bytes;
+            lease
+                .ledger
+                .reserve(&lease.owner, self.mem_limit, extra, false)?;
+            lease.bytes = 0;
+        }
+        Ok(Some(RetainedCharge {
+            owner,
+            id: Some(lease.owner.id),
+            bytes,
+        }))
+    }
+
     /// The query's program of a regular expression, compiled and charged on first use.
     /// `Ok(None)` for a pattern or flags that do not compile.
     pub(super) fn regex(
@@ -3811,6 +3854,35 @@ impl Ctx {
 impl Charge<'_> {
     pub(super) fn bytes(&self) -> u64 {
         self.bytes.get()
+    }
+
+    /// An empty child charge sharing this charge's owner on the same context, suitable
+    /// for later adoption via [`Charge::adopt_charge`] without an owner mismatch.
+    pub(super) fn part(&self) -> Charge<'_> {
+        Charge {
+            ctx: self.ctx,
+            bytes: std::cell::Cell::new(0),
+            owner: std::cell::Cell::new(self.owner.get()),
+        }
+    }
+
+    /// Resize this live charge to `bytes` and transfer ownership into a [`RetainedCharge`]
+    /// without releasing or double-charging.
+    pub(super) fn into_retained(self, bytes: u64) -> Result<Option<RetainedCharge>> {
+        let owner = self.ctx.owner.lock().clone();
+        if owner.strong_count() == 0 {
+            if !self.ctx.streams {
+                return Ok(None);
+            }
+            return Err(Error::invalid("cursor context owner has not been attached"));
+        }
+        self.resize(bytes)?;
+        let id = self.disarm();
+        Ok(Some(RetainedCharge {
+            owner,
+            id: (bytes > 0).then_some(id).flatten(),
+            bytes,
+        }))
     }
 
     pub(super) fn belongs_to(&self, ctx: &Ctx) -> bool {

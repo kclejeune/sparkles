@@ -138,6 +138,7 @@ impl ExistsSpec {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn new_ordinary_charged(
         ctx: &Ctx,
         pattern: &GraphPattern,
@@ -146,26 +147,56 @@ impl ExistsSpec {
         vars: Vec<VarId>,
         bound: Vec<(VarId, Id)>,
     ) -> Result<ExistsSpec> {
+        Self::new_ordinary_charged_with_admission(
+            ctx,
+            pattern,
+            view_patterns,
+            graph,
+            vars,
+            bound,
+            None,
+        )
+    }
+
+    pub(super) fn new_ordinary_charged_with_admission(
+        ctx: &Ctx,
+        pattern: &GraphPattern,
+        view_patterns: Option<&super::viewsvc::ViewPatterns>,
+        graph: super::plan::ActiveGraph,
+        vars: Vec<VarId>,
+        bound: Vec<(VarId, Id)>,
+        admission: Option<&super::ctx::Charge<'_>>,
+    ) -> Result<ExistsSpec> {
         ctx.check()?;
         let pattern_bytes = Self::ordinary_pattern_bytes(pattern);
         let pattern_charge = ctx.retained_charge(pattern_bytes)?;
+        if pattern_charge.is_none()
+            && let Some(held) = admission
+        {
+            held.add(pattern_bytes)?;
+        }
         let owned = Arc::new(OrdinaryPattern {
             syntax: pattern.clone(),
             bytes: pattern_bytes,
             _charge: pattern_charge,
         });
         let projected = match view_patterns {
-            Some(vp) => vp.project_retained(pattern, &owned.syntax, ctx)?.map(
-                |(projected, bytes, charge)| {
+            Some(vp) => vp
+                .project_retained(pattern, &owned.syntax, ctx, admission)?
+                .map(|(projected, bytes, charge)| {
                     Arc::new(RetainedViewPatterns::from_retained(
                         projected, bytes, charge,
                     ))
-                },
-            ),
+                }),
             None => None,
         };
-        let spec_charge =
-            ctx.retained_charge(Self::spec_bytes(vars.capacity(), bound.capacity()))?;
+        let spec_bytes = Self::spec_bytes(vars.capacity(), bound.capacity());
+        let spec_charge = ctx.retained_charge(spec_bytes)?;
+        if spec_charge.is_none()
+            && let Some(held) = admission
+        {
+            held.add(spec_bytes)?;
+        }
         let calls_service = super::cursor::calls_service(&owned.syntax);
         Ok(Self::from_pattern(
             ExistsPattern::Ordinary(owned),
@@ -276,7 +307,7 @@ impl ExistsSpec {
                 self.bound.capacity(),
             ));
         }
-        bytes
+        bytes.saturating_add(self.plan_cache.uncharged_admit_bytes())
     }
 
     /// Memoize the answer for `key`, charging the entry first, in both accounting modes.

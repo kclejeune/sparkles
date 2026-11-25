@@ -1695,8 +1695,10 @@ fn prepare_query_input_policy(
         selector_graphs,
         inherited,
     )?;
-    if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
-        ctx.enable_cursor_accounting()?;
+    if let Some(started) = cursor_started {
+        if automatic.is_none() {
+            ctx.enable_cursor_accounting()?;
+        }
         ctx.deadline = opts.effective_deadline(started)?;
     }
     // a provider that rewrites the query (OWL 2 QL, spec F17 §7) plans the rewritten one
@@ -1776,28 +1778,25 @@ fn prepare_query_input_policy(
     let plan_depth = depth::check_plan(node.depth())?;
     ioacct::mark("planned");
     exec::prefetch_scans(&ctx, &node);
-    let streamed = if let Some(automatic) = automatic
+    let (streamed, mut admission_lease) = if let Some(automatic) = automatic
         && bound.is_empty()
     {
-        cursor::auto_streaming(&ctx, &node, kind, automatic)?
+        cursor::auto_streaming_lease(&ctx, &node, kind, automatic)?
     } else {
-        false
+        (false, None)
     };
     if streamed {
-        let started = cursor_started.expect("automatic preparation start");
         let mutable = Arc::get_mut(&mut ctx)
             .ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
         mutable.enable_cursor_accounting()?;
-        mutable.deadline = opts.effective_deadline(started)?;
-    } else if automatic.is_some() {
-        exists::clear_cached_plans(&node);
     }
     // Retained charges release through the shared context in both accounting modes.
     // An eager context is attached once the automatic choice no longer needs it alone,
     // so its planning keeps what it retains uncharged, as before.
     ctx.attach_owner();
     if streamed {
-        exists::charge_cached_plans(&ctx, &node)?;
+        exists::charge_cached_plans(&ctx, &node, admission_lease.as_mut())?;
+        drop(admission_lease);
     }
     ctx.check()?;
     Ok(PreparedQuery {

@@ -865,6 +865,21 @@ fn deep_exists_enforces_tight_memory_budget_and_cancellation() {
     .expect("pre-cancelled depth-16 query must fail");
     assert!(matches!(err, Error::Cancelled), "got {err}");
 
+    // Expired deadline at depth 16 returns Timeout (never falls back to eager).
+    let err = query_execution(
+        s.snapshot(),
+        &depth16_decor,
+        &QueryOptions {
+            deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            ..Default::default()
+        },
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .err()
+    .expect("expired-deadline depth-16 query must fail");
+    assert!(matches!(err, Error::Timeout), "got {err}");
+
     // Cancellation after opening streamed depth-16 cursor stops execution cleanly.
     let mid_cancel = Arc::new(AtomicBool::new(false));
     let exec = query_execution(

@@ -1566,7 +1566,7 @@ linked spec Outcome records how they landed.
 
 - **432.** DBpedia `births-by-decade` on forge after decimal arithmetic and inline date parts, which now takes 3.9 ms warm and 27.5 ms cold against QLever's 17.2 and 29.3 ms in the complete-HTTP timer. [DBpedia](benchmarks/dbpedia/RESULTS.md#decimal-arithmetic-and-inline-dates), [X06](specs/X06-benchmark-coverage.md#births-by-decade-after-decimal-arithmetic-on-forge)
 - **1121.** Immutable shared view versions with frozen term tables and a native streaming `ViewRead` cursor over current, stale, history-rewound and rebuilt reads. [X14 Outcome](specs/X14-unified-executor/SPEC.md#streamed-service-text-and-history-readers)
-- **1081.** Arbitrary `EXISTS` and `NOT EXISTS` nesting depth in automatic streaming admission via per-spec plan and verdict caching, linear planning and strict-build reuse, and stack guards. [X05 Outcome](specs/X05-streaming-query-execution.md#arbitrary-exists-nesting-depth-2026-11-24)
+- **1081.** Arbitrary `EXISTS` and `NOT EXISTS` nesting depth in automatic streaming admission via per-spec plan and verdict caching, one unsubstituted plan build and strict check per spec, and stack guards. [X05 Outcome](specs/X05-streaming-query-execution.md#arbitrary-exists-nesting-depth-2026-11-24)
 
 ## Keeping this current
 

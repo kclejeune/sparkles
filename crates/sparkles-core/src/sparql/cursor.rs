@@ -1316,12 +1316,22 @@ pub(super) const AUTO_SCAN_ROWS: f64 = 1_000.0;
 /// count is now branch-free and measured 0.79 to 0.88 times eager execution's time at
 /// 1.05M and 10.5M, so it streams as a grouping again. It holds 2.2 MB where eager
 /// execution holds 19.8 MB at 10.5M.
+#[cfg(test)]
 pub(super) fn auto_streaming(
     ctx: &Ctx,
     node: &Node,
     kind: QueryKind,
     options: &CursorOptions,
 ) -> Result<bool> {
+    Ok(auto_streaming_lease(ctx, node, kind, options)?.0)
+}
+
+pub(super) fn auto_streaming_lease(
+    ctx: &Ctx,
+    node: &Node,
+    kind: QueryKind,
+    options: &CursorOptions,
+) -> Result<(bool, Option<super::query_memory::QueryMemoryLease>)> {
     fn scan(ctx: &Ctx, node: &Node) -> bool {
         match &node.kind {
             Kind::Scan(spec) => {
@@ -1345,29 +1355,55 @@ pub(super) fn auto_streaming(
     // An ASK pulls one row through the cursor, which stops at it, unless the planner
     // found its input small enough to run whole (item 827).
     if kind == QueryKind::Ask {
-        return Ok(!super::demand::whole_slice(node));
+        return Ok((!super::demand::whole_slice(node), None));
     }
     // A plan expected to pass the row budgets stays eager, so that it fails before the
     // first byte of output with an error status rather than partway through a stream.
     if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
-        return Ok(false);
+        return Ok((false, None));
     }
     let admission = ctx.charge(0)?;
-    if spill_admitted(ctx, node, kind, Some(&admission))?
+    struct ClearOnDrop<'a> {
+        node: &'a Node,
+        keep: bool,
+    }
+    impl Drop for ClearOnDrop<'_> {
+        fn drop(&mut self) {
+            if !self.keep {
+                super::exists::clear_cached_plans(self.node);
+            }
+        }
+    }
+    // Declared after `admission` so on eager fallback, error, or unwind, cached plans
+    // and structural metadata drop before `admission` releases its reservation.
+    let mut clear_guard = ClearOnDrop { node, keep: false };
+    let admitted = if spill_admitted(ctx, node, kind, Some(&admission))?
         || memory_admitted(ctx, node, kind, options, Some(&admission))?
     {
-        return Ok(true);
+        true
+    } else {
+        let scanned = node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node);
+        if !(scanned || grouped(ctx, node, Some(&admission))?) {
+            false
+        } else {
+            let headroom = cursor_headroom(ctx, node, options, true);
+            kind == QueryKind::Select
+                && ctx.snap.delta.is_empty()
+                && batches_admitted(options)
+                && headroom < u64::MAX
+                && ctx.memory_remaining() >= headroom
+        }
+    };
+    if !admitted {
+        return Ok((false, None));
     }
-    let scanned = node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node);
-    if !(scanned || grouped(ctx, node, Some(&admission))?) {
-        return Ok(false);
-    }
-    let headroom = cursor_headroom(ctx, node, options, true);
-    Ok(kind == QueryKind::Select
-        && ctx.snap.delta.is_empty()
-        && batches_admitted(options)
-        && headroom < u64::MAX
-        && ctx.memory_remaining() >= headroom)
+    let lease = if admission.bytes() > 0 {
+        Some(admission.output_lease(admission.bytes())?)
+    } else {
+        None
+    };
+    clear_guard.keep = true;
+    Ok((true, lease))
 }
 
 /// Whether the cursor's batches are large enough for automatic admission to pay off.
@@ -1455,11 +1491,11 @@ fn spill_admitted(
     if kind != QueryKind::Select || ctx.spill.is_none() || !ctx.snap.delta.is_empty() {
         return Ok(false);
     }
-    if !streams_natively_with_admission(ctx, node, admission)? {
+    let bytes = largest_output_bytes(node);
+    if !bytes.is_finite() || bytes * 2.0 <= admission_room(ctx) {
         return Ok(false);
     }
-    let bytes = largest_output_bytes(node);
-    Ok(bytes.is_finite() && bytes * 2.0 > admission_room(ctx))
+    streams_natively_with_admission(ctx, node, admission)
 }
 
 /// Whether automatic execution runs `node` as a cursor because eager execution is
@@ -1756,7 +1792,9 @@ fn streams_natively_with_admission(
             let planned =
                 match super::exists::unsubstituted_plan_with_admission(ctx, spec, admission) {
                     Ok(planned) => planned,
-                    Err(e @ (Error::Cancelled | Error::Timeout)) => return Err(e),
+                    Err(
+                        e @ (Error::Cancelled | Error::Timeout | Error::Io(_) | Error::Corrupt(_)),
+                    ) => return Err(e),
                     Err(Error::BudgetExceeded(_)) => return Ok(None),
                     Err(_) => {
                         spec.plan_cache.set_native(false);
@@ -2105,7 +2143,9 @@ fn fits_without_spill(
     let options = within_first_deadline(options, started);
     let p = match super::prepare_query(snapshot.clone(), parsed, &options, None, None) {
         Ok(p) => p,
-        Err(e @ (Error::Cancelled | Error::Timeout)) => return Err(e),
+        Err(e @ (Error::Cancelled | Error::Timeout | Error::Io(_) | Error::Corrupt(_))) => {
+            return Err(e);
+        }
         Err(_) => return Ok(false),
     };
     cursor_fits(&p.ctx, &p.node, p.kind, cursor, false, None)
@@ -3085,6 +3125,24 @@ pub(super) fn plan_bytes(node: &Node) -> u64 {
     )
 }
 
+/// Bytes copied when cloning a cached [`Node`] into a cursor (`exists_streams`, `drain`).
+/// Counts owned node storage and `Kind::Values` column backing, while excluding
+/// `Arc`-shared `ExistsSpec` and `PreparedGraphBranches` backing that `Node::clone` shares.
+fn cloned_plan_bytes(node: &Node) -> u64 {
+    let mut extra = match &node.kind {
+        Kind::Values(t) => capacity_bytes(t),
+        Kind::OrderedTopK(top) => cloned_plan_bytes(&top.fallback),
+        _ => 0,
+    };
+    for child in &node.children {
+        extra = extra.saturating_add(cloned_plan_bytes(child));
+    }
+    (node.desc.len() as u64)
+        .saturating_add(node.vars.len() as u64 * 32)
+        .saturating_add(1024)
+        .saturating_add(extra)
+}
+
 enum State {
     Scalar(Node),
     /// Counts per key, read from the index or its statistics into charged group state
@@ -3521,13 +3579,24 @@ fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
             continue;
         }
         let built = planned.and_then(|node| {
+            // Reserve the cloned plan's owned storage (including `Kind::Values` tables)
+            // before cloning while `CachedPlan` keeps the original `Arc<Node>` live.
+            let _plan = OwnedCharge::new(ctx, cloned_plan_bytes(&node))?;
             super::depth::guard_exists(|| {
-                Operator::build(ctx, (*node).clone(), FallbackPolicy::RejectMaterialization)
+                let _op =
+                    Operator::build(ctx, (*node).clone(), FallbackPolicy::RejectMaterialization)?;
+                Ok(())
             })
         });
         match built {
-            Ok(_) => spec.plan_cache.set_strict(true),
-            Err(error @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
+            Ok(()) => spec.plan_cache.set_strict(true),
+            Err(
+                error @ (Error::Cancelled
+                | Error::Timeout
+                | Error::BudgetExceeded(_)
+                | Error::Io(_)
+                | Error::Corrupt(_)),
+            ) => {
                 return Err(error);
             }
             Err(_) => {
@@ -3543,11 +3612,14 @@ fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
 /// it to read their pattern without materializing its solutions.
 pub(super) fn drain(
     ctx: &Arc<Ctx>,
-    node: Node,
+    node: &Node,
     each: &mut dyn FnMut(&Table) -> Result<()>,
 ) -> Result<()> {
     let options = CursorOptions::default();
-    let mut root = Operator::build(ctx, node, FallbackPolicy::AllowMaterialization)?;
+    // Reserve the cloned plan's owned storage before cloning while the cached `Arc<Node>`
+    // remains live; `root` drops before `_plan`, matching `pull_planned`.
+    let _plan = OwnedCharge::new(ctx, cloned_plan_bytes(node))?;
+    let mut root = Operator::build(ctx, node.clone(), FallbackPolicy::AllowMaterialization)?;
     while let Some(batch) = root.next(ctx, &options, options.batch_rows)? {
         each(&batch.table)?;
     }
@@ -8136,7 +8208,6 @@ mod retained_variable_tests {
                 ..Default::default()
             };
             super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.set(0));
-            let started = Instant::now();
             let exec = query_execution(
                 store.snapshot(),
                 &q,
@@ -8145,7 +8216,6 @@ mod retained_variable_tests {
                 ExecutionMode::Auto,
             )
             .unwrap();
-            let open_ms = started.elapsed().as_secs_f64() * 1000.0;
             let QueryExecution::Select(mut c) = exec else {
                 panic!("depth {depth}: expected automatic streaming");
             };
@@ -8161,10 +8231,6 @@ mod retained_variable_tests {
                 }
             }
             let plans_built = super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.get());
-            let total_ms = started.elapsed().as_secs_f64() * 1000.0;
-            eprintln!(
-                "depth={depth} plans_built={plans_built} open_ms={open_ms:.3} total_ms={total_ms:.3}"
-            );
             assert_eq!(
                 plans_built, depth as u64,
                 "depth {depth}: each ExistsSpec must be planned at most once (got {plans_built})"
@@ -8239,6 +8305,603 @@ mod retained_variable_tests {
         assert!(
             matches!(err, Error::Cancelled),
             "expected Cancelled, got {err}"
+        );
+    }
+
+    #[test]
+    fn deep_exists_preplanning_refuses_large_values_under_low_budget() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:e0> <urn:n0> .\n<urn:n0> <urn:e1> 0 .\n".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        // Use inline integer literals so VALUES exercises pure column-table reservation
+        // without allocating query-local vocabulary entries.
+        let mut values = String::from("VALUES ?v1 { ");
+        for i in 0..20_000 {
+            values.push_str(&format!("{i} "));
+        }
+        values.push('}');
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }} }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        let limit = 32 << 10;
+        let pool = super::super::pool::QueryPool::new(limit);
+        let opts = QueryOptions {
+            max_memory_bytes: Some(limit),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let mut p =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let mut group = &mut p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        // Find the top-level ExistsSpec and verify unsubstituted_plan refuses before
+        // allocating the 20,000-row VALUES table (~160 KiB > 32 KiB limit).
+        let mut specs = Vec::new();
+        for e in own_exprs(&group.children[0].kind) {
+            e.exists_specs(&mut specs);
+        }
+        assert_eq!(specs.len(), 1);
+        let spec = specs[0].clone();
+        let err = super::super::exists::unsubstituted_plan(&p.ctx, &spec)
+            .err()
+            .expect("large VALUES inside EXISTS must fail under 32 KiB budget");
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded, got {err}"
+        );
+        assert!(!spec.plan_cache.has_cached_plan());
+        assert!(!spec.plan_cache.has_cached_admit());
+        assert!(
+            p.ctx.mem_peak() <= limit,
+            "peak {} exceeded limit {limit}",
+            p.ctx.mem_peak()
+        );
+        // Under auto_streaming, the budget refusal keeps the query eager with zero leaks.
+        assert!(!auto_streaming(&p.ctx, &p.node, p.kind, &CursorOptions::default()).unwrap());
+        assert!(!spec.plan_cache.has_cached_plan());
+        assert!(!spec.plan_cache.has_cached_admit());
+        let ctx = p.ctx.clone();
+        drop(spec);
+        drop(p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_admission_handoff_preserves_pool_reservation_across_cursor_mode() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:e0> <urn:n0> .\n<urn:n0> <urn:e1> 0 .\n".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let mut values = String::from("VALUES ?v1 { ");
+        for i in 0..16_000 {
+            values.push_str(&format!("{i} "));
+        }
+        values.push('}');
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }} }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        let pool = super::super::pool::QueryPool::new(4 << 20);
+        let opts = QueryOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        // Build an unattached Ctx + plan mirroring prepare_query_input_policy before
+        // auto_streaming_lease runs.
+        let mut ctx = super::super::Ctx::new(store.snapshot());
+        ctx.set_grant(opts.query_grant());
+        let mut ctx = Arc::new(ctx);
+        let mut planner = super::super::plan::Planner::new(&ctx);
+        let pattern = match &parsed {
+            spargebra::Query::Select { pattern, .. } => pattern,
+            _ => unreachable!(),
+        };
+        let mut node = planner
+            .plan(
+                pattern,
+                &super::super::plan::ActiveGraph::Default,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut group = &mut node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+
+        let (streamed, mut lease) =
+            auto_streaming_lease(&ctx, &node, QueryKind::Select, &CursorOptions::default())
+                .unwrap();
+        assert!(
+            streamed,
+            "expected grouped query with VALUES EXISTS to stream"
+        );
+        let lease_bytes = lease
+            .as_ref()
+            .expect("unattached admission must return a live lease")
+            .bytes;
+        assert!(
+            lease_bytes >= 128_000,
+            "expected >= 128 KiB cached VALUES plan lease, got {lease_bytes}"
+        );
+        // Occupy every remaining byte in the shared pool with a concurrent query so any
+        // release during `enable_cursor_accounting` would be immediately stolen.
+        let free = pool.capacity().saturating_sub(pool.granted());
+        let competitor = pool.empty_grant();
+        competitor.charge(free).unwrap();
+        assert_eq!(pool.granted(), pool.capacity());
+
+        let mutable = Arc::get_mut(&mut ctx).expect("ctx must remain uniquely owned");
+        mutable.enable_cursor_accounting().unwrap();
+        assert!(
+            ctx.granted_bytes() >= lease_bytes,
+            "cursor_mode must keep cached-plan reservation backed ({} < {lease_bytes})",
+            ctx.granted_bytes()
+        );
+        ctx.attach_owner();
+        super::super::exists::charge_cached_plans(&ctx, &node, lease.as_mut())
+            .expect("handoff into RetainedCharge must succeed with zero free pool bytes");
+        assert_eq!(
+            lease.as_ref().unwrap().bytes,
+            0,
+            "entire admission lease must be transferred to cached plans"
+        );
+        drop(lease);
+        assert!(ctx.live_bytes() >= lease_bytes);
+        drop(node);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        drop(competitor);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_charges_cloned_plan_in_strict_validation_and_drain() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:e0> <urn:n0> .\n<urn:n0> <urn:e1> 0 .\n".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let mut values = String::from("VALUES ?v1 { ");
+        for i in 0..20_000 {
+            values.push_str(&format!("{i} "));
+        }
+        values.push('}');
+        let q = format!(
+            "SELECT ?s {{ ?s <urn:e0> ?v0 FILTER EXISTS {{ ?v0 <urn:e1> ?v1 . {values} }} }}"
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+
+        // Measure the exact bytes of one cached plan copy.
+        let probe_p = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &QueryOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut probe_specs = Vec::new();
+        for e in own_exprs(&probe_p.node.children[0].kind) {
+            e.exists_specs(&mut probe_specs);
+        }
+        let probe_cached =
+            super::super::exists::unsubstituted_plan(&probe_p.ctx, probe_specs[0]).unwrap();
+        let one_copy = cloned_plan_bytes(&probe_cached);
+        assert!(
+            one_copy >= 160_000,
+            "expected >= 160 KiB VALUES plan, got {one_copy}"
+        );
+        drop(probe_cached);
+        drop(probe_p);
+
+        // Budget strictly between 1x and 2x the VALUES plan size: first cached plan fits,
+        // cloning a second copy in `exists_streams` or `drain` must fail with BudgetExceeded.
+        let tight_limit = one_copy + one_copy / 2;
+        let pool = super::super::pool::QueryPool::new(tight_limit);
+        let tight_opts = QueryOptions {
+            max_memory_bytes: Some(tight_limit),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let tight_p =
+            super::super::prepare_query(store.snapshot(), &parsed, &tight_opts, None, None)
+                .unwrap();
+        let filter_node = &tight_p.node.children[0];
+        let mut specs = Vec::new();
+        for e in own_exprs(&filter_node.kind) {
+            e.exists_specs(&mut specs);
+        }
+        let spec = specs[0].clone();
+        let cached = super::super::exists::unsubstituted_plan(&tight_p.ctx, &spec)
+            .expect("single cached copy must fit in 1.5x budget");
+        let err = exists_streams(&tight_p.ctx, &filter_node.kind)
+            .expect_err("strict validation clone must fail between 1x and 2x budget");
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded from exists_streams, got {err}"
+        );
+        assert_eq!(
+            spec.plan_cache.strict(),
+            None,
+            "BudgetExceeded must not cache strict=false"
+        );
+        let err = drain(&tight_p.ctx, &cached, &mut |_| Ok(()))
+            .expect_err("drain clone must fail between 1x and 2x budget");
+        assert!(
+            matches!(err, Error::BudgetExceeded(_)),
+            "expected BudgetExceeded from drain, got {err}"
+        );
+        let ctx = tight_p.ctx.clone();
+        drop(cached);
+        drop(spec);
+        drop(tight_p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+
+        // With >= 3x budget, both strict validation and drain succeed and release the copy.
+        let roomy_limit = one_copy * 4;
+        let roomy_pool = super::super::pool::QueryPool::new(roomy_limit);
+        let roomy_opts = QueryOptions {
+            max_memory_bytes: Some(roomy_limit),
+            pool: Some(roomy_pool.clone()),
+            ..Default::default()
+        };
+        let roomy_p =
+            super::super::prepare_query(store.snapshot(), &parsed, &roomy_opts, None, None)
+                .unwrap();
+        let filter_node = &roomy_p.node.children[0];
+        let mut specs = Vec::new();
+        for e in own_exprs(&filter_node.kind) {
+            e.exists_specs(&mut specs);
+        }
+        let cached = super::super::exists::unsubstituted_plan(&roomy_p.ctx, specs[0]).unwrap();
+        let live_after_cache = roomy_p.ctx.live_bytes();
+        assert!(exists_streams(&roomy_p.ctx, &filter_node.kind).unwrap());
+        assert_eq!(roomy_p.ctx.live_bytes(), live_after_cache);
+        let mut rows = 0usize;
+        drain(&roomy_p.ctx, &cached, &mut |t| {
+            rows += t.len();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(roomy_p.ctx.live_bytes(), live_after_cache);
+        let ctx = roomy_p.ctx.clone();
+        drop(cached);
+        drop(roomy_p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(roomy_pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_clears_speculative_admit_metadata_on_eager_fallback() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::new();
+        for i in 0..2_000 {
+            ttl.push_str(&format!("<urn:s{i}> <urn:p> <urn:o{i}> .\n"));
+            ttl.push_str(&format!("<urn:o{i}> <urn:q> <urn:k{i}> .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        // Query with ORDER BY + correlated EXISTS: `largest_output_bytes` exceeds half of a
+        // small budget so `memory_admitted` -> `cursor_fits` runs `streams_natively` AND
+        // `cursor_state_bytes` -> `keyed_exists_bytes` (populating `PlanCache::admit`),
+        // then declines streaming because ORDER BY + key-set state does not fit in half room.
+        let q = "SELECT ?s ?o { ?s <urn:p> ?o FILTER EXISTS { ?o <urn:q> ?k } } ORDER BY ?o";
+        let parsed = super::super::parse_query(q, None, &[]).unwrap();
+        let pool = super::super::pool::QueryPool::new(512 << 10);
+        let opts = QueryOptions {
+            max_memory_bytes: Some(512 << 10),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let mut p =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        // Raise estimates so `memory_admitted` triggers `cursor_fits` -> `keyed_exists_bytes`,
+        // then `cursor_fits` declines because state * 2 + headroom > admission_room.
+        p.node.est = 25_000.0;
+        p.node.children[0].est = 25_000.0;
+        p.node.children[0].children[0].est = 25_000.0;
+        let mut specs = Vec::new();
+        fn collect_specs<'a>(n: &'a Node, out: &mut Vec<&'a Arc<super::super::expr::ExistsSpec>>) {
+            for e in own_exprs(&n.kind) {
+                e.exists_specs(out);
+            }
+            for c in &n.children {
+                collect_specs(c, out);
+            }
+        }
+        collect_specs(&p.node, &mut specs);
+        assert_eq!(specs.len(), 1);
+        let spec = specs[0].clone();
+
+        // Confirm `cursor_state_bytes` populates `admit` when called directly.
+        let _ = cursor_state_bytes(&p.ctx, &p.node, None).unwrap();
+        assert!(
+            spec.plan_cache.has_cached_admit(),
+            "cursor_state_bytes should populate structural admit metadata"
+        );
+        super::super::exists::clear_cached_plans(&p.node);
+        assert!(!spec.plan_cache.has_cached_admit());
+        assert!(!spec.plan_cache.has_cached_plan());
+
+        // Now run full `auto_streaming`, which declines streaming and must clear both
+        // cached plans and structural admit metadata before returning.
+        assert!(
+            !auto_streaming(&p.ctx, &p.node, p.kind, &CursorOptions::default()).unwrap(),
+            "expected cursor_fits to decline streaming"
+        );
+        assert!(
+            !spec.plan_cache.has_cached_plan(),
+            "eager fallback must clear cached plan"
+        );
+        assert!(
+            !spec.plan_cache.has_cached_admit(),
+            "eager fallback must clear cached admit metadata"
+        );
+        let ctx = p.ctx.clone();
+        drop(spec);
+        drop(p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_original_deadline_and_mid_admission_abort_cleanup() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                super::super::exists::AFTER_CACHE_PLAN_HOOK.with(|h| *h.borrow_mut() = None);
+            }
+        }
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::from("<urn:s0> <urn:e0> <urn:n0> .\n");
+        for level in 0..16 {
+            ttl.push_str(&format!(
+                "<urn:n{level}> <urn:e{}> <urn:n{}> .\n",
+                level + 1,
+                level + 1
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let q = format!(
+            "SELECT (COUNT(*) AS ?n) {{ ?s <urn:e0> ?v0{} }}",
+            nested_exists_body(16, false, "")
+        );
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+
+        // 1. A relative timeout already expired relative to `started` (before parsing) must
+        // fail in `prepare_query` before automatic admission builds any EXISTS plan.
+        super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        let expired_start = Instant::now() - Duration::from_secs(2);
+        let err = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &QueryOptions {
+                timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+            Some(expired_start),
+            Some(&CursorOptions::default()),
+        )
+        .err()
+        .expect("already-expired relative timeout from started must fail");
+        assert!(matches!(err, Error::Timeout), "expected Timeout, got {err}");
+        assert_eq!(
+            super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.get()),
+            0,
+            "expired query must not plan EXISTS during admission"
+        );
+
+        // 2. Deterministic mid-admission cancellation after caching the 1st nested plan:
+        // must stop immediately, return Cancelled, and clean up the partially populated cache.
+        let pool = super::super::pool::QueryPool::new(16 << 20);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let opts = QueryOptions {
+            cancel: Some(cancel.clone()),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let mut p =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let mut group = &mut p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        let mut specs = Vec::new();
+        for e in own_exprs(&group.children[0].kind) {
+            e.exists_specs(&mut specs);
+        }
+        let outer_spec = specs[0].clone();
+        super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        {
+            let _reset = ResetHook;
+            let cancel_hook = cancel.clone();
+            super::super::exists::AFTER_CACHE_PLAN_HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |count| {
+                    if count == 1 {
+                        cancel_hook.store(true, Ordering::SeqCst);
+                    }
+                }));
+            });
+            let err =
+                auto_streaming(&p.ctx, &p.node, p.kind, &CursorOptions::default()).unwrap_err();
+            assert!(
+                matches!(err, Error::Cancelled),
+                "expected Cancelled, got {err}"
+            );
+        }
+        assert_eq!(
+            super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.get()),
+            1,
+            "cancellation after 1st cached plan must stop before planning deeper levels"
+        );
+        assert!(
+            !outer_spec.plan_cache.has_cached_plan() && !outer_spec.plan_cache.has_cached_admit(),
+            "partially populated cache must be cleaned up on cancellation"
+        );
+        let ctx = p.ctx.clone();
+        drop(outer_spec);
+        drop(p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+
+        // 3. Deterministic mid-admission timeout after caching the 1st nested plan.
+        let deadline = Instant::now() + Duration::from_millis(15);
+        let opts = QueryOptions {
+            deadline: Some(deadline),
+            pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        let mut p =
+            super::super::prepare_query(store.snapshot(), &parsed, &opts, None, None).unwrap();
+        let mut group = &mut p.node;
+        while !matches!(group.kind, Kind::Group { .. }) {
+            group = &mut group.children[0];
+        }
+        group.children[0].est = AUTO_GROUP_ROWS;
+        let mut specs = Vec::new();
+        for e in own_exprs(&group.children[0].kind) {
+            e.exists_specs(&mut specs);
+        }
+        let outer_spec = specs[0].clone();
+        super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        {
+            let _reset = ResetHook;
+            super::super::exists::AFTER_CACHE_PLAN_HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |count| {
+                    if count == 1 {
+                        while Instant::now() <= deadline {
+                            std::thread::yield_now();
+                        }
+                    }
+                }));
+            });
+            let err =
+                auto_streaming(&p.ctx, &p.node, p.kind, &CursorOptions::default()).unwrap_err();
+            assert!(matches!(err, Error::Timeout), "expected Timeout, got {err}");
+        }
+        assert_eq!(
+            super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.get()),
+            1,
+            "timeout after 1st cached plan must stop before planning deeper levels"
+        );
+        assert!(
+            !outer_spec.plan_cache.has_cached_plan() && !outer_spec.plan_cache.has_cached_admit(),
+            "partially populated cache must be cleaned up on timeout"
+        );
+        let ctx = p.ctx.clone();
+        drop(outer_spec);
+        drop(p);
+        assert_eq!(ctx.live_bytes(), 0);
+        drop(ctx);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn deep_exists_small_spill_query_skips_speculative_planning() {
+        use crate::io::Source;
+        use crate::spill::{Spill, SpillOptions};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::from("<urn:s0> <urn:e0> <urn:n0> .\n");
+        for level in 0..8 {
+            ttl.push_str(&format!(
+                "<urn:n{level}> <urn:e{}> <urn:n{}> .\n",
+                level + 1,
+                level + 1
+            ));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let q = format!(
+            "SELECT ?s {{ ?s <urn:e0> ?v0{} }}",
+            nested_exists_body(8, false, "")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = Spill::open(&SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.set(0));
+        let prepared = super::super::prepare_query(
+            store.snapshot(),
+            &parsed,
+            &QueryOptions {
+                spill: Some(spill),
+                ..Default::default()
+            },
+            Some(Instant::now()),
+            Some(&CursorOptions::default()),
+        )
+        .unwrap();
+        assert!(
+            !prepared.ctx.streams(),
+            "small query with spill enabled should stay eager"
+        );
+        assert_eq!(
+            super::super::exists::EXISTS_PLANS_BUILT.with(|n| n.get()),
+            0,
+            "small eager query with spill enabled must not speculatively plan EXISTS in spill_admitted"
         );
     }
 }

@@ -1969,36 +1969,59 @@ decorrelation state.
 Before this change, automatic admission discarded the unsubstituted plans it built and
 re-planned patterns across `keyed_exists`, `streams_natively`, and `cursor_state_bytes`,
 while `Operator::build_for` re-ran `exists_streams` at every nested key-set drain in
-quadratic $O(D^2)$ work. With `PlanCache`, `unsubstituted_plan` plans each `ExistsSpec`
-at most once per query execution and shares the resulting `Arc<Node>` across admission,
-strict-cursor validation, and key-set building. During `auto_streaming` before
-`ctx.attach_owner()`, newly cached plans charge a transient `Charge` on the query context
-so peak admission memory stays bounded without retaining a strong `Arc<Ctx>`. When
-automatic admission chooses streaming, `charge_cached_plans` upgrades every cached plan
-to a `RetainedCharge` after `ctx.attach_owner()`, and `prepare` drops the cached plan and
-its charge as soon as a key set transitions to `State::Built` or `State::Rejected`. When
-automatic admission keeps a query eager, `clear_cached_plans` drops all admission-cached
-plans before execution so unreached branches retain no memory.
+quadratic O(D^2) strict builds. With `PlanCache`, `unsubstituted_plan` builds one
+unsubstituted plan and runs one strict cursor check per `ExistsSpec` (D calls for a
+depth-D chain) and shares the resulting `Arc<Node>` across admission, strict-cursor
+validation, and key-set building. Compiling each ordinary nested `ExistsSpec` still walks
+and clones its remaining `GraphPattern` suffix for variable collection, layout sizing,
+syntax retention, and `SERVICE` detection, so total ordinary compilation work and live
+syntax bytes across a depth-D chain remain O(D^2) in the nested suffix size, bounded by
+`MAX_ALGEBRA_DEPTH` and released once each key set finishes or on eager fallback.
 
-Automatic admission and state estimation now propagate cancellation and timeout errors
-instead of swallowing them into eager fallback. Per-row substitution through
+Speculative `EXISTS` planning reserves a shallow node estimate before invoking the
+planner, and ordinary `VALUES` tables and unattached nested `EXISTS` specs reserve their
+backing before allocation. During `auto_streaming_lease` before `ctx.attach_owner()`,
+newly cached plans and structural admission metadata adopt their live charges into a
+single admission reservation and hand it across `enable_cursor_accounting` via a
+`QueryMemoryLease`, so no pool bytes are released between admission and
+`charge_cached_plans`. Strict validation (`exists_streams`) and key-set draining
+(`cursor::drain`) reserve `cloned_plan_bytes` before cloning a cached `Node` while the
+cached `Arc<Node>` remains live. Once a key set consumes its structural admission metadata
+or transitions to `State::Built` or `State::Rejected`, `PlanCache` drops the cached plan,
+metadata, and retained charges. When automatic admission keeps a query eager or aborts on
+error, `clear_cached_plans` drops all cached plans and structural admission metadata
+before the admission reservation releases.
+
+Query preparation installs the `started`-anchored deadline before automatic admission,
+and automatic admission, state estimation, strict validation, and key-set admission all
+propagate `Cancelled`, `Timeout`, `Io`, and `Corrupt` errors instead of swallowing them
+into eager fallback or caching negative verdicts. Per-row substitution through
 `cursor::has_solution` skips speculative `exists_streams` preflight checks under
 `AllowMaterialization` so deeply nested correlated `EXISTS` patterns do not re-plan
-unreached inner levels per outer key. Recursive transitions across `streams_natively`,
+unreached inner levels per outer key. `spill_admitted` checks `largest_output_bytes`
+before `streams_natively_with_admission` so small eager queries with spill enabled skip
+speculative `EXISTS` planning. Recursive transitions across `streams_natively`,
 `exists_streams`, `cursor_state_bytes`, `exists::build`, `exists::build_streaming`, and
 `plan::eval_exists` run inside `depth::guard_exists` (`stacker::maybe_grow`) so deep
 nesting executes safely on 2 MiB threads in both debug and release builds. Existing
 admission exclusions for `SERVICE` inside `EXISTS`, `OPTIONAL` conditions holding
 `EXISTS` (item 570), and `decorrelate_exists: false` remain unchanged.
 
-In unit tests on Boat worker `bx_4xarzecx` (debug build, 75,000-subject chain), end-to-end
-automatic streaming at depths 8, 12, and 16 built exactly 8, 12, and 16 unsubstituted
-plans in 4.5 to 6.9 ms of open time, releasing all `Ctx` live bytes and `QueryPool`
-grants on cursor drop. `tests/exists_auto.rs` verifies automatic streaming, strict
+As debug test evidence on Boat worker `bx_4xarzecx` (debug build, 75,000-subject chain;
+not published benchmark numbers), automatic streaming at depths 8, 12, and 16 built
+exactly 8, 12, and 16 unsubstituted plans in 4.5 to 6.9 ms of open time, releasing all
+`Ctx` live bytes and `QueryPool` grants on cursor drop. Unit tests in `cursor.rs` cover
+pre-planning budget refusal on large nested `VALUES`, zero-gap pool reservation handoff
+across `enable_cursor_accounting` under a saturated shared `QueryPool`, cloning charges in
+`exists_streams` and `cursor::drain` between one and two copies, clearing of speculative
+`PlanCache::admit` metadata on eager fallback, pre-expired relative timeouts anchored at
+`started`, deterministic mid-admission cancellation and timeout after caching the first
+nested plan (verifying partial-cache cleanup), and `spill_admitted` short-circuiting on
+small eager queries. `tests/exists_auto.rs` verifies automatic streaming, strict
 non-materializing cursors at batch sizes 1, 64, and 4096, and exact parity with eager and
 per-key evaluation at depths 5, 8, and 16 across pure `EXISTS`, alternating `NOT EXISTS`,
 deeply correlated outer variables, `UNION`, `OPTIONAL`, named and variable `GRAPH`, empty
 and non-empty branches, `BIND`, `SUM`, and `ORDER BY`, as well as tight memory budgets
-from 256 KiB to 16 MiB and cancellation during both admission and execution.
-`crates/sparkles/tests/nesting.rs` verifies depth-16 and depth-32 streamed execution on a
-2 MiB stack.
+from 256 KiB to 16 MiB, pre-cancelled and expired-deadline admission, and cancellation
+before the first pull. `crates/sparkles/tests/nesting.rs` verifies depth-16 and depth-32
+streamed execution on a 2 MiB stack.

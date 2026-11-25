@@ -125,11 +125,18 @@ thread_local! {
 }
 
 #[cfg(test)]
+type AfterCachePlanHook = Box<dyn FnMut(u64)>;
+
+#[cfg(test)]
 thread_local! {
     /// tests: decorrelate whenever the pattern is admitted, whatever it costs
     pub(crate) static FORCE: Cell<bool> = const { Cell::new(false) };
     /// tests: number of unsubstituted EXISTS plans built on this thread
     pub(super) static EXISTS_PLANS_BUILT: Cell<u64> = const { Cell::new(0) };
+    /// tests: optional deterministic hook invoked right after caching an unsubstituted
+    /// EXISTS plan, with the cumulative `EXISTS_PLANS_BUILT` count on this thread
+    pub(super) static AFTER_CACHE_PLAN_HOOK: std::cell::RefCell<Option<AfterCachePlanHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn forced() -> bool {
@@ -163,8 +170,10 @@ pub(super) struct PlanCache {
     /// Populated at most once per `ExistsSpec`; dropped once `Decor` reaches
     /// `State::Built` or `State::Rejected`, or when automatic admission keeps the query eager.
     plan: Mutex<Option<CachedPlan>>,
-    /// Cached structural admission (keys and risky variables) or rejection reason.
-    admit: Mutex<Option<std::result::Result<AdmitMeta, String>>>,
+    /// Cached structural admission (keys and risky variables) or rejection reason, with
+    /// its retained memory charge. Cleared once `Decor` consumes or rejects it, or when
+    /// automatic admission keeps the query eager.
+    admit: Mutex<Option<CachedAdmit>>,
     /// Cached result of `cursor::streams_natively` on this spec's unsubstituted plan:
     /// 0 = unknown, 1 = false, 2 = true.
     native: AtomicU8,
@@ -179,10 +188,31 @@ struct CachedPlan {
     charge: Option<RetainedCharge>,
 }
 
+struct CachedAdmit {
+    result: std::result::Result<AdmitMeta, String>,
+    bytes: u64,
+    charge: Option<RetainedCharge>,
+}
+
 #[derive(Clone)]
 struct AdmitMeta {
     keys: Vec<VarId>,
     risky: Vec<VarId>,
+}
+
+fn admit_bytes(result: &std::result::Result<AdmitMeta, String>) -> u64 {
+    match result {
+        Ok(meta) => (meta
+            .keys
+            .capacity()
+            .saturating_mul(std::mem::size_of::<VarId>()))
+        .saturating_add(
+            meta.risky
+                .capacity()
+                .saturating_mul(std::mem::size_of::<VarId>()),
+        ) as u64,
+        Err(reason) => reason.capacity() as u64,
+    }
 }
 
 impl PlanCache {
@@ -214,6 +244,25 @@ impl PlanCache {
 
     pub(super) fn release_plan(&self) {
         *self.plan.lock() = None;
+        *self.admit.lock() = None;
+    }
+
+    pub(super) fn uncharged_admit_bytes(&self) -> u64 {
+        self.admit
+            .lock()
+            .as_ref()
+            .filter(|cached| cached.charge.is_none())
+            .map_or(0, |cached| cached.bytes)
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_cached_plan(&self) -> bool {
+        self.plan.lock().is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_cached_admit(&self) -> bool {
+        self.admit.lock().is_some()
     }
 }
 
@@ -345,13 +394,60 @@ fn exists_of(e: &Expr) -> Option<(&ExistsSpec, bool)> {
     }
 }
 
+/// Conservative pre-planning reservation for one EXISTS level, walking only the
+/// immediate `GraphPattern` nodes without recursing into nested `EXISTS` patterns (which
+/// reserve their own syntax/spec bytes inside `ExistsSpec::new_ordinary_charged_with_admission`,
+/// and `VALUES` blocks reserve their exact table backing before allocating in `Planner`).
+fn shallow_plan_estimate(spec: &ExistsSpec) -> u64 {
+    use GraphPattern as GP;
+    let mut stack = vec![spec.pattern()];
+    let mut nodes = 0u64;
+    while let Some(gp) = stack.pop() {
+        nodes = nodes.saturating_add(1);
+        match gp {
+            GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => {}
+            GP::Join { left, right }
+            | GP::LeftJoin { left, right, .. }
+            | GP::Lateral { left, right }
+            | GP::Union { left, right }
+            | GP::Minus { left, right }
+            | GP::SemiJoin { left, right }
+            | GP::AntiJoin { left, right } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            GP::Filter { inner, .. }
+            | GP::Graph { inner, .. }
+            | GP::Extend { inner, .. }
+            | GP::Assign { inner, .. }
+            | GP::Unfold { inner, .. }
+            | GP::OrderBy { inner, .. }
+            | GP::Project { inner, .. }
+            | GP::Distinct { inner }
+            | GP::Reduced { inner }
+            | GP::Slice { inner, .. }
+            | GP::Group { inner, .. }
+            | GP::Service { inner, .. } => {
+                stack.push(inner);
+            }
+        }
+    }
+    nodes
+        .saturating_mul(1024)
+        .saturating_add((spec.vars.len() as u64).saturating_mul(128))
+        .saturating_add(2048)
+}
+
 /// Plan `(spec.pattern(), spec.graph)` unsubstituted at most once per [`ExistsSpec`],
 /// returning a shared `Arc<Node>` cached in [`ExistsSpec::plan_cache`].
 ///
 /// Errors (`Cancelled`, `Timeout`, `BudgetExceeded`, or planning errors) are never cached.
-/// Once `ctx.attach_owner()` has run, the cached plan is charged via [`Ctx::retained_charge`];
-/// before attachment (during automatic admission), `admission` bounds peak planning memory
-/// transiently without creating a strong `Arc<Ctx>` reference.
+/// Before invoking the planner, a conservative reservation covers immediate plan nodes
+/// while ordinary `VALUES` tables and unattached nested `EXISTS` specs reserve their
+/// backing before allocating. Once `ctx.attach_owner()` has run, the live planning charge
+/// is resized and converted directly into a [`RetainedCharge`] with no release gap;
+/// before attachment (during automatic admission), it is adopted into `admission` and
+/// carried across `enable_cursor_accounting` via a [`super::query_memory::QueryMemoryLease`].
 pub(super) fn unsubstituted_plan(ctx: &Ctx, spec: &ExistsSpec) -> Result<Arc<Node>> {
     unsubstituted_plan_with_admission(ctx, spec, None)
 }
@@ -371,21 +467,28 @@ pub(super) fn unsubstituted_plan_with_admission(
             return Ok(cached.node.clone());
         }
     }
+    let pre_bytes = shallow_plan_estimate(spec);
+    let plan_guard = match admission {
+        Some(held) if ctx.shared().is_none() => {
+            let part = held.part();
+            part.add(pre_bytes)?;
+            part
+        }
+        _ => ctx.charge(pre_bytes)?,
+    };
     #[cfg(test)]
-    EXISTS_PLANS_BUILT.with(|n| n.set(n.get() + 1));
-    let node = Planner::for_exists(ctx, spec).plan(spec.pattern(), &spec.graph, Vec::new())?;
+    let built_count = EXISTS_PLANS_BUILT.with(|n| {
+        let next = n.get() + 1;
+        n.set(next);
+        next
+    });
+    let node = Planner::for_exists_with_charge(ctx, spec, Some(&plan_guard)).plan(
+        spec.pattern(),
+        &spec.graph,
+        Vec::new(),
+    )?;
     super::depth::check_plan(node.depth())?;
     let bytes = super::cursor::plan_bytes(&node);
-    let charge = if ctx.shared().is_some() {
-        ctx.retained_charge(bytes)?
-    } else {
-        if let Some(held) = admission {
-            held.add(bytes)?;
-        } else {
-            let _ = ctx.charge(bytes)?;
-        }
-        None
-    };
     let node = Arc::new(node);
     let mut slot = spec.plan_cache.plan.lock();
     if let Some(existing) = slot.as_mut() {
@@ -394,10 +497,27 @@ pub(super) fn unsubstituted_plan_with_admission(
         }
         return Ok(existing.node.clone());
     }
+    let charge = if ctx.shared().is_some() {
+        plan_guard.into_retained(bytes)?
+    } else {
+        plan_guard.resize(bytes)?;
+        if let Some(held) = admission {
+            let mut transfer = Some(plan_guard);
+            held.adopt_charge(&mut transfer)?;
+        }
+        None
+    };
     *slot = Some(CachedPlan {
         node: node.clone(),
         bytes,
         charge,
+    });
+    drop(slot);
+    #[cfg(test)]
+    AFTER_CACHE_PLAN_HOOK.with(|hook| {
+        if let Some(f) = hook.borrow_mut().as_mut() {
+            f(built_count);
+        }
     });
     Ok(node)
 }
@@ -441,13 +561,15 @@ fn visit_exists_specs(
     }
 }
 
-/// Drop uncharged admission-cached EXISTS plans when automatic admission keeps a query
-/// eager, so unreached EXISTS branches retain zero overhead and preserve eager peaks.
+/// Drop uncharged admission-cached EXISTS plans and structural admission metadata when
+/// automatic admission keeps a query eager or aborts on error, so unreached EXISTS
+/// branches retain zero overhead and preserve eager peaks.
 pub(super) fn clear_cached_plans(node: &Node) {
     fn clear(node: &Node, seen: &mut FxHashSet<usize>) {
         let mut specs = Vec::new();
         visit_exists_specs(node, seen, &mut |spec| specs.push(spec.clone()));
         for spec in specs {
+            *spec.plan_cache.admit.lock() = None;
             if let Some(cached) = spec.plan_cache.plan.lock().take() {
                 super::depth::guard_exists(|| clear(&cached.node, seen));
             }
@@ -457,19 +579,48 @@ pub(super) fn clear_cached_plans(node: &Node) {
     clear(node, &mut seen);
 }
 
-/// Upgrade every admission-cached EXISTS plan under `node` to a [`RetainedCharge`] once
-/// `ctx.attach_owner()` has run, clearing all cached plans on error.
-pub(super) fn charge_cached_plans(ctx: &Ctx, node: &Node) -> Result<()> {
-    fn charge(ctx: &Ctx, node: &Node, seen: &mut FxHashSet<usize>) -> Result<()> {
+/// Upgrade every admission-cached EXISTS plan and structural admission metadata under
+/// `node` to a [`RetainedCharge`] once `ctx.attach_owner()` has run, splitting directly
+/// out of `admission_lease` when present so no pool bytes are released in between.
+/// Clears all cached plans and metadata on error.
+pub(super) fn charge_cached_plans(
+    ctx: &Ctx,
+    node: &Node,
+    mut admission_lease: Option<&mut super::query_memory::QueryMemoryLease>,
+) -> Result<()> {
+    fn charge_bytes(
+        ctx: &Ctx,
+        lease: &mut Option<&mut super::query_memory::QueryMemoryLease>,
+        bytes: u64,
+    ) -> Result<Option<RetainedCharge>> {
+        match lease.as_deref_mut() {
+            Some(lease) => ctx.retained_charge_from_lease(lease, bytes),
+            None => ctx.retained_charge(bytes),
+        }
+    }
+    fn charge(
+        ctx: &Ctx,
+        node: &Node,
+        seen: &mut FxHashSet<usize>,
+        lease: &mut Option<&mut super::query_memory::QueryMemoryLease>,
+    ) -> Result<()> {
         let mut specs = Vec::new();
         visit_exists_specs(node, seen, &mut |spec| specs.push(spec.clone()));
         for spec in specs {
             ctx.check()?;
+            {
+                let mut admit_slot = spec.plan_cache.admit.lock();
+                if let Some(admit) = admit_slot.as_mut()
+                    && admit.charge.is_none()
+                {
+                    admit.charge = charge_bytes(ctx, lease, admit.bytes)?;
+                }
+            }
             let inner = {
                 let mut slot = spec.plan_cache.plan.lock();
                 if let Some(cached) = slot.as_mut() {
                     if cached.charge.is_none() {
-                        cached.charge = ctx.retained_charge(cached.bytes)?;
+                        cached.charge = charge_bytes(ctx, lease, cached.bytes)?;
                     }
                     Some(cached.node.clone())
                 } else {
@@ -477,13 +628,13 @@ pub(super) fn charge_cached_plans(ctx: &Ctx, node: &Node) -> Result<()> {
                 }
             };
             if let Some(inner) = inner {
-                super::depth::guard_exists(|| charge(ctx, &inner, seen))?;
+                super::depth::guard_exists(|| charge(ctx, &inner, seen, lease))?;
             }
         }
         Ok(())
     }
     let mut seen = FxHashSet::default();
-    if let Err(err) = charge(ctx, node, &mut seen) {
+    if let Err(err) = charge(ctx, node, &mut seen, &mut admission_lease) {
         clear_cached_plans(node);
         return Err(err);
     }
@@ -510,8 +661,13 @@ pub(super) fn keyed_plan(
     if !ctx.opt.decorrelate_exists {
         return Ok(None);
     }
-    let Ok(meta) = admit_meta(ctx, spec) else {
-        return Ok(None);
+    let meta = match admit_meta(ctx, spec, admission, true) {
+        Ok(Ok(meta)) => meta,
+        Ok(Err(_)) | Err(Error::BudgetExceeded(_)) => return Ok(None),
+        Err(e @ (Error::Cancelled | Error::Timeout | Error::Io(_) | Error::Corrupt(_))) => {
+            return Err(e);
+        }
+        Err(_) => return Ok(None),
     };
     let constant = |v: &VarId| spec.bound.iter().any(|(b, _)| b == v);
     if meta
@@ -526,7 +682,9 @@ pub(super) fn keyed_plan(
     }
     let node = match unsubstituted_plan_with_admission(ctx, spec, admission) {
         Ok(node) => node,
-        Err(e @ (Error::Cancelled | Error::Timeout)) => return Err(e),
+        Err(e @ (Error::Cancelled | Error::Timeout | Error::Io(_) | Error::Corrupt(_))) => {
+            return Err(e);
+        }
         Err(_) => return Ok(None),
     };
     if meta.keys.iter().any(|v| !node.vars.contains(v)) {
@@ -1146,7 +1304,7 @@ fn build_streaming(
     }
     let mut solutions = 0usize;
     super::depth::guard_exists(|| {
-        super::cursor::drain(ctx, node.clone(), &mut |t: &Table| {
+        super::cursor::drain(ctx, node, &mut |t: &Table| {
             let cols: Vec<&[Id]> = keys
                 .iter()
                 .map(|&v| {
@@ -1195,12 +1353,28 @@ fn build_streaming(
 // ------------------------------------------------------------------ admission ------
 
 /// Structural admission of `spec`: classify its key and risky variables once per
-/// `ExistsSpec` without mutating `Decor::reason` or `Decor::state`.
-fn admit_meta(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<AdmitMeta, String> {
+/// `ExistsSpec` without mutating `Decor::reason` or `Decor::state`. When `cache` is
+/// true, retains the result charged to `ctx` (or `admission` before attachment); when
+/// `cache` is false (`admit` in `prepare`), consumes any previously cached entry and
+/// drops its charge immediately.
+fn admit_meta(
+    ctx: &Ctx,
+    spec: &ExistsSpec,
+    admission: Option<&Charge<'_>>,
+    cache: bool,
+) -> Result<std::result::Result<AdmitMeta, String>> {
+    ctx.check()?;
     {
-        let guard = spec.plan_cache.admit.lock();
-        if let Some(cached) = guard.as_ref() {
-            return cached.clone();
+        let mut guard = spec.plan_cache.admit.lock();
+        if cache {
+            if let Some(cached) = guard.as_mut() {
+                if cached.charge.is_none() && ctx.shared().is_some() {
+                    cached.charge = ctx.retained_charge(cached.bytes)?;
+                }
+                return Ok(cached.result.clone());
+            }
+        } else if let Some(cached) = guard.take() {
+            return Ok(cached.result);
         }
     }
     let computed = (|| -> std::result::Result<AdmitMeta, String> {
@@ -1242,19 +1416,46 @@ fn admit_meta(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<AdmitMeta, St
         risky.sort_unstable();
         Ok(AdmitMeta { keys, risky })
     })();
-    let mut guard = spec.plan_cache.admit.lock();
-    if let Some(existing) = guard.as_ref() {
-        return existing.clone();
+    if !cache {
+        return Ok(computed);
     }
-    *guard = Some(computed.clone());
-    computed
+    let bytes = admit_bytes(&computed);
+    let mut guard = spec.plan_cache.admit.lock();
+    if let Some(existing) = guard.as_mut() {
+        if existing.charge.is_none() && ctx.shared().is_some() {
+            existing.charge = ctx.retained_charge(existing.bytes)?;
+        }
+        return Ok(existing.result.clone());
+    }
+    let charge = if ctx.shared().is_some() {
+        ctx.retained_charge(bytes)?
+    } else if let Some(held) = admission {
+        held.add(bytes)?;
+        None
+    } else {
+        // Unattached context without an admission guard: do not retain uncharged backing.
+        return Ok(computed);
+    };
+    *guard = Some(CachedAdmit {
+        result: computed.clone(),
+        bytes,
+        charge,
+    });
+    Ok(computed)
 }
 
 /// Check the pattern against the admitted algebra and reuse its unsubstituted plan.
 fn admit(ctx: &Ctx, spec: &ExistsSpec) -> Result<std::result::Result<Plan, String>> {
-    let meta = match admit_meta(ctx, spec) {
-        Ok(meta) => meta,
-        Err(reason) => return Ok(Err(reason)),
+    let meta = match admit_meta(ctx, spec, None, false) {
+        Ok(Ok(meta)) => meta,
+        Ok(Err(reason)) => return Ok(Err(reason)),
+        Err(e @ (Error::Timeout | Error::Cancelled | Error::Io(_) | Error::Corrupt(_))) => {
+            return Err(e);
+        }
+        Err(Error::BudgetExceeded(budget)) => {
+            return Ok(Err(Error::BudgetExceeded(budget).to_string()));
+        }
+        Err(e) => return Ok(Err(format!("admitting it failed ({e})"))),
     };
     let node = match unsubstituted_plan(ctx, spec) {
         Ok(node) => node,

@@ -996,6 +996,9 @@ pub struct Planner<'a> {
     seen: std::cell::RefCell<FxHashMap<SeenPattern, u32>>,
     /// how many times each pattern occurs in the source
     source_counts: std::cell::OnceCell<FxHashMap<SeenPattern, u32>>,
+    /// Live planning charge for speculative EXISTS planning so ordinary VALUES tables and
+    /// unattached nested EXISTS syntax reserve memory before allocating.
+    plan_charge: Option<&'a super::ctx::Charge<'a>>,
 }
 
 #[cfg(test)]
@@ -1063,12 +1066,22 @@ impl<'a> Planner<'a> {
             source_sse: Default::default(),
             seen: Default::default(),
             source_counts: Default::default(),
+            plan_charge: None,
         }
     }
 
     pub(super) fn for_exists(ctx: &'a Ctx, spec: &'a ExistsSpec) -> Self {
+        Self::for_exists_with_charge(ctx, spec, None)
+    }
+
+    pub(super) fn for_exists_with_charge(
+        ctx: &'a Ctx,
+        spec: &'a ExistsSpec,
+        plan_charge: Option<&'a super::ctx::Charge<'a>>,
+    ) -> Self {
         let mut planner = Self::new(ctx);
         planner.view_patterns = spec.view_patterns();
+        planner.plan_charge = plan_charge;
         planner
     }
 
@@ -1118,13 +1131,14 @@ impl<'a> Planner<'a> {
                     bound.push((v, id));
                 }
             }
-            Ok(Arc::new(ExistsSpec::new_ordinary_charged(
+            Ok(Arc::new(ExistsSpec::new_ordinary_charged_with_admission(
                 ctx,
                 p,
                 self.view_patterns,
                 graph.clone(),
                 vars,
                 bound,
+                self.plan_charge,
             )?))
         };
         super::expr::compile_expression(
@@ -1855,27 +1869,88 @@ impl<'a> Planner<'a> {
                     return self.apply_filters(values, filters);
                 }
                 let vars: Vec<VarId> = variables.iter().map(|v| self.ctx.var(v.as_str())).collect();
+                let width = vars.len();
+                let rows = bindings.len();
+                let table_bytes = (rows as u64)
+                    .saturating_mul((width as u64).saturating_mul(std::mem::size_of::<Id>() as u64))
+                    .saturating_add(
+                        (width as u64).saturating_mul(std::mem::size_of::<Vec<Id>>() as u64),
+                    )
+                    .saturating_add(
+                        (width as u64).saturating_mul(std::mem::size_of::<VarId>() as u64),
+                    );
+                if let Some(held) = self.plan_charge {
+                    held.add(table_bytes)?;
+                }
                 let mut t = Table::new(vars.clone());
+                if self.plan_charge.is_some() {
+                    for col in &mut t.cols {
+                        col.try_reserve_exact(rows)
+                            .map_err(|_| self.ctx.memory_exceeded(table_bytes))?;
+                    }
+                }
                 // a term repeated in the table is looked up once
                 let mut seen: FxHashMap<&GroundTerm, Id> = FxHashMap::default();
-                for row in bindings {
-                    let ids: Vec<Id> = row
-                        .iter()
-                        .map(|t| match t {
+                let seen_charge = self.plan_charge.map(|_| self.ctx.charge(0)).transpose()?;
+                let mut seen_full = false;
+                let mut row_ids = Vec::with_capacity(width);
+                for (row_idx, row) in bindings.iter().enumerate() {
+                    if row_idx % 1024 == 0 {
+                        self.ctx.check()?;
+                    }
+                    row_ids.clear();
+                    for term in row {
+                        let id = match term {
                             None => Id::UNDEF,
-                            Some(t) => *seen.entry(t).or_insert_with(|| match t {
-                                GroundTerm::NamedNode(n) => {
-                                    self.ctx.intern_term(&Term::NamedNode(n.clone()))
+                            Some(term) => {
+                                if let Some(&id) = seen.get(term) {
+                                    id
+                                } else {
+                                    let id = match term {
+                                        GroundTerm::NamedNode(n) => {
+                                            self.ctx.intern_term(&Term::NamedNode(n.clone()))
+                                        }
+                                        GroundTerm::Literal(l) if !native => {
+                                            self.ctx.intern_query_literal(l)
+                                        }
+                                        _ => self.ctx.intern_term(&ground_term(term)),
+                                    };
+                                    if !seen_full {
+                                        if let Some(charge) = &seen_charge {
+                                            let cap = seen.capacity();
+                                            let grown = sparkles_budget::sizes::table_grown(
+                                                cap,
+                                                seen.len(),
+                                                1,
+                                            );
+                                            if grown > cap {
+                                                let slot = std::mem::size_of::<(&GroundTerm, Id)>();
+                                                let need = sparkles_budget::sizes::table_bytes(
+                                                    grown, slot,
+                                                )
+                                                    as u64;
+                                                if charge.resize(need).is_ok() {
+                                                    seen.insert(term, id);
+                                                } else {
+                                                    seen_full = true;
+                                                }
+                                            } else {
+                                                seen.insert(term, id);
+                                            }
+                                        } else {
+                                            seen.insert(term, id);
+                                        }
+                                    }
+                                    id
                                 }
-                                GroundTerm::Literal(l) if !native => {
-                                    self.ctx.intern_query_literal(l)
-                                }
-                                _ => self.ctx.intern_term(&ground_term(t)),
-                            }),
-                        })
-                        .collect();
-                    t.push_row(&ids);
+                            }
+                        };
+                        row_ids.push(id);
+                    }
+                    t.push_row(&row_ids);
                 }
+                drop(seen);
+                drop(seen_charge);
                 // substituted variables (initial bindings, filter equalities): keep only
                 // compatible rows and fill their UNDEF cells with the bound value, so the
                 // table agrees with the substitution the rest of the plan assumes
