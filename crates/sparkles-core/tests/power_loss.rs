@@ -529,9 +529,13 @@ fn run_writer(
         .env_remove(BACKGROUND)
         .env_remove("SPARKLES_IO_DELAY_US")
         .env_remove("SPARKLES_IO_SYNC_ENTERED")
-        .env_remove("SPARKLES_IO_SYNC_RELEASE");
+        .env_remove("SPARKLES_IO_SYNC_RELEASE")
+        .env_remove("SPARKLES_IO_HOLD_ANN_UNTIL_WAL");
     if record {
         cmd.env("SPARKLES_IO_LOG", root.join("io.log"));
+        if cfg.threads == 1 && !text && fault.is_empty() {
+            cmd.env("SPARKLES_IO_HOLD_ANN_UNTIL_WAL", "1");
+        }
     }
     if background {
         assert!(text && record && fault.is_empty());
@@ -1513,9 +1517,13 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
     // in either order and whether or not the writes overlap.
     let (mut open, mut ann_done, mut wal_done) = (false, false, false);
     let (mut forced, mut split) = (0usize, 0usize);
-    let (mut missing_ann_dropped, mut missing_ann_dropped_direct) = (0usize, 0usize);
+    let (mut missing_ann_dropped, mut missing_ann_dropped_direct, mut missing_ann_with_prior) =
+        (0usize, 0usize, 0usize);
     let (mut last_asymmetric_seq, mut last_asymmetric_direct_seq) = (None::<u64>, None::<u64>);
-    let mut commit_wal_dsync = false;
+    let (mut pending_wal_dsync, mut commit_wal_dsync) = (false, false);
+    let (mut commit_wal_written, mut commit_vocab_written) = (false, false);
+    let hold_ann = cfg.threads == 1 && !text;
+    let workload_commits = (cfg.threads * cfg.commits) as usize;
     const FORCED: usize = 48;
     const MAX_ASYMMETRIC: usize = 4;
     for (i, rec) in log.iter().enumerate() {
@@ -1526,7 +1534,10 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             let t = u32::from_le_bytes(data[8..12].try_into().unwrap());
             let k = u32::from_le_bytes(data[12..16].try_into().unwrap());
             acked.push((seq, t, k));
+            pending_wal_dsync = false;
             commit_wal_dsync = false;
+            commit_wal_written = false;
+            commit_vocab_written = false;
         }
         model.apply(rec);
         // Always check the clean state just after the forced locked pass, even when
@@ -1536,11 +1547,29 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
         let ann = |path: &str| path.ends_with("/annotations.bin");
         let wal = |path: &str| path.ends_with("/wal.log");
         let vocab = |path: &str| path.ends_with("/delta.vocab");
-        if let Rec::Write { path, dsync, .. } = rec
-            && wal(path)
-            && *dsync
-        {
-            commit_wal_dsync = true;
+        match rec {
+            Rec::Write { path, dsync, .. } if wal(path) => {
+                if *dsync {
+                    pending_wal_dsync = true;
+                }
+            }
+            Rec::WriteEnd { path, failed, .. } if wal(path) => {
+                if !failed {
+                    commit_wal_written = true;
+                    if pending_wal_dsync {
+                        commit_wal_dsync = true;
+                    }
+                }
+                pending_wal_dsync = false;
+            }
+            Rec::WriteEnd {
+                path,
+                failed: false,
+                ..
+            } if vocab(path) => {
+                commit_vocab_written = true;
+            }
+            _ => {}
         }
         if let Rec::Write { path, .. } = rec
             && (ann(path) || wal(path))
@@ -1563,15 +1592,26 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             _ => (false, false),
         };
         // Deterministically construct an asymmetric crash image where a complete WAL
-        // transaction and its vocabulary reached disk while its pending annotation write
-        // did not, and verify that recovery truncates that exact tail commit.
-        if !background
-            && matches!(
-                rec,
-                Rec::Write { path, .. } | Rec::WriteEnd { path, failed: false, .. }
-                    if wal(path) || vocab(path)
-            )
-        {
+        // transaction and its vocabulary reached disk while its annotation write has
+        // not yet reached disk, keeping all prior durable annotations intact, and
+        // verify that recovery truncates that exact tail commit.
+        let asymmetric_candidate = if hold_ann {
+            acked.len() < workload_commits
+                && commit_wal_written
+                && commit_vocab_written
+                && matches!(
+                    rec,
+                    Rec::WriteEnd { path, failed: false, .. } if wal(path) || vocab(path)
+                )
+        } else {
+            !background
+                && matches!(
+                    rec,
+                    Rec::Write { path, .. } | Rec::WriteEnd { path, failed: false, .. }
+                        if wal(path) || vocab(path)
+                )
+        };
+        if asymmetric_candidate {
             let top = acked
                 .iter()
                 .map(|a| a.0)
@@ -1592,7 +1632,15 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
                 let pre = check(&img, &CheckOptions::default()).unwrap();
                 let needle =
                     format!("the annotation of commit {next} is missing from annotations.bin");
-                if pre.status == Status::Warning && pre.to_text().contains(&needle) {
+                let matched = pre.status == Status::Warning && pre.to_text().contains(&needle);
+                if hold_ann {
+                    assert!(
+                        matched,
+                        "{name}: handshake image after record {i} for commit {next} (dsync={commit_wal_dsync}) did not report missing-annotation warning:\n{}",
+                        pre.to_text()
+                    );
+                }
+                if matched {
                     let what = format!(
                         "{name}: crash after record {i} of {}, complete WAL+vocab with missing annotation for commit {next} (dsync={commit_wal_dsync})",
                         log.len()
@@ -1601,6 +1649,9 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
                     named = named.max(p.unwrap_or(0));
                     images += 1;
                     missing_ann_dropped += 1;
+                    if top > u64::from(base) {
+                        missing_ann_with_prior += 1;
+                    }
                     last_asymmetric_seq = Some(next);
                     if commit_wal_dsync {
                         missing_ann_dropped_direct += 1;
@@ -1678,15 +1729,19 @@ fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
             "{name}: no crash point fell between a fence's annotation write and its log write"
         );
     }
-    if cfg.threads == 1 && !text {
+    if hold_ann {
         assert!(
-            missing_ann_dropped > 0,
-            "{name}: no crash image had a complete WAL commit and vocabulary with its annotation missing"
+            missing_ann_dropped >= MAX_ASYMMETRIC,
+            "{name}: expected at least {MAX_ASYMMETRIC} asymmetric missing-annotation crash images, got {missing_ann_dropped}"
+        );
+        assert!(
+            missing_ann_with_prior > 0,
+            "{name}: no asymmetric missing-annotation crash image kept prior durable annotations"
         );
         if cfg.direct && direct_io_available(&run.root) {
-            assert!(
-                missing_ann_dropped_direct > 0,
-                "{name}: no direct-I/O crash image had a complete WAL commit and vocabulary with its annotation missing"
+            assert_eq!(
+                missing_ann_dropped_direct, MAX_ASYMMETRIC,
+                "{name}: expected {MAX_ASYMMETRIC} direct-I/O asymmetric missing-annotation crash images, got {missing_ann_dropped_direct}"
             );
         }
     }

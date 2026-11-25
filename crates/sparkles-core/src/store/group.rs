@@ -1046,9 +1046,31 @@ impl WriteTxn<'_> {
             _family: family,
         };
         if !grouped {
+            // Reconcile `w.head` to the published snapshot even if `drive_sealed`
+            // unwinds after `publish_commit` stores the new snapshot (e.g. at
+            // `commit-published` or `embed_noted`), while leaving `w.poisoned = true`
+            // and keeping the previous head for unwinds before snapshot publication.
+            struct SoloHead<'a> {
+                store: &'a Store,
+                w: &'a mut WriterState,
+                committed: CommitInfo,
+            }
+            impl Drop for SoloHead<'_> {
+                fn drop(&mut self) {
+                    if self.store.current.load().commit == self.committed.seq {
+                        self.w.head = self.committed;
+                    }
+                }
+            }
             let batch = group.enqueue_and_seal_idle(pending)?;
+            let solo_head = SoloHead {
+                store,
+                w,
+                committed: c,
+            };
             group.drive_sealed(store, batch, Some(sync))?;
-            w.head = c;
+            drop(solo_head);
+            debug_assert_eq!(w.head.seq, c.seq);
             if arm_control {
                 store.failpoint("control-commit-published");
             }
@@ -4734,6 +4756,100 @@ mod tests {
             assert_eq!(reopened.snapshot().commit, 1, "group_commit={group_commit}");
             let r2 = insert(&reopened, "second-after-reopen").unwrap();
             assert_eq!(r2.commit.seq, 2, "group_commit={group_commit}");
+        }
+    }
+
+    /// An unwind inside a solo fence after snapshot publication reconciles the writer's
+    /// head to the published snapshot before releasing the writer lock while keeping the
+    /// writer poisoned and the coordinator failed.
+    #[test]
+    fn solo_fence_unwind_after_publication_reconciles_head_and_keeps_poison() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        for group_commit in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir
+                .path()
+                .join(if group_commit { "grouped" } else { "solo" });
+            let opts = StoreOptions {
+                group_commit,
+                ..Default::default()
+            };
+            let s = Store::open(&root, opts.clone()).unwrap();
+            let r1 = insert(&s, "first").unwrap();
+            assert_eq!(r1.commit.seq, 1);
+
+            let mut commits = s.subscribe_commits();
+            s.set_failpoint(
+                "commit-published",
+                Some(Arc::new(|_: &Store| {
+                    panic!("solo fence unwind after publication")
+                })),
+            );
+            // `CommitKind::Load` takes the solo fallback even when `group_commit` is true.
+            let panicked = catch_unwind(AssertUnwindSafe(|| {
+                kind_insert(
+                    &s,
+                    CommitKind::Load,
+                    Default::default(),
+                    in_graph("second", "urn:g"),
+                )
+            }));
+            assert!(panicked.is_err(), "group_commit={group_commit}");
+            s.set_failpoint("commit-published", None);
+
+            // Check snapshot, watch receiver, writer head, and non-draining historical
+            // resolution immediately after the caught unwind, before any operation drains
+            // the coordinator.
+            assert_eq!(s.snapshot().commit, 2, "group_commit={group_commit}");
+            assert_eq!(
+                *commits.borrow_and_update(),
+                2,
+                "group_commit={group_commit}: watch receiver must see commit 2"
+            );
+            {
+                let w = s.writer.lock();
+                assert_eq!(
+                    w.head.seq, 2,
+                    "group_commit={group_commit}: writer head must match published snapshot immediately"
+                );
+                assert!(
+                    w.poisoned,
+                    "group_commit={group_commit}: writer must remain poisoned after post-publication unwind"
+                );
+            }
+            assert!(
+                s.group.as_ref().unwrap().failed(),
+                "group_commit={group_commit}: coordinator must remain failed"
+            );
+            let (at2, _) = s
+                .snapshot_at(&crate::history::At::Commit(2), &Default::default())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "group_commit={group_commit}: snapshot_at(2) must succeed before drain: {e}"
+                    )
+                });
+            assert_eq!(at2.commit, 2, "group_commit={group_commit}");
+            assert_eq!(s.head_commit().seq, 2, "group_commit={group_commit}");
+            assert!(
+                matches!(
+                    s.try_write_with(CommitKind::Update, Default::default()),
+                    Err(Error::Poisoned)
+                ),
+                "group_commit={group_commit}: try_write_with must stay poisoned"
+            );
+            let mut txn = s.write_as(CommitKind::Update);
+            let term = Term::NamedNode(NamedNode::new("urn:after-pub-unwind").unwrap());
+            assert!(
+                matches!(txn.intern(&term), Err(Error::Poisoned)),
+                "group_commit={group_commit}: intern must stay poisoned"
+            );
+            drop(txn);
+            drop(s);
+
+            let reopened = Store::open(&root, opts).unwrap();
+            assert_eq!(reopened.snapshot().commit, 2, "group_commit={group_commit}");
+            let r3 = insert(&reopened, "third-after-reopen").unwrap();
+            assert_eq!(r3.commit.seq, 3, "group_commit={group_commit}");
         }
     }
 

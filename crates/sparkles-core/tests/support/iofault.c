@@ -17,6 +17,12 @@
 // text-file sync signals entry and waits up to five seconds for a designated writer's
 // release. This deterministic crash-fixture interleaving is not a performance mode.
 //
+// With SPARKLES_IO_HOLD_ANN_UNTIL_WAL set, positioned writes (pwrite/pwrite64) to
+// annotations.bin wait (bounded to five seconds) until both wal.log and delta.vocab
+// have completed a write in the current commit epoch (reset when ack.log is written),
+// so single-writer crash fixtures deterministically observe complete WAL+vocab writes
+// before the matching annotation becomes durable.
+//
 // Log record, little endian:
 //   u8 kind (1 write begin, 2 write end, 3 truncate, 4 sync begin, 5 sync end, 6 rename,
 //   7 unlink, 8 create),
@@ -70,6 +76,20 @@ static int ready;
 static long delay_us;
 static const char *sync_entered, *sync_release;
 static int sync_gated;
+static int hold_ann_until_wal;
+static pthread_mutex_t ann_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ann_cv;
+static pthread_once_t ann_cv_once = PTHREAD_ONCE_INIT;
+static int ann_wal_done;
+static int ann_vocab_done;
+
+static void init_ann_cv(void) {
+  pthread_condattr_t attr;
+  pthread_condattr_init(&attr);
+  pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+  pthread_cond_init(&ann_cv, &attr);
+  pthread_condattr_destroy(&attr);
+}
 
 #define MAX_FAULTS 16
 static struct {
@@ -100,6 +120,9 @@ static void init(void) {
   if (d) delay_us = atol(d);
   sync_entered = getenv("SPARKLES_IO_SYNC_ENTERED");
   sync_release = getenv("SPARKLES_IO_SYNC_RELEASE");
+  pthread_once(&ann_cv_once, init_ann_cv);
+  const char *hold = getenv("SPARKLES_IO_HOLD_ANN_UNTIL_WAL");
+  hold_ann_until_wal = hold && hold[0] && strcmp(hold, "0") != 0;
   const char *log = getenv("SPARKLES_IO_LOG");
   if (log && root_len) logfd = real_open(log, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
   const char *spec = getenv("SPARKLES_IO_FAULT");
@@ -230,6 +253,52 @@ static int sync_call(const char *op, int fd) {
 int fdatasync(int fd) { return sync_call("fdatasync", fd); }
 int fsync(int fd) { return sync_call("fsync", fd); }
 
+static int wait_ann_for_wal_and_vocab(void) {
+  if (!hold_ann_until_wal) return 0;
+  const char *arm = getenv("SPARKLES_IO_ARM");
+  if (arm && access(arm, F_OK) != 0) return 0;
+  pthread_once(&ann_cv_once, init_ann_cv);
+  struct timespec deadline;
+  if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) return -1;
+  deadline.tv_sec += 5;
+  pthread_mutex_lock(&ann_mu);
+  while (!(ann_wal_done && ann_vocab_done)) {
+    int rc = pthread_cond_timedwait(&ann_cv, &ann_mu, &deadline);
+    if (rc == ETIMEDOUT) {
+      pthread_mutex_unlock(&ann_mu);
+      errno = ETIMEDOUT;
+      return -1;
+    }
+    if (rc != 0 && rc != EINTR) {
+      pthread_mutex_unlock(&ann_mu);
+      errno = rc;
+      return -1;
+    }
+  }
+  pthread_mutex_unlock(&ann_mu);
+  return 0;
+}
+
+static void note_ann_io_done(const char *path) {
+  if (!hold_ann_until_wal) return;
+  const char *arm = getenv("SPARKLES_IO_ARM");
+  if (arm && access(arm, F_OK) != 0) return;
+  int is_wal = ends_with(path, "/wal.log");
+  int is_vocab = ends_with(path, "/delta.vocab");
+  int is_ack = ends_with(path, "/ack.log");
+  if (!is_wal && !is_vocab && !is_ack) return;
+  pthread_once(&ann_cv_once, init_ann_cv);
+  pthread_mutex_lock(&ann_mu);
+  if (is_wal) ann_wal_done = 1;
+  if (is_vocab) ann_vocab_done = 1;
+  if (is_ack) {
+    ann_wal_done = 0;
+    ann_vocab_done = 0;
+  }
+  pthread_cond_broadcast(&ann_cv);
+  pthread_mutex_unlock(&ann_mu);
+}
+
 static ssize_t write_call(int fd, const void *buf, size_t n, off_t off, int positioned) {
   init();
   char path[PATH_MAX];
@@ -244,6 +313,11 @@ static ssize_t write_call(int fd, const void *buf, size_t n, off_t off, int posi
       off = real_lseek(fd, 0, SEEK_CUR);
     }
   }
+  if (hold_ann_until_wal && positioned && ends_with(path, "/annotations.bin")) {
+    if (wait_ann_for_wal_and_vocab() != 0) {
+      return -1;
+    }
+  }
   record(K_WRITE, dsync, path, (uint64_t)off, n, buf);
   ssize_t r;
   if (should_fail("pwrite", path)) {
@@ -255,6 +329,9 @@ static ssize_t write_call(int fd, const void *buf, size_t n, off_t off, int posi
   }
   int saved = errno;
   record(K_WRITE_END, r != (ssize_t)n, path, (uint64_t)off, r < 0 ? 0 : (uint64_t)r, NULL);
+  if (hold_ann_until_wal && r == (ssize_t)n) {
+    note_ann_io_done(path);
+  }
   errno = saved;
   return r;
 }
