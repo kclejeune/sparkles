@@ -11,7 +11,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { startServer, stopServer } from '../server-process';
+import { serverLogTail, startServer, stopServer } from '../../scripts/server-process.mjs';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
 export const DEMO = join(ROOT, 'docs/demo');
@@ -83,7 +83,10 @@ export default async function globalSetup(_config: FullConfig) {
   } catch (e) {
     process.off('exit', kill);
     await stopServer(child);
-    throw new Error(`${e instanceof Error ? e.message : e}; server log ${log}`, { cause: e });
+    throw new Error(
+      `${e instanceof Error ? e.message : e}. Server log ${log}:\n${serverLogTail(log)}`,
+      { cause: e },
+    );
   }
   process.env.SPARKLES_SCREENSHOTS_URL = url;
 

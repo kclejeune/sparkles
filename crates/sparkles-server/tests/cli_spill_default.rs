@@ -8,7 +8,7 @@ mod common;
 use serde_json::Value as J;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn serve(data: &Path, extra: &[&str]) -> Command {
@@ -100,23 +100,11 @@ fn spill_is_on_by_default_and_an_unusable_directory_only_fails_an_explicit_reque
         assert!(text.contains("running without spill"), "{text}");
     }
     for mode in ["on", "encrypted"] {
-        let mut child = serve(&data, &["--spill", mode, "--spill-dir", unusable])
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(&log).unwrap())
-            .spawn()
-            .unwrap();
-        let t0 = Instant::now();
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if t0.elapsed() > Duration::from_secs(30) {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("--spill {mode} with an unusable directory did not fail the start");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let status = common::ServerProcess::spawn(
+            &mut serve(&data, &["--spill", mode, "--spill-dir", unusable]),
+            std::fs::File::create(&log).unwrap(),
+        )
+        .wait_for_exit(Duration::from_secs(30), &log);
         assert!(!status.success(), "--spill {mode}");
     }
     for mode in ["on", "encrypted"] {

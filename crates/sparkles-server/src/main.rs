@@ -2626,6 +2626,7 @@ fn rejected_exit(e: anyhow::Error) -> anyhow::Error {
 
 /// The input graphs that `sparkles infer` was given, or `None` when it was given none of
 /// the input options and the recorded inputs apply.
+#[cfg(feature = "reasoning")]
 fn cli_inputs(
     data_graphs: &[String],
     ontology_graphs: &[String],
@@ -3480,7 +3481,11 @@ fn run() -> Result<()> {
             // and runs its request itself, instead of waking this thread to accept and
             // then another worker to serve it.
             let serve = async move {
-                let addr = format!("{host}:{port}");
+                let addr = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                };
                 let tcp = match &unix_socket {
                     None => Some(
                         tokio::net::TcpListener::bind(&addr)
@@ -3502,7 +3507,17 @@ fn run() -> Result<()> {
                     let l = tokio::net::TcpListener::bind(maddr)
                         .await
                         .with_context(|| format!("binding --metrics-addr {maddr}"))?;
-                    tracing::info!("metrics at http://{maddr}/$/metrics");
+                    let bound = if maddr
+                        .rsplit_once(':')
+                        .is_some_and(|(_, port)| port.parse::<u16>() == Ok(0))
+                    {
+                        l.local_addr()
+                            .context("reading the metrics listener address")?
+                            .to_string()
+                    } else {
+                        maddr.clone()
+                    };
+                    tracing::info!("metrics at http://{bound}/$/metrics");
                     let service = obs::metrics_router(st.clone())
                         .into_make_service_with_connect_info::<auth::Peer>();
                     tokio::spawn(async move {

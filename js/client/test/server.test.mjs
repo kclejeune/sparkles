@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { startServer, stopServer } from '../../../ui/scripts/server-process.mjs';
 import { SparklesClient, factory, BudgetExceededError, ConflictError } from '../dist/index.js';
 
 const binary = process.env.SPARKLES_CLIENT_TEST_SERVER_BIN;
@@ -13,9 +13,8 @@ test(
   async () => {
     const directory = await mkdtemp(join(tmpdir(), 'sparkles-client-server-'));
     let server;
-    let output = '';
     try {
-      server = spawn(
+      const { child, url: base } = await startServer(
         binary,
         [
           'serve',
@@ -36,36 +35,10 @@ test(
           '--service-cache-mb',
           '0',
         ],
-        { env: { ...process.env, RUST_LOG: 'info' } },
+        join(directory, 'server.log'),
+        { timeout: 15_000 },
       );
-      server.stderr.on('data', (data) => {
-        output += data;
-      });
-      server.stdout.on('data', (data) => {
-        output += data;
-      });
-      let startupError;
-      server.once('error', (error) => {
-        startupError = error;
-      });
-      const startupDeadline = Date.now() + 15_000;
-      let base;
-      for (;;) {
-        if (startupError) throw startupError;
-        if (server.exitCode !== null || server.signalCode !== null || Date.now() >= startupDeadline)
-          throw new Error('Server did not start: ' + output);
-        base ??= output.match(
-          / listening on (http:\/\/127\.0\.0\.1:[1-9][0-9]*)\/ \(UI at \/ui\/\)/,
-        )?.[1];
-        if (base) {
-          try {
-            if ((await fetch(base + '/$/ready', { signal: AbortSignal.timeout(1000) })).ok) break;
-          } catch {
-            /* Await startup. */
-          }
-        }
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
+      server = child;
       const client = new SparklesClient(base),
         main = client.dataset('wiki');
       const inserted = await main.update('INSERT DATA { ex:s ex:p "héllo"@fr }', {
@@ -136,11 +109,7 @@ test(
       assert.equal(renamed.response.status, 200);
       assert(await client.dataset('wiki', 'renamed').ask('ASK { <urn:t> <urn:p> 2 }'));
     } finally {
-      if (server?.pid && server.exitCode === null && server.signalCode === null) {
-        const exited = new Promise((resolve) => server.once('exit', resolve));
-        server.kill('SIGTERM');
-        await exited;
-      }
+      if (server) await stopServer(server);
       await rm(directory, { recursive: true, force: true });
     }
   },

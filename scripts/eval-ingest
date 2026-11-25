@@ -62,7 +62,7 @@ import urllib.parse
 import urllib.request
 from decimal import Decimal, InvalidOperation
 
-from sparkles_test_server import stop_server, wait_for_listener
+from sparkles_test_server import DIRECT_HTTP, stop_server, wait_for_listener, wait_for_ready
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_SET = ROOT / "testsuite" / "ingest" / "sample.json"
@@ -128,9 +128,10 @@ def norm_term(t):
 
 
 class Client:
-    def __init__(self, base, token=None):
+    def __init__(self, base, token=None, *, open_url=urllib.request.urlopen):
         self.base = base.rstrip("/")
         self.token = token
+        self.open_url = open_url
 
     def request(self, method, path, body=None, headers=None):
         h = {"Accept": "application/json"}
@@ -143,7 +144,7 @@ class Client:
         h.update(headers or {})
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=h)
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with self.open_url(req, timeout=120) as r:
                 raw = r.read().decode()
                 ctype = r.headers.get("Content-Type", "")
         except urllib.error.HTTPError as e:
@@ -487,18 +488,12 @@ def self_test(args):
              str(tmp / "data"), "--loc", f"org={db}", "--mcp", "--mcp-allow-update"],
             stdout=log_file,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "RUST_LOG": "info"},
+            env={**os.environ, "RUST_LOG": "info", "NO_COLOR": "1"},
         )
     try:
-        client = Client(wait_for_listener(server, log_path, time.monotonic() + 60))
-        for _ in range(300):
-            try:
-                client.get("/$/ready")
-                break
-            except Exception:
-                if server.poll() is not None:
-                    sys.exit(f"sparkles serve exited; see {tmp / 'serve.log'}")
-                time.sleep(0.2)
+        base = wait_for_listener(server, log_path, time.monotonic() + 60)
+        wait_for_ready(server, base, log_path, time.monotonic() + 60)
+        client = Client(base, open_url=DIRECT_HTTP.open)
         runs = {}
         for agent in ("oracle", "weak"):
             sample = json.loads(sample_path.read_text())

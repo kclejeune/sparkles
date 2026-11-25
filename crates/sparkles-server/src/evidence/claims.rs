@@ -891,6 +891,7 @@ pub(crate) fn record_json(r: &sparkles::evidence::ProposedRecord) -> J {
 }
 
 /// The caller's authority fence, for a proposal made outside `POST /{ds}/claims`.
+#[cfg(feature = "mcp")]
 pub(crate) fn caller_fence(
     st: Arc<AppState>,
     p: Principal,
@@ -901,6 +902,7 @@ pub(crate) fn caller_fence(
 /// Propose `input` on `logical`, a branch of `main` or `main` itself, as `p`, reading
 /// references with `p`'s query view as `POST /{ds}/claims` does. A claims ingestion
 /// publishes its batch and its source registration this way.
+#[cfg(feature = "mcp")]
 pub(crate) fn propose_ingested(
     st: &Arc<AppState>,
     (main, logical): (&Arc<crate::state::Dataset>, &Arc<crate::state::Dataset>),

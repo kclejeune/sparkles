@@ -1,10 +1,13 @@
 //! Launch a CLI test server and learn the port from this child's own startup log.
 
+use regex::Regex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
+use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 pub fn serve() -> Command {
@@ -21,6 +24,32 @@ pub fn serve() -> Command {
 pub struct ServerProcess(Child);
 
 impl ServerProcess {
+    pub fn spawn(command: &mut Command, stderr: File) -> Self {
+        Self(
+            command
+                .env("NO_COLOR", "1")
+                .stdout(Stdio::null())
+                .stderr(stderr)
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    #[allow(dead_code)] // Used only by suites that expect the server to exit.
+    pub fn wait_for_exit(mut self, timeout: Duration, log: &Path) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sparkles serve did not exit within {timeout:?}; see {log:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait for the bind, which can precede dataset readiness.
     pub fn start(command: &mut Command, log: &Path) -> (Self, u16) {
         let stderr = OpenOptions::new()
@@ -31,37 +60,52 @@ impl ServerProcess {
         let mut reader = File::open(log).unwrap();
         // A restart may reuse the log. Read only what the new process writes.
         reader.seek(SeekFrom::End(0)).unwrap();
-        let mut server = Self(
-            command
-                .stdout(Stdio::null())
-                .stderr(stderr)
-                .spawn()
-                .unwrap(),
-        );
-        let deadline = Instant::now() + Duration::from_secs(120);
-        let mut bytes = Vec::new();
-        loop {
-            reader.read_to_end(&mut bytes).unwrap();
-            let text = String::from_utf8_lossy(&bytes);
-            if let Some(status) = server.try_wait().unwrap() {
-                panic!(
-                    "sparkles serve exited with {status} before reporting its listener:\n{text}"
-                );
-            }
-            if let Some(port) = text.lines().find_map(|line| {
-                let (_, address) = line.split_once(" listening on http://127.0.0.1:")?;
-                let (port, _) = address.split_once("/ (UI at /ui/)")?;
-                port.parse::<u16>().ok().filter(|&port| port != 0)
-            }) {
-                return (server, port);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "sparkles serve did not report its listener:\n{text}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut server = Self::spawn(command, stderr);
+        let port = wait_for_listener(reader, || server.try_wait());
+        (server, port)
     }
+}
+
+pub(super) fn wait_for_listener(
+    mut reader: impl Read,
+    mut try_wait: impl FnMut() -> std::io::Result<Option<ExitStatus>>,
+) -> u16 {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut bytes = Vec::new();
+    loop {
+        reader.read_to_end(&mut bytes).unwrap();
+        if let Some(status) = try_wait().unwrap() {
+            reader.read_to_end(&mut bytes).unwrap();
+            panic!(
+                "sparkles serve exited with {status} before reporting its listener:\n{}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(port) = listener_port(&text) {
+            return port;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sparkles serve did not report its listener:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn listener_port(output: &str) -> Option<u16> {
+    static RECORD: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"(?m)^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z +INFO sparkles: Sparkles \S+",
+            r" listening on http://(\S+)/ \(UI at /ui/\), opening [0-9]+ datasets\r?\n"
+        ))
+        .unwrap()
+    });
+    RECORD
+        .captures_iter(output)
+        .filter_map(|record| record[1].parse::<SocketAddr>().ok())
+        .find(|addr| addr.ip().is_loopback() && addr.port() != 0)
+        .map(|addr| addr.port())
 }
 
 impl Deref for ServerProcess {

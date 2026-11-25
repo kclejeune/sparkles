@@ -37,16 +37,20 @@
 # also asks `crash-harness verify --index` to compare the index with the recovered data.
 #
 # --flags are global flags given to `sparkles` before `serve`, to run the crashes with
-# and without group commit. --serve-flags are options of `serve`, for example a lower
+# and without group commit. PORT defaults to 0 so the kernel chooses the port.
+# --serve-flags are options of `serve`, for example a lower
 # --auto-compact-min-quads so that a short load crosses a compaction. Results go to
 # DIR/results.tsv and DIR/summary.json, and the
 # exit status is 0 only when every check passed.
 set -euo pipefail
 
+# shellcheck source=scripts/sparkles-test-server.sh
+source "$(dirname "${BASH_SOURCE[0]}")/sparkles-test-server.sh"
+
 MODE=${1:-}
 [ -n "$MODE" ] && shift
 FS='' BIN='' HARNESS='' WORK='' POINTS=1000 KILLS=200 SECONDS_RUN=20 CLIENTS=16 JOBS=8 FLAGS='' SERVE_FLAGS='' INDEX=none
-PORT=${PORT:-3931}
+PORT=${PORT:-0}
 POS=()
 while [ $# -gt 0 ]; do
   case $1 in
@@ -122,17 +126,16 @@ load_store() { # <store>: the seed, then the index of --index
 
 SPID=
 start_server() { # <store>
+  local log="$WORK/server.log" url
+  : > "$log"
   # the test file systems are small, so the server keeps only 64 MiB free instead of 1 GiB
   # shellcheck disable=SC2086 # the flags are a command line
-  "$BIN" $FLAGS serve --data "$WORK/srv" --loc "ds=$1" --port "$PORT" --no-access-log \
-    --min-free-disk-mb "${MIN_FREE_MB:-64}" $SERVE_FLAGS > "$WORK/server.log" 2>&1 &
+  RUST_LOG=info NO_COLOR=1 "$BIN" $FLAGS serve --data "$WORK/srv" --loc "ds=$1" --no-access-log \
+    --min-free-disk-mb "${MIN_FREE_MB:-64}" $SERVE_FLAGS --host 127.0.0.1 --port "$PORT" \
+    --log-format text >> "$log" 2>&1 &
   SPID=$!
-  for _ in $(seq 1 300); do
-    curl -sf "http://127.0.0.1:$PORT/\$/ready" > /dev/null 2>&1 && return 0
-    kill -0 "$SPID" 2> /dev/null || die "the server exited, see $WORK/server.log"
-    sleep 0.1
-  done
-  die "the server did not start"
+  url=$(sparkles_wait_ready "$SPID" "$log" 300) || die "the server did not start"
+  SERVER_ADDR=${url#http://}
 }
 kill_server() {
   [ -n "$SPID" ] && kill -9 "$SPID" 2> /dev/null || true
@@ -197,7 +200,7 @@ case $MODE in
     dmsetup message "$DM" 0 mark start
     start_server "$MNT/db"
     drc=0
-    "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/receipts.txt" \
+    "$HARNESS" drive --addr "$SERVER_ADDR" --ds ds --receipts "$WORK/receipts.txt" \
       --clients "$CLIENTS" --seconds "$SECONDS_RUN" --mark-cmd "dmsetup message $DM 0 mark" ${DRIVE_INDEX[@]+"${DRIVE_INDEX[@]}"} \
       > "$WORK/drive.json" || drc=$?
     cat "$WORK/drive.json"
@@ -254,7 +257,7 @@ case $MODE in
         : > "$receipts"
       fi
       start_server "$db"
-      "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$receipts" \
+      "$HARNESS" drive --addr "$SERVER_ADDR" --ds ds --receipts "$receipts" \
         --clients "$CLIENTS" --seconds 30 --run "k$i" ${DRIVE_INDEX[@]+"${DRIVE_INDEX[@]}"} > "$WORK/drive.json" 2> "$WORK/drive.err" &
       DPID=$!
       # a random moment between 0.2 and 2.2 seconds into the load
@@ -313,7 +316,7 @@ case $MODE in
     "$BIN" load --loc "$db" "$WORK/seed.nt" > "$WORK/load.log" 2>&1
     MIN_FREE_MB=1000000000 start_server "$db"
     drc=0
-    timeout 60 "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/selftest-refused.txt" \
+    timeout 60 "$HARNESS" drive --addr "$SERVER_ADDR" --ds ds --receipts "$WORK/selftest-refused.txt" \
       --clients 2 --seconds 2 > "$WORK/drive.json" 2> "$WORK/drive.err" || drc=$?
     kill_server
     if [ "$drc" != 2 ] || ! grep -q 'HTTP 507' "$WORK/drive.err"; then
@@ -322,13 +325,13 @@ case $MODE in
     log "refused writes: driver status $drc with a 507, as it should be"
     start_server "$db"
     drc=0
-    timeout 60 "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/selftest-ok.txt" \
+    timeout 60 "$HARNESS" drive --addr "$SERVER_ADDR" --ds ds --receipts "$WORK/selftest-ok.txt" \
       --clients 2 --seconds 2 > "$WORK/drive.json" 2> "$WORK/drive.err" || drc=$?
     [ "$drc" = 0 ] || die "the driver failed a working run with status $drc: $(cat "$WORK/drive.json" "$WORK/drive.err")"
     log "working run: $(cat "$WORK/drive.json")"
     # a run whose marks all fail would replay every image against no receipts
     drc=0
-    timeout 60 "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/selftest-marks.txt" \
+    timeout 60 "$HARNESS" drive --addr "$SERVER_ADDR" --ds ds --receipts "$WORK/selftest-marks.txt" \
       --clients 2 --seconds 2 --mark-cmd false > "$WORK/drive.json" 2> "$WORK/drive.err" || drc=$?
     kill_server
     rm -rf "$db"

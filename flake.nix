@@ -289,6 +289,7 @@
                   src = lib.fileset.toSource {
                     root = ./.;
                     fileset = lib.fileset.unions [
+                      ./scripts/sparkles-test-server.sh
                       ./scripts/test-jena-clients.sh
                       ./testsuite/jena-clients
                     ];

@@ -243,8 +243,9 @@ the default `sparkles serve` does, with a backup configuration that lets its API
 repositories under a temporary directory, a settings file (`--settings`) that also locks
 a model provider's endpoint, a model configuration (`--model-config`) with a declared
 key, and an in-memory dataset it declares (`--mem`). The teardown stops both servers and deletes
-the directories. `SPARKLES_E2E_KEEP=1` keeps them, with `server.log`, and
-`SPARKLES_E2E_PORT=N` runs the two servers on ports N and N + 1. A debug binary
+the directories. `SPARKLES_E2E_KEEP=1` keeps them, with `server.log`. Unset
+`SPARKLES_E2E_PORT` or set it to zero for two kernel-assigned ports. A positive value N
+runs the two servers on ports N and N + 1. A debug binary
 reads `build/` from disk, so run `pnpm build` first. The tests cover signing in with a
 password, a token minted on the tokens page that calls the API but cannot sign in to the
 UI, the query page, Explore, Similar, text search and the dataset history. Against the

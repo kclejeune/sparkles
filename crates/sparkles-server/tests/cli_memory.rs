@@ -802,7 +802,12 @@ fn memory_import_sync_and_brief() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let dead = format!("http://{}", listener.local_addr().unwrap());
     let o = post(&f.project().join("src/main.rs"), &dead);
-    drop(listener);
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "the hook attempted to open an HTTP connection"
+    );
     assert_eq!(o.status.code(), Some(0), "no request: {}", stdout(&o));
     assert!(stdout(&o).is_empty());
     // a memory file: that one file

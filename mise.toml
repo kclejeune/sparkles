@@ -440,8 +440,11 @@ description = "Check cited source paths and public documentation entry-page link
 run = ["python3 scripts/check-doc-paths.py --code", "python3 scripts/check-doc-links.py"]
 
 [tasks."test:quickstart"]
-description = "Build the server and exercise the README quick start"
-run = "mbx sparkles-task -- bash -ec 'mbx build -p sparkles-server && python3 scripts/test-quickstart.py'"
+description = "Exercise subprocess harnesses and build the server for the README quick start"
+run = [
+  "python3 scripts/test-sparkles-test-server.py",
+  "mbx sparkles-task -- bash -ec 'mbx build -p sparkles-server && python3 scripts/test-quickstart.py'",
+]
 
 [tasks.check]
 description = "Fast compile check of all crates and targets + UI type check"
@@ -729,7 +732,7 @@ run = "pnpm --dir js build"
 
 [tasks."node:test"]
 # The remote client's tests run against a debug server, so every Rust input counts.
-sources = ["@group:rust", "@group:js", "scripts/node-native.sh"]
+sources = ["@group:rust", "@group:js", "scripts/node-native.sh", "ui/scripts/server-process.mjs"]
 outputs = []
 tools = { node = "24" }
 description = "Test Node bindings, remote client and transaction/lifecycle contracts, with the remote client's tests against a debug server"

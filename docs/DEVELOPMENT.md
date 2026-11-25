@@ -471,7 +471,10 @@ retries no other test.
 
 Test harnesses that start `sparkles serve` use `--port 0` to let the kernel assign a
 loopback port when the child binds. They read the address from that child's startup log
-before making any HTTP requests. Tests that need an open dataset also wait for `/$/ready`.
+before making any HTTP requests. A harness that allows a fixed port still waits for its
+own child's bind record. Tests that need an open dataset wait for readiness or retry
+the query. The kernel assigns and binds the port in one operation, and can reuse the
+address once the child closes its listener.
 
 ### Partitioned test runs
 

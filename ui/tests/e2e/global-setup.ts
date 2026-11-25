@@ -31,7 +31,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { BROWSE_TURTLE } from '../browse-fixture';
-import { startServer, stopServer } from '../server-process';
+import { startServer, stopServer } from '../../scripts/server-process.mjs';
 import {
   BROWSE_EDIT_AUTH,
   BROWSE_EDIT_OPEN_GRAPH,

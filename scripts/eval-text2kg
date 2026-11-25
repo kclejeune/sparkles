@@ -66,7 +66,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from sparkles_test_server import stop_server, wait_for_listener
+from sparkles_test_server import DIRECT_HTTP, stop_server, wait_for_listener, wait_for_ready
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASE = "http://text2kgbench.example/"
@@ -177,7 +177,7 @@ class Client:
             h["Content-Type"] = "application/json"
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=h)
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with DIRECT_HTTP.open(req, timeout=120) as r:
                 raw = r.read().decode()
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"{method} {path}: {e.code} {e.read().decode()[:500]}") from None
@@ -194,18 +194,11 @@ def serve(args, dbs, tmp):
     log_path = tmp / "serve.log"
     with log_path.open("w") as log_file:
         proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT,
-                                env={**os.environ, "RUST_LOG": "info"})
+                                env={**os.environ, "RUST_LOG": "info", "NO_COLOR": "1"})
     try:
-        client = Client(wait_for_listener(proc, log_path, time.monotonic() + 60))
-        for _ in range(300):
-            try:
-                with urllib.request.urlopen(f"{client.base}/$/ready", timeout=5):
-                    return proc, client
-            except OSError:
-                if proc.poll() is not None:
-                    raise RuntimeError(f"sparkles serve exited; see {log_path}") from None
-                time.sleep(0.2)
-        raise RuntimeError(f"sparkles serve did not become ready; see {log_path}")
+        base = wait_for_listener(proc, log_path, time.monotonic() + 60)
+        wait_for_ready(proc, base, log_path, time.monotonic() + 60)
+        return proc, Client(base)
     except BaseException:
         stop_server(proc, timeout=20)
         raise

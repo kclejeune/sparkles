@@ -158,14 +158,19 @@ RULES = [
      ["licenses"]),
     # select() reads these two at both commits; see read_roots.
     (["Cargo.lock", "mise.toml"], ["base"]),
-    (["README.md", "scripts/test-quickstart.py"], ["quickstart"]),
+    ([
+        "README.md", "scripts/test-quickstart.py", "scripts/test-sparkles-test-server.py",
+        "scripts/sparkles_test_server.py", "scripts/sparkles-test-server.sh",
+        "scripts/power-loss.sh", "scripts/test-jena-clients.sh",
+        "ui/scripts/seed-design.mjs", "ui/scripts/perf-seed.mjs", "ui/scripts/server-process.mjs",
+    ], ["quickstart"]),
     (["scripts/build-fmt-wasm.sh"], ["wasm"]),
     (["ui/*"], ["base", "ui"]),
     # The Python tests also read Jena's patch fixtures from sparkles-core.
     (["crates/sparkles-py/*", "scripts/py-test.sh", "crates/sparkles-core/tests/patch/*"], ["base", "py"]),
     (["crates/sparkles-ffi/*", "jvm/*", "scripts/jvm-native.sh", "scripts/jvm-gradle.sh", "scripts/with-lock.py"],
      ["base", "jvm"]),
-    (["crates/sparkles-node/*", "js/*", "scripts/node-native.sh"], ["base", "node"]),
+    (["crates/sparkles-node/*", "js/*", "scripts/node-native.sh", "ui/scripts/server-process.mjs"], ["base", "node"]),
     (BINDING_SURFACE, ["base", "py", "jvm", "node"]),
     (CONFORMANCE_PATHS, ["conformance"]),
     (SPILL_PATHS, ["spill"]),

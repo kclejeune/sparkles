@@ -6,7 +6,9 @@ mod common;
 use serde_json::{Value as J, json};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(feature = "auth")]
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sparkles");

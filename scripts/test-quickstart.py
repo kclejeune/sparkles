@@ -27,21 +27,24 @@ with tempfile.TemporaryDirectory(prefix='sparkles-quickstart-') as work:
     log = Path(work) / 'server.log'
     with log.open('w') as stderr:
         process = subprocess.Popen(server.split() + ['--host', '127.0.0.1', '--port', '0'],
-                                   cwd=work, env={**env, 'RUST_LOG': 'info'},
+                                   cwd=work, env={**env, 'RUST_LOG': 'info', 'NO_COLOR': '1'},
                                    stdout=subprocess.DEVNULL, stderr=stderr)
     try:
         deadline = time.monotonic() + 30
         base = wait_for_listener(process, log, deadline)
         command = http.replace('localhost:3030', base.removeprefix('http://'))
-        while True:
+        query_env = {**env, 'no_proxy': '127.0.0.1', 'NO_PROXY': '127.0.0.1'}
+        while process.poll() is None:
             result = subprocess.run(command,
-                                    shell=True, cwd=work, env=env, text=True,
+                                    shell=True, cwd=work, env=query_env, text=True,
                                     capture_output=True, timeout=10)
-            if result.returncode == 0:
+            if result.returncode == 0 and process.poll() is None:
                 break
             if process.poll() is not None or time.monotonic() >= deadline:
                 raise RuntimeError(f'Server did not answer: {result.stderr}')
             time.sleep(0.1)
+        else:
+            raise RuntimeError(f'sparkles serve exited; see {log}')
         if result.stdout.replace('\r', '').strip() != 'n\n1':
             raise RuntimeError(f'Unexpected HTTP query response: {result.stdout!r}')
     finally:

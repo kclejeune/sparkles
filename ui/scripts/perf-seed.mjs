@@ -16,15 +16,15 @@
 // (default ../target/release/sparkles), SPARKLES_UI_DIR a UI build to serve instead of the
 // embedded one, SPARKLES_PERF_DATASETS the datasets to serve (default chebi,taxon,taxon1m,taxon300k,hub,unesco),
 // SPARKLES_PERF_DIR the data directory (default ~/.cache/sparkles-ui-seed/perf-data, where a
-// dataset that was loaded is kept), SPARKLES_SEED_PORT the port (default a free one) and
+// dataset that was loaded is kept), SPARKLES_SEED_PORT the port (default assigned by the kernel) and
 // SPARKLES_PERF_MEM the memory cap of the load and of the server (default 12G, applied with
 // systemd-run when it exists). The script prints `ready <url>` once every dataset answers.
 
-import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:net';
-import { homedir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { runSeedServer, waitForReady } from './server-process.mjs';
 
 const ROOT = resolve(import.meta.dirname, '../..');
 const BIN = process.env.SPARKLES_BIN ?? join(ROOT, 'target/release/sparkles');
@@ -53,22 +53,10 @@ const SOURCES = {
   unesco: { file: join(CACHE, 'unesco-thesaurus.ttl'), gen: null },
 };
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const scoped = (cmd, args) =>
   spawnSync('which', ['systemd-run']).status === 0
     ? ['systemd-run', ['--user', '--scope', '-q', '-p', `MemoryMax=${MEM}`, cmd, ...args]]
     : [cmd, args];
-
-function freePort() {
-  return new Promise((ok, fail) => {
-    const s = createServer();
-    s.once('error', fail);
-    s.listen(0, '127.0.0.1', () => {
-      const { port } = s.address();
-      s.close(() => ok(port));
-    });
-  });
-}
 
 function load(ds) {
   const marker = join(DIR, ds, '.perf-loaded');
@@ -94,8 +82,6 @@ async function main() {
   if (!existsSync(BIN)) throw new Error(`no Sparkles binary at ${BIN}`);
   mkdirSync(DIR, { recursive: true });
   for (const ds of WANT) load(ds);
-  const port = Number(process.env.SPARKLES_SEED_PORT ?? (await freePort()));
-  const url = `http://127.0.0.1:${port}`;
   const args = [
     'serve',
     '--data',
@@ -103,36 +89,21 @@ async function main() {
     '--host',
     '127.0.0.1',
     '--port',
-    String(port),
+    process.env.SPARKLES_SEED_PORT ?? '0',
   ];
   for (const ds of WANT) args.push('--loc', `${ds}=${join(DIR, ds)}`);
   const [cmd, full] = scoped(BIN, args);
-  const child = spawn(cmd, full, { stdio: 'inherit', env: process.env });
-  const stop = () => child.kill('SIGTERM');
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
-  child.once('exit', () => process.exit(0));
-  for (let i = 0; ; i++) {
-    try {
-      if ((await fetch(`${url}/$/ping`)).ok) break;
-    } catch {
-      // not listening yet
-    }
-    if (i > 1200) throw new Error('sparkles serve did not answer within 120 s');
-    await sleep(100);
+  const run = mkdtempSync(join(tmpdir(), 'sparkles-perf-seed-'));
+  try {
+    await runSeedServer(cmd, full, join(run, 'server.log'), 120_000, async (child, url) => {
+      for (const ds of WANT) await waitForReady(child, `${url}/$/ready/${ds}`, 600_000);
+    });
+  } finally {
+    rmSync(run, { recursive: true, force: true });
   }
-  for (const ds of WANT)
-    for (let i = 0; ; i++) {
-      const r = await fetch(`${url}/$/ready/${ds}`);
-      if (r.ok) break;
-      if (i > 6000) throw new Error(`dataset ${ds} did not open within 10 min`);
-      await sleep(100);
-    }
-  console.log(`ready ${url}`);
 }
 
 main().catch((e) => {
   console.error(e);
   process.exitCode = 1;
-  process.emit('SIGTERM');
 });
