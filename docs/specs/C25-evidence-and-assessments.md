@@ -572,7 +572,10 @@ predecessor revision in format 3 of `config.json` and write a versioned swap mar
 both copies against the durable registry before removing either one, synchronizing the
 database directory before removing the marker during live and startup rollbacks. Unmarked
 format 2 pairs reconcile against the registered UUID and fail closed on ambiguous
-identities, while unmarked format 1 swaps retain roll-forward recovery. Ambiguous legacy
+identities, while unmarked format 1 rows retain roll-forward recovery. Unmarked
+roll-forward synchronizes the database directory under the live store lock before
+removing a predecessor, and obsolete unmarked copies with no persistent registry row
+are retired without populating the live path. Ambiguous legacy
 journal records and competing staged restore copies remain available for recovery.
 Startup preserves
 unknown kept copies and reports retained paths, byte counts and incomplete counts.

@@ -2257,8 +2257,8 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     record_dir_sync(path.parent().unwrap_or(Path::new(".")));
     Ok(())
 }
-pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
-    #[cfg(test)]
+#[cfg(test)]
+pub(super) fn check_dir_sync_fail(dir: &Path) -> Result<()> {
     if FAIL_NEXT_DIR_SYNC.with_borrow_mut(|target| {
         if target.as_deref() == Some(dir) {
             *target = None;
@@ -2269,6 +2269,11 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     }) {
         return Err(std::io::Error::other("injected dir sync failure").into());
     }
+    Ok(())
+}
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    check_dir_sync_fail(dir)?;
     sparkles_core::fsutil::sync_dir(dir)?;
     #[cfg(test)]
     record_dir_sync(dir);

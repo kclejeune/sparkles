@@ -91,8 +91,11 @@ the predecessor when the predecessor revision survived or a live rollback failed
 removing the predecessor when the restored revision committed. Live and startup rollbacks
 synchronize the database directory after moving the live path aside and before clearing
 the swap marker. Unmarked format 2 pairs reconcile against the registered UUID before
-deleting either copy and refuse ambiguous identity combinations, while unmarked format 1
-swaps retain their existing roll-forward recovery. Publication synchronizes the journal
+deleting either copy and refuse ambiguous identity combinations. Unmarked format 1
+rows retain roll-forward recovery, unmarked roll-forward synchronizes the database
+directory under the live store lock before removing a predecessor, and obsolete
+unmarked copies without a persistent registry row are retired without populating the
+live path. Publication synchronizes the journal
 namespace before replacing the registry, and startup synchronizes the registry before
 acting on the delete outcome it observes. Power-loss recovery requires a filesystem and
 platform that support durable directory synchronization.

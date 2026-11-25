@@ -309,6 +309,8 @@ impl RecoveryDir {
     }
 
     pub fn sync(&self) -> crate::Result<()> {
+        #[cfg(test)]
+        super::check_dir_sync_fail(&self.path)?;
         #[cfg(unix)]
         self.file.sync_all()?;
         #[cfg(test)]

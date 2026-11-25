@@ -6,10 +6,17 @@
 //!   reconciled against the durable `config.json` revision (rolling back to the
 //!   predecessor when the predecessor revision survived, or removing `.replaced-*`
 //!   when the restored revision or a later registration survived);
-//! * an unmarked legacy `databases/.replaced-<ds>-<task>` with no `databases/<ds>` is
-//!   renamed back to `<ds>` with a WARN, and next to a `databases/<ds>` is removed. A
-//!   copy kept on purpose (`keepReplaced`) is renamed by the restore to `.kept-<ds>-<task>`,
-//!   which this rule does not match;
+//! * an unmarked legacy `databases/.replaced-<ds>-<task>` is reconciled against
+//!   `config.json`: for a persistent row with a UUID, `databases` is synchronized
+//!   under the live store lock before removing `.replaced-*` when `databases/<ds>`
+//!   matches the UUID and has `CURRENT`, a sole matching predecessor is restored
+//!   when it does not, and ambiguous identities fail closed; for a format 1
+//!   persistent row without a UUID, roll-forward synchronizes `databases` under
+//!   the live store lock before removing `.replaced-*` and a sole predecessor is
+//!   restored with a WARN when `databases/<ds>` is absent; with no persistent
+//!   registry row, obsolete `.replaced-*` copies are retired without populating
+//!   `databases/<ds>`. A copy kept on purpose (`keepReplaced`) is renamed by the
+//!   restore to `.kept-<ds>-<task>`, which this rule does not match;
 //! * `tmp/verify-*` (the scratch directory of a `restore`-level verification) and
 //!   `tmp/memory-backup-*` (the temporary copy of an in-memory dataset being backed
 //!   up) are removed.
@@ -333,107 +340,142 @@ pub(super) fn recover(
         }
 
         if !unmarked.is_empty() {
-            if let Some(reg_id) = registered.and_then(|row| row.id) {
-                let live = delete::child_if_present(databases, OsStr::new(&ds))?;
-                let live_id = match &live {
-                    Some(dir) => delete::dataset_id(dir)?,
-                    None => None,
-                };
-                let mut candidates = Vec::with_capacity(unmarked.len());
-                for dir in unmarked {
-                    let id = delete::dataset_id(&dir)?;
-                    candidates.push((dir, id));
-                }
-                match (live, live_id) {
-                    (Some(live_dir), Some(id)) if id == reg_id => {
-                        if !live_dir
-                            .entry(OsStr::new("CURRENT"))
-                            .is_ok_and(|entry| entry.kind == Kind::File)
-                        {
-                            return Err(Error::Corrupt(format!(
-                                "live dataset /{ds} is missing CURRENT while unmarked restore copies remain"
-                            )));
+            match registered {
+                Some(row) if row.id.is_some() => {
+                    let reg_id = row.id.expect("checked above");
+                    let live = delete::child_if_present(databases, OsStr::new(&ds))?;
+                    let live_id = match &live {
+                        Some(dir) => delete::dataset_id(dir)?,
+                        None => None,
+                    };
+                    let mut candidates = Vec::with_capacity(unmarked.len());
+                    for dir in unmarked {
+                        let id = delete::dataset_id(&dir)?;
+                        candidates.push((dir, id));
+                    }
+                    match (live, live_id) {
+                        (Some(live_dir), Some(id)) if id == reg_id => {
+                            if !live_dir
+                                .entry(OsStr::new("CURRENT"))
+                                .is_ok_and(|entry| entry.kind == Kind::File)
+                            {
+                                return Err(Error::Corrupt(format!(
+                                    "live dataset /{ds} is missing CURRENT while unmarked restore copies remain"
+                                )));
+                            }
+                            let _live_lock = delete::lock_candidate(&live_dir, reg_id, false)?;
+                            // Make the selected live directory name durable before touching any predecessor.
+                            databases.sync()?;
+                            for (replaced_dir, rep_id) in candidates {
+                                tracing::info!(
+                                    target: "sparkles::backup",
+                                    "removing {} (the restore of /{ds} had finished)",
+                                    replaced_dir.path().display()
+                                );
+                                let lock = match rep_id {
+                                    Some(id) => delete::lock_candidate(&replaced_dir, id, true)?,
+                                    None => delete::lock_dataset(&replaced_dir)?,
+                                };
+                                databases.remove_child(&replaced_dir, lock)?;
+                                databases.sync()?;
+                            }
                         }
-                        let _live_lock = delete::lock_candidate(&live_dir, reg_id, false)?;
-                        for (replaced_dir, rep_id) in candidates {
+                        (live, _) => {
+                            if candidates.len() != 1 || candidates[0].1 != Some(reg_id) {
+                                return Err(Error::Corrupt(format!(
+                                    "unmarked restore swap for /{ds} does not match registered identity {reg_id}"
+                                )));
+                            }
+                            let (replaced_dir, _) = candidates.pop().expect("single candidate");
+                            let mut replaced = delete::LockedDeleteDir::open(replaced_dir, reg_id)?;
+                            let discard = if let Some(mut live_dir) = live {
+                                let live_lock = delete::lock_dataset(&live_dir)?;
+                                #[cfg(not(unix))]
+                                let live_lock = {
+                                    drop(live_lock);
+                                    None
+                                };
+                                #[cfg(unix)]
+                                let live_lock = Some(live_lock);
+                                let discard_name = OsString::from(format!(
+                                    "{RESTORE_PREFIX}{ds}-rollback-{}",
+                                    Uuid::new_v4()
+                                ));
+                                databases.rename_child(&mut live_dir, &discard_name)?;
+                                databases.sync()?;
+                                Some((live_dir, live_lock))
+                            } else {
+                                None
+                            };
+                            tracing::warn!(
+                                target: "sparkles::backup",
+                                "an unmarked in-place restore of /{ds} did not commit: putting back {}",
+                                replaced.path().display()
+                            );
+                            replaced.rename(databases, &ds)?;
+                            databases.sync()?;
+                            drop(replaced);
+                            if let Some((discard_dir, live_lock)) = discard {
+                                let lock = match live_lock {
+                                    Some(lock) => lock,
+                                    None => delete::lock_dataset(&discard_dir)?,
+                                };
+                                databases.remove_child(&discard_dir, lock)?;
+                                databases.sync()?;
+                            }
+                        }
+                    }
+                }
+                Some(_) => {
+                    // Legacy format 1 persistent row without a recorded UUID.
+                    if let Some(live_dir) = delete::child_if_present(databases, OsStr::new(&ds))? {
+                        let _live_lock = delete::lock_dataset(&live_dir)?;
+                        databases.sync()?;
+                        for replaced_dir in unmarked {
                             tracing::info!(
                                 target: "sparkles::backup",
                                 "removing {} (the restore of /{ds} had finished)",
                                 replaced_dir.path().display()
                             );
-                            let lock = match rep_id {
-                                Some(id) => delete::lock_candidate(&replaced_dir, id, true)?,
-                                None => delete::lock_dataset(&replaced_dir)?,
-                            };
+                            let lock = delete::lock_dataset(&replaced_dir)?;
                             databases.remove_child(&replaced_dir, lock)?;
                             databases.sync()?;
                         }
-                    }
-                    (live, _) => {
-                        if candidates.len() != 1 || candidates[0].1 != Some(reg_id) {
+                    } else {
+                        if unmarked.len() != 1 {
                             return Err(Error::Corrupt(format!(
-                                "unmarked restore swap for /{ds} does not match registered identity {reg_id}"
+                                "multiple unmarked restore copies remain for legacy dataset /{ds}"
                             )));
                         }
-                        let (replaced_dir, _) = candidates.pop().expect("single candidate");
-                        let mut replaced = delete::LockedDeleteDir::open(replaced_dir, reg_id)?;
-                        let discard = if let Some(mut live_dir) = live {
-                            let live_lock = delete::lock_dataset(&live_dir)?;
-                            #[cfg(not(unix))]
-                            let live_lock = {
-                                drop(live_lock);
-                                None
-                            };
-                            #[cfg(unix)]
-                            let live_lock = Some(live_lock);
-                            let discard_name = OsString::from(format!(
-                                "{RESTORE_PREFIX}{ds}-rollback-{}",
-                                Uuid::new_v4()
-                            ));
-                            databases.rename_child(&mut live_dir, &discard_name)?;
-                            databases.sync()?;
-                            Some((live_dir, live_lock))
-                        } else {
-                            None
-                        };
-                        tracing::warn!(
-                            target: "sparkles::backup",
-                            "an unmarked in-place restore of /{ds} did not commit: putting back {}",
-                            replaced.path().display()
-                        );
-                        replaced.rename(databases, &ds)?;
-                        databases.sync()?;
-                        drop(replaced);
-                        if let Some((discard_dir, live_lock)) = discard {
-                            let lock = match live_lock {
-                                Some(lock) => lock,
-                                None => delete::lock_dataset(&discard_dir)?,
-                            };
-                            databases.remove_child(&discard_dir, lock)?;
-                            databases.sync()?;
-                        }
-                    }
-                }
-            } else {
-                for replaced_dir in unmarked {
-                    let path = replaced_dir.path().to_path_buf();
-                    let target = databases.path().join(&ds);
-                    if target.exists() {
-                        tracing::info!(
-                            target: "sparkles::backup",
-                            "removing {} (the restore of /{ds} had finished)",
-                            path.display()
-                        );
-                        std::fs::remove_dir_all(&path)?;
-                    } else {
+                        let mut replaced_dir = unmarked.pop().expect("single candidate");
+                        let lock = delete::lock_dataset(&replaced_dir)?;
+                        #[cfg(not(unix))]
+                        drop(lock);
                         tracing::warn!(
                             target: "sparkles::backup",
                             "an in-place restore of /{ds} was interrupted: putting back {}",
-                            path.display()
+                            replaced_dir.path().display()
                         );
-                        std::fs::rename(&path, &target)?;
+                        databases.rename_child(&mut replaced_dir, OsStr::new(&ds))?;
+                        databases.sync()?;
+                        #[cfg(unix)]
+                        drop(lock);
                     }
+                }
+                None => {
+                    // No persistent registry row owns this alias: retire obsolete staged
+                    // copies without populating the live path.
                     databases.sync()?;
+                    for replaced_dir in unmarked {
+                        tracing::info!(
+                            target: "sparkles::backup",
+                            "removing obsolete {} (/{ds} is not a registered persistent dataset)",
+                            replaced_dir.path().display()
+                        );
+                        let lock = delete::lock_dataset(&replaced_dir)?;
+                        databases.remove_child(&replaced_dir, lock)?;
+                        databases.sync()?;
+                    }
                 }
             }
         }
@@ -627,6 +669,8 @@ mod tests {
 
     #[test]
     fn leftovers_are_cleaned_up() {
+        use super::super::{DatasetKind, RegistryEntry};
+
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("databases");
         for d in [
@@ -634,6 +678,7 @@ mod tests {
             ".replaced-a-5",
             "a",
             ".replaced-b-6",
+            ".replaced-z-8",
             ".kept-c-7",
         ] {
             std::fs::create_dir_all(db.join(d)).unwrap();
@@ -643,13 +688,25 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("tmp").join("memory-backup-x1")).unwrap();
         let catalog = RecoveryDir::open(dir.path()).unwrap();
         let databases = delete::open_databases(&catalog).unwrap();
-        recover(
-            &catalog,
-            &databases,
-            &Registry::default(),
-            &Default::default(),
-        )
-        .unwrap();
+        let legacy_registry = Registry {
+            datasets: vec![
+                RegistryEntry {
+                    name: "a".into(),
+                    kind: DatasetKind::Persistent,
+                    id: None,
+                    revision: None,
+                    reasoning: None,
+                },
+                RegistryEntry {
+                    name: "b".into(),
+                    kind: DatasetKind::Persistent,
+                    id: None,
+                    revision: None,
+                    reasoning: None,
+                },
+            ],
+        };
+        recover(&catalog, &databases, &legacy_registry, &Default::default()).unwrap();
         let mut left: Vec<String> = std::fs::read_dir(&db)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())

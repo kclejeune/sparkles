@@ -3282,6 +3282,262 @@ mod tests {
     }
 
     #[test]
+    fn r5_unmarked_roll_forward_syncs_databases_before_removing_predecessor() {
+        use super::super::{CONFIG_FILE, FAIL_NEXT_DIR_SYNC, take_catalog_dir_syncs};
+        use crate::store::Store;
+
+        for format_version in [2u32, 1u32] {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let predecessor = catalog.create("ds", &Default::default()).unwrap();
+            predecessor
+                .update("INSERT DATA { <urn:old> <urn:p> 1 }")
+                .unwrap();
+            let id = predecessor.dataset_id();
+            let old_head = predecessor.head_commit();
+            drop(predecessor);
+            drop(catalog);
+
+            let db = std::path::absolute(dir.path()).unwrap().join("databases");
+            let replaced = db.join(".replaced-ds-5");
+            copy_store(&db.join("ds"), &replaced);
+            let live = Store::open_existing(&db.join("ds"), Default::default(), Some(id)).unwrap();
+            crate::sparql::update::update(
+                &live,
+                "INSERT DATA { <urn:new> <urn:p> 2 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let new_head = live.head_commit();
+            assert_ne!(old_head, new_head);
+            drop(live);
+
+            assert!(
+                !std::fs::read_dir(&db)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .any(|n| n.starts_with(".restore-")),
+                "fixture must have no .restore-* leftover"
+            );
+
+            let config = if format_version == 2 {
+                serde_json::json!({
+                    "format": 2,
+                    "datasets": [{
+                        "name": "ds",
+                        "type": "persistent",
+                        "id": id,
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "format": 1,
+                    "datasets": [{
+                        "name": "ds",
+                        "type": "persistent",
+                    }]
+                })
+            };
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+
+            // Injecting a failure on the pre-cleanup `databases` sync must preserve both copies.
+            FAIL_NEXT_DIR_SYNC.set(Some(db.clone()));
+            let err = Catalog::open(dir.path(), Default::default())
+                .err()
+                .expect("pre-cleanup databases sync failure must abort recovery");
+            assert!(
+                FAIL_NEXT_DIR_SYNC.replace(None).is_none(),
+                "format {format_version}: databases sync must be attempted before cleanup: {err}"
+            );
+            assert!(
+                err.to_string().contains("injected dir sync failure"),
+                "format {format_version}: {err}"
+            );
+            assert!(
+                db.join("ds/CURRENT").exists() && replaced.join("CURRENT").exists(),
+                "format {format_version}: failed pre-cleanup sync must preserve both live and predecessor"
+            );
+            let live_check =
+                Store::open_existing(&db.join("ds"), Default::default(), Some(id)).unwrap();
+            assert_eq!(live_check.head_commit(), new_head);
+            drop(live_check);
+            let pred_check = Store::open_existing(&replaced, Default::default(), Some(id)).unwrap();
+            assert_eq!(pred_check.head_commit(), old_head);
+            drop(pred_check);
+
+            // Clean open must sync `databases` before unlinking `.replaced-ds-5`, then keep live.
+            let _ = take_catalog_dir_syncs();
+            #[cfg(unix)]
+            let syncs_before_unlink = {
+                let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let slot = captured.clone();
+                let target = replaced.clone();
+                super::super::delete_fs::DURING_REMOVAL.set(Some(Box::new(move |path| {
+                    if path == target {
+                        *slot.borrow_mut() = Some(take_catalog_dir_syncs());
+                    }
+                })));
+                captured
+            };
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            #[cfg(unix)]
+            {
+                super::super::delete_fs::DURING_REMOVAL.set(None);
+                let syncs = syncs_before_unlink
+                    .borrow_mut()
+                    .take()
+                    .expect("predecessor removal must run through RecoveryDir::remove_child");
+                assert!(
+                    syncs.contains(&db),
+                    "format {format_version}: databases must sync before unlinking predecessor; saw {syncs:?}"
+                );
+            }
+            assert!(
+                reopened.refusal("ds").is_none(),
+                "{:?}",
+                reopened.refusals()
+            );
+            let active = reopened.get("ds").unwrap();
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (id, new_head),
+                "format {format_version}"
+            );
+            assert!(!replaced.exists());
+        }
+    }
+
+    #[test]
+    fn r5_empty_registry_stale_unmarked_predecessor_and_format3_trash_reuses_alias() {
+        use super::super::CONFIG_FILE;
+        use crate::store::Store;
+
+        // Subtest A: empty format 2 registry + stale unmarked predecessor + committed format 3 trash.
+        // Retiring the journal on open 1 must not allow open 2 to roll back the stale predecessor,
+        // and the alias must be cleanly reusable.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let intent = interrupted_delete(dir.path(), CRASH_AFTER_SAVE);
+            let db = dir.path().join("databases");
+            let kept = db.join(intent.kept_name());
+            let trash = db.join(intent.trash_name());
+            std::fs::rename(&kept, &trash).unwrap();
+
+            let replaced = db.join(".replaced-doomed-9");
+            let stale = Store::open(&replaced, Default::default()).unwrap();
+            crate::sparql::update::update(
+                &stale,
+                "INSERT DATA { <urn:stale> <urn:p> 99 }",
+                &Default::default(),
+            )
+            .unwrap();
+            let stale_id = stale.dataset_id();
+            drop(stale);
+
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                serde_json::to_vec(&serde_json::json!({
+                    "format": 2,
+                    "datasets": [],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let journal = dir.path().join(INTENT_FILE);
+            std::fs::write(
+                &journal,
+                serde_json::to_vec(&serde_json::json!({
+                    "format": 3,
+                    "intents": [{
+                        "name": intent.name,
+                        "id": intent.id,
+                        "token": intent.token,
+                        "state": "prepared",
+                    }],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            assert!(!db.join("doomed").exists());
+            assert!(replaced.join("CURRENT").exists() && trash.join("CURRENT").exists());
+
+            // Open 1: trash is cleaned and journal retired; stale predecessor must not populate live.
+            let first = Catalog::open(dir.path(), Default::default()).unwrap();
+            assert!(first.get("doomed").is_none());
+            assert!(first.refusal("doomed").is_none());
+            assert!(
+                !db.join("doomed").exists(),
+                "stale unmarked predecessor must not repopulate empty live alias"
+            );
+            assert!(!replaced.exists());
+            assert!(!trash.exists() && !journal.exists());
+            drop(first);
+
+            // Open 2: with the journal gone, the alias remains free and reusable.
+            let second = Catalog::open(dir.path(), Default::default()).unwrap();
+            assert!(second.get("doomed").is_none());
+            assert!(second.refusal("doomed").is_none());
+            assert!(!db.join("doomed").exists());
+            let fresh = second.create("doomed", &Default::default()).unwrap();
+            assert_ne!(fresh.dataset_id(), stale_id);
+            assert_eq!(fresh.len(), 0);
+            fresh
+                .update("INSERT DATA { <urn:fresh> <urn:p> 1 }")
+                .unwrap();
+            let fresh_id = fresh.dataset_id();
+            let fresh_head = fresh.head_commit();
+            drop((fresh, second));
+
+            let third = Catalog::open(dir.path(), Default::default()).unwrap();
+            let active = third.get("doomed").unwrap();
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (fresh_id, fresh_head)
+            );
+        }
+
+        // Subtest B: an existing format 1 persistent row without a UUID retains legacy rollback.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(dir.path(), Default::default()).unwrap();
+            let ds = catalog.create("legacy", &Default::default()).unwrap();
+            ds.update("INSERT DATA { <urn:legacy> <urn:p> 5 }").unwrap();
+            let legacy_id = ds.dataset_id();
+            let legacy_head = ds.head_commit();
+            drop((ds, catalog));
+
+            let db = dir.path().join("databases");
+            let replaced = db.join(".replaced-legacy-4");
+            std::fs::rename(db.join("legacy"), &replaced).unwrap();
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                serde_json::to_vec(&serde_json::json!({
+                    "format": 1,
+                    "datasets": [{
+                        "name": "legacy",
+                        "type": "persistent",
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+            let active = reopened.get("legacy").unwrap();
+            assert_eq!(
+                (active.dataset_id(), active.head_commit()),
+                (legacy_id, legacy_head)
+            );
+            assert!(!replaced.exists());
+        }
+    }
+
+    #[test]
     fn staging_failures_and_precommit_crashes_restore_the_registered_dataset() {
         use super::super::{
             DELETE_BEFORE_MOVE, DELETE_FAIL, DELETE_ROLLBACK_MOVE, DELETE_ROLLBACK_SYNC,
