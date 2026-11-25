@@ -15,13 +15,14 @@
 //!   up) are removed.
 
 use super::delete;
-use super::delete_fs::RecoveryDir;
-use super::{CONFIG_FILE, Registry, write_file_atomic};
+use super::delete_fs::{Kind, RecoveryDir};
+use super::{CONFIG_FILE, Registry};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read};
+#[cfg(feature = "backup")]
 use std::path::Path;
 use uuid::Uuid;
 
@@ -30,10 +31,11 @@ pub const RESTORE_PREFIX: &str = ".restore-";
 /// Prefix of the replaced directory of an in-place restore: `.replaced-<ds>-<task>`.
 pub const REPLACED_PREFIX: &str = ".replaced-";
 /// Prefix of a replaced directory kept with `keepReplaced`: `.kept-<ds>-<task>`.
+#[cfg(feature = "backup")]
 pub const KEPT_PREFIX: &str = super::KEPT_PREFIX;
 /// Versioned marker stored inside `.replaced-<ds>-<task>` for registry-backed swaps.
 pub(super) const SWAP_MARKER: &str = ".restore-swap.json";
-const SWAP_MARKER_FORMAT: u32 = 1;
+const SWAP_MARKER_FORMAT: u32 = sparkles_core::formats::RESTORE_SWAP_MARKER.writes;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +49,7 @@ pub(super) struct SwapMarker {
     pub(super) restored_revision: Uuid,
 }
 
+#[cfg(feature = "backup")]
 impl SwapMarker {
     pub(super) fn new(
         dataset: impl Into<String>,
@@ -66,18 +69,34 @@ impl SwapMarker {
     }
 }
 
+#[cfg(feature = "backup")]
 pub(super) fn write_swap_marker(replaced: &Path, marker: &SwapMarker) -> Result<()> {
     let bytes = serde_json::to_vec(marker).map_err(|e| Error::invalid(e.to_string()))?;
-    write_file_atomic(&replaced.join(SWAP_MARKER), &bytes)
+    super::write_file_atomic(&replaced.join(SWAP_MARKER), &bytes)
 }
 
-pub(super) fn remove_swap_marker(replaced: &Path) -> std::io::Result<()> {
+#[cfg(all(feature = "backup", test))]
+type MarkerRemoveHook = Box<dyn FnMut(&Path)>;
+#[cfg(all(feature = "backup", test))]
+thread_local! {
+    pub(crate) static BEFORE_SWAP_MARKER_REMOVE: std::cell::RefCell<Option<MarkerRemoveHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "backup")]
+pub(super) fn remove_swap_marker(replaced: &Path) -> Result<()> {
+    #[cfg(test)]
+    BEFORE_SWAP_MARKER_REMOVE.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook(replaced);
+        }
+    });
     match std::fs::remove_file(replaced.join(SWAP_MARKER)) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     }
-    sparkles_core::fsutil::sync_dir(replaced)
+    super::sync_dir(replaced)
 }
 
 fn read_swap_marker(replaced: &RecoveryDir, dataset: &str) -> Result<Option<SwapMarker>> {
@@ -166,7 +185,6 @@ pub(super) fn recover(
     let mut restore_leftovers = Vec::new();
     let mut replaced_entries: BTreeMap<String, Vec<(RecoveryDir, Option<SwapMarker>)>> =
         BTreeMap::new();
-    let mut has_marked = false;
     for entry in databases.names()? {
         let name = entry?;
         let text = name.to_string_lossy().into_owned();
@@ -178,7 +196,6 @@ pub(super) fn recover(
             }
             let dir = databases.child(&name)?;
             let marker = read_swap_marker(&dir, ds)?;
-            has_marked |= marker.is_some();
             replaced_entries
                 .entry(ds.to_string())
                 .or_default()
@@ -198,8 +215,8 @@ pub(super) fn recover(
         databases.sync()?;
     }
 
-    // Make the observed registry durable before any marked swap removes either copy.
-    if has_marked {
+    // Make the observed registry durable before any swap removes either copy.
+    if !replaced_entries.is_empty() {
         catalog.sync()?;
     }
 
@@ -267,11 +284,13 @@ pub(super) fn recover(
                     let discard_name =
                         OsString::from(format!("{RESTORE_PREFIX}{ds}-rollback-{}", Uuid::new_v4()));
                     databases.rename_child(&mut live, &discard_name)?;
-                    databases.sync()?;
                     Some((live, live_lock))
                 } else {
                     None
                 };
+            // Establish that `live` is durably absent before clearing the swap marker,
+            // even when an earlier failed live rollback left it visibly missing without a sync.
+            databases.sync()?;
             tracing::warn!(
                 target: "sparkles::backup",
                 "an in-place restore of /{ds} did not commit: putting back {}",
@@ -313,25 +332,110 @@ pub(super) fn recover(
             databases.sync()?;
         }
 
-        for replaced_dir in unmarked {
-            let path = replaced_dir.path().to_path_buf();
-            let target = databases.path().join(&ds);
-            if target.exists() {
-                tracing::info!(
-                    target: "sparkles::backup",
-                    "removing {} (the restore of /{ds} had finished)",
-                    path.display()
-                );
-                std::fs::remove_dir_all(&path)?;
+        if !unmarked.is_empty() {
+            if let Some(reg_id) = registered.and_then(|row| row.id) {
+                let live = delete::child_if_present(databases, OsStr::new(&ds))?;
+                let live_id = match &live {
+                    Some(dir) => delete::dataset_id(dir)?,
+                    None => None,
+                };
+                let mut candidates = Vec::with_capacity(unmarked.len());
+                for dir in unmarked {
+                    let id = delete::dataset_id(&dir)?;
+                    candidates.push((dir, id));
+                }
+                match (live, live_id) {
+                    (Some(live_dir), Some(id)) if id == reg_id => {
+                        if !live_dir
+                            .entry(OsStr::new("CURRENT"))
+                            .is_ok_and(|entry| entry.kind == Kind::File)
+                        {
+                            return Err(Error::Corrupt(format!(
+                                "live dataset /{ds} is missing CURRENT while unmarked restore copies remain"
+                            )));
+                        }
+                        let _live_lock = delete::lock_candidate(&live_dir, reg_id, false)?;
+                        for (replaced_dir, rep_id) in candidates {
+                            tracing::info!(
+                                target: "sparkles::backup",
+                                "removing {} (the restore of /{ds} had finished)",
+                                replaced_dir.path().display()
+                            );
+                            let lock = match rep_id {
+                                Some(id) => delete::lock_candidate(&replaced_dir, id, true)?,
+                                None => delete::lock_dataset(&replaced_dir)?,
+                            };
+                            databases.remove_child(&replaced_dir, lock)?;
+                            databases.sync()?;
+                        }
+                    }
+                    (live, _) => {
+                        if candidates.len() != 1 || candidates[0].1 != Some(reg_id) {
+                            return Err(Error::Corrupt(format!(
+                                "unmarked restore swap for /{ds} does not match registered identity {reg_id}"
+                            )));
+                        }
+                        let (replaced_dir, _) = candidates.pop().expect("single candidate");
+                        let mut replaced = delete::LockedDeleteDir::open(replaced_dir, reg_id)?;
+                        let discard = if let Some(mut live_dir) = live {
+                            let live_lock = delete::lock_dataset(&live_dir)?;
+                            #[cfg(not(unix))]
+                            let live_lock = {
+                                drop(live_lock);
+                                None
+                            };
+                            #[cfg(unix)]
+                            let live_lock = Some(live_lock);
+                            let discard_name = OsString::from(format!(
+                                "{RESTORE_PREFIX}{ds}-rollback-{}",
+                                Uuid::new_v4()
+                            ));
+                            databases.rename_child(&mut live_dir, &discard_name)?;
+                            databases.sync()?;
+                            Some((live_dir, live_lock))
+                        } else {
+                            None
+                        };
+                        tracing::warn!(
+                            target: "sparkles::backup",
+                            "an unmarked in-place restore of /{ds} did not commit: putting back {}",
+                            replaced.path().display()
+                        );
+                        replaced.rename(databases, &ds)?;
+                        databases.sync()?;
+                        drop(replaced);
+                        if let Some((discard_dir, live_lock)) = discard {
+                            let lock = match live_lock {
+                                Some(lock) => lock,
+                                None => delete::lock_dataset(&discard_dir)?,
+                            };
+                            databases.remove_child(&discard_dir, lock)?;
+                            databases.sync()?;
+                        }
+                    }
+                }
             } else {
-                tracing::warn!(
-                    target: "sparkles::backup",
-                    "an in-place restore of /{ds} was interrupted: putting back {}",
-                    path.display()
-                );
-                std::fs::rename(&path, &target)?;
+                for replaced_dir in unmarked {
+                    let path = replaced_dir.path().to_path_buf();
+                    let target = databases.path().join(&ds);
+                    if target.exists() {
+                        tracing::info!(
+                            target: "sparkles::backup",
+                            "removing {} (the restore of /{ds} had finished)",
+                            path.display()
+                        );
+                        std::fs::remove_dir_all(&path)?;
+                    } else {
+                        tracing::warn!(
+                            target: "sparkles::backup",
+                            "an in-place restore of /{ds} was interrupted: putting back {}",
+                            path.display()
+                        );
+                        std::fs::rename(&path, &target)?;
+                    }
+                    databases.sync()?;
+                }
             }
-            databases.sync()?;
         }
     }
 
@@ -347,6 +451,7 @@ pub(super) fn recover(
     Ok(())
 }
 
+#[cfg(feature = "backup")]
 impl super::Catalog {
     /// Publish a downloaded restore under a reservation made before queuing work.
     #[doc(hidden)]

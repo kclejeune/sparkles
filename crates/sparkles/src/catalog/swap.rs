@@ -65,14 +65,25 @@ pub fn replace_in_place(
 }
 
 #[cfg(test)]
+type RollbackHook = Box<dyn FnMut()>;
+#[cfg(test)]
 thread_local! {
     /// Stop the swap after rename 1, 2 or 3 without cleaning up, as a crash would.
     pub(crate) static CRASH_AFTER: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// Inject a failure on the first live rollback rename after a pre-replacement error.
     pub(crate) static FAIL_ROLLBACK_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Runs at the start of live `BeforeReplace` rollback before moving `root` aside.
+    pub(crate) static ROLLBACK_HOOK: std::cell::RefCell<Option<RollbackHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn rollback_rename_fail_point() -> std::io::Result<()> {
+    #[cfg(test)]
+    ROLLBACK_HOOK.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook();
+        }
+    });
     #[cfg(test)]
     if FAIL_ROLLBACK_RENAME.replace(false) {
         return Err(std::io::Error::other(
@@ -320,33 +331,37 @@ fn swap(
         restored_id,
         restored_revision,
     );
-    if let Err(error) = write_swap_marker(&replaced, &marker).and_then(|()| sync_dir(&databases)) {
+    // Make rename 1 durable before writing the swap marker into `replaced` so a
+    // power loss cannot lose rename 1 while leaving the marker inside `root`.
+    if let Err(error) = sync_dir(&databases).and_then(|()| write_swap_marker(&replaced, &marker)) {
         let err = BackupError::internal(format!(
             "marking the in-place restore swap of /{name}: {error:#}"
         ));
         if let Err(e2) = remove_swap_marker(&replaced)
-            .and_then(|()| std::fs::rename(&replaced, &root))
-            .map_err(crate::Error::from)
+            .and_then(|()| std::fs::rename(&replaced, &root).map_err(crate::Error::from))
             .and_then(|()| sync_dir(&databases))
         {
-            return Err(BackupError::internal(format!(
+            let message = format!(
                 "{err}; putting back {} failed too: {e2} (the next start repairs it)",
                 replaced.display()
-            )));
+            );
+            st.mark_swap_rollback_failed(name, message.clone());
+            return Err(BackupError::internal(message));
         }
         return Err(reopen_after(st, name, err));
     }
     if let Err(e) = std::fs::rename(restored, &root) {
         let err = io("moving the restored copy to", &root, e);
         if let Err(e2) = remove_swap_marker(&replaced)
-            .and_then(|()| std::fs::rename(&replaced, &root))
-            .map_err(crate::Error::from)
+            .and_then(|()| std::fs::rename(&replaced, &root).map_err(crate::Error::from))
             .and_then(|()| sync_dir(&databases))
         {
-            return Err(BackupError::internal(format!(
+            let message = format!(
                 "{err}; putting back {} failed too: {e2} (the next start repairs it)",
                 replaced.display()
-            )));
+            );
+            st.mark_swap_rollback_failed(name, message.clone());
+            return Err(BackupError::internal(message));
         }
         return Err(reopen_after(st, name, err));
     }
@@ -398,11 +413,14 @@ fn swap(
         }
         Err(RegistryCommitError::BeforeReplace(error)) => {
             let failed = databases.join(format!("{RESTORE_PREFIX}{name}-{task}"));
+            // Synchronize moving the restored copy aside before removing the swap
+            // marker so power loss cannot leave both live C and unmarked staged B.
             let back = rollback_rename_fail_point()
                 .and_then(|()| std::fs::rename(&root, &failed))
-                .and_then(|()| remove_swap_marker(&replaced))
-                .and_then(|()| std::fs::rename(&replaced, &root))
                 .map_err(crate::Error::from)
+                .and_then(|()| sync_dir(&databases))
+                .and_then(|()| remove_swap_marker(&replaced))
+                .and_then(|()| std::fs::rename(&replaced, &root).map_err(crate::Error::from))
                 .and_then(|()| sync_dir(&databases));
             let err = BackupError::internal(format!("publishing the restored /{name}: {error}"));
             match back {

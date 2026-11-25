@@ -389,10 +389,10 @@ pub const LINK: FileKind = FileKind {
 pub const CATALOG: FileKind = FileKind {
     id: "catalog",
     files: "config.json of the data directory",
-    marker: "`format`, absent meaning 1. Format 2 records persistent dataset UUIDs and swap revisions",
+    marker: "`format`, absent meaning 1. Format 2 records persistent dataset UUIDs; format 3 adds swap revisions",
     class: Class::Primary,
-    writes: 2,
-    reads: &[1, 2],
+    writes: 3,
+    reads: &[1, 2, 3],
 };
 
 /// The full-text index.
@@ -619,6 +619,16 @@ pub const MIGRATION_STATE: FileKind = FileKind {
     reads: &[1],
 };
 
+/// Staged in-place restore swap state stored inside the replaced predecessor directory.
+pub const RESTORE_SWAP_MARKER: FileKind = FileKind {
+    id: "restore-swap-marker",
+    files: "databases/.replaced-NAME-TASK/.restore-swap.json",
+    marker: "JSON `format`, naming the dataset, predecessor and restored identities and swap revisions",
+    class: Class::Config,
+    writes: 1,
+    reads: &[1],
+};
+
 /// The family prefix of a sealed server runtime secret, including unknown versions.
 pub const SEALED_SECRET_FAMILY: &str = "sparkles-sealed-secret/";
 /// The exact existing v1 writer prefix, checked against [`RUNTIME_SECRETS`].
@@ -696,6 +706,7 @@ pub const KINDS: &[&FileKind] = &[
     &LINK,
     &CATALOG,
     &MIGRATION_STATE,
+    &RESTORE_SWAP_MARKER,
     &RUNTIME_SECRETS,
     &SECRETS_KEY,
     &TEXT,
@@ -821,7 +832,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     named(ds("graphrag/state.json", 3), "version"),
     named(ds("graphrag/ledger.json", 1), "version"),
     // the data directory
-    server("config.json", 2),
+    server("config.json", 3),
     server("delete.json", 4),
     server("models.json", 1),
     server("notifications.json", 1),
@@ -1559,6 +1570,29 @@ mod algo_catalog_registry_tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["writes"], 2);
+    }
+
+    #[test]
+    fn catalog_and_restore_swap_marker_formats_are_registered() {
+        let catalog = kind("catalog").expect("catalog format must be registered");
+        assert_eq!(catalog.writes, 3);
+        assert_eq!(catalog.reads, &[1, 2, 3]);
+        assert_eq!(settings_file("config.json").unwrap().writes, 3);
+
+        let marker =
+            kind("restore-swap-marker").expect("restore swap marker format must be registered");
+        assert_eq!(marker.writes, 1);
+        assert_eq!(marker.reads, &[1]);
+        assert_eq!(marker.class, Class::Config);
+
+        let inventory = report();
+        let kinds = inventory["kinds"].as_array().unwrap();
+        assert!(kinds.iter().any(|k| k["id"] == "restore-swap-marker"));
+        assert!(
+            kinds
+                .iter()
+                .any(|k| k["id"] == "catalog" && k["writes"] == 3)
+        );
     }
 }
 

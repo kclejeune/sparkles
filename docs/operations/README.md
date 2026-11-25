@@ -84,15 +84,18 @@ on disk.
 
 An indeterminate registry commit keeps the name unavailable until the catalog reopens.
 A restore with that outcome preserves its published root. An in-place restore records a
-swap revision in `config.json` and writes a versioned swap marker in its `.replaced-`
-predecessor directory before moving the restored copy into place. Startup synchronizes
-the registry before reconciling marked swaps, restoring the predecessor when the
-predecessor revision survived or a live rollback failed and removing the predecessor
-when the restored revision committed. Unmarked swaps from older releases retain their
-existing roll-forward recovery. Publication synchronizes the journal namespace before
-replacing the registry, and startup synchronizes the registry before acting on the
-delete outcome it observes. Power-loss recovery requires a filesystem and platform that
-support durable directory synchronization.
+swap revision in format 3 of `config.json` and writes a versioned swap marker in its
+`.replaced-` predecessor directory before moving the restored copy into place. All
+catalog builds synchronize the registry and reconcile marked swaps on startup, restoring
+the predecessor when the predecessor revision survived or a live rollback failed and
+removing the predecessor when the restored revision committed. Live and startup rollbacks
+synchronize the database directory after moving the live path aside and before clearing
+the swap marker. Unmarked format 2 pairs reconcile against the registered UUID before
+deleting either copy and refuse ambiguous identity combinations, while unmarked format 1
+swaps retain their existing roll-forward recovery. Publication synchronizes the journal
+namespace before replacing the registry, and startup synchronizes the registry before
+acting on the delete outcome it observes. Power-loss recovery requires a filesystem and
+platform that support durable directory synchronization.
 
 Warnings report `path`, `retained_bytes`, and whether the byte count is complete.
 Startup leaves unrecognized kept entries in place. Copies marked by a `keepReplaced`

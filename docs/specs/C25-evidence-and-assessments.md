@@ -552,25 +552,28 @@ back before reopen, or remains unavailable with its original bytes and reported 
 Uncertain moved data uses the existing retained `.kept-<name>-<token>` convention.
 Managed persistent deletes record an intent, stage the source and synchronize its new
 name before removing the registry row. Format 2 of `config.json` stores persistent
-dataset UUIDs and swap revisions. Format 4 of `delete.json` records the prepared stage
-and can record a committed decision before a later registration reuses the alias and
-UUID. Startup validates the journal and registry before recovering any operation, and
-checks registered UUIDs when opening persistent datasets. For a prepared delete, it
-restores a verified staged copy when the original UUID remains registered and reclaims
-the copy when the registry records the deletion or a replacement. It takes the store
-process lock before moving or removing a copy and synchronizes the database directory
-before retiring the intent. Live deletion and startup recovery hold the process lock
-while removing store contents. Format 3 prepared records retain their provenance on
-rewrite; a sole verified `.deleted-<token>` trash copy proves the older delete
-committed and allows a same-UUID replacement to open, while an ambiguous kept copy or
-conflicting path keeps the registration closed and retains the staged copy. Restore
-publication synchronizes the journal before replacing the registry and preserves
-dataset bytes after an indeterminate registry replacement. In-place restores write a
-versioned swap marker in `.replaced-<name>-<task>` and commit a new swap revision in
-`config.json` so startup reconciles both copies against the durable registry before
-removing either one, while unmarked legacy swaps retain roll-forward recovery. Ambiguous
-legacy journal records and competing staged restore copies remain available for
-recovery.
+dataset UUIDs, and format 3 adds swap revisions. Format 4 of `delete.json` records the
+prepared stage and can record a committed decision before a later registration reuses the
+alias and UUID. Startup validates the journal and registry before recovering any
+operation, and checks registered UUIDs when opening persistent datasets. For a prepared
+delete, it restores a verified staged copy when the original UUID remains registered and
+reclaims the copy when the registry records the deletion or a replacement. It takes the
+store process lock before moving or removing a copy and synchronizes the database
+directory before retiring the intent. Live deletion and startup recovery hold the process
+lock while removing store contents. Format 3 prepared records retain their provenance on
+rewrite; a sole verified `.deleted-<token>` trash copy is classified as committed before
+conflict and duplicate-root checks, allowing a same-UUID replacement or verified legacy
+predecessor to recover while reclaiming only the trash copies, while an ambiguous kept
+copy or conflicting path keeps the registration closed and retains the staged copy.
+Restore publication synchronizes the journal before replacing the registry and preserves
+dataset bytes after an indeterminate registry replacement. In-place restores persist the
+predecessor revision in format 3 of `config.json` and write a versioned swap marker in
+`.replaced-<name>-<task>` after synchronizing rename 1 so all catalog builds reconcile
+both copies against the durable registry before removing either one, synchronizing the
+database directory before removing the marker during live and startup rollbacks. Unmarked
+format 2 pairs reconcile against the registered UUID and fail closed on ambiguous
+identities, while unmarked format 1 swaps retain roll-forward recovery. Ambiguous legacy
+journal records and competing staged restore copies remain available for recovery.
 Startup preserves
 unknown kept copies and reports retained paths, byte counts and incomplete counts.
 Restores mark intentional `keepReplaced` copies so their warnings do not depend on the

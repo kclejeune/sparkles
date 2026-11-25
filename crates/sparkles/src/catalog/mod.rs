@@ -24,7 +24,6 @@ mod gate;
 #[cfg(test)]
 mod lifecycle_tests;
 mod rename;
-#[cfg(feature = "backup")]
 mod restore;
 #[cfg(test)]
 mod source_tests;
@@ -333,7 +332,6 @@ impl Catalog {
                 )));
             }
             None => {
-                #[cfg(feature = "backup")]
                 if let Some(existing_databases) =
                     delete::child_if_present(&catalog_dir, OsStr::new("databases"))?
                     && restore::has_marked_swaps(&existing_databases)?
@@ -347,11 +345,7 @@ impl Catalog {
         };
         let databases = delete::open_databases(&catalog_dir)?;
         rename::recover(&dir)?;
-        #[cfg(feature = "backup")]
         let restore_conflicts = delete::restore_conflicts(&databases, &registry, &intents)?;
-        #[cfg(not(feature = "backup"))]
-        let restore_conflicts = BTreeSet::new();
-        #[cfg(feature = "backup")]
         restore::recover(&catalog_dir, &databases, &registry, &restore_conflicts)?;
         let delete_refusals = delete::recover(
             &catalog_dir,
@@ -1709,6 +1703,11 @@ impl Catalog {
         Registry { datasets }
     }
     fn replace_registry_locked(&self, dir: &Path, registry: &Registry) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_REGISTRY_REPLACE.get() > 0 {
+            FAIL_REGISTRY_REPLACE.set(FAIL_REGISTRY_REPLACE.get() - 1);
+            return Err(std::io::Error::other("injected registry replace failure").into());
+        }
         let _intent_lock = self.inner.delete_intents.lock();
         delete::settle_reused_identities(dir, registry)?;
         let bytes = sparkles_core::formats::settings_to_vec(CONFIG_FILE, registry)?;
@@ -1812,18 +1811,37 @@ impl Catalog {
         let _g = self.manage()?;
         self.require_determinate_registry(name)?;
         let (revision, needs_save) = {
-            let mut detached = self.inner.detached.lock();
-            let entry = detached.get_mut(name).ok_or_else(|| {
+            let detached = self.inner.detached.lock();
+            let entry = detached.get(name).ok_or_else(|| {
                 Error::Corrupt(format!("dataset /{name} is not detached for swap"))
             })?;
             let needs_save = entry.id != Some(id) || entry.revision.is_none();
             let revision = entry.revision.unwrap_or_else(Uuid::new_v4);
-            entry.id = Some(id);
-            entry.revision = Some(revision);
             (revision, needs_save)
         };
-        if needs_save {
-            self.save_locked()?;
+        if let Some(dir) = self.dir() {
+            if needs_save {
+                let mut registry = self.registry_locked();
+                let row = registry
+                    .datasets
+                    .iter_mut()
+                    .find(|row| row.name == name && row.kind == DatasetKind::Persistent)
+                    .ok_or_else(|| {
+                        Error::Corrupt(format!("dataset /{name} has no persistent registry row"))
+                    })?;
+                row.id = Some(id);
+                row.revision = Some(revision);
+                self.replace_registry_locked(dir, &registry)?;
+                sync_dir(dir)?;
+            } else {
+                // Ensure a previously visible revision is durable before rename 1.
+                sync_dir(dir)?;
+            }
+        }
+        let mut detached = self.inner.detached.lock();
+        if let Some(entry) = detached.get_mut(name) {
+            entry.id = Some(id);
+            entry.revision = Some(revision);
         }
         Ok(revision)
     }
@@ -1996,7 +2014,7 @@ fn read_registry_at(dir: &RecoveryDir) -> Result<Option<Registry>> {
     let corrupt = |error| Error::Corrupt(format!("{CONFIG_FILE}: {error}"));
     let header: Header = serde_json::from_slice(&bytes).map_err(corrupt)?;
     // Older catalog registries omit the version and persistent identities.
-    sparkles_core::formats::check_settings(
+    let format = sparkles_core::formats::check_settings(
         CONFIG_FILE,
         &serde_json::json!({ "format": header.format }),
     )?;
@@ -2004,6 +2022,12 @@ fn read_registry_at(dir: &RecoveryDir) -> Result<Option<Registry>> {
     let mut names = BTreeSet::new();
     for entry in &registry.datasets {
         check_name(&entry.name)?;
+        if format < 3 && entry.revision.is_some() {
+            return Err(Error::Corrupt(format!(
+                "{CONFIG_FILE}: swap revision for '{}' requires format 3",
+                entry.name,
+            )));
+        }
         if !names.insert(&entry.name) {
             return Err(Error::Corrupt(format!(
                 "duplicate dataset '{}' in {CONFIG_FILE}",
@@ -2215,6 +2239,8 @@ pub(crate) fn component(e: anyhow::Error) -> Error {
 #[cfg(test)]
 thread_local! {
     static FAIL_RESTORE_REGISTRY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_REGISTRY_REPLACE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static FAIL_NEXT_DIR_SYNC: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 fn sync_restored_registry(dir: &Path) -> Result<()> {
     #[cfg(test)]
@@ -2232,6 +2258,17 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_DIR_SYNC.with_borrow_mut(|target| {
+        if target.as_deref() == Some(dir) {
+            *target = None;
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(std::io::Error::other("injected dir sync failure").into());
+    }
     sparkles_core::fsutil::sync_dir(dir)?;
     #[cfg(test)]
     record_dir_sync(dir);
