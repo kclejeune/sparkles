@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### JUnit evidence for reused gate test passes
+
+The batch gate verifies a cached Rust test pass against the original gate's retained
+JUnit report and manifest. The replayed log links the receipts, including when an
+earlier run's output has been archived. This completes roadmap item 1094.
+
 ### Prepared and evidence views no longer leak raw snapshots, masks or bound policies
 
 `PreparedView::{snapshot, access}`, `BoundEvidenceView::{snapshot, shared_snapshot}`,
