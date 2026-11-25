@@ -446,7 +446,7 @@ fn reserve_more_credit(
     Ok(())
 }
 
-const INLINE_RETURN_SCOPES: usize = 8;
+const INLINE_RETURN_SCOPES: usize = 2;
 
 static NEXT_RETURN_SCOPE_TID: AtomicU64 = AtomicU64::new(1);
 
@@ -492,6 +492,7 @@ impl InlineReturnScopes {
 const _: () = {
     assert!(!std::mem::needs_drop::<std::cell::Cell<usize>>());
     assert!(!std::mem::needs_drop::<InlineReturnScopes>());
+    assert!(std::mem::size_of::<InlineReturnScopes>() <= 48);
 };
 
 thread_local! {
