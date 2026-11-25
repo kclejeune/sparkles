@@ -51,6 +51,10 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 /// `owl:Thing`, and its head.
 pub type AxClause = (Box<[Ex]>, Box<[Ex]>);
 
+/// Indexed item 728 / item 896 (R4) lazy cardinality clause:
+/// `(guard, bound, qualified_role, head)`.
+type LazyIx = (Option<Ex>, u32, Role, Box<[Ex]>);
+
 /// What Tier D reads in the index.
 #[derive(Default)]
 pub struct DlIx {
@@ -89,7 +93,7 @@ pub struct DlIx {
     /// item 728 / item 896 (R4) clauses of a cardinality in a negative position: the
     /// optional guard expression over x, the bound the at-most rule counts to, the
     /// qualified role and the head's atoms over x
-    lazy: Vec<(Option<Ex>, u32, Role, Box<[Ex]>)>,
+    lazy: Vec<LazyIx>,
     /// guarded lazy clause ids indexed by their guard expression over x
     lazy_by_guard: FxHashMap<Ex, Vec<u32>>,
     /// for each expression, whether it is an at-least conjunction that the order of a run
@@ -461,7 +465,7 @@ impl DlIx {
             + table_bytes(self.quals_of.capacity(), 32)
             + table_bytes(self.atmost.capacity(), 12)
             + self.atmosts.capacity() * 12
-            + self.lazy.capacity() * std::mem::size_of::<(Option<Ex>, u32, Role, Box<[Ex]>)>()
+            + self.lazy.capacity() * std::mem::size_of::<LazyIx>()
             + self
                 .lazy
                 .iter()
@@ -514,7 +518,7 @@ impl DlIx {
             + table_bytes(self.quals_of.len(), 32)
             + table_bytes(self.atmost.len(), 12)
             + self.atmosts.len() * 12
-            + self.lazy.len() * std::mem::size_of::<(Option<Ex>, u32, Role, Box<[Ex]>)>()
+            + self.lazy.len() * std::mem::size_of::<LazyIx>()
             + self
                 .lazy
                 .iter()

@@ -3111,4 +3111,87 @@ mod tests {
             assert_eq!(t.get(id).head(), &[Lit::x(i as u32)]);
         }
     }
+
+    #[test]
+    fn clause_blocker_checks_exact_subsumption_and_charges_every_inspected_entry() {
+        let mut s = Store::default();
+        let (p, q, r, g1, g2, w2) = (10, 11, 12, 20, 21, 22);
+        // C: P -> Q v G2 (also present in store so we verify C never self-blocks)
+        let c = Clause::new(vec![Lit::x(p)], vec![Lit::x(q), Lit::x(g2)]);
+        s.add(c.clone());
+        // Dead and non-subsuming clauses carrying G1 must still be counted as reads.
+        let dead_id = s
+            .add(Clause::new(
+                vec![Lit::x(p)],
+                vec![Lit::x(q), Lit::x(r), Lit::x(g1)],
+            ))
+            .is_some();
+        assert!(dead_id);
+        s.clauses.last_mut().unwrap().dead = true;
+        // Clause with extra literal R outside Q v W2 v {G1} must NOT block C.
+        s.add(Clause::new(
+            vec![Lit::x(p)],
+            vec![Lit::x(q), Lit::x(r), Lit::x(g1)],
+        ));
+        // Clause with extra body literal R must NOT block C.
+        s.add(Clause::new(
+            vec![Lit::x(p), Lit::x(r)],
+            vec![Lit::x(q), Lit::x(g1)],
+        ));
+        // Clause whose head contains G2 itself must NOT block C (resolved G2 is excluded).
+        s.add(Clause::new(vec![Lit::x(p)], vec![Lit::x(g1), Lit::x(g2)]));
+
+        let mut reads = 0usize;
+        let hit = s.has_clause_blocker(
+            c.body(),
+            c.head(),
+            Lit::x(g2),
+            Lit::x(w2),
+            &[g1],
+            16,
+            &mut reads,
+            |_| true,
+        );
+        assert!(!hit, "non-subsuming clauses must not block C");
+        assert_eq!(
+            reads, 4,
+            "all four by_lit entries (including dead/sig-rejected) must be counted"
+        );
+
+        // Stopping early via keep_going must terminate the scan and return false.
+        let mut reads_stop = 0usize;
+        let mut ticks = 0usize;
+        let hit_stop = s.has_clause_blocker(
+            c.body(),
+            c.head(),
+            Lit::x(g2),
+            Lit::x(w2),
+            &[g1],
+            2,
+            &mut reads_stop,
+            |r| {
+                ticks += 1;
+                *r = 0;
+                false
+            },
+        );
+        assert!(!hit_stop);
+        assert_eq!(ticks, 1);
+
+        // Now add a live unprocessed clause D: P -> Q v G1 subsuming C's weakened head.
+        s.add(Clause::new(vec![Lit::x(p)], vec![Lit::x(q), Lit::x(g1)]));
+        let mut reads_hit = 0usize;
+        let hit2 = s.has_clause_blocker(
+            c.body(),
+            c.head(),
+            Lit::x(g2),
+            Lit::x(w2),
+            &[g1],
+            16,
+            &mut reads_hit,
+            |_| true,
+        );
+        assert!(hit2, "live unprocessed D: P -> Q v G1 must block C");
+        assert!(reads_hit >= 1);
+    }
 }

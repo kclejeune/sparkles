@@ -33,6 +33,10 @@ use crate::model::*;
 use crate::vocab;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+/// Item 728 / item 896 (R4) clause for a cardinality in a negative position:
+/// `(guard, n - 1, role, qualifier, head)`.
+pub type LazyAx = (Option<Ex>, u32, Role, Ex, Vec<Ex>);
+
 /// What the normalization of a Tier D run adds beside the normalized axioms.
 #[derive(Default)]
 pub struct DlAx {
@@ -59,7 +63,7 @@ pub struct DlAx {
     /// optional guard expression over x, the bound `n - 1` that the at-most rule counts
     /// to, the role, the filler's negative form B (⊤ when unqualified), and the head's
     /// atoms over x
-    pub lazy: Vec<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>,
+    pub lazy: Vec<LazyAx>,
     /// the at-least conjunctions `H` that a cardinality in a negative position makes,
     /// which the order of a run without the root ranks below every class
     pub low: Vec<Ex>,
@@ -100,7 +104,7 @@ impl DlAx {
                 .iter()
                 .map(|(_, es)| es.capacity() * 4)
                 .sum::<usize>()
-            + self.lazy.capacity() * std::mem::size_of::<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>()
+            + self.lazy.capacity() * std::mem::size_of::<LazyAx>()
             + self
                 .lazy
                 .iter()
@@ -138,7 +142,7 @@ impl DlAx {
             + self.rdis.len() * 8
             + self.ne.len() * std::mem::size_of::<(Ex, Vec<Ex>)>()
             + self.ne.iter().map(|(_, es)| es.len() * 4).sum::<usize>()
-            + self.lazy.len() * std::mem::size_of::<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>()
+            + self.lazy.len() * std::mem::size_of::<LazyAx>()
             + self
                 .lazy
                 .iter()
@@ -211,7 +215,7 @@ struct Out {
     /// the minimum restrictions of a rooted run with counting, as [`DlAx::ne`]
     ne: Vec<(Ex, Vec<Ex>)>,
     /// item 728 / item 896 (R4) clauses of a cardinality in a negative position, as [`DlAx::lazy`]
-    lazy: Vec<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>,
+    lazy: Vec<LazyAx>,
     /// the at-least conjunctions ranked lowest, as [`DlAx::low`]
     low: Vec<Ex>,
     /// the minimums of a run that orders its number restrictions: the name, the
@@ -313,7 +317,7 @@ impl Out {
                 .iter()
                 .map(|(_, _, _, _, h)| h.capacity() * 4)
                 .sum::<usize>()
-            + self.lazy.capacity() * std::mem::size_of::<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>()
+            + self.lazy.capacity() * std::mem::size_of::<LazyAx>()
             + self.low.capacity() * 4
             + self.least.capacity() * 20
     }
@@ -1876,13 +1880,13 @@ fn conj_in(it: &mut Interner, mut es: Vec<Ex>) -> Ex {
 /// if `r` lacks an inverse). Non-simple outer negative existentials still recurse into
 /// their fillers and rebuild so inner simple existentials never reach `ix.exist_of`.
 /// Compound conjunction qualifiers keep item 897's canonical bridge `(e, n)`.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn shadow_negative(
     it: &mut Interner,
     ax: &mut Axioms,
     clauses: &mut Vec<(Vec<Ex>, Vec<Ex>)>,
     atmost: &mut [(Ex, u32, Role, Ex)],
-    lazy: &mut Vec<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>,
+    lazy: &mut Vec<LazyAx>,
     inv: &[Role],
     rb: &RoleBox,
     stop: &dyn Fn() -> bool,
@@ -2414,12 +2418,11 @@ fn acyclic(edges: &FxHashMap<Ex, Vec<Ex>>) -> bool {
 /// superrole of `l` from the same state into the same state (roadmap item 712). The rules
 /// apply a universal on a role to every link and backward link under it, so a state stands
 /// for the same universal after either reduction (F24, "The disjunctive rules").
-#[allow(clippy::type_complexity)]
 fn unfold(
     it: &mut Interner,
     ax: &mut Axioms,
     clauses: &[(Vec<Ex>, Vec<Ex>)],
-    lazy: &[(Option<Ex>, u32, Role, Ex, Vec<Ex>)],
+    lazy: &[LazyAx],
     rb: &mut RoleBox,
     level: u8,
 ) {
@@ -3530,5 +3533,174 @@ mod tests {
         .unwrap();
         assert_eq!(taken, vec![true, true, true, true]);
         assert_eq!(dl.rdis.len(), 400 * 399 / 2 + 1 + 200 * 199 / 2);
+    }
+
+    #[test]
+    fn r1b_skips_only_optional_weakenings_and_clears_on_any_truncation() {
+        let body = "EquivalentObjectProperties(:r :t)
+             SubClassOf(:A1 ObjectMinCardinality(3 :r :F))
+             SubClassOf(:A2 ObjectMinCardinality(3 :r :F))
+             SubClassOf(:B ObjectMinCardinality(3 :t :F))
+             SubClassOf(:C ObjectMinCardinality(2 :r :F))
+             SubClassOf(:D ObjectMaxCardinality(1 :r :F))";
+        let (d, ax, mut it) = run_order(body, true);
+        let a1 = least_of(&d, &ax, &mut it, "A1");
+        let a2 = least_of(&d, &ax, &mut it, "A2");
+        let b = least_of(&d, &ax, &mut it, "B");
+        let c_min = least_of(&d, &ax, &mut it, "C");
+        let (rep_a, dup_a) = (a1.min(a2), a1.max(a2));
+        let (small_rep, large_rep) = (rep_a.min(b), rep_a.max(b));
+        // Mandatory spared -> representative edges MUST NOT be skipped on non-unit premises.
+        assert!(
+            !d.skip_weaken
+                .get(&dup_a)
+                .is_some_and(|v| v.contains(&rep_a)),
+            "duplicate -> representative edge is mandatory"
+        );
+        assert!(
+            !d.skip_weaken
+                .get(&large_rep)
+                .is_some_and(|v| v.contains(&small_rep)),
+            "large -> small equivalent representative return edge is mandatory"
+        );
+        // Optional forward weakenings ARE recorded in skip_weaken while staying in ax.subs.
+        assert!(
+            d.skip_weaken
+                .get(&rep_a)
+                .is_some_and(|v| v.contains(&dup_a))
+        );
+        assert!(
+            d.skip_weaken
+                .get(&small_rep)
+                .is_some_and(|v| v.contains(&large_rep))
+        );
+        assert!(
+            d.skip_weaken
+                .get(&rep_a)
+                .is_some_and(|v| v.contains(&c_min))
+        );
+        assert!(ax.subs.contains(&(rep_a, c_min)));
+
+        // Any truncating bound (including omitting a 3-entry duplicate bundle!) must leave
+        // skip_weaken completely empty.
+        for bound in [0, 1, 2, 3, 5, 8] {
+            let (_, d_cut, _, _) = run_order_within(body, true, bound);
+            assert!(
+                d_cut.skip_weaken.is_empty(),
+                "bound {bound} omitted eligible bundles so skip_weaken must be empty"
+            );
+        }
+    }
+
+    #[test]
+    fn r2_canonical_shadow_pass_handles_nested_nonsimple_and_refused_axioms() {
+        // 1. Simple negative existentials are unified into one canonical shadow name across
+        //    ax.subs, ax.disjoint, clauses, and atmost qualifiers; a refused axiom before
+        //    the valid axioms leaves no dangling cache entry; and nested ∃t.(∃s.A) over
+        //    transitive t and simple s rewrites the inner ∃s.A while keeping outer t.
+        let body = "TransitiveObjectProperty(:t)
+             SubClassOf(ObjectSomeValuesFrom(:s :A) ObjectMinCardinality(65 :s :A))
+             SubClassOf(ObjectSomeValuesFrom(:s :A) :C1)
+             DisjointClasses(ObjectSomeValuesFrom(:s :A) :C2)
+             SubClassOf(:K ObjectMaxCardinality(1 :q ObjectSomeValuesFrom(:s :A)))
+             SubClassOf(ObjectSomeValuesFrom(:t ObjectSomeValuesFrom(:s :A)) :C3)
+             ObjectPropertyRange(:s :Ran)";
+        let (taken, d, ax, mut it) = run_order_within(body, true, ORDER_RELATIONS);
+        assert!(!taken[1], "the >64 minimum axiom must be refused");
+        assert!(taken[2] && taken[3] && taken[4] && taken[5] && taken[6]);
+
+        let s_role = it.role(RoleName::Object(ObjectProperty::new("http://ex.org/s")));
+        let s_inv = it.role(RoleName::Inverse(ObjectProperty::new("http://ex.org/s")));
+        let t_role = it.role(RoleName::Object(ObjectProperty::new("http://ex.org/t")));
+        let a_ex = it.class(&Class::new("http://ex.org/A"));
+        let c1_ex = it.class(&Class::new("http://ex.org/C1"));
+        let c3_ex = it.class(&Class::new("http://ex.org/C3"));
+        let ran_ex = it.class(&Class::new("http://ex.org/Ran"));
+
+        // Find the canonical shadow N from `(N, C1)` in ax.subs.
+        let n_shadow = ax
+            .subs
+            .iter()
+            .find(|&&(_, rhs)| rhs == c1_ex)
+            .map(|&(lhs, _)| lhs)
+            .expect("C1 subsumption");
+        assert!(matches!(it.nodes[n_shadow as usize], Node::Fresh(_)));
+        // Its defining universal `A ⊑ ∀s⁻.N` must be committed in ax.subs.
+        let forall_s_inv_n = it.node(Node::Forall(s_inv, n_shadow));
+        assert!(
+            ax.subs.contains(&(a_ex, forall_s_inv_n)),
+            "committed shadow definition A ⊑ ∀s⁻.N must exist"
+        );
+        // The same canonical N is reused in DisjointClasses and in the atmost qualifier.
+        assert!(ax.disjoint.iter().any(|set| set.contains(&n_shadow)));
+        assert!(d.atmost.iter().any(|&(_, _, _, b)| b == n_shadow));
+        // Nested ∃t.(∃s.A) ⊑ C3 must keep outer transitive t and rewrite inner ∃s.A to N.
+        let nested_outer = it.node(Node::Exist(t_role, n_shadow));
+        assert!(
+            ax.subs.contains(&(nested_outer, c3_ex)),
+            "outer non-simple existential must rebuild over inner shadow N"
+        );
+        // No simple-role `Node::Exist(s, _)` may remain on any LHS of ax.subs.
+        assert!(
+            !ax.subs
+                .iter()
+                .any(|&(lhs, _)| matches!(it.nodes[lhs as usize], Node::Exist(r, _) if r == s_role || r == s_inv)),
+            "no simple-role existential may remain in negative positions"
+        );
+        // Range(s, Ran) keeps `(s, Ran)` in ax.ranges AND emits `⊤ ⊑ ∀s.Ran`.
+        assert!(ax.ranges.contains(&(s_role, ran_ex)));
+        let forall_s_ran = it.node(Node::Forall(s_role, ran_ex));
+        assert!(ax.subs.contains(&(TOP, forall_s_ran)));
+    }
+
+    #[test]
+    fn r4_guarded_exact_cardinality_and_overflow_rejection() {
+        // Guarded chemical definition emits one guarded lazy clause with qualifier preserved
+        // and no holder for the ≥2 part.
+        let (d, _, mut it) = run_order(
+            "EquivalentClasses(:Acyl ObjectIntersectionOf(:Carbon
+               ObjectExactCardinality(1 :d :Oxygen)
+               ObjectExactCardinality(2 :s :Organic)))",
+            true,
+        );
+        let s_role = it.role(RoleName::Object(ObjectProperty::new("http://ex.org/s")));
+        let org_ex = it.class(&Class::new("http://ex.org/Organic"));
+        assert_eq!(d.lazy.len(), 1);
+        let (guard, bound, role, qual, head) = &d.lazy[0];
+        assert!(guard.is_some(), "guarded definition must retain guard");
+        assert_eq!(*bound, 1);
+        assert_eq!(*role, s_role);
+        assert_eq!(*qual, org_ex, "lazy tuple must preserve qualifier B");
+        assert!(head.len() >= 2);
+
+        // Checked n+1 overflow on LHS exact/max cardinality must be refused cleanly.
+        let max_u32 = u32::MAX;
+        let overflow_ax = AxiomKind::SubClassOf(
+            ClassExpression::ObjectExactCardinality(max_u32, self::role("r"), None),
+            c("B"),
+        );
+        let max_count = AxiomKind::SubClassOf(
+            c("Z"),
+            ClassExpression::ObjectMaxCardinality(1, self::role("u"), None),
+        );
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let allowed = Allowed {
+            counting: true,
+            rooted: false,
+            order: true,
+            ..Allowed::default()
+        };
+        let (taken, _) = normalize(
+            &[&union(), &max_count, &overflow_ax],
+            &mut it,
+            &mut ax,
+            None,
+            &|| false,
+            allowed,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(taken, vec![true, true, false]);
     }
 }
