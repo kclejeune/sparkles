@@ -1106,13 +1106,18 @@ impl<'a> Planner<'a> {
         let exists = |p: &GraphPattern| -> Result<Arc<ExistsSpec>> {
             let mut names = Vec::new();
             collect_pattern_vars(p, &mut names);
-            let mut vars: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
-            vars.sort_unstable();
-            vars.dedup();
-            let bound = vars
-                .iter()
-                .filter_map(|v| subst.get(v).map(|id| (*v, *id)))
-                .collect();
+            let mut deduped: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
+            deduped.sort_unstable();
+            deduped.dedup();
+            let mut vars = Vec::with_capacity(deduped.len());
+            vars.extend_from_slice(&deduped);
+            let bound_len = vars.iter().filter(|v| subst.contains_key(v)).count();
+            let mut bound = Vec::with_capacity(bound_len);
+            for &v in &vars {
+                if let Some(&id) = subst.get(&v) {
+                    bound.push((v, id));
+                }
+            }
             Ok(Arc::new(ExistsSpec::new_ordinary_charged(
                 ctx,
                 p,

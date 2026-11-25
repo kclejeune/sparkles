@@ -5,7 +5,7 @@ use super::*;
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-pub(super) const COMPILER: &str = "f13-phase2-3";
+pub(super) const COMPILER: &str = "f13-phase2-4";
 
 /// Whether `access` has protections that depend on the data, with the reason the
 /// whole query is then evaluated again (spec F13 §6.2).
@@ -92,20 +92,30 @@ pub(super) fn normalized(q: &Query, text: &str) -> String {
     out
 }
 
-pub(super) fn key_of(
+pub(super) fn key_with_compiler(
+    compiler: &str,
     q: &Query,
     text: &str,
     access: Option<&Arc<GraphAccess>>,
     whole: Option<&str>,
 ) -> u64 {
     let mut h = Sha256::new();
-    h.update(COMPILER.as_bytes());
+    h.update(compiler.as_bytes());
     h.update([0]);
     h.update(normalized(q, text).as_bytes());
     h.update([0]);
     h.update(access_fingerprint(access).to_le_bytes());
     h.update(whole.unwrap_or("").as_bytes());
     u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
+}
+
+pub(super) fn key_of(
+    q: &Query,
+    text: &str,
+    access: Option<&Arc<GraphAccess>>,
+    whole: Option<&str>,
+) -> u64 {
+    key_with_compiler(COMPILER, q, text, access, whole)
 }
 
 #[cfg(test)]
@@ -136,6 +146,9 @@ mod compiler_tests {
         ("f13-phase2-2", "9910b68bd4b7e026"),
         // ORDER BY with LIMIT and OFFSET compiles to the window operator (item 419)
         ("f13-phase2-3", "33695b11351c501e"),
+        // an EXISTS whose LIMIT/OFFSET slice mentions an outer variable compiles to
+        // substitution (exists or recompute under GRAPH) instead of a match join (item 1121)
+        ("f13-phase2-4", "33695b11351c501e"),
     ];
 
     /// The variants of `ops::Op` as the source declares them, without comments or

@@ -2843,12 +2843,13 @@ pub(super) fn plan_bytes(node: &Node) -> u64 {
 
     fn walk_node(
         node: &Node,
+        charge_node: bool,
         seen_specs: &mut FxHashSet<usize>,
         seen_patterns: &mut FxHashSet<usize>,
         seen_view_patterns: &mut FxHashSet<usize>,
     ) -> u64 {
         let mut extra = match &node.kind {
-            Kind::Values(t) => capacity_bytes(t),
+            Kind::Values(t) if charge_node => capacity_bytes(t),
             Kind::Filter(exprs) | Kind::CountFilterScan { filter: exprs, .. } => {
                 exprs.iter().fold(0u64, |acc, e| {
                     acc.saturating_add(expr_exists_bytes(
@@ -2891,6 +2892,7 @@ pub(super) fn plan_bytes(node: &Node) -> u64 {
                 })
                 .saturating_add(walk_node(
                     &top.fallback,
+                    charge_node,
                     seen_specs,
                     seen_patterns,
                     seen_view_patterns,
@@ -2933,9 +2935,12 @@ pub(super) fn plan_bytes(node: &Node) -> u64 {
                 }
                 total
             }),
+            // PreparedGraphBranches already reserves retained branch nodes and VALUES tables
+            // inside `_held`; walk branch plans only to cover any uncharged EXISTS backing.
             Kind::GraphBranches(branches) => branches.inputs.iter().fold(0u64, |acc, branch| {
                 acc.saturating_add(walk_node(
                     branch,
+                    false,
                     seen_specs,
                     seen_patterns,
                     seen_view_patterns,
@@ -2946,15 +2951,20 @@ pub(super) fn plan_bytes(node: &Node) -> u64 {
         for child in &node.children {
             extra = extra.saturating_add(walk_node(
                 child,
+                charge_node,
                 seen_specs,
                 seen_patterns,
                 seen_view_patterns,
             ));
         }
-        (node.desc.len() as u64)
-            .saturating_add(node.vars.len() as u64 * 32)
-            .saturating_add(1024)
-            .saturating_add(extra)
+        if charge_node {
+            (node.desc.len() as u64)
+                .saturating_add(node.vars.len() as u64 * 32)
+                .saturating_add(1024)
+                .saturating_add(extra)
+        } else {
+            extra
+        }
     }
 
     let mut seen_specs = FxHashSet::default();
@@ -2962,6 +2972,7 @@ pub(super) fn plan_bytes(node: &Node) -> u64 {
     let mut seen_view_patterns = FxHashSet::default();
     walk_node(
         node,
+        true,
         &mut seen_specs,
         &mut seen_patterns,
         &mut seen_view_patterns,

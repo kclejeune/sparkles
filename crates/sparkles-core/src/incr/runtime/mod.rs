@@ -65,6 +65,16 @@ pub(crate) use cell::{Cell, Slot};
 use internal::InternalCell;
 pub use internal::InternalCircuit;
 pub use key::{access_fingerprint, covers, whole_reason};
+#[cfg(test)]
+pub(crate) fn checkpoint_fingerprint_for_compiler(compiler: &str, q: &Query, text: &str) -> u64 {
+    let key = key::key_with_compiler(compiler, q, text, None, None);
+    let mut h = Sha256::new();
+    h.update(key.to_le_bytes());
+    h.update(b"\0aggregate-errors\0");
+    let errors = crate::sparql::AggregateErrors::default();
+    h.update(errors.as_str().as_bytes());
+    u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
+}
 use stats::Counters;
 pub use stats::{RuntimeStats, ViewStat};
 pub use worker::WorkerPause;

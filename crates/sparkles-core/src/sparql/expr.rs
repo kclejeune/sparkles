@@ -161,7 +161,8 @@ impl ExistsSpec {
             ),
             None => None,
         };
-        let spec_charge = ctx.retained_charge(Self::spec_bytes(vars.len(), bound.len()))?;
+        let spec_charge =
+            ctx.retained_charge(Self::spec_bytes(vars.capacity(), bound.capacity()))?;
         let calls_service = super::cursor::calls_service(&owned.syntax);
         Ok(Self::from_pattern(
             ExistsPattern::Ordinary(owned),
@@ -266,7 +267,10 @@ impl ExistsSpec {
             bytes = bytes.saturating_add(vp.bytes);
         }
         if matches!(self._held, BackingCredit::None) {
-            bytes = bytes.saturating_add(Self::spec_bytes(self.vars.len(), self.bound.len()));
+            bytes = bytes.saturating_add(Self::spec_bytes(
+                self.vars.capacity(),
+                self.bound.capacity(),
+            ));
         }
         bytes
     }
@@ -317,7 +321,10 @@ impl ExistsSpec {
 
     /// The same EXISTS with `v` substituted by `c` as well.
     pub fn with_bound(&self, v: VarId, c: Id) -> Self {
-        let mut bound = self.bound.clone();
+        let mut vars = Vec::with_capacity(self.vars.len());
+        vars.extend_from_slice(&self.vars);
+        let mut bound = Vec::with_capacity(self.bound.len().saturating_add(1));
+        bound.extend_from_slice(&self.bound);
         bound.push((v, c));
         let pattern = match &self.pattern {
             ExistsPattern::Ordinary(pattern) => ExistsPattern::Ordinary(pattern.clone()),
@@ -327,7 +334,7 @@ impl ExistsSpec {
             pattern,
             self.calls_service,
             self.graph.clone(),
-            self.vars.clone(),
+            vars,
             bound,
             self.view_patterns.clone(),
             BackingCredit::None,
@@ -378,6 +385,8 @@ impl ExistsSpec {
                     },
                     BackingCredit::None | BackingCredit::Reservation(_) => BackingCredit::None,
                 };
+                let mut vars = Vec::with_capacity(self.vars.len());
+                vars.extend_from_slice(&self.vars);
                 let mut bound = Vec::with_capacity(new_len);
                 bound.extend_from_slice(&self.bound);
                 bound.push((v, c));
@@ -385,7 +394,7 @@ impl ExistsSpec {
                     ExistsPattern::Ordinary(pattern.clone()),
                     self.calls_service,
                     self.graph.clone(),
-                    self.vars.clone(),
+                    vars,
                     bound,
                     self.view_patterns.clone(),
                     credit,
