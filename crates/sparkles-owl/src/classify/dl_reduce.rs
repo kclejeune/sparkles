@@ -166,6 +166,8 @@ impl Reduction {
             if super::logical(k) && super::el_breaks_polled(k, &work)? {
                 is_outside_bits[i / 64] |= 1u64 << (i % 64);
                 if seen.insert_polled(k, &mut steps, &mut work)? {
+                    #[cfg(test)]
+                    super::admission_test::hit(super::admission_test::Point::OutsideElBeforeShape);
                     out.add(dl::shape_polled(k, super::RANGE_POLL_STEP, &mut || {
                         work.poll()
                     })?);
@@ -187,9 +189,13 @@ impl Reduction {
                 false,
                 &mut work,
             )?;
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElBeforeDropBits);
             let bits_bytes = super::vec_bytes(&is_outside_bits);
             drop(is_outside_bits);
             work.release(bits_bytes);
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElAfterDropBits);
             let missing_bytes = super::vec_bytes(&missing);
             for (i, (&k, miss)) in chains.iter().zip(missing.iter()).enumerate() {
                 if i.is_multiple_of(super::RANGE_POLL_STEP) {
@@ -199,16 +205,28 @@ impl Reduction {
                     out.horn += 1;
                 }
             }
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElBeforeDropMissing);
             drop(missing);
             work.release(missing_bytes);
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElAfterDropMissing);
         } else {
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElBeforeDropBits);
             let bits_bytes = super::vec_bytes(&is_outside_bits);
             drop(is_outside_bits);
             work.release(bits_bytes);
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::OutsideElAfterDropBits);
         }
+        #[cfg(test)]
+        super::admission_test::hit(super::admission_test::Point::OutsideElBeforeDropChains);
         let chains_bytes = super::vec_bytes(&chains);
         drop(chains);
         work.release(chains_bytes);
+        #[cfg(test)]
+        super::admission_test::hit(super::admission_test::Point::OutsideElAfterDropChains);
         let mut left: super::polled::PolledSet<'_, AxiomKind> = super::polled::PolledSet::new();
         for (i, e) in excluded.iter().enumerate() {
             if i.is_multiple_of(super::RANGE_POLL_STEP) {

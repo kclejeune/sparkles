@@ -46,9 +46,24 @@ pub(super) enum Point {
     BuildMissingConsumeStart {
         peak: usize,
     },
+    BuildDiagnosticAllocated,
     BuildMissingConsumeEnd {
         peak: usize,
     },
+    BuildBeforeChainsDrop {
+        base: usize,
+    },
+    BuildAfterChainsDrop {
+        base: usize,
+        scratch: usize,
+    },
+    OutsideElBeforeShape,
+    OutsideElBeforeDropBits,
+    OutsideElAfterDropBits,
+    OutsideElBeforeDropMissing,
+    OutsideElAfterDropMissing,
+    OutsideElBeforeDropChains,
+    OutsideElAfterDropChains,
     OriginalRangeScan,
     OriginalRangeBeforeDropNeeded,
     OriginalRangeAfterDropNeeded,

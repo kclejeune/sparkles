@@ -46,9 +46,11 @@ fn eq_str_polled(
     budget: &impl ScratchBudget,
 ) -> Result<bool, Error> {
     if a.len() != b.len() {
+        tick(steps, budget)?;
         return Ok(false);
     }
-    if std::ptr::eq(a.as_ptr(), b.as_ptr()) {
+    if std::ptr::eq(a.as_ptr(), b.as_ptr()) || a.is_empty() {
+        tick(steps, budget)?;
         return Ok(true);
     }
     for (ca, cb) in a
@@ -70,7 +72,8 @@ fn cmp_str_polled(
     steps: &mut usize,
     budget: &impl ScratchBudget,
 ) -> Result<Ordering, Error> {
-    if a.len() == b.len() && std::ptr::eq(a.as_ptr(), b.as_ptr()) {
+    if a.len() == b.len() && (std::ptr::eq(a.as_ptr(), b.as_ptr()) || a.is_empty()) {
+        tick(steps, budget)?;
         return Ok(Ordering::Equal);
     }
     let mut ia = a.as_bytes().chunks(STR_CHUNK_BYTES);
@@ -159,6 +162,7 @@ fn hash_lit_polled(
             hash_str_polled(lang, h, steps, budget)?;
         }
     }
+    l.as_rdf().direction().hash(h);
     Ok(())
 }
 
@@ -168,6 +172,10 @@ fn eq_lit_polled(
     steps: &mut usize,
     budget: &impl ScratchBudget,
 ) -> Result<bool, Error> {
+    if a.as_rdf().direction() != b.as_rdf().direction() {
+        tick(steps, budget)?;
+        return Ok(false);
+    }
     if !eq_str_polled(a.value(), b.value(), steps, budget)? {
         return Ok(false);
     }
@@ -1522,6 +1530,22 @@ mod tests {
         prop_oneof![
             Just(Literal::simple("a")),
             Just(Literal::lang("a", "en").unwrap()),
+            Just(Literal::from(
+                oxrdf::Literal::new_directional_language_tagged_literal(
+                    "a",
+                    "en",
+                    oxrdf::BaseDirection::Ltr,
+                )
+                .unwrap()
+            )),
+            Just(Literal::from(
+                oxrdf::Literal::new_directional_language_tagged_literal(
+                    "a",
+                    "en",
+                    oxrdf::BaseDirection::Rtl,
+                )
+                .unwrap()
+            )),
             prop::sample::select(vec!["integer", "string"])
                 .prop_map(|d| Literal::typed("1", &format!("{XSD}{d}"))),
         ]
