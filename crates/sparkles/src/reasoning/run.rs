@@ -473,7 +473,7 @@ pub(crate) fn diagnose_snapshot_with(
                 typing_controls.memory_parent = opts.grant.as_ref().map(|g| g.memory_parent());
             }
             match r.commit {
-                Some(c) => match sparkles_reasoner::literal_typings_controlled(
+                Some(c) => match sparkles_reasoner::literal_typings_controlled_guarded(
                     store,
                     c,
                     cache,
@@ -514,9 +514,13 @@ pub(crate) fn diagnose_snapshot_with(
         }
         _ => opts,
     };
-    let report =
-        sparkles_reasoner::diagnostics::diagnose_controlled(snap, opts, typings.as_ref(), controls)
-            .map_err(from_anyhow)?;
+    let report = sparkles_reasoner::diagnostics::diagnose_controlled(
+        snap,
+        opts,
+        typings.as_deref(),
+        controls,
+    )
+    .map_err(from_anyhow)?;
     let inferences = record
         .filter(|_| opts.inferences)
         .map(|r| (r.profile.clone(), freshness(r, store, commit)));

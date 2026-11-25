@@ -634,19 +634,62 @@ fn sh(local: &str) -> NamedNode {
 /// whose value space they are: the facts `lit rdf:type DT`, with `DT` in the OWL 2 RL
 /// datatype map, which RDF cannot state and the inferred graph therefore lacks. See
 /// [`crate::literal_typings`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LiteralTypings {
     /// the commit of the materialization
     pub commit: u64,
     /// the literal and the datatype, each literal outside the datatype's value space
     pub facts: Vec<(Literal, NamedNode)>,
-    /// Keeps pooled/bounded summary credit alive until `facts` drops.
-    pub(crate) _held: Option<Arc<crate::budget::Held>>,
 }
 
-impl PartialEq for LiteralTypings {
+/// [`LiteralTypings`] paired with an opaque budget guard that keeps pooled summary
+/// credit alive until this wrapper drops. Declared with `typings` before `_held` so
+/// `facts` drops before credit returns.
+#[derive(Clone, Debug, Default)]
+pub struct GuardedLiteralTypings {
+    typings: LiteralTypings,
+    _held: Option<Arc<crate::budget::Held>>,
+}
+
+impl PartialEq for GuardedLiteralTypings {
     fn eq(&self, other: &Self) -> bool {
-        self.commit == other.commit && self.facts == other.facts
+        self.typings == other.typings
+    }
+}
+
+impl Eq for GuardedLiteralTypings {}
+
+impl std::ops::Deref for GuardedLiteralTypings {
+    type Target = LiteralTypings;
+
+    fn deref(&self) -> &Self::Target {
+        &self.typings
+    }
+}
+
+impl AsRef<LiteralTypings> for GuardedLiteralTypings {
+    fn as_ref(&self) -> &LiteralTypings {
+        &self.typings
+    }
+}
+
+impl GuardedLiteralTypings {
+    pub(crate) fn new(typings: LiteralTypings, held: Option<Arc<crate::budget::Held>>) -> Self {
+        Self {
+            typings,
+            _held: held,
+        }
+    }
+
+    /// Borrow the inner [`LiteralTypings`].
+    pub fn typings(&self) -> &LiteralTypings {
+        &self.typings
+    }
+
+    /// Consume the wrapper and return the inner [`LiteralTypings`], releasing any
+    /// attached summary credit.
+    pub fn into_typings(self) -> LiteralTypings {
+        self.typings
     }
 }
 

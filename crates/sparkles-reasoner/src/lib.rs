@@ -58,6 +58,7 @@ pub use inputs::{
 };
 pub use maintain::{
     Cache, DEFAULT_CACHE_TRIPLES, FactWitnesses, literal_typings, literal_typings_controlled,
+    literal_typings_controlled_guarded,
 };
 pub use parser::{
     BuiltinCall, Clause, Direction, Node, RelationAtom, Rule, RuleParseError, TriplePattern,

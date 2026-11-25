@@ -293,7 +293,7 @@ pub(crate) fn stored(
             .saturating_sub(control.witness_memory.unwrap_or(0))
             / 8
     });
-    let typings = sparkles_reasoner::literal_typings_controlled(
+    let typings = sparkles_reasoner::literal_typings_controlled_guarded(
         dataset.store(),
         snapshot.commit,
         Some(cache),
@@ -633,7 +633,7 @@ fn analyze_with_cache_limit(
         Ok(())
     })?;
     let typings = context
-        .take_literal_typings(snapshot.commit)
+        .take_literal_typings_guarded(snapshot.commit)
         .ok_or_else(|| budget("the analysis did not retain its generalized diagnostics"))?;
     hold(
         share,

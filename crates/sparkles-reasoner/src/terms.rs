@@ -153,6 +153,53 @@ fn rule_bnode_term(key: &[u8]) -> Term {
     Term::BlankNode(BlankNode::new_unchecked(label))
 }
 
+/// Decode a serialized vocabulary key after charging its RDF heap estimate to `budget`.
+pub(crate) fn decode_key_controlled(
+    key: &[u8],
+    budget: &Arc<Budget>,
+) -> Result<(Term, Held), BudgetFailure> {
+    let mut decoded = Held::new(budget);
+    decoded.try_grow(key.len().saturating_mul(8).saturating_add(256))?;
+    Ok((id::key_to_term(key), decoded))
+}
+
+/// Decode a store-backed (non-local) term id from `snap` after reserving reconstruction
+/// and RDF heap space in `budget`.
+pub(crate) fn decode_store_term_controlled(
+    snap: &Snapshot,
+    raw: u64,
+    budget: &Arc<Budget>,
+) -> Result<(Option<Term>, Held), BudgetFailure> {
+    let id = Id(raw);
+    let mut decoded = Held::new(budget);
+    let mut decode = |key: &[u8]| -> Result<Term, BudgetFailure> {
+        decoded.try_grow(key.len().saturating_mul(8).saturating_add(256))?;
+        Ok(id::key_to_term(key))
+    };
+    let term = match id.tag() {
+        Tag::Vocab => {
+            let mut reconstruction = Held::new(budget);
+            snap.generation
+                .vocab
+                .get_with_checked(
+                    id.payload(),
+                    |capacity| reconstruction.try_set(capacity.saturating_mul(2)),
+                    decode,
+                )?
+                .transpose()?
+        }
+        Tag::Delta => snap
+            .generation
+            .dvocab
+            .with(|vocab| vocab.get(id.payload()).map(&mut decode).transpose())?,
+        _ => {
+            decoded.try_grow(256)?;
+            snap.term(id)
+        }
+    };
+    Ok((term, decoded))
+}
+
 /// Term context shared by all evaluation threads.
 pub(crate) struct Terms {
     pub snap: Arc<Snapshot>,
@@ -1062,56 +1109,6 @@ impl Terms {
         debug_assert!(live <= retained.bytes());
         retained.shrink(retained.bytes().saturating_sub(live));
         Ok((term, retained))
-    }
-
-    /// Decode a summary term only after reserving reconstruction and RDF heap space.
-    /// The returned holder covers the decoded term until the caller drops it.
-    pub fn term_controlled(
-        &self,
-        raw: u64,
-        budget: &Arc<Budget>,
-    ) -> Result<(Option<Term>, Held), BudgetFailure> {
-        let id = Id(raw);
-        let mut decoded = Held::new(budget);
-        let mut decode = |key: &[u8]| -> Result<Term, BudgetFailure> {
-            decoded.try_grow(key.len().saturating_mul(8).saturating_add(256))?;
-            Ok(id::key_to_term(key))
-        };
-        let term = match id.tag() {
-            Tag::Local => match self.table.get(id.payload()) {
-                Some(LocalTerm::Key(key)) => Some(decode(key)?),
-                Some(LocalTerm::RuleBNode(key)) => {
-                    decoded.try_grow(key.len().saturating_mul(8).saturating_add(256))?;
-                    self.term(raw)
-                }
-                _ => {
-                    decoded.try_grow(256)?;
-                    self.term(raw)
-                }
-            },
-            Tag::Vocab => {
-                let mut reconstruction = Held::new(budget);
-                self.snap
-                    .generation
-                    .vocab
-                    .get_with_checked(
-                        id.payload(),
-                        |capacity| reconstruction.try_set(capacity.saturating_mul(2)),
-                        decode,
-                    )?
-                    .transpose()?
-            }
-            Tag::Delta => self
-                .snap
-                .generation
-                .dvocab
-                .with(|vocab| vocab.get(id.payload()).map(&mut decode).transpose())?,
-            _ => {
-                decoded.try_grow(256)?;
-                self.term(raw)
-            }
-        };
-        Ok((term, decoded))
     }
 
     /// The vocabulary key of a term (`None` for a local blank node).

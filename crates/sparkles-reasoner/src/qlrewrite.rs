@@ -48,7 +48,7 @@ use sparkles_core::error::Result;
 use sparkles_core::id::Id;
 use sparkles_core::index::Perm;
 use sparkles_core::sparql::exec::PlanInfo;
-use sparkles_core::sparql::reasoning::{Rewritten, SessionRequest};
+use sparkles_core::sparql::reasoning::{GuardedRewritten, Rewritten, SessionRequest};
 use sparkles_core::store::{Chunk, Snapshot};
 use sparkles_owl::model::{
     AxiomKind, ClassExpression as Ce, DataRange, ObjectPropertyExpression as Ope,
@@ -866,17 +866,25 @@ impl Bgp<'_> {
     }
 
     /// PerfectRef from `q0`, or `None` when the rewriting passes `max` queries. The
-    /// queries it keeps are charged to `budget` while it runs, and released when it
-    /// returns, whether it succeeds, passes the bound or fails.
+    /// queries it keeps are charged to `budget` while it runs; on success the surviving
+    /// queries' credit is returned in `Held` so they stay charged while rendered, and on
+    /// bound overflow or error all credit is released on unwind/return.
     fn perfect_ref(
         &self,
         q0: Cq,
         max: usize,
         stop: &dyn Fn() -> Result<()>,
         budget: &Arc<crate::budget::Budget>,
-    ) -> Result<Option<Vec<Cq>>> {
+    ) -> Result<Option<(Vec<Cq>, crate::budget::Held)>> {
         let mut held = crate::budget::Held::new(budget);
-        self.perfect_ref_charged(q0, max, stop, &mut held)
+        let Some(out) = self.perfect_ref_charged(q0, max, stop, &mut held)? else {
+            return Ok(None);
+        };
+        let kept_bytes = out
+            .iter()
+            .fold(0usize, |acc, q| acc.saturating_add(cq_bytes(q)));
+        held.shrink(held.bytes().saturating_sub(kept_bytes));
+        Ok(Some((out, held)))
     }
 
     fn perfect_ref_charged(
@@ -1111,8 +1119,9 @@ struct Rewriter<'a> {
     derive: Vec<Vec<TriplePattern>>,
     nodes: Vec<PlanInfo>,
     warnings: Vec<String>,
-    /// charge for copied branches in wider-group filters; drops before `budget`
-    copies_held: crate::budget::Held,
+    /// charge for emitted rewritten algebra (first branch copies and wider-group filters);
+    /// drops before `budget`
+    emitted_held: crate::budget::Held,
     /// the query's memory budget, declared last so buffers and `Held` drop before parent credit returns
     budget: Arc<crate::budget::Budget>,
 }
@@ -1259,12 +1268,16 @@ impl Rewriter<'_> {
             binds: Vec::new(),
         };
         let start = bgp.normalize(q0.clone());
-        let Some(branches) = bgp.perfect_ref(q0, self.max_union, self.stop, &self.budget)? else {
+        let Some((branches, branches_held)) =
+            bgp.perfect_ref(q0, self.max_union, self.stop, &self.budget)?
+        else {
             return Ok(Outcome::Derive(format!(
                 "its rewriting passed budget.maxUnion ({} branches)",
                 self.max_union
             )));
         };
+        // Bind `branches_held` before `branches` so `branches` drops before credit returns.
+        let (branches_held, branches) = (branches_held, branches);
         // no inclusion applied: the pattern keeps its own form and multiplicities
         if branches.len() == 1 && branches[0] == start {
             return Ok(Outcome::Unchanged);
@@ -1301,7 +1314,10 @@ impl Rewriter<'_> {
         // the branches grouped by the variables they give a value: a branch that gives
         // every variable one answers as the stored and derived facts would, and one that
         // leaves some to unnamed individuals answers only where no branch that names more
-        // of them gives the same values to the ones it names
+        // of them gives the same values to the ones it names.
+        // `groups_held` is declared before `groups` so temporary rendered branches drop
+        // before their credit returns.
+        let mut groups_held = crate::budget::Held::new(&self.budget);
         let mut groups: Vec<(Vec<u32>, Vec<Rendered>)> = Vec::new();
         for q in &branches {
             let tp = |t: T, rw: &mut Self| -> TermPattern {
@@ -1354,11 +1370,16 @@ impl Rewriter<'_> {
                 binds,
                 bind_names,
             };
+            groups_held
+                .try_grow(b.bytes())
+                .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
             match groups.iter_mut().find(|(s, _)| *s == set) {
                 Some((_, g)) => g.push(b),
                 None => groups.push((set, vec![b])),
             }
         }
+        drop(branches);
+        drop(branches_held);
         // a branch's bindings: `BIND` for a variable the branch gives its value, and a
         // test of the value for one that the row of an outer `NOT EXISTS` already holds,
         // since a substituted variable cannot be bound again
@@ -1409,16 +1430,19 @@ impl Rewriter<'_> {
                 self.max_union
             )));
         }
-        // the bytes of the copies, with the strings of their terms
+        // Admit both the first emitted copy of every branch and every wider-group
+        // `NOT EXISTS` copy while `groups_held` stays charged for the overlapping
+        // temporary `Rendered` state.
         let mut bytes = 0usize;
-        for (set, _) in &groups {
+        for (set, group) in &groups {
+            bytes = bytes.saturating_add(group.iter().map(Rendered::bytes).sum::<usize>());
             for (s, g) in &groups {
                 if s.len() > set.len() && set.iter().all(|v| s.contains(v)) {
                     bytes = bytes.saturating_add(g.iter().map(Rendered::bytes).sum::<usize>());
                 }
             }
         }
-        self.copies_held
+        self.emitted_held
             .try_grow(bytes)
             .map_err(|e| crate::query::memory_error(e, "the OWL 2 QL rewriting"))?;
         let mut parts = Vec::with_capacity(groups.len());
@@ -1442,6 +1466,8 @@ impl Rewriter<'_> {
                 },
             });
         }
+        drop(groups);
+        drop(groups_held);
         let union = union_of(parts).expect("the rewriting keeps the query it starts from");
         // each solution of the pattern's variables and blank nodes once, as matching the
         // stored and derived facts gives it, with the blank nodes then left out
@@ -1722,6 +1748,29 @@ pub fn rewrite_query_with_parent(
     memory_parent: Option<crate::ParentHandle>,
     stop: &dyn Fn() -> Result<()>,
 ) -> Result<Option<Rewritten>> {
+    Ok(rewrite_query_guarded_with_parent(
+        query,
+        bound,
+        tbox,
+        max_union,
+        max_memory,
+        memory_parent,
+        stop,
+    )?
+    .map(GuardedRewritten::into_rewritten))
+}
+
+/// [`rewrite_query_with_parent`], returning the rewritten query paired with its memory
+/// guard so emitted algebra stays charged until the caller drops it.
+pub fn rewrite_query_guarded_with_parent(
+    query: &Query,
+    bound: &[(String, Term)],
+    tbox: &Tbox,
+    max_union: usize,
+    max_memory: Option<u64>,
+    memory_parent: Option<crate::ParentHandle>,
+    stop: &dyn Fn() -> Result<()>,
+) -> Result<Option<GuardedRewritten>> {
     let budget = crate::budget::Budget::with_parent(
         max_memory.map(|m| m.min(usize::MAX as u64) as usize),
         memory_parent,
@@ -1738,7 +1787,7 @@ pub(crate) fn rewrite_query_in_budget(
     max_union: usize,
     budget: &Arc<crate::budget::Budget>,
     stop: &dyn Fn() -> Result<()>,
-) -> Result<Option<Rewritten>> {
+) -> Result<Option<GuardedRewritten>> {
     // the projection that ASK wraps its pattern in names every variable, and none of them
     // is an answer, so it does not count
     let sse = match query {
@@ -1760,7 +1809,7 @@ pub(crate) fn rewrite_query_in_budget(
     for (name, _) in bound {
         *counts.entry(format!("?{name}")).or_default() += 1;
     }
-    let copies_held = crate::budget::Held::new(budget);
+    let emitted_held = crate::budget::Held::new(budget);
     let mut rw = Rewriter {
         tbox,
         max_union,
@@ -1773,7 +1822,7 @@ pub(crate) fn rewrite_query_in_budget(
         derive: Vec::new(),
         nodes: Vec::new(),
         warnings: tbox.warnings(),
-        copies_held,
+        emitted_held,
         budget: budget.clone(),
     };
     let rewrite = |p: &GraphPattern, rw: &mut Rewriter| rw.pattern(p);
@@ -1812,15 +1861,17 @@ pub(crate) fn rewrite_query_in_budget(
         // query-time reasoning refuses DESCRIBE before it rewrites
         Query::Describe { .. } => return Ok(None),
     };
-    let memory_guard = (rw.copies_held.bytes() > 0)
-        .then(|| Arc::new(rw.copies_held) as Arc<dyn std::any::Any + Send + Sync>);
-    Ok(Some(Rewritten {
-        query,
-        derive: rw.derive,
-        nodes: rw.nodes,
-        warnings: rw.warnings,
+    let memory_guard = (rw.emitted_held.bytes() > 0)
+        .then(|| Arc::new(rw.emitted_held) as Arc<dyn std::any::Any + Send + Sync>);
+    Ok(Some(GuardedRewritten::with_guard(
+        Rewritten {
+            query,
+            derive: rw.derive,
+            nodes: rw.nodes,
+            warnings: rw.warnings,
+        },
         memory_guard,
-    }))
+    )))
 }
 
 #[cfg(test)]

@@ -145,6 +145,15 @@ impl ReasoningProvider for AutoReasoner {
         self.inner.rewrite(query, bound, req)
     }
 
+    fn rewrite_guarded(
+        &self,
+        query: &spargebra::Query,
+        bound: &[(String, oxrdf::Term)],
+        req: &SessionRequest,
+    ) -> Result<Option<sparkles_core::sparql::reasoning::GuardedRewritten>> {
+        self.inner.rewrite_guarded(query, bound, req)
+    }
+
     fn start(&self, req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {
         let materialization = self.materialization(&req);
         let inner = self.inner.start(req)?;
@@ -269,6 +278,25 @@ impl ReasoningProvider for Limited {
         let rewritten = self.inner.rewrite(query, bound, &req)?;
         // the terminology's parsing has no checks of its own, so the allowance is checked
         // once more before the rewritten query is planned
+        (req.stop)()?;
+        Ok(rewritten)
+    }
+
+    fn rewrite_guarded(
+        &self,
+        query: &spargebra::Query,
+        bound: &[(String, oxrdf::Term)],
+        req: &SessionRequest,
+    ) -> Result<Option<sparkles_core::sparql::reasoning::GuardedRewritten>> {
+        let req = SessionRequest {
+            snap: req.snap.clone(),
+            readable: req.readable.clone(),
+            stop: self.limit(req.stop.clone()),
+            max_memory: req.max_memory,
+            memory_parent: req.memory_parent.clone(),
+            no_cache: req.no_cache,
+        };
+        let rewritten = self.inner.rewrite_guarded(query, bound, &req)?;
         (req.stop)()?;
         Ok(rewritten)
     }

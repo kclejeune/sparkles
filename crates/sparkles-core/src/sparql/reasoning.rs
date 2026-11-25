@@ -166,9 +166,53 @@ pub struct Rewritten {
     pub nodes: Vec<PlanInfo>,
     /// warnings for the response, such as axioms the rewriting ignored
     pub warnings: Vec<String>,
-    /// Opaque credit guard keeping rewritten algebra copies charged until dropped.
-    /// Declared last so `query`, `derive`, `nodes`, and `warnings` drop before credit returns.
+}
+
+/// A [`Rewritten`] query paired with an optional opaque credit guard that keeps
+/// rewritten algebra allocations charged until planning and execution release them.
+/// Declared with `rewritten` before `memory_guard` so the algebra drops before credit
+/// returns.
+#[derive(Clone, Debug)]
+pub struct GuardedRewritten {
+    pub rewritten: Rewritten,
     pub memory_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl GuardedRewritten {
+    /// Wrap a [`Rewritten`] query with no attached memory guard.
+    pub fn unguarded(rewritten: Rewritten) -> Self {
+        Self {
+            rewritten,
+            memory_guard: None,
+        }
+    }
+
+    /// Wrap a [`Rewritten`] query with an optional opaque memory guard.
+    pub fn with_guard(
+        rewritten: Rewritten,
+        memory_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Self {
+        Self {
+            rewritten,
+            memory_guard,
+        }
+    }
+
+    /// Borrow the inner [`Rewritten`] query.
+    pub fn rewritten(&self) -> &Rewritten {
+        &self.rewritten
+    }
+
+    /// Clone the optional opaque memory guard.
+    pub fn memory_guard(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.memory_guard.clone()
+    }
+
+    /// Consume the wrapper and return the inner [`Rewritten`] query, dropping any
+    /// attached memory guard.
+    pub fn into_rewritten(self) -> Rewritten {
+        self.rewritten
+    }
 }
 
 /// A reasoner that derives facts for queries (see the module documentation).
@@ -211,6 +255,20 @@ pub trait ReasoningProvider: Send + Sync {
     ) -> Result<Option<Rewritten>> {
         let _ = (query, bound, req);
         Ok(None)
+    }
+    /// Like [`rewrite`](Self::rewrite), also returning an opaque memory guard that keeps
+    /// rewritten algebra credit charged until planning and execution release it.
+    /// Defaults to calling [`rewrite`](Self::rewrite) with no attached guard so custom
+    /// providers implementing only `rewrite` keep compiling and running unchanged.
+    fn rewrite_guarded(
+        &self,
+        query: &spargebra::Query,
+        bound: &[(String, Term)],
+        req: &SessionRequest,
+    ) -> Result<Option<GuardedRewritten>> {
+        Ok(self
+            .rewrite(query, bound, req)?
+            .map(GuardedRewritten::unguarded))
     }
 }
 
@@ -767,7 +825,7 @@ pub(crate) fn rewrite(
     provider: &Arc<dyn ReasoningProvider>,
     query: &spargebra::Query,
     opts: &QueryOptions,
-) -> Result<Option<Rewritten>> {
+) -> Result<Option<GuardedRewritten>> {
     if !provider.rewrites() {
         return Ok(None);
     }
@@ -778,7 +836,7 @@ pub(crate) fn rewrite(
         .iter()
         .map(|(name, t)| (name.trim_start_matches(['?', '$']).to_string(), t.clone()))
         .collect();
-    provider.rewrite(query, &bound, &req)
+    provider.rewrite_guarded(query, &bound, &req)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1747,7 +1805,6 @@ mod tests {
                     derive: Vec::new(),
                     nodes: Vec::new(),
                     warnings: Vec::new(),
-                    memory_guard: None,
                 }))
             }
             fn start(&self, _req: SessionRequest) -> Result<Box<dyn ReasoningSession>> {

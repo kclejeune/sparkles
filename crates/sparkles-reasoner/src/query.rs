@@ -382,6 +382,17 @@ impl ReasoningProvider for QueryReasoner {
         bound: &[(String, oxrdf::Term)],
         req: &SessionRequest,
     ) -> Result<Option<sparkles_core::sparql::reasoning::Rewritten>> {
+        Ok(self
+            .rewrite_guarded(query, bound, req)?
+            .map(sparkles_core::sparql::reasoning::GuardedRewritten::into_rewritten))
+    }
+
+    fn rewrite_guarded(
+        &self,
+        query: &spargebra::Query,
+        bound: &[(String, oxrdf::Term)],
+        req: &SessionRequest,
+    ) -> Result<Option<sparkles_core::sparql::reasoning::GuardedRewritten>> {
         if self.shared.profile != Profile::OwlQl {
             return Ok(None);
         }

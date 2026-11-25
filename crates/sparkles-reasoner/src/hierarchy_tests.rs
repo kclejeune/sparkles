@@ -766,10 +766,14 @@ fn cached_diagnostic_summary_releases_credit_outside_cache_lock() {
         memory_parent: Some(parent),
         ..Default::default()
     };
-    let typings =
-        crate::literal_typings_controlled(&store, store.snapshot().commit, Some(&cache), &controls)
-            .unwrap()
-            .expect("cached summary");
+    let typings = crate::literal_typings_controlled_guarded(
+        &store,
+        store.snapshot().commit,
+        Some(&cache),
+        &controls,
+    )
+    .unwrap()
+    .expect("cached summary");
     assert_eq!(typings.facts.len(), 1);
     assert!(
         releases.load(Ordering::SeqCst) >= 1,
@@ -901,13 +905,17 @@ fn owl_ql_tbox_hit_combined_budget_and_rewritten_guard_stay_charged() {
          @prefix owl: <http://www.w3.org/2002/07/owl#> .
          @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
          ex:A a owl:Class .
+         ex:B a owl:Class .
          ex:p a owl:ObjectProperty .
          ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ; owl:someValuesFrom owl:Thing ] .\n",
     );
-    for i in 0..80 {
+    // 320 subclasses of an unrelated class ex:B with ~1000-byte IRIs => ~644 structural
+    // triples (<= 1024, so Tbox::read's scan batch is 512 KiB) and Tbox::approx_bytes()
+    // is ~680 KiB without inflating ex:p's rewrite branches.
+    for i in 0..320 {
         onto.push_str(&format!(
-            "ex:SubClassLongName_{i:03}_{} a owl:Class ; rdfs:subClassOf ex:A .\n",
-            "x".repeat(400)
+            "ex:SubClassLongName_{i:03}_{} a owl:Class ; rdfs:subClassOf ex:B .\n",
+            "x".repeat(1000)
         ));
     }
     load_turtle(&store, &onto);
@@ -958,7 +966,7 @@ fn owl_ql_tbox_hit_combined_budget_and_rewritten_guard_stay_charged() {
     );
     assert_eq!(tight_hit.granted(), 0);
 
-    // 2. Rewritten with non-zero copied algebra retains pool credit until Rewritten drops.
+    // 2. Rewritten with non-zero algebra retains pool credit until GuardedRewritten drops.
     let long = "v".repeat(64 * 1024);
     let parsed = spargebra::SparqlParser::new()
         .parse_query(&format!(
@@ -974,25 +982,58 @@ fn owl_ql_tbox_hit_combined_budget_and_rewritten_guard_stay_charged() {
         no_cache: false,
     };
     let rewritten = ql
-        .rewrite(&parsed, &[], &rw_req)
+        .rewrite_guarded(&parsed, &[], &rw_req)
         .unwrap()
         .expect("rewritten");
-    let live_copies = pool.granted();
+    let live_emitted = pool.granted();
     assert!(
-        live_copies > 0,
-        "Rewritten must keep copies_held charged while alive"
+        live_emitted > 0,
+        "GuardedRewritten must keep emitted_held charged while alive"
     );
     drop(rewritten);
     assert_eq!(pool.granted(), 0);
 
-    // 3. Cold TBox + rewrite combined live bytes exceeding budget must refuse.
-    // TBox (~70 KiB) fits alone and copies_held (~65 KiB) fits alone under 110 KiB,
-    // while both live simultaneously exceed 110 KiB.
-    crate::qlrewrite::clear();
-    let combined_cap = 110 * 1024u64;
+    // 3. Cold TBox + rewrite combined live bytes exceeding budget must refuse during
+    // rewriting, while cold TBox reading and rewriting each fit separately under `combined_cap`.
+    let combined_cap = 900 * 1024u64;
     let combined_pool = QueryPool::new(combined_cap);
+
+    // 3a. Cold TBox scan + ChargedTbox alone fits in `combined_cap`.
+    crate::qlrewrite::clear();
+    let solo_tbox = ql
+        .owl_ql_tbox(&SessionRequest {
+            snap: store.snapshot(),
+            readable: None,
+            stop: Arc::new(|| Ok(())),
+            max_memory: Some((16 * MIB) as u64),
+            memory_parent: Some(combined_pool.work_parent()),
+            no_cache: true,
+        })
+        .unwrap()
+        .expect("cold TBox must fit alone in combined_cap");
+    assert_eq!(combined_pool.granted(), 0);
+
+    // 3b. Rewriting alone (against the already-built TBox) fits in `combined_cap`.
+    let solo_rw = crate::qlrewrite::rewrite_query_guarded_with_parent(
+        &parsed,
+        &[],
+        &solo_tbox,
+        crate::qlrewrite::DEFAULT_MAX_UNION,
+        Some((16 * MIB) as u64),
+        Some(combined_pool.work_parent()),
+        &|| Ok(()),
+    )
+    .unwrap()
+    .expect("rewriting alone must fit in combined_cap");
+    assert!(combined_pool.granted() > 0);
+    drop(solo_rw);
+    drop(solo_tbox);
+    assert_eq!(combined_pool.granted(), 0);
+
+    // 3c. Cold TBox + rewrite sharing one budget must refuse during rewriting.
+    crate::qlrewrite::clear();
     let combined_err = ql
-        .rewrite(
+        .rewrite_guarded(
             &parsed,
             &[],
             &SessionRequest {
@@ -1016,6 +1057,107 @@ fn owl_ql_tbox_hit_combined_budget_and_rewritten_guard_stay_charged() {
         "combined cold TBox + rewrite must refuse under tight pool: {combined_err:?}"
     );
     assert_eq!(combined_pool.granted(), 0);
+}
+
+#[test]
+fn owl_ql_single_group_union_admits_branches_and_keeps_credit_through_planning() {
+    use sparkles_core::sparql::reasoning::{ReasoningProvider, SessionRequest};
+
+    let store = Store::in_memory(StoreOptions::default());
+    let mut onto = String::from(
+        "@prefix ex: <http://ex.org/> .
+         @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:A a owl:Class .\n",
+    );
+    for i in 0..80 {
+        onto.push_str(&format!(
+            "ex:SubClassSingleGroup_{i:03}_{} a owl:Class ; rdfs:subClassOf ex:A .\n",
+            "x".repeat(400)
+        ));
+    }
+    onto.push_str("ex:s1 a ex:SubClassSingleGroup_000_");
+    onto.push_str(&"x".repeat(400));
+    onto.push_str(" .\n");
+    load_turtle(&store, &onto);
+
+    let pool = QueryPool::new((64 * MIB) as u64);
+    let ql = crate::query::QueryReasoner::new(
+        crate::Profile::OwlQl,
+        &crate::Extras::default(),
+        crate::Inputs::default(),
+    )
+    .unwrap()
+    .with_pool(pool.clone());
+
+    // Single binding group ({?s}): zero wider-group NOT EXISTS copies.
+    let q_str = "PREFIX ex: <http://ex.org/> SELECT ?s WHERE { ?s a ex:A }";
+    let parsed = spargebra::SparqlParser::new().parse_query(q_str).unwrap();
+
+    // 1. Direct rewrite_guarded retains credit for emitted UNION branches until dropped.
+    let req = SessionRequest {
+        snap: store.snapshot(),
+        readable: None,
+        stop: Arc::new(|| Ok(())),
+        max_memory: Some((16 * MIB) as u64),
+        memory_parent: Some(pool.work_parent()),
+        no_cache: true,
+    };
+    let guarded = ql
+        .rewrite_guarded(&parsed, &[], &req)
+        .unwrap()
+        .expect("single-group UNION rewrite");
+    assert!(guarded.memory_guard.is_some());
+    let branches = guarded
+        .rewritten
+        .nodes
+        .iter()
+        .filter_map(|n| n.counters.as_ref()?.get("branches")?.as_u64())
+        .collect::<Vec<_>>();
+    assert_eq!(branches, vec![81]);
+    let live_bytes = pool.granted();
+    assert!(
+        live_bytes > 0,
+        "single-binding-group UNION must retain emitted branch credit while alive"
+    );
+    drop(guarded);
+    assert_eq!(pool.granted(), 0);
+
+    // 2. Near capacity (admits perfect_ref Cqs, refuses rendered + emitted UNION branches).
+    let tbox = ql.owl_ql_tbox(&req).unwrap().expect("tbox");
+    assert_eq!(pool.granted(), 0);
+    let tight_pool = QueryPool::new(40 * 1024);
+    let err = crate::qlrewrite::rewrite_query_guarded_with_parent(
+        &parsed,
+        &[],
+        &tbox,
+        crate::qlrewrite::DEFAULT_MAX_UNION,
+        Some((16 * MIB) as u64),
+        Some(tight_pool.work_parent()),
+        &|| Ok(()),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            sparkles_core::Error::BudgetExceeded(sparkles_core::Budget {
+                kind: sparkles_core::BudgetKind::ServerMemory,
+                ..
+            })
+        ),
+        "single-group UNION rewrite must refuse near capacity: {err:?}"
+    );
+    assert_eq!(tight_pool.granted(), 0);
+
+    // 3. Full SPARQL query handoff through planner returns credit to 0 after execution.
+    let opts = sparkles_core::sparql::QueryOptions {
+        pool: Some(pool.clone()),
+        reasoning: Some(Arc::new(ql)),
+        ..Default::default()
+    };
+    let result = sparkles_core::sparql::query(store.snapshot(), q_str, &opts).unwrap();
+    drop(result);
+    assert_eq!(pool.granted(), 0);
 }
 
 #[test]
@@ -1304,15 +1446,17 @@ fn failed_take_for_does_not_restore_after_interleaved_clear() {
     assert!(rpool.domain_stats().retained_reserved > 0);
 
     load_turtle(&store, "@prefix ex: <http://ex.org/> . ex:y a ex:A .");
-    // Interleave cache.clear() after take_for detaches the entry and before transfer fails.
+    // Interleave cache.clear() after take_for detaches the entry and before transfer fails,
+    // running on a dedicated reasoning worker pool to verify cache-scoped hooks work cross-thread.
     let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let hook_flag = hook_fired.clone();
     let cache_clear = cache.clone();
-    crate::maintain::on_take_detached(move || {
+    cache.on_take_detached(move || {
         hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         cache_clear.clear();
     });
 
+    let worker_pool = crate::thread_pool(1).unwrap();
     // Reserve nearly all of rpool's work capacity so transfer_budget refuses on Scope::Work,
     // while leaving room if `incremental_rules` runs cold before `take_for`.
     let blocker = rpool.empty_grant();
@@ -1328,6 +1472,7 @@ fn failed_take_for_does_not_restore_after_interleaved_clear() {
         &crate::ReasonOptions {
             max_memory: Some(16 * MIB),
             memory_parent: Some(rpool.work_parent()),
+            pool: Some(worker_pool),
             ..Default::default()
         },
     )
@@ -1393,19 +1538,19 @@ fn literal_typings_retains_credit_across_cached_file_and_analysis() {
     .unwrap();
     let mem_commit = mem_report.receipt.unwrap().commit.seq;
     let analysis_typings = ctx
-        .take_literal_typings(mem_commit)
+        .take_literal_typings_guarded(mem_commit)
         .expect("analysis typings");
     drop(ctx);
     drop(witnesses);
     assert_eq!(analysis_typings.facts.len(), 40);
     assert!(
         pool.granted() > 0,
-        "AnalysisContext::take_literal_typings must retain pool credit"
+        "AnalysisContext::take_literal_typings_guarded must retain pool credit"
     );
     drop(analysis_typings);
     assert_eq!(pool.granted(), 0);
 
-    // 2. Cached & file-backed literal_typings_controlled (persistent store) retain pool
+    // 2. Cached & file-backed literal_typings_controlled_guarded (persistent store) retain pool
     //    credit until dropped, and file-backed refuses under a tight pool near capacity.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
@@ -1432,24 +1577,25 @@ fn literal_typings_retains_credit_across_cached_file_and_analysis() {
         memory_parent: Some(pool.work_parent()),
         ..Default::default()
     };
-    let cached_typings = crate::literal_typings_controlled(&store, commit, Some(&cache), &controls)
-        .unwrap()
-        .expect("cached typings");
+    let cached_typings =
+        crate::literal_typings_controlled_guarded(&store, commit, Some(&cache), &controls)
+            .unwrap()
+            .expect("cached typings");
     assert_eq!(cached_typings.facts.len(), 40);
     assert!(
         pool.granted() > 0,
-        "cached literal_typings_controlled must retain pool credit"
+        "cached literal_typings_controlled_guarded must retain pool credit"
     );
     drop(cached_typings);
     assert_eq!(pool.granted(), 0);
 
-    let file_typings = crate::literal_typings_controlled(&store, commit, None, &controls)
+    let file_typings = crate::literal_typings_controlled_guarded(&store, commit, None, &controls)
         .unwrap()
         .expect("file-backed typings");
     assert_eq!(file_typings.facts.len(), 40);
     assert!(
         pool.granted() > 0,
-        "file-backed literal_typings_controlled must retain pool credit"
+        "file-backed literal_typings_controlled_guarded must retain pool credit"
     );
     drop(file_typings);
     assert_eq!(pool.granted(), 0);
@@ -1460,9 +1606,349 @@ fn literal_typings_retains_credit_across_cached_file_and_analysis() {
         memory_parent: Some(tight.work_parent()),
         ..Default::default()
     };
-    let err = crate::literal_typings_controlled(&store, commit, None, &tight_controls).unwrap_err();
+    let err = crate::literal_typings_controlled_guarded(&store, commit, None, &tight_controls)
+        .unwrap_err();
     assert!(is_server_memory_anyhow(&err), "unexpected error: {err:#}");
     assert_eq!(tight.granted(), 0);
+}
+
+#[test]
+fn take_for_refusal_preserves_existing_witnesses_when_bound_changes() {
+    let store = Store::in_memory(StoreOptions::default());
+    load_turtle(
+        &store,
+        "@prefix ex: <http://ex.org/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:A rdfs:subClassOf ex:B .
+         ex:B rdfs:subClassOf ex:C .
+         ex:x a ex:A .",
+    );
+    let rpool = QueryPool::with_retained_capacity((16 * MIB) as u64, (4 * MIB) as u64).unwrap();
+    let cache = crate::Cache::new(10_000).with_retained_parent(Some(rpool.retained_parent()));
+    let r1 = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(rpool.work_parent()),
+            witnesses: Some(4),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let c1 = r1.receipt.unwrap().commit.seq;
+    // Warm INCREMENTAL_RULES for RdfsSimple with an incremental step carrying witnesses.
+    load_turtle(&store, "@prefix ex: <http://ex.org/> . ex:y a ex:A .");
+    let r2 = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: Some(c1),
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(rpool.work_parent()),
+            witnesses: Some(4),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let c2 = r2.receipt.unwrap().commit.seq;
+    let derived = oxrdf::Triple::new(
+        oxrdf::NamedNode::new_unchecked("http://ex.org/x"),
+        oxrdf::vocab::rdf::TYPE,
+        oxrdf::NamedNode::new_unchecked("http://ex.org/C"),
+    );
+    let before_report = cache.witness_report().expect("kept witness report");
+    let before_fact = cache.witnesses(&derived).expect("kept fact witnesses");
+
+    load_turtle(&store, "@prefix ex: <http://ex.org/> . ex:z a ex:A .");
+    let blocker = rpool.empty_grant();
+    blocker.charge((16 * MIB - 128) as u64).unwrap();
+
+    // Request with witnesses disabled and a full work pool: refusal must preserve witnesses.
+    let err = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: Some(c2),
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            max_memory: Some(16 * MIB),
+            memory_parent: Some(rpool.work_parent()),
+            witnesses: None,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(is_server_memory_anyhow(&err), "unexpected error: {err:#}");
+    assert_eq!(cache.kept().map(|(_, seq)| seq), Some(c2));
+    assert_eq!(
+        cache.witness_report(),
+        Some(before_report.clone()),
+        "failed take_for with witnesses=None must preserve kept witness report"
+    );
+    assert_eq!(
+        cache.witnesses(&derived),
+        Some(before_fact.clone()),
+        "failed take_for with witnesses=None must preserve kept fact witnesses"
+    );
+
+    // Request with a different witness bound and a full work pool must also preserve witnesses.
+    let err = crate::materialize_incremental(
+        &store,
+        &crate::Profile::RdfsSimple,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: Some(c2),
+            cache: Some(&cache),
+        },
+        &crate::ReasonOptions {
+            max_memory: Some(16 * MIB),
+            memory_parent: Some(rpool.work_parent()),
+            witnesses: Some(2),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(is_server_memory_anyhow(&err), "unexpected error: {err:#}");
+    assert_eq!(cache.witness_report(), Some(before_report));
+    assert_eq!(cache.witnesses(&derived), Some(before_fact));
+
+    drop(blocker);
+    cache.clear();
+    let after = rpool.domain_stats();
+    assert_eq!((after.work_reserved, after.retained_reserved), (0, 0));
+}
+
+#[test]
+fn diagnostic_summary_overlap_keeps_cache_hit_and_one_x_retained_replacement() {
+    use sparkles_budget::MemoryDomain;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let big = "z".repeat(256 * 1024);
+    let profile = crate::Profile::Rules(
+        "[type: (?x <urn:value> ?v) -> (?v <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2001/XMLSchema#integer>)]"
+            .into(),
+    );
+
+    // Part A: In-memory store — an incremental update overlapping an in-flight cached
+    // diagnostic summary decode still hits the cache (Method::Incremental, not Method::Full).
+    let store_a = Arc::new(Store::in_memory(StoreOptions::default()));
+    load_turtle(&store_a, &format!("<urn:item> <urn:value> \"{big}\" ."));
+    let cache_a = Arc::new(crate::Cache::default());
+    let r1 = crate::materialize_incremental(
+        &store_a,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&cache_a),
+        },
+        &crate::ReasonOptions::default(),
+    )
+    .unwrap();
+    let c1 = r1.receipt.unwrap().commit.seq;
+    assert_eq!(cache_a.kept().map(|(_, seq)| seq), Some(c1));
+    load_turtle(&store_a, "<urn:item2> <urn:value> \"not-an-int\" .");
+
+    let owned_a = Arc::new(AtomicU64::new(0));
+    let ran_inc = Arc::new(AtomicBool::new(false));
+    let inc_method = Arc::new(std::sync::Mutex::new(None));
+    let take_a = owned_a.clone();
+    let give_a = owned_a.clone();
+    let ran_inc_cb = ran_inc.clone();
+    let inc_method_cb = inc_method.clone();
+    let store_a_cb = store_a.clone();
+    let cache_a_cb = cache_a.clone();
+    let profile_a = profile.clone();
+    let domain_a = MemoryDomain::new();
+    let parent_a = domain_a.parent(
+        move |n| {
+            take_a.fetch_add(n, Ordering::SeqCst);
+            Ok(())
+        },
+        move |n| {
+            give_a.fetch_sub(n, Ordering::SeqCst);
+            if !ran_inc_cb.swap(true, Ordering::SeqCst) {
+                let r2 = crate::materialize_incremental(
+                    &store_a_cb,
+                    &profile_a,
+                    &crate::Extras::default(),
+                    crate::Incremental {
+                        since: Some(c1),
+                        cache: Some(&cache_a_cb),
+                    },
+                    &crate::ReasonOptions::default(),
+                )
+                .unwrap();
+                *inc_method_cb.lock().unwrap() = Some((r2.method, r2.receipt.unwrap().commit.seq));
+            }
+        },
+    );
+    let typings_a = crate::literal_typings_controlled_guarded(
+        &store_a,
+        c1,
+        Some(&cache_a),
+        &crate::diagnostics::DiagnosticControls {
+            memory_parent: Some(parent_a),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .expect("commit-1 typings");
+    assert!(
+        ran_inc.load(Ordering::SeqCst),
+        "expected decode release callback to drive overlapping incremental update"
+    );
+    let (method, c2) = inc_method.lock().unwrap().expect("incremental result");
+    assert_eq!(
+        method,
+        crate::Method::Incremental,
+        "overlapping diagnostic scan must not turn an in-memory cache hit into a full materialization"
+    );
+    assert_eq!(cache_a.kept().map(|(_, seq)| seq), Some(c2));
+    assert_eq!(typings_a.commit, c1);
+    assert_eq!(typings_a.facts.len(), 1);
+    assert!(owned_a.load(Ordering::SeqCst) > 0);
+    drop(typings_a);
+    assert_eq!(owned_a.load(Ordering::SeqCst), 0);
+
+    // Part B: 1x retained pool — a full replacement overlapping an in-flight diagnostic
+    // summary decode clears and replaces the cache within 1x retained capacity.
+    let store_b = Arc::new(Store::in_memory(StoreOptions::default()));
+    let mut ttl_b = format!(
+        "@prefix ex: <http://ex.org/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         <urn:item> <urn:value> \"{big}\" .\n"
+    );
+    for i in 0..400 {
+        ttl_b.push_str(&format!("<urn:s{i}> <urn:value> \"lit{i}\" .\n"));
+    }
+    load_turtle(&store_b, &ttl_b);
+
+    let probe_pool =
+        QueryPool::with_retained_capacity((16 * MIB) as u64, (8 * MIB) as u64).unwrap();
+    let probe_cache =
+        crate::Cache::new(100_000).with_retained_parent(Some(probe_pool.retained_parent()));
+    crate::materialize_incremental(
+        &store_b,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&probe_cache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(probe_pool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let one_retained = probe_pool.domain_stats().retained_reserved;
+    assert!(one_retained > 0);
+    probe_cache.clear();
+
+    let cap = one_retained + (one_retained / 2).max(64 * 1024);
+    assert!(cap < one_retained * 2);
+    let rpool = Arc::new(QueryPool::with_retained_capacity((16 * MIB) as u64, cap).unwrap());
+    let rcache =
+        Arc::new(crate::Cache::new(100_000).with_retained_parent(Some(rpool.retained_parent())));
+    let rb1 = crate::materialize_incremental(
+        &store_b,
+        &profile,
+        &crate::Extras::default(),
+        crate::Incremental {
+            since: None,
+            cache: Some(&rcache),
+        },
+        &crate::ReasonOptions {
+            memory_parent: Some(rpool.work_parent()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cb1 = rb1.receipt.unwrap().commit.seq;
+    assert_eq!(rcache.kept().map(|(_, seq)| seq), Some(cb1));
+    load_turtle(&store_b, "<urn:extra> <urn:value> \"extra-lit\" .");
+
+    let owned_b = Arc::new(AtomicU64::new(0));
+    let ran_rep = Arc::new(AtomicBool::new(false));
+    let rep_commit = Arc::new(std::sync::Mutex::new(None));
+    let take_b = owned_b.clone();
+    let give_b = owned_b.clone();
+    let ran_rep_cb = ran_rep.clone();
+    let rep_commit_cb = rep_commit.clone();
+    let store_b_cb = store_b.clone();
+    let rcache_cb = rcache.clone();
+    let rpool_cb = rpool.clone();
+    let profile_b = profile.clone();
+    let domain_b = MemoryDomain::new();
+    let parent_b = domain_b.parent(
+        move |n| {
+            take_b.fetch_add(n, Ordering::SeqCst);
+            Ok(())
+        },
+        move |n| {
+            give_b.fetch_sub(n, Ordering::SeqCst);
+            if !ran_rep_cb.swap(true, Ordering::SeqCst) {
+                let rb2 = crate::materialize_incremental(
+                    &store_b_cb,
+                    &profile_b,
+                    &crate::Extras::default(),
+                    crate::Incremental {
+                        since: None,
+                        cache: Some(&rcache_cb),
+                    },
+                    &crate::ReasonOptions {
+                        memory_parent: Some(rpool_cb.work_parent()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                *rep_commit_cb.lock().unwrap() = Some(rb2.receipt.unwrap().commit.seq);
+            }
+        },
+    );
+    let typings_b = crate::literal_typings_controlled_guarded(
+        &store_b,
+        cb1,
+        Some(&rcache),
+        &crate::diagnostics::DiagnosticControls {
+            memory_parent: Some(parent_b),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .expect("commit-1 typings under replacement");
+    assert!(
+        ran_rep.load(Ordering::SeqCst),
+        "expected decode release callback to drive overlapping replacement"
+    );
+    let cb2 = rep_commit.lock().unwrap().expect("replacement commit");
+    assert_ne!(cb1, cb2);
+    assert_eq!(
+        rcache.kept().map(|(_, seq)| seq),
+        Some(cb2),
+        "overlapping diagnostic scan must not pin old retained credit across cache.clear()"
+    );
+    assert_eq!(typings_b.commit, cb1);
+    assert_eq!(typings_b.facts.len(), 401);
+    drop(typings_b);
+    assert_eq!(owned_b.load(Ordering::SeqCst), 0);
+    let stats = rpool.domain_stats();
+    assert_eq!(stats.work_reserved, 0);
+    assert!(stats.retained_reserved > 0 && stats.retained_reserved <= cap);
+    rcache.clear();
+    let after = rpool.domain_stats();
+    assert_eq!((after.work_reserved, after.retained_reserved), (0, 0));
 }
 
 #[test]

@@ -300,3 +300,90 @@ fn concurrent_query_and_reasoner_overshoot_refused_with_server_memory() {
     drop(concurrent);
     assert_eq!(pool.granted(), 0);
 }
+
+#[test]
+fn public_rewritten_and_literal_typings_struct_literals_compile_and_work() {
+    use sparkles::reasoning::reasoner::diagnostics::LiteralTypings;
+    use sparkles::sparql::reasoning::{
+        Demand, DemandInfo, Derived, ReasoningProvider, ReasoningSession, Report, Rewritten,
+        SessionRequest,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // External 2-field LiteralTypings struct literal + Eq.
+    let a = LiteralTypings {
+        commit: 7,
+        facts: Vec::new(),
+    };
+    let b = LiteralTypings {
+        commit: 7,
+        facts: Vec::new(),
+    };
+    assert_eq!(a, b);
+
+    // External 4-field Rewritten struct literal in a custom ReasoningProvider.
+    struct EmptySession;
+    impl ReasoningSession for EmptySession {
+        fn intensional(
+            &self,
+            _s: Option<&oxrdf::Term>,
+            _p: Option<&oxrdf::Term>,
+            _o: Option<&oxrdf::Term>,
+        ) -> sparkles::Result<bool> {
+            Ok(false)
+        }
+        fn prepare(
+            &mut self,
+            demands: &[Demand],
+            _estimates: bool,
+        ) -> sparkles::Result<Vec<DemandInfo>> {
+            Ok(vec![DemandInfo::default(); demands.len()])
+        }
+        fn derive(&mut self, _seeds: Vec<(usize, Vec<u64>)>) -> sparkles::Result<Derived> {
+            Ok(Derived::default())
+        }
+        fn report(&self) -> Report {
+            Report::default()
+        }
+    }
+
+    struct DownstreamProvider {
+        calls: AtomicUsize,
+    }
+    impl ReasoningProvider for DownstreamProvider {
+        fn label(&self) -> String {
+            "downstream-custom".into()
+        }
+        fn rewrite(
+            &self,
+            query: &spargebra::Query,
+            _bound: &[(String, oxrdf::Term)],
+            _req: &SessionRequest,
+        ) -> sparkles::Result<Option<Rewritten>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Rewritten {
+                query: query.clone(),
+                derive: Vec::new(),
+                nodes: Vec::new(),
+                warnings: Vec::new(),
+            }))
+        }
+        fn start(&self, _req: SessionRequest) -> sparkles::Result<Box<dyn ReasoningSession>> {
+            Ok(Box::new(EmptySession))
+        }
+    }
+
+    let ds = Dataset::memory();
+    let provider = Arc::new(DownstreamProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let pool = QueryPool::new(16 * MIB);
+    let opts = sparkles::sparql::QueryOptions {
+        pool: Some(pool.clone()),
+        reasoning: Some(provider.clone()),
+        ..Default::default()
+    };
+    sparkles::sparql::query(ds.store().snapshot(), "SELECT * WHERE { ?s ?p ?o }", &opts).unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(pool.granted(), 0);
+}

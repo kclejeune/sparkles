@@ -200,7 +200,6 @@ impl AnalysisContext {
             LiteralTypings {
                 commit: 0,
                 facts: found,
-                _held: None,
             },
             held,
         ));
@@ -208,14 +207,22 @@ impl AnalysisContext {
         Ok(())
     }
 
-    /// Consume the summary independently of optional closure caching, carrying its credit
-    /// guard until the returned summary drops.
+    /// Consume the summary independently of optional closure caching.
     pub fn take_literal_typings(&self, commit: u64) -> Option<LiteralTypings> {
+        self.take_literal_typings_guarded(commit)
+            .map(crate::diagnostics::GuardedLiteralTypings::into_typings)
+    }
+
+    /// Consume the summary independently of optional closure caching, carrying its credit
+    /// guard until the returned wrapper drops.
+    pub fn take_literal_typings_guarded(
+        &self,
+        commit: u64,
+    ) -> Option<crate::diagnostics::GuardedLiteralTypings> {
         let taken = self.typings.lock().unwrap().take();
         taken.map(|(mut typings, held)| {
             typings.commit = commit;
-            typings._held = Some(Arc::new(held));
-            typings
+            crate::diagnostics::GuardedLiteralTypings::new(typings, Some(Arc::new(held)))
         })
     }
 }

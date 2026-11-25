@@ -1674,7 +1674,7 @@ fn prepare_query_input_policy(
         }
         None => None,
     };
-    let parsed = rewritten.as_ref().map_or(parsed, |r| &r.query);
+    let parsed = rewritten.as_ref().map_or(parsed, |r| &r.rewritten.query);
     let (pattern, _, _) = split(parsed);
     ctx.configure_extensions(pattern);
     if let Some(provider) = &opts.reasoning {
@@ -1682,7 +1682,9 @@ fn prepare_query_input_policy(
             &mut ctx,
             provider,
             pattern,
-            rewritten.as_ref(),
+            rewritten
+                .as_ref()
+                .map(reasoning::GuardedRewritten::rewritten),
             opts,
             dataset,
             base,
@@ -1750,7 +1752,7 @@ fn prepare_query_input_policy(
     // so its planning keeps what it retains uncharged, as before.
     ctx.attach_owner();
     ctx.check()?;
-    let rewrite_guard = rewritten.as_ref().and_then(|r| r.memory_guard.clone());
+    let rewrite_guard = rewritten.as_ref().and_then(|r| r.memory_guard());
     Ok(PreparedQuery {
         ctx,
         node,
@@ -2028,7 +2030,7 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
             }
             None => None,
         };
-        let parsed = rewritten.as_ref().map_or(&parsed, |r| &r.query);
+        let parsed = rewritten.as_ref().map_or(&parsed, |r| &r.rewritten.query);
         let (pattern, _, _) = split(parsed);
         ctx.configure_extensions(pattern);
         if let Some(provider) = &opts.reasoning {
@@ -2036,7 +2038,9 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
                 &mut ctx,
                 provider,
                 pattern,
-                rewritten.as_ref(),
+                rewritten
+                    .as_ref()
+                    .map(reasoning::GuardedRewritten::rewritten),
                 opts,
                 dataset,
                 base,

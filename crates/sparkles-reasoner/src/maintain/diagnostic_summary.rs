@@ -1,8 +1,9 @@
 //! Controlled reads of exact generalized typings from the selected materialization.
 
 use super::*;
-use crate::diagnostics::{DiagnosticControls, check_control};
+use crate::diagnostics::{DiagnosticControls, GuardedLiteralTypings, check_control};
 use std::io::Read as _;
+use std::mem::size_of;
 
 fn check(controls: &DiagnosticControls) -> anyhow::Result<()> {
     check_control(controls.deadline, controls.cancel.as_deref())?;
@@ -16,6 +17,179 @@ fn fact_bytes(literal: &Literal, datatype: &NamedNode) -> usize {
         + datatype.as_str().len() * 2
 }
 
+enum CachedSnapshot {
+    Empty,
+    Data {
+        snap: Arc<Snapshot>,
+        candidates: Vec<(u64, u64)>,
+        local_keys: FxHashMap<u64, Vec<u8>>,
+        // Declared last so `candidates` and `local_keys` drop before credit returns.
+        _held: Held,
+    },
+    Missing,
+}
+
+/// Extract the candidate literal-typing ids and any needed `Tag::Local` keys from `cache`
+/// without holding `cache.kept` across any `Budget` acquisition, release, or term decode.
+fn snapshot_cached_typings(
+    store: &Store,
+    commit: u64,
+    cache: &Cache,
+    controls: &DiagnosticControls,
+    budget: &Arc<Budget>,
+) -> anyhow::Result<CachedSnapshot> {
+    let ty_key = sparkles_core::id::iri_key(rdf::TYPE.as_str());
+    loop {
+        check(controls)?;
+        // Phase 1: size candidates and unique `Tag::Local` keys under `cache.kept.lock()`
+        // without allocating or touching `budget`.
+        let sizing = {
+            let slot = cache.kept.lock();
+            match slot.kept.as_ref() {
+                Some(kept) if kept.dataset_id == store.dataset_id() && kept.commit == commit => {
+                    let terms = &kept.closure.terms;
+                    let ty_id = terms.snap.lookup_iri(rdf::TYPE.as_str()).map(|i| i.0);
+                    let mut count = 0usize;
+                    let mut local_entries = 0usize;
+                    let mut local_bytes = 0usize;
+                    // Small stack cache to avoid over-counting repeated local datatype IRIs
+                    // without heap allocation while the cache mutex is held.
+                    let mut seen_obj_locals = [0u64; 32];
+                    let mut seen_obj_len = 0usize;
+                    for (idx, triple) in kept.generalized.iter().enumerate() {
+                        if idx.is_multiple_of(1024) {
+                            check(controls)?;
+                        }
+                        let is_type = if Id(triple[1]).tag() == sparkles_core::id::Tag::Local {
+                            terms.local_key(triple[1]) == Some(ty_key.as_slice())
+                        } else {
+                            ty_id == Some(triple[1])
+                        };
+                        if !is_type
+                            || terms.kind(triple[0]) != crate::terms::Kind::Literal
+                            || terms.kind(triple[2]) != crate::terms::Kind::Iri
+                        {
+                            continue;
+                        }
+                        count += 1;
+                        if Id(triple[0]).tag() == sparkles_core::id::Tag::Local
+                            && let Some(key) = terms.local_key(triple[0])
+                        {
+                            local_entries += 1;
+                            local_bytes = local_bytes.saturating_add(key.len());
+                        }
+                        if Id(triple[2]).tag() == sparkles_core::id::Tag::Local
+                            && let Some(key) = terms.local_key(triple[2])
+                            && !seen_obj_locals[..seen_obj_len].contains(&triple[2])
+                        {
+                            if seen_obj_len < seen_obj_locals.len() {
+                                seen_obj_locals[seen_obj_len] = triple[2];
+                                seen_obj_len += 1;
+                            }
+                            local_entries += 1;
+                            local_bytes = local_bytes.saturating_add(key.len());
+                        }
+                    }
+                    Some((slot.generation, count, local_entries, local_bytes))
+                }
+                _ => None,
+            }
+        };
+        let Some((generation, count, local_entries, local_bytes)) = sizing else {
+            return Ok(CachedSnapshot::Missing);
+        };
+        if count == 0 {
+            return Ok(CachedSnapshot::Empty);
+        }
+        // Phase 2: pre-admit the snapshot buffers outside `cache.kept.lock()`.
+        let map_bytes = if local_entries == 0 {
+            0
+        } else {
+            table_bytes(table_capacity(local_entries), size_of::<(u64, Vec<u8>)>())
+        };
+        let need_bytes = count
+            .saturating_mul(size_of::<(u64, u64)>())
+            .saturating_add(map_bytes)
+            .saturating_add(local_bytes);
+        let held = Held::try_new(budget, need_bytes)?;
+        // Phase 3: re-lock briefly to copy out raw ids and local keys while generation matches.
+        enum CopyStep {
+            Copied(Arc<Snapshot>, Vec<(u64, u64)>, FxHashMap<u64, Vec<u8>>),
+            Retry,
+            Missing,
+        }
+        let copied = {
+            let slot = cache.kept.lock();
+            match slot.kept.as_ref() {
+                Some(kept)
+                    if slot.generation == generation
+                        && kept.dataset_id == store.dataset_id()
+                        && kept.commit == commit =>
+                {
+                    let terms = &kept.closure.terms;
+                    let ty_id = terms.snap.lookup_iri(rdf::TYPE.as_str()).map(|i| i.0);
+                    let mut candidates = Vec::with_capacity(count);
+                    let mut local_keys = FxHashMap::default();
+                    if local_entries > 0 {
+                        local_keys.reserve(local_entries);
+                    }
+                    for (idx, triple) in kept.generalized.iter().enumerate() {
+                        if idx.is_multiple_of(1024) {
+                            check(controls)?;
+                        }
+                        let is_type = if Id(triple[1]).tag() == sparkles_core::id::Tag::Local {
+                            terms.local_key(triple[1]) == Some(ty_key.as_slice())
+                        } else {
+                            ty_id == Some(triple[1])
+                        };
+                        if !is_type
+                            || terms.kind(triple[0]) != crate::terms::Kind::Literal
+                            || terms.kind(triple[2]) != crate::terms::Kind::Iri
+                        {
+                            continue;
+                        }
+                        candidates.push((triple[0], triple[2]));
+                        if Id(triple[0]).tag() == sparkles_core::id::Tag::Local
+                            && !local_keys.contains_key(&triple[0])
+                            && let Some(key) = terms.local_key(triple[0])
+                        {
+                            local_keys.insert(triple[0], key.to_vec());
+                        }
+                        if Id(triple[2]).tag() == sparkles_core::id::Tag::Local
+                            && !local_keys.contains_key(&triple[2])
+                            && let Some(key) = terms.local_key(triple[2])
+                        {
+                            local_keys.insert(triple[2], key.to_vec());
+                        }
+                    }
+                    CopyStep::Copied(terms.snap.clone(), candidates, local_keys)
+                }
+                Some(kept) if kept.dataset_id == store.dataset_id() && kept.commit == commit => {
+                    CopyStep::Retry
+                }
+                _ => CopyStep::Missing,
+            }
+        };
+        match copied {
+            CopyStep::Copied(snap, candidates, local_keys) => {
+                return Ok(CachedSnapshot::Data {
+                    snap,
+                    candidates,
+                    local_keys,
+                    _held: held,
+                });
+            }
+            CopyStep::Retry => {
+                drop(held);
+            }
+            CopyStep::Missing => {
+                drop(held);
+                return Ok(CachedSnapshot::Missing);
+            }
+        }
+    }
+}
+
 /// Read actual materialized terms under a separate diagnostic memory share. Missing
 /// or inconsistent optional state returns None, never a recomputed volatile summary.
 pub fn literal_typings_controlled(
@@ -24,6 +198,20 @@ pub fn literal_typings_controlled(
     cache: Option<&Cache>,
     controls: &DiagnosticControls,
 ) -> anyhow::Result<Option<LiteralTypings>> {
+    Ok(
+        literal_typings_controlled_guarded(store, commit, cache, controls)?
+            .map(GuardedLiteralTypings::into_typings),
+    )
+}
+
+/// [`literal_typings_controlled`], returning a [`GuardedLiteralTypings`] that keeps
+/// pooled summary credit charged until the caller drops the summary.
+pub fn literal_typings_controlled_guarded(
+    store: &Store,
+    commit: u64,
+    cache: Option<&Cache>,
+    controls: &DiagnosticControls,
+) -> anyhow::Result<Option<GuardedLiteralTypings>> {
     check(controls)?;
     let budget = Budget::with_parent(
         controls
@@ -31,41 +219,76 @@ pub fn literal_typings_controlled(
             .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX)),
         controls.memory_parent.clone(),
     );
-    let kept = cache.and_then(|cache| {
-        let slot = cache.kept.try_lock()?;
-        slot.kept
-            .as_ref()
-            .filter(|kept| kept.dataset_id == store.dataset_id() && kept.commit == commit)
-            .cloned()
-    });
-    if let Some(kept) = kept {
-        let mut found_held = Held::new(&budget);
-        let mut found = Vec::new();
-        let terms = &kept.closure.terms;
-        let predicate = Term::NamedNode(rdf::TYPE.into_owned());
-        for triple in &kept.generalized {
-            check(controls)?;
-            let (actual_predicate, _predicate_memory) =
-                terms.term_controlled(triple[1], &budget)?;
-            if actual_predicate.as_ref() != Some(&predicate) {
-                continue;
+    if let Some(cache) = cache {
+        match snapshot_cached_typings(store, commit, cache, controls, &budget)? {
+            CachedSnapshot::Empty => {
+                return Ok(Some(GuardedLiteralTypings::new(
+                    LiteralTypings {
+                        commit,
+                        facts: Vec::new(),
+                    },
+                    None,
+                )));
             }
-            let (subject, _subject_memory) = terms.term_controlled(triple[0], &budget)?;
-            let (object, _object_memory) = terms.term_controlled(triple[2], &budget)?;
-            if let (Some(subject), Some(object)) = (subject, object)
-                && let Some((literal, datatype)) =
-                    LiteralTypings::violation(&subject, &predicate, &object)
-            {
-                found_held.try_grow(fact_bytes(&literal, &datatype))?;
-                found.push((literal, datatype));
+            CachedSnapshot::Data {
+                snap,
+                candidates,
+                local_keys,
+                _held,
+            } => {
+                let mut found_held = Held::new(&budget);
+                let mut found = Vec::new();
+                let predicate = Term::NamedNode(rdf::TYPE.into_owned());
+                for (subject_id, object_id) in &candidates {
+                    check(controls)?;
+                    let (subject, _subject_memory) =
+                        if Id(*subject_id).tag() == sparkles_core::id::Tag::Local {
+                            match local_keys.get(subject_id) {
+                                Some(key) => {
+                                    let (term, held) =
+                                        crate::terms::decode_key_controlled(key, &budget)?;
+                                    (Some(term), held)
+                                }
+                                None => (None, Held::new(&budget)),
+                            }
+                        } else {
+                            crate::terms::decode_store_term_controlled(&snap, *subject_id, &budget)?
+                        };
+                    let (object, _object_memory) =
+                        if Id(*object_id).tag() == sparkles_core::id::Tag::Local {
+                            match local_keys.get(object_id) {
+                                Some(key) => {
+                                    let (term, held) =
+                                        crate::terms::decode_key_controlled(key, &budget)?;
+                                    (Some(term), held)
+                                }
+                                None => (None, Held::new(&budget)),
+                            }
+                        } else {
+                            crate::terms::decode_store_term_controlled(&snap, *object_id, &budget)?
+                        };
+                    if let (Some(subject), Some(object)) = (subject, object)
+                        && let Some((literal, datatype)) =
+                            LiteralTypings::violation(&subject, &predicate, &object)
+                    {
+                        found_held.try_grow(fact_bytes(&literal, &datatype))?;
+                        found.push((literal, datatype));
+                    }
+                }
+                drop(candidates);
+                drop(local_keys);
+                drop(_held);
+                let summary_held = (!found.is_empty()).then(|| Arc::new(found_held));
+                return Ok(Some(GuardedLiteralTypings::new(
+                    LiteralTypings {
+                        commit,
+                        facts: found,
+                    },
+                    summary_held,
+                )));
             }
+            CachedSnapshot::Missing => {}
         }
-        let summary_held = (!found.is_empty()).then(|| Arc::new(found_held));
-        return Ok(Some(LiteralTypings {
-            commit,
-            facts: found,
-            _held: summary_held,
-        }));
     }
     let Some(root) = store.root() else {
         return Ok(None);
@@ -119,11 +342,13 @@ pub fn literal_typings_controlled(
         return Ok(None);
     }
     if found.is_empty() {
-        return Ok(Some(LiteralTypings {
-            commit,
-            facts: Vec::new(),
-            _held: None,
-        }));
+        return Ok(Some(GuardedLiteralTypings::new(
+            LiteralTypings {
+                commit,
+                facts: Vec::new(),
+            },
+            None,
+        )));
     }
     let mut summary_held = Held::new(&budget);
     summary_held.try_grow(
@@ -139,11 +364,10 @@ pub fn literal_typings_controlled(
         drop(entry_held);
     }
     drop(_buf_held);
-    Ok(Some(LiteralTypings {
-        commit,
-        facts,
-        _held: Some(Arc::new(summary_held)),
-    }))
+    Ok(Some(GuardedLiteralTypings::new(
+        LiteralTypings { commit, facts },
+        Some(Arc::new(summary_held)),
+    )))
 }
 
 fn keys<R: std::io::Read>(

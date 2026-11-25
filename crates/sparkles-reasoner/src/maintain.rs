@@ -11,7 +11,7 @@
 //! to the run's commit and rules by `reasoning-generalized.json`.
 
 mod diagnostic_summary;
-pub use diagnostic_summary::literal_typings_controlled;
+pub use diagnostic_summary::{literal_typings_controlled, literal_typings_controlled_guarded};
 
 use crate::INFERRED_GRAPH;
 use crate::budget::{Budget, BudgetFailure, Held, table_bytes, table_capacity};
@@ -35,16 +35,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(test)]
-static TAKE_DETACHED: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
-
-#[cfg(test)]
-pub(crate) fn on_take_detached(hook: impl FnOnce() + Send + 'static) {
-    *TAKE_DETACHED.lock() = Some(Box::new(hook));
-}
-
 struct CacheSlot {
-    kept: Option<Arc<Kept>>,
+    kept: Option<Kept>,
     generation: u64,
 }
 
@@ -58,6 +50,8 @@ pub struct Cache {
     kept: Mutex<CacheSlot>,
     max_triples: AtomicUsize,
     retained_parent: Option<crate::ParentHandle>,
+    #[cfg(test)]
+    on_take_detached: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Default of [`Cache::new`]'s limit.
@@ -90,7 +84,14 @@ impl Cache {
             }),
             max_triples: AtomicUsize::new(max_triples),
             retained_parent: None,
+            #[cfg(test)]
+            on_take_detached: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn on_take_detached(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.on_take_detached.lock() = Some(Box::new(hook));
     }
 
     /// Charge closures kept in this cache to `parent` instead of holding no retained pool credit.
@@ -218,9 +219,6 @@ impl Cache {
             } else if kept.inputs != want.inputs {
                 slot.generation = slot.generation.wrapping_add(1);
                 (slot.kept.take(), 0, Some(Taken::InputsChanged))
-            } else if Arc::strong_count(kept) > 1 {
-                // A concurrent diagnostic reader holds a shared read handle to this entry.
-                return Taken::None;
             } else {
                 let generation = slot.generation;
                 (slot.kept.take(), generation, None)
@@ -230,26 +228,25 @@ impl Cache {
             drop(taken);
             return outcome;
         }
-        let Some(arc) = taken else {
+        let Some(mut kept) = taken else {
             return Taken::None;
         };
-        let mut kept = Arc::try_unwrap(arc)
-            .ok()
-            .expect("exclusive kept closure after strong_count check");
-        // witnesses the run will not update are dropped before the closure is charged, so
-        // that a run without them, or with another bound, is not refused for their memory
-        if kept.witnesses.as_ref().map(Witnesses::max) != want.witnesses {
-            kept.witnesses = None;
-        }
+        // Hold aside witnesses the run will not update so the transfer does not charge
+        // them, while preserving them if admission is refused and the entry is restored.
+        let excluded_witnesses = if kept.witnesses.as_ref().map(Witnesses::max) != want.witnesses {
+            kept.witnesses.take()
+        } else {
+            None
+        };
         #[cfg(test)]
-        if let Some(hook) = TAKE_DETACHED.lock().take() {
+        if let Some(hook) = self.on_take_detached.lock().take() {
             hook();
         }
         let restore = |this: &Self, kept: Kept, expected_gen: u64| {
             let displaced = {
                 let mut slot = this.kept.lock();
                 if slot.generation == expected_gen && slot.kept.is_none() {
-                    slot.kept = Some(Arc::new(kept));
+                    slot.kept = Some(kept);
                     None
                 } else {
                     Some(kept)
@@ -258,12 +255,16 @@ impl Cache {
             drop(displaced);
         };
         if let Err(e) = kept.transfer_budget(budget) {
+            if let Some(w) = excluded_witnesses {
+                kept.witnesses = Some(w);
+            }
             restore(self, kept, taken_gen);
             return Taken::Refused(
                 e.with_context(" (taking the closure kept in memory)".into())
                     .into(),
             );
         }
+        drop(excluded_witnesses);
         Taken::Kept(Box::new(kept))
     }
 
@@ -275,7 +276,7 @@ impl Cache {
         let old = {
             let mut slot = self.kept.lock();
             slot.generation = slot.generation.wrapping_add(1);
-            slot.kept.replace(Arc::new(k))
+            slot.kept.replace(k)
         };
         drop(old);
     }
@@ -1345,59 +1346,61 @@ pub fn literal_typings(
     cache: Option<&Cache>,
 ) -> anyhow::Result<Option<LiteralTypings>> {
     if let Some(c) = cache {
-        let kept = {
-            let slot = c.kept.lock();
-            slot.kept
-                .as_ref()
-                .filter(|k| k.dataset_id == store.dataset_id() && k.commit == commit)
-                .cloned()
-        };
-        let Some(k) = kept else {
-            return saved(store, commit);
-        };
         let ty_term = Term::NamedNode(rdf::TYPE.into_owned());
         let mut found = Vec::new();
         let mut pending: Vec<(u64, u64)> = Vec::new();
         let mut datatypes: FxHashMap<u64, Option<NamedNode>> = FxHashMap::default();
-        let terms = &k.closure.terms;
-        let ty = terms.snap.lookup_iri(rdf::TYPE.as_str()).map(|i| i.0);
-        let mut predicates: FxHashMap<u64, bool> = FxHashMap::default();
-        for t in &k.generalized {
-            let is_type = match ty {
-                Some(ty) => t[1] == ty,
-                None => *predicates
-                    .entry(t[1])
-                    .or_insert_with(|| terms.term(t[1]).as_ref() == Some(&ty_term)),
-            };
-            if !is_type || terms.kind(t[0]) != crate::terms::Kind::Literal {
-                continue;
-            }
-            let dt = datatypes
-                .entry(t[2])
-                .or_insert_with(|| match terms.term(t[2]) {
-                    Some(Term::NamedNode(n)) if crate::diagnostics::decidable_range(n.as_str()) => {
-                        Some(n)
+        let snap = {
+            let slot = c.kept.lock();
+            match slot.kept.as_ref() {
+                Some(k) if k.dataset_id == store.dataset_id() && k.commit == commit => {
+                    let terms = &k.closure.terms;
+                    let ty = terms.snap.lookup_iri(rdf::TYPE.as_str()).map(|i| i.0);
+                    let mut predicates: FxHashMap<u64, bool> = FxHashMap::default();
+                    for t in &k.generalized {
+                        let is_type = match ty {
+                            Some(ty) => t[1] == ty,
+                            None => *predicates
+                                .entry(t[1])
+                                .or_insert_with(|| terms.term(t[1]).as_ref() == Some(&ty_term)),
+                        };
+                        if !is_type || terms.kind(t[0]) != crate::terms::Kind::Literal {
+                            continue;
+                        }
+                        let dt = datatypes
+                            .entry(t[2])
+                            .or_insert_with(|| match terms.term(t[2]) {
+                                Some(Term::NamedNode(n))
+                                    if crate::diagnostics::decidable_range(n.as_str()) =>
+                                {
+                                    Some(n)
+                                }
+                                _ => None,
+                            });
+                        let Some(dt) = dt else {
+                            continue;
+                        };
+                        if Id(t[0]).tag() == sparkles_core::id::Tag::Local {
+                            let Some(s) = terms.term(t[0]) else {
+                                continue;
+                            };
+                            found.extend(LiteralTypings::violation(
+                                &s,
+                                &ty_term,
+                                &Term::NamedNode(dt.clone()),
+                            ));
+                        } else {
+                            pending.push((t[0], t[2]));
+                        }
                     }
-                    _ => None,
-                });
-            let Some(dt) = dt else {
-                continue;
-            };
-            if Id(t[0]).tag() == sparkles_core::id::Tag::Local {
-                let Some(s) = terms.term(t[0]) else {
-                    continue;
-                };
-                found.extend(LiteralTypings::violation(
-                    &s,
-                    &ty_term,
-                    &Term::NamedNode(dt.clone()),
-                ));
-            } else {
-                pending.push((t[0], t[2]));
+                    Some(terms.snap.clone())
+                }
+                _ => None,
             }
-        }
-        let snap = terms.snap.clone();
-        drop(k);
+        };
+        let Some(snap) = snap else {
+            return saved(store, commit);
+        };
         pending.sort_unstable();
         for (s, dt) in pending {
             let (Some(s), Some(Some(dt))) = (snap.term(Id(s)), datatypes.get(&dt)) else {
@@ -1412,7 +1415,6 @@ pub fn literal_typings(
         return Ok(Some(LiteralTypings {
             commit,
             facts: found,
-            _held: None,
         }));
     }
     saved(store, commit)
@@ -1423,13 +1425,8 @@ fn saved(store: &Store, commit: u64) -> anyhow::Result<Option<LiteralTypings>> {
     let Some(root) = store.root() else {
         return Ok(None);
     };
-    Ok(
-        saved_typings(root, store.dataset_id(), commit).map(|facts| LiteralTypings {
-            commit,
-            facts,
-            _held: None,
-        }),
-    )
+    Ok(saved_typings(root, store.dataset_id(), commit)
+        .map(|facts| LiteralTypings { commit, facts }))
 }
 
 /// The literal typings among the generalized facts a persistent dataset saved for the
