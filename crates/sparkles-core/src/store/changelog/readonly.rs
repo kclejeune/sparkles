@@ -395,6 +395,7 @@ mod tests {
                                     descending,
                                     true,
                                     false,
+                                    None,
                                     &mut || Ok(()),
                                     None,
                                     &mut |meta, add, quad| {

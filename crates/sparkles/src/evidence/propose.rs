@@ -1079,6 +1079,10 @@ impl OperationStores {
                 }
             };
             for (first, last) in ranges {
+                control.check()?;
+                if preparation.check().is_err() {
+                    return Ok(true);
+                }
                 if remaining == 0 {
                     return Ok(true);
                 }
@@ -1089,9 +1093,9 @@ impl OperationStores {
                 query.limit = remaining;
                 let changes = if first < last {
                     let result = if no_wait {
-                        store.try_published_history_changes(&query)
+                        store.try_published_history_changes(&query, READS_BYTES)
                     } else {
-                        store.published_history_changes(&query)
+                        store.published_history_changes(&query, READS_BYTES)
                     };
                     match result {
                         Ok(result)
@@ -1104,6 +1108,9 @@ impl OperationStores {
                         Ok(_) => None,
                         Err(_) => {
                             control.check()?;
+                            if preparation.check().is_err() {
+                                return Ok(true);
+                            }
                             None
                         }
                     }

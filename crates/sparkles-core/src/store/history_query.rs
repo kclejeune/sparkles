@@ -267,10 +267,17 @@ impl ChangeLog {
     /// Run a history query against the commits up to `upto` (the state the caller
     /// reads). Bounds given as [`HistoryBound::At`] must already be resolved.
     pub fn query(&self, q: &HistoryQuery, upto: u64) -> Result<HistoryResult> {
-        self.query_with(q, upto, false)
+        self.query_with(q, upto, false, None)
     }
 
-    fn query_with(&self, q: &HistoryQuery, upto: u64, no_wait: bool) -> Result<HistoryResult> {
+    fn query_with(
+        &self,
+        q: &HistoryQuery,
+        upto: u64,
+        no_wait: bool,
+        max_bytes: Option<u64>,
+    ) -> Result<HistoryResult> {
+        let bounded = no_wait || max_bytes.is_some();
         let (from, to, upto) = if no_wait {
             q.check()?;
             if !self.is_enabled() {
@@ -282,6 +289,11 @@ impl ChangeLog {
                 .map_or(upto, |through| upto.min(through));
             let (from, to) = self.bounds(q, upto, &|| q.check())?;
             (from, to, upto)
+        } else if max_bytes.is_some() {
+            let check_fn = || q.check();
+            let upto = self.prepare(q, upto, Some(&check_fn))?;
+            let (from, to) = self.bounds(q, upto, &check_fn)?;
+            (from, to, upto)
         } else {
             self.range(q, upto)?
         };
@@ -289,11 +301,12 @@ impl ChangeLog {
         let access = q.access.as_ref().filter(|a| !a.reads_everything());
         let mut readable: FxHashMap<Arc<[u8]>, bool> = FxHashMap::default();
         let mut changes = Vec::new();
+        let mut result_bytes = 0u64;
         let mut truncated = false;
         let mut n = 0u64;
         let mut check = || {
             n += 1;
-            if no_wait || self.read_only_through().is_some() {
+            if bounded || self.read_only_through().is_some() {
                 return q.check();
             }
             if n & 0xFF != 0 {
@@ -322,6 +335,7 @@ impl ChangeLog {
             q.descending,
             true,
             no_wait,
+            max_bytes,
             &mut check,
             None,
             &mut |c, add, k: &QuadKey| {
@@ -335,6 +349,14 @@ impl ChangeLog {
                 if q.limit > 0 && changes.len() >= q.limit {
                     truncated = true;
                     return Ok(false);
+                }
+                if let Some(limit) = max_bytes {
+                    let add_bytes = k.iter().map(|t| t.len() as u64).sum::<u64>()
+                        + std::mem::size_of::<HistoryChange>() as u64;
+                    result_bytes = result_bytes.saturating_add(add_bytes);
+                    if result_bytes > limit {
+                        return Err(super::changelog::memory_budget(limit, result_bytes));
+                    }
                 }
                 if let Some(quad) = key_quad(k) {
                     changes.push(HistoryChange {
@@ -389,19 +411,27 @@ impl Store {
     /// Read commit or time bounds through the published head without taking the
     /// writer. Any staged or unpublished changes are beyond the log's requested bound.
     #[doc(hidden)]
-    pub fn published_history_changes(&self, q: &HistoryQuery) -> Result<HistoryResult> {
+    pub fn published_history_changes(
+        &self,
+        q: &HistoryQuery,
+        max_memory_bytes: u64,
+    ) -> Result<HistoryResult> {
         let Some(log) = &self.changelog else {
             return Err(Error::HistoryUnsupported(
                 "this store has no change log".into(),
             ));
         };
-        log.query(q, self.snapshot().commit)
+        log.query_with(q, self.snapshot().commit, false, Some(max_memory_bytes))
     }
 
     /// Read commit bounds through the published head without flushing queued records
     /// or waiting for the log lock. Unflushed records are reported as gaps.
     #[doc(hidden)]
-    pub fn try_published_history_changes(&self, q: &HistoryQuery) -> Result<HistoryResult> {
+    pub fn try_published_history_changes(
+        &self,
+        q: &HistoryQuery,
+        max_memory_bytes: u64,
+    ) -> Result<HistoryResult> {
         if q.from
             .iter()
             .chain(&q.to)
@@ -414,7 +444,7 @@ impl Store {
                 "this store has no change log".into(),
             ));
         };
-        log.query_with(q, self.snapshot().commit, true)
+        log.query_with(q, self.snapshot().commit, true, Some(max_memory_bytes))
     }
 
     /// The commit a selector names, without asking that its state be readable.

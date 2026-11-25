@@ -63,6 +63,40 @@ mod readonly;
 
 pub(crate) use pager::HistoryPages;
 
+/// Test-only observation of changelog index and record read progress.
+#[cfg(feature = "failpoints")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeLogReadEvent {
+    IndexReadChunk,
+    IndexDecode,
+    RecordReadChunk,
+    RecordDecode,
+}
+
+#[cfg(feature = "failpoints")]
+pub type ChangeLogReadObserver = Arc<dyn Fn(ChangeLogReadEvent) + Send + Sync>;
+
+#[cfg(feature = "failpoints")]
+thread_local! {
+    static CHANGELOG_READ_OBSERVER: std::cell::RefCell<Option<ChangeLogReadObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a thread-local observer for changelog index and record reads.
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub fn set_changelog_read_observer(observer: Option<ChangeLogReadObserver>) {
+    CHANGELOG_READ_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(feature = "failpoints")]
+fn observe_changelog_read(event: ChangeLogReadEvent) {
+    let observer = CHANGELOG_READ_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(event);
+    }
+}
+
 use super::diff::{Keys, QuadKey};
 use super::*;
 use rustc_hash::FxHashMap;
@@ -70,6 +104,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Weak;
 use std::time::{Duration, Instant};
+
+pub(super) fn memory_budget(limit: u64, requested: u64) -> Error {
+    Error::BudgetExceeded(crate::Budget {
+        kind: crate::BudgetKind::Memory,
+        limit,
+        requested,
+    })
+}
 
 /// The directory of a persistent store's change log.
 pub const CHANGES_DIR: &str = "changes";
@@ -891,13 +933,14 @@ impl SegIndex {
 
     /// Decode an index file: (first, last, index).
     fn decode(b: &[u8], dataset_id: uuid::Uuid) -> Option<(u64, u64, SegIndex)> {
-        Self::decode_with(b, dataset_id, None).ok().flatten()
+        Self::decode_with(b, dataset_id, None, None).ok().flatten()
     }
 
     fn decode_with(
         b: &[u8],
         dataset_id: uuid::Uuid,
         mut check: Option<&mut dyn FnMut() -> Result<()>>,
+        max_bytes: Option<u64>,
     ) -> Result<Option<(u64, u64, SegIndex)>> {
         if b.len() < IDX_HEADER || &b[0..8] != IDX_MAGIC {
             return Ok(None);
@@ -921,10 +964,35 @@ impl SegIndex {
         if actual_crc != u32_at(56) {
             return Ok(None);
         }
+        let min_bytes = (nrecs as u64)
+            .saturating_mul(25)
+            .saturating_add((nposts as u64).saturating_mul(12));
+        if min_bytes > body.len() as u64 {
+            return Ok(None);
+        }
         let mut c = Cur { b: body, i: 0 };
         let mut ix = SegIndex::default();
+        if let Some(limit) = max_bytes {
+            let decoded = (nrecs as u64)
+                .saturating_mul(std::mem::size_of::<RecEntry>() as u64)
+                .saturating_add(
+                    (nposts as u64).saturating_mul(std::mem::size_of::<(u64, u32)>() as u64),
+                );
+            let held = (b.len() as u64).saturating_add(decoded);
+            if held > limit {
+                return Err(memory_budget(limit, held));
+            }
+            ix.recs.try_reserve_exact(nrecs).map_err(|_| {
+                Error::HistoryUnsupported("history-log index allocation was refused".into())
+            })?;
+            ix.postings.try_reserve_exact(nposts).map_err(|_| {
+                Error::HistoryUnsupported("history-log index allocation was refused".into())
+            })?;
+        }
         #[cfg(test)]
         open_tests::observe(open_tests::Event::IndexRecords);
+        #[cfg(feature = "failpoints")]
+        observe_changelog_read(ChangeLogReadEvent::IndexDecode);
         for idx in 0..nrecs {
             if idx.is_multiple_of(CHECK_STRIDE)
                 && let Some(check) = check.as_deref_mut()
@@ -1551,7 +1619,7 @@ impl ChangeLog {
 
     /// The index of segment `i`.
     fn index(&self, inner: &mut Inner, i: usize) -> Result<Arc<SegIndex>> {
-        self.index_with(inner, i, None)
+        self.index_with(inner, i, None, None)
     }
 
     fn index_with(
@@ -1559,6 +1627,7 @@ impl ChangeLog {
         inner: &mut Inner,
         i: usize,
         mut check: Option<&mut dyn FnMut() -> Result<()>>,
+        max_bytes: Option<u64>,
     ) -> Result<Arc<SegIndex>> {
         if let Some(ix) = &inner.segs[i].index {
             return Ok(ix.clone());
@@ -1574,17 +1643,19 @@ impl ChangeLog {
             .idx_path()
             .expect("a sealed persistent segment");
         let b = match check.as_deref_mut() {
-            Some(check) => Self::read_index_checked(&path, check)?,
+            Some(check) => Self::read_index_checked(&path, check, max_bytes)?,
             None => {
                 #[cfg(test)]
                 open_tests::observe(open_tests::Event::IndexReadAttempt);
                 let bytes = std::fs::read(&path)?;
                 #[cfg(test)]
                 open_tests::observe(open_tests::Event::IndexReadChunk);
+                #[cfg(feature = "failpoints")]
+                observe_changelog_read(ChangeLogReadEvent::IndexReadChunk);
                 bytes
             }
         };
-        let (_, _, ix) = SegIndex::decode_with(&b, self.dataset_id, check)?
+        let (_, _, ix) = SegIndex::decode_with(&b, self.dataset_id, check, max_bytes)?
             .ok_or_else(|| Error::Corrupt(format!("{}: damaged index", path.display())))?;
         let ix = Arc::new(ix);
         inner.cache.push_front((first, ix.clone()));
@@ -1593,9 +1664,19 @@ impl ChangeLog {
     }
 
     /// Read the entire sidecar, polling before each read and every interrupted retry.
-    fn read_index_checked(path: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<Vec<u8>> {
+    fn read_index_checked(
+        path: &Path,
+        check: &mut dyn FnMut() -> Result<()>,
+        max_bytes: Option<u64>,
+    ) -> Result<Vec<u8>> {
         check()?;
         let mut file = File::open(path)?;
+        if let Some(limit) = max_bytes {
+            let len = file.metadata()?.len();
+            if len > limit {
+                return Err(memory_budget(limit, len));
+            }
+        }
         let mut bytes = Vec::new();
         let mut chunk = [0; 64 << 10];
         loop {
@@ -1605,12 +1686,20 @@ impl ChangeLog {
             match file.read(&mut chunk) {
                 Ok(0) => return Ok(bytes),
                 Ok(n) => {
+                    let next = (bytes.len() as u64).saturating_add(n as u64);
+                    if let Some(limit) = max_bytes
+                        && next > limit
+                    {
+                        return Err(memory_budget(limit, next));
+                    }
                     bytes.try_reserve(n).map_err(|error| {
                         std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
                     })?;
                     bytes.extend_from_slice(&chunk[..n]);
                     #[cfg(test)]
                     open_tests::observe(open_tests::Event::IndexReadChunk);
+                    #[cfg(feature = "failpoints")]
+                    observe_changelog_read(ChangeLogReadEvent::IndexReadChunk);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error.into()),
@@ -1629,6 +1718,10 @@ impl ChangeLog {
         };
         if seg.path.is_none() {
             let (body, _) = frame(&seg.mem, offset as usize).ok_or_else(damaged)?;
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::RecordDecode);
             return decode(body).ok_or_else(damaged);
         }
         let path = seg.path.as_ref().expect("checked");
@@ -1639,7 +1732,11 @@ impl ChangeLog {
         let mut buf = vec![0u8; 8 + len];
         buf[..8].copy_from_slice(&h);
         read_exact_at(&f, &mut buf[8..], offset + 8)?;
+        #[cfg(feature = "failpoints")]
+        observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
         let (body, _) = frame(&buf, 0).ok_or_else(damaged)?;
+        #[cfg(feature = "failpoints")]
+        observe_changelog_read(ChangeLogReadEvent::RecordDecode);
         decode(body).ok_or_else(damaged)
     }
 
@@ -1675,6 +1772,8 @@ impl ChangeLog {
                 check()?;
                 admit(frame + held)?;
                 check()?;
+                #[cfg(feature = "failpoints")]
+                observe_changelog_read(ChangeLogReadEvent::RecordDecode);
                 let r = decode_admitted_checked(body, check)?.ok_or_else(damaged)?;
                 Ok::<_, Error>((r, held))
             };
@@ -1709,6 +1808,8 @@ impl ChangeLog {
                 .and_then(|n| n.checked_add(start as u64))
                 .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
             readonly::read_exact_at_checked(&f, &mut body[start..end], read_offset, check)?;
+            #[cfg(feature = "failpoints")]
+            observe_changelog_read(ChangeLogReadEvent::RecordReadChunk);
             check()?;
             crc.update(&body[start..end]);
         }
@@ -1893,7 +1994,7 @@ impl ChangeLog {
             check()?;
             #[cfg(test)]
             open_tests::observe(open_tests::Event::TimestampIndex);
-            let ix = self.index_with(&mut inner, i, Some(check))?;
+            let ix = self.index_with(&mut inner, i, Some(check), None)?;
             let n = ix.recs.partition_point(|r| r.ts <= ms);
             // a gap tells no time of its own
             for (idx, r) in ix.recs[..n].iter().rev().enumerate() {
@@ -1934,6 +2035,7 @@ impl ChangeLog {
         descending: bool,
         holes_after_stop: bool,
         no_wait: bool,
+        max_bytes: Option<u64>,
         check: &mut dyn FnMut() -> Result<()>,
         mut paged: Option<&mut PageHooks<'_, '_>>,
         visit: &mut Visit<'_>,
@@ -1941,11 +2043,18 @@ impl ChangeLog {
         if let Some(reader) = &self.readonly {
             return reader.scan(from, to, filter, descending, check, visit);
         }
+        let checked = no_wait || paged.is_some() || max_bytes.is_some();
+        if checked {
+            check()?;
+        }
         let mut inner = if no_wait {
             self.inner.try_lock().ok_or(Error::WriterBusy)?
         } else {
             self.inner.lock()
         };
+        if checked {
+            check()?;
+        }
         let mut holes: Vec<Unrecorded> = Vec::new();
         if from > to {
             return Ok(holes);
@@ -1982,7 +2091,7 @@ impl ChangeLog {
         };
         let mut stop = false;
         'segs: for i in order {
-            if no_wait || paged.is_some() {
+            if checked {
                 check()?;
             }
             let (sf, sl) = (inner.segs[i].first, inner.segs[i].last);
@@ -2011,7 +2120,11 @@ impl ChangeLog {
             if stop && !holes_after_stop {
                 break;
             }
-            let ix = self.index(&mut inner, i)?;
+            let ix = if checked {
+                self.index_with(&mut inner, i, Some(check), max_bytes)?
+            } else {
+                self.index(&mut inner, i)?
+            };
             let lo = ix.recs.partition_point(|r| r.seq < from);
             let hi = ix.recs.partition_point(|r| r.seq <= to);
             // A gap can begin in the requested window but end after it. That
@@ -2023,7 +2136,10 @@ impl ChangeLog {
                         .get(hi)
                         .is_some_and(|record| record.hole.is_some_and(|(first, _)| first <= to)),
                 );
-            for r in &ix.recs[lo..hole_hi] {
+            for (idx, r) in ix.recs[lo..hole_hi].iter().enumerate() {
+                if checked && idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                    check()?;
+                }
                 if let Some((f, reason)) = r.hole {
                     holes.push(Unrecorded {
                         from: f.max(from),
@@ -2041,13 +2157,22 @@ impl ChangeLog {
                 Some(roles) => {
                     let mut acc: Option<Vec<u32>> = None;
                     for hs in roles {
+                        if checked {
+                            check()?;
+                        }
                         let mut v = Vec::new();
                         for h in hs {
+                            if checked {
+                                check()?;
+                            }
                             ix.lookup(*h, &mut v);
                         }
                         v.retain(|&o| (lo as u32..hi as u32).contains(&o));
                         v.sort_unstable();
                         v.dedup();
+                        if checked {
+                            check()?;
+                        }
                         acc = Some(match acc {
                             None => v,
                             Some(a) => a
@@ -2078,12 +2203,25 @@ impl ChangeLog {
                 }
                 let record = match paged.as_deref_mut() {
                     Some(p) => self.read_admitted(&inner, i, e.offset, p.admit, check)?,
+                    None if checked => {
+                        let mut admit = |bytes: u64| {
+                            if let Some(limit) = max_bytes
+                                && bytes > limit
+                            {
+                                Err(memory_budget(limit, bytes))
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        self.read_admitted(&inner, i, e.offset, &mut admit, check)?
+                    }
                     None => self.read(&inner, i, e.offset)?,
                 };
                 if let Record::Changes(c, changes) = &record {
+                    #[cfg(test)]
                     let is_paged = paged.is_some();
                     for (idx, (add, k)) in changes.iter().enumerate() {
-                        if (no_wait || is_paged) && idx.is_multiple_of(CHECK_STRIDE) {
+                        if checked && idx.is_multiple_of(CHECK_STRIDE) {
                             check()?;
                         }
                         #[cfg(test)]
@@ -2979,6 +3117,7 @@ mod settings_format_tests {
             false,
             false,
             false,
+            None,
             &mut || Ok(()),
             Some(&mut PageHooks {
                 admit: &mut admit,
@@ -3004,6 +3143,7 @@ mod settings_format_tests {
             false,
             false,
             false,
+            None,
             &mut || {
                 if evaluated.get() == 1_024 {
                     Err(Error::Cancelled)
@@ -3221,6 +3361,205 @@ mod settings_format_tests {
                 admits <= 1,
                 "fail_poll={fail_poll}: expected at most frame admission before decode, got {admits}"
             );
+        }
+    }
+
+    #[test]
+    fn published_history_changes_check_cold_indexes_and_bound_records() {
+        use crate::store::history_query::{HistoryBound, HistoryQuery};
+        use std::rc::Rc;
+
+        // 1. Cold sealed index (> 128 KiB): cancel, deadline, and budget refusal before full read.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            change_log_segment_bytes: 4096,
+            ..Default::default()
+        };
+        let store = Store::open(dir.path(), opts.clone()).unwrap();
+        store.change_log().unwrap().set_background(false);
+        let mut triples = String::new();
+        use std::fmt::Write as _;
+        for i in 0..8_000 {
+            writeln!(&mut triples, "<urn:idx{i}> <urn:p> {i} .").unwrap();
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {triples} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let big_payload = "r".repeat(256 << 10);
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ <urn:target> <urn:p> \"{big_payload}\" . }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let head = store.head_commit().seq;
+        let log = store.change_log().unwrap().clone();
+        let first_idx_len = {
+            let mut inner = log.inner.lock();
+            assert!(inner.segs.len() >= 2);
+            assert!(inner.segs[0].sealed);
+            inner.cache.clear();
+            inner.segs[0].idx_path().unwrap().metadata().unwrap().len()
+        };
+        assert!(first_idx_len > (128 << 10));
+
+        for no_wait in [true, false] {
+            // 1a. Mid-read cancellation during cold index load stops before chunk 2 and decode.
+            log.inner.lock().cache.clear();
+            let flag = Arc::new(AtomicBool::new(false));
+            let stop = flag.clone();
+            let progress = Rc::new(Cell::new((0usize, 0usize)));
+            let witness = progress.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                let (mut chunks, mut after) = witness.get();
+                match event {
+                    open_tests::Event::IndexReadChunk => {
+                        if chunks == 0 {
+                            chunks = 1;
+                            stop.store(true, Ordering::Relaxed);
+                        } else {
+                            after += 1;
+                        }
+                    }
+                    open_tests::Event::IndexCrcChunk
+                    | open_tests::Event::IndexRecords
+                    | open_tests::Event::IndexRecord
+                    | open_tests::Event::IndexPosting
+                        if chunks > 0 =>
+                    {
+                        after += 1;
+                    }
+                    _ => {}
+                }
+                witness.set((chunks, after));
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(head)),
+                cancel: Some(flag.clone()),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 16 << 20)
+            } else {
+                store.published_history_changes(&q, 16 << 20)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::Cancelled)),
+                "no_wait={no_wait}: {res:?}"
+            );
+            assert_eq!(progress.get(), (1, 0), "no_wait={no_wait}");
+            assert!(
+                log.inner.lock().cache.is_empty(),
+                "cancelled cold index must not be cached"
+            );
+
+            // 1b. Deadline expiration after the first cold index chunk stops with Timeout.
+            log.inner.lock().cache.clear();
+            let deadline = Instant::now() + Duration::from_millis(20);
+            let expired = Rc::new(Cell::new((0usize, 0usize)));
+            let witness = expired.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                let (mut chunks, mut after) = witness.get();
+                match event {
+                    open_tests::Event::IndexReadChunk => {
+                        if chunks == 0 {
+                            chunks = 1;
+                            while Instant::now() <= deadline {
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                        } else {
+                            after += 1;
+                        }
+                    }
+                    open_tests::Event::IndexCrcChunk | open_tests::Event::IndexRecords
+                        if chunks > 0 =>
+                    {
+                        after += 1;
+                    }
+                    _ => {}
+                }
+                witness.set((chunks, after));
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(head)),
+                deadline: Some(deadline),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 16 << 20)
+            } else {
+                store.published_history_changes(&q, 16 << 20)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::Timeout)),
+                "no_wait={no_wait}: {res:?}"
+            );
+            assert_eq!(expired.get(), (1, 0), "no_wait={no_wait}");
+
+            // 1c. Oversized cold index is refused before reading any chunk.
+            log.inner.lock().cache.clear();
+            let attempts = Rc::new(Cell::new(0usize));
+            let witness = attempts.clone();
+            let observer = open_tests::Observe::new(move |event| {
+                if event == open_tests::Event::IndexReadAttempt {
+                    witness.set(witness.get() + 1);
+                }
+            });
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:missing"))],
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(head)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 64 << 10)
+            } else {
+                store.published_history_changes(&q, 64 << 10)
+            };
+            drop(observer);
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: {res:?}"
+            );
+            assert_eq!(attempts.get(), 0, "no_wait={no_wait}");
+
+            // 2. Oversized matching record (> 256 KiB) is refused before reading when budget is small,
+            //    and succeeds when the budget covers frame + decoded footprint.
+            let q = HistoryQuery {
+                subjects: vec![Term::NamedNode(NamedNode::new_unchecked("urn:target"))],
+                from: Some(HistoryBound::Commit(head)),
+                to: Some(HistoryBound::Commit(head)),
+                ..Default::default()
+            };
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 64 << 10)
+            } else {
+                store.published_history_changes(&q, 64 << 10)
+            };
+            assert!(
+                matches!(res, Err(Error::BudgetExceeded(_))),
+                "no_wait={no_wait}: {res:?}"
+            );
+
+            let res = if no_wait {
+                store.try_published_history_changes(&q, 16 << 20)
+            } else {
+                store.published_history_changes(&q, 16 << 20)
+            }
+            .unwrap();
+            assert_eq!(res.changes.len(), 1, "no_wait={no_wait}");
+            assert_eq!(res.changes[0].commit.seq, head, "no_wait={no_wait}");
         }
     }
 }

@@ -124,6 +124,8 @@ pub use changelog::{
     CHANGE_LOG_FILE, CHANGES_DIR, ChangeCommit, ChangeLog, ChangeLogSettings, ChangeLogStatus,
     Unrecorded, UnrecordedReason,
 };
+#[cfg(feature = "failpoints")]
+pub use changelog::{ChangeLogReadEvent, ChangeLogReadObserver, set_changelog_read_observer};
 pub use changes::{ChangePage, ChangesOptions, CommitChanges};
 pub use clone::{CloneMethod, CloneMode, CloneOptions, CloneReport};
 pub use commit_graph::{CommitGraph, CommitGraphOptions, GraphBranch, GraphCommit, GraphCursor};

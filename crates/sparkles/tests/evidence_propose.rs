@@ -2952,3 +2952,279 @@ fn reconciliation_keeps_holds_when_an_expected_attachment_is_pending() {
         [hold_id]
     );
 }
+
+#[test]
+fn post_commit_reconciliation_cancels_during_cold_changelog_index_read() {
+    use sparkles::store::{ChangeLogReadEvent, StoreOptions, set_changelog_read_observer};
+    use std::sync::atomic::AtomicUsize;
+
+    struct ResetObserver;
+    impl Drop for ResetObserver {
+        fn drop(&mut self) {
+            set_changelog_read_observer(None);
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let catalog_opts = StoreOptions {
+        change_log_segment_bytes: 4096,
+        ..Default::default()
+    };
+    let fact;
+    let foreign_orphan = uuid::Uuid::from_u128(1);
+    let local_orphan = uuid::Uuid::from_u128(2);
+    {
+        let catalog = sparkles::Catalog::open(dir.path(), catalog_opts.clone().into()).unwrap();
+        let origin = catalog.create("origin", &Default::default()).unwrap();
+        let target = catalog.create("target", &Default::default()).unwrap();
+        configured(&origin);
+        fact = with_fact(&target);
+        // Write enough distinct terms to produce a sealed .idx file larger than 128 KiB (>2 chunks).
+        let mut triples = String::new();
+        use std::fmt::Write as _;
+        for i in 0..8_000 {
+            writeln!(&mut triples, "<urn:big{i}> <urn:p> {i} .").unwrap();
+        }
+        origin
+            .update(&format!("INSERT DATA {{ {triples} }}"))
+            .unwrap();
+        origin.store().flush_change_log().unwrap();
+        origin
+            .update("INSERT DATA { <urn:after> <urn:p> 1 . }")
+            .unwrap();
+        origin.store().flush_change_log().unwrap();
+
+        let changes_dir = origin.store().root().unwrap().join("changes");
+        let max_idx_len = std::fs::read_dir(&changes_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("idx"))
+            .map(|e| e.metadata().unwrap().len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_idx_len > (128 << 10),
+            "expected sealed cold index > 128 KiB, got {max_idx_len}"
+        );
+
+        evidence::acquire_hold_for(
+            &target,
+            foreign_orphan,
+            &[evidence::CommitRef {
+                branch_id: target.dataset_id(),
+                seq: fact,
+            }],
+            Some(origin.dataset_id()),
+        )
+        .unwrap();
+        evidence::acquire_hold(
+            &target,
+            local_orphan,
+            &[evidence::CommitRef {
+                branch_id: target.dataset_id(),
+                seq: fact,
+            }],
+        )
+        .unwrap();
+    }
+
+    // Reopen so every sealed segment index is cold (not in ChangeLog::inner.cache).
+    let catalog = sparkles::Catalog::open(dir.path(), catalog_opts.into()).unwrap();
+    let origin = catalog.get("origin").unwrap();
+    let target = catalog.get("target").unwrap();
+    let future = target.store().head_commit().timestamp_ms + 2 * sparkles::holds::DEFAULT_GRACE_MS;
+    target.store().set_clock(Arc::new(move || future));
+
+    let control = Control::none();
+    let cancel = control.cancel.clone();
+    let triggered = Arc::new(AtomicBool::new(false));
+    let chunks_after = Arc::new(AtomicUsize::new(0));
+    let decodes_after = Arc::new(AtomicUsize::new(0));
+    let t = triggered.clone();
+    let c_after = chunks_after.clone();
+    let d_after = decodes_after.clone();
+    let _reset = ResetObserver;
+    set_changelog_read_observer(Some(Arc::new(move |event| match event {
+        ChangeLogReadEvent::IndexReadChunk => {
+            if !t.swap(true, Ordering::SeqCst) {
+                cancel.cancel();
+            } else {
+                c_after.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        ChangeLogReadEvent::IndexDecode if t.load(Ordering::SeqCst) => {
+            d_after.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    })));
+
+    let proposed = evidence::propose(
+        Some(&catalog),
+        &origin,
+        &origin,
+        &batch_for_fact(&target, target.dataset_id(), fact),
+        &options(),
+        &mut |_, _| all(),
+        &control,
+    )
+    .unwrap();
+    drop(_reset);
+
+    assert!(proposed.committed);
+    assert!(
+        triggered.load(Ordering::SeqCst),
+        "cold index read was not reached"
+    );
+    assert!(matches!(control.check(), Err(sparkles::Error::Cancelled)));
+    assert_eq!(
+        chunks_after.load(Ordering::SeqCst),
+        0,
+        "continued reading cold index chunks after cancellation"
+    );
+    assert_eq!(
+        decodes_after.load(Ordering::SeqCst),
+        0,
+        "decoded cold index after cancellation"
+    );
+    let held: Vec<_> = evidence::holds(&target)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(held.len(), 3);
+    assert!(held.contains(&foreign_orphan));
+    assert!(held.contains(&local_orphan));
+    assert!(held.contains(&proposed.hold.unwrap()));
+}
+
+#[test]
+fn post_commit_reconciliation_cancels_during_large_changelog_record_read() {
+    use sparkles::store::{ChangeLogReadEvent, StoreOptions, set_changelog_read_observer};
+    use std::sync::atomic::AtomicUsize;
+
+    struct ResetObserver;
+    impl Drop for ResetObserver {
+        fn drop(&mut self) {
+            set_changelog_read_observer(None);
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = sparkles::Catalog::open(
+        dir.path(),
+        StoreOptions {
+            change_log_segment_bytes: 4096,
+            ..Default::default()
+        }
+        .into(),
+    )
+    .unwrap();
+    let origin = catalog.create("origin", &Default::default()).unwrap();
+    let target = catalog.create("target", &Default::default()).unwrap();
+    configured(&origin);
+    let fact = with_fact(&target);
+    let foreign_orphan = uuid::Uuid::from_u128(1);
+    let local_orphan = uuid::Uuid::from_u128(2);
+    let op = evidence::operation_iri(foreign_orphan);
+    let payload = "p".repeat(256 << 10);
+
+    // Record a >256 KiB commit matching the foreign orphan's subject and rdf:type predicate,
+    // then remove it so current_holds is false and historical_holds reads the large record.
+    origin
+        .update(&format!(
+            "INSERT DATA {{ <{}> a <urn:not-an-operation> ; <urn:pad> \"{payload}\" . }}",
+            op.as_str()
+        ))
+        .unwrap();
+    origin.store().flush_change_log().unwrap();
+    origin
+        .update(&format!(
+            "DELETE DATA {{ <{}> a <urn:not-an-operation> ; <urn:pad> \"{payload}\" . }}",
+            op.as_str()
+        ))
+        .unwrap();
+    origin.store().flush_change_log().unwrap();
+
+    evidence::acquire_hold_for(
+        &target,
+        foreign_orphan,
+        &[evidence::CommitRef {
+            branch_id: target.dataset_id(),
+            seq: fact,
+        }],
+        Some(origin.dataset_id()),
+    )
+    .unwrap();
+    evidence::acquire_hold(
+        &target,
+        local_orphan,
+        &[evidence::CommitRef {
+            branch_id: target.dataset_id(),
+            seq: fact,
+        }],
+    )
+    .unwrap();
+    let future = target.store().head_commit().timestamp_ms + 2 * sparkles::holds::DEFAULT_GRACE_MS;
+    target.store().set_clock(Arc::new(move || future));
+
+    let control = Control::none();
+    let cancel = control.cancel.clone();
+    let triggered = Arc::new(AtomicBool::new(false));
+    let chunks_after = Arc::new(AtomicUsize::new(0));
+    let decodes_after = Arc::new(AtomicUsize::new(0));
+    let t = triggered.clone();
+    let c_after = chunks_after.clone();
+    let d_after = decodes_after.clone();
+    let _reset = ResetObserver;
+    set_changelog_read_observer(Some(Arc::new(move |event| match event {
+        ChangeLogReadEvent::RecordReadChunk => {
+            if !t.swap(true, Ordering::SeqCst) {
+                cancel.cancel();
+            } else {
+                c_after.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        ChangeLogReadEvent::RecordDecode if t.load(Ordering::SeqCst) => {
+            d_after.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    })));
+
+    let proposed = evidence::propose(
+        Some(&catalog),
+        &origin,
+        &origin,
+        &batch_for_fact(&target, target.dataset_id(), fact),
+        &options(),
+        &mut |_, _| all(),
+        &control,
+    )
+    .unwrap();
+    drop(_reset);
+
+    assert!(proposed.committed);
+    assert!(
+        triggered.load(Ordering::SeqCst),
+        "large record read was not reached"
+    );
+    assert!(matches!(control.check(), Err(sparkles::Error::Cancelled)));
+    assert_eq!(
+        chunks_after.load(Ordering::SeqCst),
+        0,
+        "continued reading large record chunks after cancellation"
+    );
+    assert_eq!(
+        decodes_after.load(Ordering::SeqCst),
+        0,
+        "decoded large record after cancellation"
+    );
+    let held: Vec<_> = evidence::holds(&target)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(held.len(), 3);
+    assert!(held.contains(&foreign_orphan));
+    assert!(held.contains(&local_orphan));
+    assert!(held.contains(&proposed.hold.unwrap()));
+}
