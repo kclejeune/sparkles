@@ -243,6 +243,86 @@ fn initial_bindings() {
 }
 
 #[test]
+fn initial_bindings_size_a_join_of_graph_unions() {
+    use std::fmt::Write;
+
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from(
+        "@prefix ex: <urn:ex:> . ex:river a ex:River . ex:places { ex:river ex:location ex:sea . ex:land ex:near ex:sea . }",
+    );
+    for i in 0..32_768 {
+        write!(data, " ex:noise{i} a ex:Other ; ex:other ex:sea .").unwrap();
+    }
+    s.load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+    let ask = |class: &str, predicate: &str| {
+        format!(
+            "PREFIX ex: <urn:ex:> ASK {{
+                {{ {{ ?s a {class} }} BIND(<urn:x-arq:DefaultGraph> AS ?g) }}
+                UNION {{ GRAPH ?g {{ ?s a {class} }} FILTER(?g != ex:inferred) }}
+                {{ {{ ?s {predicate} ?o }} BIND(<urn:x-arq:DefaultGraph> AS ?h) }}
+                UNION {{ GRAPH ?h {{ ?s {predicate} ?o }} FILTER(?h != ex:inferred) }}
+            }}"
+        )
+    };
+    // This is the largest row table described by the plan, before execution's
+    // accounting adds working storage. Unrelated quads must not inflate it.
+    fn largest_table(plan: &PlanInfo) -> f64 {
+        plan.children.iter().map(largest_table).fold(
+            plan.estimated_rows * plan.columns.len().max(1) as f64 * 8.0,
+            f64::max,
+        )
+    }
+    let budget = 1 << 20;
+    let inline_opts = QueryOptions {
+        max_memory_bytes: Some(budget),
+        ..Default::default()
+    };
+    let bound = ask("?class", "?predicate");
+    let (_, unbound_plan) = explain(s.snapshot(), &bound, &inline_opts).unwrap();
+    assert!(largest_table(&unbound_plan) > budget as f64);
+
+    for (predicate, expected) in [("location", true), ("near", false)] {
+        let bound_opts = QueryOptions {
+            initial_bindings: vec![
+                (
+                    "?class".into(),
+                    oxrdf::NamedNode::new_unchecked("urn:ex:River").into(),
+                ),
+                (
+                    "$predicate".into(),
+                    oxrdf::NamedNode::new_unchecked(format!("urn:ex:{predicate}")).into(),
+                ),
+            ],
+            ..inline_opts.clone()
+        };
+        let inline = ask("ex:River", &format!("ex:{predicate}"));
+        let inline_run = query(s.snapshot(), &inline, &inline_opts).unwrap();
+        let bound_run = query(s.snapshot(), &bound, &bound_opts).unwrap();
+        assert_eq!(inline_run.boolean, expected);
+        assert_eq!(bound_run.boolean, expected);
+        // Plan descriptions and variable names can account for small differences.
+        assert!(
+            bound_run.mem_peak_bytes.abs_diff(inline_run.mem_peak_bytes) < 4096,
+            "bound and inlined execution peaks were {} and {} bytes",
+            bound_run.mem_peak_bytes,
+            inline_run.mem_peak_bytes
+        );
+
+        let (_, inline_plan) = explain(s.snapshot(), &inline, &inline_opts).unwrap();
+        let (_, bound_plan) = explain(s.snapshot(), &bound, &bound_opts).unwrap();
+        let bound_bytes = largest_table(&bound_plan);
+        assert_eq!(
+            bound_bytes,
+            largest_table(&inline_plan),
+            "largest estimated row table in bytes, with an execution peak of {} bytes",
+            bound_run.mem_peak_bytes
+        );
+        assert!(bound_bytes <= bound_run.mem_peak_bytes as f64);
+    }
+}
+
+#[test]
 fn rdf12_triple_terms() {
     let data = r#"
         PREFIX : <http://ex.org/>

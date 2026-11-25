@@ -1064,6 +1064,14 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// Install a request binding before planning and return the IDs for result projection.
+    pub(super) fn bind_initial(&mut self, name: &str, term: &Term) -> (VarId, Id) {
+        let var = self.ctx.var(name.trim_start_matches(['?', '$']));
+        let id = self.ctx.intern_outside_term(term);
+        self.subst.insert(var, id);
+        (var, id)
+    }
+
     /// Whether the variable or blank node `t`, which a property function call binds,
     /// occurs in the query anywhere but that call. Every occurrence in the algebra's SSE
     /// form counts, so the answer errs towards "used" (a string that happens to contain

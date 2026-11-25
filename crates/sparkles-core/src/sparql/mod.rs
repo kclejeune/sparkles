@@ -1728,13 +1728,11 @@ fn prepare_query_input_policy(
     }
     let mut planner = Planner::new(&ctx);
     planner.source = Some(parsed);
-    let mut bound: Vec<(table::VarId, Id)> = Vec::new();
-    for (name, term) in &opts.initial_bindings {
-        let v = ctx.var(name.trim_start_matches(['?', '$']));
-        let id = ctx.intern_outside_term(term);
-        planner.subst.insert(v, id);
-        bound.push((v, id));
-    }
+    let bound: Vec<_> = opts
+        .initial_bindings
+        .iter()
+        .map(|(name, term)| planner.bind_initial(name, term))
+        .collect();
     let (kind, pattern) = match parsed {
         Query::Select { .. } => (QueryKind::Select, pattern.clone()),
         Query::Ask { .. } => (
@@ -2029,7 +2027,8 @@ fn graph_root(kind: QueryKind, mut where_plan: PlanInfo, stage: Instant) -> Plan
     }
 }
 
-/// EXPLAIN: algebra (SSE) and the plan without executing it.
+/// EXPLAIN: source algebra (SSE) and the plan with the request's bindings applied,
+/// without executing it.
 pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(String, PlanInfo)> {
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     let depth = depth::check_query(&parsed)?;
@@ -2064,6 +2063,9 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
         let mut planner = Planner::new(&ctx);
         planner.source = Some(parsed);
+        for (name, term) in &opts.initial_bindings {
+            planner.bind_initial(name, term);
+        }
         // the shape that execution plans: ASK as a slice of one solution
         let kind = match parsed {
             Query::Select { .. } => QueryKind::Select,
