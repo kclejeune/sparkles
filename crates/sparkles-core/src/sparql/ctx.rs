@@ -2078,6 +2078,37 @@ impl Ctx {
         }
     }
 
+    /// Run an optional single-threaded planning estimator (such as FILTER selectivity
+    /// sampling) that may decline on a memory budget refusal without poisoning the query's
+    /// sticky failure latch. Pre-existing failures, cancellation, and timeout always
+    /// propagate and are never cleared.
+    pub(super) fn try_optional_memory_budget<T>(
+        &self,
+        f: impl FnOnce() -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        self.check()?;
+        match f() {
+            Ok(v) => Ok(v),
+            Err(Error::BudgetExceeded(b))
+                if matches!(b.kind, BudgetKind::Memory | BudgetKind::ServerMemory) =>
+            {
+                let mut slot = self.memory_failure.failure.lock();
+                if matches!(
+                    slot.as_ref(),
+                    Some(ResourceRefusal::Budget(latched))
+                        if matches!(latched.kind, BudgetKind::Memory | BudgetKind::ServerMemory)
+                ) {
+                    *slot = None;
+                    self.memory_failure.failed.store(false, Ordering::Release);
+                }
+                drop(slot);
+                self.check()?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Charge `bytes` more of query-local terms and memos, which stay until the context
     /// drops, in both accounting modes. Infallible expression interning must not turn a
     /// resource failure into an ordinary unbound BIND, so a refusal is recorded and fails

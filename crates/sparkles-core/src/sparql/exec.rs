@@ -11003,8 +11003,8 @@ mod string_order_tests {
         }
     }
 
-    /// A cursor reserves the keys its floors read, so a string longer than the budget
-    /// fails the mask with a memory refusal, while an eager table reads it unchecked.
+    /// Both accounting modes reserve the keys their floors read, so a string longer than
+    /// the budget fails the mask with a memory refusal in eager and cursor modes alike.
     #[test]
     fn a_refused_floor_fails_the_cursor_mask() {
         use super::super::expr::CmpOp;
@@ -11019,14 +11019,10 @@ mod string_order_tests {
             let (t, x, y) = product(&ctx, &ids);
             let e = cmp(x, y, CmpOp::Lt);
             let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
-            if cursor {
-                assert!(
-                    matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
-                    "{outcome:?}"
-                );
-            } else {
-                assert!(outcome.unwrap().is_some());
-            }
+            assert!(
+                matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+                "cursor={cursor}: {outcome:?}"
+            );
         }
     }
 

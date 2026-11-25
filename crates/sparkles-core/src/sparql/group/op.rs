@@ -242,7 +242,11 @@ impl Grouping {
         charged: bool,
         spill: bool,
     ) -> Result<Self> {
-        let bytes = aggs.len() as u64 * 256 + keys.len() as u64 * 64 + 1024;
+        let bytes = if spill {
+            aggs.len() as u64 * 256 + keys.len() as u64 * 64 + 1024
+        } else {
+            aggs.len() as u64 * 64 + keys.len() as u64 * 64 + 64
+        };
         let charge = if charged {
             ctx.retained_charge(bytes)?
         } else {

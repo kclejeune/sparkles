@@ -265,17 +265,7 @@ impl Described<'_> {
             .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
         for triple in &self.triples {
             ctx.check()?;
-            // The outer Triple slots are already included above. This envelope
-            // conservatively includes each owned lexical allocation and nested box.
-            let subject = match &triple.subject {
-                oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
-                oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
-            };
-            let payload = super::output::term_bytes(&triple.object)
-                .and_then(|n| n.checked_add(subject as u64))
-                .and_then(|n| n.checked_add(triple.predicate.as_str().len() as u64))
-                .and_then(|n| n.checked_add(256))
-                .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+            let payload = described_triple_bytes(ctx, triple)?;
             bytes = bytes
                 .checked_add(payload)
                 .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
@@ -450,6 +440,20 @@ fn resources(ctx: &Ctx, t: &Table, seen: &mut FxHashSet<Id>) -> Vec<Id> {
         }
     }
     resources
+}
+
+/// Conservative retained byte envelope for one described triple's owned terms,
+/// shared between [`Describer::emit`] and [`Described::into_output`].
+fn described_triple_bytes(ctx: &Ctx, triple: &Triple) -> Result<u64> {
+    let subject = match &triple.subject {
+        oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+        oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+    };
+    super::output::term_bytes(&triple.object)
+        .and_then(|n| n.checked_add(subject as u64))
+        .and_then(|n| n.checked_add(triple.predicate.as_str().len() as u64))
+        .and_then(|n| n.checked_add(256))
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))
 }
 
 impl Describer<'_> {
@@ -843,7 +847,11 @@ impl<'a> Describer<'a> {
         }
         let decode = self.ctx.charge(0)?;
         if let Some(triple) = self.decode_triple_checked(s, p, o, &decode)? {
-            let bytes = super::graph_triple_bytes(&triple);
+            let payload = described_triple_bytes(self.ctx, &triple)?;
+            // Admit both the triple's owned payload and the Vec<Triple> growth slot
+            // envelope so `Described::into_output` never exceeds its original admission.
+            let slot_envelope = (std::mem::size_of::<Triple>() as u64).saturating_mul(2);
+            let bytes = payload.saturating_add(slot_envelope);
             self.reserve(bytes)?;
             self.transient = self.transient.saturating_add(bytes);
             self.out.push(triple);

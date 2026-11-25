@@ -67,7 +67,13 @@ const WHOLE_RANGE: u64 = 4096;
 /// group binds (`leaves` are the patterns' access paths), keeping it in the query's
 /// context for the planner.
 pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) {
+    if leaves.iter().any(|l| matches!(l[0].kind, Kind::Empty)) || ctx.check().is_err() {
+        return;
+    }
     for f in filters {
+        if ctx.check().is_err() {
+            return;
+        }
         if f.has_exists() {
             continue;
         }
@@ -98,11 +104,17 @@ pub(super) fn prepare(ctx: &Ctx, leaves: &[Vec<Node>], filters: &[Expr]) {
             })
             .min_by_key(|s| s.cols.first().is_some_and(|(_, v)| vars.contains(v)));
         let Some(spec) = spec else { continue };
-        match selectivity(ctx, spec, f, &vars, &text) {
+        match ctx.try_optional_memory_budget(|| selectivity(ctx, spec, f, &vars, &text)) {
             Ok(Some(s)) => ctx.set_sampled(text, s),
             Ok(None) => {}
             Err(e) => {
-                tracing::debug!(target: "sparkles::sparql::sample", "no sampled selectivity for {text}: {e}")
+                tracing::debug!(target: "sparkles::sparql::sample", "no sampled selectivity for {text}: {e}");
+                if matches!(
+                    e,
+                    crate::error::Error::Cancelled | crate::error::Error::Timeout
+                ) {
+                    return;
+                }
             }
         }
     }
