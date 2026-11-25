@@ -996,10 +996,16 @@ normal test report, rather than every intermediate report from the feature matri
 `ci.exit` keeps the original CI result. The separate `ci-receipts.exit` fails if a
 selected Rust task has no retained report or evidence cannot be copied and verified.
 Not-selected tasks, tasks that never started and selections with no Rust packages are
-recorded separately. No replacement XML is generated for a missing report. A successful
-cached task whose report has been collected can therefore have a passing task result and
-failed evidence retention. The gate does not rerun that task automatically. Compiler
-cache directories are not a store for validation evidence.
+recorded separately. No replacement XML is generated for a missing report.
+
+When mise reuses a passing Rust test task, its replayed log names the gate run that
+produced the report and gives the hash of that run's JUnit manifest. The current
+manifest records the same reference. The `ci-receipts` step verifies the source
+manifest, its passing test result and the hashes of its retained files on the CI host.
+At least one report must have been created or changed during the source test task.
+The check looks in archived output if the gate name has since been used again. A missing
+or changed source still fails evidence retention even when the cached task passes.
+The gate does not rerun that task automatically.
 
 `scripts/ci.sh` runs on the primary host, which is `GATE_PRIMARY` or the first gate host.
 When the batch needs a conformance step, the steps run on a second gate host for the same

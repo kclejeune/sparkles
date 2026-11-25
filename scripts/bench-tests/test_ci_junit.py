@@ -24,6 +24,9 @@ class CiJunitIntegration(unittest.TestCase):
         profiles=("default",),
         later=False,
         copy_error=False,
+        gate_run="",
+        replayed_log=None,
+        preexisting=False,
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -33,22 +36,32 @@ class CiJunitIntegration(unittest.TestCase):
             target.mkdir(parents=True)
             (root / "target").symlink_to(target)
             target.with_suffix(".json").write_text('{"workspace_root":"fixture"}\n')
+            if preexisting:
+                report = target / "nextest/default/junit.xml"
+                report.parent.mkdir(parents=True)
+                report.write_bytes(b"<testsuites/>\n")
             for name in ("ci.sh", "ci-retain-junit.py"):
                 if (ROOT / "scripts" / name).exists():
                     shutil.copyfile(ROOT / "scripts" / name, root / "scripts" / name)
             tools = {
-                "git": '#!/bin/sh\ncase "$1" in rev-parse) echo 1111111111111111111111111111111111111111;; status) :;; *) exit 1;; esac\n',
+                "git": '#!/bin/sh\ncase "$1" in rev-parse) echo "$FIXTURE_COMMIT";; status) :;; *) exit 1;; esac\n',
                 "mbx": '#!/bin/bash\nshift 2\ntouch "$PWD/lease-live"\n"$@"\nrc=$?\nrm -rf "$PWD/cache" "$PWD/target" "$PWD/lease-live"\nexit "$rc"\n',
                 "mise": """#!/usr/bin/env python3
-import os,pathlib,sys
+import os,pathlib,subprocess,sys
 root=pathlib.Path.cwd(); task=sys.argv[-1]
 if task=='test':
  assert (root/'lease-live').exists()
+ if 'REPLAYED_LOG' in os.environ:
+  print(os.environ['REPLAYED_LOG'], end='')
+  sys.exit(0)
  if os.environ['MISSING']=='0':
   for profile in os.environ['PROFILES'].split(','):
    p=root/'target/nextest'/profile/'junit.xml'; p.parent.mkdir(parents=True,exist_ok=True)
    p.write_bytes(('<testsuites fixture="'+profile+'"><testsuite failures="'+os.environ['FAIL']+'"/></testsuites>\\n').encode())
  if os.environ['COPY_ERROR']=='1': (root/'.artifacts/ci/junit/.staging').mkdir()
+ if os.environ['FAIL']=='0' and os.environ['SPARKLES_CI_GATE_RUN']:
+  with open('.artifacts/ci/junit-retention.log', 'a') as log:
+   subprocess.run([sys.executable, 'scripts/ci-retain-junit.py', 'cache-origin'], stderr=log)
  sys.exit(29 if os.environ['FAIL']=='1' else 0)
 if task=='node:test':
  p=root/'target/nextest/default/junit.xml';p.write_text('overwritten by later task')
@@ -65,7 +78,11 @@ if task=='node:test':
                 MISSING="1" if missing else "0",
                 PROFILES=",".join(profiles),
                 COPY_ERROR="1" if copy_error else "0",
+                FIXTURE_COMMIT=("2" if replayed_log is not None else "1") * 40,
+                SPARKLES_CI_GATE_RUN=gate_run,
             )
+            if replayed_log is not None:
+                env["REPLAYED_LOG"] = replayed_log
             env.pop("SPARKLES_CI_LEASED", None)
             tasks = ["test", "node:test"] if later else ["test"]
             result = subprocess.run(
@@ -217,7 +234,7 @@ class RetentionDataControls(unittest.TestCase):
 
     def test_unknown_version_and_inconsistent_state_refuse(self):
         value = self.manifest()
-        value["version"] = 2
+        value["version"] = 3
         self.rewrite(value)
         with self.assertRaises(ValueError):
             self.helper.verify(self.out)
@@ -321,7 +338,7 @@ class ReaderContractControls(unittest.TestCase):
     def test_boolean_and_unknown_versions_refuse(self):
         self.capture()
         original = self.manifest()
-        for version in (True, 2):
+        for version in (True, 3):
             with self.subTest(version=version):
                 value = dict(original, version=version)
                 self.rewrite(value)
@@ -338,11 +355,17 @@ class ReaderContractControls(unittest.TestCase):
             identity, source_path=str(outside), retained_path="test/../../outside.json"
         )
         self.rewrite(value)
+        read_regular = self.helper.read_regular
+
+        def manifest_only(path):
+            self.assertEqual(path, self.out / "manifest.json")
+            return read_regular(path)
+
         with (
             mock.patch.object(
                 self.helper,
                 "read_regular",
-                side_effect=AssertionError("must refuse before file reads"),
+                side_effect=manifest_only,
             ),
             self.assertRaises(ValueError),
         ):
@@ -431,66 +454,166 @@ class ReaderContractControls(unittest.TestCase):
 
 
 class GateRetentionControls(unittest.TestCase):
-    def gate_copy(self, missing=False, copy_error=False):
+    run_ci = CiJunitIntegration.run_ci
+
+    def retain(self, root):
+        source = (ROOT / "scripts/gate/remote/gate-inner.sh").read_text()
+        function = source.split("  retain_ci_receipts() {", 1)[1].split(
+            "  step ci-receipts retain_ci_receipts", 1
+        )[0]
+        script = (
+            'set -uo pipefail\nG="$PWD/gate"\nout="$G/out/current"\nretain_ci_receipts() {'
+            + function
+            + '\nretain_ci_receipts\nrc=$?\necho "$rc" > "$out/ci-receipts.exit"\nexit "$rc"\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            check=False,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def gate_receipts(
+        self, files, source_files=None, *, archive=False, ci_exit=0, copy_error=False
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
-            (root / ".artifacts/ci").mkdir(parents=True)
             shutil.copyfile(
                 ROOT / "scripts/ci-retain-junit.py", root / "scripts/ci-retain-junit.py"
             )
-            out = root / "gate-out"
-            out.mkdir()
-            (out / "ci.exit").write_text("29\n")
-            spec = importlib.util.spec_from_file_location(
-                "gate_fixture_helper", root / "scripts/ci-retain-junit.py"
-            )
-            helper = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(helper)
-            args = type("Args", (), {"base": "", "packages": "all", "selected": True})()
-            retained = root / ".artifacts/ci/junit"
-            with mock.patch.object(
-                helper.subprocess, "check_output", side_effect=["a" * 40, ""]
-            ):
-                helper.init(root, retained, args)
-            helper.before(root, retained)
-            if not missing:
-                report = root / "target/nextest/default/junit.xml"
-                report.parent.mkdir(parents=True)
-                report.write_bytes(
-                    b'<testsuites><testsuite failures="1"/></testsuites>\n'
-                )
-            helper.after(root, retained, 0 if missing else 29)
+            out = root / "gate/out/current"
+            out.mkdir(parents=True)
+            (out / "ci.exit").write_text(f"{ci_exit}\n")
             if copy_error:
                 (out / "ci-receipts").mkdir()
-            source = (ROOT / "scripts/gate/remote/gate-inner.sh").read_text()
-            function = source.split("  retain_ci_receipts() {", 1)[1].split(
-                "  step ci-receipts retain_ci_receipts", 1
-            )[0]
-            script = (
-                'set -uo pipefail\nout="$PWD/gate-out"\nretain_ci_receipts() {'
-                + function
-                + '\nretain_ci_receipts\nrc=$?\necho "$rc" > "$out/ci-receipts.exit"\nexit "$rc"\n'
+            source = "original.old-123" if archive else "original"
+            for target, contents in (
+                (root / ".artifacts/ci", files),
+                (out.parent / source / "ci-receipts", source_files or {}),
+            ):
+                for name, data in contents.items():
+                    path = target / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
+            result = self.retain(root)
+            self.assertEqual((out / "ci.exit").read_text(), f"{ci_exit}\n")
+            self.assertEqual(
+                (out / "ci-receipts.exit").read_text(), f"{result.returncode}\n"
             )
-            result = subprocess.run(
-                ["bash", "-c", script],
-                check=False,
-                cwd=root,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertEqual((out / "ci.exit").read_text(), "29\n")
-            return result.returncode, int((out / "ci-receipts.exit").read_text())
+            return result
 
-    def test_valid_copy_has_separate_status_without_rewriting_ci_failure(self):
-        self.assertEqual(self.gate_copy(), (0, 0))
+    def test_fresh_passing_gate_verifies_only_with_a_report(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                result, receipt, files = self.run_ci(gate_run="current", missing=missing)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(receipt["status"], "missing" if missing else "retained")
+                gate = self.gate_receipts(files)
+                self.assertEqual(gate.returncode, int(missing), gate.stderr)
+                if missing:
+                    self.assertIn("JUnit evidence is missing", gate.stderr)
 
-    def test_missing_report_fails_evidence_only(self):
-        self.assertEqual(self.gate_copy(missing=True), (1, 1))
+    def test_fresh_failing_gate_keeps_the_original_report_and_exit(self):
+        result, receipt, files = self.run_ci(gate_run="current", failing=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(receipt["status"], "retained")
+        self.assertEqual(receipt["task_exit"], 29)
+        self.assertIn(b'failures="1"', files["junit/test/default/junit.xml"])
+        self.assertNotIn(b"sparkles-gate-junit-v1", files["logs/test.log"])
+        gate = self.gate_receipts(files, ci_exit=result.returncode)
+        self.assertEqual(gate.returncode, 0, gate.stderr)
 
     def test_copy_failure_is_not_hidden(self):
-        self.assertEqual(self.gate_copy(copy_error=True), (1, 1))
+        _, _, files = self.run_ci(gate_run="current")
+        gate = self.gate_receipts(files, copy_error=True)
+        self.assertEqual(gate.returncode, 1)
+
+    def reuse(self, source_files):
+        result, receipt, files = self.run_ci(
+            gate_run="current", replayed_log=source_files["logs/test.log"].decode()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(receipt["status"], "reused")
+        self.assertEqual(receipt["task_exit"], 0)
+        self.assertEqual(receipt["source_commit"], "2" * 40)
+        self.assertEqual(receipt["reused_from"]["run"], "original")
+        self.assertFalse(any(name.endswith(".xml") for name in files))
+        return files
+
+    def test_reused_gate_verifies_original_and_archived_reports(self):
+        result, _, original = self.run_ci(gate_run="original")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        files = self.reuse(original)
+        for archive in (False, True):
+            with self.subTest(archive=archive):
+                gate = self.gate_receipts(files, original, archive=archive)
+                self.assertEqual(gate.returncode, 0, gate.stderr)
+
+    def test_reused_gate_refuses_missing_or_changed_original_evidence(self):
+        _, _, original = self.run_ci(gate_run="original")
+        files = self.reuse(original)
+        for name in (
+            "junit/manifest.json",
+            "junit/test/default/junit.xml",
+            "junit/target-metadata.json",
+        ):
+            for delete in (False, True):
+                with self.subTest(name=name, delete=delete):
+                    invalid = dict(original)
+                    if delete:
+                        del invalid[name]
+                    else:
+                        invalid[name] += b"changed"
+                    gate = self.gate_receipts(files, invalid)
+                    self.assertEqual(gate.returncode, 1, gate.stderr)
+        gate = self.gate_receipts(files)
+        self.assertIn("JUnit origin manifest is missing or differs", gate.stderr)
+
+    def test_reused_gate_refuses_original_that_never_retained_junit(self):
+        _, _, original = self.run_ci(gate_run="original", missing=True)
+        gate = self.gate_receipts(self.reuse(original), original)
+        self.assertEqual(gate.returncode, 1)
+        self.assertIn("has no matching passing JUnit evidence", gate.stderr)
+
+    def test_reused_gate_refuses_report_unchanged_in_original_run(self):
+        _, _, original = self.run_ci(gate_run="original", missing=True, preexisting=True)
+        gate = self.gate_receipts(self.reuse(original), original)
+        self.assertEqual(gate.returncode, 1)
+        self.assertIn("has no fresh JUnit report", gate.stderr)
+
+    def test_reused_gate_refuses_reference_that_differs_from_test_log(self):
+        _, _, original = self.run_ci(gate_run="original")
+        files = self.reuse(original)
+        manifest = json.loads(files["junit/manifest.json"])
+        manifest["reused_from"]["run"] = "another"
+        files["junit/manifest.json"] = json.dumps(manifest).encode()
+        gate = self.gate_receipts(files, original)
+        self.assertEqual(gate.returncode, 1)
+        self.assertIn("JUnit origin differs from the test log", gate.stderr)
+
+    def test_reused_gate_refuses_reference_for_different_package_selection(self):
+        _, _, original = self.run_ci(gate_run="original")
+        files = self.reuse(original)
+        manifest = json.loads(files["junit/manifest.json"])
+        manifest["selection_packages"] = "sparkles-core"
+        files["junit/manifest.json"] = json.dumps(manifest).encode()
+        gate = self.gate_receipts(files, original)
+        self.assertEqual(gate.returncode, 1)
+        self.assertIn("has no matching passing JUnit evidence", gate.stderr)
+
+    def test_gate_refuses_cached_success_without_one_well_formed_origin(self):
+        _, _, original = self.run_ci(gate_run="original")
+        marker = original["logs/test.log"].decode()
+        for log in ("", marker + marker, marker.replace("original", "../original")):
+            with self.subTest(log=log):
+                result, receipt, files = self.run_ci(gate_run="current", replayed_log=log)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(receipt["status"], "error")
+                self.assertIn("test log must name one JUnit origin", receipt["error"])
+                self.assertEqual(self.gate_receipts(files, original).returncode, 1)
 
 
 if __name__ == "__main__":
