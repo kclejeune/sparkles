@@ -479,7 +479,91 @@ fn classify_answers_in_part_under_a_deadline() {
     );
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert!(out(&o).starts_with("consistent:"), "{}", out(&o));
+    assert!(out(&o).contains("full disjunctive run on "), "{}", out(&o));
     assert!(!out(&o).contains("partial"), "{}", out(&o));
+
+    // A stopped partial run in `--format text` prints `partial:`, the tier, and `incomplete`.
+    let big = dir.join("dl-big.ofn");
+    std::fs::write(
+        &big,
+        cases(if cfg!(debug_assertions) { 120 } else { 400 }, false),
+    )
+    .unwrap();
+    let full = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "dl-big.ofn",
+            "--threads",
+            "1",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(full.status.code(), Some(0), "{}", err(&full));
+    let fj: serde_json::Value = serde_json::from_slice(&full.stdout).unwrap();
+    let s = &fj["stats"];
+    let took = (s["indexMs"].as_f64().unwrap()
+        + s["saturationMs"].as_f64().unwrap()
+        + s["taxonomyMs"].as_f64().unwrap())
+        / 1000.0;
+    let limit = ((took * 20000.0) as u64).max(2000);
+    let saw_partial_text = std::cell::Cell::new(false);
+    let run_text = |ms: u64| -> bool {
+        let timeout = format!("{}", ms as f64 / 1000.0);
+        let o = sparkles(
+            dir,
+            &[
+                "ontology",
+                "classify",
+                "dl-big.ofn",
+                "--partial",
+                "--threads",
+                "1",
+                "--timeout",
+                &timeout,
+                "--about",
+                "http://ex.org/C0",
+                "--format",
+                "text",
+            ],
+        );
+        if o.status.code() == Some(2) {
+            let text = out(&o);
+            assert!(text.contains("partial:"), "{text}");
+            assert!(text.contains("incomplete "), "{text}");
+            assert!(text.contains("disjunctive run on "), "{text}");
+            if text.contains("incomplete http://ex.org/C0") {
+                assert!(
+                    text.contains("  incomplete   yes (superclasses may be missing)"),
+                    "{text}"
+                );
+            }
+            saw_partial_text.set(true);
+            return true;
+        }
+        o.status.code() == Some(0)
+    };
+    let after = |ms: u64| ms + (ms * 8 / 100).max(1);
+    let (mut lo, mut ms) = (0u64, 2u64);
+    while ms < limit && !run_text(ms) {
+        lo = ms;
+        ms = after(ms);
+    }
+    let mut hi = ms;
+    while hi - lo > 1 && !saw_partial_text.get() {
+        let mid = (lo + hi) / 2;
+        if run_text(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    assert!(
+        saw_partial_text.get(),
+        "no deadline gave a partial --format text answer"
+    );
 }
 
 #[test]
@@ -538,12 +622,19 @@ fn a_classification_that_leaves_an_axiom_out_is_incomplete_or_refused() {
             "classify",
             "irl1.ofn",
             "--assertions",
+            "--about",
+            "http://example.org/irl#K",
             "--format",
             "text",
         ],
     );
     assert!(
         out(&o).contains("incomplete http://example.org/irl#K"),
+        "{}",
+        out(&o)
+    );
+    assert!(
+        out(&o).contains("  incomplete   yes (superclasses may be missing)"),
         "{}",
         out(&o)
     );

@@ -842,7 +842,7 @@ fn ontology(p: &mut Paths) {
                 "200",
                 "The classification, with the receipt when a write asked for one.",
                 Some(json!({
-                    "application/json": { "schema": { "oneOf": [{ "type": "object", "required": ["consistent","complete","completeForTaken","classes"], "properties": {"consistent":{"type":"boolean"},"complete":{"type":"boolean","description":"Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way."},"completeForTaken":{"type":"boolean","description":"Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer."},"classes":{"type":"integer"},"unmappedTriples":{"type":"array","description":"The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed.","items":{"type":"object","required":["subject","predicate","object"],"properties":{"subject":{"type":"string"},"predicate":{"type":"string"},"object":{"type":"string"}}}},"unmappedTruncated":{"type":"boolean","description":"Whether `stats.unmapped` counts more triples than `unmappedTriples` lists."}} }, sref("OntologyFrameClassification")] } },
+                    "application/json": { "schema": { "oneOf": [sref("OntologyClassification"), sref("OntologyFrameClassification")] } },
                     "text/owl-functional": { "schema": { "type": "string" } }
                 })),
             )

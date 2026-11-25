@@ -217,13 +217,126 @@ pub(super) fn put_all(put: &mut impl FnMut(&str, J)) {
         )
     };
     put(
+        "OntologyClassification",
+        obj(
+            &[
+                "dataset",
+                "commit",
+                "mode",
+                "graphs",
+                "imports",
+                "warnings",
+                "consistent",
+                "consistency",
+                "complete",
+                "completeForTaken",
+                "partial",
+                "tier",
+                "incompleteCount",
+                "incomplete",
+                "reused",
+                "classes",
+                "nodeCount",
+                "unsatisfiableCount",
+                "unsatisfiable",
+                "unmappedTriples",
+                "unmappedTruncated",
+                "excludedCount",
+                "excluded",
+                "stats",
+                "classificationSource",
+                "resultId",
+            ],
+            json!({
+                "dataset": text,
+                "commit": n,
+                "mode": string_enum(&["lenient", "strict"]),
+                "graphs": array(text.clone()),
+                "imports": array(json!({"type": "object"})),
+                "warnings": array(text.clone()),
+                "consistent": {"type": "boolean"},
+                "consistency": string_enum(&["consistent", "inconsistent", "unknown"]),
+                "complete": {
+                    "type": "boolean",
+                    "description": "Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way."
+                },
+                "completeForTaken": {
+                    "type": "boolean",
+                    "description": "Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer."
+                },
+                "partial": {"type": "boolean"},
+                "tier": string_enum(&["el", "horn", "disjunctive"]),
+                "incompleteCount": n,
+                "incomplete": array(text.clone()),
+                "reused": {"type": "boolean"},
+                "classes": n,
+                "nodeCount": n,
+                "unsatisfiableCount": n,
+                "unsatisfiable": array(text.clone()),
+                "unmappedTriples": {
+                    "type": "array",
+                    "description": "The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed.",
+                    "items": {
+                        "type": "object",
+                        "required": ["subject", "predicate", "object"],
+                        "properties": {
+                            "subject": {"type": "string"},
+                            "predicate": {"type": "string"},
+                            "object": {"type": "string"}
+                        }
+                    }
+                },
+                "unmappedTruncated": {
+                    "type": "boolean",
+                    "description": "Whether `stats.unmapped` counts more triples than `unmappedTriples` lists."
+                },
+                "excludedCount": n,
+                "excluded": array(json!({"type": "object"})),
+                "stats": {"type": "object"},
+                "classificationSource": sref("ClassificationSourceIdentity"),
+                "resultId": {"type": "string", "format": "uuid"},
+                "nodes": array(json!({"type": "object"})),
+                "offset": n,
+                "next": n,
+                "class": obj(
+                    &[
+                        "node",
+                        "classes",
+                        "parents",
+                        "parentClasses",
+                        "children",
+                        "iri",
+                        "unsatisfiable",
+                        "incomplete",
+                        "childClasses",
+                        "superClasses",
+                    ],
+                    json!({
+                        "node": n,
+                        "classes": array(text.clone()),
+                        "parents": array(n.clone()),
+                        "parentClasses": array(text.clone()),
+                        "children": n,
+                        "iri": text,
+                        "unsatisfiable": {"type": "boolean"},
+                        "incomplete": {"type": "boolean"},
+                        "childClasses": array(text.clone()),
+                        "superClasses": array(text.clone())
+                    }),
+                ),
+                "written": {"type": "object"},
+                "receipt": {"type": "object"}
+            }),
+        ),
+    );
+    put(
         "OntologyFrameClassification",
         obj(
             &["dataset", "commit", "classificationSource", "frame"],
             json!({
                 "dataset":text,"commit":n,"classificationSource":sref("ClassificationSourceIdentity"),
-                "frame":obj(&["iri","result","outcome","unsatisfiable","parents","equivalents","excluded","sources","retention"],json!({
-                    "iri":text,"result":sref("ClassificationResult"),"outcome":sref("ClassificationOutcome"),"unsatisfiable":{"type":"boolean"},
+                "frame":obj(&["iri","result","outcome","unsatisfiable","incomplete","parents","equivalents","excluded","sources","retention"],json!({
+                    "iri":text,"result":sref("ClassificationResult"),"outcome":sref("ClassificationOutcome"),"unsatisfiable":{"type":"boolean"},"incomplete":{"type":"boolean"},
                     "parents":projected("ClassificationParent"),"equivalents":projected("ClassificationName"),"excluded":projected("ClassificationExcluded"),
                     "sources":obj(&["total","truncated","items"],json!({"total":n,"truncated":{"type":"boolean"},"items":{"type":"array","maxItems":1000,"items":sref("ClassificationSourceRow")}})),
                     "retention":obj(&["kept","resultId"],json!({"kept":{"type":"boolean"},"resultId":nullable("string")}))

@@ -1374,6 +1374,114 @@ async fn classify_leaves_the_consistency_unknown_when_stopped_early() {
     partial_over_http(true).await;
 }
 
+#[tokio::test]
+async fn partial_classification_reports_per_class_incomplete_on_frame_and_about() {
+    let data = cases(case_count(), false);
+    let (full, _) = whole_over_http(false).await;
+    let estimate = full["stats"]["estimatedBytes"].as_u64().unwrap();
+    // Find a deterministic budget that stops the disjunctive run with multiple open classes.
+    let mut found = None;
+    for k in 1..20 {
+        let budget = estimate * k / 20;
+        let s = server_with_memory(&data, Some(budget));
+        let r = post(
+            &s.app,
+            "/$/ontology/t/classify",
+            json!({"partial": true, "threads": 1, "limit": 10000}),
+        )
+        .await;
+        if r.status != StatusCode::OK {
+            continue;
+        }
+        let j = r.json();
+        if j["partial"] == true
+            && j["incomplete"]
+                .as_array()
+                .is_some_and(|open| open.len() > 1)
+        {
+            let open_iri = j["incomplete"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            found = Some((budget, open_iri));
+            break;
+        }
+    }
+    let (budget, open_iri) = found.expect("no budget gave a partial answer with open classes");
+
+    // Legacy `about` reports `class.incomplete: true` even when `limit: 1` truncates `incomplete`.
+    let s = server_with_memory(&data, Some(budget));
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"partial": true, "threads": 1, "limit": 1, "about": open_iri}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["partial"], true, "{j}");
+    assert_eq!(j["complete"], false, "{j}");
+    assert_eq!(j["incomplete"].as_array().unwrap().len(), 1, "{j}");
+    assert_ne!(j["incomplete"][0], json!(open_iri), "{j}");
+    assert_eq!(j["class"]["iri"], json!(open_iri), "{j}");
+    assert_eq!(j["class"]["incomplete"], true, "{j}");
+
+    // `projection=frame` reports `frame.incomplete: true` alongside outcome and non-retention.
+    let s = server_with_memory(&data, Some(budget));
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"projection": "frame", "about": open_iri, "partial": true, "threads": 1, "limit": 10}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    let frame = &j["frame"];
+    assert_eq!(frame["iri"], json!(open_iri), "{j}");
+    assert_eq!(frame["incomplete"], true, "{j}");
+    assert_eq!(frame["outcome"]["partial"], true, "{j}");
+    assert_eq!(frame["outcome"]["complete"], false, "{j}");
+    assert_eq!(frame["outcome"]["tier"], "disjunctive", "{j}");
+    assert!(
+        frame["outcome"]["incompleteCount"].as_u64().unwrap_or(0) > 1,
+        "{j}"
+    );
+    assert!(
+        matches!(
+            frame["outcome"]["consistency"].as_str(),
+            Some("consistent" | "unknown")
+        ),
+        "{j}"
+    );
+    assert_eq!(frame["retention"]["kept"], false, "{j}");
+    assert!(frame["retention"]["resultId"].is_null(), "{j}");
+
+    // Complete run reports `incomplete: false` on both legacy `about` and `projection=frame`.
+    let s = server_of(&data);
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"about": open_iri, "threads": 1}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["class"]["incomplete"], false);
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"projection": "frame", "about": open_iri, "threads": 1}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["frame"]["incomplete"], false, "{j}");
+    assert_eq!(j["frame"]["outcome"]["complete"], true, "{j}");
+}
+
 /// Every quad of dataset `t`, as sorted N-Quads lines.
 async fn quads(app: &Router, ds: &str) -> Vec<String> {
     let r = send(
