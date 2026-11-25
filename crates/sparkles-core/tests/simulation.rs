@@ -193,7 +193,14 @@ fn copies_stop_on_cancellation_and_refuse_an_insufficient_memory_grant() {
 
 #[test]
 fn retained_dry_run_nested_blank_ids_are_reserved_before_new_allocations() {
-    for case in ["triple", "cdt-list", "cdt-map", "cdt-quoted-plus-unicode"] {
+    for case in [
+        "triple",
+        "cdt-list",
+        "cdt-map",
+        "cdt-quoted-plus-unicode",
+        "cdt-long-langtag-ext",
+        "cdt-long-langtag-variant",
+    ] {
         let source = Store::in_memory(Default::default());
         let options = WriteOptions {
             dry_run: Some(DryRun {
@@ -232,6 +239,14 @@ fn retained_dry_run_nested_blank_ids_are_reserved_before_new_allocations() {
                     NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
                 ))
             }
+            "cdt-long-langtag-ext" => Term::Literal(Literal::new_typed_literal(
+                format!("[\"v\"@en-a{}, _:{}]", "-zz".repeat(90), blank.as_str()),
+                NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+            )),
+            "cdt-long-langtag-variant" => Term::Literal(Literal::new_typed_literal(
+                format!("[\"v\"@en{}, _:{}]", "-1901".repeat(60), blank.as_str()),
+                NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+            )),
             _ => unreachable!(),
         };
         let subject = transaction
@@ -487,6 +502,65 @@ fn compacted_base_vocab_copy_accounts_for_live_scratch_and_entry_overhead() {
         qnode,
         "source allocator counter must still be at the unallocated quoted target label"
     );
+    drop(qsrc_check);
+
+    // Same tight-cap check for a compacted CDT literal containing short and >256-byte
+    // language-tagged strings alongside a blank node.
+    let lang_source = Store::in_memory(Default::default());
+    let mut ltx = lang_source.write();
+    let lnode = Id::bnode(0);
+    let lang_lex = format!(
+        "[\"{payload}\"@en, \"v\"@en-a{}, _:{}]",
+        "-zz".repeat(90),
+        bnode_label(lnode.payload())
+    );
+    let lang_object = Term::Literal(Literal::new_typed_literal(
+        lang_lex.clone(),
+        NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+    ));
+    let ls = ltx
+        .intern(&Term::NamedNode(NamedNode::new("urn:s").unwrap()))
+        .unwrap();
+    let lp = ltx
+        .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+        .unwrap();
+    let lo = ltx.intern(&lang_object).unwrap();
+    ltx.insert([ls, lp, lo, Id::DEFAULT_GRAPH]).unwrap();
+    ltx.commit().unwrap();
+    lang_source.compact().unwrap();
+    let lang_snap = lang_source.snapshot();
+    let lang_key_len = lang_lex.len() as u64 + 3 + sparkles_core::sparql::cdt::LIST.len() as u64;
+    let lang_refused = lang_source.copy_view_to_memory(
+        &lang_snap,
+        StoreOptions {
+            max_memory_bytes: Some(108 + lang_key_len * 2),
+            ..Default::default()
+        },
+        &Default::default(),
+        |_| Ok(true),
+    );
+    assert!(matches!(lang_refused, Err(Error::StorageFull(_))));
+    let lang_copied = lang_source
+        .copy_view_to_memory(
+            &lang_snap,
+            StoreOptions {
+                max_memory_bytes: Some(108 + lang_key_len * 2 + 48),
+                ..Default::default()
+            },
+            &Default::default(),
+            |_| Ok(true),
+        )
+        .unwrap();
+    assert_eq!(state(&lang_snap), state(&lang_copied.snapshot()));
+    let mut lwrite = lang_copied.write();
+    assert_ne!(
+        lwrite.new_bnode(),
+        lnode,
+        "blank node beside language-tagged terms must be reserved under tight cap"
+    );
+    drop(lwrite);
+    let mut lsrc_check = lang_source.write();
+    assert_eq!(lsrc_check.new_bnode(), lnode);
 }
 
 #[test]
@@ -750,6 +824,126 @@ fn deeply_nested_cdt_blank_ids_are_reserved_without_stack_overflow() {
         })
         .unwrap();
     handle.join().unwrap();
+}
+
+#[test]
+fn bare_nesting_past_131072_and_wide_map_copy_respect_bounds_and_cancellation() {
+    // Public writer stores a 131,073-deep bare list without a depth cap; both valid
+    // and ill-typed trailing-comma forms must copy cleanly without errors.
+    let depth = 131_073;
+    for (valid, inner) in [(true, "_:b0"), (false, "_:b0,")] {
+        let source = Store::in_memory(Default::default());
+        let mut tx = source.write();
+        let s = tx
+            .intern(&Term::NamedNode(NamedNode::new("urn:s").unwrap()))
+            .unwrap();
+        let p = tx
+            .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+            .unwrap();
+        let lex = format!("{}{inner}{}", "[".repeat(depth), "]".repeat(depth));
+        let o = tx
+            .intern(&Term::Literal(Literal::new_typed_literal(
+                lex,
+                NamedNode::new(sparkles_core::sparql::cdt::LIST).unwrap(),
+            )))
+            .unwrap();
+        tx.insert([s, p, o, Id::DEFAULT_GRAPH]).unwrap();
+        tx.commit().unwrap();
+        let snap = source.snapshot();
+        let copied = source
+            .copy_view_to_memory(&snap, Default::default(), &Default::default(), |_| Ok(true))
+            .unwrap();
+        assert_eq!(state(&snap), state(&copied.snapshot()));
+        let mut write = copied.write();
+        if valid {
+            assert_ne!(
+                write.new_bnode(),
+                Id::bnode(0),
+                "131_073-deep valid CDT list must reserve _:b0"
+            );
+        } else {
+            assert_eq!(
+                write.new_bnode(),
+                Id::bnode(0),
+                "131_073-deep trailing-comma CDT list must skip cleanly without advancing allocator"
+            );
+        }
+    }
+
+    // 50,000-key valid map copies promptly, reserves _:b0, honors deadlines, and
+    // respects tight memory caps without quadratic fallback work.
+    let source = Store::in_memory(Default::default());
+    let mut tx = source.write();
+    let s = tx
+        .intern(&Term::NamedNode(NamedNode::new("urn:s").unwrap()))
+        .unwrap();
+    let p = tx
+        .intern(&Term::NamedNode(NamedNode::new("urn:p").unwrap()))
+        .unwrap();
+    let mut map_lex = String::with_capacity(50_000 * 14);
+    map_lex.push('{');
+    for i in 0..50_000 {
+        if i > 0 {
+            map_lex.push(',');
+        }
+        use std::fmt::Write;
+        let _ = write!(&mut map_lex, "\"k{i:05}\":{i}");
+    }
+    map_lex.push_str(",\"last\":_:b0}");
+    let map_key_len = map_lex.len() as u64 + 3 + sparkles_core::sparql::cdt::MAP.len() as u64;
+    let o = tx
+        .intern(&Term::Literal(Literal::new_typed_literal(
+            map_lex,
+            NamedNode::new(sparkles_core::sparql::cdt::MAP).unwrap(),
+        )))
+        .unwrap();
+    tx.insert([s, p, o, Id::DEFAULT_GRAPH]).unwrap();
+    tx.commit().unwrap();
+    let snap = source.snapshot();
+
+    let copied = source
+        .copy_view_to_memory(&snap, Default::default(), &Default::default(), |_| Ok(true))
+        .unwrap();
+    assert_eq!(state(&snap), state(&copied.snapshot()));
+    assert_ne!(
+        copied.write().new_bnode(),
+        Id::bnode(0),
+        "50,000-key valid map must reserve trailing _:b0"
+    );
+
+    // An ultra-tight cap that barely covers the key bytes (leaving too little room
+    // for the 50,000-key duplicate index) must refuse promptly with StorageFull.
+    let tight = source.copy_view_to_memory(
+        &snap,
+        StoreOptions {
+            max_memory_bytes: Some(108 + map_key_len + 48),
+            ..Default::default()
+        },
+        &Default::default(),
+        |_| Ok(true),
+    );
+    assert!(matches!(tight, Err(Error::StorageFull(_))));
+
+    // Flipping cancel inside `keep` before copying the quad stops inside CDT
+    // validation (yielding Cancelled before the wide-map StorageFull cap fires).
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_opts = WriteOptions {
+        cancel: Some(cancelled.clone()),
+        ..Default::default()
+    };
+    let cancel_res = source.copy_view_to_memory(
+        &snap,
+        StoreOptions {
+            max_memory_bytes: Some(108 + map_key_len + 48),
+            ..Default::default()
+        },
+        &cancel_opts,
+        |_| {
+            cancelled.store(true, Ordering::Relaxed);
+            Ok(true)
+        },
+    );
+    assert!(matches!(cancel_res, Err(Error::Cancelled)));
 }
 
 #[test]

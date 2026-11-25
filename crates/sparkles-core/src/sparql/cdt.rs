@@ -584,17 +584,58 @@ fn literal(lex: &str, dt: &str) -> Term {
 
 /// Maximum nesting depth of *quoted* composite literals (`"..."^^<cdt:List>`
 /// nested inside another composite literal). Bare `[` / `{` nesting is validated
-/// and scanned iteratively with a fixed stack-allocated bitset and zero heap.
+/// and scanned iteratively with a fixed sliding-window stack bitset and zero heap.
 const MAX_QUOTED_CDT_DEPTH: usize = 64;
 
-/// Maximum bare `[` / `{` nesting depth tracked in `validate_cdt`'s fixed
-/// stack-allocated container bitset (16 KiB on the stack, 0 heap).
-const MAX_BARE_CDT_DEPTH: usize = 2048 * 64;
+/// Sliding window of bare `[` / `{` container kinds tracked in `validate_cdt`'s
+/// fixed stack-allocated bitset (8 KiB on the stack, 0 heap). Nesting beyond
+/// the window slides by half a window on push and refills on pop, so bare
+/// nesting has no artificial depth ceiling.
+const CONTAINER_WINDOW_BITS: usize = 1024 * 64;
+const CONTAINER_WINDOW_WORDS: usize = CONTAINER_WINDOW_BITS / 64;
+const CONTAINER_WINDOW_HALF_WORDS: usize = CONTAINER_WINDOW_WORDS / 2;
+const CONTAINER_WINDOW_HALF_BITS: usize = CONTAINER_WINDOW_HALF_WORDS * 64;
 
-/// Stack-allocated open map frames and key pool for exact duplicate-key checks
-/// without heap allocation. Maps deeper or wider fall back to a streaming scan.
+/// Sliding window of open map frames and fixed stack pool for O(1) zero-heap
+/// duplicate-key checks on ordinary maps. Wider maps promote to a memory-
+/// preflighted open-addressing hash table, or fall back to a bounded zero-heap
+/// batched scan when a tight memory cap refuses the table.
 const INLINE_MAP_FRAMES: usize = 256;
+const INLINE_MAP_FRAMES_HALF: usize = INLINE_MAP_FRAMES / 2;
 const INLINE_MAP_KEY_POOL: usize = 512;
+const INLINE_MAP_KEY_BUCKETS: usize = 1024;
+const MAX_ZERO_HEAP_MAP_RESCAN_VISITS: usize = 262_144;
+
+/// The 26 RFC 5646 grandfathered tags accepted by `oxilangtag` 0.1.6
+/// (maximum length 11 bytes: `"cel-gaulish"`).
+const GRANDFATHERED_LANGTAGS: [&str; 26] = [
+    "art-lojban",
+    "cel-gaulish",
+    "en-GB-oed",
+    "i-ami",
+    "i-bnn",
+    "i-default",
+    "i-enochian",
+    "i-hak",
+    "i-klingon",
+    "i-lux",
+    "i-mingo",
+    "i-navajo",
+    "i-pwn",
+    "i-tao",
+    "i-tay",
+    "i-tsu",
+    "no-bok",
+    "no-nyn",
+    "sgn-BE-FR",
+    "sgn-BE-NL",
+    "sgn-CH-DE",
+    "zh-guoyu",
+    "zh-hakka",
+    "zh-min",
+    "zh-min-nan",
+    "zh-xiang",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CdtKind {
@@ -692,19 +733,39 @@ fn fnv1a_char(mut h: u64, c: char) -> u64 {
     h
 }
 
-fn hash_source(stream: &mut CdtStream<'_>, mut src: CharSource, mut h: u64) -> u64 {
-    while let Some(c) = src.next(stream) {
-        h = fnv1a_char(h, c);
-    }
-    h
+#[inline]
+fn mix_tag(mut h: u64) -> u32 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    (h ^ (h >> 32)) as u32
 }
 
-fn sources_eq(stream: &mut CdtStream<'_>, mut a: CharSource, mut b: CharSource) -> bool {
+fn hash_source(
+    stream: &mut CdtStream<'_>,
+    mut src: CharSource,
+    mut h: u64,
+    check: &mut dyn FnMut() -> crate::error::Result<()>,
+) -> crate::error::Result<u64> {
+    while let Some(c) = src.next(stream) {
+        stream.tick(check)?;
+        h = fnv1a_char(h, c);
+    }
+    Ok(h)
+}
+
+fn sources_eq(
+    stream: &mut CdtStream<'_>,
+    mut a: CharSource,
+    mut b: CharSource,
+    check: &mut dyn FnMut() -> crate::error::Result<()>,
+) -> crate::error::Result<bool> {
     loop {
+        stream.tick(check)?;
         match (a.next(stream), b.next(stream)) {
             (Some(x), Some(y)) if x == y => {}
-            (None, None) => return true,
-            _ => return false,
+            (None, None) => return Ok(true),
+            _ => return Ok(false),
         }
     }
 }
@@ -762,55 +823,70 @@ fn literal_key_parts(key: KeyKind) -> Option<(CharSource, Option<CharSource>, Ch
     }
 }
 
-fn hash_map_key(stream: &mut CdtStream<'_>, key: KeyKind) -> u64 {
+fn hash_map_key(
+    stream: &mut CdtStream<'_>,
+    key: KeyKind,
+    check: &mut dyn FnMut() -> crate::error::Result<()>,
+) -> crate::error::Result<u64> {
     let saved = stream.pos;
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    match key {
-        KeyKind::Iri { start, end } => {
-            h = fnv1a_byte(h, 0);
-            h = hash_source(stream, CharSource::Raw { pos: start, end }, h);
-        }
-        other => {
-            let (dt, lang, val) = literal_key_parts(other).expect("non-IRI key is a literal");
-            h = fnv1a_byte(h, 1);
-            h = hash_source(stream, dt, h);
-            h = fnv1a_byte(h, 0xff);
-            if let Some(lang) = lang {
-                h = fnv1a_byte(h, 0xfd);
-                h = hash_source(stream, lang, h);
-            } else {
-                h = fnv1a_byte(h, 0xfe);
+    let res = (|| {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        match key {
+            KeyKind::Iri { start, end } => {
+                h = fnv1a_byte(h, 0);
+                h = hash_source(stream, CharSource::Raw { pos: start, end }, h, check)?;
             }
-            h = fnv1a_byte(h, 0xff);
-            h = hash_source(stream, val, h);
+            other => {
+                let (dt, lang, val) = literal_key_parts(other).expect("non-IRI key is a literal");
+                h = fnv1a_byte(h, 1);
+                h = hash_source(stream, dt, h, check)?;
+                h = fnv1a_byte(h, 0xff);
+                if let Some(lang) = lang {
+                    h = fnv1a_byte(h, 0xfd);
+                    h = hash_source(stream, lang, h, check)?;
+                } else {
+                    h = fnv1a_byte(h, 0xfe);
+                }
+                h = fnv1a_byte(h, 0xff);
+                h = hash_source(stream, val, h, check)?;
+            }
         }
-    }
+        Ok(h)
+    })();
     stream.pos = saved;
-    h
+    res
 }
 
-fn map_keys_equal(stream: &mut CdtStream<'_>, a: KeyKind, b: KeyKind) -> bool {
+fn map_keys_equal(
+    stream: &mut CdtStream<'_>,
+    a: KeyKind,
+    b: KeyKind,
+    check: &mut dyn FnMut() -> crate::error::Result<()>,
+) -> crate::error::Result<bool> {
     let saved = stream.pos;
-    let eq = match (a, b) {
+    let res = match (a, b) {
         (KeyKind::Iri { start: sa, end: ea }, KeyKind::Iri { start: sb, end: eb }) => sources_eq(
             stream,
             CharSource::Raw { pos: sa, end: ea },
             CharSource::Raw { pos: sb, end: eb },
+            check,
         ),
-        (KeyKind::Iri { .. }, _) | (_, KeyKind::Iri { .. }) => false,
-        (la, lb) => {
+        (KeyKind::Iri { .. }, _) | (_, KeyKind::Iri { .. }) => Ok(false),
+        (la, lb) => (|| {
             let (dt_a, lang_a, val_a) = literal_key_parts(la).expect("literal key");
             let (dt_b, lang_b, val_b) = literal_key_parts(lb).expect("literal key");
             let lang_eq = match (lang_a, lang_b) {
                 (None, None) => true,
-                (Some(x), Some(y)) => sources_eq(stream, x, y),
+                (Some(x), Some(y)) => sources_eq(stream, x, y, check)?,
                 _ => false,
             };
-            lang_eq && sources_eq(stream, dt_a, dt_b) && sources_eq(stream, val_a, val_b)
-        }
+            Ok(lang_eq
+                && sources_eq(stream, dt_a, dt_b, check)?
+                && sources_eq(stream, val_a, val_b, check)?)
+        })(),
     };
     stream.pos = saved;
-    eq
+    res
 }
 
 #[inline]
@@ -851,6 +927,7 @@ struct CdtStream<'a> {
     pos: usize,
     depth: usize,
     ends: [usize; MAX_QUOTED_CDT_DEPTH],
+    steps: u32,
 }
 
 impl<'a> CdtStream<'a> {
@@ -860,7 +937,20 @@ impl<'a> CdtStream<'a> {
             pos: 0,
             depth: 0,
             ends: [0; MAX_QUOTED_CDT_DEPTH],
+            steps: 0,
         }
+    }
+
+    #[inline]
+    fn tick(
+        &mut self,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        self.steps = self.steps.wrapping_add(1);
+        if self.steps & 1023 == 0 {
+            check()?;
+        }
+        Ok(())
     }
 
     #[inline]
@@ -930,14 +1020,19 @@ impl<'a> CdtStream<'a> {
         }
     }
 
-    fn skip_ws(&mut self) {
+    fn skip_ws(
+        &mut self,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
         while let Some(c) = self.peek_char() {
             if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c') {
+                self.tick(check)?;
                 let _ = self.next_char();
             } else {
                 break;
             }
         }
+        Ok(())
     }
 
     fn eat(&mut self, expected: char) -> bool {
@@ -986,149 +1081,242 @@ impl<'a> CdtStream<'a> {
         None
     }
 
-    fn eat_iri_span(&mut self) -> Option<(usize, usize)> {
+    fn eat_iri_span(
+        &mut self,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<Option<(usize, usize)>> {
         if !self.eat('<') {
-            return None;
+            return Ok(None);
         }
         let start = self.pos;
         loop {
+            self.tick(check)?;
             let before = self.pos;
-            let ch = self.next_char()?;
+            let Some(ch) = self.next_char() else {
+                return Ok(None);
+            };
             if ch == '>' {
-                return Some((start, before));
+                return Ok(Some((start, before)));
             }
             if matches!(ch, '<' | '"' | '{' | '}' | '^' | '\\' | '|' | '`') || ch <= ' ' {
-                return None;
+                return Ok(None);
             }
         }
     }
 
-    fn eat_string_after_quote(&mut self, q: char) -> Option<(usize, usize)> {
+    fn eat_string_after_quote(
+        &mut self,
+        q: char,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<Option<(usize, usize)>> {
         let long = self.eat_double_quote(q);
         let body_start = self.pos;
         loop {
+            self.tick(check)?;
             let before = self.pos;
-            let ch = self.next_char()?;
+            let Some(ch) = self.next_char() else {
+                return Ok(None);
+            };
             if long {
                 if ch == q && self.eat_double_quote(q) {
-                    return Some((body_start, before));
+                    return Ok(Some((body_start, before)));
                 }
             } else if ch == q {
-                return Some((body_start, before));
+                return Ok(Some((body_start, before)));
             } else if ch == '\n' || ch == '\r' {
-                return None;
+                return Ok(None);
             }
-            if ch == '\\' {
-                self.next_escape(self.depth)?;
+            if ch == '\\' && self.next_escape(self.depth).is_none() {
+                return Ok(None);
             }
         }
     }
 
-    fn eat_langtag_span(&mut self, validate_bcp47: bool) -> Option<(usize, usize)> {
+    /// Consume a language tag (`[a-zA-Z]+(-[a-zA-Z0-9]+)*`) and, when
+    /// `validate_bcp47` is set, validate it in streaming O(1) stack and zero
+    /// heap with exact parity to `oxilangtag` 0.1.6's `parse_language_tag`.
+    fn eat_langtag_span(
+        &mut self,
+        validate_bcp47: bool,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<Option<(usize, usize)>> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum LangState {
+            AfterLanguage,
+            AfterExtLang,
+            AfterScript,
+            AfterRegion,
+            InExtension { expected: bool },
+            InPrivateUse { expected: bool },
+        }
+
         let start = self.pos;
-        let mut buf = [0u8; 256];
-        let mut len = 0usize;
-        let mut overflow = false;
-        let mut in_private_use = false;
-        let mut private_use_prefix_ok = false;
-        let mut private_use_valid = true;
+        let mut prefix = [0u8; 11];
+        let mut total_len = 0usize;
 
         let mut primary_len = 0usize;
+        let mut first_primary = 0u8;
         while let Some(c) = self.peek_char() {
             if c.is_ascii_alphabetic() {
+                self.tick(check)?;
                 let _ = self.next_char();
-                primary_len += 1;
-                if len < buf.len() {
-                    buf[len] = c as u8;
-                    len += 1;
-                } else {
-                    overflow = true;
+                let b = c as u8;
+                if primary_len == 0 {
+                    first_primary = b;
                 }
+                if total_len < prefix.len() {
+                    prefix[total_len] = b;
+                }
+                total_len += 1;
+                primary_len += 1;
             } else {
                 break;
             }
         }
         if primary_len == 0 {
-            return None;
-        }
-        if primary_len == 1 && buf[0].eq_ignore_ascii_case(&b'x') {
-            in_private_use = true;
-            private_use_prefix_ok = true;
+            return Ok(None);
         }
 
+        let mut extlangs_count = 0u8;
+        let (mut valid, mut state) =
+            if primary_len == 1 && first_primary.eq_ignore_ascii_case(&b'x') {
+                (true, LangState::InPrivateUse { expected: true })
+            } else if (2..=8).contains(&primary_len) {
+                if primary_len < 4 {
+                    (true, LangState::AfterLanguage)
+                } else {
+                    (true, LangState::AfterExtLang)
+                }
+            } else {
+                (false, LangState::AfterExtLang)
+            };
+
         while self.peek_char() == Some('-') {
+            self.tick(check)?;
             let saved = self.pos;
+            let saved_total_len = total_len;
             let _ = self.next_char();
             let mut sub_len = 0usize;
             let mut first_sub = 0u8;
-            let sub_start_buf = len;
+            let mut all_alpha = true;
+            let mut all_digit = true;
             while let Some(c) = self.peek_char() {
                 if c.is_ascii_alphanumeric() {
+                    self.tick(check)?;
                     let _ = self.next_char();
+                    let b = c as u8;
                     if sub_len == 0 {
-                        first_sub = c as u8;
+                        if total_len < prefix.len() {
+                            prefix[total_len] = b'-';
+                        }
+                        total_len += 1;
+                        first_sub = b;
                     }
+                    if total_len < prefix.len() {
+                        prefix[total_len] = b;
+                    }
+                    total_len += 1;
+                    all_alpha &= b.is_ascii_alphabetic();
+                    all_digit &= b.is_ascii_digit();
                     sub_len += 1;
-                    if !overflow && len + 1 < buf.len() {
-                        if sub_len == 1 {
-                            buf[len] = b'-';
-                            len += 1;
-                        }
-                        buf[len] = c as u8;
-                        len += 1;
-                    } else {
-                        if !overflow {
-                            len = sub_start_buf;
-                        }
-                        overflow = true;
-                    }
                 } else {
                     break;
                 }
             }
             if sub_len == 0 {
                 self.pos = saved;
+                total_len = saved_total_len;
                 break;
             }
-            if in_private_use {
+            if validate_bcp47 && valid {
                 if sub_len > 8 {
-                    private_use_valid = false;
-                }
-            } else if sub_len == 1 && first_sub.eq_ignore_ascii_case(&b'x') {
-                if !overflow && validate_bcp47 {
-                    let prefix_end = sub_start_buf;
-                    if let Ok(prefix) = std::str::from_utf8(&buf[..prefix_end]) {
-                        let mut probe = [0u8; 260];
-                        probe[..prefix.len()].copy_from_slice(prefix.as_bytes());
-                        probe[prefix.len()..prefix.len() + 4].copy_from_slice(b"-x-a");
-                        if let Ok(s) = std::str::from_utf8(&probe[..prefix.len() + 4]) {
-                            private_use_prefix_ok =
-                                Literal::new_language_tagged_literal("", s).is_ok();
+                    valid = false;
+                } else {
+                    match state {
+                        LangState::InPrivateUse { .. } => {
+                            state = LangState::InPrivateUse { expected: false };
+                        }
+                        _ if sub_len == 1 && first_sub.eq_ignore_ascii_case(&b'x') => {
+                            if matches!(state, LangState::InExtension { expected: true }) {
+                                valid = false;
+                            } else {
+                                state = LangState::InPrivateUse { expected: true };
+                            }
+                        }
+                        _ if sub_len == 1 => {
+                            if matches!(state, LangState::InExtension { expected: true }) {
+                                valid = false;
+                            } else {
+                                state = LangState::InExtension { expected: true };
+                            }
+                        }
+                        LangState::InExtension { .. } => {
+                            state = LangState::InExtension { expected: false };
+                        }
+                        LangState::AfterLanguage if sub_len == 3 && all_alpha => {
+                            extlangs_count += 1;
+                            if extlangs_count > 3 {
+                                valid = false;
+                            }
+                        }
+                        LangState::AfterLanguage | LangState::AfterExtLang
+                            if sub_len == 4 && all_alpha =>
+                        {
+                            state = LangState::AfterScript;
+                        }
+                        LangState::AfterLanguage
+                        | LangState::AfterExtLang
+                        | LangState::AfterScript
+                            if (sub_len == 2 && all_alpha) || (sub_len == 3 && all_digit) =>
+                        {
+                            state = LangState::AfterRegion;
+                        }
+                        LangState::AfterLanguage
+                        | LangState::AfterExtLang
+                        | LangState::AfterScript
+                        | LangState::AfterRegion
+                            if (sub_len >= 5 && first_sub.is_ascii_alphabetic())
+                                || (sub_len >= 4 && first_sub.is_ascii_digit()) =>
+                        {
+                            state = LangState::AfterRegion;
+                        }
+                        _ => {
+                            valid = false;
                         }
                     }
                 }
-                in_private_use = true;
             }
         }
         let end = self.pos;
         if validate_bcp47 {
-            if !overflow {
-                let tag = std::str::from_utf8(&buf[..len]).ok()?;
-                Literal::new_language_tagged_literal("", tag).ok()?;
-            } else if !(in_private_use && private_use_prefix_ok && private_use_valid) {
-                return None;
+            let is_grandfathered = (5..=11).contains(&total_len)
+                && GRANDFATHERED_LANGTAGS.iter().any(|g| {
+                    g.len() == total_len && g.as_bytes().eq_ignore_ascii_case(&prefix[..total_len])
+                });
+            let normal_ok = valid
+                && !matches!(
+                    state,
+                    LangState::InExtension { expected: true }
+                        | LangState::InPrivateUse { expected: true }
+                );
+            if !is_grandfathered && !normal_ok {
+                return Ok(None);
             }
         }
-        Some((start, end))
+        Ok(Some((start, end)))
     }
 
-    fn eat_number_span(&mut self) -> Option<(usize, usize, &'static str)> {
+    fn eat_number_span(
+        &mut self,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<Option<(usize, usize, &'static str)>> {
         let start = self.pos;
         if matches!(self.peek_char(), Some('+' | '-')) {
             let _ = self.next_char();
         }
         let mut int_digits = 0usize;
         while self.peek_char().is_some_and(|c| c.is_ascii_digit()) {
+            self.tick(check)?;
             let _ = self.next_char();
             int_digits += 1;
         }
@@ -1138,6 +1326,7 @@ impl<'a> CdtStream<'a> {
             let saved = self.pos;
             let _ = self.next_char();
             while self.peek_char().is_some_and(|c| c.is_ascii_digit()) {
+                self.tick(check)?;
                 let _ = self.next_char();
                 frac_digits += 1;
             }
@@ -1149,7 +1338,7 @@ impl<'a> CdtStream<'a> {
         }
         if int_digits == 0 && frac_digits == 0 {
             self.pos = start;
-            return None;
+            return Ok(None);
         }
         let mut exp = false;
         if matches!(self.peek_char(), Some('e' | 'E')) {
@@ -1160,6 +1349,7 @@ impl<'a> CdtStream<'a> {
             }
             let mut exp_digits = 0usize;
             while self.peek_char().is_some_and(|c| c.is_ascii_digit()) {
+                self.tick(check)?;
                 let _ = self.next_char();
                 exp_digits += 1;
             }
@@ -1176,7 +1366,7 @@ impl<'a> CdtStream<'a> {
         } else {
             xsd::INTEGER.as_str()
         };
-        Some((start, self.pos, dt))
+        Ok(Some((start, self.pos, dt)))
     }
 
     fn eat_bool(&mut self) -> Option<bool> {
@@ -1221,6 +1411,7 @@ impl<'a> CdtStream<'a> {
 
     fn eat_bnode_after_underscore(
         &mut self,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
         mut visit: Option<&mut dyn FnMut(crate::id::Id) -> crate::error::Result<()>>,
     ) -> crate::error::Result<bool> {
         if !self.eat(':') {
@@ -1246,6 +1437,7 @@ impl<'a> CdtStream<'a> {
         let mut last_ok_valid = valid_stored;
         let mut saw_dot = false;
         while let Some(ch) = self.next_char() {
+            self.tick(check)?;
             if ch == '_' || ch == '-' || ch == '\u{b7}' || ch.is_alphanumeric() {
                 if saw_dot {
                     valid_stored = false;
@@ -1285,47 +1477,86 @@ impl<'a> CdtStream<'a> {
         Ok(true)
     }
 
-    fn eat_map_key(&mut self, validate_bcp47: bool) -> Option<KeyKind> {
-        match self.peek_char()? {
-            '<' => {
-                let (start, end) = self.eat_iri_span()?;
-                Some(KeyKind::Iri { start, end })
-            }
-            '"' | '\'' => {
-                let q = self.next_char()?;
-                let (body_start, body_end) = self.eat_string_after_quote(q)?;
+    fn eat_map_key(
+        &mut self,
+        validate_bcp47: bool,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<Option<KeyKind>> {
+        match self.peek_char() {
+            Some('<') => Ok(self
+                .eat_iri_span(check)?
+                .map(|(start, end)| KeyKind::Iri { start, end })),
+            Some('"' | '\'') => {
+                let q = self.next_char().expect("peeked quote");
+                let Some((body_start, body_end)) = self.eat_string_after_quote(q, check)? else {
+                    return Ok(None);
+                };
                 let suffix = if self.eat('@') {
-                    let (start, end) = self.eat_langtag_span(validate_bcp47)?;
+                    let Some((start, end)) = self.eat_langtag_span(validate_bcp47, check)? else {
+                        return Ok(None);
+                    };
                     KeySuffix::Lang { start, end }
                 } else if self.eat_str("^^") {
-                    let (start, end) = self.eat_iri_span()?;
+                    let Some((start, end)) = self.eat_iri_span(check)? else {
+                        return Ok(None);
+                    };
                     KeySuffix::Typed { start, end }
                 } else {
                     KeySuffix::Plain
                 };
-                Some(KeyKind::String {
+                Ok(Some(KeyKind::String {
                     body_start,
                     body_end,
                     suffix,
-                })
+                }))
             }
-            '+' | '-' | '.' | '0'..='9' => {
-                let (start, end, dt) = self.eat_number_span()?;
-                Some(KeyKind::Number { start, end, dt })
-            }
-            't' | 'T' | 'f' | 'F' => self.eat_bool().map(KeyKind::Bool),
-            _ => None,
+            Some('+' | '-' | '.' | '0'..='9') => Ok(self
+                .eat_number_span(check)?
+                .map(|(start, end, dt)| KeyKind::Number { start, end, dt })),
+            Some('t' | 'T' | 'f' | 'F') => Ok(self.eat_bool().map(KeyKind::Bool)),
+            _ => Ok(None),
         }
     }
 
-    fn eat_term_any(&mut self) -> crate::error::Result<bool> {
+    fn eat_term_any(
+        &mut self,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<bool> {
         if self.peek_char() == Some('_') {
             let _ = self.next_char();
-            self.eat_bnode_after_underscore(None)
+            self.eat_bnode_after_underscore(check, None)
         } else {
-            Ok(self.eat_map_key(true).is_some())
+            Ok(self.eat_map_key(true, check)?.is_some())
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct PoolEntry {
+    start: usize,
+    tag: u32,
+    next: u16,
+}
+
+impl PoolEntry {
+    const EMPTY: Self = Self {
+        start: 0,
+        tag: 0,
+        next: 0,
+    };
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapKeyMode {
+    /// All keys seen so far in this map are indexed in `key_pool`/`key_buckets`.
+    Inline,
+    /// All keys seen so far in this map are indexed in the matching top
+    /// `overflow_tables` entry. This map holds zero slots in `key_pool`.
+    WideTable,
+    /// Keys before `batch_start` (or all keys so far when `None`) are pairwise
+    /// distinct; keys from `batch_start` onward are buffered in `key_pool` and
+    /// checked against earlier entries when the batch flushes or the map closes.
+    BatchedFallback { batch_start: Option<usize> },
 }
 
 #[derive(Clone, Copy)]
@@ -1333,7 +1564,8 @@ struct MapFrame {
     start: usize,
     key_base: u16,
     key_count: u16,
-    overflowed: bool,
+    mode: MapKeyMode,
+    mem_refused: bool,
 }
 
 impl MapFrame {
@@ -1341,28 +1573,322 @@ impl MapFrame {
         start: 0,
         key_base: 0,
         key_count: 0,
-        overflowed: false,
+        mode: MapKeyMode::Inline,
+        mem_refused: false,
     };
 }
 
+enum WideSlots {
+    Small(Vec<(u32, u32)>),
+    Large(Vec<(u64, usize)>),
+}
+
+struct WideKeySet {
+    slots: WideSlots,
+    len: usize,
+}
+
+impl WideKeySet {
+    fn bytes_for(cap: usize, large: bool) -> u64 {
+        let elem = if large {
+            std::mem::size_of::<(u64, usize)>()
+        } else {
+            std::mem::size_of::<(u32, u32)>()
+        };
+        (cap as u64).saturating_mul(elem as u64)
+    }
+
+    fn new_preflighted(
+        cap: usize,
+        large: bool,
+        active_heap: &mut u64,
+        allow_mem: &mut dyn FnMut(u64) -> bool,
+    ) -> Option<Self> {
+        let cap = cap.next_power_of_two().max(1024);
+        let bytes = Self::bytes_for(cap, large);
+        if !allow_mem(active_heap.saturating_add(bytes)) {
+            return None;
+        }
+        let slots = if large {
+            WideSlots::Large(vec![(0u64, 0usize); cap])
+        } else {
+            WideSlots::Small(vec![(0u32, 0u32); cap])
+        };
+        *active_heap = active_heap.saturating_add(bytes);
+        Some(Self { slots, len: 0 })
+    }
+
+    fn capacity(&self) -> usize {
+        match &self.slots {
+            WideSlots::Small(v) => v.len(),
+            WideSlots::Large(v) => v.len(),
+        }
+    }
+
+    fn is_large(&self) -> bool {
+        matches!(self.slots, WideSlots::Large(_))
+    }
+
+    fn bytes(&self) -> u64 {
+        Self::bytes_for(self.capacity(), self.is_large())
+    }
+
+    fn needs_grow(&self) -> bool {
+        self.len.saturating_mul(4) >= self.capacity().saturating_mul(3)
+    }
+
+    fn contains(
+        &self,
+        stream: &mut CdtStream<'_>,
+        key: KeyKind,
+        hash: u64,
+        tag: u32,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<bool> {
+        match &self.slots {
+            WideSlots::Small(slots) => {
+                let mask = slots.len() - 1;
+                let mut idx = (tag as usize) & mask;
+                loop {
+                    stream.tick(check)?;
+                    let (slot_tag, pos1) = slots[idx];
+                    if pos1 == 0 {
+                        return Ok(false);
+                    }
+                    if slot_tag == tag {
+                        let saved = stream.pos;
+                        stream.pos = (pos1 - 1) as usize;
+                        let prev_key = stream.eat_map_key(false, check);
+                        stream.pos = saved;
+                        if let Some(prev_key) = prev_key?
+                            && map_keys_equal(stream, prev_key, key, check)?
+                        {
+                            return Ok(true);
+                        }
+                    }
+                    idx = (idx + 1) & mask;
+                }
+            }
+            WideSlots::Large(slots) => {
+                let mask = slots.len() - 1;
+                let mut idx = (tag as usize) & mask;
+                loop {
+                    stream.tick(check)?;
+                    let (slot_hash, pos1) = slots[idx];
+                    if pos1 == 0 {
+                        return Ok(false);
+                    }
+                    if slot_hash == hash {
+                        let saved = stream.pos;
+                        stream.pos = pos1 - 1;
+                        let prev_key = stream.eat_map_key(false, check);
+                        stream.pos = saved;
+                        if let Some(prev_key) = prev_key?
+                            && map_keys_equal(stream, prev_key, key, check)?
+                        {
+                            return Ok(true);
+                        }
+                    }
+                    idx = (idx + 1) & mask;
+                }
+            }
+        }
+    }
+
+    fn grow_preflighted(
+        &mut self,
+        active_heap: &mut u64,
+        allow_mem: &mut dyn FnMut(u64) -> bool,
+    ) -> bool {
+        let old_cap = self.capacity();
+        let Some(new_cap) = old_cap.checked_mul(2) else {
+            return false;
+        };
+        let old_bytes = self.bytes();
+        let new_bytes = Self::bytes_for(new_cap, self.is_large());
+        // Account for old and new buffers live simultaneously during rehash.
+        if !allow_mem(active_heap.saturating_add(new_bytes)) {
+            return false;
+        }
+        let new_mask = new_cap - 1;
+        match &mut self.slots {
+            WideSlots::Small(old) => {
+                let mut next = vec![(0u32, 0u32); new_cap];
+                for &(tag, pos1) in old.iter() {
+                    if pos1 != 0 {
+                        let mut idx = (tag as usize) & new_mask;
+                        while next[idx].1 != 0 {
+                            idx = (idx + 1) & new_mask;
+                        }
+                        next[idx] = (tag, pos1);
+                    }
+                }
+                *old = next;
+            }
+            WideSlots::Large(old) => {
+                let mut next = vec![(0u64, 0usize); new_cap];
+                for &(hash, pos1) in old.iter() {
+                    if pos1 != 0 {
+                        let mut idx = (mix_tag(hash) as usize) & new_mask;
+                        while next[idx].1 != 0 {
+                            idx = (idx + 1) & new_mask;
+                        }
+                        next[idx] = (hash, pos1);
+                    }
+                }
+                *old = next;
+            }
+        }
+        *active_heap = active_heap
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        true
+    }
+
+    fn insert_unique(&mut self, hash: u64, tag: u32, pos: usize) {
+        match &mut self.slots {
+            WideSlots::Small(slots) => {
+                let mask = slots.len() - 1;
+                let mut idx = (tag as usize) & mask;
+                while slots[idx].1 != 0 {
+                    idx = (idx + 1) & mask;
+                }
+                slots[idx] = (tag, (pos as u32) + 1);
+            }
+            WideSlots::Large(slots) => {
+                let mask = slots.len() - 1;
+                let mut idx = (tag as usize) & mask;
+                while slots[idx].1 != 0 {
+                    idx = (idx + 1) & mask;
+                }
+                slots[idx] = (hash, pos + 1);
+            }
+        }
+        self.len += 1;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MapKeyEntry {
+    start: usize,
+    hash: u64,
+    tag: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FallbackScan {
+    NoDuplicate,
+    Duplicate,
+    BudgetExceeded,
+}
+
+fn skip_map_entry_value(
+    stream: &mut CdtStream<'_>,
+    check: &mut dyn FnMut() -> crate::error::Result<()>,
+) -> crate::error::Result<bool> {
+    stream.skip_ws(check)?;
+    if !stream.eat(':') {
+        return Ok(false);
+    }
+    let mut val_depth = 0usize;
+    while let Some(ch) = stream.next_char() {
+        stream.tick(check)?;
+        match ch {
+            '[' | '{' => val_depth += 1,
+            ']' | '}' => {
+                if val_depth == 0 {
+                    break;
+                }
+                val_depth -= 1;
+            }
+            ',' if val_depth == 0 => break,
+            '<' => {
+                while let Some(c) = stream.next_char() {
+                    stream.tick(check)?;
+                    if c == '>' {
+                        break;
+                    }
+                }
+            }
+            '"' | '\'' => {
+                let _ = stream.eat_string_after_quote(ch, check)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
+fn scan_single_against_prior(
+    stream: &mut CdtStream<'_>,
+    map_start: usize,
+    cur_key: KeyKind,
+    cur: MapKeyEntry,
+    fallback_visits: &mut usize,
+    check: &mut dyn FnMut() -> crate::error::Result<()>,
+) -> crate::error::Result<FallbackScan> {
+    let saved = stream.pos;
+    stream.pos = map_start;
+    let res = (|| {
+        loop {
+            stream.skip_ws(check)?;
+            if stream.pos >= cur.start {
+                return Ok(FallbackScan::NoDuplicate);
+            }
+            stream.tick(check)?;
+            *fallback_visits = fallback_visits.saturating_add(1);
+            if *fallback_visits > MAX_ZERO_HEAP_MAP_RESCAN_VISITS {
+                return Ok(FallbackScan::BudgetExceeded);
+            }
+            let Some(prev_key) = stream.eat_map_key(false, check)? else {
+                return Ok(FallbackScan::NoDuplicate);
+            };
+            if hash_map_key(stream, prev_key, check)? == cur.hash
+                && map_keys_equal(stream, prev_key, cur_key, check)?
+            {
+                return Ok(FallbackScan::Duplicate);
+            }
+            if !skip_map_entry_value(stream, check)? {
+                return Ok(FallbackScan::NoDuplicate);
+            }
+        }
+    })();
+    stream.pos = saved;
+    res
+}
+
 struct ContainerStack {
-    bits: [u64; MAX_BARE_CDT_DEPTH / 64],
+    bits: [u64; CONTAINER_WINDOW_WORDS],
+    bits_base: usize,
     depth: usize,
     map_frames: [MapFrame; INLINE_MAP_FRAMES],
+    map_frame_base: usize,
     map_depth: usize,
-    key_pool: [(u64, usize); INLINE_MAP_KEY_POOL],
+    key_pool: [PoolEntry; INLINE_MAP_KEY_POOL],
     key_pool_len: usize,
+    key_buckets: [u16; INLINE_MAP_KEY_BUCKETS],
+    overflow_tables: Vec<(usize, WideKeySet)>,
+    overflow_tables_vec_bytes: u64,
+    active_heap_bytes: u64,
+    fallback_visits: usize,
 }
 
 impl ContainerStack {
     fn new() -> Self {
         Self {
-            bits: [0; MAX_BARE_CDT_DEPTH / 64],
+            bits: [0; CONTAINER_WINDOW_WORDS],
+            bits_base: 0,
             depth: 0,
             map_frames: [MapFrame::EMPTY; INLINE_MAP_FRAMES],
+            map_frame_base: 0,
             map_depth: 0,
-            key_pool: [(0, 0); INLINE_MAP_KEY_POOL],
+            key_pool: [PoolEntry::EMPTY; INLINE_MAP_KEY_POOL],
             key_pool_len: 0,
+            key_buckets: [0; INLINE_MAP_KEY_BUCKETS],
+            overflow_tables: Vec::new(),
+            overflow_tables_vec_bytes: 0,
+            active_heap_bytes: 0,
+            fallback_visits: 0,
         }
     }
 
@@ -1373,153 +1899,740 @@ impl ContainerStack {
 
     #[inline]
     fn top_is_map(&self) -> bool {
-        let idx = self.depth - 1;
-        (self.bits[idx / 64] >> (idx % 64)) & 1 != 0
+        let rel = (self.depth - 1) - self.bits_base;
+        (self.bits[rel / 64] >> (rel % 64)) & 1 != 0
     }
 
-    fn push_list(&mut self) -> crate::error::Result<()> {
-        if self.depth >= MAX_BARE_CDT_DEPTH {
-            return Err(crate::error::Error::invalid(
-                "composite literal exceeds bare nesting ceiling",
-            ));
+    fn push_bit(&mut self, is_map: bool) {
+        if self.depth == self.bits_base + CONTAINER_WINDOW_BITS {
+            self.bits.copy_within(CONTAINER_WINDOW_HALF_WORDS.., 0);
+            self.bits[CONTAINER_WINDOW_HALF_WORDS..].fill(0);
+            self.bits_base += CONTAINER_WINDOW_HALF_BITS;
         }
-        self.bits[self.depth / 64] &= !(1u64 << (self.depth % 64));
+        let rel = self.depth - self.bits_base;
+        if is_map {
+            self.bits[rel / 64] |= 1u64 << (rel % 64);
+        } else {
+            self.bits[rel / 64] &= !(1u64 << (rel % 64));
+        }
         self.depth += 1;
-        Ok(())
     }
 
-    fn push_map(&mut self, start: usize) -> crate::error::Result<()> {
-        if self.depth >= MAX_BARE_CDT_DEPTH {
-            return Err(crate::error::Error::invalid(
-                "composite literal exceeds bare nesting ceiling",
-            ));
+    fn push_list(&mut self) {
+        self.push_bit(false);
+    }
+
+    fn push_pool_entry(&mut self, tag: u32, start: usize) {
+        let idx = self.key_pool_len;
+        let bucket = (tag as usize) & (INLINE_MAP_KEY_BUCKETS - 1);
+        let prev_head = self.key_buckets[bucket];
+        self.key_pool[idx] = PoolEntry {
+            start,
+            tag,
+            next: prev_head,
+        };
+        self.key_buckets[bucket] = (idx + 1) as u16;
+        self.key_pool_len += 1;
+    }
+
+    fn pop_pool_to(&mut self, base: usize) {
+        while self.key_pool_len > base {
+            self.key_pool_len -= 1;
+            let entry = self.key_pool[self.key_pool_len];
+            let bucket = (entry.tag as usize) & (INLINE_MAP_KEY_BUCKETS - 1);
+            self.key_buckets[bucket] = entry.next;
         }
-        self.bits[self.depth / 64] |= 1u64 << (self.depth % 64);
-        self.depth += 1;
-        if self.map_depth < INLINE_MAP_FRAMES {
-            self.map_frames[self.map_depth] = MapFrame {
-                start,
-                key_base: self.key_pool_len as u16,
-                key_count: 0,
-                overflowed: false,
-            };
+    }
+
+    fn pool_contains(
+        &self,
+        stream: &mut CdtStream<'_>,
+        frame_key_base: usize,
+        key: KeyKind,
+        tag: u32,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<bool> {
+        let mut cur = self.key_buckets[(tag as usize) & (INLINE_MAP_KEY_BUCKETS - 1)];
+        while cur != 0 {
+            stream.tick(check)?;
+            let idx = (cur - 1) as usize;
+            if idx < frame_key_base {
+                break;
+            }
+            let entry = self.key_pool[idx];
+            if entry.tag == tag {
+                let saved = stream.pos;
+                stream.pos = entry.start;
+                let prev_key = stream.eat_map_key(false, check);
+                stream.pos = saved;
+                if let Some(prev_key) = prev_key?
+                    && map_keys_equal(stream, prev_key, key, check)?
+                {
+                    return Ok(true);
+                }
+            }
+            cur = entry.next;
         }
+        Ok(false)
+    }
+
+    fn ensure_overflow_tables_slot_with_extra(
+        &mut self,
+        extra_bytes: u64,
+        allow_mem: &mut dyn FnMut(u64) -> bool,
+    ) -> bool {
+        if self.overflow_tables.len() < self.overflow_tables.capacity() {
+            return allow_mem(self.active_heap_bytes.saturating_add(extra_bytes));
+        }
+        let old_cap = self.overflow_tables.capacity();
+        let new_cap = if old_cap == 0 {
+            4
+        } else {
+            old_cap.saturating_mul(2)
+        };
+        let elem = std::mem::size_of::<(usize, WideKeySet)>() as u64;
+        let new_bytes = (new_cap as u64).saturating_mul(elem);
+        if !allow_mem(
+            self.active_heap_bytes
+                .saturating_add(new_bytes)
+                .saturating_add(extra_bytes),
+        ) {
+            return false;
+        }
+        self.overflow_tables
+            .reserve_exact(new_cap - self.overflow_tables.len());
+        self.active_heap_bytes = self
+            .active_heap_bytes
+            .saturating_sub(self.overflow_tables_vec_bytes)
+            .saturating_add(new_bytes);
+        self.overflow_tables_vec_bytes = new_bytes;
+        true
+    }
+
+    fn scan_batch_against_prior(
+        &mut self,
+        stream: &mut CdtStream<'_>,
+        map_start: usize,
+        batch_start: usize,
+        frame_key_base: usize,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<FallbackScan> {
+        let saved = stream.pos;
+        stream.pos = map_start;
+        let res = (|| {
+            loop {
+                stream.skip_ws(check)?;
+                if stream.pos >= batch_start {
+                    return Ok(FallbackScan::NoDuplicate);
+                }
+                stream.tick(check)?;
+                self.fallback_visits = self.fallback_visits.saturating_add(1);
+                if self.fallback_visits > MAX_ZERO_HEAP_MAP_RESCAN_VISITS {
+                    return Ok(FallbackScan::BudgetExceeded);
+                }
+                let Some(prev_key) = stream.eat_map_key(false, check)? else {
+                    return Ok(FallbackScan::NoDuplicate);
+                };
+                let prev_hash = hash_map_key(stream, prev_key, check)?;
+                let prev_tag = mix_tag(prev_hash);
+                let mut cur = self.key_buckets[(prev_tag as usize) & (INLINE_MAP_KEY_BUCKETS - 1)];
+                while cur != 0 {
+                    let idx = (cur - 1) as usize;
+                    if idx < frame_key_base {
+                        break;
+                    }
+                    let entry = self.key_pool[idx];
+                    if entry.tag == prev_tag {
+                        let after_prev = stream.pos;
+                        stream.pos = entry.start;
+                        let batch_key = stream.eat_map_key(false, check);
+                        stream.pos = after_prev;
+                        if let Some(batch_key) = batch_key?
+                            && map_keys_equal(stream, prev_key, batch_key, check)?
+                        {
+                            return Ok(FallbackScan::Duplicate);
+                        }
+                    }
+                    cur = entry.next;
+                }
+                if !skip_map_entry_value(stream, check)? {
+                    return Ok(FallbackScan::NoDuplicate);
+                }
+            }
+        })();
+        stream.pos = saved;
+        res
+    }
+
+    fn shift_map_frames(
+        &mut self,
+        stream: &mut CdtStream<'_>,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<bool> {
+        // Flush any buffered batched-fallback frames from innermost to outermost
+        // so the LIFO key_buckets chains stay exact while clearing key_pool.
+        for i in (0..INLINE_MAP_FRAMES).rev() {
+            let frame = self.map_frames[i];
+            if let MapKeyMode::BatchedFallback {
+                batch_start: Some(b_start),
+            } = frame.mode
+            {
+                match self.scan_batch_against_prior(
+                    stream,
+                    frame.start,
+                    b_start,
+                    frame.key_base as usize,
+                    check,
+                )? {
+                    FallbackScan::NoDuplicate => {}
+                    FallbackScan::Duplicate => return Ok(false),
+                    FallbackScan::BudgetExceeded => {
+                        return Err(crate::error::Error::StorageFull(
+                            "composite literal duplicate-key validation exceeds memory budget"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            self.pop_pool_to(frame.key_base as usize);
+        }
+        debug_assert_eq!(self.key_pool_len, 0);
+        self.map_frames.copy_within(INLINE_MAP_FRAMES_HALF.., 0);
+        for frame in &mut self.map_frames[..INLINE_MAP_FRAMES_HALF] {
+            frame.key_base = 0;
+            frame.key_count = 0;
+            if frame.mode != MapKeyMode::WideTable {
+                frame.mode = MapKeyMode::BatchedFallback { batch_start: None };
+            }
+        }
+        self.map_frame_base += INLINE_MAP_FRAMES_HALF;
+        Ok(true)
+    }
+
+    fn push_map(
+        &mut self,
+        start: usize,
+        stream: &mut CdtStream<'_>,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<bool> {
+        self.push_bit(true);
+        if self.map_depth == self.map_frame_base + INLINE_MAP_FRAMES
+            && !self.shift_map_frames(stream, check)?
+        {
+            return Ok(false);
+        }
+        let rel = self.map_depth - self.map_frame_base;
+        self.map_frames[rel] = MapFrame {
+            start,
+            key_base: self.key_pool_len as u16,
+            key_count: 0,
+            mode: MapKeyMode::Inline,
+            mem_refused: false,
+        };
         self.map_depth += 1;
+        Ok(true)
+    }
+
+    fn refill_bits(
+        &mut self,
+        stream: &mut CdtStream<'_>,
+        level_start: usize,
+        up_to: usize,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        let new_base = self.bits_base.saturating_sub(CONTAINER_WINDOW_HALF_BITS);
+        let window_end = new_base + CONTAINER_WINDOW_BITS;
+        self.bits.fill(0);
+        let saved = stream.pos;
+        stream.pos = level_start;
+        let res: crate::error::Result<()> = (|| {
+            let mut d = 0usize;
+            while stream.pos < up_to {
+                stream.tick(check)?;
+                let Some(ch) = stream.next_char() else {
+                    break;
+                };
+                match ch {
+                    '[' => {
+                        if d >= new_base && d < window_end {
+                            let rel = d - new_base;
+                            self.bits[rel / 64] &= !(1u64 << (rel % 64));
+                        }
+                        d += 1;
+                    }
+                    '{' => {
+                        if d >= new_base && d < window_end {
+                            let rel = d - new_base;
+                            self.bits[rel / 64] |= 1u64 << (rel % 64);
+                        }
+                        d += 1;
+                    }
+                    ']' | '}' => d = d.saturating_sub(1),
+                    '<' => {
+                        while let Some(c) = stream.next_char() {
+                            stream.tick(check)?;
+                            if c == '>' {
+                                break;
+                            }
+                        }
+                    }
+                    '"' | '\'' => {
+                        let _ = stream.eat_string_after_quote(ch, check)?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        })();
+        stream.pos = saved;
+        res?;
+        self.bits_base = new_base;
         Ok(())
     }
 
-    fn pop(&mut self) {
-        let was_map = self.top_is_map();
+    fn refill_map_frames(
+        &mut self,
+        stream: &mut CdtStream<'_>,
+        level_start: usize,
+        up_to: usize,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        let new_base = self.map_frame_base.saturating_sub(INLINE_MAP_FRAMES_HALF);
+        let window_end = new_base + INLINE_MAP_FRAMES;
+        let saved = stream.pos;
+        stream.pos = level_start;
+        let res: crate::error::Result<()> = (|| {
+            let mut m = 0usize;
+            while stream.pos < up_to {
+                stream.tick(check)?;
+                let Some(ch) = stream.next_char() else {
+                    break;
+                };
+                match ch {
+                    '{' => {
+                        if m >= new_base && m < window_end {
+                            let map_depth_1 = m + 1;
+                            let has_table = self
+                                .overflow_tables
+                                .binary_search_by_key(&map_depth_1, |(d, _)| *d)
+                                .is_ok();
+                            self.map_frames[m - new_base] = MapFrame {
+                                start: stream.pos,
+                                key_base: self.key_pool_len as u16,
+                                key_count: 0,
+                                mode: if has_table {
+                                    MapKeyMode::WideTable
+                                } else {
+                                    MapKeyMode::BatchedFallback { batch_start: None }
+                                },
+                                mem_refused: false,
+                            };
+                        }
+                        m += 1;
+                    }
+                    '}' => m = m.saturating_sub(1),
+                    '<' => {
+                        while let Some(c) = stream.next_char() {
+                            stream.tick(check)?;
+                            if c == '>' {
+                                break;
+                            }
+                        }
+                    }
+                    '"' | '\'' => {
+                        let _ = stream.eat_string_after_quote(ch, check)?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        })();
+        stream.pos = saved;
+        res?;
+        self.map_frame_base = new_base;
+        Ok(())
+    }
+
+    fn pop_list(
+        &mut self,
+        stream: &mut CdtStream<'_>,
+        level_start: usize,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        debug_assert!(!self.top_is_map());
         self.depth -= 1;
-        if was_map {
-            self.map_depth -= 1;
-            if self.map_depth < INLINE_MAP_FRAMES {
-                self.key_pool_len = self.map_frames[self.map_depth].key_base as usize;
-            }
+        if self.depth > 0 && self.depth - 1 < self.bits_base {
+            self.refill_bits(stream, level_start, stream.pos, check)?;
         }
+        Ok(())
     }
-}
 
-fn find_deep_map_start(
-    stream: &mut CdtStream<'_>,
-    level_start: usize,
-    target_depth: usize,
-    up_to: usize,
-) -> usize {
-    let saved = stream.pos;
-    stream.pos = level_start;
-    let mut d = 0usize;
-    let mut last_map_start = level_start;
-    while stream.pos < up_to {
-        let Some(ch) = stream.next_char() else {
-            break;
-        };
-        match ch {
-            '[' => d += 1,
-            '{' => {
-                d += 1;
-                if d == target_depth {
-                    last_map_start = stream.pos;
-                }
+    fn finish_map_and_pop(
+        &mut self,
+        stream: &mut CdtStream<'_>,
+        level_start: usize,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<bool> {
+        debug_assert!(self.top_is_map());
+        let frame_idx = (self.map_depth - 1) - self.map_frame_base;
+        let frame = self.map_frames[frame_idx];
+        match frame.mode {
+            MapKeyMode::Inline => {
+                self.pop_pool_to(frame.key_base as usize);
             }
-            ']' | '}' => d = d.saturating_sub(1),
-            '<' => {
-                while let Some(c) = stream.next_char() {
-                    if c == '>' {
-                        break;
-                    }
-                }
+            MapKeyMode::WideTable => {
+                let (d, table) = self
+                    .overflow_tables
+                    .pop()
+                    .expect("wide table matches active map frame");
+                debug_assert_eq!(d, self.map_depth);
+                self.active_heap_bytes = self.active_heap_bytes.saturating_sub(table.bytes());
+                drop(table);
+                self.pop_pool_to(frame.key_base as usize);
             }
-            '"' | '\'' => {
-                let _ = stream.eat_string_after_quote(ch);
-            }
-            _ => {}
-        }
-    }
-    stream.pos = saved;
-    last_map_start
-}
-
-fn scan_map_duplicate(
-    stream: &mut CdtStream<'_>,
-    map_start: usize,
-    cur_key_start: usize,
-    cur_key: KeyKind,
-    cur_hash: u64,
-) -> bool {
-    let saved = stream.pos;
-    stream.pos = map_start;
-    let mut dup = false;
-    loop {
-        stream.skip_ws();
-        if stream.pos >= cur_key_start {
-            break;
-        }
-        let Some(prev_key) = stream.eat_map_key(false) else {
-            break;
-        };
-        if hash_map_key(stream, prev_key) == cur_hash && map_keys_equal(stream, prev_key, cur_key) {
-            dup = true;
-            break;
-        }
-        stream.skip_ws();
-        if !stream.eat(':') {
-            break;
-        }
-        let mut val_depth = 0usize;
-        while let Some(ch) = stream.next_char() {
-            match ch {
-                '[' | '{' => val_depth += 1,
-                ']' | '}' => {
-                    if val_depth == 0 {
-                        break;
-                    }
-                    val_depth -= 1;
-                }
-                ',' if val_depth == 0 => break,
-                '<' => {
-                    while let Some(c) = stream.next_char() {
-                        if c == '>' {
-                            break;
+            MapKeyMode::BatchedFallback { batch_start } => {
+                if let Some(b_start) = batch_start {
+                    match self.scan_batch_against_prior(
+                        stream,
+                        frame.start,
+                        b_start,
+                        frame.key_base as usize,
+                        check,
+                    )? {
+                        FallbackScan::NoDuplicate => {}
+                        FallbackScan::Duplicate => return Ok(false),
+                        FallbackScan::BudgetExceeded => {
+                            return Err(crate::error::Error::StorageFull(
+                                "composite literal duplicate-key validation exceeds memory budget"
+                                    .into(),
+                            ));
                         }
                     }
                 }
-                '"' | '\'' => {
-                    let _ = stream.eat_string_after_quote(ch);
+                self.pop_pool_to(frame.key_base as usize);
+            }
+        }
+        self.depth -= 1;
+        self.map_depth -= 1;
+        if self.depth > 0 && self.depth - 1 < self.bits_base {
+            self.refill_bits(stream, level_start, stream.pos, check)?;
+        }
+        if self.map_depth > 0 && self.map_depth - 1 < self.map_frame_base {
+            self.refill_map_frames(stream, level_start, stream.pos, check)?;
+        }
+        Ok(true)
+    }
+
+    fn try_promote_inline_to_wide(
+        &mut self,
+        frame_idx: usize,
+        stream: &mut CdtStream<'_>,
+        cur: MapKeyEntry,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+        allow_mem: &mut dyn FnMut(u64) -> bool,
+    ) -> crate::error::Result<bool> {
+        let frame = self.map_frames[frame_idx];
+        let large = stream.s.len() >= u32::MAX as usize;
+        let init_cap = ((frame.key_count as usize + 1) * 4 / 3 + 1)
+            .next_power_of_two()
+            .max(1024);
+        let init_bytes = WideKeySet::bytes_for(init_cap, large);
+        if !self.ensure_overflow_tables_slot_with_extra(init_bytes, allow_mem) {
+            return Ok(false);
+        }
+        let Some(mut table) =
+            WideKeySet::new_preflighted(init_cap, large, &mut self.active_heap_bytes, allow_mem)
+        else {
+            return Ok(false);
+        };
+        let start_i = frame.key_base as usize;
+        let end_i = start_i + frame.key_count as usize;
+        for idx in start_i..end_i {
+            let entry = self.key_pool[idx];
+            let hash = if large {
+                let saved = stream.pos;
+                stream.pos = entry.start;
+                let prev_key = stream.eat_map_key(false, check);
+                stream.pos = saved;
+                if let Some(prev_key) = prev_key? {
+                    hash_map_key(stream, prev_key, check)?
+                } else {
+                    0
                 }
-                _ => {}
+            } else {
+                0
+            };
+            table.insert_unique(hash, entry.tag, entry.start);
+        }
+        table.insert_unique(cur.hash, cur.tag, cur.start);
+        self.pop_pool_to(start_i);
+        self.overflow_tables.push((self.map_depth, table));
+        self.map_frames[frame_idx].mode = MapKeyMode::WideTable;
+        self.map_frames[frame_idx].key_count = 0;
+        Ok(true)
+    }
+
+    /// Attempt to promote a refilled `BatchedFallback` map frame into a
+    /// preflighted `WideKeySet` by scanning its earlier entries once.
+    /// Returns `Ok(Some(true))` on promotion, `Ok(Some(false))` if a duplicate
+    /// was found, and `Ok(None)` if `allow_mem` refused the table.
+    fn try_promote_batched_to_wide(
+        &mut self,
+        frame_idx: usize,
+        stream: &mut CdtStream<'_>,
+        prior_end: usize,
+        cur: MapKeyEntry,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+        allow_mem: &mut dyn FnMut(u64) -> bool,
+    ) -> crate::error::Result<Option<bool>> {
+        let frame = self.map_frames[frame_idx];
+        let large = stream.s.len() >= u32::MAX as usize;
+        let init_cap = ((frame.key_count as usize + 1) * 4 / 3 + 1)
+            .next_power_of_two()
+            .max(1024);
+        let init_bytes = WideKeySet::bytes_for(init_cap, large);
+        if !self.ensure_overflow_tables_slot_with_extra(init_bytes, allow_mem) {
+            return Ok(None);
+        }
+        let Some(mut table) =
+            WideKeySet::new_preflighted(init_cap, large, &mut self.active_heap_bytes, allow_mem)
+        else {
+            return Ok(None);
+        };
+        let start_i = frame.key_base as usize;
+        let end_i = start_i + frame.key_count as usize;
+        for idx in start_i..end_i {
+            let entry = self.key_pool[idx];
+            let hash = if large {
+                let saved = stream.pos;
+                stream.pos = entry.start;
+                let prev_key = stream.eat_map_key(false, check);
+                stream.pos = saved;
+                if let Some(prev_key) = prev_key? {
+                    hash_map_key(stream, prev_key, check)?
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            table.insert_unique(hash, entry.tag, entry.start);
+        }
+        table.insert_unique(cur.hash, cur.tag, cur.start);
+
+        let saved = stream.pos;
+        stream.pos = frame.start;
+        let scan_res: crate::error::Result<Option<bool>> = (|| {
+            loop {
+                stream.skip_ws(check)?;
+                if stream.pos >= prior_end {
+                    return Ok(Some(true));
+                }
+                stream.tick(check)?;
+                let prev_start = stream.pos;
+                let Some(prev_key) = stream.eat_map_key(false, check)? else {
+                    return Ok(Some(true));
+                };
+                let prev_hash = hash_map_key(stream, prev_key, check)?;
+                let prev_tag = mix_tag(prev_hash);
+                if table.contains(stream, prev_key, prev_hash, prev_tag, check)? {
+                    return Ok(Some(false));
+                }
+                if table.needs_grow()
+                    && !table.grow_preflighted(&mut self.active_heap_bytes, allow_mem)
+                {
+                    return Ok(None);
+                }
+                table.insert_unique(prev_hash, prev_tag, prev_start);
+                if !skip_map_entry_value(stream, check)? {
+                    return Ok(Some(true));
+                }
+            }
+        })();
+        stream.pos = saved;
+        match scan_res {
+            Ok(Some(true)) => {
+                self.pop_pool_to(start_i);
+                self.overflow_tables.push((self.map_depth, table));
+                self.map_frames[frame_idx].mode = MapKeyMode::WideTable;
+                self.map_frames[frame_idx].key_count = 0;
+                Ok(Some(true))
+            }
+            Ok(Some(false)) => {
+                self.active_heap_bytes = self.active_heap_bytes.saturating_sub(table.bytes());
+                drop(table);
+                Ok(Some(false))
+            }
+            Ok(None) => {
+                self.active_heap_bytes = self.active_heap_bytes.saturating_sub(table.bytes());
+                drop(table);
+                Ok(None)
+            }
+            Err(e) => {
+                self.active_heap_bytes = self.active_heap_bytes.saturating_sub(table.bytes());
+                drop(table);
+                Err(e)
             }
         }
     }
-    stream.pos = saved;
-    dup
+
+    /// Record `cur_key` in the current innermost map frame and return `Ok(false)`
+    /// when it duplicates an earlier key of the same map.
+    fn register_map_key(
+        &mut self,
+        stream: &mut CdtStream<'_>,
+        key_start: usize,
+        key: KeyKind,
+        cur_hash: u64,
+        check: &mut dyn FnMut() -> crate::error::Result<()>,
+        allow_mem: &mut dyn FnMut(u64) -> bool,
+    ) -> crate::error::Result<bool> {
+        let cur = MapKeyEntry {
+            start: key_start,
+            hash: cur_hash,
+            tag: mix_tag(cur_hash),
+        };
+        let frame_idx = (self.map_depth - 1) - self.map_frame_base;
+        let frame = self.map_frames[frame_idx];
+        match frame.mode {
+            MapKeyMode::Inline => {
+                if self.pool_contains(stream, frame.key_base as usize, key, cur.tag, check)? {
+                    return Ok(false);
+                }
+                if self.key_pool_len < INLINE_MAP_KEY_POOL {
+                    self.push_pool_entry(cur.tag, cur.start);
+                    self.map_frames[frame_idx].key_count += 1;
+                    return Ok(true);
+                }
+                if self.try_promote_inline_to_wide(frame_idx, stream, cur, check, allow_mem)? {
+                    return Ok(true);
+                }
+                // Tight memory cap refused WideTable; all prior keys in key_pool
+                // were already checked against each other and against cur_key.
+                self.pop_pool_to(frame.key_base as usize);
+                self.map_frames[frame_idx].key_count = 0;
+                self.map_frames[frame_idx].mem_refused = true;
+                self.map_frames[frame_idx].mode = MapKeyMode::BatchedFallback { batch_start: None };
+                Ok(true)
+            }
+            MapKeyMode::WideTable => {
+                let (d, table) = self
+                    .overflow_tables
+                    .last_mut()
+                    .expect("wide table matches active map frame");
+                debug_assert_eq!(*d, self.map_depth);
+                if table.contains(stream, key, cur.hash, cur.tag, check)? {
+                    return Ok(false);
+                }
+                if table.needs_grow() {
+                    if table.grow_preflighted(&mut self.active_heap_bytes, allow_mem) {
+                        table.insert_unique(cur.hash, cur.tag, cur.start);
+                    } else {
+                        // Tight memory cap refused doubling; drop table and continue
+                        // in bounded zero-heap batched fallback. All keys up to and
+                        // including cur_key are already verified pairwise distinct.
+                        let (_, old) = self.overflow_tables.pop().expect("wide table exists");
+                        self.active_heap_bytes = self.active_heap_bytes.saturating_sub(old.bytes());
+                        drop(old);
+                        self.map_frames[frame_idx].key_base = self.key_pool_len as u16;
+                        self.map_frames[frame_idx].key_count = 0;
+                        self.map_frames[frame_idx].mem_refused = true;
+                        self.map_frames[frame_idx].mode =
+                            MapKeyMode::BatchedFallback { batch_start: None };
+                    }
+                } else {
+                    table.insert_unique(cur.hash, cur.tag, cur.start);
+                }
+                Ok(true)
+            }
+            MapKeyMode::BatchedFallback { batch_start } => {
+                if batch_start.is_some()
+                    && self.pool_contains(stream, frame.key_base as usize, key, cur.tag, check)?
+                {
+                    return Ok(false);
+                }
+                if self.key_pool_len < INLINE_MAP_KEY_POOL {
+                    if batch_start.is_none() {
+                        self.map_frames[frame_idx].mode = MapKeyMode::BatchedFallback {
+                            batch_start: Some(cur.start),
+                        };
+                    }
+                    self.push_pool_entry(cur.tag, cur.start);
+                    self.map_frames[frame_idx].key_count += 1;
+                    return Ok(true);
+                }
+                // Key pool is full. If this frame entered BatchedFallback due to
+                // map_frames shifting (not a memory refusal), try promoting to WideTable.
+                let prior_end = batch_start.unwrap_or(cur.start);
+                if !frame.mem_refused {
+                    match self.try_promote_batched_to_wide(
+                        frame_idx, stream, prior_end, cur, check, allow_mem,
+                    )? {
+                        Some(ok) => return Ok(ok),
+                        None => {
+                            self.map_frames[frame_idx].mem_refused = true;
+                        }
+                    }
+                }
+                if let Some(b_start) = batch_start {
+                    match self.scan_batch_against_prior(
+                        stream,
+                        frame.start,
+                        b_start,
+                        frame.key_base as usize,
+                        check,
+                    )? {
+                        FallbackScan::NoDuplicate => {}
+                        FallbackScan::Duplicate => return Ok(false),
+                        FallbackScan::BudgetExceeded => {
+                            return Err(crate::error::Error::StorageFull(
+                                "composite literal duplicate-key validation exceeds memory budget"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    self.pop_pool_to(frame.key_base as usize);
+                    self.map_frames[frame_idx].key_count = 0;
+                    self.map_frames[frame_idx].mode = MapKeyMode::BatchedFallback {
+                        batch_start: Some(cur.start),
+                    };
+                    self.push_pool_entry(cur.tag, cur.start);
+                    self.map_frames[frame_idx].key_count = 1;
+                    Ok(true)
+                } else {
+                    match scan_single_against_prior(
+                        stream,
+                        frame.start,
+                        key,
+                        cur,
+                        &mut self.fallback_visits,
+                        check,
+                    )? {
+                        FallbackScan::NoDuplicate => Ok(true),
+                        FallbackScan::Duplicate => Ok(false),
+                        FallbackScan::BudgetExceeded => Err(crate::error::Error::StorageFull(
+                            "composite literal duplicate-key validation exceeds memory budget"
+                                .into(),
+                        )),
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Validate a single CDT lexical level (matching `parse_list` / `parse_map`,
 /// including all bare nested lists/maps and map duplicate-key checks, without
-/// descending into quoted nested CDT literals) iteratively in O(1) stack and
-/// zero heap.
-fn validate_cdt(stream: &mut CdtStream<'_>, is_map: bool) -> crate::error::Result<bool> {
+/// descending into quoted nested CDT literals) iteratively in O(1) stack.
+/// Uses zero heap for all lists, language tags, and maps up to 512 keys; wider
+/// maps promote to a memory-preflighted hash table (or a bounded zero-heap
+/// batched fallback when memory is tight) and check cancellation throughout.
+fn validate_cdt(
+    stream: &mut CdtStream<'_>,
+    is_map: bool,
+    check: &mut dyn FnMut() -> crate::error::Result<()>,
+    allow_mem: &mut dyn FnMut(u64) -> bool,
+) -> crate::error::Result<bool> {
     #[derive(Clone, Copy)]
     enum Expect {
         ListStartOrEnd,
@@ -1530,7 +2643,7 @@ fn validate_cdt(stream: &mut CdtStream<'_>, is_map: bool) -> crate::error::Resul
     }
 
     let level_start = stream.pos;
-    stream.skip_ws();
+    stream.skip_ws(check)?;
     let mut stack = ContainerStack::new();
     let mut expect = if is_map {
         if !stream.eat('{') {
@@ -1539,7 +2652,9 @@ fn validate_cdt(stream: &mut CdtStream<'_>, is_map: bool) -> crate::error::Resul
         if stack.depth >= stream.limit().saturating_sub(stream.pos) {
             return Ok(false);
         }
-        stack.push_map(stream.pos)?;
+        if !stack.push_map(stream.pos, stream, check)? {
+            return Ok(false);
+        }
         Expect::MapStartOrEnd
     } else {
         if !stream.eat('[') {
@@ -1548,16 +2663,17 @@ fn validate_cdt(stream: &mut CdtStream<'_>, is_map: bool) -> crate::error::Resul
         if stack.depth >= stream.limit().saturating_sub(stream.pos) {
             return Ok(false);
         }
-        stack.push_list()?;
+        stack.push_list();
         Expect::ListStartOrEnd
     };
 
     loop {
-        stream.skip_ws();
+        stream.tick(check)?;
+        stream.skip_ws(check)?;
         match expect {
             Expect::ListStartOrEnd => {
                 if stream.eat(']') {
-                    stack.pop();
+                    stack.pop_list(stream, level_start, check)?;
                     expect = Expect::AfterValue;
                     continue;
                 }
@@ -1569,7 +2685,7 @@ fn validate_cdt(stream: &mut CdtStream<'_>, is_map: bool) -> crate::error::Resul
                     if stack.depth >= stream.limit().saturating_sub(stream.pos) {
                         return Ok(false);
                     }
-                    stack.push_list()?;
+                    stack.push_list();
                     expect = Expect::ListStartOrEnd;
                 }
                 Some('{') => {
@@ -1577,10 +2693,12 @@ fn validate_cdt(stream: &mut CdtStream<'_>, is_map: bool) -> crate::error::Resul
                     if stack.depth >= stream.limit().saturating_sub(stream.pos) {
                         return Ok(false);
                     }
-                    stack.push_map(stream.pos)?;
+                    if !stack.push_map(stream.pos, stream, check)? {
+                        return Ok(false);
+                    }
                     expect = Expect::MapStartOrEnd;
                 }
-                Some(_) if stream.eat_null() || stream.eat_term_any()? => {
+                Some(_) if stream.eat_null() || stream.eat_term_any(check)? => {
                     expect = Expect::AfterValue;
                 }
                 _ => return Ok(false),
@@ -1588,55 +2706,21 @@ fn validate_cdt(stream: &mut CdtStream<'_>, is_map: bool) -> crate::error::Resul
             Expect::MapStartOrEnd | Expect::MapKey => {
                 let is_first_key = matches!(expect, Expect::MapStartOrEnd);
                 if is_first_key && stream.eat('}') {
-                    stack.pop();
+                    if !stack.finish_map_and_pop(stream, level_start, check)? {
+                        return Ok(false);
+                    }
                     expect = Expect::AfterValue;
                     continue;
                 }
                 let key_start = stream.pos;
-                let Some(key) = stream.eat_map_key(true) else {
+                let Some(key) = stream.eat_map_key(true, check)? else {
                     return Ok(false);
                 };
-                let cur_hash = hash_map_key(stream, key);
-                if stack.map_depth <= INLINE_MAP_FRAMES {
-                    let frame_idx = stack.map_depth - 1;
-                    let frame = stack.map_frames[frame_idx];
-                    if !is_first_key {
-                        if !frame.overflowed {
-                            let start_i = frame.key_base as usize;
-                            let end_i = start_i + frame.key_count as usize;
-                            for &(prev_hash, prev_start) in &stack.key_pool[start_i..end_i] {
-                                if prev_hash == cur_hash {
-                                    let saved = stream.pos;
-                                    stream.pos = prev_start;
-                                    let prev_key = stream.eat_map_key(false);
-                                    stream.pos = saved;
-                                    if let Some(prev_key) = prev_key
-                                        && map_keys_equal(stream, prev_key, key)
-                                    {
-                                        return Ok(false);
-                                    }
-                                }
-                            }
-                        } else if scan_map_duplicate(stream, frame.start, key_start, key, cur_hash)
-                        {
-                            return Ok(false);
-                        }
-                    }
-                    if !frame.overflowed && stack.key_pool_len < INLINE_MAP_KEY_POOL {
-                        stack.key_pool[stack.key_pool_len] = (cur_hash, key_start);
-                        stack.key_pool_len += 1;
-                        stack.map_frames[frame_idx].key_count += 1;
-                    } else {
-                        stack.map_frames[frame_idx].overflowed = true;
-                    }
-                } else if !is_first_key {
-                    let map_start =
-                        find_deep_map_start(stream, level_start, stack.depth, key_start);
-                    if scan_map_duplicate(stream, map_start, key_start, key, cur_hash) {
-                        return Ok(false);
-                    }
+                let cur_hash = hash_map_key(stream, key, check)?;
+                if !stack.register_map_key(stream, key_start, key, cur_hash, check, allow_mem)? {
+                    return Ok(false);
                 }
-                stream.skip_ws();
+                stream.skip_ws(check)?;
                 if !stream.eat(':') {
                     return Ok(false);
                 }
@@ -1648,14 +2732,16 @@ fn validate_cdt(stream: &mut CdtStream<'_>, is_map: bool) -> crate::error::Resul
                 }
                 if stack.top_is_map() {
                     if stream.eat('}') {
-                        stack.pop();
+                        if !stack.finish_map_and_pop(stream, level_start, check)? {
+                            return Ok(false);
+                        }
                     } else if stream.eat(',') {
                         expect = Expect::MapKey;
                     } else {
                         return Ok(false);
                     }
                 } else if stream.eat(']') {
-                    stack.pop();
+                    stack.pop_list(stream, level_start, check)?;
                 } else if stream.eat(',') {
                     expect = Expect::ListValue;
                 } else {
@@ -1665,19 +2751,24 @@ fn validate_cdt(stream: &mut CdtStream<'_>, is_map: bool) -> crate::error::Resul
         }
     }
 
-    stream.skip_ws();
+    stream.skip_ws(check)?;
     Ok(stream.peek_char().is_none())
 }
 
-/// Scan a composite literal's lexical form in O(1) heap and O(1) stack without
-/// constructing parsed elements or replacement strings, calling `visit` for
-/// every stored blank-node id referenced as a CDT blank node (including inside
-/// arbitrarily nested bare lists/maps and quoted nested `cdt:List` / `cdt:Map`
-/// literals). Ill-typed CDT literals (or ill-typed quoted nested CDT literals)
-/// are skipped cleanly without calling `visit`, matching `relabel_lexical`.
+/// Scan a composite literal's lexical form in O(1) stack without constructing
+/// parsed elements or replacement strings, calling `visit` for every stored
+/// blank-node id referenced as a CDT blank node (including inside arbitrarily
+/// nested bare lists/maps and quoted nested `cdt:List` / `cdt:Map` literals).
+/// Uses zero heap for lists, language tags, and maps up to 512 keys; wider maps
+/// preflight temporary duplicate-key indexes through `allow_mem` and drop them
+/// before returning. `check` is polled periodically for cancellation/deadlines.
+/// Ill-typed CDT literals (or ill-typed quoted nested CDT literals) are skipped
+/// cleanly without calling `visit`, matching `relabel_lexical`.
 pub(crate) fn scan_bnode_ids(
     lex: &str,
     dt: &str,
+    mut check: impl FnMut() -> crate::error::Result<()>,
+    mut allow_mem: impl FnMut(u64) -> bool,
     mut visit: impl FnMut(crate::id::Id) -> crate::error::Result<()>,
 ) -> crate::error::Result<()> {
     if !is_cdt(dt) {
@@ -1688,9 +2779,10 @@ pub(crate) fn scan_bnode_ids(
     let mut current_is_map = dt == MAP;
     let mut need_validate = true;
     loop {
+        stream.tick(&mut check)?;
         if need_validate {
             let level_start = stream.pos;
-            if !validate_cdt(&mut stream, current_is_map)? {
+            if !validate_cdt(&mut stream, current_is_map, &mut check, &mut allow_mem)? {
                 if stream.depth == 0 {
                     return Ok(());
                 }
@@ -1713,13 +2805,16 @@ pub(crate) fn scan_bnode_ids(
         match c {
             '<' => {
                 while let Some(ch) = stream.next_char() {
+                    stream.tick(&mut check)?;
                     if ch == '>' {
                         break;
                     }
                 }
             }
             '"' | '\'' => {
-                if let Some((body_start, body_end)) = stream.eat_string_after_quote(c) {
+                if let Some((body_start, body_end)) =
+                    stream.eat_string_after_quote(c, &mut check)?
+                {
                     if let Some(kind) = stream.eat_cdt_kind() {
                         let raw = &lex.as_bytes()[body_start..body_end];
                         if memchr::memmem::find(raw, b"_:").is_some()
@@ -1738,14 +2833,14 @@ pub(crate) fn scan_bnode_ids(
                             need_validate = true;
                         }
                     } else if stream.eat('@') {
-                        let _ = stream.eat_langtag_span(false);
+                        let _ = stream.eat_langtag_span(false, &mut check)?;
                     } else if stream.eat_str("^^") {
-                        let _ = stream.eat_iri_span();
+                        let _ = stream.eat_iri_span(&mut check)?;
                     }
                 }
             }
             '_' => {
-                stream.eat_bnode_after_underscore(Some(&mut visit))?;
+                stream.eat_bnode_after_underscore(&mut check, Some(&mut visit))?;
             }
             _ => {}
         }
@@ -2559,10 +3654,16 @@ mod tests {
     fn scans_bnode_ids_iteratively_across_strings_iris_and_quoted_cdts() {
         let scan_dt = |lex: &str, dt: &str| -> Vec<u64> {
             let mut ids = Vec::new();
-            scan_bnode_ids(lex, dt, |id| {
-                ids.push(id.payload());
-                Ok(())
-            })
+            scan_bnode_ids(
+                lex,
+                dt,
+                || Ok(()),
+                |_| true,
+                |id| {
+                    ids.push(id.payload());
+                    Ok(())
+                },
+            )
             .unwrap();
             ids
         };
@@ -2659,10 +3760,16 @@ mod tests {
                     deep.push(']');
                 }
                 let mut ids = Vec::new();
-                scan_bnode_ids(&deep, LIST, |id| {
-                    ids.push(id.payload());
-                    Ok(())
-                })
+                scan_bnode_ids(
+                    &deep,
+                    LIST,
+                    || Ok(()),
+                    |_| true,
+                    |id| {
+                        ids.push(id.payload());
+                        Ok(())
+                    },
+                )
                 .unwrap();
                 assert_eq!(ids, vec![0x2a]);
 
@@ -2676,15 +3783,369 @@ mod tests {
                     deep_dup_map.push('}');
                 }
                 let mut dup_ids = Vec::new();
-                scan_bnode_ids(&deep_dup_map, MAP, |id| {
-                    dup_ids.push(id.payload());
-                    Ok(())
-                })
+                scan_bnode_ids(
+                    &deep_dup_map,
+                    MAP,
+                    || Ok(()),
+                    |_| true,
+                    |id| {
+                        dup_ids.push(id.payload());
+                        Ok(())
+                    },
+                )
                 .unwrap();
                 assert!(dup_ids.is_empty());
             })
             .unwrap();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_langtag_validation_matches_oxilangtag_at_arbitrary_lengths_with_zero_heap() {
+        let long_ext = format!("en-a{}", "-zz".repeat(90));
+        let long_var = format!("en{}", "-1901".repeat(60));
+        let long_prefix_priv = format!("en-u{}-x-priv1-priv2", "-aa".repeat(90));
+        let long_ext_bad_subtag = format!("en-a{}-123456789", "-zz".repeat(90));
+        let long_ext_empty_priv = format!("en-a{}-x", "-zz".repeat(90));
+        let long_priv = format!("x{}", "-abcd1234".repeat(40));
+
+        let mut tags: Vec<String> = GRANDFATHERED_LANGTAGS
+            .iter()
+            .flat_map(|g| {
+                [
+                    (*g).to_string(),
+                    g.to_ascii_uppercase(),
+                    g.to_ascii_lowercase(),
+                ]
+            })
+            .collect();
+        tags.extend(
+            [
+                "en",
+                "EN-us",
+                "zh-cmn-Hans-CN",
+                "en-aaa-bbb-ccc",
+                "en-aaa-bbb-ccc-ddd",
+                "abcd-aaa",
+                "abcd-Latn-419-1901-biske",
+                "x-a",
+                "X-12345678-z",
+                "x",
+                "en-x",
+                "en-x-a",
+                "en-a-bb-c-dd",
+                "en-a-b",
+                "en-a-x-foo",
+                "en-1-2",
+                "en-1-ab",
+                "en-1-ab-2",
+                "en-123456789",
+                "a-bc",
+                "i-klingon-extra",
+                "cel-gaulish-x",
+                "en-gb-oed-1901",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        tags.extend([
+            long_ext.clone(),
+            long_var.clone(),
+            long_prefix_priv.clone(),
+            long_ext_bad_subtag,
+            long_ext_empty_priv,
+            long_priv,
+        ]);
+
+        for tag in &tags {
+            let lex = format!("[\"v\"@{tag}, _:b0]");
+            let parser_ok = parse_list(&lex).is_some();
+            let mut visited = Vec::new();
+            scan_bnode_ids(
+                &lex,
+                LIST,
+                || Ok(()),
+                |_| true,
+                |id| {
+                    visited.push(id.payload());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                !visited.is_empty(),
+                parser_ok,
+                "scanner/parser mismatch on language tag {tag:?}"
+            );
+            if parser_ok {
+                assert_eq!(visited, vec![0]);
+            }
+        }
+
+        // Verify zero heap allocation while validating short, grandfathered, and >256-byte tags.
+        let zero_heap_lex = format!(
+            "[\"a\"@en, \"b\"@en-GB-oed, \"c\"@{long_ext}, \"d\"@{long_var}, \"e\"@{long_prefix_priv}, _:b5]"
+        );
+        let mut seen = None;
+        let largest = crate::test_alloc::record_largest(|| {
+            scan_bnode_ids(
+                &zero_heap_lex,
+                LIST,
+                || Ok(()),
+                |_| true,
+                |id| {
+                    seen = Some(id.payload());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        assert_eq!(seen, Some(5));
+        assert_eq!(
+            largest, 0,
+            "language-tagged CDT validation must perform zero heap allocations"
+        );
+    }
+
+    #[test]
+    fn bare_nesting_past_131072_and_window_boundaries_scans_with_zero_heap() {
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let depth = 131_073;
+                let valid = format!("{}_:b0{}", "[".repeat(depth), "]".repeat(depth));
+                let mut seen = None;
+                let largest = crate::test_alloc::record_largest(|| {
+                    scan_bnode_ids(
+                        &valid,
+                        LIST,
+                        || Ok(()),
+                        |_| true,
+                        |id| {
+                            seen = Some(id.payload());
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                });
+                assert_eq!(seen, Some(0));
+                assert_eq!(
+                    largest, 0,
+                    "131_073-deep bare list validation must perform zero heap allocations"
+                );
+
+                // Trailing comma at depth 131,073 must skip cleanly as ill-typed rather than error.
+                let ill_typed = format!("{}_:b0,{}", "[".repeat(depth), "]".repeat(depth));
+                let mut ill_seen = false;
+                scan_bnode_ids(
+                    &ill_typed,
+                    LIST,
+                    || Ok(()),
+                    |_| true,
+                    |_| {
+                        ill_seen = true;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert!(!ill_seen);
+
+                // Mixed list/map nesting crossing both CONTAINER_WINDOW_BITS (65,536) and
+                // INLINE_MAP_FRAMES (256) exercises upward slide and downward refill.
+                let outer_lists = 66_000;
+                let inner_maps = 300;
+                let mut mixed = String::new();
+                for _ in 0..outer_lists {
+                    mixed.push('[');
+                }
+                for _ in 0..inner_maps {
+                    mixed.push_str("{\"k\":");
+                }
+                mixed.push_str("_:b9");
+                for _ in 0..inner_maps {
+                    mixed.push('}');
+                }
+                for _ in 0..outer_lists {
+                    mixed.push(']');
+                }
+                let mut mixed_seen = None;
+                let mixed_largest = crate::test_alloc::record_largest(|| {
+                    scan_bnode_ids(
+                        &mixed,
+                        LIST,
+                        || Ok(()),
+                        |_| true,
+                        |id| {
+                            mixed_seen = Some(id.payload());
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                });
+                assert_eq!(mixed_seen, Some(9));
+                assert_eq!(mixed_largest, 0);
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn wide_and_deep_maps_validate_linearly_with_cancellation_and_memory_bounds() {
+        // 50,000-key valid map and duplicate map.
+        let mut wide = String::with_capacity(50_000 * 14);
+        wide.push('{');
+        for i in 0..50_000 {
+            if i > 0 {
+                wide.push(',');
+            }
+            use std::fmt::Write;
+            let _ = write!(&mut wide, "\"k{i:05}\":{i}");
+        }
+        wide.push_str(",\"last\":_:b0}");
+        let mut ids = Vec::new();
+        scan_bnode_ids(
+            &wide,
+            MAP,
+            || Ok(()),
+            |_| true,
+            |id| {
+                ids.push(id.payload());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, vec![0]);
+
+        let mut wide_dup = wide[..wide.len() - 1].to_string();
+        wide_dup.push_str(",\"k00000\":1}");
+        let mut dup_ids = Vec::new();
+        scan_bnode_ids(
+            &wide_dup,
+            MAP,
+            || Ok(()),
+            |_| true,
+            |id| {
+                dup_ids.push(id.payload());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(dup_ids.is_empty());
+
+        // Cancellation inside a wide map stops promptly.
+        let mut ticks = 0usize;
+        let cancelled = scan_bnode_ids(
+            &wide,
+            MAP,
+            || {
+                ticks += 1;
+                if ticks >= 2 {
+                    Err(crate::error::Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            |_| true,
+            |_| Ok(()),
+        );
+        assert!(matches!(cancelled, Err(crate::error::Error::Cancelled)));
+
+        // When allow_mem refuses all heap allocations:
+        // - a 600-key map validates in zero heap via bounded batched fallback,
+        // - a 50,000-key map refuses promptly with StorageFull instead of going quadratic.
+        let mut mid_map = String::from("{");
+        for i in 0..600 {
+            if i > 0 {
+                mid_map.push(',');
+            }
+            use std::fmt::Write;
+            let _ = write!(&mut mid_map, "\"m{i}\":{i}");
+        }
+        mid_map.push_str(",\"last\":_:b4}");
+        let mut mid_seen = None;
+        let mid_largest = crate::test_alloc::record_largest(|| {
+            scan_bnode_ids(
+                &mid_map,
+                MAP,
+                || Ok(()),
+                |_| false,
+                |id| {
+                    mid_seen = Some(id.payload());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        assert_eq!(mid_seen, Some(4));
+        assert_eq!(mid_largest, 0);
+
+        let mut mid_dup = mid_map[..mid_map.len() - 1].to_string();
+        mid_dup.push_str(",\"m0\":99}");
+        let mut mid_dup_seen = false;
+        scan_bnode_ids(
+            &mid_dup,
+            MAP,
+            || Ok(()),
+            |_| false,
+            |_| {
+                mid_dup_seen = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!mid_dup_seen);
+
+        let refused_wide = scan_bnode_ids(&wide, MAP, || Ok(()), |_| false, |_| Ok(()));
+        assert!(matches!(
+            refused_wide,
+            Err(crate::error::Error::StorageFull(_))
+        ));
+
+        // 300-deep nested map where the outermost map receives 600 additional keys
+        // after popping back from >INLINE_MAP_FRAMES nesting (exercises shift + refill
+        // + try_promote_batched_to_wide).
+        let mut deep_then_wide = String::from("{\"k0\":");
+        for _ in 0..300 {
+            deep_then_wide.push_str("{\"in\":");
+        }
+        deep_then_wide.push('0');
+        for _ in 0..300 {
+            deep_then_wide.push('}');
+        }
+        for i in 1..600 {
+            use std::fmt::Write;
+            let _ = write!(&mut deep_then_wide, ",\"k{i}\":{i}");
+        }
+        deep_then_wide.push_str(",\"last\":_:b7}");
+        let mut dtw_ids = Vec::new();
+        scan_bnode_ids(
+            &deep_then_wide,
+            MAP,
+            || Ok(()),
+            |_| true,
+            |id| {
+                dtw_ids.push(id.payload());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(dtw_ids, vec![7]);
+
+        let mut dtw_dup = deep_then_wide[..deep_then_wide.len() - 1].to_string();
+        dtw_dup.push_str(",\"k0\":1}");
+        let mut dtw_dup_ids = Vec::new();
+        scan_bnode_ids(
+            &dtw_dup,
+            MAP,
+            || Ok(()),
+            |_| true,
+            |id| {
+                dtw_dup_ids.push(id.payload());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(dtw_dup_ids.is_empty());
     }
 
     #[test]
