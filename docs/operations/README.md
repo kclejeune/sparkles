@@ -64,7 +64,8 @@ Managed persistent deletes use the catalog's `delete.json` journal. Startup chec
 journal and registry before recovering any pending rename, restore or delete. An
 unsupported format, invalid journal or registry, or symlink in place of `delete.json`,
 `config.json`, or the `databases` directory prevents the catalog from opening. A prepared
-delete requires a valid registry, even when the registry contains no datasets.
+delete or any staged `databases/.replaced-<name>-<task>` directory requires a valid
+registry, even when the registry contains no datasets.
 
 Before committing a delete, the catalog moves the dataset to
 `databases/.kept-<name>-<token>` and synchronizes the database directory. The persistent
@@ -95,7 +96,10 @@ deleting either copy and refuse ambiguous identity combinations. Unmarked format
 rows retain roll-forward recovery, unmarked roll-forward synchronizes the database
 directory under the live store lock before removing a predecessor, and obsolete
 unmarked copies without a persistent registry row are retired without populating the
-live path. Publication synchronizes the journal
+live path. A staged `.replaced-` copy carrying a validated `keepReplaced` marker is
+moved to its `.kept-` name under the store lock when that destination is free, or
+retained and reported when the destination is occupied, leaving the live alias untouched.
+Publication synchronizes the journal
 namespace before replacing the registry, and startup synchronizes the registry before
 acting on the delete outcome it observes. Power-loss recovery requires a filesystem and
 platform that support durable directory synchronization.

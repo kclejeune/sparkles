@@ -334,7 +334,7 @@ impl Catalog {
             None => {
                 if let Some(existing_databases) =
                     delete::child_if_present(&catalog_dir, OsStr::new("databases"))?
-                    && restore::has_marked_swaps(&existing_databases)?
+                    && restore::has_staged_swaps(&existing_databases)?
                 {
                     return Err(Error::Corrupt(format!(
                         "{CONFIG_FILE} is missing while a staged restore swap requires recovery"

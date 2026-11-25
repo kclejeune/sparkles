@@ -575,7 +575,11 @@ format 2 pairs reconcile against the registered UUID and fail closed on ambiguou
 identities, while unmarked format 1 rows retain roll-forward recovery. Unmarked
 roll-forward synchronizes the database directory under the live store lock before
 removing a predecessor, and obsolete unmarked copies with no persistent registry row
-are retired without populating the live path. Ambiguous legacy
+are retired without populating the live path. Startup refuses to open when `config.json`
+is absent beside any `.replaced-` directory while still reporting newer swap marker
+formats as unsupported. A `.replaced-` copy carrying a validated `.keep-replaced-v1`
+marker is moved to `.kept-<name>-<task>` under the store lock when free, or retained
+and warned when occupied, keeping the live alias untouched. Ambiguous legacy
 journal records and competing staged restore copies remain available for recovery.
 Startup preserves
 unknown kept copies and reports retained paths, byte counts and incomplete counts.

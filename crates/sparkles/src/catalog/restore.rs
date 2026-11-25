@@ -6,6 +6,11 @@
 //!   reconciled against the durable `config.json` revision (rolling back to the
 //!   predecessor when the predecessor revision survived, or removing `.replaced-*`
 //!   when the restored revision or a later registration survived);
+//! * `databases/.replaced-<ds>-<task>` carrying a validated `.keep-replaced-v1`
+//!   marker from a `keepReplaced` restore whose final rename did not finish is
+//!   moved to `.kept-<ds>-<task>` under the store lock when that destination is
+//!   free, or retained with a warning when occupied, without populating the live
+//!   path;
 //! * an unmarked legacy `databases/.replaced-<ds>-<task>` is reconciled against
 //!   `config.json`: for a persistent row with a UUID, `databases` is synchronized
 //!   under the live store lock before removing `.replaced-*` when `databases/<ds>`
@@ -15,8 +20,8 @@
 //!   the live store lock before removing `.replaced-*` and a sole predecessor is
 //!   restored with a WARN when `databases/<ds>` is absent; with no persistent
 //!   registry row, obsolete `.replaced-*` copies are retired without populating
-//!   `databases/<ds>`. A copy kept on purpose (`keepReplaced`) is renamed by the
-//!   restore to `.kept-<ds>-<task>`, which this rule does not match;
+//!   `databases/<ds>`. Missing `config.json` fails closed whenever any
+//!   `.replaced-*` entry is present;
 //! * `tmp/verify-*` (the scratch directory of a `restore`-level verification) and
 //!   `tmp/memory-backup-*` (the temporary copy of an in-memory dataset being backed
 //!   up) are removed.
@@ -157,9 +162,11 @@ fn read_swap_marker(replaced: &RecoveryDir, dataset: &str) -> Result<Option<Swap
     Ok(Some(marker))
 }
 
-/// Whether `databases` contains any `.replaced-<ds>-<task>` directory with a
-/// registry-backed swap marker (requiring `config.json` for recovery).
-pub(super) fn has_marked_swaps(databases: &RecoveryDir) -> Result<bool> {
+/// Whether `databases` contains any `.replaced-<ds>-<task>` directory
+/// (requiring `config.json` for recovery). Validates swap markers on every
+/// staged entry so a newer format still reports [`Error::Unsupported`].
+pub(super) fn has_staged_swaps(databases: &RecoveryDir) -> Result<bool> {
+    let mut found = false;
     for entry in databases.names()? {
         let name = entry?;
         let text = name.to_string_lossy();
@@ -167,11 +174,134 @@ pub(super) fn has_marked_swaps(databases: &RecoveryDir) -> Result<bool> {
             continue;
         };
         let dir = databases.child(&name)?;
-        if read_swap_marker(&dir, ds)?.is_some() {
-            return Ok(true);
-        }
+        let _ = read_swap_marker(&dir, ds)?;
+        found = true;
     }
-    Ok(false)
+    Ok(found)
+}
+
+/// If `dir` is a `.replaced-<ds>-<task>` directory carrying a validated
+/// `.keep-replaced-v1` marker matching `.kept-<ds>-<task>`, return that destination name.
+fn keep_replaced_target(dir: &RecoveryDir) -> Result<Option<String>> {
+    let Some(rest) = dir
+        .path()
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.strip_prefix(REPLACED_PREFIX))
+    else {
+        return Ok(None);
+    };
+    let expected = format!("{}{rest}", super::KEPT_PREFIX);
+    let file = match dir.open_file(OsStr::new(delete::KEEP_REPLACED_MARKER), false) {
+        Ok(file) => file,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::InvalidData) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut marker = Vec::new();
+    file.take(expected.len() as u64 + 1)
+        .read_to_end(&mut marker)?;
+    Ok((marker == expected.as_bytes()).then_some(expected))
+}
+
+/// Whether a `.replaced-<ds>-<task>` directory has no swap marker and carries a
+/// validated `.keep-replaced-v1` marker (so it is an intentionally retained copy
+/// rather than a rollback candidate for `ds`).
+pub(super) fn is_unmarked_keep_replaced(dir: &RecoveryDir, ds: &str) -> Result<bool> {
+    if read_swap_marker(dir, ds)?.is_some() {
+        return Ok(false);
+    }
+    Ok(keep_replaced_target(dir)?.is_some())
+}
+
+fn rename_keep_replaced(
+    databases: &RecoveryDir,
+    ds: &str,
+    mut replaced_dir: RecoveryDir,
+    lock: sparkles_core::store::ProcessLock,
+    kept_name: &str,
+) -> Result<()> {
+    let replaced_name = replaced_dir
+        .path()
+        .file_name()
+        .expect("replaced directory name")
+        .to_os_string();
+    let kept_os = OsStr::new(kept_name);
+    match databases.entry(kept_os) {
+        Ok(_) => {
+            drop(lock);
+            delete::warn_retained_restore(
+                databases,
+                &replaced_name,
+                Some(ds),
+                format!("keepReplaced destination {kept_name} already exists"),
+            );
+            return Ok(());
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    replaced_dir.verify_lock(&lock)?;
+    #[cfg(not(unix))]
+    drop(lock);
+    match databases.rename_child(&mut replaced_dir, kept_os) {
+        Ok(()) => {
+            databases.sync()?;
+            #[cfg(unix)]
+            drop(lock);
+            tracing::info!(
+                target: "sparkles::backup",
+                path = %databases.path().join(kept_os).display(),
+                dataset = ds,
+                "finished retaining keepReplaced restore predecessor"
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            #[cfg(unix)]
+            drop(lock);
+            delete::warn_retained_restore(
+                databases,
+                &replaced_name,
+                Some(ds),
+                format!("keepReplaced destination {kept_name} already exists"),
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn finish_keep_replaced(
+    databases: &RecoveryDir,
+    ds: &str,
+    replaced_dir: RecoveryDir,
+    kept_name: &str,
+) -> Result<()> {
+    let replaced_name = replaced_dir
+        .path()
+        .file_name()
+        .expect("replaced directory name")
+        .to_os_string();
+    match databases.entry(OsStr::new(kept_name)) {
+        Ok(_) => {
+            delete::warn_retained_restore(
+                databases,
+                &replaced_name,
+                Some(ds),
+                format!("keepReplaced destination {kept_name} already exists"),
+            );
+            return Ok(());
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let lock = match delete::dataset_id(&replaced_dir)? {
+        Some(id) => delete::lock_candidate(&replaced_dir, id, false)?,
+        None => delete::lock_dataset(&replaced_dir)?,
+    };
+    rename_keep_replaced(databases, ds, replaced_dir, lock, kept_name)
 }
 
 /// The dataset name of `.replaced-<ds>-<task>` (the task id is numeric).
@@ -230,11 +360,16 @@ pub(super) fn recover(
     for (ds, entries) in replaced_entries {
         let mut rollbacks = Vec::new();
         let mut completions = Vec::new();
+        let mut kept_replaced = Vec::new();
         let mut unmarked = Vec::new();
         let registered = delete::registered_dataset(registry, &ds);
         for (dir, marker) in entries {
             let Some(marker) = marker else {
-                unmarked.push(dir);
+                if let Some(kept_name) = keep_replaced_target(&dir)? {
+                    kept_replaced.push((dir, kept_name));
+                } else {
+                    unmarked.push(dir);
+                }
                 continue;
             };
             match registered {
@@ -329,6 +464,17 @@ pub(super) fn recover(
             {
                 let _live_lock = delete::lock_candidate(&live, expected_id, false)?;
             }
+            if let Some(kept_name) = keep_replaced_target(&replaced_dir)? {
+                let lock = delete::lock_candidate(&replaced_dir, marker.predecessor_id, false)?;
+                match replaced_dir.remove_file(OsStr::new(SWAP_MARKER)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                replaced_dir.sync()?;
+                rename_keep_replaced(databases, &ds, replaced_dir, lock, &kept_name)?;
+                continue;
+            }
             tracing::info!(
                 target: "sparkles::backup",
                 "removing {} (the restore of /{ds} had committed)",
@@ -337,6 +483,10 @@ pub(super) fn recover(
             let lock = delete::lock_candidate(&replaced_dir, marker.predecessor_id, true)?;
             databases.remove_child(&replaced_dir, lock)?;
             databases.sync()?;
+        }
+
+        for (replaced_dir, kept_name) in kept_replaced {
+            finish_keep_replaced(databases, &ds, replaced_dir, &kept_name)?;
         }
 
         if !unmarked.is_empty() {
