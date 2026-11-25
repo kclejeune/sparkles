@@ -6,7 +6,9 @@ use super::dl_clause::{
 };
 use super::dl_rules::{Deriver, DlRun, Found, MREPAIR_ON, NoopDerive};
 use super::index::{Axioms, Ex, Index, Interner};
-use super::numeric::tests::{measure, sample};
+use super::numeric::tests::{
+    measure, sample, take_watched_deallocations, watch_deallocation, watched_deallocations,
+};
 use super::saturate::{Concl, Sink, State};
 use super::*;
 use rustc_hash::FxHashMap;
@@ -2023,7 +2025,10 @@ fn drain_single_conclusion_early_stop_and_panic_drop_products_before_release() {
     impl Deriver for StopOrPanicOnFirst {
         fn derive<S: Sink>(&self, _: &Index, _: &mut State, _: super::dl_rules::Side, _: &mut S) {
             if self.should_panic {
-                panic!("simulated panic on first single conclusion");
+                // Unwind directly without invoking the global panic hook so
+                // `RUST_BACKTRACE=1`/`full` symbolization does not allocate megabytes on
+                // the thread-local counting allocator before `held_guard` drops.
+                std::panic::resume_unwind(Box::new("simulated panic on first single conclusion"));
             }
             self.stop_flag.store(true, Ordering::Relaxed);
         }
@@ -2032,6 +2037,7 @@ fn drain_single_conclusion_early_stop_and_panic_drop_products_before_release() {
         run: &'a DlRun,
         live_charge: Arc<AtomicUsize>,
         heap_at_release: Arc<AtomicUsize>,
+        watched_deallocs_at_release: Arc<AtomicUsize>,
         released: Arc<AtomicUsize>,
         stop_flag: Arc<AtomicBool>,
     }
@@ -2047,6 +2053,8 @@ fn drain_single_conclusion_early_stop_and_panic_drop_products_before_release() {
         }
         fn release_data(&mut self, bytes: usize) {
             self.heap_at_release.store(sample().live, Ordering::Relaxed);
+            self.watched_deallocs_at_release
+                .store(watched_deallocations().unwrap_or(0), Ordering::Relaxed);
             self.live_charge.fetch_sub(bytes, Ordering::Relaxed);
             self.released.fetch_add(bytes, Ordering::Relaxed);
         }
@@ -2054,6 +2062,13 @@ fn drain_single_conclusion_early_stop_and_panic_drop_products_before_release() {
             self.stop_flag.load(Ordering::Relaxed)
         }
         fn worked(&mut self, _: usize) {}
+    }
+
+    struct ClearDeallocWatch;
+    impl Drop for ClearDeallocWatch {
+        fn drop(&mut self) {
+            let _ = take_watched_deallocations();
+        }
     }
 
     let (ix, _, _) = rooted_index(
@@ -2067,6 +2082,7 @@ fn drain_single_conclusion_early_stop_and_panic_drop_products_before_release() {
         let _ = super::dl_rules::ds(&mut st);
         let live_charge = Arc::new(AtomicUsize::new(0));
         let heap_at_release = Arc::new(AtomicUsize::new(usize::MAX));
+        let watched_deallocs_at_release = Arc::new(AtomicUsize::new(0));
         let released = Arc::new(AtomicUsize::new(0));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let deriver = StopOrPanicOnFirst {
@@ -2077,6 +2093,7 @@ fn drain_single_conclusion_early_stop_and_panic_drop_products_before_release() {
             run: &run,
             live_charge: live_charge.clone(),
             heap_at_release: heap_at_release.clone(),
+            watched_deallocs_at_release: watched_deallocs_at_release.clone(),
             released: released.clone(),
             stop_flag: stop_flag.clone(),
         };
@@ -2084,14 +2101,19 @@ fn drain_single_conclusion_early_stop_and_panic_drop_products_before_release() {
         let mut prods_bytes = 0usize;
         let (_, _) = measure(|| {
             let wide = |base: Ex| (Vec::new(), (base..base + 256).map(Lit::x).collect());
-            let list_a: Vec<_> = (0..16u32).map(|i| wide(100 + i * 300)).collect();
+            let list_a: Vec<(Vec<Lit>, Vec<Lit>)> =
+                (0..16u32).map(|i| wide(100 + i * 300)).collect();
             let list_b: Vec<_> = (0..4u32).map(|i| wide(10_000 + i * 300)).collect();
+            let watched_addr = list_a[0].1.as_ptr().addr();
+            let watched_layout = std::alloc::Layout::array::<Lit>(list_a[0].1.capacity()).unwrap();
             let mut found = Found::default();
             found.push((Vec::new(), vec![Lit::x(1)]));
             found.push((Vec::new(), vec![Lit::x(2)]));
             let one_bytes = found.held_bytes();
             found.products(vec![list_a, list_b], (Vec::new(), Vec::new()));
             prods_bytes = found.held_bytes() - one_bytes;
+            watch_deallocation(watched_addr, watched_layout);
+            let _clear_watch = ClearDeallocWatch;
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 super::dl_rules::drain_with(&ix, &mut st, found, &mut sink, &deriver);
             }));
@@ -2105,6 +2127,10 @@ fn drain_single_conclusion_early_stop_and_panic_drop_products_before_release() {
         assert!(
             released.load(Ordering::Relaxed) > 32 << 10,
             "should_panic={should_panic}: expected wide held reservation release"
+        );
+        assert!(
+            watched_deallocs_at_release.load(Ordering::Relaxed) >= 1,
+            "should_panic={should_panic}: watched product buffer was not deallocated before held_guard released credit"
         );
         let live_at_release = heap_at_release.load(Ordering::Relaxed);
         if should_panic {
