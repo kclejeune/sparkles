@@ -1896,14 +1896,15 @@
                         </p>{/if}
                       {#if classifyError}<p class="error-box" role="alert">{classifyError}</p>{/if}
                       {#if inferred}
-                        {#if classification && !classification.consistent}
+                        {#if classification && (classification.consistency === 'inconsistent' || (!classification.consistency && !classification.consistent))}
                           <p class="error-box" role="alert">
                             The ontology is inconsistent, so every class is unsatisfiable.
                           </p>
                         {:else if classification?.consistency === 'unknown'}
                           <p class="note">
-                            Consistency is unknown, since the classification left out part of the
-                            input.
+                            {classification.partial
+                              ? 'Consistency is unknown because the classification stopped before deciding it.'
+                              : 'Consistency is unknown, since the classification left out part of the input.'}
                           </p>
                         {/if}
                         <OntoTree

@@ -622,6 +622,7 @@ pub struct EntityStatus {
     pub iri: String,
     pub present: bool,
     pub unsatisfiable: Option<bool>,
+    pub incomplete: Option<bool>,
     pub representative: Option<String>,
     pub equivalence_count: Option<usize>,
     pub children: Option<usize>,
@@ -753,6 +754,8 @@ impl Ontologies {
                 iri: iri.clone(),
                 present,
                 unsatisfiable: present.then(|| taxonomy.is_unsatisfiable(&class)),
+                incomplete: present
+                    .then(|| p.classification.incomplete.binary_search(&class).is_ok()),
                 representative: node
                     .and_then(|node| node.classes.first())
                     .map(|class| class.as_str().to_string()),

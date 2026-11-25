@@ -167,8 +167,9 @@ the floor.
    engine half of phase 7, then the final speed gate. The rules of the nominals phase are
    built as an option that is off by default, and items 1220, 823, 1061, 1075 and 1284 finish that
    phase before the engine half of phase 7 and the final speed gate. The surfaces of phase 7, which
-   expose `complete`, the incomplete classes and the consistency state, run beside them
-   because they need only phase 4's API. Item 753 delivers item 603's incremental
+   expose `complete`, the incomplete classes, the consistency state, `partial`, `expansion` and
+   `tier`, are shipped across Rust, HTTP, the CLI and the bindings, while EL and Horn partial
+   answers remain in item 714 and workbench deadline controls remain in item 719. Item 753 delivers item 603's incremental
    maintenance requirement for supported Horn and disjunctive tiers alongside these
    phases, after their invalidation dependencies are defined, and extends it as later
    constructs land. Items 590 and 664 coordinate assertion retention and EL invalidation.

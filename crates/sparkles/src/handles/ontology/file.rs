@@ -91,6 +91,15 @@ pub struct FileClassification {
     pub excluded: Vec<Excluded>,
 }
 
+impl FileClassification {
+    /// Whether every subsumption between named classes that the ontology entails is in
+    /// the taxonomy: true when no axiom is left out or used only in part and the run was
+    /// not stopped part way ([`ClassifyRequest::partial`]).
+    pub fn complete(&self) -> bool {
+        self.excluded.is_empty() && self.classification.complete
+    }
+}
+
 impl OntologyFile {
     /// Read `path` as `req` asks, parsing on up to `threads` threads (0: one per core),
     /// or `None` when the store path reads the file instead (see the module).

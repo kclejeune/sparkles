@@ -4697,6 +4697,7 @@
       "ClassificationExcluded": {
         "properties": {
           "axiom": {
+            "additionalProperties": true,
             "description": "An OWL axiom in the public structural JSON form.",
             "type": "object"
           },
@@ -15221,6 +15222,12 @@
                       "null"
                     ]
                   },
+                  "incomplete": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
                   "iri": {
                     "type": "string"
                   },
@@ -15249,7 +15256,8 @@
                 "required": [
                   "iri",
                   "present",
-                  "unsatisfiable"
+                  "unsatisfiable",
+                  "incomplete"
                 ],
                 "type": "object"
               }
@@ -19414,6 +19422,1055 @@
         ],
         "type": "object"
       },
+      "OntologyClassification": {
+        "properties": {
+          "class": {
+            "properties": {
+              "childClasses": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "children": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "classes": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "incomplete": {
+                "type": "boolean"
+              },
+              "iri": {
+                "type": "string"
+              },
+              "node": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "parentClasses": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "parents": {
+                "items": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "superClasses": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "unsatisfiable": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "node",
+              "classes",
+              "parents",
+              "parentClasses",
+              "children",
+              "iri",
+              "unsatisfiable",
+              "incomplete",
+              "childClasses",
+              "superClasses"
+            ],
+            "type": "object"
+          },
+          "classes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "classificationSource": {
+            "$ref": "#/components/schemas/ClassificationSourceIdentity"
+          },
+          "commit": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "complete": {
+            "description": "Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way.",
+            "type": "boolean"
+          },
+          "completeForTaken": {
+            "description": "Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer.",
+            "type": "boolean"
+          },
+          "consistency": {
+            "enum": [
+              "consistent",
+              "inconsistent",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "consistent": {
+            "type": "boolean"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "excluded": {
+            "items": {
+              "additionalProperties": true,
+              "properties": {
+                "axiom": {
+                  "additionalProperties": true,
+                  "description": "An OWL axiom in the public structural JSON form.",
+                  "type": "object"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "ofn": {
+                  "type": "string"
+                },
+                "partial": {
+                  "type": "string"
+                },
+                "rule": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "ofn",
+                "axiom"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "excludedCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "graphs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "imports": {
+            "items": {
+              "additionalProperties": true,
+              "properties": {
+                "graph": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "iri": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "iri",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "incomplete": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "incompleteCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "lenient",
+              "strict"
+            ],
+            "type": "string"
+          },
+          "next": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "nodeCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "nodes": {
+            "items": {
+              "properties": {
+                "children": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "classes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "node": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "parentClasses": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "parents": {
+                  "items": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "node",
+                "classes",
+                "parents",
+                "parentClasses",
+                "children"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "offset": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "partial": {
+            "type": "boolean"
+          },
+          "resultId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "reused": {
+            "type": "boolean"
+          },
+          "stats": {
+            "additionalProperties": true,
+            "properties": {
+              "added": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "cleared": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "conclusions": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "contexts": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "coverageMs": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "coverageOver": {
+                "type": "boolean"
+              },
+              "coverageStopped": {
+                "type": "boolean"
+              },
+              "estimatedBytes": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "incremental": {
+                "type": "boolean"
+              },
+              "indexMs": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "removed": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "saturationMs": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "taxonomyMs": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "threads": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "unmapped": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "incremental",
+              "added",
+              "removed",
+              "cleared",
+              "contexts",
+              "conclusions",
+              "estimatedBytes",
+              "threads",
+              "indexMs",
+              "saturationMs",
+              "taxonomyMs",
+              "coverageMs",
+              "coverageOver",
+              "coverageStopped",
+              "unmapped"
+            ],
+            "type": "object"
+          },
+          "tier": {
+            "enum": [
+              "el",
+              "horn",
+              "disjunctive"
+            ],
+            "type": "string"
+          },
+          "unmappedTriples": {
+            "description": "The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed.",
+            "items": {
+              "properties": {
+                "object": {
+                  "type": "string"
+                },
+                "predicate": {
+                  "type": "string"
+                },
+                "subject": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "subject",
+                "predicate",
+                "object"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "unmappedTruncated": {
+            "description": "Whether `stats.unmapped` counts more triples than `unmappedTriples` lists.",
+            "type": "boolean"
+          },
+          "unsatisfiable": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unsatisfiableCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "written": {
+            "additionalProperties": true,
+            "properties": {
+              "absent": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "added": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "addedAxioms": {
+                "items": {
+                  "properties": {
+                    "axiom": {
+                      "additionalProperties": true,
+                      "description": "An OWL axiom in the public structural JSON form.",
+                      "type": "object"
+                    },
+                    "ofn": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "ofn",
+                    "axiom"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "axiomsTruncated": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              },
+              "declared": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "deleted": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "inserted": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kept": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "present": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "removed": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "removedAxioms": {
+                "items": {
+                  "properties": {
+                    "axiom": {
+                      "additionalProperties": true,
+                      "description": "An OWL axiom in the public structural JSON form.",
+                      "type": "object"
+                    },
+                    "ofn": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "ofn",
+                    "axiom"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "added",
+              "present",
+              "removed",
+              "absent",
+              "declared",
+              "addedAxioms",
+              "removedAxioms",
+              "axiomsTruncated",
+              "inserted",
+              "deleted",
+              "kept",
+              "committed"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "mode",
+          "graphs",
+          "imports",
+          "warnings",
+          "consistent",
+          "consistency",
+          "complete",
+          "completeForTaken",
+          "partial",
+          "tier",
+          "incompleteCount",
+          "incomplete",
+          "reused",
+          "classes",
+          "nodeCount",
+          "unsatisfiableCount",
+          "unsatisfiable",
+          "unmappedTriples",
+          "unmappedTruncated",
+          "excludedCount",
+          "excluded",
+          "stats",
+          "classificationSource",
+          "resultId"
+        ],
+        "type": "object"
+      },
+      "OntologyClassificationReceipt": {
+        "properties": {
+          "class": {
+            "properties": {
+              "childClasses": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "children": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "classes": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "incomplete": {
+                "type": "boolean"
+              },
+              "iri": {
+                "type": "string"
+              },
+              "node": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "parentClasses": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "parents": {
+                "items": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "superClasses": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "unsatisfiable": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "node",
+              "classes",
+              "parents",
+              "parentClasses",
+              "children",
+              "iri",
+              "unsatisfiable",
+              "incomplete",
+              "childClasses",
+              "superClasses"
+            ],
+            "type": "object"
+          },
+          "classes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "classificationSource": {
+            "$ref": "#/components/schemas/ClassificationSourceIdentity"
+          },
+          "commit": {
+            "$ref": "#/components/schemas/Commit"
+          },
+          "committed": {
+            "type": "boolean"
+          },
+          "complete": {
+            "description": "Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way.",
+            "type": "boolean"
+          },
+          "completeForTaken": {
+            "description": "Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer.",
+            "type": "boolean"
+          },
+          "consistency": {
+            "enum": [
+              "consistent",
+              "inconsistent",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "consistent": {
+            "type": "boolean"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "excluded": {
+            "items": {
+              "additionalProperties": true,
+              "properties": {
+                "axiom": {
+                  "additionalProperties": true,
+                  "description": "An OWL axiom in the public structural JSON form.",
+                  "type": "object"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "ofn": {
+                  "type": "string"
+                },
+                "partial": {
+                  "type": "string"
+                },
+                "rule": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "ofn",
+                "axiom"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "excludedCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "graphs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "imports": {
+            "items": {
+              "additionalProperties": true,
+              "properties": {
+                "graph": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "iri": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "iri",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "incomplete": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "incompleteCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "lenient",
+              "strict"
+            ],
+            "type": "string"
+          },
+          "next": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "nodeCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "nodes": {
+            "items": {
+              "properties": {
+                "children": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "classes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "node": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "parentClasses": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "parents": {
+                  "items": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "node",
+                "classes",
+                "parents",
+                "parentClasses",
+                "children"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "offset": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "partial": {
+            "type": "boolean"
+          },
+          "resultId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "reused": {
+            "type": "boolean"
+          },
+          "stats": {
+            "additionalProperties": true,
+            "properties": {
+              "added": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "cleared": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "conclusions": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "contexts": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "coverageMs": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "coverageOver": {
+                "type": "boolean"
+              },
+              "coverageStopped": {
+                "type": "boolean"
+              },
+              "estimatedBytes": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "incremental": {
+                "type": "boolean"
+              },
+              "indexMs": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "removed": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "saturationMs": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "taxonomyMs": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "threads": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "unmapped": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "incremental",
+              "added",
+              "removed",
+              "cleared",
+              "contexts",
+              "conclusions",
+              "estimatedBytes",
+              "threads",
+              "indexMs",
+              "saturationMs",
+              "taxonomyMs",
+              "coverageMs",
+              "coverageOver",
+              "coverageStopped",
+              "unmapped"
+            ],
+            "type": "object"
+          },
+          "tier": {
+            "enum": [
+              "el",
+              "horn",
+              "disjunctive"
+            ],
+            "type": "string"
+          },
+          "unmappedTriples": {
+            "description": "The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed.",
+            "items": {
+              "properties": {
+                "object": {
+                  "type": "string"
+                },
+                "predicate": {
+                  "type": "string"
+                },
+                "subject": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "subject",
+                "predicate",
+                "object"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "unmappedTruncated": {
+            "description": "Whether `stats.unmapped` counts more triples than `unmappedTriples` lists.",
+            "type": "boolean"
+          },
+          "unsatisfiable": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unsatisfiableCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "validation": {
+            "$ref": "#/components/schemas/ValidationSummary"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "written": {
+            "additionalProperties": true,
+            "properties": {
+              "absent": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "added": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "addedAxioms": {
+                "items": {
+                  "properties": {
+                    "axiom": {
+                      "additionalProperties": true,
+                      "description": "An OWL axiom in the public structural JSON form.",
+                      "type": "object"
+                    },
+                    "ofn": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "ofn",
+                    "axiom"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "axiomsTruncated": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              },
+              "declared": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "deleted": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "inserted": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kept": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "present": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "removed": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "removedAxioms": {
+                "items": {
+                  "properties": {
+                    "axiom": {
+                      "additionalProperties": true,
+                      "description": "An OWL axiom in the public structural JSON form.",
+                      "type": "object"
+                    },
+                    "ofn": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "ofn",
+                    "axiom"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "added",
+              "present",
+              "removed",
+              "absent",
+              "declared",
+              "addedAxioms",
+              "removedAxioms",
+              "axiomsTruncated",
+              "inserted",
+              "deleted",
+              "kept",
+              "committed"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "mode",
+          "graphs",
+          "imports",
+          "warnings",
+          "consistent",
+          "consistency",
+          "complete",
+          "completeForTaken",
+          "partial",
+          "tier",
+          "incompleteCount",
+          "incomplete",
+          "reused",
+          "classes",
+          "nodeCount",
+          "unsatisfiableCount",
+          "unsatisfiable",
+          "unmappedTriples",
+          "unmappedTruncated",
+          "excludedCount",
+          "excluded",
+          "stats",
+          "classificationSource",
+          "resultId",
+          "datasetId",
+          "committed",
+          "written"
+        ],
+        "type": "object"
+      },
       "OntologyFrameClassification": {
         "properties": {
           "classificationSource": {
@@ -19487,6 +20544,9 @@
                   "items"
                 ],
                 "type": "object"
+              },
+              "incomplete": {
+                "type": "boolean"
               },
               "iri": {
                 "type": "string"
@@ -19578,6 +20638,7 @@
               "result",
               "outcome",
               "unsatisfiable",
+              "incomplete",
               "parents",
               "equivalents",
               "excluded",
@@ -41905,7 +42966,7 @@
     },
     "/$/ontology/{ds}/classify": {
       "post": {
-        "description": "Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what a run with the disjunctive rules proved before it stopped. The answer's `complete` is false for such a partial answer, `partial` is true, `incomplete` lists the classes whose superclasses it may miss and `consistency` is `consistent`, `inconsistent` or `unknown`. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.",
+        "description": "Classifies the ontology's terminology using the OWL 2 EL, Horn or disjunctive rules that the axioms need, and answers whether it is consistent, the unsatisfiable classes, the axioms that the classification left out or used only in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses, its equivalent classes and whether it is in the incomplete set, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. With `projection` set to `frame`, `about` returns bounded direct parents, equivalents, source samples and exclusion samples instead of the full taxonomy payload. The dataset keeps the last eligible classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what a run with the disjunctive rules proved before it stopped. `complete` is false when the run stopped early, left axioms out or used them only in part, left assertions unread or saw unmapped triples, and `incomplete` lists the classes whose superclasses may be missed while `consistency` is `consistent`, `inconsistent` or `unknown`. A finished run has `partial` false and `completeForTaken` true, and still leaves affected classes in `incomplete` when excluded axioms, unread assertions or unmapped triples could affect them. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ontology"
         },
@@ -42146,61 +43207,17 @@
                 "schema": {
                   "oneOf": [
                     {
-                      "properties": {
-                        "classes": {
-                          "type": "integer"
-                        },
-                        "complete": {
-                          "description": "Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way.",
-                          "type": "boolean"
-                        },
-                        "completeForTaken": {
-                          "description": "Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer.",
-                          "type": "boolean"
-                        },
-                        "consistent": {
-                          "type": "boolean"
-                        },
-                        "unmappedTriples": {
-                          "description": "The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed.",
-                          "items": {
-                            "properties": {
-                              "object": {
-                                "type": "string"
-                              },
-                              "predicate": {
-                                "type": "string"
-                              },
-                              "subject": {
-                                "type": "string"
-                              }
-                            },
-                            "required": [
-                              "subject",
-                              "predicate",
-                              "object"
-                            ],
-                            "type": "object"
-                          },
-                          "type": "array"
-                        },
-                        "unmappedTruncated": {
-                          "description": "Whether `stats.unmapped` counts more triples than `unmappedTriples` lists.",
-                          "type": "boolean"
-                        }
-                      },
-                      "required": [
-                        "consistent",
-                        "complete",
-                        "completeForTaken",
-                        "classes"
-                      ],
-                      "type": "object"
+                      "$ref": "#/components/schemas/OntologyClassification"
                     },
                     {
                       "$ref": "#/components/schemas/OntologyFrameClassification"
                     }
                   ]
+                }
+              },
+              "application/x-sparkles+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OntologyClassificationReceipt"
                 }
               },
               "text/owl-functional": {
@@ -42209,7 +43226,7 @@
                 }
               }
             },
-            "description": "The classification, with the receipt when a write asked for one."
+            "description": "The classification, or the receipt-bearing classification under `application/x-sparkles+json` when a `target` write asks for a receipt."
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"

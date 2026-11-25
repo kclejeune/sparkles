@@ -1761,6 +1761,7 @@ pub fn classification_body(
         let mut x = node_json(t, n);
         x["iri"] = json!(about);
         x["unsatisfiable"] = json!(t.is_unsatisfiable(&class));
+        x["incomplete"] = json!(cl.incomplete.binary_search(&class).is_ok());
         x["childClasses"] = json!(firsts(t.node(n).children.clone()));
         x["superClasses"] = json!(
             t.ancestors(n)
@@ -2126,10 +2127,16 @@ fn frame_body(name: &str, c: &Classified, req: &OntologyRequest, q: &ClassifyQue
         source_samples.push(handle.source.source_row(i).expect("source ordinal"));
     }
     let class = sparkles_owl::Class::new(about.as_str());
+    let incomplete = handle
+        .classification
+        .incomplete
+        .binary_search(&class)
+        .is_ok();
     Ok(
         json!({"dataset":name,"commit":h.commit,"classificationSource":handle.identity(),"frame":{
             "iri":about,"result":handle.metadata(),"outcome":handle.outcome(),
             "unsatisfiable":handle.classification.taxonomy.is_unsatisfiable(&class),
+            "incomplete":incomplete,
             "parents":project(parents),"equivalents":project(equivalents),"excluded":project(exclusions),
             "sources":{"items":source_samples,"total":handle.source.source_count(),"truncated":handle.source.source_count()>q.limit},
             "retention":{"kept":kept,"resultId":if kept { Some(handle.id) } else { None::<uuid::Uuid> }}

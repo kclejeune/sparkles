@@ -1124,12 +1124,13 @@ fn print_classify(j: &J) {
     }
     let s = &j["stats"];
     println!(
-        "{} run on {} threads: index {:.1} ms, saturation {:.1} ms, taxonomy {:.1} ms",
+        "{} {} run on {} threads: index {:.1} ms, saturation {:.1} ms, taxonomy {:.1} ms",
         if s["incremental"].as_bool() == Some(true) {
             "incremental"
         } else {
             "full"
         },
+        j["tier"].as_str().unwrap_or("el"),
         s["threads"],
         s["indexMs"].as_f64().unwrap_or(0.0),
         s["saturationMs"].as_f64().unwrap_or(0.0),
@@ -1146,6 +1147,9 @@ fn print_classify(j: &J) {
                 .join(" ")
         };
         println!("class {}", c["iri"].as_str().unwrap_or(""));
+        if c["incomplete"].as_bool() == Some(true) {
+            println!("  incomplete   yes (superclasses may be missing)");
+        }
         println!("  equivalent   {}", list("classes"));
         println!("  parents      {}", list("parentClasses"));
         println!("  children     {}", list("childClasses"));

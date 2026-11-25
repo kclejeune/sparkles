@@ -2404,7 +2404,7 @@ export interface paths {
         put?: never;
         /**
          * Classify an ontology and optionally project a bounded class frame
-         * @description Classifies the terminology with the OWL 2 EL classifier and answers whether it is consistent, the unsatisfiable classes, the axioms outside OWL 2 EL that the classification left out or used in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses and its equivalent classes, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. The dataset keeps the last classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what a run with the disjunctive rules proved before it stopped. The answer's `complete` is false for such a partial answer, `partial` is true, `incomplete` lists the classes whose superclasses it may miss and `consistency` is `consistent`, `inconsistent` or `unknown`. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.
+         * @description Classifies the ontology's terminology using the OWL 2 EL, Horn or disjunctive rules that the axioms need, and answers whether it is consistent, the unsatisfiable classes, the axioms that the classification left out or used only in part, and the run's statistics. `about` adds one class's direct and inferred superclasses and subclasses, its equivalent classes and whether it is in the incomplete set, which is `404` for a class the ontology does not mention, and `nodes` adds the taxonomy one page of nodes at a time. With `projection` set to `frame`, `about` returns bounded direct parents, equivalents, source samples and exclusion samples instead of the full taxonomy payload. The dataset keeps the last eligible classification and reuses it incrementally when the ontology changes. `target` writes the direct taxonomy into that named graph as one commit with PROV-O provenance on its ontology header, which needs write access, and replaces the taxonomy the graph held. A graph read that changed after the classification is `409`. `format=ofn` answers the direct taxonomy in functional-style syntax. A run past the memory budget is `507` and past its deadline `408`, unless `partial` asks for what a run with the disjunctive rules proved before it stopped. `complete` is false when the run stopped early, left axioms out or used them only in part, left assertions unread or saw unmapped triples, and `incomplete` lists the classes whose superclasses may be missed while `consistency` is `consistent`, `inconsistent` or `unknown`. A finished run has `partial` false and `completeForTaken` true, and still leaves affected classes in `incomplete` when excluded axioms, unread assertions or unmapped triples could affect them. `tier` names the rules the axioms need, `el`, `horn` or `disjunctive`. `partial` cannot go with `target` or `format=ofn`.
          */
         post: operations["classifyOntology"];
         delete?: never;
@@ -6280,7 +6280,9 @@ export interface components {
         };
         ClassificationExcluded: {
             /** @description An OWL axiom in the public structural JSON form. */
-            axiom: Record<string, never>;
+            axiom: {
+                [key: string]: unknown;
+            };
             gap: {
                 /** @constant */
                 kind: "omitted";
@@ -9399,6 +9401,7 @@ export interface components {
             entity: null | {
                 children?: number | null;
                 equivalenceCount?: number | null;
+                incomplete: boolean | null;
                 iri: string;
                 parents?: number | null;
                 present: boolean;
@@ -10900,6 +10903,261 @@ export interface components {
             error: string;
             error_description?: string;
         };
+        OntologyClassification: {
+            class?: {
+                childClasses: string[];
+                children: number;
+                classes: string[];
+                incomplete: boolean;
+                iri: string;
+                node: number;
+                parentClasses: string[];
+                parents: number[];
+                superClasses: string[];
+                unsatisfiable: boolean;
+            };
+            classes: number;
+            classificationSource: components["schemas"]["ClassificationSourceIdentity"];
+            commit: number;
+            /** @description Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way. */
+            complete: boolean;
+            /** @description Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer. */
+            completeForTaken: boolean;
+            /** @enum {string} */
+            consistency: "consistent" | "inconsistent" | "unknown";
+            consistent: boolean;
+            dataset: string;
+            excluded: ({
+                /** @description An OWL axiom in the public structural JSON form. */
+                axiom: {
+                    [key: string]: unknown;
+                };
+                message?: string;
+                ofn: string;
+                partial?: string;
+                rule?: string;
+                type: string;
+            } & {
+                [key: string]: unknown;
+            })[];
+            excludedCount: number;
+            graphs: string[];
+            imports: ({
+                graph: string | null;
+                iri: string;
+            } & {
+                [key: string]: unknown;
+            })[];
+            incomplete: string[];
+            incompleteCount: number;
+            /** @enum {string} */
+            mode: "lenient" | "strict";
+            next?: number;
+            nodeCount: number;
+            nodes?: {
+                children: number;
+                classes: string[];
+                node: number;
+                parentClasses: string[];
+                parents: number[];
+            }[];
+            offset?: number;
+            partial: boolean;
+            /** Format: uuid */
+            resultId: string;
+            reused: boolean;
+            stats: {
+                added: number;
+                cleared: number;
+                conclusions: number;
+                contexts: number;
+                coverageMs: number;
+                coverageOver: boolean;
+                coverageStopped: boolean;
+                estimatedBytes: number;
+                incremental: boolean;
+                indexMs: number;
+                removed: number;
+                saturationMs: number;
+                taxonomyMs: number;
+                threads: number;
+                unmapped: number;
+            } & {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            tier: "el" | "horn" | "disjunctive";
+            /** @description The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed. */
+            unmappedTriples: {
+                object: string;
+                predicate: string;
+                subject: string;
+            }[];
+            /** @description Whether `stats.unmapped` counts more triples than `unmappedTriples` lists. */
+            unmappedTruncated: boolean;
+            unsatisfiable: string[];
+            unsatisfiableCount: number;
+            warnings: string[];
+            written?: {
+                absent: string[];
+                added: number;
+                addedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+                axiomsTruncated: boolean;
+                committed: boolean;
+                declared: string[];
+                deleted: number;
+                inserted: number;
+                kept: number;
+                present: number;
+                removed: number;
+                removedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+            } & {
+                [key: string]: unknown;
+            };
+        };
+        OntologyClassificationReceipt: {
+            class?: {
+                childClasses: string[];
+                children: number;
+                classes: string[];
+                incomplete: boolean;
+                iri: string;
+                node: number;
+                parentClasses: string[];
+                parents: number[];
+                superClasses: string[];
+                unsatisfiable: boolean;
+            };
+            classes: number;
+            classificationSource: components["schemas"]["ClassificationSourceIdentity"];
+            commit: components["schemas"]["Commit"];
+            committed: boolean;
+            /** @description Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way. */
+            complete: boolean;
+            /** @description Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer. */
+            completeForTaken: boolean;
+            /** @enum {string} */
+            consistency: "consistent" | "inconsistent" | "unknown";
+            consistent: boolean;
+            dataset: string;
+            datasetId: string;
+            excluded: ({
+                /** @description An OWL axiom in the public structural JSON form. */
+                axiom: {
+                    [key: string]: unknown;
+                };
+                message?: string;
+                ofn: string;
+                partial?: string;
+                rule?: string;
+                type: string;
+            } & {
+                [key: string]: unknown;
+            })[];
+            excludedCount: number;
+            graphs: string[];
+            imports: ({
+                graph: string | null;
+                iri: string;
+            } & {
+                [key: string]: unknown;
+            })[];
+            incomplete: string[];
+            incompleteCount: number;
+            /** @enum {string} */
+            mode: "lenient" | "strict";
+            next?: number;
+            nodeCount: number;
+            nodes?: {
+                children: number;
+                classes: string[];
+                node: number;
+                parentClasses: string[];
+                parents: number[];
+            }[];
+            offset?: number;
+            partial: boolean;
+            /** Format: uuid */
+            resultId: string;
+            reused: boolean;
+            stats: {
+                added: number;
+                cleared: number;
+                conclusions: number;
+                contexts: number;
+                coverageMs: number;
+                coverageOver: boolean;
+                coverageStopped: boolean;
+                estimatedBytes: number;
+                incremental: boolean;
+                indexMs: number;
+                removed: number;
+                saturationMs: number;
+                taxonomyMs: number;
+                threads: number;
+                unmapped: number;
+            } & {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            tier: "el" | "horn" | "disjunctive";
+            /** @description The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed. */
+            unmappedTriples: {
+                object: string;
+                predicate: string;
+                subject: string;
+            }[];
+            /** @description Whether `stats.unmapped` counts more triples than `unmappedTriples` lists. */
+            unmappedTruncated: boolean;
+            unsatisfiable: string[];
+            unsatisfiableCount: number;
+            validation?: components["schemas"]["ValidationSummary"];
+            warnings: string[];
+            written: {
+                absent: string[];
+                added: number;
+                addedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+                axiomsTruncated: boolean;
+                committed: boolean;
+                declared: string[];
+                deleted: number;
+                inserted: number;
+                kept: number;
+                present: number;
+                removed: number;
+                removedAxioms: {
+                    /** @description An OWL axiom in the public structural JSON form. */
+                    axiom: {
+                        [key: string]: unknown;
+                    };
+                    ofn: string;
+                    type: string;
+                }[];
+            } & {
+                [key: string]: unknown;
+            };
+        };
         OntologyFrameClassification: {
             classificationSource: components["schemas"]["ClassificationSourceIdentity"];
             commit: number;
@@ -10917,6 +11175,7 @@ export interface components {
                     total: number;
                     truncated: boolean;
                 };
+                incomplete: boolean;
                 iri: string;
                 outcome: components["schemas"]["ClassificationOutcome"];
                 parents: {
@@ -19967,28 +20226,14 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The classification, with the receipt when a write asked for one. */
+            /** @description The classification, or the receipt-bearing classification under `application/x-sparkles+json` when a `target` write asks for a receipt. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        classes: number;
-                        /** @description Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way. */
-                        complete: boolean;
-                        /** @description Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer. */
-                        completeForTaken: boolean;
-                        consistent: boolean;
-                        /** @description The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed. */
-                        unmappedTriples?: {
-                            object: string;
-                            predicate: string;
-                            subject: string;
-                        }[];
-                        /** @description Whether `stats.unmapped` counts more triples than `unmappedTriples` lists. */
-                        unmappedTruncated?: boolean;
-                    } | components["schemas"]["OntologyFrameClassification"];
+                    "application/json": components["schemas"]["OntologyClassification"] | components["schemas"]["OntologyFrameClassification"];
+                    "application/x-sparkles+json": components["schemas"]["OntologyClassificationReceipt"];
                     "text/owl-functional": string;
                 };
             };

@@ -79,6 +79,7 @@ export type KeptClassification = {
     iri: string;
     present: boolean;
     unsatisfiable: boolean | null;
+    incomplete: boolean | null;
     representative?: string | null;
     equivalenceCount?: number | null;
     children?: number | null;
@@ -103,6 +104,7 @@ export type ProjectedClassification = {
     result: ClassificationResult;
     outcome: ClassificationOutcome;
     unsatisfiable: boolean;
+    incomplete: boolean;
     parents: { items: ClassificationName[]; total: number; truncated: boolean; limit: number };
     equivalents: { items: ClassificationName[]; total: number; truncated: boolean; limit: number };
     sources: { items: ClassificationSourceRow[]; total: number; truncated: boolean };

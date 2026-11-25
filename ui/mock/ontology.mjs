@@ -1783,6 +1783,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
               iri: about,
               present,
               unsatisfiable: present ? false : null,
+              incomplete: present ? false : null,
               representative: entityNode?.classes[0] ?? null,
               equivalenceCount: entityNode?.classes.length ?? null,
               children: entityNode?.children ?? null,
@@ -2318,6 +2319,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
         node: i,
         iri: body.about,
         unsatisfiable: false,
+        incomplete: false,
         parentClasses: n.parents.map((x) => c.nodes[x].classes[0]),
       };
     }
@@ -2341,6 +2343,7 @@ export async function handleOntology(req, res, url, seg, ctx) {
           result: kept.result,
           outcome: kept.outcome,
           unsatisfiable: false,
+          incomplete: false,
           parents: projected('parents'),
           equivalents: projected('equivalents'),
           excluded: projected('excluded'),

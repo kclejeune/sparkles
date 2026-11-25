@@ -220,6 +220,7 @@ export type Classification = {
   /** complete for the axioms the run took, as a profile reasoner reports */
   completeForTaken?: boolean;
   incompleteCount?: number;
+  incomplete?: string[];
   classes: number;
   nodeCount: number;
   unsatisfiableCount: number;

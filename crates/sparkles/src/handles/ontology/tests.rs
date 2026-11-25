@@ -2932,4 +2932,167 @@ mod classification {
         let again = h.classify(&req, &partial_request(), &opts()).unwrap();
         assert!(again.reused && again.complete());
     }
+
+    #[test]
+    fn file_classification_complete_and_per_class_incomplete_on_wire_and_frame() {
+        let body = cases(if cfg!(debug_assertions) { 120 } else { 400 }, false);
+        let ttl = format!(
+            "@prefix : <http://ex.org/> .\n\
+             @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n{body}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let complete_path = dir.path().join("complete.ttl");
+        std::fs::write(&complete_path, &ttl).unwrap();
+        let req = OntologyRequest::default();
+
+        let file = super::file::OntologyFile::read(&complete_path, &req, 1)
+            .unwrap()
+            .expect("turtle file reads directly");
+        let full_file = file.classify(&partial_request(), &opts()).unwrap();
+        assert!(full_file.complete());
+
+        let peak = full_file.classification.stats.peak_memory as u64;
+        let partial_file = (1..20)
+            .find_map(|k| {
+                let o = QueryOptions {
+                    max_memory_bytes: Some(peak * k / 20),
+                    ..opts()
+                };
+                match file.classify(&partial_request(), &o) {
+                    Ok(c)
+                        if !c.classification.complete_for_taken
+                            && !c.classification.incomplete.is_empty() =>
+                    {
+                        Some(c)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("no budget gave a partial file classification");
+        assert!(!partial_file.complete());
+
+        // Excluded axioms also make FileClassification::complete() false.
+        let excl_path = dir.path().join("excluded.ttl");
+        std::fs::write(
+            &excl_path,
+            "@prefix : <http://ex.org/> .
+             @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             :A a owl:Class . :B a owl:Class .
+             :a a :A .
+             :A rdfs:subClassOf :B .\n",
+        )
+        .unwrap();
+        let excl_file = super::file::OntologyFile::read(&excl_path, &req, 1)
+            .unwrap()
+            .expect("turtle file reads directly");
+        let excl_cls = excl_file
+            .classify(&ClassifyRequest::default(), &opts())
+            .unwrap();
+        assert!(!excl_cls.excluded.is_empty());
+        assert!(!excl_cls.complete());
+
+        // Partial dataset classification: check legacy `about` (even when `limit: 1` truncates
+        // top-level `incomplete`) and `projection=frame`.
+        let (ds, part) = (1..20)
+            .find_map(|k| {
+                let ds = dataset(&body);
+                let o = QueryOptions {
+                    max_memory_bytes: Some(peak * k / 20),
+                    ..opts()
+                };
+                match ds.ontology().classify(&req, &partial_request(), &o) {
+                    Ok(c)
+                        if !c.classification.complete_for_taken
+                            && c.classification.incomplete.len() > 1 =>
+                    {
+                        Some((ds, c))
+                    }
+                    _ => None,
+                }
+            })
+            .expect("no budget answered in part with multiple incomplete classes");
+        let open_iri = part
+            .classification
+            .incomplete
+            .last()
+            .unwrap()
+            .as_str()
+            .to_string();
+        let renderer = crate::owl::ofn::Renderer::new(ds.prefixes());
+
+        let legacy_open = wire::classify_body(
+            "ds",
+            &part,
+            &req,
+            &renderer,
+            &wire::ClassifyQuery {
+                about: Some(open_iri.clone()),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy_open["incomplete"].as_array().unwrap().len(), 1);
+        assert_ne!(legacy_open["incomplete"][0], json!(open_iri));
+        assert_eq!(legacy_open["class"]["iri"], json!(open_iri));
+        assert_eq!(legacy_open["class"]["incomplete"], json!(true));
+
+        let frame_open = wire::classify_body(
+            "ds",
+            &part,
+            &req,
+            &renderer,
+            &wire::ClassifyQuery {
+                projection: Some(wire::ClassifyProjection::Frame),
+                about: Some(open_iri.clone()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(frame_open["frame"]["iri"], json!(open_iri));
+        assert_eq!(frame_open["frame"]["incomplete"], json!(true));
+        assert_eq!(frame_open["frame"]["outcome"]["partial"], json!(true));
+        assert_eq!(frame_open["frame"]["outcome"]["complete"], json!(false));
+        assert_eq!(frame_open["frame"]["retention"]["kept"], json!(false));
+        assert!(frame_open["frame"]["retention"]["resultId"].is_null());
+
+        // Complete classification reports `incomplete: false` on both legacy `about` and frame.
+        let full = ds
+            .ontology()
+            .classify(&req, &ClassifyRequest::default(), &opts())
+            .unwrap();
+        let legacy_done = wire::classify_body(
+            "ds",
+            &full,
+            &req,
+            &renderer,
+            &wire::ClassifyQuery {
+                about: Some(open_iri.clone()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(legacy_done["class"]["incomplete"], json!(false));
+
+        let frame_done = wire::classify_body(
+            "ds",
+            &full,
+            &req,
+            &renderer,
+            &wire::ClassifyQuery {
+                projection: Some(wire::ClassifyProjection::Frame),
+                about: Some(open_iri),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(frame_done["frame"]["incomplete"], json!(false));
+        assert_eq!(frame_done["frame"]["outcome"]["partial"], json!(false));
+        assert_eq!(frame_done["frame"]["outcome"]["complete"], json!(true));
+    }
 }

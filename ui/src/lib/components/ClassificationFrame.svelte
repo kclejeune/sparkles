@@ -154,6 +154,18 @@
       {#if model.reply?.entity?.unsatisfiable}<p class="note error">
           This class is unsatisfiable.
         </p>{/if}
+      {#if outcome.consistency === 'unknown'}<p class="note">
+          {outcome.partial
+            ? 'Consistency is unknown because the classification stopped before deciding it.'
+            : 'Consistency is unknown.'}
+        </p>{/if}
+      {#if model.reply?.entity?.incomplete}<p class="note">
+          {outcome.partial
+            ? 'This class is incomplete in this partial classification and may miss inferred clauses.'
+            : outcome.excludedCount > 0 || outcome.unmappedCount > 0
+              ? 'This class is incomplete because the classification excluded or could not map part of the input, and may miss inferred clauses.'
+              : 'This class is incomplete and may miss inferred clauses.'}
+        </p>{/if}
       {#if model.reply?.entity?.present === false}<p class="note">
           The classification has no named-class node for this entity.
         </p>{/if}
