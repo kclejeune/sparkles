@@ -320,6 +320,9 @@ pub struct Circuit {
     /// the index estimates the latest build computed, which tests read
     #[cfg(test)]
     pub(crate) build_estimated: u64,
+    /// number of times `publish_version_budgeted` checked admission for a published version
+    #[cfg(test)]
+    pub(crate) version_publish_attempts: usize,
     /// number of times `publish_version_with_rows` allocated a published version
     #[cfg(test)]
     pub(crate) version_allocs: usize,
@@ -536,6 +539,8 @@ impl Circuit {
             build_scanned: 0,
             #[cfg(test)]
             build_estimated: 0,
+            #[cfg(test)]
+            version_publish_attempts: 0,
             #[cfg(test)]
             version_allocs: 0,
             pool: None,
@@ -991,6 +996,10 @@ impl Circuit {
             self.version = None;
             return Ok(());
         }
+        #[cfg(test)]
+        {
+            self.version_publish_attempts += 1;
+        }
         let (row_count, alloc_bytes) = self.projected_version_alloc_bytes(reuse_terms)?;
         let target = self
             .bytes()
@@ -1019,7 +1028,12 @@ impl Circuit {
         let (columns, published_columns) = if let Some(prev) = &self.version {
             (prev.columns.clone(), prev.published_columns.clone())
         } else {
-            let columns: Arc<[String]> = self.columns().into();
+            let columns: Arc<[String]> = Arc::from_iter(
+                self.root
+                    .schema
+                    .iter()
+                    .map(|&v| self.vars[v as usize].clone()),
+            );
             let bytes = columns.len() * std::mem::size_of::<String>()
                 + columns.iter().map(String::capacity).sum::<usize>()
                 + 32
@@ -2089,6 +2103,7 @@ mod tests {
     #[test]
     fn build_and_decode_pre_admit_published_version_before_allocating() {
         use crate::error::BudgetKind;
+        use std::sync::atomic::Ordering;
 
         let store = Store::in_memory(crate::store::StoreOptions::default());
         let mut nt = String::new();
@@ -2106,119 +2121,488 @@ mod tests {
             .unwrap();
         let snap = store.snapshot();
 
-        // Project 10 columns so the published flat `ViewTable::ids` buffer (2000 * 10 * 8
-        // = 160 KiB) is strictly larger than every allocation made while building or
-        // decoding the mutable circuit state.
+        // Project 16 columns so the published flat `ViewTable::ids` buffer (2000 * 16 * 8
+        // = 256 KiB) is strictly larger than every allocation made while building or
+        // decoding the mutable circuit state, and so `self.result + version_bytes` exceeds
+        // the transient mutable-pass peak (including `Window::diff`'s scratch on the
+        // ordered query) allowing `steady - 1` to reach publication admission.
         let queries = [
-            "SELECT ?s ?o (?o AS ?c2) (?o AS ?c3) (?o AS ?c4) (?o AS ?c5) (?o AS ?c6) (?o AS ?c7) (?o AS ?c8) (?o AS ?c9) \
-             WHERE { ?s <urn:p> ?o }",
-            "SELECT ?s ?o (?o AS ?c2) (?o AS ?c3) (?o AS ?c4) (?o AS ?c5) (?o AS ?c6) (?o AS ?c7) (?o AS ?c8) (?o AS ?c9) \
-             WHERE { ?s <urn:p> ?o } ORDER BY ?o LIMIT 2000",
+            (
+                "SELECT ?s ?o (?o AS ?c2) (?o AS ?c3) (?o AS ?c4) (?o AS ?c5) (?o AS ?c6) (?o AS ?c7) (?o AS ?c8) (?o AS ?c9) \
+                 ?u10 ?u11 ?u12 ?u13 ?u14 ?u15 \
+                 WHERE { ?s <urn:p> ?o }",
+                false,
+            ),
+            (
+                "SELECT ?s ?o ?u2 ?u3 ?u4 ?u5 ?u6 ?u7 ?u8 ?u9 ?u10 ?u11 ?u12 ?u13 ?u14 ?u15 \
+                 WHERE { ?s <urn:p> ?o } ORDER BY ?o LIMIT 2000",
+                true,
+            ),
         ];
-        let table_ids_bytes = 2000 * 10 * std::mem::size_of::<Id>();
+        let table_ids_bytes = 2000 * 16 * std::mem::size_of::<Id>();
 
-        for text in queries {
+        for (text, expect_ordered_window) in queries {
             let parsed = parse_query(text, None, &[]).unwrap();
             let compiled = || super::super::compile::compile(&parsed, None).unwrap();
 
-            let pool = QueryPool::new(16 << 20);
+            for with_version_pool in [false, true] {
+                let pool = QueryPool::new(16 << 20);
+                let published = with_version_pool.then(|| Arc::new(AtomicU64::new(0)));
+                let mut reference = Circuit::new(compiled(), None);
+                assert_eq!(
+                    reference
+                        .root
+                        .result_window()
+                        .is_some_and(|(w, _)| w.positions),
+                    expect_ordered_window,
+                    "unexpected ordered-window shape for `{text}`"
+                );
+                reference.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                reference.set_version_pool(published.clone());
+                reference.build(snap.clone(), &Control::none()).unwrap();
+                assert_eq!(reference.version_publish_attempts, 1);
+                assert_eq!(reference.version_allocs, 1);
+                let steady = reference.bytes();
+                let version_bytes = reference.version_bytes();
+                assert!(
+                    version_bytes as usize >= table_ids_bytes,
+                    "version_bytes ({version_bytes}) must cover flat ViewTable::ids ({table_ids_bytes})"
+                );
+                if let Some(counter) = &published {
+                    let expected = reference.version.as_ref().unwrap().published_bytes();
+                    assert!(expected >= table_ids_bytes as u64);
+                    assert_eq!(counter.load(Ordering::Relaxed), expected);
+                }
+                let body = reference.encode(&snap).unwrap();
+                drop(reference);
+                assert_eq!(pool.granted(), 0);
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+
+                // Measure decoded steady bytes directly, since ordered checkpoint decode can
+                // retain a different window capacity or omit sort keys compared to build.
+                let mut decoded_ref = Circuit::new(compiled(), None);
+                decoded_ref.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                decoded_ref.set_version_pool(published.clone());
+                decoded_ref.decode(&body, &snap).unwrap();
+                assert_eq!(decoded_ref.version_publish_attempts, 1);
+                assert_eq!(decoded_ref.version_allocs, 1);
+                let decoded_steady = decoded_ref.bytes();
+                let decoded_version_bytes = decoded_ref.version_bytes();
+                assert!(
+                    decoded_version_bytes as usize >= table_ids_bytes,
+                    "decoded version_bytes ({decoded_version_bytes}) must cover flat ViewTable::ids ({table_ids_bytes})"
+                );
+                if let Some(counter) = &published {
+                    let expected = decoded_ref.version.as_ref().unwrap().published_bytes();
+                    assert_eq!(counter.load(Ordering::Relaxed), expected);
+                }
+                drop(decoded_ref);
+                assert_eq!(pool.granted(), 0);
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+
+                // Control: build at the exact steady ceiling succeeds.
+                let mut exact_build = Circuit::new(compiled(), None);
+                exact_build.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                exact_build.set_version_pool(published.clone());
+                exact_build.max_memory_bytes = Some(steady);
+                exact_build.build(snap.clone(), &Control::none()).unwrap();
+                assert_eq!(exact_build.version_publish_attempts, 1);
+                assert_eq!(exact_build.version_allocs, 1);
+                if let Some(counter) = &published {
+                    assert_eq!(
+                        counter.load(Ordering::Relaxed),
+                        exact_build.version.as_ref().unwrap().published_bytes()
+                    );
+                }
+                drop(exact_build);
+                assert_eq!(pool.granted(), 0);
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+
+                // 1. Build 1 byte below steady fits the mutable pass, reaches publication
+                //    admission, and refuses before allocating `ViewTable::ids`.
+                let mut tight_build = Circuit::new(compiled(), None);
+                tight_build.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                tight_build.set_version_pool(published.clone());
+                tight_build.max_memory_bytes = Some(steady - 1);
+                let mut build_res = Ok(());
+                let build_largest = crate::test_alloc::record_largest(|| {
+                    build_res = tight_build.build(snap.clone(), &Control::none());
+                });
+                assert!(
+                    matches!(
+                        build_res,
+                        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                    ),
+                    "build 1 byte below steady must refuse publication with Memory: {build_res:?}"
+                );
+                assert_eq!(
+                    tight_build.version_publish_attempts, 1,
+                    "build must reach publication admission before refusing for `{text}` (version_pool={with_version_pool})"
+                );
+                assert_eq!(
+                    tight_build.version_allocs, 0,
+                    "build must refuse publication before entering version allocation for `{text}`"
+                );
+                assert!(
+                    build_largest < table_ids_bytes,
+                    "build allocated {build_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
+                );
+                assert!(tight_build.version.is_none());
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+                drop(tight_build);
+                assert_eq!(pool.granted(), 0);
+
+                // Control: decode at the exact publication ceiling succeeds.
+                let exact_decode_limit = body.len() as u64 + decoded_steady;
+                let mut exact_decode = Circuit::new(compiled(), None);
+                exact_decode.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                exact_decode.set_version_pool(published.clone());
+                exact_decode.max_memory_bytes = Some(exact_decode_limit);
+                exact_decode.decode(&body, &snap).unwrap();
+                assert_eq!(exact_decode.version_publish_attempts, 1);
+                assert_eq!(exact_decode.version_allocs, 1);
+                if let Some(counter) = &published {
+                    assert_eq!(
+                        counter.load(Ordering::Relaxed),
+                        exact_decode.version.as_ref().unwrap().published_bytes()
+                    );
+                }
+                drop(exact_decode);
+                assert_eq!(pool.granted(), 0);
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+
+                // 2. Decode 1 byte below publication total fits `body` + mutable state +
+                //    reader IDs, reaches publication admission, and refuses before allocating
+                //    `ViewTable::ids`.
+                let decode_limit = exact_decode_limit - 1;
+                let mut tight_decode = Circuit::new(compiled(), None);
+                tight_decode.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+                tight_decode.set_version_pool(published.clone());
+                tight_decode.max_memory_bytes = Some(decode_limit);
+                let mut decode_res = Ok(());
+                let decode_largest = crate::test_alloc::record_largest(|| {
+                    decode_res = tight_decode.decode(&body, &snap);
+                });
+                assert!(
+                    matches!(
+                        decode_res,
+                        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+                    ),
+                    "decode 1 byte below publication total must refuse with Memory: {decode_res:?}"
+                );
+                assert_eq!(
+                    tight_decode.version_publish_attempts, 1,
+                    "decode must reach publication admission before refusing for `{text}` (version_pool={with_version_pool})"
+                );
+                assert_eq!(
+                    tight_decode.version_allocs, 0,
+                    "decode must refuse publication before entering version allocation for `{text}`"
+                );
+                assert!(
+                    decode_largest < table_ids_bytes,
+                    "decode allocated {decode_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
+                );
+                assert!(tight_decode.version.is_none());
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+                drop(tight_decode);
+                assert_eq!(pool.granted(), 0);
+
+                // 3. Shared QueryPool ceiling 1 byte below steady fits mutable state + pass
+                //    scratch, reaches publication admission, and refuses with ServerMemory
+                //    before allocating `ViewTable::ids`.
+                let tight_pool = QueryPool::new(steady - 1);
+                let mut pool_build = Circuit::new(compiled(), None);
+                pool_build.set_pool(Some(tight_pool.clone()), Some(tight_pool.work_parent()));
+                pool_build.set_version_pool(published.clone());
+                let mut pool_res = Ok(());
+                let pool_largest = crate::test_alloc::record_largest(|| {
+                    pool_res = pool_build.build(snap.clone(), &Control::none());
+                });
+                assert!(
+                    matches!(
+                        pool_res,
+                        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory
+                    ),
+                    "build against tight QueryPool must refuse publication with ServerMemory: {pool_res:?}"
+                );
+                assert_eq!(
+                    pool_build.version_publish_attempts, 1,
+                    "pooled build must reach publication admission before refusing for `{text}` (version_pool={with_version_pool})"
+                );
+                assert_eq!(
+                    pool_build.version_allocs, 0,
+                    "pooled build must refuse publication before entering version allocation for `{text}`"
+                );
+                assert!(
+                    pool_largest < table_ids_bytes,
+                    "pooled build allocated {pool_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
+                );
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+                drop(pool_build);
+                assert_eq!(tight_pool.granted(), 0);
+
+                // 4. Shared QueryPool ceiling 1 byte below decoded publication total reaches
+                //    publication admission and refuses with ServerMemory before allocating.
+                let tight_decode_pool = QueryPool::new(decode_limit);
+                let mut pool_decode = Circuit::new(compiled(), None);
+                pool_decode.set_pool(
+                    Some(tight_decode_pool.clone()),
+                    Some(tight_decode_pool.work_parent()),
+                );
+                pool_decode.set_version_pool(published.clone());
+                let mut pool_decode_res = Ok(());
+                let pool_decode_largest = crate::test_alloc::record_largest(|| {
+                    pool_decode_res = pool_decode.decode(&body, &snap);
+                });
+                assert!(
+                    matches!(
+                        pool_decode_res,
+                        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory
+                    ),
+                    "decode against tight QueryPool must refuse publication with ServerMemory: {pool_decode_res:?}"
+                );
+                assert_eq!(
+                    pool_decode.version_publish_attempts, 1,
+                    "pooled decode must reach publication admission before refusing for `{text}` (version_pool={with_version_pool})"
+                );
+                assert_eq!(
+                    pool_decode.version_allocs, 0,
+                    "pooled decode must refuse publication before entering version allocation for `{text}`"
+                );
+                assert!(
+                    pool_decode_largest < table_ids_bytes,
+                    "pooled decode allocated {pool_decode_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
+                );
+                if let Some(counter) = &published {
+                    assert_eq!(counter.load(Ordering::Relaxed), 0);
+                }
+                drop(pool_decode);
+                assert_eq!(tight_decode_pool.granted(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn wide_empty_projection_stays_within_publication_ceiling() {
+        use crate::error::BudgetKind;
+        use std::fmt::Write;
+        use std::sync::atomic::Ordering;
+
+        const WIDTH: usize = 2048;
+        let mut text = String::from("SELECT");
+        for i in 0..WIDTH {
+            write!(&mut text, " ?c{i:04}").unwrap();
+        }
+        text.push_str(" WHERE { <urn:missing> <urn:p> ?c0000 }");
+
+        let store = Store::in_memory(crate::store::StoreOptions::default());
+        let snap = store.snapshot();
+        let parsed = parse_query(&text, None, &[]).unwrap();
+        let compiled = || super::super::compile::compile(&parsed, None).unwrap();
+        let col_slots_bytes = WIDTH * std::mem::size_of::<String>();
+
+        for with_version_pool in [false, true] {
+            let wide_pool = QueryPool::new(16 << 20);
+            let published = with_version_pool.then(|| Arc::new(AtomicU64::new(0)));
+
             let mut reference = Circuit::new(compiled(), None);
-            reference.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+            reference.set_pool(Some(wide_pool.clone()), Some(wide_pool.work_parent()));
+            reference.set_version_pool(published.clone());
             reference.build(snap.clone(), &Control::none()).unwrap();
+            assert_eq!(reference.version_publish_attempts, 1);
             assert_eq!(reference.version_allocs, 1);
+            assert!(reference.result.is_empty());
+            assert!(reference.terms.is_empty());
+            assert_eq!(reference.root.schema.len(), WIDTH);
             let steady = reference.bytes();
             let version_bytes = reference.version_bytes();
-            assert!(
-                version_bytes as usize >= table_ids_bytes,
-                "version_bytes ({version_bytes}) must cover flat ViewTable::ids ({table_ids_bytes})"
+            assert_eq!(
+                steady, version_bytes,
+                "wide empty projection must have no mutable row or term bytes"
             );
+            assert!(
+                version_bytes as usize >= col_slots_bytes,
+                "version_bytes ({version_bytes}) must cover column slots ({col_slots_bytes})"
+            );
+            if let Some(counter) = &published {
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    reference.version.as_ref().unwrap().published_bytes()
+                );
+            }
             let body = reference.encode(&snap).unwrap();
             drop(reference);
-            assert_eq!(pool.granted(), 0);
+            assert_eq!(wide_pool.granted(), 0);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
 
-            // 1. Build with a local budget that fits the mutable state + build pass, but
-            //    refuses the published version before allocating `ViewTable::ids`.
-            let mut tight_build = Circuit::new(compiled(), None);
-            tight_build.set_pool(Some(pool.clone()), Some(pool.work_parent()));
-            tight_build.max_memory_bytes = Some(steady - 1);
+            // Build at the exact publication ceiling: only one column slot array is allocated,
+            // so live heap peak stays within a small fixed overhead of the admitted ceiling
+            // rather than spiking by a second `WIDTH * size_of::<String>()` slot array (~48 KiB).
+            const FIXED_OVERHEAD: usize = 512;
+            assert!(col_slots_bytes > FIXED_OVERHEAD * 32);
+            let build_pool = QueryPool::new(steady);
+            let mut ceil_build = Circuit::new(compiled(), None);
+            ceil_build.set_pool(Some(build_pool.clone()), Some(build_pool.work_parent()));
+            ceil_build.set_version_pool(published.clone());
+            ceil_build.max_memory_bytes = Some(steady);
             let mut build_res = Ok(());
-            let build_largest = crate::test_alloc::record_largest(|| {
-                build_res = tight_build.build(snap.clone(), &Control::none());
+            let build_peak = crate::test_alloc::record_peak_live(|| {
+                build_res = ceil_build.build(snap.clone(), &Control::none());
             });
+            build_res.unwrap();
+            assert_eq!(ceil_build.version_publish_attempts, 1);
+            assert_eq!(ceil_build.version_allocs, 1);
             assert!(
-                matches!(
-                    build_res,
-                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
-                ),
-                "build 1 byte below steady must refuse publication with Memory: {build_res:?}"
+                build_peak <= steady as usize + FIXED_OVERHEAD,
+                "wide empty build peak live bytes ({build_peak}) exceeded admitted ceiling ({steady}) + {FIXED_OVERHEAD} (version_pool={with_version_pool})"
             );
-            assert_eq!(
-                tight_build.version_allocs, 0,
-                "build must refuse publication before entering version allocation for `{text}`"
-            );
-            assert!(
-                build_largest < table_ids_bytes,
-                "build allocated {build_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
-            );
-            assert!(tight_build.version.is_none());
-            drop(tight_build);
-            assert_eq!(pool.granted(), 0);
+            if let Some(counter) = &published {
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    ceil_build.version.as_ref().unwrap().published_bytes()
+                );
+            }
+            drop(ceil_build);
+            assert_eq!(build_pool.granted(), 0);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
 
-            // 2. Decode with a local budget that fits `body` + mutable state + reader IDs,
-            //    but refuses publication before allocating `ViewTable::ids`.
-            let decode_limit = body.len() as u64 + steady - 1;
-            let mut tight_decode = Circuit::new(compiled(), None);
-            tight_decode.set_pool(Some(pool.clone()), Some(pool.work_parent()));
-            tight_decode.max_memory_bytes = Some(decode_limit);
+            // Checkpoint decode at the exact publication ceiling stays within the admitted
+            // publication bytes as well.
+            let decode_ceiling = body.len() as u64 + steady;
+            let decode_pool = QueryPool::new(decode_ceiling);
+            let mut ceil_decode = Circuit::new(compiled(), None);
+            ceil_decode.set_pool(Some(decode_pool.clone()), Some(decode_pool.work_parent()));
+            ceil_decode.set_version_pool(published.clone());
+            ceil_decode.max_memory_bytes = Some(decode_ceiling);
             let mut decode_res = Ok(());
-            let decode_largest = crate::test_alloc::record_largest(|| {
-                decode_res = tight_decode.decode(&body, &snap);
+            let decode_peak = crate::test_alloc::record_peak_live(|| {
+                decode_res = ceil_decode.decode(&body, &snap);
             });
+            decode_res.unwrap();
+            assert_eq!(ceil_decode.version_publish_attempts, 1);
+            assert_eq!(ceil_decode.version_allocs, 1);
             assert!(
-                matches!(
-                    decode_res,
-                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
-                ),
-                "decode 1 byte below publication total must refuse with Memory: {decode_res:?}"
+                decode_peak <= steady as usize + FIXED_OVERHEAD,
+                "wide empty decode peak live bytes ({decode_peak}) exceeded admitted ceiling ({steady}) + {FIXED_OVERHEAD} (version_pool={with_version_pool})"
             );
-            assert_eq!(
-                tight_decode.version_allocs, 0,
-                "decode must refuse publication before entering version allocation for `{text}`"
-            );
-            assert!(
-                decode_largest < table_ids_bytes,
-                "decode allocated {decode_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
-            );
-            assert!(tight_decode.version.is_none());
-            drop(tight_decode);
-            assert_eq!(pool.granted(), 0);
+            if let Some(counter) = &published {
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    ceil_decode.version.as_ref().unwrap().published_bytes()
+                );
+            }
+            drop(ceil_decode);
+            assert_eq!(decode_pool.granted(), 0);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
 
-            // 3. Shared QueryPool ceiling that fits mutable state + pass scratch, but
-            //    refuses publication with ServerMemory before allocating `ViewTable::ids`.
+            // 1 byte below the ceiling refuses at publication admission before allocating the
+            // column slot array (both local limit and shared QueryPool, for build and decode).
+            let mut tight_build = Circuit::new(compiled(), None);
+            tight_build.set_pool(Some(wide_pool.clone()), Some(wide_pool.work_parent()));
+            tight_build.set_version_pool(published.clone());
+            tight_build.max_memory_bytes = Some(steady - 1);
+            let mut tight_build_res = Ok(());
+            let tight_build_largest = crate::test_alloc::record_largest(|| {
+                tight_build_res = tight_build.build(snap.clone(), &Control::none());
+            });
+            assert!(matches!(
+                tight_build_res,
+                Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+            ));
+            assert_eq!(tight_build.version_publish_attempts, 1);
+            assert_eq!(tight_build.version_allocs, 0);
+            assert!(tight_build_largest < col_slots_bytes);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
+            drop(tight_build);
+            assert_eq!(wide_pool.granted(), 0);
+
+            let mut tight_decode = Circuit::new(compiled(), None);
+            tight_decode.set_pool(Some(wide_pool.clone()), Some(wide_pool.work_parent()));
+            tight_decode.set_version_pool(published.clone());
+            tight_decode.max_memory_bytes = Some(decode_ceiling - 1);
+            let mut tight_decode_res = Ok(());
+            let tight_decode_largest = crate::test_alloc::record_largest(|| {
+                tight_decode_res = tight_decode.decode(&body, &snap);
+            });
+            assert!(matches!(
+                tight_decode_res,
+                Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+            ));
+            assert_eq!(tight_decode.version_publish_attempts, 1);
+            assert_eq!(tight_decode.version_allocs, 0);
+            assert!(tight_decode_largest < col_slots_bytes);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
+            drop(tight_decode);
+            assert_eq!(wide_pool.granted(), 0);
+
             let tight_pool = QueryPool::new(steady - 1);
             let mut pool_build = Circuit::new(compiled(), None);
             pool_build.set_pool(Some(tight_pool.clone()), Some(tight_pool.work_parent()));
-            let mut pool_res = Ok(());
-            let pool_largest = crate::test_alloc::record_largest(|| {
-                pool_res = pool_build.build(snap.clone(), &Control::none());
+            pool_build.set_version_pool(published.clone());
+            let mut pool_build_res = Ok(());
+            let pool_build_largest = crate::test_alloc::record_largest(|| {
+                pool_build_res = pool_build.build(snap.clone(), &Control::none());
             });
-            assert!(
-                matches!(
-                    pool_res,
-                    Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory
-                ),
-                "build against tight QueryPool must refuse publication with ServerMemory: {pool_res:?}"
-            );
-            assert_eq!(
-                pool_build.version_allocs, 0,
-                "pooled build must refuse publication before entering version allocation for `{text}`"
-            );
-            assert!(
-                pool_largest < table_ids_bytes,
-                "pooled build allocated {pool_largest} bytes (>= ViewTable::ids {table_ids_bytes}) before refusing publication for `{text}`"
-            );
+            assert!(matches!(
+                pool_build_res,
+                Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory
+            ));
+            assert_eq!(pool_build.version_publish_attempts, 1);
+            assert_eq!(pool_build.version_allocs, 0);
+            assert!(pool_build_largest < col_slots_bytes);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
             drop(pool_build);
             assert_eq!(tight_pool.granted(), 0);
+
+            let tight_decode_pool = QueryPool::new(decode_ceiling - 1);
+            let mut pool_decode = Circuit::new(compiled(), None);
+            pool_decode.set_pool(
+                Some(tight_decode_pool.clone()),
+                Some(tight_decode_pool.work_parent()),
+            );
+            pool_decode.set_version_pool(published.clone());
+            let mut pool_decode_res = Ok(());
+            let pool_decode_largest = crate::test_alloc::record_largest(|| {
+                pool_decode_res = pool_decode.decode(&body, &snap);
+            });
+            assert!(matches!(
+                pool_decode_res,
+                Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory
+            ));
+            assert_eq!(pool_decode.version_publish_attempts, 1);
+            assert_eq!(pool_decode.version_allocs, 0);
+            assert!(pool_decode_largest < col_slots_bytes);
+            if let Some(counter) = &published {
+                assert_eq!(counter.load(Ordering::Relaxed), 0);
+            }
+            drop(pool_decode);
+            assert_eq!(tight_decode_pool.granted(), 0);
         }
     }
 }

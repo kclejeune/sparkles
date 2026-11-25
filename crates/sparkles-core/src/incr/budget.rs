@@ -731,7 +731,7 @@ impl ViewBudget {
     }
 
     /// Ensure `state_bytes + pass_bytes` covers at least `target_bytes` before allocating
-    /// a new retained structure (such as a published [`ViewVersion`]).
+    /// a new retained structure (such as a published [`crate::sparql::viewsvc::ViewVersion`]).
     pub(crate) fn try_reserve_pass_to_cover(&self, target_bytes: u64) -> Result<()> {
         let mut s = self.inner.lock();
         let cur = s.state_bytes.saturating_add(s.pass_bytes);
