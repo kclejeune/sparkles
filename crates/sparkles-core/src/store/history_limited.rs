@@ -174,15 +174,15 @@ impl Store {
 
     pub(super) fn cache_limited_snapshot(
         history: &mut crate::history::HistoryState,
-        cached: crate::history::Cached,
+        mut snap: Snapshot,
+        owner: u32,
+        seq: u64,
+        bytes: u64,
+        end: wal::WalPoint,
         limit: &ReadLimit<'_>,
-    ) -> Result<()> {
-        let retained = preparation_delta_bytes(&cached.snap.delta).max(SHARED_SNAPSHOT_BYTES);
-        let mut before = 0u64;
-        for entry in &history.cache {
-            limit.check(retained)?;
-            before = before.saturating_add(entry.bytes);
-        }
+    ) -> Result<Arc<Snapshot>> {
+        let retained = preparation_delta_bytes(&snap.delta).max(SHARED_SNAPSHOT_BYTES);
+        limit.check(retained)?;
         if history.cache.len() == history.cache.capacity() {
             let next = history.cache.capacity().saturating_mul(2).max(1);
             let relocating = (history.cache.capacity().saturating_add(next) as u64)
@@ -191,7 +191,7 @@ impl Store {
             // vector or evict unrelated entries merely to return its completed view.
             if retained.saturating_add(relocating) > limit.remaining() {
                 limit.check(retained)?;
-                return Ok(());
+                return Ok(Arc::new(snap));
             }
             if history
                 .cache
@@ -199,20 +199,30 @@ impl Store {
                 .is_err()
             {
                 limit.check(retained)?;
-                return Ok(());
+                return Ok(Arc::new(snap));
             }
         }
         limit.check(retained)?;
-        let after = before.saturating_add(cached.bytes);
-        history.cache.insert(0, cached);
-        history.settle_precounted(after);
+        let hold = (bytes > 0).then(|| caches::BudgetHold::new(history.budget.clone(), bytes));
         if history.budget.over() {
-            // Only the optional new entry is removed. Existing cache capacity,
+            // Only the optional new entry is omitted. Existing cache capacity,
             // states and warm pins are not narrowed by this request.
-            history.cache.remove(0);
-            history.settle_precounted(before);
+            drop(hold);
+            return Ok(Arc::new(snap));
         }
-        Ok(())
+        snap.history_charge = hold;
+        let snap = Arc::new(snap);
+        history.cache.insert(
+            0,
+            crate::history::Cached {
+                generation: owner,
+                seq,
+                snap: snap.clone(),
+                bytes,
+                end,
+            },
+        );
+        Ok(snap)
     }
 
     /// Origin-aware bounded counterpart of snapshot_at_with_branch.
@@ -765,5 +775,60 @@ mod tests {
         drop(held);
         task.join().unwrap();
         assert!(matches!(result, Ok(Err(Error::Timeout))));
+    }
+
+    #[test]
+    fn uncapped_replay_checks_control_after_materialize_before_caching() {
+        struct CancelOn {
+            checks: std::sync::atomic::AtomicUsize,
+            cancel_at: usize,
+        }
+        impl ReadControl for CancelOn {
+            fn check_read(&self) -> Result<()> {
+                let n = self.checks.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= self.cancel_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn temporary(&self, memory_bytes: u64) -> Result<crate::access::Preparation> {
+                crate::access::Preparation::new(crate::task::Control::none(), memory_bytes)
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path(), StoreOptions::default()).unwrap();
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:a> <urn:p> 1 }",
+            &Default::default(),
+        )
+        .unwrap();
+        crate::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:b> <urn:p> 2 }",
+            &Default::default(),
+        )
+        .unwrap();
+        // Check 1 is entry, checks 2 and 3 are locking history (before and after
+        // try_lock_for), and check 4 is the post-materialize check before stats
+        // updates and caching.
+        let control = CancelOn {
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            cancel_at: 4,
+        };
+        let result = store.snapshot_at_inner(&At::Commit(1), &control, None);
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "expected post-materialize cancellation, got {:?} (checks={})",
+            result.err(),
+            control.checks.load(Ordering::Relaxed)
+        );
+        let history = store.history.as_ref().unwrap().lock();
+        assert_eq!(history.misses, 1);
+        assert_eq!(history.materializations, 0);
+        assert!(history.cache.is_empty());
     }
 }

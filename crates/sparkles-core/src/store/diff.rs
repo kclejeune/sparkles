@@ -749,6 +749,7 @@ impl Store {
             delta: mark.delta.clone(),
             dvocab_len: mark.dvocab_len,
             commit: mark.commit,
+            history_charge: None,
             ..to.clone()
         };
         let mut net = Net {

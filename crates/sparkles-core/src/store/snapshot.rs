@@ -53,6 +53,7 @@ impl SnapshotBuilder {
             historical: false,
             counts: Default::default(),
             mask: None,
+            history_charge: None,
             change_log: shared.change_log,
         })
     }
@@ -81,6 +82,7 @@ impl SnapshotBuilder {
             historical: false,
             counts: Default::default(),
             mask: None,
+            history_charge: None,
             change_log: base.change_log.clone(),
         })
     }

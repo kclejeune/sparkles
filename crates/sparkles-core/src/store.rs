@@ -657,6 +657,9 @@ pub struct Snapshot {
     /// the quads a triple-level access view hides, when this snapshot is such a view's
     /// (they are in the delta as deletions; see [`crate::access::triples`])
     pub(crate) mask: Option<Arc<crate::access::Mask>>,
+    /// shared history-cache budget hold carried by a cached historical snapshot and
+    /// any derived masked snapshot sharing its persistent delta nodes
+    pub(crate) history_charge: Option<Arc<caches::BudgetHold>>,
     /// the store's change log, which history queries read (see [`ChangeLog`])
     pub change_log: Option<Arc<ChangeLog>>,
 }
@@ -3239,9 +3242,26 @@ impl Store {
             let mut m = limit.read_limit().lock(mem)?;
             return match m.get_with(seq, &limit)? {
                 Some(snap) => {
-                    limit.check(history_limited::SHARED_SNAPSHOT_BYTES)?;
+                    let generation_bytes =
+                        if C::ACCOUNTS && !Arc::ptr_eq(&snap.generation, &live.generation) {
+                            snap.generation
+                                .retained_bytes_limited(&limit.read_limit())?
+                        } else {
+                            0
+                        };
+                    limit
+                        .read_limit()
+                        .holding(generation_bytes)?
+                        .check(history_limited::SHARED_SNAPSHOT_BYTES)?;
                     m.hits += 1;
-                    Ok((snap, r, history_limited::SnapshotCharge::shared()))
+                    Ok((
+                        snap,
+                        r,
+                        history_limited::SnapshotCharge {
+                            delta_bytes: history_limited::SHARED_SNAPSHOT_BYTES,
+                            generation_bytes,
+                        },
+                    ))
                 }
                 None => {
                     drop(m);
@@ -3350,6 +3370,7 @@ impl Store {
             limit.check(bytes)?;
             bytes
         } else {
+            limit.check(0)?;
             0
         };
         h.materializations += 1;
@@ -3360,52 +3381,71 @@ impl Store {
         } else {
             generation.dvocab.len()
         };
-        let snap = Arc::new(
-            self.snapshot_of(generation, seq)
-                .delta(delta)
-                .dvocab_len(dvocab_len)
-                .geo(self.historical_geo())
-                .historical(true)
-                .build(),
-        );
+        let mut snap = self
+            .snapshot_of(generation, seq)
+            .delta(delta)
+            .dvocab_len(dvocab_len)
+            .geo(self.historical_geo())
+            .historical(true)
+            .build();
         let charge = history_limited::SnapshotCharge {
             delta_bytes: delta_charge,
             generation_bytes,
         };
-        let cached = crate::history::Cached {
-            generation: owner,
-            seq,
-            snap: snap.clone(),
-            bytes,
-            end,
-        };
         if C::ACCOUNTS {
-            Self::cache_limited_snapshot(&mut h, cached, &limit.read_limit())?;
+            let snap = Self::cache_limited_snapshot(
+                &mut h,
+                snap,
+                owner,
+                seq,
+                bytes,
+                end,
+                &limit.read_limit(),
+            )?;
             return Ok((snap, r, charge));
         }
-        h.cache.insert(0, cached);
-        // evict the least recently used states, warm pins' last
+        // Charge the shared history budget before evicting so states still pinned
+        // by active controlled views or derived masks stay accounted through eviction.
+        let hold = (bytes > 0).then(|| caches::BudgetHold::new(h.budget.clone(), bytes));
         let warm: Vec<(u32, u64)> = h
             .pins
             .values()
             .filter(|p| p.warm)
             .filter_map(|p| h.owner(p.seq, current, r.head).map(|o| (o, p.seq)))
             .collect();
-        h.settle();
-        while h.budget.over() && h.cache.len() > 1 {
-            let i = (0..h.cache.len())
+        let new_is_warm = warm.contains(&(owner, seq));
+        while h.budget.over() && !h.cache.is_empty() {
+            if let Some(i) = (0..h.cache.len())
                 .rev()
                 .find(|&i| !warm.contains(&(h.cache[i].generation, h.cache[i].seq)))
-                .unwrap_or(h.cache.len() - 1);
-            h.cache.remove(i);
-            h.settle();
+            {
+                h.cache.remove(i);
+            } else if new_is_warm {
+                h.cache.pop();
+            } else {
+                break;
+            }
         }
-        // The caches of other stores can leave the shared budget over its capacity even
-        // when this store holds only the state just built. It is then not cached.
-        if h.budget.over() && h.cache.len() == 1 && h.cache[0].seq == seq {
-            h.cache.clear();
-            h.settle();
-        }
+        // Other stores' caches, warm pins, or evicted states still pinned by active
+        // views can leave the shared budget over capacity; do not cache the new state.
+        let snap = if !h.budget.over() {
+            snap.history_charge = hold;
+            let snap = Arc::new(snap);
+            h.cache.insert(
+                0,
+                crate::history::Cached {
+                    generation: owner,
+                    seq,
+                    snap: snap.clone(),
+                    bytes,
+                    end,
+                },
+            );
+            snap
+        } else {
+            drop(hold);
+            Arc::new(snap)
+        };
         Ok((snap, r, charge))
     }
 
@@ -8005,7 +8045,6 @@ fn collect_generations(
     for (no, dir) in doomed {
         h.open.retain(|(n, _)| *n != no);
         h.cache.retain(|c| c.generation != no);
-        h.settle();
         match crate::history::retire_generation(root, &dir) {
             Ok(d) => {
                 h.gens.remove(&no);

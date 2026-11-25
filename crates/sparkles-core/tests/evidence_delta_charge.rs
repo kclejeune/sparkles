@@ -2,7 +2,10 @@
 //! in bounded history reads and evidence resolution (roadmap item 542).
 
 use oxrdf::{Literal, NamedNode, Term, Triple};
-use sparkles_core::access::{Caller, GraphAccess, Graphs, Limits, Protection, Rule, TripleRules};
+use sparkles_core::Error;
+use sparkles_core::access::{
+    Caller, GraphAccess, Graphs, Limits, Preparation, Protection, Rule, TripleRules,
+};
 use sparkles_core::evidence::{
     GraphIdentity, RecordKind, Settings, Sha256Digest, StoredFactRef,
     resolve::{MEMORY_BYTES, RecordRequest, Resolver},
@@ -10,6 +13,7 @@ use sparkles_core::evidence::{
 use sparkles_core::history::{At, HistoryOptions, SnapshotOptions};
 use sparkles_core::id::Id;
 use sparkles_core::managed::{OwnerEntry, OwnerKind};
+use sparkles_core::store::caches::{CacheSizes, SharedCaches};
 use sparkles_core::store::{Store, StoreOptions};
 use sparkles_core::task::Control;
 use std::collections::BTreeMap;
@@ -480,6 +484,319 @@ fn private_historical_replays_accumulate_retained_charge_and_enforce_allowance()
             Some(&all()),
             &fact(&store, commits[2], "urn:s4000", "urn:p", "v4000"),
         )
+        .unwrap_err();
+    assert_eq!(err.code(), "incomplete-evidence");
+}
+
+#[test]
+fn evicted_cached_state_stays_accounted_in_history_budget_while_pinned_by_resolver() {
+    for masked in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        // 30 MiB fits one 50,000-quad cached delta (~22.4 MiB), not two (~44.8 MiB).
+        let shared = SharedCaches::new(CacheSizes {
+            blocks: 0,
+            results: 0,
+            service: 0,
+            history: 30 << 20,
+        });
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                shared: Some(shared.scope()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c1 = insert_delta_quads(&store, 0, 50_000, true);
+        store
+            .create_snapshot("keep-c1", &At::Commit(c1), None)
+            .unwrap();
+        // Advance one commit before compaction so gen-1 starts after c1 and c1
+        // remains served by sealed gen-0 with its 50,000-quad delta.
+        let _c1_next = insert_delta_quads(&store, 100_000, 1, false);
+        store.compact().unwrap();
+        let c2 = insert_delta_quads(&store, 50_000, 50_000, true);
+        let _c3 = insert_delta_quads(&store, 100_001, 1, false);
+
+        // Warm c1 into the shared history cache.
+        store
+            .snapshot_at(&At::Commit(c1), &HistoryOptions::default())
+            .unwrap();
+        let c1_budget = shared.history().used();
+        assert!(
+            c1_budget > 20_000_000,
+            "expected c1 in shared history budget, got {c1_budget} (masked={masked})"
+        );
+        assert_eq!(store.history().cache_entries, 1);
+
+        let policy = if masked { secret_policy() } else { all() };
+        let mut r = Resolver::new(Control::none(), MEMORY_BYTES).unwrap();
+        let v1 = r
+            .stored_fact(
+                "pinned-c1",
+                &store,
+                Some(&policy),
+                &fact(&store, c1, "urn:s1", "urn:p", "v1"),
+            )
+            .unwrap();
+        assert_eq!(v1.commit, c1);
+
+        // Another reader materializes c2 and attempts to replace c1 in the cache.
+        // Because r still pins c1 (directly or through a derived triple mask), c1's
+        // BudgetHold keeps the shared history budget occupied and prevents c2 from
+        // entering the cache past the 30 MiB cap.
+        store
+            .snapshot_at(&At::Commit(c2), &HistoryOptions::default())
+            .unwrap();
+        assert_eq!(
+            shared.history().used(),
+            c1_budget,
+            "pinned evicted state must keep its shared history budget charge (masked={masked})"
+        );
+        assert_eq!(
+            store.history().cache_entries,
+            0,
+            "oversized replacement must not enter cache while pinned state occupies budget (masked={masked})"
+        );
+
+        // The same resolver therefore sees a cache miss on c2 and refuses private
+        // 50,000-quad replay under 64 MiB instead of pinning a second uncharged state.
+        let err = r
+            .stored_fact(
+                "miss-c2",
+                &store,
+                Some(&policy),
+                &fact(&store, c2, "urn:s50001", "urn:p", "v50001"),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "incomplete-evidence");
+
+        // Dropping the resolver releases the pinned BudgetHold back to the shared budget.
+        drop(r);
+        assert_eq!(
+            shared.history().used(),
+            0,
+            "dropping resolver must release pinned history budget (masked={masked})"
+        );
+
+        // Warming c2 now succeeds and a fresh resolver hits the cache cleanly.
+        store
+            .snapshot_at(&At::Commit(c2), &HistoryOptions::default())
+            .unwrap();
+        assert_eq!(store.history().cache_entries, 1);
+        assert!(shared.history().used() > 20_000_000);
+        let mut r2 = Resolver::new(Control::none(), MEMORY_BYTES).unwrap();
+        let v2 = r2
+            .stored_fact(
+                "warm-c2",
+                &store,
+                Some(&policy),
+                &fact(&store, c2, "urn:s50001", "urn:p", "v50001"),
+            )
+            .unwrap();
+        assert_eq!(v2.commit, c2);
+    }
+}
+
+#[test]
+fn non_live_generation_cached_hits_charge_retained_generation_bytes() {
+    for persistent in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = if persistent {
+            Store::open(dir.path(), StoreOptions::default()).unwrap()
+        } else {
+            Store::in_memory(StoreOptions::default())
+        };
+        // Insert 600 quads with 1,536-byte literals so the pre-compaction
+        // generation's DeltaVocab exceeds 900 KiB.
+        let mut txn = store.write();
+        let p = txn.intern(&Term::NamedNode(iri("urn:payload"))).unwrap();
+        let mut first_val = String::new();
+        for i in 0..600 {
+            let s = txn
+                .intern(&Term::NamedNode(iri(&format!("urn:item:{i}"))))
+                .unwrap();
+            let val = format!("{i:0>1536}");
+            if i == 0 {
+                first_val = val.clone();
+            }
+            let o = txn
+                .intern(&Term::Literal(Literal::new_simple_literal(val)))
+                .unwrap();
+            txn.insert([s, p, o, Id::DEFAULT_GRAPH]).unwrap();
+        }
+        txn.commit().unwrap();
+        let c1 = store.head_commit().seq;
+        store
+            .create_snapshot("pre-compact", &At::Head, None)
+            .unwrap();
+        // Advance one commit before compaction so the compacted live generation
+        // starts after c1 and both persistent and in-memory hits read the non-live
+        // pre-compaction generation.
+        let _c2 = insert_delta_quads(&store, 10_000, 1, false);
+        store.compact().unwrap();
+        if persistent {
+            // Warm c1 into h.cache on the non-live sealed generation.
+            store
+                .snapshot_at(&At::Commit(c1), &HistoryOptions::default())
+                .unwrap();
+        }
+
+        let target = fact(&store, c1, "urn:item:0", "urn:payload", &first_val);
+
+        // 128 KiB exceeds the 4 KiB delta handle plus read metadata, but is far
+        // below the non-live generation's >900 KiB dictionary and must refuse.
+        let mut tight = Resolver::new(Control::none(), 128 << 10).unwrap();
+        let err = tight
+            .stored_fact("non-live-tight", &store, Some(&all()), &target)
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            "incomplete-evidence",
+            "non-live generation hit must enforce generation_bytes (persistent={persistent})"
+        );
+
+        // Under 64 MiB it succeeds and retains the non-live generation charge.
+        let mut wide = Resolver::new(Control::none(), MEMORY_BYTES).unwrap();
+        let verified = wide
+            .stored_fact("non-live-wide", &store, Some(&all()), &target)
+            .unwrap();
+        assert_eq!(verified.commit, c1);
+        assert!(
+            used(&wide) >= 900_000,
+            "expected non-live generation charge >= 900 KiB, got {} (persistent={persistent})",
+            used(&wide)
+        );
+    }
+}
+
+#[test]
+fn clean_and_dirty_write_txn_prepare_read_view_on_large_uncompacted_delta() {
+    let store = Store::in_memory(StoreOptions::default());
+    insert_delta_quads(&store, 0, 50_000, false);
+    assert!(store.snapshot().delta.inserts() >= 50_000);
+
+    let mut txn = store.write();
+    // 64 MiB covers the generation dictionary plus 4 KiB shared delta handle,
+    // while 50,000 delta quads at 2 KiB/quad exceed 100 MiB.
+    let cap = MEMORY_BYTES;
+    {
+        let prep = Preparation::new(Control::none(), cap).unwrap();
+        let clean = txn.prepare_read_view(&prep).unwrap();
+        assert_eq!(clean.len(), 50_000);
+    }
+
+    let s = txn.intern(&Term::NamedNode(iri("urn:dirty"))).unwrap();
+    let p = txn.intern(&Term::NamedNode(iri("urn:p"))).unwrap();
+    let o = txn
+        .intern(&Term::Literal(Literal::new_simple_literal("dirty")))
+        .unwrap();
+    txn.insert([s, p, o, Id::DEFAULT_GRAPH]).unwrap();
+    let prep = Preparation::new(Control::none(), cap).unwrap();
+    assert!(matches!(
+        txn.prepare_read_view(&prep),
+        Err(Error::BudgetExceeded(_))
+    ));
+}
+
+#[test]
+fn prepare_read_and_evidence_view_charge_shared_live_delta_by_handle() {
+    let store = Store::in_memory(StoreOptions::default());
+    let init = Preparation::new(Control::none(), 16 << 20).unwrap();
+    store.activate_memory_configuration_history(&init).unwrap();
+    let commit = insert_delta_quads(&store, 0, 50_000, false);
+
+    // 50,000 uncompacted live delta quads would exceed 64 MiB under 2 KiB/quad,
+    // but both prepare_read and evidence_view admit the shared live delta by handle.
+    let prep = Preparation::new(Control::none(), MEMORY_BYTES).unwrap();
+    let view = store.prepare_read(all(), &prep).unwrap();
+    assert_eq!(view.len(), 50_000);
+    drop(view);
+    let ev = store.evidence_view(&At::Head, &prep).unwrap();
+    assert_eq!(ev.commit().seq, commit);
+    drop(ev);
+
+    // Both still charge the generation's owned dictionary and refuse a tight cap.
+    let tight = Preparation::new(Control::none(), 64 << 10).unwrap();
+    assert!(matches!(
+        store.prepare_read(all(), &tight),
+        Err(Error::BudgetExceeded(_))
+    ));
+    assert!(matches!(
+        store.evidence_view(&At::Head, &tight),
+        Err(Error::BudgetExceeded(_))
+    ));
+}
+
+#[test]
+fn unopened_cold_branch_resolver_charges_private_delta_and_cold_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dataset_id, small_id, c_small, large_id, c_large) = {
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        insert_delta_quads(&store, 0, 1, false);
+        store
+            .create_branch("cold-small", &Default::default())
+            .unwrap();
+        let small_branch = store.branch("cold-small").unwrap();
+        let c_small = insert_delta_quads(&small_branch, 10, 200, false);
+        let small_id = small_branch.branch_id();
+        drop(small_branch);
+
+        store
+            .create_branch("cold-large", &Default::default())
+            .unwrap();
+        let large_branch = store.branch("cold-large").unwrap();
+        let c_large = insert_delta_quads(&large_branch, 1_000, 50_000, false);
+        let large_id = large_branch.branch_id();
+        drop(large_branch);
+
+        (store.dataset_id(), small_id, c_small, large_id, c_large)
+    };
+
+    // Reopen only the main store so both branches stay unopened.
+    let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    assert_eq!(store.dataset_id(), dataset_id);
+
+    let small_ref = StoredFactRef {
+        dataset: dataset_id,
+        branch: small_id,
+        commit: c_small,
+        graph: GraphIdentity::Default,
+        expected: Triple::new(
+            iri("urn:s10"),
+            iri("urn:p"),
+            Literal::new_simple_literal("v10"),
+        ),
+        anchor: None,
+    };
+    let mut r = Resolver::new(Control::none(), MEMORY_BYTES).unwrap();
+    let verified = r
+        .stored_fact("cold-small", &store, Some(&all()), &small_ref)
+        .unwrap();
+    assert_eq!(verified.served_by, small_id);
+    assert_eq!(verified.commit, c_small);
+    // 200 quads private delta (~528 KiB) + cold generation charge.
+    assert!(
+        used(&r) >= 400_000,
+        "unopened cold branch replay must retain private delta + generation charge, got {}",
+        used(&r)
+    );
+
+    let large_ref = StoredFactRef {
+        dataset: dataset_id,
+        branch: large_id,
+        commit: c_large,
+        graph: GraphIdentity::Default,
+        expected: Triple::new(
+            iri("urn:s50999"),
+            iri("urn:p"),
+            Literal::new_simple_literal("v50999"),
+        ),
+        anchor: None,
+    };
+    let mut r_large = Resolver::new(Control::none(), MEMORY_BYTES).unwrap();
+    let err = r_large
+        .stored_fact("cold-large", &store, Some(&all()), &large_ref)
         .unwrap_err();
     assert_eq!(err.code(), "incomplete-evidence");
 }

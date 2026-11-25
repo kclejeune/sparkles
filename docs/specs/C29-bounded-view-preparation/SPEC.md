@@ -245,10 +245,14 @@ shared snapshots from freshly materialized private replays. A live snapshot, an
 in-memory retained snapshot or a persistent history-cache hit charges a fixed 4 KiB
 handle cost for its shared delta rather than 2 KiB per delta quad, while still checking
 cancellation, deadlines, the effective shared history capacity and any non-live sealed
-generation's owned dictionary. Freshly materialized WAL replays, unopened cold branch
+or pre-compaction generation's owned dictionary. A cached snapshot's store-level
+history-budget hold stays attached to the snapshot and any derived triple-masked
+snapshot until all views pinning its delta nodes drop, so cache eviction cannot release
+the shared budget early. Freshly materialized WAL replays, unopened cold branch
 replays and dirty transaction views keep full pre-admitted delta accounting before
 allocation. The release diagnostic (`evidence_resolution_delta_charge_diagnostic`) on
-Boat worker `bx_z8s55a5v` confirmed constant 6,400-byte retained preparation for shared
+Boat worker `bx_z8s55a5v`, which is a local diagnostic and not a published
+benchmark-host result, confirmed constant 6,400-byte retained preparation for shared
 live and cached stored-fact resolution across 10,000 to 100,000 uncompacted delta
 quads, while uncached private WAL replays refused cleanly with `incomplete-evidence` at
 50,000 and 100,000 quads.
