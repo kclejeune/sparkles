@@ -949,7 +949,7 @@ fn fusable(
 
 fn star_desc(spec: &IndexJoinSpec, ctx: &Ctx) -> String {
     let term = |id: u64| {
-        ctx.term(Id(id))
+        ctx.plan_term(Id(id))
             .map_or_else(|| format!("{:?}", Id(id)), |t| super::plan::short(&t))
     };
     spec.probes

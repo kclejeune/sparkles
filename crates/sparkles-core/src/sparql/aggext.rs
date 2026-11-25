@@ -141,13 +141,29 @@ pub(crate) fn aggregate(ctx: &Ctx, iri: &str, vals: &[std::result::Result<Id, ()
 }
 
 /// A value as a double, as ARQ's `NodeValue.getDouble`; `None` for a value that is not a
-/// number (and for unbound).
-fn double_of(ctx: &Ctx, id: Id) -> Option<f64> {
-    match id.tag() {
+/// number (and for unbound). Propagates any memory or control refusal.
+fn double_of_checked(ctx: &Ctx, id: Id) -> crate::error::Result<Option<f64>> {
+    Ok(match id.tag() {
         Tag::Int => Some(id.as_i64() as f64),
         Tag::Double => Some(id.as_f64()),
         Tag::Undef => None,
-        _ => Some(f64::from(Num::of(&ctx.value(id)?).ok()?.to_double())),
+        _ => match ctx.value_checked(id)? {
+            Some(v) => Num::of(&v).ok().map(|n| f64::from(n.to_double())),
+            None => None,
+        },
+    })
+}
+
+/// A value as a double, as ARQ's `NodeValue.getDouble`; `None` for a value that is not a
+/// number (and for unbound). Latches any memory refusal onto `ctx` so the next check
+/// preserves the original error.
+fn double_of(ctx: &Ctx, id: Id) -> Option<f64> {
+    match double_of_checked(ctx, id) {
+        Ok(v) => v,
+        Err(error) => {
+            ctx.fail_memory(&error);
+            None
+        }
     }
 }
 

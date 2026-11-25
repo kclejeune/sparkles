@@ -139,6 +139,20 @@ fn tail_key(rel: u64, cols: &[u64]) -> Option<Vec<u8>> {
     Some(key)
 }
 
+fn rule_bnode_label_len(key: &[u8]) -> usize {
+    8 + 2 * (key.len() - 3)
+}
+
+fn rule_bnode_term(key: &[u8]) -> Term {
+    use std::fmt::Write;
+    let mut label = String::with_capacity(rule_bnode_label_len(key));
+    label.push_str("spkrule_");
+    for byte in &key[3..] {
+        write!(label, "{byte:02x}").expect("String write");
+    }
+    Term::BlankNode(BlankNode::new_unchecked(label))
+}
+
 /// Term context shared by all evaluation threads.
 pub(crate) struct Terms {
     pub snap: Arc<Snapshot>,
@@ -188,7 +202,7 @@ impl Terms {
     pub fn new_in(snap: Arc<Snapshot>, budget: &Arc<Budget>) -> Result<Terms, BudgetFailure> {
         let fixed = 40 * size_of::<OnceLock<Box<[OnceLock<LocalTerm>]>>>();
         let fixed_credit = Held::try_new_exact(budget, fixed)?;
-        let lit_range = snap.generation.vocab.prefix_range(b"\"");
+        let lit_range = (0, snap.generation.vocab.first_triple());
         let mut t = Terms {
             snap,
             analysis: None,
@@ -233,6 +247,84 @@ impl Terms {
             oxrdf::vocab::xsd::DATE_TIME,
         ));
         t.now = t.try_id_for(&now)?;
+        drop(now);
+        drop(temporary);
+        Ok(t)
+    }
+
+    /// Construct in the receiving budget before allocating the segment index or
+    /// initial RDF/NOW keys, admitting vocabulary lookup scratch and polling live controls.
+    pub(crate) fn new_in_controlled(
+        snap: Arc<Snapshot>,
+        budget: &Arc<Budget>,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Terms> {
+        check()?;
+        let fixed = 40 * size_of::<OnceLock<Box<[OnceLock<LocalTerm>]>>>();
+        let fixed_credit = match Held::try_new_exact(budget, fixed) {
+            Ok(held) => held,
+            Err(err) => {
+                check()?;
+                return Err(err.into());
+            }
+        };
+        let lit_range = (0, snap.generation.vocab.first_triple());
+        let mut t = Terms {
+            snap,
+            analysis: None,
+            analysis_round: AtomicUsize::new(0),
+            lit_range,
+            locals: RwLock::new(Locals::default()),
+            table: LocalTable::new(),
+            regex_cache: Mutex::new(RegexCache::default()),
+            credit: TermCredit {
+                budget: RwLock::new(budget.clone()),
+                charged: AtomicUsize::new(fixed),
+            },
+            rdf_first: 0,
+            rdf_rest: 0,
+            rdf_nil: 0,
+            now: 0,
+        };
+        let _ = fixed_credit.into_bytes();
+        let mut rdf = [0; 3];
+        for (i, suffix) in ["first", "rest", "nil"].iter().enumerate() {
+            check()?;
+            let bytes = crate::parser::RDF_NS
+                .len()
+                .checked_add(suffix.len())
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|n| n.checked_add(size_of::<Term>()))
+                .ok_or_else(|| BudgetFailure::parent(sparkles_budget::ParentRefused::Overflow))?;
+            let temporary = match Held::try_new_exact(budget, bytes) {
+                Ok(held) => held,
+                Err(err) => {
+                    check()?;
+                    return Err(err.into());
+                }
+            };
+            let term = Term::NamedNode(NamedNode::new_unchecked(format!(
+                "{}{suffix}",
+                crate::parser::RDF_NS
+            )));
+            rdf[i] = t.try_id_for_controlled(&term, &mut check)?;
+            drop(term);
+            drop(temporary);
+        }
+        [t.rdf_first, t.rdf_rest, t.rdf_nil] = rdf;
+        check()?;
+        let temporary = match Held::try_new_exact(budget, 256) {
+            Ok(held) => held,
+            Err(err) => {
+                check()?;
+                return Err(err.into());
+            }
+        };
+        let now = Term::Literal(Literal::new_typed_literal(
+            oxsdatatypes::DateTime::now().to_string(),
+            oxrdf::vocab::xsd::DATE_TIME,
+        ));
+        t.now = t.try_id_for_controlled(&now, &mut check)?;
         drop(now);
         drop(temporary);
         Ok(t)
@@ -364,6 +456,108 @@ impl Terms {
         self.id_charged(t, true)
     }
 
+    /// Strict [`try_id_for`](Self::try_id_for) that admits vocabulary reconstruction
+    /// scratch against the term table's budget and polls live controls.
+    pub(crate) fn try_id_for_controlled(
+        &self,
+        t: &Term,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<u64> {
+        check()?;
+        if let Some(id) = id::inline_id(t) {
+            return Ok(id.0);
+        }
+        if matches!(t, Term::BlankNode(_)) {
+            return match self.id_charged(t, true) {
+                Ok(id) => Ok(id),
+                Err(err) => {
+                    check()?;
+                    Err(err.into())
+                }
+            };
+        }
+        let budget = self.budget();
+        let key = match key::WorkingKey::new(t, &budget, true) {
+            Ok(key) => key,
+            Err(err) => {
+                check()?;
+                return Err(err.into());
+            }
+        };
+        if let Some(id) = self.lookup_key_controlled(key.as_slice(), &budget, &mut check)? {
+            return Ok(id.0);
+        }
+        check()?;
+        match key.intern(self, true) {
+            Ok(id) => Ok(id),
+            Err(err) => {
+                check()?;
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Strict [`try_id_for_key`](Self::try_id_for_key) that admits vocabulary
+    /// reconstruction scratch against the term table's budget and polls live controls.
+    pub(crate) fn try_id_for_key_controlled(
+        &self,
+        key: &[u8],
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<u64> {
+        let budget = self.budget();
+        if let Some(id) = self.lookup_key_controlled(key, &budget, &mut check)? {
+            return Ok(id.0);
+        }
+        check()?;
+        let temporary = match Held::try_new_exact(&budget, key.len()) {
+            Ok(held) => held,
+            Err(err) => {
+                check()?;
+                return Err(err.into());
+            }
+        };
+        match self.local_keyed(
+            Some(temporary),
+            key.to_vec(),
+            LocalTerm::Key(Vec::new()),
+            true,
+        ) {
+            Ok(id) => Ok(id),
+            Err(err) => {
+                check()?;
+                Err(err.into())
+            }
+        }
+    }
+
+    fn lookup_key_controlled(
+        &self,
+        key: &[u8],
+        budget: &Arc<Budget>,
+        check: &mut impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<Id>> {
+        let check = std::cell::RefCell::new(check);
+        let scratch = std::cell::RefCell::new(Held::new(budget));
+        self.snap.lookup_key_controlled(
+            key,
+            |old, new| -> anyhow::Result<()> {
+                if let Err(err) = scratch.borrow_mut().try_set(old.saturating_add(new)) {
+                    (check.borrow_mut())()?;
+                    return Err(err.into());
+                }
+                Ok(())
+            },
+            |capacity| -> anyhow::Result<()> {
+                if let Err(err) = scratch.borrow_mut().try_set(capacity) {
+                    (check.borrow_mut())()?;
+                    return Err(err.into());
+                }
+                Ok(())
+            },
+            || (check.borrow_mut())(),
+        )
+    }
+
     /// The id of the IRI or literal with vocabulary key `key`: in the store, else a
     /// (new) local id, failing without a new term when it does not fit the budget.
     pub fn try_id_for_key(&self, key: &[u8]) -> Result<u64, BudgetFailure> {
@@ -440,6 +634,27 @@ impl Terms {
             Term::BlankNode(node) => self.rule_bnode(node, false),
             _ => self.id_for(term),
         }
+    }
+
+    /// Strict [`id_for_rule`](Self::id_for_rule) that admits vocabulary reconstruction
+    /// scratch against the term table's budget and polls live controls, while preserving
+    /// rule blank-node handling without interpreting encoded response labels.
+    pub(crate) fn try_id_for_rule_controlled(
+        &self,
+        term: &Term,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<u64> {
+        if let Term::BlankNode(node) = term {
+            check()?;
+            return match self.rule_bnode(node, true) {
+                Ok(id) => Ok(id),
+                Err(err) => {
+                    check()?;
+                    Err(err.into())
+                }
+            };
+        }
+        self.try_id_for_controlled(term, check)
     }
 
     fn rule_bnode(&self, node: &BlankNode, strict: bool) -> Result<u64, BudgetFailure> {
@@ -696,7 +911,11 @@ impl Terms {
                     Kind::Other
                 }
             }
-            Tag::Delta => self.snap.key(i).map_or(Kind::Other, |k| key_kind(&k)),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|v| v.get(i.payload()).map_or(Kind::Other, key_kind)),
             Tag::Local => self.local_kind(id),
             _ => Kind::Other,
         }
@@ -710,19 +929,137 @@ impl Terms {
                 LocalTerm::BNode => {
                     Term::BlankNode(BlankNode::new_unchecked(format!("r{:x}", i.payload())))
                 }
-                LocalTerm::RuleBNode(key) => {
-                    use std::fmt::Write;
-                    let mut label = String::with_capacity(8 + 2 * (key.len() - 3));
-                    label.push_str("spkrule_");
-                    for byte in &key[3..] {
-                        write!(label, "{byte:02x}").expect("String write");
-                    }
-                    Term::BlankNode(BlankNode::new_unchecked(label))
-                }
+                LocalTerm::RuleBNode(key) => rule_bnode_term(&key),
                 LocalTerm::Tail(_) => return None,
             });
         }
         self.snap.term(i)
+    }
+
+    /// Inspect the IRI string of `id` from a borrowed vocabulary key without cloning
+    /// delta/local keys or allocating an owned `Term`, admitting base-vocabulary
+    /// reconstruction scratch against the term table's budget and polling `check`.
+    /// Returns `Ok(None)` immediately without reading vocabulary storage when `id` is
+    /// not an IRI.
+    pub(crate) fn with_iri_controlled<T>(
+        &self,
+        id: u64,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+        mut f: impl FnMut(&str) -> T,
+    ) -> anyhow::Result<Option<T>> {
+        check()?;
+        if self.kind(id) != Kind::Iri {
+            return Ok(None);
+        }
+        let i = Id(id);
+        match i.tag() {
+            Tag::Local => {
+                let Some(key) = self.local_key(id) else {
+                    return Ok(None);
+                };
+                Ok(key
+                    .strip_prefix(b"<")
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .map(&mut f))
+            }
+            Tag::Delta => Ok(self.snap.generation.dvocab.with(|v| {
+                v.get(i.payload())
+                    .and_then(|key| key.strip_prefix(b"<"))
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .map(&mut f)
+            })),
+            Tag::Vocab => {
+                let budget = self.budget();
+                let check = std::cell::RefCell::new(check);
+                let scratch = std::cell::RefCell::new(Held::new(&budget));
+                let result = self
+                    .snap
+                    .generation
+                    .vocab
+                    .get_with_controlled_capacity_checked(
+                        i.payload(),
+                        |old, new| -> anyhow::Result<()> {
+                            if let Err(err) = scratch.borrow_mut().try_set(old.saturating_add(new))
+                            {
+                                (check.borrow_mut())()?;
+                                return Err(err.into());
+                            }
+                            Ok(())
+                        },
+                        |capacity| -> anyhow::Result<()> {
+                            if let Err(err) = scratch.borrow_mut().try_set(capacity) {
+                                (check.borrow_mut())()?;
+                                return Err(err.into());
+                            }
+                            Ok(())
+                        },
+                        |_| (check.borrow_mut())(),
+                        |key| -> anyhow::Result<Option<T>> {
+                            Ok(key
+                                .strip_prefix(b"<")
+                                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                                .map(&mut f))
+                        },
+                    )?;
+                Ok(result.flatten())
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Decode under the proof budget, keeping the value's credit with the result.
+    pub(crate) fn term_admitted(
+        &self,
+        raw: u64,
+        budget: &Arc<Budget>,
+    ) -> anyhow::Result<(Option<Term>, Held)> {
+        let id = Id(raw);
+        let slot = std::mem::size_of::<Term>();
+        let mut retained = Held::new(budget);
+        let mut decode = |key: &[u8]| -> anyhow::Result<Term> {
+            let bytes = usize::try_from(id::key_decode_bytes(key)?).unwrap_or(usize::MAX);
+            retained.try_grow(bytes.saturating_add(slot))?;
+            Ok(id::key_to_term(key))
+        };
+        let term = match id.tag() {
+            Tag::Local => match self.table.get(id.payload()) {
+                Some(LocalTerm::Key(key)) => Some(decode(key)?),
+                Some(LocalTerm::RuleBNode(key)) => {
+                    retained.try_grow(rule_bnode_label_len(key).saturating_add(slot))?;
+                    Some(rule_bnode_term(key))
+                }
+                Some(LocalTerm::BNode) => {
+                    retained.try_grow(32 + slot)?;
+                    self.term(raw)
+                }
+                _ => None,
+            },
+            Tag::Vocab => {
+                let scratch = std::cell::RefCell::new(Held::new(budget));
+                self.snap.generation.vocab.get_with_controlled_capacity(
+                    id.payload(),
+                    |old, new| -> anyhow::Result<()> {
+                        Ok(scratch.borrow_mut().try_set(old.saturating_add(new))?)
+                    },
+                    |capacity| Ok(scratch.borrow_mut().try_set(capacity)?),
+                    decode,
+                )?
+            }
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|vocab| vocab.get(id.payload()).map(&mut decode).transpose())?,
+            Tag::Undef | Tag::Special => None,
+            _ => {
+                retained.try_grow(256)?;
+                self.term(raw)
+            }
+        };
+        let live = term.as_ref().map_or(0, sparkles_core::explain::term_bytes);
+        debug_assert!(live <= retained.bytes());
+        retained.shrink(retained.bytes().saturating_sub(live));
+        Ok((term, retained))
     }
 
     /// Decode a summary term only after reserving reconstruction and RDF heap space.

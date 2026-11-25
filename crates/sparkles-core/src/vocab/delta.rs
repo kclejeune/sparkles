@@ -807,6 +807,18 @@ impl DeltaVocab {
         Ok(result)
     }
 
+    /// Find a key visible to the snapshot with interruptible lock acquisition and search.
+    pub(crate) fn find_prepared<E>(
+        &self,
+        key: &[u8],
+        limit: u64,
+        mut check: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<u64>, E> {
+        let check = std::cell::RefCell::new(&mut check);
+        let guard = crate::task::read_lock_with(&self.inner, || check.borrow_mut()())?;
+        guard.find_prepared_with(key, limit, |_| check.borrow_mut()())
+    }
+
     pub(crate) fn with_prepared<R>(
         &self,
         preparation: &crate::access::Preparation,
@@ -827,7 +839,11 @@ impl DeltaVocab {
         self.len() == 0
     }
     pub fn get(&self, id: u64) -> Option<Vec<u8>> {
-        self.inner.read().get(id).map(|k| k.to_vec())
+        self.inner.read().get(id).map(|k| {
+            #[cfg(test)]
+            DELTA_KEY_COPIES.with(|n| n.set(n.get() + 1));
+            k.to_vec()
+        })
     }
     pub fn find(&self, key: &[u8]) -> Option<u64> {
         self.inner.read().find(key)
@@ -1112,6 +1128,16 @@ fn extend_read_only_controlled(
     budget.drop_vec(parsed.keys);
     budget.drop_vec(bytes);
     budget.check()
+}
+
+#[cfg(test)]
+thread_local! {
+    static DELTA_KEY_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "geo"))]
+pub(crate) fn delta_key_copies() -> usize {
+    DELTA_KEY_COPIES.with(|n| n.get())
 }
 
 #[cfg(test)]

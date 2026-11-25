@@ -295,12 +295,12 @@ impl Table {
     }
 
     /// Controlled opt-in decoder. Old decoder paths retain their optimized loops.
-    pub(super) fn measure_controlled(
+    pub(super) fn measure_controlled<E: From<Error>>(
         &self,
         codes: &[u8],
-        mut admit: impl FnMut(usize) -> Result<()>,
-        checkpoint: &mut impl FnMut(&'static str) -> Result<()>,
-    ) -> Result<usize> {
+        mut admit: impl FnMut(usize) -> Result<(), E>,
+        checkpoint: &mut impl FnMut(&'static str) -> Result<(), E>,
+    ) -> Result<usize, E> {
         let (mut at, mut length, mut since_check) = (0usize, 0usize, 0usize);
         while at < codes.len() {
             let code = codes[at];
@@ -326,13 +326,13 @@ impl Table {
         Ok(length)
     }
 
-    pub(super) fn decode_controlled(
+    pub(super) fn decode_controlled<E>(
         &self,
         codes: &[u8],
         max: usize,
         output: &mut Vec<u8>,
-        checkpoint: &mut impl FnMut(&'static str) -> Result<()>,
-    ) -> Result<()> {
+        checkpoint: &mut impl FnMut(&'static str) -> Result<(), E>,
+    ) -> Result<(), E> {
         let limit = output.len().saturating_add(max).min(output.capacity());
         let (mut at, mut since_check) = (0usize, 0usize);
         while at < codes.len() && output.len() < limit {

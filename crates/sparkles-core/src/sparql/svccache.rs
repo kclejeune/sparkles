@@ -350,17 +350,105 @@ impl ServiceCache {
     }
 }
 
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 = self.0.saturating_add(s.len());
+        Ok(())
+    }
+}
+
+/// Exact serialized byte length of [`key`] for the same arguments, without allocating.
+pub fn key_len(scope: &str, url: &str, pattern: &str, values: &[(&str, &Term)]) -> usize {
+    let mut len = scope
+        .len()
+        .saturating_add(url.len())
+        .saturating_add(pattern.len())
+        .saturating_add(3);
+    for &(v, t) in values {
+        let mut c = ByteCounter(0);
+        let _ = write!(c, "{t}");
+        len = len
+            .saturating_add(v.len())
+            .saturating_add(c.0)
+            .saturating_add(3);
+    }
+    len
+}
+
+struct CheckedWriter<F, E> {
+    buf: String,
+    admit: F,
+    err: Option<E>,
+}
+
+impl<F, E> Write for CheckedWriter<F, E>
+where
+    F: FnMut(usize) -> std::result::Result<(), E>,
+{
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if self.err.is_some() {
+            return Err(std::fmt::Error);
+        }
+        let needed = self.buf.len().saturating_add(s.len());
+        if needed > self.buf.capacity() {
+            let next_cap = self.buf.capacity().saturating_mul(2).max(needed);
+            if let Err(e) = (self.admit)(next_cap) {
+                self.err = Some(e);
+                return Err(std::fmt::Error);
+            }
+            self.buf.reserve(needed - self.buf.len());
+        }
+        self.buf.push_str(s);
+        Ok(())
+    }
+}
+
+/// Build the key of one request, admitting its serialized capacity before allocating the
+/// `String` and before any buffer growth while formatting terms.
+pub fn try_key<E>(
+    scope: &str,
+    url: &str,
+    pattern: &str,
+    values: &[(&str, &Term)],
+    mut admit: impl FnMut(usize) -> std::result::Result<(), E>,
+) -> std::result::Result<String, E> {
+    let exact = key_len(scope, url, pattern, values);
+    admit(exact)?;
+    let buf = String::with_capacity(exact);
+    if buf.capacity() > exact {
+        admit(buf.capacity())?;
+    }
+    let mut w = CheckedWriter {
+        buf,
+        admit,
+        err: None,
+    };
+    let _ = write!(w, "{scope}\u{0}{url}\u{0}{pattern}\u{0}");
+    if let Some(e) = w.err {
+        return Err(e);
+    }
+    if !values.is_empty() {
+        let mut vs: Vec<_> = values.to_vec();
+        vs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (v, t) in vs {
+            if write!(w, "?{v}={t};").is_err()
+                && let Some(e) = w.err
+            {
+                return Err(e);
+            }
+        }
+    }
+    debug_assert_eq!(w.buf.len(), exact);
+    Ok(w.buf)
+}
+
 /// The key of one request: the caller's scope, the endpoint, the SERVICE pattern as
 /// written and the values substituted into it, by variable name.
 pub fn key(scope: &str, url: &str, pattern: &str, values: &[(&str, &Term)]) -> String {
-    let mut s = String::with_capacity(scope.len() + url.len() + pattern.len() + 64);
-    let _ = write!(s, "{scope}\u{0}{url}\u{0}{pattern}\u{0}");
-    let mut vs: Vec<_> = values.to_vec();
-    vs.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    for (v, t) in vs {
-        let _ = write!(s, "?{v}={t};");
-    }
-    s
+    try_key::<std::convert::Infallible>(scope, url, pattern, values, |_| Ok(()))
+        .unwrap_or_else(|e| match e {})
 }
 
 #[cfg(test)]

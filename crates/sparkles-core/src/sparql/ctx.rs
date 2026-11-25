@@ -13,7 +13,7 @@ use crate::vocab::AppendVocab;
 use oxrdf::Term;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -1103,6 +1103,9 @@ pub struct Ctx {
     /// whether the query streams through pull cursors, whose grant follows their live
     /// bytes (see [`Ctx::streams`])
     streams: bool,
+    /// active scoped strict-decode guards (such as constant folding) that refuse eager
+    /// decode envelope overflows instead of silently dropping them
+    strict_decode: AtomicU32,
     // Data and weak retained caches drop before final ledger ownership.
     fast: FastMemory,
     memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
@@ -1555,6 +1558,7 @@ impl Ctx {
             owner: Default::default(),
             regex: Default::default(),
             streams: false,
+            strict_decode: AtomicU32::new(0),
             fast: Default::default(),
             memory: Default::default(),
             snap,
@@ -2133,7 +2137,7 @@ impl Ctx {
 
     /// Record the first supported execution refusal met by infallible code, so
     /// the next check preserves its original typed outcome in both modes.
-    pub(super) fn fail_memory(&self, error: &Error) {
+    pub(crate) fn fail_memory(&self, error: &Error) {
         if self.memory_failure.failed.load(Ordering::Acquire) {
             return;
         }
@@ -2272,6 +2276,21 @@ impl Ctx {
         self.streams()
     }
 
+    /// Whether a scoped strict-decode guard is active on this context (for example,
+    /// constant folding during planning), requiring eager decodes to refuse on budget
+    /// overflow and check live controls during vocabulary reconstruction.
+    #[inline]
+    fn is_strict_decode(&self) -> bool {
+        self.strict_decode.load(Ordering::Relaxed) != 0
+    }
+
+    /// Enable strict decoding for the lifetime of the returned guard so evaluator term
+    /// and value decodes propagate budget and control refusals even in eager mode.
+    pub(super) fn strict_decode_guard(&self) -> StrictDecodeGuard<'_> {
+        self.strict_decode.fetch_add(1, Ordering::AcqRel);
+        StrictDecodeGuard { ctx: self }
+    }
+
     #[cold]
     #[inline(never)]
     fn grow_decode(&self, need: u64) -> Result<()> {
@@ -2289,10 +2308,12 @@ impl Ctx {
                 // Eager callers of `term` and `value`, the planner's plan text and the
                 // readers of a finished result among them, cannot report a refusal. An
                 // eager envelope is therefore charged when the budget and the pool allow
-                // it, and otherwise the key is decoded without it, as eager decoding
-                // always was. The next growth tries the charge again.
-                let Ok(charge) = self.charge(need - *peak) else {
-                    return Ok(());
+                // it, and otherwise the key is decoded without it, unless a scoped
+                // strict-decode guard is active. The next growth tries the charge again.
+                let charge = match self.charge(need - *peak) {
+                    Ok(charge) => charge,
+                    Err(error) if self.is_strict_decode() => return Err(error),
+                    Err(_) => return Ok(()),
                 };
                 let id = charge.disarm();
                 debug_assert!(owner.is_none() || id.is_none() || *owner == id);
@@ -2324,6 +2345,21 @@ impl Ctx {
     /// decoding inside the envelope. A refusal records a failure and gives `None`.
     #[inline]
     fn with_vocab_key<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
+        let strict = self.is_strict_decode();
+        if strict {
+            return match self.snap.generation.vocab.get_with_controlled(
+                id,
+                |need| self.reserve_decode_checked(need),
+                |_| self.check(),
+                |key| self.reserve_decode(key.len()).then(|| f(key)),
+            ) {
+                Ok(found) => found.flatten(),
+                Err(error) => {
+                    self.fail_memory(&error);
+                    None
+                }
+            };
+        }
         if !self.envelope_refuses() {
             // An envelope that never refuses is charged after the key is rebuilt, on the
             // vocabulary's unchecked path. Checking it before each step of the rebuild
@@ -2874,19 +2910,184 @@ impl Ctx {
     pub fn term(&self, id: Id) -> Option<Term> {
         match id.tag() {
             Tag::Local => {
+                if self.is_strict_decode() && self.check().is_err() {
+                    return None;
+                }
                 let local = self.local.read();
                 let key = local.get(id.payload())?;
                 self.reserve_decode(key.len()).then(|| id::key_to_term(key))
             }
             Tag::Vocab => self.with_vocab_key(id.payload(), id::key_to_term),
-            Tag::Delta => self.snap.generation.dvocab.with(|vocab| {
-                vocab
-                    .get(id.payload())
-                    .and_then(|key| self.reserve_decode(key.len()).then(|| id::key_to_term(key)))
-            }),
+            Tag::Delta => {
+                if self.is_strict_decode() && self.check().is_err() {
+                    return None;
+                }
+                self.snap.generation.dvocab.with(|vocab| {
+                    vocab.get(id.payload()).and_then(|key| {
+                        self.reserve_decode(key.len()).then(|| id::key_to_term(key))
+                    })
+                })
+            }
             Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
             _ => self.snap.term(id),
         }
+    }
+
+    #[inline]
+    fn checked_decode_bytes(len: usize) -> u64 {
+        (len as u64).saturating_mul(8).saturating_add(128)
+    }
+
+    /// Decode an id into an RDF term, checking live request controls and charging the
+    /// owned decoded bytes onto `credit` so output credit stays alive with its owner.
+    /// Vocabulary reconstruction scratch is charged separately while the key is rebuilt.
+    pub(crate) fn term_checked_into(&self, id: Id, credit: &Charge<'_>) -> Result<Option<Term>> {
+        assert!(
+            credit.belongs_to(self),
+            "decode credit belongs to its query"
+        );
+        self.check()?;
+        match id.tag() {
+            Tag::Undef | Tag::Special => Ok(None),
+            Tag::Local => {
+                let len = self.local.read().get(id.payload()).map(<[u8]>::len);
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                credit.add(Self::checked_decode_bytes(len))?;
+                self.check()?;
+                Ok(self.local.read().get(id.payload()).map(id::key_to_term))
+            }
+            Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| {
+                credit.add(Self::checked_decode_bytes(key.len()))?;
+                self.check()?;
+                Ok(id::key_to_term(key))
+            }),
+            Tag::Delta => {
+                let len = self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|vocab| vocab.get(id.payload()).map(<[u8]>::len));
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                credit.add(Self::checked_decode_bytes(len))?;
+                self.check()?;
+                Ok(self
+                    .snap
+                    .generation
+                    .dvocab
+                    .with(|vocab| vocab.get(id.payload()).map(id::key_to_term)))
+            }
+            Tag::BNode => {
+                credit.add(Self::checked_decode_bytes(0))?;
+                Ok(Some(Term::BlankNode(bnode_for(id))))
+            }
+            _ => {
+                let term = self.snap.term(id);
+                if term.is_some() {
+                    credit.add(Self::checked_decode_bytes(0))?;
+                }
+                Ok(term)
+            }
+        }
+    }
+
+    /// Decode one transient RDF term under live request controls and the query's memory
+    /// budget, propagating any memory or control refusal with its original error instead
+    /// of returning `None`. Callers that retain or decode multiple terms together should
+    /// pass a live [`Charge`] to [`Ctx::term_checked_into`].
+    pub(crate) fn term_checked(&self, id: Id) -> Result<Option<Term>> {
+        let decode = self.charge(0)?;
+        self.term_checked_into(id, &decode)
+    }
+
+    /// Decode an id into a value, checking live request controls and charging the owned
+    /// decoded bytes onto `credit` so output credit stays alive with its owner.
+    /// Vocabulary reconstruction scratch and optional value-cache admission stay separate.
+    pub(crate) fn value_checked_into(&self, id: Id, credit: &Charge<'_>) -> Result<Option<Value>> {
+        assert!(
+            credit.belongs_to(self),
+            "decode credit belongs to its query"
+        );
+        self.check()?;
+        match id.tag() {
+            Tag::Undef | Tag::Special => Ok(None),
+            Tag::Int => Ok(Some(Value::Integer(id.as_i64().into()))),
+            Tag::Bool => Ok(Some(Value::Bool(id.as_bool()))),
+            Tag::Double => Ok(Some(Value::Double(id.as_f64().into()))),
+            Tag::Decimal => Ok(Some(Value::Decimal(id::unpack_decimal(id.payload())))),
+            Tag::DateTime | Tag::Date => {
+                Ok(id::inline_to_literal(id).map(|l| Value::from_literal(&l)))
+            }
+            Tag::BNode => {
+                credit.add(Self::checked_decode_bytes(0))?;
+                Ok(Some(Value::BNode(bnode_for(id).as_str().into())))
+            }
+            _ => {
+                if id.tag() == Tag::Vocab
+                    && let Some(v) = self.column_value(id.payload())
+                {
+                    return Ok(Some(v));
+                }
+                if let Some(v) = self.values.get(id) {
+                    return Ok(Some(v));
+                }
+                let v = match id.tag() {
+                    Tag::Vocab => self.with_controlled_vocab_key(id.payload(), |key| {
+                        credit.add(Self::checked_decode_bytes(key.len()))?;
+                        self.check()?;
+                        Ok(Value::from_key(key))
+                    })?,
+                    Tag::Delta => {
+                        let len = self
+                            .snap
+                            .generation
+                            .dvocab
+                            .with(|v| v.get(id.payload()).map(<[u8]>::len));
+                        match len {
+                            Some(len) => {
+                                credit.add(Self::checked_decode_bytes(len))?;
+                                self.check()?;
+                                self.snap
+                                    .generation
+                                    .dvocab
+                                    .with(|v| v.get(id.payload()).map(Value::from_key))
+                            }
+                            None => None,
+                        }
+                    }
+                    Tag::Local => {
+                        let len = self.local.read().get(id.payload()).map(<[u8]>::len);
+                        match len {
+                            Some(len) => {
+                                credit.add(Self::checked_decode_bytes(len))?;
+                                self.check()?;
+                                self.local.read().get(id.payload()).map(Value::from_key)
+                            }
+                            None => None,
+                        }
+                    }
+                    _ => unreachable!("dictionary value tag"),
+                };
+                if let Some(v) = v {
+                    self.cache_value(id, &v);
+                    Ok(Some(v))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Decode one transient value under live request controls and the query's memory
+    /// budget, propagating any memory or control refusal with its original error instead
+    /// of returning `None`. Callers that retain or decode multiple values together should
+    /// pass a live [`Charge`] to [`Ctx::value_checked_into`].
+    pub(crate) fn value_checked(&self, id: Id) -> Result<Option<Value>> {
+        let decode = self.charge(0)?;
+        self.value_checked_into(id, &decode)
     }
 
     /// Decode one retained output cell after admitting its owned payload. Unlike the
@@ -2910,7 +3111,7 @@ impl Ctx {
                     .local
                     .read()
                     .get(id.payload())
-                    .map(|key| output_key_bytes(self, key, 0))
+                    .map(|key| output_key_bytes(self, key))
                     .transpose()?;
                 match bytes {
                     None => None,
@@ -2928,7 +3129,7 @@ impl Ctx {
                     .with(|vocab| {
                         vocab
                             .get(id.payload())
-                            .map(|key| output_key_bytes(self, key, 0))
+                            .map(|key| output_key_bytes(self, key))
                     })
                     .transpose()?;
                 match bytes {
@@ -3004,7 +3205,7 @@ impl Ctx {
                     .local
                     .read()
                     .get(id.payload())
-                    .map(|key| output_key_bytes(self, key, 0))
+                    .map(|key| output_key_bytes(self, key))
                     .transpose()?;
                 if let Some(bytes) = bytes {
                     row.add(bytes)?;
@@ -3021,7 +3222,7 @@ impl Ctx {
                     .with(|vocab| {
                         vocab
                             .get(id.payload())
-                            .map(|key| output_key_bytes(self, key, 0))
+                            .map(|key| output_key_bytes(self, key))
                     })
                     .transpose()?;
                 if let Some(bytes) = bytes {
@@ -3148,7 +3349,7 @@ impl Ctx {
         }
         let decode = || {
             self.check()?;
-            storage.add(output_key_bytes(self, key, 0)?)?;
+            storage.add(output_key_bytes(self, key)?)?;
             #[cfg(test)]
             {
                 use crate::algo::memory::probe;
@@ -3193,6 +3394,34 @@ impl Ctx {
             },
             f,
         )
+    }
+
+    /// Reconstruct one base vocabulary key with query-owned scratch credit and live
+    /// request-control checkpoints. Twice the requested size covers old and new buffers
+    /// during reallocation.
+    pub(super) fn with_controlled_vocab_key<T>(
+        &self,
+        id: u64,
+        mut f: impl FnMut(&[u8]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        self.check()?;
+        let scratch = self.charge(0)?;
+        let mut reserved = 0;
+        self.snap
+            .generation
+            .vocab
+            .get_with_controlled(
+                id,
+                |need| {
+                    let bytes = (need as u64).saturating_mul(2);
+                    scratch.add(bytes.saturating_sub(reserved))?;
+                    reserved = bytes;
+                    Ok(())
+                },
+                |_| self.check(),
+                &mut f,
+            )?
+            .transpose()
     }
 
     /// Algorithm-owned key reconstruction never populates the eager value cache.
@@ -3378,12 +3607,21 @@ impl Ctx {
                     |key: &[u8]| self.reserve_decode(key.len()).then(|| Value::from_key(key));
                 let v = match id.tag() {
                     Tag::Vocab => self.with_vocab_key(id.payload(), Value::from_key),
-                    Tag::Delta => self
-                        .snap
-                        .generation
-                        .dvocab
-                        .with(|v| v.get(id.payload()).and_then(decode)),
-                    Tag::Local => self.local.read().get(id.payload()).and_then(decode),
+                    Tag::Delta => {
+                        if self.is_strict_decode() && self.check().is_err() {
+                            return None;
+                        }
+                        self.snap
+                            .generation
+                            .dvocab
+                            .with(|v| v.get(id.payload()).and_then(decode))
+                    }
+                    Tag::Local => {
+                        if self.is_strict_decode() && self.check().is_err() {
+                            return None;
+                        }
+                        self.local.read().get(id.payload()).and_then(decode)
+                    }
                     _ => unreachable!("dictionary value tag"),
                 }?;
                 self.cache_value(id, &v);
@@ -3495,7 +3733,11 @@ impl Ctx {
                     TermKind::Literal
                 }
             }
-            Tag::Delta => self.snap.key(id).map_or(TermKind::None, |k| key_kind(&k)),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|d| d.get(id.payload()).map_or(TermKind::None, key_kind)),
             Tag::Local => self
                 .local
                 .read()
@@ -3518,6 +3760,38 @@ impl Ctx {
         let lexical = |k: &[u8]| -> Option<std::ops::Range<usize>> {
             (k.len() >= 2 && k[0] == b'"' && k[k.len() - 1] == id::KEY_SEP).then(|| 1..k.len() - 1)
         };
+        if self.is_strict_decode() {
+            let mut order = None;
+            let outer = v.get_with_controlled(
+                x,
+                |need| self.reserve_decode_checked(need),
+                |_| self.check(),
+                |kx| {
+                    let Some(rx) = lexical(kx) else {
+                        return Ok(());
+                    };
+                    v.get_with_controlled(
+                        y,
+                        |need| self.reserve_decode_checked(need),
+                        |_| self.check(),
+                        |ky| {
+                            if let Some(ry) = lexical(ky) {
+                                order = Some(kx[rx.clone()].cmp(&ky[ry]));
+                            }
+                        },
+                    )
+                    .map(|_| ())
+                },
+            );
+            return match outer {
+                Ok(Some(Ok(()))) => order,
+                Ok(Some(Err(error))) | Err(error) => {
+                    self.fail_memory(&error);
+                    None
+                }
+                Ok(None) => None,
+            };
+        }
         // The reconstruction of both keys is reserved before it grows them, within the
         // high-water envelope of transient decoding ([`Ctx::reserve_decode`]). That
         // envelope covers a key of the largest size seen so far on every worker, both
@@ -3595,6 +3869,12 @@ impl Ctx {
         id: u64,
         f: impl FnOnce(Option<usize>, &[u8]) -> T,
     ) -> Option<T> {
+        if self.is_strict_decode() {
+            let mut f = Some(f);
+            return self
+                .with_vocab_key(id, |key| f.take().map(|f| f(None, key)))
+                .flatten();
+        }
         let vocab = &self.snap.generation.vocab;
         if !self.envelope_refuses() {
             let mut f = Some(f);
@@ -3757,6 +4037,19 @@ impl Ctx {
     /// envelope. A refusal records a failure and gives `None`.
     fn vocab_lower_bound(&self, key: &[u8]) -> Option<u64> {
         let v = &self.snap.generation.vocab;
+        if self.is_strict_decode() {
+            return match v.find_with_controlled(
+                key,
+                |need| self.reserve_decode_checked(need),
+                |_| self.check(),
+            ) {
+                Ok(Ok(i) | Err(i)) => Some(i),
+                Err(error) => {
+                    self.fail_memory(&error);
+                    None
+                }
+            };
+        }
         if !self.envelope_refuses() {
             let (Ok(i) | Err(i)) = v.find(key);
             return Some(i);
@@ -3794,7 +4087,7 @@ fn output_key_term(ctx: &Ctx, key: &[u8], row: &RowCredit<'_>) -> Result<Term> {
         )?;
         return Ok(text.into_term());
     }
-    row.add(output_key_bytes(ctx, key, 0)?)?;
+    row.add(output_key_bytes(ctx, key)?)?;
     Ok(copied_output_key(key))
 }
 
@@ -3810,97 +4103,8 @@ fn copied_output_key(key: &[u8]) -> Term {
     }
 }
 
-fn output_key_bytes(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
-    if depth == 0 && key.first() == Some(&b'(') {
-        return super::depth::with_stack(crate::nesting::MAX_TRIPLE_TERMS, || {
-            output_key_bytes_inner(ctx, key, depth)
-        });
-    }
-    output_key_bytes_inner(ctx, key, depth)
-}
-fn output_key_bytes_inner(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
-    let overflow = || ctx.memory_exceeded(u64::MAX);
-    let malformed = || Error::Corrupt("invalid vocabulary triple-term key".into());
-    if depth > crate::nesting::MAX_TRIPLE_TERMS {
-        return Err(malformed());
-    }
-    if key.first() != Some(&b'(') {
-        // UTF-8 text is copied into String. The fixed allowance covers
-        // a datatype/language string, blank-node formatting and string construction.
-        // A damaged key's lossy UTF-8 route can expand each byte to three bytes.
-        let bytes = (key.len() as u64).checked_mul(3).ok_or_else(overflow)?;
-        // Literal separators and blank-node binary IDs are not UTF-8 text.
-        let mut overlap = 64u64;
-        let valid = match key.first() {
-            Some(b'"') => {
-                let sep = key
-                    .iter()
-                    .rposition(|&b| b == id::KEY_SEP)
-                    .unwrap_or(key.len());
-                let suffix = key.get(sep + 1..).unwrap_or(&[]);
-                if suffix.first() == Some(&b'@') {
-                    // lang_literal borrows a temporary decoded tag while oxrdf
-                    // copies that tag into its final owned String.
-                    let tag = &suffix[1..];
-                    let copies = if std::str::from_utf8(tag).is_ok() {
-                        1
-                    } else {
-                        3
-                    };
-                    overlap = overlap
-                        .checked_add(
-                            (tag.len() as u64)
-                                .checked_mul(copies)
-                                .ok_or_else(overflow)?,
-                        )
-                        .ok_or_else(overflow)?;
-                }
-                std::str::from_utf8(&key[1..sep]).is_ok() && std::str::from_utf8(suffix).is_ok()
-            }
-            Some(b'_') => true,
-            _ => std::str::from_utf8(key).is_ok(),
-        };
-        return (if valid { key.len() as u64 } else { bytes })
-            .checked_add(overlap)
-            .ok_or_else(overflow);
-    }
-    let mut bytes =
-        (3 * std::mem::size_of::<Term>()) as u64 + std::mem::size_of::<oxrdf::Triple>() as u64;
-    let mut pos = 1usize;
-    for _ in 0..3 {
-        // Only existing three-component headers are walked, without allocation.
-        // Invalid lengths are corruption; they are not relabeled budget failures.
-        let mut len = 0u64;
-        let mut shift = 0;
-        loop {
-            let next = *key.get(pos).ok_or_else(malformed)?;
-            pos += 1;
-            if shift == 63 && next > 1 {
-                return Err(malformed());
-            }
-            len |= u64::from(next & 127)
-                .checked_shl(shift)
-                .ok_or_else(malformed)?;
-            if next & 128 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err(malformed());
-            }
-        }
-        let len = usize::try_from(len).map_err(|_| malformed())?;
-        let end = pos.checked_add(len).ok_or_else(malformed)?;
-        let part = key.get(pos..end).ok_or_else(malformed)?;
-        bytes = bytes
-            .checked_add(output_key_bytes(ctx, part, depth + 1)?)
-            .ok_or_else(overflow)?;
-        pos = end;
-    }
-    if pos != key.len() {
-        return Err(malformed());
-    }
-    Ok(bytes)
+fn output_key_bytes(ctx: &Ctx, key: &[u8]) -> Result<u64> {
+    id::key_decode_bytes_with(key, || ctx.memory_exceeded(u64::MAX))
 }
 
 /// Estimated bytes of `rows` rows of `width` ids (a row of a zero-width table still
@@ -3908,6 +4112,17 @@ fn output_key_bytes_inner(ctx: &Ctx, key: &[u8], depth: usize) -> Result<u64> {
 #[inline]
 pub fn table_bytes(rows: usize, width: usize) -> u64 {
     (rows as u64).saturating_mul(width.max(1) as u64 * 8)
+}
+
+/// RAII guard returned by [`Ctx::strict_decode_guard`].
+pub(super) struct StrictDecodeGuard<'a> {
+    ctx: &'a Ctx,
+}
+
+impl Drop for StrictDecodeGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.strict_decode.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Estimated memory held by a running operator (its input tables), released when the
@@ -4677,7 +4892,7 @@ mod charge_tests {
             assert_eq!(term, id::key_to_term(key), "{key:?}");
             assert_eq!(
                 row.used.get(),
-                output_key_bytes(&ctx, key, 0).unwrap(),
+                output_key_bytes(&ctx, key).unwrap(),
                 "{key:?}"
             );
         }

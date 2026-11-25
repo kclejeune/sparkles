@@ -9182,7 +9182,7 @@ fn spatial_relate(
 }
 
 /// The vector of entity `e` under `pred` in the active graph (`None`: it has none).
-fn entity_vector(
+pub(super) fn entity_vector(
     ctx: &Ctx,
     spec: &super::plan::VectorSpec,
     pred: Id,
@@ -9204,7 +9204,7 @@ fn entity_vector(
             .ok_or_else(|| Error::invalid("the entity's vector is not a valid spk:vector")),
         many => Err(Error::invalid(format!(
             "entity {} has {} vectors for the predicate; pass a vector literal",
-            ctx.term(e).map_or("?".into(), |t| t.to_string()),
+            ctx.plan_term(e).map_or("?".into(), |t| t.to_string()),
             many.len()
         ))),
     }

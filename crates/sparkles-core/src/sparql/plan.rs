@@ -2029,7 +2029,7 @@ impl<'a> Planner<'a> {
             } => {
                 let mut child = self.plan(inner, g, Vec::new())?;
                 super::demand::plan_slice(self.ctx, &mut child, *start, *length);
-                let n = slice(child, *start, *length, self.ctx);
+                let n = slice(child, *start, *length, self.ctx)?;
                 self.apply_filters(n, filters)
             }
             GP::Group {
@@ -2158,7 +2158,7 @@ impl<'a> Planner<'a> {
                     };
                 // the constants in force (initial bindings, the row of an EXISTS or a
                 // LATERAL) are sent as values
-                let subst = super::enhancer::planner_subst(self, inner);
+                let (subst, subst_credit) = super::enhancer::planner_subst(self, inner)?;
                 let mut names = Vec::new();
                 collect_pattern_vars(inner, &mut names);
                 let mut vars: Vec<VarId> = names
@@ -2178,6 +2178,8 @@ impl<'a> Planner<'a> {
                 } else {
                     super::enhancer::single_request(&super::enhancer::substitute(inner, &subst))
                 };
+                drop(subst);
+                drop(subst_credit);
                 let mut n = Node::leaf(
                     Kind::Service {
                         endpoint,
@@ -4826,7 +4828,7 @@ impl<'a> Planner<'a> {
             *append_credit = self.grow_filters(filters, more, 4, |f| f.append(settled))?;
         }
         // components connected by a spatial conjunct are joined on it
-        super::geojoin::spatial_joins(&mut parts, filters, self.ctx);
+        super::geojoin::spatial_joins(&mut parts, filters, self.ctx)?;
         // cross products between components, smallest first
         parts.sort_by(|a, b| a.est.total_cmp(&b.est));
         let mut it = parts.into_iter();
@@ -5054,7 +5056,7 @@ impl<'a> Planner<'a> {
                     if now.is_empty() {
                         n
                     } else {
-                        filter(n, now, self.ctx)
+                        filter_checked(n, now, self.ctx)?
                     },
                     None,
                 ));
@@ -5118,14 +5120,14 @@ impl<'a> Planner<'a> {
         owned: u64,
     ) -> Result<(Node, Option<Reservation>)> {
         let Some(mut held) = scratch else {
-            return Ok((filter(n, exprs, self.ctx), None));
+            return Ok((filter_checked(n, exprs, self.ctx)?, None));
         };
         let before = {
             let mut layout = super::checked_layout::Layout::retained(held.preparation());
             layout.shallow(&n)?;
             layout.bytes()
         };
-        let f = filter(n, exprs, self.ctx);
+        let f = filter_checked(n, exprs, self.ctx)?;
         // The FILTER, and the scan under it that range pushdown made in place of `n`,
         // or `n` itself, whose storage `before` measured.
         let (after, spatial) = {
@@ -6729,16 +6731,27 @@ pub(super) fn filter_bound<'e>(
 }
 
 pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
+    match filter_checked(n.clone(), exprs.clone(), ctx) {
+        Ok(out) => out,
+        Err(error) => {
+            ctx.fail_memory(&error);
+            let texts: Vec<String> = exprs.iter().map(|e| e.display(ctx)).collect();
+            Node::unary(Kind::Filter(exprs), n, texts.join(" && "))
+        }
+    }
+}
+
+pub(super) fn filter_checked(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Result<Node> {
     #[cfg(test)]
     let _stage = crate::test_alloc::Stage::within(6);
-    let (n, exprs) = push_range(n, exprs, ctx);
+    let (n, exprs) = push_range(n, exprs, ctx)?;
     let (n, exprs) = {
         #[cfg(test)]
         let _stage = crate::test_alloc::Stage::enter(9);
-        super::geopf::push_spatial(n, exprs, ctx)
+        super::geopf::push_spatial_checked(n, exprs, ctx)?
     };
     if exprs.is_empty() {
-        return n;
+        return Ok(n);
     }
     let texts: Vec<String> = exprs.iter().map(|e| e.display(ctx)).collect();
     let sampled: Vec<Option<super::sample::Sampled>> =
@@ -6769,7 +6782,7 @@ pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
     for d in f.dist.values_mut() {
         *d = d.min(f.est.max(1.0));
     }
-    f
+    Ok(f)
 }
 
 /// The rows a FILTER over scan `n` reads, and the key ranges it reads them in, when a
@@ -6950,7 +6963,22 @@ pub(super) enum RangeOp {
 
 /// `?v op c` for a filter conjunct comparing variable `v` with a numeric literal.
 pub(super) fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, super::value::Value)> {
-    compare_atom(e, v, ctx, super::value::Value::is_numeric)
+    match range_atom_checked(e, v, ctx) {
+        Ok(v) => v,
+        Err(error) => {
+            ctx.fail_memory(&error);
+            None
+        }
+    }
+}
+
+/// [`range_atom`], propagating any memory or control refusal with its original error.
+pub(super) fn range_atom_checked(
+    e: &Expr,
+    v: VarId,
+    ctx: &Ctx,
+) -> Result<Option<(RangeOp, super::value::Value)>> {
+    compare_atom_checked(e, v, ctx, super::value::Value::is_numeric)
 }
 
 /// `?v op c` for a filter conjunct comparing variable `v` with a constant `c` that
@@ -6961,19 +6989,38 @@ pub(super) fn compare_atom(
     ctx: &Ctx,
     accept: fn(&super::value::Value) -> bool,
 ) -> Option<(RangeOp, super::value::Value)> {
+    match compare_atom_checked(e, v, ctx, accept) {
+        Ok(v) => v,
+        Err(error) => {
+            ctx.fail_memory(&error);
+            None
+        }
+    }
+}
+
+/// [`compare_atom`], propagating any memory or control refusal with its original error.
+pub(super) fn compare_atom_checked(
+    e: &Expr,
+    v: VarId,
+    ctx: &Ctx,
+    accept: fn(&super::value::Value) -> bool,
+) -> Result<Option<(RangeOp, super::value::Value)>> {
     use super::expr::CmpOp;
     let (a, b, op) = match e {
         Expr::Cmp(a, b, op) => (a, b, Some(*op)),
         Expr::Eq(a, b) => (a, b, None),
-        _ => return None,
+        _ => return Ok(None),
     };
-    fn constant(e: &Expr, ctx: &Ctx) -> Option<super::value::Value> {
+    fn constant(e: &Expr, ctx: &Ctx) -> Result<Option<super::value::Value>> {
         use super::value::{NumOp, Value, arith};
-        match e {
+        Ok(match e {
             Expr::Lit(_, c) => Some(c.clone()),
-            Expr::Const(id) => ctx.value(*id),
-            Expr::Neg(x) => arith(NumOp::Sub, &Value::Integer(0.into()), &constant(x, ctx)?).ok(),
-            Expr::Pos(x) => constant(x, ctx).filter(|c| c.is_numeric()),
+            Expr::Const(id) => ctx.value_checked(*id)?,
+            Expr::Neg(x) => match constant(x, ctx)? {
+                Some(x) => arith(NumOp::Sub, &Value::Integer(0.into()), &x).ok(),
+                None => None,
+            },
+            Expr::Pos(x) => constant(x, ctx)?.filter(|c| c.is_numeric()),
             Expr::Arith(x, y, op) => {
                 use super::expr::ArithOp;
                 let op = match op {
@@ -6982,23 +7029,30 @@ pub(super) fn compare_atom(
                     ArithOp::Mul => NumOp::Mul,
                     ArithOp::Div => NumOp::Div,
                 };
-                let (x, y) = (constant(x, ctx)?, constant(y, ctx)?);
+                let (Some(x), Some(y)) = (constant(x, ctx)?, constant(y, ctx)?) else {
+                    return Ok(None);
+                };
                 if !(x.is_numeric() && y.is_numeric()) {
-                    return None;
+                    return Ok(None);
                 }
                 arith(op, &x, &y).ok()
             }
             _ => None,
-        }
+        })
     }
-    let constant = |e: &Expr| constant(e, ctx);
     let (c, flip) = match (&**a, &**b) {
-        (Expr::Var(x), c) if *x == v => (constant(c)?, false),
-        (c, Expr::Var(x)) if *x == v => (constant(c)?, true),
-        _ => return None,
+        (Expr::Var(x), c) if *x == v => match constant(c, ctx)? {
+            Some(c) => (c, false),
+            None => return Ok(None),
+        },
+        (c, Expr::Var(x)) if *x == v => match constant(c, ctx)? {
+            Some(c) => (c, true),
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
     };
     if !accept(&c) {
-        return None;
+        return Ok(None);
     }
     let op = match (op, flip) {
         (None, _) => RangeOp::Eq,
@@ -7007,7 +7061,7 @@ pub(super) fn compare_atom(
         (Some(CmpOp::Gt), false) | (Some(CmpOp::Lt), true) => RangeOp::Gt,
         (Some(CmpOp::Ge), false) | (Some(CmpOp::Le), true) => RangeOp::Ge,
     };
-    Some((op, c))
+    Ok(Some((op, c)))
 }
 
 /// Id ranges whose values satisfy every atom (see [`RangeSpec`]).
@@ -7060,16 +7114,24 @@ pub(super) fn numeric_segment(
     lo: u64,
     hi: u64,
 ) -> Option<IdRange> {
-    use super::value::compare;
+    use super::value::{Value, compare};
     use std::cmp::Ordering;
+    let _ = ctx;
+    debug_assert!(matches!(tag, Tag::Int | Tag::Decimal));
     // the atoms split into lower bounds (false, then true along a segment in value order)
     // and upper bounds (true, then false); `=` is both
     let cmp = |id: u64| {
-        ctx.value(Id(id)).map(|x| {
+        let id = Id(id);
+        let x = match id.tag() {
+            Tag::Int => Value::Integer(id.as_i64().into()),
+            Tag::Decimal => Value::Decimal(crate::id::unpack_decimal(id.payload())),
+            _ => return None,
+        };
+        Some(
             atoms
                 .iter()
-                .map(move |(op, c)| (*op, compare(&x, c).ok().flatten()))
-        })
+                .map(move |(op, c)| (*op, compare(&x, c).ok().flatten())),
+        )
     };
     let lower_ok = |id: u64| {
         cmp(id).is_some_and(|mut it| {
@@ -7123,27 +7185,31 @@ thread_local! {
 }
 
 /// Move numeric range conjuncts on a scan's sorted column into an [`Kind::RangeScan`].
-fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
+fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Result<(Node, Vec<Expr>)> {
     let Kind::Scan(spec) = &n.kind else {
-        return (n, exprs);
+        return Ok((n, exprs));
     };
     let Some(&(col, v)) = spec.cols.first() else {
-        return (n, exprs);
+        return Ok((n, exprs));
     };
     if !ctx.opt.range_pushdown || col != spec.prefix.len() || spec.graph_col == col {
-        return (n, exprs);
+        return Ok((n, exprs));
     }
-    let (pushed, rest): (Vec<Expr>, Vec<Expr>) = exprs
-        .into_iter()
-        .flat_map(Expr::conjuncts)
-        .partition(|e| range_atom(e, v, ctx).is_some());
+    let mut pushed = Vec::new();
+    let mut rest = Vec::new();
+    let mut atoms = Vec::new();
+    for e in exprs.into_iter().flat_map(Expr::conjuncts) {
+        match range_atom_checked(&e, v, ctx)? {
+            Some(atom) => {
+                pushed.push(e);
+                atoms.push(atom);
+            }
+            None => rest.push(e),
+        }
+    }
     if pushed.is_empty() {
-        return (n, rest);
+        return Ok((n, rest));
     }
-    let atoms: Vec<_> = pushed
-        .iter()
-        .filter_map(|e| range_atom(e, v, ctx))
-        .collect();
     let ranges = numeric_ranges(&atoms, ctx);
     let exact = ranges.iter().filter(|r| r.exact).count();
     let desc = format!(
@@ -7173,7 +7239,7 @@ fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
                 .count_between(spec.perm, bound(r.lo, 0), bound(r.hi, u64::MAX))
         };
         let Ok(rows) = counted else {
-            return (n, rest.into_iter().chain(pushed).collect());
+            return Ok((n, rest.into_iter().chain(pushed).collect()));
         };
         let rows = rows as f64;
         if r.exact {
@@ -7205,7 +7271,7 @@ fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
     for d in r.dist.values_mut() {
         *d = d.min(r.est.max(1.0));
     }
-    (r, rest)
+    Ok((r, rest))
 }
 
 /// Id segments of a key column in id order, covering every id, with how ids order the
@@ -7287,7 +7353,8 @@ const LEXICAL_PROBE_ROWS: usize = 32;
 /// another kind, the generic plan answers after the first step, so the planner keeps
 /// the plain sort for columns that do not start with plain strings, such
 /// as language-tagged labels. Only the plan depends on this check.
-fn plain_strings_first(ctx: &Ctx, scan: &ScanSpec, lo: u64, hi: u64) -> bool {
+pub(super) fn plain_strings_first(ctx: &Ctx, scan: &ScanSpec, lo: u64, hi: u64) -> Result<bool> {
+    ctx.check()?;
     let col = scan.prefix.len();
     let bound = |id: u64, fill: u64| {
         let mut key = crate::index::pad(&scan.prefix, fill);
@@ -7307,15 +7374,23 @@ fn plain_strings_first(ctx: &Ctx, scan: &ScanSpec, lo: u64, hi: u64) -> bool {
             }
             Ok(ids.len() < LEXICAL_PROBE_ROWS)
         });
-    let vocab = &ctx.snap.generation.vocab;
-    read.is_ok()
-        && !ids.is_empty()
-        && ids.iter().all(|&id| {
-            Id(id).tag() == Tag::Vocab
-                && vocab.get(Id(id).payload()).is_some_and(|k| {
-                    k.first() == Some(&b'"') && k.last() == Some(&crate::id::KEY_SEP)
-                })
-        })
+    if read.is_err() || ids.is_empty() {
+        return Ok(false);
+    }
+    for &id in &ids {
+        if Id(id).tag() != Tag::Vocab {
+            return Ok(false);
+        }
+        let plain = ctx
+            .with_controlled_vocab_key(Id(id).payload(), |k| {
+                Ok(k.first() == Some(&b'"') && k.last() == Some(&crate::id::KEY_SEP))
+            })?
+            .unwrap_or(false);
+        if !plain {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// What placing the read steps at the best end of a monotone [`OrderedTopK`] piece costs,
@@ -7339,19 +7414,19 @@ fn force_ordered_topk() -> bool {
 /// `ORDER BY ?v LIMIT k` over a single scan (and FILTERs over it), with `?v` one of the
 /// scan's variables: an [`OrderedTopK`] when the scan can be read in the order of `?v`
 /// and that reads at most half of its rows (counted exactly per id piece).
-fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
+fn ordered_topk(n: Node, ctx: &Ctx) -> Result<Node> {
     let Kind::OrderBy {
         keys,
         limit: Some(k),
     } = &n.kind
     else {
-        return n;
+        return Ok(n);
     };
     if !ctx.opt.ordered_topk || *k == 0 {
-        return n;
+        return Ok(n);
     }
     let [(Expr::Var(v), asc)] = keys.as_slice() else {
-        return n;
+        return Ok(n);
     };
     let (v, asc, k) = (*v, *asc, *k);
     let child = &n.children[0];
@@ -7363,19 +7438,19 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
         .iter()
         .any(|e| e.has_exists() || !super::cache::deterministic(e))
     {
-        return n;
+        return Ok(n);
     }
     let (spec, range) = match &leaf.kind {
         Kind::Scan(spec) => (spec, None),
         Kind::RangeScan(spec, range) => (spec, Some(range)),
-        _ => return n,
+        _ => return Ok(n),
     };
     let Some(scan) = reorder_scan(spec, v) else {
-        return n;
+        return Ok(n);
     };
     let col = scan.prefix.len();
     if scan.graph_col == col || scan.cols.first().map(|c| c.1) != Some(v) {
-        return n;
+        return Ok(n);
     }
     // the generic plan's rows come in its scan's key order
     let mut tie: Vec<(usize, VarId)> = spec.cols.clone();
@@ -7437,7 +7512,7 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
                 .snap
                 .count_between(scan.perm, bound(lo, 0), bound(hi, u64::MAX))
             else {
-                return n;
+                return Ok(n);
             };
             if rows == 0 {
                 continue;
@@ -7458,7 +7533,7 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
             // when they look like plain strings there
             let lexical = asc
                 && literals.is_some_and(|(a, b)| a <= lo && hi <= b)
-                && (force_ordered_topk() || plain_strings_first(ctx, &scan, lo, hi));
+                && (force_ordered_topk() || plain_strings_first(ctx, &scan, lo, hi)?);
             read += match mono {
                 Some(_) => rows.min(TOPK_EDGE_ROWS + k as f64 / sel),
                 None if lexical => rows.min(TOPK_EDGE_ROWS + k as f64 / sel),
@@ -7474,7 +7549,7 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
         }
     }
     if pieces.is_empty() || read * 2.0 > total && !force_ordered_topk() {
-        return n;
+        return Ok(n);
     }
     let desc = format!(
         "{desc} | {} limit {k} [{} of {} id pieces in value order]",
@@ -7491,7 +7566,7 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
     for d in dist.values_mut() {
         *d = d.min(est.max(1.0));
     }
-    Node {
+    Ok(Node {
         vars: n.vars.clone(),
         certain: n.certain.clone(),
         kind: Kind::OrderedTopK(Box::new(OrderedTopK {
@@ -7511,7 +7586,7 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
         cost: read + seeks + est,
         dist,
         desc,
-    }
+    })
 }
 
 pub fn project(n: Node, vars: Vec<VarId>, ctx: &Ctx) -> Node {
@@ -7537,7 +7612,7 @@ fn project_described(n: Node, vars: Vec<VarId>, desc: String) -> Node {
     p
 }
 
-fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
+fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Result<Node> {
     // ORDER BY + LIMIT → top-k (also through a projection), over a single scan read in
     // value order when that is cheaper
     let limit = length.map(|l| l.saturating_add(start));
@@ -7557,9 +7632,9 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
                 *limit = Some(k);
             }
             ordered_topk(
-                super::geojoin::spatial_knn(super::vectortopk::vector_topk(n, ctx), ctx),
+                super::geojoin::spatial_knn(super::vectortopk::vector_topk(n, ctx)?, ctx)?,
                 ctx,
-            )
+            )?
         }
         (mut n, Some(k))
             if matches!(n.kind, Kind::Project(_))
@@ -7571,9 +7646,9 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
             }
             let order = n.children.pop().unwrap();
             n.children.push(ordered_topk(
-                super::geojoin::spatial_knn(super::vectortopk::vector_topk(order, ctx), ctx),
+                super::geojoin::spatial_knn(super::vectortopk::vector_topk(order, ctx)?, ctx)?,
                 ctx,
-            ));
+            )?);
             n
         }
         (n, _) => n,
@@ -7602,7 +7677,7 @@ fn slice(child: Node, start: usize, length: Option<usize>, ctx: &Ctx) -> Node {
     if let Some(l) = length {
         n.est = n.est.min(l as f64);
     }
-    n
+    Ok(n)
 }
 
 /// Pass a LIMIT of `k` rows without OFFSET into an operator below it whose first `k`

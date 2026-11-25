@@ -76,7 +76,11 @@ struct Shared {
 
 /// A rule program of the IR over a session's terms.
 pub(crate) type ProgramSource = Arc<
-    dyn Fn(&Terms, &mut WorkingWarnings) -> anyhow::Result<crate::engine::frontend::ProgramInfo>
+    dyn Fn(
+            &Terms,
+            &mut WorkingWarnings,
+            &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<crate::engine::frontend::ProgramInfo>
         + Send
         + Sync,
 >;
@@ -105,9 +109,13 @@ impl QueryReasoner {
         crate::parser::check_program_includes(&rules)?;
         let program: Option<ProgramSource> = crate::parser::uses_program(&rules).then(|| {
             let parsed = Arc::new(rules.clone());
-            let source: ProgramSource = Arc::new(move |t: &Terms, w: &mut WorkingWarnings| {
-                crate::engine::frontend::compile(&parsed, t, w, true)
-            });
+            let source: ProgramSource = Arc::new(
+                move |t: &Terms,
+                      w: &mut WorkingWarnings,
+                      check: &mut dyn FnMut() -> anyhow::Result<()>| {
+                    crate::engine::frontend::compile_controlled(&parsed, t, w, true, check)
+                },
+            );
             source
         });
         Ok(QueryReasoner {
@@ -458,6 +466,53 @@ fn demand_text(d: &Demand) -> String {
     format!("{{ {} {} {} }}", t(&d.s), t(&d.p), t(&d.o))
 }
 
+/// What a [`Session::run`] call is deriving, formatted lazily only on error or debug
+/// tracing so large literal demands are never formatted on the normal path.
+#[derive(Clone, Copy)]
+enum RunWhat<'a> {
+    Label(&'a str),
+    Demands(&'a [usize]),
+}
+
+fn format_what<'a>(
+    what: RunWhat<'a>,
+    demands: &[Demand],
+    keys: &[Key],
+    consts: &[[u64; 3]],
+) -> std::borrow::Cow<'a, str> {
+    match what {
+        RunWhat::Label(s) => std::borrow::Cow::Borrowed(s),
+        RunWhat::Demands(ids) => std::borrow::Cow::Owned(
+            ids.iter()
+                .map(|&d| {
+                    if let Some(demand) = demands.get(d) {
+                        demand_text(demand)
+                    } else {
+                        let c = &consts[d];
+                        let k = &keys[d];
+                        let s = if k.s {
+                            format!("#{}", c[0])
+                        } else {
+                            "?".to_string()
+                        };
+                        let p = match k.p {
+                            KeyP::Const(id) => format!("#{id}"),
+                            _ => "?".to_string(),
+                        };
+                        let o = if k.o {
+                            format!("#{}", c[2])
+                        } else {
+                            "?".to_string()
+                        };
+                        format!("{{ {s} {p} {o} }}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    }
+}
+
 /// A short name of a term for EXPLAIN.
 fn short(t: &Term) -> String {
     const NS: [(&str, &str); 4] = [
@@ -567,6 +622,22 @@ enum Compiled {
     },
 }
 
+fn session_check(
+    stop: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
+) -> impl FnMut() -> anyhow::Result<()> + '_ {
+    move || stop().map_err(anyhow::Error::new)
+}
+
+fn session_compile_error(e: anyhow::Error, what: &str) -> Error {
+    if let Some(m) = BudgetFailure::from_anyhow(&e) {
+        return memory_error(m, what);
+    }
+    match e.downcast::<Error>() {
+        Ok(core) => core,
+        Err(e) => component(RULES_CODE, format!("{e:#}")),
+    }
+}
+
 /// The lowered rules of the program that `source` makes over `terms`, in stratum order.
 /// Demand stages every negation in a stage of its own below its rule (see
 /// [`demand::transform`]), so the strata's boundaries are not kept.
@@ -575,12 +646,13 @@ fn program_rules(
     terms: &Terms,
     budget: &Arc<Budget>,
     warnings: &mut WorkingWarnings,
+    stop: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
 ) -> Result<Compiled> {
-    let failed = |e: anyhow::Error| match BudgetFailure::from_anyhow(&e) {
-        Some(m) => memory_error(m, "the rule program"),
-        None => component(RULES_CODE, format!("{e:#}")),
-    };
-    let program = Box::new(source(terms, warnings).map_err(failed)?);
+    let mut check = session_check(stop);
+    let program = Box::new(
+        source(terms, warnings, &mut check)
+            .map_err(|e| session_compile_error(e, "the rule program"))?,
+    );
     let mut lowered = program.program.lower(budget).map_err(|e| match e {
         crate::ir::lower::LowerError::Memory(m) => memory_error(m, "the rule program"),
         e => component(RULES_CODE, e.to_string()),
@@ -636,6 +708,7 @@ pub(crate) struct Session {
     /// whether the demand program rewrites linear recursion (see [`demand::transform`])
     rewrite_linear: bool,
     graphs: Vec<Id>,
+    _graphs_held: Held,
     absent: bool,
     stop: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     budget: Arc<Budget>,
@@ -737,33 +810,38 @@ impl Session {
         let t0 = std::time::Instant::now();
         let snap = req.snap;
         let budget = Budget::new(req.max_memory.map(|m| m.min(usize::MAX as u64) as usize));
-        let terms = Terms::new(snap.clone());
-        terms
-            .set_budget(&budget)
-            .map_err(|e| memory_error(e, "the rules"))?;
+        let terms = Terms::new_in_controlled(snap.clone(), &budget, session_check(&req.stop))
+            .map_err(|e| session_compile_error(e, "the rules"))?;
         let mut warnings = WorkingWarnings::try_clone_from(&shared.warnings, &budget)
             .map_err(|e| memory_error(e, "the rule warnings"))?;
         let compiled = match &shared.program {
             None => Compiled::Profile(
-                engine::compile_info(&shared.rules, &terms, &mut warnings, true)
-                    .map_err(|e| memory_error(e, "the compiled rules"))?,
+                engine::compile_info_controlled(
+                    &shared.rules,
+                    &terms,
+                    &mut warnings,
+                    true,
+                    &mut session_check(&req.stop),
+                )
+                .map_err(|e| session_compile_error(e, "the compiled rules"))?,
             ),
-            Some(source) => program_rules(source, &terms, &budget, &mut warnings)?,
+            Some(source) => program_rules(source, &terms, &budget, &mut warnings, &req.stop)?,
         };
         let closures = (!shared.closures).then_some(false);
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
-        let resolved = match &req.readable {
-            Some(readable) => inputs::resolve_readable(&snap, &shared.inputs, &|g| readable(g)),
-            None => inputs::resolve(&snap, &shared.inputs),
+        let (graphs, _graphs_held) = {
+            let mut check = session_check(&req.stop);
+            inputs::resolve_session_inputs_controlled(
+                &snap,
+                &shared.inputs,
+                req.readable.as_deref(),
+                &mut warnings,
+                &budget,
+                &mut check,
+            )
+            .map_err(|e| session_compile_error(e, "input graphs"))?
         };
-        warnings
-            .extend_borrowed(&resolved.warnings)
-            .map_err(|e| memory_error(e, "input warnings"))?;
-        let mut graphs = resolved.ids(&snap);
         tracing::debug!(target: "sparkles_reasoner::demand", "session: rules compiled and inputs resolved in {:?}", t0.elapsed());
-        if let Some(readable) = &req.readable {
-            graphs.retain(|g| readable(*g));
-        }
         let absent = graphs.contains(&Id::DEFAULT_GRAPH);
         // The view without its commit names the anchor whose tables may answer this
         // commit too (spec F17 §6.2): the session then keys the cache by the anchor's view.
@@ -808,6 +886,7 @@ impl Session {
             compiled,
             rewrite_linear: true,
             graphs,
+            _graphs_held,
             absent,
             stop: req.stop,
             budget,
@@ -859,8 +938,8 @@ impl Session {
 
     fn id_of(&self, t: &Term) -> Result<u64> {
         self.terms
-            .try_id_for(t)
-            .map_err(|e| memory_error(e, "pattern constants"))
+            .try_id_for_controlled(t, session_check(&self.stop))
+            .map_err(|e| session_compile_error(e, "pattern constants"))
     }
 
     /// The table cache's key of demand `d` with `seeds` (sorted), when it may be cached.
@@ -887,7 +966,7 @@ impl Session {
 
     /// Evaluate `rules` from row `start` on, under the limits, checking the query's
     /// deadline and cancellation meanwhile.
-    fn run(&mut self, pre: bool, stage: usize, start: u32, what: &str) -> Result<()> {
+    fn run(&mut self, pre: bool, stage: usize, start: u32, what: RunWhat<'_>) -> Result<()> {
         if !pre && self.compact_done {
             (self.stop)()?;
             return Ok(());
@@ -936,6 +1015,7 @@ impl Session {
         let derived = g.inferred_since(g.offset()).saturating_sub(self.killed);
         let max = self.shared.max_derived;
         if derived > max {
+            let what = format_what(what, &self.demands, &self.keys, &self.consts);
             return Err(component(
                 BUDGET_CODE,
                 format!(
@@ -1011,7 +1091,10 @@ impl Session {
                             continue;
                         }
                         let t = g.triple(i);
-                        g.kill(&t).map_err(|e| memory_error(e, what))?;
+                        g.kill(&t).map_err(|e| {
+                            let what = format_what(what, &self.demands, &self.keys, &self.consts);
+                            memory_error(e, &what)
+                        })?;
                         killed += !self.hidden.contains(&t[1]) as usize;
                     }
                     limits.closures = false;
@@ -1038,6 +1121,7 @@ impl Session {
             self.compact_done = true;
         }
         r.map(|_| ()).map_err(|e| {
+            let what = format_what(what, &self.demands, &self.keys, &self.consts);
             if let Some(l) = e.downcast_ref::<InferredLimitExceeded>() {
                 return component(
                     BUDGET_CODE,
@@ -1049,7 +1133,7 @@ impl Session {
                 );
             }
             if let Some(m) = BudgetFailure::from_anyhow(&e) {
-                return memory_error(m, what);
+                return memory_error(m, &what);
             }
             let msg = format!("{e:#}");
             if msg.contains("did not reach a fixpoint") {
@@ -1138,7 +1222,7 @@ impl Session {
             let seeds = stage.seeds.clone();
             let start = g.len();
             g.try_add_batch(seeds).map_err(|e| memory_error(e, what))?;
-            self.run(pre, si, start, what)?;
+            self.run(pre, si, start, RunWhat::Label(what))?;
         }
         if let Some((_, key)) = equality
             && !self.cached_equality
@@ -1202,8 +1286,8 @@ impl Session {
         for (old, key) in keys {
             let new = self
                 .terms
-                .try_id_for_key(key)
-                .map_err(|e| memory_error(e, "the equality stages"))?;
+                .try_id_for_key_controlled(key, session_check(&self.stop))
+                .map_err(|e| session_compile_error(e, "the equality stages"))?;
             map.insert(*old, new);
         }
         Ok((map, held))
@@ -1228,7 +1312,8 @@ impl Session {
     ) -> Result<usize> {
         // the bytes the session's rules hold charged while they live
         let mut w = WorkingWarnings::new(budget);
-        program_rules(source, terms, budget, &mut w).map(|_compiled| budget.used())
+        let stop: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(|| Ok(()));
+        program_rules(source, terms, budget, &mut w, &stop).map(|_compiled| budget.used())
     }
 
     fn equality_table(&self) -> Option<(Table, Held)> {
@@ -1307,7 +1392,8 @@ impl Session {
         // program's, since the schema pass and specialization may leave out the rules
         // that hold its IR features (item 839)
         let replay = self.compiled.replays_lists();
-        demand::transform(
+        let mut check = session_check(&self.stop);
+        demand::transform_controlled(
             rules,
             &self.terms,
             roots,
@@ -1315,11 +1401,13 @@ impl Session {
             pass,
             self.rewrite_linear,
             replay,
+            &mut check,
         )
         .map_err(|e| match e {
             TransformError::Memory(m) => memory_error(m, "the demand program"),
             TransformError::TooLarge(_) => component(BUDGET_CODE, e.to_string()),
             TransformError::NotStratified => component(RULES_CODE, e.to_string()),
+            TransformError::Control(e) => session_compile_error(e, "the demand program"),
         })
     }
 
@@ -1500,7 +1588,12 @@ impl Session {
         self.compact = false;
         let iri = |s: &str| Term::NamedNode(oxrdf::NamedNode::new_unchecked(s));
         let rdf_type = self.id_of(&iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"))?;
-        let vocab = Vocab::of(self.compiled.rules(), &self.terms);
+        let vocab = Vocab::of_controlled(
+            self.compiled.rules(),
+            &self.terms,
+            session_check(&self.stop),
+        )
+        .map_err(|e| session_compile_error(e, "the demand vocabulary"))?;
         let roots = demand::schema_roots(&vocab, rdf_type);
         self.make_graph()?;
         let t0 = std::time::Instant::now();
@@ -1608,7 +1701,7 @@ impl Session {
             let start = g.len();
             g.try_add_batch(seeds)
                 .map_err(|e| memory_error(e, "the schema"))?;
-            self.run(true, 0, start, "the schema")?;
+            self.run(true, 0, start, RunWhat::Label("the schema"))?;
             if let Some(key) = key.filter(|_| fresh) {
                 // the schema facts the lower stages gave belong to the schema, and their
                 // instance facts are derived again by the sessions that read the table
@@ -1849,22 +1942,10 @@ impl Session {
     }
 
     /// [`derive_all`](Self::derive_all) for patterns of ids, `None` where a position is
-    /// free, which may name a relation's key (item 839's plan, §20.2). A pattern names its
-    /// terms in the reports where they have one.
+    /// free, which may name a relation's key (item 839's plan, §20.2). Keeps demands in id
+    /// form without decoding terms back into [`Demand`] or cloning held terms.
     pub(crate) fn derive_ids(&mut self, pats: &[[Option<u64>; 3]]) -> Result<()> {
-        let term = |x: Option<u64>| match x.and_then(|id| self.terms.term(id)) {
-            Some(t) => DemandTerm::Const(t),
-            None => DemandTerm::Var,
-        };
-        let demands: Vec<Demand> = pats
-            .iter()
-            .map(|p| Demand {
-                s: term(p[0]),
-                p: term(p[1]),
-                o: term(p[2]),
-            })
-            .collect();
-        self.prepare_ids(&demands, Some(pats), false)?;
+        self.prepare_ids_only(pats)?;
         let seeds = (0..pats.len()).map(|d| (d, Vec::new())).collect();
         self.derive(seeds)?;
         Ok(())
@@ -2005,8 +2086,8 @@ impl Session {
         for (old, key) in &t.keys {
             let new = self
                 .terms
-                .try_id_for_key(key)
-                .map_err(|e| memory_error(e, "a cached table"))?;
+                .try_id_for_key_controlled(key, session_check(&self.stop))
+                .map_err(|e| session_compile_error(e, "a cached table"))?;
             map.insert(*old, new);
         }
         Ok(t.facts()
@@ -2075,8 +2156,8 @@ impl Session {
         for (old, key) in &t.keys {
             let new = self
                 .terms
-                .try_id_for_key(key)
-                .map_err(|e| memory_error(e, "a cached table"))?;
+                .try_id_for_key_controlled(key, session_check(&self.stop))
+                .map_err(|e| session_compile_error(e, "a cached table"))?;
             map.insert(*old, new);
             if Id(new).tag() == Tag::Local && self.locals_sent.insert(new) {
                 out.locals.push((new, OutTerm::Key(key.clone())));
@@ -2112,11 +2193,7 @@ impl Session {
                 *by_pred.entry(t[1]).or_default() += 1;
             }
         }
-        let name = |x: u64| {
-            self.terms
-                .term(x)
-                .map_or_else(|| format!("#{x}"), |t| t.to_string())
-        };
+        let name = |x: u64| format!("#{x}");
         for (si, st) in program.stages.iter().enumerate() {
             for (k, m) in st.keys() {
                 if let Some(n) = by_magic.get(&m) {
@@ -2261,32 +2338,58 @@ fn estimate(g: &Graph, a: &Atom, bound: &[bool]) -> (f64, f64) {
 }
 
 impl Session {
-    /// [`ReasoningSession::prepare`], with the constants of each demand given by id in
-    /// `ids` when it is set, where `demands` names them only for the reports: a relation's
-    /// key has no term (item 839's plan, §20.2).
-    fn prepare_ids(
-        &mut self,
-        demands: &[Demand],
-        ids: Option<&[[Option<u64>; 3]]>,
-        estimates: bool,
-    ) -> Result<Vec<DemandInfo>> {
-        self.demands = demands.to_vec();
-        self.by_id = ids.is_some();
+    /// Prepare patterns given only by id, without allocating or cloning [`Demand`] terms.
+    fn prepare_ids_only(&mut self, pats: &[[Option<u64>; 3]]) -> Result<()> {
+        self.demands.clear();
+        self.by_id = true;
         self.keys.clear();
         self.consts.clear();
         self.seeded.clear();
-        // which positions of each demand are constants
-        let mut constant: Vec<[bool; 3]> = Vec::with_capacity(demands.len());
-        for (di, d) in demands.iter().enumerate() {
+        let rdf_type = self.id_of(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()))?;
+        for pat in pats {
             let mut c = [0u64; 3];
             let mut fixed = [false; 3];
-            let given = ids.map(|x| x[di]);
-            let mut val = |t: &DemandTerm, i: usize| -> Result<bool> {
-                if let Some(g) = given {
-                    fixed[i] = g[i].is_some();
-                    c[i] = g[i].unwrap_or(0);
-                    return Ok(fixed[i]);
+            for i in 0..3 {
+                if let Some(id) = pat[i] {
+                    c[i] = id;
+                    fixed[i] = true;
                 }
+            }
+            let kp = if fixed[1] {
+                KeyP::Const(c[1])
+            } else {
+                KeyP::Free
+            };
+            let k = Key::new(fixed[0], kp, fixed[2]);
+            self.keys.push(if fixed[1] && fixed[2] && c[1] == rdf_type {
+                k.with_class(c[2])
+            } else {
+                k
+            });
+            self.consts.push(c);
+            self.seeded.push(Seeded::None);
+        }
+        self.reports = vec![DemandReport::default(); pats.len()];
+        self.seeds = vec![FxHashSet::default(); pats.len()];
+        self.program = None;
+        self.specialized = false;
+        Ok(())
+    }
+
+    /// [`ReasoningSession::prepare`] for term-bearing demands.
+    fn prepare_demands(&mut self, demands: &[Demand], estimates: bool) -> Result<Vec<DemandInfo>> {
+        self.demands = demands.to_vec();
+        self.by_id = false;
+        self.keys.clear();
+        self.consts.clear();
+        self.seeded.clear();
+        let rdf_type = self.id_of(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()))?;
+        // which positions of each demand are constants
+        let mut constant: Vec<[bool; 3]> = Vec::with_capacity(demands.len());
+        for d in demands {
+            let mut c = [0u64; 3];
+            let mut fixed = [false; 3];
+            let mut val = |t: &DemandTerm, i: usize| -> Result<bool> {
                 Ok(match t {
                     DemandTerm::Const(t) => {
                         let id = self.id_of(t)?;
@@ -2303,7 +2406,6 @@ impl Session {
             let o = val(&d.o, 2)?;
             let kp = if p { KeyP::Const(c[1]) } else { KeyP::Free };
             let k = Key::new(s, kp, o);
-            let rdf_type = self.id_of(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()))?;
             constant.push(fixed);
             self.keys.push(if fixed[1] && fixed[2] && c[1] == rdf_type {
                 k.with_class(c[2])
@@ -2397,7 +2499,7 @@ impl ReasoningSession for Session {
     }
 
     fn prepare(&mut self, demands: &[Demand], estimates: bool) -> Result<Vec<DemandInfo>> {
-        self.prepare_ids(demands, None, estimates)
+        self.prepare_demands(demands, estimates)
     }
 
     fn derive(&mut self, seeds: Vec<(usize, Vec<u64>)>) -> Result<Derived> {
@@ -2424,11 +2526,7 @@ impl ReasoningSession for Session {
             misses.push((d, s, key));
         }
         if !misses.is_empty() {
-            let what = misses
-                .iter()
-                .map(|(d, _, _)| demand_text(&self.demands[*d]))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let miss_ids: Vec<usize> = misses.iter().map(|(d, _, _)| *d).collect();
             self.ensure_program()?;
             self.ensure_graph()?;
             if let Some((lo, hi)) = self.lower_rows.take() {
@@ -2476,10 +2574,26 @@ impl ReasoningSession for Session {
             }
             let g = self.graph.as_mut().expect("graph made");
             let start = g.len();
-            g.try_add_batch(magic).map_err(|e| memory_error(e, &what))?;
+            g.try_add_batch(magic).map_err(|e| {
+                let what = format_what(
+                    RunWhat::Demands(&miss_ids),
+                    &self.demands,
+                    &self.keys,
+                    &self.consts,
+                );
+                memory_error(e, &what)
+            })?;
             let t0 = std::time::Instant::now();
-            self.run(false, 0, start, &what)?;
-            tracing::debug!(target: "sparkles_reasoner::demand", "derived {what} in {:?}", t0.elapsed());
+            self.run(false, 0, start, RunWhat::Demands(&miss_ids))?;
+            if tracing::enabled!(target: "sparkles_reasoner::demand", tracing::Level::DEBUG) {
+                let what = format_what(
+                    RunWhat::Demands(&miss_ids),
+                    &self.demands,
+                    &self.keys,
+                    &self.consts,
+                );
+                tracing::debug!(target: "sparkles_reasoner::demand", "derived {what} in {:?}", t0.elapsed());
+            }
             self.export(&mut out);
             if !self.made_bnodes {
                 let table = Arc::new(Table {

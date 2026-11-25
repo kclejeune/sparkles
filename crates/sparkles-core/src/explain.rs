@@ -173,22 +173,39 @@ impl Derivation {
     /// The heap the node and its premises hold, with their decoded terms.
     pub fn heap_bytes(&self) -> usize {
         std::mem::size_of::<Derivation>()
-            + self.triple.iter().map(term_bytes).sum::<usize>()
-            + self.graph.as_ref().map_or(0, String::len)
-            + self
-                .bindings
-                .iter()
-                .map(|(n, t)| n.len() + term_bytes(t))
-                .sum::<usize>()
-            + self.builtins.iter().map(String::len).sum::<usize>()
-            + self.relation.as_ref().map_or(0, |r| {
-                r.name.len() + r.args.iter().map(term_bytes).sum::<usize>()
-            })
-            + self
-                .premises
-                .iter()
-                .map(Derivation::heap_bytes)
-                .sum::<usize>()
+            .saturating_add(
+                self.triple
+                    .iter()
+                    .map(term_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(self.graph.as_ref().map_or(0, String::len))
+            .saturating_add(
+                self.bindings
+                    .iter()
+                    .map(|(n, t)| n.len().saturating_add(term_bytes(t)))
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.builtins
+                    .iter()
+                    .map(String::len)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(self.relation.as_ref().map_or(0, |r| {
+                r.name.len().saturating_add(
+                    r.args
+                        .iter()
+                        .map(term_bytes)
+                        .fold(0usize, usize::saturating_add),
+                )
+            }))
+            .saturating_add(
+                self.premises
+                    .iter()
+                    .map(Derivation::heap_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
     }
 
     /// The number of nodes in the tree, shared repeats included.
@@ -286,16 +303,30 @@ pub struct ExplainLimits {
     pub max_memory: Option<usize>,
 }
 
-/// The heap a decoded term holds.
-pub fn term_bytes(t: &Term) -> usize {
-    std::mem::size_of::<Term>()
-        + match t {
-            Term::NamedNode(n) => n.as_str().len(),
-            Term::BlankNode(b) => b.as_str().len(),
+/// The heap a decoded term holds, including nested RDF-star triple terms.
+pub fn term_bytes(mut t: &Term) -> usize {
+    let mut bytes = std::mem::size_of::<Term>();
+    loop {
+        match t {
+            Term::NamedNode(n) => return bytes.saturating_add(n.as_str().len()),
+            Term::BlankNode(b) => return bytes.saturating_add(b.as_str().len()),
             Term::Literal(l) => {
-                l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+                return bytes
+                    .saturating_add(l.value().len())
+                    .saturating_add(l.datatype().as_str().len())
+                    .saturating_add(l.language().map_or(0, str::len));
             }
-            #[allow(unreachable_patterns)]
-            _ => 64,
+            Term::Triple(triple) => {
+                let subj = match &triple.subject {
+                    oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+                    oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+                };
+                bytes = bytes
+                    .saturating_add(std::mem::size_of::<oxrdf::Triple>())
+                    .saturating_add(subj)
+                    .saturating_add(triple.predicate.as_str().len());
+                t = &triple.object;
+            }
         }
+    }
 }

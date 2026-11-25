@@ -27,39 +27,145 @@ fn reserve(id: Id, next: &mut u64, ordinals: &mut u64) -> Result<()> {
     Ok(())
 }
 
-fn reserve_term(term: &Term, next: &mut u64, ordinals: &mut u64) -> Result<()> {
-    match term {
-        Term::BlankNode(node) => {
-            if let Some(id) = parse_bnode_label(node.as_str()) {
-                reserve(id, next, ordinals)?;
+const APPEND_VOCAB_ENTRY_BYTES: u64 = 48;
+
+fn split_triple_key(key: &[u8]) -> Result<(&[u8], &[u8], &[u8])> {
+    let malformed = || Error::Corrupt("invalid vocabulary triple-term key".into());
+    let mut pos = 1usize;
+    let mut parts = [&[][..]; 3];
+    for part in &mut parts {
+        let mut len = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let next = *key.get(pos).ok_or_else(malformed)?;
+            pos += 1;
+            if shift == 63 && next > 1 {
+                return Err(malformed());
+            }
+            len |= u64::from(next & 127)
+                .checked_shl(shift)
+                .ok_or_else(malformed)?;
+            if next & 128 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 64 {
+                return Err(malformed());
             }
         }
-        Term::Triple(triple) => {
-            if let NamedOrBlankNode::BlankNode(node) = &triple.subject
-                && let Some(id) = parse_bnode_label(node.as_str())
-            {
-                reserve(id, next, ordinals)?;
-            }
-            reserve_term(&triple.object, next, ordinals)?;
-        }
-        Term::Literal(literal) if crate::sparql::cdt::may_name_bnodes(literal) => {
-            let mut failed = None;
-            let _ = crate::sparql::cdt::relabel_term(term, &mut |label| {
-                if failed.is_none()
-                    && let Some(id) = parse_bnode_label(label)
-                    && let Err(error) = reserve(id, next, ordinals)
-                {
-                    failed = Some(error);
-                }
-                label.to_string()
-            });
-            if let Some(error) = failed {
-                return Err(error);
-            }
-        }
-        _ => {}
+        let len = usize::try_from(len).map_err(|_| malformed())?;
+        let end = pos.checked_add(len).ok_or_else(malformed)?;
+        *part = key.get(pos..end).ok_or_else(malformed)?;
+        pos = end;
     }
-    Ok(())
+    if pos != key.len() {
+        return Err(malformed());
+    }
+    Ok((parts[0], parts[1], parts[2]))
+}
+
+fn reserve_cdt_key(
+    key: &[u8],
+    next: &mut u64,
+    ordinals: &mut u64,
+    check: &mut dyn FnMut() -> Result<()>,
+    allow_mem: &mut dyn FnMut(u64) -> bool,
+) -> Result<()> {
+    let Some(sep) = key.iter().rposition(|&b| b == id::KEY_SEP) else {
+        return Ok(());
+    };
+    let Some(dt_bytes) = key[sep + 1..].strip_prefix(b"^") else {
+        return Ok(());
+    };
+    let Ok(dt) = std::str::from_utf8(dt_bytes) else {
+        return Ok(());
+    };
+    if !crate::sparql::cdt::is_cdt(dt) {
+        return Ok(());
+    }
+    let raw_lex = &key[1..sep];
+    if memchr::memmem::find(raw_lex, b"_:").is_none() && memchr::memchr(b'\\', raw_lex).is_none() {
+        return Ok(());
+    }
+    let lex = std::str::from_utf8(raw_lex)
+        .map_err(|_| Error::Corrupt("invalid UTF-8 in vocabulary composite literal key".into()))?;
+    crate::sparql::cdt::scan_bnode_ids(lex, dt, check, allow_mem, |id| reserve(id, next, ordinals))
+}
+
+/// Reserve every stored blank node named inside `key` (RDF 1.2 triple terms and
+/// CDT literals) directly from the vocabulary bytes in O(1) stack, using zero
+/// heap for ordinary literals and preflighting wide-map duplicate indexes.
+fn reserve_key(
+    key: &[u8],
+    next: &mut u64,
+    ordinals: &mut u64,
+    check: &mut dyn FnMut() -> Result<()>,
+    allow_mem: &mut dyn FnMut(u64) -> bool,
+) -> Result<()> {
+    let mut current = key;
+    let mut depth = 0usize;
+    loop {
+        match current.first() {
+            Some(b'(') => {
+                depth += 1;
+                if depth > crate::nesting::MAX_TRIPLE_TERMS {
+                    return Err(Error::invalid(format!(
+                        "triple term nested deeper than {} levels",
+                        crate::nesting::MAX_TRIPLE_TERMS
+                    )));
+                }
+                let (subject, _predicate, object) = split_triple_key(current)?;
+                if subject.first() == Some(&b'_') && subject.len() == 9 {
+                    let payload =
+                        u64::from_be_bytes(subject[1..9].try_into().unwrap()) & id::PAYLOAD_MASK;
+                    reserve(Id::bnode(payload), next, ordinals)?;
+                }
+                current = object;
+            }
+            Some(b'_') if current.len() == 9 => {
+                let payload =
+                    u64::from_be_bytes(current[1..9].try_into().unwrap()) & id::PAYLOAD_MASK;
+                return reserve(Id::bnode(payload), next, ordinals);
+            }
+            Some(b'"') => return reserve_cdt_key(current, next, ordinals, check, allow_mem),
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn copy_key_into(
+    copied: &Store,
+    transaction: &mut WriteTxn<'_>,
+    key: &[u8],
+    scratch_bytes: u64,
+    next_ordinal: &mut u64,
+    control: &WriteOptions,
+) -> Result<Id> {
+    if let Some(existing) = transaction.lookup_key(key) {
+        return Ok(existing);
+    }
+    let mem_budget = if let Some(max) = copied.opts.max_memory_bytes {
+        let base = transaction.memory_size().saturating_add(scratch_bytes);
+        let base_total = copied.memory_with_configuration(base)?;
+        copied.check_memory_total(
+            base_total
+                .saturating_add(key.len() as u64)
+                .saturating_add(APPEND_VOCAB_ENTRY_BYTES),
+        )?;
+        Some((base_total, max))
+    } else {
+        None
+    };
+    reserve_key(
+        key,
+        &mut transaction.guard.next_bnode,
+        next_ordinal,
+        &mut || control.check(),
+        &mut |extra_bytes| {
+            mem_budget.is_none_or(|(base_total, max)| base_total.saturating_add(extra_bytes) <= max)
+        },
+    )?;
+    transaction.intern_key(key)
 }
 
 impl Store {
@@ -150,30 +256,89 @@ impl Store {
             if !keep(ids)? {
                 return Ok(());
             }
-            let quad = view
-                .quad_to_terms(ids)
-                .ok_or_else(|| Error::invalid("the simulated view contains an unknown term"))?;
-            for &id in ids {
-                reserve(id, &mut transaction.guard.next_bnode, &mut next_ordinal)?;
+            let mut copied_ids = [Id::UNDEF; 4];
+            for (pos, &id) in ids.iter().enumerate() {
+                copied_ids[pos] = if pos == 3 && id == Id::DEFAULT_GRAPH {
+                    Id::DEFAULT_GRAPH
+                } else {
+                    match id.tag() {
+                        crate::id::Tag::Bool
+                        | crate::id::Tag::Int
+                        | crate::id::Tag::Double
+                        | crate::id::Tag::Decimal
+                        | crate::id::Tag::DateTime
+                        | crate::id::Tag::Date => id,
+                        crate::id::Tag::BNode => {
+                            reserve(id, &mut transaction.guard.next_bnode, &mut next_ordinal)?;
+                            id
+                        }
+                        crate::id::Tag::Delta => view.generation.dvocab.with(|v| {
+                            let key = v.get(id.payload()).ok_or_else(|| {
+                                Error::invalid("the simulated view contains an unknown term")
+                            })?;
+                            copy_key_into(
+                                &copied,
+                                &mut transaction,
+                                key,
+                                0,
+                                &mut next_ordinal,
+                                control,
+                            )
+                        })?,
+                        crate::id::Tag::Vocab => {
+                            let base_mem = if copied.opts.max_memory_bytes.is_some() {
+                                transaction.memory_size()
+                            } else {
+                                0
+                            };
+                            let scratch_bytes = std::cell::Cell::new(0u64);
+                            view.generation
+                                .vocab
+                                .get_with_controlled_capacity_checked(
+                                    id.payload(),
+                                    |old, new| {
+                                        if copied.opts.max_memory_bytes.is_some() {
+                                            copied.check_memory(
+                                                base_mem
+                                                    .saturating_add(old as u64)
+                                                    .saturating_add(new as u64),
+                                            )?;
+                                        }
+                                        Ok(())
+                                    },
+                                    |cap| {
+                                        let cap = cap as u64;
+                                        scratch_bytes.set(cap);
+                                        if copied.opts.max_memory_bytes.is_some() {
+                                            copied.check_memory(base_mem.saturating_add(cap))?;
+                                        }
+                                        Ok(())
+                                    },
+                                    |_| control.check(),
+                                    |key| {
+                                        copy_key_into(
+                                            &copied,
+                                            &mut transaction,
+                                            key,
+                                            scratch_bytes.get(),
+                                            &mut next_ordinal,
+                                            control,
+                                        )
+                                    },
+                                )?
+                                .ok_or_else(|| {
+                                    Error::invalid("the simulated view contains an unknown term")
+                                })?
+                        }
+                        _ => {
+                            return Err(Error::invalid(
+                                "the simulated view contains an unknown term",
+                            ));
+                        }
+                    }
+                };
             }
-            reserve_term(
-                &quad.object,
-                &mut transaction.guard.next_bnode,
-                &mut next_ordinal,
-            )?;
-            let subject = match quad.subject {
-                NamedOrBlankNode::NamedNode(node) => Term::NamedNode(node),
-                NamedOrBlankNode::BlankNode(node) => Term::BlankNode(node),
-            };
-            let s = transaction.intern(&subject)?;
-            let p = transaction.intern(&Term::NamedNode(quad.predicate))?;
-            let o = transaction.intern(&quad.object)?;
-            let g = match quad.graph_name {
-                GraphName::DefaultGraph => Id::DEFAULT_GRAPH,
-                GraphName::NamedNode(node) => transaction.intern(&Term::NamedNode(node))?,
-                GraphName::BlankNode(node) => transaction.intern(&Term::BlankNode(node))?,
-            };
-            transaction.insert([s, p, o, g])?;
+            transaction.insert(copied_ids)?;
             transaction.check_storage()?;
             Ok(())
         })?;

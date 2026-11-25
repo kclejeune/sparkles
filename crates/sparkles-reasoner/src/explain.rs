@@ -47,7 +47,9 @@ pub use sparkles_core::explain::{
 };
 use sparkles_core::id::{Id, Tag};
 use sparkles_core::index::Perm;
-use sparkles_core::sparql::reasoning::{Demand, DemandTerm, SessionRequest};
+use sparkles_core::sparql::reasoning::SessionRequest;
+#[cfg(test)]
+use sparkles_core::sparql::reasoning::{Demand, DemandTerm};
 use sparkles_core::store::Snapshot;
 use std::cell::Cell;
 use std::sync::Arc;
@@ -121,8 +123,8 @@ pub struct DemandInput<'a> {
     pub reasoner: &'a QueryReasoner,
     /// the snapshot of the caller's view
     pub snap: Arc<Snapshot>,
-    /// whether the caller may read a graph, `None` for every graph
-    pub readable: Option<Arc<dyn Fn(Id) -> bool + Send + Sync>>,
+    /// the caller's bound graph access, `None` for every graph
+    pub readable: Option<Arc<sparkles_core::access::GraphAccess>>,
 }
 
 /// The OWL 2 RL rule id of a rule of the `owl-rl` profile: its name when the name follows
@@ -613,31 +615,60 @@ fn term_bytes(t: &Term) -> usize {
     sparkles_core::explain::term_bytes(t)
 }
 
-/// A term written for a builtin call: N-Triples, or `_` for a wildcard.
-fn call_arg(t: Option<Term>) -> String {
-    t.map_or_else(|| "_".to_string(), |t| t.to_string())
+pub(crate) struct CallBytes(pub usize);
+impl std::fmt::Write for CallBytes {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 = self.0.checked_add(s.len()).ok_or(std::fmt::Error)?;
+        Ok(())
+    }
+}
+
+pub(crate) fn write_call(
+    out: &mut impl std::fmt::Write,
+    prefix: &str,
+    name: &str,
+    args: &[Option<Term>],
+    sep: &str,
+) -> std::fmt::Result {
+    write!(out, "{prefix}{name}(")?;
+    for (i, arg) in args.iter().enumerate() {
+        if i != 0 {
+            out.write_str(sep)?;
+        }
+        match arg {
+            Some(term) => write!(out, "{term}")?,
+            None => out.write_str("_")?,
+        }
+    }
+    out.write_str(")")
 }
 
 /// Builds the answer's trees, numbering facts once across them.
 struct Builder<'s, 'a> {
     s: &'s Search<'a>,
-    /// charged with the answer's nodes and decoded terms, which it holds until it returns
-    budget: &'s Arc<Budget>,
+    /// Own the output's credit until it is transferred to the returned proof.
+    memory: Held,
     max_depth: u32,
     ids: FxHashMap<u32, u32>,
     next: u32,
 }
 
 impl Builder<'_, '_> {
-    fn term(&self, id: u64) -> anyhow::Result<Term> {
-        self.s
-            .terms
-            .term(id)
-            .ok_or_else(|| anyhow::anyhow!("term {id} of a derivation is unknown"))
+    fn charge(&mut self, bytes: usize) -> Result<(), BudgetFailure> {
+        self.memory
+            .try_grow(bytes)
+            .map_err(|e| e.with_context(" while building an explanation".to_string()))
+    }
+
+    fn term(&mut self, id: u64) -> anyhow::Result<Term> {
+        let (term, held) = self.s.terms.term_admitted(id, self.memory.budget())?;
+        let term = term.ok_or_else(|| anyhow::anyhow!("term {id} of a derivation is unknown"))?;
+        self.memory.absorb(held);
+        Ok(term)
     }
 
     /// The relation fact `f`, when it is one.
-    fn relation(&self, f: u32) -> anyhow::Result<Option<RelationAtom>> {
+    fn relation(&mut self, f: u32) -> anyhow::Result<Option<RelationAtom>> {
         let t = self.s.facts[f as usize];
         let Some(r) = crate::ir::lower::rel_of(t[1]) else {
             return Ok(None);
@@ -663,22 +694,18 @@ impl Builder<'_, '_> {
                 cols.extend(tail);
             }
         }
+        self.charge(rel.name.len())?;
         let args = cols
             .into_iter()
             .map(|x| self.term(x))
             .collect::<anyhow::Result<Vec<Term>>>()?;
-        let atom = RelationAtom {
+        Ok(Some(RelationAtom {
             name: rel.name.to_string(),
             args,
-        };
-        let bytes = atom.name.len() + atom.args.iter().map(term_bytes).sum::<usize>();
-        self.budget
-            .try_charge(bytes)
-            .map_err(|e| e.with_context(" while building an explanation".to_string()))?;
-        Ok(Some(atom))
+        }))
     }
 
-    fn triple(&self, f: u32) -> anyhow::Result<[Term; 3]> {
+    fn triple(&mut self, f: u32) -> anyhow::Result<[Term; 3]> {
         let t = self.s.facts[f as usize];
         if let Some(r) = crate::ir::lower::rel_of(t[1]) {
             // a relation node's triple names its relation, and is no fact
@@ -696,23 +723,16 @@ impl Builder<'_, '_> {
                 }
                 .iri(),
             );
-            self.budget
-                .try_charge(std::mem::size_of::<Derivation>() + 3 * term_bytes(&iri))
-                .map_err(|e| e.with_context(" while building an explanation".to_string()))?;
+            self.charge(std::mem::size_of::<Derivation>() + 3 * term_bytes(&iri))?;
             return Ok([iri.clone(), iri.clone(), iri]);
         }
-        let triple = [self.term(t[0])?, self.term(t[1])?, self.term(t[2])?];
-        // the node and its decoded terms, which a large literal can make large
-        let bytes =
-            std::mem::size_of::<Derivation>() + triple.iter().map(term_bytes).sum::<usize>();
-        self.budget
-            .try_charge(bytes)
-            .map_err(|e| e.with_context(" while building an explanation".to_string()))?;
-        Ok(triple)
+        self.charge(std::mem::size_of::<Derivation>())?;
+        Ok([self.term(t[0])?, self.term(t[1])?, self.term(t[2])?])
     }
 
-    fn graph(&self, g: Id) -> anyhow::Result<String> {
+    fn graph(&mut self, g: Id) -> anyhow::Result<String> {
         if g == Id::DEFAULT_GRAPH {
+            self.charge("default".len())?;
             return Ok("default".to_string());
         }
         match self.term(g.0)? {
@@ -747,7 +767,7 @@ impl Builder<'_, '_> {
 
     /// The bindings of instance `inst` by variable name, and its builtins as calls.
     #[allow(clippy::type_complexity)]
-    fn bindings(&self, inst: u32) -> anyhow::Result<(Vec<(String, Term)>, Vec<String>)> {
+    fn bindings(&mut self, inst: u32) -> anyhow::Result<(Vec<(String, Term)>, Vec<String>)> {
         let s = self.s;
         let i = &s.insts[inst as usize];
         if i.rule == GEO_RULE {
@@ -759,7 +779,6 @@ impl Builder<'_, '_> {
         };
         let vals = &s.binds[i.binds as usize..i.binds as usize + rule.nvars];
         let mut bindings = Vec::new();
-        let mut bytes = 0usize;
         for (v, &x) in vals.iter().enumerate() {
             if x == 0 {
                 continue;
@@ -769,60 +788,77 @@ impl Builder<'_, '_> {
             if name.is_empty() {
                 continue;
             }
-            let t = self.term(x)?;
-            bytes += name.len() + term_bytes(&t);
-            bindings.push((name, t));
+            self.charge(name.len())?;
+            bindings.push((name, self.term(x)?));
         }
         let mut builtins = Vec::new();
         for (j, b) in rule.builtins.iter().enumerate() {
             use crate::builtins::BuiltinKind as B;
-            let arg = |a: &Slot| match *a {
-                Slot::Const(c) => call_arg(s.terms.term(c)),
-                Slot::Var(v) if vals[v] != 0 => call_arg(s.terms.term(vals[v])),
-                _ => call_arg(None),
-            };
             let call = match b.kind {
                 // the lowering of a relation atom, which the node shows as its premise
                 B::RelTail | B::RelTuple => continue,
-                B::RelAbsent => self.negated(&b.args, &arg),
+                B::RelAbsent => self.negated(&b.args, vals)?,
                 _ => {
-                    let args: Vec<String> = b.args.iter().map(arg).collect();
                     let name = info.builtins.get(j).map_or("builtin", String::as_str);
-                    format!("{name}({})", args.join(", "))
+                    self.builtin_call("", name, &[&b.args], ", ", vals)?
                 }
             };
-            bytes += call.len();
             builtins.push(call);
         }
-        self.budget
-            .try_charge(bytes)
-            .map_err(|e| e.with_context(" while building an explanation".to_string()))?;
         Ok((bindings, builtins))
     }
 
     /// A negated atom (item 839) as a call: `not name(args)` for a relation, whose lowered
     /// arguments are the first column, the key and the other columns, and `not (s p o)`
     /// for a triple.
-    fn negated(&self, args: &[Slot], arg: &dyn Fn(&Slot) -> String) -> String {
+    fn negated(&mut self, args: &[Slot], vals: &[u64]) -> anyhow::Result<String> {
         let key = match args.get(1) {
             Some(Slot::Const(k)) => crate::ir::lower::rel_of(*k),
             _ => None,
         };
         let rel = key.and_then(|r| self.s.rs.relations.and_then(|rs| rs.get(r)));
         let Some(rel) = rel else {
-            let a: Vec<String> = args.iter().map(arg).collect();
-            return format!("not ({})", a.join(" "));
+            return self.builtin_call("not ", "", &[args], " ", vals);
         };
-        let cols: Vec<String> = match rel.arity {
-            0 => Vec::new(),
-            1 => vec![arg(&args[0])],
-            2 => vec![arg(&args[0]), arg(&args[2])],
-            _ => std::iter::once(&args[0])
-                .chain(&args[2..])
-                .map(arg)
-                .collect(),
+        let cols: &[&[Slot]] = match rel.arity {
+            0 => &[],
+            1 => &[&args[..1]],
+            2 => &[&args[..1], &args[2..3]],
+            _ => &[&args[..1], &args[2..]],
         };
-        format!("not {}({})", rel.name, cols.join(", "))
+        self.builtin_call("not ", &rel.name, cols, ", ", vals)
+    }
+
+    fn builtin_call(
+        &mut self,
+        prefix: &str,
+        name: &str,
+        groups: &[&[Slot]],
+        sep: &str,
+        vals: &[u64],
+    ) -> anyhow::Result<String> {
+        let count = groups.iter().map(|group| group.len()).sum::<usize>();
+        let mut temporary = Held::try_new_exact(
+            self.memory.budget(),
+            count * std::mem::size_of::<Option<Term>>(),
+        )?;
+        let mut args = Vec::with_capacity(count);
+        for arg in groups.iter().flat_map(|group| group.iter()) {
+            let id = match *arg {
+                Slot::Const(c) => c,
+                Slot::Var(v) => vals[v],
+                Slot::Any => 0,
+            };
+            let (term, held) = self.s.terms.term_admitted(id, self.memory.budget())?;
+            temporary.absorb(held);
+            args.push(term);
+        }
+        let mut bytes = CallBytes(0);
+        write_call(&mut bytes, prefix, name, &args, sep)?;
+        self.charge(bytes.0 + std::mem::size_of::<String>())?;
+        let mut call = String::with_capacity(bytes.0);
+        write_call(&mut call, prefix, name, &args, sep)?;
+        Ok(call)
     }
 
     fn generalized(&self, f: u32) -> bool {
@@ -830,7 +866,7 @@ impl Builder<'_, '_> {
         !crate::ir::lower::is_key(t[1]) && !self.s.terms.valid(t)
     }
 
-    fn leaf_node(&self, f: u32, id: u32, shared: bool, l: Leaf) -> anyhow::Result<Derivation> {
+    fn leaf_node(&mut self, f: u32, id: u32, shared: bool, l: Leaf) -> anyhow::Result<Derivation> {
         let triple = self.triple(f)?;
         let mut d = Derivation::asserted(triple, None);
         d.id = id;
@@ -1014,17 +1050,17 @@ fn materialized(
     let base = Arc::new(Base::new(snap.clone(), &graphs)?);
     let mut g = Graph::with_base(base);
     g.set_budget(&budget)?;
-    let terms = Terms::new(snap.clone());
-    terms.set_budget(&budget)?;
+    let terms = Terms::new_in_controlled(snap.clone(), &budget, || check_controls(opts))?;
     let mut warnings = WorkingWarnings::new(&budget);
     let parsed = crate::profile_rules(input.profile, input.extras)?;
     let sources = crate::rule_sources(input.profile, input.extras)?;
     if crate::parser::uses_program(&parsed) {
         drop(g);
         drop(terms);
-        let source = |t: &Terms, w: &mut WorkingWarnings| {
-            crate::engine::frontend::compile(&parsed, t, w, false)
-        };
+        let source =
+            |t: &Terms, w: &mut WorkingWarnings, check: &mut dyn FnMut() -> anyhow::Result<()>| {
+                crate::engine::frontend::compile_controlled(&parsed, t, w, false, check)
+            };
         // the generalized facts are not part of the dataset's graphs, so a derivation
         // through one is not found, as for Jena rules
         return program_search(
@@ -1039,7 +1075,10 @@ fn materialized(
             opts,
         );
     }
-    let compiled = engine::compile_info(&parsed, &terms, &mut warnings, false)?;
+    let compiled =
+        engine::compile_info_controlled(&parsed, &terms, &mut warnings, false, &mut || {
+            check_controls(opts)
+        })?;
     let (rules, infos) = (compiled.rules(), compiled.infos());
     let rs = RuleSet {
         rules,
@@ -1048,13 +1087,13 @@ fn materialized(
         geo: input
             .extras
             .geo_default_geometry
-            .then(|| crate::geo_ids(&terms))
+            .then(|| crate::geo_ids_controlled(&terms, || check_controls(opts)))
             .transpose()?,
         relations: None,
     };
     let mut root = [0u64; 3];
     for (k, t) in triple.iter().enumerate() {
-        let id = terms.try_id_for(t)?;
+        let id = terms.try_id_for_controlled(t, || check_controls(opts))?;
         if Id(id).tag() == Tag::Local {
             return Ok(Explained::NotFound);
         }
@@ -1096,16 +1135,18 @@ pub(crate) fn explain_program(
     triple: &[Term; 3],
     opts: &ExplainOptions,
 ) -> anyhow::Result<Explained> {
-    let source = |t: &Terms, _: &mut WorkingWarnings| {
-        let p = crate::ir::Program::new(
-            program.relations.clone(),
-            program.rules.clone(),
-            &crate::ir::Vocab::of(t),
-            &t.budget(),
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(crate::engine::frontend::ProgramInfo::bare(p, &t.budget()))
-    };
+    let source =
+        |t: &Terms, _: &mut WorkingWarnings, check: &mut dyn FnMut() -> anyhow::Result<()>| {
+            let vocab = crate::ir::Vocab::try_of_controlled(t, check)?;
+            let p = crate::ir::Program::new(
+                program.relations.clone(),
+                program.rules.clone(),
+                &vocab,
+                &t.budget(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(crate::engine::frontend::ProgramInfo::bare(p, &t.budget()))
+        };
     let sources = vec!["rules".to_string()];
     budget_errors(program_search(
         snap,
@@ -1121,7 +1162,11 @@ pub(crate) fn explain_program(
 }
 
 /// What a program explanation compiles over its own terms.
-type ExplainSource<'a> = dyn Fn(&Terms, &mut WorkingWarnings) -> anyhow::Result<crate::engine::frontend::ProgramInfo>
+type ExplainSource<'a> = dyn Fn(
+        &Terms,
+        &mut WorkingWarnings,
+        &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<crate::engine::frontend::ProgramInfo>
     + 'a;
 
 /// The lowered rules of every stratum of `program`, in stratum order, with the infos of
@@ -1216,14 +1261,13 @@ fn program_search(
     let base = Arc::new(Base::new(snap.clone(), &graphs)?);
     let mut g = Graph::with_base(base);
     g.set_budget(&budget)?;
-    let terms = Terms::new(snap.clone());
-    terms.set_budget(&budget)?;
+    let terms = Terms::new_in_controlled(snap.clone(), &budget, || check_controls(opts))?;
     // the generalized facts, saved as term keys, in this explanation's terms; the credit
     // also holds the metadata of the rules below while the search runs
     let mut held = Held::new(&budget);
     {
         held.try_grow(generalized.len() * size_of::<Triple>())?;
-        let id = |k: &[u8]| terms.try_id_for_key(k);
+        let id = |k: &[u8]| terms.try_id_for_key_controlled(k, || check_controls(opts));
         let mut facts: Vec<Triple> = Vec::with_capacity(generalized.len());
         for k in generalized {
             facts.push([id(&k[0])?, id(&k[1])?, id(&k[2])?]);
@@ -1234,9 +1278,9 @@ fn program_search(
     // the program is compiled over this explanation's terms, which hold the local terms
     // its constants need
     let mut warnings = WorkingWarnings::new(&budget);
-    let info = source(&terms, &mut warnings)?;
+    let info = source(&terms, &mut warnings, &mut || check_controls(opts))?;
     let program = &info.program;
-    let vocab = crate::ir::Vocab::of(&terms);
+    let vocab = crate::ir::Vocab::try_of_controlled(&terms, || check_controls(opts))?;
     let part = program
         .relation_part(&vocab, &budget)
         .map_err(|e| match e {
@@ -1279,12 +1323,14 @@ fn program_search(
         rules: &rules,
         infos: &infos,
         sources,
-        geo: geo.then(|| crate::geo_ids(&terms)).transpose()?,
+        geo: geo
+            .then(|| crate::geo_ids_controlled(&terms, || check_controls(opts)))
+            .transpose()?,
         relations: Some(&program.relations),
     };
     let mut root = [0u64; 3];
     for (k, t) in triple.iter().enumerate() {
-        let id = terms.try_id_for(t)?;
+        let id = terms.try_id_for_controlled(t, || check_controls(opts))?;
         if Id(id).tag() == Tag::Local {
             return Ok(Explained::NotFound);
         }
@@ -1464,12 +1510,13 @@ fn search(
         if let Some(reason) = short {
             let mut b = Builder {
                 s: &s,
-                budget,
+                memory: Held::new(budget),
                 max_depth: opts.max_depth.min(MAX_DEPTH_LIMIT),
                 ids: FxHashMap::default(),
                 next: 0,
             };
             let tree = b.partial(r, 0, &mut Vec::new())?;
+            b.memory.into_bytes();
             return Ok(Explained::Partial {
                 tree: Box::new(tree),
                 reason,
@@ -1485,7 +1532,7 @@ fn search(
     s.via = via;
     let mut b = Builder {
         s: &s,
-        budget,
+        memory: Held::new(budget),
         max_depth: opts.max_depth.min(MAX_DEPTH_LIMIT),
         ids: FxHashMap::default(),
         next: 0,
@@ -1500,7 +1547,23 @@ fn search(
         trees.push(b.node(r, 0, Some(i))?);
     }
     let more = tops.len() + usize::from(s.leaf[r as usize].is_some()) > trees.len();
+    b.memory.into_bytes();
     Ok(Explained::Found { trees, more })
+}
+
+/// Fail when an explanation's cancellation flag or deadline has tripped.
+pub(crate) fn check_controls(opts: &ExplainOptions) -> anyhow::Result<()> {
+    if opts
+        .cancel
+        .as_ref()
+        .is_some_and(|c| c.load(Ordering::Relaxed))
+    {
+        return Err(anyhow::Error::new(sparkles_core::Error::Cancelled));
+    }
+    if opts.deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(ExplainBudgetExceeded("the explanation passed its timeout".to_string()).into());
+    }
+    Ok(())
 }
 
 /// The stop function of a session from an explanation's controls.
@@ -1536,6 +1599,7 @@ pub(crate) fn session_error(e: sparkles_core::Error) -> anyhow::Error {
 }
 
 /// A demand for `t` with its three positions constant.
+#[cfg(test)]
 pub(crate) fn demand_of(t: &[Term; 3]) -> Demand {
     Demand {
         s: DemandTerm::Const(t[0].clone()),
@@ -1596,7 +1660,10 @@ pub(crate) fn search_session(
         rules: p.rules,
         infos: p.infos,
         sources: p.sources,
-        geo: p.geo_default.then(|| crate::geo_ids(p.terms)).transpose()?,
+        geo: p
+            .geo_default
+            .then(|| crate::geo_ids_controlled(p.terms, || check_controls(opts)))
+            .transpose()?,
         relations: p.relations,
     };
     search(
@@ -1624,15 +1691,17 @@ pub fn explain_demand(
 ) -> anyhow::Result<Explained> {
     budget_errors((|| {
         let mut session = demand_session(input, opts, true)?;
+        let root = {
+            let terms = session.terms();
+            [
+                terms.try_id_for_controlled(&triple[0], || check_controls(opts))?,
+                terms.try_id_for_controlled(&triple[1], || check_controls(opts))?,
+                terms.try_id_for_controlled(&triple[2], || check_controls(opts))?,
+            ]
+        };
         session
-            .derive_all(&[demand_of(triple)])
+            .derive_ids(&[[Some(root[0]), Some(root[1]), Some(root[2])]])
             .map_err(session_error)?;
-        let terms = session.terms();
-        let root = [
-            terms.try_id_for(&triple[0])?,
-            terms.try_id_for(&triple[1])?,
-            terms.try_id_for(&triple[2])?,
-        ];
         let holds = session.graph().is_some_and(|g| g.contains(&root));
         if !holds {
             return Ok(Explained::NotFound);
@@ -1727,6 +1796,1655 @@ mod partial_tests {
     }
 
     #[test]
+    fn proof_triple_admits_the_second_literal_while_the_first_is_live() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let mut tx = store.write();
+        let literal = tx
+            .intern(&oxrdf::Literal::new_simple_literal("z".repeat(65_536)).into())
+            .unwrap();
+        let predicate = tx
+            .intern(&oxrdf::NamedNode::new_unchecked("urn:p").into())
+            .unwrap();
+        tx.insert([predicate, predicate, literal, Id::DEFAULT_GRAPH])
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(literal.tag(), Tag::Delta);
+        let snap = store.snapshot();
+        let terms = Terms::new(snap.clone());
+        let rs = RuleSet {
+            rules: &[],
+            infos: &[],
+            sources: &[],
+            geo: None,
+            relations: None,
+        };
+        let mut graph = Graph::with_capacity(0);
+        let plans = Plans::new(&mut graph, &[]).unwrap();
+        const LIMIT: usize = 96 * 1024;
+        let budget = Budget::new(Some(LIMIT));
+        let search = Search {
+            snap: &snap,
+            g: &graph,
+            terms: &terms,
+            rs: &rs,
+            plans: &plans,
+            inputs: &[],
+            extra: &FxHashSet::default(),
+            budget: &budget,
+            opts: &ExplainOptions::default(),
+            rounds: &[],
+            abort: AtomicBool::new(false),
+            facts: vec![[literal.0, predicate.0, literal.0]],
+            index: FxHashMap::default(),
+            leaf: Vec::new(),
+            by_head: Vec::new(),
+            insts: Vec::new(),
+            premises: Vec::new(),
+            binds: Vec::new(),
+            visited: 0,
+            depth: Vec::new(),
+            via: Vec::new(),
+            kept: 0,
+            full_schedule: None,
+            _full_schedule_allocation: None,
+        };
+        let mut builder = Builder {
+            s: &search,
+            memory: Held::new(&budget),
+            max_depth: 1,
+            ids: FxHashMap::default(),
+            next: 0,
+        };
+        let (result, peak) = crate::alloc_probe::peak_of(|| builder.triple(0));
+        assert!(
+            peak <= LIMIT,
+            "proof allocated both 64 KiB literals before refusing (peak={peak})"
+        );
+        assert!(BudgetFailure::from_anyhow(&result.unwrap_err()).is_some());
+        drop(builder);
+        assert_eq!(budget.used(), 0);
+
+        let mut builder = Builder {
+            s: &search,
+            memory: Held::new(&budget),
+            max_depth: 1,
+            ids: FxHashMap::default(),
+            next: 0,
+        };
+        let (result, peak) = crate::alloc_probe::peak_of(|| {
+            builder.builtin_call("", "print", &[&[Slot::Const(literal.0)]], ", ", &[])
+        });
+        assert!(
+            peak <= LIMIT,
+            "builtin allocated both the 64 KiB term and call before refusing (peak={peak})"
+        );
+        assert!(BudgetFailure::from_anyhow(&result.unwrap_err()).is_some());
+    }
+
+    #[test]
+    fn proof_leaf_classification_keeps_large_delta_object_within_budget() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let mut tx = store.write();
+        let subject = tx
+            .intern(&oxrdf::NamedNode::new_unchecked("urn:s").into())
+            .unwrap();
+        let predicate = tx
+            .intern(&oxrdf::NamedNode::new_unchecked("urn:p").into())
+            .unwrap();
+        let value = "z".repeat(65_536);
+        let literal = tx
+            .intern(&oxrdf::Literal::new_simple_literal(value.clone()).into())
+            .unwrap();
+        tx.insert([subject, predicate, literal, Id::DEFAULT_GRAPH])
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(literal.tag(), Tag::Delta);
+        let snap = store.snapshot();
+        let terms = Terms::new(snap.clone());
+        let rs = RuleSet {
+            rules: &[],
+            infos: &[],
+            sources: &[],
+            geo: None,
+            relations: None,
+        };
+        let mut graph = Graph::with_capacity(0);
+        let plans = Plans::new(&mut graph, &[]).unwrap();
+        const LIMIT: usize = 96 * 1024;
+        let budget = Budget::new(Some(LIMIT));
+        let search = Search {
+            snap: &snap,
+            g: &graph,
+            terms: &terms,
+            rs: &rs,
+            plans: &plans,
+            inputs: &[Id::DEFAULT_GRAPH],
+            extra: &FxHashSet::default(),
+            budget: &budget,
+            opts: &ExplainOptions::default(),
+            rounds: &[],
+            abort: AtomicBool::new(false),
+            facts: vec![[subject.0, predicate.0, literal.0]],
+            index: FxHashMap::default(),
+            leaf: vec![Some(Leaf::Graph(Id::DEFAULT_GRAPH))],
+            by_head: vec![Vec::new()],
+            insts: Vec::new(),
+            premises: Vec::new(),
+            binds: Vec::new(),
+            visited: 0,
+            depth: vec![0],
+            via: vec![NONE],
+            kept: 0,
+            full_schedule: None,
+            _full_schedule_allocation: None,
+        };
+        let mut builder = Builder {
+            s: &search,
+            memory: Held::new(&budget),
+            max_depth: 1,
+            ids: FxHashMap::default(),
+            next: 0,
+        };
+        let (result, peak) = crate::alloc_probe::peak_of(|| builder.node(0, 0, None));
+        let proof = result.expect("valid leaf with one 64 KiB delta literal fits in 96 KiB");
+        assert!(
+            peak <= LIMIT,
+            "leaf classification copied the 64 KiB delta key while its literal was live (peak={peak})"
+        );
+        assert!(!proof.generalized);
+        assert_eq!(proof.kind, DerivationKind::Asserted);
+        assert_eq!(
+            proof.triple[2],
+            Term::Literal(oxrdf::Literal::new_simple_literal(value))
+        );
+        drop(proof);
+        drop(builder);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn explanation_root_lookup_admits_fsst_scratch_and_polls_controls() {
+        use sparkles_core::{
+            builder::{BuildOptions, VocabCodec},
+            io::{RdfFormat, Source},
+            store::{Store, StoreOptions},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            &dir.path().join("db"),
+            StoreOptions {
+                build: BuildOptions {
+                    vocab_codec: Some(VocabCodec::Fsst),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let long = "z".repeat(65_536);
+        let mut data = format!(r#"@prefix ex: <http://ex.org/> . ex:s ex:p "a", "{long}""#);
+        for i in 2..sparkles_core::vocab::FC_BLOCK {
+            data.push_str(&format!(r#", "~filler{i}""#));
+        }
+        data.push_str(" .");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.is_fsst());
+        assert_eq!(
+            snap.generation.vocab.find(&sparkles_core::id::term_key(
+                &oxrdf::Literal::new_simple_literal(long).into()
+            )),
+            Ok(1)
+        );
+
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let lit = |s: &str| Term::Literal(oxrdf::Literal::new_simple_literal(s));
+        // Use "0fresh" (sorts before uncompressed entry 0 "a") so compiling the rule
+        // itself does not scan entry 1; only the tested root lookups do.
+        let profile = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [derive: (?x ex:p ?y) -> (?x ex:q ?y)] \
+             [fresh: (?x ex:p \"a\") -> (?x ex:derived \"0fresh\")]"
+                .into(),
+        );
+        let extras = Extras::default();
+
+        // Measure the budget used by materialized setup before root lookup, then leave 8 KiB.
+        let setup_budget = Budget::unlimited();
+        let base = Arc::new(Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap());
+        let mut g = Graph::with_base(base);
+        g.set_budget(&setup_budget).unwrap();
+        let setup_terms = Terms::new_in(snap.clone(), &setup_budget).unwrap();
+        let mut warnings = WorkingWarnings::new(&setup_budget);
+        let parsed = crate::profile_rules(&profile, &extras).unwrap();
+        let _compiled = engine::compile_info(&parsed, &setup_terms, &mut warnings, false).unwrap();
+        let mat_limit = setup_budget.used() + 8192;
+
+        let mat_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &profile,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        // Entry 0 ("a") is uncompressed; measure baseline peak without scanning entry 1.
+        let (_, mat_baseline) = crate::alloc_probe::peak_of(|| {
+            explain(
+                &mat_input,
+                &[ex("s"), ex("p"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let mat_opts = ExplainOptions {
+            max_memory: Some(mat_limit),
+            ..Default::default()
+        };
+        // 1. Materialized strict reasoner route on absent short literal "b".
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            explain(&mat_input, &[ex("s"), ex("p"), lit("b")], &mat_opts)
+        });
+        assert!(
+            peak < mat_baseline + 16_384,
+            "materialized root miss allocated 64 KiB FSST suffix (peak={peak}, baseline={mat_baseline})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+        // 2. Materialized strict reasoner route on present short filler sorting after 64 KiB literal.
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            explain(&mat_input, &[ex("s"), ex("p"), lit("~filler2")], &mat_opts)
+        });
+        assert!(
+            peak < mat_baseline + 16_384,
+            "materialized root hit allocated 64 KiB FSST suffix (peak={peak}, baseline={mat_baseline})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+
+        // 3. Demand and why-not routes with 8 KiB left after demand session setup.
+        let reasoner =
+            QueryReasoner::new(profile.clone(), &extras, crate::Inputs::default()).unwrap();
+        let demand_input = DemandInput {
+            reasoner: &reasoner,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let probe_session =
+            demand_session(&demand_input, &ExplainOptions::default(), true).unwrap();
+        let demand_limit = probe_session.budget().used() + 8192;
+        drop(probe_session);
+        let (_, demand_baseline) = crate::alloc_probe::peak_of(|| {
+            explain_demand(
+                &demand_input,
+                &[ex("s"), ex("absent"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let demand_opts = ExplainOptions {
+            max_memory: Some(demand_limit),
+            ..Default::default()
+        };
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            explain_demand(&demand_input, &[ex("s"), ex("q"), lit("b")], &demand_opts)
+        });
+        assert!(
+            peak < demand_baseline + 16_384,
+            "demand root miss allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            explain_demand(
+                &demand_input,
+                &[ex("s"), ex("q"), lit("~filler2")],
+                &demand_opts,
+            )
+        });
+        assert!(
+            peak < demand_baseline + 16_384,
+            "demand root hit allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+
+        let whynot_opts = crate::whynot::WhyNotOptions {
+            explain: demand_opts,
+            ..Default::default()
+        };
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            crate::whynot::why_not(&demand_input, &[ex("s"), ex("q"), lit("b")], &whynot_opts)
+        });
+        assert!(
+            peak < demand_baseline + 16_384,
+            "why-not root miss allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+
+        // Local-interning behavior on misses is preserved when budget allows.
+        let found = explain_demand(
+            &demand_input,
+            &[ex("s"), ex("derived"), lit("0fresh")],
+            &ExplainOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(found, Explained::Found { .. }));
+        let wn = crate::whynot::why_not(
+            &demand_input,
+            &[ex("s"), ex("q"), lit("b")],
+            &crate::whynot::WhyNotOptions::default(),
+        )
+        .unwrap();
+        assert!(!matches!(wn, crate::whynot::WhyNot::Entailed));
+
+        // Direct strict term lookup with 8 KiB left after Terms::new_in refuses before
+        // allocating the 64 KiB FSST suffix, and polls live cancellation/deadline controls.
+        let direct_probe = Budget::unlimited();
+        let _direct_setup = Terms::new_in(snap.clone(), &direct_probe).unwrap();
+        let direct_limit = direct_probe.used() + 8192;
+        let direct_budget = Budget::new(Some(direct_limit));
+        let direct_terms = Terms::new_in(snap.clone(), &direct_budget).unwrap();
+        for term in [lit("b"), lit("~filler2")] {
+            let (res, peak) = crate::alloc_probe::peak_of(|| {
+                direct_terms.try_id_for_controlled(&term, || Ok(()))
+            });
+            assert!(
+                peak <= 8192,
+                "direct strict lookup for {term} allocated oversized FSST scratch (peak={peak})"
+            );
+            assert!(BudgetFailure::from_anyhow(&res.unwrap_err()).is_some());
+        }
+        let mid_budget = Budget::unlimited();
+        let mid_terms = Terms::new_in(snap.clone(), &mid_budget).unwrap();
+        let polls = Cell::new(0usize);
+        let (stopped, peak) = crate::alloc_probe::peak_of(|| {
+            mid_terms.try_id_for_controlled(&lit("b"), || {
+                let n = polls.get() + 1;
+                polls.set(n);
+                if n >= 8 {
+                    Err(anyhow::Error::new(sparkles_core::Error::Cancelled))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        assert!(
+            peak <= 8192,
+            "mid-scan cancellation should stop before 64 KiB allocation (peak={peak})"
+        );
+        assert!(
+            stopped
+                .unwrap_err()
+                .downcast_ref::<sparkles_core::Error>()
+                .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+        );
+        let expired_opts = ExplainOptions {
+            deadline: Some(Instant::now() - std::time::Duration::from_secs(1)),
+            ..Default::default()
+        };
+        assert!(
+            explain(&mat_input, &[ex("s"), ex("p"), lit("b")], &expired_opts)
+                .unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+        let cancel_opts = ExplainOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        };
+        assert!(
+            explain(&mat_input, &[ex("s"), ex("p"), lit("b")], &cancel_opts)
+                .unwrap_err()
+                .downcast_ref::<sparkles_core::Error>()
+                .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+        );
+    }
+
+    #[test]
+    fn explanation_rule_constant_lookup_admits_fsst_scratch_and_polls_controls() {
+        use sparkles_core::{
+            builder::{BuildOptions, VocabCodec},
+            io::{RdfFormat, Source},
+            store::{Store, StoreOptions},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            &dir.path().join("db"),
+            StoreOptions {
+                build: BuildOptions {
+                    vocab_codec: Some(VocabCodec::Fsst),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let long = "z".repeat(65_536);
+        let mut data = format!(r#"@prefix ex: <http://ex.org/> . ex:s ex:p "a", "{long}""#);
+        for i in 2..sparkles_core::vocab::FC_BLOCK {
+            data.push_str(&format!(r#", "~filler{i}""#));
+        }
+        data.push_str(" .");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.is_fsst());
+
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let lit = |s: &str| Term::Literal(oxrdf::Literal::new_simple_literal(s));
+        let extras = Extras::default();
+
+        // Baseline rules use "a" (uncompressed entry 0) and "0fresh" (sorts before entry 0),
+        // so baseline compilation never scans entry 1; target rules use "b", whose
+        // three-byte literal probe shares the tag with "a" and reaches the 64 KiB entry 1.
+        let jena_a = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [derive: (?x ex:p ?y) -> (?x ex:q ?y)] \
+             [fresh: (?x ex:p \"a\") -> (?x ex:derived \"0fresh\")]"
+                .into(),
+        );
+        let jena_b = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [derive: (?x ex:p ?y) -> (?x ex:q ?y)] \
+             [fresh: (?x ex:p \"b\") -> (?x ex:derived \"0fresh\")]"
+                .into(),
+        );
+        let prog_a = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [rel: (?x ex:p \"a\") -> r(?x)] \
+             [out: r(?x) -> (?x ex:q \"a\")]"
+                .into(),
+        );
+        let prog_b = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [rel: (?x ex:p \"b\") -> r(?x)] \
+             [out: r(?x) -> (?x ex:q \"b\")]"
+                .into(),
+        );
+
+        let setup_budget = Budget::unlimited();
+        let base = Arc::new(Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap());
+        let mut g = Graph::with_base(base);
+        g.set_budget(&setup_budget).unwrap();
+        let setup_terms = Terms::new_in(snap.clone(), &setup_budget).unwrap();
+        let mut warnings = WorkingWarnings::new(&setup_budget);
+        let parsed_a = crate::profile_rules(&jena_a, &extras).unwrap();
+        let _compiled_a =
+            engine::compile_info(&parsed_a, &setup_terms, &mut warnings, false).unwrap();
+        let mat_limit = setup_budget.used() + 8192;
+
+        let mat_a_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &jena_a,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let mat_b_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &jena_b,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let (_, mat_baseline) = crate::alloc_probe::peak_of(|| {
+            explain(
+                &mat_a_input,
+                &[ex("s"), ex("p"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let mat_opts = ExplainOptions {
+            max_memory: Some(mat_limit),
+            ..Default::default()
+        };
+        for root_obj in [lit("b"), lit("a")] {
+            let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+                explain(
+                    &mat_b_input,
+                    &[ex("s"), ex("p"), root_obj.clone()],
+                    &mat_opts,
+                )
+            });
+            assert!(
+                peak < mat_baseline + 16_384 && largest < 65_536,
+                "materialized rule constant \"b\" with root {root_obj} allocated 64 KiB FSST suffix (peak={peak}, baseline={mat_baseline}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some()
+            );
+        }
+
+        // Program rules (uses_program == true) in materialized program_search.
+        let prog_a_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &prog_a,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let prog_b_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &prog_b,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let (_, prog_baseline) = crate::alloc_probe::peak_of(|| {
+            explain(
+                &prog_a_input,
+                &[ex("s"), ex("p"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let prog_opts = ExplainOptions {
+            max_memory: Some(mat_limit + 4096),
+            ..Default::default()
+        };
+        for root_obj in [lit("b"), lit("a")] {
+            let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+                explain(
+                    &prog_b_input,
+                    &[ex("s"), ex("p"), root_obj.clone()],
+                    &prog_opts,
+                )
+            });
+            assert!(
+                peak < prog_baseline + 16_384 && largest < 65_536,
+                "program rule constant \"b\" with root {root_obj} allocated 64 KiB FSST suffix (peak={peak}, baseline={prog_baseline}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some()
+            );
+        }
+
+        // Demand and why-not sessions compile rules in Session::new before root lookup.
+        let reasoner_a =
+            QueryReasoner::new(jena_a.clone(), &extras, crate::Inputs::default()).unwrap();
+        let demand_a_input = DemandInput {
+            reasoner: &reasoner_a,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let probe_session =
+            demand_session(&demand_a_input, &ExplainOptions::default(), true).unwrap();
+        let demand_limit = probe_session.budget().used() + 8192;
+        drop(probe_session);
+        let (_, demand_baseline) = crate::alloc_probe::peak_of(|| {
+            explain_demand(
+                &demand_a_input,
+                &[ex("s"), ex("absent"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let reasoner_b =
+            QueryReasoner::new(jena_b.clone(), &extras, crate::Inputs::default()).unwrap();
+        let demand_b_input = DemandInput {
+            reasoner: &reasoner_b,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let demand_opts = ExplainOptions {
+            max_memory: Some(demand_limit),
+            ..Default::default()
+        };
+        for root_obj in [lit("b"), lit("a")] {
+            let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+                explain_demand(
+                    &demand_b_input,
+                    &[ex("s"), ex("q"), root_obj.clone()],
+                    &demand_opts,
+                )
+            });
+            assert!(
+                peak < demand_baseline + 16_384 && largest < 65_536,
+                "demand rule constant \"b\" with root {root_obj} allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some()
+            );
+        }
+
+        let whynot_opts = crate::whynot::WhyNotOptions {
+            explain: demand_opts.clone(),
+            ..Default::default()
+        };
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            crate::whynot::why_not(&demand_b_input, &[ex("s"), ex("q"), lit("b")], &whynot_opts)
+        });
+        assert!(
+            peak < demand_baseline + 16_384 && largest < 65_536,
+            "why-not rule constant \"b\" allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline}, largest={largest})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+
+        // Demand program rules (uses_program == true) in Session::new -> program_rules.
+        let reasoner_prog_a =
+            QueryReasoner::new(prog_a, &extras, crate::Inputs::default()).unwrap();
+        let demand_prog_a = DemandInput {
+            reasoner: &reasoner_prog_a,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let probe_prog = demand_session(&demand_prog_a, &ExplainOptions::default(), true).unwrap();
+        let demand_prog_limit = probe_prog.budget().used() + 8192;
+        drop(probe_prog);
+        let (_, demand_prog_baseline) = crate::alloc_probe::peak_of(|| {
+            explain_demand(
+                &demand_prog_a,
+                &[ex("s"), ex("absent"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let reasoner_prog_b =
+            QueryReasoner::new(prog_b.clone(), &extras, crate::Inputs::default()).unwrap();
+        let demand_prog_b = DemandInput {
+            reasoner: &reasoner_prog_b,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let demand_prog_opts = ExplainOptions {
+            max_memory: Some(demand_prog_limit),
+            ..Default::default()
+        };
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            explain_demand(
+                &demand_prog_b,
+                &[ex("s"), ex("q"), lit("b")],
+                &demand_prog_opts,
+            )
+        });
+        assert!(
+            peak < demand_prog_baseline + 16_384 && largest < 65_536,
+            "demand program constant \"b\" allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_prog_baseline}, largest={largest})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+
+        // Cancellation and expired deadline stop before rule/program compilation allocates
+        // the 64 KiB FSST suffix.
+        let cancel_opts = ExplainOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        };
+        let expired_opts = ExplainOptions {
+            deadline: Some(Instant::now() - std::time::Duration::from_secs(1)),
+            ..Default::default()
+        };
+        for (label, input, baseline) in [
+            ("materialized", &mat_b_input, mat_baseline),
+            ("program", &prog_b_input, prog_baseline),
+        ] {
+            let (res, peak) = crate::alloc_probe::peak_of(|| {
+                explain(input, &[ex("s"), ex("p"), lit("a")], &cancel_opts)
+            });
+            assert!(
+                peak < baseline + 16_384,
+                "{label} cancel allocated 64 KiB FSST suffix (peak={peak}, baseline={baseline})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<sparkles_core::Error>()
+                    .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+            );
+
+            let (res, peak) = crate::alloc_probe::peak_of(|| {
+                explain(input, &[ex("s"), ex("p"), lit("a")], &expired_opts)
+            });
+            assert!(
+                peak < baseline + 16_384,
+                "{label} expired deadline allocated 64 KiB FSST suffix (peak={peak}, baseline={baseline})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some()
+            );
+        }
+
+        // Mid-scan cancellation stops inside controlled Jena and program compilation
+        // before allocating the 64 KiB FSST suffix.
+        let parsed_b = crate::profile_rules(&jena_b, &extras).unwrap();
+        let parsed_prog_b = crate::profile_rules(&prog_b, &extras).unwrap();
+        let mid_budget = Budget::unlimited();
+        let mid_terms = Terms::new_in(snap.clone(), &mid_budget).unwrap();
+        let mut mid_warnings = WorkingWarnings::new(&mid_budget);
+        let polls = Cell::new(0usize);
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            engine::compile_info_controlled(
+                &parsed_b,
+                &mid_terms,
+                &mut mid_warnings,
+                false,
+                &mut || {
+                    let n = polls.get() + 1;
+                    polls.set(n);
+                    if n >= 16 {
+                        Err(anyhow::Error::new(sparkles_core::Error::Cancelled))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        });
+        assert!(
+            peak <= 16_384,
+            "mid-compile Jena cancellation allocated 64 KiB FSST suffix (peak={peak})"
+        );
+        assert!(
+            res.err()
+                .expect("mid-compile cancellation")
+                .downcast_ref::<sparkles_core::Error>()
+                .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+        );
+        let polls = Cell::new(0usize);
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            crate::engine::frontend::compile_controlled(
+                &parsed_prog_b,
+                &mid_terms,
+                &mut mid_warnings,
+                false,
+                &mut || {
+                    let n = polls.get() + 1;
+                    polls.set(n);
+                    if n >= 16 {
+                        Err(anyhow::Error::new(sparkles_core::Error::Cancelled))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        });
+        assert!(
+            peak <= 16_384,
+            "mid-compile program cancellation allocated 64 KiB FSST suffix (peak={peak})"
+        );
+        assert!(
+            res.err()
+                .expect("mid-compile program cancellation")
+                .downcast_ref::<sparkles_core::Error>()
+                .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+        );
+
+        // Controlled compilation preserves rule blank-node handling without interpreting
+        // encoded response labels such as `spkrule_62` (hex for "b").
+        let bnode_terms = Terms::new_in(snap.clone(), &Budget::unlimited()).unwrap();
+        let plain_bnode = bnode_terms
+            .try_id_for_rule_controlled(
+                &Term::BlankNode(oxrdf::BlankNode::new_unchecked("b")),
+                || Ok(()),
+            )
+            .unwrap();
+        let encoded_like_bnode = bnode_terms
+            .try_id_for_rule_controlled(
+                &Term::BlankNode(oxrdf::BlankNode::new_unchecked("spkrule_62")),
+                || Ok(()),
+            )
+            .unwrap();
+        assert!(bnode_terms.is_rule_bnode(plain_bnode));
+        assert!(bnode_terms.is_rule_bnode(encoded_like_bnode));
+        assert_ne!(plain_bnode, encoded_like_bnode);
+        // By contrast, general response-side lookup decodes `spkrule_62` back to `_:b`.
+        let decoded_bnode = bnode_terms
+            .try_id_for_controlled(
+                &Term::BlankNode(oxrdf::BlankNode::new_unchecked("spkrule_62")),
+                || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(decoded_bnode, plain_bnode);
+    }
+
+    #[test]
+    fn explanation_terms_init_avoids_fsst_literal_boundary_decode() {
+        use sparkles_core::{
+            builder::{BuildOptions, VocabCodec},
+            io::{RdfFormat, Source},
+            store::{Store, StoreOptions},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            &dir.path().join("db"),
+            StoreOptions {
+                build: BuildOptions {
+                    vocab_codec: Some(VocabCodec::Fsst),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Block 0 holds one short literal "a" at entry 0, immediately followed by a
+        // compressible 64 KiB first IRI at entry 1 and short <http://b.org/...> fillers
+        // filling the rest of block 0 so <http://ex.org/*> sits in block 1+.
+        // Add enough <http://m.org/...> IRIs to cross vocabmerge::SAMPLE_EVERY (4096) so
+        // the FSST IRI table (kind 1) is trained and compresses the 64 KiB IRI at entry 1.
+        let long = "z".repeat(65_536);
+        let mut data =
+            format!(r#"@prefix ex: <http://ex.org/> . ex:s ex:p "a", <http://a.org/{long}>"#);
+        for i in 2..sparkles_core::vocab::FC_BLOCK {
+            data.push_str(&format!(", <http://b.org/f{i:02}>"));
+        }
+        let sample_z = "z".repeat(256);
+        for i in 0..4112 {
+            data.push_str(&format!(", <http://m.org/k{i:04}_{sample_z}>"));
+        }
+        data.push_str(" .");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.is_fsst());
+        assert_eq!(snap.generation.vocab.first_triple(), 1);
+
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let lit = |s: &str| Term::Literal(oxrdf::Literal::new_simple_literal(s));
+        let extras = Extras::default();
+        let jena = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . [derive: (?x ex:p ?y) -> (?x ex:q ?y)]".into(),
+        );
+        let prog = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [rel: (?x ex:p \"a\") -> r(?x)] \
+             [out: r(?x) -> (?x ex:q \"a\")]"
+                .into(),
+        );
+
+        let measure_fresh = |f: Box<dyn FnOnce() -> anyhow::Result<bool> + Send + '_>| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || crate::alloc_probe::peak_and_largest_of(f))
+                    .join()
+                    .unwrap()
+            })
+        };
+
+        let mat_jena_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &jena,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let (res, peak, largest) = measure_fresh(Box::new(|| {
+            explain(
+                &mat_jena_input,
+                &[ex("s"), ex("p"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .map(|_| true)
+        }));
+        assert!(res.is_ok(), "materialized Jena failed: {res:?}");
+        assert!(
+            largest < 65_536,
+            "materialized Jena Terms init decoded 64 KiB boundary IRI (peak={peak}, largest={largest})"
+        );
+
+        let mat_prog_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &prog,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        let (res, peak, largest) = measure_fresh(Box::new(|| {
+            explain(
+                &mat_prog_input,
+                &[ex("s"), ex("p"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .map(|_| true)
+        }));
+        assert!(res.is_ok(), "materialized program failed: {res:?}");
+        assert!(
+            largest < 65_536,
+            "materialized program Terms init decoded 64 KiB boundary IRI (peak={peak}, largest={largest})"
+        );
+
+        let reasoner = QueryReasoner::new(jena, &extras, crate::Inputs::default()).unwrap();
+        let demand_input = DemandInput {
+            reasoner: &reasoner,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let (res, peak, largest) = measure_fresh(Box::new(|| {
+            explain_demand(
+                &demand_input,
+                &[ex("s"), ex("q"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .map(|_| true)
+        }));
+        assert!(res.is_ok(), "demand explain failed: {res:?}");
+        assert!(
+            largest < 65_536,
+            "demand Terms init decoded 64 KiB boundary IRI (peak={peak}, largest={largest})"
+        );
+
+        let (res, peak, largest) = measure_fresh(Box::new(|| {
+            crate::whynot::why_not(
+                &demand_input,
+                &[ex("s"), ex("zabsent"), lit("a")],
+                &crate::whynot::WhyNotOptions::default(),
+            )
+            .map(|_| true)
+        }));
+        assert!(res.is_ok(), "why-not failed: {res:?}");
+        assert!(
+            largest < 65_536,
+            "why-not Terms init decoded 64 KiB boundary IRI (peak={peak}, largest={largest})"
+        );
+    }
+
+    #[test]
+    fn explanation_imports_and_named_graph_admit_fsst_scratch() {
+        use sparkles_core::{
+            builder::{BuildOptions, VocabCodec},
+            io::{RdfFormat, Source},
+            store::{Store, StoreOptions},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            &dir.path().join("db"),
+            StoreOptions {
+                build: BuildOptions {
+                    vocab_codec: Some(VocabCodec::Fsst),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let long = "z".repeat(65_536);
+        let fc = sparkles_core::vocab::FC_BLOCK;
+        // Zero literals so rank 0 is an IRI and the FSST IRI table trains directly.
+        // Block 0: rdf:first/nil/rest/type + fillers so Terms::new_in_controlled succeeds
+        //          without touching any 64 KiB block.
+        // Block 1: owl:a, 64 KiB owl:b{long}, owl:imports + owl:j* fillers.
+        // Block 2: short owl:r* fillers so owl:sameAs probes stay out of Block 1.
+        // Block 3: x:a, 64 KiB x:b{long}, x:g (named input graph), x:imp (imported graph) + fillers.
+        // Block 4+: z:* used by rules and target triple.
+        let mut data = String::from(
+            "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+             @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+             @prefix x: <http://x.org/> .\n\
+             @prefix z: <http://z.org/> .\n\
+             {\n  z:s z:p z:o, rdf:first, rdf:nil, rdf:rest, rdf:type",
+        );
+        for i in 0..(fc - 4) {
+            data.push_str(&format!(
+                ", <http://www.w3.org/1999/02/22-rdf-syntax-ns#z{i:02}>"
+            ));
+        }
+        data.push_str(&format!(", owl:a, <http://www.w3.org/2002/07/owl#b{long}>"));
+        for i in 0..(fc - 3) {
+            data.push_str(&format!(", <http://www.w3.org/2002/07/owl#j{i:02}>"));
+        }
+        for i in 0..fc {
+            data.push_str(&format!(", <http://www.w3.org/2002/07/owl#r{i:02}>"));
+        }
+        data.push_str(&format!(", x:a, <http://x.org/b{long}>"));
+        for i in 0..(fc - 4) {
+            data.push_str(&format!(", <http://x.org/z{i:02}>"));
+        }
+        data.push_str(" .\n  z:s owl:imports x:imp .\n}\n");
+        data.push_str("x:g { z:s z:p z:o . }\n");
+        data.push_str("x:imp { z:s z:p z:o . }\n");
+        store
+            .load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+            .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.is_fsst());
+
+        let z = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://z.org/{local}")).unwrap())
+        };
+        let extras = Extras::default();
+        let rules = Profile::Rules(
+            "@prefix z: <http://z.org/> . [derive: (?x z:p ?y) -> (?x z:q ?y)]".into(),
+        );
+        let named_inputs = crate::Inputs {
+            data_graphs: vec![crate::inputs::GraphRef::Named("http://x.org/g".into())],
+            imports: crate::inputs::ImportMode::None,
+            ..Default::default()
+        };
+        let import_inputs = crate::Inputs {
+            data_graphs: vec![crate::inputs::GraphRef::Default],
+            imports: crate::inputs::ImportMode::Dataset,
+            ..Default::default()
+        };
+
+        for (label, inputs) in [
+            ("named-graph", named_inputs),
+            ("owl-imports", import_inputs),
+        ] {
+            let reasoner = QueryReasoner::new(rules.clone(), &extras, inputs).unwrap();
+            let input = DemandInput {
+                reasoner: &reasoner,
+                snap: snap.clone(),
+                readable: None,
+            };
+            let opts = ExplainOptions {
+                max_memory: Some(48 * 1024),
+                ..Default::default()
+            };
+            let (res, peak, largest) = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        crate::alloc_probe::peak_and_largest_of(|| {
+                            explain_demand(&input, &[z("s"), z("q"), z("o")], &opts)
+                        })
+                    })
+                    .join()
+                    .unwrap()
+            });
+            assert!(
+                largest < 65_536,
+                "{label} demand decoded 64 KiB FSST suffix (peak={peak}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some(),
+                "{label} demand expected ExplainBudgetExceeded"
+            );
+
+            let wn_opts = crate::whynot::WhyNotOptions {
+                explain: opts,
+                ..Default::default()
+            };
+            let (res, peak, largest) = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        crate::alloc_probe::peak_and_largest_of(|| {
+                            crate::whynot::why_not(&input, &[z("s"), z("q"), z("o")], &wn_opts)
+                        })
+                    })
+                    .join()
+                    .unwrap()
+            });
+            assert!(
+                largest < 65_536,
+                "{label} why-not decoded 64 KiB FSST suffix (peak={peak}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<ExplainBudgetExceeded>()
+                    .is_some(),
+                "{label} why-not expected ExplainBudgetExceeded"
+            );
+
+            let cancel_opts = ExplainOptions {
+                cancel: Some(Arc::new(AtomicBool::new(true))),
+                ..Default::default()
+            };
+            let (res, peak, largest) = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        crate::alloc_probe::peak_and_largest_of(|| {
+                            explain_demand(&input, &[z("s"), z("q"), z("o")], &cancel_opts)
+                        })
+                    })
+                    .join()
+                    .unwrap()
+            });
+            assert!(
+                largest < 65_536,
+                "{label} cancel decoded 64 KiB FSST suffix (peak={peak}, largest={largest})"
+            );
+            assert!(
+                res.unwrap_err()
+                    .downcast_ref::<sparkles_core::Error>()
+                    .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled)),
+                "{label} expected Cancelled"
+            );
+        }
+
+        // Empty readable input set: when access denies the sole configured default graph,
+        // the session must skip the owl:imports vocabulary probe rather than triggering
+        // the 64 KiB FSST block decode and refusing under the 48 KiB cap.
+        let import_inputs = crate::Inputs {
+            data_graphs: vec![crate::inputs::GraphRef::Default],
+            imports: crate::inputs::ImportMode::Dataset,
+            ..Default::default()
+        };
+        let reasoner = QueryReasoner::new(rules, &extras, import_inputs).unwrap();
+        let denied = Arc::new(sparkles_core::access::GraphAccess::graphs(
+            sparkles_core::access::Graphs::none(),
+            sparkles_core::access::Graphs::none(),
+        ));
+        let denied_input = DemandInput {
+            reasoner: &reasoner,
+            snap: snap.clone(),
+            readable: Some(denied),
+        };
+        let opts_48k = ExplainOptions {
+            max_memory: Some(48 * 1024),
+            ..Default::default()
+        };
+        let (session_res, peak, largest) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    crate::alloc_probe::peak_and_largest_of(|| {
+                        demand_session(&denied_input, &opts_48k, true).map(|_| ())
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(
+            largest < 65_536,
+            "denied default graph session probed 64 KiB owl:imports FSST block (peak={peak}, largest={largest})"
+        );
+        assert!(
+            session_res.is_ok(),
+            "denied default graph session should succeed under 48 KiB cap without probing owl:imports, got {session_res:?}"
+        );
+
+        let opts_60k = ExplainOptions {
+            max_memory: Some(60 * 1024),
+            ..Default::default()
+        };
+        let (res, peak, largest) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    crate::alloc_probe::peak_and_largest_of(|| {
+                        explain_demand(&denied_input, &[z("s"), z("q"), z("o")], &opts_60k)
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(
+            largest < 65_536,
+            "denied default graph demand probed 64 KiB owl:imports FSST block (peak={peak}, largest={largest})"
+        );
+        assert!(
+            matches!(res, Ok(Explained::NotFound)),
+            "denied default graph demand should return NotFound without probing owl:imports, got {res:?}"
+        );
+
+        let wn_opts = crate::whynot::WhyNotOptions {
+            explain: opts_48k,
+            ..Default::default()
+        };
+        let (res, peak, largest) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    crate::alloc_probe::peak_and_largest_of(|| {
+                        crate::whynot::why_not(
+                            &denied_input,
+                            &[z("s"), z("unrelated"), z("o")],
+                            &wn_opts,
+                        )
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(
+            largest < 65_536,
+            "denied default graph why-not probed 64 KiB owl:imports FSST block (peak={peak}, largest={largest})"
+        );
+        assert!(
+            matches!(res, Ok(crate::whynot::WhyNot::NotEntailed { .. })),
+            "denied default graph why-not should return NotEntailed without probing owl:imports, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn demand_vocab_classification_avoids_delta_literal_copies() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let long = "z".repeat(65_536);
+        let update = format!(
+            "INSERT DATA {{ <http://ex.org/other> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \"{long}\" }}"
+        );
+        sparkles_core::sparql::update::update(&store, &update, &Default::default()).unwrap();
+        let snap = store.snapshot();
+        let long_term = Term::Literal(oxrdf::Literal::new_simple_literal(long.clone()));
+        assert_eq!(
+            snap.lookup_term(&long_term).unwrap().tag(),
+            Tag::Delta,
+            "fixture requires long literal in delta vocabulary"
+        );
+
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let extras = Extras::default();
+        let base_rules = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> . \
+             [r: (?x rdf:type \"a\") -> (?x ex:q ex:o)]"
+                .into(),
+        );
+        let target_rules = Profile::Rules(format!(
+            "@prefix ex: <http://ex.org/> . \
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> . \
+             [r: (?x rdf:type \"{long}\") -> (?x ex:q ex:o)]"
+        ));
+
+        let base_reasoner =
+            QueryReasoner::new(base_rules, &extras, crate::Inputs::default()).unwrap();
+        let base_input = DemandInput {
+            reasoner: &base_reasoner,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let probe = demand_session(&base_input, &ExplainOptions::default(), true).unwrap();
+        let base_used = probe.budget().used();
+        drop(probe);
+
+        // Cap fits the single 64 KiB encoded compilation probe plus session overhead,
+        // while excluding two simultaneous 64 KiB owned copies (delta key + lexical String).
+        let cap = base_used + 80 * 1024;
+        assert!(cap < base_used + 2 * 65_536);
+
+        let target_reasoner =
+            QueryReasoner::new(target_rules, &extras, crate::Inputs::default()).unwrap();
+        let target_input = DemandInput {
+            reasoner: &target_reasoner,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let opts = ExplainOptions {
+            max_memory: Some(cap),
+            ..Default::default()
+        };
+
+        // Direct derive_ids check after Session::new drops its compilation probe:
+        // demand::Vocab::of must allocate zero 64 KiB copies of the delta literal.
+        let mut session = demand_session(&target_input, &opts, true).unwrap();
+        let target_ids = [
+            session.terms().try_id_for(&ex("s")).unwrap(),
+            session.terms().try_id_for(&ex("q")).unwrap(),
+            session.terms().try_id_for(&ex("o")).unwrap(),
+        ];
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            session.derive_ids(&[[
+                Some(target_ids[0]),
+                Some(target_ids[1]),
+                Some(target_ids[2]),
+            ]])
+        });
+        assert!(res.is_ok(), "derive_ids failed: {res:?}");
+        assert!(
+            largest < 32_768 && peak < 65_536,
+            "derive_ids copied delta literal during Vocab::of (peak={peak}, largest={largest})"
+        );
+        drop(session);
+
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            explain_demand(&target_input, &[ex("s"), ex("q"), ex("o")], &opts)
+        });
+        assert!(res.is_ok(), "explain_demand failed: {res:?}");
+        assert!(
+            peak < base_used + 112 * 1024,
+            "explain_demand spiked to two live copies of delta literal (peak={peak}, cap={cap}, largest={largest})"
+        );
+
+        let wn_opts = crate::whynot::WhyNotOptions {
+            explain: opts,
+            ..Default::default()
+        };
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            crate::whynot::why_not(
+                &target_input,
+                &[ex("s"), ex("unrelated"), ex("o")],
+                &wn_opts,
+            )
+        });
+        assert!(res.is_ok(), "why_not failed: {res:?}");
+        assert!(
+            peak < base_used + 112 * 1024,
+            "why_not spiked to two live copies of delta literal (peak={peak}, cap={cap}, largest={largest})"
+        );
+
+        // Verify demand::Vocab::of_controlled polls live controls without copying delta keys.
+        let parsed = crate::profile_rules(
+            &Profile::Rules(format!(
+                "@prefix ex: <http://ex.org/> . \
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> . \
+             [r: (?x rdf:type \"{long}\") -> (?x ex:q ex:o)]"
+            )),
+            &extras,
+        )
+        .unwrap();
+        let ctrl_budget = Budget::unlimited();
+        let ctrl_terms = Terms::new_in(snap.clone(), &ctrl_budget).unwrap();
+        let mut ctrl_warnings = WorkingWarnings::new(&ctrl_budget);
+        let compiled =
+            engine::compile_info(&parsed, &ctrl_terms, &mut ctrl_warnings, false).unwrap();
+        let polls = Cell::new(0usize);
+        let (cancelled, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            crate::demand::Vocab::of_controlled(compiled.rules(), &ctrl_terms, || {
+                let n = polls.get() + 1;
+                polls.set(n);
+                if n >= 2 {
+                    Err(anyhow::Error::new(sparkles_core::Error::Cancelled))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        assert!(
+            largest < 16_384 && peak < 16_384,
+            "Vocab::of_controlled allocated on delta literal before cancel (peak={peak}, largest={largest})"
+        );
+        assert!(
+            cancelled
+                .err()
+                .expect("expected cancellation")
+                .downcast_ref::<sparkles_core::Error>()
+                .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+        );
+    }
+
+    #[test]
+    fn explanation_owl_imports_retains_decode_credit_across_long_delta_iris() {
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let long = "z".repeat(65_536);
+        let imp1 = format!("http://imp.org/one_{long}");
+        let imp2 = format!("http://imp.org/two_{long}");
+        let imp3 = format!("http://imp.org/three_{long}");
+        let owl_imports = crate::inputs::OWL_IMPORTS;
+
+        let extras = Extras::default();
+        let rules = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . [derive: (?x ex:p ?y) -> (?x ex:q ?y)]".into(),
+        );
+        let inputs = crate::Inputs {
+            data_graphs: vec![crate::inputs::GraphRef::Default],
+            imports: crate::inputs::ImportMode::Dataset,
+            ..Default::default()
+        };
+        let reasoner = QueryReasoner::new(rules, &extras, inputs).unwrap();
+
+        // Baseline session memory without long owl:imports IRIs.
+        let base_store = sparkles_core::store::Store::in_memory(Default::default());
+        sparkles_core::sparql::update::update(
+            &base_store,
+            "INSERT DATA { <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> }",
+            &Default::default(),
+        )
+        .unwrap();
+        let base_input = DemandInput {
+            reasoner: &reasoner,
+            snap: base_store.snapshot(),
+            readable: None,
+        };
+        let probe = demand_session(&base_input, &ExplainOptions::default(), true).unwrap();
+        let base_used = probe.budget().used();
+        drop(probe);
+
+        // Headroom fits one 64 KiB decoded import name, strictly below two simultaneous 64 KiB names.
+        let cap = base_used + 96 * 1024;
+        assert!(cap < base_used + 2 * 65_536);
+        let opts = ExplainOptions {
+            max_memory: Some(cap),
+            ..Default::default()
+        };
+
+        // 1. Three distinct long delta owl:imports IRIs that do not resolve to graphs:
+        //    credit must stay with each live decoded name and its retained warning so the
+        //    cap refuses before accumulating multiple 64 KiB strings in memory.
+        let unresolved_store = sparkles_core::store::Store::in_memory(Default::default());
+        sparkles_core::sparql::update::update(
+            &unresolved_store,
+            &format!(
+                "INSERT DATA {{ \
+                    <http://ex.org/ont> <{owl_imports}> <{imp1}>, <{imp2}>, <{imp3}> . \
+                    <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> . \
+                }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let unresolved_snap = unresolved_store.snapshot();
+        for iri in [&imp1, &imp2, &imp3] {
+            assert_eq!(unresolved_snap.lookup_iri(iri).unwrap().tag(), Tag::Delta);
+        }
+        let unresolved_input = DemandInput {
+            reasoner: &reasoner,
+            snap: unresolved_snap,
+            readable: None,
+        };
+
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            explain_demand(&unresolved_input, &[ex("s"), ex("q"), ex("o")], &opts)
+        });
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some(),
+            "unresolved long delta imports expected ExplainBudgetExceeded"
+        );
+        assert!(
+            peak < base_used + 112 * 1024,
+            "unresolved long delta imports exceeded single-name headroom (peak={peak}, cap={cap}, largest={largest})"
+        );
+
+        let wn_opts = crate::whynot::WhyNotOptions {
+            explain: opts.clone(),
+            ..Default::default()
+        };
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            crate::whynot::why_not(&unresolved_input, &[ex("s"), ex("q"), ex("o")], &wn_opts)
+        });
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some(),
+            "unresolved long delta imports why-not expected ExplainBudgetExceeded"
+        );
+        assert!(
+            peak < base_used + 112 * 1024,
+            "unresolved long delta imports why-not exceeded single-name headroom (peak={peak}, cap={cap}, largest={largest})"
+        );
+
+        // 2. Three distinct long delta owl:imports IRIs that DO resolve to existing graphs:
+        //    processing each decoded name incrementally while holding its credit keeps peak
+        //    within single-name headroom and derives the triple from the 3rd imported graph.
+        let resolved_store = sparkles_core::store::Store::in_memory(Default::default());
+        sparkles_core::sparql::update::update(
+            &resolved_store,
+            &format!(
+                "INSERT DATA {{ \
+                    <http://ex.org/ont> <{owl_imports}> <{imp1}>, <{imp2}>, <{imp3}> . \
+                    GRAPH <{imp1}> {{ <http://ex.org/a1> <http://ex.org/r> <http://ex.org/b1> }} \
+                    GRAPH <{imp2}> {{ <http://ex.org/a2> <http://ex.org/r> <http://ex.org/b2> }} \
+                    GRAPH <{imp3}> {{ <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> }} \
+                }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let resolved_input = DemandInput {
+            reasoner: &reasoner,
+            snap: resolved_store.snapshot(),
+            readable: None,
+        };
+        let (res, peak, largest) = crate::alloc_probe::peak_and_largest_of(|| {
+            explain_demand(&resolved_input, &[ex("s"), ex("q"), ex("o")], &opts)
+        });
+        assert!(
+            matches!(res, Ok(Explained::Found { ref trees, .. }) if !trees.is_empty()),
+            "resolved long delta imports should derive from 3rd graph, got {res:?}"
+        );
+        assert!(
+            peak < base_used + 112 * 1024,
+            "resolved long delta imports held multiple 64 KiB names live at once (peak={peak}, cap={cap}, largest={largest})"
+        );
+    }
+
+    #[test]
+    fn demand_debug_trace_avoids_unchecked_predicate_decode() {
+        struct DemandDebugSubscriber;
+        impl tracing::Subscriber for DemandDebugSubscriber {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.target() == "sparkles_reasoner::demand"
+                    && *meta.level() <= tracing::Level::DEBUG
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let long = "z".repeat(65_536);
+        let long_p = format!("http://ex.org/p_{long}");
+        sparkles_core::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ \
+                    <http://ex.org/s> <http://ex.org/p> <http://ex.org/o> . \
+                    <http://ex.org/a> <{long_p}> <http://ex.org/b> . \
+                }}"
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        let snap = store.snapshot();
+        assert_eq!(snap.lookup_iri(&long_p).unwrap().tag(), Tag::Delta);
+
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let extras = Extras::default();
+        let rules = Profile::Rules(format!(
+            "@prefix ex: <http://ex.org/> . \
+             [r1: (?x ex:p ?y) -> (?x <{long_p}> ?y)] \
+             [r2: (?x <{long_p}> ?y) -> (?x ex:q ?y)]"
+        ));
+        let reasoner = QueryReasoner::new(rules, &extras, crate::Inputs::default()).unwrap();
+        let input = DemandInput {
+            reasoner: &reasoner,
+            snap,
+            readable: None,
+        };
+        let mut session = demand_session(&input, &ExplainOptions::default(), true).unwrap();
+        let target_ids = [
+            session.terms().try_id_for(&ex("s")).unwrap(),
+            session.terms().try_id_for(&ex("q")).unwrap(),
+            session.terms().try_id_for(&ex("o")).unwrap(),
+        ];
+
+        let (res, peak, largest) = tracing::subscriber::with_default(DemandDebugSubscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            crate::alloc_probe::peak_and_largest_of(|| {
+                session.derive_ids(&[[
+                    Some(target_ids[0]),
+                    Some(target_ids[1]),
+                    Some(target_ids[2]),
+                ]])
+            })
+        });
+        assert!(res.is_ok(), "derive_ids with debug tracing failed: {res:?}");
+        assert!(
+            largest < 32_768 && peak < 65_536,
+            "demand debug trace decoded 64 KiB delta predicate (peak={peak}, largest={largest})"
+        );
+    }
+
+    #[test]
+    fn proof_decode_admits_nested_triple_allocations() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let mut term: Term = oxrdf::NamedNode::new_unchecked("urn:o").into();
+        let subject = oxrdf::NamedNode::new_unchecked("urn:s");
+        let predicate = oxrdf::NamedNode::new_unchecked("urn:p");
+        for _ in 0..16 {
+            term = Term::Triple(Box::new(oxrdf::Triple::new(
+                subject.clone(),
+                predicate.clone(),
+                term,
+            )));
+        }
+        let key = sparkles_core::id::term_key(&term);
+        let limit = key.len() * 2;
+        let terms = Terms::new(store.snapshot());
+        let id = terms.id_for(&term).unwrap();
+        let budget = Budget::new(Some(limit));
+        let (result, peak) = crate::alloc_probe::peak_of(|| terms.term_admitted(id, &budget));
+        assert!(
+            peak <= limit,
+            "decoded a nested triple over budget (peak={peak})"
+        );
+        assert!(BudgetFailure::from_anyhow(&result.unwrap_err()).is_some());
+        assert_eq!(budget.used(), 0);
+        let (decoded, held) = terms.term_admitted(id, &Budget::unlimited()).unwrap();
+        assert_eq!(decoded.as_ref(), Some(&term));
+        assert_eq!(held.bytes(), term_bytes(&term));
+    }
+
+    #[test]
     fn partial_tree_after_expansion_has_depth_entries_for_new_premises() {
         let store = sparkles_core::store::Store::in_memory(Default::default());
         let snap = store.snapshot();
@@ -1801,7 +3519,7 @@ mod partial_tests {
             .expect("unlimited rule instance");
         let mut builder = Builder {
             s: &search,
-            budget: &budget,
+            memory: Held::new(&budget),
             max_depth: 32,
             ids: FxHashMap::default(),
             next: 0,

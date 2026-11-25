@@ -3587,12 +3587,12 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
         if rounds_expected {
             assert!(rounds > 1, "the star is planned in rounds");
         }
-        // For the chains apart, the checked plan takes the query context's first growth
-        // step, when it decodes a scan's constant term for the plan text (in its scan
-        // options), and the step stays as the context's admitted high point. Its live
-        // bytes are unchanged, and shrinking it returns the credit.
-        if apart {
-            assert_eq!(ctx.live_bytes(), live_before, "width {width}: live bytes");
+        // Ordinary plan text decodes through `plan_term` without touching the query
+        // context's eager grant, so when `ordinary` did not already take the context's
+        // first growth step, the checked plan takes it in `write_checked_plan_term`
+        // and `shrink_retained` returns it. Live bytes remain unchanged.
+        assert_eq!(ctx.live_bytes(), live_before, "width {width}: live bytes");
+        if prep.inner_used() > before {
             assert!(
                 prep.inner_used() <= before + (64 << 10),
                 "width {width}: one growth step"

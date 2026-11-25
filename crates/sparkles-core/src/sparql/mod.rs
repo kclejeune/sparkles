@@ -780,7 +780,7 @@ fn make_ctx_input_policy(
         .clone()
         .unwrap_or_else(|| crate::outbound::RequestBudget::new(&opts.outbound));
     ctx.rdfs = match &opts.rdfs {
-        Some(r) => Some(r.schema_controlled(&ctx.snap, &mut || ctx.check())?),
+        Some(r) => Some(r.schema_in_ctx(&ctx)?),
         None => None,
     };
     ctx.use_cache = !opts.no_cache && selector_graphs.is_none();
@@ -2755,6 +2755,8 @@ mod sample_tests;
 mod stats_tests;
 #[cfg(test)]
 mod strfilter_tests;
+#[cfg(test)]
+mod strict_decode_tests;
 #[cfg(test)]
 mod tests;
 

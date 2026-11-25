@@ -568,12 +568,12 @@ impl Tools<'_> {
                         .map_err(|e| ctx.engine(e))?,
                     None => reader.snap().clone(),
                 };
-                let readable = reader.opts.graphs.as_ref().map(|a| {
-                    let a = a.clone();
-                    let snap = reader.snap().clone();
-                    Arc::new(move |g| a.bound(&snap).readable_id(&snap, g))
-                        as Arc<dyn Fn(sparkles::id::Id) -> bool + Send + Sync>
-                });
+                let readable = reader
+                    .opts
+                    .graphs
+                    .as_ref()
+                    .filter(|a| !a.reads_all())
+                    .map(|a| a.bound(reader.snap()));
                 let triple: [Term; 3] = s.constants.clone().try_into().expect("three constants");
                 let input = sparkles_reasoner::explain::DemandInput {
                     reasoner: &reasoner,

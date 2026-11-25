@@ -39,7 +39,7 @@
 //! query does not call.
 
 mod explain;
-pub use explain::{AssertedResolver, SchemaLeaves};
+pub use explain::{AssertedResolver, SchemaLeaves, WorkspaceResolver};
 
 use super::ctx::Ctx;
 use crate::error::Result;
@@ -297,6 +297,54 @@ impl RdfsOnRead {
         snap: &Snapshot,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Arc<RdfsSchema>> {
+        self.schema_controlled_with_memory(snap, None, check)
+    }
+
+    /// Read or build this snapshot's schema within the request's controls and an
+    /// optional explanation answer memory limit (bounded via [`ExplainWorkspace`]).
+    pub fn schema_controlled_with_memory(
+        &self,
+        snap: &Snapshot,
+        max_memory: Option<usize>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Arc<RdfsSchema>> {
+        let workspace = ExplainWorkspace::for_answer_limit(max_memory);
+        self.schema_controlled_with_workspace(snap, &workspace, check)
+    }
+
+    /// Read or build this snapshot's schema within the request's controls and a shared
+    /// [`ExplainWorkspace`], releasing the temporary build triples once the schema is built.
+    pub(crate) fn schema_controlled_with_workspace(
+        &self,
+        snap: &Snapshot,
+        workspace: &ExplainWorkspace,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Arc<RdfsSchema>> {
+        let mut hold = workspace.hold(0)?;
+        self.schema_with(snap, check, &mut |id, check| {
+            let term = workspace.decode_term(snap, id, check)?;
+            if let Some(t) = &term {
+                hold.add(crate::explain::term_bytes(t))?;
+            }
+            Ok(term)
+        })
+    }
+
+    /// Read or build this query's schema under its context's controls and decode budget.
+    pub(crate) fn schema_in_ctx(&self, ctx: &Ctx) -> Result<Arc<RdfsSchema>> {
+        let decoded = ctx.charge(0)?;
+        self.schema_with(&ctx.snap, &mut || ctx.check(), &mut |id, check| {
+            check()?;
+            ctx.term_checked_into(id, &decoded)
+        })
+    }
+
+    fn schema_with(
+        &self,
+        snap: &Snapshot,
+        check: &mut dyn FnMut() -> Result<()>,
+        decode: &mut TermDecode<'_>,
+    ) -> Result<Arc<RdfsSchema>> {
         check()?;
         let graph = match &self.source {
             SchemaSource::Fixed(s) => return Ok(s.clone()),
@@ -313,10 +361,219 @@ impl RdfsOnRead {
         {
             return Ok(s.clone());
         }
-        let s = Arc::new(schema_of_graph_controlled(snap, graph.as_deref(), check)?);
+        let s = Arc::new(schema_of_graph_with(snap, graph.as_deref(), check, decode)?);
         *self.last.lock() = Some((key, s.clone()));
         Ok(s)
     }
+}
+
+/// Explicit workspace accounting for vocabulary reconstruction and decoded terms
+/// during an explanation request.
+///
+/// When the caller sets an answer memory limit (`ExplainLimits::max_memory`), the
+/// answer itself stays checked against that exact limit (`Derivation::heap_bytes`),
+/// while the transient decode workspace is bounded to `2 * answer_limit + 256` bytes.
+/// That bound allows any term that fits the answer limit to be reconstructed while
+/// old and new scratch buffers or scratch and decoded output coexist, while refusing
+/// oversized keys and accumulated proof-search or schema decodes before allocating.
+pub struct ExplainWorkspace {
+    limit: Option<usize>,
+    retained: Cell<usize>,
+    scratch: Cell<usize>,
+}
+
+/// Scoped hold of retained decoded bytes on an [`ExplainWorkspace`], automatically
+/// released when dropped.
+pub(crate) struct WorkspaceHold<'a> {
+    workspace: &'a ExplainWorkspace,
+    bytes: usize,
+}
+
+impl<'a> WorkspaceHold<'a> {
+    pub(crate) fn add(&mut self, bytes: usize) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let next = self.workspace.retained.get().saturating_add(bytes);
+        self.workspace.check_total(
+            next.saturating_add(self.workspace.scratch.get()),
+            "retaining decoded explanation terms",
+        )?;
+        self.workspace.retained.set(next);
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn release(&mut self, bytes: usize) {
+        let drop_bytes = bytes.min(self.bytes);
+        if drop_bytes == 0 {
+            return;
+        }
+        self.bytes -= drop_bytes;
+        self.workspace
+            .retained
+            .set(self.workspace.retained.get().saturating_sub(drop_bytes));
+    }
+
+    pub(crate) fn resize(&mut self, bytes: usize) -> Result<()> {
+        if bytes > self.bytes {
+            self.add(bytes - self.bytes)
+        } else {
+            self.release(self.bytes - bytes);
+            Ok(())
+        }
+    }
+
+    pub(crate) fn absorb(&mut self, mut other: WorkspaceHold<'a>) {
+        debug_assert!(std::ptr::eq(self.workspace, other.workspace));
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        other.bytes = 0;
+    }
+
+    pub(crate) fn split(&mut self, bytes: usize) -> WorkspaceHold<'a> {
+        let moved = bytes.min(self.bytes);
+        self.bytes -= moved;
+        WorkspaceHold {
+            workspace: self.workspace,
+            bytes: moved,
+        }
+    }
+}
+
+impl Drop for WorkspaceHold<'_> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.workspace
+                .retained
+                .set(self.workspace.retained.get().saturating_sub(self.bytes));
+        }
+    }
+}
+
+impl ExplainWorkspace {
+    pub fn for_answer_limit(max_memory: Option<usize>) -> Self {
+        Self {
+            limit: max_memory.map(|limit| limit.saturating_mul(2).saturating_add(256)),
+            retained: Cell::new(0),
+            scratch: Cell::new(0),
+        }
+    }
+
+    /// Bytes currently retained in this workspace by live proof-search state.
+    pub fn retained(&self) -> usize {
+        self.retained.get()
+    }
+
+    fn check_total(&self, total: usize, what: &str) -> Result<()> {
+        if let Some(limit) = self.limit
+            && total > limit
+        {
+            return Err(explain::budget(format!(
+                "{what} needs {total} bytes, over its workspace memory limit of {limit}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Hold `bytes` of retained decoded state in this workspace until the returned guard drops.
+    pub(crate) fn hold(&self, bytes: usize) -> Result<WorkspaceHold<'_>> {
+        let mut guard = WorkspaceHold {
+            workspace: self,
+            bytes: 0,
+        };
+        guard.add(bytes)?;
+        Ok(guard)
+    }
+
+    /// Decode a graph id's display name within this workspace and request controls.
+    pub fn graph_name(
+        &self,
+        snap: &Snapshot,
+        graph: Id,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<String>> {
+        check()?;
+        if graph == Id::DEFAULT_GRAPH {
+            self.check_total(
+                self.retained.get().saturating_add("default".len()),
+                "decoding an explanation graph name",
+            )?;
+            return Ok(Some("default".to_string()));
+        }
+        Ok(match self.decode_term(snap, graph, check)? {
+            Some(Term::NamedNode(name)) => Some(name.into_string()),
+            _ => None,
+        })
+    }
+
+    /// Build an asserted leaf derivation from a borrowed triple, decoding the graph name
+    /// first and admitting the output copy together with the graph name before cloning
+    /// `triple`.
+    pub fn asserted_leaf(
+        &self,
+        snap: &Snapshot,
+        graph: Id,
+        triple: &[Term; 3],
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<crate::explain::Derivation> {
+        let graph_name = self.graph_name(snap, graph, check)?;
+        let copy_bytes = triple
+            .iter()
+            .map(crate::explain::term_bytes)
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(graph_name.as_ref().map_or(0, String::len));
+        let _copy_hold = self.hold(copy_bytes)?;
+        Ok(crate::explain::Derivation::asserted(
+            triple.clone(),
+            graph_name,
+        ))
+    }
+
+    /// Decode one stored term while accounting for coexisting old/new scratch buffers,
+    /// coexisting scratch and decoded output, and already-retained bytes.
+    pub(crate) fn decode_term(
+        &self,
+        snap: &Snapshot,
+        id: Id,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Term>> {
+        snap.term_controlled_owned(
+            id,
+            &mut |old_cap, new_cap| {
+                let peak = self
+                    .retained
+                    .get()
+                    .saturating_add(old_cap)
+                    .saturating_add(new_cap);
+                self.check_total(peak, "reconstructing an explanation vocabulary key")
+            },
+            &mut |cap| {
+                self.scratch.set(cap);
+                Ok(())
+            },
+            &mut |scratch_cap, key_len| {
+                let output_est = key_len.saturating_add(std::mem::size_of::<Term>());
+                let peak = self
+                    .retained
+                    .get()
+                    .saturating_add(scratch_cap)
+                    .saturating_add(output_est);
+                self.check_total(peak, "decoding an explanation term")
+            },
+            check,
+        )
+    }
+}
+
+/// Decode a graph id's display name for an explanation leaf under request controls and
+/// workspace memory accounting.
+pub fn explain_graph_name_controlled(
+    snap: &Snapshot,
+    graph: Id,
+    max_memory: Option<usize>,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<String>> {
+    ExplainWorkspace::for_answer_limit(max_memory).graph_name(snap, graph, check)
 }
 
 /// The schema in graph `graph` (`None`: the default graph) of a snapshot.
@@ -328,6 +585,19 @@ fn schema_of_graph_controlled(
     snap: &Snapshot,
     graph: Option<&str>,
     check: &mut dyn FnMut() -> Result<()>,
+) -> Result<RdfsSchema> {
+    schema_of_graph_with(snap, graph, check, &mut |id, check| {
+        snap.term_controlled(id, &mut |_| Ok(()), check)
+    })
+}
+
+type TermDecode<'a> = dyn FnMut(Id, &mut dyn FnMut() -> Result<()>) -> Result<Option<Term>> + 'a;
+
+fn schema_of_graph_with(
+    snap: &Snapshot,
+    graph: Option<&str>,
+    check: &mut dyn FnMut() -> Result<()>,
+    decode: &mut TermDecode<'_>,
 ) -> Result<RdfsSchema> {
     check()?;
     let g = match graph {
@@ -353,7 +623,7 @@ fn schema_of_graph_controlled(
             if q[3] != g {
                 return Ok(());
             }
-            let (Some(s), Some(o)) = (snap.term(q[0]), snap.term(q[2])) else {
+            let (Some(s), Some(o)) = (decode(q[0], check)?, decode(q[2], check)?) else {
                 return Ok(());
             };
             let s = match s {

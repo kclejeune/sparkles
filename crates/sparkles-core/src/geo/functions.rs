@@ -209,7 +209,10 @@ impl Call<'_, '_> {
         // held until the query ends, like the local vocabulary the literal lands in
         match self.ctx.charge(lex.len() as u64 + 64) {
             Ok(c) => std::mem::forget(c),
-            Err(_) => return Err(TypeError),
+            Err(error) => {
+                self.ctx.fail_memory(&error);
+                return Err(TypeError);
+            }
         }
         Ok(Val::V(Value::Other {
             lex: lex.into(),

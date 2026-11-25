@@ -8,10 +8,10 @@
 //! triple of a subproperty. A subclass or subproperty fact the schema graph does not hold
 //! directly is derived by `rdfs11` or `rdfs5` from a chain of facts it holds.
 
-use super::RdfsSchema;
+use super::{ExplainWorkspace, RdfsOnRead, RdfsSchema};
 use crate::error::Result;
 use crate::explain::{
-    Derivation, ExplainBudgetExceeded, ExplainLimits, Explained, RuleRef, finish,
+    Derivation, ExplainBudgetExceeded, ExplainLimits, Explained, RuleRef, finish, term_bytes,
 };
 use crate::id::Id;
 use crate::index::Perm;
@@ -19,6 +19,7 @@ use crate::store::Snapshot;
 use oxrdf::vocab::{rdf, rdfs};
 use oxrdf::{NamedNode, NamedNodeRef, Term};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Where the schema's facts are, for the leaves of an explanation.
@@ -38,14 +39,38 @@ const MAX_READS: usize = 100_000;
 /// Resolve a stored leaf before the explainer chooses a derivation.
 pub type AssertedResolver<'a> = dyn Fn(Id, &[Term; 3]) -> Result<Option<Derivation>> + 'a;
 
+/// Resolve a stored leaf using the proof search's shared [`ExplainWorkspace`].
+pub type WorkspaceResolver<'a> =
+    dyn Fn(Id, &[Term; 3], &ExplainWorkspace) -> Result<Option<Derivation>> + 'a;
+
+fn named_node_bytes(n: &NamedNode) -> usize {
+    n.as_str()
+        .len()
+        .saturating_add(std::mem::size_of::<NamedNode>())
+}
+
+fn triple_copy_bytes(s: &Term, p: &NamedNode, o: &Term) -> usize {
+    term_bytes(s)
+        .saturating_add(named_node_bytes(p))
+        .saturating_add(term_bytes(o))
+}
+
+fn triple_bytes(triple: &[Term; 3]) -> usize {
+    triple
+        .iter()
+        .map(term_bytes)
+        .fold(0usize, usize::saturating_add)
+}
+
 struct Cx<'a> {
-    schema: &'a RdfsSchema,
+    schema: Option<&'a RdfsSchema>,
     snap: &'a Snapshot,
     leaves: SchemaLeaves,
     deadline: Option<Instant>,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    workspace: ExplainWorkspace,
     reads: std::cell::Cell<usize>,
-    resolve: Option<&'a AssertedResolver<'a>>,
+    resolve: Option<&'a WorkspaceResolver<'a>>,
 }
 
 fn nn(n: NamedNodeRef<'_>) -> Term {
@@ -130,24 +155,43 @@ impl Cx<'_> {
         self.snap.lookup_term(t)
     }
 
-    fn graph_name(&self, g: Id) -> Option<String> {
-        if g == Id::DEFAULT_GRAPH {
-            return Some("default".to_string());
-        }
-        match self.snap.term(g)? {
-            Term::NamedNode(n) => Some(n.into_string()),
-            _ => None,
-        }
+    fn decode_term(&self, id: Id) -> Result<Option<Term>> {
+        self.workspace
+            .decode_term(self.snap, id, &mut || self.check())
+    }
+
+    fn schema(&self) -> &RdfsSchema {
+        self.schema
+            .expect("schema is loaded before rule search starts")
+    }
+
+    fn graph_name(&self, g: Id) -> Result<Option<String>> {
+        self.workspace
+            .graph_name(self.snap, g, &mut || self.check())
     }
 
     fn leaf(&self, g: Id, triple: &[Term; 3]) -> Result<Option<Derivation>> {
         self.check()?;
         match self.resolve {
-            Some(resolve) => resolve(g, triple),
-            None => Ok(Some(Derivation::asserted(
-                triple.clone(),
-                self.graph_name(g),
-            ))),
+            Some(resolve) => resolve(g, triple, &self.workspace),
+            None => self
+                .workspace
+                .asserted_leaf(self.snap, g, triple, &mut || self.check())
+                .map(Some),
+        }
+    }
+
+    /// Build a leaf derivation by moving an already-owned, workspace-held candidate triple
+    /// directly into the proof after decoding its graph name (avoiding a second copy of
+    /// `triple` while the candidate is live).
+    fn leaf_owned(&self, g: Id, triple: [Term; 3]) -> Result<Option<Derivation>> {
+        self.check()?;
+        match self.resolve {
+            Some(resolve) => resolve(g, &triple, &self.workspace),
+            None => {
+                let graph = self.graph_name(g)?;
+                Ok(Some(Derivation::asserted(triple, graph)))
+            }
         }
     }
 
@@ -156,6 +200,13 @@ impl Cx<'_> {
             return Ok(None);
         }
         self.leaf(g, triple)
+    }
+
+    fn asserted_owned(&self, g: Id, triple: [Term; 3]) -> Result<Option<Derivation>> {
+        if !self.held(g, &triple)? {
+            return Ok(None);
+        }
+        self.leaf_owned(g, triple)
     }
 
     /// Whether graph `g` holds `s p o`.
@@ -177,9 +228,10 @@ impl Cx<'_> {
         let mut found = None;
         self.scan_rows(Perm::Gspo, &[g.0, subject.0, predicate.0], |key| {
             self.read()?;
-            if let Some(object) = self.snap.term(Id(key[3])) {
+            if let Some(object) = self.decode_term(Id(key[3]))? {
+                let _hold = self.workspace.hold(triple_copy_bytes(s, p, &object))?;
                 let triple = [s.clone(), Term::NamedNode(p.clone()), object];
-                if let Some(proof) = self.leaf(g, &triple)? {
+                if let Some(proof) = self.leaf_owned(g, triple)? {
                     found = Some(proof);
                     return Ok(false);
                 }
@@ -200,10 +252,11 @@ impl Cx<'_> {
         self.scan_rows(Perm::Pos, &[predicate.0, object.0], |key| {
             let q = Perm::Pos.to_quad(key);
             if q[3] == g
-                && let Some(subject) = self.snap.term(q[0])
+                && let Some(subject) = self.decode_term(q[0])?
             {
+                let _hold = self.workspace.hold(triple_copy_bytes(&subject, p, o))?;
                 let triple = [subject, Term::NamedNode(p.clone()), o.clone()];
-                if let Some(proof) = self.leaf(g, &triple)? {
+                if let Some(proof) = self.leaf_owned(g, triple)? {
                     found = Some(proof);
                     return Ok(false);
                 }
@@ -226,28 +279,47 @@ impl Cx<'_> {
                 return Ok(Some(d));
             }
         }
-        let subs: Vec<NamedNode> = RdfsSchema::get(&self.schema.sub_class, c.as_ref())
+        let rdf_type_bytes = rdf::TYPE
+            .as_str()
+            .len()
+            .saturating_add(std::mem::size_of::<Term>());
+        for d in self
+            .schema()
+            .sub_class
+            .get(c)
             .into_iter()
             .flatten()
             .filter(|d| *d != c)
-            .cloned()
-            .collect();
-        for d in &subs {
-            let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
-            let premise = if let Some(proof) = self.asserted(g, &typed)? {
-                Some(proof)
-            } else {
-                match self.by_domain_range(g, s, d, false)? {
+        {
+            let premise = {
+                let _typed_hold = self.workspace.hold(
+                    term_bytes(s)
+                        .saturating_add(rdf_type_bytes)
+                        .saturating_add(named_node_bytes(d)),
+                )?;
+                let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
+                self.asserted_owned(g, typed)?
+            };
+            let premise = match premise {
+                Some(proof) => Some(proof),
+                None => match self.by_domain_range(g, s, d, false)? {
                     Some(x) => Some(x),
                     None => self.by_domain_range(g, s, d, true)?,
-                }
+                },
             };
             let Some(premise) = premise else {
                 continue;
             };
+            let mut premise_hold = self.workspace.hold(premise.heap_bytes())?;
             let Some(sc) = self.chain(d, rdfs::SUB_CLASS_OF, c)? else {
                 continue;
             };
+            premise_hold.add(
+                sc.heap_bytes()
+                    .saturating_add(term_bytes(s))
+                    .saturating_add(rdf_type_bytes)
+                    .saturating_add(named_node_bytes(c)),
+            )?;
             let t = [s.clone(), nn(rdf::TYPE), Term::NamedNode(c.clone())];
             return Ok(Some(Derivation::derived(
                 t,
@@ -266,19 +338,42 @@ impl Cx<'_> {
         pred: NamedNodeRef<'_>,
         b: &NamedNode,
     ) -> Result<Option<Derivation>> {
-        let t = [
-            Term::NamedNode(a.clone()),
-            nn(pred),
-            Term::NamedNode(b.clone()),
-        ];
         Ok(match self.leaves {
             // a document's leaves are the triples of its closure, so a fact outside it is
             // no leaf
-            SchemaLeaves::Document => self
-                .schema
-                .closes(a, pred, b)
-                .then(|| Derivation::asserted(t, None)),
-            SchemaLeaves::Graph(g) => self.asserted(g, &t)?,
+            SchemaLeaves::Document => {
+                if !self.schema().closes(a, pred, b) {
+                    return Ok(None);
+                }
+                let _fact_hold = self.workspace.hold(
+                    named_node_bytes(a)
+                        .saturating_add(pred.as_str().len())
+                        .saturating_add(std::mem::size_of::<Term>())
+                        .saturating_add(named_node_bytes(b)),
+                )?;
+                Some(Derivation::asserted(
+                    [
+                        Term::NamedNode(a.clone()),
+                        nn(pred),
+                        Term::NamedNode(b.clone()),
+                    ],
+                    None,
+                ))
+            }
+            SchemaLeaves::Graph(g) => {
+                let _fact_hold = self.workspace.hold(
+                    named_node_bytes(a)
+                        .saturating_add(pred.as_str().len())
+                        .saturating_add(std::mem::size_of::<Term>())
+                        .saturating_add(named_node_bytes(b)),
+                )?;
+                let t = [
+                    Term::NamedNode(a.clone()),
+                    nn(pred),
+                    Term::NamedNode(b.clone()),
+                ];
+                self.asserted_owned(g, t)?
+            }
             SchemaLeaves::Hidden => None,
         })
     }
@@ -299,9 +394,12 @@ impl Cx<'_> {
         // the shortest path of direct facts from a to b
         let pred_owned = pred.into_owned();
         let mut back: BTreeMap<NamedNode, NamedNode> = BTreeMap::new();
+        let mut search_hold = self.workspace.hold(named_node_bytes(a))?;
         let mut queue = VecDeque::from([a.clone()]);
         let mut reached = false;
         while let Some(x) = queue.pop_front() {
+            let x_bytes = named_node_bytes(&x);
+            let _x_hold = search_hold.split(x_bytes);
             if &x == b {
                 reached = true;
                 break;
@@ -317,18 +415,30 @@ impl Cx<'_> {
             // request's controls as the rows stream
             self.scan_rows(Perm::Gspo, &[g.0, xi.0, pi.0], |k| {
                 self.read()?;
-                if let Some(Term::NamedNode(y)) = self.snap.term(Id(k[3]))
+                if let Some(Term::NamedNode(y)) = self.decode_term(Id(k[3]))?
                     && &y != a
                     && !back.contains_key(&y)
                 {
-                    let triple = [
-                        Term::NamedNode(x.clone()),
-                        Term::NamedNode(pred_owned.clone()),
-                        Term::NamedNode(y.clone()),
-                    ];
-                    if self.leaf(g, &triple)?.is_none() {
+                    let y_bytes = named_node_bytes(&y);
+                    let y_hold = self.workspace.hold(y_bytes)?;
+                    let supported = {
+                        let _triple_hold = self.workspace.hold(
+                            x_bytes
+                                .saturating_add(named_node_bytes(&pred_owned))
+                                .saturating_add(y_bytes),
+                        )?;
+                        let triple = [
+                            Term::NamedNode(x.clone()),
+                            Term::NamedNode(pred_owned.clone()),
+                            Term::NamedNode(y.clone()),
+                        ];
+                        self.leaf_owned(g, triple)?.is_some()
+                    };
+                    if !supported {
                         return Ok(true);
                     }
+                    search_hold.add(y_bytes.saturating_add(x_bytes))?;
+                    search_hold.absorb(y_hold);
                     back.insert(y.clone(), x.clone());
                     queue.push_back(y);
                 }
@@ -338,11 +448,16 @@ impl Cx<'_> {
         if !reached {
             return Ok(None);
         }
+        let mut path_hold = self.workspace.hold(named_node_bytes(b))?;
         let mut path = vec![b.clone()];
         while path.last() != Some(a) {
             let prev = back[path.last().unwrap()].clone();
+            path_hold.add(named_node_bytes(&prev))?;
             path.push(prev);
         }
+        drop(back);
+        drop(queue);
+        drop(search_hold);
         path.reverse();
         let name = if pred == rdfs::SUB_CLASS_OF {
             "rdfs11"
@@ -350,19 +465,31 @@ impl Cx<'_> {
             "rdfs5"
         };
         let leaf = |x: &NamedNode, y: &NamedNode| -> Result<Derivation> {
+            let _triple_hold = self.workspace.hold(
+                named_node_bytes(x)
+                    .saturating_add(named_node_bytes(&pred_owned))
+                    .saturating_add(named_node_bytes(y)),
+            )?;
             let triple = [
                 Term::NamedNode(x.clone()),
                 Term::NamedNode(pred_owned.clone()),
                 Term::NamedNode(y.clone()),
             ];
-            self.leaf(g, &triple)?.ok_or_else(|| {
+            self.leaf_owned(g, triple)?.ok_or_else(|| {
                 crate::Error::invalid("the schema premise no longer has a supported derivation")
             })
         };
         // a sc x1, x1 sc ... sc b: fold from the right
         let n = path.len();
+        let mut d_hold = self.workspace.hold(0)?;
         let mut d = leaf(&path[n - 2], &path[n - 1])?;
+        d_hold.resize(d.heap_bytes())?;
         for i in (0..n - 2).rev() {
+            let step = leaf(&path[i], &path[i + 1])?;
+            let next_conclusion = named_node_bytes(&path[i])
+                .saturating_add(named_node_bytes(&pred_owned))
+                .saturating_add(named_node_bytes(&path[n - 1]));
+            d_hold.add(step.heap_bytes().saturating_add(next_conclusion))?;
             d = Derivation::derived(
                 [
                     Term::NamedNode(path[i].clone()),
@@ -370,9 +497,13 @@ impl Cx<'_> {
                     Term::NamedNode(path[n - 1].clone()),
                 ],
                 rule(name),
-                vec![leaf(&path[i], &path[i + 1])?, d],
+                vec![step, d],
             );
+            d_hold.resize(d.heap_bytes())?;
         }
+        drop(path);
+        drop(path_hold);
+        drop(d_hold);
         Ok(Some(d))
     }
 
@@ -386,9 +517,9 @@ impl Cx<'_> {
         range: bool,
     ) -> Result<Option<Derivation>> {
         let (m, pred, name) = if range {
-            (&self.schema.range, rdfs::RANGE, "rdfs3")
+            (&self.schema().range, rdfs::RANGE, "rdfs3")
         } else {
-            (&self.schema.domain, rdfs::DOMAIN, "rdfs2")
+            (&self.schema().domain, rdfs::DOMAIN, "rdfs2")
         };
         for (p, classes) in m {
             if !classes.contains(c) {
@@ -402,9 +533,21 @@ impl Cx<'_> {
             let Some(data) = other else {
                 continue;
             };
+            let mut data_hold = self.workspace.hold(data.heap_bytes())?;
             let Some(fact) = self.schema_fact(p, pred, c)? else {
                 continue;
             };
+            data_hold.add(
+                fact.heap_bytes()
+                    .saturating_add(term_bytes(s))
+                    .saturating_add(
+                        rdf::TYPE
+                            .as_str()
+                            .len()
+                            .saturating_add(std::mem::size_of::<Term>()),
+                    )
+                    .saturating_add(named_node_bytes(c)),
+            )?;
             return Ok(Some(Derivation::derived(
                 [s.clone(), nn(rdf::TYPE), Term::NamedNode(c.clone())],
                 rule(name),
@@ -415,11 +558,246 @@ impl Cx<'_> {
     }
 }
 
-fn budget(m: String) -> crate::error::Error {
+pub(super) fn budget(m: String) -> crate::error::Error {
     crate::error::Error::Component(Box::new(
         crate::error::ComponentError::new("reasoner", "reasoning-budget", m.clone())
             .with_source(ExplainBudgetExceeded(m)),
     ))
+}
+
+enum LoadedSchema<'a> {
+    Borrowed(&'a RdfsSchema),
+    Owned(Arc<RdfsSchema>),
+}
+
+impl std::ops::Deref for LoadedSchema<'_> {
+    type Target = RdfsSchema;
+
+    fn deref(&self) -> &RdfsSchema {
+        match self {
+            LoadedSchema::Borrowed(s) => s,
+            LoadedSchema::Owned(s) => s,
+        }
+    }
+}
+
+fn explain_inner<'a>(
+    snap: &Snapshot,
+    leaves: SchemaLeaves,
+    graphs: &[Id],
+    triple: &[Term; 3],
+    limits: ExplainLimits,
+    resolve: Option<&WorkspaceResolver<'_>>,
+    load_schema: impl FnOnce(
+        &ExplainWorkspace,
+        &mut dyn FnMut() -> Result<()>,
+    ) -> Result<LoadedSchema<'a>>,
+) -> Result<Explained> {
+    let ExplainLimits {
+        max_trees,
+        max_depth,
+        deadline,
+        cancel,
+        max_memory,
+    } = limits;
+    let mut cx = Cx {
+        schema: None,
+        snap,
+        leaves,
+        deadline,
+        cancel,
+        workspace: ExplainWorkspace::for_answer_limit(max_memory),
+        reads: std::cell::Cell::new(0),
+        resolve,
+    };
+    cx.check()?;
+    // the trees hold at most one derivation per rule, so their decoded terms are
+    // measured once they are built, before the answer keeps them
+    let fits = |trees: &[Derivation]| -> Result<()> {
+        if let Some(limit) = max_memory {
+            let bytes: usize = trees.iter().map(Derivation::heap_bytes).sum();
+            if bytes > limit {
+                return Err(budget(format!(
+                    "the explanation's answer needs {bytes} bytes, over its memory limit of {limit}"
+                )));
+            }
+        }
+        Ok(())
+    };
+    for &g in graphs {
+        if let Some(proof) = cx.asserted(g, triple)? {
+            let mut trees = vec![proof];
+            fits(&trees)?;
+            finish(&mut trees, max_depth);
+            return Ok(Explained::Found { trees, more: false });
+        }
+    }
+    if leaves == SchemaLeaves::Hidden {
+        return Ok(Explained::NotFound);
+    }
+    let loaded = load_schema(&cx.workspace, &mut || cx.check())?;
+    let schema: &RdfsSchema = &loaded;
+    cx.schema = Some(schema);
+    // the best tree of each top rule
+    let mut tops: BTreeMap<String, Derivation> = BTreeMap::new();
+    let mut tops_hold = cx.workspace.hold(0)?;
+    fn keep_top<'w>(
+        tops: &mut BTreeMap<String, Derivation>,
+        tops_hold: &mut super::WorkspaceHold<'w>,
+        d: Derivation,
+        mut held: Option<super::WorkspaceHold<'w>>,
+    ) -> Result<()> {
+        let name = d.rule.as_ref().map(|r| r.name.clone()).unwrap_or_default();
+        match tops.get(&name) {
+            Some(have) if have.depth <= d.depth => {
+                drop(d);
+                drop(held);
+                Ok(())
+            }
+            _ => {
+                let old = tops.remove(&name);
+                drop(old);
+                if let Some(h) = held.take() {
+                    tops_hold.absorb(h);
+                }
+                tops.insert(name, d);
+                tops_hold.resize(
+                    tops.values()
+                        .map(Derivation::heap_bytes)
+                        .fold(0usize, usize::saturating_add),
+                )
+            }
+        }
+    }
+    let [s, p, o] = triple;
+    let Term::NamedNode(p) = p else {
+        return Ok(Explained::NotFound);
+    };
+    let pr = p.as_ref();
+    // a fact of the schema's closure, which a tree cut at the depth limit asks for
+    if (pr == rdfs::SUB_CLASS_OF || pr == rdfs::SUB_PROPERTY_OF)
+        && let (Term::NamedNode(a), Term::NamedNode(b)) = (s, o)
+        && a != b
+        && let Some(d) = cx.chain(a, pr, b)?
+    {
+        keep_top(&mut tops, &mut tops_hold, d, None)?;
+    }
+    if pr == rdf::TYPE
+        && let Term::NamedNode(c) = o
+    {
+        let rdf_type_bytes = rdf::TYPE
+            .as_str()
+            .len()
+            .saturating_add(std::mem::size_of::<Term>());
+        let subs = schema.sub_class.get(c);
+        for &g in graphs {
+            for range in [false, true] {
+                if let Some(d) = cx.by_domain_range(g, s, c, range)? {
+                    keep_top(&mut tops, &mut tops_hold, d, None)?;
+                }
+            }
+            for d in subs.into_iter().flatten().filter(|d| *d != c) {
+                let premise = {
+                    let _typed_hold = cx.workspace.hold(
+                        term_bytes(s)
+                            .saturating_add(rdf_type_bytes)
+                            .saturating_add(named_node_bytes(d)),
+                    )?;
+                    let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
+                    cx.asserted_owned(g, typed)?
+                };
+                let premise = match premise {
+                    Some(proof) => Some(proof),
+                    None => match cx.by_domain_range(g, s, d, false)? {
+                        Some(x) => Some(x),
+                        None => cx.by_domain_range(g, s, d, true)?,
+                    },
+                };
+                let Some(premise) = premise else {
+                    continue;
+                };
+                let mut premise_hold = cx.workspace.hold(premise.heap_bytes())?;
+                let Some(sc) = cx.chain(d, rdfs::SUB_CLASS_OF, c)? else {
+                    continue;
+                };
+                premise_hold.add(sc.heap_bytes().saturating_add(triple_bytes(triple)))?;
+                let derived = Derivation::derived(triple.clone(), rule("rdfs9"), vec![premise, sc]);
+                keep_top(&mut tops, &mut tops_hold, derived, Some(premise_hold))?;
+            }
+        }
+    }
+    if pr != rdfs::SUB_CLASS_OF && pr != rdfs::SUB_PROPERTY_OF {
+        let subs = schema.sub_prop.get(p);
+        'graphs: for &g in graphs {
+            for q in subs.into_iter().flatten().filter(|q| *q != p) {
+                let asserted = {
+                    let _stored_hold = cx.workspace.hold(triple_copy_bytes(s, q, o))?;
+                    let stored = [s.clone(), Term::NamedNode(q.clone()), o.clone()];
+                    cx.asserted_owned(g, stored)?
+                };
+                let premise = if let Some(proof) = asserted {
+                    proof
+                } else if q.as_ref() == rdf::TYPE
+                    && let Term::NamedNode(c) = o
+                    && let Some(d) = cx.type_in(g, s, c)?
+                {
+                    // RDFS on read answers a superproperty of rdf:type from a type
+                    // it derives, as well as from a stored one
+                    d
+                } else {
+                    continue;
+                };
+                let mut premise_hold = cx.workspace.hold(premise.heap_bytes())?;
+                let Some(sp) = cx.chain(q, rdfs::SUB_PROPERTY_OF, p)? else {
+                    continue;
+                };
+                premise_hold.add(sp.heap_bytes().saturating_add(triple_bytes(triple)))?;
+                let derived = Derivation::derived(triple.clone(), rule("rdfs7"), vec![premise, sp]);
+                keep_top(&mut tops, &mut tops_hold, derived, Some(premise_hold))?;
+                break 'graphs;
+            }
+        }
+    }
+    drop(tops_hold);
+    if tops.is_empty() {
+        return Ok(Explained::NotFound);
+    }
+    let mut all: Vec<Derivation> = tops.into_values().collect();
+    fits(&all)?;
+    all.sort_by_key(|d| d.depth);
+    let more = all.len() > max_trees.max(1);
+    all.truncate(max_trees.max(1));
+    finish(&mut all, max_depth);
+    cx.check()?;
+    Ok(Explained::Found { trees: all, more })
+}
+
+impl RdfsOnRead {
+    /// Explain `triple` over `graphs`, checking visible asserted answers before building a
+    /// cold graph-backed schema and sharing one [`ExplainWorkspace`] across proof search
+    /// and `resolve`.
+    pub fn explain_resolving(
+        &self,
+        snap: &Snapshot,
+        leaves: SchemaLeaves,
+        graphs: &[Id],
+        triple: &[Term; 3],
+        limits: ExplainLimits,
+        resolve: Option<&WorkspaceResolver<'_>>,
+    ) -> Result<Explained> {
+        explain_inner(
+            snap,
+            leaves,
+            graphs,
+            triple,
+            limits,
+            resolve,
+            |workspace, check| {
+                self.schema_controlled_with_workspace(snap, workspace, check)
+                    .map(LoadedSchema::Owned)
+            },
+        )
+    }
 }
 
 impl RdfsSchema {
@@ -448,151 +826,11 @@ impl RdfsSchema {
         limits: ExplainLimits,
         resolve: Option<&AssertedResolver<'_>>,
     ) -> Result<Explained> {
-        let ExplainLimits {
-            max_trees,
-            max_depth,
-            deadline,
-            cancel,
-            max_memory,
-        } = limits;
-        let cx = Cx {
-            schema: self,
-            snap,
-            leaves,
-            deadline,
-            cancel,
-            reads: std::cell::Cell::new(0),
-            resolve,
-        };
-        cx.check()?;
-        // the trees hold at most one derivation per rule, so their decoded terms are
-        // measured once they are built, before the answer keeps them
-        let fits = |trees: &[Derivation]| -> Result<()> {
-            if let Some(limit) = max_memory {
-                let bytes: usize = trees.iter().map(Derivation::heap_bytes).sum();
-                if bytes > limit {
-                    return Err(budget(format!(
-                        "the explanation's answer needs {bytes} bytes, over its memory limit of {limit}"
-                    )));
-                }
-            }
-            Ok(())
-        };
-        for &g in graphs {
-            if let Some(proof) = cx.asserted(g, triple)? {
-                let mut trees = vec![proof];
-                fits(&trees)?;
-                finish(&mut trees, max_depth);
-                return Ok(Explained::Found { trees, more: false });
-            }
-        }
-        // the best tree of each top rule
-        let mut tops: BTreeMap<String, Derivation> = BTreeMap::new();
-        let mut keep = |d: Derivation| {
-            let name = d.rule.as_ref().map(|r| r.name.clone()).unwrap_or_default();
-            match tops.get(&name) {
-                Some(have) if have.depth <= d.depth => {}
-                _ => {
-                    tops.insert(name, d);
-                }
-            }
-        };
-        let [s, p, o] = triple;
-        let Term::NamedNode(p) = p else {
-            return Ok(Explained::NotFound);
-        };
-        let pr = p.as_ref();
-        // a fact of the schema's closure, which a tree cut at the depth limit asks for
-        if (pr == rdfs::SUB_CLASS_OF || pr == rdfs::SUB_PROPERTY_OF)
-            && let (Term::NamedNode(a), Term::NamedNode(b)) = (s, o)
-            && a != b
-            && let Some(d) = cx.chain(a, pr, b)?
-        {
-            keep(d);
-        }
-        if pr == rdf::TYPE
-            && let Term::NamedNode(c) = o
-        {
-            let subs: Vec<NamedNode> = Self::get(&self.sub_class, c.as_ref())
-                .into_iter()
-                .flatten()
-                .filter(|d| *d != c)
-                .cloned()
-                .collect();
-            for &g in graphs {
-                for range in [false, true] {
-                    if let Some(d) = cx.by_domain_range(g, s, c, range)? {
-                        keep(d);
-                    }
-                }
-                for d in &subs {
-                    let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
-                    let premise = if let Some(proof) = cx.asserted(g, &typed)? {
-                        Some(proof)
-                    } else {
-                        match cx.by_domain_range(g, s, d, false)? {
-                            Some(x) => Some(x),
-                            None => cx.by_domain_range(g, s, d, true)?,
-                        }
-                    };
-                    let Some(premise) = premise else {
-                        continue;
-                    };
-                    let Some(sc) = cx.chain(d, rdfs::SUB_CLASS_OF, c)? else {
-                        continue;
-                    };
-                    keep(Derivation::derived(
-                        triple.clone(),
-                        rule("rdfs9"),
-                        vec![premise, sc],
-                    ));
-                }
-            }
-        }
-        if pr != rdfs::SUB_CLASS_OF && pr != rdfs::SUB_PROPERTY_OF {
-            let subs: Vec<NamedNode> = Self::get(&self.sub_prop, pr)
-                .into_iter()
-                .flatten()
-                .filter(|q| *q != p)
-                .cloned()
-                .collect();
-            'graphs: for &g in graphs {
-                for q in &subs {
-                    let stored = [s.clone(), Term::NamedNode(q.clone()), o.clone()];
-                    let premise = if let Some(proof) = cx.asserted(g, &stored)? {
-                        proof
-                    } else if q.as_ref() == rdf::TYPE
-                        && let Term::NamedNode(c) = o
-                        && let Some(d) = cx.type_in(g, s, c)?
-                    {
-                        // RDFS on read answers a superproperty of rdf:type from a type
-                        // it derives, as well as from a stored one
-                        d
-                    } else {
-                        continue;
-                    };
-                    let Some(sp) = cx.chain(q, rdfs::SUB_PROPERTY_OF, p)? else {
-                        continue;
-                    };
-                    keep(Derivation::derived(
-                        triple.clone(),
-                        rule("rdfs7"),
-                        vec![premise, sp],
-                    ));
-                    break 'graphs;
-                }
-            }
-        }
-        if tops.is_empty() {
-            return Ok(Explained::NotFound);
-        }
-        let mut all: Vec<Derivation> = tops.into_values().collect();
-        fits(&all)?;
-        all.sort_by_key(|d| d.depth);
-        let more = all.len() > max_trees.max(1);
-        all.truncate(max_trees.max(1));
-        finish(&mut all, max_depth);
-        cx.check()?;
-        Ok(Explained::Found { trees: all, more })
+        let wrapped =
+            resolve.map(|r| move |g: Id, t: &[Term; 3], _workspace: &ExplainWorkspace| r(g, t));
+        let resolve = wrapped.as_ref().map(|r| r as &WorkspaceResolver<'_>);
+        explain_inner(snap, leaves, graphs, triple, limits, resolve, |_, _| {
+            Ok(LoadedSchema::Borrowed(self))
+        })
     }
 }

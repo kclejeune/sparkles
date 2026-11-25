@@ -702,7 +702,7 @@ impl Expr {
         }
 
         match self {
-            Expr::Const(id) | Expr::Lit(id, _) => match ctx.term(*id) {
+            Expr::Const(id) | Expr::Lit(id, _) => match ctx.plan_term(*id) {
                 Some(term) => write!(text, "{term}"),
                 None => text.write_str("UNDEF"),
             },

@@ -796,6 +796,107 @@ impl Snapshot {
         }
     }
 
+    /// Id of a term if it exists in this snapshot, checking live controls and admitting
+    /// the probe and coexisting vocabulary reconstruction buffers before allocating.
+    pub fn lookup_term_controlled(
+        &self,
+        t: &Term,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Id>> {
+        check()?;
+        match t {
+            Term::BlankNode(b) => Ok(parse_bnode_label(b.as_str())),
+            _ => {
+                if let Some(id) = id::inline_id(t) {
+                    return Ok(Some(id));
+                }
+                let Some(len) = id::term_key_len(t.as_ref()) else {
+                    admit(usize::MAX)?;
+                    return Err(Error::invalid("term key length overflow"));
+                };
+                admit(len)?;
+                check()?;
+                let mut key = Vec::with_capacity(len);
+                if key.capacity() > len {
+                    admit(key.capacity())?;
+                }
+                id::write_term_ref_key(t.as_ref(), &mut key);
+                debug_assert_eq!(key.len(), len);
+                self.lookup_key_controlled(
+                    &key,
+                    |old, new| {
+                        let bytes = key.capacity().saturating_add(old).saturating_add(new);
+                        admit(bytes)
+                    },
+                    |_| Ok(()),
+                    check,
+                )
+            }
+        }
+    }
+
+    /// Id of an IRI if it exists in this snapshot, checking live controls and admitting
+    /// the probe and coexisting vocabulary reconstruction buffers before allocating.
+    pub fn lookup_iri_controlled(
+        &self,
+        iri: &str,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Id>> {
+        check()?;
+        let Some(len) = iri.len().checked_add(1) else {
+            admit(usize::MAX)?;
+            return Err(Error::invalid("IRI key length overflow"));
+        };
+        admit(len)?;
+        check()?;
+        let mut key = Vec::with_capacity(len);
+        if key.capacity() > len {
+            admit(key.capacity())?;
+        }
+        key.push(b'<');
+        key.extend_from_slice(iri.as_bytes());
+        debug_assert_eq!(key.len(), len);
+        self.lookup_key_controlled(
+            &key,
+            |old, new| {
+                let bytes = key.capacity().saturating_add(old).saturating_add(new);
+                admit(bytes)
+            },
+            |_| Ok(()),
+            check,
+        )
+    }
+
+    /// Id of a vocabulary key if it exists in this snapshot, checking live controls and
+    /// admitting coexisting vocabulary reconstruction buffers during growth, then only the
+    /// settled scratch allocation.
+    pub fn lookup_key_controlled<E: From<Error>>(
+        &self,
+        key: &[u8],
+        grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
+        settled: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut check: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<Id>, E> {
+        check()?;
+        let found =
+            match self
+                .generation
+                .vocab
+                .find_with_controlled_capacity(key, grow, settled, |_| check())?
+            {
+                Ok(i) => Some(Id::vocab(i)),
+                Err(_) => self
+                    .generation
+                    .dvocab
+                    .find_prepared(key, self.dvocab_len, &mut check)?
+                    .map(Id::delta),
+            };
+        check()?;
+        Ok(found)
+    }
+
     pub fn lookup_iri(&self, iri: &str) -> Option<Id> {
         self.lookup_key(&id::iri_key(iri))
     }
@@ -833,6 +934,115 @@ impl Snapshot {
                 .get_with(id.payload(), id::key_to_term),
             Tag::Delta => self.key(id).map(|k| id::key_to_term(&k)),
             _ => None,
+        }
+    }
+
+    /// Decode a stored id into an RDF term under explicit memory and control callbacks,
+    /// propagating any refusal with its original error instead of returning `None`.
+    pub(crate) fn term_controlled(
+        &self,
+        id: Id,
+        reserve: &mut dyn FnMut(usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Term>> {
+        check()?;
+        match id.tag() {
+            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date => {
+                Ok(id::inline_to_literal(id).map(Term::Literal))
+            }
+            Tag::BNode => Ok(Some(Term::BlankNode(bnode_for(id)))),
+            Tag::Vocab => self.generation.vocab.get_with_controlled(
+                id.payload(),
+                reserve,
+                |_| check(),
+                id::key_to_term,
+            ),
+            Tag::Delta => {
+                let len = self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(<[u8]>::len));
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                reserve(len)?;
+                check()?;
+                Ok(self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(id::key_to_term)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Decode a stored id into an RDF term with explicit callbacks for vocabulary
+    /// scratch growth (`old_cap`, `new_cap`), settled scratch capacity (`cap`),
+    /// coexisting scratch and decoded-output bytes (`scratch_cap`, `key_len`), and
+    /// live request-control checkpoints.
+    pub(crate) fn term_controlled_owned(
+        &self,
+        id: Id,
+        grow: &mut dyn FnMut(usize, usize) -> Result<()>,
+        settled: &mut dyn FnMut(usize) -> Result<()>,
+        output: &mut dyn FnMut(usize, usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Term>> {
+        check()?;
+        match id.tag() {
+            Tag::Bool | Tag::Int | Tag::Double | Tag::Decimal | Tag::DateTime | Tag::Date => {
+                output(0, 0)?;
+                Ok(id::inline_to_literal(id).map(Term::Literal))
+            }
+            Tag::BNode => {
+                output(0, 0)?;
+                Ok(Some(Term::BlankNode(bnode_for(id))))
+            }
+            Tag::Vocab => {
+                let key = self.generation.vocab.get_owned_with_controlled(
+                    id.payload(),
+                    grow,
+                    &mut *settled,
+                    |_| check(),
+                    Ok,
+                );
+                let Some(key) = (match key {
+                    Ok(key) => key,
+                    Err(err) => {
+                        let _ = settled(0);
+                        return Err(err);
+                    }
+                }) else {
+                    settled(0)?;
+                    return Ok(None);
+                };
+                let cap = key.capacity();
+                if let Err(err) = output(cap, key.len()).and_then(|()| check()) {
+                    drop(key);
+                    let _ = settled(0);
+                    return Err(err);
+                }
+                let term = id::key_to_term(&key);
+                drop(key);
+                settled(0)?;
+                Ok(Some(term))
+            }
+            Tag::Delta => {
+                let len = self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(<[u8]>::len));
+                let Some(len) = len else {
+                    return Ok(None);
+                };
+                output(0, len)?;
+                check()?;
+                Ok(self
+                    .generation
+                    .dvocab
+                    .with(|v| v.get(id.payload()).map(id::key_to_term)))
+            }
+            _ => Ok(None),
         }
     }
 

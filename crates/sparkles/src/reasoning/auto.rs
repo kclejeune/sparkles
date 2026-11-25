@@ -80,17 +80,12 @@ impl AutoReasoner {
             return derive(why);
         }
         // a caller whose protections hide the inferences cannot read the graph (C12b)
-        if let Some(readable) = &req.readable {
-            let inferred = oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
-                crate::reasoning::INFERRED_GRAPH,
-            ));
-            if req
-                .snap
-                .lookup_term(&inferred)
-                .is_some_and(|g| !readable(g))
-            {
-                return derive("the caller cannot read the inferred graph".to_string());
-            }
+        if let Some(readable) = &req.readable
+            && !readable
+                .read
+                .allows_named_iri(crate::reasoning::INFERRED_GRAPH)
+        {
+            return derive("the caller cannot read the inferred graph".to_string());
         }
         let f = freshness(&record, self.dataset.store(), req.snap.commit);
         match f.stale {

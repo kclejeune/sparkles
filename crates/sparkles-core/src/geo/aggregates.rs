@@ -32,9 +32,21 @@ pub fn evaluate(ctx: &Ctx, local: &str, vals: &[std::result::Result<Id, ()>]) ->
 }
 
 fn compute(ctx: &Ctx, local: &str, vals: &[std::result::Result<Id, ()>]) -> Option<Id> {
+    if let Err(error) = ctx.check() {
+        ctx.fail_memory(&error);
+        return None;
+    }
     let mut gs: Vec<GeomRef> = Vec::with_capacity(vals.len());
     for v in vals {
-        gs.push(memo::by_id(ctx, (*v).ok()?, None).ok()?);
+        let id = (*v).ok()?;
+        match memo::by_id_checked(ctx, id) {
+            Ok(Some(g)) => gs.push(g),
+            Ok(None) => return None,
+            Err(error) => {
+                ctx.fail_memory(&error);
+                return None;
+            }
+        }
     }
     let first = gs.first()?;
     let refs: Vec<&Geom> = gs.iter().map(|g| &**g).collect();
@@ -54,9 +66,22 @@ fn compute(ctx: &Ctx, local: &str, vals: &[std::result::Result<Id, ()>]) -> Opti
             .ok()?
         }
     };
-    let dt = match ctx.value(vals[0].ok()?) {
-        Some(Value::Other { dt, .. }) if &*dt == GEOJSON_LITERAL => GEOJSON_LITERAL,
-        _ => super::vocab::WKT_LITERAL,
+    let dt = {
+        let decode = match ctx.charge(0) {
+            Ok(charge) => charge,
+            Err(error) => {
+                ctx.fail_memory(&error);
+                return None;
+            }
+        };
+        match ctx.value_checked_into(vals[0].ok()?, &decode) {
+            Ok(Some(Value::Other { dt, .. })) if &*dt == GEOJSON_LITERAL => GEOJSON_LITERAL,
+            Ok(_) => super::vocab::WKT_LITERAL,
+            Err(error) => {
+                ctx.fail_memory(&error);
+                return None;
+            }
+        }
     };
     let lex = if dt == GEOJSON_LITERAL {
         out.crs.known()?;
@@ -65,7 +90,13 @@ fn compute(ctx: &Ctx, local: &str, vals: &[std::result::Result<Id, ()>]) -> Opti
         write::to_wkt(&out)
     };
     // held until the query ends, like the local vocabulary the literal lands in
-    std::mem::forget(ctx.charge(lex.len() as u64 + 64).ok()?);
+    match ctx.charge(lex.len() as u64 + 64) {
+        Ok(charge) => std::mem::forget(charge),
+        Err(error) => {
+            ctx.fail_memory(&error);
+            return None;
+        }
+    }
     Some(ctx.intern_value(&Value::Other {
         lex: lex.into(),
         dt: dt.into(),

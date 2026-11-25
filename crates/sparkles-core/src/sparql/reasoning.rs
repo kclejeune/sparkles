@@ -140,8 +140,8 @@ pub struct Report {
 pub struct SessionRequest {
     /// the caller's view of the data
     pub snap: Arc<Snapshot>,
-    /// whether the caller may read a graph (`None`: every graph)
-    pub readable: Option<Arc<dyn Fn(Id) -> bool + Send + Sync>>,
+    /// the caller's bound graph access (`None`: every graph)
+    pub readable: Option<Arc<crate::access::GraphAccess>>,
     /// fails with [`Error::Timeout`] or [`Error::Cancelled`] when the query must stop
     pub stop: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     /// the query's memory budget, in bytes
@@ -737,14 +737,7 @@ pub(crate) fn request(ctx: &Ctx, opts: &QueryOptions) -> SessionRequest {
             Ok(())
         }) as Arc<dyn Fn() -> Result<()> + Send + Sync>
     };
-    let readable: Option<Arc<dyn Fn(Id) -> bool + Send + Sync>> = match &ctx.graphs {
-        Some(a) if !a.reads_all() => {
-            let a = a.clone();
-            let snap = ctx.snap.clone();
-            Some(Arc::new(move |g: Id| a.readable_id(&snap, g)))
-        }
-        _ => None,
-    };
+    let readable = ctx.graphs.clone().filter(|a| !a.reads_all());
     SessionRequest {
         snap: ctx.snap.clone(),
         readable,

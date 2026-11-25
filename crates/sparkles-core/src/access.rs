@@ -602,6 +602,18 @@ impl Graphs {
             Graphs::Only(r) => iri != UNION_GRAPH_IRI && r.matches_iri(iri),
         }
     }
+
+    /// Whether the named graph IRI `iri` is in the set (`urn:x-arq:DefaultGraph` is the
+    /// default graph; unlike [`allows_iri`](Self::allows_iri), literal `"default"` is
+    /// treated as a named IRI rather than the default graph, matching
+    /// [`allows`](Self::allows)).
+    pub fn allows_named_iri(&self, iri: &str) -> bool {
+        match self {
+            Graphs::All => true,
+            Graphs::Only(r) if iri == DEFAULT_GRAPH_IRI => r.default_graph,
+            Graphs::Only(r) => iri != UNION_GRAPH_IRI && r.matches_iri(iri),
+        }
+    }
 }
 
 /// What one request may read and write. Writes need both: a graph is writable when it
@@ -895,6 +907,58 @@ impl GraphAccess {
             return self.read.default_graph();
         }
         graph_term(snap, g).is_some_and(|t| self.read.allows(Some(&t)))
+    }
+
+    /// Whether the graph id `g` of `snap` is readable, borrowing stored IRI keys instead
+    /// of allocating an owned `Term`, admitting base-vocabulary reconstruction scratch
+    /// via `grow` / `settled`, and polling `check`.
+    pub fn readable_id_controlled<E: From<Error>>(
+        &self,
+        snap: &Snapshot,
+        g: Id,
+        mut grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
+        mut settled: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut check: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<bool, E> {
+        check()?;
+        let Graphs::Only(rule) = &self.read else {
+            return Ok(true);
+        };
+        if g == Id::DEFAULT_GRAPH {
+            return Ok(rule.default_graph);
+        }
+        match g.tag() {
+            Tag::BNode => Ok(rule.blank_nodes),
+            Tag::Delta => Ok(snap.generation.dvocab.with(|v| {
+                let Some(key) = v.get(g.payload()) else {
+                    return false;
+                };
+                key.strip_prefix(b"<")
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .is_some_and(|iri| self.read.allows_named_iri(iri))
+            })),
+            Tag::Vocab => {
+                if g.payload() >= snap.generation.vocab.len()
+                    || !snap.generation.vocab.is_iri(g.payload())
+                {
+                    return Ok(false);
+                }
+                let allowed = snap.generation.vocab.get_with_controlled_capacity_checked(
+                    g.payload(),
+                    &mut grow,
+                    &mut settled,
+                    |_| check(),
+                    |key| {
+                        Ok(key
+                            .strip_prefix(b"<")
+                            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                            .is_some_and(|iri| self.read.allows_named_iri(iri)))
+                    },
+                )?;
+                Ok(allowed.unwrap_or(false))
+            }
+            _ => Ok(false),
+        }
     }
 }
 

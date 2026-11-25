@@ -560,13 +560,21 @@ pub fn clear() {
 pub(crate) fn tbox(req: &SessionRequest, inputs: &Inputs) -> Result<Arc<Tbox>> {
     let snap = &req.snap;
     let resolved = match &req.readable {
-        Some(readable) => inputs::resolve_readable(snap, inputs, &|g| readable(g)),
-        None => inputs::resolve(snap, inputs),
+        Some(access) if !access.reads_all() => {
+            inputs::resolve_readable_iri(snap, inputs, &|g| match g {
+                inputs::GraphRef::Default => access.read.default_graph(),
+                inputs::GraphRef::Named(iri) => access.read.allows_named_iri(iri),
+            })
+        }
+        _ => inputs::resolve(snap, inputs),
     };
-    let mut graphs = resolved.ids(snap);
-    if let Some(readable) = &req.readable {
-        graphs.retain(|g| readable(*g));
-    }
+    let graphs = match &req.readable {
+        Some(access) if !access.reads_all() => resolved.readable_ids(snap, &|g| match g {
+            inputs::GraphRef::Default => access.read.default_graph(),
+            inputs::GraphRef::Named(iri) => access.read.allows_named_iri(iri),
+        }),
+        _ => resolved.ids(snap),
+    };
     let key = (snap.cacheable && !req.no_cache).then(|| {
         format!(
             "{}|{}|{}|{:?}",

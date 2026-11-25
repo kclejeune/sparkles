@@ -33,9 +33,11 @@ pub(super) fn reasoner(source: &Source) -> QueryReasoner {
         Inputs::default(),
     )
     .unwrap()
-    .with_program(Arc::new(move |t: &Terms, _: &mut WorkingWarnings| {
-        Ok(ProgramInfo::bare(build(&s, t), &t.budget()))
-    }))
+    .with_program(Arc::new(
+        move |t: &Terms, _: &mut WorkingWarnings, _: &mut dyn FnMut() -> anyhow::Result<()>| {
+            Ok(ProgramInfo::bare(build(&s, t), &t.budget()))
+        },
+    ))
 }
 
 fn request(snap: &Arc<Snapshot>) -> SessionRequest {
@@ -817,9 +819,11 @@ fn a_lowering_past_the_budget_is_a_memory_failure() {
     let vv = v.clone();
     let source: Source = Arc::new(move |_: &Terms| chain_and_key_rules(&vv));
     let s = source.clone();
-    let ps: crate::query::ProgramSource = Arc::new(move |t: &Terms, _: &mut WorkingWarnings| {
-        Ok(ProgramInfo::bare(build(&s, t), &t.budget()))
-    });
+    let ps: crate::query::ProgramSource = Arc::new(
+        move |t: &Terms, _: &mut WorkingWarnings, _: &mut dyn FnMut() -> anyhow::Result<()>| {
+            Ok(ProgramInfo::bare(build(&s, t), &t.budget()))
+        },
+    );
     let terms = Terms::new(v.store.snapshot());
     let small = crate::budget::Budget::new(Some(256));
     let e = Session::program_rules_for_tests(&ps, &terms, &small).unwrap_err();
@@ -838,8 +842,8 @@ fn the_relation_catalog_stays_charged() {
     let name = "r".repeat(1 << 20);
     let v = Arc::new(TV::new());
     let p0 = v.props[0];
-    let source: crate::query::ProgramSource =
-        Arc::new(move |t: &Terms, _: &mut WorkingWarnings| {
+    let source: crate::query::ProgramSource = Arc::new(
+        move |t: &Terms, _: &mut WorkingWarnings, _: &mut dyn FnMut() -> anyhow::Result<()>| {
             let mut rels = Relations::default();
             let r = rels.declare(&name, 1, false).unwrap();
             let rules = vec![rule(
@@ -849,7 +853,8 @@ fn the_relation_catalog_stays_charged() {
             )];
             let p = Program::new(rels, rules, &Vocab::of(t), &t.budget()).unwrap();
             Ok(ProgramInfo::bare(p, &t.budget()))
-        });
+        },
+    );
     let budget = crate::budget::Budget::new(None);
     let terms = Terms::new(v.store.snapshot());
     terms.set_budget(&budget).unwrap();
