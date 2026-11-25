@@ -2429,6 +2429,34 @@ impl Out<'_, '_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static PROBE_PUBLISH_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn invoke_probe_publish_hook() {
+    PROBE_PUBLISH_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
+}
+
+#[cfg(test)]
+fn with_probe_publish_hook<R>(hook: impl Fn() + 'static, f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PROBE_PUBLISH_HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+    PROBE_PUBLISH_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    let _reset = Reset;
+    f()
+}
+
 impl<'a> Run<'a> {
     fn get_dynamic_core(&self, e: Ex) -> &'a [Ex] {
         self.dynamic.expect("a run with the Horn rules").core(e)
@@ -3143,6 +3171,8 @@ impl<'a> Run<'a> {
                     .get(c.clause_id as usize)
                     .is_some_and(|s| !s.dead)
             {
+                #[cfg(test)]
+                invoke_probe_publish_hook();
                 slot.winner = Some(c);
                 let won = self.publish_split_stop();
                 if !won {
@@ -3164,6 +3194,9 @@ impl<'a> Run<'a> {
         if slot.winner.is_none()
             && !self.stopped()
             && let Some(chosen) = rescanned
+            && (dl.work() >= dl.split_probe()
+                || (dl.split_mode() == super::dl_rules::SplitMode::EagerPureThenProbe
+                    && chosen.prio >= 2))
         {
             slot.winner = Some(chosen);
             let won = self.publish_split_stop();
@@ -8078,6 +8111,311 @@ mod horn_accounting_tests {
             );
             assert_eq!(dyn_tbl2.len(), 1024, "failed writer must publish no ID");
             let _ = budget.calls;
+        }
+
+        // 4. `Table::push_clause_admitted` panicking second top-up refunds first grant cleanly.
+        {
+            let mut dl_t = DlRun::new(false, Default::default());
+            for _ in 0..1023 {
+                let _ = dl_t
+                    .table
+                    .push(Clause::new(vec![Lit::x(1)], vec![Lit::x(2)]));
+            }
+            dl_t.table.sync_unadmitted_on_begin_run();
+            let charge_calls = std::sync::atomic::AtomicUsize::new(0);
+            let charge_cb = |more: usize| -> bool {
+                let n = charge_calls.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 {
+                    assert!(more > 0);
+                    // Concurrent writer claims slot 1023 so the next attempt crosses 1024.
+                    let _ = dl_t
+                        .table
+                        .push(Clause::new(vec![Lit::x(9)], vec![Lit::x(10)]));
+                    true
+                } else {
+                    panic_any(TopupBoom);
+                }
+            };
+            let b = Bounds {
+                threads: 1,
+                deadline: None,
+                max_memory: None,
+                cancelled: None,
+                charge: Some(&charge_cb),
+                base_memory: 100,
+                base_queued: 0,
+                peak_memory: 100,
+                paid_memory: 100,
+                dynamic: None,
+                dl: Some(&dl_t),
+                partial: false,
+                steps: false,
+            };
+            let run_t = run(&f.ix, &ctx, &b);
+            run_t.set_queued(0);
+            let (mut l, mut w, mut o, mut m) = (
+                Vec::new(),
+                VecDeque::new(),
+                Outbox::default(),
+                Marks::default(),
+            );
+            let caught = catch_unwind(AssertUnwindSafe(|| {
+                let mut out = Out {
+                    run: &run_t,
+                    me: f.root,
+                    local: &mut l,
+                    woke: &mut w,
+                    outbox: &mut o,
+                    marks: &mut m,
+                    pending: false,
+                    sent: 0,
+                    work: 0,
+                    kept: 0,
+                    wake_split: false,
+                    already_panicking: std::thread::panicking(),
+                };
+                let _ = push_clause_admitted(&mut out, 32, || {
+                    Clause::new(vec![Lit::x(7)], vec![Lit::x(8)])
+                });
+            }))
+            .unwrap_err();
+            assert_eq!(caught.downcast_ref::<TopupBoom>(), Some(&TopupBoom));
+            assert_eq!(
+                charge_calls.load(Ordering::Relaxed),
+                2,
+                "Table top-up must invoke charge twice across segment boundary"
+            );
+            assert_eq!(
+                dl_t.table.len(),
+                1024,
+                "failed Table writer must publish no slot 1024"
+            );
+            let ledger = run_t.admission.lock();
+            assert_eq!(
+                ledger.committed, 100,
+                "panicking second Table top-up must refund first grant completely"
+            );
+            assert!(
+                ledger.paid > 100,
+                "prior successful pool payment must remain in paid"
+            );
+        }
+    }
+
+    /// Real production-path barrier race for `Run::try_probe_split` (Sol r1 P2 #1 +
+    /// Neon r1 NB1):
+    /// 1. Worker A validates liveness under `root_st`, pauses inside the critical section
+    ///    before `publish_split_stop`, proving a concurrent mutator cannot enter `root_st`
+    ///    until AFTER `STOP_SPLIT` and `slot.winner` are committed.
+    /// 2. Mutator then kills the clause and rescans/clears `slot.best`; `winner` survives.
+    /// 3. When a rescan in `EagerPureThenProbe` mode downgrades from prio 2 to prio 1 while
+    ///    `dl.work() < dl.split_probe()`, `try_probe_split` refreshes `best` and does NOT
+    ///    publish `STOP_SPLIT`.
+    #[test]
+    fn try_probe_split_barrier_race_holds_root_lock_through_cas_and_rechecks_threshold() {
+        use super::super::dl_clause::{Clause, Made, RTerm, XLit};
+        use super::super::dl_root::rescan_split_cand;
+        use super::super::dl_rules::{DlRun, DlSt, SplitCand, SplitMode};
+        use crate::classify::{Limits, Saturation};
+        use std::sync::{Arc, Barrier};
+
+        // Build a minimal rooted Index so `ix.dl.root` is `Some(root_ex)`.
+        let ofn = "Prefix(:=<http://example.org/p#>)\nOntology(<http://example.org/p>\n  ClassAssertion(ObjectOneOf(:a :b) :a)\n  SubClassOf(:A ObjectUnionOf(:B :C))\n)";
+        let doc = crate::ofn_read::parse(ofn).unwrap();
+        let refs: Vec<&crate::model::AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let mut sat = Saturation::new();
+        let limits = Limits {
+            threads: 1,
+            rooted: true,
+            ..Limits::default()
+        };
+        let _ = sat.saturate(&refs, None, &limits).unwrap();
+        let ix = sat.index.as_ref().expect("saturated index");
+        let root_ex = ix.dl.as_deref().and_then(|d| d.root).expect("rooted index");
+        let n_ctx = sat.interner.len();
+
+        // 1. Barrier race on production `Run::try_probe_split`.
+        {
+            let ctx: Contexts = (0..n_ctx).map(|_| OnceLock::new()).collect();
+            let mut dl = DlRun::new(false, Default::default());
+            dl.configure_split(
+                SplitMode::ProbeOnly,
+                10,
+                7,
+                vec![0, 1].into_boxed_slice(),
+                Vec::new().into_boxed_slice(),
+            );
+            dl.count(10);
+            let mk = |xl: XLit| match dl.lits.lit(xl, |_| None) {
+                Made::Lit(l) => l,
+                other => panic!("expected literal, got {other:?}"),
+            };
+            let eq01 = mk(XLit::Eq(RTerm::C(0), RTerm::C(1)));
+            let atom = mk(XLit::Atom(10, RTerm::C(0)));
+            let mut dl_st = DlSt::default();
+            let _ = dl_st.store.add(Clause::new(Vec::new(), vec![eq01, atom]));
+            let cand = SplitCand {
+                epoch: 7,
+                prio: 1,
+                head_len: 2,
+                rank_lo: 0,
+                rank_hi: 1,
+                u_id: 0,
+                v_id: 1,
+                clause_id: 0,
+            };
+            dl.record_split_cand(cand);
+            let root_box = Box::new(Ctx::default());
+            {
+                let mut st = root_box.st.lock();
+                st.extra = Some(Box::new(Extra {
+                    dl: Some(Box::new(dl_st)),
+                    ..Extra::default()
+                }));
+            }
+            let _ = ctx[root_ex as usize].set(root_box);
+            let b = Bounds {
+                threads: 2,
+                deadline: None,
+                max_memory: None,
+                cancelled: None,
+                charge: None,
+                base_memory: 0,
+                base_queued: 0,
+                peak_memory: 0,
+                paid_memory: 0,
+                dynamic: None,
+                dl: Some(&dl),
+                partial: false,
+                steps: false,
+            };
+            let run_obj = run(ix, &ctx, &b);
+            let bar_in = Arc::new(Barrier::new(2));
+            let bar_go = Arc::new(Barrier::new(2));
+            std::thread::scope(|s| {
+                let run_ref = &run_obj;
+                let b_in = bar_in.clone();
+                let b_go = bar_go.clone();
+                let worker_a = s.spawn(move || {
+                    super::with_probe_publish_hook(
+                        move || {
+                            b_in.wait();
+                            b_go.wait();
+                        },
+                        || run_ref.try_probe_split(),
+                    );
+                });
+
+                // Wait until Worker A is inside `root_st -> split_slot`, before CAS.
+                bar_in.wait();
+                let root_ctx = ctx[root_ex as usize].get().unwrap();
+                assert!(
+                    root_ctx.st.try_lock().is_none(),
+                    "try_probe_split must hold root_st across liveness check and publication"
+                );
+                assert!(
+                    !run_obj.stopped(),
+                    "STOP_SPLIT must not be published before critical-section CAS"
+                );
+                // Release Worker A to commit winner + publish_split_stop and drop root_st.
+                bar_go.wait();
+                // Mutator enters `root_st` immediately after Worker A releases it.
+                let mut st = root_ctx.st.lock();
+                assert_eq!(
+                    run_obj.stop.load(Ordering::Acquire),
+                    STOP_SPLIT,
+                    "STOP_SPLIT must already be published before root_st is released"
+                );
+                let x = st.extra.as_mut().unwrap().dl.as_mut().unwrap();
+                x.store.clauses[0].dead = true;
+                let rescanned = rescan_split_cand(ix, x, &dl, &mut || true);
+                assert!(rescanned.is_none());
+                {
+                    let mut slot = dl.split_slot.lock();
+                    dl.refresh_split_best_locked(&mut slot, rescanned);
+                    assert!(slot.best.is_none());
+                    assert_eq!(slot.winner, Some(cand));
+                }
+                drop(st);
+                worker_a.join().unwrap();
+            });
+            assert_eq!(dl.take_winning_split(), Some(cand));
+        }
+
+        // 2. Rescan downgrading prio 2 -> prio 1 while `work < split_probe` in
+        //    `EagerPureThenProbe` mode must refresh `best` and NOT publish `STOP_SPLIT`.
+        {
+            let ctx: Contexts = (0..n_ctx).map(|_| OnceLock::new()).collect();
+            let mut dl = DlRun::new(false, Default::default());
+            dl.configure_split(
+                SplitMode::EagerPureThenProbe,
+                1000,
+                9,
+                vec![0, 1, 2].into_boxed_slice(),
+                Vec::new().into_boxed_slice(),
+            );
+            dl.count(10); // strictly below probe=1000
+            let mk = |xl: XLit| match dl.lits.lit(xl, |_| None) {
+                Made::Lit(l) => l,
+                other => panic!("expected literal, got {other:?}"),
+            };
+            let eq01 = mk(XLit::Eq(RTerm::C(0), RTerm::C(1)));
+            let eq02 = mk(XLit::Eq(RTerm::C(0), RTerm::C(2)));
+            let atom = mk(XLit::Atom(10, RTerm::C(0)));
+            let mut dl_st = DlSt::default();
+            let _ = dl_st.store.add(Clause::new(Vec::new(), vec![eq01, eq02]));
+            let _ = dl_st.store.add(Clause::new(Vec::new(), vec![eq01, atom]));
+            assert_eq!(dl_st.store.clauses.len(), 2);
+            // Slot 0 (prio 2) is dead; slot 1 (prio 1 mixed) is live.
+            dl_st.store.clauses[0].dead = true;
+            dl.record_split_cand(SplitCand {
+                epoch: 9,
+                prio: 2,
+                head_len: 2,
+                rank_lo: 0,
+                rank_hi: 1,
+                u_id: 0,
+                v_id: 1,
+                clause_id: 0,
+            });
+            assert!(
+                dl.split_probe_reached(),
+                "stale prio-2 hint triggers probe entry"
+            );
+            let root_box = Box::new(Ctx::default());
+            {
+                let mut st = root_box.st.lock();
+                st.extra = Some(Box::new(Extra {
+                    dl: Some(Box::new(dl_st)),
+                    ..Extra::default()
+                }));
+            }
+            let _ = ctx[root_ex as usize].set(root_box);
+            let b = Bounds {
+                threads: 1,
+                deadline: None,
+                max_memory: None,
+                cancelled: None,
+                charge: None,
+                base_memory: 0,
+                base_queued: 0,
+                peak_memory: 0,
+                paid_memory: 0,
+                dynamic: None,
+                dl: Some(&dl),
+                partial: false,
+                steps: false,
+            };
+            let run_obj = run(ix, &ctx, &b);
+            run_obj.try_probe_split();
+            assert!(
+                !run_obj.stopped(),
+                "downgraded prio-1 rescan below probe threshold must not publish STOP_SPLIT"
+            );
+            assert_eq!(dl.best_split_prio.load(Ordering::Acquire), 1);
+            let slot = dl.split_slot.lock();
+            assert_eq!(slot.best.map(|c| c.prio), Some(1));
+            assert!(slot.winner.is_none());
         }
     }
 }

@@ -935,9 +935,33 @@ pub struct Rooted<'a> {
     pub ground_total: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    static GROUND_TOTAL_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Temporarily overrides [`ground_total`] on the current thread for deterministic tests.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn with_ground_total<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            GROUND_TOTAL_TEST.with(|c| c.set(self.0));
+        }
+    }
+    let prev = GROUND_TOTAL_TEST.with(|c| c.replace(Some(on)));
+    let _reset = Reset(prev);
+    f()
+}
+
 /// Whether every context compares two ground literals by one shared order, item 804's
 /// second departure. `SPARKLES_ROOTED_GROUND_ORDER=0` turns it off, for measurement.
 pub fn ground_total() -> bool {
+    #[cfg(test)]
+    if let Some(v) = GROUND_TOTAL_TEST.with(|c| c.get()) {
+        return v;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_GROUND_ORDER").is_none_or(|v| v != "0"))
 }

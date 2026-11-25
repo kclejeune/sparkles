@@ -1200,6 +1200,15 @@ pub(super) fn build_inconsistent(
             bottom.push(c.clone());
         }
     } else {
+        let active_threads = threads.clamp(1, classes.len().div_ceil(super::MIN_CLASSES).max(1));
+        let chunk_size = classes.len().div_ceil(active_threads);
+        let num_chunks = classes.len().div_ceil(chunk_size);
+        let chunks_bytes = num_chunks
+            .checked_mul(std::mem::size_of::<Vec<Class>>())
+            .and_then(|b| b.checked_add(classes.len().checked_mul(std::mem::size_of::<Class>())?))
+            .ok_or(Halt::Memory(usize::MAX))?;
+        let mut chunks_debit = BudgetDebit::new(budget);
+        chunks_debit.add(chunks_bytes)?;
         let chunks = super::par_map(classes, threads, super::MIN_CLASSES, |_, chunk| {
             let mut out = Vec::with_capacity(chunk.len());
             for (i, c) in chunk.iter().enumerate() {
@@ -1212,11 +1221,14 @@ pub(super) fn build_inconsistent(
             out
         });
         if stopped.load(Ordering::Relaxed) {
+            drop(chunks);
+            drop(chunks_debit);
             return Err(Halt::Stopped);
         }
         for chunk in chunks {
             bottom.extend(chunk);
         }
+        drop(chunks_debit);
     }
     let mut at = Vec::with_capacity(classes.len());
     for i in 0..classes.len() {

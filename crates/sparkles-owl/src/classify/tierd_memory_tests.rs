@@ -7290,3 +7290,335 @@ fn split_single_ledger_retained_bytes_between_rounds_and_dynamic_fold() {
         "final dynamic fold must equal base + full dynamic bytes exactly once (no double count)"
     );
 }
+
+/// Sol r1 #1, #2, #3 + Neon r1 B2:
+/// 1. Production-path leaf-export overlap refusal: cap allows leaf saturation and export
+///    scratch individually, but excludes their overlap (`leaf_live + export_scratch`),
+///    refusing inside `export_split_leaf` and recording the combined peak.
+/// 2. Allocation-site refusal tests with counting allocator: original-signature collection
+///    refusal (before un-admitted growth) and parallel `taxonomy::build_inconsistent`
+///    refusal when cap allows `bottom` alone but excludes `bottom + chunks`.
+/// 3. Nested forks + forced merges (`STOP_MERGE`) with live sibling `Arc<CanonMap>`s on
+///    `stack` under both a tight hard cap and a refusing pool callback.
+#[test]
+fn split_leaf_export_overlap_allocation_sites_nested_forks_and_parallel_inconsistent() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // 1. Parallel `taxonomy::build_inconsistent` (`threads > 1 && classes.len() >= MIN_CLASSES`):
+    //    cap allows `bottom` (`bytes`) alone, excludes `bottom + chunks` -> refuses cleanly
+    //    BEFORE allocating `chunks`, then full cap succeeds and settles exact live debit!
+    {
+        let n = super::MIN_CLASSES + 64;
+        let classes: Vec<Class> = (0..n)
+            .map(|i| Class::new(format!("urn:incons:C{i:04}")))
+            .collect();
+        let iri_bytes: usize = classes.iter().map(|c| c.as_str().len()).sum();
+        let bottom_bytes = 2 * std::mem::size_of::<super::taxonomy::Node>()
+            + (n + 2) * std::mem::size_of::<Class>()
+            + n * std::mem::size_of::<(u32, u32)>()
+            + iri_bytes
+            + crate::vocab::OWL_NOTHING.len()
+            + crate::vocab::OWL_THING.len();
+        // Cap strictly between `bottom_bytes` and `bottom_bytes + chunks_bytes`!
+        let overlap_cap = bottom_bytes + 64;
+        let live = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let refused = super::taxonomy::build_inconsistent(&classes, 4, &|| false, &|d: isize| {
+            if d >= 0 {
+                let next = live.load(Ordering::Relaxed).saturating_add(d as usize);
+                peak.fetch_max(next, Ordering::Relaxed);
+                if next > overlap_cap {
+                    return Err(next);
+                }
+                live.store(next, Ordering::Relaxed);
+            } else {
+                live.fetch_sub(d.unsigned_abs(), Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        assert!(
+            matches!(refused, Err(super::taxonomy::Halt::Memory(used)) if used > overlap_cap),
+            "parallel build_inconsistent must refuse before allocating overlapping chunks"
+        );
+        assert_eq!(
+            live.load(Ordering::Relaxed),
+            0,
+            "refused parallel build_inconsistent must release bottom debit cleanly"
+        );
+
+        // Full cap succeeds, records peak > bottom_bytes (covering `bottom + chunks`),
+        // and drops `chunks` debit back to exact `owned` bytes.
+        let live_ok = AtomicUsize::new(0);
+        let peak_ok = AtomicUsize::new(0);
+        let (tax, owned) =
+            super::taxonomy::build_inconsistent(&classes, 4, &|| false, &|d: isize| {
+                if d >= 0 {
+                    let next = live_ok.load(Ordering::Relaxed).saturating_add(d as usize);
+                    peak_ok.fetch_max(next, Ordering::Relaxed);
+                    live_ok.store(next, Ordering::Relaxed);
+                } else {
+                    live_ok.fetch_sub(d.unsigned_abs(), Ordering::Relaxed);
+                }
+                Ok(())
+            })
+            .expect("parallel build_inconsistent must succeed under full cap");
+        assert_eq!(owned, bottom_bytes);
+        assert_eq!(live_ok.load(Ordering::Relaxed), owned);
+        assert!(
+            peak_ok.load(Ordering::Relaxed) >= owned + n * std::mem::size_of::<Class>(),
+            "parallel build_inconsistent peak ({}) must cover bottom + chunks overlap",
+            peak_ok.load(Ordering::Relaxed)
+        );
+        assert_eq!(tax.nodes().len(), 2);
+    }
+
+    // 2. Original-signature collection pre-admission refusal (Sol r1 #2):
+    //    with many classes and a tiny memory cap, `run_splitting` refuses during
+    //    `raw_classes`/`raw_inds` growth BEFORE un-admitted growth and reports attempted peak.
+    {
+        let mut ax = Vec::new();
+        let a = crate::model::Individual::named("http://example.org/sig#a");
+        let b = crate::model::Individual::named("http://example.org/sig#b");
+        ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
+            crate::model::ClassExpression::ObjectOneOf(std::collections::BTreeSet::from([
+                a.clone(),
+                b.clone(),
+            ])),
+            a,
+        )));
+        for i in 0..256 {
+            ax.push(crate::model::Axiom::new(AxiomKind::Declaration(
+                crate::model::Entity::Class(Class::new(format!("http://example.org/sig#C{i:03}"))),
+            )));
+        }
+        let refs: Vec<&AxiomKind> = ax.iter().map(|x| &x.kind).collect();
+        let cap = 256usize;
+        let mut sat = Saturation::new();
+        let lim = Limits {
+            threads: 1,
+            rooted: true,
+            rooted_eq_split: true,
+            max_memory: Some(cap),
+            ..Limits::default()
+        };
+        let (res, sample) = measure(|| sat.classify(&refs, None, &lim));
+        assert!(
+            matches!(res, Err(Error::Memory { used, .. }) if used > cap),
+            "tiny cap must refuse original-signature collection cleanly, got {res:?}"
+        );
+        assert!(
+            sample.peak < 8192,
+            "refused signature collection must stop before full table allocation (peak={})",
+            sample.peak
+        );
+    }
+
+    // 3. Leaf-export overlap refusal + nested forks & forced merges (`shoi-042` with
+    //    `rooted_merge = true`, which executes 2 nested forks and 2 forced `STOP_MERGE`s
+    //    with live sibling frames + `Arc<CanonMap>`s on `stack`):
+    //    verify:
+    //    (a) a cap/pool refusing right above leaf saturation peak but below `leaf + export`
+    //        refuses cleanly (recording combined peak, clearing `split_answer`) and recovers;
+    //    (b) refusing pool across nested forks / forced merges refuses cleanly and recovers.
+    {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
+        let doc =
+            crate::ofn_read::parse(&std::fs::read_to_string(dir.join("shoi-042.ofn")).unwrap())
+                .unwrap();
+        let refs: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let lim_base = Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            rooted_eq_split: true,
+            ..Limits::default()
+        };
+        // Measure exact pool charge increments across a full nested-fork + forced-merge run.
+        let total_charged = Arc::new(AtomicUsize::new(0));
+        let max_step_at = Arc::new(AtomicUsize::new(0));
+        let steps = Arc::new(parking_lot::Mutex::new(Vec::<usize>::new()));
+        let tc = total_charged.clone();
+        let stp = steps.clone();
+        let mut sat = Saturation::new();
+        let ok = sat
+            .classify(
+                &refs,
+                None,
+                &Limits {
+                    charge: Some(Arc::new(move |more: usize| {
+                        let cur = tc.fetch_add(more, Ordering::Relaxed) + more;
+                        stp.lock().push(cur);
+                        true
+                    })),
+                    ..lim_base.clone()
+                },
+            )
+            .unwrap();
+        assert!(ok.complete && ok.stats.dl_rooted_splits >= 2 && ok.stats.dl_rooted_restarts >= 1);
+        let full_peak = ok.stats.peak_memory;
+        let recorded = steps.lock().clone();
+        assert!(
+            recorded.len() >= 2,
+            "nested fork + merge + export must record multiple pool charge milestones"
+        );
+        // Set a refusing pool threshold strictly below `full_peak` (at the second-to-last
+        // milestone, or 98% of full peak) so saturation/early forks succeed and the overlap
+        // export/finalization step is refused by the pool!
+        let cutoff = recorded
+            .iter()
+            .rev()
+            .find(|&&v| v < full_peak)
+            .copied()
+            .unwrap_or(full_peak.saturating_sub(64));
+        max_step_at.store(cutoff, Ordering::Relaxed);
+
+        let pool_used = Arc::new(AtomicUsize::new(0));
+        let pool_refused = Arc::new(AtomicBool::new(false));
+        let pu = pool_used.clone();
+        let pr = pool_refused.clone();
+        let lim_pool = Limits {
+            charge: Some(Arc::new(move |more: usize| {
+                let prev = pu.load(Ordering::Relaxed);
+                let next = prev.saturating_add(more);
+                if next > cutoff {
+                    pr.store(true, Ordering::Relaxed);
+                    return false;
+                }
+                pu.store(next, Ordering::Relaxed);
+                true
+            })),
+            ..lim_base.clone()
+        };
+        let mut sat_pool = Saturation::new();
+        let pool_out = sat_pool.classify(&refs, None, &lim_pool);
+        assert!(
+            pool_refused.load(Ordering::Relaxed),
+            "pool cutoff {cutoff} (full_peak={full_peak}) must trigger a pool refusal"
+        );
+        match pool_out {
+            Ok(fb) => {
+                assert!(!fb.complete && fb.stats.dl_over_budget);
+                assert!(sat_pool.split_answer.is_none());
+            }
+            Err(Error::Memory { used, .. }) => {
+                assert!(used > cutoff);
+                assert!(sat_pool.split_answer.is_none());
+            }
+            Err(other) => panic!("unexpected error on pool refusal: {other:?}"),
+        }
+        // Hard-cap overlap refusal right below `full_peak` also refuses cleanly and recovers!
+        let mut sat_cap = Saturation::new();
+        let cap_out = sat_cap.classify(
+            &refs,
+            None,
+            &Limits {
+                max_memory: Some(cutoff),
+                ..lim_base.clone()
+            },
+        );
+        match cap_out {
+            Ok(fb) => {
+                assert!(!fb.complete && fb.stats.dl_over_budget);
+                assert!(sat_cap.split_answer.is_none());
+            }
+            Err(Error::Memory { used, .. }) => {
+                assert!(used > cutoff);
+                assert!(sat_cap.split_answer.is_none());
+            }
+            Err(other) => panic!("unexpected error on hard-cap overlap refusal: {other:?}"),
+        }
+        let rec = sat_cap.classify(&refs, None, &lim_base).unwrap();
+        assert_eq!(rec.taxonomy, ok.taxonomy);
+    }
+
+    // 4. Dedicated leaf-export overlap refusal test (Sol r1 #1):
+    //    Build a 200-class chain beside `a = b ∨ a = c` (`probe = 0` forces an immediate
+    //    fork!). Measure (a) standalone saturated leaf footprint on the exact `a = b` leaf
+    //    theory (`saturate()` peak) and (b) combined split-run peak (`leaf_live + export_scratch`).
+    //    Verify the combined peak strictly exceeds the standalone leaf peak, and a cap
+    //    strictly between them allows leaf saturation to finish while refusing inside
+    //    `export_split_leaf`!
+    {
+        let n_chain = 200usize;
+        let mut ax = Vec::with_capacity(n_chain + 4);
+        let a = crate::model::Individual::named("http://example.org/ov#a");
+        let b = crate::model::Individual::named("http://example.org/ov#b");
+        let c_ind = crate::model::Individual::named("http://example.org/ov#c");
+        ax.push(crate::model::Axiom::new(AxiomKind::ClassAssertion(
+            crate::model::ClassExpression::ObjectOneOf(std::collections::BTreeSet::from([
+                b.clone(),
+                c_ind,
+            ])),
+            a.clone(),
+        )));
+        for i in 0..n_chain {
+            let ci = Class::new(format!("http://example.org/ov#C{i:03}"));
+            if i + 1 < n_chain {
+                let cj = Class::new(format!("http://example.org/ov#C{:03}", i + 1));
+                ax.push(crate::model::Axiom::sub_class_of(ci, cj));
+            }
+        }
+        let mut ax_leaf = ax.clone();
+        ax_leaf.push(crate::model::Axiom::new(AxiomKind::SameIndividual(
+            std::collections::BTreeSet::from([a, b]),
+        )));
+        let refs: Vec<&AxiomKind> = ax.iter().map(|x| &x.kind).collect();
+        let leaf_refs: Vec<&AxiomKind> = ax_leaf.iter().map(|x| &x.kind).collect();
+        let lim_sat = Limits {
+            threads: 1,
+            rooted: true,
+            rooted_merge: true,
+            rooted_eq_split: false,
+            ..Limits::default()
+        };
+        let mut sat_only = Saturation::new();
+        let sat_res = sat_only.saturate(&leaf_refs, None, &lim_sat).unwrap();
+        let leaf_alone_peak = sat_res.stats.peak_memory;
+
+        let lim_fork = Limits {
+            rooted_eq_split: true,
+            ..lim_sat.clone()
+        };
+        let mut sat_fork = Saturation::new();
+        let fork_res = super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
+            sat_fork.classify(&refs, None, &lim_fork).unwrap()
+        });
+        assert!(fork_res.complete && fork_res.stats.dl_rooted_splits >= 1);
+        let combined_peak = fork_res.stats.peak_memory;
+        assert!(
+            combined_peak > leaf_alone_peak + 1024,
+            "combined leaf+export peak ({combined_peak}) must strictly exceed leaf-only peak ({leaf_alone_peak})"
+        );
+        // Set cap strictly above `leaf_alone_peak` and strictly below `combined_peak` so
+        // leaf saturation fits while leaf + export_scratch overlap is refused!
+        let overlap_cap = leaf_alone_peak + (combined_peak - leaf_alone_peak) / 2;
+        let mut sat_ov = Saturation::new();
+        let ov_res = super::with_split_knobs(Some(0), Some(true), Some(2), Some(4), || {
+            sat_ov.classify(
+                &refs,
+                None,
+                &Limits {
+                    max_memory: Some(overlap_cap),
+                    ..lim_fork.clone()
+                },
+            )
+        });
+        match ov_res {
+            Ok(fb) => {
+                assert!(
+                    !fb.complete && fb.stats.dl_over_budget,
+                    "overlap cap {overlap_cap} must refuse split export (got complete={}, over={})",
+                    fb.complete,
+                    fb.stats.dl_over_budget
+                );
+                assert!(sat_ov.split_answer.is_none());
+            }
+            Err(Error::Memory { used, .. }) => {
+                assert!(used > overlap_cap);
+                assert!(sat_ov.split_answer.is_none());
+            }
+            Err(other) => panic!("unexpected error on leaf-export overlap refusal: {other:?}"),
+        }
+    }
+}

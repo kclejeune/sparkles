@@ -4137,6 +4137,8 @@ fn a_rooted_run_that_splits_disjunctive_equalities_finishes_shoi_042() {
     // 2. Split ON finishes shoi-042 across all 4 configs × dl_steps {true, false} ×
     //    rooted_merge {true, false} with exact HermiT taxonomy AND exact describe() instances.
     for rooted_merge in [true, false] {
+        let mut baseline_splits = None;
+        let mut baseline_leaves = None;
         for dl_steps in [true, false] {
             for (threads, expansion) in CONFIGS {
                 let at = format!(
@@ -4172,6 +4174,24 @@ fn a_rooted_run_that_splits_disjunctive_equalities_finishes_shoi_042() {
                     "{at}: expected >= 2 leaves: {:?}",
                     out.stats
                 );
+                if dl_steps {
+                    if let Some(s) = baseline_splits {
+                        assert_eq!(
+                            out.stats.dl_rooted_splits, s,
+                            "{at}: stepped split count mismatch"
+                        );
+                    } else {
+                        baseline_splits = Some(out.stats.dl_rooted_splits);
+                    }
+                    if let Some(l) = baseline_leaves {
+                        assert_eq!(
+                            out.stats.dl_rooted_leaves, l,
+                            "{at}: stepped leaf count mismatch"
+                        );
+                    } else {
+                        baseline_leaves = Some(out.stats.dl_rooted_leaves);
+                    }
+                }
                 assert!(
                     out.stats.dl_rooted_spent + out.stats.dl_work <= (1 << 19),
                     "{at}: total work exceeded bound: {:?}",
@@ -4402,7 +4422,7 @@ fn split_export_edge_cases_hidden_nominals_declared_individuals_and_leaves() {
             .unwrap();
         assert!(
             out.complete,
-            "Part 4 HasKey+fork must complete: stats={:?} excluded={:?}",
+            "Part 1 declared-only+fork must complete: stats={:?} excluded={:?}",
             out.stats,
             k.excluded()
         );
@@ -4423,8 +4443,8 @@ fn split_export_edge_cases_hidden_nominals_declared_individuals_and_leaves() {
 
     // 2. Hidden-only nominal inconsistency (anonymous witness `_:w` forced into an
     //    unsatisfiable class inside leaf `a1 == a2` while consistent in leaf `a1 != a2`),
-    //    AND all-inconsistent ontology (0 consistent leaves) where declared-only `:ghost`
-    //    belongs to every class (including `owl:Nothing`).
+    //    AND branch-specific all-inconsistent ontology (0 consistent leaves AFTER a real
+    //    fork!) where declared-only `:ghost` belongs to every class (including `owl:Nothing`).
     {
         let ax_one_incons = with_fork(
             "ClassAssertion(:Hide _:w)
@@ -4440,17 +4460,50 @@ fn split_export_edge_cases_hidden_nominals_declared_individuals_and_leaves() {
         assert_eq!(out.consistency, Consistency::Consistent);
     }
     {
-        let ax_all_incons = with_fork(
+        // All-inconsistent ontology with a real fork (`dl_rooted_splits >= 1`, 0 consistent
+        // leaves): put the existential contradiction axioms BEFORE `shoi-042` so `shoi-042`'s
+        // higher-Ex non-root contexts are activated first and cross SPLIT_PROBE (16,384)
+        // before `:Trap` resolves its contradiction; depth 0 forks and every terminal leaf
+        // is proved inconsistent, and the resulting `SplitAnswer` (`build_inconsistent`)
+        // lists declared-only `:ghost` in `describe(:Boom)` and `describe(owl:Nothing)`.
+        let mut ax_all_incons = axioms(
             "Declaration(NamedIndividual(:ghost))
-             ClassAssertion(:Boom _:w)
-             SubClassOf(:Boom :Contra)
-             SubClassOf(:Contra ObjectComplementOf(:Boom))",
+             Declaration(Class(:Boom))
+             ClassAssertion(ObjectSomeValuesFrom(:rTrap1 :Trap1) <http://example.org/d#a0>)
+             SubClassOf(:Trap1 ObjectSomeValuesFrom(:rTrap2 :Trap2))
+             SubClassOf(:Trap2 ObjectSomeValuesFrom(:rTrap3 :Trap3))
+             SubClassOf(:Trap3 :ContraA)
+             SubClassOf(:Trap3 :ContraB)
+             SubClassOf(:ContraA ObjectComplementOf(:ContraB))",
+        );
+        ax_all_incons.extend(
+            shoi042
+                .iter()
+                .filter(|a| !matches!(a.kind, AxiomKind::Declaration(Entity::DataProperty(_))))
+                .cloned(),
         );
         let mut k = Classifier::of(&ax_all_incons);
         let out = k.classify(&lim_split).unwrap();
         assert!(out.complete);
         assert_eq!(out.consistency, Consistency::Inconsistent);
+        assert!(
+            out.stats.dl_rooted_splits >= 1 && out.stats.dl_rooted_leaves >= 2,
+            "all-inconsistent fixture must exercise a real fork with 0 consistent leaves: {:?}",
+            out.stats
+        );
         assert!(out.taxonomy.is_unsatisfiable(&c("Boom")));
+        let ghost = NamedIndividual::new(format!("{EX}ghost"));
+        assert!(
+            k.describe(&c("Boom")).unwrap().instances.contains(&ghost),
+            "declared-only :ghost must appear in describe(:Boom) on inconsistent ontology"
+        );
+        assert!(
+            k.describe(&Class::nothing())
+                .unwrap()
+                .instances
+                .contains(&ghost),
+            "declared-only :ghost must appear in describe(owl:Nothing) on inconsistent ontology"
+        );
     }
 
     // 3. Class unsat in leaf 1 (`a1 == a2`) and sat in leaf 2 (`a1 != a2`):
@@ -4472,7 +4525,7 @@ fn split_export_edge_cases_hidden_nominals_declared_individuals_and_leaves() {
             .unwrap();
         assert!(
             out.complete,
-            "Part 4 HasKey+fork must complete: stats={:?} excluded={:?}",
+            "Part 3 half-unsat+fork must complete: stats={:?} excluded={:?}",
             out.stats,
             k.excluded()
         );

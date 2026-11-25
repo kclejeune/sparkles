@@ -573,15 +573,14 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
         let split_mode = max_guard.dl().split_mode();
         if split_mode != super::dl_rules::SplitMode::Disabled {
             let mut scan = Scan(0);
-            let cand = disj_const_eq(
+            let cand = disj_const_eq_sink(
                 &x.store.clauses[id as usize].c,
                 id as usize,
-                max_guard.dl(),
+                &mut max_guard,
                 inv,
                 &mut scan,
-                &mut |_reads| max_guard.go_on(),
             );
-            scan.end(&mut max_guard);
+            scan.charge_pending(&mut max_guard);
             if max_guard.stopped() {
                 x.store.interrupted = true;
                 break;
@@ -745,6 +744,81 @@ fn harvest_and_halt_merge<S: Sink>(
 /// Literals scanned between cooperative polls in [`disj_const_eq`].
 const HEAD_POLL_EVERY: usize = 1024;
 
+fn inspect_split_lit(
+    lit: Lit,
+    dl: &super::dl_rules::DlRun,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    all_pos_const_eq: &mut bool,
+    best_pair: &mut Option<(u32, u32, u32, u32)>,
+) {
+    match dl.lits.view(lit, inv) {
+        XLit::Eq(RTerm::C(a), RTerm::C(b)) => {
+            if a == b {
+                return;
+            }
+            let ra = dl.const_rank.get(a as usize).copied().unwrap_or(u32::MAX);
+            let rb = dl.const_rank.get(b as usize).copied().unwrap_or(u32::MAX);
+            if ra == u32::MAX || rb == u32::MAX || ra == rb {
+                return;
+            }
+            let pair_id = (a.min(b), a.max(b));
+            if dl.branch_neq.binary_search(&pair_id).is_ok() {
+                return;
+            }
+            let cand_pair = if ra < rb {
+                (ra, rb, a, b)
+            } else {
+                (rb, ra, b, a)
+            };
+            if best_pair.is_none_or(|cur| (cand_pair.0, cand_pair.1) < (cur.0, cur.1)) {
+                *best_pair = Some(cand_pair);
+            }
+        }
+        _ => {
+            *all_pos_const_eq = false;
+        }
+    }
+}
+
+/// Inspects a live empty-body root clause with `head().len() >= 2` during `dl_root::flush`,
+/// charging every completed block of reads to `out` before polling `out.go_on()`.
+fn disj_const_eq_sink<S: Sink>(
+    c: &Clause,
+    slot_id: usize,
+    out: &mut S,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    scan: &mut Scan,
+) -> Option<super::dl_rules::SplitCand> {
+    if !c.body().is_empty() || c.head().len() < 2 {
+        return None;
+    }
+    let clause_id = u32::try_from(slot_id).ok()?;
+    let head = c.head();
+    let mut all_pos_const_eq = true;
+    let mut best_pair: Option<(u32, u32, u32, u32)> = None;
+    for (idx, &lit) in head.iter().enumerate() {
+        scan.0 = scan.0.saturating_add(1);
+        if idx > 0 && idx % HEAD_POLL_EVERY == 0 {
+            scan.charge_pending(out);
+            if !out.go_on() {
+                return None;
+            }
+        }
+        inspect_split_lit(lit, out.dl(), inv, &mut all_pos_const_eq, &mut best_pair);
+    }
+    let (rank_lo, rank_hi, u_id, v_id) = best_pair?;
+    Some(super::dl_rules::SplitCand {
+        epoch: out.dl().split_epoch(),
+        prio: if all_pos_const_eq { 2 } else { 1 },
+        head_len: u32::try_from(head.len()).unwrap_or(u32::MAX),
+        rank_lo,
+        rank_hi,
+        u_id,
+        v_id,
+        clause_id,
+    })
+}
+
 /// Inspects a live empty-body root clause with `head().len() >= 2` for an eligible
 /// undecided disjunctive constant equality (`XLit::Eq(RTerm::C(a), RTerm::C(b))`).
 ///
@@ -764,8 +838,6 @@ pub(crate) fn disj_const_eq(
     }
     let clause_id = u32::try_from(slot_id).ok()?;
     let head = c.head();
-    let const_rank = &dl.const_rank;
-    let branch_neq = &dl.branch_neq;
     let mut all_pos_const_eq = true;
     let mut best_pair: Option<(u32, u32, u32, u32)> = None; // (rank_lo, rank_hi, u_id, v_id)
     for (idx, &lit) in head.iter().enumerate() {
@@ -773,33 +845,7 @@ pub(crate) fn disj_const_eq(
         if idx > 0 && idx % HEAD_POLL_EVERY == 0 && !poll(&mut scan.0) {
             return None;
         }
-        match dl.lits.view(lit, inv) {
-            XLit::Eq(RTerm::C(a), RTerm::C(b)) => {
-                if a == b {
-                    continue;
-                }
-                let ra = const_rank.get(a as usize).copied().unwrap_or(u32::MAX);
-                let rb = const_rank.get(b as usize).copied().unwrap_or(u32::MAX);
-                if ra == u32::MAX || rb == u32::MAX || ra == rb {
-                    continue;
-                }
-                let pair_id = (a.min(b), a.max(b));
-                if branch_neq.binary_search(&pair_id).is_ok() {
-                    continue;
-                }
-                let cand_pair = if ra < rb {
-                    (ra, rb, a, b)
-                } else {
-                    (rb, ra, b, a)
-                };
-                if best_pair.is_none_or(|cur| (cand_pair.0, cand_pair.1) < (cur.0, cur.1)) {
-                    best_pair = Some(cand_pair);
-                }
-            }
-            _ => {
-                all_pos_const_eq = false;
-            }
-        }
+        inspect_split_lit(lit, dl, inv, &mut all_pos_const_eq, &mut best_pair);
     }
     let (rank_lo, rank_hi, u_id, v_id) = best_pair?;
     Some(super::dl_rules::SplitCand {
@@ -3805,6 +3851,17 @@ impl Scan {
     /// Charges the reads since the last check.
     fn end<S: Sink>(self, out: &mut S) {
         out.worked(self.0 % M_SCAN / WORK_READS);
+    }
+
+    /// Charges every unbilled work unit accumulated in `self.0` and keeps only the
+    /// remainder below `WORK_READS`, for scans whose poll callback charges and reduces
+    /// `self.0` directly rather than going through [`Scan::read`].
+    fn charge_pending<S: Sink>(&mut self, out: &mut S) {
+        let work = self.0 / WORK_READS;
+        if work > 0 {
+            out.worked(work);
+            self.0 %= WORK_READS;
+        }
     }
 }
 
@@ -10578,5 +10635,154 @@ Ontology(<http://example.org/g6>
             Some(cand),
             "immutable winner must never be clobbered by post-publication subsumption/rescan"
         );
+    }
+
+    /// Sol r1 #4: `dl_root::flush` must charge every full `M_SCAN` block of split-candidate
+    /// head reads during discovery (never losing 1,024-literal blocks via `Scan::end`'s
+    /// `% M_SCAN`), and stop early mid-head under a tight work bound.
+    #[test]
+    fn flush_charges_full_blocks_for_long_split_candidate_heads_and_stops_under_tight_bound() {
+        use super::super::dl_rules::SplitMode;
+        use super::super::saturate::{Extra, State};
+        use std::sync::atomic::Ordering;
+
+        let mut sig = Sig::new();
+        sig.ind("a");
+        sig.ind("b");
+        let (ix, _) = probe_ix(sig);
+
+        struct WorkSink<'a> {
+            dl: &'a DlRun,
+            stopped: std::cell::Cell<bool>,
+        }
+        impl Sink for WorkSink<'_> {
+            fn send(&mut self, _: Ex, _: Concl) {}
+            fn me(&mut self, _: Concl) {}
+            fn dl(&self) -> &DlRun {
+                self.dl
+            }
+            fn worked(&mut self, n: usize) {
+                self.dl.count(n);
+            }
+            fn go_on(&self) -> bool {
+                if self.dl.over_work() {
+                    self.stopped.set(true);
+                    return false;
+                }
+                !self.stopped.get()
+            }
+            fn stopped(&self) -> bool {
+                self.stopped.get() || self.dl.over_work()
+            }
+            fn admit_dl(&mut self, _: usize) -> bool {
+                true
+            }
+            fn credit_dl(&mut self, _: usize) {}
+            fn commit_dl(&mut self, _: usize, _: usize) {}
+        }
+
+        // 1. Exact 1,024-literal head: must charge at least `1024 / WORK_READS == 64` work
+        //    units (before the fix, `1024 % 1024 == 0` charged 0 work units!).
+        {
+            let mut run = DlRun::new(false, Default::default());
+            run.configure_split(
+                SplitMode::ProbeOnly,
+                100_000,
+                1,
+                vec![0, 1].into_boxed_slice(),
+                Vec::new().into_boxed_slice(),
+            );
+            let mk = |xl: XLit| match run.lits.lit(xl, |_| None) {
+                Made::Lit(l) => l,
+                other => panic!("expected literal for {xl:?}, got {other:?}"),
+            };
+            let eq01 = mk(XLit::Eq(RTerm::C(0), RTerm::C(1)));
+            let mut head_1024 = Vec::with_capacity(1024);
+            for i in 0..1023u32 {
+                head_1024.push(mk(XLit::Atom(200 + i, RTerm::C(0))));
+            }
+            head_1024.push(eq01);
+            assert_eq!(head_1024.len(), 1024);
+
+            let mut dl_st = DlSt::default();
+            let _ = dl_st.store.add(Clause::new(Vec::new(), head_1024));
+            let mut st = State {
+                extra: Some(Box::new(Extra {
+                    dl: Some(Box::new(dl_st)),
+                    ..Extra::default()
+                })),
+                ..State::default()
+            };
+            let work_before = run.work();
+            let mut sink = WorkSink {
+                dl: &run,
+                stopped: std::cell::Cell::new(false),
+            };
+            let _ = flush(&ix, &mut st, &mut sink, 1);
+            let delta = run.work().saturating_sub(work_before);
+            assert!(
+                delta >= 1024 / WORK_READS,
+                "1,024-literal head must charge at least {} work units in flush, got {delta}",
+                1024 / WORK_READS
+            );
+            assert!(
+                run.has_split_cand.load(Ordering::Acquire),
+                "candidate must still be recorded"
+            );
+        }
+
+        // 2. 2,500-literal head under a tight work bound (cap = 80): `flush` must charge
+        //    the first full block before polling and stop early with `interrupted == true`.
+        {
+            let mut run = DlRun::new(false, Default::default());
+            run.set_work_limit(80);
+            run.configure_split(
+                SplitMode::ProbeOnly,
+                100_000,
+                2,
+                vec![0, 1].into_boxed_slice(),
+                Vec::new().into_boxed_slice(),
+            );
+            let mk = |xl: XLit| match run.lits.lit(xl, |_| None) {
+                Made::Lit(l) => l,
+                other => panic!("expected literal for {xl:?}, got {other:?}"),
+            };
+            let eq01 = mk(XLit::Eq(RTerm::C(0), RTerm::C(1)));
+            let mut head_2500 = Vec::with_capacity(2500);
+            for i in 0..2499u32 {
+                head_2500.push(mk(XLit::Atom(200 + i, RTerm::C(0))));
+            }
+            head_2500.push(eq01);
+
+            let mut dl_st = DlSt::default();
+            let _ = dl_st.store.add(Clause::new(Vec::new(), head_2500));
+            let mut st = State {
+                extra: Some(Box::new(Extra {
+                    dl: Some(Box::new(dl_st)),
+                    ..Extra::default()
+                })),
+                ..State::default()
+            };
+            // Pre-charge 20 work units so the first 64-unit block (total 84 > 80) trips
+            // `over_work()` during the first periodic poll inside `disj_const_eq`!
+            run.count(20);
+            let mut sink = WorkSink {
+                dl: &run,
+                stopped: std::cell::Cell::new(false),
+            };
+            let _ = flush(&ix, &mut st, &mut sink, 1);
+            assert!(
+                run.over_work(),
+                "first 1,024-literal block must trip work bound (work={})",
+                run.work()
+            );
+            assert!(
+                st.extra
+                    .as_ref()
+                    .and_then(|e| e.dl.as_deref())
+                    .is_some_and(|x| x.store.interrupted),
+                "early termination mid-head must mark root store interrupted"
+            );
+        }
     }
 }

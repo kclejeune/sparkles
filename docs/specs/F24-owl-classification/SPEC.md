@@ -375,6 +375,19 @@ item 1291 are the upfront 32-slot `Segs` directory, `Table::push` segment alloca
 un-admitted `Lits::lit` calls outside root initialization, which remain post-counted in
 `DlRun::bytes`, and premise-list preparation and read metering, which remain in item 1280.
 
+Item 1075 delivers demand-driven binary case splitting over disjunctive constant
+equalities in rooted runs behind the default-off `Limits::rooted_eq_split` switch, as
+[item 1075](#item-1075-binary-splitting-over-disjunctive-equalities-of-constants)
+describes. When enabled on full classifications, branches that reach the probe threshold
+or derive a pure constant-equality disjunction at depth one and below fork into equality
+and disequality children, intersect their terminal leaves' closed subsumptions and public
+instances under one shared work bound and pre-admitted memory ledger, and retain a compact
+`SplitAnswer` for `describe` queries. On `shoi-042` it completes within the 524,288 bound
+across all thread, expansion and step configurations with zero taxonomy differences against
+the checked-in HermiT oracle and exact `describe` instances, and across all 50 `shoi`
+fixtures it completes within the bound with zero taxonomy differences against HermiT.
+Enabling the switch by default waits on benchmark-host qualification under item 823.
+
 A returned clause reserves memory before its products run, both on initial arrival and when a
 late premise replays saved returns. Before item 1291, the product of a clause that
 is not ground charged each union that it kept, as every rule did, but not the table that
@@ -5170,16 +5183,17 @@ Every branch partition, disequality list, clause and dynamic conjunction inserti
 leaf closure, taxonomy construction and retained answer is pre-admitted against the
 single memory ledger and caller pool before allocation.
 
-On the `shoi-042` fixture in a release build on the worker host, enabling
-`Limits::rooted_eq_split` with `Limits::rooted_merge` finishes in 15 to 17 ms across one
-and four threads under both cautious and eager expansion, with two splits, three
-consistent leaves, two merge restarts, 18,103 prefix conclusions and 21,144 leaf
-conclusions for a total of 39,247 derived conclusions against the 524,288 bound. With
-`Limits::rooted_merge` off it finishes in 18 to 19 ms across all four configurations with
-18,032 prefix conclusions and 30,595 leaf conclusions for a total of 48,627 conclusions.
-Every configuration matches HermiT's taxonomy and exact individual instances with zero
-excluded axioms and no fallback. Across all 50 `shoi` fixtures with both switches on, all
-50 complete within the 524,288 bound with zero taxonomy differences against HermiT.
+On the `shoi-042` fixture, enabling `Limits::rooted_eq_split` with `Limits::rooted_merge`
+completes across one and four threads under both cautious and eager expansion and both
+stepped and unstepped drivers, with two splits, three consistent leaves, two merge
+restarts, 18,103 prefix conclusions and 21,144 leaf conclusions for a total of 39,247
+derived conclusions against the 524,288 bound. With `Limits::rooted_merge` off it
+completes across all configurations with 18,032 prefix conclusions and 30,595 leaf
+conclusions for a total of 48,627 conclusions. Every configuration matches the checked-in
+HermiT taxonomy oracle and the exact individual instances of `shoi-042` with zero excluded
+axioms and no fallback. Across all 50 `shoi` fixtures with both switches on, all 50
+complete within the 524,288 bound with zero taxonomy differences against the checked-in
+HermiT oracles. Benchmark-host timings remain for default-on qualification under item 823.
 
 ### Anonymous individuals and top-property inclusions
 

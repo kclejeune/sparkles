@@ -586,7 +586,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   the check off, after items 1250 and 1280. A
   rooted run without counting has a bound of 524,288 derived conclusions,
   `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
-  default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It takes
+  default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. When
+  `Limits::rooted_eq_split` is enabled alongside `Limits::rooted`, full classifications
+  that approach the bound with an undecided disjunctive constant equality in the root
+  split into equality and disequality branches and intersect the terminal leaves'
+  taxonomies and public instances under the shared work and memory budgets. It takes
   keys over object properties and the universal object property by rewriting them into
   class axioms over fresh names, which never reach an answer, and a run of the rewritten
   axioms rebuilds after every edit. A key whose rewriting passes its budget, about 60
