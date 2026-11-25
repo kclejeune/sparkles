@@ -148,6 +148,23 @@ impl ReaderSource {
         }))
     }
 
+    /// A stream whose compression has already been decoded (such as an HTTP `LOAD` body
+    /// decoded under its outbound response budget). Every read still checks the write
+    /// controls once [`decode`](Self::decode) installs them.
+    pub(crate) fn new_decoded(reader: impl Read + Send + 'static) -> ReaderSource {
+        let controls: Controls = Arc::default();
+        let raw = Controlled {
+            inner: Box::new(reader),
+            controls: Arc::clone(&controls),
+        };
+        ReaderSource(Mutex::new(ReaderState {
+            head: Vec::new(),
+            reader: Some(Box::new(raw)),
+            decoded: true,
+            controls,
+        }))
+    }
+
     /// The first `n` bytes of the stream (fewer at its end), kept to be read again.
     fn peek(&self, n: usize) -> Result<Vec<u8>> {
         let mut state = self.0.lock();
@@ -199,7 +216,7 @@ impl ReaderSource {
         Ok(())
     }
 
-    fn decoded(&self) -> bool {
+    pub(crate) fn decoded(&self) -> bool {
         self.0.lock().decoded
     }
 
@@ -443,6 +460,18 @@ impl Source {
     ) -> Source {
         let mut src = Source::from_bytes(Vec::new(), format, graph);
         src.data = SourceData::reader(reader);
+        src.name = "<reader>".into();
+        src
+    }
+
+    /// A source read once from an already-decompressed `reader`.
+    pub(crate) fn from_decoded_reader(
+        reader: impl Read + Send + 'static,
+        format: impl Into<RdfSyntax>,
+        graph: Option<NamedNode>,
+    ) -> Source {
+        let mut src = Source::from_bytes(Vec::new(), format, graph);
+        src.data = SourceData::Reader(ReaderSource::new_decoded(reader));
         src.name = "<reader>".into();
         src
     }

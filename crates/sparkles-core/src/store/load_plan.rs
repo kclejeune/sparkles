@@ -1,5 +1,5 @@
-//! The choice between a bulk rebuild and a transaction for a load, a replace, a bulk
-//! insert and a patch (spec X16, phase 4).
+//! The choice between a bulk rebuild and a transaction for a load, a replace, a single-operation
+//! SPARQL `LOAD`, a bulk insert and a patch (spec X16, phase 4 and item 846).
 //!
 //! A bulk plan builds a new generation from the head and the new quads, which costs a
 //! fixed rebuild of about 20 ms and scales far better than per-quad delta inserts. A
@@ -7,22 +7,23 @@
 //! entry point that can take either path asks [`LoadPlan::choose`], and the table test
 //! in `load_plan_tests.rs` records the plan each one chooses at every boundary.
 //!
-//! One rule serves the four entry points. A size is above the threshold only when it is
+//! One rule serves the five entry points. A size is above the threshold only when it is
 //! strictly greater. A load goes into an empty store by a rebuild unless its sources are
-//! all streams that end within [`SMALL_STREAM_BYTES`]. A replace, whatever the store
-//! holds, and a load into a store that holds data go by a rebuild when their estimate is
-//! above the threshold or their streams hold more than [`BYTES_PER_QUAD`] bytes per
-//! threshold quad, so a small replace into an empty store takes a transaction. Reading streams ahead to tell holds up to
-//! that many bytes in memory before the parse starts, which is the cost of the probe. A
-//! batch that a transaction stages, from a bulk insert or a patch, is rebuilt when it is
-//! above the threshold. A write limited to some graphs parses its sources in a
-//! transaction, since a rebuild from sources does not check each quad's graph, while its
-//! batches, whose graphs are checked as they are staged, can still be rebuilt. Triple
-//! protections, managed graphs, control records and a patch's delete row keep a batch in
-//! the delta.
+//! all streams that end within [`SMALL_STREAM_BYTES`]. A replace or a single-operation
+//! SPARQL `LOAD`, whatever the store holds, and a load into a store that holds data go by
+//! a rebuild when their estimate is above the threshold or their streams hold more than
+//! [`BYTES_PER_QUAD`] bytes per threshold quad, so a small replace or SPARQL `LOAD` into
+//! an empty store takes a transaction. Reading streams ahead to tell holds up to that many
+//! bytes in memory before the parse starts, which is the cost of the probe. A batch that a
+//! transaction stages, from a bulk insert or a patch, is rebuilt when it is above the
+//! threshold. A write limited to some graphs parses its sources in a transaction, since a
+//! rebuild from sources does not check each quad's graph, while its batches, whose graphs
+//! are checked as they are staged, can still be rebuilt. Triple protections, managed
+//! graphs, control records and a patch's delete row keep a batch in the delta.
 //!
-//! SPARQL `LOAD` is not an entry point of the plan. It inserts per quad whatever its
-//! size, so that an update keeps one memory and lock profile (spec X16, decision 4).
+//! A SPARQL `LOAD` inside a multi-operation update request or an open write transaction
+//! stays transactional so that all operations of the request remain atomic in one
+//! transaction (spec X16, decision 4).
 //!
 //! [`WriteTxn`]: super::WriteTxn
 
@@ -54,6 +55,8 @@ pub(crate) enum Entry {
     Load,
     /// [`Store::replace_with`](super::Store::replace_with)
     Replace,
+    /// A single-operation SPARQL `LOAD` (`sparql::update`).
+    SparqlLoad,
     /// [`WriteTxn::insert_bulk`](super::WriteTxn::insert_bulk)
     InsertBulk,
     /// [`Store::patch_apply`](super::Store::patch_apply)
@@ -140,7 +143,7 @@ impl LoadPlan {
         let bulk = match i.entry {
             // A rebuild from sources does not check each quad's graph, so a write limited
             // to some graphs parses them in a transaction.
-            Entry::Load | Entry::Replace if i.restricted => false,
+            Entry::Load | Entry::Replace | Entry::SparqlLoad if i.restricted => false,
             Entry::Load if i.empty_head => {
                 // A stream that ends within a few thousand quads goes into an empty
                 // store by a transaction, which costs less than the fixed cost of a
@@ -150,7 +153,7 @@ impl LoadPlan {
                     && !sizes.exceeds(SMALL_STREAM_BYTES)?;
                 !small_streams
             }
-            Entry::Load | Entry::Replace => {
+            Entry::Load | Entry::Replace | Entry::SparqlLoad => {
                 // a bound past the largest byte count is one no stream exceeds
                 let bound = i.threshold.checked_mul(BYTES_PER_QUAD);
                 sizes.estimate() > i.threshold

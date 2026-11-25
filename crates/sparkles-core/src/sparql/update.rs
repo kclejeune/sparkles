@@ -244,6 +244,12 @@ fn run_update(
     let mut wopts = opts.write.clone();
     if wopts.graphs.is_none() {
         wopts.graphs = opts.graphs.clone();
+    } else if opts.graphs.is_none()
+        && let Some(access) = wopts.graphs.as_ref()
+    {
+        for op in &parsed.operations {
+            check_constant_graphs(access, op)?;
+        }
     }
     if wopts.cancel.is_none() {
         wopts.cancel = opts.cancel.clone();
@@ -260,6 +266,30 @@ fn run_update(
                 .cancellation
                 .as_ref()
                 .map_or_else(|| query_flags.clone(), |c| c.combine(&query_flags)),
+        );
+    }
+    // A LOAD that is the only operation of its request uses the unified load plan
+    // (spec X16, item 846): large unrestricted loads take the bulk rebuild path and
+    // smaller or graph-restricted loads stay transactional. Multi-operation requests
+    // stay in one write transaction below so all operations remain atomic together.
+    if let [
+        GraphUpdateOperation::Load {
+            silent,
+            source,
+            destination,
+        },
+    ] = parsed.operations.as_slice()
+    {
+        return run_single_load(
+            store,
+            *silent,
+            source,
+            destination,
+            &req,
+            wopts,
+            kind,
+            parse_ms,
+            t1,
         );
     }
     // only a store that groups commits drains on a refusal, so only it needs a copy
@@ -914,6 +944,199 @@ fn bnode(txn: &mut WriteTxn<'_>, map: &mut FxHashMap<String, Id>, b: &BlankNode)
     id
 }
 
+const LOAD_ACCEPT: &str = "text/turtle, application/n-triples, application/n-quads, \
+    application/trig, application/rdf+xml, application/ld+json;q=0.9, \
+    application/trix+xml;q=0.8, application/rdf+thrift;q=0.8, \
+    application/rdf+protobuf;q=0.8, application/rdf+json;q=0.8, text/owl-functional;q=0.7";
+
+fn resolve_http_format(url: &str, ct: &str) -> Result<RdfSyntax> {
+    let url_path = std::path::Path::new(url);
+    JenaFormat::from_media_type(ct)
+        .map(RdfSyntax::Jena)
+        .or_else(|| crate::io::format_for_media_type(ct).map(RdfSyntax::Rdf))
+        .or_else(|| RdfSyntax::from_name(ct).filter(|s| *s == RdfSyntax::OwlFunctional))
+        .or_else(|| RdfSyntax::from_path(url_path))
+        .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))
+}
+
+/// Wraps an HTTP `LOAD` body reader so plain I/O failures (connection drops, response
+/// timeouts, uncompressed response ceilings) become `Error::Invalid("LOAD <url>: …")`
+/// while typed engine errors (budgets, cancellation, timeout) keep their own variants.
+struct LoadHttpReader<R> {
+    inner: R,
+    url: String,
+}
+
+impl<R: Read> Read for LoadHttpReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner
+            .read(buf)
+            .map_err(|e| match crate::codec::io_error(e) {
+                Error::Io(raw) => {
+                    std::io::Error::other(Error::invalid(format!("LOAD {}: {raw}", self.url)))
+                }
+                other => std::io::Error::other(other),
+            })
+    }
+}
+
+/// Whether `LOAD SILENT` hides `e` from the load path: source, fetch, format and parse
+/// failures are hidden, while permissions, budgets, cancellation, write guards,
+/// preconditions, storage limits, managed-graph boundaries, dry runs and store failures
+/// are not.
+fn silent_suppresses(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::RdfParse(_) | Error::Invalid(_) | Error::Unsupported(_)
+    ) || matches!(
+        e,
+        Error::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+    )
+}
+
+/// Build a [`crate::io::Source`] for a single-operation SPARQL `LOAD`, checking file or
+/// outbound permissions before the writer lock is acquired.
+fn prepare_load_source(
+    source: &NamedNode,
+    dest: &GraphName,
+    req: &Request<'_>,
+) -> Result<crate::io::Source> {
+    let opts = req.opts;
+    let url = source.as_str();
+    let graph = match dest {
+        GraphName::NamedNode(n) => Some(n.clone()),
+        GraphName::DefaultGraph => None,
+    };
+    if url.starts_with("file:") {
+        if opts.forbid_file_load {
+            return Err(Error::NotPermitted(
+                "LOAD <file:…> requires server-admin".into(),
+            ));
+        }
+        let path = opts.file_loads.check(url)?;
+        let mut src = crate::io::Source::from_path(&path, graph)?;
+        src.base = Some(url.to_string());
+        src.name = path.display().to_string();
+        // Open and inspect the file's magic bytes before taking the writer lock, so a
+        // missing file or unsupported codec fails here as a source error.
+        let _ = src.codec()?;
+        return Ok(src);
+    }
+    if opts.forbid_remote_load {
+        return Err(Error::NotPermitted(
+            "LOAD <http…> requires the federate permission".into(),
+        ));
+    }
+    let policy = &opts.outbound;
+    let timeout = req.deadline.map_or(policy.timeout, |d| {
+        d.saturating_duration_since(Instant::now())
+    });
+    let resp = policy
+        .send(&req.budget, url, timeout, |client, u| {
+            client.get(u).header("Accept", LOAD_ACCEPT)
+        })
+        .map_err(|f| {
+            f.into_error(&format!("LOAD <{url}>"), |m| {
+                Error::invalid(format!("LOAD {url}: {m}"))
+            })
+        })?;
+    if !resp.status.is_success() {
+        return Err(Error::invalid(format!("LOAD {url}: {}", resp.status)));
+    }
+    let format = resolve_http_format(url, &resp.content_type)?;
+    let url_path = std::path::Path::new(url);
+    let mut body = resp.body;
+    let (codec, head) =
+        crate::io::sniff_codec(&mut body, Some(url_path), url).map_err(|e| read_error(url, e))?;
+    // Compressed data counts in the request's budget once decompressed, and is held to
+    // the response ceiling then too.
+    let (body, count) = if codec == crate::codec::Codec::None {
+        (body, None)
+    } else {
+        let (body, budget) = body.uncounted();
+        (body, Some(budget))
+    };
+    let r = codec.reader_send(
+        std::io::Cursor::new(head).chain(body),
+        Some(policy.max_response_bytes),
+    )?;
+    let r: Box<dyn Read + Send> = match count {
+        Some(budget) => Box::new(crate::outbound::Counted { inner: r, budget }),
+        None => r,
+    };
+    let mut src = crate::io::Source::from_decoded_reader(
+        LoadHttpReader {
+            inner: r,
+            url: url.to_string(),
+        },
+        format,
+        graph,
+    );
+    src.base = Some(url.to_string());
+    src.name = url.to_string();
+    src.max_decompressed = Some(policy.max_response_bytes);
+    Ok(src)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_single_load(
+    store: &Store,
+    silent: bool,
+    source: &NamedNode,
+    destination: &GraphName,
+    req: &Request<'_>,
+    wopts: crate::guard::WriteOptions,
+    kind: crate::commit::CommitKind,
+    parse_ms: f64,
+    t1: Instant,
+) -> Result<UpdateStats> {
+    req.check()?;
+    if let Some(m) = &wopts.message {
+        crate::annotations::validate_message(m)?;
+    }
+    let noop = |wopts: crate::guard::WriteOptions| -> Result<crate::commit::Receipt> {
+        req.check()?;
+        store.try_write_with(kind, wopts)?.commit()
+    };
+    let receipt = match prepare_load_source(source, destination, req) {
+        Ok(src) => match store.load_sparql(&src, kind, &wopts) {
+            Ok(r) => r,
+            Err(e) if silent && silent_suppresses(&e) => noop(wopts)?,
+            Err(e) => return Err(e),
+        },
+        Err(e) if silent && (silent_suppresses(&e) || matches!(e, Error::Io(_))) => noop(wopts)?,
+        Err(e) => return Err(e),
+    };
+    let inserted = if receipt.committed {
+        receipt.commit.inserted
+    } else {
+        0
+    };
+    let exec_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    Ok(UpdateStats {
+        inserted,
+        deleted: 0,
+        operations: 1,
+        timing: Timing {
+            parse_ms,
+            plan_ms: 0.0,
+            exec_ms,
+            serialize_ms: 0.0,
+            total_ms: parse_ms + exec_ms,
+        },
+        commit: Some(receipt),
+        mem_peak_bytes: 0,
+        rows_produced: 0,
+    })
+}
+
 fn load(
     txn: &mut WriteTxn<'_>,
     source: &NamedNode,
@@ -960,13 +1183,7 @@ fn load(
     });
     let resp = policy
         .send(&req.budget, url, timeout, |client, u| {
-            client.get(u).header(
-                "Accept",
-                "text/turtle, application/n-triples, application/n-quads, application/trig, \
-                 application/rdf+xml, application/ld+json;q=0.9, application/trix+xml;q=0.8, \
-                 application/rdf+thrift;q=0.8, application/rdf+protobuf;q=0.8, \
-                 application/rdf+json;q=0.8, text/owl-functional;q=0.7",
-            )
+            client.get(u).header("Accept", LOAD_ACCEPT)
         })
         .map_err(|f| {
             f.into_error(&format!("LOAD <{url}>"), |m| {
@@ -976,14 +1193,8 @@ fn load(
     if !resp.status.is_success() {
         return Err(Error::invalid(format!("LOAD {url}: {}", resp.status)));
     }
-    let ct = resp.content_type;
+    let format = resolve_http_format(url, &resp.content_type)?;
     let url_path = std::path::Path::new(url);
-    let format = JenaFormat::from_media_type(&ct)
-        .map(RdfSyntax::Jena)
-        .or_else(|| crate::io::format_for_media_type(&ct).map(RdfSyntax::Rdf))
-        .or_else(|| RdfSyntax::from_name(&ct).filter(|s| *s == RdfSyntax::OwlFunctional))
-        .or_else(|| RdfSyntax::from_path(url_path))
-        .ok_or_else(|| Error::invalid(format!("LOAD {url}: unknown content type {ct}")))?;
     let mut body = resp.body;
     let (codec, head) =
         crate::io::sniff_codec(&mut body, Some(url_path), url).map_err(|e| read_error(url, e))?;

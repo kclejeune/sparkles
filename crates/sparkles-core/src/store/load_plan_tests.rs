@@ -12,7 +12,7 @@ use oxrdf::NamedNode;
 use oxrdfio::RdfFormat;
 use std::sync::Arc;
 
-use Entry::{InsertBulk, Load, Patch, Replace};
+use Entry::{InsertBulk, Load, Patch, Replace, SparqlLoad};
 use LoadPlan::{Bulk, Transactional as Txn};
 
 /// The threshold of the table.
@@ -30,7 +30,7 @@ struct Row {
 
 /// Inputs of `entry` with `quads` from files, or a batch of `quads`.
 fn sized(entry: Entry, quads: u64) -> LoadInputs {
-    let files = matches!(entry, Load | Replace) as usize;
+    let files = matches!(entry, Load | Replace | SparqlLoad) as usize;
     LoadInputs {
         quads,
         sources: files,
@@ -115,6 +115,19 @@ fn rows() -> Vec<Row> {
         row("replace: a small file and a large stream", mixed(Replace), LARGE + 1, Bulk, &[LARGE]),
         row("replace: restricted, above the threshold", restricted(sized(Replace, T + 1)), 0, Txn, &[]),
         row("replace: restricted, large stream", restricted(stream(Replace)), LARGE + 1, Txn, &[]),
+        // sparql LOAD (single-operation request)
+        row("sparql_load: empty head, a small file", empty(sized(SparqlLoad, 1)), 0, Txn, &[]),
+        row("sparql_load: empty head, a file at the threshold", empty(sized(SparqlLoad, T)), 0, Txn, &[]),
+        row("sparql_load: empty head, a file above the threshold", empty(sized(SparqlLoad, T + 1)), 0, Bulk, &[]),
+        row("sparql_load: empty head, stream at the large bound", empty(stream(SparqlLoad)), LARGE, Txn, &[LARGE]),
+        row("sparql_load: empty head, stream above the large bound", empty(stream(SparqlLoad)), LARGE + 1, Bulk, &[LARGE]),
+        row("sparql_load: estimate at the threshold", sized(SparqlLoad, T), 0, Txn, &[]),
+        row("sparql_load: estimate above the threshold", sized(SparqlLoad, T + 1), 0, Bulk, &[]),
+        row("sparql_load: stream at the large bound", stream(SparqlLoad), LARGE, Txn, &[LARGE]),
+        row("sparql_load: stream above the large bound", stream(SparqlLoad), LARGE + 1, Bulk, &[LARGE]),
+        row("sparql_load: restricted, empty head, above the threshold", restricted(empty(sized(SparqlLoad, T + 1))), 0, Txn, &[]),
+        row("sparql_load: restricted, above the threshold", restricted(sized(SparqlLoad, T + 1)), 0, Txn, &[]),
+        row("sparql_load: restricted, large stream", restricted(stream(SparqlLoad)), LARGE + 1, Txn, &[]),
         // insert_bulk
         row("insert_bulk: below the threshold", sized(InsertBulk, T - 1), 0, Txn, &[]),
         row("insert_bulk: at the threshold", sized(InsertBulk, T), 0, Txn, &[]),
@@ -178,7 +191,7 @@ fn plan_table() {
             ));
         }
         // the estimate reads file sources, so a plan that it does not decide skips it
-        let sources = matches!(r.inputs.entry, Load | Replace);
+        let sources = matches!(r.inputs.entry, Load | Replace | SparqlLoad);
         let needed =
             sources && !r.inputs.restricted && !(r.inputs.empty_head && r.inputs.entry == Load);
         if estimated != needed {
@@ -640,5 +653,520 @@ fn a_dry_run_over_the_memory_limit_is_previewed() {
         let (projected, limit) = (p.storage.projected.unwrap(), p.storage.limit.unwrap());
         assert!(projected > limit, "{name}: {projected} <= {limit}");
         assert_eq!(s.snapshot().len(), before, "{name}");
+    }
+}
+
+#[test]
+fn sparql_load_plans_and_semantics() {
+    use crate::error::Error;
+    use crate::outbound::OutboundPolicy;
+    use crate::sparql::{FileLoads, QueryOptions, query, update::update};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let write_nt = |name: &str, from: u64, n: u64| {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, ntriples(from, n)).unwrap();
+        p
+    };
+    let file_url = |p: &std::path::Path| format!("file://{}", p.display());
+    let ask = |s: &Store, q: &str| {
+        query(s.snapshot(), q, &QueryOptions::default())
+            .unwrap()
+            .boolean
+    };
+
+    let small_file = write_nt("small.nt", 100, E);
+    let large_file = write_nt("large.nt", 200, E + 1);
+    let extra_file = write_nt("extra.nt", 300, E + 1);
+
+    // 1. Single-operation large LOAD (default graph & INTO GRAPH) takes Bulk on both empty
+    // and seeded stores; small LOAD stays Transactional on both.
+    let file_cases = [
+        ("empty head, at threshold", store(), &small_file, None, Txn),
+        (
+            "empty head, above threshold (default)",
+            store(),
+            &large_file,
+            None,
+            Bulk,
+        ),
+        (
+            "empty head, above threshold (INTO GRAPH)",
+            store(),
+            &large_file,
+            Some("http://ex.org/g"),
+            Bulk,
+        ),
+        ("seeded, at threshold", seeded(2), &small_file, None, Txn),
+        (
+            "seeded, above threshold (default)",
+            seeded(2),
+            &large_file,
+            None,
+            Bulk,
+        ),
+        (
+            "seeded, above threshold (INTO GRAPH)",
+            seeded(2),
+            &large_file,
+            Some("http://ex.org/g"),
+            Bulk,
+        ),
+    ];
+    for (name, s, path, graph, expected) in file_cases {
+        let before = s.snapshot().len();
+        let stmt = match graph {
+            Some(g) => format!("LOAD <{}> INTO GRAPH <{g}>", file_url(path)),
+            None => format!("LOAD <{}>", file_url(path)),
+        };
+        let stats = update(&s, &stmt, &QueryOptions::default()).unwrap();
+        let receipt = stats.commit.as_ref().expect("receipt");
+        assert_eq!(plan_of(&s), expected, "{name}");
+        assert_eq!(receipt.commit.bulk, expected == Bulk, "{name}");
+        let want_inserted = if expected == Bulk { E + 1 } else { E };
+        assert_eq!(stats.inserted, want_inserted, "{name}");
+        assert_eq!(s.snapshot().len(), before + want_inserted, "{name}");
+        if let Some(g) = graph {
+            assert!(
+                ask(
+                    &s,
+                    &format!("ASK {{ GRAPH <{g}> {{ <http://ex.org/s200> ?p ?o }} }}")
+                ),
+                "{name}"
+            );
+            assert!(
+                !ask(&s, "ASK { <http://ex.org/s200> ?p ?o }"),
+                "{name}: default graph untouched"
+            );
+        }
+    }
+
+    // 2. Single-operation HTTP LOAD (plain and gzipped) follows the stream probe boundary.
+    let serve = |body: Vec<u8>, ct: &'static str| -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut b).unwrap_or(0) == 1 {
+                    head.push(b[0]);
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+            }
+        });
+        format!("http://127.0.0.1:{port}/data.nt")
+    };
+    let http_opts = QueryOptions {
+        outbound: OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for (name, s, n, gzip, expected) in [
+        ("http empty, at bound", store(), E, false, Txn),
+        ("http empty, above bound", store(), E + 1, false, Bulk),
+        ("http seeded, at bound", seeded(2), E, false, Txn),
+        ("http seeded, above bound", seeded(2), E + 1, false, Bulk),
+        (
+            "http seeded gzip, above bound",
+            seeded(2),
+            E + 1,
+            true,
+            Bulk,
+        ),
+    ] {
+        let raw = ntriples(400, n);
+        let body = if gzip {
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            gz.write_all(&raw).unwrap();
+            gz.finish().unwrap()
+        } else {
+            raw
+        };
+        let url = serve(body, "application/n-triples");
+        let stats = update(
+            &s,
+            &format!("LOAD <{url}> INTO GRAPH <http://ex.org/h>"),
+            &http_opts,
+        )
+        .unwrap();
+        assert_eq!(plan_of(&s), expected, "{name}");
+        assert_eq!(
+            stats.commit.unwrap().commit.bulk,
+            expected == Bulk,
+            "{name}"
+        );
+        assert_eq!(stats.inserted, n, "{name}");
+        assert!(
+            ask(
+                &s,
+                "ASK { GRAPH <http://ex.org/h> { <http://ex.org/s400> ?p ?o } }"
+            ),
+            "{name}"
+        );
+    }
+
+    // 3. Multi-operation request containing a large LOAD stays transactional and atomic.
+    let s = seeded(2);
+    let multi = format!(
+        "INSERT DATA {{ <http://ex.org/m> <http://ex.org/p> 1 }} ; LOAD <{}>",
+        file_url(&large_file)
+    );
+    let stats = update(&s, &multi, &QueryOptions::default()).unwrap();
+    assert_eq!(plan_of(&s), Txn, "multi-op stays transactional");
+    assert!(!stats.commit.unwrap().commit.bulk);
+    assert_eq!(stats.inserted, E + 2);
+    assert_eq!(stats.operations, 2);
+
+    // Multi-op atomicity: if the second operation fails, the first large LOAD is rolled back.
+    let s = seeded(2);
+    let bad = tmp.path().join("broken.nt");
+    std::fs::write(&bad, "<urn:broken \n").unwrap();
+    let multi_fail = format!(
+        "LOAD <{}> ; LOAD <{}>",
+        file_url(&large_file),
+        file_url(&bad)
+    );
+    assert!(update(&s, &multi_fail, &QueryOptions::default()).is_err());
+    assert_eq!(
+        s.snapshot().len(),
+        2,
+        "failed multi-op leaves store unchanged"
+    );
+
+    // 4. Restricted graph access keeps a large LOAD transactional and enforces rules.
+    let s = seeded(2);
+    let restricted_q = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::graphs(
+            Graphs::All,
+            Graphs::Only(GraphRule::new(["default"], &[])),
+        ))),
+        ..Default::default()
+    };
+    let stats = update(
+        &s,
+        &format!("LOAD <{}>", file_url(&large_file)),
+        &restricted_q,
+    )
+    .unwrap();
+    assert_eq!(plan_of(&s), Txn, "restricted stays transactional");
+    assert!(!stats.commit.unwrap().commit.bulk);
+    assert_eq!(stats.inserted, E + 1);
+    // Disallowed target graph is refused even under LOAD SILENT.
+    let err = update(
+        &s,
+        &format!(
+            "LOAD SILENT <{}> INTO GRAPH <http://ex.org/forbidden>",
+            file_url(&extra_file)
+        ),
+        &restricted_q,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::NotPermitted(_)), "{err:?}");
+
+    // 5. LOAD SILENT suppresses source/parse errors (including large malformed files) and
+    // returns an unchanged-head receipt, while still surfacing refusals, preconditions,
+    // dry runs and managed-graph boundaries.
+    let big_bad = tmp.path().join("big_broken.nt");
+    let mut bad_bytes = ntriples(500, E + 5);
+    bad_bytes.extend_from_slice(b"<urn:broken \n");
+    std::fs::write(&big_bad, bad_bytes).unwrap();
+    let s = seeded(2);
+    let stats = update(
+        &s,
+        &format!("LOAD SILENT <{}>", file_url(&big_bad)),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(stats.inserted, 0);
+    assert!(!stats.commit.as_ref().unwrap().committed);
+    assert_eq!(s.snapshot().len(), 2);
+
+    // Precondition failure is NOT hidden by LOAD SILENT.
+    let mut pre_opts = QueryOptions::default();
+    pre_opts.write.precondition = Some(crate::guard::Precondition::new(|_| {
+        Err(Error::PreconditionFailed("stale".into()))
+    }));
+    let err = update(
+        &s,
+        &format!("LOAD SILENT <{}>", file_url(&big_bad)),
+        &pre_opts,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::PreconditionFailed(_)), "{err:?}");
+
+    // Dry run is NOT hidden by LOAD SILENT and previews a bulk LOAD cleanly.
+    let mut dry_opts = QueryOptions::default();
+    dry_opts.write.dry_run = Some(Default::default());
+    let p = crate::preview::catch(
+        update(&s, &format!("LOAD <{}>", file_url(&large_file)), &dry_opts)
+            .map(|st| st.commit.unwrap()),
+    )
+    .unwrap();
+    assert!(p.commit.as_ref().unwrap().bulk);
+    assert_eq!(s.snapshot().len(), 2, "dry run writes nothing");
+
+    // FileLoads::Disabled is NOT hidden by LOAD SILENT.
+    let disabled = QueryOptions {
+        file_loads: FileLoads::Disabled,
+        ..Default::default()
+    };
+    let err = update(
+        &s,
+        &format!("LOAD SILENT <{}>", file_url(&large_file)),
+        &disabled,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::NotPermitted(_)), "{err:?}");
+
+    // Managed graph fence blocks a bulk LOAD targeting a managed graph even under SILENT.
+    let s = seeded(2);
+    let managed_graph = "http://ex.org/managed";
+    let settings = br#"{"format":1,"profile":1}"#;
+    let owner =
+        crate::managed::OwnerEntry::for_settings(1, vec![managed_graph.to_string()], settings);
+    let _managed = s
+        .enable_managed(crate::managed::OwnerKind::Evidence, owner, settings)
+        .unwrap();
+    let err = update(
+        &s,
+        &format!(
+            "LOAD SILENT <{}> INTO GRAPH <{managed_graph}>",
+            file_url(&large_file)
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Managed(_)), "{err:?}");
+
+    // Cancellation stops a single-op LOAD before committing.
+    let s = store();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let cancelled = QueryOptions {
+        cancel: Some(cancel),
+        ..Default::default()
+    };
+    let err = update(&s, &format!("LOAD <{}>", file_url(&large_file)), &cancelled).unwrap_err();
+    assert!(matches!(err, Error::Cancelled), "{err:?}");
+    assert_eq!(s.snapshot().len(), 0);
+}
+
+/// Measures wall time, writer-lock hold time, concurrent reader latency, and peak RSS
+/// (`VmHWM`) for a large single-operation SPARQL `LOAD` (`file:` and `http:`) under the
+/// default bulk threshold versus forced transactional (`bulk_threshold = u64::MAX`).
+/// Filter with `SPARQL_LOAD_MODE=bulk|txn`, `SPARQL_LOAD_KIND=persistent|memory`, and
+/// `SPARQL_LOAD_SOURCE=file|http` so each arm can run in its own process for an exact
+/// `VmHWM` reading.
+/// Run with:
+/// `SPARQL_LOAD_QUADS=300000 mbx test --release -p sparkles-core --lib -- --ignored sparql_load_profile --nocapture`
+#[test]
+#[ignore]
+fn sparql_load_profile() {
+    use crate::outbound::OutboundPolicy;
+    use crate::sparql::{QueryOptions, update::update};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let env_u64 = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let n = env_u64("SPARQL_LOAD_QUADS", 300_000);
+    let rounds = env_u64("SPARQL_LOAD_ROUNDS", 3);
+    let mode_filter = std::env::var("SPARQL_LOAD_MODE").unwrap_or_else(|_| "both".into());
+    let kind_filter = std::env::var("SPARQL_LOAD_KIND").unwrap_or_else(|_| "both".into());
+    let source_filter = std::env::var("SPARQL_LOAD_SOURCE").unwrap_or_else(|_| "both".into());
+
+    let data = ntriples(0, n);
+    let tmp = tempfile::tempdir().unwrap();
+    let file_path = tmp.path().join("big.nt");
+    std::fs::write(&file_path, &data).unwrap();
+    let file_url = format!("file://{}", file_path.display());
+
+    let vm_hwm_kib = || -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmHWM:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(0)
+    };
+
+    let run_with_probes =
+        |s: &Arc<Store>, f: &dyn Fn(&Store) -> crate::sparql::update::UpdateStats| {
+            let done = Arc::new(AtomicBool::new(false));
+            let s_reader = Arc::clone(s);
+            let done_r = Arc::clone(&done);
+            let reader_handle = std::thread::spawn(move || {
+                let mut reads = 0u64;
+                let mut max_us = 0u128;
+                while !done_r.load(Ordering::Relaxed) {
+                    let rt = Instant::now();
+                    let _ = s_reader.snapshot().len();
+                    max_us = max_us.max(rt.elapsed().as_micros());
+                    reads += 1;
+                    std::thread::sleep(Duration::from_micros(250));
+                }
+                (reads, max_us)
+            });
+            let s_lock = Arc::clone(s);
+            let done_l = Arc::clone(&done);
+            let t_start = Instant::now();
+            let lock_handle = std::thread::spawn(move || {
+                let mut first_busy: Option<Duration> = None;
+                let mut busy_samples = 0u64;
+                let mut total_samples = 0u64;
+                let probe_opts = WriteOptions {
+                    no_wait: true,
+                    ..Default::default()
+                };
+                while !done_l.load(Ordering::Relaxed) {
+                    total_samples += 1;
+                    match s_lock.try_write_with(CommitKind::Update, probe_opts.clone()) {
+                        Err(crate::error::Error::WriterBusy) => {
+                            if first_busy.is_none() {
+                                first_busy = Some(t_start.elapsed());
+                            }
+                            busy_samples += 1;
+                        }
+                        Ok(txn) => drop(txn),
+                        Err(_) => {}
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                (first_busy, busy_samples, total_samples)
+            });
+
+            let t0 = Instant::now();
+            let st = f(s);
+            let elapsed = t0.elapsed();
+            done.store(true, Ordering::Relaxed);
+            let (reads, max_read_us) = reader_handle.join().unwrap();
+            let (first_busy, busy_samples, total_samples) = lock_handle.join().unwrap();
+            let bulk = st.commit.as_ref().unwrap().commit.bulk;
+            (
+                elapsed,
+                bulk,
+                reads,
+                max_read_us,
+                first_busy.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                busy_samples,
+                total_samples,
+            )
+        };
+
+    let kinds: Vec<bool> = match kind_filter.as_str() {
+        "persistent" => vec![true],
+        "memory" => vec![false],
+        _ => vec![true, false],
+    };
+    let modes: Vec<(&str, u64)> = match mode_filter.as_str() {
+        "bulk" => vec![("bulk", StoreOptions::default().bulk_threshold)],
+        "txn" => vec![("txn", u64::MAX)],
+        _ => vec![
+            ("bulk", StoreOptions::default().bulk_threshold),
+            ("txn", u64::MAX),
+        ],
+    };
+    let sources: Vec<&str> = match source_filter.as_str() {
+        "file" => vec!["file"],
+        "http" => vec!["http"],
+        _ => vec!["file", "http"],
+    };
+
+    for round in 0..rounds {
+        for &persistent in &kinds {
+            let kind = if persistent {
+                "persistent"
+            } else {
+                "in-memory"
+            };
+            for &(label, threshold) in &modes {
+                for &src_kind in &sources {
+                    let db_dir = tempfile::tempdir().unwrap();
+                    let opts = StoreOptions {
+                        bulk_threshold: threshold,
+                        ..StoreOptions::default()
+                    };
+                    let s = Arc::new(if persistent {
+                        Store::open(&db_dir.path().join("db"), opts).unwrap()
+                    } else {
+                        Store::in_memory(opts)
+                    });
+                    s.load(&[bytes(10 * n, 1000)]).unwrap();
+
+                    let (elapsed, bulk, reads, max_read_us, pre_lock_ms, busy, total) = if src_kind
+                        == "file"
+                    {
+                        run_with_probes(&s, &|st| {
+                            update(st, &format!("LOAD <{file_url}>"), &QueryOptions::default())
+                                .unwrap()
+                        })
+                    } else {
+                        let payload = data.clone();
+                        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                        let port = listener.local_addr().unwrap().port();
+                        let srv = std::thread::spawn(move || {
+                            if let Ok((mut stream, _)) = listener.accept() {
+                                let mut head = Vec::new();
+                                let mut b = [0u8; 1];
+                                while !head.ends_with(b"\r\n\r\n")
+                                    && stream.read(&mut b).unwrap_or(0) == 1
+                                {
+                                    head.push(b[0]);
+                                }
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/n-triples\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                    payload.len()
+                                );
+                                let _ = stream.write_all(&payload);
+                            }
+                        });
+                        let http_opts = QueryOptions {
+                            outbound: OutboundPolicy {
+                                allow_private: true,
+                                max_response_bytes: (data.len() as u64) + (1 << 20),
+                                max_request_bytes: (data.len() as u64) + (1 << 20),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        };
+                        let res = run_with_probes(&s, &|st| {
+                            update(
+                                st,
+                                &format!("LOAD <http://127.0.0.1:{port}/big.nt>"),
+                                &http_opts,
+                            )
+                            .unwrap()
+                        });
+                        let _ = srv.join();
+                        res
+                    };
+                    drop(s);
+                    println!(
+                        "round {round} | {kind:10} | {src_kind:4} | {label:4} | {n} quads | wall {:.3}s | bulk={bulk} | pre_lock={pre_lock_ms:.1}ms | lock_busy={busy}/{total} | reads={reads} max={max_read_us}us | VmHWM={} MiB",
+                        elapsed.as_secs_f64(),
+                        vm_hwm_kib() / 1024
+                    );
+                }
+            }
+        }
     }
 }

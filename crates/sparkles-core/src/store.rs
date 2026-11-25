@@ -5432,7 +5432,34 @@ impl Store {
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
     ) -> Result<Receipt> {
-        let plan = self.source_plan(load_plan::Entry::Load, sources, o)?;
+        self.load_with_entry(load_plan::Entry::Load, sources, kind, o)
+    }
+
+    /// Execute a single-operation SPARQL `LOAD` through [`LoadPlan::choose`]: a large
+    /// unrestricted load takes the bulk rebuild path and smaller or graph-restricted
+    /// loads stay transactional (spec X16, item 846).
+    pub(crate) fn load_sparql(
+        &self,
+        source: &Source,
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+    ) -> Result<Receipt> {
+        self.load_with_entry(
+            load_plan::Entry::SparqlLoad,
+            std::slice::from_ref(source),
+            kind,
+            o,
+        )
+    }
+
+    fn load_with_entry(
+        &self,
+        entry: load_plan::Entry,
+        sources: &[Source],
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+    ) -> Result<Receipt> {
+        let plan = self.source_plan(entry, sources, o)?;
         if plan == LoadPlan::Bulk {
             let mut w = self.lock_writer(o)?;
             if w.poisoned {
@@ -7786,8 +7813,12 @@ fn estimated_quads(sources: &[Source]) -> u64 {
 fn control_streams(sources: &[Source], o: &crate::guard::WriteOptions) -> Result<()> {
     for s in sources {
         if let crate::io::SourceData::Reader(r) = &s.data {
-            r.read_ahead(crate::codec::Codec::MAGIC_LEN, &|| o.check())?;
-            r.decode(s.codec()?, s.max_decompressed, o)?;
+            if r.decoded() {
+                r.decode(crate::codec::Codec::None, s.max_decompressed, o)?;
+            } else {
+                r.read_ahead(crate::codec::Codec::MAGIC_LEN, &|| o.check())?;
+                r.decode(s.codec()?, s.max_decompressed, o)?;
+            }
         }
     }
     Ok(())
