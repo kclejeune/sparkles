@@ -2560,12 +2560,16 @@ fn same_tables_with_stop_polls_dense_role_closure_and_data_tables() {
     let roles_fn = ix_fn_a.roles.sup.len();
     assert_eq!(roles_fn, n + 2);
     assert_eq!(ix_fn_b.roles.sup.len(), roles_fn);
+    assert_eq!(ix_fn_a.roles.linear.len(), roles_fn);
+    assert!(ix_fn_a.roles.inv.is_empty());
     assert_eq!(ix_fn_a.selfs.len(), 1);
     assert_eq!(ix_fn_b.selfs.len(), 1);
     assert_ne!(ix_fn_a.selfs, ix_fn_b.selfs);
-    // Without inner `functional` slice ticks, `sup` (2R) + `right`/`left`/`range`/`data_range`
-    // (4R) + `functional` outer (R) + `empty` (R) = 8*R ticks; inner `functional` adds `n` ticks.
-    let without_inner_func_polls = (8 * roles_fn) / index::POLL_CHANGED;
+    // Non-inner ticks before `selfs`: `sup` (2R) + `right`/`left`/`range`/`data_range` (4R) +
+    // `functional` outer (R) + `empty` (R) + `linear` (R) = 9*R ticks; inner `functional` adds `n`
+    // ticks. Removing either `functional` polling layer drops total ticks to <= 9*R (`9` polls),
+    // whereas both layers together reach `9*R + n = 42,018` ticks (`10` polls).
+    let without_one_func_layer_polls = (9 * roles_fn) / index::POLL_CHANGED;
     let fn_polls = AtomicUsize::new(0);
     assert_eq!(
         ix_fn_b.same_tables_with_stop(ix_fn_a, &|| {
@@ -2575,17 +2579,17 @@ fn same_tables_with_stop_polls_dense_role_closure_and_data_tables() {
         Some(false)
     );
     assert!(
-        fn_polls.load(Ordering::Relaxed) > without_inner_func_polls,
-        "functional outer+inner polling must exceed non-inner poll bound ({without_inner_func_polls}), got {}",
+        fn_polls.load(Ordering::Relaxed) > without_one_func_layer_polls,
+        "functional outer+inner polling must exceed single-layer poll bound ({without_one_func_layer_polls}), got {}",
         fn_polls.load(Ordering::Relaxed)
     );
     let cancel_fn = AtomicUsize::new(0);
     assert_eq!(
         ix_fn_b.same_tables_with_stop(ix_fn_a, &|| {
-            cancel_fn.fetch_add(1, Ordering::Relaxed) == without_inner_func_polls
+            cancel_fn.fetch_add(1, Ordering::Relaxed) == without_one_func_layer_polls
         }),
         None,
-        "cancellation inside functional/empty must fire before reaching selfs mismatch"
+        "cancellation from combined functional outer+inner polling must fire before reaching selfs mismatch"
     );
 
     // 2c. Cached `Roles::any_functional` makes `saturate::plain` O(1) and rejects a newly

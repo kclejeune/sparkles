@@ -302,6 +302,15 @@ impl ScratchGuard {
         Ok(())
     }
 
+    /// Release `less` temporary scratch bytes without reducing [`Budget::peak`].
+    pub fn shrink(&mut self, less: usize) {
+        let release = less.min(self.bytes);
+        if release != 0 {
+            self.budget.release_scratch(release);
+            self.bytes -= release;
+        }
+    }
+
     /// Atomically transfers `retained` bytes from this scratch guard into the budget's
     /// retained baseline and releases any remaining scratch bytes, without polling
     /// cancellation or leaving an uncharged window.
