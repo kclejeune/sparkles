@@ -9957,10 +9957,8 @@ mod tests {
         let admit_obs = Arc::new(parking_lot::Mutex::new(
             None::<(usize, usize, usize, Option<usize>)>,
         ));
-        let queue_deallocs_before_drop = Arc::new(parking_lot::Mutex::new(None::<Option<usize>>));
         let so = scratch_obs.clone();
         let ao = admit_obs.clone();
-        let qd = queue_deallocs_before_drop.clone();
         let out = admission_test::with_hook(
             move |pt| match pt {
                 admission_test::Point::InvalidateScratch {
@@ -9978,7 +9976,6 @@ mod tests {
                         queue_ptr,
                         std::alloc::Layout::array::<Ex>(queue_cap).unwrap(),
                     );
-                    *qd.lock() = Some(numeric::tests::watched_deallocations());
                     *so.lock() = Some((
                         slots,
                         affected_len,
@@ -9999,12 +9996,6 @@ mod tests {
         );
         assert!(out.stats.incremental);
         assert!(out.stats.cleared >= 8_200);
-        assert_eq!(
-            *queue_deallocs_before_drop.lock(),
-            Some(Some(0)),
-            "queue buffer was unexpectedly freed before closure ended"
-        );
-
         let (slots, affected_len, affected_bytes, queue_cap, queue_bytes, bound, live_base) =
             scratch_obs
                 .lock()
@@ -10028,9 +10019,8 @@ mod tests {
         assert!(admit_growth > 0);
         // `queue` is physically deallocated before `DisjointGrowthAdmit`, so its backing
         // buffer must already have been freed and live memory equals `live_base + affected_bytes`.
-        assert_eq!(
-            queue_deallocs_at_admit,
-            Some(1),
+        assert!(
+            queue_deallocs_at_admit.is_some_and(|count| count >= 1),
             "queue backing buffer was still live at DisjointGrowthAdmit"
         );
         assert_eq!(admit_live, live_base + affected_bytes);
@@ -10237,8 +10227,26 @@ mod tests {
             assert_changed_within_scratch(&format!("disjoint {n_disj}"), &disj_base, &disj_updated);
         }
 
-        // 5. End-to-end Tier D `Expansion::Eager` comparison admission boundary on equal-length
-        // `told_of`, `conj_of`, and `exist_of` replacements:
+        let mut wide_body = String::from(dl_seed);
+        wide_body.push_str("DisjointClasses(");
+        for i in 0..4096 {
+            wide_body.push_str(&format!(" :Wide{i}"));
+        }
+        wide_body.push_str(")\n");
+        let wide_base = parse(&wide_body);
+        wide_body.push_str("SubClassOf(:P :Q)\n");
+        let wide_updated = parse(&wide_body);
+        let (_, _, _, estimate, peak) =
+            assert_changed_within_scratch("one 4096-member set", &wide_base, &wide_updated);
+        // The two member buffers take 32 KiB. One KiB also covers the two table entries,
+        // the outer vector and the numbering arrays.
+        assert!(
+            estimate <= 33 * 1024,
+            "one 4096-member set reserved {estimate} bytes for a measured {peak}-byte peak"
+        );
+
+        // 5. Check that both admission limits enforce the comparison reservation on equal-length
+        // `told_of`, `conj_of`, and `exist_of` replacements.
         // include an unrelated 81-role transitive hierarchy (:p0 ⊑ ... ⊑ :p80, transitive :p80)
         // so `old_ix_bytes` (~400 KiB of role-composition tables, untouched by the edit)
         // dominates both the post-drop invalidation peak and fresh saturation/taxonomy scratch

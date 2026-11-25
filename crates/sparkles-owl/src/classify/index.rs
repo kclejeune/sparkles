@@ -2641,6 +2641,14 @@ impl Index {
             }
     }
 
+    fn disjoint_set_count(&self) -> usize {
+        self.disjoint
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |s| s as usize + 1)
+    }
+
     /// For each expression of `old`, whether a context that holds it reads other rules
     /// here than a run over `old` gave it (roadmap item 753): another successor, told
     /// superexpressions, conjunctions, negative existential restrictions or
@@ -2656,16 +2664,8 @@ impl Index {
         let (old_sets, new_sets) = if old.disjoint.is_empty() && self.disjoint.is_empty() {
             (Vec::new(), Vec::new())
         } else {
-            let set_count = |ix: &Index| {
-                ix.disjoint
-                    .iter()
-                    .copied()
-                    .max()
-                    .map_or(0, |m| m as usize + 1)
-            };
-            let old_n = set_count(old);
-            let new_n = set_count(self);
-            debug_assert!(old_n <= old.disjoint.len() && new_n <= self.disjoint.len());
+            let old_n = old.disjoint_set_count();
+            let new_n = self.disjoint_set_count();
             // The disjointness sets of each index by their members, pre-sized to avoid
             // amortized doubling during the comparison.
             let members = |ix: &Index, n_sets: usize| -> Vec<Vec<Ex>> {
@@ -2766,26 +2766,37 @@ impl Index {
     /// and the `changed` mark vector with Tier D's clause-key sets. Per-head `told`, `conj`
     /// and `exist` slices are pre-sorted in [`Index::build`] and compared without allocation.
     pub fn changed_scratch(&self, old: &Index) -> usize {
-        let d_old = old.disjoint.len();
-        let d_new = self.disjoint.len();
-        let d = d_old.saturating_add(d_new);
-        let disj_phase = if d == 0 {
-            0
-        } else {
-            super::dl_clause::hash_table_bytes(d, std::mem::size_of::<(Vec<Ex>, u32)>())
+        let old_sets = old.disjoint_set_count();
+        let new_sets = self.disjoint_set_count();
+        let sets = old_sets.saturating_add(new_sets);
+        let memberships = old.disjoint.len().saturating_add(self.disjoint.len());
+        let numbering_bytes = sets.saturating_mul(std::mem::size_of::<u32>());
+        let disj_phase =
+            super::dl_clause::hash_table_bytes(sets, std::mem::size_of::<(Vec<Ex>, u32)>())
+                .saturating_add(memberships.saturating_mul(std::mem::size_of::<Ex>()))
+                .saturating_add(numbering_bytes)
                 .saturating_add(
-                    d.saturating_mul(std::mem::size_of::<Ex>() + std::mem::size_of::<u32>()),
-                )
-                .saturating_add(
-                    d_old
-                        .max(d_new)
+                    old_sets
+                        .max(new_sets)
                         .saturating_mul(std::mem::size_of::<Vec<Ex>>()),
-                )
+                );
+        // Only equal-length spans can allocate both comparison buffers.
+        let max_span = if old_sets != 0 && new_sets != 0 {
+            old.heads
+                .iter()
+                .zip(&self.heads)
+                .filter(|(a, b)| a.disj.len == b.disj.len)
+                .map(|(a, _)| a.disj.len as usize)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
         };
         let scan_phase = old
             .heads
             .len()
-            .saturating_add(d.saturating_mul(2 * std::mem::size_of::<u32>()));
+            .saturating_add(numbering_bytes)
+            .saturating_add(max_span.saturating_mul(2 * std::mem::size_of::<u32>()));
         let dl_phase = old.heads.len().saturating_add(match (&old.dl, &self.dl) {
             (Some(a), Some(b)) => b.changed_scratch(a),
             _ => 0,

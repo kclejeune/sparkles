@@ -307,10 +307,6 @@ impl DlIx {
             && self.witnesses.is_empty()
     }
 
-    /// Marks in `changed`, which covers the expressions of `old`, each expression that
-    /// keys other rules here than in `old`: one in the body of a clause that only one of
-    /// the two has, one with another hypothetical successor or successor core, and one
-    /// that the order of atoms ranks differently.
     /// Upper bound on peak scratch bytes that [`DlIx::changed`] allocates for the
     /// comparison with `old`: both pre-sized clause-key hash sets and their sorted head
     /// copies.
@@ -330,6 +326,10 @@ impl DlIx {
         keys(old).saturating_add(keys(self))
     }
 
+    /// Marks in `changed`, which covers the expressions of `old`, each expression that
+    /// keys other rules here than in `old`: one in the body of a clause that only one of
+    /// the two has, one with another hypothetical successor or successor core, and one
+    /// that the order of atoms ranks differently.
     pub fn changed(&self, old: &DlIx, changed: &mut [bool]) {
         type Key<'a> = (&'a [Ex], Vec<Ex>);
         fn keys(d: &DlIx) -> FxHashSet<Key<'_>> {
