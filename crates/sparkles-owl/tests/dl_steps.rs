@@ -204,8 +204,9 @@ fn a_run_in_steps_derives_the_same_on_every_number_of_threads() {
 }
 
 /// The cases of [`cases`] that a run in steps finishes within the default bound, three
-/// more since a product derives only its least unions (item 969).
-const WITHIN: usize = 174;
+/// more since a product derives only its least unions (item 969) and one more (`qz-0082`)
+/// with item 896's counting refinements.
+const WITHIN: usize = 175;
 
 /// One case run many times on one, four and eight threads gives one outcome, at the
 /// default bound, which it keeps, at a bound equal to the conclusions it derives, which

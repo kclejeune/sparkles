@@ -54,11 +54,12 @@ pub struct DlAx {
     /// in a rooted run with counting, the minimum restrictions: a holder M and the
     /// existential restrictions whose successor terms differ, `M(x) → f_i(x) ≉ f_j(x)`
     pub ne: Vec<(Ex, Vec<Ex>)>,
-    /// item 728's clauses for an exact or minimum cardinality in a negative position,
-    /// `r_B(x, z_1) ∧ … ∧ r_B(x, z_n) → head ⊔ ⋁ z_i ≈ z_j`: the bound `n - 1` that the
-    /// at-most rule counts to, the role, the filler's negative form B, ⊤ when unqualified,
-    /// and the head's atoms over x, `y` with the at-least conjunction `H` of an exact one
-    pub lazy: Vec<(u32, Role, Ex, Vec<Ex>)>,
+    /// item 728 / item 896 (R4) clauses for an exact or minimum cardinality in a negative
+    /// position, `[guard(x) ∧] r_B(x, z_1) ∧ … ∧ r_B(x, z_n) → head ⊔ ⋁ z_i ≈ z_j`: the
+    /// optional guard expression over x, the bound `n - 1` that the at-most rule counts
+    /// to, the role, the filler's negative form B (⊤ when unqualified), and the head's
+    /// atoms over x
+    pub lazy: Vec<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>,
     /// the at-least conjunctions `H` that a cardinality in a negative position makes,
     /// which the order of a run without the root ranks below every class
     pub low: Vec<Ex>,
@@ -99,6 +100,13 @@ impl DlAx {
                 .iter()
                 .map(|(_, es)| es.capacity() * 4)
                 .sum::<usize>()
+            + self.lazy.capacity() * std::mem::size_of::<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>()
+            + self
+                .lazy
+                .iter()
+                .map(|(_, _, _, _, h)| h.capacity() * 4)
+                .sum::<usize>()
+            + self.low.capacity() * 4
             + self.least.capacity() * std::mem::size_of::<(Ex, Option<Ex>)>()
             + super::saturate::table_bytes(
                 self.blockers.capacity(),
@@ -130,6 +138,13 @@ impl DlAx {
             + self.rdis.len() * 8
             + self.ne.len() * std::mem::size_of::<(Ex, Vec<Ex>)>()
             + self.ne.iter().map(|(_, es)| es.len() * 4).sum::<usize>()
+            + self.lazy.len() * std::mem::size_of::<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>()
+            + self
+                .lazy
+                .iter()
+                .map(|(_, _, _, _, h)| h.len() * 4)
+                .sum::<usize>()
+            + self.low.len() * 4
             + self.least.len() * std::mem::size_of::<(Ex, Option<Ex>)>()
             + super::saturate::table_bytes(
                 self.blockers.len(),
@@ -195,8 +210,8 @@ struct Out {
     irreflexive: Vec<Role>,
     /// the minimum restrictions of a rooted run with counting, as [`DlAx::ne`]
     ne: Vec<(Ex, Vec<Ex>)>,
-    /// item 728's clauses of a cardinality in a negative position, as [`DlAx::lazy`]
-    lazy: Vec<(u32, Role, Ex, Vec<Ex>)>,
+    /// item 728 / item 896 (R4) clauses of a cardinality in a negative position, as [`DlAx::lazy`]
+    lazy: Vec<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>,
     /// the at-least conjunctions ranked lowest, as [`DlAx::low`]
     low: Vec<Ex>,
     /// the minimums of a run that orders its number restrictions: the name, the
@@ -296,9 +311,9 @@ impl Out {
             + self
                 .lazy
                 .iter()
-                .map(|(_, _, _, h)| 40 + h.capacity() * 4)
+                .map(|(_, _, _, _, h)| h.capacity() * 4)
                 .sum::<usize>()
-            + self.lazy.capacity() * 40
+            + self.lazy.capacity() * std::mem::size_of::<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>()
             + self.low.capacity() * 4
             + self.least.capacity() * 20
     }
@@ -747,6 +762,9 @@ impl Norm<'_, '_> {
         Ok(match c {
             C::Class(c) => self.it.class(c),
             C::ObjectIntersectionOf(cs) => {
+                if self.order && has_guarded_card(cs) {
+                    return self.neg_inter_order(cs, d);
+                }
                 // `D ⊓ ¬F ⊑ y` is the clause `D → y ⊔ F`, with a body, where the complement
                 // alone would give a clause of every context; so are `∀r.F` and `≤n r.F`,
                 // whose duals are `∃r.¬F` and `≥(n+1) r.F`
@@ -851,7 +869,7 @@ impl Norm<'_, '_> {
                     return Ok(BOTTOM);
                 }
                 let y = self.it.fresh_class();
-                self.out.lazy.push((n - 1, r, b, vec![y]));
+                self.out.lazy.push((None, n - 1, r, b, vec![y]));
                 y
             }
             C::ObjectMinCardinality(..) => {
@@ -947,7 +965,7 @@ impl Norm<'_, '_> {
                     if hi != BOTTOM {
                         head.push(hi);
                     }
-                    self.out.lazy.push((n - 1, r, b, head));
+                    self.out.lazy.push((None, n - 1, r, b, head));
                 }
                 y
             }
@@ -1035,6 +1053,10 @@ impl Norm<'_, '_> {
 
     /// `⊓lhs ⊑ ⊔rhs`.
     fn sub(&mut self, lhs: Vec<ClassExpression>, rhs: Vec<ClassExpression>) -> Result<(), Why> {
+        if self.order {
+            let _ = self.sub_order(lhs, rhs, 0, false)?;
+            return Ok(());
+        }
         use ClassExpression as C;
         let mut left: Vec<ClassExpression> = Vec::new();
         let mut right: Vec<ClassExpression> = Vec::new();
@@ -1099,6 +1121,169 @@ impl Norm<'_, '_> {
             self.out.clauses.push((body, head));
         }
         Ok(())
+    }
+
+    /// Negative intersection under `order` when any conjunct is an exact cardinality or a
+    /// minimum cardinality `>= 2` (item 896, R4).
+    fn neg_inter_order(
+        &mut self,
+        cs: &std::collections::BTreeSet<ClassExpression>,
+        depth: usize,
+    ) -> Result<Ex, Why> {
+        self.sub_order(cs.iter().cloned().collect(), Vec::new(), depth, true)
+    }
+
+    /// Guarded normalization for `⊓lhs ⊑ ⊔rhs` (and `neg(⊓lhs)` when `as_neg` is true)
+    /// under `order` (item 896, R4).
+    ///
+    /// Splits `=n r.F` (`n >= 1`) into `≥n r.F` on the LHS (shadowed for `n = 1`, guarded
+    /// lazy DL-clause for `n >= 2`) and `≥(n+1) r.F` in the guarded head, and keeps
+    /// `≥n r.F` (`n >= 2`) as a guarded lazy DL-clause instead of creating an at-most
+    /// holder `M_{≤n-1}`.
+    fn sub_order(
+        &mut self,
+        lhs: Vec<ClassExpression>,
+        rhs: Vec<ClassExpression>,
+        depth: usize,
+        as_neg: bool,
+    ) -> Result<Ex, Why> {
+        use ClassExpression as C;
+        if depth > 256 {
+            return Err("class expressions nested too deeply");
+        }
+        let mut left: Vec<ClassExpression> = Vec::new();
+        let mut mins_l: Vec<(u32, ObjectPropertyExpression, Option<Box<ClassExpression>>)> =
+            Vec::new();
+        let mut right: Vec<(ClassExpression, bool)> = Vec::new();
+        let mut todo_l = lhs;
+        let mut todo_r: Vec<(ClassExpression, bool)> =
+            rhs.into_iter().map(|c| (c, false)).collect();
+        let mut steps = 0usize;
+        while !todo_l.is_empty() || !todo_r.is_empty() {
+            steps += 1;
+            if steps > 4096 {
+                return Err("class expressions nested too deeply");
+            }
+            if let Some(c) = todo_l.pop() {
+                match c {
+                    C::ObjectIntersectionOf(cs) => todo_l.extend(cs),
+                    C::ObjectExactCardinality(0, p, f) => {
+                        todo_r.push((C::ObjectMinCardinality(1, p, f), false));
+                    }
+                    C::ObjectExactCardinality(n, p, f) => {
+                        let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
+                        todo_l.push(C::ObjectMinCardinality(n, p.clone(), f.clone()));
+                        todo_r.push((C::ObjectMinCardinality(n1, p, f), true));
+                    }
+                    C::ObjectMinCardinality(0, ..) => {}
+                    C::ObjectMinCardinality(n, p, f) if n >= 2 => {
+                        mins_l.push((n, p, f));
+                    }
+                    C::ObjectMaxCardinality(n, p, f) => {
+                        let n1 = n.checked_add(1).ok_or("a cardinality too large")?;
+                        todo_r.push((C::ObjectMinCardinality(n1, p, f), n >= 1));
+                    }
+                    c if self.dual(&c).is_some() => {
+                        let dual = self.dual(&c).expect("a dual");
+                        todo_r.push((dual, false));
+                    }
+                    C::Class(ref k) if k.as_str() == vocab::OWL_THING => {}
+                    c => left.push(c),
+                }
+                continue;
+            }
+            if let Some((c, is_low)) = todo_r.pop() {
+                match c {
+                    C::ObjectUnionOf(cs) => {
+                        todo_r.extend(cs.into_iter().map(|x| (x, false)));
+                    }
+                    C::ObjectComplementOf(f) => todo_l.push(*f),
+                    C::Class(ref k) if k.as_str() == vocab::OWL_NOTHING => {}
+                    c => right.push((c, is_low)),
+                }
+            }
+        }
+        // Normalize every subexpression before tautology short-circuits so unsupported
+        // roles, fillers, cardinalities, or depth limits reject the axiom consistently.
+        let mut body = left
+            .iter()
+            .map(|c| self.neg(c, depth))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut norm_mins: Vec<(u32, Role, Ex)> = Vec::with_capacity(mins_l.len());
+        for (n, p, f) in &mins_l {
+            let r = self.role(p)?;
+            let b = self.qualifier(f.as_deref(), depth)?;
+            norm_mins.push((*n, r, b));
+        }
+        let mut head = Vec::with_capacity(right.len());
+        for (c, is_low) in &right {
+            let h = self.pos(c, depth)?;
+            if *is_low && self.counting && h != TOP && h != BOTTOM {
+                self.out.low.push(h);
+            }
+            head.push(h);
+        }
+        if head.contains(&TOP)
+            || body.contains(&BOTTOM)
+            || norm_mins.iter().any(|&(_, _, b)| b == BOTTOM)
+        {
+            return Ok(if as_neg { BOTTOM } else { TOP });
+        }
+        head.retain(|&x| x != BOTTOM);
+        head.sort_unstable();
+        head.dedup();
+        body.retain(|&x| x != TOP);
+        body.sort_unstable();
+        body.dedup();
+        if head.iter().any(|h| body.contains(h)) {
+            return Ok(if as_neg { BOTTOM } else { TOP });
+        }
+        let ret = if as_neg {
+            if norm_mins.is_empty() && head.is_empty() {
+                return Ok(self.conj(body));
+            }
+            let y = self.it.fresh_class();
+            head.push(y);
+            head.sort_unstable();
+            head.dedup();
+            y
+        } else {
+            TOP
+        };
+        if norm_mins.is_empty() {
+            if head.len() <= 1 {
+                let y = self.conj(body);
+                let x = head.first().copied().unwrap_or(BOTTOM);
+                if x != y {
+                    self.out.subs.push((y, x));
+                }
+            } else {
+                self.out.clauses.push((body, head));
+            }
+            return Ok(ret);
+        }
+        norm_mins.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| (a.1, a.2).cmp(&(b.1, b.2))));
+        norm_mins.dedup();
+        let base_guard = if body.is_empty() {
+            None
+        } else {
+            Some(self.conj(body.clone()))
+        };
+        for &(n_i, r_i, b_i) in &norm_mins[1..] {
+            let y_i = self.it.fresh_class();
+            self.out
+                .lazy
+                .push((base_guard, n_i - 1, r_i, b_i, vec![y_i]));
+            body.push(y_i);
+        }
+        let primary_guard = if body.is_empty() {
+            None
+        } else {
+            Some(self.conj(body))
+        };
+        let (n_0, r_0, b_0) = norm_mins[0];
+        self.out.lazy.push((primary_guard, n_0 - 1, r_0, b_0, head));
+        Ok(ret)
     }
 
     /// Whether an axiom is a role axiom the run takes before the class axioms.
@@ -1532,7 +1717,7 @@ fn normalize_within(
     }
     // number restrictions and disjointness need simple roles, which OWL 2 DL asks
     if all.atmost.iter().any(|&(_, _, r, _)| !rb.simple(r))
-        || all.lazy.iter().any(|&(_, r, _, _)| !rb.simple(r))
+        || all.lazy.iter().any(|&(_, _, r, _, _)| !rb.simple(r))
         || all
             .rdis
             .iter()
@@ -1603,7 +1788,7 @@ fn normalize_within(
     } else {
         Default::default()
     };
-    unfold(it, ax, &all.clauses, &mut rb, allowed.automata);
+    unfold(it, ax, &all.clauses, &all.lazy, &mut rb, allowed.automata);
     let mut dl = DlAx {
         clauses: all.clauses,
         atmost: all.atmost,
@@ -1642,6 +1827,26 @@ fn normalize_within(
     Ok(Some((taken, dl)))
 }
 
+/// Whether a conjunction contains an exact cardinality or a minimum cardinality `>= 2`
+/// (including inside nested intersections, bounded to 4096 visited nodes).
+fn has_guarded_card(cs: &std::collections::BTreeSet<ClassExpression>) -> bool {
+    let mut stack: Vec<&ClassExpression> = cs.iter().collect();
+    let mut steps = 0usize;
+    while let Some(c) = stack.pop() {
+        steps += 1;
+        if steps > 4096 {
+            return false;
+        }
+        match c {
+            ClassExpression::ObjectIntersectionOf(inner) => stack.extend(inner.iter()),
+            ClassExpression::ObjectExactCardinality(..) => return true,
+            ClassExpression::ObjectMinCardinality(n, ..) if *n >= 2 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Canonical conjunction over `it`, sorting and deduplicating conjuncts and folding `⊤`/`⊥`.
 fn conj_in(it: &mut Interner, mut es: Vec<Ex>) -> Ex {
     es.sort_unstable();
@@ -1677,7 +1882,7 @@ fn shadow_negative(
     ax: &mut Axioms,
     clauses: &mut Vec<(Vec<Ex>, Vec<Ex>)>,
     atmost: &mut [(Ex, u32, Role, Ex)],
-    lazy: &mut [(u32, Role, Ex, Vec<Ex>)],
+    lazy: &mut Vec<(Option<Ex>, u32, Role, Ex, Vec<Ex>)>,
     inv: &[Role],
     rb: &RoleBox,
     stop: &dyn Fn() -> bool,
@@ -1861,9 +2066,22 @@ fn shadow_negative(
     for (_, _, _, b) in atmost.iter_mut() {
         *b = ctx.rewrite_qual(*b)?;
     }
-    for (_, _, b, _) in lazy.iter_mut() {
-        *b = ctx.rewrite_qual(*b)?;
+    let mut keep_lazy = Vec::with_capacity(lazy.len());
+    for (mut guard, k, r, mut b, head) in std::mem::take(lazy) {
+        if let Some(g) = guard {
+            let rg = ctx.rewrite(g, false)?;
+            if rg == BOTTOM {
+                continue;
+            }
+            guard = (rg != TOP).then_some(rg);
+        }
+        b = ctx.rewrite_qual(b)?;
+        if b == BOTTOM {
+            continue;
+        }
+        keep_lazy.push((guard, k, r, b, head));
     }
+    *lazy = keep_lazy;
     ax.subs.extend(ctx.new_subs);
     Ok(())
 }
@@ -2196,10 +2414,12 @@ fn acyclic(edges: &FxHashMap<Ex, Vec<Ex>>) -> bool {
 /// superrole of `l` from the same state into the same state (roadmap item 712). The rules
 /// apply a universal on a role to every link and backward link under it, so a state stands
 /// for the same universal after either reduction (F24, "The disjunctive rules").
+#[allow(clippy::type_complexity)]
 fn unfold(
     it: &mut Interner,
     ax: &mut Axioms,
     clauses: &[(Vec<Ex>, Vec<Ex>)],
+    lazy: &[(Option<Ex>, u32, Role, Ex, Vec<Ex>)],
     rb: &mut RoleBox,
     level: u8,
 ) {
@@ -2211,6 +2431,12 @@ fn unfold(
     for (b, h) in clauses {
         neg.extend(b.iter().copied());
         pos.extend(h.iter().copied());
+    }
+    for (guard, _, _, _, head) in lazy {
+        if let Some(g) = *guard {
+            neg.push(g);
+        }
+        pos.extend(head.iter().copied());
     }
     let mut seen: FxHashSet<(Ex, bool)> = FxHashSet::default();
     let mut todo: Vec<(Ex, bool)> = pos.into_iter().map(|e| (e, true)).collect();

@@ -86,9 +86,12 @@ pub struct DlIx {
     atmost: FxHashMap<Ex, (u32, Role)>,
     /// the holders, bounds and roles of the at-most restrictions
     atmosts: Vec<(Ex, u32, Role)>,
-    /// item 728's clauses of a cardinality in a negative position, without a holder: the
-    /// bound the at-most rule counts to, the qualified role and the head's atoms over x
-    lazy: Vec<(u32, Role, Box<[Ex]>)>,
+    /// item 728 / item 896 (R4) clauses of a cardinality in a negative position: the
+    /// optional guard expression over x, the bound the at-most rule counts to, the
+    /// qualified role and the head's atoms over x
+    lazy: Vec<(Option<Ex>, u32, Role, Box<[Ex]>)>,
+    /// guarded lazy clause ids indexed by their guard expression over x
+    lazy_by_guard: FxHashMap<Ex, Vec<u32>>,
     /// for each expression, whether it is an at-least conjunction that the order of a run
     /// without the root ranks below every class, item 728
     low: Vec<bool>,
@@ -165,7 +168,7 @@ impl DlIx {
             .atmost
             .iter()
             .map(|&(_, _, s, b)| (s, b))
-            .chain(dl.lazy.iter().map(|&(_, s, b, _)| (s, b)))
+            .chain(dl.lazy.iter().map(|&(_, _, s, b, _)| (s, b)))
         {
             let r = if b == TOP { Some(s) } else { ix.roles.inv(s) };
             if let Some(w) = r.and_then(|r| wanted.get_mut(r as usize)) {
@@ -244,9 +247,14 @@ impl DlIx {
             d.atmost.insert(m, (k, q));
             d.atmosts.push((m, k, q));
         }
-        for (k, s, b, head) in &dl.lazy {
+        for (guard, k, s, b, head) in &dl.lazy {
             let q = qualified(&mut d, *s, *b);
-            d.lazy.push((*k, q, head.clone().into_boxed_slice()));
+            let id = d.lazy.len() as u32;
+            if let Some(g) = *guard {
+                d.lazy_by_guard.entry(g).or_default().push(id);
+            }
+            d.lazy
+                .push((*guard, *k, q, head.clone().into_boxed_slice()));
         }
         d.order = dl.order;
         d.blockers = dl
@@ -309,6 +317,7 @@ impl DlIx {
             && self.quals.is_empty()
             && self.atmosts.is_empty()
             && self.lazy.is_empty()
+            && self.lazy_by_guard.is_empty()
             && self.rdis.is_empty()
             && self.ne_of.is_empty()
             && self.blockers.is_empty()
@@ -395,7 +404,9 @@ impl DlIx {
             if self
                 .atmosts
                 .iter()
-                .any(|&(_, _, q)| self.inv(ix, q).is_some_and(|i| g[i as usize]))
+                .map(|&(_, _, q)| q)
+                .chain(self.lazy.iter().map(|&(_, _, q, _)| q))
+                .any(|q| self.inv(ix, q).is_some_and(|i| g[i as usize]))
             {
                 for t in 0..total {
                     if g[t]
@@ -450,6 +461,18 @@ impl DlIx {
             + table_bytes(self.quals_of.capacity(), 32)
             + table_bytes(self.atmost.capacity(), 12)
             + self.atmosts.capacity() * 12
+            + self.lazy.capacity() * std::mem::size_of::<(Option<Ex>, u32, Role, Box<[Ex]>)>()
+            + self
+                .lazy
+                .iter()
+                .map(|(_, _, _, h)| h.len() * 4)
+                .sum::<usize>()
+            + table_bytes(self.lazy_by_guard.capacity(), 32)
+            + self
+                .lazy_by_guard
+                .values()
+                .map(|v| v.capacity() * 4)
+                .sum::<usize>()
             + self.rdis.capacity() * 8
             + self.carry.capacity()
             + self.consts.capacity() * 8
@@ -491,6 +514,18 @@ impl DlIx {
             + table_bytes(self.quals_of.len(), 32)
             + table_bytes(self.atmost.len(), 12)
             + self.atmosts.len() * 12
+            + self.lazy.len() * std::mem::size_of::<(Option<Ex>, u32, Role, Box<[Ex]>)>()
+            + self
+                .lazy
+                .iter()
+                .map(|(_, _, _, h)| h.len() * 4)
+                .sum::<usize>()
+            + table_bytes(self.lazy_by_guard.len(), 32)
+            + self
+                .lazy_by_guard
+                .values()
+                .map(|v| v.len() * 4)
+                .sum::<usize>()
             + self.rdis.len() * 8
             + self.carry.len()
             + self.consts.len() * 8
@@ -5068,20 +5103,14 @@ fn on_rl<S: Sink>(
             return false;
         }
     }
-    // item 728's clauses, with the new premise fixed in the product
-    for (n, q, head) in &dx.lazy {
+    // item 728 / item 896 (R4) lazy clauses, with the new premise fixed in the product
+    for (lguard, n, q, head) in &dx.lazy {
+        let holder = match *lguard {
+            Some(g) => Holder::Class(g),
+            None => Holder::Unit,
+        };
         if dx.sub(ix, s, *q)
-            && !at_most(
-                ix,
-                st,
-                *n,
-                *q,
-                Holder::Unit,
-                Some((f, prem)),
-                head,
-                found,
-                guard,
-            )
+            && !at_most(ix, st, *n, *q, holder, Some((f, prem)), head, found, guard)
         {
             return false;
         }
@@ -5480,6 +5509,25 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
         {
             mark_interrupted(st);
             return;
+        }
+        if let Some(ids) = dx.lazy_by_guard.get(&d) {
+            for &id in ids {
+                let (_, n, q, ref head) = dx.lazy[id as usize];
+                if !at_most(
+                    ix,
+                    st,
+                    n,
+                    q,
+                    Holder::Unit,
+                    None,
+                    head,
+                    &mut found,
+                    &mut found_guard,
+                ) {
+                    mark_interrupted(st);
+                    return;
+                }
+            }
         }
         if !on_filler(ix, st, d, &unit, &mut found, &mut found_guard) {
             mark_interrupted(st);
@@ -7078,6 +7126,25 @@ fn process<S: Sink>(
                     {
                         mark_interrupted(st);
                         return;
+                    }
+                    if let Some(ids) = dx.lazy_by_guard.get(&d) {
+                        for &id in ids {
+                            let (_, n, q, ref head) = dx.lazy[id as usize];
+                            if !at_most(
+                                ix,
+                                st,
+                                n,
+                                q,
+                                Holder::Prem(&prem),
+                                None,
+                                head,
+                                &mut found,
+                                &mut found_guard,
+                            ) {
+                                mark_interrupted(st);
+                                return;
+                            }
+                        }
                     }
                     if !on_filler(ix, st, d, &prem, &mut found, &mut found_guard) {
                         mark_interrupted(st);
